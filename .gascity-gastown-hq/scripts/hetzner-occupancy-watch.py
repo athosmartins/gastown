@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""hetzner-occupancy-watch.py — o nó Hetzner pago está trabalhando? Uma leitura a cada 15 min; aviso ao Mayor se ocioso com fila ou se a CPU fica abaixo da régua. (ga-2hd02v.1.12, ga-2hd02v.6)
+"""hetzner-occupancy-watch.py — o nó Hetzner pago está trabalhando? Uma leitura a cada 15 min; aviso ao Mayor se ocioso com fila ou se a CPU fica abaixo da régua; diz a causa em números e age em degraus. (ga-2hd02v.1.12, ga-2hd02v.6, ga-2hd02v.5.10)
 
 Contents
-  Regra · Estado · Aviso · Arquivos · Uso
+  Regra · Estado · Aviso · Causa, degraus e número do dia · Arquivos · Uso
 
 REGRA (Athos, 14/10): "Hetzner pago trabalha sempre". O launchd do mini roda isto a cada 900 s (com.gascity.hetzner-occupancy-watch). Cada rodada faz TRÊS
 leituras, e cada uma tem três estados (leu / não consegui ler / vale X): "não consegui" nunca vira "ocioso" nem "ocupado".
@@ -22,6 +22,28 @@ AVISO    ao Mayor por `gc mail send` (não nudge: o nudge ao Mayor trava com a s
   cego     nenhuma leitura decidiu o estado há >= 1 h (sessões, CPU ou fila ilegíveis), OU a CPU não é lida há >= 1 h (com a CPU cega o aviso de CPU baixa está mudo, mesmo que a sessão prove "ocupado"); cooldown de 6 h
   foco     o foco do gate (gate-focus.state, mesma regra de 3 estados da gate-focus-lib.sh) liga: só conserto é despachado, então o aviso de ocioso se cala
   chave    o aviso só sai com <cidade>/.gc/hetzner-occupancy-alarm.on presente (e sem HETZNER_OCC_ALARM=0): sem ela é o modo só-medir, INERTE de propósito (mede e grava, nunca manda mail)
+CAUSA, DEGRAUS E NÚMERO DO DIA  (ga-2hd02v.5.10; 04/11, das 10h às 14h: CPU em 24-47 % em 18 leituras seguidas (4 h36 abaixo da régua) e o vigia só avisava, não dizia por quê nem agia; pedido do Athos: monitorar de perto e agir)
+  causa em números  a MESMA ssh da CPU traz também os contadores de cgroup v2 (cpu.stat do user-<uid>.slice e do ballast.slice), o iowait do /proc/stat, a MemAvailable e a lista de sessões do tmux do nó. Cada leitura do JSONL ganha
+           `nucleos` = {sessoes, lastro, sistema, espera, livres} (núcleos MÉDIOS na janela; somam o ncpu): lastro = ballast.slice, sessoes = o resto do user-<uid>.slice (sessões e o que o mbp-run lança por ssh), sistema = o que sobra do
+           ocupado (kernel, serviços do root), espera = iowait, livres = o que nem trabalha nem espera; `ram_mb` (MemAvailable); `lixo` = sessões do tmux do nó que a cidade não reconhece; e `causa`, UMA entre
+           lixo > RAM > lastro-sem-trabalho > fila-sem-elegível > cego, só com a CPU lida e abaixo da régua (acima dela é null). A ordem é de PRIORIDADE, não prova de culpa: o que prova é o `efeito` medido na leitura seguinte.
+           lixo = há sessão do tmux do nó (nome com -remote-) que a cidade não lista (em nenhum estado), não segura bead e está quieta há >= 30 min (HETZNER_OCC_D1_IDLE_S); RAM = MemAvailable abaixo do piso de partida do lastro (14336 MB,
+           HETZNER_OCC_RAM_START_MB) mais um slot (1024 MB): subir o lastro é inútil; lastro-sem-trabalho = sobram >= 2 núcleos livres e há RAM para mais lastro; fila-sem-elegível = a fila elegível do Pilot (hq) lida e vazia;
+           cego = o que falta para dizer a causa não foi lido (CPU, cgroup, RAM, fila) OU nenhuma das quatro explica. Leitura cega NUNCA vira "ocioso" nem dispara degrau (os 3 estados valem aqui também).
+  degraus  só com a CPU abaixo da régua há >= 30 min (a sequência de `baixa`) e a causa dizendo qual: lixo → D1, lastro-sem-trabalho → D2, fila-sem-elegível → D3; um degrau que não resolve (tentativas esgotadas) deixa o seguinte agir. UM degrau por
+           leitura e no mínimo 30 min (HETZNER_OCC_ACT_COOLDOWN_S) entre duas ações, para o efeito de cada uma ser medível. Cada degrau tem SUA chave em <cidade>/.gc (sem ela o degrau só mede: INERTE) e grava na leitura seguinte o `efeito` medido
+           (CPU antes/depois da ação). Nada aqui liga a queima (burn.on) nem despacha bead de P2 ao mini (Athos, 12/10).
+    D1 lixo     hetzner-occupancy-d1.on: mata a sessão do tmux do nó que a cidade não reconhece (precedente ga-vg16lk; caso real gate-reviewer-remote-adhoc-033f7bd5c1, 4 h parada em 04/11). Nunca mata sessão que a cidade lista, nem a que segura bead, nem a
+                que mexeu nos últimos 30 min: o ssh que mata confere a quietude de novo no próprio nó (TOCTOU) e a lista da cidade e a dos donos de bead têm de ter sido LIDAS (ilegível = não mata). No máximo 2 por leitura.
+    D2 lastro   hetzner-occupancy-d2.on: PEDE mais lastro gravando ~/gt-remote/ballast/lastro-pedido.json no nó ({v, epoch, ate, slots_extra, livres, ram_mb, quem}); quem consome é o governo do lastro (ga-2hd02v.5.11), que também aplica os pisos de RAM
+                dele: o vigia só pede com MemAvailable >= piso + 1 slot, e o pedido vence em 2 leituras (ate). Sem consumidor o efeito medido é zero e a escada segue.
+    D3 fila     hetzner-occupancy-d3.on: tira da memória de vereditos do Pilot (<cidade>/.gc/wa-node-pass-memo.tsv) as linhas `unknown` ainda frescas, e a passada seguinte reclassifica essas beads de WA; o «Só no ocioso» (P2+ só ocupa o nó quando
+                nenhuma P0/P1 cabe lá, Athos 30/10; ga-2hd02v.3.18 e, na passada do disk floor, ga-2hd02v.3.26) já é do Pilot e vale para o que voltar `node`: o vigia não despacha nada.
+    D4 esgotou  hetzner-occupancy-d4.on: abaixo da régua há >= 6 h (HETZNER_OCC_D4_AFTER_S), sem nenhum degrau aplicável que ainda tenha tentativa (ou com a causa RAM, em que nada cabe) → UM `notify` ao Athos por dia (quanto, por quê, o que foi tentado) e
+                uma bead com a causa. O notify roda com NOTIFY_STRICT_EXIT=1 e o rc é conferido: 0 saiu, 10 segurado até as 7 h e 11 já tinha saído contam como entregue; 12 (digest/teto), 13, 14, timeout e qualquer outro NÃO saíram (04/11, ga-i4t0lzx:
+                exit 12 e o aviso não chegou): o vigia manda o mesmo texto por `gc mail send mayor` uma vez e tenta o notify de novo a cada hora.
+  número do dia  hetzner-occupancy-dia.on: na 1ª leitura de cada dia, se o dia anterior fechou com ocupacao_pct < régua (e >= 48 janelas de CPU lidas: dia cego não tem número), 1 notify ao Athos com o % e a causa principal do dia; dia na meta
+           ou sem número não avisa (e não gasta o aviso).
 ARQUIVOS (só em <cidade>/.gc): hetzner-occupancy.jsonl (uma leitura por rodada) · hetzner-occupancy-daily.json (o número por dia: ocupado/ocioso/desconhecido;
   ocupacao_pct = a média de CPU do nó no dia, ponderada pela janela (cpu_nucleos_s / cpu_capacidade_s; cpu_janelas = quantas janelas entraram), null se nenhuma janela foi lida;
   ocupacao_sessao_pct = ocupado/(ocupado+ocioso), o número que ocupacao_pct era até a ga-2hd02v.6, null se nenhuma leitura decidiu. Dia gravado antes dela fica com o número antigo
@@ -31,6 +53,7 @@ USO      hetzner-occupancy-watch.py [--print] [--dry-run] [--print-config]
          exit 0 ok (inclui "outra instância rodando") · 1 crash (traceback no stderr) · 3 não consegui gravar
 """
 import argparse
+import base64
 import calendar
 import errno
 import fcntl
@@ -50,7 +73,22 @@ LIVE = frozenset({"active", "awake"})  # = bead_state.LIVE_SESSION_STATES
 DEAD = frozenset({"asleep", "drained", "closed", "archived", "quarantined", "failed-create"})  # = bead_state.DEAD_SESSION_STATES
 WARMUP = frozenset({"sem-leitura-anterior", "leitura-anterior-velha", "contador-recuou", "relogio-recuou"})  # a CPU só semeou o baseline: não é "cego"
 BEGIN, END = "@@OCC-BEGIN@@", "@@OCC-END@@"
-REMOTE_CMD = "echo %s; grep '^cpu' /proc/stat; echo %s" % (BEGIN, END)
+S_CG, S_MEM, S_TMUX, S_NOW = "@@OCC-CG@@", "@@OCC-MEM@@", "@@OCC-TMUX@@", "@@OCC-NOW@@"
+# A MESMA ssh traz o /proc/stat e o resto (ga-2hd02v.5.10): cada parte tem o seu marcador e a falha de uma não derruba as outras. `u` = cpu.stat do user-<uid>.slice, `l` = o do ballast.slice (some quando nada do lastro roda),
+# `m 1` = o gerenciador de usuário existe (sem ele a ausência do `l` não quer dizer "lastro parado"). O tmux diz o rc antes da lista: "sem servidor" (rc 1) é lista vazia, qualquer outra falha NÃO é.
+REMOTE_CMD = (
+    "echo " + BEGIN + "; grep '^cpu' /proc/stat; U=$(id -u); B=/sys/fs/cgroup/user.slice/user-$U.slice; "
+    "echo " + S_CG + "; [ -d \"$B/user@$U.service\" ] && echo m 1; "
+    "for p in \"u:$B\" \"l:$B/user@$U.service/ballast.slice\"; do awk -v k=\"${p%%:*}\" '/^usage_usec/{print k, $2}' \"${p#*:}/cpu.stat\" 2>/dev/null; done; "
+    "echo " + S_MEM + "; grep -E '^(MemAvailable|MemTotal):' /proc/meminfo; "
+    "echo " + S_TMUX + "; o=$(tmux -L gc-remote list-sessions -F '#{session_name}|#{session_activity}' 2>&1); echo \"rc=$?\"; echo \"$o\"; "
+    "echo " + S_NOW + "; date +%s; echo " + END
+)
+RUNGS = ("d1", "d2", "d3")  # a ordem da escada; o D4 (esgotou) é o aviso, não um degrau que age
+CAUSAS = ("lixo", "RAM", "lastro-sem-trabalho", "fila-sem-elegível", "cego")
+RUNG_OF_CAUSE = {"lixo": "d1", "lastro-sem-trabalho": "d2", "fila-sem-elegível": "d3"}  # a causa diz por qual degrau começa; RAM e cego não têm degrau
+SAFE_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,80}")
+BALLAST_REQ = "lastro-pedido.json"
 RULE = 2  # a regra que produziu a leitura (vai no JSONL como "regra"): 2 = ocupado é sessão que SEGURA bead (ga-l9q18u); leitura sem o campo é da regra 1, em que sessão viva bastava
 
 
@@ -97,15 +135,28 @@ def load_config(env):
         gc_timeout_s=_num(env, "HETZNER_OCC_GC_TIMEOUT_S", 60, int, 1), bd_timeout_s=_num(env, "HETZNER_OCC_BD_TIMEOUT_S", 60, int, 1),
         focus_stale_s=_num(env, "GATE_FOCUS_STALE_S", 7200, int, 1),
         pilot_file=env.get("HETZNER_OCC_PILOT_FILE") or os.path.join(home, ".gc", "pilot-dispatchable.json"),
-        gc_bin=env.get("GC_BIN", "gc"), ssh_bin=env.get("SSH_BIN", "ssh"), bd_bin=env.get("BD_BIN", "bd"),
+        gc_bin=env.get("GC_BIN", "gc"), ssh_bin=env.get("SSH_BIN", "ssh"), bd_bin=env.get("BD_BIN", "bd"), notify_bin=env.get("NOTIFY_BIN", "notify"),
+        # a escada (ga-2hd02v.5.10): o que é "lixo", o intervalo entre ações, as tentativas por degrau, quando o D4 desiste e os pisos de RAM do lastro (os do hetzner-ballast.py: partida 14336, pausa 10240, morte 7168)
+        d1_idle_s=_num(env, "HETZNER_OCC_D1_IDLE_S", 1800, int, 60), d1_max=_num(env, "HETZNER_OCC_D1_MAX", 2, int, 1),
+        act_cooldown_s=_num(env, "HETZNER_OCC_ACT_COOLDOWN_S", 1800, int, 0), act_tries=_num(env, "HETZNER_OCC_ACT_TRIES", 2, int, 1),
+        d4_after_s=_num(env, "HETZNER_OCC_D4_AFTER_S", 21600, int, 60), notify_retry_s=_num(env, "HETZNER_OCC_NOTIFY_RETRY_S", 3600, int, 0), notify_timeout_s=_num(env, "HETZNER_OCC_NOTIFY_TIMEOUT_S", 60, int, 1),
+        ram_start_mb=_num(env, "HETZNER_OCC_RAM_START_MB", 14336, int, 0), ram_slot_mb=_num(env, "HETZNER_OCC_RAM_SLOT_MB", 1024, int, 1),
+        min_free_cores=_num(env, "HETZNER_OCC_MIN_FREE_CORES", 2, float, 0.1), day_min_windows=_num(env, "HETZNER_OCC_DAY_MIN_WINDOWS", 48, int, 1),
+        ballast_home=env.get("HETZNER_OCC_BALLAST_HOME", "~/gt-remote/ballast"),
+        wa_memo=env.get("HETZNER_OCC_WA_MEMO") or os.path.join(city, ".gc", "wa-node-pass-memo.tsv"), memo_unknown_ttl_s=_num(env, "PILOT_WA_NODE_PASS_UNKNOWN_TTL", 3600, int, 1),
         now=_now(env),
     )
     if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._@-]*", c.ssh_host):
         raise ValueError("HETZNER_SSH_HOST inválido: %r" % c.ssh_host)
     if c.low_pct > 100:  # acima de 100 toda janela seria "baixa": o aviso sairia a cada cooldown para sempre (inf também cai aqui; NaN já reprovou no _num)
         raise ValueError("HETZNER_OCC_LOW_PCT=%r acima de 100" % c.low_pct)
+    if not re.fullmatch(r"~?/?[A-Za-z0-9._/-]+", c.ballast_home) or ".." in c.ballast_home:
+        raise ValueError("HETZNER_OCC_BALLAST_HOME inválido: %r" % c.ballast_home)
     c.alarm_key = os.path.join(c.gc_dir, "hetzner-occupancy-alarm.on")
     c.alarm = env.get("HETZNER_OCC_ALARM") != "0" and os.path.exists(c.alarm_key)  # chave ilegível/ausente = desligado (o estado inerte)
+    # uma chave por degrau (e uma para o número do dia): ausente/ilegível = o degrau só mede, nunca age. HETZNER_OCC_ACT=0 desliga todas de uma vez
+    c.keys = {k: os.path.join(c.gc_dir, "hetzner-occupancy-%s.on" % k) for k in ("d1", "d2", "d3", "d4", "dia")}
+    c.on = {k: env.get("HETZNER_OCC_ACT") != "0" and os.path.exists(p) for k, p in c.keys.items()}
     return c
 
 
@@ -115,10 +166,11 @@ def _now(env):
 
 
 # ---- processos e arquivos ----------------------------------------------------------------------------------------------------------------------------
-def run_cmd(argv, timeout):
-    """(rc, stdout, stderr, porque). porque: None = rodou até o fim · 'timeout' (o grupo de processos inteiro morre) · 'nao-executou'."""
+def run_cmd(argv, timeout, env=None):
+    """(rc, stdout, stderr, porque). porque: None = rodou até o fim · 'timeout' (o grupo de processos inteiro morre) · 'nao-executou'. env = variáveis a MAIS (o notify precisa das suas)."""
     try:
-        p = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True, errors="replace", start_new_session=True)
+        p = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True, errors="replace", start_new_session=True,
+                             env=dict(os.environ, **env) if env else None)
     except OSError as e:
         return None, "", str(e), "nao-executou"
     try:
@@ -249,7 +301,8 @@ def read_holders(c):
 
 
 def read_sessions(c):
-    r = {"lido": False, "ativas": None, "ocupadas": None, "nomes": [], "nomes_ocupadas": [], "motivo": None}
+    # `_reconhecidas` (todo nome que a cidade lista, em qualquer estado, host ou alias) e `_donos` (os assignees de bead in_progress) NÃO vão ao JSONL (o run os tira): servem ao D1, que só mata o que a cidade não reconhece
+    r = {"lido": False, "ativas": None, "ocupadas": None, "nomes": [], "nomes_ocupadas": [], "motivo": None, "_reconhecidas": None, "_donos": None}
     rc, out, err, why = run_cmd([c.gc_bin, "--city", c.city, "session", "list", "--json"], c.gc_timeout_s)
     r["motivo"] = _failed(rc, why, "gc")
     if r["motivo"]:
@@ -268,9 +321,13 @@ def read_sessions(c):
         r["motivo"] = "sem-lista-sessions"
         return r
     other = re.compile(r"-remote-(%s)(-|$)" % "|".join(re.escape(h) for h in c.other_hosts)) if c.other_hosts else None
-    active, live, bad_entry, bad_state = [], [], 0, 0
+    active, live, bad_entry, bad_state, known = [], [], 0, 0, set()
     for s in lst:
         ident = _ident(s)
+        if isinstance(s, dict):
+            known.update(_owners(s))  # o que a cidade conhece por nome, qualquer estado (viva, dormindo, fechada, de outro host): o D1 só mata o que NÃO está aqui
+            if ident:
+                known.add(ident)
         if ident is None:
             bad_entry += 1
         elif "-remote-" not in "-%s-" % ident or (other and other.search(ident)):
@@ -282,6 +339,8 @@ def read_sessions(c):
             live.append((ident, _owners(s)))
         elif not (isinstance(s.get("state"), str) and s["state"] in DEAD):
             bad_state += 1  # state ausente ou fora do vocabulário (draining, start-pending...): não dá para dizer que trabalha nem que dorme
+    if not bad_entry:  # uma entrada sem nome pode ser justamente a sessão que o tmux tem: com ela ilegível a lista não prova que "a cidade não conhece" nada
+        r["_reconhecidas"] = known
     if bad_entry + bad_state:
         r["ilegiveis"] = bad_entry + bad_state
     unreadable = "entrada-ilegivel" if bad_entry else "estado-ilegivel"
@@ -296,6 +355,7 @@ def read_sessions(c):
     if held is None:
         r["motivo"], r["detalhe"] = why, detail  # ocupadas fica null (não 0): não sei quem segura bead
         return r
+    r["_donos"] = held
     mine = sorted(i for i, owners in live if held.intersection(owners))
     r.update(ocupadas=len(mine), nomes_ocupadas=mine)
     if mine:  # uma sessão que segura bead provada basta, mesmo com entrada ilegível ou sem nome ao lado
@@ -317,6 +377,7 @@ def parse_stat(out):
         return None, "sem-marcador"
     i = lines.index(BEGIN)
     body = lines[i + 1:lines.index(END, i + 1)]
+    body = body[:next((k for k, ln in enumerate(body) if ln == S_CG), len(body))]  # só o /proc/stat: depois do marcador é a leitura irmã (cgroup, RAM, tmux), que não tem linha `cpu`
     agg, ncpu = None, 0
     for ln in body:
         f = ln.split()
@@ -340,8 +401,9 @@ def _baseline_ok(b):
     return isinstance(b, dict) and all(isinstance(b.get(k), int) and not isinstance(b.get(k), bool) and b[k] >= 0 for k in ("epoch", "busy", "total"))
 
 
-def read_cpu(c, base, now):
-    """(cpu, novo_baseline|None, núcleos). novo_baseline None = manter o antigo; a falha de leitura NUNCA apaga o baseline."""
+def read_cpu(c, base, now, raw=None):
+    """(cpu, novo_baseline|None, núcleos). novo_baseline None = manter o antigo; a falha de leitura NUNCA apaga o baseline. `raw` (dict, opcional) recebe a saída da ssh (`out`) e o que o parse_stat leu
+    (`busy`, `total`, `ncpu`) para as leituras irmãs da causa: o retorno e o baseline do CPU não mudam por causa dele."""
     cpu = {"lido": False, "nucleos": None, "ncpu": None, "janela_s": None, "pct": None, "motivo": None}
     argv = [c.ssh_bin, "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", c.ssh_host, REMOTE_CMD]
     rc, out, err, why = run_cmd(argv, c.ssh_timeout_s)
@@ -349,11 +411,15 @@ def read_cpu(c, base, now):
     if cpu["motivo"]:
         cpu["detalhe"] = _oneline(err)
         return cpu, None, None
+    if raw is not None:
+        raw["out"] = out
     got, cpu["motivo"] = parse_stat(out)
     if got is None:
         return cpu, None, None
     busy, total, ncpu = got
     cpu["ncpu"] = ncpu
+    if raw is not None:
+        raw.update(busy=busy, total=total, ncpu=ncpu)
     now_b = {"epoch": now, "busy": busy, "total": total}
     if not _baseline_ok(base):
         cpu["motivo"] = "sem-leitura-anterior"
@@ -379,6 +445,166 @@ def read_cpu(c, base, now):
     cores = db * ncpu / dt
     cpu.update(lido=True, nucleos=round(cores, 2), pct=round(100.0 * db / dt, 1), motivo=None)
     return cpu, now_b, cores
+
+
+# ---- leituras irmãs da CPU: de onde vem o número (cgroup, iowait, RAM, tmux do nó) -----------------------------------------------------------------------
+def _section(lines, mark):
+    """As linhas entre o marcador e o próximo marcador; None se o marcador não veio (parte que falta ≠ parte vazia)."""
+    if mark not in lines:
+        return None
+    out = []
+    for ln in lines[lines.index(mark) + 1:]:
+        if ln.startswith("@@OCC-"):
+            break
+        out.append(ln)
+    return out
+
+
+def parse_extra(out):
+    """O que a ssh traz além do /proc/stat. Cada parte é lida sozinha e a que falta fica None/lido=False, NUNCA zero: o que não li não é "nada rodando"."""
+    ex = {"iow": None, "u": None, "l": None, "m": False, "cg": False, "ram_mb": None, "node_now": None, "tmux": {"lido": False, "sessoes": [], "motivo": "sem-secao"}}
+    lines = [ln.strip() for ln in (out or "").splitlines()]
+    if BEGIN not in lines or END not in lines[lines.index(BEGIN) + 1:]:
+        return ex
+    i = lines.index(BEGIN)
+    lines = lines[i + 1:lines.index(END, i + 1)]
+    head = lines[:next((k for k, ln in enumerate(lines) if ln.startswith("@@OCC-")), len(lines))]
+    for ln in head:
+        f = ln.split()
+        if f and f[0] == "cpu" and len(f) >= 9 and re.fullmatch(r"[0-9]+", f[5]):
+            ex["iow"] = int(f[5])  # user nice system idle IOWAIT irq softirq steal
+    cg = _section(lines, S_CG)
+    if cg is not None:
+        ex["cg"] = True
+        for ln in cg:
+            f = ln.split()
+            if len(f) == 2 and re.fullmatch(r"[0-9]+", f[1]):
+                if f[0] == "m":
+                    ex["m"] = True
+                elif f[0] in ("u", "l"):
+                    ex[f[0]] = int(f[1])
+    mem = _section(lines, S_MEM)
+    for ln in mem or []:
+        m = re.fullmatch(r"MemAvailable:\s+([0-9]+)\s*kB", ln)
+        if m:
+            ex["ram_mb"] = int(m.group(1)) // 1024
+    t, tm = ex["tmux"], _section(lines, S_TMUX)
+    if tm is not None:
+        if not tm or not re.fullmatch(r"rc=[0-9]+", tm[0]):
+            t["motivo"] = "rc-ausente"
+        else:
+            rc, body = int(tm[0][3:]), [x for x in tm[1:] if x]
+            if rc == 0:
+                ses, bad = [], 0
+                for ln in body:
+                    name, sep, act = ln.rpartition("|")
+                    if sep and name and re.fullmatch(r"[0-9]+", act):
+                        ses.append((name, int(act)))
+                    else:
+                        bad += 1
+                t.update(lido=not bad, sessoes=ses if not bad else [], motivo="linha-ilegivel" if bad else None)
+            elif rc == 1 and body and re.match(r"(no server running|error connecting to .*No such file or directory)", body[0]):
+                t.update(lido=True, sessoes=[], motivo=None)  # sem servidor tmux no nó = nenhuma sessão (leu); qualquer outra falha do tmux NÃO é lista vazia
+            else:
+                t["motivo"] = "tmux-rc-%d" % rc
+    nw = _section(lines, S_NOW)
+    if nw and re.fullmatch(r"[0-9]+", nw[0]):
+        ex["node_now"] = int(nw[0])
+    return ex
+
+
+def _extra_base_ok(b):
+    return (isinstance(b, dict) and all(isinstance(b.get(k), int) and not isinstance(b.get(k), bool) and b[k] >= 0 for k in ("epoch", "u", "iow", "busy", "total"))
+            and (b.get("l") is None or (isinstance(b["l"], int) and not isinstance(b["l"], bool) and b["l"] >= 0)))
+
+
+def read_nucleos(c, base, ex, raw, now):
+    """(nucleos, novo_baseline|None): a CPU da janela repartida em núcleos MÉDIOS (somam o ncpu): sessoes, lastro, sistema, espera (iowait) e livres. Baseline próprio (`cpu_extra`), separado do da CPU.
+    Janela inválida (1ª leitura, relógio, contador que recuou, fatia do lastro que sumiu) = lido False com o motivo: nunca um número chutado. Sem `l` nas duas pontas, com o gerenciador de usuário de pé, o lastro foi 0."""
+    n = {"lido": False, "sessoes": None, "lastro": None, "sistema": None, "espera": None, "livres": None, "janela_s": None, "motivo": None}
+    if not raw or "busy" not in raw:
+        n["motivo"] = "sem-leitura-cpu"
+        return n, None
+    if not ex["cg"] or ex["u"] is None:
+        n["motivo"] = "cgroup-ilegivel"
+        return n, None
+    if ex["iow"] is None:
+        n["motivo"] = "iowait-ilegivel"
+        return n, None
+    if ex["l"] is None and not ex["m"]:
+        n["motivo"] = "sem-gerenciador-de-usuario"  # sem ele a ausência do `l` não diz "lastro parado": pode ser a leitura que falhou
+        return n, None
+    cur = {"epoch": now, "u": ex["u"], "l": ex["l"], "iow": ex["iow"], "busy": raw["busy"], "total": raw["total"]}
+    if not _extra_base_ok(base):
+        n["motivo"] = "sem-leitura-anterior"
+        return n, cur
+    win = now - base["epoch"]
+    n["janela_s"] = win
+    if win < 0:
+        n["motivo"] = "relogio-recuou"
+        return n, cur
+    if win < c.min_window_s:
+        n["motivo"] = "janela-curta"
+        return n, None
+    if win > c.max_window_s:
+        n["motivo"] = "leitura-anterior-velha"
+        return n, cur
+    du, dio, db, dt = cur["u"] - base["u"], cur["iow"] - base["iow"], cur["busy"] - base["busy"], cur["total"] - base["total"]
+    if min(du, dio, db, dt) < 0:
+        n["motivo"] = "contador-recuou"
+        return n, cur
+    if dt == 0:
+        n["motivo"] = "sem-tick"
+        return n, None
+    pl, l = base.get("l"), cur["l"]
+    if pl is not None and (l is None or l < pl):
+        n["motivo"] = "lastro-sumiu" if l is None else "contador-recuou"  # a fatia do lastro foi recriada: não sei o quanto rodou antes de sumir
+        return n, cur
+    dl = l if pl is None and l is not None else (l - pl if l is not None else 0)  # fatia nascida na janela conta do zero; ausente nas duas pontas = 0
+    ncpu, us = raw["ncpu"], win * 1e6
+    busy_c, user_c = db * ncpu / dt, du / us
+    if user_c > ncpu * 1.1:
+        n["motivo"] = "contador-implausivel"  # o cgroup diz mais núcleos do que o nó tem: um dos dois contadores não é o que penso
+        return n, cur
+    n.update(lido=True, lastro=round(dl / us, 2), sessoes=round(max(0, du - dl) / us, 2), sistema=round(max(0.0, busy_c - user_c), 2), espera=round(dio * ncpu / dt, 2),
+             livres=round(max(0.0, ncpu - busy_c - dio * ncpu / dt), 2), motivo=None)  # steal não entra em nenhuma conta: cai em `livres` (no nó dedicado é ~0)
+    return n, cur
+
+
+def find_lixo(c, sess, ex):
+    """O lixo do D1: sessão do tmux do nó (nome com -remote-) que a cidade NÃO lista em estado nenhum, não segura bead e está quieta há >= HETZNER_OCC_D1_IDLE_S. Três estados: o tmux, a lista da cidade,
+    o relógio do nó e os donos de bead têm de ter sido LIDOS; o que não li dá lido False (e o D1 não mata nada). `_alvos` (interno) = os nomes a matar, os mais quietos primeiro."""
+    r = {"lido": False, "n": 0, "nomes": [], "ocioso_max_s": None, "motivo": None, "_alvos": []}
+    t = ex["tmux"]
+    if not t["lido"]:
+        r["motivo"] = "tmux-ilegivel:" + str(t["motivo"])
+        return r
+    known = sess.get("_reconhecidas")
+    if known is None:
+        r["motivo"] = "cidade-ilegivel"
+        return r
+    if ex["node_now"] is None:
+        r["motivo"] = "sem-relogio-do-no"
+        return r
+    other = re.compile(r"-remote-(%s)(-|$)" % "|".join(re.escape(h) for h in c.other_hosts)) if c.other_hosts else None
+    cand = []
+    for name, act in t["sessoes"]:
+        if "-remote-" not in "-%s-" % name or not SAFE_NAME.fullmatch(name) or name in known or (other and other.search(name)):
+            continue
+        idle = ex["node_now"] - act
+        if idle >= c.d1_idle_s:
+            cand.append((idle, name))
+    if cand:
+        donos = sess.get("_donos")
+        if donos is None:
+            donos, why, _d = read_holders(c)  # a cidade pode estar sem sessão viva (o bd nem foi chamado) ou o bd falhou: leio agora, e se não leio, não mato
+            if donos is None:
+                r["motivo"] = "donos-ilegivel:" + str(why)
+                return r
+        cand = [(i, n) for i, n in cand if n not in donos]
+    cand.sort(key=lambda x: (-x[0], x[1]))
+    r.update(lido=True, n=len(cand), nomes=[n for _i, n in cand[:3]], ocioso_max_s=cand[0][0] if cand else None, _alvos=[n for _i, n in cand[:c.d1_max]])
+    return r
 
 
 # ---- leitura 3: fila do Pilot e foco do gate ---------------------------------------------------------------------------------------------------------
@@ -506,7 +732,7 @@ def idle_mail(c, rd, span):
         "• fila (até %d; primeiros ids): %s" % (fila["n"], ", ".join(fila["ids"])),
         "• foco do gate: " + foco,
         "A fila é lida do pilot-dispatchable.json ANTES dos vetos de pool e do freio de top-up: parte dela pode estar vetada, então o número é um teto, não uma promessa.",
-        "O vigia só mede e avisa: não atribui nem despacha nada. Próximo aviso deste tipo em no mínimo %d h. Voltar a só-medir: rm %s" % (c.idle_cooldown_s // 3600, c.alarm_key),
+        "O vigia não atribui nem despacha bead nenhuma; mede, avisa e, só nos degraus cuja chave .on existe, age (mata sessão sem dono, pede lastro, reclassifica a fila de WA). Próximo aviso deste tipo em no mínimo %d h. Voltar a só-medir: rm %s" % (c.idle_cooldown_s // 3600, c.alarm_key),
     ])
     return subj, body
 
@@ -541,9 +767,10 @@ def low_mail(c, rd, low):
         "• última janela: %s%% (%s núcleo(s) de %s ocupados, janela de %s s)" % (cpu["pct"], cpu["nucleos"], cpu["ncpu"], cpu["janela_s"]),
         "• contexto (não entra na decisão): sessões remotas vivas: %s · segurando bead: %s · fila do Pilot (hq): %s · foco do gate: %s" % (
             _show(sess["ativas"]), _show(sess["ocupadas"]), _show(fila["n"], "não lida"), foco),
+    ] + ([cause_line(rd)] if cause_line(rd) else []) + [
         "Este aviso NÃO depende de fila nem de sessão: com sessão segurando bead e a CPU parada ele sai do mesmo jeito (foi o que faltou na madrugada de 20/10, 7 h com 0 a 15% de CPU e zero aviso). "
         "A fila, quando lida, é a do Pilot ANTES dos vetos de pool e do freio de top-up: é um teto, não uma promessa.",
-        "O vigia só mede e avisa: não atribui nem despacha nada. Próximo aviso deste tipo em no mínimo %d h. Voltar a só-medir: rm %s" % (c.low_cooldown_s // 3600, c.alarm_key),
+        "O vigia não atribui nem despacha bead nenhuma; mede, avisa e, só nos degraus cuja chave .on existe, age (mata sessão sem dono, pede lastro, reclassifica a fila de WA). Próximo aviso deste tipo em no mínimo %d h. Voltar a só-medir: rm %s" % (c.low_cooldown_s // 3600, c.alarm_key),
     ])
     return subj, body
 
@@ -551,6 +778,305 @@ def low_mail(c, rd, low):
 def send_mail(c, subj, body):
     rc, _o, _e, why = run_cmd([c.gc_bin, "--city", c.city, "mail", "send", "mayor", "-s", subj, "-m", body], 45)
     return why is None and rc == 0
+
+
+# ---- a causa, a escada e o aviso (ga-2hd02v.5.10) ----------------------------------------------------------------------------------------------------
+CAUSA_FRASE = {
+    "lixo": "sessão sem dono parada no nó (a cidade não a conhece)",
+    "RAM": "pouca memória livre no nó: não cabe mais lastro",
+    "lastro-sem-trabalho": "sobram núcleos livres e o lastro não os usa",
+    "fila-sem-elegível": "a fila do Pilot não tem bead elegível para o nó",
+}
+RUNG_NOME = {"d1": "matar sessão sem dono", "d2": "pedir mais lastro", "d3": "reclassificar a fila de WA"}
+
+
+def pick_cause(c, cpu, nuc, ram_mb, lixo, fila):
+    """UMA causa, só com a CPU lida e abaixo da régua (None = acima dela, nada a explicar). Ordem de PRIORIDADE (não prova de culpa; o `efeito` da leitura seguinte é que prova): lixo > RAM > lastro-sem-trabalho >
+    fila-sem-elegível > cego. cego = o que falta para dizer a causa não foi lido, ou nenhuma das quatro explica: leitura cega nunca vira causa nem dispara degrau."""
+    if not cpu["lido"]:
+        return "cego"
+    if cpu["pct"] >= c.low_pct:
+        return None
+    if not nuc["lido"]:
+        return "cego"
+    if lixo["lido"] and lixo["n"] > 0:
+        return "lixo"
+    if nuc["livres"] >= c.min_free_cores:
+        if ram_mb is None:
+            return "cego"  # com núcleo sobrando, é a RAM que decide se o lastro cabe: sem ela não sei
+        if ram_mb < c.ram_start_mb + c.ram_slot_mb:
+            return "RAM"
+        return "lastro-sem-trabalho"
+    if fila["lido"] and fila["n"] == 0:
+        return "fila-sem-elegível"
+    return "cego"
+
+
+def memo_unknown(c, now):
+    """(chaves, linhas, motivo): as chaves (id, updated_at) cuja ÚLTIMA linha na memória do Pilot é `unknown` ainda fresca (a última linha da bead vale, como no _pilot_wa_node_pass_memo_hit). Arquivo ausente = memória
+    vazia (leu); arquivo que não abre = (None, None, motivo): o D3 não sabe se há o que reclassificar."""
+    try:
+        with open(c.wa_memo, encoding="utf-8") as f:
+            lines = f.read().splitlines()
+    except FileNotFoundError:
+        return set(), [], None
+    except (OSError, ValueError):
+        return None, None, "memo-ilegivel"
+    last = {}
+    for ln in lines:
+        f = ln.split("\t")
+        if len(f) == 4 and re.fullmatch(r"[0-9]+", f[0]):
+            last[(f[1], f[2])] = (int(f[0]), f[3])
+    return {k for k, (ep, v) in last.items() if v == "unknown" and now - ep < c.memo_unknown_ttl_s}, lines, None
+
+
+def purge_memo(c, now):
+    """(chaves_removidas, motivo|None). Tira da memória TODAS as linhas das beads cuja última linha é `unknown` fresca: sem elas a próxima passada do Pilot sonda a bead de novo (reclassifica). Reescrita atômica;
+    uma linha que o Pilot acrescente entre a leitura e o rename se perde, e isso é inofensivo (a memória só poupa orçamento de sonda)."""
+    keys, lines, why = memo_unknown(c, now)
+    if keys is None:
+        return 0, why
+    if not keys:
+        return 0, None
+    keep = [ln for ln in lines if not (len(ln.split("\t")) == 4 and (ln.split("\t")[1], ln.split("\t")[2]) in keys)]
+    try:
+        write_atomic(c.wa_memo, "".join(ln + "\n" for ln in keep))
+    except Fail:
+        return 0, "memo-nao-gravou"
+    return len(keys), None
+
+
+def d2_extra(c, nuc, ram_mb):
+    """Quantos slots a mais o vigia pede: no máximo os núcleos livres, o que a RAM acima do piso de partida comporta (1 slot por ram_slot_mb) e 4. 0 = não há o que pedir (ou não li a RAM)."""
+    if not nuc["lido"] or ram_mb is None:
+        return 0
+    return max(0, min(int(nuc["livres"]), (ram_mb - c.ram_start_mb) // c.ram_slot_mb, 4))
+
+
+def _tries(st, k):
+    d = st.get("degraus")
+    e = d.get(k) if isinstance(d, dict) else None
+    return _int(e.get("tentativas"), 0) if isinstance(e, dict) else 0
+
+
+def plan_ladder(c, cause, low_due, st, now, lixo, nuc, ram_mb, memo_n):
+    """(status_por_degrau, escolhido|None, esgotou). A escada só mexe com a CPU abaixo da régua há >= 30 min (low_due) e causa que diga por onde começar; considera os degraus a partir do da causa, em ordem; UM por leitura
+    e com o intervalo global entre ações. Aplicabilidade em 3 estados (sim/não/não li): o que não li NUNCA conta como "esgotado". esgotou = causa dita (ou RAM, em que nada cabe) e nenhum degrau aplicável com chave e
+    tentativa sobrando; degrau aplicável com a chave desligada NÃO esgota (ninguém autorizou a tentar)."""
+    status = {k: None for k in RUNGS}
+    if not low_due or cause is None:
+        return {k: "nao-devido" for k in RUNGS}, None, False
+    if cause == "cego":
+        return {k: "cego" for k in RUNGS}, None, False
+    if cause == "RAM":
+        return {k: "ram" for k in RUNGS}, None, True
+    appl = {"d1": None if not lixo["lido"] else lixo["n"] > 0 and bool(lixo["_alvos"]),
+            "d2": None if not nuc["lido"] or ram_mb is None else d2_extra(c, nuc, ram_mb) >= 1,
+            "d3": None if memo_n is None else memo_n > 0}
+    last = _int(st.get("ultima_acao_em"))
+    cooling = last is not None and 0 <= now - last < c.act_cooldown_s
+    chosen, exhausted = None, True
+    for i, k in enumerate(RUNGS):
+        if i < RUNGS.index(RUNG_OF_CAUSE[cause]):
+            status[k] = "fora"
+        elif appl[k] is None:
+            status[k], exhausted = "cego", False
+        elif not appl[k]:
+            status[k] = "nao-aplica"
+        elif not c.on[k]:
+            status[k], exhausted = "desligado", False
+        elif _tries(st, k) >= c.act_tries:
+            status[k] = "esgotado"
+        else:
+            exhausted = False
+            if cooling:
+                status[k] = "cooldown"
+            elif chosen is None:
+                chosen, status[k] = k, "pronto"
+            else:
+                status[k] = "aguarda"  # um degrau antes deste age primeiro
+    return status, chosen, exhausted
+
+
+def _ssh_node(c, script):
+    return run_cmd([c.ssh_bin, "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", c.ssh_host, script], c.ssh_timeout_s)
+
+
+def _ssh_verdict(c, script, ok_word):
+    """(ok, rótulo): o ssh de ação diz UMA palavra na última linha; só `ok_word` com rc 0 conta como feito. Falha, timeout e saída muda são rótulos, nunca sucesso."""
+    rc, out, _e, why = _ssh_node(c, script)
+    if why:
+        return False, why
+    words = out.split()
+    if rc != 0:
+        return False, "rc-%s" % rc
+    return (words[-1] == ok_word, words[-1]) if words else (False, "sem-saida")
+
+
+def kill_idle_session(c, name):
+    """(ok, rótulo). O ssh confere DE NOVO, no próprio nó, que a sessão existe e segue quieta há >= d1_idle_s (a leitura que a achou é de minutos atrás: uma sessão que voltou a trabalhar não morre). Só nome
+    seguro e com -remote- chega aqui."""
+    if not SAFE_NAME.fullmatch(name) or "-remote-" not in "-%s-" % name:
+        return False, "nome-recusado"
+    script = ('S=%s; T="tmux -L gc-remote"; $T has-session -t "=$S" 2>/dev/null || { echo ausente; exit 0; }; '
+              'a=$($T display-message -p -t "=$S:" "#{session_activity}" 2>/dev/null); n=$(date +%%s); '
+              'case "$a" in ""|*[!0-9]*) echo ilegivel; exit 0;; esac; '
+              '[ $((n - a)) -lt %d ] && { echo ativa; exit 0; }; '
+              '$T kill-session -t "=$S" 2>/dev/null && echo morta || echo falhou' % (name, c.d1_idle_s))
+    return _ssh_verdict(c, script, "morta")
+
+
+def request_ballast(c, extra, nuc, ram_mb, now):
+    """(ok, rótulo): grava ~/gt-remote/ballast/lastro-pedido.json no nó (tmp + mv: o governo nunca lê meio arquivo). O pedido VENCE em 2 leituras (`ate`): quem não renova não deixa pedido velho de pé."""
+    body = json.dumps({"v": 1, "epoch": now, "ate": now + 2 * c.interval_s, "slots_extra": extra, "livres": nuc["livres"], "ram_mb": ram_mb, "quem": "hetzner-occupancy-watch"}, separators=(",", ":"))
+    b64 = base64.b64encode(body.encode("utf-8")).decode("ascii")
+    script = ('H=\'%s\'; case "$H" in "~/"*) H="$HOME/${H#"~/"}";; esac; [ -d "$H" ] || { echo sem-lastro; exit 0; }; '
+              'echo %s | base64 -d > "$H/.%s.tmp" && mv "$H/.%s.tmp" "$H/%s" && echo gravado || echo falhou' % (c.ballast_home, b64, BALLAST_REQ, BALLAST_REQ, BALLAST_REQ))
+    return _ssh_verdict(c, script, "gravado")
+
+
+def do_rung(c, k, lixo, nuc, ram_mb, now):
+    """(ok, o_que, detalhe): executa o degrau `k`. ok = mudou alguma coisa (o efeito dela só se mede se mudou)."""
+    if k == "d1":
+        res = [(n,) + kill_idle_session(c, n) for n in lixo["_alvos"]]
+        done = [n for n, ok, _w in res if ok]
+        return bool(done), "matou %d sessão(ões) sem dono: %s" % (len(done), ", ".join(done) or "-"), ", ".join("%s=%s" % (n, w) for n, _ok, w in res)
+    if k == "d2":
+        extra = d2_extra(c, nuc, ram_mb)
+        ok, w = request_ballast(c, extra, nuc, ram_mb, now)
+        return ok, "pediu +%d slot(s) de lastro" % extra, w
+    n, why = purge_memo(c, now)
+    return why is None and n > 0, "tirou %d bead(s) `unknown` da memória do Pilot" % n, why or "ok"
+
+
+def measure_effects(st, cpu, nuc):
+    """(efeitos, pendentes_restantes). O efeito de uma ação é medido na leitura SEGUINTE (a janela dela começa depois da ação): CPU e lastro antes/depois. Sem CPU lida a pendência espera até 3 leituras e depois
+    vira {"motivo": "cpu-nao-lida"}: efeito que não deu para medir é dito, não inventado."""
+    out, keep = [], []
+    for p in st.get("pendentes") or []:
+        a = p.get("antes") if isinstance(p, dict) else None
+        if not isinstance(a, dict) or _int(p.get("em")) is None:
+            continue  # lixo no estado (editado à mão): descarta
+        base = {"degrau": p.get("degrau"), "em": p["em"], "o_que": p.get("o_que")}
+        if cpu["lido"]:
+            ef = dict(base, pct_antes=a.get("pct"), pct_depois=cpu["pct"], nucleos_antes=a.get("nucleos"), nucleos_depois=cpu["nucleos"],
+                      ganho_nucleos=round(cpu["nucleos"] - a["nucleos"], 2) if isinstance(a.get("nucleos"), (int, float)) else None)
+            if nuc["lido"]:
+                ef.update(lastro_antes=a.get("lastro"), lastro_depois=nuc["lastro"], livres_antes=a.get("livres"), livres_depois=nuc["livres"])
+            out.append(ef)
+        elif _int(p.get("leituras"), 0) + 1 >= 3:
+            out.append(dict(base, motivo="cpu-nao-lida"))
+        else:
+            keep.append(dict(p, leituras=_int(p.get("leituras"), 0) + 1))
+    return out, keep
+
+
+def send_notify(c, title, text):
+    """(entregue, rótulo). NOTIFY_STRICT_EXIT=1 dá um rc por desfecho e SÓ ele diz se saiu: 0 entregue, 10 segurado até as 7 h (sai no flush) e 11 já tinha saído contam; 12 digest/teto, 13 autodispatch, 14 dropado,
+    timeout e qualquer outro rc NÃO saíram (04/11, ga-i4t0lzx: exit 12 e o Athos não soube)."""
+    rc, _o, _e, why = run_cmd([c.notify_bin, "-t", title, text], c.notify_timeout_s, env={"NOTIFY_STRICT_EXIT": "1", "NOTIFY_FORCE_PUSH": "1"})
+    if why:
+        return False, why
+    ok = {0: "entregue", 10: "segurado-ate-7h", 11: "ja-tinha-saido"}
+    return (True, ok[rc]) if rc in ok else (False, "rc-%s" % rc)
+
+
+def deliver(c, title, text, falha_em, now):
+    """(entregue, rótulo, falha_em_novo, mail_ok|None). O notify que não saiu tenta de novo a cada notify_retry_s; o mesmo texto vai UMA vez por `gc mail send mayor` (o Mayor repassa), na 1ª falha."""
+    if falha_em is not None and 0 <= now - falha_em < c.notify_retry_s:
+        return False, "espera-retry", falha_em, None
+    ok, why = send_notify(c, title, text)
+    if ok:
+        return True, why, None, None
+    mail = send_mail(c, title, text + "\n\n(O notify ao Athos não saiu: %s. Mando o mesmo texto aqui e tento o notify de novo em %d min.)" % (why, _mins(c.notify_retry_s))) if falha_em is None else None
+    return False, why, now, mail
+
+
+def plan_notice(c, key, due, done, falha_em, now, dry):
+    """O estado de um aviso ao Athos: nao · desligado (sem a chave) · ja-avisou · espera-retry · enviaria (--dry-run) · enviar."""
+    if not due:
+        return "nao"
+    if not c.on[key]:
+        return "desligado"
+    if done:
+        return "ja-avisou"
+    if falha_em is not None and 0 <= now - falha_em < c.notify_retry_s:
+        return "espera-retry"
+    return "enviaria" if dry else "enviar"
+
+
+def yesterday_key(now):
+    lt = time.localtime(now)
+    midnight = time.mktime((lt.tm_year, lt.tm_mon, lt.tm_mday, 0, 0, 0, 0, 0, -1))
+    return time.strftime("%Y-%m-%d", time.localtime(midnight - 43200))  # meio-dia de ontem: imune a horário de verão
+
+
+def main_cause(day):
+    """(causa, leituras, total): a causa que mais apareceu no dia (empate: a de maior prioridade). None se o dia não registrou causa."""
+    t = day.get("causas") if isinstance(day, dict) else None
+    if not isinstance(t, dict):
+        return None, 0, 0
+    cnt = {k: t[k] for k in CAUSAS if k != "cego" and isinstance(t.get(k), int) and t[k] > 0}
+    if not cnt:
+        return None, 0, 0
+    best = max(cnt, key=lambda k: (cnt[k], -CAUSAS.index(k)))
+    return best, cnt[best], sum(cnt.values())
+
+
+def judge_yesterday(c, daily, now):
+    """(veredito, dia, chave): na-meta · sem-numero · sem-dia-anterior · abaixo. Dia sem >= day_min_windows janelas de CPU lidas não tem número (dia cego não é "abaixo" nem "na meta")."""
+    key = yesterday_key(now)
+    day = (daily or {}).get("dias", {}).get(key)
+    if not isinstance(day, dict):
+        return "sem-dia-anterior", None, key
+    pct, wins = _flt(day.get("ocupacao_pct")), _int(day.get("cpu_janelas"), 0)
+    if pct is None or wins < c.day_min_windows:
+        return "sem-numero", day, key
+    return ("abaixo" if pct < c.low_pct else "na-meta"), day, key
+
+
+def day_notice(c, day, key):
+    pct, causa, n, total = day["ocupacao_pct"], *main_cause(day)
+    why = "causa principal: %s (%d de %d leituras abaixo da meta)" % (CAUSA_FRASE[causa], n, total) if causa else "a causa não foi registrada nesse dia"
+    acoes = _int(day.get("acoes"), 0)
+    title = "Hetzner fechou ontem em %s%% de CPU (meta %g%%)" % (pct, c.low_pct)
+    text = "Ontem (%s) o Hetzner pago fechou o dia com a CPU média em %s%%; a meta é %g%%. %s. O vigia agiu %d vez(es) no dia. Detalhe: %s" % (
+        key[8:10] + "/" + key[5:7], pct, c.low_pct, why[0].upper() + why[1:], acoes, os.path.join(c.gc_dir, "hetzner-occupancy.jsonl"))
+    return title, text
+
+
+def d4_notice(c, rd, low, st, cause):
+    span, media = rd["epoch"] - low["desde"], _avg_pct(low["nucleos_s"], low["cap_s"])
+    nuc = rd["nucleos"]
+    tried = []
+    for k in RUNGS:  # `st` é o estado NOVO: a tentativa desta leitura já está contada
+        n = _tries(st, k)
+        ganho = st["degraus"][k].get("ganho_nucleos") if n else None
+        if n:
+            tried.append("%s %dx%s" % (RUNG_NOME[k], n, "" if ganho is None else " (ganho medido: %+.2f núcleo)" % ganho))
+    nums = "" if not nuc["lido"] else " Hoje: %s núcleos em sessões, %s no lastro, %s de sistema, %s esperando disco, %s livres." % (nuc["sessoes"], nuc["lastro"], nuc["sistema"], nuc["espera"], nuc["livres"])
+    title = "Hetzner abaixo de %g%% há %d h: esgotei o que o vigia faz sozinho" % (c.low_pct, span // 3600)
+    text = "O Hetzner pago está com a CPU média em %s%% há %d h (meta %g%%). Causa: %s.%s Tentei: %s. Nada mais que o vigia possa fazer sozinho." % (
+        media, span // 3600, c.low_pct, CAUSA_FRASE.get(cause, "não identificada"), nums, "; ".join(tried) or "nada (a causa não tem degrau que caiba)")
+    return title, text
+
+
+def create_d4_bead(c, title, text):
+    """(id|None, rótulo). Bead SEM story:approved nem exec:auto: nada a despacha sozinho, é registro da causa (o aviso é o notify)."""
+    rc, out, err, why = run_cmd([c.bd_bin, "-C", c.city, "create", "--silent", "-t", "task", "-p", "2", "-l", "area:infra,hetzner-ocupacao", "--title", title, "-d", text], c.bd_timeout_s)
+    motivo = _failed(rc, why, "bd")
+    bid = out.strip().splitlines()[-1].strip() if out.strip() else ""
+    if motivo or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", bid):
+        return None, motivo or "id-ilegivel"
+    return bid, "criada"
+
+
+def cause_line(rd):
+    n = rd.get("nucleos")
+    if not n or not n.get("lido"):
+        return None
+    return "• de onde vem o número (núcleos médios na janela): sessões %s · lastro %s · sistema %s · espera de disco %s · livres %s · causa: %s" % (
+        n["sessoes"], n["lastro"], n["sistema"], n["espera"], n["livres"], rd.get("causa") or "-")
 
 
 def _plan(c, due, last_at, cooldown_s, now, dry, silent=None):
@@ -569,7 +1095,9 @@ def run(args, env):
     c = load_config(env)
     if args.print_config:
         keys = ("city", "interval_s", "busy_cores", "stores", "other_hosts", "ssh_host", "alarm", "alarm_key", "idle_after_s", "blind_after_s", "slack_s",
-                "idle_cooldown_s", "blind_cooldown_s", "low_pct", "low_after_s", "low_cooldown_s", "min_window_s", "max_window_s", "ssh_timeout_s", "gc_timeout_s", "bd_timeout_s", "pilot_file")
+                "idle_cooldown_s", "blind_cooldown_s", "low_pct", "low_after_s", "low_cooldown_s", "min_window_s", "max_window_s", "ssh_timeout_s", "gc_timeout_s", "bd_timeout_s", "pilot_file",
+                "d1_idle_s", "d1_max", "act_cooldown_s", "act_tries", "d4_after_s", "notify_retry_s", "notify_timeout_s", "ram_start_mb", "ram_slot_mb", "min_free_cores", "day_min_windows", "ballast_home", "wa_memo",
+                "memo_unknown_ttl_s", "keys", "on")
         print(json.dumps({k: getattr(c, k) for k in keys}, ensure_ascii=False, indent=2))
         return 0
     now, dry = c.now, args.dry_run
@@ -577,12 +1105,23 @@ def run(args, env):
         print("hetzner-occupancy-watch: outra instância ainda está rodando; saio sem medir (o lock é do kernel e some sozinho)", file=sys.stderr)
         return 0
     state_path = os.path.join(c.gc_dir, "hetzner-occupancy.state.json")
+    daily_path = os.path.join(c.gc_dir, "hetzner-occupancy-daily.json")
     st = load_json(state_path, lambda o: isinstance(o, dict), now, dry) or {}
+    today = time.strftime("%Y-%m-%d", time.localtime(now))
 
     sess = read_sessions(c)
-    cpu, new_base, cores = read_cpu(c, st.get("cpu"), now)
+    raw = {}
+    cpu, new_base, cores = read_cpu(c, st.get("cpu"), now, raw)
+    ex = parse_extra(raw.get("out"))
+    nuc, new_xbase = read_nucleos(c, st.get("cpu_extra"), ex, raw, now)
     fila, foco = read_queue(c, now), read_focus(c, now)
     est = decide(sess, cpu, cores, c.busy_cores)
+    lixo = find_lixo(c, sess, ex)
+    sess.pop("_reconhecidas", None)  # só serviam ao find_lixo: não vão ao JSONL
+    sess.pop("_donos", None)
+    memo_keys, _memo_lines, _memo_why = memo_unknown(c, now)
+    memo_n = None if memo_keys is None else len(memo_keys)
+    cause = pick_cause(c, cpu, nuc, ex["ram_mb"], lixo, fila)
 
     decided = est == "ocupado" or (est == "ocioso" and fila["lido"])
     warm = est == "desconhecido" and sess["lido"] and cpu["motivo"] in WARMUP
@@ -598,7 +1137,8 @@ def run(args, env):
     low = low_streak(c, st, cpu, cores, now)
 
     rd = {"ts": time.strftime("%Y-%m-%dT%H:%M:%S%z", time.localtime(now)), "epoch": now, "regra": RULE, "estado": est, "sessoes": sess, "cpu": cpu, "fila": fila, "foco": foco,
-          "ociosas_seguidas": ocio, "cegas_seguidas": cegas, "baixas_seguidas": low["n"], "cpu_cegas_seguidas": cpu_cegas}
+          "ociosas_seguidas": ocio, "cegas_seguidas": cegas, "baixas_seguidas": low["n"], "cpu_cegas_seguidas": cpu_cegas,
+          "nucleos": nuc, "ram_mb": ex["ram_mb"], "lixo": {k: v for k, v in lixo.items() if not k.startswith("_")}, "memo_unknown": memo_n, "causa": cause}
     idle_due = est == "ocioso" and fila["lido"] and fila["n"] > 0 and now - ocio_desde >= c.idle_after_s - c.slack_s
     blind_state_due = cegas > 0 and now - decidida_em >= c.blind_after_s - c.slack_s
     blind_cpu_due = cpu_cegas > 0 and now - cpu_lida_em >= c.blind_after_s - c.slack_s
@@ -612,10 +1152,42 @@ def run(args, env):
     if dry:
         rd["dry_run"] = True
 
+    # a escada: o efeito da ação da leitura anterior, depois o degrau desta
+    efeitos, pendentes = measure_effects(st, cpu, nuc)
+    deg_old = st.get("degraus") if low["n"] > 0 and isinstance(st.get("degraus"), dict) else {}  # sequência nova = tentativas novas
+    deg = {k: dict(v) for k, v in deg_old.items() if k in RUNGS and isinstance(v, dict)}
+    for ef in efeitos:
+        if ef.get("degrau") in deg and ef.get("ganho_nucleos") is not None:
+            deg[ef["degrau"]]["ganho_nucleos"] = ef["ganho_nucleos"]
+    status, chosen, exhausted = plan_ladder(c, cause, low_due, {"degraus": deg, "ultima_acao_em": st.get("ultima_acao_em")}, now, lixo, nuc, ex["ram_mb"], memo_n)
+    if dry and chosen:
+        status[chosen] = "agiria"
+    rd.update(degrau=status, acao=[], efeito=efeitos)
+
+    daily = load_json(daily_path, lambda o: isinstance(o, dict) and isinstance(o.get("dias"), dict), now, dry) if c.on["dia"] else None
+    if daily is not None:
+        migrate_daily(daily)
     new_st = {"versao": 1, "cpu": new_base or (st.get("cpu") if _baseline_ok(st.get("cpu")) else None), "ociosas_seguidas": ocio, "ocioso_desde": ocio_desde,
               "cegas_seguidas": cegas, "decidida_em": decidida_em, "alarme_ocioso_em": last_idle, "alarme_cego_em": last_blind, "atualizado_em": now,
               "cpu_cegas_seguidas": cpu_cegas, "cpu_lida_em": cpu_lida_em, "baixas_seguidas": low["n"], "baixa_desde": low["desde"],
-              "baixa_nucleos_s": None if low["n"] == 0 else round(low["nucleos_s"], 2), "baixa_capacidade_s": None if low["n"] == 0 else low["cap_s"], "alarme_baixa_em": last_low}
+              "baixa_nucleos_s": None if low["n"] == 0 else round(low["nucleos_s"], 2), "baixa_capacidade_s": None if low["n"] == 0 else low["cap_s"], "alarme_baixa_em": last_low,
+              "cpu_extra": new_xbase or (st.get("cpu_extra") if _extra_base_ok(st.get("cpu_extra")) else None), "degraus": deg, "pendentes": pendentes,
+              "ultima_acao_em": _int(st.get("ultima_acao_em")), "d4_dia": st.get("d4_dia"), "d4_bead": st.get("d4_bead") if low["n"] > 0 else None, "d4_falha_em": _int(st.get("d4_falha_em")),
+              "dia_avaliado": st.get("dia_avaliado"), "dia_falha_em": _int(st.get("dia_falha_em"))}
+
+    # avisos ao Athos: o D4 (esgotou) e o número do dia
+    d4_due = low["n"] > 0 and exhausted and now - low["desde"] >= c.d4_after_s - c.slack_s
+    s_d4 = plan_notice(c, "d4", d4_due, st.get("d4_dia") == today, new_st["d4_falha_em"], now, dry)
+    yday = ykey = None
+    if not c.on["dia"]:
+        verdict = "desligado"  # sem a chave: nem avalia (INERTE)
+    elif st.get("dia_avaliado") == today:
+        verdict = "ja-avaliado"
+    else:
+        verdict, yday, ykey = judge_yesterday(c, daily, now)
+    s_dia = plan_notice(c, "dia", True, False, new_st["dia_falha_em"], now, dry) if verdict == "abaixo" else verdict
+    rd.update(d4=s_d4, numero_do_dia=s_dia)
+
     sends = []  # (chave do estado, valor antigo, assunto, corpo)
     if a_idle == "enviar":
         sends.append(("alarme_ocioso_em", last_idle, ("ocioso",)) + idle_mail(c, rd, now - ocio_desde))
@@ -624,9 +1196,23 @@ def run(args, env):
     if a_low == "enviar":
         sends.append(("alarme_baixa_em", last_low, ("cpu_baixa",)) + low_mail(c, rd, low))
     if not dry:
+        if verdict in ("na-meta", "sem-numero", "sem-dia-anterior"):
+            new_st["dia_avaliado"] = today  # avaliou de verdade e não há o que avisar: não reavalia o dia todo
         for key, _old, _k, _s, _b in sends:
             new_st[key] = now  # o cooldown é gravado ANTES do mail: se não der para gravar, o mail nem sai (nada de repetir a cada rodada)
-        write_atomic(state_path, json.dumps(new_st, ensure_ascii=False, sort_keys=True, indent=1))
+        if chosen:
+            new_st["degraus"].setdefault(chosen, {})["tentativas"] = _tries(new_st, chosen) + 1  # a tentativa é gravada ANTES de agir: se o processo morrer no meio, não repete sem conta
+            new_st["ultima_acao_em"] = now
+        save = lambda: write_atomic(state_path, json.dumps(new_st, ensure_ascii=False, sort_keys=True, indent=1))
+        save()
+        if chosen:
+            ok, o_que, det = do_rung(c, chosen, lixo, nuc, ex["ram_mb"], now)
+            rd["acao"].append({"degrau": chosen, "ok": ok, "o_que": o_que, "detalhe": det})
+            status[chosen] = "agiu" if ok else "falhou"
+            if ok:  # só o que mudou algo tem efeito a medir; a tentativa que falhou já gastou a vez
+                new_st["pendentes"].append({"degrau": chosen, "em": now, "o_que": o_que, "leituras": 0,
+                                            "antes": {"pct": cpu["pct"], "nucleos": cpu["nucleos"], "lastro": nuc["lastro"], "livres": nuc["livres"], "sessoes": nuc["sessoes"]}})
+            save()
         failed = False
         for key, old, (kind,), subj, body in sends:
             ok = send_mail(c, subj, body)
@@ -634,13 +1220,46 @@ def run(args, env):
             if not ok:
                 new_st[key], failed = old, True  # mail que falha não gasta o cooldown: a próxima rodada tenta de novo
         if failed:
-            write_atomic(state_path, json.dumps(new_st, ensure_ascii=False, sort_keys=True, indent=1))
+            save()
+        if s_d4 == "enviar":
+            if not new_st["d4_bead"]:
+                t4, x4 = d4_notice(c, rd, low, new_st, cause)
+                bid, why = create_d4_bead(c, t4, x4)
+                rd["d4_bead"] = bid or why
+                if bid:
+                    new_st["d4_bead"] = bid
+                    save()  # a bead é gravada ANTES do aviso: o retry não cria outra
+            t4, x4 = d4_notice(c, rd, low, new_st, cause)
+            if new_st["d4_bead"]:
+                x4 += " Bead: %s." % new_st["d4_bead"]
+            new_st["d4_dia"] = today
+            save()
+            ok4, why4, falha4, mail4 = deliver(c, t4, x4, new_st["d4_falha_em"], now)
+            rd["d4"] = "enviado:" + why4 if ok4 else "falhou:" + why4
+            if mail4 is not None:
+                rd["d4_mail"] = "enviado" if mail4 else "falhou"
+            new_st["d4_falha_em"] = falha4
+            if not ok4:
+                new_st["d4_dia"] = st.get("d4_dia")  # não saiu: não conta como o aviso do dia (a próxima hora tenta de novo)
+            save()
+        if s_dia == "enviar":
+            tt, xx = day_notice(c, yday, ykey)
+            new_st["dia_avaliado"] = today
+            save()
+            okd, whyd, falhad, maild = deliver(c, tt, xx, new_st["dia_falha_em"], now)
+            rd["numero_do_dia"] = "enviado:" + whyd if okd else "falhou:" + whyd
+            if maild is not None:
+                rd["numero_do_dia_mail"] = "enviado" if maild else "falhou"
+            new_st["dia_falha_em"] = falhad
+            if not okd:
+                new_st["dia_avaliado"] = st.get("dia_avaliado")
+            save()
         append_line(os.path.join(c.gc_dir, "hetzner-occupancy.jsonl"), json.dumps(rd, ensure_ascii=False, separators=(",", ":")))
-        daily_path = os.path.join(c.gc_dir, "hetzner-occupancy-daily.json")
-        daily = load_json(daily_path, lambda o: isinstance(o, dict) and isinstance(o.get("dias"), dict), now, dry) or {"dias": {}}
-        migrate_daily(daily)
-        day = daily["dias"].setdefault(time.strftime("%Y-%m-%d", time.localtime(now)), {"ocupado": 0, "ocioso": 0, "desconhecido": 0, "leituras": 0, "ocupacao_pct": None, "ocupacao_sessao_pct": None,
-                                                                                         "cpu_janelas": 0, "cpu_nucleos_s": 0.0, "cpu_capacidade_s": 0})
+        if daily is None:
+            daily = load_json(daily_path, lambda o: isinstance(o, dict) and isinstance(o.get("dias"), dict), now, dry) or {"dias": {}}
+            migrate_daily(daily)
+        day = daily["dias"].setdefault(today, {"ocupado": 0, "ocioso": 0, "desconhecido": 0, "leituras": 0, "ocupacao_pct": None, "ocupacao_sessao_pct": None,
+                                               "cpu_janelas": 0, "cpu_nucleos_s": 0.0, "cpu_capacidade_s": 0})
         day[est] += 1
         day["leituras"] += 1
         dec = day["ocupado"] + day["ocioso"]
@@ -650,13 +1269,24 @@ def run(args, env):
             day["cpu_nucleos_s"] = round(day["cpu_nucleos_s"] + cores * cpu["janela_s"], 2)
             day["cpu_capacidade_s"] += cpu["ncpu"] * cpu["janela_s"]
         day["ocupacao_pct"] = _avg_pct(day["cpu_nucleos_s"], day["cpu_capacidade_s"])
+        # os extras do dia só aparecem quando há dado (o dia antigo e o dia sem leitura da causa ficam como estavam)
+        if cause not in (None, "cego"):  # CPU lida e abaixo da régua, com causa dita
+            day.setdefault("causas", {})
+            day["causas"][cause] = _int(day["causas"].get(cause), 0) + 1
+        if nuc["lido"]:
+            ds = day.setdefault("decomp_s", {})
+            for k in ("sessoes", "lastro", "sistema", "espera", "livres"):
+                ds[k] = round(_flt(ds.get(k), 0.0) + nuc[k] * nuc["janela_s"], 2)
+            day["decomp_win_s"] = _int(day.get("decomp_win_s"), 0) + nuc["janela_s"]
+        if rd["acao"]:
+            day["acoes"] = _int(day.get("acoes"), 0) + len(rd["acao"])
         daily["intervalo_s"] = c.interval_s
         write_atomic(daily_path, json.dumps(daily, ensure_ascii=False, sort_keys=True, indent=1))
     if args.show:
         print(json.dumps(rd, ensure_ascii=False, indent=2))
     else:
-        print("%s estado=%s sessoes=%s cpu=%s fila=%s foco=%s ociosas=%d cegas=%d alarme=%s/%s/%s" % (
-            rd["ts"], est, sess["ativas"], cpu["nucleos"], fila["n"], foco, ocio, cegas, rd["alarme"]["ocioso"], rd["alarme"]["cego"], rd["alarme"]["cpu_baixa"]))
+        print("%s estado=%s sessoes=%s cpu=%s fila=%s foco=%s ociosas=%d cegas=%d alarme=%s/%s/%s causa=%s" % (
+            rd["ts"], est, sess["ativas"], cpu["nucleos"], fila["n"], foco, ocio, cegas, rd["alarme"]["ocioso"], rd["alarme"]["cego"], rd["alarme"]["cpu_baixa"], cause))
     return 0
 
 

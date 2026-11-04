@@ -85,24 +85,73 @@ cat > "$T/bin/ssh" <<'EOF'
 #!/usr/bin/env bash
 # ssh de mentira: grava os argumentos; devolve $STUB_SSH_FILE (a saída que o servidor daria), ou falha com $STUB_SSH_RC (com $STUB_OUTFAIL imprime a saída COMPLETA antes de falhar), ou trava $STUB_SSH_SLEEP s
 echo "$*" >> "$STUB_DIR/ssh.calls"
+# AÇÃO no nó (ga-2hd02v.5.10: matar sessão, gravar o pedido de lastro): a chamada que NÃO é a leitura (a leitura leva o marcador @@OCC-BEGIN@@). Vai também para ssh.act; o último argumento é o script que o servidor rodaria.
+# $STUB_ACT_RC falha a chamada; $STUB_ACT_SLEEP a trava; $STUB_ACT_OUT força o veredito (a palavra que o script diria). Sem nenhum, o script RODA DE VERDADE (bash local) contra o "nó" de mentira: tmux e date falsos em $STUB_NODEBIN
+# (a sessões em $STUB_DIR/node.tmux, linhas nome|atividade; o relógio em node.now) e HOME em $STUB_NODE_HOME. Isso confere o shell do vigia (aspas, $(), a ordem do mata-depois-de-conferir), não só o texto dele.
+case "$*" in
+  *@@OCC-BEGIN@@*) ;;
+  *)
+    echo "$*" >> "$STUB_DIR/ssh.act"
+    [ -n "${STUB_STATE_FILE:-}" ] && [ -f "$STUB_STATE_FILE" ] && cp "$STUB_STATE_FILE" "$STUB_DIR/act.state"   # o estado como estava NA HORA da ação (a tentativa já tem de estar gravada)
+    [ -n "${STUB_ACT_SLEEP:-}" ] && sleep "$STUB_ACT_SLEEP"
+    if [ "${STUB_ACT_RC:-0}" != 0 ]; then echo "ssh: erro injetado (ação)" >&2; exit "$STUB_ACT_RC"; fi
+    if [ -n "${STUB_ACT_OUT:-}" ]; then echo "$STUB_ACT_OUT"; exit 0; fi
+    exec env -i PATH="$STUB_NODEBIN:/usr/bin:/bin" HOME="$STUB_NODE_HOME" STUB_DIR="$STUB_DIR" STUB_TMUX_ACT_BAD="${STUB_TMUX_ACT_BAD:-}" STUB_TMUX_KILL_FAIL="${STUB_TMUX_KILL_FAIL:-}" bash -c "${@: -1}" ;;
+esac
 [ -n "${STUB_SSH_SLEEP:-}" ] && sleep "$STUB_SSH_SLEEP"
 if [ "${STUB_SSH_RC:-0}" != 0 ]; then echo "ssh: erro injetado" >&2; [ -n "${STUB_OUTFAIL:-}" ] && [ -n "${STUB_SSH_FILE:-}" ] && cat "$STUB_SSH_FILE"; exit "$STUB_SSH_RC"; fi
 [ -n "${STUB_SSH_FILE:-}" ] && cat "$STUB_SSH_FILE"
+# $STUB_DIR/after-read.sh (se existir) roda DEPOIS de a leitura sair e some: é o que muda no nó entre a leitura e a ação (a janela do TOCTOU)
+[ -f "$STUB_DIR/after-read.sh" ] && { bash "$STUB_DIR/after-read.sh"; rm -f "$STUB_DIR/after-read.sh"; }
 exit 0
 EOF
 cat > "$T/bin/bd" <<'EOF'
 #!/usr/bin/env bash
-# bd de mentira: a ÚNICA forma permitida é a leitura de quem segura bead (`-C <cidade> list --status in_progress --json --limit 0`): devolve $STUB_BD_FILE (ou falha com $STUB_BD_RC; com $STUB_OUTFAIL imprime o JSON COMPLETO antes de falhar; com $STUB_BD_SLEEP trava esses segundos); qualquer outra forma é PROIBIDA (rc 99, marcada)
+# bd de mentira: duas formas permitidas. (1) a leitura de quem segura bead (`-C <cidade> list --status in_progress --json --limit 0`): devolve $STUB_BD_FILE (ou falha com $STUB_BD_RC; com $STUB_OUTFAIL imprime o JSON COMPLETO antes de falhar;
+# com $STUB_BD_SLEEP trava esses segundos). (2) a bead do aviso D4 (`-C <cidade> create --silent -t task -p 2 -l area:infra,hetzner-ocupacao --title <t> -d <d>`, 14 argumentos, a forma EXATA): grava create.N.title/.desc, imprime
+# $STUB_BD_CREATE_ID (padrão ga-d4test; VAZIO = não imprime nada) e sai com $STUB_BD_CREATE_RC. Qualquer outra forma é PROIBIDA (rc 99, marcada).
 echo "bd $*" >> "$STUB_DIR/bd.calls"
+if [ "$#" -eq 14 ] && [ "$1" = "-C" ] && [ "$3 $4 $5 $6 $7 $8 $9 ${10} ${11}" = "create --silent -t task -p 2 -l area:infra,hetzner-ocupacao --title" ] && [ "${13}" = "-d" ]; then
+  c=$(( $(cat "$STUB_DIR/create.count" 2>/dev/null || echo 0) + 1 )); echo "$c" > "$STUB_DIR/create.count"
+  printf '%s' "${12}" > "$STUB_DIR/create.$c.title"; printf '%s' "${14}" > "$STUB_DIR/create.$c.desc"
+  [ "${STUB_BD_CREATE_RC:-0}" != 0 ] && { echo "bd: erro injetado (create)" >&2; exit "$STUB_BD_CREATE_RC"; }
+  case "${STUB_BD_CREATE_ID:-}" in VAZIO) ;; "") echo ga-d4test ;; *) echo "$STUB_BD_CREATE_ID" ;; esac; exit 0
+fi
 if [ "$#" -ne 8 ] || [ "$1" != "-C" ] || [ "$3 $4 $5 $6 $7 $8" != "list --status in_progress --json --limit 0" ]; then echo "FORBIDDEN bd $*" >> "$STUB_DIR/forbidden.calls"; exit 99; fi
 [ -n "${STUB_BD_SLEEP:-}" ] && sleep "$STUB_BD_SLEEP"
 if [ "${STUB_BD_RC:-0}" != 0 ]; then echo "bd: erro injetado" >&2; [ -n "${STUB_OUTFAIL:-}" ] && [ -n "${STUB_BD_FILE:-}" ] && cat "$STUB_BD_FILE"; exit "$STUB_BD_RC"; fi
 [ -n "${STUB_BD_FILE:-}" ] && cat "$STUB_BD_FILE"
 exit 0
 EOF
-for b in dolt notify; do   # o vigia NUNCA deve chamar dolt nem notify; o bd só na forma acima (uma leitura, nunca uma escrita)
-  printf '#!/usr/bin/env bash\necho "FORBIDDEN %s $*" >> "$STUB_DIR/forbidden.calls"\nexit 99\n' "$b" > "$T/bin/$b"
-done
+printf '#!/usr/bin/env bash\necho "FORBIDDEN dolt $*" >> "$STUB_DIR/forbidden.calls"\nexit 99\n' > "$T/bin/dolt"   # o vigia NUNCA chama dolt
+cat > "$T/bin/notify" <<'EOF'
+#!/usr/bin/env bash
+# notify de mentira (o do Athos de verdade manda push): grava a chamada (argumentos e as 2 variáveis que o vigia põe), conta e sai com $STUB_NOTIFY_RC (padrão 0); $STUB_NOTIFY_SLEEP o trava.
+c=$(( $(cat "$STUB_DIR/notify.count" 2>/dev/null || echo 0) + 1 )); echo "$c" > "$STUB_DIR/notify.count"
+echo "notify $*" >> "$STUB_DIR/notify.calls"
+printf '%s' "${NOTIFY_STRICT_EXIT:-}/${NOTIFY_FORCE_PUSH:-}" > "$STUB_DIR/notify.$c.env"
+if [ "$#" -eq 3 ] && [ "$1" = "-t" ]; then printf '%s' "$2" > "$STUB_DIR/notify.$c.title"; printf '%s' "$3" > "$STUB_DIR/notify.$c.text"; else echo "FORBIDDEN notify $*" >> "$STUB_DIR/forbidden.calls"; exit 99; fi
+[ -n "${STUB_NOTIFY_SLEEP:-}" ] && sleep "$STUB_NOTIFY_SLEEP"
+exit "${STUB_NOTIFY_RC:-0}"
+EOF
+# o "nó" para as ações do ssh (ver o ssh de mentira): tmux e date falsos, longe do PATH do vigia ($T/bin/node não está nele)
+mkdir -p "$T/bin/node"
+cat > "$T/bin/node/tmux" <<'EOF'
+#!/usr/bin/env bash
+# tmux do nó: só o que o script de matar usa (-L gc-remote has-session / display-message / kill-session), sobre $STUB_DIR/node.tmux (nome|atividade). $STUB_TMUX_ACT_BAD: a atividade vem ilegível; $STUB_TMUX_KILL_FAIL: o kill falha
+f="$STUB_DIR/node.tmux"
+[ "$1" = "-L" ] && [ "$2" = "gc-remote" ] || { echo "tmux falso: esperava -L gc-remote: $*" >&2; exit 2; }
+shift 2
+name=""; [ "$2" = "-t" ] && name="${3#=}"; [ "$1" = "display-message" ] && name="${4#=}"; name="${name%:}"
+case "$1" in
+  has-session) grep -q "^${name}|" "$f" ;;
+  display-message) [ -n "${STUB_TMUX_ACT_BAD:-}" ] && { echo "xx"; exit 0; }; grep "^${name}|" "$f" | head -n 1 | sed 's/^.*|//' ;;
+  kill-session) [ -n "${STUB_TMUX_KILL_FAIL:-}" ] && exit 1; grep -q "^${name}|" "$f" || exit 1; grep -v "^${name}|" "$f" > "$f.new"; mv "$f.new" "$f"; echo "$name" >> "$STUB_DIR/node.killed" ;;
+  *) echo "tmux falso: subcomando $1" >&2; exit 2 ;;
+esac
+EOF
+printf '#!/usr/bin/env bash\n[ "$1" = "+%%s" ] && { cat "$STUB_DIR/node.now"; echo; exit 0; }\nexec /bin/date "$@"\n' > "$T/bin/node/date"
+chmod +x "$T/bin/node/tmux" "$T/bin/node/date"
 # python3 de mentira (só o W() o vê: o PATH dele começa em $T/bin). O python do sistema do macOS (CLT 3.9) grava o bytecode em $HOME/Library/Caches/com.apple.python se o ambiente não manda parar; o do Linux não grava em HOME nenhum.
 # Foi por isso que a suíte passava no Linux e reprovava no mini (gate ga-ztz9yn, "e nada no HOME"): este reproduz o padrão do macOS em qualquer sistema, e o controle no fim do grupo saida prova que ele suja o HOME.
 # HOCC_SLOW_START=N: o wrapper dorme N s antes de subir o python, como o mini sob carga (load ~50 em 10 núcleos): prova que nenhum caso depende de o vigia subir rápido. Com os mutantes demora; use HOCC_NO_MUTANTS=1 ou um grupo.
@@ -130,6 +179,9 @@ fresh() {   # cidade, HOME, stubs e relógio novos; sessões = nenhuma remota; f
   mkdir -p "$C/.gc/logs" "$HM/.gc" "$T/stub" "$T/tmp"; : > "$C/.gc/hetzner-occupancy-alarm.on"
   NOW=${1:-$NOW0}; CB=0; CI=0; NCPU=16; RC=0; TENV=()
   STUB_GC_RC=0; STUB_GC_SLEEP=""; STUB_SSH_RC=0; STUB_SSH_SLEEP=""; STUB_MAIL_RC=0; STUB_SSH_FILE=""; STUB_OUTFAIL=""; STUB_BD_RC=0; STUB_BD_SLEEP=""
+  # a escada (ga-2hd02v.5.10): o que as ações, o notify, o bd create e o "nó" de mentira devolvem, e os contadores/menu da leitura completa (xtick)
+  STUB_ACT_RC=0; STUB_ACT_SLEEP=""; STUB_ACT_OUT=""; STUB_TMUX_ACT_BAD=""; STUB_TMUX_KILL_FAIL=""; STUB_BD_CREATE_ID=""; STUB_BD_CREATE_RC=0; STUB_NOTIFY_RC=0; STUB_NOTIFY_SLEEP=""
+  XU=0; XL=0; CW=0; X_OMIT=""; X_RAM_MB=20000; X_TMUX=lista
   PILOT_HQ=3; PILOT_WA=0; FOCUS=off; WOUT="$T/out.json"; WERR="$T/err"
   # o aviso de CPU baixa (ga-2hd02v.6) nasce DESLIGADO aqui (régua 0 = nenhuma janela é baixa): os grupos antigos usam CPU de 0,3 % como "ocioso" e contam mails, e o de CPU baixa viria junto em todos.
   # Quem testa o aviso novo (grupo baixa) e a configuração padrão (cfg) pede o padrão de verdade com fresh_lp.
@@ -148,6 +200,9 @@ W() {   # W [VAR=valor ...] [-- args do vigia] : roda o vigia no ambiente do cen
     STUB_BD_FILE="${STUB_BD_FILE:-}" STUB_BD_RC="${STUB_BD_RC:-0}" STUB_BD_SLEEP="${STUB_BD_SLEEP:-}" \
     STUB_DIR="$T/stub" STUB_STATE_FILE="$C/.gc/hetzner-occupancy.state.json" STUB_GC_FILE="${STUB_GC_FILE:-}" STUB_GC_RC="${STUB_GC_RC:-0}" STUB_GC_SLEEP="${STUB_GC_SLEEP:-}" \
     STUB_SSH_FILE="${STUB_SSH_FILE:-}" STUB_SSH_RC="${STUB_SSH_RC:-0}" STUB_SSH_SLEEP="${STUB_SSH_SLEEP:-}" STUB_MAIL_RC="${STUB_MAIL_RC:-0}" STUB_OUTFAIL="${STUB_OUTFAIL:-}" \
+    NOTIFY_BIN="$T/bin/notify" STUB_NODEBIN="$T/bin/node" STUB_NODE_HOME="$T/stub/nodehome" STUB_ACT_RC="${STUB_ACT_RC:-0}" STUB_ACT_SLEEP="${STUB_ACT_SLEEP:-}" STUB_ACT_OUT="${STUB_ACT_OUT:-}" \
+    STUB_TMUX_ACT_BAD="${STUB_TMUX_ACT_BAD:-}" STUB_TMUX_KILL_FAIL="${STUB_TMUX_KILL_FAIL:-}" STUB_BD_CREATE_ID="${STUB_BD_CREATE_ID:-}" STUB_BD_CREATE_RC="${STUB_BD_CREATE_RC:-0}" \
+    STUB_NOTIFY_RC="${STUB_NOTIFY_RC:-0}" STUB_NOTIFY_SLEEP="${STUB_NOTIFY_SLEEP:-}" \
     ${LOWPCT:+"$LOWPCT"} "${extra[@]+"${extra[@]}"}" python3 "$WATCH" "$@" >"$WOUT" 2>"$WERR"
   RC=$?
 }
@@ -196,6 +251,53 @@ mailfield() { cat "$T/stub/mail.$1.$2" 2>/dev/null; }
 reading() { jv "$WOUT" "$1"; }          # campo da leitura que o --print acabou de imprimir
 state_f() { jv "$C/.gc/hetzner-occupancy.state.json" "$1"; }
 await() { local i=0; while [ ! -s "$1" ] && [ "$i" -lt 300 ]; do sleep 0.1; i=$((i+1)); done; [ -s "$1" ]; }   # espera o arquivo ter conteúdo: rc 0 no 1º instante em que o evento acontece; ~30 s é só a paciência do teste (chegar lá já é a falha), não um prazo que o vigia tenha de cumprir
+
+# ---- a leitura COMPLETA do nó, para os grupos da causa, da escada e dos avisos (ga-2hd02v.5.10) --------------------------------------------------------------------------------
+GHOST=gate-reviewer-remote-adhoc-033f7bd5c1   # o caso real de 04/11: sessão do tmux do nó, 4 h parada, que a cidade não conhecia
+LOWW="200 30 50 150"   # sessões 2,0 · lastro 0,3 · sistema 0,5 · espera de disco 1,5 núcleos (em centinúcleos): CPU a 17,5 %, 11,7 núcleos livres
+xwrite() {   # xwrite <arquivo>: a saída COMPLETA da ssh de leitura (/proc/stat com ruído de .bashrc antes + cgroup + RAM + tmux + relógio do nó). X_OMIT = o que falta (cg m u l mem tmux now); X_TMUX = lista|semservidor|falha|lixo|semrc
+  local i=0 o=" $X_OMIT "
+  { echo "ruído do .bashrc do servidor"; echo "@@OCC-BEGIN@@"
+    echo "cpu  $CB 0 0 $CI $CW 0 0 0 0 0"
+    while [ "$i" -lt "$NCPU" ]; do echo "cpu$i 0 0 0 0 0 0 0 0 0 0"; i=$((i+1)); done
+    case "$o" in *" cg "*) ;; *) echo "@@OCC-CG@@"
+      case "$o" in *" m "*) ;; *) echo "m 1" ;; esac
+      case "$o" in *" u "*) ;; *) echo "u $XU" ;; esac
+      case "$o" in *" l "*) ;; *) echo "l $XL" ;; esac ;; esac
+    case "$o" in *" mem "*) ;; *) echo "@@OCC-MEM@@"; echo "MemTotal:       32768000 kB"; echo "MemAvailable:   $((X_RAM_MB * 1024)) kB" ;; esac
+    case "$o" in *" tmux "*) ;; *) echo "@@OCC-TMUX@@"
+      case "$X_TMUX" in
+        lista) echo "rc=0"; cat "$T/stub/node.tmux" ;;
+        semservidor) echo "rc=1"; echo "no server running on /tmp/tmux-1000/gc-remote" ;;
+        falha) echo "rc=1"; echo "server exited unexpectedly" ;;
+        lixo) echo "rc=0"; echo "linha sem barra" ;;
+        semrc) cat "$T/stub/node.tmux" ;;
+      esac ;; esac
+    case "$o" in *" now "*) ;; *) echo "@@OCC-NOW@@"; echo "$NOW" ;; esac
+    echo "@@OCC-END@@"; } > "$1"
+}
+xtick() {   # xtick <segundos> <sessões> <lastro> <sistema> <espera> : como o tick, com a leitura COMPLETA; as 4 partes em centinúcleos médios na janela (100 = 1 núcleo; sessões+lastro = o user slice). XARGS troca os argumentos do vigia (padrão --print)
+  local s=$1 se=$2 la=$3 sy=$4 io=$5
+  NOW=$((NOW + s)); CB=$((CB + (se + la + sy) * s)); CW=$((CW + io * s)); CI=$((CI + (NCPU * 100 - se - la - sy - io) * s))
+  XU=$((XU + (se + la) * s * 10000)); XL=$((XL + la * s * 10000))   # 100 centinúcleos x 1 s = 1 000 000 us de cgroup
+  xwrite "$T/stat.txt"; STUB_SSH_FILE="$T/stat.txt"; printf '%s' "$NOW" > "$T/stub/node.now"
+  [ "$PILOT_HQ" != none ] && pilot 60 1800 "$PILOT_HQ" "$PILOT_WA"
+  focus_is "$FOCUS"
+  W "${TENV[@]+"${TENV[@]}"}" -- ${XARGS---print}
+}
+xone() { xtick 900 "$@" >/dev/null; xtick 900 "$@"; }   # xone <4 partes>: a semente do baseline e UMA janela lida (a que o teste examina)
+xdue() { xtick 900 "$@" >/dev/null; xtick 900 "$@" >/dev/null; xtick 900 "$@"; }   # a semente, a 1ª janela baixa e a 2ª (30 min medidos): a 1ª leitura em que a escada pode agir
+node_add() { printf '%s|%s\n' "$1" "$((NOW + ${3:-1800} - $2))" >> "$T/stub/node.tmux"; }   # node_add <nome> <parada_há_s> [segundos_até_a_leitura=1800]: uma sessão no tmux do nó, parada há <parada_há_s> NO MOMENTO DA LEITURA (a atividade é fixa e o relógio corre: 1800 s = o xone, 2700 s = o xdue)
+after_read() { printf '%s\n' "$1" > "$T/stub/after-read.sh"; }   # after_read <comando>: roda no nó DEPOIS da próxima leitura (a janela entre achar e agir); $STUB_DIR e o relógio em $STUB_DIR/node.now
+node_has() { grep -q "^$1|" "$T/stub/node.tmux" && echo 1 || echo 0; }
+keys_on() { local k; for k in "$@"; do : > "$C/.gc/hetzner-occupancy-$k.on"; done; }
+acts() { cat "$T/stub/ssh.act" 2>/dev/null | wc -l | tr -d ' '; }   # quantas ações o vigia mandou ao nó
+notifies() { cat "$T/stub/notify.count" 2>/dev/null || echo 0; }
+creates() { cat "$T/stub/create.count" 2>/dev/null || echo 0; }
+xfresh() {   # xfresh [epoch]: o fresh_lp com o aviso ANTIGO desligado (o mail dele não entra na conta de quem testa a escada), nenhuma chave da escada e o nó de mentira de pé (pasta do lastro, tmux vazio, relógio)
+  fresh_lp "$@"; rm -f "$C/.gc/hetzner-occupancy-alarm.on"; unset XARGS
+  NODE="$T/stub/nodehome"; mkdir -p "$NODE/gt-remote/ballast"; : > "$T/stub/node.tmux"; printf '%s' "$NOW" > "$T/stub/node.now"
+}
 
 # ============================================================================================================================================================================
 g_cfg() {
@@ -850,15 +952,15 @@ g_saida() {
   fresh; tick 900 5 >/dev/null
   W HETZNER_OCC_BUSY_CORES=nao-e-numero -- --print
   check "config inválida: sai com erro (rc != 0)" "$([ "$RC" -ne 0 ] && echo 1 || echo 0)"; has "... traceback à vista no stderr (não engolido)" "Traceback" "$(cat "$WERR")"
-  check "... e nada sai por notify, bd, dolt nem mail (a chave .on está posta)" "$([ ! -s "$T/stub/forbidden.calls" ] && [ "$(mails)" = 0 ] && echo 1 || echo 0)"
+  check "... e nada sai por notify, bd create, ação ao nó, dolt nem mail (a chave .on está posta)" "$([ ! -s "$T/stub/forbidden.calls" ] && [ "$(mails)" = 0 ] && [ "$(notifies)" = 0 ] && [ "$(creates)" = 0 ] && [ "$(acts)" = 0 ] && echo 1 || echo 0)"
   fresh; rm -f "$C/.gc/hetzner-occupancy-alarm.on"; rmdir "$C/.gc/logs" "$C/.gc"; : > "$C/.gc"     # .gc virou ARQUIVO: nenhuma gravação é possível, para qualquer usuário (inclusive root)
   tick 900 5
   eq "não consegui gravar: rc 3" 3 "$RC"; has "... diz 'não consegui gravar'" "não consegui gravar" "$(cat "$WERR")"
-  check "... e nada sai por notify, bd, dolt nem mail" "$([ ! -s "$T/stub/forbidden.calls" ] && [ "$(mails)" = 0 ] && echo 1 || echo 0)"
+  check "... e nada sai por notify, bd create, ação ao nó, dolt nem mail" "$([ ! -s "$T/stub/forbidden.calls" ] && [ "$(mails)" = 0 ] && [ "$(notifies)" = 0 ] && [ "$(creates)" = 0 ] && [ "$(acts)" = 0 ] && echo 1 || echo 0)"
 
   echo "--- saida: só LÊ o mundo (do bd, só a lista de in_progress; nada de dolt nem notify, nem outro subcomando do gc)"
   fresh; sessions_are "$SJ_ZOMBIES"; beads_are '[]'; tick 900 5 >/dev/null; idle_run 3
-  check "nenhuma chamada proibida (bd fora da leitura de in_progress, dolt, notify, outro subcomando do gc)" "$([ ! -s "$T/stub/forbidden.calls" ] && echo 1 || echo 0)"
+  check "nenhuma chamada proibida (bd fora da leitura de in_progress, dolt, outro subcomando do gc) e, sem as chaves da escada, nenhum notify, bd create nem ação ao nó" "$([ ! -s "$T/stub/forbidden.calls" ] && [ "$(notifies)" = 0 ] && [ "$(creates)" = 0 ] && [ "$(acts)" = 0 ] && echo 1 || echo 0)"
   check "... o bd foi mesmo chamado (há sessão viva) e sempre na forma da leitura" "$([ -s "$T/stub/bd.calls" ] && [ "$(grep -v -c "^bd -C $C list --status in_progress --json --limit 0$" "$T/stub/bd.calls")" = 0 ] && echo 1 || echo 0)"
   eq "gc só chamado para 'session list --json' e 'mail send mayor'" 0 "$(grep '^gc ' "$T/stub/gc.calls" | grep -v -e ' session list --json$' -e ' mail send mayor ' | wc -l | tr -d ' ')"
   eq "gc sempre com --city explícito (não depende do cwd do launchd)" 0 "$(grep '^gc ' "$T/stub/gc.calls" | grep -v "^gc --city $C " | wc -l | tr -d ' ')"
@@ -1145,6 +1247,478 @@ json.dump(d, open(p, "w"))' "$C/.gc/hetzner-occupancy.state.json" "$@"
 }
 
 # ============================================================================================================================================================================
+g_causa() {
+  echo "--- causa: de onde vem o número (núcleos por parte), UMA causa por leitura abaixo da régua, e o que NÃO é lido nunca vira causa (ga-2hd02v.5.10)"
+  local dj a0; fresh_lp; xfresh; dj="$C/.gc/hetzner-occupancy-daily.json"
+  xtick 900 $LOWW >/dev/null
+  eq "1ª leitura: a CPU só semeou o baseline, então não há núcleos por parte (motivo dito)" "false/sem-leitura-anterior" "$(reading nucleos.lido)/$(reading nucleos.motivo)"
+  eq "... e a causa é 'cego' (nunca um chute)" cego "$(reading causa)"
+  xtick 900 $LOWW
+  eq "a janela lida: 2,0 núcleos em sessões" 2.0 "$(reading nucleos.sessoes)"; eq "... 0,3 no lastro" 0.3 "$(reading nucleos.lastro)"; eq "... 0,5 de sistema (CPU total menos o user slice)" 0.5 "$(reading nucleos.sistema)"
+  eq "... 1,5 esperando disco (iowait)" 1.5 "$(reading nucleos.espera)"; eq "... 11,7 livres (16 - 2,8 ocupados - 1,5 de espera)" 11.7 "$(reading nucleos.livres)"; eq "... na janela de 900 s" 900 "$(reading nucleos.janela_s)"
+  eq "a CPU da mesma leitura: 17,5 % (2,8 de 16)" 17.5 "$(reading cpu.pct)"; eq "a RAM livre do nó vai na leitura" 20000 "$(reading ram_mb)"
+  eq "a causa: sobram núcleos e a RAM comporta mais lastro = lastro-sem-trabalho" lastro-sem-trabalho "$(reading causa)"
+  eq "o lixo foi LIDO e não há (tmux do nó vazio)" "true/0" "$(reading lixo.lido)/$(reading lixo.n)"
+  eq "o diário do dia conta a causa" 1 "$(jv "$dj" dias.2026-10-19.causas.lastro-sem-trabalho)"; eq "... e a 1ª leitura (cego) NÃO entrou na conta de causas" 1 "$(jv "$dj" dias.2026-10-19.causas | python3 -I -c 'import json,sys; print(sum(json.load(sys.stdin).values()))')"
+  eq "o diário soma os núcleos-segundo de cada parte (sessões 2,0 x 900 s)" 1800.0 "$(jv "$dj" dias.2026-10-19.decomp_s.sessoes)"; eq "... os livres (11,7 x 900)" 10530.0 "$(jv "$dj" dias.2026-10-19.decomp_s.livres)"
+  eq "... e as janelas que entraram na decomposição" 900 "$(jv "$dj" dias.2026-10-19.decomp_win_s)"
+  XARGS= xtick 900 $LOWW; has "a linha-resumo termina com a causa" " causa=lastro-sem-trabalho" "$(cat "$WOUT")"
+  eq "a CPU média do diário (o número de sempre) continua sendo a de CPU, não mudou" 17.5 "$(jv "$dj" dias.2026-10-19.ocupacao_pct)"
+
+  # ---- a régua: acima dela não há o que explicar; a causa só existe com a CPU lida E abaixo --------------------------------------------------------------------------------
+  xfresh; xone 1300 30 30 0 >/dev/null; eq "CPU em 85,0 % (13,6 núcleos): na meta, sem causa" "85.0/null" "$(reading cpu.pct)/$(reading causa)"
+  xfresh; xone 1299 30 30 0 >/dev/null; eq "CPU em 84,9 %: abaixo da meta, tem causa (os núcleos livres são 2,4 e a RAM sobra)" "84.9/lastro-sem-trabalho" "$(reading cpu.pct)/$(reading causa)"
+  xfresh; xone 1400 30 50 0 >/dev/null; eq "CPU em 92,5 %: sem causa" null "$(reading causa)"
+  eq "... e sem causa o diário não conta causa nenhuma" null "$(jv "$dj" dias.2026-10-19.causas)"
+  xfresh; xone 1400 30 50 0 >/dev/null; eq "... mas a decomposição vai para o diário mesmo assim (é medida, não causa)" 14.0 "$(python3 -I -c 'import json,sys; print(json.load(open(sys.argv[1]))["dias"]["2026-10-19"]["decomp_s"]["sessoes"]/900)' "$dj")"
+
+  # ---- a RAM decide se o lastro cabe: piso de partida 14336 MB + 1 slot de 1024 -------------------------------------------------------------------------------------------
+  xfresh; X_RAM_MB=15359; xone $LOWW >/dev/null; eq "RAM 15359 MB (1 MB abaixo do piso + 1 slot): causa RAM" RAM "$(reading causa)"
+  xfresh; X_RAM_MB=15360; xone $LOWW >/dev/null; eq "RAM 15360 MB: já cabe um slot" lastro-sem-trabalho "$(reading causa)"
+  xfresh; X_OMIT="mem"; xone $LOWW >/dev/null; eq "RAM não lida com núcleos sobrando: cego (não sei se o lastro cabe), e o JSONL diz ram_mb null" "cego/null" "$(reading causa)/$(reading ram_mb)"
+  xfresh; X_RAM_MB=8000; node_add "$GHOST" 14400; xone $LOWW >/dev/null; eq "o lixo vem ANTES da RAM na prioridade (a sessão sem dono se resolve sem lastro)" lixo "$(reading causa)"
+
+  # ---- fila sem elegível: só quando os núcleos NÃO sobram (iowait os come) e a fila foi LIDA e vazia ----------------------------------------------------------------------------
+  xfresh; PILOT_HQ=0; xone 600 30 50 800 >/dev/null; eq "sem núcleo sobrando (livres 1,2) e a fila lida vazia: fila-sem-elegível" "1.2/fila-sem-elegível" "$(reading nucleos.livres)/$(reading causa)"
+  xfresh; PILOT_HQ=3; xone 600 30 50 800 >/dev/null; eq "sem núcleo sobrando e a fila TEM item: nada das quatro explica = cego (não inventa causa)" cego "$(reading causa)"
+  xfresh; PILOT_HQ=none; xone 600 30 50 800 >/dev/null; eq "sem núcleo sobrando e a fila não lida (arquivo do Pilot ausente): cego, nunca 'fila vazia'" cego "$(reading causa)"
+  xfresh; PILOT_HQ=0; xone 600 30 50 720 >/dev/null; eq "livres EXATAMENTE 2,0 contam como sobra (a régua é >=)" "2.0/lastro-sem-trabalho" "$(reading nucleos.livres)/$(reading causa)"
+  xfresh; PILOT_HQ=0; xone 600 30 50 730 >/dev/null; eq "livres 1,9: a fila vazia decide" "1.9/fila-sem-elegível" "$(reading nucleos.livres)/$(reading causa)"
+
+  # ---- o lixo: sessão do tmux do nó que a cidade não conhece, não segura bead e está quieta há >= 30 min ----------------------------------------------------------------------------
+  xfresh; node_add "$GHOST" 14400; xone $LOWW >/dev/null
+  eq "o caso real de 04/11 (a gate-reviewer-remote-adhoc parada há 4 h, fora da cidade): causa lixo" lixo "$(reading causa)"; eq "... n e o nome na leitura" "1/[\"$GHOST\"]" "$(reading lixo.n)/$(reading lixo.nomes)"; eq "... e há quanto tempo está parada" 14400 "$(reading lixo.ocioso_max_s)"
+  check "o alvo interno (_alvos) NÃO vai ao JSONL" "$(grep -q '_alvos\|_reconhecidas\|_donos' "$WOUT" && echo 0 || echo 1)"
+  xfresh; node_add "$GHOST" 1799; xone $LOWW >/dev/null; eq "quieta há 1799 s: ainda não é lixo" "0/lastro-sem-trabalho" "$(reading lixo.n)/$(reading causa)"
+  xfresh; node_add "$GHOST" 1800; xone $LOWW >/dev/null; eq "quieta há 1800 s: é" "1/lixo" "$(reading lixo.n)/$(reading causa)"
+  xfresh; W HETZNER_OCC_D1_IDLE_S=7200 -- --print-config; eq "o prazo do lixo é configurável (D1_IDLE_S)" 7200 "$(reading d1_idle_s)"
+  xfresh; node_add dog-remote-velha 14400; xone $LOWW >/dev/null; eq "sessão que a cidade lista (mesmo dormindo, 'asleep') NÃO é lixo" 0 "$(reading lixo.n)"
+  xfresh; node_add dog-remote-gapxi4ls 14400; sessions_are "$SJ_REMOTE"; xone $LOWW >/dev/null; eq "sessão viva que a cidade lista: não é lixo" 0 "$(reading lixo.n)"
+  xfresh; node_add dog-remote-2 14400; sessions_are "$SJ_ZOMBIES"; xone $LOWW >/dev/null; eq "o ALIAS do pool também reconhece (dog-remote-2): não é lixo" 0 "$(reading lixo.n)"
+  xfresh; node_add "$GHOST" 14400; beads_are "[{\"id\":\"ga-b9\",\"status\":\"in_progress\",\"assignee\":\"$GHOST\"}]"; xone $LOWW >/dev/null
+  eq "sessão que SEGURA uma bead in_progress nunca é lixo, mesmo fora da lista da cidade e parada" "0/lastro-sem-trabalho" "$(reading lixo.n)/$(reading causa)"
+  xfresh; node_add gate-reviewer-remote-mbp-ab12 14400; xone $LOWW >/dev/null; eq "sessão de outro host (-remote-mbp-) não é do nó: não é lixo" 0 "$(reading lixo.n)"
+  xfresh; node_add worker-abc 14400; node_add 'evil;touch-remote-x' 14400; xone $LOWW >/dev/null; eq "nome sem -remote- e nome com caractere perigoso: nunca candidatos" 0 "$(reading lixo.n)"
+  xfresh; node_add gate-reviewer-remote-young 600; xone $LOWW >/dev/null; eq "sessão sem dono parada há só 10 min (< 30): ainda pode estar trabalhando, não é lixo" "0/true" "$(reading lixo.n)/$(reading lixo.lido)"
+  xfresh; node_add "$GHOST" 14400; node_add "gate-reviewer-remote-b" 20000; node_add "gate-reviewer-remote-c" 9000; xone $LOWW >/dev/null
+  eq "3 candidatas: n=3, as mais quietas primeiro" "3/[\"gate-reviewer-remote-b\", \"$GHOST\", \"gate-reviewer-remote-c\"]" "$(reading lixo.n)/$(reading lixo.nomes)"
+  xfresh; node_add "$GHOST" 14400; sessions_are '{"sessions":[{"id":"s1"}]}'; xone $LOWW >/dev/null
+  eq "a cidade com entrada sem nome: não sei o que ela conhece, então NÃO há lixo (lido false, motivo dito)" "false/cidade-ilegivel/lastro-sem-trabalho" "$(reading lixo.lido)/$(reading lixo.motivo)/$(reading causa)"
+  xfresh; node_add "$GHOST" 14400; STUB_GC_RC=1; xone $LOWW >/dev/null; eq "gc que falha: lixo não lido (o mesmo)" "false/cidade-ilegivel" "$(reading lixo.lido)/$(reading lixo.motivo)"
+  xfresh; node_add "$GHOST" 14400; STUB_BD_RC=1; sessions_are "$SJ_REMOTE"; xone $LOWW >/dev/null; eq "bd que falha com a cidade com sessão viva: não sei quem segura bead, então o lixo NÃO é lido" "false/donos-ilegivel:bd-falhou" "$(reading lixo.lido)/$(reading lixo.motivo)"
+  xfresh; node_add "$GHOST" 14400; STUB_BD_RC=1; xone $LOWW >/dev/null; eq "cidade sem sessão viva (o gc não chamou o bd) e o bd fora: o vigia lê os donos ele mesmo; falhou, então o lixo NÃO é lido" "false/donos-ilegivel:bd-falhou" "$(reading lixo.lido)/$(reading lixo.motivo)"
+  xfresh; node_add "$GHOST" 14400; X_OMIT="now"; xone $LOWW >/dev/null; eq "sem o relógio do nó não sei há quanto a sessão está parada: lixo não lido" "false/sem-relogio-do-no" "$(reading lixo.lido)/$(reading lixo.motivo)"
+  xfresh; node_add "$GHOST" 14400; X_TMUX=falha; xone $LOWW >/dev/null; eq "tmux que falha por outro motivo (rc 1, não é 'sem servidor'): NÃO é lista vazia" "false/tmux-ilegivel:tmux-rc-1" "$(reading lixo.lido)/$(reading lixo.motivo)"
+  xfresh; X_TMUX=semservidor; xone $LOWW >/dev/null; eq "tmux sem servidor no nó: lista vazia, lida" "true/0" "$(reading lixo.lido)/$(reading lixo.n)"
+  xfresh; X_TMUX=lixo; xone $LOWW >/dev/null; eq "linha do tmux que não é nome|atividade: lista ilegível inteira" "false/tmux-ilegivel:linha-ilegivel" "$(reading lixo.lido)/$(reading lixo.motivo)"
+  xfresh; X_TMUX=semrc; xone $LOWW >/dev/null; eq "tmux sem o rc= antes da lista: ilegível" "false/tmux-ilegivel:rc-ausente" "$(reading lixo.lido)/$(reading lixo.motivo)"
+  xfresh; X_OMIT="tmux"; xone $LOWW >/dev/null; eq "seção do tmux ausente (a ssh cortou): ilegível, não vazia" "false/tmux-ilegivel:sem-secao" "$(reading lixo.lido)/$(reading lixo.motivo)"
+
+  # ---- o que não foi lido nunca vira causa: cego, sem degrau, sem ação -------------------------------------------------------------------------------------------------------
+  local why
+  for why in "cg:cgroup-ilegivel" "u:cgroup-ilegivel" "m l:sem-gerenciador-de-usuario"; do
+    xfresh; X_OMIT="${why%%:*}"; xone $LOWW >/dev/null
+    eq "sem '${why%%:*}' na leitura: núcleos não lidos (${why#*:}), a CPU segue lida e a causa é cego" "false/${why#*:}/cego" "$(reading nucleos.lido)/$(reading nucleos.motivo)/$(reading causa)"
+  done
+  xfresh; X_OMIT="m"; xone $LOWW >/dev/null; eq "sem o 'm 1' mas com o l lido: dá para ler (o lastro existe)" true "$(reading nucleos.lido)"
+  xfresh; X_OMIT="l"; xone $LOWW >/dev/null; eq "sem o l com o gerenciador de pé, nas duas pontas: lastro 0 (nada do lastro rodou) e as sessões ficam com o user slice todo" "0.0/2.3" "$(reading nucleos.lastro)/$(reading nucleos.sessoes)"
+  xfresh; xtick 900 $LOWW >/dev/null; X_OMIT="l"; xtick 900 $LOWW; eq "o l SUMIU entre as duas pontas: a fatia foi recriada, não sei o quanto rodou (não lido)" "false/lastro-sumiu/cego" "$(reading nucleos.lido)/$(reading nucleos.motivo)/$(reading causa)"
+  xtick 900 $LOWW; eq "... e na leitura seguinte (ausente nas duas pontas) volta a ser lastro 0" "true/0.0" "$(reading nucleos.lido)/$(reading nucleos.lastro)"
+  xfresh; X_OMIT="l"; xtick 900 $LOWW >/dev/null; X_OMIT=""; xtick 900 $LOWW; eq "fatia do lastro NASCIDA na janela conta desde zero" 0.6 "$(reading nucleos.lastro)"
+  xfresh; xtick 900 $LOWW >/dev/null; xtick 900 $LOWW >/dev/null; XL=0; xtick 900 $LOWW; eq "contador do lastro que recuou: não lido (contador-recuou)" "false/contador-recuou" "$(reading nucleos.lido)/$(reading nucleos.motivo)"
+  xfresh; xtick 900 $LOWW >/dev/null; xtick 900 $LOWW >/dev/null; XU=0; xtick 900 $LOWW; eq "contador do user slice que recuou: o mesmo" "false/contador-recuou" "$(reading nucleos.lido)/$(reading nucleos.motivo)"
+  xfresh; xtick 900 $LOWW >/dev/null; XU=$((XU + 20000000000)); xtick 900 $LOWW; eq "o cgroup diz mais núcleos (22) do que o nó tem (16): implausível, não lido" "false/contador-implausivel/cego" "$(reading nucleos.lido)/$(reading nucleos.motivo)/$(reading causa)"
+  xfresh; xtick 900 $LOWW >/dev/null; xtick 60 $LOWW; eq "janela de 60 s: curta demais, núcleos não lidos" "false/janela-curta" "$(reading nucleos.lido)/$(reading nucleos.motivo)"
+  xfresh; xtick 900 $LOWW >/dev/null; xtick 2701 $LOWW; eq "janela de 2701 s (mais de 3 intervalos): a leitura anterior é velha demais" "false/leitura-anterior-velha" "$(reading nucleos.lido)/$(reading nucleos.motivo)"
+  # o relógio que recuou e os contadores que não andaram: a leitura é a mesma de uma janela curta/estourada de longe (lido false), então só o MOTIVO e o baseline dizem qual guarda agiu
+  xparado() {   # xparado <delta_s>: o relógio anda <delta_s> (pode ser negativo) e os contadores NÃO andam: a mesma leitura completa do nó, só com outra hora
+    NOW=$((NOW + $1)); xwrite "$T/stat.txt"; STUB_SSH_FILE="$T/stat.txt"; printf '%s' "$NOW" > "$T/stub/node.now"
+    [ "$PILOT_HQ" != none ] && pilot 60 1800 "$PILOT_HQ" "$PILOT_WA"
+    focus_is "$FOCUS"
+    W "${TENV[@]+"${TENV[@]}"}" -- ${XARGS---print}
+  }
+  xfresh; xtick 900 $LOWW >/dev/null; a0=$NOW; CB=$((CB + 1000)); CI=$((CI + 1000)); xparado -300
+  eq "relógio do nó recuou (baseline no futuro): núcleos não lidos, com o motivo certo (não 'janela-curta')" "false/relogio-recuou" "$(reading nucleos.lido)/$(reading nucleos.motivo)"
+  eq "... e o baseline dos núcleos é REPOSTO no relógio novo (a próxima janela já mede)" "$NOW" "$(state_f cpu_extra.epoch)"
+  xfresh; xtick 900 $LOWW >/dev/null; a0=$NOW; xparado 900
+  eq "contadores iguais nas duas pontas (nenhum tick na janela): núcleos não lidos, sem dividir por zero" "0/false/sem-tick" "$RC/$(reading nucleos.lido)/$(reading nucleos.motivo)"
+  eq "... e o baseline dos núcleos fica onde estava (nada foi medido: não é trocado)" "$a0" "$(state_f cpu_extra.epoch)"
+  xfresh; xtick 900 $LOWW >/dev/null; xtick 900 $LOWW >/dev/null; STUB_SSH_RC=1; xtick 900 $LOWW; eq "ssh que cai: CPU não lida, núcleos não lidos (sem-leitura-cpu) e a causa é cego" "false/false/sem-leitura-cpu/cego" "$(reading cpu.lido)/$(reading nucleos.lido)/$(reading nucleos.motivo)/$(reading causa)"
+  eq "... e não vai ação nenhuma ao nó numa leitura cega" 0 "$(acts)"
+  xfresh; xtick 900 $LOWW >/dev/null; xtick 900 $LOWW >/dev/null; STUB_SSH_RC=1; xtick 900 $LOWW >/dev/null; STUB_SSH_RC=0; xtick 900 $LOWW; eq "o baseline antigo sobrevive à ssh que caiu: a janela seguinte é de 1800 s (2 intervalos) e é lida" "true/1800" "$(reading nucleos.lido)/$(reading nucleos.janela_s)"
+  xfresh; xone 200 30 50 0 >/dev/null; check "o JSONL tem os campos da causa (nucleos, ram_mb, lixo, memo_unknown, causa, degrau, acao, efeito)" "$(python3 -I -c 'import json,sys; d=json.loads(open(sys.argv[1]).read().splitlines()[-1]); print(int(all(k in d for k in ("nucleos","ram_mb","lixo","memo_unknown","causa","degrau","acao","efeito"))))' "$C/.gc/hetzner-occupancy.jsonl")"
+}
+
+# ============================================================================================================================================================================
+g_escada() {
+  echo "--- escada: configuração, chaves, um degrau por leitura, o que cada degrau faz no nó e o efeito medido na leitura seguinte (ga-2hd02v.5.10)"
+  local dj kj MEMO R v bad_h a0
+  xfresh; dj="$C/.gc/hetzner-occupancy-daily.json"; kj="$NODE/gt-remote/ballast/lastro-pedido.json"; MEMO="$C/.gc/wa-node-pass-memo.tsv"
+  ghost3() { xfresh; if [ $# -eq 0 ]; then keys_on d1 d2 d3; else keys_on "$@"; fi; node_add "$GHOST" 14400 2700; xtick 900 $LOWW >/dev/null; xtick 900 $LOWW >/dev/null; }   # a semente e a 1ª janela baixa; a 3ª leitura (que o teste faz) é a 1ª com 30 min medidos
+  verd() { echo "$(reading acao.0.ok)/$(reading acao.0.detalhe)/$(reading degrau.d1)/$(state_f degraus.d1.tentativas)/$(state_f pendentes)"; }
+  memo_put() { printf '%s\t%s\t%s\t%s\n' "$@" >> "$MEMO"; }
+  fixture_memo() { R=$((NOW + 2700)); : > "$MEMO"
+    memo_put $((R-100)) wa-1 u1 unknown; memo_put $((R-50)) wa-1 u1 unknown; memo_put $((R-5000)) wa-2 u2 unknown; memo_put $((R-100)) wa-3 u3 mini
+    memo_put $((R-900)) wa-4 u4 unknown; memo_put $((R-100)) wa-4 u4 mini; memo_put $((R-100)) wa-5 u5 unknown; memo_put $((R-100)) wa-5 u6 mini
+    memo_put $((R-3599)) wa-6 u6 unknown; memo_put $((R-3600)) wa-7 u7 unknown; printf 'linha ruim sem tabs\n3 campos\ta\tb\n' >> "$MEMO"; }
+
+  # ---- configuração em vigor ---------------------------------------------------------------------------------------------------------------------------------------------------
+  W -- --print-config
+  eq "padrão: lixo = parado há 30 min, no máximo 2 por leitura" "1800/2" "$(reading d1_idle_s)/$(reading d1_max)"; eq "padrão: 30 min entre ações, 2 tentativas por degrau" "1800/2" "$(reading act_cooldown_s)/$(reading act_tries)"
+  eq "padrão: o D4 só depois de 6 h" 21600 "$(reading d4_after_s)"; eq "padrão: notify de novo a cada 1 h e 60 s de paciência" "3600/60" "$(reading notify_retry_s)/$(reading notify_timeout_s)"
+  eq "padrão: pisos de RAM do lastro (partida 14336 MB, slot 1024 MB) e 2 núcleos livres" "14336/1024/2.0" "$(reading ram_start_mb)/$(reading ram_slot_mb)/$(reading min_free_cores)"
+  eq "padrão: o dia precisa de 48 janelas lidas para ter número; a pasta do lastro; a memória dos vereditos 'unknown' dura 1 h" "48/~/gt-remote/ballast/3600" "$(reading day_min_windows)/$(reading ballast_home)/$(reading memo_unknown_ttl_s)"
+  eq "sem nenhuma chave: nenhum degrau liga (INERTE por padrão)" '{"d1": false, "d2": false, "d3": false, "d4": false, "dia": false}' "$(reading on)"
+  keys_on d1 dia; W -- --print-config; eq "a chave .on liga só o degrau dela" '{"d1": true, "d2": false, "d3": false, "d4": false, "dia": true}' "$(reading on)"
+  W HETZNER_OCC_ACT=0 -- --print-config; eq "HETZNER_OCC_ACT=0 desliga TODAS as chaves de uma vez" '{"d1": false, "d2": false, "d3": false, "d4": false, "dia": false}' "$(reading on)"
+  : > "$C/.gc/hetzner-occupancy-alarm.on"; W HETZNER_OCC_ACT=0 -- --print-config; eq "... mas não mexe na chave do aviso antigo (alarm)" true "$(reading alarm)"; rm -f "$C/.gc/hetzner-occupancy-alarm.on"
+  for bad_h in 'HETZNER_OCC_D4_AFTER_S=30' 'HETZNER_OCC_D1_IDLE_S=30' 'HETZNER_OCC_D1_MAX=0' 'HETZNER_OCC_ACT_TRIES=0' 'HETZNER_OCC_NOTIFY_TIMEOUT_S=0' 'HETZNER_OCC_DAY_MIN_WINDOWS=0' 'HETZNER_OCC_MIN_FREE_CORES=0' 'HETZNER_OCC_BALLAST_HOME=/x;rm' 'HETZNER_OCC_BALLAST_HOME=../x' 'HETZNER_OCC_BALLAST_HOME=a b' "HETZNER_OCC_BALLAST_HOME=x'y"; do
+    W "$bad_h" -- --print-config; check "$bad_h: recusado (rc != 0), nunca vira um comando no nó" "$([ "$RC" -ne 0 ] && echo 1 || echo 0)"
+  done
+  W HETZNER_OCC_ACT_COOLDOWN_S=0 -- --print-config; eq "intervalo entre ações 0 é aceito" 0 "$(reading act_cooldown_s)"
+
+  # ---- sem a chave nada age; antes de 30 min medidos nada é devido ---------------------------------------------------------------------------------------------------------------
+  xfresh; node_add "$GHOST" 14400 2700; xdue $LOWW
+  eq "sem NENHUMA chave: só mede (d1 e d2 aplicam mas estão desligados, d3 não tem o que fazer) e nada vai ao nó" "desligado/desligado/nao-aplica/0" "$(reading degrau.d1)/$(reading degrau.d2)/$(reading degrau.d3)/$(acts)"
+  eq "... a causa está dita e a sessão segue de pé" "lixo/1" "$(reading causa)/$(node_has "$GHOST")"; eq "... e nenhuma tentativa foi gasta" "null/[]" "$(state_f degraus.d1.tentativas)/$(state_f pendentes)"
+  xfresh; keys_on d1 d2 d3; node_add "$GHOST" 14400; xone $LOWW
+  eq "com as chaves e a causa, mas só 15 min medidos: nada é devido (nem ação)" "nao-devido/nao-devido/nao-devido/0" "$(reading degrau.d1)/$(reading degrau.d2)/$(reading degrau.d3)/$(acts)"
+  xfresh; keys_on d1 d2 d3; node_add "$GHOST" 14400 2700; TENV=(HETZNER_OCC_ACT=0); xdue $LOWW; eq "HETZNER_OCC_ACT=0 com as chaves postas: nada age" "desligado/0/1" "$(reading degrau.d1)/$(acts)/$(node_has "$GHOST")"
+
+  # ---- leitura cega: a CPU baixa há 30 min, as 3 chaves postas e o lixo lá, mas o cgroup não veio: não sei a causa, então nada age -----------------------------------------------------
+  xfresh; keys_on d1 d2 d3; node_add "$GHOST" 14400 2700; X_OMIT="cg"; xdue $LOWW
+  eq "leitura cega (cgroup ilegível) com CPU baixa há 30 min: a causa é cego, NENHUM degrau age e a sessão-lixo segue de pé" "cego/cego/cego/cego/0/1" "$(reading causa)/$(reading degrau.d1)/$(reading degrau.d2)/$(reading degrau.d3)/$(acts)/$(node_has "$GHOST")"
+  eq "... e nenhuma tentativa é gasta nem fica efeito pendente" "null/[]" "$(state_f degraus.d1.tentativas)/$(state_f pendentes)"
+
+  # ---- D1: o caso real de 04/11 --------------------------------------------------------------------------------------------------------------------------------------------------
+  ghost3; xtick 900 $LOWW
+  eq "D1 com a chave e 30 min medidos: mata a sessão sem dono" "agiu/aguarda/nao-aplica" "$(reading degrau.d1)/$(reading degrau.d2)/$(reading degrau.d3)"
+  eq "... UM degrau por leitura (o d2 espera a vez), uma chamada ao nó" "1" "$(acts)"; eq "... a ação diz o que fez e o veredito do nó" "true/matou 1 sessão(ões) sem dono: $GHOST/$GHOST=morta" "$(reading acao.0.ok)/$(reading acao.0.o_que)/$(reading acao.0.detalhe)"
+  eq "... a sessão saiu do tmux do nó (de verdade, pelo script remoto)" "0/$GHOST" "$(node_has "$GHOST")/$(cat "$T/stub/node.killed")"
+  has "o comando ao nó mata pelo nome exato" "kill-session -t \"=\$S\"" "$(cat "$T/stub/ssh.act")"; has "... e o nome vai no comando" "S=$GHOST;" "$(cat "$T/stub/ssh.act")"
+  has "o ssh de ação também: BatchMode (nunca espera senha), ConnectTimeout e o host" "BatchMode=yes -o ConnectTimeout=10 hetzner-teste" "$(cat "$T/stub/ssh.act")"
+  eq "a tentativa e o relógio da ação JÁ estavam gravados quando o ssh de ação rodou (processo que morre no meio não repete sem conta)" "1/$NOW" "$(jv "$T/stub/act.state" degraus.d1.tentativas)/$(jv "$T/stub/act.state" ultima_acao_em)"
+  eq "o estado fica com a tentativa e o relógio" "1/$NOW" "$(state_f degraus.d1.tentativas)/$(state_f ultima_acao_em)"
+  eq "... e a ação pendente de medir: o antes (CPU 17,5 %, 2,8 núcleos, lastro 0,3, 11,7 livres)" "d1/17.5/2.8/0.3/11.7" "$(state_f pendentes.0.degrau)/$(state_f pendentes.0.antes.pct)/$(state_f pendentes.0.antes.nucleos)/$(state_f pendentes.0.antes.lastro)/$(state_f pendentes.0.antes.livres)"
+  eq "o diário conta a ação do dia" 1 "$(jv "$dj" dias.2026-10-19.acoes)"
+  xtick 900 255 30 50 150
+  eq "leitura seguinte, ainda no intervalo de 30 min: o d1 não tem mais lixo (fora) e o d2 espera o intervalo (cooldown)" "fora/cooldown/nao-aplica/0/1" "$(reading degrau.d1)/$(reading degrau.d2)/$(reading degrau.d3)/$(reading acao | python3 -I -c 'import json,sys; print(len(json.load(sys.stdin)))')/$(acts)"
+  eq "... e o EFEITO da ação anterior, medido: de 2,8 para 3,35 núcleos = +0,55" "d1/2.8/3.35/0.55" "$(reading efeito.0.degrau)/$(reading efeito.0.nucleos_antes)/$(reading efeito.0.nucleos_depois)/$(reading efeito.0.ganho_nucleos)"
+  eq "... a CPU antes e depois, e o lastro e os livres antes e depois" "17.5/20.9/0.3/0.3/11.7/11.15" "$(reading efeito.0.pct_antes)/$(reading efeito.0.pct_depois)/$(reading efeito.0.lastro_antes)/$(reading efeito.0.lastro_depois)/$(reading efeito.0.livres_antes)/$(reading efeito.0.livres_depois)"
+  eq "... guardado no degrau (o aviso do D4 o cita) e a pendência some" "0.55/[]" "$(state_f degraus.d1.ganho_nucleos)/$(state_f pendentes)"
+  xtick 900 255 30 50 150
+  eq "30 min depois da ação o intervalo acabou: sem lixo, a causa é o lastro e o D2 pede mais slots" "lastro-sem-trabalho/agiu/2" "$(reading causa)/$(reading degrau.d2)/$(acts)"
+  eq "... o pedido de lastro: v1, +4 slots (livres 11, RAM comporta 5, teto 4), de quem, com a RAM" "1/4/hetzner-occupancy-watch/20000" "$(jv "$kj" v)/$(jv "$kj" slots_extra)/$(jv "$kj" quem)/$(jv "$kj" ram_mb)"
+  eq "... vale por 2 leituras (ate = epoch + 1800) e o epoch é o da ação" "1800/$NOW" "$(( $(jv "$kj" ate) - $(jv "$kj" epoch) ))/$(jv "$kj" epoch)"
+  eq "... e a pasta do lastro só tem o pedido (o tmp foi movido, não ficou)" "lastro-pedido.json" "$(ls -A "$NODE/gt-remote/ballast")"
+  eq "... a ação diz o que pediu" "true/pediu +4 slot(s) de lastro/gravado" "$(reading acao.0.ok)/$(reading acao.0.o_que)/$(reading acao.0.detalhe)"
+  xtick 900 255 30 50 150; eq "o efeito do D2 também é medido na leitura seguinte (aqui a CPU não mudou: ganho 0)" "d2/0.0" "$(reading efeito.0.degrau)/$(reading efeito.0.ganho_nucleos)"
+  check "NUNCA liga a queima: nenhum comando ao nó cita burn e nenhum arquivo burn* nasce na cidade nem no nó" "$([ "$(cat "$T/stub/ssh.act" "$T/stub/ssh.calls" | grep -ci burn)" = 0 ] && [ -z "$(find "$C" "$NODE" -iname '*burn*')" ] && echo 1 || echo 0)"
+  eq "o diário: 2 ações no dia (d1 e d2)" 2 "$(jv "$dj" dias.2026-10-19.acoes)"
+
+  # ---- D1: só o que a cidade não conhece e ninguém segura; o nó re-confere na hora de matar --------------------------------------------------------------------------------------------
+  ghost3; node_add dog-remote-gapxi4ls 20000 2700; sessions_are "$SJ_REMOTE"; xtick 900 $LOWW
+  eq "uma sessão que a cidade conhece e segura bead, parada há 5 h, NÃO morre; só o lixo morre" "$GHOST/1" "$(cat "$T/stub/node.killed")/$(node_has dog-remote-gapxi4ls)"
+  ghost3; node_add gate-reviewer-remote-b 20000 2700; node_add gate-reviewer-remote-c 9000 2700; xtick 900 $LOWW
+  eq "3 sem dono e d1_max=2: matou as 2 mais quietas, a mais nova fica" "2/gate-reviewer-remote-b $GHOST/1" "$(wc -l < "$T/stub/node.killed" | tr -d ' ')/$(tr '\n' ' ' < "$T/stub/node.killed" | sed 's/ $//')/$(node_has gate-reviewer-remote-c)"
+  eq "... a ação lista as 2 e o veredito de cada" "matou 2 sessão(ões) sem dono: gate-reviewer-remote-b, $GHOST/gate-reviewer-remote-b=morta, $GHOST=morta" "$(reading acao.0.o_que)/$(reading acao.0.detalhe)"
+  ghost3; node_add gate-reviewer-remote-b 20000 2700; TENV=(HETZNER_OCC_D1_MAX=1); xtick 900 $LOWW; eq "D1_MAX=1: só a mais quieta" "1/gate-reviewer-remote-b" "$(wc -l < "$T/stub/node.killed" | tr -d ' ')/$(cat "$T/stub/node.killed")"
+  ghost3; after_read ': > "$STUB_DIR/node.tmux"'; xtick 900 $LOWW
+  eq "a sessão SUMIU entre a leitura e a ação: o nó diz 'ausente', nada é morto, a tentativa gasta a vez e não há efeito a medir" "false/$GHOST=ausente/falhou/1/[]" "$(verd)"
+  ghost3; after_read 'printf "%s|%s\n" '"$GHOST"' "$(cat "$STUB_DIR/node.now")" > "$STUB_DIR/node.tmux"'; xtick 900 $LOWW
+  eq "a sessão VOLTOU a trabalhar entre a leitura e a ação: o nó diz 'ativa' e ela não morre" "false/$GHOST=ativa/falhou/1/[]/1" "$(verd)/$(node_has "$GHOST")"
+  ghost3; STUB_TMUX_ACT_BAD=1; xtick 900 $LOWW; eq "atividade que o nó não consegue ler: 'ilegivel', não mata" "false/$GHOST=ilegivel/falhou/1/[]/1" "$(verd)/$(node_has "$GHOST")"
+  ghost3; STUB_TMUX_KILL_FAIL=1; xtick 900 $LOWW; eq "o tmux recusa o kill: 'falhou'" "false/$GHOST=falhou/falhou/1/[]" "$(verd)"
+  ghost3; STUB_ACT_RC=255; xtick 900 $LOWW; eq "ssh de ação que cai (rc 255): 'rc-255' e não há sucesso" "false/$GHOST=rc-255/falhou/1/[]" "$(verd)"
+  ghost3; STUB_ACT_SLEEP=8; TENV=(HETZNER_OCC_SSH_TIMEOUT_S=3); xtick 900 $LOWW; eq "ssh de ação que trava além do prazo: 'timeout'" "false/$GHOST=timeout/falhou/1/[]" "$(verd)"
+  ghost3; STUB_ACT_OUT=" "; xtick 900 $LOWW; eq "ssh de ação sem palavra nenhuma na saída: 'sem-saida', nunca sucesso" "false/$GHOST=sem-saida/falhou/1/[]" "$(verd)"
+  ghost3; STUB_ACT_OUT="morta falhou"; xtick 900 $LOWW; eq "vale a ÚLTIMA palavra do veredito" "false/$GHOST=falhou/falhou/1/[]" "$(verd)"
+  ghost3; STUB_ACT_OUT="morta"; xtick 900 $LOWW; eq "só 'morta' com rc 0 é sucesso (e então há efeito a medir)" "true/$GHOST=morta/agiu/1/1" "$(reading acao.0.ok)/$(reading acao.0.detalhe)/$(reading degrau.d1)/$(state_f degraus.d1.tentativas)/$(state_f pendentes | python3 -I -c 'import json,sys; print(len(json.load(sys.stdin)))')"
+  a0=$(acts)
+  python3 -I - "$WATCH" <<'PY' > "$T/unit.out" 2>&1
+import importlib.util, sys
+spec = importlib.util.spec_from_file_location("hoc_watch", sys.argv[1]); m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
+c = m.load_config({"GC_CITY_PATH": "/nonexistent", "HOME": "/nonexistent"})
+for name in ("worker-1", "a b-remote-x", "x;touch-remote-y", "-remote-$(id)", "", "gateremote-x"):
+    print(name, m.kill_idle_session(c, name))
+PY
+  eq "a função que mata recusa nome sem -remote- ou com caractere de shell, sem chamar o ssh" "worker-1 (False, 'nome-recusado')|a b-remote-x (False, 'nome-recusado')|x;touch-remote-y (False, 'nome-recusado')|-remote-\$(id) (False, 'nome-recusado')| (False, 'nome-recusado')|gateremote-x (False, 'nome-recusado')" "$(tr '\n' '|' < "$T/unit.out" | sed 's/|$//')"
+  eq "... (o ssh de verdade nem foi chamado)" "$a0" "$(acts)"
+
+  # ---- tentativas, intervalo e a escada que desce ----------------------------------------------------------------------------------------------------------------------------------
+  ghost3; STUB_TMUX_KILL_FAIL=1; xtick 900 $LOWW >/dev/null; xtick 900 $LOWW; eq "ação que falhou: o intervalo de 30 min vale mesmo assim (d1 e d2 em cooldown)" "cooldown/cooldown/1" "$(reading degrau.d1)/$(reading degrau.d2)/$(acts)"
+  xtick 900 $LOWW; eq "30 min depois: a 2ª tentativa do d1 (também falha)" "falhou/2" "$(reading degrau.d1)/$(state_f degraus.d1.tentativas)"
+  xtick 900 $LOWW >/dev/null; xtick 900 $LOWW; eq "tentativas gastas: o d1 está esgotado e a escada DESCE para o d2, que age" "esgotado/agiu/3" "$(reading degrau.d1)/$(reading degrau.d2)/$(acts)"
+  xfresh; keys_on d2; TENV=(HETZNER_OCC_ACT_COOLDOWN_S=0); xdue $LOWW >/dev/null; xtick 900 $LOWW >/dev/null; xtick 900 $LOWW
+  eq "sem intervalo e com a chave só do d2: tentativa 1, 2 e então 'esgotado'" "fora/esgotado/nao-aplica/2" "$(reading degrau.d1)/$(reading degrau.d2)/$(reading degrau.d3)/$(state_f degraus.d2.tentativas)"
+  eq "... d4 ainda não é devido (a sequência tem 45 min, não 6 h)" nao "$(reading d4)"
+  xtick 900 1400 30 50 0; eq "a CPU volta à meta: a sequência acaba e as tentativas zeram (estado limpo)" "null/0/{}" "$(reading causa)/$(state_f baixas_seguidas)/$(state_f degraus)"
+  xtick 900 $LOWW >/dev/null; xtick 900 $LOWW; eq "nova sequência baixa de 30 min: o d2 tem tentativas de novo" "agiu/1" "$(reading degrau.d2)/$(state_f degraus.d2.tentativas)"
+  ghost3 d1; xtick 900 $LOWW; STUB_SSH_RC=1; xtick 900 $LOWW >/dev/null; xtick 900 $LOWW >/dev/null
+  eq "CPU não lida logo depois da ação: a pendência espera (leituras 2)" "d1/2" "$(state_f pendentes.0.degrau)/$(state_f pendentes.0.leituras)"
+  xtick 900 $LOWW; eq "na 3ª leitura sem CPU o efeito vira 'cpu-nao-lida' (dito, nunca inventado) e a pendência some" "d1/cpu-nao-lida/[]" "$(reading efeito.0.degrau)/$(reading efeito.0.motivo)/$(state_f pendentes)"
+  ghost3 d1; XARGS="--print --dry-run" xtick 900 $LOWW; eq "--dry-run: diz 'agiria' e NÃO age, não grava estado nem JSONL" "agiria/0/1/null/2" "$(reading degrau.d1)/$(acts)/$(node_has "$GHOST")/$(state_f ultima_acao_em)/$(wc -l < "$C/.gc/hetzner-occupancy.jsonl" | tr -d ' ')"
+
+  # ---- D2: o pedido de lastro e os pisos de RAM ------------------------------------------------------------------------------------------------------------------------------------
+  xfresh; keys_on d2; X_RAM_MB=16500; xdue $LOWW >/dev/null; eq "RAM 16500 MB (2 slots acima do piso de 14336): pede +2" 2 "$(jv "$kj" slots_extra)"
+  xfresh; keys_on d2; X_RAM_MB=15360; xdue $LOWW >/dev/null; eq "RAM 15360 MB: pede +1" 1 "$(jv "$kj" slots_extra)"
+  xfresh; keys_on d2; xdue 1000 30 50 300 >/dev/null; eq "só 2,2 núcleos livres: pede +2 (a parte inteira dos livres)" "2.2/2" "$(reading nucleos.livres)/$(jv "$kj" slots_extra)"
+  xfresh; keys_on d1 d2 d3; X_RAM_MB=15000; xdue $LOWW; eq "RAM abaixo do piso de partida + 1 slot: a causa é RAM, NENHUM degrau age (nada cabe; a pasta do lastro segue vazia)" "RAM/ram/ram/ram/0/0" "$(reading causa)/$(reading degrau.d1)/$(reading degrau.d2)/$(reading degrau.d3)/$(acts)/$(ls -A "$NODE/gt-remote/ballast" | wc -l | tr -d ' ')"
+  xfresh; keys_on d2; rm -rf "$NODE/gt-remote"; xdue $LOWW; eq "sem a pasta do lastro no nó: 'sem-lastro', não cria nada e a tentativa gasta a vez" "false/sem-lastro/falhou/0" "$(reading acao.0.ok)/$(reading acao.0.detalhe)/$(reading degrau.d2)/$([ -e "$NODE/gt-remote" ] && echo 1 || echo 0)"
+  xfresh; keys_on d2; mkdir -p "$NODE/gt-remote/outro"; TENV=(HETZNER_OCC_BALLAST_HOME='~/gt-remote/outro'); xdue $LOWW >/dev/null; eq "a pasta do lastro é configurável" "1/0" "$([ -f "$NODE/gt-remote/outro/lastro-pedido.json" ] && echo 1 || echo 0)/$([ -e "$kj" ] && echo 1 || echo 0)"
+  xfresh; keys_on d2; STUB_ACT_RC=1; xdue $LOWW; eq "ssh que falha no D2: não é sucesso e não há efeito a medir" "false/rc-1/falhou/[]" "$(reading acao.0.ok)/$(reading acao.0.detalhe)/$(reading degrau.d2)/$(state_f pendentes)"
+
+  # ---- D3: a memória de vereditos 'unknown' do Pilot ------------------------------------------------------------------------------------------------------------------------------
+  xfresh; keys_on d3; PILOT_HQ=0; fixture_memo; xdue 600 30 50 800
+  eq "sem núcleo sobrando e fila vazia: a causa é a fila e o D3 age (d1 e d2 ficam fora)" "fila-sem-elegível/fora/fora/agiu" "$(reading causa)/$(reading degrau.d1)/$(reading degrau.d2)/$(reading degrau.d3)"
+  eq "a leitura conta as beads 'unknown' frescas (a última linha da bead vale; vencida não conta)" 3 "$(reading memo_unknown)"
+  has "o D3 diz quantas tirou" "tirou 3 bead(s)" "$(reading acao.0.o_que)"
+  printf '%s\t%s\t%s\t%s\n' $((R-5000)) wa-2 u2 unknown $((R-100)) wa-3 u3 mini $((R-900)) wa-4 u4 unknown $((R-100)) wa-4 u4 mini $((R-100)) wa-5 u6 mini $((R-3600)) wa-7 u7 unknown > "$T/memo.expect"; printf 'linha ruim sem tabs\n3 campos\ta\tb\n' >> "$T/memo.expect"
+  check "a memória fica SÓ sem as 3 beads 'unknown' frescas (todas as linhas delas); as vencidas, as de outro veredito e as linhas que não são de 4 campos ficam, na ordem" "$(cmp -s "$MEMO" "$T/memo.expect" && echo 1 || echo 0)"
+  eq "... e não sobra tmp ao lado" "wa-node-pass-memo.tsv" "$(ls -A "$C/.gc" | grep memo | tr '\n' ' ' | sed 's/ $//')"
+  xfresh; keys_on d3; PILOT_HQ=0; fixture_memo; cp "$MEMO" "$T/memo.before"; XARGS="--print --dry-run" xdue 600 30 50 800 >/dev/null; check "--dry-run: a memória do Pilot NÃO é tocada" "$(cmp -s "$MEMO" "$T/memo.before" && echo 1 || echo 0)"
+  xfresh; keys_on d3; PILOT_HQ=0; xdue 600 30 50 800; eq "memória ausente = vazia (lida): d3 não tem o que fazer e o vigia não cria o arquivo" "0/nao-aplica/0" "$(reading memo_unknown)/$(reading degrau.d3)/$([ -e "$MEMO" ] && echo 1 || echo 0)"
+  xfresh; keys_on d3; PILOT_HQ=0; mkdir -p "$MEMO"; xdue 600 30 50 800; eq "memória que não abre: NÃO lida (null) e o d3 diz 'cego', nunca 'nada a fazer'" "null/cego/0" "$(reading memo_unknown)/$(reading degrau.d3)/$(acts)"
+  xfresh; keys_on d3; PILOT_HQ=0; W HETZNER_OCC_WA_MEMO="$T/outra-memoria.tsv" -- --print-config; eq "o caminho da memória é configurável" "$T/outra-memoria.tsv" "$(reading wa_memo)"
+  xfresh; keys_on d2 d3; fixture_memo; TENV=(HETZNER_OCC_ACT_TRIES=1 HETZNER_OCC_ACT_COOLDOWN_S=0); xdue $LOWW >/dev/null; xtick 900 $LOWW
+  eq "causa lastro: o d2 gasta a única tentativa e a escada desce ao d3 (que tira as 'unknown'; 15 min depois a de 3599 s já venceu, sobram 2)" "esgotado/agiu/tirou 2 bead(s)" "$(reading degrau.d2)/$(reading degrau.d3)/$(reading acao.0.o_que | sed 's/ `unknown`.*//')"
+  eq "... e o D3 mediu o efeito do D2 na mesma leitura" d2 "$(reading efeito.0.degrau)"
+
+  # ---- o aviso antigo e a escada convivem: o mail de CPU baixa leva os números e a causa -------------------------------------------------------------------------------------------------
+  ghost3; : > "$C/.gc/hetzner-occupancy-alarm.on"; xtick 900 $LOWW
+  eq "com o aviso antigo ligado: o mail de CPU baixa sai UMA vez e a escada age na mesma leitura" "1/agiu" "$(mails)/$(reading degrau.d1)"
+  has "o mail diz de onde vem o número (as partes e a causa)" "de onde vem o número (núcleos médios na janela): sessões 2.0 · lastro 0.3 · sistema 0.5 · espera de disco 1.5 · livres 11.7 · causa: lixo" "$(mailfield 1 body)"
+  has "... e o fecho do mail não diz que o vigia só mede" "só nos degraus cuja chave .on existe, age" "$(mailfield 1 body)"
+}
+
+# ============================================================================================================================================================================
+g_aviso() {
+  echo "--- aviso: o D4 (esgotou) avisa o Athos no máximo 1x por dia, com a bead da causa; o rc do notify vale; o número do dia (ga-2hd02v.5.10)"
+  local dj rc_ok rc_bad
+  dj() { echo "$C/.gc/hetzner-occupancy-daily.json"; }
+  xrun() { local n=$1; shift; while [ "$n" -gt 1 ]; do xtick 900 "$@" >/dev/null; n=$((n-1)); done; xtick 900 "$@"; }   # xrun <n> <4 partes>: n leituras de 15 min; a última fica em $WOUT (a semente conta como a 1ª)
+  # a sequência baixa precisa ter 6 h para o D4; com HETZNER_OCC_D4_AFTER_S=3600 são a semente + 4 janelas (a 5ª leitura: 3600 s medidos, 3480 s bastam)
+  d4_setup() { xfresh; keys_on d2 d4; TENV=(HETZNER_OCC_D4_AFTER_S=3600 HETZNER_OCC_ACT_TRIES=1 HETZNER_OCC_ACT_COOLDOWN_S=0); }   # causa lastro: o d2 gasta a única tentativa e a escada esgota
+
+  # ---- o D4: só com a chave, a sequência de 6 h e a escada esgotada ------------------------------------------------------------------------------------------------------------------
+  d4_setup; xrun 4 $LOWW
+  eq "a 4ª leitura (2700 s medidos): o D4 ainda não é devido (a escada já esgotou, falta o tempo)" "nao/esgotado/0/0" "$(reading d4)/$(reading degrau.d2)/$(notifies)/$(creates)"
+  xtick 900 $LOWW
+  eq "a 5ª (3600 s, o d4_after_s): avisa o Athos UMA vez e cria UMA bead" "enviado:entregue/1/1" "$(reading d4)/$(notifies)/$(creates)"
+  eq "... a bead da causa vai no JSONL e no estado" "ga-d4test/ga-d4test" "$(reading d4_bead)/$(state_f d4_bead)"
+  eq "... o notify roda com os 2 sinais certos (rc por desfecho e push forçado)" "1/1" "$(cut -d/ -f1 "$T/stub/notify.1.env")/$(cut -d/ -f2 "$T/stub/notify.1.env")"
+  has "... o título é de produto: quanto, há quanto tempo e que o vigia esgotou" "Hetzner abaixo de 85% há 1 h: esgotei o que o vigia faz sozinho" "$(cat "$T/stub/notify.1.title")"
+  has "... o texto diz quanto (17.5 % de CPU), a causa em português e os números de hoje" "CPU média em 17.5% há 1 h (meta 85%). Causa: sobram núcleos livres e o lastro não os usa. Hoje: 2.0 núcleos em sessões, 0.3 no lastro, 0.5 de sistema, 1.5 esperando disco, 11.7 livres." "$(cat "$T/stub/notify.1.text")"
+  has "... diz o que tentou, com o ganho medido (o D2 não mexeu na CPU: +0.00)" "Tentei: pedir mais lastro 1x (ganho medido: +0.00 núcleo). Nada mais que o vigia possa fazer sozinho." "$(cat "$T/stub/notify.1.text")"
+  has "... e a bead onde a causa fica registrada" "Bead: ga-d4test." "$(cat "$T/stub/notify.1.text")"
+  eq "a bead leva o MESMO texto do aviso (sem a linha da bead) e o título" "$(cat "$T/stub/notify.1.title")" "$(cat "$T/stub/create.1.title")"
+  has "... e a descrição da bead tem a causa" "Causa: sobram núcleos livres e o lastro não os usa." "$(cat "$T/stub/create.1.desc")"
+  hasnt "... sem ids, caminhos de código nem jargão do vigia no texto ao Athos" "degrau" "$(cat "$T/stub/notify.1.text")"
+  check "a bead nasce SEM story:approved nem exec:auto (nada a despacha sozinho; só registra)" "$(grep -q 'story:approved\|exec:auto' "$T/stub/bd.calls" && echo 0 || echo 1)"
+  eq "o estado marca o dia do aviso (hoje) e não há falha pendente" "2026-10-19/null" "$(state_f d4_dia)/$(state_f d4_falha_em)"
+  xtick 900 $LOWW; eq "a leitura seguinte, no mesmo dia: 'ja-avisou' (no máximo 1 por dia), nada novo sai" "ja-avisou/1/1" "$(reading d4)/$(notifies)/$(creates)"
+  xrun 20 $LOWW; eq "... nem 5 h depois, no mesmo dia (e a bead é a mesma, não nasce outra)" "ja-avisou/1/1/ga-d4test" "$(reading d4)/$(notifies)/$(creates)/$(state_f d4_bead)"
+  xtick 900 1400 30 50 0; eq "a CPU volta à meta: a sequência acaba e a bead guardada é esquecida (a próxima sequência abre outra)" "null/null" "$(state_f d4_bead)/$(reading causa)"
+  # a virada do dia: começa às 22 h, o aviso sai às 23 h15 e a 1ª leitura depois da meia-noite avisa de novo, com a MESMA bead
+  d4_setup; xfresh $((NOW0 + 36000)); keys_on d2 d4; TENV=(HETZNER_OCC_D4_AFTER_S=3600 HETZNER_OCC_ACT_TRIES=1 HETZNER_OCC_ACT_COOLDOWN_S=0); xrun 5 $LOWW
+  eq "às 23 h15 de 19/10: o aviso do dia sai" "enviado:entregue/2026-10-19/1" "$(reading d4)/$(state_f d4_dia)/$(notifies)"
+  xtick 900 $LOWW >/dev/null; xtick 900 $LOWW; eq "23 h30 e 23 h45 (ainda 19/10): nada novo" "ja-avisou/1" "$(reading d4)/$(notifies)"
+  xtick 900 $LOWW; eq "00 h00 de 20/10: dia novo, escada esgotada e sequência de pé: avisa de novo (1 por dia), com a mesma bead, sem criar outra" "enviado:entregue/2026-10-20/2/1/ga-d4test" "$(reading d4)/$(state_f d4_dia)/$(notifies)/$(creates)/$(state_f d4_bead)"
+  has "... e o texto do 2º dia cita a mesma bead" "Bead: ga-d4test." "$(cat "$T/stub/notify.2.text")"
+
+  # ---- as portas do D4 ------------------------------------------------------------------------------------------------------------------------------------------------------------
+  d4_setup; rm -f "$C/.gc/hetzner-occupancy-d4.on"; keys_on d2; xrun 5 $LOWW; eq "sem a chave do d4: só mede ('desligado'), nada sai e nenhuma bead nasce" "desligado/0/0" "$(reading d4)/$(notifies)/$(creates)"
+  d4_setup; TENV+=(HETZNER_OCC_ACT=0); xrun 5 $LOWW; eq "HETZNER_OCC_ACT=0: os degraus ficam desligados (não esgotam: ninguém autorizou), o D4 nem é devido e nada sai" "nao/0/0" "$(reading d4)/$(notifies)/$(creates)"
+  d4_setup; keys_on d4; rm -f "$C/.gc/hetzner-occupancy-d2.on"; xrun 5 $LOWW; eq "escada NÃO esgotada (o d2 aplica mas a chave dele está desligada: ninguém autorizou a tentar): o D4 não avisa" "desligado/nao/0/0" "$(reading degrau.d2)/$(reading d4)/$(notifies)/$(creates)"
+  d4_setup; TENV+=(HETZNER_OCC_ACT_TRIES=3); xrun 5 $LOWW; eq "tentativa sobrando no d2 (3, gastou 3 só no 7º tick): não esgotou, não avisa" "nao/0/0" "$(reading d4)/$(notifies)/$(creates)"
+  d4_setup; X_RAM_MB=15000; xrun 5 $LOWW; eq "causa RAM: nada cabe, a escada está esgotada de saída; o D4 avisa e diz que não tentou nada (a causa não tem degrau)" "enviado:entregue/1" "$(reading d4)/$(notifies)"
+  has "... com a causa em português e 'nada' no que tentou" "Causa: pouca memória livre no nó: não cabe mais lastro." "$(cat "$T/stub/notify.1.text")"; has "... e que não tentou nada" "Tentei: nada (a causa não tem degrau que caiba)." "$(cat "$T/stub/notify.1.text")"
+  d4_setup; X_OMIT="mem"; xrun 5 $LOWW; eq "RAM não lida com núcleo sobrando: a causa é cego, a escada nunca esgota e o D4 NÃO avisa (o cego não vira 'esgotei')" "cego/nao/0/0" "$(reading causa)/$(reading d4)/$(notifies)/$(creates)"
+  d4_setup; xrun 4 $LOWW >/dev/null; STUB_SSH_RC=1; xtick 900 $LOWW; eq "CPU não lida na hora do aviso: não há sequência baixa lida, o D4 não é devido" "nao/0" "$(reading d4)/$(notifies)"
+  d4_setup; xrun 4 $LOWW >/dev/null; cp "$C/.gc/hetzner-occupancy.state.json" "$T/state.before"; XARGS="--print --dry-run" xtick 900 $LOWW; eq "--dry-run: diz 'enviaria', não manda, não cria bead e não grava o estado" "enviaria/0/0/1" "$(reading d4)/$(notifies)/$(creates)/$(cmp -s "$C/.gc/hetzner-occupancy.state.json" "$T/state.before" && echo 1 || echo 0)"
+  d4_setup; xrun 5 $LOWW; eq "(controle) o mesmo cenário, sem nenhuma das portas fechadas, avisa" "enviado:entregue" "$(reading d4)"
+
+  # ---- o rc do notify: só 0, 10 e 11 são entregue; o resto NÃO saiu (04/11, ga-i4t0lzx: exit 12 e o Athos não soube) ------------------------------------------------------------
+  for rc_ok in "0 entregue" "10 segurado-ate-7h" "11 ja-tinha-saido"; do
+    d4_setup; STUB_NOTIFY_RC=${rc_ok%% *}; xrun 5 $LOWW; eq "notify rc ${rc_ok%% *}: conta como entregue (${rc_ok#* }), sem mail de reserva e sem tentar de novo" "enviado:${rc_ok#* }/1/0/null" "$(reading d4)/$(notifies)/$(mails)/$(state_f d4_falha_em)"
+  done
+  for rc_bad in 12 13 14 1 2 99 255; do
+    d4_setup; STUB_NOTIFY_RC=$rc_bad; xrun 5 $LOWW
+    eq "notify rc $rc_bad: NÃO saiu: o vigia diz 'falhou' (nunca 'enviado'), manda o mesmo texto UMA vez por mail ao Mayor e anota a hora da falha" "falhou:rc-$rc_bad/enviado/1/1/$NOW" "$(reading d4)/$(reading d4_mail)/$(notifies)/$(mails)/$(state_f d4_falha_em)"
+    eq "... o aviso do dia NÃO é dado como feito (volta para tentar de novo)" "null" "$(state_f d4_dia)"
+  done
+  d4_setup; STUB_NOTIFY_RC=12; xrun 5 $LOWW; has "o mail de reserva leva o mesmo título, o mesmo texto e diz que o notify não saiu e quando tenta de novo" "O notify ao Athos não saiu: rc-12. Mando o mesmo texto aqui e tento o notify de novo em 60 min." "$(mailfield 1 body)"
+  eq "... e o assunto do mail é o título do aviso" "$(cat "$T/stub/notify.1.title")" "$(mailfield 1 subj)"
+  has "... com o texto do aviso inteiro" "$(cat "$T/stub/notify.1.text")" "$(mailfield 1 body)"
+  xtick 900 $LOWW; eq "15 min depois: 'espera-retry' (o notify de novo só depois de 1 h), nada sai, o mail não se repete" "espera-retry/1/1" "$(reading d4)/$(notifies)/$(mails)"
+  xtick 900 $LOWW >/dev/null; xtick 900 $LOWW >/dev/null; STUB_NOTIFY_RC=12; xtick 900 $LOWW
+  eq "1 h depois do aviso que falhou: tenta o notify de novo (falha de novo: 'falhou', mas SEM mail repetido — a reserva sai uma vez só)" "falhou:rc-12/2/1" "$(reading d4)/$(notifies)/$(mails)"
+  eq "... e a bead continua a mesma (o retry não cria outra)" "1/ga-d4test" "$(creates)/$(state_f d4_bead)"
+  STUB_NOTIFY_RC=0; xtick 900 $LOWW >/dev/null; xtick 900 $LOWW >/dev/null; xtick 900 $LOWW >/dev/null; xtick 900 $LOWW
+  eq "1 h depois, o notify volta a funcionar: 'enviado', o aviso do dia fica feito e a falha é limpa" "enviado:entregue/3/2026-10-19/null" "$(reading d4)/$(notifies)/$(state_f d4_dia)/$(state_f d4_falha_em)"
+  xtick 900 $LOWW; eq "... e não repete no mesmo dia" "ja-avisou/3" "$(reading d4)/$(notifies)"
+  d4_setup; STUB_NOTIFY_SLEEP=8; TENV+=(HETZNER_OCC_NOTIFY_TIMEOUT_S=2); xrun 5 $LOWW; eq "notify que trava (além do notify_timeout_s): 'timeout' = NÃO saiu, com o mail de reserva" "falhou:timeout/enviado/1" "$(reading d4)/$(reading d4_mail)/$(mails)"
+  d4_setup; TENV+=(NOTIFY_BIN="$T/bin/nao-existe"); xrun 5 $LOWW; eq "notify que nem existe: 'nao-executou' = NÃO saiu, com o mail de reserva" "falhou:nao-executou/enviado" "$(reading d4)/$(reading d4_mail)"
+  d4_setup; STUB_NOTIFY_RC=12; STUB_MAIL_RC=1; xrun 5 $LOWW; eq "notify e mail falham juntos: o vigia diz as DUAS falhas e continua tentando o notify" "falhou:rc-12/falhou/2026-10-19/null" "$(reading d4)/$(reading d4_mail)/2026-10-19/$(state_f d4_dia)"
+
+  # ---- a bead do D4 ---------------------------------------------------------------------------------------------------------------------------------------------------------------
+  d4_setup; STUB_BD_CREATE_RC=1; xrun 5 $LOWW
+  eq "bd create que falha: o aviso SAI mesmo assim (o Athos sabe) sem a linha da bead, e o JSONL diz por que não houve bead" "enviado:entregue/1/1/bd-falhou/null" "$(reading d4)/$(notifies)/$(creates)/$(reading d4_bead)/$(state_f d4_bead)"
+  hasnt "... o texto não cita bead nenhuma" "Bead:" "$(cat "$T/stub/notify.1.text")"
+  d4_setup; STUB_BD_CREATE_ID="id com espaço;rm"; xrun 5 $LOWW; eq "id que o bd devolve fora do formato: 'id-ilegivel', não vai no texto nem no estado" "id-ilegivel/null" "$(reading d4_bead)/$(state_f d4_bead)"
+  d4_setup; STUB_BD_CREATE_ID=VAZIO; xrun 5 $LOWW; eq "bd sem id nenhum na saída: idem" "id-ilegivel" "$(reading d4_bead)"
+  d4_setup; STUB_NOTIFY_RC=12; xrun 5 $LOWW >/dev/null; STUB_NOTIFY_RC=0; xtick 900 $LOWW >/dev/null; xtick 900 $LOWW >/dev/null; xtick 900 $LOWW >/dev/null; xtick 900 $LOWW; eq "retry depois de 1 h reaproveita a bead (1 create só)" "1/enviado:entregue" "$(creates)/$(reading d4)"
+
+  # ---- o que não li não esgota a escada ---------------------------------------------------------------------------------------------------------------------------------------------
+  xfresh; keys_on d3 d4; PILOT_HQ=0; mkdir -p "$C/.gc/wa-node-pass-memo.tsv"; TENV=(HETZNER_OCC_D4_AFTER_S=3600); xrun 5 600 30 50 800
+  eq "memória do Pilot que não abre: o D3 é 'cego' e a escada NÃO esgotou, então 1 h abaixo da régua não avisa nem cria bead" "fila-sem-elegível/cego/nao/0/0" "$(reading causa)/$(reading degrau.d3)/$(reading d4)/$(notifies)/$(creates)"
+  xfresh; keys_on d3 d4; PILOT_HQ=0; TENV=(HETZNER_OCC_D4_AFTER_S=3600); xrun 5 600 30 50 800
+  eq "... o controle: com a memória LIDA e sem 'unknown' (nada a reclassificar) a escada esgotou e o D4 avisa" "nao-aplica/enviado:entregue/1/1" "$(reading degrau.d3)/$(reading d4)/$(notifies)/$(creates)"
+
+  # ---- o número do dia -------------------------------------------------------------------------------------------------------------------------------------------------------------
+  numdia() { python3 -I - "$(dj)" "$1" "$2" "$3" "$4" "$5" <<'PY'
+import json, sys
+p, key, pct, wins, causas, acoes = sys.argv[1:7]
+try:
+    d = json.load(open(p))
+except OSError:
+    d = {"dias": {}}
+day = {"ocupado": 0, "ocioso": 0, "desconhecido": 0, "leituras": int(wins), "ocupacao_pct": None if pct == "null" else float(pct), "ocupacao_sessao_pct": None,
+       "cpu_janelas": int(wins), "cpu_nucleos_s": 0.0, "cpu_capacidade_s": 0}
+if causas != "-":
+    day["causas"] = json.loads(causas)
+if acoes != "-":
+    day["acoes"] = int(acoes)
+d["dias"][key] = day
+json.dump(d, open(p, "w"))
+PY
+  }
+  # o dia 18/10 fechou em 60 % (abaixo): 40 leituras com a causa 'lastro' e 6 com 'lixo'; 3 ações
+  xfresh; keys_on dia; numdia 2026-10-18 60.0 96 '{"lastro-sem-trabalho":40,"lixo":6}' 3; xtick 900 $LOWW
+  eq "ontem fechou em 60 % (abaixo de 85): UM aviso ao Athos com o número e a causa principal" "enviado:entregue/1/0" "$(reading numero_do_dia)/$(notifies)/$(mails)"
+  has "... o título tem a porcentagem e a meta" "Hetzner fechou ontem em 60.0% de CPU (meta 85%)" "$(cat "$T/stub/notify.1.title")"
+  has "... o texto: o dia, o número, a causa principal com a conta, quantas vezes o vigia agiu e onde está o detalhe" "Ontem (18/10) o Hetzner pago fechou o dia com a CPU média em 60.0%; a meta é 85%. Causa principal: sobram núcleos livres e o lastro não os usa (40 de 46 leituras abaixo da meta). O vigia agiu 3 vez(es) no dia. Detalhe: $C/.gc/hetzner-occupancy.jsonl" "$(cat "$T/stub/notify.1.text")"
+  eq "o notify do dia roda com os 2 sinais e o dia fica avaliado (hoje)" "1/1/2026-10-19" "$(cut -d/ -f1 "$T/stub/notify.1.env")/$(cut -d/ -f2 "$T/stub/notify.1.env")/$(state_f dia_avaliado)"
+  xtick 900 $LOWW; eq "a leitura seguinte, no mesmo dia: 'ja-avaliado', nada mais" "ja-avaliado/1" "$(reading numero_do_dia)/$(notifies)"
+  xfresh; keys_on dia; numdia 2026-10-18 85.0 96 '{"lixo":2}' 1; xtick 900 1000 30 50 150; eq "ontem fechou NA META (85,0 %, a régua é < e não <=): não avisa, não age e o dia fica avaliado" "na-meta/0/0/0/2026-10-19" "$(reading numero_do_dia)/$(notifies)/$(mails)/$(acts)/$(state_f dia_avaliado)"
+  xfresh; keys_on dia; numdia 2026-10-18 84.9 96 '{"lixo":2}' -; xtick 900 $LOWW; eq "84,9 % é abaixo; sem 'acoes' no dia, o texto diz 0 vez(es)" "enviado:entregue" "$(reading numero_do_dia)"; has "... e diz 0 vez(es)" "O vigia agiu 0 vez(es) no dia." "$(cat "$T/stub/notify.1.text")"
+  xfresh; keys_on dia; numdia 2026-10-18 60.0 47 '{"lixo":2}' 1; xtick 900 $LOWW; eq "dia com 47 janelas lidas (< 48): é dia cego, NÃO tem número: nem 'abaixo' nem 'na meta', sem aviso" "sem-numero/0/2026-10-19" "$(reading numero_do_dia)/$(notifies)/$(state_f dia_avaliado)"
+  xfresh; keys_on dia; numdia 2026-10-18 60.0 48 '{"lixo":2}' 1; xtick 900 $LOWW; eq "48 janelas: já tem número" "enviado:entregue" "$(reading numero_do_dia)"
+  xfresh; keys_on dia; numdia 2026-10-18 null 96 '{"lixo":2}' 1; xtick 900 $LOWW; eq "dia sem ocupacao_pct (nenhuma janela lida): sem número, sem aviso" "sem-numero/0" "$(reading numero_do_dia)/$(notifies)"
+  xfresh; keys_on dia; xtick 900 $LOWW; eq "sem registro de ontem: 'sem-dia-anterior', sem aviso (o 1º dia do vigia)" "sem-dia-anterior/0/2026-10-19" "$(reading numero_do_dia)/$(notifies)/$(state_f dia_avaliado)"
+  xfresh; keys_on dia; numdia 2026-10-17 40.0 96 '{"lixo":2}' 1; xtick 900 $LOWW; eq "só vale o dia de ONTEM (o de anteontem, a 40 %, não avisa)" "sem-dia-anterior/0" "$(reading numero_do_dia)/$(notifies)"
+  xfresh; keys_on dia; numdia 2026-10-18 60.0 96 - -; xtick 900 $LOWW; eq "dia abaixo sem causa registrada: o aviso diz isso, sem inventar causa" "enviado:entregue" "$(reading numero_do_dia)"; has "... 'a causa não foi registrada nesse dia'" "A causa não foi registrada nesse dia." "$(cat "$T/stub/notify.1.text")"
+  xfresh; keys_on dia; numdia 2026-10-18 60.0 96 '{"lixo":5,"RAM":5,"cego":30}' 2; xtick 900 $LOWW; eq "o 'cego' nunca é a causa principal; o empate entre causas vai para a de maior prioridade (lixo)" "enviado:entregue" "$(reading numero_do_dia)"; has "... lixo, 5 de 10" "Causa principal: sessão sem dono parada no nó (a cidade não a conhece) (5 de 10 leituras abaixo da meta)." "$(cat "$T/stub/notify.1.text")"
+  # sem a chave
+  xfresh; numdia 2026-10-18 60.0 96 '{"lixo":2}' 1; xtick 900 $LOWW; eq "sem a chave dia: só mede ('desligado'), nada sai e o dia NÃO fica avaliado (ligar a chave depois ainda avisa hoje)" "desligado/0/null" "$(reading numero_do_dia)/$(notifies)/$(state_f dia_avaliado)"
+  xfresh; keys_on dia; numdia 2026-10-18 60.0 96 '{"lixo":2}' 1; TENV=(HETZNER_OCC_ACT=0); xtick 900 $LOWW; eq "HETZNER_OCC_ACT=0: idem" "desligado/0" "$(reading numero_do_dia)/$(notifies)"
+  # --dry-run
+  xfresh; keys_on dia; numdia 2026-10-18 60.0 96 '{"lixo":2}' 1; XARGS="--print --dry-run"; xtick 900 $LOWW; eq "--dry-run: 'enviaria' e nada sai nem é gravado (nem o estado nasce)" "enviaria/0/0" "$(reading numero_do_dia)/$(notifies)/$([ -e "$C/.gc/hetzner-occupancy.state.json" ] && echo 1 || echo 0)"
+  # o dia do mês anterior: ontem = 31/10 quando hoje é 01/11
+  xfresh $(date -j -f '%Y-%m-%d %H:%M:%S' '2026-11-01 12:00:00' +%s 2>/dev/null || python3 -I -c 'import time; print(int(time.mktime((2026,11,1,12,0,0,0,0,-1))))'); keys_on dia; numdia 2026-10-31 60.0 96 '{"lixo":2}' 1; xtick 900 $LOWW; eq "virada de mês: hoje 01/11, ontem foi 31/10" "enviado:entregue" "$(reading numero_do_dia)"; has "... e o texto diz 31/10" "Ontem (31/10)" "$(cat "$T/stub/notify.1.text")"
+  # falha do notify do dia
+  xfresh; keys_on dia; numdia 2026-10-18 60.0 96 '{"lixo":2}' 1; STUB_NOTIFY_RC=12; xtick 900 $LOWW
+  eq "notify do dia que falha (rc 12): 'falhou', mail de reserva uma vez, o dia NÃO fica avaliado e a falha é anotada" "falhou:rc-12/enviado/1/1/null/$NOW" "$(reading numero_do_dia)/$(reading numero_do_dia_mail)/$(notifies)/$(mails)/$(state_f dia_avaliado)/$(state_f dia_falha_em)"
+  xtick 900 $LOWW; eq "15 min depois: 'espera-retry' (1 h entre tentativas), nada novo sai" "espera-retry/1/1" "$(reading numero_do_dia)/$(notifies)/$(mails)"
+  STUB_NOTIFY_RC=0; xtick 900 $LOWW >/dev/null; xtick 900 $LOWW >/dev/null; xtick 900 $LOWW
+  eq "1 h depois o notify volta: 'enviado', o dia fica avaliado e a falha limpa; o mail de reserva não se repetiu" "enviado:entregue/2026-10-19/null/1" "$(reading numero_do_dia)/$(state_f dia_avaliado)/$(state_f dia_falha_em)/$(mails)"
+  # o número do dia e o D4 são avisos diferentes: o mesmo dia pode ter os dois
+  d4_setup; keys_on dia; numdia 2026-10-18 60.0 96 '{"lixo":2}' 1; xrun 5 $LOWW
+  eq "o D4 e o número do dia são independentes: 2 notifies (um de cada), cada um uma vez" "enviado:entregue/ja-avaliado/2" "$(reading d4)/$(reading numero_do_dia)/$(notifies)"
+  # o diário guarda causas e ações do dia
+  xfresh; keys_on d1; node_add "$GHOST" 14400 2700; xdue $LOWW >/dev/null
+  eq "o diário do dia soma a causa (lixo, 2 leituras baixas com lixo: a 3ª leitura é a que agiu) e a ação" "lixo/1" "$(jv "$(dj)" dias.2026-10-19.causas | python3 -I -c 'import json,sys; d=json.loads(sys.stdin.read()); print(max(d, key=d.get))')/$(jv "$(dj)" dias.2026-10-19.acoes)"
+}
+
+# ============================================================================================================================================================================
+g_replay() {
+  echo "--- replay: as 18 leituras reais de 04/11 (10h05-14h26, CPU 24-47 %, todas 'ocupado') devolvem a causa e o degrau esperados; o dia na meta e o vigia cego não agem nem avisam (ga-2hd02v.5.10)"
+  # epoch, janela (s) e núcleos médios em centinúcleos das leituras REAIS de .gc/hetzner-occupancy.jsonl (16 vCPU), e quantas beads do hq a fila do Pilot tinha. Só o que o JSONL antigo não tinha (as partes dos núcleos)
+  # é sintetizado: espera de disco 1,52, lastro 0,30 e sistema 0,50 por janela; o resto são as sessões. A sessão-lixo do caso real e uma sessão viva que a cidade conhece e que segura bead moram no tmux do nó.
+  local ROWS="1793797501 967 664 0
+1793798422 921 699 0
+1793799344 922 754 0
+1793800263 919 637 0
+1793801185 922 431 0
+1793802102 917 421 0
+1793803021 919 560 0
+1793803939 918 511 0
+1793804862 923 447 1
+1793805783 921 460 0
+1793806713 930 517 1
+1793807650 937 614 1
+1793808594 944 640 0
+1793809513 919 424 0
+1793810433 920 631 0
+1793811359 926 542 1
+1793812271 912 391 1
+1793813199 928 535 0"
+  local SEED=1793796534 kj dj rp_e rp_j rp_c rp_f rp_s k
+  replay_setup() {   # replay_setup <chaves…>: o nó do dia 04/11 às 09h48 (a semente do baseline) com o lixo parado há 4 h na 2ª leitura
+    xfresh $((SEED - 900)); keys_on "$@"; sessions_are "$SJ_REMOTE"; beads_are "$BJ_REMOTE"
+    xtick 900 200 30 50 152 >/dev/null
+    node_add "$GHOST" 14400 1888; node_add dog-remote-gapxi4ls 60 0
+    kj="$NODE/gt-remote/ballast/lastro-pedido.json"; dj="$C/.gc/hetzner-occupancy-daily.json"
+  }
+  replay_run() {   # replay_run <real|meta>: roda as 18 janelas e junta, por leitura, causa/d1/d2/d3/nº de ações/ganho medido
+    local mode=$1
+    RP=(); RPE=()
+    while read -r rp_e rp_j rp_c rp_f <&3; do
+      [ -n "$rp_e" ] || continue
+      if [ "$mode" = real ]; then rp_s=$((rp_c - 80)); else rp_s=1300; fi   # meta: 13,8 núcleos = 86,2 % de 16
+      PILOT_HQ=$rp_f xtick "$rp_j" "$rp_s" 30 50 152 >/dev/null
+      [ "$NOW" = "$rp_e" ] || bad "o relógio do replay desencontrou: $NOW em vez de $rp_e"
+      RP+=("$(reading causa)/$(reading degrau.d1)/$(reading degrau.d2)/$(reading degrau.d3)/$(reading acao | python3 -I -c 'import json,sys; print(len(json.load(sys.stdin)))')/$(reading efeito.0.ganho_nucleos | sed 's/^<ilegivel>$/-/')")
+      RPE+=("$(reading estado)")
+    done 3<<<"$ROWS"
+  }
+  rp_join() { local IFS='|'; echo "$*"; }
+
+  # ---- o dia real: causa e degrau de cada leitura --------------------------------------------------------------------------------------------------------------------------------
+  replay_setup d1 d2 d3 d4 dia; replay_run real
+  eq "leitura 1 (CPU 41,5 %; só 15 min medidos na 1ª janela baixa): a causa é o lixo, o degrau ainda não é devido" "lixo/nao-devido/nao-devido/nao-devido/0/-" "${RP[0]}"
+  eq "leitura 2 (a 1ª com 30 min, 1888 s): o D1 mata a sessão sem dono (o caso gate-reviewer-remote-adhoc-033f7bd5c1) e o d2 espera a vez" "lixo/agiu/aguarda/nao-aplica/1/-" "${RP[1]}"
+  eq "leitura 3: sem lixo a causa vira lastro; o intervalo de 30 min segura o d2; o efeito do D1, medido: 6,99 → 7,54 núcleos (+0,55)" "lastro-sem-trabalho/fora/cooldown/nao-aplica/0/0.55" "${RP[2]}"
+  eq "leitura 4 (+1841 s): o D2 pede lastro" "lastro-sem-trabalho/fora/agiu/nao-aplica/1/-" "${RP[3]}"
+  eq "leitura 5: cooldown, e o efeito do D2 medido SEM maquiagem (a CPU caiu 2,06 núcleos: o pedido sozinho não provou nada)" "lastro-sem-trabalho/fora/cooldown/nao-aplica/0/-2.06" "${RP[4]}"
+  eq "leitura 6: 2ª e última tentativa do D2" "lastro-sem-trabalho/fora/agiu/nao-aplica/1/-" "${RP[5]}"
+  eq "leitura 7: as 2 tentativas do d2 já estão gastas (o esgotado vem antes do intervalo) e o efeito da 2ª, medido: +1,39" "lastro-sem-trabalho/fora/esgotado/nao-aplica/0/1.39" "${RP[6]}"
+  eq "leitura 8: d2 esgotado, d3 sem o que fazer (memória do Pilot vazia), nada a medir" "lastro-sem-trabalho/fora/esgotado/nao-aplica/0/-" "${RP[7]}"
+  eq "leituras 9 a 18: escada esgotada, nada mais age" "$(rp_join "${RP[@]:8}")" "$(rp_join $(for k in 1 2 3 4 5 6 7 8 9 10; do echo "lastro-sem-trabalho/fora/esgotado/nao-aplica/0/-"; done))"
+  eq "o estado do vigia nas 18 leituras: 'ocupado' em todas (a sessão segura bead): o log antigo dizia 'ocupado' o dia inteiro com a CPU a 24-47 %" "18/ocupado" "$(printf '%s\n' "${RPE[@]}" | sort | uniq -c | awk '{print $1"/"$2}')"
+  eq "no nó: só a sessão-lixo morreu (a sessão que a cidade conhece e segura bead segue de pé)" "$GHOST/1" "$(cat "$T/stub/node.killed")/$(node_has dog-remote-gapxi4ls)"
+  eq "3 ações no dia (D1, D2, D2) e 3 chamadas de ação ao nó" "3/3" "$(jv "$dj" dias.2026-11-04.acoes)/$(acts)"
+  eq "o pedido de lastro que ficou no nó é o da última tentativa: v1, +4 slots (livres 8, RAM 20000 comporta 5, teto 4), válido por 2 leituras (1800 s)" "1/4/1793802102/1800" "$(jv "$kj" v)/$(jv "$kj" slots_extra)/$(jv "$kj" epoch)/$(( $(jv "$kj" ate) - $(jv "$kj" epoch) ))"
+  eq "o diário do dia: a causa principal é lastro (16 de 18) e o lixo 2; a média de CPU do dia é a do log (34,3 %)" "16/2/34.3" "$(jv "$dj" dias.2026-11-04.causas.lastro-sem-trabalho)/$(jv "$dj" dias.2026-11-04.causas.lixo)/$(jv "$dj" dias.2026-11-04.ocupacao_pct)"
+  eq "o D4 não é devido (4 h36 de sequência baixa < 6 h): nenhum aviso, nenhuma bead" "nao/0/0/0" "$(reading d4)/$(notifies)/$(creates)/$(mails)"
+  eq "o JSONL tem a semente e as 18 leituras" 19 "$(wc -l < "$C/.gc/hetzner-occupancy.jsonl" | tr -d ' ')"
+  check "NUNCA liga a queima (nenhum comando ao nó cita burn; nenhum burn.on nasce)" "$([ "$(cat "$T/stub/ssh.act" "$T/stub/ssh.calls" | grep -ci burn)" = 0 ] && [ -z "$(find "$C" "$NODE" -iname '*burn*')" ] && echo 1 || echo 0)"
+  # o dia seguinte: o número do dia, com as 18 janelas valendo como dia (o padrão exige 48 = 12 h; o log real de 04/11 só tem as 4 h da janela de 10h-14h)
+  NOW=$((NOW + 40000)); TENV=(HETZNER_OCC_DAY_MIN_WINDOWS=10); xtick 900 $LOWW
+  eq "05/11, 1ª leitura do dia: o número do dia sai ao Athos, UMA vez" "enviado:entregue/1" "$(reading numero_do_dia)/$(notifies)"
+  has "... com a porcentagem e a meta no título" "Hetzner fechou ontem em 34.3% de CPU (meta 85%)" "$(cat "$T/stub/notify.1.title")"
+  has "... e a causa principal e as ações no texto" "Ontem (04/11) o Hetzner pago fechou o dia com a CPU média em 34.3%; a meta é 85%. Causa principal: sobram núcleos livres e o lastro não os usa (16 de 18 leituras abaixo da meta). O vigia agiu 3 vez(es) no dia." "$(cat "$T/stub/notify.1.text")"
+  xtick 900 $LOWW; eq "a leitura seguinte: já avaliado, não repete" "ja-avaliado/1" "$(reading numero_do_dia)/$(notifies)"
+
+  # ---- controle negativo: as MESMAS 18 janelas, a CPU na meta (86,2 %), com a sessão-lixo no nó e todas as chaves ligadas ------------------------------------------------------
+  replay_setup d1 d2 d3 d4 dia; replay_run meta
+  eq "o dia na meta: nenhuma leitura tem causa e nenhum degrau é devido (nem com o lixo lá)" "18/null/nao-devido/nao-devido/nao-devido/0/-" "$(printf '%s\n' "${RP[@]}" | sort | uniq -c | awk '{print $1"/"$2}')"
+  eq "... nada vai ao nó, a sessão-lixo continua lá, nenhum notify, mail nem bead" "0/1/0/0/0" "$(acts)/$(node_has "$GHOST")/$(notifies)/$(mails)/$(creates)"
+  eq "... e o pedido de lastro não nasce" 0 "$([ -e "$NODE/gt-remote/ballast/lastro-pedido.json" ] && echo 1 || echo 0)"
+  NOW=$((NOW + 40000)); TENV=(HETZNER_OCC_DAY_MIN_WINDOWS=10); xtick 900 $LOWW
+  eq "05/11: o dia fechou na meta (86,2 %): 'na-meta', NÃO avisa, e o dia fica avaliado" "na-meta/0/0/$(state_f dia_avaliado)" "$(reading numero_do_dia)/$(notifies)/$(mails)/2026-11-05"
+
+  # ---- vigia cego: o mesmo dia com o ssh caído --------------------------------------------------------------------------------------------------------------------------------
+  xfresh $((SEED - 900)); keys_on d1 d2 d3 d4 dia; node_add "$GHOST" 14400 1888; STUB_SSH_RC=1; RP=(); RPE=()
+  for k in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18; do
+    xtick 920 200 30 50 152 >/dev/null; RP+=("$(reading causa)/$(reading degrau.d1)/$(reading d4)"); RPE+=("$(reading estado)")
+  done
+  eq "ssh caído o dia inteiro: nenhuma leitura tem causa dita (todas 'cego') e nenhum degrau é devido" "18/cego/nao-devido/nao" "$(printf '%s\n' "${RP[@]}" | sort | uniq -c | awk '{print $1"/"$2}')"
+  eq "... o estado é 'desconhecido' (nunca 'ocioso': não ler não é provar que está parado)" "18/desconhecido" "$(printf '%s\n' "${RPE[@]}" | sort | uniq -c | awk '{print $1"/"$2}')"
+  eq "... e não age, não avisa, não cria bead" "0/1/0/0/0" "$(acts)/$(node_has "$GHOST")/$(notifies)/$(mails)/$(creates)"
+}
+
+# ============================================================================================================================================================================
 # ---- CONTROLE NEGATIVO -----------------------------------------------------------------------------------------------------------------------------------------------------------
 # mutante <nome> <grupos> <trecho> <troca>: troca UM trecho literal do script (tem de aparecer exatamente 1 vez), roda só os grupos que deveriam pegar e exige reprovação. Padrão que não existe = erro.
 # O padrão é conferido aqui, em série; a suíte do mutante roda num subshell em segundo plano (no máximo HOCC_JOBS) e o resultado vai para um arquivo, lido em ordem por mutantes_wait
@@ -1211,11 +1785,11 @@ g_mutantes() {
   mutante gc-sem-city "saida" $'[c.gc_bin, "--city", c.city, "session", "list", "--json"]' $'[c.gc_bin, "session", "list", "--json"]'
   mutante falha-apaga-o-baseline "cpu" $'"cpu": new_base or (st.get("cpu") if _baseline_ok(st.get("cpu")) else None),' $'"cpu": new_base,'
   mutante janela-curta-troca-o-baseline "cpu" $'cpu["motivo"] = "janela-curta"\n        return cpu, None, None' $'cpu["motivo"] = "janela-curta"\n        return cpu, now_b, None'
-  mutante janela-curta-lida "cpu" $'if win < c.min_window_s:' $'if False:'
-  mutante janela-velha-lida "cpu" $'if win > c.max_window_s:' $'if False:'
-  mutante relogio-recuou-lido "cpu" $'if win < 0:' $'if False:'
+  mutante janela-curta-lida "cpu" $'if win < c.min_window_s:\n        cpu["motivo"] = "janela-curta"' $'if False:\n        cpu["motivo"] = "janela-curta"'
+  mutante janela-velha-lida "cpu" $'if win > c.max_window_s:\n        cpu["motivo"] = "leitura-anterior-velha"' $'if False:\n        cpu["motivo"] = "leitura-anterior-velha"'
+  mutante relogio-recuou-lido "cpu" $'if win < 0:\n        cpu["motivo"] = "relogio-recuou"' $'if False:\n        cpu["motivo"] = "relogio-recuou"'
   mutante contador-recuou-lido "cpu" $'if db < 0 or dt < 0:' $'if False:'
-  mutante sem-tick-lido "cpu" $'if dt == 0:' $'if False:'
+  mutante sem-tick-lido "cpu" $'if dt == 0:\n        cpu["motivo"] = "sem-tick"' $'if False:\n        cpu["motivo"] = "sem-tick"'
   mutante ncpu-ignorado "cpu" $'cores = db * ncpu / dt' $'cores = db / dt'
   mutante iowait-conta-como-ocupado "cpu" $'return (total - v[3] - v[4] - v[7], total, ncpu), None' $'return (total - v[3] - v[7], total, ncpu), None'
   mutante steal-conta-como-ocupado "cpu" $'return (total - v[3] - v[4] - v[7], total, ncpu), None' $'return (total - v[3] - v[4], total, ncpu), None'
@@ -1228,8 +1802,8 @@ g_mutantes() {
   mutante guest-conta-em-dobro "cpu" $'v = [int(x) for x in agg[1:9]] if agg else []' $'v = [int(x) for x in agg[1:11]] if agg else []'
   mutante linha-cpu-curta-lida "cpu" $'if len(v) < 8 or min(v) < 0:' $'if min(v, default=0) < 0:'
   mutante sem-nucleos-lido "cpu" $'if ncpu == 0:' $'if False:'
-  mutante sem-marcador-lido "cpu" $'if BEGIN not in lines or END not in lines[lines.index(BEGIN) + 1:]:' $'if False:'
-  mutante ssh-sem-batchmode "cpu" $'"-o", "BatchMode=yes", ' $''
+  mutante sem-marcador-lido "cpu" $'if BEGIN not in lines or END not in lines[lines.index(BEGIN) + 1:]:\n        return None, "sem-marcador"' $'if False:\n        return None, "sem-marcador"'
+  mutante ssh-sem-batchmode "cpu" $'argv = [c.ssh_bin, "-o", "BatchMode=yes", ' $'argv = [c.ssh_bin, '
   mutante ssh-sem-timeout "cpu" $'rc, out, err, why = run_cmd(argv, c.ssh_timeout_s)' $'rc, out, err, why = run_cmd(argv, 600)'
   mutante host-ssh-sem-validacao "cfg" $'if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._@-]*", c.ssh_host):' $'if False:'
   mutante ocioso-com-uma-leitura-so "estado" $'if sess["lido"] and cpu["lido"]:' $'if sess["lido"] or cpu["lido"]:'
@@ -1268,7 +1842,7 @@ g_mutantes() {
   mutante ts-hora-utc-sufixo-local "saida" $'"ts": time.strftime("%Y-%m-%dT%H:%M:%S%z", time.localtime(now))' $'"ts": time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(now)) + time.strftime("%z", time.localtime(now))'
   mutante corrompido-nao-guarda-a-copia "saida" $'os.replace(path, dest)' $'pass'
   mutante sem-instancia-unica "saida" $'if not dry and take_lock(c.gc_dir) is None:' $'if False:'
-  mutante dry-run-grava-e-avisa "saida" $'    if not dry:\n        for key, _old, _k, _s, _b in sends:' $'    if True:\n        for key, _old, _k, _s, _b in sends:'
+  mutante dry-run-grava-e-avisa "saida" $'    if not dry:\n        if verdict in ("na-meta", "sem-numero", "sem-dia-anterior"):' $'    if True:\n        if verdict in ("na-meta", "sem-numero", "sem-dia-anterior"):'
   mutante falha-de-gravacao-sai-0 "saida" $'return e.rc' $'return 0'
   mutante crash-sem-traceback "saida" $'traceback.print_exc()' $'pass'
   mutante crash-avisa-pelo-notify "saida" $'    except Exception:  # inclui configuração inválida: o traceback fica à vista no log do launchd\n        traceback.print_exc()' $'    except Exception:\n        traceback.print_exc(); subprocess.run(["notify", "caiu"])'
@@ -1314,10 +1888,70 @@ g_mutantes() {
   mutante diario-antigo-perde-o-numero-de-sessao "baixa" $'day["ocupacao_sessao_pct"] = day["ocupacao_pct"]' $'day["ocupacao_sessao_pct"] = None'
   mutante diario-antigo-fica-com-cara-de-cpu "baixa" $'day.update(ocupacao_pct=None, cpu_janelas=0' $'day.update(cpu_janelas=0'
   mutante diario-migra-a-cada-rodada "baixa" $'if isinstance(day, dict) and "cpu_janelas" not in day:' $'if isinstance(day, dict):'
+  # ---- ga-2hd02v.5.10: a causa, a escada e o aviso. Cada trecho trocado abaixo é uma regra de SEGURANÇA ou de verdade do número; o grupo dito TEM de reprovar -----------------------------------
+  # as cópias das guardas da CPU dentro da leitura dos núcleos (read_nucleos) e da leitura irmã (parse_extra): cada uma tem o seu mutante, senão uma delas poderia sumir sem ninguém ver
+  mutante nuc-janela-curta-lida "causa" $'if win < c.min_window_s:\n        n["motivo"] = "janela-curta"' $'if False:\n        n["motivo"] = "janela-curta"'
+  mutante nuc-janela-velha-lida "causa" $'if win > c.max_window_s:\n        n["motivo"] = "leitura-anterior-velha"' $'if False:\n        n["motivo"] = "leitura-anterior-velha"'
+  mutante nuc-relogio-recuou-lido "causa" $'if win < 0:\n        n["motivo"] = "relogio-recuou"' $'if False:\n        n["motivo"] = "relogio-recuou"'
+  mutante nuc-contador-recuou-lido "causa" $'if min(du, dio, db, dt) < 0:' $'if False:'
+  mutante nuc-sem-tick-lido "causa" $'if dt == 0:\n        n["motivo"] = "sem-tick"' $'if False:\n        n["motivo"] = "sem-tick"'
+  mutante extra-sem-marcador-lido "causa" $'if BEGIN not in lines or END not in lines[lines.index(BEGIN) + 1:]:\n        return ex' $'if False:\n        return ex'
+  mutante acao-ssh-sem-batchmode "escada" $'return run_cmd([c.ssh_bin, "-o", "BatchMode=yes", ' $'return run_cmd([c.ssh_bin, '
+  # a causa: o que não li nunca vira causa nem degrau
+  mutante ram-ilegivel-pede-lastro "causa" $'if ram_mb is None:\n            return "cego"' $'if ram_mb is None:\n            return "lastro-sem-trabalho"'
+  mutante sem-piso-de-ram "causa escada" $'if ram_mb < c.ram_start_mb + c.ram_slot_mb:\n            return "RAM"' $'if False:\n            return "RAM"'
+  mutante nenhuma-causa-explica-vira-fila "causa" $'if fila["lido"] and fila["n"] == 0:\n        return "fila-sem-elegível"\n    return "cego"' $'return "fila-sem-elegível"'
+  mutante fila-ilegivel-vira-vazia "causa" $'if fila["lido"] and fila["n"] == 0:' $'if fila["n"] in (0, None):'
+  mutante cego-tem-degrau "escada" $'    if cause == "cego":\n        return {k: "cego" for k in RUNGS}, None, False' $'    if False:\n        return {k: "cego" for k in RUNGS}, None, False'
+  # a escada: um degrau por vez, com intervalo, com tentativas contadas e sem esgotar o que não li ou ninguém autorizou
+  mutante sem-intervalo-entre-acoes "escada" $'cooling = last is not None and 0 <= now - last < c.act_cooldown_s' $'cooling = False'
+  mutante tentativas-sem-limite "escada" $'elif _tries(st, k) >= c.act_tries:' $'elif False:'
+  mutante degrau-desligado-esgota "escada aviso" $'status[k], exhausted = "desligado", False' $'status[k] = "desligado"'
+  mutante degrau-cego-esgota "escada aviso" $'status[k], exhausted = "cego", False' $'status[k] = "cego"'
+  mutante dois-degraus-na-mesma-leitura "escada" $'elif chosen is None:\n                chosen, status[k] = k, "pronto"' $'else:\n                chosen, status[k] = k, "pronto"'
+  mutante acao-sem-chave "escada" $'elif not c.on[k]:\n            status[k], exhausted = "desligado", False' $'elif False:\n            status[k], exhausted = "desligado", False'
+  mutante tentativa-gravada-depois-da-acao "escada" $'        save()\n        if chosen:\n            ok, o_que, det = do_rung(' $'        if chosen:\n            ok, o_que, det = do_rung('
+  mutante acao-falha-mede-efeito "escada" $'            if ok:  # só o que mudou algo tem efeito a medir' $'            if True:  # só o que mudou algo tem efeito a medir'
+  # D1: nunca mata o que a cidade conhece, o que segura bead, nem o que não leu
+  mutante d1-mata-sessao-da-cidade "causa escada" $'or name in known or (other and other.search(name)):' $'or (other and other.search(name)):'
+  mutante d1-ignora-dono-de-bead "causa escada" $'cand = [(i, n) for i, n in cand if n not in donos]' $'cand = cand'
+  mutante d1-sem-limite-de-quietude "causa escada" $'if idle >= c.d1_idle_s:' $'if True:'
+  mutante d1-sem-reconferir-no-no "escada" $'[ $((n - a)) -lt %d ] && { echo ativa; exit 0; }' $'[ 0 -lt %d ] && { echo ativa; exit 0; }'
+  mutante d1-nome-sem-remote "escada" $'if not SAFE_NAME.fullmatch(name) or "-remote-" not in "-%s-" % name:\n        return False, "nome-recusado"' $'if False:\n        return False, "nome-recusado"'
+  mutante d1-morta-qualquer-palavra "escada" $'return (words[-1] == ok_word, words[-1]) if words else (False, "sem-saida")' $'return (True, words[-1]) if words else (False, "sem-saida")'
+  mutante d1-rc-ignorado "escada" $'    if rc != 0:\n        return False, "rc-%s" % rc\n    return (words' $'    return (words'
+  # D2: o pedido vence e respeita os pisos
+  mutante pedido-sem-validade "escada" $'"ate": now + 2 * c.interval_s' $'"ate": now + 2000 * c.interval_s'
+  mutante pedido-sem-teto "escada" $'min(int(nuc["livres"]), (ram_mb - c.ram_start_mb) // c.ram_slot_mb, 4)' $'min(int(nuc["livres"]), (ram_mb - c.ram_start_mb) // c.ram_slot_mb, 400)'
+  mutante pedido-ignora-a-ram "escada" $'min(int(nuc["livres"]), (ram_mb - c.ram_start_mb) // c.ram_slot_mb, 4)' $'min(int(nuc["livres"]), 4)'
+  # D3: memória ilegível não é memória vazia; vence a última linha da bead
+  mutante memoria-ilegivel-vira-vazia "escada" $'return None, None, "memo-ilegivel"' $'return set(), [], None'
+  mutante memoria-vencida-conta "escada" $'if v == "unknown" and now - ep < c.memo_unknown_ttl_s}' $'if v == "unknown"}'
+  # o notify: só o rc diz se saiu
+  mutante notify-12-conta "aviso" $'ok = {0: "entregue", 10: "segurado-ate-7h", 11: "ja-tinha-saido"}' $'ok = {0: "entregue", 10: "segurado-ate-7h", 11: "ja-tinha-saido", 12: "digest"}'
+  mutante notify-so-0-conta "aviso" $'ok = {0: "entregue", 10: "segurado-ate-7h", 11: "ja-tinha-saido"}' $'ok = {0: "entregue"}'
+  mutante notify-sem-strict-exit "aviso" $'"NOTIFY_STRICT_EXIT": "1", ' $''
+  mutante notify-sem-force-push "aviso" $', "NOTIFY_FORCE_PUSH": "1"' $''
+  mutante notify-falho-vira-do-dia "aviso" $'new_st["d4_dia"] = st.get("d4_dia")  # não saiu' $'pass  # não saiu'
+  mutante notify-falho-gasta-o-dia "aviso" $'new_st["dia_avaliado"] = st.get("dia_avaliado")' $'pass'
+  mutante notify-falho-sem-mail "aviso" $'if falha_em is None else None' $'if False else None'
+  mutante notify-sem-espera-do-retry "aviso" $'    if falha_em is not None and 0 <= now - falha_em < c.notify_retry_s:\n        return "espera-retry"' $'    if False:\n        return "espera-retry"'
+  # D4: só depois de 6 h, só esgotado, uma vez por dia, e a bead é registro (nunca despachável)
+  mutante d4-sem-esgotar "aviso" $'d4_due = low["n"] > 0 and exhausted and' $'d4_due = low["n"] > 0 and'
+  mutante d4-sem-esperar-6h "aviso" $'now - low["desde"] >= c.d4_after_s - c.slack_s' $'now - low["desde"] >= 0'
+  mutante d4-bead-despachavel "aviso" $'"area:infra,hetzner-ocupacao"' $'"area:infra,hetzner-ocupacao,story:approved,exec:auto"'
+  mutante d4-bead-nao-guardada "aviso" $'                if bid:\n                    new_st["d4_bead"] = bid\n' $'                if bid:\n                    pass\n'
+  mutante d4-dia-nao-gravado "aviso" $'            new_st["d4_dia"] = today\n            save()\n            ok4' $'            save()\n            ok4'
+  # o número do dia: só dia com número, só abaixo da meta
+  mutante dia-cego-vira-abaixo "aviso" $'if pct is None or wins < c.day_min_windows:' $'if pct is None:'
+  mutante dia-na-meta-avisa "aviso replay" $'return ("abaixo" if pct < c.low_pct else "na-meta"), day, key' $'return "abaixo", day, key'
+  mutante dia-sem-chave-avalia "aviso" $'    if not c.on["dia"]:\n        verdict = "desligado"' $'    if False:\n        verdict = "desligado"'
+  mutante dia-avisa-duas-vezes "aviso" $'    elif st.get("dia_avaliado") == today:\n        verdict = "ja-avaliado"' $'    elif False:\n        verdict = "ja-avaliado"'
+  mutante dia-causa-cega-conta "aviso" $'cnt = {k: t[k] for k in CAUSAS if k != "cego" and' $'cnt = {k: t[k] for k in CAUSAS if'
   mutantes_wait
 }
 
-GROUPS_ALL="cfg sess bead cpu fila estado alarme baixa saida lastro"
+GROUPS_ALL="cfg sess bead cpu fila estado alarme baixa saida lastro causa escada aviso replay"
 run_groups() { local g; for g in "$@"; do "g_$g"; done; }
 
 DEFAULT="$GROUPS_ALL mutantes"; [ -z "${HOCC_NO_MUTANTS:-}" ] || DEFAULT="$GROUPS_ALL"
