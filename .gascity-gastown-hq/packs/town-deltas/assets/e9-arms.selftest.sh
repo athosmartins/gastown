@@ -272,6 +272,11 @@ if [ "$(id -u)" != 0 ]; then
   run assign ga-w2 /s; chmod 600 "$SD/e9-roster.jsonl"
   [ -z "$OUT" ] && [ "$RC" = 3 ] && ok "a roster with no read permission: no arm, exit 3 (the recorded 'off' is not replaced by a fresh 'on')" || bad "chmod 000 roster: out='$OUT' rc=$RC"
 fi
+# a roster that is a SPECIAL file: a symlink to /dev/null is the classic "throw it away". It exists, it is not a regular file, and jq reads it as an EMPTY
+# file (rc 0): without the `[ -f ] && [ -r ]` guard of e9_recorded_arm the answer would be "no row" — the one answer that lets the arm be recomputed
+newstate; conf planner_pct=100 salt=t1; ln -s /dev/null "$SD/e9-roster.jsonl"
+run assign ga-w6 /s; [ -z "$OUT" ] && [ "$RC" = 3 ] && ok "a roster that is a symlink to /dev/null (jq reads it as empty): no arm, exit 3 — it cannot be told, never 'no row'" || bad "/dev/null roster: assign out='$OUT' rc=$RC"
+run peek ga-w6; [ -z "$OUT" ] && [ "$RC" = 3 ] && ok "peek on the /dev/null roster: no arm, exit 3" || bad "/dev/null roster: peek out='$OUT' rc=$RC"
 newstate; conf planner_pct=100 salt=t1; printf '{"event":"assign","bead":"ga-w3","salt":"t1","planner_arm":"maybe"}\n' > "$SD/e9-roster.jsonl"
 run assign ga-w3 /s; [ -z "$OUT" ] && [ "$RC" = 3 ] && ok "a row whose arm is not on|off: no arm, exit 3 (a row with no usable arm is not 'no row')" || bad "garbled arm: out='$OUT' rc=$RC"
 newstate; conf planner_pct=100 salt=t1; printf '{"event":"assign","bead":"ga-w4","salt":"t1"}\n' > "$SD/e9-roster.jsonl"
@@ -586,11 +591,11 @@ echo "== 9. the status of every branch, and the functions the CLI never reaches 
 # child that sources the library; where a command has to fail in a way the real tools do not, a FUNCTION shim FAILS AFTER DOING OR PRINTING THE
 # GOOD THING (the third state a happy-path test never produces). EQUIVALENT, documented: df54f81999 (`last="$(…)" || :` -> `&& :`: an assignment
 # that is not the last element of an AND-OR list is exempt from errexit either way and nobody reads the list's status; the 141-tail case in
-# section 3 runs under set -euo pipefail and is green with both); 1319ac4b9f and f5aa70ca4e (`{ [ -f ] && [ -r ]; } || return 3` in
-# e9_recorded_arm: the jq call right below fails with rc 2 on exactly the roster those guards turn away and that is already mapped to 3; the
-# directory, mode-000 and dangling-link cases of section 3 stay green without them).
+# section 3 runs under set -euo pipefail and is green with both). NOT equivalent, killed (ga-pfnzwda): 1319ac4b9f and f5aa70ca4e (`{ [ -f ] && [ -r ]; }
+# || return 3` in e9_recorded_arm). This block used to say the jq call right below fails with rc 2 on exactly the roster those guards turn away; it does
+# not: a roster that is a symlink to /dev/null is read by jq as EMPTY (rc 0), so without the guard the answer is "no row" (rc 1, the arm may be
+# recomputed), and a FIFO makes jq wait for a writer forever. The /dev/null case of section 3 fails on both.
 # EQUIVALENT df54f81999: `last="$(...)" || :` -> `&& :`: an assignment that is not the last element of an AND-OR list is exempt from errexit either way, and nobody reads the list's status
-# EQUIVALENT 1319ac4b9f f5aa70ca4e: the `{ [ -f ] && [ -r ]; } || return 3` guard of e9_recorded_arm: the jq call right below fails with rc 2 on exactly the roster it turns away, and that is already mapped to 3
 kid() { /bin/bash -c "$1" _ "$E9" 2>&1; }   # <script>: a child shell; $1 in the script is the library
 newstate
 _o="$(kid 'set -e; . "$1"; e9_conf_load; echo "reached state=$E9_STATE"')"; _rc=$?

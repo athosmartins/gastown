@@ -1210,9 +1210,10 @@ echo "== helpers: status and edges =="
 # _trg_state_write: the redirection after it fails on the same missing directory and returns 1); c76d35419c and 22ec8a2fd6 (`|| true` -> `&& true` after a status the function discards: both end in `return 0`).
 # EQUIVALENT 35d16b9578: _trg_backoff_s: `-lt` -> `-le` while s == cap doubles once more and the clamp brings it back to the cap
 # EQUIVALENT 9d28f4e738: _trg_backoff_s: `-gt` -> `-ge` assigns the cap to the cap: s and max are both canonical numbers there (max went through $(( 10#$max )) above), so at equality the TEXT is the same too (2964 base x max x n combinations, zero-padded and garbled ones included: identical output)
-# EQUIVALENT 4fbf2ea052: the poll's clamp of a stored backoff, `-gt` -> `-ge`: at equality it assigns the same number
+# EQUIVALENT 4fbf2ea052 cac26e2671: the poll's clamp of a stored backoff (the direct one and the release one), `-gt` -> `-ge`: at equality it assigns the same number, and the same TEXT too, because _trg_state_readable (checked first in the poll) admits only canonical numbers: no leading zero, at most 18 digits
 # EQUIVALENT 4f99aaeef8: `mkdir -p ... || return 1` in _trg_state_write: the redirection after it fails on the same missing directory and returns 1
 # EQUIVALENT 22ec8a2fd6: `|| true` -> `&& true` after a status the function discards: it ends in `return 0`
+# EQUIVALENT c76d35419c: the `|| true` of _trg_stuck_sweep -> `&& true`: `A || B && true` makes the same two lock checks in the same order (measured over the four status pairs, with and without errexit: same calls, return 0) and the function ends in `return 0` right below
 _t="$T/helpers"; mkdir -p "$_t"
 _pi_bad=""; for _v in "" abc 0 -1 1.5; do _trg_pos_int "$_v" && _pi_bad="$_pi_bad [$_v]"; done
 _pi_good=""; for _v in 1 6 007; do _trg_pos_int "$_v" || _pi_good="$_pi_good [$_v]"; done

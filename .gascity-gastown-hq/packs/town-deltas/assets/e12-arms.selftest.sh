@@ -222,6 +222,11 @@ run assign "$ID_C" /store; [ "$OUT" = control ] && [ "$RC" = 0 ] && [ "$(rowsfor
 newstate; conf treated_pct=50; ln -s "$SD/no-such-roster" "$SD/e12-roster.jsonl"
 run assign "$ID_T" /store
 [ -z "$OUT" ] && [ "$RC" = 3 ] && [ ! -e "$SD/no-such-roster" ] && ok "roster is a dangling symlink → no arm, exit 3, nothing created behind it (it cannot be read; not 'no row')" || bad "dangling roster symlink: out='$OUT' rc=$RC target-created=$([ -e "$SD/no-such-roster" ] && echo yes || echo no)"
+# a roster that is a symlink to /dev/null (the classic "throw it away") is not a regular file either, and jq reads it as an EMPTY file (rc 0): without the
+# `[ -f ] && [ -r ]` guard of e12_recorded_arm the answer would be "no row" — the one answer that lets the arm be recomputed
+newstate; conf treated_pct=50; ln -s /dev/null "$SD/e12-roster.jsonl"
+run assign "$ID_T" /store
+[ -z "$OUT" ] && [ "$RC" = 3 ] && ok "roster is a symlink to /dev/null (jq reads it as empty) → no arm, exit 3 (it cannot be told; not 'no row')" || bad "/dev/null roster: out='$OUT' rc=$RC"
 # jq missing and no roster yet: "cannot read" (3), said as such — it used to fall through to the append and be reported as an unwritable roster (5)
 _nojq="$W/nojq-path"; mkdir -p "$_nojq"
 for _t in date mkdir cut tail od tr cat sha256sum openssl shasum perl; do _p="$(command -v "$_t" 2>/dev/null)" && [ -n "$_p" ] && ln -sf "$_p" "$_nojq/$_t"; done
@@ -408,10 +413,10 @@ done
 # by their status, and e12_conf_load with no conf and e12_main with no argument were never run under set -e. Each case below calls the
 # function in a child that sources the library. Where a command has to fail in a way the real tools do not, a FUNCTION shim stands in for
 # jq, tr, od or mkdir and FAILS AFTER DOING OR PRINTING THE GOOD THING — the third state a happy-path test never produces. (ga-qec2rdl,
-# hq-mutants lastro.) EQUIVALENT, documented: 4f28f91c90 and de3fb6044f (`{ [ -f ] && [ -r ]; } ||
-# return 3` in e12_recorded_arm): the jq call right below fails with rc 2 on exactly the roster those guards turn away, and that failure is
-# already mapped to rc 3. Measured with and without the guard on a directory, a chmod-000 file and a dangling link: rc 3, empty stdout.
-# EQUIVALENT 4f28f91c90 de3fb6044f: the `{ [ -f ] && [ -r ]; } || return 3` guard of e12_recorded_arm: the jq call right below fails with rc 2 on exactly the roster it turns away, and that failure is already mapped to rc 3 (measured with and without the guard)
+# hq-mutants lastro.) NOT equivalent, killed (ga-pfnzwda): 4f28f91c90 and de3fb6044f (`{ [ -f ] && [ -r ]; } || return 3` in e12_recorded_arm). This block
+# used to say the jq call right below fails with rc 2 on exactly the roster those guards turn away, measured on a directory, a chmod-000 file and a dangling
+# link. It does not for every roster: a symlink to /dev/null is read by jq as EMPTY (rc 0), so without the guard the answer is "no row" (rc 1, the arm may be
+# recomputed), and a FIFO makes jq wait for a writer forever. The /dev/null case of section 4 fails on both.
 echo "== 9. e12_record and e12_conf_load: the status of every branch =="
 rec() { # <prelude> — a child sources the lib, runs the prelude (shims), calls e12_record and prints its status
   "${BASH:-/bin/bash}" -c '. "$1"; E12_STATE_DIR="$2"; E12_PCT=50; eval "$3"; e12_record b-1 /st treated stage1; echo "rc=$?"' _ "$E12" "$SD" "$1" 2>/dev/null
