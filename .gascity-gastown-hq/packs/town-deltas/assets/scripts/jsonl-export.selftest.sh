@@ -1013,8 +1013,22 @@ B=$(commits); STUB_FAIL_comments=1 splitrun 31 201 201
 { [ "$(commits)" = $((B + 1)) ] && [ "$(piece_rows comments)" = 31 ] && [ "$(piece_rows issues)" = 201 ] && ! changed | grep -q 'wa/comments/' && clean_wt; } \
   && ok "split: a comments table kept at its previous version keeps its pieces; issues still commit" \
   || bad "split kept table: commits $B -> $(commits), comments=$(piece_rows comments) issues=$(piece_rows issues), changed: $(changed)"
+# a kept table is HEAD's version in HEAD's layout, whatever the working tree holds (a run killed between the discard's rm and its restore leaves the dir gone; a killed split, a stray piece or document): the DB is staged whole
+B=$(commits); rm -rf "$ARCH/wa/comments"; mkdir "$ARCH/wa/comments"; echo '{"rows": []}' > "$ARCH/wa/comments/2026-11-09.jsonl"; echo '{"rows": []}' > "$ARCH/wa/comments.jsonl"
+STUB_FAIL_comments=1 splitrun 31 201 201
+{ [ "$(layout comments)" = pieces ] && [ "$(piece_rows comments)" = 31 ] && [ "$(commits)" = "$B" ] && clean_wt; } \
+  && ok "split: a kept comments table is HEAD's pieces whatever the working tree holds (dir gone, stray piece, stray single document): nothing to commit" \
+  || bad "split kept table, tree out of step: layout=$(layout comments) comments=$(piece_rows comments) commits $B -> $(commits), status: $(git -C "$ARCH" status --porcelain | tr '\n' ' '): $OUT"
 splitrun 31 100 100
 case "$OUT" in *HALTED*) ok "split: the spike check reads the previous count from the pieces (201 -> 100 halts)" ;; *) bad "split: 201 -> 100 did not halt, the previous count was not read from the pieces: $OUT" ;; esac
+# a previous count that cannot be read (a truncated piece in HEAD) skips the spike check AND says why, as the single document always did through jq: never a silent "first run"
+fresh_archive splitprev
+splitrun 30 200 200
+printf '{"rows": [' > "$ARCH/wa/issues/2026-11-01.jsonl"; git -C "$ARCH" -c user.name=t -c user.email=t@t commit -qam 'truncated piece'
+splitrun 30 200 200
+{ [ "$RC" = 0 ] && case "$OUT" in *"jsonl_split:"*"previous issue count of wa unreadable"*"spike check skipped"*) true ;; *) false ;; esac; } \
+  && ok "split: a truncated piece in HEAD skips the spike check and the log says why (fail-open, not silent)" \
+  || bad "split truncated HEAD piece: rc=$RC: $OUT"
 
 # a piece temp of ANOTHER live process (the splitter leaves those alone) must stay out of the commit: the exclude in the exporter's `git add` covers every *.jsonl.tmp.*, not only issues'
 fresh_archive splittmp
@@ -1032,7 +1046,7 @@ fresh_archive splitfb
 mkdir -p "$E2E/nopy"; printf '#!/bin/sh\necho "python3: injected failure" >&2\nexit 127\n' > "$E2E/nopy/python3"; chmod +x "$E2E/nopy/python3"
 splitrun 30 200 200
 E2E_EXTRA_PATH="$E2E/nopy" splitrun 31 200 200
-{ [ "$RC" = 0 ] && [ "$(layout issues)" = single ] && [ "$(layout comments)" = single ] && in_tree wa.jsonl && clean_wt; } && case "$OUT" in *"could not split"*) true ;; *) false ;; esac \
+{ [ "$RC" = 0 ] && [ "$(layout issues)" = single ] && [ "$(layout comments)" = single ] && in_tree wa.jsonl && clean_wt; } && case "$OUT" in *"could not split"*"spike check skipped"*) true ;; *) false ;; esac \
   && ok "split fallback: a splitter that cannot run leaves the single documents and the flat copy (never both layouts, never none), and says so" \
   || bad "split fallback: rc=$RC issues=$(layout issues) comments=$(layout comments) flat=$(in_tree wa.jsonl && echo yes): $OUT"
 splitrun 31 200 200

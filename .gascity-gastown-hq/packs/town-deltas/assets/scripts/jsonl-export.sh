@@ -1034,13 +1034,15 @@ discard_staged_archive_outputs() {
 }
 
 # prev_issue_count <db> — the rows of the previous snapshot's issues table, read from HEAD: one document (the old layout) or the day pieces (ga-e4cbc5s, jsonl_split.py count-head).
-# vazio (the table is not in HEAD) → 0, the first run; falhou/ilegível → 0 too, as it always was: no previous count, no spike check — a read that failed is never a spike.
+# vazio (the table is not in HEAD) → 0, the first run; falhou/ilegível → 0 too, as it always was (no previous count, no spike check — a read that failed is never a spike), but SAID on stderr, which is where jq
+# said it for the document: count-head names the piece, the line below says the check was skipped. A skipped check must not look like a first run.
 prev_issue_count() {
     local db="$1"
     if git -C "$ARCHIVE_REPO" cat-file -e "HEAD:$db/issues.jsonl" 2>/dev/null; then
         git -C "$ARCHIVE_REPO" show "HEAD:$db/issues.jsonl" 2>/dev/null | count_jsonl_rows || echo "0"
     else
-        python3 -I "$SCRIPT_DIR/jsonl_split.py" count-head --repo "$ARCHIVE_REPO" --db "$db" --table issues 2>/dev/null || echo "0"
+        python3 -I "$SCRIPT_DIR/jsonl_split.py" count-head --repo "$ARCHIVE_REPO" --db "$db" --table issues \
+            || { echo "jsonl-export: previous issue count of $db unreadable; spike check skipped this run (ga-e4cbc5s)" >&2; echo "0"; }
     fi
 }
 
@@ -1947,8 +1949,9 @@ read_table_once() {
     return 0
 }
 
-# Puts the previous version of <db>/<table>.jsonl back in the working tree; a table with no previous version ends up with no file. Return 1 when git cannot restore it, or cannot
-# say whether HEAD has one: the DB is staged as a whole, so deleting the file on a guess would commit the table's removal from the snapshot.
+# Puts the previous version of <db>/<table> back in the working tree, in the layout HEAD has it: the document <db>/<table>.jsonl or the day pieces in <db>/<table>/ (ga-e4cbc5s). A table with no previous
+# version ends up with no file, and what the tree holds of the table besides HEAD's version goes too (a leftover document would be split into HEAD's pieces). Return 1 when git cannot restore it, or cannot
+# say whether HEAD has one: the DB is staged as a whole, so deleting the table on a guess would commit its removal from the snapshot.
 keep_previous_table() {
     local db="$1" table="$2" path="$1/$2.jsonl" listed refs
 
@@ -1956,20 +1959,18 @@ keep_previous_table() {
     if ! git -C "$ARCHIVE_REPO" rev-parse --verify --quiet HEAD >/dev/null 2>&1; then
         # vazio → no refs, a first run; falhou/com refs → git cannot say, the tree is left alone and the caller discards the DB
         if refs=$(git -C "$ARCHIVE_REPO" for-each-ref --count=1 2>/dev/null) && [ -z "$refs" ]; then
-            rm -f "$ARCHIVE_REPO/$path"
+            rm -rf "$ARCHIVE_REPO/$path" "$ARCHIVE_REPO/$db/$table"
             return 0
         fi
         return 1
     fi
-    # vazio → HEAD has no such file (a table new to this DB); falhou → git cannot say, the tree is left alone and the caller discards the DB
-    if ! listed=$(git -C "$ARCHIVE_REPO" ls-tree --name-only HEAD -- "$path" 2>/dev/null); then
+    # vazio → HEAD has neither the document nor the pieces (a table new to this DB); falhou → git cannot say, the tree is left alone and the caller discards the DB
+    if ! listed=$(git -C "$ARCHIVE_REPO" ls-tree --name-only HEAD -- "$path" "$db/$table" 2>/dev/null); then
         return 1
     fi
-    if [ -n "$listed" ]; then
-        git -C "$ARCHIVE_REPO" restore --source=HEAD --worktree -- "$path" >/dev/null 2>&1
-    else
-        rm -f "$ARCHIVE_REPO/$path"
-    fi
+    rm -rf "$ARCHIVE_REPO/$path" "$ARCHIVE_REPO/$db/$table" || return 1
+    # $listed = the names HEAD has (a database name is [A-Za-z0-9_-], a table's is fixed: nothing to split or glob); restore refuses a name HEAD lacks, so only those
+    [ -z "$listed" ] || git -C "$ARCHIVE_REPO" restore --source=HEAD --worktree -- $listed >/dev/null 2>&1
 }
 
 # One attempt at a table that has a key (ga-l6v576): its keys, its rows, its keys again, and the verdict of table_keys_verdict. Sets SUPP_VERDICT (complete | short | unknown | failed) and
