@@ -2,9 +2,12 @@
 """claude-crew-account — ga-qdtmq2 (Fase 2 da ga-xoe5ao): the Claude account of the Mayor and the named crews, LIVE.
 
 Who this is for: the sessions launched with --remote-control (providers claude-rc / claude-rc-crew). They are NOT wrapped
-(city.toml), so they read the DEFAULT Keychain item "Claude Code-credentials". claude re-reads that item every ~30 s, so
-rewriting it moves every one of them to another account in about a minute, with the SAME remote session, the conversation
-intact and no restart (measured, ga-2yyitx / ga-yyltfk). Decision of Athos (06/10): live, no restart.
+(city.toml), so they read the DEFAULT login: the Keychain item "Claude Code-credentials" AND ~/.claude/.credentials.json - the file claude
+falls back to when it cannot read the Keychain, which is the case of every session of the tmux server `-L gascity`: it lives in launchd's
+Background session, where `security` answers rc 36 (ga-i4t0lzx, 04/11: the job wrote only the item and its switch moved nothing for the Mayor and
+the crews for 1 h 20, until Athos's /login wrote the FILE). claude re-reads them every ~30 s, so rewriting both moves every session to another
+account in about a minute, with the SAME remote session, the conversation intact and no restart (measured, ga-2yyitx / ga-yyltfk).
+Decision of Athos (06/10): live, no restart.
 
 The decision is NOT taken here. The pool daemon (claude-pool-account.py, ga-8hcnvb.1) is the single decider of "which
 account is current" (CLAUDE_POOL_STATE); this script FOLLOWS it, so agents, crews and services never disagree
@@ -82,7 +85,17 @@ What it does, every run (launchd StartInterval, single instance via flock):
      times (what a refused refresh looks like - inferred from the log, not seen in the CLI) is dead: it is not written again until it is
      logged in again, instead of every 6 h for ever (burn/dead_login; log #324-#334). (d) A refresh
      token has an ABSOLUTE life (~30 days): logins ending within a week are said once a day (warn_expiring). NOT here: logging an account in by
-     itself - it needs the mini's browser + gmail-totp and Anthropic's login has a human-verification puzzle (ga-yyltfk); the notice says so.
+     itself - that is claude-login-renew.py (its own launchd job; it needs the mini's browser + gmail-totp and Anthropic's login has a
+     human-verification puzzle, ga-yyltfk); the notice says which job does it and what to do when that did not work.
+  8. TWO STORES, ONE LOGIN (ga-i4t0lzx): the default login lives in the item AND in the credentials file, and the sessions rotate the token in the
+     FILE (the Background cannot write the item). So (a) the NEWEST of the two (refresh expiry, then access expiry; a full login beats a half one;
+     "cannot tell" is said and never decided) is the login in use: it is what sync-back saves to its owner and what the profile is asked about, and a
+     /login done in the file clears the no-login alarm like one done in the item. (b) A switch writes the FILE first (atomic, 0600, read back), then
+     the item (read back), and puts the file back if the item failed - the stores never disagree about the account. (c) With nothing to switch, the
+     store that is behind is healed from the one that is ahead (a missing file is created; a file that cannot be read as a login is NOT overwritten).
+     (d) A FULL login a write would destroy - one this job did not write itself (`wrote`), that the profile cannot place as an older login of the same
+     account - is PARKED first in an item nothing reads ("...CREW-RESERVE-PARKED-<fingerprint>"); a park that fails stops the write. (e) notify's push
+     cap answers exit 12 to the forced push: an urgent alert is asked again, once, as a decision that waits for Athos (the route the cap exempts).
 
 Secrets: held in memory; the only place they leave is `security -i` STDIN (hex). Never argv, env, log, state or alert.
 Accounts are named by e-mail + sha256[:8] fingerprints.
@@ -91,7 +104,7 @@ KNOBS: GC_CREW_ACCOUNT=0 or <city>/.gc/no-crew-account -> the run does nothing. 
 GC_CREW_UNSTICK=1 or <city>/.gc/crew-unstick-on -> the Escape of step 5 is armed; GC_CREW_UNSTICK=0 disarms it whatever the file says.
 GC_CREW_RESET=1 or <city>/.gc/crew-reset-on -> the `gc session reset` of step 6 is armed (conversation NOT preserved); GC_CREW_RESET=0 disarms it.
 SEAMS (tests): CLAUDE_CREW_GC (the gc binary), CLAUDE_CREW_STATE, CLAUDE_CREW_DECISION, CLAUDE_CREW_ACCOUNTS (json), CLAUDE_CREW_ACCOUNTS_DIR,
-CLAUDE_CREW_SECURITY, CLAUDE_CREW_SESSIONS_DIR, CLAUDE_CREW_NOTIFY, CLAUDE_CREW_NOW, CLAUDE_CREW_USER,
+CLAUDE_CREW_SECURITY, CLAUDE_CREW_SESSIONS_DIR, CLAUDE_CREW_NOTIFY, CLAUDE_CREW_NOW, CLAUDE_CREW_USER, CLAUDE_CREW_CRED_FILE (the credentials file),
 CLAUDE_CREW_TMUX (the tmux binary), CLAUDE_CREW_TMUX_SOCKET (default "gascity"),
 CLAUDE_CREW_PROFILE_URL (honoured ONLY for a loopback host).
 """
@@ -132,6 +145,12 @@ MIN_REFRESH_LEFT_S = 86400      # a login whose refresh token has < 1 day left i
 ALERT_EVERY_S = 6 * 3600
 ALERT_RETRY_S = 300             # a push that was NOT delivered is retried after this, not after ALERT_EVERY_S
 NOTIFY_DELIVERED = (0, 10, 11)  # ga-xoe5ao.4, NOTIFY_STRICT_EXIT: 0 pushed (2xx), 10 held for the 7h flush by the quiet hours, 11 a push with this title went out < 30 min ago
+NOTIFY_CAPPED = 12              # ga-i4t0lzx: digest / the global push cap (8 pushes per 60 min): held, NOT delivered. The "decisao" route is exempt from the cap (see push)
+WAITS_FOR_ATHOS = "👉 aguardando você"   # a marker notify's "decisao" rule matches ("aguardando você"); the text of an alert that really waits for Athos starts with it
+CRED_FILE_NAME = ".credentials.json"
+PARKED_PREFIX = RESERVE_PREFIX + "PARKED-"       # + the fingerprint of the refresh token: where a full login is kept before a write would destroy it (nothing reads these)
+PARKED_RE = re.compile(re.escape(PARKED_PREFIX) + r"[0-9a-f]{8}")
+WROTE_MAX = 16                  # refresh-token fingerprints this job wrote to the default stores (`wrote`): an older login of those is no loss, it is the ancestor of what is there
 NO_LOGIN_WARN_S = 600           # ga-xoe5ao.4: no full login in the default item this long IN A ROW = news (push + mail to the Mayor)
 NO_LOGIN_END_S = 600            # ... and it is over only after a full login has been there this long (a heal that is blank again in 3-4 min is the SAME episode)
 BURN_WINDOW_S = 1800            # a blind write whose login is gone from the default this soon looks like a refresh the CLI refused (inferred from the log, not seen)
@@ -265,6 +284,11 @@ def security_bin() -> str:
     return os.environ.get("CLAUDE_CREW_SECURITY") or "security"
 
 
+def cred_file() -> Path:
+    """The credentials file of the default config dir: what claude reads when it cannot read the Keychain (every session of the tmux server in the Background)."""
+    return Path(os.environ.get("CLAUDE_CREW_CRED_FILE") or Path.home() / ".claude" / CRED_FILE_NAME)
+
+
 def accounts() -> Dict[str, dict]:
     raw = os.environ.get("CLAUDE_CREW_ACCOUNTS")
     if raw:
@@ -289,6 +313,11 @@ def dir_service(path: str) -> str:
 
 def reserve_service(email: str) -> str:
     return RESERVE_PREFIX + re.sub(r"[^A-Za-z0-9.@-]", "_", email)
+
+
+def parked_service(rfp: str) -> str:
+    """Where a full login is kept before a write would destroy it: named by the fingerprint of its refresh token, read by nobody (it is in no account's source list)."""
+    return PARKED_PREFIX + rfp
 
 
 def source_services(email: str) -> List[str]:
@@ -353,7 +382,7 @@ def kc_read(service: str) -> Tuple[str, Optional[str], Optional[dict]]:
 
 def kc_write(service: str, acct: str, blob: dict) -> bool:
     """Rewrite ONE allowlisted item. The secret travels only as hex on `security -i`'s stdin."""
-    if service not in writable_services() or not SERVICE_RE.fullmatch(service) or '"' in service:
+    if (service not in writable_services() and not PARKED_RE.fullmatch(service)) or not SERVICE_RE.fullmatch(service) or '"' in service:
         log("ERROR", "refusing to write a Keychain item that is not on this script's allowlist")
         return False
     if not USER_RE.fullmatch(acct or ""):
@@ -583,6 +612,262 @@ def dead_login(st: Optional[dict], rfp: Optional[str]) -> Optional[str]:
     return f"{n} writes of it were each followed by an empty default item (it looks like a refresh the CLI refused)" if n >= BURN_LIMIT else None
 
 
+# ── the credentials file, and the two stores of the default login (ga-i4t0lzx) ─────────────────────────────────────
+# The pool daemon's ga-6gat1o rigor (claude-pool-account.py: write_cred_file / put_cred_file / heal_cred_file), for the file the Mayor's and the crews'
+# sessions really read. Here the file is a login the SESSIONS rotate, so it is also a SOURCE: it is read, compared with the item, and the newer one wins.
+def cred_refusal() -> Optional[str]:
+    """Why the credentials file must NOT be read or written (None = it may). vazio → no file yet is fine (it is created); falhou/ilegível → a path
+    this cannot look at is refused: 'could not tell' never becomes a write."""
+    p = cred_file()
+    if not p.is_absolute():
+        return "the credentials file path is not absolute"
+    if p.name != CRED_FILE_NAME:
+        return f"the credentials file is not named {CRED_FILE_NAME}"
+    try:
+        if p.is_symlink():
+            return "the credentials file is a symlink (replacing it would break the link and writing through it would write somewhere else)"
+        if p.exists() and not p.is_file():
+            return "something that is not a regular file is in the credentials file's place"
+        if p.parent.exists() and not p.parent.is_dir():
+            return "the parent of the credentials file is not a directory"
+    except OSError:
+        return "could not look at the credentials file's path"
+    return None
+
+
+def read_cred_file() -> Tuple[str, Optional[dict], Optional[bytes]]:
+    """(state, blob, raw): ('ok', blob, raw) a login object is in it | ('missing', None, raw) no file at all (raw None) or a blank one (raw = its bytes)
+    | ('unknown', blob-or-None, raw) it was read but is not JSON, or holds no login object - never overwritten by a HEAL (it could be a login this does
+    not understand; a deliberate switch replaces it, keeping what else it carries) | ('unreadable', None, None) it is there and could not be read - nothing
+    is written over what cannot be looked at | ('refused', None, None) the path is one this job will not touch (cred_refusal)."""
+    if cred_refusal():
+        return "refused", None, None
+    try:
+        raw = cred_file().read_bytes()
+    except FileNotFoundError:
+        return "missing", None, None
+    except OSError:
+        return "unreadable", None, None
+    if not raw.strip():
+        return "missing", None, raw
+    try:
+        d = json.loads(raw.decode("utf-8"))
+    except (ValueError, RecursionError):
+        return "unknown", None, raw
+    if not isinstance(d, dict):
+        return "unknown", None, raw
+    if not isinstance(d.get("claudeAiOauth"), dict):
+        return "unknown", d, raw
+    return "ok", d, raw
+
+
+def _atomic_write(p: Path, data: bytes) -> None:
+    """A temp file beside `p`, created 0600 (never wider, not even for a moment), fsynced, renamed over it: a session reads the old file or the new one,
+    never half of one. Raises OSError; the temp file never outlives the call."""
+    tmp = p.with_name(p.name + f".tmp.{os.getpid()}")
+    try:
+        p.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        try:
+            tmp.unlink()                                       # a leftover of a crashed run that had this pid: O_EXCL below would refuse to reuse it
+        except FileNotFoundError:
+            pass
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+        os.fchmod(fd, 0o600)                                   # exactly 0600 whatever the umask is
+        with os.fdopen(fd, "wb") as f:
+            f.write(data)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, p)
+    finally:
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+
+
+def put_cred_file(login: dict, base: Optional[dict]) -> bool:
+    """Write `login` (its claudeAiOauth only; whatever else the file carries stays) to the credentials file, then LOOK: it has to read back as that login.
+    A local file that does not read back is a failure - not 'unverified', which is what a locked Keychain earns."""
+    why = cred_refusal()
+    if why:
+        log("ERROR", f"refusing to write the credentials file: {why}")
+        return False
+    new = with_login(base, login)
+    try:
+        _atomic_write(cred_file(), json.dumps(new).encode())
+    except OSError as e:
+        log("ERROR", f"credentials file not written ({type(e).__name__})")
+        return False
+    # vazio → 'missing' after a write that reported success: the login is not there, False; falhou/ilegível → anything but this very login is False too
+    state, back, _ = read_cred_file()
+    if state == "ok" and back is not None and same_login(back, new):
+        return True
+    log("ERROR", "credentials file written but it does not read back as the login written "
+                 f"({'refresh fp=' + str(fp(back['claudeAiOauth'].get('refreshToken'))) if state == 'ok' and back else 'no login in it'})")
+    return False
+
+
+def restore_cred_file(raw: Optional[bytes], written: dict) -> bool:
+    """Put the file back as it was (raw None = it did not exist) - but only if it still holds what THIS run wrote: a session may have refreshed it in the
+    meantime, and that newer login is never overwritten by a rollback."""
+    state, back, _ = read_cred_file()
+    if state != "ok" or back is None or not same_login(back, written):
+        log("WARN", "credentials file NOT put back: it no longer holds what this run wrote (a session refreshed it?) - it is left as it is; the next run reconciles")
+        return False
+    try:
+        if raw is None:
+            cred_file().unlink()
+        else:
+            _atomic_write(cred_file(), raw)
+    except OSError as e:
+        log("ERROR", f"credentials file could NOT be put back ({type(e).__name__}): it holds the new login while the item holds the old one; the next run reconciles")
+        return False
+    log("WARN", "credentials file put back as it was (the item write failed)")
+    return True
+
+
+def _cmp(a, b) -> Optional[int]:
+    if any(not isinstance(x, (int, float)) or isinstance(x, bool) for x in (a, b)):
+        return None
+    return (a > b) - (a < b)
+
+
+def recency(a: dict, b: dict) -> Optional[int]:
+    """Which of two logins is the newer: >0 a, <0 b, 0 the very same login, None cannot tell. By the refresh token's expiry (later = a later login)
+    and the access token's (later = refreshed later); the two must not disagree, and a login with neither number is never called newer."""
+    oa, ob = a["claudeAiOauth"], b["claudeAiOauth"]
+    if same_login(a, b):
+        return 0
+    ds = [_cmp(oa.get("refreshTokenExpiresAt"), ob.get("refreshTokenExpiresAt")), _cmp(oa.get("expiresAt"), ob.get("expiresAt"))]
+    signs = {d for d in ds if d}
+    if len(signs) == 2 or (not signs and (all(d is None for d in ds) or fp(oa.get("refreshToken")) != fp(ob.get("refreshToken")))):
+        return None
+    return signs.pop() if signs else 0
+
+
+def pick_current(item: dict, fblob: Optional[dict], t: float) -> Tuple[dict, str, Optional[str]]:
+    """(login, 'item'|'file', note): the login the default account is ON - the newest of the item and the credentials file. A full login beats one that
+    is not; two full ones are ordered by recency(); when that cannot tell, the item stays what it always was and the note says so (the caller then
+    synchronises nothing: two logins that cannot be compared are never overwritten blind)."""
+    if fblob is None or same_login(item, fblob):
+        return item, "item", None
+    fi, ff = full_login(item, t)[0], full_login(fblob, t)[0]
+    if ff and not fi:
+        return fblob, "file", None
+    if fi != ff or not fi:
+        return item, "item", None
+    r = recency(item, fblob)
+    if r is None:
+        return item, "item", "the item and the credentials file hold different full logins and nothing says which is the newer"
+    return (item, "item", None) if r >= 0 else (fblob, "file", None)
+
+
+def note_wrote(st: dict, rfp: Optional[str], email: str, t: float) -> None:
+    """This job just wrote the login with this refresh-token fingerprint to a default store: an older login of it that is found later is its ancestor, no loss."""
+    if not rfp:
+        return
+    # vazio → a new table; falhou/ilegível → a new table too (knowledge is lost, none is invented: at worst one login is parked that did not need it)
+    wrote = st.get("wrote")
+    wrote = _prune(wrote if isinstance(wrote, dict) else {}, OWNERS_KEEP_S, WROTE_MAX - 1, t)
+    wrote[rfp] = {"email": email, "at": t}
+    st["wrote"] = wrote
+
+
+def needs_park(st: dict, loser: Optional[dict], winner: dict, ident: Optional[str], t: float) -> bool:
+    """Would overwriting `loser` destroy a login worth keeping? Only a FULL login can be one. It is not when it is the winner's own, when this job wrote it,
+    or when the profile places it as the same account's and the winner is the newer. Every doubt lands on the keeping side: it is parked."""
+    if loser is None or not isinstance(loser.get("claudeAiOauth"), dict) or not full_login(loser, t)[0]:
+        return False
+    lrfp = fp(loser["claudeAiOauth"].get("refreshToken"))
+    if lrfp == fp(winner["claudeAiOauth"].get("refreshToken")):
+        return False
+    wrote = st.get("wrote")
+    if lrfp and isinstance(wrote, dict) and lrfp in wrote:
+        return False
+    r = recency(winner, loser)
+    if ident and r is not None and r > 0 and profile_email(loser["claudeAiOauth"].get("accessToken") or "") == ident:
+        return False
+    return True
+
+
+def park(login: dict, store: str) -> bool:
+    """Keep a full login whole in an item nothing reads, before a write destroys its only copy. Verified: a park that cannot be proven stops the write."""
+    o = login["claudeAiOauth"]
+    rfp = fp(o.get("refreshToken"))
+    svc = parked_service(rfp or "")
+    ok = verified_write(svc, login_name(), {"claudeAiOauth": o})
+    log("WARN" if ok else "ERROR", ("parked" if ok else "could NOT park") + f" the full login (refresh fp {rfp}, ends "
+        f"{_iso(o['refreshTokenExpiresAt'] / 1000.0) if isinstance(o.get('refreshTokenExpiresAt'), (int, float)) and not isinstance(o.get('refreshTokenExpiresAt'), bool) else 'unknown'}) "
+        f"that the default {store} held and a write was about to destroy: {svc}")
+    return ok
+
+
+def put_default(st: dict, acct: str, item: dict, cur: dict, ident: Optional[str], fs: str, fblob: Optional[dict], fraw: Optional[bytes],
+                login: dict, target: str, t: float) -> Tuple[bool, str]:
+    """Move the default account to `login`: the credentials file FIRST (the one the sessions read; atomic, read back), then the item (read back). If
+    the item fails the file is put back, so the stores never disagree about the account. A full login either write would destroy is parked first.
+    Returns (done, why-not)."""
+    why = cred_refusal()
+    if why:
+        return False, why
+    if fs == "unreadable":
+        return False, "the credentials file is there but could not be read: nothing is written over what cannot be looked at"
+    new_rfp = fp(login["claudeAiOauth"].get("refreshToken"))
+    for store, held in (("item", item), ("file", fblob if fs == "ok" else None)):
+        if held is not None and fp(held["claudeAiOauth"].get("refreshToken")) != new_rfp and needs_park(st, held, cur, ident, t):
+            if not park(held, store):
+                return False, f"the full login the default {store} holds could not be parked first (see the log): it is not overwritten"
+    base = fblob if isinstance(fblob, dict) else None          # whatever else the file carries stays (a file that is not JSON at all is replaced whole)
+    if not put_cred_file(login, base):
+        return False, "the credentials file could not be written or did not read back (see the log)"
+    if not verified_write(DEFAULT_SERVICE, acct, with_login(item, login)):
+        restore_cred_file(fraw, with_login(base, login))
+        return False, "the Keychain item could not be written or did not read back (see the log); the credentials file was put back"
+    note_wrote(st, new_rfp, target, t)
+    return True, ""
+
+
+def heal_stores(st: dict, ident: str, cur: dict, cur_store: str, acct: str, item: dict, fs: str, fblob: Optional[dict], ambiguous: bool,
+                t: float, dry: bool) -> None:
+    """Nothing has to switch: the store that is BEHIND takes the login of the one that is ahead (a missing file is created). The sessions rotate the
+    token in the file, so a file that is ahead is the normal case and the item follows it. Not done when the two cannot be ordered, and never to a file
+    that cannot be read as a login or that this job will not touch (it could hold a login this does not understand)."""
+    if ambiguous:
+        return
+    rfp = fp(cur["claudeAiOauth"].get("refreshToken"))
+    if cur_store == "item":
+        if fs in ("unknown", "refused", "unreadable"):
+            if st.get("heal_skip") != fs:
+                st["heal_skip"] = fs
+                log("WARN", f"the credentials file is {fs}: not touched and not healed from the item - a session that cannot read the Keychain runs on whatever it holds")
+            return
+        st.pop("heal_skip", None)
+        if fs == "ok" and fblob is not None and fp(fblob["claudeAiOauth"].get("refreshToken")) == rfp:
+            return
+        loser, store, src = (fblob if fs == "ok" else None), "file", "item"
+    else:
+        if fp(item["claudeAiOauth"].get("refreshToken")) == rfp:
+            return
+        loser, store, src = item, "item", "file"
+    if dry:
+        log("INFO", f"DRY-RUN would heal the default {store} from the {src} (refresh fp {rfp}, {ident}'s login)")
+        return
+    behind = f"the default {store} is behind the {src} (it holds an older login, or none) and could not be brought up to date"
+    if needs_park(st, loser, cur, ident, t) and not park(loser, store):
+        alert(st, "write-failed", f"{behind}: the full login it holds could not be parked first, so it is NOT overwritten (see the log)", t)
+        return
+    if store == "file":
+        done = put_cred_file(cur, fblob if fs == "ok" and isinstance(fblob, dict) else None)
+    else:
+        done = verified_write(DEFAULT_SERVICE, acct, with_login(item, cur))
+    if done:
+        note_wrote(st, rfp, ident, t)
+        log("INFO", f"healed the default {store} from the {src}: {ident}'s login (refresh fp {rfp}) - the {store} held "
+                    f"{'refresh fp ' + str(fp(loser['claudeAiOauth'].get('refreshToken'))) if loser else 'nothing'}")
+    else:
+        alert(st, "write-failed", f"{behind} (see the log): a session that reads it runs on a login the other store has already outlived", t)
+
+
 # ── state / alerts ───────────────────────────────────────────────────────
 def load_json(p: Path) -> Optional[dict]:
     try:
@@ -616,7 +901,43 @@ def publish_state(st: dict) -> None:
     os.replace(tmp, p)
 
 
-def push(title: str, text: str) -> bool:
+def _notify_once(n: str, title: str, text: str, forced: bool, say=None) -> Optional[int]:
+    """One `notify -p 4` call; its exit code, or None when it could not run (said in the log; `say` is the caller's logger: claude-login-renew has its own log).
+    `forced` = NOTIFY_FORCE_PUSH (keeps the push out of the muted digest - and puts it under the global push cap, which is what the "decisao" route below is for)."""
+    say = say or log
+    env = {**os.environ, "NOTIFY_STRICT_EXIT": "1"}
+    env.pop("NOTIFY_FORCE_PUSH", None)
+    if forced:
+        env["NOTIFY_FORCE_PUSH"] = "1"
+    try:
+        # vazio (nothing printed) → fine, only the exit code counts; falhou/ilegível (cannot run) → None: NOT delivered, said, retried
+        r = subprocess.run([n, "-t", title, "-p", "4", text], env=env, capture_output=True, text=True, timeout=30, check=False)
+    except (OSError, subprocess.SubprocessError) as e:
+        say("ERROR", f"notify could not run ({type(e).__name__}): the push '{title}' was not delivered")
+        return None
+    return r.returncode
+
+
+def deliver(n: str, title: str, body: str, urgent: bool, say=None) -> bool:
+    """The push itself, shared by this job and claude-login-renew (two copies of the 04/11 swallow is how it survived the first fix). `body` is sent as is.
+    Forced first; on exit 12 (notify's push cap) an `urgent` one is asked ONCE more, unforced, as a decision that waits for Athos (the route the cap exempts):
+    the marker leads the title and the text. Delivered = notify's strict 0 / 10 / 11; anything else, or notify not running, is NOT delivered and said."""
+    say = say or log
+    rc = _notify_once(n, title, body, forced=True, say=say)
+    if rc is None:
+        return False
+    if rc == NOTIFY_CAPPED and urgent:
+        say("WARN", f"notify exit={rc} (its push cap): '{title}' is asked again as a decision that waits for Athos")
+        rc = _notify_once(n, f"{WAITS_FOR_ATHOS} — {title}", f"{WAITS_FOR_ATHOS} — {body}", forced=False, say=say)
+        if rc is None:
+            return False
+    if rc not in NOTIFY_DELIVERED:
+        say("ERROR", f"notify exit={rc}: the push '{title}' was not delivered")
+        return False
+    return True
+
+
+def push(title: str, text: str, urgent: bool = False) -> bool:
     """One `notify -p 4` under notify's STRICT contract (its policy_exit, as quoted in git-loose-repack.sh notify_send; claude-pool-guard send_alert).
     By default EVERY path that did NOT push exits 0 and an unknown source goes to the muted digest; this job took that 0 for "told" and stayed
     silent for 6 h. It is one of the holes found after 01/11 08:39Z-02/11 03:10Z (18.5 h in which nobody heard that Remote Control was down);
@@ -625,29 +946,26 @@ def push(title: str, text: str) -> bool:
     carries the condition), 12 digest or push cap, anything else failed. Delivered = 0, 10 or 11; the rest, and notify missing or not running,
     is NOT delivered and the caller retries. NOTIFY_FORCE_PUSH keeps every push out of the muted digest; it does NOT pierce the quiet hours
     (disk-recovery-ladder.sh: "FORCE_PUSH nao fura a madrugada"; git-loose-repack.sh gets 10 for a night job - read there, not measured here),
-    so a push made at night comes back 10 and counts as told: at night the mail to the Mayor is the immediate channel, the phone hears at 07:00."""
+    so a push made at night comes back 10 and counts as told: at night the mail to the Mayor is the immediate channel, the phone hears at 07:00.
+
+    ga-i4t0lzx - the 12 that swallowed the alert of 04/11 (13:56Z-14:48Z: "notify exit=12" once per retry window, the outage unannounced): a FORCED push
+    is the "push forced" route and notify's global cap (8 pushes / 60 min) holds it; the "decisao" route (a text that says it waits for Athos) is
+    exempt from the cap and is NOT forced. So an `urgent` alert (a condition only a human can end) that comes back 12 is asked ONCE more, in that
+    shape: the marker leads the text, `job falhou: claude-crew-account` stays (the auto-repair route), the title carries the marker (a different
+    title: the dedup of the first one cannot swallow it). Not urgent (a forecast, an all-clear) = held means held, retried later like before."""
     n = os.environ.get("CLAUDE_CREW_NOTIFY") or shutil.which("notify")
     if not n:
         log("ERROR", f"no notify binary: the push '{title}' could not be sent")
         return False
-    env = {**os.environ, "NOTIFY_STRICT_EXIT": "1", "NOTIFY_FORCE_PUSH": "1"}
-    try:
-        # vazio (nothing printed) → fine, only the exit code counts; falhou/ilegível (cannot run, any exit but 0/10/11) → NOT delivered, said, retried
-        r = subprocess.run([n, "-t", title, "-p", "4", f"job falhou: claude-crew-account — {text}"], env=env,
-                           capture_output=True, text=True, timeout=30, check=False)
-    except (OSError, subprocess.SubprocessError) as e:
-        log("ERROR", f"notify could not run ({type(e).__name__}): the push '{title}' was not delivered")
-        return False
-    if r.returncode not in NOTIFY_DELIVERED:
-        log("ERROR", f"notify exit={r.returncode}: the push '{title}' was not delivered")
-        return False
-    return True
+    return deliver(n, title, f"job falhou: claude-crew-account — {text}", urgent)
 
 
-def alert(st: dict, key: str, msg: str, t: float, every: float = ALERT_EVERY_S) -> bool:
+def alert(st: dict, key: str, msg: str, t: float, every: float = ALERT_EVERY_S, urgent: bool = True) -> bool:
     """One named line in the log, and ONE push per key per `every`. The title carries the key (notify drops the 2nd push of a title within
     30 min, so two conditions sharing one lost the second). The text carries 'job falhou' so notify routes it to the auto-repair path
     (bead + agent) and not to a mute digest (CLAUDE.md, 'Job agendado novo').
+    `urgent` (the default: nearly every alert here is a condition only a human can end) lets the push go past notify's push cap (see push); a
+    forecast or an all-clear says urgent=False.
     Returns True only when THIS call delivered the push: a condition that fires once (rc-lost) keeps the False and retries."""
     log("WARN", ("DRY-RUN would alert: " if DRY else "") + msg)
     if DRY:
@@ -655,7 +973,7 @@ def alert(st: dict, key: str, msg: str, t: float, every: float = ALERT_EVERY_S) 
     al = st.setdefault("alerts", {})
     if t - _num(al.get(key)) < every:
         return False
-    delivered = push(f"Troca de conta (crews): {key}", msg)
+    delivered = push(f"Troca de conta (crews): {key}", msg, urgent=urgent)
     # "told" only when it was delivered; otherwise the key is set so that it is retried after ALERT_RETRY_S
     al[key] = t if delivered else t - every + ALERT_RETRY_S
     return delivered
@@ -699,7 +1017,9 @@ def no_login_text(ep: dict, dec, t: float) -> str:
     else:
         fix = f"Fix: log ONE account in, the pool's pick first - {relogin_cmd(want)} - and this job writes it to the default item within a minute."
     return (f"the Mayor and the crews have had NO full Claude login for {int((t - _num(ep.get('since'))) // 60)} min - Remote Control is down "
-            f"({ep.get('why')}).{did} {fix} Automatic relogin (gmail-totp) is NOT wired into this job: it needs the mini's browser (ga-xoe5ao.4, item 2).")
+            f"({ep.get('why')}).{did} {fix} The automatic relogin is the separate job claude-login-renew (launchd, every 15 min): it tries one account per run, the "
+            "pool's pick first, in the mini's own browser, and sends its own push when only a person can finish it - if this outage outlives a few of its "
+            "runs, read .gc/logs/claude-login-renew.log (every run leaves a line there).")
 
 
 def _episode(st: dict) -> Optional[dict]:
@@ -770,7 +1090,7 @@ def tell_no_login(st: dict, dec, t: float) -> None:
     ep.setdefault("ending", t)                             # the outage is over for the news from here: a relapse is a NEW episode (watch_no_login), and the retry hour runs from now
     text = (f"Remote Control is BACK: a full login is in the default item again - first seen {int((t - gs) // 60)} min ago, and there on this "
             f"check too (the Mayor and the crews had none for {int((gs - since) // 60)} min)")
-    if not ep.get("end_push") and alert(st, "no-login-end", text, t):
+    if not ep.get("end_push") and alert(st, "no-login-end", text, t, urgent=False):
         ep["end_push"] = t
     if not ep.get("end_mail") and t - _num(ep.get("mail_try")) >= ALERT_RETRY_S:
         ep["mail_try"] = t
@@ -1395,7 +1715,7 @@ def reset_stopped(st: dict, dec, to, pid: int, rec: dict, t: float, banner: bool
     if rc == 0:
         log("WARN", f"switch to {to}: {name} was stopped {STALL_S // 60} min on the limit and was reset with gc session reset {sid}")
         alert(st, key, f"{name} was stopped on claude's limit for {STALL_S // 60} min and was reset (gc session reset {sid}): its conversation is "
-                       "NOT preserved - it starts a fresh one", t)
+                       "NOT preserved - it starts a fresh one", t, urgent=False)       # news after the fact, nothing waits for Athos
     else:
         out = (f"could not be reset (gc session reset {sid} failed, exit={rc})" if rc is not None else
                f"may or may not have been reset (gc session reset {sid} gave no answer: timeout, or gc could not run)")   # no answer != failed
@@ -1599,12 +1919,35 @@ def exhausted(dec: dict, email: str, t: float) -> bool:
     return isinstance(r, (int, float)) and r > t
 
 
+def source_refusal(st: Optional[dict], email: str, svc: str, blob: dict, t: float) -> Optional[str]:
+    """Why the login in `svc` (read, a login object in it) is NOT one this job would write as `email`'s (None = it would). One question, one answer: load_source
+    asks it to pick a source, and claude-login-renew asks it to know whether an account HAS a usable login - two judges of 'usable' disagreed on 04/11
+    (the renew job called a held login usable and never launched, while this job refused it)."""
+    rfp = fp(blob["claudeAiOauth"].get("refreshToken"))
+    q = ((st or {}).get("bad_sources") or {}).get(svc)
+    if isinstance(q, dict) and q.get("rfp") == rfp:
+        return f"quarantined (it turned out to hold {q.get('owner')}'s login, not {email}'s)"
+    k = known_owner(st, rfp, t)               # the NAME of an item is not its owner: a login the profile already gave to someone else is not this one's
+    if k and k[0] != email:
+        return f"holds {k[0]}'s login, not {email}'s (the profile said so on {_iso(k[1])}) - not written as {email}'s"
+    ok, reason = full_login(blob, t)
+    if not ok:
+        return reason
+    d = dead_login(st, rfp)                  # ga-xoe5ao.4: written blind BURN_LIMIT times, each time followed by an empty default: not again, however old the hold
+    if d is not None:
+        return f"dead - {d}; it is not written again until it is logged in again"
+    h = held_login(st, rfp, t)
+    if h is not None:
+        return (f"held - an unverified switch from this very login was made {h}; it is not written again until it is "
+                f"logged in again or {UNVERIFIED_HOLD_S // 3600} h have passed")
+    return None
+
+
 def load_source(email: str, t: float, st: Optional[dict] = None) -> Tuple[Optional[Tuple[str, str, dict]], List[str], bool]:
     """The first usable full login of `email`: ((service, acct, blob), [], False) or (None, [why-not per place], unreadable).
     'Could not read' ends the search (falling through to a later place would hand out whatever stale copy lives there) and
     sets `unreadable`: that is "cannot tell if it has a login", which no caller may treat as "it has none"."""
     why = []
-    bad = (st or {}).get("bad_sources") or {}
     for svc in source_services(email):
         s, acct, blob = kc_read(svc)
         if s == "unknown":
@@ -1613,27 +1956,9 @@ def load_source(email: str, t: float, st: Optional[dict] = None) -> Tuple[Option
         if s != "ok":
             why.append(f"{svc}: {s}")
             continue
-        rfp = fp(blob["claudeAiOauth"].get("refreshToken"))
-        q = bad.get(svc)
-        if isinstance(q, dict) and q.get("rfp") == rfp:
-            why.append(f"{svc}: quarantined (it turned out to hold {q.get('owner')}'s login, not {email}'s)")
-            continue
-        k = known_owner(st, rfp, t)           # the NAME of an item is not its owner: a login the profile already gave to someone else is not this one's
-        if k and k[0] != email:
-            why.append(f"{svc}: holds {k[0]}'s login, not {email}'s (the profile said so on {_iso(k[1])}) - not written as {email}'s")
-            continue
-        ok, reason = full_login(blob, t)
-        if not ok:
-            why.append(f"{svc}: {reason}")
-            continue
-        d = dead_login(st, rfp)                  # ga-xoe5ao.4: written blind BURN_LIMIT times, each time followed by an empty default: not again, however old the hold
-        if d is not None:
-            why.append(f"{svc}: dead - {d}; it is not written again until it is logged in again")
-            continue
-        h = held_login(st, rfp, t)
-        if h is not None:
-            why.append(f"{svc}: held - an unverified switch from this very login was made {h}; it is not written again until it is "
-                       f"logged in again or {UNVERIFIED_HOLD_S // 3600} h have passed")
+        r = source_refusal(st, email, svc, blob, t)
+        if r is not None:
+            why.append(f"{svc}: {r}")
             continue
         return (svc, acct, blob), [], False      # type: ignore[return-value]
     return None, why, False
@@ -1830,11 +2155,11 @@ def warn_expiring(st: dict, t: float) -> None:
     for email, left in sorted(best.items()):
         if email not in unread and 0 < left <= EXPIRY_WARN_S:
             alert(st, f"expiring:{email}", f"the best login of {email} ends in {left / 86400:.1f} days (a refresh token lives ~30 days from the "
-                  f"login): log it in again before then - {relogin_cmd(email)}", t, every=EXPIRY_EVERY_S)
+                  f"login): log it in again before then - {relogin_cmd(email)}", t, every=EXPIRY_EVERY_S, urgent=False)
 
 
 def _follow(st: dict, dec: dict, user: str, t: float, dry: bool) -> int:
-    s, acct, cur = kc_read(DEFAULT_SERVICE)
+    s, acct, item = kc_read(DEFAULT_SERVICE)
     if s != "ok":
         log("WARN", f"the default item is {s} (absent, unreadable or holding no login) - NOT touched and NOT healed: "
                     "Remote Control may be down for Mayor and crews")
@@ -1842,13 +2167,23 @@ def _follow(st: dict, dec: dict, user: str, t: float, dry: bool) -> int:
             alert(st, "default-missing", "the default item does not exist: Remote Control is down for Mayor and crews until a "
                   "login is put back (this script heals only a default item that exists)", t)
             watch_no_login(st, True, "the default item does not exist", t, heals=False)
-        elif isinstance(cur, dict):
+        elif isinstance(item, dict):
             # vazio/falhou: 'unknown' WITHOUT a blob (locked keychain, crashed security, not an object) is neither: the episode is left as it is;
             # 'unknown' WITH a blob = read and parsed, and there is no login object in it - the very outage this exists for, still not touched or healed
             alert(st, "default-no-login", "the default item holds no login object (a logged-out CLI?): Remote Control is down for Mayor and crews "
                   "until a login is put back (this script heals only a default item that holds one)", t)
             watch_no_login(st, True, "the default item holds no login object", t, heals=False)
         return 0
+    # ga-i4t0lzx: the sessions of the tmux server (the Background) cannot read the Keychain: they read, and rotate the token in, the credentials FILE.
+    # The default account is on the NEWEST of the two logins; everything below (whose, usable?, sync-back) is about that one.
+    fs, fblob, fraw = read_cred_file()
+    cur, cur_store, ambiguous = pick_current(item, fblob if fs == "ok" else None, t)
+    if ambiguous:
+        if st.get("two_stores_note") != ambiguous:
+            st["two_stores_note"] = ambiguous
+            log("WARN", f"{ambiguous}: the item stays what it was and nothing is synchronised between the two")
+    else:
+        st.pop("two_stores_note", None)
     ok, why = full_login(cur, t)
     settle_last_write(st, cur, ok, why, t)
     watch_no_login(st, not ok, why, t)
@@ -1878,6 +2213,8 @@ def _follow(st: dict, dec: dict, user: str, t: float, dry: bool) -> int:
                   "can be saved", t)
             return 0
     if target is None or src is None:
+        if ok and ident:
+            heal_stores(st, ident, cur, cur_store, acct or user, item, fs, fblob, bool(ambiguous), t, dry)
         return 0
     svc, sacct, blob = src
     claimed = profile_email(blob["claudeAiOauth"]["accessToken"])
@@ -1889,9 +2226,9 @@ def _follow(st: dict, dec: dict, user: str, t: float, dry: bool) -> int:
                     + ("" if claimed else " [owner unverified: the profile cannot answer for that token]"))
         return 0
     before = bridges()
-    if not verified_write(DEFAULT_SERVICE, acct or user, with_login(cur, blob)):
-        alert(st, "write-failed", f"could not write the {target} login to the default item (refused, failed or not verified - "
-                                  "see the log)", t)
+    done, why_not = put_default(st, acct or user, item, cur, ident if ok else None, fs, fblob, fraw, blob, target, t)
+    if not done:
+        alert(st, "write-failed", f"could not write the {target} login to the default stores (refused, failed or not verified): {why_not}", t)
         return 0
     f_new = fp(blob["claudeAiOauth"].get("accessToken"))
     if not ok:

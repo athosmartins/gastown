@@ -139,7 +139,11 @@ sys.exit(2)
 '''
 
 NOTIFY = ("#!/bin/sh\necho \"$@\" >> \"$FAKE_SEC_DIR/notify.log\"\necho \"$NOTIFY_STRICT_EXIT/$NOTIFY_FORCE_PUSH\" >> \"$FAKE_SEC_DIR/notify.env\"\n"
-          "[ -n \"$FAKE_NOTIFY_FAIL\" ] && exit 7\nexit \"${FAKE_NOTIFY_RC:-0}\"\n")      # FAKE_NOTIFY_RC: the strict exit codes of the real notify
+          "[ -n \"$FAKE_NOTIFY_FAIL\" ] && exit 7\n"
+          # FAKE_NOTIFY_CAP: the real notify's push cap (8/h): a FORCED push is the "push forced" rule and the cap holds it (12); only the "decisao" rule - the text says it
+          # waits for Athos - is exempt (notify: global_rate_limited, classify_route_detail rule 2), and it is not forced
+          "if [ -n \"$FAKE_NOTIFY_CAP\" ]; then\n  if [ -z \"$NOTIFY_FORCE_PUSH\" ] && echo \"$@\" | grep -qiE 'aguardando você|needs-human'; then exit 0; fi\n  exit 12\nfi\n"
+          "exit \"${FAKE_NOTIFY_RC:-0}\"\n")      # FAKE_NOTIFY_RC: the strict exit codes of the real notify
 EMAIL = {"crypto": "athoscrypto@gmail.com", "amb": "throw.away.amb@gmail.com", "b85": "athosb85@gmail.com",
          "terr": "terrenos.incorporacoes@gmail.com", "martins": "athosmartins@gmail.com"}
 
@@ -174,7 +178,7 @@ def _real_files():
     # and the launchd job rewrites it - and logs, and takes the lock - on its own schedule, so these are watched for writes made
     # BY THIS PROCESS (see _watching), never compared before/after.
     cities = {c for c in (_REAL_ENV.get("GC_CITY_PATH"), str(Path.home() / "gt" / ".gascity-gastown-hq")) if c}
-    out = [Path(crew.DEFAULT_STATE)]
+    out = [Path(crew.DEFAULT_STATE), Path.home() / ".claude" / ".credentials.json"]       # the file the Mayor's and the crews' tmux sessions read
     for c in sorted(cities):
         out += [Path(c) / ".gc" / "logs" / "claude-crew-account.log", Path(c) / ".gc" / "claude-crew-account.lock"]
     return out
@@ -263,7 +267,8 @@ def _pin_env(monkeypatch, tmp_path):
     for k, v in {"CLAUDE_CREW_NOTIFY": g / "notify", "CLAUDE_CREW_SECURITY": g / "security", "CLAUDE_CREW_TMUX": g / "tmux", "CLAUDE_CREW_GC": g / "gc",
                  "GC_CITY_PATH": tmp_path / "pinned-city", "CLAUDE_CREW_STATE": tmp_path / "pinned-state.json",
                  "CLAUDE_CREW_DECISION": tmp_path / "pinned-decision.json", "CLAUDE_CREW_SESSIONS_DIR": tmp_path / "pinned-sessions",
-                 "CLAUDE_CREW_ACCOUNTS_DIR": tmp_path / "pinned-accts", "HOME": tmp_path / "pinned-home"}.items():
+                 "CLAUDE_CREW_ACCOUNTS_DIR": tmp_path / "pinned-accts", "HOME": tmp_path / "pinned-home",
+                 "CLAUDE_CREW_CRED_FILE": tmp_path / "pinned-cred" / ".credentials.json"}.items():
         monkeypatch.setenv(k, str(v))
     monkeypatch.setenv("PATH", f"{g / 'bin'}:/usr/bin:/bin")        # `which notify` / bare `security` find a sentinel, never the real one
 
@@ -408,15 +413,17 @@ class World:
             "CLAUDE_CREW_DECISION": str(self.d / "pool_decision.json"), "CLAUDE_CREW_SESSIONS_DIR": str(self.d / "sessions"),
             "CLAUDE_CREW_ACCOUNTS_DIR": str(self.d / "accts"), "CLAUDE_CREW_USER": "athos", "GC_CITY_PATH": str(self.d / "city"),
             "CLAUDE_CREW_PROFILE_URL": f"http://127.0.0.1:{self.srv.server_address[1]}/profile", "CLAUDE_CREW_NOW": str(self.now),
+            "CLAUDE_CREW_CRED_FILE": str(self.d / "claude-home" / ".credentials.json"),
         }.items():
             monkeypatch.setenv(k, v)
         for k in ("GC_CREW_ACCOUNT", "CLAUDE_CREW_ACCOUNTS", "FAKE_SEC_FAIL", "FAKE_SEC_WFAIL", "FAKE_SEC_DROP", "FAKE_NOTIFY_FAIL",
                   "GC_CREW_UNSTICK", "FAKE_TMUX_DOWN", "CLAUDE_CREW_TMUX_SOCKET", "GC_CREW_RESET", "FAKE_GC_LIST_FAIL", "FAKE_GC_RESET_FAIL",
-                  "FAKE_NOTIFY_RC", "FAKE_GC_MAIL_FAIL", "NOTIFY_STRICT_EXIT", "NOTIFY_FORCE_PUSH"):
+                  "FAKE_NOTIFY_RC", "FAKE_NOTIFY_CAP", "FAKE_GC_MAIL_FAIL", "NOTIFY_STRICT_EXIT", "NOTIFY_FORCE_PUSH"):
             monkeypatch.delenv(k, raising=False)
         self.mp = monkeypatch
         # the world must be sealed: every seam inside this tmp dir, none of them a sentinel
-        for fn in (crew.security_bin, crew.state_path, crew.decision_path, crew.sessions_dir, crew.tmux_bin):
+        for fn in (crew.security_bin, crew.state_path, crew.decision_path, crew.sessions_dir, crew.tmux_bin,
+                   *([crew.cred_file] if hasattr(crew, "cred_file") else [])):        # (the previous HEAD has no credentials-file seam: its tests must still run)
             assert str(fn()).startswith(str(self.d)), f"{fn.__name__} escapes the test world: {fn()}"
         assert os.environ["CLAUDE_CREW_NOTIFY"].startswith(str(self.d)) and str(crew.city()).startswith(str(self.d))
 
@@ -433,6 +440,19 @@ class World:
     def get(self, service):
         v = self.store().get(service)
         return json.loads(v["secret"]) if v else None
+
+    # the credentials file the Mayor's and the crews' tmux sessions read (they run where the Keychain answers rc 36)
+    @property
+    def cred(self):
+        return Path(os.environ["CLAUDE_CREW_CRED_FILE"])
+
+    def put_file(self, b, **extra):
+        self.cred.parent.mkdir(parents=True, exist_ok=True)
+        self.cred.write_text(json.dumps({**b, **extra}))
+        self.cred.chmod(0o600)
+
+    def get_file(self):
+        return json.loads(self.cred.read_text()) if self.cred.exists() else None
 
     def writes(self):
         p = self.d / "writes.log"
@@ -997,10 +1017,12 @@ def test_a_quarantined_source_comes_back_when_it_is_logged_in_again(w):
 
 # ── ga-xoe5ao.2, defect 2: the heal-fallback writes the same unverified login once, not every cycle ────────────────────
 def _blank_default(w):
-    """What is left in the default item when the CLI could not use the login it found there: a login blob with no access token."""
+    """What is left in the default when the CLI could not use the login it found there: a login blob with no access token. claude reads the item AND
+    the credentials file (ga-i4t0lzx: the sessions of the Background read the file), so a CLI that gave up on the login leaves both blank."""
     b = blob("blank")
     b["claudeAiOauth"]["accessToken"] = ""
     w.put(crew.DEFAULT_SERVICE, b)
+    w.put_file(b)
 
 
 def _heal_loop_world(w):
@@ -2427,14 +2449,16 @@ def test_a_push_asks_notify_for_its_strict_exit_codes_and_forces_it(w):
     assert len(w.notified()) == 1 and w.notify_envs() == ["1/1"]
 
 
-@pytest.mark.parametrize("rc, told", [(0, True), (10, True), (11, True), (12, False), (13, False), (1, False)])
-def test_only_the_exit_codes_of_a_push_that_reached_somebody_count_as_told(w, rc, told):
-    """Breaks if 'told' is exit 0 alone (held for the 7h flush and already-out ARE told) or anything but 7 (12 is the digest / the rate cap)."""
+@pytest.mark.parametrize("rc, calls", [(0, 1), (10, 1), (11, 1), (12, 4), (13, 2), (1, 2)])
+def test_only_the_exit_codes_of_a_push_that_reached_somebody_count_as_told(w, rc, calls):
+    """Breaks if 'told' is exit 0 alone (held for the 7h flush and already-out ARE told) or anything but 7 (12 is the digest / the rate cap).
+    `calls` = how many times notify was run in all: 1 = told at once; 2 = tried again after the retry window; 4 = 12 is the cap, so each of
+    the two tries is ALSO asked once more as a decision that waits for Athos (ga-i4t0lzx) - and that one is held too when notify says 12 to it."""
     _no_login_problem(w)
     w.mp.setenv("FAKE_NOTIFY_RC", str(rc))
     w.run()
     w.run(at=w.now + 600)                                         # past the 5 minutes in which a push that did not go is retried
-    assert len(w.notified()) == (1 if told else 2)
+    assert len(w.notified()) == calls
 
 
 def test_two_conditions_never_share_a_title(w):
@@ -2457,7 +2481,8 @@ def test_the_outage_is_told_after_ten_minutes_by_push_and_mail_again_when_it_end
     mail = w.mails()[0]
     subject, body = mail[mail.index("-s") + 1], mail[mail.index("-m") + 1]
     assert mail[4:7] == ["mayor/", "--from", "controller"] and "SEM login completo" in subject
-    assert "Not usable:" in body and EMAIL["b85"] in body and f"claude auth login --email {EMAIL['terr']}" in body and "NOT wired" in body
+    assert "Not usable:" in body and EMAIL["b85"] in body and f"claude auth login --email {EMAIL['terr']}" in body
+    assert "NOT wired" not in body and "claude-login-renew" in body        # ga-i4t0lzx: the automatic relogin IS wired (its own launchd job) - the stale sentence told the Mayor it was not
     _run_dead(w, 21600 + 600, 21600 + 660, 21600 + 720, 21600 + 780, 21600 + 840)     # 6 h on: every hold has lapsed, each login gets its one more try
     _run_dead(w, 43200 + 600, 64800 + 600)
     assert w.writes().count(crew.DEFAULT_SERVICE) == 8           # 4 logins x BURN_LIMIT, then dead (the old script: one more round every 6 h)
@@ -2825,3 +2850,281 @@ def test_a_good_since_that_cannot_be_read_restarts_the_end_clock_and_never_tells
     assert _back_pushes(w) == [] and w.state()["no_login"]["good_since"] == w.now + 1400
     w.run(at=w.now + 2000)                                        # ten minutes later the end is told, once
     assert len(_back_pushes(w)) == 1
+
+
+# ══ ga-i4t0lzx (claude-crew-account.py): the 04/11 swap of the Mayor's/crews' account hung 1 h 20 - the job wrote only the Keychain item ═══════════
+# The tmux server `-L gascity` lives in launchd's Background session, where `security` answers rc 36: the Mayor's and the crews' claude read
+# ~/.claude/.credentials.json (what claude falls back to when it cannot read the Keychain). The job wrote the item alone, so its switches moved
+# nothing for them; Athos's /login at 12:11 wrote the FILE and that is what fixed it. The tests below are the job learning that the file exists.
+def _parked(w):
+    return {k: json.loads(v["secret"]) for k, v in w.store().items() if k.startswith(crew.RESERVE_PREFIX + "PARKED-")}
+
+
+def _vouched(w, key, b):
+    """A login whose access token the profile answers for (a fresh one: the sessions' own refresh, or somebody's /login)."""
+    w.tokens[b["claudeAiOauth"]["accessToken"]] = EMAIL[key]
+    return b
+
+
+def _in_both(w, key, b):
+    w.default(key, b)
+    w.put_file(b)
+
+
+@pytest.mark.parametrize("before", ["same-login", "missing", "garbage", "other-keys"])
+def test_a_switch_reaches_the_credentials_file_the_sessions_read_not_only_the_keychain_item(w, before):
+    """Breaks if the switch writes the item alone (04/11 12:03 - 13:23: the sessions kept the old account while the item said the new one). The file
+    gets the same login as the item, 0600, nothing else of the file is lost, and no temp file is left beside it."""
+    cur = blob("crypto")
+    _in_both(w, "crypto", cur) if before in ("same-login", "other-keys") else w.default("crypto", cur)
+    w.account("crypto", cur)
+    amb = blob("amb")
+    w.account("amb", amb)
+    w.decide("amb")
+    if before == "other-keys":
+        w.put_file(cur, mcpOAuth={"srv": {"serverName": "x"}})
+    if before == "garbage":
+        w.cred.parent.mkdir(parents=True)
+        w.cred.write_text("{not json")
+    w.run()
+    f = w.get_file()
+    assert f is not None and _rt(f) == _rt(amb) == _rt(w.get(crew.DEFAULT_SERVICE))
+    assert f["claudeAiOauth"] == w.get(crew.DEFAULT_SERVICE)["claudeAiOauth"]
+    assert stat.S_IMODE(w.cred.stat().st_mode) == 0o600
+    assert os.listdir(w.cred.parent) == [".credentials.json"]
+    if before == "other-keys":
+        assert f["mcpOAuth"] == {"srv": {"serverName": "x"}}      # only the login moves (the same rule as the item)
+    assert w.state()["current"] == EMAIL["amb"] and _parked(w) == {}
+    for text in (w.argv_log(), w.log(), json.dumps(w.state()), "\n".join(w.notified())):
+        assert secrets_in(text, w) == []
+
+
+def test_the_file_is_a_source_of_the_newest_refresh_token_when_the_leaving_login_is_saved(w):
+    """Breaks if only the item is looked at before the switch: the sessions rotate the token in the FILE (the item cannot be written from the
+    Background), so the item holds the old, dead refresh token and the stored copy would be refreshed from it - the only live copy lost."""
+    b0 = blob("crypto", rt="crypto-old", rexp_days=20)
+    _in_both(w, "crypto", b0)
+    w.account("crypto", blob("crypto", rt="crypto-old", rexp_days=20))
+    w.account("amb", blob("amb"))
+    w.decide("crypto")
+    w.run()
+    assert w.writes() == []                                       # in sync, the two stores agree: nothing to do
+    newer = _vouched(w, "crypto", blob("crypto-file", rt="crypto-rotated", rexp_days=29.5))
+    w.put_file(newer)                                             # the sessions refreshed: ONLY the file has the new login
+    w.decide("amb")
+    w.run(at=w.now + 60)
+    assert _rt(w.get(w.src_service("crypto"))) == "sk-ant-ort01-crypto-rotated-ref"        # saved from the FILE
+    assert w.writes()[0] == w.src_service("crypto") and crew.DEFAULT_SERVICE in w.writes()  # ...before the item was overwritten
+    assert _rt(w.get(crew.DEFAULT_SERVICE)) == _rt(w.get_file()) == "sk-ant-ort01-amb-ref"
+    assert _parked(w) == {}                                       # the stale item held the same account's older login: nothing worth keeping
+
+
+def test_a_file_that_is_ahead_of_the_item_heals_the_item_when_nothing_has_to_switch(w):
+    """Breaks if the two stores are allowed to drift for ever: the item must follow the file the sessions rotate (and it is not rewritten once it does)."""
+    b0 = blob("crypto", rt="crypto-old", rexp_days=20)
+    _in_both(w, "crypto", b0)
+    w.account("crypto", blob("crypto", rt="crypto-old", rexp_days=20))
+    w.decide("crypto")
+    newer = _vouched(w, "crypto", blob("crypto-file", rt="crypto-rotated", rexp_days=29.5))
+    w.put_file(newer)
+    w.run()
+    assert _rt(w.get(crew.DEFAULT_SERVICE)) == "sk-ant-ort01-crypto-rotated-ref" and w.get_file() == newer      # the winner is not rewritten
+    assert _rt(w.get(w.src_service("crypto"))) == "sk-ant-ort01-crypto-rotated-ref"                              # and its owner's stored copy keeps up
+    n = len(w.writes())
+    w.run(at=w.now + 60)
+    w.run(at=w.now + 120)
+    assert len(w.writes()) == n and _parked(w) == {}              # quiet once the stores agree
+
+
+@pytest.mark.parametrize("file_is", ["behind", "missing"])
+def test_an_item_that_is_ahead_of_the_file_or_a_file_that_is_missing_is_healed_from_the_item(w, file_is):
+    """Breaks if a session that cannot read the Keychain is left with nothing (a missing file) or with a login the item has already outlived."""
+    newer = _vouched(w, "crypto", blob("crypto-item", rt="crypto-rotated", rexp_days=29.5))
+    w.default("crypto", newer)
+    w.account("crypto", blob("crypto", rt="crypto-rotated", rexp_days=29.5))
+    if file_is == "behind":
+        w.put_file(blob("crypto", rt="crypto-old", rexp_days=20))
+    w.decide("crypto")
+    w.run()
+    assert w.get_file()["claudeAiOauth"] == newer["claudeAiOauth"] and stat.S_IMODE(w.cred.stat().st_mode) == 0o600
+    assert crew.DEFAULT_SERVICE not in w.writes()                 # the item was the winner: only the file moved
+
+
+def test_a_file_that_cannot_be_read_as_a_login_is_not_overwritten_by_the_heal(w):
+    """Negative control (the old script never looks at the file): 'could not read it' is not 'it is empty' - the heal leaves it alone; only a
+    deliberate switch (above) replaces it."""
+    cur = blob("crypto")
+    w.default("crypto", cur)
+    w.account("crypto", cur)
+    w.decide("crypto")
+    w.cred.parent.mkdir(parents=True)
+    w.cred.write_text("{not json")
+    w.run()
+    assert w.cred.read_text() == "{not json" and w.writes() == []
+
+
+def test_a_login_done_in_the_file_is_seen_and_clears_the_alarm_with_nobody_touching_the_job(w):
+    """The 04/11 12:11 shape end to end. Breaks if a /login that landed in the FILE is invisible to the job: the item stays blank, the outage
+    stays open and the push goes on until a human also copies the login to the item by hand (which kills one of the two copies of the token)."""
+    _blank_default(w)
+    w.decide("terr")
+    _run_dead(w, 0, 180, 360, 540, 600, 660)                      # no login anywhere: the episode is told
+    assert len(_ep_pushes(w)) == 1 and len(w.mails()) == 1
+    relogin = _vouched(w, "terr", blob("terr-relogin"))
+    w.put_file(relogin)                                           # claude /login in a session of the Background: it writes the file
+    for s in (700, 1340, 2000):
+        w.run(at=w.now + s)
+    assert len(_back_pushes(w)) == 1 and len(w.mails()) == 2      # the end is told once, on both channels
+    assert "no_login" not in w.state() and w.state()["no_login_last"]["end_told"] is True
+    assert _rt(w.get(crew.DEFAULT_SERVICE)) == _rt(relogin) and w.get_file() == relogin      # the item follows the file; the file is not touched
+
+
+@pytest.mark.parametrize("fault", ["FAKE_SEC_WFAIL", "FAKE_SEC_DROP"])
+def test_an_item_write_that_fails_puts_the_file_back_so_the_two_stores_never_disagree(w, fault):
+    """Breaks if the file is left on the new account while the item (the next run's `current`) says the old one: a half switch. The file is
+    written FIRST (a local write that cannot half-fail), the item second, and a failed item puts the file back as it was."""
+    cur = blob("crypto")
+    _in_both(w, "crypto", cur)
+    w.account("crypto", cur)
+    w.account("amb", blob("amb"))
+    w.decide("amb")
+    before = w.cred.read_bytes()
+    w.mp.setenv(fault, crew.DEFAULT_SERVICE)
+    w.run()
+    assert w.cred.read_bytes() == before and _rt(w.get(crew.DEFAULT_SERVICE)) == _rt(cur)
+    assert "credentials file put back" in w.log()                 # it WAS written, and restored: not merely never touched
+    assert len([n for n in w.notified() if "write-failed" in n]) == 1 and w.state()["current"] == EMAIL["crypto"]
+    assert os.listdir(w.cred.parent) == [".credentials.json"]
+
+
+def test_a_credentials_file_that_is_a_symlink_is_refused_and_nothing_at_all_is_written(w):
+    """Breaks if the switch goes ahead when the file cannot be written safely: a switch that does not reach the file is the very bug."""
+    cur = blob("crypto")
+    w.default("crypto", cur)
+    w.account("crypto", cur)
+    w.account("amb", blob("amb"))
+    w.decide("amb")
+    other = w.d / "elsewhere.json"
+    other.write_text(json.dumps(cur))
+    w.cred.parent.mkdir(parents=True)
+    os.symlink(other, w.cred)
+    w.run()
+    assert w.writes() == [] and other.read_text() == json.dumps(cur) and w.cred.is_symlink()
+    said = [n for n in w.notified() if "write-failed" in n]
+    assert len(said) == 1 and "credentials file" in said[0] and "symlink" in said[0]
+
+
+def test_a_file_that_does_not_read_back_as_the_login_is_a_failed_write(w, monkeypatch):
+    """Breaks if 'written' is believed without looking (ga-6gat1o: write, then read back). The item is not touched and no temp file is left."""
+    cur = blob("crypto")
+    _in_both(w, "crypto", cur)
+    w.account("crypto", cur)
+    w.account("amb", blob("amb"))
+    w.decide("amb")
+    real = os.replace
+
+    def lossy(src, dst, *a, **k):
+        if str(dst).endswith(".credentials.json"):
+            return                                                # reported as done, never lands
+        return real(src, dst, *a, **k)
+    monkeypatch.setattr(os, "replace", lossy)
+    w.run()
+    assert w.writes() == [] and w.get_file() == cur and os.listdir(w.cred.parent) == [".credentials.json"]
+    assert len([n for n in w.notified() if "write-failed" in n]) == 1
+
+
+def test_dry_run_leaves_the_credentials_file_alone(w):
+    cur = blob("crypto")
+    _in_both(w, "crypto", cur)
+    w.account("crypto", cur)
+    w.account("amb", blob("amb"))
+    w.decide("amb")
+    before = w.cred.read_bytes()
+    w.run(dry=True)
+    assert w.cred.read_bytes() == before and w.writes() == [] and w.notified() == []
+
+
+def test_a_login_nobody_can_vouch_for_is_parked_before_it_is_overwritten(w):
+    """Breaks if the loser of the two stores is simply destroyed: the item holds a full login this job never wrote and the profile cannot place
+    (its token is expired), the file holds a NEWER login of another account (a /login). The file wins; the item's login is parked, whole, in an item
+    nothing reads, so a human can still get it back - 'the refresh token lives in one place', never in none."""
+    item = blob("crypto-item", rt="crypto-item")
+    w.put(crew.DEFAULT_SERVICE, item)                             # not registered with the profile: unplaceable
+    fileb = _vouched(w, "amb", blob("amb-file", rt="amb-file", rexp_days=29.5))
+    w.put_file(fileb)
+    w.decide("amb")
+    w.run()
+    assert _rt(w.get(crew.DEFAULT_SERVICE)) == _rt(fileb) and w.get_file() == fileb
+    parked = _parked(w)
+    assert len(parked) == 1 and _rt(next(iter(parked.values()))) == _rt(item)
+    for text in (w.argv_log(), w.log(), json.dumps(w.state()), "\n".join(w.notified())):
+        assert secrets_in(text, w) == []
+
+
+def test_a_park_that_fails_stops_the_overwrite(w):
+    item = blob("crypto-item", rt="crypto-item")
+    w.put(crew.DEFAULT_SERVICE, item)
+    fileb = _vouched(w, "amb", blob("amb-file", rt="amb-file", rexp_days=29.5))
+    w.put_file(fileb)
+    w.decide("amb")
+    w.mp.setenv("FAKE_SEC_WFAIL", crew.parked_service(crew.fp(_rt(item))))
+    w.run()
+    assert _rt(w.get(crew.DEFAULT_SERVICE)) == _rt(item) and _parked(w) == {}      # the only copy of that login was not touched
+    assert len([n for n in w.notified() if "write-failed" in n]) == 1
+
+
+def test_two_full_logins_that_cannot_be_compared_are_never_synchronised_blind_but_a_switch_parks_the_loser(w):
+    """The two stores hold different full logins and neither carries a refresh expiry nor differs in its access expiry: which is newer is not
+    knowable. Nothing is rewritten while the pool has nothing to move; a deliberate switch keeps the other one, parked."""
+    a = _vouched(w, "crypto", blob("crypto", rt="crypto-a", rexp_days=None))
+    b = _vouched(w, "crypto", blob("crypto-b", rt="crypto-b", rexp_days=None))
+    w.default("crypto", a)
+    w.put_file(b)
+    w.account("crypto", a)
+    w.account("amb", blob("amb"))
+    w.decide("crypto")
+    w.run()
+    assert w.writes() == [] and w.get_file() == b and _parked(w) == {}
+    w.decide("amb")
+    w.run(at=w.now + 60)
+    assert _rt(w.get_file()) == _rt(w.get(crew.DEFAULT_SERVICE)) == "sk-ant-ort01-amb-ref"
+    assert [_rt(v) for v in _parked(w).values()] == ["sk-ant-ort01-crypto-b-ref"]      # the item's login won (arbitrarily): the file's one was kept
+
+
+# ── ga-i4t0lzx: exit 12 of notify is its push cap, and the cap swallowed the alert of an outage ────────────────────────────────────────────
+def test_a_push_the_cap_of_notify_held_is_asked_again_as_a_decision_that_waits_for_athos(w):
+    """Breaks if exit 12 ends in 'not delivered, retry the same shape' for ever (04/11 13:56Z - 14:48Z: 'notify exit=12' once a retry window, the
+    outage unannounced). notify's cap (8 pushes / 60 min) holds a FORCED push; the 'decisao' route - the text says it waits for Athos - is
+    exempt from it and is not forced. The second ask carries the marker and keeps 'job falhou' (the auto-repair route)."""
+    _no_login_problem(w)
+    w.mp.setenv("FAKE_NOTIFY_CAP", "1")
+    w.run()
+    assert len(w.notified()) == 2 and w.notify_envs() == ["1/1", "1/"]
+    assert "aguardando você" not in w.notified()[0] and "aguardando você" in w.notified()[1]
+    assert "job falhou: claude-crew-account" in w.notified()[1] and "notify exit=12" in w.log()
+    w.run(at=w.now + 600)
+    assert len(w.notified()) == 2                                 # it reached somebody: not retried every five minutes
+    assert w.state()["alerts"]["no-login:" + EMAIL["amb"]] == w.now
+
+
+def test_the_forecast_of_an_expiring_login_is_not_escalated_past_the_cap(w):
+    """Negative control (the old script never escalates): a login that ends in 5 days is not a decision that waits for Athos tonight - a held
+    forecast stays held and is tried again, it does not jump the cap that exists to protect the phone."""
+    w.default("crypto", blob("crypto", rexp_days=20))
+    w.account("crypto", blob("crypto", rexp_days=20))
+    w.account("amb", blob("amb", rexp_days=5))
+    w.decide("crypto")
+    w.mp.setenv("FAKE_NOTIFY_CAP", "1")
+    w.run()
+    assert len([n for n in w.notified() if "ends in" in n]) == 1 and w.notify_envs() == ["1/1"]
+    assert "aguardando" not in "\n".join(w.notified())
+
+
+def test_an_escalated_push_that_is_also_held_is_not_told_and_the_escalation_does_not_loop(w):
+    """Breaks if the escalation is retried inside one run or recorded as told when notify held it again."""
+    _no_login_problem(w)
+    w.mp.setenv("FAKE_NOTIFY_RC", "12")
+    w.run()
+    assert len(w.notified()) == 2 and w.notify_envs() == ["1/1", "1/"]                # two asks, no third
+    w.run(at=w.now + 60)
+    assert len(w.notified()) == 2                                 # inside the retry window: nothing more
