@@ -145,7 +145,7 @@ A bead só conhecia as 3 primeiras porque o builder para na 1ª recusa. **As gua
 | `credenciais` | só 3 arquivos, modo 600 e dono `runner`; qualquer outro com chave privada/token **por conteúdo**, ou loja conhecida (`.netrc`, `.git-credentials`, `.aws`…), é achado | — |
 | `github-e-espelho` | o `scan` que o servidor já tem | `hetzner-remote-git.sh scan` |
 | `dados` | NOME · GRANDE · JWT · CONTEÚDO (telefones/CPFs) nos arquivos soltos do home e em cada diretório de topo e filho de `gt-remote/`, **exceto** `.cache`, `.local`, `.duckdb`, `.ssh` e `gt-remote/{bin,bundle,bundle-out,git,keys,venv-wa}` (a linha LIMPO repete essa lista); diretório novo é auditado | **`node_audit`** da semeadura, via `mbp-run.sh --host linux --audit-node DIR[::maxdepth=N\|::prune=a:b/c]` (os padrões de `find` vivem só lá; ganhou um argumento opcional, sem ele a semeadura é a mesma) |
-| `backup-de-bead` | `.dolt`, `.dolt-backup`, `issues.jsonl`, `beads*.jsonl`, `.beads` com algo além de lock | — |
+| `backup-de-bead` | `.dolt`, `.dolt-backup`, `issues.jsonl`, `beads*.jsonl`, qualquer `.jsonl` dentro de um `jsonl-archive/` (as peças por dia, ga-e4cbc5s), `.beads` com algo além de lock | — |
 
 **As credenciais são 3, não 2**: o login do claude (`~/.claude/.credentials.json`), a chave do atalho ssh→mini (`~/.ssh/mini_shim_ed25519`) **e a chave do espelho git** (`~/gt-remote/keys/gt_mirror`, criada na fatia 4: lê só o espelho do mini, nenhum GitHub). A bead citava 2; a 3ª é por desenho e está na lista `CRED_ALLOW` com esse motivo — se o Mayor não a quer, é tirá-la da lista e o achado aparece.
 
