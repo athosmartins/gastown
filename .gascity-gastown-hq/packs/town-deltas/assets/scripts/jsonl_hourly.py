@@ -253,7 +253,7 @@ def read_tree_sizes(path):
 
 def _join(src, it, first, names, sizes, box):
     """Bytes do documento único de uma tabela, feito das peças `names` (membros SEGUIDOS do tar, `first` já lido, o resto vem de `it`): o cabeçalho da 1ª, as linhas de todas
-    separadas por `,`, a cauda no fim. Cada peça é conferida enquanto passa (nome e tamanho contra a árvore, cabeçalho e cauda do Dolt, ao menos uma linha). No fim, `box["next"]` = o membro seguinte."""
+    separadas por `,`, a cauda no fim. Cada peça é conferida enquanto passa (nome e tamanho contra a árvore, cabeçalho e cauda do Dolt, ao menos uma linha — nenhuma só se for a única peça). No fim, `box["next"]` = o membro seguinte."""
     m = first
     for i, name in enumerate(names):
         m = m if i == 0 else next(it, None)

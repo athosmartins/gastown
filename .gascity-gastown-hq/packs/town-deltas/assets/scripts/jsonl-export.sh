@@ -285,7 +285,7 @@ PUSH_RETRY_DELAY_MIN="${GC_JSONL_PUSH_RETRY_DELAY_MIN:-1}"
 PUSH_RETRY_DELAY_SPAN="${GC_JSONL_PUSH_RETRY_DELAY_SPAN:-4}"
 SCRUB="${GC_JSONL_SCRUB:-true}"
 # ga-e4cbc5s: issues and comments are archived as one file per DAY of created_at (<db>/<table>/AAAA-MM-DD.jsonl, jsonl_split.py) and not as one document that every run rewrites and git stores whole again
-# (hq/comments.jsonl 509 MB + hq/issues.jsonl 112 MB: ~180 MB a backup). GC_JSONL_SPLIT=0 is the kill switch: the next run puts both tables back as single documents, and the flat <db>.jsonl copy.
+# (hq/comments.jsonl 509 MB + hq/issues.jsonl 112 MB: ~180 MB a backup). GC_JSONL_SPLIT=0 (anything but 1) is the kill switch: the next run puts both tables back as single documents, and the flat <db>.jsonl copy.
 JEX_SPLIT="${GC_JSONL_SPLIT:-1}"
 COMMENTS_ROWS=""
 # ga-fegzc8h: the run's time budget. The order's timeout (840 s, under the 15 m interval: there is no single-flight lock) kills the run, and the one commit sits after the LAST database, so a run that
@@ -1045,8 +1045,8 @@ prev_issue_count() {
 }
 
 # split_db_tables <db> — publishes <db>/issues.jsonl and <db>/comments.jsonl as day pieces (jsonl_split.py writes only the pieces that changed, so a backup adds a few MB to .git and not the table) and removes
-# the single document, and with the issues' the flat <db>.jsonl copy. Any doubt keeps the single document — the layout of before, which every reader still takes — and removes the pieces: a table is never in
-# both layouts and never in none. A table kept at its previous version this run has no single document here: its pieces stay as they are. Return 1 only when a leftover cannot be removed (both layouts
+# the single document, and with the issues' the flat <db>.jsonl copy. Any doubt keeps the single document — the layout of before, which every reader still takes — and removes the pieces: a table is never committed in
+# both layouts, and a split that fails never costs the table its snapshot. A table kept at its previous version this run has no single document here: its pieces stay as they are. Return 1 only when a leftover cannot be removed (both layouts
 # would be committed): the caller discards the database.
 # vazio (no document: a kept table) → nothing to do; falhou (no python3, an unreadable document, rows != the count this export took) → the single document stays and the pieces go, said on stderr
 split_db_tables() {
