@@ -1205,8 +1205,7 @@ echo "== helpers: status and edges =="
 # EQUIVALENT, documented (8ea215a12c is NOT one any more: `_gc_required_parts` failing inside _gc_trigger_decision is a case of its own, in the decision section, ga-szzbm93):
 # 35d16b9578 and 9d28f4e738 (_trg_backoff_s: `-lt` -> `-le` while s == cap doubles once more and
 # the clamp brings it back to the cap; `-gt` -> `-ge` assigns the cap to the cap); cac26e2671 and 4fbf2ea052 (the poll's clamp of a stored backoff, `-gt` -> `-ge`: at equality it assigns the same number);
-# fa54519c71 (`[ -f ] || return 1` in _trg_state_readable: for a directory the `wc -l <` below fails to read it and the same `return 1` follows; so it does for /dev/null, 0 lines. Only a path whose read never
-# finishes tells the two apart, and for the worse (a FIFO: the open() of `wc -l <` waits for a writer; /dev/zero: no end). Nothing creates one at the state path, so no case: a timed one needs an open fd, a subshell and a timer); 4f99aaeef8 (`mkdir -p ... || return 1` in
+# (fa54519c71, `[ -f ] || return 1` in _trg_state_readable, is NOT one: a FIFO at the state path tells the two apart (the open() of `wc -l <` waits for a writer, so without the guard the poll never answers) and a timed case below kills it, ga-m7uqm07); 4f99aaeef8 (`mkdir -p ... || return 1` in
 # _trg_state_write: the redirection after it fails on the same missing directory and returns 1); c76d35419c and 22ec8a2fd6 (`|| true` -> `&& true` after a status the function discards: both end in `return 0`).
 # EQUIVALENT 35d16b9578: _trg_backoff_s: `-lt` -> `-le` while s == cap doubles once more and the clamp brings it back to the cap
 # EQUIVALENT 9d28f4e738: _trg_backoff_s: `-gt` -> `-ge` assigns the cap to the cap: s and max are both canonical numbers there (max went through $(( 10#$max )) above), so at equality the TEXT is the same too (2964 base x max x n combinations, zero-padded and garbled ones included: identical output)
@@ -1224,6 +1223,22 @@ _trg_set_backoff release 3 30 && _trg_set_backoff direct 4 40; _trg_set_backoff 
 [ "$_rc" = 1 ] && [ "$_TRG_ATT/$_TRG_NEXT/$_TRG_DATT/$_TRG_DNEXT" = "3/30/4/40" ] && ok "set_backoff: release and direct each set their own pair; any other kind is refused (1) and touches nothing" || bad "set_backoff: rc=$_rc pairs=$_TRG_ATT/$_TRG_NEXT/$_TRG_DATT/$_TRG_DNEXT"
 mkdir -p "$_t/adir"; _trg_state_readable "$_t/adir"; _rc=$?
 [ "$_rc" = 1 ] && ok "state_readable: a directory where the record should be is not a record (1)" || bad "state_readable on a directory: rc=$_rc"
+# ga-m7uqm07: a FIFO where the record should be. `[ -f ] || return 1` is what answers 1 at once: without it the `wc -l <` below opens the FIFO and waits for a writer that never comes, so the poll would hang
+# instead of saying "unreadable". The answer is read from a file with a 3 s bound (a hang is a FAIL, not a stuck selftest); a writer is then opened and closed so a hung reader ends by itself and leaves no process behind.
+# vazio → o FIFO sem escritor nao e "sem historico": e ilegivel (1); falhou/ilegivel (mkfifo ausente) → o caso e pulado e dito, nunca contado como verde
+if mkfifo "$_t/afifo" 2>/dev/null; then
+  rm -f "$_t/fifo.rc"
+  ( _trg_state_readable "$_t/afifo"; echo "$?" > "$_t/fifo.rc" ) 2>/dev/null &
+  _fp=$!; _w=0
+  while [ ! -s "$_t/fifo.rc" ] && [ "$_w" -lt 30 ]; do sleep 0.1; _w=$((_w+1)); done
+  _fifo_rc="$(cat "$_t/fifo.rc" 2>/dev/null)"
+  exec 9<>"$_t/afifo"; sleep 0.3; exec 9>&-
+  wait "$_fp" 2>/dev/null
+  [ "$_fifo_rc" = 1 ] && ok "state_readable: a FIFO where the record should be answers 1 at once (it does not wait for a writer)" || bad "state_readable on a FIFO: answer='${_fifo_rc:-none in 3 s}' (a hang reads as none)"
+  unset _fp _w _fifo_rc
+else
+  echo "  SKIP: state_readable on a FIFO: mkfifo unavailable here (case not run)"
+fi
 : > "$_t/afile"; _trg_state_write "$_t/afile/sub/state" 1 d 0 0 0 0 2>/dev/null; _rc=$?
 [ "$_rc" = 1 ] && ok "state_write: a directory that cannot be made fails the write (1)" || bad "state_write under a file: rc=$_rc"
 ( GC_TRIGGER_STATE="$_t/rec.state"; _TRG_ATT=1; _TRG_NEXT=2; _TRG_DATT=3; _TRG_DNEXT=4; _trg_record 100 "WAIT x" ) 2>/dev/null; _rc_ok=$?
