@@ -2,7 +2,7 @@
 """hetzner-ballast.py — o lastro do nó Hetzner: trabalho útil de baixa prioridade que ocupa a CPU que sobra e cede na hora. (ga-2hd02v.5) Python 3.9+, só biblioteca padrão.
 
 Contents
-  Para que serve · Roda ONDE · O contrato do nice · Teto de sistema por item · Um tick · Itens · Três estados · Arquivos · Uso
+  Para que serve · Roda ONDE · O contrato do nice · Teto de sistema por item · Slots elásticos · Um tick · Itens · Três estados · Arquivos · Uso
 
 PARA QUE SERVE
   Athos (20/10): "se está 100% ocupado a gente fica feliz; o que não pode é ficar menos". Mesmo com toda bead elegível indo ao nó, a fila tem buracos (madrugada de 20/10: 7 h em 0-15% de CPU).
@@ -19,6 +19,14 @@ TETO DE SISTEMA POR ITEM  (ga-kgnjkt8; runbook: "Teto de sistema por item")
   (teto-processos / teto-memoria); o fim de rodada e o stop mandam cgroup.kill, que pega também quem fez setsid. Contador ilegível ou caminho que não é o escopo DESTA rodada nunca vira 'zero estouros'
   nem alcança outro cgroup. Sem LINGER ligado para o usuário (ou sem o barramento do gerenciador de usuário) o item NÃO começa: nota sem-teto no tick, motivo no stderr. O linger é exigido mesmo com sessão
   aberta: quem pergunta o status (ssh) está DENTRO de uma sessão, e é ela que sobe o gerenciador; o tick do cron não abre sessão, então só o linger é um fato que os dois enxergam igual.
+SLOTS ELÁSTICOS  (ga-2hd02v.5.11; runbook: "Slots elásticos")
+  O governo conta núcleo NOMINAL: o item reservava 4 e a CPU ociosa do nó (30-37% de ocupação na tarde de 04/11) ficava sem uso. A coluna de núcleos do registro aceita `N-M`: o N continua sendo o que o item RESERVA do orçamento (e o
+  que o faz caber ao lado dos outros); o M é até onde ele pode subir. O governo mede a CPU ociosa REAL do tick (idle + iowait do /proc/stat), a RAM (MemAvailable) e a pressão de disco (PSI io) e escreve em runs/<rodada>/slots quantos
+  slots o motor do item pode usar AGORA (o motor relê o arquivo: hq-mutate.py --slots-file). Sobe +BALLAST_ELASTIC_STEP com >= BALLAST_ELASTIC_ROOM núcleos ociosos além da reserva, RAM que mantém MemAvailable >= o piso de partida
+  depois dos slots novos (BALLAST_SLOT_MB cada) e disco sem pressão (io full avg10 <= metade de BALLAST_IO_FULL_MAX); desce com RAM abaixo do piso de retomada + 1 GB, com io full acima do teto ou com menos de 1 núcleo ocioso (a reserva).
+  Leitura que não veio (CPU, RAM) NUNCA muda o limite; PSI que não veio só impede de SUBIR. `elastic.off` na pasta do lastro derruba ao mínimo. O teto de RSS do item sobe na mesma proporção (rss_mb x slots / N) e o do escopo é o do máximo.
+  FG LÍQUIDO: o /proc/stat põe o tempo de KERNEL de qualquer processo em `system`, que o governo lê como carga de sessão: copiar árvores e o journal do próprio lastro tiravam núcleos do orçamento. O cpu.stat do escopo de cada item diz
+  quanto foi (system_usec) e o governo tira o delta disso do fg (cpu.prev guarda a leitura anterior); sem a leitura, sem correção.
 UM TICK  (exit 0 sempre que "não consegui ler" — vira nota no registro; 3 só se não dá para gravar)
   1 lê o registro, /proc/stat, /proc/meminfo e a tabela de processos  2 dá fim aos itens que acabaram (results.jsonl); item que bateu no teto de sistema leva KILL; sobrevivente na sessão de um item que já gravou o rc (órfão) leva TERM depois
   de BALLAST_ORPHAN_GRACE_S (180 s) e a rodada fecha pelo rc do item, com `orfaos` na linha  3 sem a chave `on`: mata o que roda e sai  4 RAM: pausa (SIGSTOP),
@@ -34,10 +42,10 @@ TRÊS ESTADOS
   state.json corrompido ou de forma errada vai para <arquivo>.corrupt-<época> e recomeça; ilegível por permissão = rc 3 (inerte). A escrita da pasta é conferida ANTES de qualquer efeito.
   O que o tick não leu fica null no registro (running, registry_errors, mode), nunca [].
 ARQUIVOS  (em $BALLAST_HOME, padrão ~/gt-remote/ballast)
-  items.tsv · items/ · on (a chave: presente = ligado) · state.json · lock · ticks.jsonl · results.jsonl · runs/<rodada>/{meta.json,log,rc,final,cgroup,ceiling}
+  items.tsv · items/ · on (a chave: presente = ligado) · elastic.off (presente = slots elásticos no mínimo) · state.json · cpu.prev · lock · ticks.jsonl · results.jsonl · runs/<rodada>/{meta.json,log,rc,final,cgroup,ceiling,slots}
 STOP  rc 0 = a sessão de cada item esvaziou (TERM+CONT, KILL 3 s depois no que sobrar) · 3 = não li os processos, nada foi morto · 5 = sobrou processo vivo (`survivors`) ou a tabela ficou
   ilegível depois do TERM (`unverified`): NÃO diz que parou · outro = o stop não rodou. `cgroup_unverified` (rc 0): rodadas com teto cujo cgroup.kill não deu para confirmar (quem fez setsid pode ter sobrado).
-USO  hetzner-ballast.py tick | status [--json] | stop      env: BALLAST_HOME BALLAST_PROC BALLAST_NOW BALLAST_ITEMS BALLAST_ITEMS_DIR BALLAST_LAUNCH_PREFIX (JSON, com `nice`; BALLAST_TEST=1 só no selftest) BALLAST_CEILING (systemd; off só no selftest) BALLAST_TASKS_MAX BALLAST_MEM_FACTOR BALLAST_RUNTIME_DIR BALLAST_LINGER_DIR BALLAST_CGROUP_ROOT e os limites BALLAST_* de load_config
+USO  hetzner-ballast.py tick | status [--json] | stop      env: BALLAST_HOME BALLAST_PROC BALLAST_NOW BALLAST_ITEMS BALLAST_ITEMS_DIR BALLAST_LAUNCH_PREFIX (JSON, com `nice`; BALLAST_TEST=1 só no selftest) BALLAST_CEILING (systemd; off só no selftest) BALLAST_TASKS_MAX BALLAST_MEM_FACTOR BALLAST_RUNTIME_DIR BALLAST_LINGER_DIR BALLAST_CGROUP_ROOT BALLAST_SLOT_MB BALLAST_IO_FULL_MAX BALLAST_ELASTIC_STEP BALLAST_ELASTIC_ROOM BALLAST_PARTIAL_COOLDOWN_S BALLAST_PARTIAL_MIN_S e os limites BALLAST_* de load_config
 """
 import fcntl
 import json
@@ -119,6 +127,9 @@ def load_config(env):
         pause_kill_ticks=_num(env, "BALLAST_PAUSE_KILL_TICKS", 5, int, 1), term_grace_s=_num(env, "BALLAST_TERM_GRACE_S", 20, int, 1),
         deadline_slack_s=_num(env, "BALLAST_DEADLINE_SLACK_S", 60, int, 0), fail_cooldown_s=_num(env, "BALLAST_FAIL_COOLDOWN_S", 600, int, 0),
         keep_runs=_num(env, "BALLAST_KEEP_RUNS", 30, int, 0), orphan_grace_s=_num(env, "BALLAST_ORPHAN_GRACE_S", 180, int, 0),
+        slot_mb=_num(env, "BALLAST_SLOT_MB", 512, int, 1), io_full_max=_num(env, "BALLAST_IO_FULL_MAX", 25.0, float, 0.0),
+        elastic_step=_num(env, "BALLAST_ELASTIC_STEP", 2, int, 1), elastic_room=_num(env, "BALLAST_ELASTIC_ROOM", 2.0, float, 0.0),
+        partial_cooldown_s=_num(env, "BALLAST_PARTIAL_COOLDOWN_S", 30, int, 0), partial_min_s=_num(env, "BALLAST_PARTIAL_MIN_S", 600, int, 0),
         launch_prefix=_prefix(prefix, env.get("BALLAST_TEST") == "1"))
 
 
@@ -158,6 +169,24 @@ def read_mem_avail_mb(root):
             except (ValueError, IndexError):
                 raise Unreadable("/proc/meminfo: MemAvailable não numérico")
     raise Unreadable("/proc/meminfo: sem MemAvailable")
+
+
+def read_psi_io(root):
+    """avg10 de `some` e de `full` do pressure/io (em %): (some, full). vazio (arquivo sem as duas linhas) / falhou / ilegível (ausente: kernel sem PSI; número que não é número, NaN) → Unreadable: o disco NÃO foi lido, nunca 'calmo'"""
+    out = {}
+    for ln in read_text(os.path.join(root, "pressure", "io")).splitlines():
+        f = ln.split()
+        if f and f[0] in ("some", "full"):
+            for kv in f[1:]:
+                k, _, v = kv.partition("=")
+                if k == "avg10":
+                    try:
+                        out[f[0]] = float(v)
+                    except ValueError:
+                        raise Unreadable("pressure/io: %s avg10 não numérico" % f[0])
+    if set(out) != {"some", "full"} or not all(math.isfinite(x) for x in out.values()):
+        raise Unreadable("pressure/io: sem as linhas some e full legíveis")
+    return out["some"], out["full"]
 
 
 def scan(root, page_kb):
@@ -251,9 +280,17 @@ def parse_registry(text):
                 raise ValueError("nome repetido %r" % name)
             if role not in ROLES:
                 raise ValueError("papel %r (work|filler)" % role)
-            ncores = "auto" if cores == "auto" else int(cores)
-            if ncores != "auto" and ncores < 1:
-                raise ValueError("núcleos %r < 1" % cores)
+            cmax = None
+            if cores == "auto":
+                ncores = "auto"
+            elif "-" in cores:   # N-M: reserva N núcleos do orçamento e pode subir até M slots (slots elásticos); só item work
+                ncores, cmax = int(cores.partition("-")[0]), int(cores.partition("-")[2])
+                if not 1 <= ncores < cmax or role != "work":
+                    raise ValueError("núcleos %r: N-M pede 1 <= N < M e papel work" % cores)
+            else:
+                ncores = int(cores)
+                if ncores < 1:
+                    raise ValueError("núcleos %r < 1" % cores)
             rss_mb, tmo_s, cool_s = int(rss), int(tmo), int(cool)
             if rss_mb < 1 or tmo_s < 1 or cool_s < 0:
                 raise ValueError("rss_mb/prazo < 1 ou cooldown < 0")
@@ -263,7 +300,7 @@ def parse_registry(text):
             errors.append("linha %d: %s" % (i, e))
             continue
         seen.add(name)
-        items.append({"name": name, "role": role, "cores": ncores, "rss_mb": rss_mb, "timeout_s": tmo_s, "cooldown_s": cool_s, "requires": req, "command": cmd})
+        items.append({"name": name, "role": role, "cores": ncores, "cores_max": cmax, "rss_mb": rss_mb, "timeout_s": tmo_s, "cooldown_s": cool_s, "requires": req, "command": cmd})
     return items, errors
 
 
@@ -468,8 +505,9 @@ def ceiling_ready(cfg):
 
 
 def mem_cap_mb(cfg, item):
-    """MemoryMax do item em MB: o rss_mb do registro (que o governo já aplica por minuto) vezes o fator; o kernel é a rede de baixo para o que passa entre dois ticks."""
-    return int(math.ceil(item["rss_mb"] * cfg.mem_factor))
+    """MemoryMax do item em MB: o rss_mb do registro (que o governo já aplica por minuto) vezes o fator; o kernel é a rede de baixo para o que passa entre dois ticks. Item elástico (N-M): o rss_mb é o de N núcleos, o escopo vale o de M."""
+    scale = item["cores_max"] / float(item["cores"]) if item.get("cores_max") else 1.0
+    return int(math.ceil(item["rss_mb"] * cfg.mem_factor * scale))
 
 
 def cgroup_dir(cfg, run):
@@ -544,6 +582,84 @@ def cgroup_kill(cfg, run):
         return "unknown"
 
 
+def read_slots_file(cfg, run, lo, hi):
+    """(slots que o governo JÁ deu à rodada, se o arquivo valia). Arquivo ausente, vazio, de texto ou fora de lo..hi → (lo, False): não sei o que o motor roda, e o mínimo é o que sempre vale"""
+    # vazio/falhou/ilegível → (lo, False)
+    try:
+        with open(os.path.join(cfg.home, "runs", run, "slots"), "r", encoding="ascii") as f:
+            n = int(f.read(32).strip())
+    except (OSError, UnicodeDecodeError, ValueError):
+        return lo, False
+    return (n, True) if lo <= n <= hi else (lo, False)
+
+
+def write_slots(cfg, run, n):
+    """grava runs/<rodada>/slots por arquivo temporário + troca (o motor nunca lê a metade). False = não gravei: o limite que o motor segue é o de antes (nada quebra)"""
+    path = os.path.join(cfg.home, "runs", run, "slots")
+    tmp = "%s.tmp.%d" % (path, os.getpid())
+    try:
+        with open(tmp, "w", encoding="ascii") as f:
+            f.write("%d\n" % n)
+        os.replace(tmp, path)
+        return True
+    except OSError:
+        return False
+
+
+def read_cpu_stat_usec(path, key):
+    """o inteiro de `key` (system_usec) do cpu.stat do cgroup, ou None. vazio (sem a chave) / falhou / ilegível (arquivo ausente, sem permissão, texto) → None: não sei, nunca 0"""
+    try:
+        with open(path, "r", encoding="ascii") as f:
+            for ln in f:
+                k, _, v = ln.partition(" ")
+                if k == key and v.strip().isdigit():
+                    return int(v.strip())
+    except (OSError, UnicodeDecodeError):
+        pass
+    return None
+
+
+def read_cpu_prev(cfg):
+    """{t, runs{rodada: system_usec}} do cpu.prev (a leitura do tick anterior), ou None. Ausente/ilegível/de forma errada → None: sem baseline não há delta"""
+    try:
+        with open(os.path.join(cfg.home, "cpu.prev"), "r", encoding="utf-8") as f:
+            d = json.load(f)
+    except (OSError, ValueError, RecursionError):
+        return None
+    if not (isinstance(d, dict) and _int(d.get("t")) and isinstance(d.get("runs"), dict) and all(isinstance(k, str) and _int(v) for k, v in d["runs"].items())):
+        return None
+    return d
+
+
+def sys_cores(cfg, run):
+    """núcleos de tempo de KERNEL que os itens gastaram desde o tick anterior (o delta de system_usec do cpu.stat do escopo de cada um), ou None. O /proc/stat põe o tempo de kernel de qualquer processo em `system`, que o governo lê como carga
+    de sessão: copiar árvores e o journal do próprio lastro (cerca de 1/4 do tempo dos itens) tiravam núcleos do orçamento. Grava a leitura de agora em cpu.prev para o tick seguinte."""
+    # vazio (nenhum item roda) → 0.0; falhou/ilegível (sem cgroup do item, cpu.stat que não leio, 1ª leitura, lacuna, contador que andou para trás, nenhum item mensurável) → None: SEM correção, o fg cru (o lado que começa menos)
+    now_runs = {}
+    for r in run.values():
+        d, _ = cgroup_dir(cfg, r["run"])
+        u = read_cpu_stat_usec(os.path.join(d, "cpu.stat"), "system_usec") if d is not None else None
+        if u is not None:
+            now_runs[r["run"]] = u
+    prev = read_cpu_prev(cfg)
+    try:
+        save_json(os.path.join(cfg.home, "cpu.prev"), {"t": cfg.now, "runs": now_runs})
+    except Fail:
+        pass   # sem gravar, o tick seguinte não tem baseline e fica sem correção (o lado inerte)
+    if not run:
+        return 0.0
+    if prev is None or not 0 < cfg.now - prev["t"] <= cfg.gap_s:
+        return None
+    tot, n = 0.0, 0
+    for rn, u in now_runs.items():
+        pu = prev["runs"].get(rn)
+        if pu is None or u < pu:   # item novo, ou cgroup recriado (o contador andou para trás): não conta
+            continue
+        tot += (u - pu) / 1e6 / (cfg.now - prev["t"])
+        n += 1
+    return tot if n else None
+
+
 def read_ceiling_report(path):
     """{tasks_peak, tasks_hit, mem_peak_mb, oom_kill} do relatório que o item grava de dentro do escopo (runs/<rodada>/ceiling), ou None. Campo ilegível é null (não sei), nunca 0."""
     # vazio (arquivo vazio, ou nenhum campo legível) → None; falhou/ilegível (ausente, sem permissão, não é texto) → None; campo que não é número → null só nele
@@ -583,6 +699,8 @@ def start_item(cfg, item, cores):
         run = "%s-%d-%d" % (item["name"], cfg.now, k)
         rundir = os.path.join(cfg.home, "runs", run)
     meta = {"item": item["name"], "role": item["role"], "cores": cores, "rss_mb": item["rss_mb"], "timeout_s": item["timeout_s"], "cooldown_s": item["cooldown_s"], "start": cfg.now}
+    if item.get("cores_max"):
+        meta["cores_max"] = item["cores_max"]
     if cfg.ceiling == "systemd":
         meta["ceiling"] = {"tasks": cfg.tasks_max, "mem_mb": mem_cap_mb(cfg, item)}
     try:
@@ -593,6 +711,9 @@ def start_item(cfg, item, cores):
         raise Fail("%s: não crio a rodada (%s)" % (rundir, e))
     env = {"PATH": os.environ.get("PATH", "/usr/local/bin:/usr/bin:/bin"), "HOME": os.path.expanduser("~"), "LC_ALL": "C", "PYTHONDONTWRITEBYTECODE": "1", "BALLAST_HOME": cfg.home,
            "BALLAST_RUN_DIR": rundir, "BALLAST_CORES": str(cores), "BALLAST_ITEM": item["name"]}
+    if item.get("cores_max"):   # o item elástico recebe o máximo e já encontra o arquivo de slots no mínimo (o motor o lê ao subir; sem gravar, ele segue o --slots dele: o mesmo mínimo)
+        env["BALLAST_CORES_MAX"] = str(item["cores_max"])
+        write_slots(cfg, run, cores)
     prefix = cfg.launch_prefix if cfg.launch_prefix is not None else default_prefix()
     # oom_score_adj 1000: se o nó (sem swap) ficar sem memória, o kernel mata o lastro antes de uma sessão (subir o próprio valor não pede root); sem /proc (macOS) a linha é silenciosa
     wrapper = ["sh", "-c", WRAP, MARK + item["name"] + ":" + run] + prefix + ["timeout", "-k", "30", str(item["timeout_s"])] + argv
@@ -739,6 +860,10 @@ def finalize(cfg, st, run, rec):
         cool = cfg.fail_cooldown_s
     if why not in ("ok", "desligado", "preempt", "stop"):
         cool = max(cool, cfg.fail_cooldown_s)
+    # rodada que o item diz `parcial` (o rodízio de mutantes acabou no PRAZO e ainda há o que varrer) e que rodou tempo de verdade volta logo: a espera de 300 s era 13% do tempo do item. Rodada curta que diz parcial (infra, motor que
+    # reclamou) e rodada que falhou NÃO: o loop de rodadas que acabam em segundos custaria um pull por volta
+    if why == "ok" and _int(row["secs"]) and row["secs"] >= cfg.partial_min_s and isinstance(summ, dict) and summ.get("result") == "parcial":
+        cool = min(cool, cfg.partial_cooldown_s)
     st["cooldown"][item] = cfg.now + cool
     rec["reaped"].append({"item": item, "run": run, "rc": rc, "why": why})
 
@@ -818,6 +943,7 @@ def cpu_step(cfg, st, vec, ncpu, rec, notes):
         else:
             fg = (d[0] + d[2] + d[5] + d[6] + d[7]) / float(dt)
             rec["fg_cores"], rec["free_pct"] = round(fg * ncpu, 1), round(100.0 * (1.0 - fg), 1)
+            rec["idle_cores"], rec["bg_cores"] = round((d[3] + d[4]) / float(dt) * ncpu, 2), round(d[1] / float(dt) * ncpu, 1)   # CPU ociosa (idle + iowait; 2 casas: é ela que decide contra a reserva de 1 núcleo) e CPU do lastro (nice) deste tick, em núcleos
             if cfg.now - last["t"] > cfg.gap_s:
                 st["free_ticks"] = 0
                 notes.append("lacuna")
@@ -856,6 +982,52 @@ def ram_step(cfg, st, run, mem, rec):
     if not run:
         st["paused"], st["paused_ticks"] = False, 0
     rec["paused"] = st["paused"]
+
+
+def elastic_decide(cfg, st, cur, lo, hi, mem, ok, room, io):
+    """(slots desejados, motivo) de UM item elástico. mem MB (ou None), ok = a leitura da CPU valeu, room = núcleos ociosos além da reserva (ou None), io = io full avg10 (ou None)."""
+    # vazio/falhou/ilegível: CPU ou RAM que não vieram → o limite FICA ("leitura"); o PSI que não veio só impede de SUBIR (nem sobe nem desce por disco); nada disso vira 'tudo livre' nem 'tudo cheio'
+    if mem is None or not ok or room is None:
+        return cur, "leitura"
+    if mem < cfg.ram_resume_mb + 1024:   # abaixo do piso de retomada + 1 GB: devolve RAM ANTES de o governo pausar tudo (e, em último caso, matar o maior item)
+        return max(lo, cur - cfg.elastic_step), "ram"
+    if io is not None and io > cfg.io_full_max:
+        return max(lo, cur - 1), "disco"
+    if room < 0:   # menos de 1 núcleo ocioso (a reserva): o lastro compete consigo mesmo e os itens de reserva dividem o que sobra
+        return max(lo, cur - 1), "cpu"
+    if st["paused"] or io is None or io > cfg.io_full_max / 2.0 or room < cfg.elastic_room:
+        return cur, "fica"
+    if cur >= hi:
+        return cur, "max"
+    k = min(cfg.elastic_step, hi - cur, int((mem - cfg.ram_start_mb) // cfg.slot_mb))
+    return (cur + k, "up") if k >= 1 else (cur, "sem-ram")
+
+
+def elastic_step(cfg, st, run, rec, mem, ok):
+    """escreve o slots-file de cada item elástico que roda. A CPU ociosa vem do tick (rec), a pressão de disco do PSI (lida só se há item elástico)."""
+    # vazio (nenhum item elástico roda) → nada; falhou/ilegível (meta sem núcleos, arquivo de slots que não grava) → o que o motor segue continua o de antes
+    todo = [(r, read_meta(cfg, r["run"]) or {}) for r in run.values()]
+    todo = [(r, m) for r, m in todo if _int(m.get("cores")) and _int(m.get("cores_max")) and 1 <= m["cores"] < m["cores_max"]]
+    if not todo:
+        return
+    io = None
+    try:
+        io = read_psi_io(cfg.proc)[1]
+    except Unreadable as e:
+        print("hetzner-ballast: %s" % e, file=sys.stderr)
+    rec["io_full"] = io
+    idle = rec.get("idle_cores")
+    room = None if idle is None else idle - cfg.reserve
+    off = os.path.exists(os.path.join(cfg.home, "elastic.off"))
+    rec["elastic"] = []
+    for r, m in todo:
+        lo, hi = m["cores"], m["cores_max"]
+        cur, known = read_slots_file(cfg, r["run"], lo, hi)
+        want, why = (lo, "chave") if off else elastic_decide(cfg, st, cur, lo, hi, mem, ok, room, io)
+        if want != cur or not known:
+            if not write_slots(cfg, r["run"], want):
+                want, why = cur, "escrita-falhou"
+        rec["elastic"].append({"item": r["item"], "run": r["run"], "from": cur, "to": want, "why": why})
 
 
 def do_tick(cfg):
@@ -924,6 +1096,14 @@ def do_tick(cfg):
     if vec is not None:
         free_ok = cpu_step(cfg, st, vec, ncpu, rec, notes)
     rec["free_ticks"] = st["free_ticks"]
+    # fg líquido: o tempo de kernel do próprio lastro (cpu.stat dos escopos) não é carga de sessão. Sem a leitura, o fg cru
+    fg_net = rec.get("fg_cores")
+    if fg_net is not None and procs is not None:
+        bg_sys = sys_cores(cfg, run)
+        rec["bg_sys"] = None if bg_sys is None else round(bg_sys, 1)
+        if bg_sys is not None:
+            fg_net = max(0.0, fg_net - bg_sys)
+        rec["fg_net"] = round(fg_net, 1)
     if procs is not None:
         # quem já levou TERM e segue vivo depois da graça leva KILL; prazo estourado (+ folga) leva TERM
         for r in list(run.values()):
@@ -934,6 +1114,8 @@ def do_tick(cfg):
             m = m or {}
             # vazio/ilegível (meta.json sem start, timeout_s ou rss_mb inteiros) → sem prazo e sem teto de RSS para ESTE item neste tick (com a nota acima): não mata por palpite (o `timeout -k` do lançamento ainda o limita)
             start, tmo, cap = m.get("start"), m.get("timeout_s"), m.get("rss_mb")
+            if _int(cap) and _int(m.get("cores")) and _int(m.get("cores_max")) and m["cores"] >= 1:   # item elástico: o teto de RSS acompanha os slots que o governo deu (rss_mb é o de N núcleos)
+                cap = cap * read_slots_file(cfg, r["run"], m["cores"], m["cores_max"])[0] // m["cores"]
             # teto de sistema: só lê o cgroup de quem foi lançado sob teto (meta.ceiling) e ainda não levou sinal; um estouro NÃO espera a graça do TERM (item que bateu no teto é lixo)
             breach = ceiling_hit(cfg, r["run"], notes) if (t is None and on and m.get("ceiling")) else None
             if t is not None:
@@ -959,6 +1141,8 @@ def do_tick(cfg):
                 del run[r["run"]]
         if mem is not None and on:
             ram_step(cfg, st, run, mem, rec)
+        if on:
+            elastic_step(cfg, st, run, rec, mem, free_ok)
     # vazio (nada roda) → []; falhou/ilegível (tabela de processos) → null, nunca []
     rec["running"] = sorted(r["item"] for r in run.values()) if procs is not None else None
     # começar itens: ligado, tudo lido, CPU livre por idle_ticks leituras seguidas, orçamento = núcleos livres - reserva. `work` primeiro; `filler` só com o que sobrar.
@@ -969,7 +1153,7 @@ def do_tick(cfg):
         print("hetzner-ballast: sem teto (%s): nenhum item começa" % ceil_why, file=sys.stderr)
     block = any(n.startswith(("leitura-ilegivel", "registro-ilegivel", "primeira-leitura", "lacuna", "sem-teto")) for n in notes)
     if on and procs is not None and not block and free_ok and mem is not None and not st["paused"] and st["free_ticks"] >= cfg.idle_ticks:
-        budget = int(ncpu - rec["fg_cores"] - cfg.reserve + 1e-9)
+        budget = int(ncpu - fg_net - cfg.reserve + 1e-9)
         running_names = seen_names | {k["item"] for k in rec["killed"]}
         # só `work` ocupa o orçamento do `work`; o filler que roda é o que sobrou e sai da frente (preempt) quando um work vai começar
         used0 = running_cores(cfg, {k: r for k, r in run.items() if (read_meta(cfg, r["run"]) or {}).get("role") != "filler"}, items, budget, notes)
@@ -1151,7 +1335,7 @@ def do_status(cfg):
     names = {r["item"] for r in run.values()}
     for it in items:
         ok, why = eligibility(cfg, it, st, names)
-        out["items"].append({"name": it["name"], "role": it["role"], "cores": it["cores"], "eligible": ok, "why": why})
+        out["items"].append({"name": it["name"], "role": it["role"], "cores": it["cores"], "cores_max": it.get("cores_max"), "eligible": ok, "why": why})
     return out
 
 

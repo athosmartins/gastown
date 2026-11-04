@@ -130,6 +130,15 @@ exec "$HBI_REAL_GIT" "$@"
 EOF
 chmod +x "$W/bin/git"
 export HBI_REAL_GIT="$(command -v git)" HBI_GIT_BAD="$W/git.bad"   # o git de brinquedo acima lê os dois (o caminho do git real é fixado AQUI, antes de o PATH do item pôr $W/bin na frente)
+cat > "$W/bin/df" <<'EOF'
+#!/bin/sh
+# df de brinquedo: o real, salvo com $HBI_DF_FREE (os KB livres que o `df -Pk` mostra, ou o texto que o caso quiser) — a pasta de brinquedo que faz de tmpfs não tem o espaço que o caso quer simular
+if [ "${HBI_DF_FREE:-}" = nada ]; then printf 'Filesystem 1024-blocks Used Available Capacity Mounted on\n'; exit 0; fi   # só o cabeçalho: o df que não trouxe a linha de dados
+if [ -n "${HBI_DF_FREE:-}" ]; then printf 'Filesystem 1024-blocks Used Available Capacity Mounted on\ntoy 99999999 1 %s 1%% /toy\n' "$HBI_DF_FREE"; exit 0; fi
+exec "$HBI_REAL_DF" "$@"
+EOF
+chmod +x "$W/bin/df"
+export HBI_REAL_DF="$(command -v df)"   # o df de brinquedo acima lê (HBI_DF_FREE vem de quem chama o runwam)
 cat > "$W/bin/ps" <<'EOF'
 #!/bin/sh
 # ps de brinquedo: o real, salvo na leitura de GRUPOS do hq-selftests.sh (`ps -axo pgid=`) quando $HBI_PS_MODE pede — o ps da leitura que falha de formas diferentes, uma por camada de proteção do `members`:
@@ -367,6 +376,8 @@ g_burn() {
 addengine() {  # motor e jaula de MENTIRA no main de brinquedo (o que o motor imprime e com que rc vem de FAKE_MODE; cada chamada fica em $W/engine.log)
   local s="$SRC/.gascity-gastown-hq/scripts"; mkdir -p "$s"; : > "$s/hq-sandbox-run.py"
   cat > "$s/hq-mutate.py" <<'PYE'
+# suporta: --slots-file --slots-max
+# suporta: --data-mb
 import json, os, signal, sys, time
 open(os.environ["FAKE_LOG"], "a").write(" ".join(sys.argv[1:]) + "\n")
 mode = os.environ.get("FAKE_MODE", "completo")
@@ -374,6 +385,8 @@ def out(d, rc):
     print(json.dumps(d), flush=True); sys.exit(rc)
 a = sys.argv[1:]
 if "--work" not in a or not os.path.isdir(a[a.index("--work") + 1]): out({"result": "work-ausente"}, 2)
+try: open(os.environ["FAKE_LOG"] + ".pid", "w").write(open(os.path.join(a[a.index("--work") + 1], "..", "pid")).read())   # o pid que o item gravou ao lado do --work (só há no tmpfs)
+except OSError: pass
 if mode == "completo":   # uma linha velha antes, o resumo, lixo JSON depois: vale o ÚLTIMO com `result`
     print(json.dumps({"result": "stale"})); print(json.dumps({"result": "completo", "mutants_run": 3, "survivors": [{"id": "m1", "file": "scripts/a.sh", "line": 7}]})); out({"x": 1}, 0)
 if mode == "novidade": out({"result": "sem-novidade"}, 0)
@@ -487,6 +500,10 @@ newwam() {  # newmut + hq-mutate-wa.py (cópia do motor de mentira) e jaula NÃO
   git -C "$GR/whatsapp_automation/repo.git" update-ref refs/remotes/origin/main "$(git -C "$WSRC" rev-parse HEAD)"
   mkdir -p "$T/venv/bin"; printf '#!/bin/sh\n' > "$T/venv/bin/python"; chmod +x "$T/venv/bin/python"
 }
+oldeng() {  # oldeng — o main do hq passa a ter o motor ANTIGO (sem a marca das opções --slots-file, --slots-max e --data-mb)
+  local s="$SRC/.gascity-gastown-hq/scripts"; grep -v 'suporta:' "$s/hq-mutate.py" > "$s/hq-mutate.py.novo" && mv "$s/hq-mutate.py.novo" "$s/hq-mutate.py"; cp "$s/hq-mutate.py" "$s/hq-mutate-wa.py"
+  git -C "$SRC" add -A && git -C "$SRC" commit -q -m motor-antigo && git -C "$GR/gascity/repo.git" fetch -q "$SRC" "+HEAD:refs/remotes/origin/main"
+}
 wanew() {  # wanew ARQUIVO — commit novo no main do WA (o espelho do nó avança)
   echo 'x = 2' > "$WSRC/lib/$1"; git -C "$WSRC" add -A && git -C "$WSRC" commit -q -m novo-wa && git -C "$GR/whatsapp_automation/repo.git" fetch -q "$WSRC" "+HEAD:refs/remotes/origin/main"
 }
@@ -494,7 +511,7 @@ wamain() { git -C "$WSRC" commit -q -m "$1" && git -C "$GR/whatsapp_automation/r
 hqmain() { git -C "$SRC" commit -q -m "$1" && git -C "$GR/gascity/repo.git" fetch -q "$SRC" "+HEAD:refs/remotes/origin/main"; }   # hqmain MSG — o mesmo para o main do hq
 runwam() {  # runwam [VAR=valor…] → $OUT, $RC (BALLAST_CORES=2: o padrão é 2 slots, 1 por núcleo)
   RDN=$((${RDN:-0}+1)); RD="$T/rd$N.$RDN"; mkdir -p "$RD"
-  OUT=$(env PATH="$W/bin:$PATH" HOME="$T/home" BALLAST_HOME="$BH" BALLAST_RUN_DIR="$RD" BALLAST_CORES=2 BALLAST_REMOTE_GIT="$W/rg" GT_REMOTE_GIT="$GR" BALLAST_WA_PYTHON="$T/venv/bin/python" FAKE_LOG="$W/engine.log" RG_CALLS="$W/rg.calls" "$@" bash "$ITEMS/wa-mutants.sh" 2>"$W/err"); RC=$?
+  OUT=$(env PATH="$W/bin:$PATH" HOME="$T/home" BALLAST_HOME="$BH" BALLAST_RUN_DIR="$RD" BALLAST_CORES=2 BALLAST_REMOTE_GIT="$W/rg" GT_REMOTE_GIT="$GR" BALLAST_WA_PYTHON="$T/venv/bin/python" FAKE_LOG="$W/engine.log" RG_CALLS="$W/rg.calls" WA_MUTANTS_SHM="" "$@" bash "$ITEMS/wa-mutants.sh" 2>"$W/err"); RC=$?
 }
 g_wam() {
   local tip hqtip tr idle old new R cmd rss cores prazo cdn dflt folga ln_w ln_h ln_m ws hm
@@ -513,6 +530,56 @@ g_wam() {
   check "wam: WA_MUTANTS_SLOTS=3 e WA_MUTANTS_BUDGET_S=90 valem" "1 1" "$(eng "--slots 3 ") $(eng "--budget-s 90")"
   : > "$W/engine.log"; runwam FAKE_MODE=completo BALLAST_CORES=abc
   check "wam: BALLAST_CORES que não é inteiro vale 2 (e os slots acompanham)" "1" "$(eng "--slots 2 ")"
+
+  # SLOTS EM TMPFS (ga-2hd02v.5.11): copiar a árvore do WA (9 mil arquivos, 166 MB) por mutante no ext4 era ~90% da escrita em disco do nó (56 MB/s, ~2 mil flushes/s: o journal) e os workers do wa-suite passavam 33-37% do tempo esperando-o. Os slots vão para
+  # <WA_MUTANTS_SHM>/ballast-wam-<rodada>/work (padrão /dev/shm). Qualquer dúvida (WA_MUTANTS_SHM vazio, pasta que não existe, relativa, sem escrita, sem espaço para SLOTS_MAX x 300 MB, df que não responde um número) → disco, como sempre; a pasta sai no fim e no TERM.
+  newwam; mkdir -p "$T/shm"; : > "$W/engine.log"; runwam FAKE_MODE=completo WA_MUTANTS_SHM="$T/shm"; rn=$(basename "$RD")
+  check "wam: com WA_MUTANTS_SHM o --work do motor é <shm>/ballast-wam-<rodada>/work (existia quando o motor rodou: o de brinquedo recusa --work ausente), o resumo diz work=shm e a pasta SOME no fim" "1 completo shm 0" "$(eng "--work $T/shm/ballast-wam-$rn/work ") $(sj result) $(sj work) $([ -e "$T/shm/ballast-wam-$rn" ] && echo 1 || echo 0)"
+  : > "$W/engine.log"; runwam FAKE_MODE=completo
+  check "wam: WA_MUTANTS_SHM vazio → os slots ficam no disco (--work \$RD/work) e o resumo diz work=disco" "1 disco" "$(eng "--work $RD/work ") $(sj work)"
+  : > "$W/engine.log"; runwam FAKE_MODE=completo WA_MUTANTS_SHM="$T/nao-existe"
+  check "wam: pasta de tmpfs que não existe → disco" "1 disco" "$(eng "--work $RD/work ") $(sj work)"
+  : > "$W/engine.log"; mkdir -p "$T/shm"; here=$PWD; cd "$T"; runwam FAKE_MODE=completo WA_MUTANTS_SHM=shm; cd "$here"
+  check "wam: pasta de tmpfs RELATIVA que existe no cwd (o rm -rf do fim nunca roda sobre um caminho que depende do cwd) → disco" "1 disco 0" "$(eng "--work $RD/work ") $(sj work) $(ls "$T/shm" | wc -l | tr -d ' ')"
+  : > "$W/engine.log"; runwam FAKE_MODE=completo WA_MUTANTS_SHM="$T/shm" HBI_DF_FREE=1000
+  check "wam: sem espaço (1000 KB livres; 2 slots x 300 MB não cabem) → disco, e nada é criado no tmpfs" "1 disco 0" "$(eng "--work $RD/work ") $(sj work) $(ls "$T/shm" | wc -l | tr -d ' ')"
+  : > "$W/engine.log"; runwam FAKE_MODE=completo WA_MUTANTS_SHM="$T/shm" HBI_DF_FREE=abc
+  check "wam: df que NÃO responde um número (leitura ilegível não é espaço) → disco" "1 disco 0" "$(eng "--work $RD/work ") $(sj work) $(ls "$T/shm" | wc -l | tr -d ' ')"
+  : > "$W/engine.log"; runwam FAKE_MODE=completo WA_MUTANTS_SHM="$T/shm" HBI_DF_FREE=nada
+  check "wam: df que não traz a linha de dados (vazio não é 'espaço de sobra') → disco, nada criado no tmpfs" "1 disco 0" "$(eng "--work $RD/work ") $(sj work) $(ls "$T/shm" | wc -l | tr -d ' ')"
+  : > "$W/engine.log"; runwam FAKE_MODE=completo WA_MUTANTS_SHM="$T/shm" HBI_DF_FREE=614399
+  check "wam: 1 KB abaixo do necessário (614399 de 614400 KB: 2 slots x 300 MB) → disco" "disco" "$(sj work)"
+  : > "$W/engine.log"; runwam FAKE_MODE=completo WA_MUTANTS_SHM="$T/shm" HBI_DF_FREE=614400
+  check "wam: com EXATAMENTE o espaço (614400 KB) → tmpfs, e o pid do item está gravado ao lado do --work quando o motor roda (é o que protege a pasta de uma varredura de outra rodada)" "shm 1" "$(sj work) $(grep -c -x '[0-9][0-9]*' "$W/engine.log.pid")"
+  newwam; mkdir -p "$T/shm"; nn=$((RDN + 1)); : > "$T/shm/ballast-wam-rd$N.$nn"; runwam FAKE_MODE=completo WA_MUTANTS_SHM="$T/shm"; rm -f "$T/shm/ballast-wam-rd$N.$nn"
+  check "wam: um ARQUIVO no lugar da pasta da rodada (o mkdir não cria) → disco, o item NÃO falha" "0 completo disco" "$RC $(sj result) $(sj work)"
+  newwam; mkdir -p "$T/shm" "$T/shm/ballast-wam-morta/sub" "$T/shm/ballast-wam-sempid"; : > "$T/shm/ballast-wam-morta/sub/f"; chmod 555 "$T/shm/ballast-wam-morta/sub"; mkdir "$T/shm/ballast-wam-viva" "$T/shm/outra" "$T/alvo"; : > "$T/shm/ballast-wam-arquivo"; : > "$T/alvo/fica"; : > "$T/shm/outra/fica"; ln -s "$T/alvo" "$T/shm/ballast-wam-link"
+  sh -c 'exit 0' & dead=$!; wait "$dead"; echo "$dead" > "$T/shm/ballast-wam-morta/pid"; sleep "$TOYSEC" & live=$!; echo "$live" > "$T/shm/ballast-wam-viva/pid"
+  runwam FAKE_MODE=completo WA_MUTANTS_SHM="$T/shm"; kill "$live" 2>/dev/null
+  check "wam: o começo varre o que sobrou de rodada morta no tmpfs (RAM que ninguém limpa): a pasta de pid morto e a sem pid saem; a de pid VIVO, a de outro nome e o link simbólico (e o alvo dele) ficam" "0 0 1 1 1 1 1" "$([ -e "$T/shm/ballast-wam-morta" ] && echo 1 || echo 0) $([ -e "$T/shm/ballast-wam-sempid" ] && echo 1 || echo 0) $([ -e "$T/shm/ballast-wam-viva" ] && echo 1 || echo 0) $([ -e "$T/shm/outra/fica" ] && echo 1 || echo 0) $([ -L "$T/shm/ballast-wam-link" ] && echo 1 || echo 0) $([ -e "$T/alvo/fica" ] && echo 1 || echo 0) $([ -f "$T/shm/ballast-wam-arquivo" ] && echo 1 || echo 0)"
+
+  # SLOTS ELÁSTICOS e TETO DE DADOS: o item só passa --slots-max/--slots-file e --data-mb a um motor que as conhece (a marca `suporta:` do motor de brinquedo); motor ANTIGO = o comportamento de sempre
+  newwam; : > "$W/engine.log"; runwam FAKE_MODE=completo BALLAST_CORES_MAX=6
+  check "wam: BALLAST_CORES_MAX=6 (o registro 2-6 do governo) com motor que conhece as opções → --slots 2 --slots-max 6 --slots-file \$RD/slots, o teto de dados --data-mb 3072, e o resumo diz slots 2 e slots_max 6" "1 1 1 1 2 6" "$(eng "--slots 2 ") $(eng "--slots-max 6 ") $(eng "--slots-file $RD/slots ") $(eng "--data-mb 3072") $(sj slots) $(sj slots_max)"
+  : > "$W/engine.log"; runwam FAKE_MODE=completo BALLAST_CORES_MAX=6 WA_MUTANTS_SLOTS_MAX=99
+  check "wam: WA_MUTANTS_SLOTS_MAX acima de 32 corta em 32" "1" "$(eng "--slots-max 32 ")"
+  : > "$W/engine.log"; runwam FAKE_MODE=completo BALLAST_CORES_MAX=abc
+  check "wam: BALLAST_CORES_MAX que não é inteiro → sem elasticidade (nenhuma das opções de slots)" "0 0" "$(eng "--slots-max ") $(eng "--slots-file ")"
+  : > "$W/engine.log"; runwam FAKE_MODE=completo BALLAST_CORES_MAX=1
+  check "wam: máximo menor que os slots (1 < 2) → sem elasticidade, e o resumo diz slots_max 2 (nunca abaixo dos slots)" "0 0 1 2" "$(eng "--slots-max ") $(eng "--slots-file ") $(eng "--slots 2 ") $(sj slots_max)"
+  : > "$W/engine.log"; runwam FAKE_MODE=completo WA_MUTANTS_DATA_MB=0
+  check "wam: WA_MUTANTS_DATA_MB=0 liga o teto de dados OFF (a opção não vai ao motor)" "0" "$(eng "--data-mb")"
+  : > "$W/engine.log"; runwam FAKE_MODE=completo WA_MUTANTS_DATA_MB=abc
+  check "wam: WA_MUTANTS_DATA_MB que não é inteiro volta ao padrão (3072)" "1" "$(eng "--data-mb 3072")"
+  : > "$W/engine.log"; runwam FAKE_MODE=completo WA_MUTANTS_DATA_MB=512
+  check "wam: WA_MUTANTS_DATA_MB=512 vale (o último argumento do motor: a linha acaba em --data-mb 512)" "1" "$(grep -c -e '--data-mb 512$' "$W/engine.log")"
+  # os interruptores de EMERGÊNCIA são arquivos na pasta do lastro (o governo monta o ambiente do item do zero: só BALLAST_*, as variáveis WA_MUTANTS_* não chegam ao item em produção)
+  newwam; mkdir -p "$T/shm"; : > "$BH/wa-mutants.noshm"; : > "$W/engine.log"; runwam FAKE_MODE=completo WA_MUTANTS_SHM="$T/shm"
+  check "wam: o arquivo wa-mutants.noshm na pasta do lastro devolve os slots ao disco mesmo com o tmpfs disponível (e a rodada não cria a pasta dela lá)" "1 disco 0" "$(eng "--work $RD/work ") $(sj work) $([ -e "$T/shm/ballast-wam-$(basename "$RD")" ] && echo 1 || echo 0)"
+  newwam; : > "$BH/wa-mutants.nodata"; : > "$W/engine.log"; runwam FAKE_MODE=completo BALLAST_CORES_MAX=6
+  check "wam: o arquivo wa-mutants.nodata na pasta do lastro liga o teto de dados OFF (a opção não vai ao motor) e os slots elásticos seguem" "0 1" "$(eng "--data-mb") $(eng "--slots-file $RD/slots")"
+  newwam; oldeng; : > "$W/engine.log"; runwam FAKE_MODE=completo BALLAST_CORES_MAX=6
+  check "wam: motor ANTIGO (sem as opções) → só os slots de sempre, nenhuma opção nova é passada (o item não quebra o motor que ainda não as conhece)" "1 0 0 0" "$(eng "--slots 2 ") $(eng "--slots-max ") $(eng "--slots-file ") $(eng "--data-mb")"
 
   newwam; runwam FAKE_MODE=novidade; tip=$(git -C "$GR/whatsapp_automation/repo.git" rev-parse refs/remotes/origin/main); hqtip=$(git -C "$GR/gascity/repo.git" rev-parse refs/remotes/origin/main)
   check "wam: motor sem-novidade (rc 0) → rc 0 e o marcador de ocioso guarda o PAR de pontas (WA:hq)" "0 sem-novidade $tip:$hqtip" "$RC $(sj result) $(cat "$BH/wa-mutants.idle" 2>/dev/null)"
@@ -609,19 +676,23 @@ g_wam() {
   check "wam: marcador de menos de 6 h + o pull do WA falhou → exit 3 pull-falhou (pull=falhou), motor não chamado" "3 pull-falhou falhou 0" "$RC $(sj result) $(sj pull) $(wc -l < "$W/engine.log" | tr -d ' ')"
 
   newwam; RDN=$((RDN+1)); RD="$T/rd$N.k"; mkdir -p "$RD"
-  PATH="$W/bin:$PATH" HOME="$T/home" BALLAST_HOME="$BH" BALLAST_RUN_DIR="$RD" BALLAST_CORES=2 BALLAST_REMOTE_GIT="$W/rg" GT_REMOTE_GIT="$GR" BALLAST_WA_PYTHON="$T/venv/bin/python" FAKE_LOG="$W/engine.log" RG_CALLS="$W/rg.calls" FAKE_MODE=term bash "$ITEMS/wa-mutants.sh" > "$W/killm.out" 2>&1 & kp=$!   # sem subshell: $kp é o próprio item
+  mkdir -p "$T/shm"; PATH="$W/bin:$PATH" HOME="$T/home" BALLAST_HOME="$BH" BALLAST_RUN_DIR="$RD" BALLAST_CORES=2 BALLAST_REMOTE_GIT="$W/rg" GT_REMOTE_GIT="$GR" BALLAST_WA_PYTHON="$T/venv/bin/python" FAKE_LOG="$W/engine.log" RG_CALLS="$W/rg.calls" WA_MUTANTS_SHM="$T/shm" FAKE_MODE=term bash "$ITEMS/wa-mutants.sh" > "$W/killm.out" 2>&1 & kp=$!   # sem subshell: $kp é o próprio item
   i=0; while [ "$i" -lt 100 ] && [ ! -e "$W/engine.log.up" ]; do sleep 0.2; i=$((i+1)); done
   kill -TERM "$kp" 2>/dev/null; wait "$kp" 2>/dev/null; krc=$?
   i=0; while [ "$i" -lt 100 ] && ! grep -q '^wt-rm whatsapp_automation ballast-wam' "$W/rg.calls"; do sleep 0.2; i=$((i+1)); done
   check "wam: TERM no meio → exit 143 e o marcador de ocioso não é gravado" "143 0" "$krc $([ -e "$BH/wa-mutants.idle" ] && echo 1 || echo 0)"
+  check "wam: TERM no meio → a pasta do tmpfs sai também (é RAM: ninguém mais a limpa até a rodada seguinte)" "0" "$([ -e "$T/shm/ballast-wam-$(basename "$RD")" ] && echo 1 || echo 0)"
   check "wam: TERM no meio → a árvore e a branch do WA saem DEPOIS de o motor acabar de parar (ENGINE-DONE antes do wt-rm: com a árvore fora, mutante em voo perderia a cópia)" "1 1 0" "$([ "$(grep -n '^ENGINE-DONE' "$W/rg.calls" | cut -d: -f1 | head -n 1)" -lt "$(grep -n '^wt-rm whatsapp_automation ballast-wam' "$W/rg.calls" | cut -d: -f1 | head -n 1)" ] 2>/dev/null && echo 1 || echo 0) $(grep -c '^wt-rm whatsapp_automation ballast-wam' "$W/rg.calls") $(git -C "$GR/whatsapp_automation/repo.git" branch --list 'worker/*' | wc -l | tr -d ' ')"
 
   # o registro REAL (hetzner-ballast.items.txt do repo): a linha wa-mutants
   R="$HERE/hetzner-ballast.items.txt"
   rf() { awk -F'\t' -v n="$1" -v c="$2" '$1 == n && NF == 8 { print $c }' "$R" 2>/dev/null; }   # campo c da linha n (8 colunas); vazio se a linha falta
-  cores=$(rf wa-mutants 3); rss=$(rf wa-mutants 4); prazo=$(rf wa-mutants 5); cdn=$(rf wa-mutants 6); cmd=$(rf wa-mutants 8)
-  case "$cores$rss$prazo$cdn" in ''|*[!0-9]*) cores=0 ;; esac
-  check "wam: a linha wa-mutants do registro é papel work, de 8 colunas, com núcleos FIXOS (inteiro >= 2: o auto levaria o orçamento inteiro) e o comando $cmd executável na pasta de itens" "work 1 1" "$(rf wa-mutants 2) $([ "$cores" -ge 2 ] && echo 1 || echo 0) $([ -n "$cmd" ] && [ -x "$ITEMS/$cmd" ] && echo 1 || echo 0)"
+  cspec=$(rf wa-mutants 3); rss=$(rf wa-mutants 4); prazo=$(rf wa-mutants 5); cdn=$(rf wa-mutants 6); cmd=$(rf wa-mutants 8)
+  cores=${cspec%%-*}; cmax=${cspec#*-}   # N-M (slots elásticos): N é a reserva do orçamento e M até onde sobe; sem `-` o item é fixo (M = N)
+  [ "$cmax" != "$cspec" ] || cmax=$cores
+  case "$cores$cmax$rss$prazo$cdn" in ''|*[!0-9]*) cores=0; cmax=0 ;; esac
+  check "wam: a linha wa-mutants do registro é papel work, de 8 colunas, com núcleos de RESERVA inteiros (N >= 2: o auto levaria o orçamento inteiro) e o comando $cmd executável na pasta de itens" "work 1 1" "$(rf wa-mutants 2) $([ "$cores" -ge 2 ] && echo 1 || echo 0) $([ -n "$cmd" ] && [ -x "$ITEMS/$cmd" ] && echo 1 || echo 0)"
+  check "wam: o item é ELÁSTICO ($cspec): o máximo passa da reserva e cabe no corte do item (32 slots)" "1 1" "$([ "$cmax" -gt "$cores" ] && echo 1 || echo 0) $([ "$cmax" -le 32 ] && echo 1 || echo 0)"
   check "wam: exige o hetzner-remote-git.sh (sem ele o item nem pull faz), o python do venv do WA e a ausência do vazamento medido pelo wa-suite (noflag:wa-suite.leak)" "1 1 1" "$(rf wa-mutants 7 | tr ',' '\n' | grep -c -x -F 'exec:~/gt-remote/bin/hetzner-remote-git.sh') $(rf wa-mutants 7 | tr ',' '\n' | grep -c -x -F 'exec:~/gt-remote/venv-wa/bin/python') $(rf wa-mutants 7 | tr ',' '\n' | grep -c -x -F 'noflag:wa-suite.leak')"
   dflt=$(grep -o 'WA_MUTANTS_BUDGET_S:-[0-9]*' "$ITEMS/wa-mutants.sh" 2>/dev/null | head -n 1 | grep -o '[0-9]*$')
   case "$dflt$prazo" in ''|*[!0-9]*) folga=0 ;; *) [ -n "$dflt" ] && [ "$((dflt + 1000))" -le "$prazo" ] && folga=1 || folga=0 ;; esac
@@ -749,9 +820,9 @@ wa-mutants.sh@@vale a PRIMEIRA linha JSON do motor, não a última@@for line in 
 wa-mutants.sh@@linha JSON sem result é aceita como resumo@@if isinstance(v, dict) and "result" in v:@@if True:
 wa-mutants.sh@@o resumo traz a ponta do hq no lugar da do WA@@"$erc" "${tested:0:9}" "${hqmain:0:9}"@@"$erc" "${hqmain:0:9}" "${hqmain:0:9}"
 wa-mutants.sh@@o resumo repete a ponta do WA no campo do hq@@rec.update(main=short, hq=hqshort,@@rec.update(main=short, hq=short,
-wa-mutants.sh@@a árvore de trabalho nunca é removida@@cleanup() { [ -z "$bead" ] || { "$RG" wt-rm "$RIG" "$bead" > /dev/null 2>&1; branch_rm; }; }@@cleanup() { :; }
+wa-mutants.sh@@a árvore de trabalho nunca é removida@@cleanup() { [ -z "$bead" ] || { "$RG" wt-rm "$RIG" "$bead" > /dev/null 2>&1; branch_rm; }; shm_rm; }@@cleanup() { :; }
 wa-mutants.sh@@a limpeza não roda no fim (sem o trap EXIT)@@trap cleanup EXIT@@:
-wa-mutants.sh@@a branch worker/* não sai no fim da rodada@@"$RG" wt-rm "$RIG" "$bead" > /dev/null 2>&1; branch_rm; }; }@@"$RG" wt-rm "$RIG" "$bead" > /dev/null 2>&1; }; }
+wa-mutants.sh@@a branch worker/* não sai no fim da rodada@@"$RG" wt-rm "$RIG" "$bead" > /dev/null 2>&1; branch_rm; }; shm_rm; }@@"$RG" wt-rm "$RIG" "$bead" > /dev/null 2>&1; }; shm_rm; }
 wa-mutants.sh@@a branch velha não sai antes do wt-add (a rodada testaria a ponta de outro dia)@@branch_rm
 if leftover; then@@if leftover; then
 wa-mutants.sh@@a árvore velha não sai antes do wt-add@@[ ! -e "$GR/$RIG/wt/$bead" ] || "$RG" wt-rm@@true || "$RG" wt-rm
@@ -792,9 +863,42 @@ wa-mutants.sh@@o estado vai para o run-dir (o rodízio recomeçaria do zero a ca
 wa-mutants.sh@@o tempo do motor passa do prazo do registro (volta o rc 124)@@WA_MUTANTS_BUDGET_S:-1800@@WA_MUTANTS_BUDGET_S:-3000
 wa-mutants.sh@@o passo do resumo que morre não deixa resumo nenhum@@if [ "$prc" -eq 1 ]; then summary resumo-falhou@@if false; then summary resumo-falhou
 wa-mutants.sh@@o rc do passo do resumo é perdido (sai sempre 0)@@exit "$prc"@@exit 0
-wa-mutants.sh@@a pasta de trabalho do motor não é criada@@mkdir -p "$RD/work" || {@@: || {
+wa-mutants.sh@@a pasta de trabalho do motor não é criada@@mkdir -p "$WORK" || {@@: || {
 wa-mutants.sh@@a pasta do motor não é criada@@mkdir -p "$ENGDIR" ||@@: ||
 wa-mutants.sh@@o motor é tirado do clone do WA em vez do hq@@show "$hqmain:.gascity-gastown-hq/scripts/$f"@@show "$main:.gascity-gastown-hq/scripts/$f"
+wa-mutants.sh@@o máximo que o governo escreve (BALLAST_CORES_MAX) é ignorado@@SLOTS_MAX=${WA_MUTANTS_SLOTS_MAX:-${BALLAST_CORES_MAX:-$SLOTS}}@@SLOTS_MAX=${WA_MUTANTS_SLOTS_MAX:-$SLOTS}
+wa-mutants.sh@@o máximo de slots passa de 32@@[ "$SLOTS_MAX" -le 32 ] || SLOTS_MAX=32@@[ "$SLOTS_MAX" -le 64 ] || SLOTS_MAX=64
+wa-mutants.sh@@o máximo abaixo dos slots vale (a elasticidade acabaria com o resumo mentindo o máximo)@@[ "$SLOTS_MAX" -ge "$SLOTS" ] || SLOTS_MAX=$SLOTS@@:
+wa-mutants.sh@@máximo que não é número vale (o teste numérico falha e o corte de 32 o empurra para 32)@@case "$SLOTS_MAX" in ''|*[!0-9]*) SLOTS_MAX=$SLOTS ;; esac@@:
+wa-mutants.sh@@o teto de dados padrão muda@@DATA_MB=${WA_MUTANTS_DATA_MB:-3072}@@DATA_MB=${WA_MUTANTS_DATA_MB:-4096}
+wa-mutants.sh@@teto de dados que não é número vale (o teste numérico falha e a opção some)@@case "$DATA_MB" in ''|*[!0-9]*) DATA_MB=3072 ;; esac@@:
+wa-mutants.sh@@WA_MUTANTS_SHM vazio não desliga o tmpfs (vira o padrão)@@SHM=${WA_MUTANTS_SHM-/dev/shm}@@SHM=${WA_MUTANTS_SHM:-/dev/shm}
+wa-mutants.sh@@pasta de tmpfs relativa vale (o rm -rf do fim dependeria do cwd)@@  case "$SHM" in /*) ;; *) return 1 ;; esac@@  :
+wa-mutants.sh@@df vazio vale como espaço de sobra@@  [ "$free" -ge $(( SLOTS_MAX * 300 * 1024 )) ] 2> /dev/null@@  [ "${free:-999999999}" -ge $(( SLOTS_MAX * 300 * 1024 )) ] 2> /dev/null
+wa-mutants.sh@@o espaço exigido por slot cai (300 MB viram 3 MB)@@  [ "$free" -ge $(( SLOTS_MAX * 300 * 1024 )) ] 2> /dev/null@@  [ "$free" -ge $(( SLOTS_MAX * 3 * 1024 )) ] 2> /dev/null
+wa-mutants.sh@@o espaço exigido não conta os slots (só 300 MB)@@  [ "$free" -ge $(( SLOTS_MAX * 300 * 1024 )) ] 2> /dev/null@@  [ "$free" -ge $(( 300 * 1024 )) ] 2> /dev/null
+wa-mutants.sh@@a varredura segue link simbólico (e leva o alvo dele)@@    [ -d "$d" ] && [ ! -L "$d" ] || continue@@    [ -d "$d" ] || continue
+wa-mutants.sh@@a varredura apaga o que não é pasta (arquivo comum com o nome)@@    [ -d "$d" ] && [ ! -L "$d" ] || continue@@    [ ! -L "$d" ] || continue
+wa-mutants.sh@@a varredura apaga a pasta de pid VIVO@@*) ! kill -0 "$op" 2> /dev/null || continue ;; esac@@*) ! kill -0 "$op" 2> /dev/null || : ;; esac
+wa-mutants.sh@@pasta sem pid (ou com lixo) conta como VIVA e fica para sempre@@case "$op" in ''|*[!0-9]*) ;; *) ! kill -0@@case "$op" in ''|*[!0-9]*) continue ;; *) ! kill -0
+wa-mutants.sh@@a varredura não devolve a permissão antes de apagar (subpasta sem escrita fica)@@    chmod -R u+rwX "$d" 2> /dev/null; rm -rf "$d" 2> /dev/null@@    rm -rf "$d" 2> /dev/null
+wa-mutants.sh@@a pasta do tmpfs leva o pid do shell e não o nome da rodada@@  SHMRUN="$SHM/ballast-wam-$(basename "$RD")"@@  SHMRUN="$SHM/ballast-wam-$$"
+wa-mutants.sh@@o pid do item não é gravado ao lado do --work@@  { mkdir -p "$SHMRUN/work" && echo $$ > "$SHMRUN/pid"; } 2> /dev/null@@  { mkdir -p "$SHMRUN/work"; } 2> /dev/null
+wa-mutants.sh@@pasta do tmpfs que não se cria não cai para o disco@@|| { shm_rm; SHMRUN=""; return 1; }@@|| :
+wa-mutants.sh@@o --work do tmpfs é a pasta da rodada e não a subpasta work@@if shm_usable && shm_prepare; then WORK="$SHMRUN/work"; WORKAT=shm; fi@@if shm_usable && shm_prepare; then WORK="$SHMRUN"; WORKAT=shm; fi
+wa-mutants.sh@@o resumo diz disco mesmo com o tmpfs@@if shm_usable && shm_prepare; then WORK="$SHMRUN/work"; WORKAT=shm; fi@@if shm_usable && shm_prepare; then WORK="$SHMRUN/work"; fi
+wa-mutants.sh@@o motor recebe o --work do disco com o tmpfs ligado@@sweep --tree "$TREE" --state "$STATE" --work "$WORK" --jail@@sweep --tree "$TREE" --state "$STATE" --work "$RD/work" --jail
+wa-mutants.sh@@a pasta do tmpfs não sai no fim nem no TERM@@cleanup() { [ -z "$bead" ] || { "$RG" wt-rm "$RIG" "$bead" > /dev/null 2>&1; branch_rm; }; shm_rm; }@@cleanup() { [ -z "$bead" ] || { "$RG" wt-rm "$RIG" "$bead" > /dev/null 2>&1; branch_rm; }; }
+wa-mutants.sh@@shm_rm não apaga nada@@shm_rm() { [ -z "$SHMRUN" ] || { chmod -R u+rwX "$SHMRUN" 2> /dev/null; rm -rf "$SHMRUN" 2> /dev/null; }; }@@shm_rm() { :; }
+wa-mutants.sh@@as opções de slots vão sem elasticidade (máximo igual aos slots)@@if [ "$SLOTS_MAX" -gt "$SLOTS" ] && grep -q -e '--slots-file'@@if [ "$SLOTS_MAX" -ge "$SLOTS" ] && grep -q -e '--slots-file'
+wa-mutants.sh@@as opções de slots vão a um motor que não as conhece@@grep -q -e '--slots-file' "$ENGDIR/hq-mutate.py" 2> /dev/null; then EXTRA+=(--slots-max@@true; then EXTRA+=(--slots-max
+wa-mutants.sh@@o slots-file aponta para outro arquivo@@--slots-file "$RD/slots")@@--slots-file "$RD/outro")
+wa-mutants.sh@@o teto de dados vai a um motor que não o conhece@@grep -q -e '--data-mb' "$ENGDIR/hq-mutate.py" 2> /dev/null; then EXTRA+=(--data-mb@@true; then EXTRA+=(--data-mb
+wa-mutants.sh@@o teto de dados 0 não desliga@@if [ "$DATA_MB" -gt 0 ] && grep@@if [ "$DATA_MB" -ge 0 ] && grep
+wa-mutants.sh@@as opções novas nunca chegam ao motor@@${EXTRA[@]+"${EXTRA[@]}"} > "$RD/engine.out"@@> "$RD/engine.out"
+wa-mutants.sh@@o resumo repete o slots no lugar do máximo@@slots=int(slots), slots_max=int(slots_max), work=workat@@slots=int(slots), slots_max=int(slots), work=workat
+wa-mutants.sh@@a bandeira wa-mutants.noshm não devolve os slots ao disco@@[ ! -e "$BH/wa-mutants.noshm" ] || SHM=""@@:
+wa-mutants.sh@@a bandeira wa-mutants.nodata não desliga o teto de dados@@[ ! -e "$BH/wa-mutants.nodata" ] || DATA_MB=0@@:
 MUT
   "$PY" -I - "$ITEMS" "$T/mutants.txt" "$T" > "$T/mutants.idx" <<'PYEOF'
 import os, re, shutil, sys

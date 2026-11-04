@@ -26,6 +26,17 @@ case "$CORES" in ''|*[!0-9]*|0) CORES=2 ;; esac
 SLOTS=${WA_MUTANTS_SLOTS:-$CORES}   # 1 mutante por núcleo reservado: o pytest do WA é CPU de verdade (importa o app inteiro), não fork e espera como o selftest de shell do hq-mutants
 case "$SLOTS" in ''|*[!0-9]*|0) SLOTS=$CORES ;; esac
 [ "$SLOTS" -le 16 ] || SLOTS=16
+# o registro `N-M` (ga-2hd02v.5.11) faz o governo escrever BALLAST_CORES_MAX=M e o slots-file da rodada: os slots sobem e descem entre SLOTS e SLOTS_MAX conforme a CPU, a RAM e o disco do nó (o motor segue o arquivo). Sem M, ou M <= SLOTS, os slots são fixos como sempre
+SLOTS_MAX=${WA_MUTANTS_SLOTS_MAX:-${BALLAST_CORES_MAX:-$SLOTS}}
+case "$SLOTS_MAX" in ''|*[!0-9]*) SLOTS_MAX=$SLOTS ;; esac
+[ "$SLOTS_MAX" -le 32 ] || SLOTS_MAX=32
+[ "$SLOTS_MAX" -ge "$SLOTS" ] || SLOTS_MAX=$SLOTS
+DATA_MB=${WA_MUTANTS_DATA_MB:-3072}   # teto de dados (RLIMIT_DATA) por processo de mutante: o legítimo mede até 1,2 GB de VmData (RSS 224 MB), o que aloca sem parar morre aos 3 GB em vez de derrubar a rodada. 0 desliga
+case "$DATA_MB" in ''|*[!0-9]*) DATA_MB=3072 ;; esac
+SHM=${WA_MUTANTS_SHM-/dev/shm}   # onde moram os slots: tmpfs. Vazio desliga (slots no disco)
+# interruptores de EMERGÊNCIA = arquivos na pasta do lastro (o governo monta o ambiente do item do zero, só BALLAST_*: as WA_MUTANTS_* acima valem em teste e à mão, não em produção): wa-mutants.noshm devolve os slots ao disco, wa-mutants.nodata desliga o teto de dados
+[ ! -e "$BH/wa-mutants.noshm" ] || SHM=""
+[ ! -e "$BH/wa-mutants.nodata" ] || DATA_MB=0
 BUDGET=${WA_MUTANTS_BUDGET_S:-1800}   # o prazo da linha do registro tem de passar disto em >= 1000 s: um mutante em voo leva até 900 s + 30 (o motor só olha o relógio entre mutantes)
 case "$BUDGET" in ''|*[!0-9]*) BUDGET=1800 ;; esac
 [ "$BUDGET" -ge 60 ] || BUDGET=60
@@ -34,7 +45,7 @@ GR=${GT_REMOTE_GIT:-$HOME/gt-remote/git}; RIG=${BALLAST_WA_RIG:-whatsapp_automat
 PYV=${BALLAST_WA_PYTHON:-$HOME/gt-remote/venv-wa/bin/python}
 STATE="$BH/wa-mutants.state.json"; IDLE="$BH/wa-mutants.idle"; ENGDIR="$RD/engine"
 export PATH="$HOME/.local/bin:$PATH" PYTHONDONTWRITEBYTECODE=1 GIT_AUTHOR_NAME=gt GIT_AUTHOR_EMAIL=gt@no GIT_COMMITTER_NAME=gt GIT_COMMITTER_EMAIL=gt@no
-bead=""; ep=""
+bead=""; ep=""; SHMRUN=""; WORKAT=disco
 say() { echo "wa-mutants: $*" >&2; }
 summary() {  # summary RESULTADO [chave=valor …] — a linha BALLAST-SUMMARY dos desfechos que não chegaram a rodar o motor
   python3 -I -c 'import sys, json
@@ -43,6 +54,29 @@ for kv in sys.argv[2:]:
     k, _, v = kv.partition("=")
     d[k] = v if k in ("main", "hq", "pull", "hqpull") else (int(v) if v.isdigit() else v)
 print("BALLAST-SUMMARY: " + json.dumps(d))' "$@"
+}
+# os slots em tmpfs (RAM): a pasta desta rodada sai no fim e no TERM (depois de o motor parar: o trap do TERM espera por ele). Só toca em SHMRUN, que é <SHM>/ballast-wam-<rodada> por construção
+shm_rm() { [ -z "$SHMRUN" ] || { chmod -R u+rwX "$SHMRUN" 2> /dev/null; rm -rf "$SHMRUN" 2> /dev/null; }; }
+# o tmpfs é usável? 0 = sim. Vazio (WA_MUTANTS_SHM vazio) / falhou (caminho relativo, df que não responde um NÚMERO — pasta que não existe, saída sem linha de dados, texto: o teste numérico falha —, menos de SLOTS_MAX x 300 MB livres) → 1: o disco, o lado de sempre; nunca "tem espaço" por falta de leitura.
+# Pasta sem escrita não precisa de teste à parte: o mkdir do shm_prepare falha e a rodada cai para o disco
+shm_usable() {
+  local free
+  case "$SHM" in /*) ;; *) return 1 ;; esac
+  free=$(df -Pk "$SHM" 2> /dev/null | awk 'NR == 2 { print $4 }')
+  [ "$free" -ge $(( SLOTS_MAX * 300 * 1024 )) ] 2> /dev/null
+}
+# varre o que rodada MORTA deixou no tmpfs (kill -9 não roda trap: seriam GB de RAM parados): pasta <SHM>/ballast-wam-* (nunca link simbólico) cujo pid gravado está morto, ou que não tem pid, sai; a de pid VIVO fica (uma rodada à mão ao lado da do governo).
+# Depois cria a desta rodada com o PRÓPRIO pid. Falhou em criar ou gravar → 1 e nada fica (disco)
+shm_prepare() {
+  local d op
+  for d in "$SHM"/ballast-wam-*; do
+    [ -d "$d" ] && [ ! -L "$d" ] || continue
+    op=$(cat "$d/pid" 2> /dev/null)
+    case "$op" in ''|*[!0-9]*) ;; *) ! kill -0 "$op" 2> /dev/null || continue ;; esac
+    chmod -R u+rwX "$d" 2> /dev/null; rm -rf "$d" 2> /dev/null
+  done
+  SHMRUN="$SHM/ballast-wam-$(basename "$RD")"
+  { mkdir -p "$SHMRUN/work" && echo $$ > "$SHMRUN/pid"; } 2> /dev/null || { shm_rm; SHMRUN=""; return 1; }
 }
 # o wt-rm só tira a ÁRVORE, não a branch worker/<nome>: nome fixo, a velha sai ANTES do wt-add (senão ele a reusaria, na ponta velha) e de novo no fim (a mesma conta do hq-mutants)
 branch_rm() { git -C "$GR/$RIG/repo.git" branch -D "worker/$bead" > /dev/null 2>&1; }
@@ -54,7 +88,7 @@ leftover() {
   git -C "$GR/$RIG/repo.git" rev-parse -q --verify "refs/heads/worker/$bead" > /dev/null 2>&1; [ $? -eq 1 ] || return 0
   return 1
 }
-cleanup() { [ -z "$bead" ] || { "$RG" wt-rm "$RIG" "$bead" > /dev/null 2>&1; branch_rm; }; }
+cleanup() { [ -z "$bead" ] || { "$RG" wt-rm "$RIG" "$bead" > /dev/null 2>&1; branch_rm; }; shm_rm; }
 trap cleanup EXIT
 # o TERM do governo vai ao GRUPO inteiro (o motor também o recebe); este trap só espera o motor acabar de matar os mutantes ANTES de a árvore sair, e pára o motor se o TERM veio só para cá
 trap '[ -z "$ep" ] || { kill -TERM "$ep" 2>/dev/null; wait "$ep" 2>/dev/null; }; exit 143' TERM INT
@@ -100,17 +134,23 @@ TREE="$GR/$RIG/wt/$bead"
 # a ponta que a árvore TESTA (a lida antes do wt-add só é a mesma se nenhum pull andou entre os dois). vazio/falhou (sem HEAD legível) → não sei o que seria varrido: arvore-sem-head, exit 3; a ponta lida antes não passa por testada
 tested=$(git -C "$TREE" rev-parse HEAD 2> /dev/null) || tested=""
 [ -n "$tested" ] || { say "não li o HEAD de $TREE"; summary arvore-sem-head main="${main:0:9}" hq="${hqmain:0:9}" pull=$pull hqpull=$hqpull; exit 3; }
-mkdir -p "$RD/work" || { say "não criei $RD/work"; summary sem-work main="${tested:0:9}" hq="${hqmain:0:9}" pull=$pull hqpull=$hqpull; exit 3; }
+WORK="$RD/work"
+if shm_usable && shm_prepare; then WORK="$SHMRUN/work"; WORKAT=shm; fi
+mkdir -p "$WORK" || { say "não criei $WORK"; summary sem-work main="${tested:0:9}" hq="${hqmain:0:9}" pull=$pull hqpull=$hqpull; exit 3; }
+# as opções de slots elásticos e de teto de dados são do motor NOVO: um motor antigo (o main do hq ainda sem elas) não as conhece e recusaria a linha (rc 2); o item confere a marca no texto dele e, sem ela, roda como sempre
+EXTRA=()
+if [ "$SLOTS_MAX" -gt "$SLOTS" ] && grep -q -e '--slots-file' "$ENGDIR/hq-mutate.py" 2> /dev/null; then EXTRA+=(--slots-max "$SLOTS_MAX" --slots-file "$RD/slots"); fi
+if [ "$DATA_MB" -gt 0 ] && grep -q -e '--data-mb' "$ENGDIR/hq-mutate.py" 2> /dev/null; then EXTRA+=(--data-mb "$DATA_MB"); fi
 
 t0=$(date +%s)
-python3 -I "$ENGDIR/hq-mutate-wa.py" sweep --tree "$TREE" --state "$STATE" --work "$RD/work" --jail "$ENGDIR/hq-sandbox-run.py" --python "$PYV" --slots "$SLOTS" --budget-s "$BUDGET" > "$RD/engine.out" 2> "$RD/engine.err" < /dev/null &
+python3 -I "$ENGDIR/hq-mutate-wa.py" sweep --tree "$TREE" --state "$STATE" --work "$WORK" --jail "$ENGDIR/hq-sandbox-run.py" --python "$PYV" --slots "$SLOTS" --budget-s "$BUDGET" ${EXTRA[@]+"${EXTRA[@]}"} > "$RD/engine.out" 2> "$RD/engine.err" < /dev/null &
 ep=$!
 wait "$ep"; erc=$?; ep=""
 
 # a ÚLTIMA linha JSON do motor com "result" vira o resumo (o motor já a limita a 6000 caracteres; o puxador do governo troca por null o que passa de ~8000). Sem ela o item NÃO fica mudo: motor-sem-resumo, exit 3.
-python3 -I - "$RD/engine.out" "$RD/engine.err" "$erc" "${tested:0:9}" "${hqmain:0:9}" "$pull" "$hqpull" "$SLOTS" "$BUDGET" "$IDLE" "$tested:$hqmain" "$(( $(date +%s) - t0 ))" << 'PY'
+python3 -I - "$RD/engine.out" "$RD/engine.err" "$erc" "${tested:0:9}" "${hqmain:0:9}" "$pull" "$hqpull" "$SLOTS" "$BUDGET" "$IDLE" "$tested:$hqmain" "$(( $(date +%s) - t0 ))" "$WORKAT" "$SLOTS_MAX" << 'PY'
 import json, os, sys
-out_p, err_p, erc, short, hqshort, pull, hqpull, slots, budget, idle_p, key, secs = sys.argv[1:13]
+out_p, err_p, erc, short, hqshort, pull, hqpull, slots, budget, idle_p, key, secs, workat, slots_max = sys.argv[1:15]
 erc = int(erc)
 rec = None
 try:
@@ -134,7 +174,7 @@ if rec is None:
     rc = 3
 else:
     rc = erc if erc in (0, 97, 143) else 3
-rec.update(main=short, hq=hqshort, pull=pull, hqpull=hqpull, slots=int(slots), budget_s=int(budget), engine_rc=erc, secs_item=int(secs))
+rec.update(main=short, hq=hqshort, pull=pull, hqpull=hqpull, slots=int(slots), slots_max=int(slots_max), work=workat, budget_s=int(budget), engine_rc=erc, secs_item=int(secs))
 if rec["result"] == "sem-novidade" and erc == 0:
     # tmp + troca; falhar aqui só repete uma rodada na seguinte, mas fica dito no resumo
     try:

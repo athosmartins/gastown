@@ -261,7 +261,9 @@ sr = kv.get("status_rc")
 st = js(kv.get("status", "")) if sr == "0" else None
 if isinstance(st, dict) and isinstance(st.get("items"), list):
     for it in st["items"]:
-        print("  item %-14s %-6s núcleos=%-4s %s" % (it.get("name"), it.get("role"), it.get("cores"), "elegível" if it.get("eligible") else "inerte: " + str(it.get("why"))))
+        cm = it.get("cores_max")   # item elástico (registro N-M, ga-2hd02v.5.11): mostra N-M, para quem confere o install ver o registro novo
+        nuc = "%s-%s" % (it.get("cores"), cm) if isinstance(cm, int) and not isinstance(cm, bool) else it.get("cores")
+        print("  item %-14s %-6s núcleos=%-4s %s" % (it.get("name"), it.get("role"), nuc, "elegível" if it.get("eligible") else "inerte: " + str(it.get("why"))))
     for e in st.get("registry_errors") or []:
         print("  ERRO NO REGISTRO: " + str(e))
     c = st.get("ceiling")   # teto de sistema por item (ga-kgnjkt8): pronto / NÃO pronto (estado, não leitura que falhou) / governo antigo sem a chave (nunca "pronto")

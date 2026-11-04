@@ -27,8 +27,9 @@
 #   teto (g_ceil, hermético; g_cgrp, o kernel de verdade): cada item começa num escopo systemd do usuário com TasksMax/MemoryMax (sem gerenciador de usuário NÃO começa) · o tick lê pids.events/memory.events do
 #     cgroup do item e o mata (teto-processos / teto-memoria; contador ilegível ≠ zero estouros) · o caminho do cgroup só vale se for o escopo DESTA rodada na ballast.slice · fim de rodada e stop mandam
 #     cgroup.kill (pega quem fez setsid) · os picos do item entram em results.jsonl. g_cgrp só roda onde há systemd --user (senão `skip`, que NÃO conta como passou): fork em laço e alocador, ambos LIMITADOS por construção.
-# CONTROLE NEGATIVO: cada mutante (um trecho do script trocado) TEM que reprovar a bateria. Mutante com descrição `[teto]` roda só os grupos do teto.
-# VARIÁVEIS: HB_UNDER_TEST (script a testar) · HB_PY (interpretador; padrão /usr/bin/python3) · HB_NO_MUTANTS=1 · HB_MUTANTS_ONLY=teto (só os mutantes do teto) · HB_ONLY=<grupo> (reg tick run ram reap fill off state logs launch send ceil cgrp; sem mutantes)
+#   elástico (g_elastic, ga-2hd02v.5.11): o registro `N-M` e os slots que sobem e descem pela CPU ociosa, a RAM e o PSI de disco (e a chave elastic.off) · o fg líquido do tempo de kernel do próprio lastro (cpu.stat) · o cooldown curto da rodada `parcial`.
+# CONTROLE NEGATIVO: cada mutante (um trecho do script trocado) TEM que reprovar a bateria. Mutante com descrição `[teto]` roda só os grupos do teto; com `[elastico]`, só o g_elastic.
+# VARIÁVEIS: HB_UNDER_TEST (script a testar) · HB_PY (interpretador; padrão /usr/bin/python3) · HB_NO_MUTANTS=1 · HB_MUTANTS_ONLY=teto|elastico (só os mutantes do teto, ou dos slots elásticos) · HB_ONLY=<grupo> (reg tick run ram reap fill off state logs launch send ceil cgrp elastic; sem mutantes)
 set -u
 HERE="$(cd "$(dirname "$0")" && pwd)"
 P="${HB_UNDER_TEST:-$HERE/hetzner-ballast.py}"
@@ -829,12 +830,152 @@ time.sleep(60)' 1024
   else ok 1 "cgrp: o escapee nem nasceu (esc.pid ausente ou inválido): o item es não começou?"; fi
 }
 
+# ── g_elastic ──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+# Slots ELÁSTICOS (ga-2hd02v.5.11). O governo conta núcleo NOMINAL: o wa-mutants reservava 4 e a CPU ociosa do nó ficava sem uso (tarde de 04/11: 30-37% de ocupação, 8 núcleos livres). O registro `N-M` (núcleos 4-12) mantém o N como reserva do
+# orçamento e deixa o item subir até o M: a cada tick o governo mede a CPU ociosa REAL (idle+iowait do /proc/stat), a RAM (MemAvailable) e a pressão de disco (PSI io) e escreve em runs/<rodada>/slots quantos slots o motor pode usar AGORA.
+#   sobe +BALLAST_ELASTIC_STEP (2) com >= BALLAST_ELASTIC_ROOM (2) núcleos ociosos ALÉM da reserva, RAM que deixa MemAvailable >= o piso de partida depois dos slots novos (512 MB cada) e disco sem pressão (io full avg10 <= metade do teto)
+#   desce 2 com MemAvailable abaixo do piso de retomada + 1 GB, 1 com io full avg10 > teto (25) ou com menos de 1 núcleo ocioso (a reserva); fica quando a leitura é boa mas não pede nada; leitura que não veio (CPU, RAM) NUNCA muda o limite
+#   e PSI que não veio só impede de SUBIR. elastic.off derruba ao mínimo. A conta de núcleos do orçamento (o que o item reserva para começar outros) continua sendo o N.
+# FG LÍQUIDO: o tempo de KERNEL do próprio lastro (copiar árvores, journal) cai na coluna `system` do /proc/stat, que o governo lê como carga de sessão; o cpu.stat do escopo de cada item diz quanto foi (system_usec) e o governo tira isso do fg.
+setpsi() {  # setpsi SOME10 FULL10 — o /proc/pressure/io de mentira
+  mkdir -p "$FP/pressure"; printf 'some avg10=%s avg60=0.00 avg300=0.00 total=0\nfull avg10=%s avg60=0.00 avg300=0.00 total=0\n' "$1" "$2" > "$FP/pressure/io"
+}
+el_one() {  # el_one LO HI [RSS_MB] — newhome + o item `wam` (work, LO-HI núcleos) rodando e visível no /proc de mentira (1 KB de RSS): PID e RUN. O item anota o BALLAST_CORES_MAX que recebeu em cmax
+  newhome; : > "$H/items.tsv"; printf '#!/bin/sh\necho "$BALLAST_CORES_MAX" > "$BALLAST_RUN_DIR/cmax"\nsleep 300\n' > "$H/items/wam.sh"; chmod +x "$H/items/wam.sh"; reg "wam|work|$1-$2|${3:-1024}|3600|300|-|wam.sh"
+  setpsi 1 1; seed; good 50; good 50; good 50; PID=$(started_pid); RUN=$(started_run); alive "$PID" wam "$RUN"
+}
+slots_now() { cat "$H/runs/$RUN/slots" 2> /dev/null | tr -d ' \n'; echo; }
+eltick() {  # eltick FG NICE MEM [SOME FULL] — um tick com a carga de sessões (FG%), a RAM e o PSI de disco dados; o resto da CPU é ociosa
+  setmem "$3"; setpsi "${4:-1}" "${5:-1}"; adv "$1" "$2"; bt
+}
+mkpar() {  # mkpar — os itens parcial.sh e completo.sh: imprimem o resumo e dormem
+  printf '#!/bin/sh\necho '"'"'BALLAST-SUMMARY: {"result": "parcial"}'"'"'\nsleep 300\n' > "$H/items/parcial.sh"; printf '#!/bin/sh\necho '"'"'BALLAST-SUMMARY: {"result": "completo"}'"'"'\nsleep 300\n' > "$H/items/completo.sh"; chmod +x "$H/items/parcial.sh" "$H/items/completo.sh"
+}
+par_one() {  # par_one SCRIPT RC SEGUNDOS [PASSO=60 [TICKS=3]] — newhome + o item `pa` (work, 2 núcleos, cooldown 300) acaba com rc RC depois de SEGUNDOS de relógio (resumo no log) e o tick que o encerra roda; depois TICKS leituras livres, uma a cada PASSO s
+  # (o pulo do relógio acima de 180 s abre uma lacuna que zera a conta de leituras livres). PAR_T = segundos depois do tick que encerrou a rodada em que o item RECOMEÇOU, em QUALQUER dos ticks ("-" = não recomeçou): o último tick sozinho não vê um recomeço mais cedo
+  newhome; : > "$H/items.tsv"; mkpar; reg "pa|work|2|1024|3600|300|-|$1"; seed; good 50; good 50; good 50; PID=$(started_pid); RUN=$(started_run); alive "$PID" pa "$RUN"
+  local i=0 k=1; while [ "$i" -lt 50 ] && ! grep -q 'BALLAST-SUMMARY' "$H/runs/$RUN/log" 2> /dev/null; do sleep 0.2; i=$((i+1)); done
+  gone "$PID"; echo "$2" > "$H/runs/$RUN/rc"; adv 50 0 "$3"; bt
+  PAR_T="-"; while [ "$k" -le "${5:-3}" ]; do adv 50 0 "${4:-60}"; bt; [ "$PAR_T" != "-" ] || [ "$(nstart)" = 0 ] || PAR_T=$((k * ${4:-60})); k=$((k+1)); done
+}
+g_elastic() {
+  local a b c d
+  # registro: N-M é o mínimo e o máximo; qualquer outra forma é erro visível e o item fica inerte
+  newhome; : > "$H/items.tsv"; reg 'a|work|2-6|1024|3600|300|-|sleeper.sh'; reg 'b|work|3|1024|3600|300|-|sleeper.sh'; reg 'c|work|2-2|1024|3600|300|-|sleeper.sh'; reg 'd|work|4-2|1024|3600|300|-|sleeper.sh'; reg 'e|work|0-4|1024|3600|300|-|sleeper.sh'; reg 'f|work|x-3|1024|3600|300|-|sleeper.sh'; reg 'g|work|3-|1024|3600|300|-|sleeper.sh'; reg 'h|filler|2-6|1024|3600|300|-|sleeper.sh'; bt status --json
+  check "elástico/registro: 2-6 lê (núcleos 2, máximo 6) e 3 continua fixo (máximo null); 2-2, 4-2, 0-4, x-3, 3- e um filler elástico são 6 erros visíveis (o filler não tem orçamento para elasticidade)" "2 6 3 null 6" "$(jget items.0.cores) $(jget items.0.cores_max) $(jget items.1.cores) $(jget items.1.cores_max) $(printf '%s' "$OUT" | "$PY" -I -c 'import sys,json; print(len(json.load(sys.stdin)["registry_errors"]))')"
+
+  # começo: o item recebe o máximo e começa no mínimo (o arquivo de slots já existe quando ele roda); a reserva do orçamento é o mínimo
+  el_one 2 6; waitfile "$H/runs/$RUN/cmax"
+  check "elástico/início: o item recebe BALLAST_CORES_MAX=6, o slots-file da rodada começa em 2 (o motor já o lê ao subir), a rodada conta 2 núcleos e a meta guarda o máximo 6" "6 2 2 6" "$(cat "$H/runs/$RUN/cmax") $(slots_now) $(jget started.0.cores) $("$PY" -I -c 'import json,sys; m=json.load(open(sys.argv[1])); print(m.get("cores_max"))' "$H/runs/$RUN/meta.json")"
+  newhome; : > "$H/items.tsv"; reg 'fx|work|2|1024|3600|300|-|sleeper.sh'; seed; good 50; good 50; good 50; RUN=$(started_run)
+  check "elástico/início: item de núcleos FIXOS não ganha arquivo de slots (nada muda para quem não é elástico)" "0" "$([ -e "$H/runs/$RUN/slots" ] && echo 1 || echo 0)"
+  newhome; fakesd; : > "$H/items.tsv"; reg 'wam|work|2-6|1024|3600|300|-|sleeper.sh'; seed; good 50; good 50; good 50; waitfile "$SD/call.1"
+  check "elástico/início: o teto de memória do escopo é o do máximo (1024 MB x 1,25 x 6/2 = 3840 MB): o kernel é a rede de baixo do máximo, não do mínimo" "1 0" "$(callhas MemoryMax=3840M) $(callhas MemoryMax=1280M)"
+
+  # sobe: CPU ociosa de sobra, RAM e disco folgados → +2 por tick até o máximo
+  el_one 2 6; eltick 30 0 28000; a=$(slots_now); eltick 30 0 28000; b=$(slots_now); eltick 30 0 28000; c=$(slots_now)
+  check "elástico/sobe: 70% da CPU ociosa (11,2 núcleos), RAM de 28 GB e disco calmo: +2 por tick (2 → 4 → 6) e nunca passa do máximo" "4 6 6" "$a $b $c"
+  check "elástico/sobe: o tick no máximo registra a decisão (de 6 para 6, motivo max) e o que mediu (11,2 núcleos ociosos, io full 1,0)" "wam 6 6 max 11.2 1.0" "$(jget elastic.0.item) $(jget elastic.0.from) $(jget elastic.0.to) $(jget elastic.0.why) $(jget idle_cores) $(jget io_full)"
+  el_one 2 6; eltick 30 0 28000; check "elástico/sobe: o primeiro tick registra de 2 para 4, motivo up" "up 2 4" "$(jget elastic.0.why) $(jget elastic.0.from) $(jget elastic.0.to)"
+  el_one 2 6; eltick 81 0 28000; a=$(slots_now); el_one 2 6; eltick 82 0 28000; b=$(slots_now)
+  check "elástico/sobe: a fronteira da CPU (>= 2 núcleos ociosos além da reserva de 1): 19% ociosos (3,04) sobem, 18% (2,88) ficam" "4 2" "$a $b"
+  NCPU=12; el_one 2 6; eltick 75 0 28000; a=$(slots_now); NCPU=16
+  check "elástico/sobe: a fronteira é INCLUSIVA: com exatamente 3,0 núcleos ociosos (25% de 12) sobram 2,0 além da reserva de 1 e o item sobe" "4" "$a"
+  el_one 2 6; eltick 85 0 28000; a=$(slots_now); eltick 94 0 28000; b=$(slots_now)
+  check "elástico/CPU: entre 1 e 3 núcleos ociosos (15% = 2,4) fica onde está; abaixo da reserva (6% = 0,96) um item que já está no mínimo continua no mínimo" "2 2" "$a $b"
+  el_one 2 6; eltick 30 0 28000; eltick 30 0 28000; eltick 93 0 28000; a=$(slots_now); eltick 94 0 28000; b=$(slots_now); eltick 94 0 28000; c=$(slots_now); eltick 94 0 28000; d=$(slots_now)
+  check "elástico/CPU saturada: de 6, 7% ociosos (1,12 núcleo, a reserva é 1) fica em 6; 6% (0,96) desce 1 por tick (5, 4, 3)" "6 5 4 3" "$a $b $c $d"
+
+  # RAM: sobe só enquanto MemAvailable - slots novos x 512 MB >= 14336 (o piso de partida); desce 2 abaixo de 13312 (retomada + 1 GB); entre os dois, fica
+  el_one 2 6; eltick 30 0 14948; a=$(slots_now); el_one 2 6; eltick 30 0 14847; b=$(slots_now)
+  check "elástico/RAM: a 14948 MB cabe 1 slot novo (14948 - 512 >= 14336) e não 2: sobe só 1; a 14847 MB nenhum cabe: fica" "3 2" "$a $b"
+  el_one 2 6; eltick 30 0 28000; eltick 30 0 28000; eltick 30 0 13500; a=$(slots_now); eltick 30 0 13312; b=$(slots_now); eltick 30 0 13311; c=$(slots_now); eltick 30 0 13000; d=$(slots_now)
+  check "elástico/RAM: de 6, a 13500 MB (entre o piso de descida e o de subida) fica; a 13312 (o piso, inclusive) fica; a 13311 desce 2 (4); e segue descendo 2 por tick até o mínimo (2)" "6 6 4 2" "$a $b $c $d"
+  el_one 2 6; eltick 30 0 14948; a=$(slots_now); eltick 30 0 13000; b=$(slots_now)
+  check "elástico/RAM: a descida para no mínimo registrado: de 3 slots (a 14948 MB sobe 1) com RAM baixa o passo de 2 daria 1, e o item fica em 2" "3 2" "$a $b"
+  el_one 2 6; eltick 30 0 28000; eltick 30 0 28000; eltick 30 0 9000; a=$(slots_now)
+  check "elástico/RAM: abaixo do piso de pausa o governo pausa o item (ram_step) e o elástico desce na hora, sem esperar (6 → 4)" "4" "$a"
+  el_one 2 6; EXTRA_ENV="BALLAST_RAM_PAUSE_MB=30000"; eltick 30 0 28000; a=$(slots_now); b=$(jget paused)
+  check "elástico/RAM: item parado por RAM nunca sobe, mesmo com CPU e RAM de sobra para os slots (aqui o piso de pausa foi posto acima da RAM só para parar o item): fica em 2 e o tick diz paused true" "2 true" "$a $b"
+  # disco: PSI io full avg10 acima de 25 desce 1 por tick; acima de 12,5 só impede de subir; ilegível só impede de subir (a RAM ainda manda descer)
+  el_one 2 6; eltick 30 0 28000; eltick 30 0 28000; eltick 30 0 28000 30 30; a=$(slots_now); eltick 30 0 28000 30 25; b=$(slots_now); eltick 30 0 28000 30 26; c=$(slots_now)
+  check "elástico/disco: io full 30 desce 1 (5); 25 (o teto, inclusive) fica; 26 desce de novo (4)" "5 5 4" "$a $b $c"
+  el_one 2 6; eltick 30 0 28000 13 13; a=$(slots_now); eltick 30 0 28000 13 12.5; b=$(slots_now)
+  check "elástico/disco: io full acima de metade do teto (13 > 12,5) impede de SUBIR e não desce; com 12,5 (inclusive) sobe" "2 4" "$a $b"
+  el_one 2 6; setmem 28000; rm -f "$FP/pressure/io"; adv 30 0; bt; a=$(slots_now)
+  check "elástico/disco: PSI ausente (o arquivo não existe) NÃO sobe: o disco não foi lido (e o tick segue, rc 0: a leitura que falta não derruba o governo)" "2 0" "$a $RC"
+  el_one 2 6; setmem 28000; printf 'some avg10=1.00 avg60=0.00 avg300=0.00 total=0\n' > "$FP/pressure/io"; adv 30 0; bt; a=$(slots_now); b=$RC
+  printf 'some avg10=nan avg60=0.00 avg300=0.00 total=0\nfull avg10=nan avg60=0.00 avg300=0.00 total=0\n' > "$FP/pressure/io"; adv 30 0; bt; c=$(slots_now)
+  check "elástico/disco: PSI só com a linha some (sem full) ou com NaN não foi lido: NÃO sobe e o tick segue (rc 0); nunca 'full 0' nem 'calmo'" "2 0 2 0" "$a $b $c $RC"
+  el_one 2 8; eltick 30 0 28000; eltick 30 0 28000; printf 'lixo\n' > "$FP/pressure/io"; setmem 28000; adv 30 0; bt; a=$(slots_now); setmem 13000; adv 30 0; bt; b=$(slots_now)
+  check "elástico/disco: PSI que não é número (lixo) não sobe nem desce (6) e a RAM baixa ainda desce (4): ler só um dos dois não congela o outro" "6 4" "$a $b"
+  # leitura que não veio nunca muda o limite
+  el_one 2 8; eltick 30 0 28000; eltick 30 0 28000; adv 30 0 300; setmem 28000; setpsi 1 1; bt; a=$(slots_now)
+  check "elástico/leitura: lacuna entre leituras da CPU (5 min sem tick) → a medida não vale e o limite fica em 6 (sem subir nem descer)" "6" "$a"
+  el_one 2 8; eltick 30 0 28000; eltick 30 0 28000; rm -f "$FP/meminfo"; setpsi 1 1; adv 30 0; bt; a=$(slots_now)
+  check "elástico/leitura: meminfo ilegível → o limite fica (nunca 'RAM livre' nem 'RAM baixa')" "6" "$a"
+  # chave de emergência
+  el_one 2 6; eltick 30 0 28000; eltick 30 0 28000; : > "$H/elastic.off"; eltick 30 0 28000; a=$(slots_now); eltick 30 0 28000; b=$(slots_now); rm -f "$H/elastic.off"; eltick 30 0 28000; c=$(slots_now)
+  check "elástico/chave: com elastic.off o item volta ao mínimo de uma vez (6 → 2) e fica; sem o arquivo ele volta a subir" "2 2 4" "$a $b $c"
+  # estado do arquivo de slots: ilegível vale o MÍNIMO (não sei o que o motor roda), e é reescrito
+  el_one 2 6; printf 'abc\n' > "$H/runs/$RUN/slots"; eltick 30 0 28000; a=$(slots_now); rm -f "$H/runs/$RUN/slots"; eltick 30 0 28000; b=$(slots_now)
+  check "elástico/arquivo: slots-file com lixo, ou apagado, vale o mínimo e o governo o reescreve (2 → 4)" "4 4" "$a $b"
+  el_one 2 6; printf '99\n' > "$H/runs/$RUN/slots"; eltick 30 0 28000; a=$(slots_now); printf '1\n' > "$H/runs/$RUN/slots"; eltick 30 0 28000; b=$(slots_now)
+  check "elástico/arquivo: número fora de 2..6 (99 acima do máximo, 1 abaixo do mínimo) também não vale: conta como o mínimo e sobe a 4, nunca para 99 nem 3" "4 4" "$a $b"
+  el_one 2 6; printf 'abc\n' > "$H/runs/$RUN/slots"; eltick 85 0 28000; a=$(slots_now)
+  check "elástico/arquivo: slots-file com lixo é reescrito mesmo quando a decisão é ficar no mínimo (15% ociosos): o motor não pode ficar lendo 'abc'" "2" "$a"
+  # teto de RSS proporcional: com 6 slots o item tem 3x o teto de RSS do mínimo
+  el_one 2 6 100; eltick 30 0 28000; eltick 30 0 28000; alive "$PID" wam "$RUN" 250000; eltick 30 0 28000; a=$(nkilled)
+  check "elástico/RSS: com 6 slots o teto de RSS é 3x (300 MB): um item de 244 MB NÃO é terminado" "0" "$a"
+  : > "$H/elastic.off"; eltick 30 0 28000; eltick 30 0 28000; b=$(nkilled)
+  check "elástico/RSS: ...e quando volta ao mínimo o teto também (100 MB): o mesmo item passa dele e é terminado por rss" "1 rss" "$b $(jget killed.0.why)"
+  # as opções do ambiente
+  el_one 2 6; EXTRA_ENV="BALLAST_ELASTIC_STEP=1"; eltick 30 0 28000; a=$(slots_now)
+  check "elástico/ambiente: BALLAST_ELASTIC_STEP=1 sobe 1 por tick" "3" "$a"
+  EXTRA_ENV="BALLAST_ELASTIC_STEP=0"; bt status --json; a=$RC; EXTRA_ENV="BALLAST_SLOT_MB=0"; bt status --json; b=$RC; EXTRA_ENV="BALLAST_IO_FULL_MAX=-1"; bt status --json; c=$RC
+  check "elástico/ambiente: passo 0, MB por slot 0 e teto de disco negativo são configuração inválida (rc 3), nunca um elástico que não anda ou que ignora o disco" "3 3 3" "$a $b $c"
+
+  # o orçamento: o tempo de KERNEL do próprio lastro não é carga de sessão. O governo lê o cpu.stat do escopo de cada item e tira o delta de system_usec do fg
+  ceil_one; reg 'big|work|4|1024|3600|300|-|sleeper.sh'
+  printf 'usage_usec 9000000\nuser_usec 4000000\nsystem_usec 1000000\n' > "$CGD/cpu.stat"; adv 50 0; bt
+  check "fg líquido: na 1ª leitura não há o que comparar (sem correção): fg 8,0 cru, orçamento 7 (16 - 8 - 1) e o item de 4 núcleos NÃO cabe ao lado do hq de 4" "[] 8.0 null" "$(jget started) $(jget fg_cores) $(jget bg_sys)"
+  printf 'usage_usec 69000000\nuser_usec 4000000\nsystem_usec 61000000\n' > "$CGD/cpu.stat"; adv 50 0; bt
+  check "fg líquido: 60 s depois o item gastou 60 s de kernel (1,0 núcleo): fg cru 8,0, líquido 7,0, orçamento 8, e o item de 4 núcleos começa" "big 1.0 7.0 8.0" "$(jget started.0.item) $(jget bg_sys) $(jget fg_net) $(jget fg_cores)"
+  ceil_one; reg 'big|work|4|1024|3600|300|-|sleeper.sh'; rm -f "$CGD/cpu.stat"; adv 50 0; bt; adv 50 0; bt
+  check "fg líquido: sem cpu.stat (não consegui ler) a correção não existe, nunca zero: orçamento cru e o item NÃO começa" "[] null" "$(jget started) $(jget bg_sys)"
+  ceil_one; reg 'big|work|4|1024|3600|300|-|sleeper.sh'; printf 'usage_usec 69000000\nsystem_usec 61000000\n' > "$CGD/cpu.stat"; adv 50 0; bt; printf 'usage_usec 9000000\nsystem_usec 1000000\n' > "$CGD/cpu.stat"; adv 50 0; bt
+  check "fg líquido: contador que anda para trás (o cgroup foi recriado) não vira correção" "[] null" "$(jget started) $(jget bg_sys)"
+  ceil_one; reg 'big|work|4|1024|3600|300|-|sleeper.sh'; printf 'usage_usec 9000000\nsystem_usec 1000000\n' > "$CGD/cpu.stat"; adv 50 0; bt; printf 'usage_usec 69000000\nsystem_usec 61000000\n' > "$CGD/cpu.stat"; adv 50 0 400; bt
+  check "fg líquido: baseline velha (400 s entre as leituras: lacuna) não corrige" "null" "$(jget bg_sys)"
+  ceil_one; reg 'big|work|4|1024|3600|300|-|sleeper.sh'; printf 'usage_usec 69000000\nsystem_usec 61000000\n' > "$CGD/cpu.stat"
+  printf '{"t": %s, "runs": {"%s": "x"}}\n' "$NOW" "$RUN" > "$H/cpu.prev"; adv 50 0; bt
+  a=$(jget bg_sys); b=$RC; printf '{"t": "%s", "runs": {"%s": 1000000}}\n' "$NOW" "$RUN" > "$H/cpu.prev"; adv 50 0; bt
+  c=$(jget bg_sys); d=$RC; printf 'lixo, nao e json {\n' > "$H/cpu.prev"; adv 50 0; bt
+  check "fg líquido: cpu.prev de forma errada (o contador é texto, o carimbo é texto) ou que nem é JSON não é baseline: sem correção (null) e o tick segue (rc 0)" "null 0 null 0 null 0" "$a $b $c $d $(jget bg_sys) $RC"
+  ceil_one; reg 'big|work|4|1024|3600|300|-|sleeper.sh'; printf 'usage_usec 9000000\nsystem_usec 1000000\n' > "$CGD/cpu.stat"; adv 50 0; bt; printf 'usage_usec 9000000\nsystem_usec 900000000\n' > "$CGD/cpu.stat"; adv 50 0; bt
+  check "fg líquido: kernel de mais que a CPU toda (899 s em 60 s: leitura absurda) leva o fg a 0, nunca a negativo (o orçamento 15 deixa o item começar)" "0.0 big" "$(jget fg_net) $(jget started.0.item)"
+
+  # cooldown: a rodada que o item diz `parcial` (o rodízio acabou no prazo e ainda há o que varrer) volta logo; a que não rodou tempo de verdade, não
+  par_one parcial.sh 0 700
+  check "cooldown: rodada de 700 s que diz parcial (rc 0) volta em 180 s (a lacuna do relógio zera as 3 leituras livres que o governo pede; o cooldown de 30 s já passou, o de 300 não)" "180" "$PAR_T"
+  par_one parcial.sh 0 600 8 4
+  check "cooldown: o cooldown da rodada parcial é de 30 s (nem 0, nem os 300 s): com leituras livres a cada 8 s a rodada de 600 s (o mínimo, inclusive) recomeça no 4º tick (32 s) e não no 3º (24 s)" "32" "$PAR_T"
+  par_one parcial.sh 0 599 8 4
+  check "cooldown: 599 s é abaixo do mínimo de 600 s: espera os 300 s de sempre (nada recomeça em 32 s)" "-" "$PAR_T"
+  par_one parcial.sh 0 120
+  check "cooldown: rodada de só 120 s que diz parcial NÃO é prazo de verdade (pode ser infra): em 180 s ela não recomeça (os 300 s de sempre)" "-" "$PAR_T"
+  par_one completo.sh 0 700
+  check "cooldown: rodada de 700 s que diz completo: em 180 s não recomeça (os 300 s de sempre)" "-" "$PAR_T"
+  par_one parcial.sh 3 700
+  check "cooldown: parcial com rc 3 é FALHA (espera ao menos 600 s): em 180 s não recomeça" "-" "$PAR_T"
+}
+
 if [ -n "${HB_MUTANT:-}" ]; then
-  if [ "${HB_MUTANT_GROUPS:-}" = teto ]; then g_ceil; g_cgrp; else g_reg; g_tick; g_run; g_ram; g_reap; g_fill; g_off; g_state; g_logs; g_launch; g_send; fi
+  if [ "${HB_MUTANT_GROUPS:-}" = teto ]; then g_ceil; g_cgrp; elif [ "${HB_MUTANT_GROUPS:-}" = elastico ]; then g_elastic; else g_reg; g_tick; g_run; g_ram; g_reap; g_fill; g_off; g_state; g_logs; g_launch; g_send; fi
   echo "RESULT $fails/$n"; [ "$fails" = 0 ]; exit $?
 fi
 if [ -n "${HB_ONLY:-}" ]; then "g_$HB_ONLY"; echo "── $((n - fails))/$n ok (só g_$HB_ONLY)"; [ "$fails" = 0 ]; exit $?; fi
-g_reg; g_tick; g_run; g_ram; g_reap; g_fill; g_off; g_state; g_logs; g_launch; g_send; g_ceil; g_cgrp
+g_reg; g_tick; g_run; g_ram; g_reap; g_fill; g_off; g_state; g_logs; g_launch; g_send; g_ceil; g_cgrp; g_elastic
 
 [ -n "${HB_NO_MUTANTS:-}" ] || {
   echo "── controle negativo: cada mutante tem que reprovar a bateria ──"
@@ -844,7 +985,7 @@ carga conta o tempo em nice (o lastro viraria carga)@@fg = (d[0] + d[2] + d[5] +
 15% exatos deixa de contar como livre (> no lugar de >=)@@rec["free_pct"] >= cfg.idle_min_pct else 0@@rec["free_pct"] > cfg.idle_min_pct else 0
 leitura abaixo de 15% não zera a conta@@st["free_ticks"] = st["free_ticks"] + 1 if rec["free_pct"] >= cfg.idle_min_pct else 0@@st["free_ticks"] = st["free_ticks"] + 1
 começa na 1ª leitura livre (sem histerese)@@st["free_ticks"] >= cfg.idle_ticks:@@st["free_ticks"] >= 1:
-orçamento sem a reserva de núcleos@@budget = int(ncpu - rec["fg_cores"] - cfg.reserve + 1e-9)@@budget = int(ncpu - rec["fg_cores"] + 1e-9)
+orçamento sem a reserva de núcleos@@budget = int(ncpu - fg_net - cfg.reserve + 1e-9)@@budget = int(ncpu - fg_net + 1e-9)
 item de N núcleos cabe mesmo estourando o orçamento (> vira >=... trocado por nunca)@@if not ok or cores < 1 or used + cores > budget:@@if not ok or cores < 1:
 auto leva o orçamento inteiro, sem descontar o que já roda@@cores = it["cores"] if it["cores"] != "auto" else budget - used@@cores = it["cores"] if it["cores"] != "auto" else budget
 teto de itens ignorado@@if len(run) + len(rec["started"]) >= cfg.max_items:@@if False:
@@ -1007,7 +1148,7 @@ a linha da rodada não diz que houve órfãos@@        row["orfaos"] = True@@   
 [teto] o systemd-run não leva MemoryMax@@"-p", "MemoryMax=%dM" % mem_cap_mb(cfg, item),@@
 [teto] o systemd-run não leva MemorySwapMax=0@@"-p", "MemorySwapMax=0",@@
 [teto] OOMPolicy=kill mata o item inteiro e leva o rc e os picos junto@@"-p", "OOMPolicy=continue"@@"-p", "OOMPolicy=kill"
-[teto] o MemoryMax ignora o fator (rss_mb cru)@@    return int(math.ceil(item["rss_mb"] * cfg.mem_factor))@@    return int(item["rss_mb"])
+[teto] o MemoryMax ignora o fator (rss_mb cru)@@    return int(math.ceil(item["rss_mb"] * cfg.mem_factor * scale))@@    return int(item["rss_mb"])
 [teto] o escopo não é --collect (escopo morto por OOM fica como unidade failed)@@"--quiet", "--collect",@@"--quiet",
 [teto] a unidade não leva o nome da rodada@@"--unit=ballast-" + run@@"--unit=ballast"
 [teto] o item herda o barramento do usuário (pode pedir um escopo fora do teto)@@"-u", "DBUS_SESSION_BUS_ADDRESS"] + wrapper@@] + wrapper
@@ -1054,6 +1195,90 @@ a linha da rodada não diz que houve órfãos@@        row["orfaos"] = True@@   
 [teto] caminho do cgroup ilegível conta como escopo vazio (nada a matar)@@    if d is None:
         return "unknown"@@    if d is None:
         return "gone"
+[elastico] o registro N-M aceita N >= M@@                if not 1 <= ncores < cmax or role != "work":@@                if not 1 <= ncores <= cmax or role != "work":
+[elastico] o registro N-M aceita N 0@@                if not 1 <= ncores < cmax or role != "work":@@                if not 0 <= ncores < cmax or role != "work":
+[elastico] filler elástico é aceito@@                if not 1 <= ncores < cmax or role != "work":@@                if not 1 <= ncores < cmax:
+[elastico] o escopo do item elástico tem o teto do mínimo (não escala pelo máximo)@@    scale = item["cores_max"] / float(item["cores"]) if item.get("cores_max") else 1.0@@    scale = 1.0
+[elastico] o item elástico não recebe o máximo@@        env["BALLAST_CORES_MAX"] = str(item["cores_max"])@@        env["BALLAST_CORES_MAX"] = str(cores)
+[elastico] o arquivo de slots começa em outro valor que o mínimo@@        write_slots(cfg, run, cores)@@        write_slots(cfg, run, item["cores_max"])
+[elastico] a meta não guarda o máximo@@    if item.get("cores_max"):
+        meta["cores_max"] = item["cores_max"]@@    if item.get("cores_max"):
+        pass
+[elastico] a gravação do slots-file não é atômica e perde o novo valor (grava no tmp e não troca)@@        os.replace(tmp, path)
+        return True@@        return True
+[elastico] a leitura ruim (CPU/RAM/ilegível) vale como 'tudo livre' e o limite sobe@@    if mem is None or not ok or room is None:
+        return cur, "leitura"@@    if mem is None or not ok or room is None:
+        room, mem = 99.0, 99999
+[elastico] RAM baixa não devolve slots@@    if mem < cfg.ram_resume_mb + 1024:@@    if False:
+[elastico] o piso de descida por RAM é o de retomada (sem o 1 GB de margem)@@    if mem < cfg.ram_resume_mb + 1024:@@    if mem < cfg.ram_resume_mb:
+[elastico] RAM baixa desce 1 em vez do passo@@        return max(lo, cur - cfg.elastic_step), "ram"@@        return max(lo, cur - 1), "ram"
+[elastico] RAM baixa desce abaixo do mínimo@@        return max(lo, cur - cfg.elastic_step), "ram"@@        return cur - cfg.elastic_step, "ram"
+[elastico] a pressão de disco acima do teto não desce@@    if io is not None and io > cfg.io_full_max:@@    if False:
+[elastico] o teto de disco é inclusivo (25 desce)@@    if io is not None and io > cfg.io_full_max:@@    if io is not None and io >= cfg.io_full_max:
+[elastico] CPU saturada (menos de 1 núcleo ocioso) não desce@@    if room < 0:@@    if False:
+[elastico] CPU saturada desce o passo todo e não 1@@        return max(lo, cur - 1), "cpu"@@        return max(lo, cur - cfg.elastic_step), "cpu"
+[elastico] sobe mesmo sem folga de CPU (a fronteira de 2 núcleos além da reserva some)@@ or room < cfg.elastic_room:@@ or room < 0:
+[elastico] a fronteira da CPU é exclusiva (>= vira >)@@ or room < cfg.elastic_room:@@ or room <= cfg.elastic_room:
+[elastico] sobe com PSI que não veio (disco 'calmo' por falta de leitura)@@    if st["paused"] or io is None or io > cfg.io_full_max / 2.0 or room < cfg.elastic_room:@@    if st["paused"] or (io or 0.0) > cfg.io_full_max / 2.0 or room < cfg.elastic_room:
+[elastico] sobe com o disco sob pressão moderada (acima de metade do teto)@@ or io > cfg.io_full_max / 2.0 or@@ or io > cfg.io_full_max or
+[elastico] a metade do teto de disco é exclusiva (12,5 não sobe)@@ or io > cfg.io_full_max / 2.0 or@@ or io >= cfg.io_full_max / 2.0 or
+[elastico] sobe com o item pausado por RAM@@    if st["paused"] or io is None@@    if io is None
+[elastico] sobe sem limite no máximo@@    if cur >= hi:
+        return cur, "max"@@    if False:
+        return cur, "max"
+[elastico] sobe sem olhar a RAM que sobra (sem os 512 MB por slot)@@    k = min(cfg.elastic_step, hi - cur, int((mem - cfg.ram_start_mb) // cfg.slot_mb))@@    k = min(cfg.elastic_step, hi - cur)
+[elastico] sobe 1 só em vez do passo@@    k = min(cfg.elastic_step, hi - cur, int((mem - cfg.ram_start_mb) // cfg.slot_mb))@@    k = min(1, hi - cur, int((mem - cfg.ram_start_mb) // cfg.slot_mb))
+[elastico] a chave elastic.off não faz nada@@    off = os.path.exists(os.path.join(cfg.home, "elastic.off"))@@    off = False
+[elastico] a chave elastic.off derruba só 1 e não ao mínimo@@        want, why = (lo, "chave") if off else@@        want, why = (max(lo, cur - 1), "chave") if off else
+[elastico] arquivo de slots ilegível vale o máximo (e não o mínimo)@@        return lo, False
+    return (n, True) if lo <= n <= hi else (lo, False)@@        return hi, False
+    return (n, True) if lo <= n <= hi else (lo, False)
+[elastico] arquivo de slots fora de lo..hi vale como está@@    return (n, True) if lo <= n <= hi else (lo, False)@@    return (n, True)
+[elastico] o arquivo de slots ilegível não é reescrito@@        if want != cur or not known:@@        if want != cur:
+[elastico] o teto de RSS não acompanha os slots@@                cap = cap * read_slots_file(cfg, r["run"], m["cores"], m["cores_max"])[0] // m["cores"]@@                cap = cap
+[elastico] o teto de RSS escala pelo máximo e não pelos slots dados@@                cap = cap * read_slots_file(cfg, r["run"], m["cores"], m["cores_max"])[0] // m["cores"]@@                cap = cap * m["cores_max"] // m["cores"]
+[elastico] a leitura do PSI aceita só a linha some (full ausente vira 0)@@    if set(out) != {"some", "full"} or not all(math.isfinite(x) for x in out.values()):
+        raise Unreadable("pressure/io: sem as linhas some e full legíveis")
+    return out["some"], out["full"]@@    if "some" not in out:
+        raise Unreadable("pressure/io: sem as linhas some e full legíveis")
+    return out["some"], out.get("full", 0.0)
+[elastico] a leitura do PSI aceita NaN (a comparação com NaN dá falso: disco 'calmo')@@    if set(out) != {"some", "full"} or not all(math.isfinite(x) for x in out.values()):@@    if set(out) != {"some", "full"}:
+[elastico] o passo do ambiente não vale (fixo em 2)@@        elastic_step=_num(env, "BALLAST_ELASTIC_STEP", 2, int, 1)@@        elastic_step=2
+[elastico] o mínimo do passo aceita 0@@"BALLAST_ELASTIC_STEP", 2, int, 1)@@"BALLAST_ELASTIC_STEP", 2, int, 0)
+[elastico] o mínimo de MB por slot aceita 0@@"BALLAST_SLOT_MB", 512, int, 1)@@"BALLAST_SLOT_MB", 512, int, 0)
+[elastico] o teto de disco negativo é aceito@@"BALLAST_IO_FULL_MAX", 25.0, float, 0.0)@@"BALLAST_IO_FULL_MAX", 25.0, float, -5.0)
+[elastico] o fg líquido não é usado no orçamento@@        budget = int(ncpu - fg_net - cfg.reserve + 1e-9)@@        budget = int(ncpu - rec["fg_cores"] - cfg.reserve + 1e-9)
+[elastico] a correção de fg vira soma (o kernel do lastro AUMENTA o fg)@@            fg_net = max(0.0, fg_net - bg_sys)@@            fg_net = fg_net + bg_sys
+[elastico] o fg líquido pode ficar negativo@@            fg_net = max(0.0, fg_net - bg_sys)@@            fg_net = fg_net - bg_sys
+[elastico] a 1ª leitura (sem baseline) já corrige@@    if prev is None or not 0 < cfg.now - prev["t"] <= cfg.gap_s:
+        return None@@    if prev is None:
+        prev = {"t": cfg.now - 60, "runs": {}}
+[elastico] a baseline velha (lacuna) ainda corrige@@    if prev is None or not 0 < cfg.now - prev["t"] <= cfg.gap_s:@@    if prev is None or not 0 < cfg.now - prev["t"]:
+[elastico] o contador que anda para trás vira correção@@        if pu is None or u < pu:@@        if pu is None:
+[elastico] o delta do kernel é dividido por outro tempo (1 s fixo)@@        tot += (u - pu) / 1e6 / (cfg.now - prev["t"])@@        tot += (u - pu) / 1e6
+[elastico] cpu.stat sem a chave ou ilegível vale 0 (o delta cheio vira correção)@@    return None
+
+
+def read_cpu_prev(cfg):@@    return 0
+
+
+def read_cpu_prev(cfg):
+[elastico] o cpu.prev de forma errada vale como baseline@@    if not (isinstance(d, dict) and _int(d.get("t")) and isinstance(d.get("runs"), dict) and all(isinstance(k, str) and _int(v) for k, v in d["runs"].items())):
+        return None@@    if not isinstance(d, dict):
+        return None
+[elastico] o cpu.prev que nem é JSON derruba o tick@@            d = json.load(f)
+    except (OSError, ValueError, RecursionError):
+        return None
+    if not (isinstance(d, dict) and _int(d.get("t"))@@            d = json.load(f)
+    except (OSError, RecursionError):
+        return None
+    if not (isinstance(d, dict) and _int(d.get("t"))
+[elastico] a rodada parcial não encurta o cooldown@@        cool = min(cool, cfg.partial_cooldown_s)@@        pass
+[elastico] a rodada parcial curta (infra) também encurta@@ and row["secs"] >= cfg.partial_min_s and@@ and True and
+[elastico] o mínimo de 600 s da rodada parcial é exclusivo (600 s não encurta)@@ and row["secs"] >= cfg.partial_min_s and@@ and row["secs"] > cfg.partial_min_s and
+[elastico] só o `parcial` de rc 0 conta mas a falha também encurta@@    if why == "ok" and _int(row["secs"])@@    if _int(row["secs"])
+[elastico] o cooldown do parcial encurta para 0 em vez do ambiente@@        cool = min(cool, cfg.partial_cooldown_s)@@        cool = 0
+[elastico] o resumo completo também encurta o cooldown@@ and summ.get("result") == "parcial":@@ and summ.get("result"):
 MUT
   "$PY" -I - "$P" "$T/mutants.txt" "$T" > "$T/mutants.idx" <<'PYEOF'
 import re, sys
@@ -1080,7 +1305,7 @@ PYEOF
   while IFS="$(printf '\t')" read -r idx st desc; do
     if [ "$st" != OK ]; then ok 1 "mutante '$desc': a âncora não casa exatamente 1 vez (o script mudou?)"; continue; fi
     case "$desc" in "[linux]"*) [ -r /proc/self/oom_score_adj ] || { echo "skip mutante '$desc' (sem /proc/self/oom_score_adj neste host)"; continue; };; esac
-    grp=""; case "$desc" in "[teto]"*|"[teto-linux]"*) grp=teto ;; esac
+    grp=""; case "$desc" in "[teto]"*|"[teto-linux]"*) grp=teto ;; "[elastico]"*) grp=elastico ;; esac
     [ -z "${HB_MUTANTS_ONLY:-}" ] || [ "$grp" = "$HB_MUTANTS_ONLY" ] || continue
     case "$desc" in "[teto-linux]"*) cgrp_ok || { echo "skip mutante '$desc' (sem systemd-run --user utilizável neste host)"; continue; };; esac
     while [ "$(jobs -r | wc -l | tr -d ' ')" -ge "$JOBS" ]; do sleep 0.3; done

@@ -44,6 +44,8 @@ if os.path.exists(os.path.expanduser("~/gov.fail." + cmd)):
 if cmd == "status":
     run = None if os.path.exists(os.path.expanduser("~/gov.running.null")) else []   # ~/gov.running.null: o governo não leu os processos (running null)
     out = {"items": [{"name": "hq-selftests", "role": "work", "cores": 4, "eligible": True, "why": ""}], "registry_errors": [], "running": run}
+    if os.path.exists(os.path.expanduser("~/gov.elastic")):   # ~/gov.elastic: o item é elástico (registro 4-12: o status do governo traz cores_max)
+        out["items"][0]["cores_max"] = 12
     ceil = {"mode": "systemd", "ready": True, "why": "", "tasks_max": 4096, "mem_factor": 1.25}   # ~/gov.ceiling.notready: sem gerenciador de usuário · ~/gov.ceiling.absent: governo antigo (o status nem tem a chave)
     if os.path.exists(os.path.expanduser("~/gov.ceiling.notready")):
         ceil.update(ready=False, why="sem linger para o usuario (/var/lib/systemd/linger/runner ausente): o gerenciador de usuario do systemd so existe com sessao aberta e o cron nao acha o barramento")
@@ -211,6 +213,10 @@ g_ctl() {
   check "status: o status do governo FALHOU → diz FALHOU (não vira 'sem itens'), rc 3" "3 1 0" "$RC $(printf '%s' "$OUT" | grep -c 'status do governo: FALHOU') $(printf '%s' "$OUT" | grep -c '  item ')"
   newenv; ctl install; ctl status
   check "status: governo ok, recém-instalado e sem tick ainda → lista o item, sem PARADO, rc 0" "0 1 0" "$RC $(printf '%s' "$OUT" | grep -c '  item hq-selftests') $(printf '%s' "$OUT" | grep -c 'PARADO')"
+  newenv; ctl install; : > "$NODE/gov.elastic"; ctl status
+  check "status: item elástico (cores_max 12) aparece como núcleos=4-12 (quem confere o install vê o registro novo); o fixo continua núcleos=4" "1" "$(printf '%s' "$OUT" | grep -c 'item hq-selftests *work *núcleos=4-12 ')"
+  newenv; ctl install; ctl status
+  check "status: item fixo (sem cores_max) mostra só núcleos=4, sem o traço" "1 0" "$(printf '%s' "$OUT" | grep -c 'item hq-selftests *work *núcleos=4 ') $(printf '%s' "$OUT" | grep -c 'núcleos=4-')"
   newenv; ctl install; printf '{"head": "abc", "dirty": false, "at": "%s", "files": {}}\n' "$(ago 259200)" > "$NODE/gt-remote/ballast/installed.json"; ctl status
   check "status: cron instalado há 3 dias e NENHUM tick registrado → PARADO (a falha mais provável de um install novo)" "1" "$(printf '%s' "$OUT" | grep -c '^PARADO')"
   newenv; ctl install; printf 'lixo{' > "$NODE/gt-remote/ballast/installed.json"; ctl status
@@ -344,6 +350,8 @@ off aceita argumento a mais@@  off)       [ $# -eq 1 ] || die 2 "$USO"; cmd_flag
 o status não mostra a nota do último tick (o fail-closed do cron fica invisível)@@    nt = "" if note is None or note == "" else (" NOTA=%s" % note if isinstance(note, str) else " NOTA=ILEGÍVEL")@@    nt = ""
 nota do tick que não é texto vira 'sem nota'@@ else " NOTA=ILEGÍVEL")@@ else "")
 burn aceita argumento fora de on|off@@  burn)      [ $# -eq 2 ] && case "$2" in on|off) true ;; *) false ;; esac || die 2@@  burn)      true || die 2
+o status mostra só o mínimo do item elástico@@        nuc = "%s-%s" % (it.get("cores"), cm) if isinstance(cm, int) and not isinstance(cm, bool) else it.get("cores")@@        nuc = it.get("cores")
+o status mostra o traço mesmo sem máximo@@isinstance(cm, int) and not isinstance(cm, bool) else it.get("cores")@@True else it.get("cores")
 MUT
   "$PY" -I - "$P" "$T/mutants.txt" "$T" > "$T/mutants.idx" <<'PYEOF'
 import re, sys
