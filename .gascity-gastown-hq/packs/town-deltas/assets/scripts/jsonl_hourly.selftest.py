@@ -553,6 +553,9 @@ with tempfile.TemporaryDirectory(prefix="jhst2.") as T2:
     orc, ose, obuilt, _ = pbuild(one)
     check("peças: uma peça só => o documento é a própria peça, byte a byte",
           orc == 0 and {f["path"]: f["sha256"] for f in obuilt["files"]}["hq/issues.jsonl"] == __import__("hashlib").sha256(piece(IS[:1]).encode()).hexdigest(), ose)
+    erc, ese, ebuilt, eart = pbuild([("hq/comments/undated.jsonl", piece([]))] + SMALL + PIECES[5:7])
+    check("peças: a tabela vazia (uma peça undated sem linhas) é um documento com 0 linhas, não uma tabela ausente",
+          erc == 0 and "hq/comments.jsonl" in [f["path"] for f in ebuilt["files"]] and json.loads(run("inspect", eart)[1])["databases"]["hq"]["comments"] == 0, "%s %s" % (erc, ese))
     irc, iso2, ierr = run("inspect", pbuild(PIECES, extra=("--ignore-db", "hq"))[3])
     check("peças: --ignore-db tira também as peças do banco, sem o documento do banco no pacote", irc == 1 and "hq" not in json.loads(iso2)["databases"], iso2)
 

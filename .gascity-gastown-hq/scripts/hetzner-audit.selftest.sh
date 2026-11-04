@@ -95,6 +95,7 @@ mk; mkdir "$SRV/.dolt-backup"; run; is backup-de-bead ACHADO ".dolt-backup"; det
 mk; mkdir -p "$SRV/.beads/eventsData"; : > "$SRV/.beads/eventsData/eventkit.lock"; run; is backup-de-bead LIMPO ".beads só com lock (como está hoje no servidor)"
 mk; mkdir -p "$SRV/.beads/dolt"; echo x > "$SRV/.beads/dolt/manifest"; run; is backup-de-bead ACHADO ".beads com conteúdo além de lock"; dets backup-de-bead ".beads (com conteúdo além de lock)"
 mk; : > "$SRV/issues.jsonl"; run; is backup-de-bead ACHADO "issues.jsonl"
+mk; mkdir -p "$SRV/x/jsonl-archive/hq/issues"; : > "$SRV/x/jsonl-archive/hq/issues/2026-11-01.jsonl"; run; is backup-de-bead ACHADO "2026-11-01.jsonl"   # ga-e4cbc5s: a day piece of the archive
 
 # --- processo ---
 mk; FAKE_PGREP=found run; is processo ACHADO "claude auth login esquecido"; dets processo "370419"; rcis 1

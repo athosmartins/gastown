@@ -12,7 +12,7 @@
 #   github-e-espelho  `hetzner-remote-git.sh scan` NO servidor (o que já existia: credencial do GitHub no host + dado negado no espelho git). Não é refeito aqui.
 #   dados             o node_audit da semeadura (mbp-run.sh --host linux --audit-node): NOME · GRANDE · JWT · CONTEÚDO (telefones/CPFs) no topo do home (só os arquivos soltos, maxdepth 1)
 #                     e em cada diretório de topo e filho de gt-remote/ EXCETO os de SKIP_NOTE (a linha LIMPO diz o que ficou de fora). Os padrões do find vivem SÓ lá; aqui só se escolhe ONDE olhar. Diretório novo = auditado.
-#   backup-de-bead    .dolt, .dolt-backup, issues.jsonl, beads*.jsonl, e .beads com algo além de lock.
+#   backup-de-bead    .dolt, .dolt-backup, issues.jsonl, beads*.jsonl, qualquer .jsonl dentro de um jsonl-archive/ (peças por dia, ga-e4cbc5s), e .beads com algo além de lock.
 #
 # TRÊS ESTADOS: achei / li tudo e não achei / não consegui ler (ssh caiu, comando ausente, pasta ilegível, saída que não reconheço). O último NUNCA vira LIMPO.
 # SAÍDA (stdout): uma linha `AUDITORIA <estado> <verificação>: <detalhe>` por verificação (+ `AUDITORIA DETALHE dados: ...` por achado), sem valor de segredo nem de dado (só caminho e contagem), e
@@ -55,7 +55,7 @@ done
 for f in .netrc .pgpass .npmrc .git-credentials .config/git/credentials .config/gh .aws .docker/config.json .config/gcloud .kube .gnupg .config/rclone .ssh/id_rsa .ssh/id_ed25519 .ssh/id_ecdsa .ssh/id_dsa; do
   [ -e "$f" ] && echo "CRED_NAME $f"
 done
-find . \( "${PR[@]}" \) -prune -o \( -name .dolt -o -name .dolt-backup -o -name dolt-backup -o -name '*.dolt' -o -name issues.jsonl -o -name 'beads*.jsonl' \) -print 2>>"$E" | sed 's#^\./##; s/^/BEAD /'
+find . \( "${PR[@]}" \) -prune -o \( -name .dolt -o -name .dolt-backup -o -name dolt-backup -o -name '*.dolt' -o -name issues.jsonl -o -name 'beads*.jsonl' -o \( -name '*.jsonl' -path '*/jsonl-archive/*' \) \) -print 2>>"$E" | sed 's#^\./##; s/^/BEAD /'
 find . \( "${PR[@]}" \) -prune -o -type d -name .beads -print 2>>"$E" | while read -r d; do
   [ -n "$(find "$d" -type f ! -name '*.lock' -print 2>>"$E" | head -n 1)" ] && echo "BEAD ${d#./} (com conteúdo além de lock)"
 done

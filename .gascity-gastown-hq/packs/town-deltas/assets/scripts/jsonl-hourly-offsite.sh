@@ -12,6 +12,7 @@
 #   jsonl-hourly/latest.json                                               ponteiro para o último snapshot que passou em TUDO; escrito por último
 #   A fonte é `git archive <sha do HEAD>`, não a árvore de trabalho: o HEAD é o único estado que o exporter garantiu completo (o gate de export curto roda antes
 #   do commit). Ficam de fora os `<db>.jsonl` da raiz (cópias exatas de <db>/issues.jsonl) e as sobras `*.tmp.*` de export abortado já commitadas.
+#   issues e comments podem estar no archive em peças por dia (<db>/<tabela>/AAAA-MM-DD.jsonl, ga-e4cbc5s): o pacote os leva JUNTOS, de volta num <db>/<tabela>.jsonl só (build --tree).
 #   Bancos que casam JHO_IGNORE_DBS (padrão `bench_*,fixdepkeys_*`; "" desliga) também ficam de fora e o manifest os nomeia em `ignored_dbs`; obrigatório que case => broken.
 #
 # GARANTIAS (e o que cada uma NÃO garante)
@@ -322,7 +323,9 @@ for n in names:
         res["ignored"] += 1
         continue
     try:
-        ages = [(n + "/" + f[:-6], now - int(os.stat(os.path.join(d, f)).st_mtime)) for f in sorted(os.listdir(d)) if f.endswith(".jsonl")]
+        # a tabela em peças por dia (ga-e4cbc5s) é o diretório <banco>/<tabela>/: o exporter avança o mtime dele a cada rodada boa
+        ages = [(n + "/" + f.replace(".jsonl", ""), now - int(os.stat(os.path.join(d, f)).st_mtime)) for f in sorted(os.listdir(d))
+                if f.endswith(".jsonl") or (os.path.isdir(os.path.join(d, f)) and not f.startswith("."))]
     except OSError as e:
         sys.stderr.write("não li o banco %s: %s\n" % (n, e)); sys.exit(3)
     if not ages:
@@ -553,8 +556,8 @@ SHA12="${SHA:0:12}"
 STAMP="$(stamp_now)"
 STEM="$STAMP-$SHA12"
 HEAD_AGE=$(( $(now_epoch) - HEAD_EPOCH ))
-# HEAD velho NÃO é exporter parado: ele só comita quando o dado muda (números no cabeçalho). Vivo = reescreveu os bancos obrigatórios (mtime de <db>/issues.jsonl; vale o mais velho). vazio/ilegível/ausente → não sei, e não sei não é vivo; falhou → idem.
-SRC_WHY=""; SRC_EPOCH="$(python3 -I -c 'import os,sys;print(min(int(os.stat(os.path.join(sys.argv[1],d,"issues.jsonl")).st_mtime) for d in sys.argv[2].split(",")))' "$ARCHIVE" "$REQUIRED_DBS" 2>/dev/null)"
+# HEAD velho NÃO é exporter parado: ele só comita quando o dado muda (números no cabeçalho). Vivo = reescreveu os bancos obrigatórios (mtime de <db>/issues.jsonl, ou do diretório <db>/issues/ em peças por dia; vale o mais velho). vazio/ilegível/ausente → não sei, e não sei não é vivo; falhou → idem.
+SRC_WHY=""; SRC_EPOCH="$(python3 -I -c 'import os,sys;print(min(int(max(os.stat(p).st_mtime for p in (os.path.join(sys.argv[1],d,"issues.jsonl"),os.path.join(sys.argv[1],d,"issues")) if os.path.exists(p))) for d in sys.argv[2].split(",")))' "$ARCHIVE" "$REQUIRED_DBS" 2>/dev/null)"
 case "$SRC_EPOCH" in
   ""|*[!0-9]*) SRC_WHY="não li quando o exporter escreveu os bancos obrigatórios ($REQUIRED_DBS)" ;;
   *) SRC_AGE=$(( $(now_epoch) - SRC_EPOCH )); [ "$SRC_AGE" -le "$STALE_SOURCE_S" ] || SRC_WHY="o exporter não reescreve os bancos obrigatórios há ${SRC_AGE}s (> ${STALE_SOURCE_S}s; HEAD de há ${HEAD_AGE}s)" ;;
@@ -598,7 +601,8 @@ fi
 # ── build: git archive do HEAD -> tar.gz filtrado ──────────────────────────────────────────────────
 log "snapshot $STEM (HEAD $SHA12, dado de há ${HEAD_AGE}s)"
 set -o pipefail
-( git -C "$ARCHIVE" archive --format=tar "$SHA" | nice -n 15 "$TIMEOUT_BIN" "$BUILD_TIMEOUT" python3 -I "$PY" build --out "$WD/snap.tar.gz" --files-out "$WD/files.json" --ignore-db "$IGNORE_DBS" ) > "$WD/build.out" 2> "$WD/build.err" \
+git -C "$ARCHIVE" ls-tree -r -l "$SHA" > "$WD/tree.txt" 2> "$WD/tree.err" || fail "ls-tree do HEAD falhou: $(tail -c 300 "$WD/tree.err" | tr '\n' ' ')"   # os tamanhos das peças por dia (ga-e4cbc5s)
+( git -C "$ARCHIVE" archive --format=tar "$SHA" | nice -n 15 "$TIMEOUT_BIN" "$BUILD_TIMEOUT" python3 -I "$PY" build --out "$WD/snap.tar.gz" --files-out "$WD/files.json" --ignore-db "$IGNORE_DBS" --tree "$WD/tree.txt" ) > "$WD/build.out" 2> "$WD/build.err" \
   || fail "build do artefato falhou: $(tail -c 300 "$WD/build.err" "$WD/build.out" 2>/dev/null | tr '\n' ' ')"
 nice -n 15 "$TIMEOUT_BIN" "$BUILD_TIMEOUT" python3 -I "$PY" inspect "$WD/snap.tar.gz" > "$WD/inspect.json" 2> "$WD/inspect.err"
 irc=$?

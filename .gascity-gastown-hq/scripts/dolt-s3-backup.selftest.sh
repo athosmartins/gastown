@@ -1381,6 +1381,10 @@ esac
 STUB
 chmod +x "$AWS_STUB_DIR/aws"
 
+# ga-e4cbc5s: the verify target must exist in BOTH archive layouts; the flat hq.jsonl is gone with the day pieces, hq/config.jsonl (a small single table) is there in either
+[ "$(sed -n 's/^JSONL_ARCHIVE_VERIFY_FILE="\([^"]*\)".*/\1/p' "$SCRIPT")" = "hq/config.jsonl" ] \
+  && ok "jsonl mirror: the verify target is hq/config.jsonl (exists with the single documents and with the day pieces)" \
+  || bad "jsonl mirror: JSONL_ARCHIVE_VERIFY_FILE is '$(sed -n 's/^JSONL_ARCHIVE_VERIFY_FILE="\([^"]*\)".*/\1/p' "$SCRIPT")', want hq/config.jsonl"
 JSONL_TEST_DIR="$(mktemp -d)"
 printf 'x%.0s' $(seq 1 100) > "$JSONL_TEST_DIR/hq.jsonl"   # exactly 100 bytes
 JSONL_TEST_LOG="$(mktemp)"

@@ -125,6 +125,7 @@ mkdir -p "$E2E/scripts" "$E2E/bin" "$E2E/city" "$E2E/state"
 cp "$SCRIPT" "$E2E/scripts/jsonl-export.sh"
 cp "$HERE/jsonl-archive-repack-window-lib.sh" "$E2E/scripts/jsonl-archive-repack-window-lib.sh"   # ga-wkoij7: sourced by the exporter at start
 cp "$HERE/disk-headroom-lib.sh" "$E2E/scripts/disk-headroom-lib.sh"   # ga-j2f5v5: the one reader of the free disk, sourced by the exporter at start
+cp "$HERE/jsonl_split.py" "$HERE/jsonl_hourly.py" "$E2E/scripts/"   # ga-e4cbc5s: the day-piece splitter and the reader it imports
 cat > "$E2E/scripts/dolt-target.sh" <<'STUB'
 # ga-l6v576: the five supplemental tables, modelled as LIVE tables. A table is a file of JSON rows in key order ($E2E_TABLE_DIR/<t>.rows), built from STUB_ROWS_<t> the first time a run
 # touches it (run_export clears the directory, so every run starts from a fresh table), and the stub answers the dialect the exporter speaks: COUNT(*), ORDER BY with LIMIT / OFFSET, and
@@ -157,9 +158,9 @@ stub_table_file() {  # stub_table_file <t> — the live table's file, built on t
   if [ ! -f "$f" ]; then
     mkdir -p "$E2E_TABLE_DIR"
     case "${STUB_PK:-id}" in *" "*) pk=composite ;; esac
-    jq -n -c --arg q "'" --arg t "$t" --argjson n "$(stub_var "STUB_ROWS_$t" 0)" --arg odd "$(stub_var "STUB_ODD_$t" 0)" --arg pk "$pk" '
+    jq -n -c --arg q "'" --arg t "$t" --argjson n "$(stub_var "STUB_ROWS_$t" 0)" --arg odd "$(stub_var "STUB_ODD_$t" 0)" --arg pk "$pk" --arg dated "$(stub_var STUB_DATED 0)" '
       def pad: ("000000" + tostring)[-6:];
-      ( [range($n) | if $pk == "composite" then {id: "\($t)-\(((. / 3) | floor) | pad)", seq: (. % 3), body: "text \(.)"} else {id: "\($t)-\(. | pad)", body: "text \(.)"} end]
+      ( [range($n) | if $pk == "composite" then {id: "\($t)-\(((. / 3) | floor) | pad)", seq: (. % 3), body: "text \(.)"} else {id: "\($t)-\(. | pad)", body: "text \(.)"} + (if $dated == "1" then {created_at: "2026-11-0\((. % 3) + 1) 10:00:00"} else {} end) end]
         + (if $odd == "1" and $n >= 60 then
              ["\($t)-000012\($q)q", "\($t)-000018\\b", "\($t)-000024\"d", "\($t)-000030 sp", "\($t)-000036 ", "\($t)-000042éñ"]
              | map({id: ., body: "odd"} + (if $pk == "composite" then {seq: 0} else {} end))
@@ -319,8 +320,8 @@ dolt_sql() {
       [ "${STUB_KILL_SELF:-0}" = "1" ] && kill -9 $$
       # STUB_TEST_ROWS extra rows are ones the SQL filter lets through but the
       # jq scrub (title ^test_) removes — like a real store's leftover fixtures.
-      jq -n -c --argjson n "$STUB_EXPORT_ROWS" --argjson t "${STUB_TEST_ROWS:-0}" \
-        '{rows: ([range($n) | {id: "wa-\(.)", title: "real issue \(.)", issue_type: "task"}]
+      jq -n -c --argjson n "$STUB_EXPORT_ROWS" --argjson t "${STUB_TEST_ROWS:-0}" --arg dated "${STUB_DATED:-0}" \
+        '{rows: ([range($n) | {id: "wa-\(.)", title: "real issue \(.)", issue_type: "task"} + (if $dated == "1" then {created_at: "2026-11-0\((. % 3) + 1) 10:00:00"} else {} end)]
                  + [range($t) | {id: "wa-t\(.)", title: "test_\(.)", issue_type: "task"}])}' ;;
     "SELECT * FROM"*) printf '{"rows":[]}\n' ;;
     *) return 1 ;;
@@ -344,6 +345,8 @@ printf '#!/bin/bash\ncase " $* " in *" cat-file "*|*" ls-tree "*) [ -n "${STUB_G
 # ga-j2f5v5: the exporter now reads the free disk. The reading is PINNED here (100 GB) for every case that is not about the disk, so a host with a low disk (this one, often) does not skip the cases below;
 # the disk cases set E2E_DISK_MB / E2E_NOW per call. Exported, so the runs that do not go through run_export (default-archive case) get the same pin.
 export DISK_FREE_OVERRIDE_MB=102400
+# ga-e4cbc5s: the cases below are about the single-document layout (their stub rows carry no created_at, so day pieces would all be "undated"); the day pieces have their own section, which sets E2E_SPLIT=1.
+export GC_JSONL_SPLIT=0
 
 ARCH="$E2E/archive"
 OUT=""
@@ -356,7 +359,7 @@ run_export() {  # run_export <export-rows> <source-count|ERR> [scrubbed-away-row
     E2E_GC_LOG="$E2E/gc.log" STUB_EXPORT_ROWS="$1" STUB_SOURCE_COUNT="$2" STUB_TEST_ROWS="${3:-0}" \
     DISK_FREE_OVERRIDE_MB="${E2E_DISK_MB:-102400}" JEX_NOW_EPOCH="${E2E_NOW:-}" E2E_DOLT_CALLS="$E2E/dolt-calls.log" \
     PATH="${E2E_EXTRA_PATH:+$E2E_EXTRA_PATH:}$SANDBOX_PATH" GC_CITY="$E2E/city" GC_PACK_STATE_DIR="${E2E_STATE:-$E2E/state}" \
-    GC_JSONL_ARCHIVE_REPO="$ARCH" \
+    GC_JSONL_ARCHIVE_REPO="$ARCH" GC_JSONL_SPLIT="${E2E_SPLIT:-0}" \
     bash "$E2E/scripts/jsonl-export.sh" 2>&1
   )
   RC=$?
@@ -978,6 +981,68 @@ chmod 755 "$E2E/ro-tmpdir"
   && ok "clean run: one start and one 'end rc=0' in the log, no marker left" \
   || bad "clean run: start=$(iq_count ' start pid=') end=$(iq_count ' end rc=0') marker=$(iq_marker): $(tr '\n' '|' < "$IQ_LOG")"
 unset GC_JSONL_EXPORT_TMP_DIR
+
+# ── ga-e4cbc5s: issues and comments go to the archive as one file per DAY of created_at, so a backup writes the pieces that changed and not the whole table ──
+# The cases above run with GC_JSONL_SPLIT=0; these turn it on (E2E_SPLIT=1) and give the stub rows a day (STUB_DATED=1). Why and how: jsonl_split.py, docs/runbooks/jsonl-hourly-offsite.md.
+in_tree()    { git -C "$ARCH" cat-file -e "HEAD:$1" 2>/dev/null; }
+pieces()     { git -C "$ARCH" ls-tree -r --name-only HEAD -- "wa/$1/" 2>/dev/null | tr '\n' ' '; }
+layout()     { local s=none; in_tree "wa/$1.jsonl" && s=single; [ -z "$(pieces "$1")" ] || { [ "$s" = none ] && s=pieces || s=both; }; echo "$s"; }   # none | single | pieces | both
+piece_rows() { local f n=0; for f in $(pieces "$1"); do n=$((n + $(git -C "$ARCH" show "HEAD:$f" | jq -s '.[0].rows | length'))); done; echo "$n"; }
+clean_wt()   { [ -z "$(git -C "$ARCH" status --porcelain)" ]; }
+changed()    { git -C "$ARCH" diff --name-only HEAD~1 HEAD | tr '\n' ' '; }
+splitrun()   { E2E_SPLIT=1 STUB_DATED=1 STUB_ROWS_comments="$1" GC_JSONL_SUPP_EXPORT_RETRY_DELAY=0 run_export "$2" "$3"; }   # splitrun <comments> <issues> <source>
+
+fresh_archive split
+splitrun 30 200 200
+{ [ "$RC" = 0 ] && [ "$(layout issues)" = pieces ] && [ "$(layout comments)" = pieces ] && ! in_tree wa.jsonl && in_tree wa/config.jsonl \
+  && [ "$(pieces issues)" = "wa/issues/2026-11-01.jsonl wa/issues/2026-11-02.jsonl wa/issues/2026-11-03.jsonl " ]; } \
+  && ok "split: issues and comments are one file per day in HEAD, no single document and no flat copy (the small tables stay single)" \
+  || bad "split: rc=$RC issues=$(layout issues) comments=$(layout comments) flat=$(in_tree wa.jsonl && echo yes) pieces=$(pieces issues): $OUT"
+{ [ "$(piece_rows issues)" = 200 ] && [ "$(piece_rows comments)" = 30 ] && clean_wt; } \
+  && ok "split: every row is in a piece (200 issues, 30 comments) and the working tree is clean" \
+  || bad "split: issues=$(piece_rows issues) comments=$(piece_rows comments) status=$(git -C "$ARCH" status --porcelain | tr '\n' ' ')"
+B=$(commits); splitrun 31 200 200
+{ [ "$(commits)" = $((B + 1)) ] && [ "$(changed)" = "wa/comments/2026-11-01.jsonl " ]; } \
+  && ok "split: one new comment changes ONE piece in the commit (the backup writes the day, not the table)" \
+  || bad "split: commits $B -> $(commits), changed: $(changed)"
+B=$(commits); splitrun 31 190 200
+{ [ "$(commits)" = "$B" ] && [ "$(piece_rows issues)" = 200 ] && clean_wt; } \
+  && ok "split: a short export is discarded and the pieces come back from HEAD (HEAD unchanged, clean tree)" \
+  || bad "split short export: commits $B -> $(commits), issues in HEAD $(piece_rows issues), status: $(git -C "$ARCH" status --porcelain | tr '\n' ' ')"
+B=$(commits); STUB_FAIL_comments=1 splitrun 31 201 201
+{ [ "$(commits)" = $((B + 1)) ] && [ "$(piece_rows comments)" = 31 ] && [ "$(piece_rows issues)" = 201 ] && ! changed | grep -q 'wa/comments/' && clean_wt; } \
+  && ok "split: a comments table kept at its previous version keeps its pieces; issues still commit" \
+  || bad "split kept table: commits $B -> $(commits), comments=$(piece_rows comments) issues=$(piece_rows issues), changed: $(changed)"
+splitrun 31 100 100
+case "$OUT" in *HALTED*) ok "split: the spike check reads the previous count from the pieces (201 -> 100 halts)" ;; *) bad "split: 201 -> 100 did not halt, the previous count was not read from the pieces: $OUT" ;; esac
+
+# a piece temp of ANOTHER live process (the splitter leaves those alone) must stay out of the commit: the exclude in the exporter's `git add` covers every *.jsonl.tmp.*, not only issues'
+fresh_archive splittmp
+splitrun 30 200 200
+mkdir -p "$ARCH/wa/comments"; : > "$ARCH/wa/comments/2026-11-01.jsonl.tmp.p$PPID"
+splitrun 31 200 200
+{ [ "$(commits)" = 2 ] && ! git -C "$ARCH" ls-tree -r --name-only HEAD | grep -q 'tmp'; } \
+  && ok "split: the temp piece of another live process is never staged" \
+  || bad "split temp piece: commits=$(commits) tracked tmp: $(git -C "$ARCH" ls-tree -r --name-only HEAD | grep tmp | tr '\n' ' ')"
+[ "$(sed -n 's/^JEX_SPLIT="${GC_JSONL_SPLIT:-\([01]\)}"$/\1/p' "$SCRIPT")" = 1 ] \
+  && ok "split: the day pieces are ON by default (the cases above always pass GC_JSONL_SPLIT)" \
+  || bad "split: the default of JEX_SPLIT is not 1 in jsonl-export.sh"
+
+fresh_archive splitfb
+mkdir -p "$E2E/nopy"; printf '#!/bin/sh\necho "python3: injected failure" >&2\nexit 127\n' > "$E2E/nopy/python3"; chmod +x "$E2E/nopy/python3"
+splitrun 30 200 200
+E2E_EXTRA_PATH="$E2E/nopy" splitrun 31 200 200
+{ [ "$RC" = 0 ] && [ "$(layout issues)" = single ] && [ "$(layout comments)" = single ] && in_tree wa.jsonl && clean_wt; } && case "$OUT" in *"could not split"*) true ;; *) false ;; esac \
+  && ok "split fallback: a splitter that cannot run leaves the single documents and the flat copy (never both layouts, never none), and says so" \
+  || bad "split fallback: rc=$RC issues=$(layout issues) comments=$(layout comments) flat=$(in_tree wa.jsonl && echo yes): $OUT"
+splitrun 31 200 200
+{ [ "$(layout issues)" = pieces ] && [ "$(layout comments)" = pieces ] && ! in_tree wa.jsonl && clean_wt; } \
+  && ok "split migration: from the single documents back to pieces in one commit, the flat copy dropped, clean tree" \
+  || bad "split migration: issues=$(layout issues) comments=$(layout comments) flat=$(in_tree wa.jsonl && echo yes) status=$(git -C "$ARCH" status --porcelain | tr '\n' ' '): $OUT"
+E2E_SPLIT=0 STUB_DATED=1 STUB_ROWS_comments=31 run_export 200 200
+{ [ "$(layout issues)" = single ] && [ "$(layout comments)" = single ] && in_tree wa.jsonl && clean_wt && ! printf '%s' "$OUT" | grep -q 'could not split'; } \
+  && ok "split kill switch: GC_JSONL_SPLIT=0 puts both tables back as single documents (and the flat copy) in one commit, without a 'could not split' complaint" \
+  || bad "split kill switch: issues=$(layout issues) comments=$(layout comments) status=$(git -C "$ARCH" status --porcelain | tr '\n' ' '): $OUT"
 
 # ── ga-l6v576: comments, config, dependencies, labels and metadata are read whole and checked against the source, like issues ──
 # They were exported with `dolt_sql ... > file 2>/dev/null || true`: no row count, no exit code, no stderr. Dolt cuts a read that runs past ~40 s — a well-formed document, exit 0, "unexpected EOF" on

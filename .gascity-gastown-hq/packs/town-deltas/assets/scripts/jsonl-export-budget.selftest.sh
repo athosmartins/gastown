@@ -35,6 +35,7 @@ selftest_fail_closed_arm cleanup
 E2E="$WORK/e2e"
 mkdir -p "$E2E/scripts" "$E2E/bin" "$E2E/city" "$E2E/state"
 cp "$SCRIPT" "$E2E/scripts/jsonl-export.sh"
+export GC_JSONL_SPLIT=0   # ga-e4cbc5s: this suite is about the budget and the single-document layout; the day pieces are tested in jsonl-export.selftest.sh
 cp "$HERE/jsonl-archive-repack-window-lib.sh" "$E2E/scripts/jsonl-archive-repack-window-lib.sh"
 cp "$HERE/disk-headroom-lib.sh" "$E2E/scripts/disk-headroom-lib.sh"
 cat > "$E2E/scripts/dolt-target.sh" <<'STUB'

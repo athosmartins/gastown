@@ -65,7 +65,7 @@ BACKUP_ROOT="$CITY/.dolt-backup"          # local staging (incremental; gc-docto
 # store's bead history as JSONL. Mirrored to S3 below, independent of the
 # per-db DOLT_BACKUP loop.
 JSONL_ARCHIVE_DIR="$CITY/.gc/runtime/packs/maintenance/jsonl-archive"
-JSONL_ARCHIVE_VERIFY_FILE="hq.jsonl"      # post-sync verify target
+JSONL_ARCHIVE_VERIFY_FILE="hq/config.jsonl"   # post-sync verify target: a small single table that exists in both layouts (ga-e4cbc5s: the flat hq.jsonl is gone with the day pieces)
 BUCKET="urblink-dolt-backups"
 S3="s3://$BUCKET"
 LOG="$CITY/.gc/logs/dolt-s3-backup.log"

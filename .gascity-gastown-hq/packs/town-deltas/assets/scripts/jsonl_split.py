@@ -90,6 +90,8 @@ def _scan(src):
         a[0] += 1
         a[1].update(data)
         a[2] += len(data)
+    if not acc:  # tabela vazia: UMA peça sem linhas; zero arquivos seria "tabela ausente" (o git não guarda diretório vazio)
+        acc[UNDATED] = [0, hashlib.sha256(PIECE_HEAD), len(PIECE_HEAD)]
     for a in acc.values():
         a[1].update(PIECE_TAIL)
         a[2] += len(PIECE_TAIL)
@@ -115,15 +117,18 @@ def _write(src, out_dir, want, acc):
                 g[1].update(data)
                 put(p, data)
         for p in want:
-            if p in got:
-                got[p][1].update(PIECE_TAIL)
-                put(p, PIECE_TAIL)
+            g = got.setdefault(p, [0, hashlib.sha256()])
+            if g[0] == 0:  # a peça sem linhas: o cabeçalho ainda falta
+                g[1].update(PIECE_HEAD)
+                put(p, PIECE_HEAD)
+            g[1].update(PIECE_TAIL)
+            put(p, PIECE_TAIL)
     except OSError as e:
         raise SplitError("falha gravando as peças de %s: %s" % (src, e))
     finally:
         for f in opened.values():
             f.close()
-    if any(p not in got or got[p][0] != acc[p][0] or got[p][1].hexdigest() != acc[p][1].hexdigest() for p in want):
+    if any(got[p][0] != acc[p][0] or got[p][1].hexdigest() != acc[p][1].hexdigest() for p in want):
         raise SplitError("%s mudou entre as duas leituras" % src)
 
 

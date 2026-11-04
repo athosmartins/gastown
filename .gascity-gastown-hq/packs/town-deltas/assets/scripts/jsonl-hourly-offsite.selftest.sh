@@ -860,6 +860,32 @@ TBL_EXEC="$(toml_get "$TBL_TOML" exec)"; TBL_EXEC="${TBL_EXEC%% --table-age}"
 [ -x "${TBL_EXEC/\$PACK_DIR/$ORDERS_DIR/..}" ] && ok "o exec do order resolve para um script executável" || bad "exec do order não resolve: $TBL_EXEC"
 [ "$(tsec "$(toml_get "$TBL_TOML" timeout)")" -lt 600 ] 2>/dev/null && ok "o order tem timeout curto (menor que o intervalo)" || bad "timeout do order: $(toml_get "$TBL_TOML" timeout)"
 
+# ── 13g. issues e comments em peças por dia no archive (ga-e4cbc5s) ──────────────────────────────────────────────────────────────────────────────────
+# O pacote leva as MESMAS tabelas de antes (o build junta as peças com os tamanhos do `git ls-tree`; aqui é o `git archive` de verdade, não um tar montado à mão) e a vigia de fonte parada e o
+# alarme de idade de tabela leem o mtime do DIRETÓRIO da tabela, que o exporter avança a cada rodada boa.
+echo "-- 13g. archive em peças por dia (ga-e4cbc5s)"
+topieces() { # db... — as issues ganham created_at em dias diferentes e issues/comments viram peças pelo divisor de verdade; o documento único sai do archive
+  local d t
+  for d in "$@"; do
+    jq -c '.rows |= map(. + {created_at: ("2026-11-0" + (.id | split("-")[-1]) + " 10:00:00")})' "$ARCH/$d/issues.jsonl" > "$ARCH/$d/i.new" && mv "$ARCH/$d/i.new" "$ARCH/$d/issues.jsonl"
+    for t in issues comments; do python3 -I "$HERE/jsonl_split.py" split --in "$ARCH/$d/$t.jsonl" --out-dir "$ARCH/$d/$t" >/dev/null && rm -f "$ARCH/$d/$t.jsonl"; done
+  done
+}
+dirs_at() { python3 -I -c 'import os,sys;t=int(sys.argv[1]);[os.utime(p,(t,t)) for p in sys.argv[2:]]' $((T0 + $1)) "$ARCH/hq/issues" "$ARCH/wa/issues"; }   # mtime dos diretórios issues/, no relógio de mentira
+new_env pieces; topieces hq wa; commit_all "peças"; NOW_OFF=0; offsite
+MAN="$(MANOF "$(ARTKEY)")"
+eq "peças: sobe (rc 0, ok new, verdict ok) com as contagens do dado: hq 2 issues, wa 1, comments 0 (tabela vazia = uma peça sem linhas, não tabela ausente)" \
+   "$RC:${OUT%% key=*}:$(jqf .verdict "$MAN"):$(jqf '[.databases.hq.issues, .databases.wa.issues, .databases.hq.comments] | join(",")' "$MAN")" "0:RESULT: ok new:ok:2,1,0"
+eq "peças: o pacote tem 12 documentos <db>/<tabela>.jsonl, nenhuma peça por dia" "$(tar -tzf "$S/bucket/obj/$(ARTKEY)" | grep -c '^[a-z]*/[a-z]*\.jsonl$'):$(tar -tzf "$S/bucket/obj/$(ARTKEY)" | grep -c '/20')" "12:0"
+new_env piecesalive; topieces hq wa; commit_all "peças"; NOW_OFF=$((7 * 3600)); dirs_at $NOW_OFF; offsite
+eq "peças: diretório issues/ avançado há pouco => exporter vivo (HEAD de 7 h): rc 0, ok new" "$RC:${OUT%% key=*}" "0:RESULT: ok new"
+new_env piecesdead; topieces hq wa; commit_all "peças"; NOW_OFF=$((7 * 3600)); dirs_at 0; offsite
+eq "peças: diretório issues/ de 7 h => fonte parada (rc 1), mesmo com o HEAD recém-feito" "$RC:${OUT:0:25}" "1:RESULT: fail fonte parada"
+new_env piecesage; topieces hq wa; commit_all "peças"; NOW_OFF=0; age_all 600; tage
+case "$OUT" in *"dbs=2 tables=12 "*) ok "idade da tabela: as peças contam como UMA tabela cada (2 bancos x 6 = 12, como no documento único)" ;; *) bad "table-age com peças: $OUT" ;; esac
+python3 -I -c 'import os,sys;t=int(sys.argv[1]);os.utime(sys.argv[2],(t,t))' $((T0 - 3 * 3600)) "$ARCH/hq/comments"; tage
+eq "idade da tabela: o diretório comments/ de 3 h (> 120 min) é a mais velha: ATRASADO rc 1 e a linha a nomeia" "$RC:${OUT:0:12}:$(printf '%s' "$OUT" | grep -c 'hq/comments')" "1:TABLES: LATE:1"
+
 echo "-- 14. helper python (suíte própria)"
 if [ -n "${JHO_SKIP_PYSUITE:-}" ]; then
   # só para a campanha de mutantes do SHELL (a suíte python tem a campanha dela); numa rodada normal isto nunca é ligado

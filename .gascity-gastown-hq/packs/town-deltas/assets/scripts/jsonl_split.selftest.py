@@ -141,9 +141,11 @@ with tempfile.TemporaryDirectory(prefix="jssp.") as T:
     os.utime(out, (1000, 1000))
     js.split_doc(src, out)
     check("split: o mtime do DIRETÓRIO avança a cada rodada boa, mesmo sem peça nova (é o carimbo de 'o exporter passou por aqui')", os.stat(out).st_mtime > time.time() - 60)
-    put(src, "{}\n")
-    r5 = js.split_doc(src, out)
-    check("split: tabela vazia ({}) => zero peças, o diretório fica e as antigas somem", names(out) == [] and r5["rows"] == 0 and r5["pieces"] == 0, repr((names(out), r5)))
+    for empty in ("{}\n", '{"rows": []}'):
+        put(src, empty)
+        r5 = js.split_doc(src, out)
+        check("split: tabela vazia (%s) => UMA peça undated sem linhas (zero arquivos seria 'tabela ausente'), as antigas somem" % empty.strip(),
+              names(out) == ["undated.jsonl"] and r5["rows"] == 0 and r5["pieces"] == 1 and read_piece(os.path.join(out, "undated.jsonl")) == [], repr((names(out), r5)))
 
     # ── B. fail-closed ───────────────────────────────────────────────────────────────────────
     print("-- B. fail-closed")

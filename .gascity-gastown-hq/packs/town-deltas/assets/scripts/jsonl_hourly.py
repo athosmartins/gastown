@@ -260,8 +260,9 @@ def _join(src, it, first, names, sizes, box):
         if m is None or m.name != name or m.size != sizes[name]:
             raise SystemExit("peça fora do que a árvore diz: esperava %s (%d bytes), veio %s" % (name, sizes[name], "nada" if m is None else "%s (%d bytes)" % (m.name, m.size)))
         fh = src.extractfile(m)
-        if m.size <= len(PIECE_HEAD) + len(PIECE_TAIL) or fh.read(len(PIECE_HEAD)) != PIECE_HEAD:
-            raise SystemExit('%s: não é um documento do Dolt `{"rows": [...]}` com ao menos uma linha' % name)
+        empty = len(PIECE_HEAD) + len(PIECE_TAIL)   # uma peça sem linhas só vale sozinha (a tabela vazia): junto de outras daria `[,`
+        if m.size < empty or (m.size == empty and len(names) > 1) or fh.read(len(PIECE_HEAD)) != PIECE_HEAD:
+            raise SystemExit('%s: não é um documento do Dolt `{"rows": [...]}` com linhas (ou sem linhas, mas só se for a única peça)' % name)
         yield PIECE_HEAD if i == 0 else b","
         left = m.size - len(PIECE_HEAD) - len(PIECE_TAIL)
         while left:

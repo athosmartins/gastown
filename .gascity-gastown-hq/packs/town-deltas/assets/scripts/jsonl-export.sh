@@ -284,6 +284,10 @@ MAX_PUSH_FAILURES="${GC_JSONL_MAX_PUSH_FAILURES:-3}"
 PUSH_RETRY_DELAY_MIN="${GC_JSONL_PUSH_RETRY_DELAY_MIN:-1}"
 PUSH_RETRY_DELAY_SPAN="${GC_JSONL_PUSH_RETRY_DELAY_SPAN:-4}"
 SCRUB="${GC_JSONL_SCRUB:-true}"
+# ga-e4cbc5s: issues and comments are archived as one file per DAY of created_at (<db>/<table>/AAAA-MM-DD.jsonl, jsonl_split.py) and not as one document that every run rewrites and git stores whole again
+# (hq/comments.jsonl 509 MB + hq/issues.jsonl 112 MB: ~180 MB a backup). GC_JSONL_SPLIT=0 is the kill switch: the next run puts both tables back as single documents, and the flat <db>.jsonl copy.
+JEX_SPLIT="${GC_JSONL_SPLIT:-1}"
+COMMENTS_ROWS=""
 # ga-fegzc8h: the run's time budget. The order's timeout (840 s, under the 15 m interval: there is no single-flight lock) kills the run, and the one commit sits after the LAST database, so a run that
 # is killed commits nothing: three runs in a row (03:09, 03:39, 04:02Z on 28/10, load 70-120) wrote every file and committed none, the archive's HEAD stood still for 8 h and the offsite stopped. A whole pass
 # is ~960 s there (hq alone 530 s, the 7 others 430 s), so no timeout under the interval ever fits it; the run now fits ITS WORK in the budget instead:
@@ -1003,7 +1007,7 @@ discard_failed_db_outputs() {
     rm -rf "$ARCHIVE_REPO/$db"
     rm -f "$ARCHIVE_REPO/$db.jsonl"
 
-    if git -C "$ARCHIVE_REPO" cat-file -e "HEAD:$db/issues.jsonl" 2>/dev/null; then
+    if git -C "$ARCHIVE_REPO" cat-file -e "HEAD:$db" 2>/dev/null; then   # the database's tree, in either layout (ga-e4cbc5s)
         git -C "$ARCHIVE_REPO" restore --source=HEAD --worktree -- "$db" >/dev/null 2>&1 || true
     fi
     if git -C "$ARCHIVE_REPO" cat-file -e "HEAD:$db.jsonl" 2>/dev/null; then
@@ -1027,6 +1031,48 @@ discard_staged_archive_outputs() {
         fi
         rm -rf "$path"
     done
+}
+
+# prev_issue_count <db> — the rows of the previous snapshot's issues table, read from HEAD: one document (the old layout) or the day pieces (ga-e4cbc5s, jsonl_split.py count-head).
+# vazio (the table is not in HEAD) → 0, the first run; falhou/ilegível → 0 too, as it always was: no previous count, no spike check — a read that failed is never a spike.
+prev_issue_count() {
+    local db="$1"
+    if git -C "$ARCHIVE_REPO" cat-file -e "HEAD:$db/issues.jsonl" 2>/dev/null; then
+        git -C "$ARCHIVE_REPO" show "HEAD:$db/issues.jsonl" 2>/dev/null | count_jsonl_rows || echo "0"
+    else
+        python3 -I "$SCRIPT_DIR/jsonl_split.py" count-head --repo "$ARCHIVE_REPO" --db "$db" --table issues 2>/dev/null || echo "0"
+    fi
+}
+
+# split_db_tables <db> — publishes <db>/issues.jsonl and <db>/comments.jsonl as day pieces (jsonl_split.py writes only the pieces that changed, so a backup adds a few MB to .git and not the table) and removes
+# the single document, and with the issues' the flat <db>.jsonl copy. Any doubt keeps the single document — the layout of before, which every reader still takes — and removes the pieces: a table is never in
+# both layouts and never in none. A table kept at its previous version this run has no single document here: its pieces stay as they are. Return 1 only when a leftover cannot be removed (both layouts
+# would be committed): the caller discards the database.
+# vazio (no document: a kept table) → nothing to do; falhou (no python3, an unreadable document, rows != the count this export took) → the single document stays and the pieces go, said on stderr
+split_db_tables() {
+    local db="$1" t file dir rows
+    for t in issues comments; do
+        file="$ARCHIVE_REPO/$db/$t.jsonl"
+        dir="$ARCHIVE_REPO/$db/$t"
+        [ -f "$file" ] || continue
+        case "$t" in issues) rows="$CURRENT_COUNT" ;; *) rows="$COMMENTS_ROWS" ;; esac
+        if [ "$JEX_SPLIT" = 1 ] && python3 -I "$SCRIPT_DIR/jsonl_split.py" split --in "$file" --out-dir "$dir" ${rows:+--expect-rows "$rows"} >/dev/null; then
+            rm -f "$file" || return 1
+        else
+            [ "$JEX_SPLIT" != 1 ] || echo "jsonl-export: could not split $db.$t into day pieces; the single document stays (ga-e4cbc5s)" >&2
+            rm -rf "$dir" || return 1
+        fi
+    done
+    [ -f "$ARCHIVE_REPO/$db/issues.jsonl" ] || rm -f "$ARCHIVE_REPO/$db.jsonl"
+}
+
+# stage_db_paths <db> — adds to STAGE_PATHS what a run stages for a database: its directory, and the flat <db>.jsonl copy while it exists or HEAD still has it (with the day pieces there is none, and `git add -A`
+# fails on a pathspec that matches nothing: the commit that drops the flat copy is the last to name it). vazio → not named; falhou (git cannot say) → not named, the deletion is staged by the next run
+stage_db_paths() {
+    STAGE_PATHS+=("$1")
+    if [ -e "$ARCHIVE_REPO/$1.jsonl" ] || [ -n "$(git -C "$ARCHIVE_REPO" ls-tree --name-only HEAD -- "$1.jsonl" 2>/dev/null)" ]; then
+        STAGE_PATHS+=("$1.jsonl")
+    fi
 }
 
 # purge_stray_export_tmp — leftovers of exports killed under the old layout, when the scratch file lived inside the archive (ga-aai87v): 19 sit in the archive's HEAD, more may be
@@ -2165,6 +2211,7 @@ while IFS= read -r DB; do
     #   unknown     -> the source (its keys, or its count) is unreadable: kept and flagged unverified, like issues;
     #   unrestorable-> the DB is discarded like any other failed step.
     SUPP_UNRESTORABLE=0
+    COMMENTS_ROWS=""
     for TABLE in $SUPP_TABLES; do
         # ga-fegzc8h: past the table cutoff of the budget the table is not read — the previous version stays, like a table Dolt cut short (rc 1 below: named in partial=, issues still commit). The scrub/validate
         # of this database and the commit still have to fit under the order's timeout. falhou (the previous version cannot be put back) → the database is discarded, like rc 2 of export_supplemental_table.
@@ -2180,6 +2227,8 @@ while IFS= read -r DB; do
         fi
         SUPP_RC=0
         export_supplemental_table "$DB" "$TABLE" || SUPP_RC=$?
+        # the rows this export wrote, for split_db_tables to check the pieces against (a kept table: no count, no check)
+        if [ "$TABLE" = comments ] && { [ "$SUPP_RC" = 0 ] || [ "$SUPP_RC" = 3 ]; }; then COMMENTS_ROWS="$SUPP_RAW_ROWS"; fi
         case "$SUPP_RC" in
             0)
                 ;;
@@ -2263,6 +2312,14 @@ while IFS= read -r DB; do
 "
         continue
     fi
+    # ga-e4cbc5s: from here the snapshot of this database is in its final layout (day pieces, or the single documents when the split is off or cannot run)
+    if ! split_db_tables "$DB"; then
+        discard_failed_db_outputs "$DB"
+        FAILED_DB_COUNT=$((FAILED_DB_COUNT + 1))
+        FAILED_DBS="${FAILED_DBS}$DB
+"
+        continue
+    fi
 
     # Partial-export gate (ga-7sxdmb). Under load Dolt can hand back a truncated
     # result set that is still a well-formed document, so validation above cannot
@@ -2309,10 +2366,7 @@ while IFS= read -r DB; do
     # messages and DOG_DONE summaries reflect what was actually archived, not the pre-scrub raw export.
 
     # Step 3: Spike detection — compare record counts against previous commit.
-    PREV_COUNT=0
-    if git -C "$ARCHIVE_REPO" cat-file -e "HEAD:$DB/issues.jsonl" 2>/dev/null; then
-        PREV_COUNT=$(git -C "$ARCHIVE_REPO" show "HEAD:$DB/issues.jsonl" 2>/dev/null | count_jsonl_rows || echo "0")
-    fi
+    PREV_COUNT=$(prev_issue_count "$DB")
 
     # Skip the percentage check on the first run (no prior commit) and when
     # the previous count is below the absolute floor — a 1→2 swing is 100% but
@@ -2328,7 +2382,7 @@ while IFS= read -r DB; do
         if [ "$DELTA" -gt "$SPIKE_THRESHOLD" ]; then
             if should_halt_for_jsonl_spike "$DB" "$PREV_COUNT" "$FILTERED_COUNT" "$SPIKE_THRESHOLD"; then
                 TOTAL_EXPORTED=$((TOTAL_EXPORTED + CURRENT_COUNT))
-                STAGE_PATHS+=("$DB" "$DB.jsonl")
+                stage_db_paths "$DB"
                 record_unverified_db
                 record_short_tables
                 HALTED=1
@@ -2354,7 +2408,7 @@ while IFS= read -r DB; do
     fi
 
     TOTAL_EXPORTED=$((TOTAL_EXPORTED + CURRENT_COUNT))
-    STAGE_PATHS+=("$DB" "$DB.jsonl")
+    stage_db_paths "$DB"
     record_unverified_db
     record_short_tables
 done <<EOF
@@ -2370,7 +2424,7 @@ cd "$ARCHIVE_REPO"
 if [ "${#STAGE_PATHS[@]}" -gt 0 ]; then
     purge_stray_export_tmp
     # The exclude holds even if the purge above could not remove one: a scratch file is never staged (ga-aai87v).
-    if ! git add -A -- "${STAGE_PATHS[@]}" ':(exclude,glob)**/issues.jsonl.tmp.*'; then
+    if ! git add -A -- "${STAGE_PATHS[@]}" ':(exclude,glob)**/*.jsonl.tmp.*'; then
         discard_staged_archive_outputs
         echo "jsonl-export: staging archive outputs failed" >&2
         exit 1
