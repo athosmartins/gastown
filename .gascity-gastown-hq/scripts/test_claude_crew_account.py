@@ -2963,6 +2963,57 @@ def test_a_file_that_cannot_be_read_as_a_login_is_not_overwritten_by_the_heal(w)
     assert w.cred.read_text() == "{not json" and w.writes() == []
 
 
+@contextlib.contextmanager
+def _file_cannot_be_read(monkeypatch, target):
+    """A scope in which the read of THAT file raises (a permission error: the bytes are there and cannot be looked at); every other read is the
+    real one. Scoped (not monkeypatch.undo(), which would also undo the fixture's own env)."""
+    real = Path.read_bytes
+
+    def read_bytes(self):
+        if str(self) == str(target):
+            raise PermissionError(13, "Permission denied", str(self))
+        return real(self)
+    with monkeypatch.context() as m:
+        m.setattr(Path, "read_bytes", read_bytes)
+        yield
+
+
+def test_read_cred_file_tells_a_file_that_cannot_be_read_from_one_that_is_not_there(w, monkeypatch):
+    """Breaks if 'it is there and the read failed' collapses into 'there is no file' (the third state): the first must never be written over, the
+    second is created. A path that is a directory fails the read for real, with no stub."""
+    assert crew.read_cred_file() == ("missing", None, None)       # no file at all: raw None
+    w.put_file(blob("crypto"))
+    before = w.cred.read_bytes()
+    with _file_cannot_be_read(monkeypatch, w.cred):
+        assert crew.read_cred_file() == ("unreadable", None, None)    # there, and the read raised
+    assert w.cred.read_bytes() == before and crew.read_cred_file()[0] == "ok"
+
+
+@pytest.mark.parametrize("what", ["switch", "heal"])
+def test_a_credentials_file_whose_read_fails_is_never_written_over_by_a_switch_or_a_heal(w, monkeypatch, what):
+    """Breaks if an unreadable file is treated as an empty one: the switch would replace a login it never saw (the very file the sessions rotate),
+    the heal would 'complete' it from the item. Nothing is written, and the run says so instead of staying quiet."""
+    cur = blob("crypto")
+    _in_both(w, "crypto", cur)
+    w.account("crypto", cur)
+    if what == "switch":
+        w.account("amb", blob("amb"))
+        w.decide("amb")
+    else:
+        w.decide("crypto")
+        w.default("crypto", blob("crypto", rt="crypto-newer", rexp_days=25))   # the item is ahead of the file: the heal would write the file
+    before = w.cred.read_bytes()
+    with _file_cannot_be_read(monkeypatch, w.cred):
+        w.run()
+    assert w.writes() == [] and w.cred.read_bytes() == before and os.listdir(w.cred.parent) == [".credentials.json"]
+    if what == "switch":
+        said = [n for n in w.notified() if "write-failed" in n]
+        assert len(said) == 1 and "could not be read" in said[0]      # the push says why the switch did not happen
+        assert w.state()["current"] == EMAIL["crypto"]                # and the state does not say it did
+    else:
+        assert "the credentials file is unreadable: not touched and not healed" in w.log()
+
+
 def test_a_login_done_in_the_file_is_seen_and_clears_the_alarm_with_nobody_touching_the_job(w):
     """The 04/11 12:11 shape end to end. Breaks if a /login that landed in the FILE is invisible to the job: the item stays blank, the outage
     stays open and the push goes on until a human also copies the login to the item by hand (which kills one of the two copies of the token)."""
