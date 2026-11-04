@@ -8,7 +8,7 @@
 #          Cada sha de teste é um commit solto sobre origin/main, montado por mk() — o que o nó empurraria.
 # CASOS    Cada guard bloqueia o que tem de bloquear; "não consegui saber" (git que falha, guard que levanta exceção, forma outra, árvore ilegível) NUNCA vira passou; o código que roda é o de origin/main e NUNCA o do sha
 #          (um sha que sobrescreve os 6 arquivos de confiança com versões hostis não deixa rastro e continua bloqueado); só o que os guards leem é exportado (dado de lead não é copiado).
-# MUTANTES Cada guarda apagada do executável tem de reprovar o caso que a prova ("teste que só passa não prova nada").
+# MUTANTES Cada guarda apagada do executável tem de reprovar o caso que a prova ("teste que só passa não prova nada"). O caso que o `mutant` re-roda e que deixa uma pasta atrás (--scratch) ganha um `control` logo abaixo da linha: sem mutação ele tem de PASSAR de novo no mesmo $T, senão o "morto" não prova a mutação (era a sobra da rodada anterior, ga-yrobz57).
 # UNIDADE  O que o CLI nunca produz — caminho com NUL ou "..", tamanhos que estouram o teto, disco no limite exato, cabeçalho do cat-file torto, registro de formas que a árvore real não tem, gitlink no ls-tree — é provado chamando a MESMA função do
 #          executável com a entrada montada (o git vira um falso que devolve o lote pedido; o disco, um número). Cada caso diz PASS/FAIL na saída e o bash só confere a linha.
 # EQUIVALENTE (ga-u6ueg0q)  `nl >= 0` no cabeçalho do cat-file: trocar por `nl >= 1` ou `nl > 0` não muda nada. nl só vale 0 quando a saída começa por quebra de linha, e raw[0:0].split() já é [] — o mesmo que o ramo else: os dois caminhos acabam em "não devolveu o blob".
@@ -117,6 +117,9 @@ gl() { grep -qE "^wa-remote-guards: $1 $2 \(" "$T/out"; }   # gl G12 PASS: a lin
 one_result() { [ "$(grep -c 'RESULT=' "$T/out")" = 1 ]; }
 no_trace() { [ ! -e "$TRACE" ]; }
 no_leftover() { [ -z "$(ls "$T/tmp" 2>/dev/null)" ]; }   # nada de wa-remote-guards-* sobrando no TMPDIR
+# nsc NOME → $SC: um caminho --scratch NOVO a cada chamada de um caso (chame direto, nunca dentro de $( ): o contador se perderia no subshell). O `mutant` re-roda o caso no MESMO $T, e um nome fixo esbarraria na
+# "sobra de outra execução" (rc 2): o caso falharia sem mutação nenhuma e todo mutante dele "morreria" à toa (ga-yrobz57). Os casos com --scratch que um `mutant` re-roda usam nsc e têm um `control` na seção dos mutantes.
+SCN=0; nsc() { SCN=$((SCN+1)); SC="$T/sc-$1-$SCN"; }
 
 rep() { head -c "$1" /dev/zero | tr '\0' "$2"; }   # rep N c: N vezes o caractere c
 mkdir -p "$T/unit-tmp"
@@ -364,7 +367,7 @@ case_aviso_format() {  # contrato com o gate-done-remote.py (guards_avisos): o n
   [ "$r" = 0 ] && res PASS && awk '/ AVISO: / { seen = 1; i = index($0, "): "); head = (i > 0 ? substr($0, 1, i) : $0); if (index($0, "IGNORE") == 0 || index(head, "IGNORE") > 0) bad = 1 } END { exit !(seen && !bad) }' "$T/out"
 }
 case_big() { SHA=$S_BIG; runx; [ "$RC" = 2 ] && res_unknown_any && has "$T/out" "lib/big.py" && has "$T/out" "não leio o que não consigo ler inteiro"; }
-case_export_only_wanted() { SHA=$S_DATA; runx -- --scratch "$T/sc-data"; [ "$RC" = 0 ] && [ -f "$T/sc-data/tree/lib/z.py" ] && [ -z "$(find "$T/sc-data/tree" -name '*.csv' -o -name '*.json' ! -path '*/mds_consumers.d/*')" ] && [ ! -e "$T/sc-data/tree/data" ]; }
+case_export_only_wanted() { SHA=$S_DATA; nsc data; runx -- --scratch "$SC"; [ "$RC" = 0 ] && [ -f "$SC/tree/lib/z.py" ] && [ -z "$(find "$SC/tree" -name '*.csv' -o -name '*.json' ! -path '*/mds_consumers.d/*')" ] && [ ! -e "$SC/tree/data" ]; }
 case_export_modes() { SHA=$S_DATA; runx -- --scratch "$T/sc-modes"; [ "$RC" = 0 ] && [ -z "$(find "$T/sc-modes/tree" \( -type f ! -perm 0600 \) -o \( -type d ! -perm 0700 \))" ]; }
 case_trusted_missing() { SHA=$S_CLEAN; runx -- --trusted-ref refs/remotes/origin/nao-existe; [ "$RC" = 2 ] && res_unknown_any; }
 res_unknown_any() { grep -qE "^wa-remote-guards: RESULT=UNKNOWN " "$T/out" && ! has "$T/out" "RESULT=PASS"; }
@@ -375,8 +378,9 @@ case_guard_raises() { SHA=$S_CLEAN; runx -- --trusted-ref refs/remotes/origin/ba
 # Aqui o G6 de confiança mata o PRÓPRIO processo depois de a linha da exportação e a do G12 serem ditas, com o stdout num ARQUIVO (bloco, não linha): só o flush=True do say() as deixa lá (b82742161c).
 # rc 137 é a pré-condição: sem ela a morte foi limpa e o buffer teria sido esvaziado na saída.
 # --scratch explícito: o processo morto não roda o finally que apaga a pasta própria, e a que sobrasse em $T/tmp quebraria no_leftover (o trap de saída recolhe $T inteiro).
+# E NOVO a cada chamada (nsc): nada apaga a pasta que a morte deixa, e o `mutant` re-roda este caso no mesmo $T; com nome fixo o export recusaria a sobra (rc 2), o caso falharia sem mutação nenhuma e o mutante "morreria" à toa.
 # vazio → sem as linhas ditas antes da morte (o buffer morreu com o processo): falha; falhou → rc != 137 (o guard de confiança não matou): falha.
-case_kill_report() { SHA=$S_CLEAN; runx -- --trusted-ref refs/remotes/origin/kill-g6 --scratch "$T/sc-kill" 2>/dev/null; [ "$RC" = 137 ] && grep -qE '^wa-remote-guards: sha=[0-9a-f]{12} guards de confiança=' "$T/out" && gl G12 PASS && ! has "$T/out" "RESULT="; }
+case_kill_report() { SHA=$S_CLEAN; nsc kill; runx -- --trusted-ref refs/remotes/origin/kill-g6 --scratch "$SC" 2>/dev/null; [ "$RC" = 137 ] && grep -qE '^wa-remote-guards: sha=[0-9a-f]{12} guards de confiança=' "$T/out" && gl G12 PASS && ! has "$T/out" "RESULT="; }
 case_shape_changed() { SHA=$S_CLEAN; runx -- --trusted-ref refs/remotes/origin/shape; [ "$RC" = 2 ] && gl G12 UNKNOWN && has "$T/out" "mudou de forma (falta scan_plist"; }
 case_unforeseen_cmd() { SHA=$S_CLEAN; runx -- --trusted-ref refs/remotes/origin/cmd; [ "$RC" = 2 ] && gl G7 UNKNOWN && has "$T/out" "o guard pediu um comando que o atalho não prevê"; }
 case_empty_trusted() { SHA=$S_CLEAN; runx -- --trusted-ref refs/remotes/origin/empty; [ "$RC" = 2 ] && res UNKNOWN && gl G12 UNKNOWN && gl G6 UNKNOWN && gl G7 UNKNOWN && gl G7b UNKNOWN; }
@@ -385,7 +389,7 @@ case_skip_env_ignored() { SHA=$S_PAID; runx GT_SKIP_LAUNCHD_PAID_GUARD=1 GT_SKIP
 case_case_collision() { [ "$CASEINS" = 0 ] && return 0; SHA=$S_CASE; runx; [ "$RC" = 2 ] && has "$T/out" "colisão de nome ou disco" && ! has "$T/out" "RESULT=PASS"; }
 case_local_branch_decoy() { SHA=$S_CLEAN; git -C "$RIG" update-ref refs/heads/origin/main "$S_TAMPER"; runx; local r=$RC; git -C "$RIG" update-ref -d refs/heads/origin/main; [ "$r" = 0 ] && grep -q "sha=$S_CLEAN trusted=$MAIN" "$T/out"; }
 case_own_tmp_removed() { SHA=$S_PAID; runx; r1=$RC; SHA=$S_LINK; runx; [ "$r1" = 1 ] && [ "$RC" = 2 ] && no_leftover; }
-case_scratch_kept_and_not_reused() { SHA=$S_CLEAN; runx -- --scratch "$T/sc-keep"; r1=$RC; k=0; [ -d "$T/sc-keep/tree" ] || k=1; runx -- --scratch "$T/sc-keep"; [ "$r1" = 0 ] && [ "$k" = 0 ] && [ "$RC" = 2 ] && has "$T/out" "sobra de outra execução"; }
+case_scratch_kept_and_not_reused() { SHA=$S_CLEAN; nsc keep; runx -- --scratch "$SC"; r1=$RC; k=0; [ -d "$SC/tree" ] || k=1; runx -- --scratch "$SC"; [ "$r1" = 0 ] && [ "$k" = 0 ] && [ "$RC" = 2 ] && has "$T/out" "sobra de outra execução"; }
 case_usage() { SHA=$S_CLEAN; ( cd "$T" && env -i PATH="$PATH_RUN" "$PY" -I -B "$EXE" ) >"$T/out" 2>"$T/err"; r1=$?; ( cd "$T" && env -i PATH="$PATH_RUN" "$PY" -I -B "$EXE" --repo "$RIG" ) >"$T/out" 2>"$T/err"; r2=$?; ( cd "$T" && env -i PATH="$PATH_RUN" "$PY" -I -B "$EXE" --repo "$T/nao-e-repo" --sha "$S_CLEAN" ) >"$T/out" 2>"$T/err"; r3=$?
   [ "$r1" = 2 ] && [ "$r2" = 2 ] && [ "$r3" = 2 ] && res_unknown_any; }
 mk "colide" '' 'h1=$(printf a | git hash-object -w --stdin); h2=$(printf b | git hash-object -w --stdin); git update-index --add --cacheinfo 100644,$h1,lib/Dup.py; git update-index --add --cacheinfo 100644,$h2,lib/dup.py'; S_CASE=$SHA
@@ -513,9 +517,14 @@ EOF
   if "case_$2" >/dev/null 2>&1; then ok 1 "mutante $1 SOBREVIVEU (o caso não pegou)"; else ok 0 "mutante $1 morto"; fi
   EXE="$T/exe.py"
 }
+# vazio → o caso não viu o comportamento bom: rc ≠ 0, FAIL; falhou → o caso não existe ou não rodou (127): FAIL também, nunca um ok.
+control() {  # control CASO — logo abaixo da linha `mutant` do CASO: re-rodado agora, no mesmo $T e com o executável SEM mutação, o caso tem de PASSAR; se falhasse, o "morto" do mutante dele não provaria a mutação (o caso falharia de qualquer jeito; o motivo achado foi a sobra de uma rodada anterior, rc 2) (ga-yrobz57)
+  EXE="$T/exe.py"; "case_$1" >/dev/null 2>&1; ok $? "controle $1: re-rodado sem mutação o caso PASSA (sem isso o 'morto' do mutante dele não prova a mutação)"
+}
 mutant facade-git-que-falha-vira-lista-vazia git_diff_fails 'out = git(self.repo, "-c", "core.quotepath=false", "diff", "--no-ext-diff", "--no-textconv", *a[2:])' $'try:\n                out = git(self.repo, "-c", "core.quotepath=false", "diff", "--no-ext-diff", "--no-textconv", *a[2:])\n            except Unknown:\n                out = b""'
 mutant g6-excecao-vira-passou guard_raises 'raise Unknown(f"G6 levantou {type(e).__name__}: {safe(e)[:120]}")' 'return "PASS", "", []'
 mutant say-sem-flush kill_report 'print(f"wa-remote-guards: {msg}", flush=True)' 'print(f"wa-remote-guards: {msg}", flush=False)'
+control kill_report
 mutant nao-sei-nao-reprova git_diff_fails 'result = "BLOCKED" if "BLOCKED" in verdicts else "UNKNOWN" if "UNKNOWN" in verdicts else "PASS"' 'result = "BLOCKED" if "BLOCKED" in verdicts else "PASS"'
 mutant bloqueado-nao-reprova g12_blocks 'result = "BLOCKED" if "BLOCKED" in verdicts else "UNKNOWN"' 'result = "UNKNOWN"'
 mutant g12-codigo-do-sha tamper_all 'mod = load_trusted(c.repo, c.tsha, "g12", c.scratch)' 'mod = load_trusted(c.repo, c.sha, "g12", c.scratch)'
@@ -526,6 +535,7 @@ mutant g12-aprovacao-ignorada g12_approved_in_sha 'labels = registry_labels(reg.
 mutant registro-com-codigo-aceito g12_registry_code 'raise Unknown(f"{REGISTRY_PATH} tem código além de uma atribuição literal de {REGISTRY_NAME} (linha {node.lineno}): não avalio sem executar")' 'raise Unknown(f"{REGISTRY_PATH}: {node.lineno}")'
 mutant plist-ilegivel-vira-aviso g12_unreadable_plist 'if unread:' 'if False:'
 mutant exporta-tudo export_only_wanted 'return path.endswith((".py", ".sh", ".plist")) or path == NOTIFY_PATH or (path.startswith(MDS_DIR) and path.endswith(".json"))' 'return True'
+control export_only_wanted
 mutant relatorio-com-controle control_chars '"?", str(s))[:300]' '"?", "")[:300] + str(s)[:300]'
 mutant symlink-vira-modo symlink 'raise Unknown(f"symlink em {safe(e.path)!r}: seguir o link leria fora da árvore, e não seguir esconderia o alvo (vale para qualquer caminho: um link de pasta esconde o script que o plist chama)")' 'raise Unknown(f"modo 120000 em {safe(e.path)!r}")'
 mutant symlink-so-no-que-os-guards-leem dirlink 'if e.mode == "120000":' 'if e.mode == "120000" and wanted(e.path):'   # a forma do gate 1: o link de pasta não é "wanted", então era pulado calado
@@ -536,6 +546,7 @@ mutant ref-de-confianca-ambigua local_branch_decoy 'TRUSTED_REF = "refs/remotes/
 mutant comando-nao-previsto-vira-vazio unforeseen_cmd $'raise Unknown(f"o guard pediu um comando que o atalho não prevê: {safe(\' \'.join(a))[:100]}")' 'return subprocess.CompletedProcess(a, 0, "" if kw.get("text") else b"", "" if kw.get("text") else b"")'
 mutant forma-outra-nao-denunciada shape_changed $'raise Unknown(f"{mod.__name__} mudou de forma (falta {\', \'.join(missing)}): atualize wa-remote-guards.py junto com o guard")' 'raise Unknown(f"{mod.__name__}: {missing}")'
 mutant scratch-reaproveitado scratch_kept_and_not_reused 'root.mkdir(parents=True, exist_ok=False, mode=0o700)' 'root.mkdir(parents=True, exist_ok=True, mode=0o700)'
+control scratch_kept_and_not_reused
 mutant tmp-proprio-nao-removido own_tmp_removed '            shutil.rmtree(scratch, ignore_errors=True)' '            pass'
 mutant certificado-sem-confianca clean 'say(f"RESULT={result} sha={sha} trusted={tsha}")' 'say(f"RESULT={result} sha={sha}")'
 mutant garantia-de-ordem order 'GUARDS = (("G12", guard_g12), ("G6", guard_g6), ("G7", guard_g7), ("G7b", guard_g7b))' 'GUARDS = (("G6", guard_g6), ("G12", guard_g12), ("G7", guard_g7), ("G7b", guard_g7b))'
