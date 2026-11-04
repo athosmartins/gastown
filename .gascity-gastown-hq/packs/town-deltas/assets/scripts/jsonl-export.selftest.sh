@@ -1009,16 +1009,20 @@ B=$(commits); splitrun 31 190 200
 { [ "$(commits)" = "$B" ] && [ "$(piece_rows issues)" = 200 ] && clean_wt; } \
   && ok "split: a short export is discarded and the pieces come back from HEAD (HEAD unchanged, clean tree)" \
   || bad "split short export: commits $B -> $(commits), issues in HEAD $(piece_rows issues), status: $(git -C "$ARCH" status --porcelain | tr '\n' ' ')"
+touch -t 202511010000 "$ARCH/wa/comments" "$E2E/ref-old"   # the table's age: the offsite's table-age alarm reads this directory's mtime
 B=$(commits); STUB_FAIL_comments=1 splitrun 31 201 201
-{ [ "$(commits)" = $((B + 1)) ] && [ "$(piece_rows comments)" = 31 ] && [ "$(piece_rows issues)" = 201 ] && ! changed | grep -q 'wa/comments/' && clean_wt; } \
-  && ok "split: a comments table kept at its previous version keeps its pieces; issues still commit" \
-  || bad "split kept table: commits $B -> $(commits), comments=$(piece_rows comments) issues=$(piece_rows issues), changed: $(changed)"
+{ [ "$(commits)" = $((B + 1)) ] && [ "$(piece_rows comments)" = 31 ] && [ "$(piece_rows issues)" = 201 ] && ! changed | grep -q 'wa/comments/' && clean_wt \
+  && [ -z "$(find "$ARCH/wa/comments" -maxdepth 0 -newer "$E2E/ref-old")" ]; } \
+  && ok "split: a comments table kept at its previous version keeps its pieces and its age (the table-age alarm still sees it stale); issues still commit" \
+  || bad "split kept table: commits $B -> $(commits), comments=$(piece_rows comments) issues=$(piece_rows issues), changed: $(changed), dir newer than its old age: $(find "$ARCH/wa/comments" -maxdepth 0 -newer "$E2E/ref-old")"
 # a kept table is HEAD's version in HEAD's layout, whatever the working tree holds (a run killed between the discard's rm and its restore leaves the dir gone; a killed split, a stray piece or document): the DB is staged whole
 B=$(commits); rm -rf "$ARCH/wa/comments"; mkdir "$ARCH/wa/comments"; echo '{"rows": []}' > "$ARCH/wa/comments/2026-11-09.jsonl"; echo '{"rows": []}' > "$ARCH/wa/comments.jsonl"
+TMPP="wa/comments/2026-11-01.jsonl.tmp.p$PPID"; : > "$ARCH/$TMPP"   # the temp piece of a live process, which a split of another run may still be writing
 STUB_FAIL_comments=1 splitrun 31 201 201
-{ [ "$(layout comments)" = pieces ] && [ "$(piece_rows comments)" = 31 ] && [ "$(commits)" = "$B" ] && clean_wt; } \
-  && ok "split: a kept comments table is HEAD's pieces whatever the working tree holds (dir gone, stray piece, stray single document): nothing to commit" \
+{ [ "$(layout comments)" = pieces ] && [ "$(piece_rows comments)" = 31 ] && [ "$(commits)" = "$B" ] && [ "$(git -C "$ARCH" status --porcelain)" = "?? $TMPP" ]; } \
+  && ok "split: a kept comments table is HEAD's pieces whatever the working tree holds (dir gone, stray piece, stray single document): nothing to commit, the live temp piece untouched" \
   || bad "split kept table, tree out of step: layout=$(layout comments) comments=$(piece_rows comments) commits $B -> $(commits), status: $(git -C "$ARCH" status --porcelain | tr '\n' ' '): $OUT"
+rm -f "$ARCH/$TMPP"
 splitrun 31 100 100
 case "$OUT" in *HALTED*) ok "split: the spike check reads the previous count from the pieces (201 -> 100 halts)" ;; *) bad "split: 201 -> 100 did not halt, the previous count was not read from the pieces: $OUT" ;; esac
 # a previous count that cannot be read (a truncated piece in HEAD) skips the spike check AND says why, as the single document always did through jq: never a silent "first run"
@@ -1152,9 +1156,10 @@ done
 # Case 3 — no previous version to keep (the first run of a DB): the short table is not written at all, and not committed.
 fresh_archive supp-short-first
 export STUB_ROWS_comments=600 STUB_LOSE_comments=256 GC_JSONL_SUPP_CHUNK_ROWS=100
+mkdir -p "$ARCH/wa/comments"; echo '{"rows": []}' > "$ARCH/wa/comments/2026-11-09.jsonl"   # day pieces of a killed first run are no previous version either (ga-e4cbc5s)
 run_export 200 200
-{ [ ! -e "$ARCH/wa/comments.jsonl" ] && ! git -C "$ARCH" cat-file -e HEAD:wa/comments.jsonl 2>/dev/null; } \
-  && ok "short, first run: a table with no previous version is left out — no truncated file in the working tree or HEAD" \
+{ [ ! -e "$ARCH/wa/comments.jsonl" ] && ! git -C "$ARCH" cat-file -e HEAD:wa/comments.jsonl 2>/dev/null && ! git -C "$ARCH" cat-file -e HEAD:wa/comments 2>/dev/null; } \
+  && ok "short, first run: a table with no previous version is left out — no truncated file in the working tree or HEAD, and no stray pieces" \
   || bad "short, first run: wa/comments.jsonl exists (file: $(supp_file_rows comments) rows, HEAD: $(supp_head_rows comments))"
 [ "$(head_rows)" = "200" ] && case "$OUT" in *"failed: wa(comments)"*) true ;; *) false ;; esac \
   && ok "short, first run: the issues commit, and wa(comments) is reported failed" \

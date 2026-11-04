@@ -1949,11 +1949,12 @@ read_table_once() {
     return 0
 }
 
-# Puts the previous version of <db>/<table> back in the working tree, in the layout HEAD has it: the document <db>/<table>.jsonl or the day pieces in <db>/<table>/ (ga-e4cbc5s). A table with no previous
-# version ends up with no file, and what the tree holds of the table besides HEAD's version goes too (a leftover document would be split into HEAD's pieces). Return 1 when git cannot restore it, or cannot
-# say whether HEAD has one: the DB is staged as a whole, so deleting the table on a guess would commit its removal from the snapshot.
+# Puts the previous version of <db>/<table> back in the working tree, in the layout HEAD has it: the document <db>/<table>.jsonl or the day pieces in <db>/<table>/ (ga-e4cbc5s). A shape HEAD has is restored (git leaves a
+# file that already equals HEAD alone, so a table kept as it was keeps its mtime, which the table-age alarm reads as its age) and loses what the tree holds beyond HEAD's (a killed split's piece; a live split's temp piece
+# stays); a shape HEAD lacks is removed (a leftover document would be split into HEAD's pieces), so a table with no previous version ends up with no file. Return 1 when git cannot restore or clean it, or cannot say
+# whether HEAD has it: the DB is staged as a whole, so deleting the table on a guess would commit its removal from the snapshot.
 keep_previous_table() {
-    local db="$1" table="$2" path="$1/$2.jsonl" listed refs
+    local db="$1" table="$2" path="$1/$2.jsonl" p listed refs
 
     # HEAD not born: the archive's first run, no ref at all, so there is no previous version to keep. A HEAD that does not resolve while refs exist is a broken repo, not a first run.
     if ! git -C "$ARCHIVE_REPO" rev-parse --verify --quiet HEAD >/dev/null 2>&1; then
@@ -1964,13 +1965,17 @@ keep_previous_table() {
         fi
         return 1
     fi
-    # vazio → HEAD has neither the document nor the pieces (a table new to this DB); falhou → git cannot say, the tree is left alone and the caller discards the DB
-    if ! listed=$(git -C "$ARCHIVE_REPO" ls-tree --name-only HEAD -- "$path" "$db/$table" 2>/dev/null); then
-        return 1
-    fi
-    rm -rf "$ARCHIVE_REPO/$path" "$ARCHIVE_REPO/$db/$table" || return 1
-    # $listed = the names HEAD has (a database name is [A-Za-z0-9_-], a table's is fixed: nothing to split or glob); restore refuses a name HEAD lacks, so only those
-    [ -z "$listed" ] || git -C "$ARCHIVE_REPO" restore --source=HEAD --worktree -- $listed >/dev/null 2>&1
+    for p in "$path" "$db/$table"; do
+        # vazio → HEAD does not have this shape of the table (new to this DB, or in the other layout); falhou → git cannot say, the tree is left alone and the caller discards the DB
+        if ! listed=$(git -C "$ARCHIVE_REPO" ls-tree --name-only HEAD -- "$p" 2>/dev/null); then
+            return 1
+        elif [ -z "$listed" ]; then
+            rm -rf "$ARCHIVE_REPO/$p" || return 1
+        else
+            git -C "$ARCHIVE_REPO" restore --source=HEAD --worktree -- "$p" >/dev/null 2>&1 \
+                && git -C "$ARCHIVE_REPO" clean -fdq -e '*.jsonl.tmp.*' -- "$p" >/dev/null 2>&1 || return 1
+        fi
+    done
 }
 
 # One attempt at a table that has a key (ga-l6v576): its keys, its rows, its keys again, and the verdict of table_keys_verdict. Sets SUPP_VERDICT (complete | short | unknown | failed) and
