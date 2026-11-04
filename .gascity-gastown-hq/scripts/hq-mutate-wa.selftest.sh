@@ -204,6 +204,21 @@ fp_uso() {
 peq "uso: sweep sem --python ou com --python que não executa = 2; plan sem --python = 0; --fam-cap 0 e --pytest-timeout 0 = 2; nada foi à jaula" " 2 2 0 2 2 jail=0" fp_uso
 fp_tmo() { newfx; mkwa; sw --pytest-timeout 7; echo "$(cnt) flags=$(pyargs | sed 's/ tests\/.*//' | sort -u | paste -sd'|' -)"; }
 peq "--pytest-timeout 7 chega ao pytest como --timeout=7" "rc=0 completo run=12 k=9 c=3 f=0 inv=0 open=3 flags=-m pytest -p no:cacheprovider -p no:randomly -q -x --tb=no --no-header --timeout=7" fp_tmo
+# TETO DE DADOS (ga-2hd02v.5.11): o wrapper põe o MESMO teto do motor (--data-mb, RLIMIT_DATA) no processo do pytest, e o filho herda. O teste de família tenta alocar 300 MB e grava o resultado FORA do slot (a jaula falsa deixa): com --data-mb 128 a alocação falha
+# (MemoryError), sem o teto passa. O RLIMIT_DATA só é imposto pelo kernel Linux: só roda se a sonda PROVAR que ele impõe o limite, senão pula com AMBIENTE (o caso do motor, no hq-mutate.selftest.sh, tem a mesma regra).
+SKIP_DATA=1; [ "$(python3 -I -c 'import resource
+d = 128 << 20
+resource.setrlimit(resource.RLIMIT_DATA, (d, d))
+try:
+    bytearray(300 << 20)
+except MemoryError:
+    print("imposto")' 2> /dev/null)" = imposto ] && SKIP_DATA=0
+mkhog() { mkdir -p "$TREE/lib" "$TREE/tests"; printf 'def inc(a):\n    return a + 1\n' > "$TREE/lib/hog.py"
+  printf 'import hog\ntry:\n    bytearray(300 << 20)\n    r = "alloc=ok"\nexcept MemoryError:\n    r = "alloc=falhou"\nopen("%s/ev", "w").write(r)\nassert hog.inc(1) == 2\n' "$F" > "$TREE/tests/test_hog.py"; }
+fp_data() { newfx; mkhog; sw --data-mb "$1"; echo "rc=$RC $(jf 'd["result"]') $(cat "$F/ev" 2> /dev/null)"; }
+fp_data128() { fp_data 128; }
+[ "$SKIP_DATA" = 1 ] || peq "--data-mb 128 chega ao pytest do wrapper: a alocação de 300 MB do teste falha (MemoryError) e a varredura é completa" "rc=0 completo alloc=falhou" fp_data 128
+peq "controle do mesmo caminho sem o teto (--data-mb 0): a alocação passa" "rc=0 completo alloc=ok" fp_data 0
 
 # ── mutantes do wrapper ────────────────────────────────────────────────────────────────────────────
 # mut NOME ANTIGO NOVO: copia o wrapper para uma pasta PRÓPRIA com o hq-mutate.py ao lado (ele o carrega de lá) e troca ANTIGO por NOVO (tem de casar exatamente 1 vez); o caminho fica em $MP
@@ -279,11 +294,14 @@ par kill_it python-nao-exec     fp_uso   " 2 2 0 2 2 jail=0" ' and os.access(min
 par kill_it cap-zero-aceito     fp_uso   " 2 2 0 2 2 jail=0" 'if mine.fam_cap < 1 or' 'if mine.fam_cap < 0 or'
 par kill_it timeout-zero-aceito fp_uso   " 2 2 0 2 2 jail=0" ' or mine.pytest_timeout < 1:' ' or mine.pytest_timeout < 0:'
 par kill_it baseline-ignorada   fp_red   "rc=0 sem-cobertura run=0 skipped=base-vermelha=1 jail=1" '    return rc, int(time.time() - t0)' '    return 0, int(time.time() - t0)'
+[ "$SKIP_DATA" = 1 ] || par kill_it dados-nao-chega  fp_data128 "rc=0 completo alloc=falhou" 'sys.executable, "-I", "-c", hqm.CAPPER, hqm.cap_arg(ctx.a), *pytest]' 'sys.executable, "-I", "-c", hqm.CAPPER, str(ctx.a.fsize_mb << 20), *pytest]'
 reap
 # controle do controle: o `mut` recusa uma âncora ambígua e uma que não casa
 FAIL0=$FAIL   # o mut recusa e conta uma falha própria: aqui a recusa é o esperado, então só a aceitação reprova
 for a in import texto-que-nao-existe-no-wrapper; do if mut ancora-ruim "$a" y > /dev/null 2>&1; then bad "mut aceitou âncora que não casa exatamente 1 vez: $a"; else FAIL=$FAIL0; ok; fi; done
 
-echo "hq-mutate-wa selftest: $PASS passed, $FAIL failed"
+[ "$SKIP_DATA" = 0 ] || echo "AMBIENTE: este kernel não impõe o RLIMIT_DATA (ou a sonda não rodou): o caso do teto de dados e o seu mutante não rodaram (o nó, Linux, roda)"
+echo "hq-mutate-wa selftest: $PASS passed, $FAIL failed$([ "$SKIP_DATA" = 1 ] && echo ", caso do teto de dados NÃO rodou (AMBIENTE)")"
 [ "$FAIL" -eq 0 ] || exit 1
+[ "$SKIP_DATA" -eq 0 ] || exit 97
 exit 0

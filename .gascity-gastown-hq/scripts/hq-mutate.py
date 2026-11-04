@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 """hq-mutate.py — varredura de MUTANTES do código que os *.selftest.sh do hq cobrem (ga-2hd02v.5.6.2): o resultado que alguém lê é a lista de testes que NÃO pegam um bug.
 ## Contents
-  Por quê · Uso · Alvos · Operadores · Autoteste embutido · Registro de equivalentes · Veredito · Teto de escrita · Estado · Aplicar um mutante (gate) · Códigos de saída
+  Por quê · Uso · Alvos · Operadores · Autoteste embutido · Registro de equivalentes · Veredito · Teto de escrita · Teto de dados · Slots dinâmicos · Estado · Aplicar um mutante (gate) · Códigos de saída
 POR QUÊ: um selftest verde com o código quebrado não prova nada. Trocar UM trecho do script (`-gt` por `-ge`, `&&` por `||`, `exit 1` por `exit 0`) e rodar a família de selftests dele diz se algum reprova; se nenhum
   reprova, o mutante SOBREVIVEU e o teste é fraco naquela linha. É CPU que o lastro do nó Hetzner gasta com nice 19 sem custo, e cada achado vira um bead (ga-2hd02v.5.6).
 USO: hq-mutate.py gen ARQUIVO [--tree HQ]                  imprime os candidatos (id, linha, operador, antes, depois), TAB; com --tree o id é o que o `sweep` grava (caminho relativo à árvore)
      hq-mutate.py plan  --tree HQ --state ARQ              imprime os alvos na ordem em que a varredura os pegaria (e por que pula os que pula)
      hq-mutate.py apply ARQUIVO --tree HQ --id ID --out SAIDA [--also SELFTEST]...   grava em SAIDA o texto do ARQUIVO com UM mutante (ver APLICAR UM MUTANTE)
-     hq-mutate.py sweep --tree HQ --state ARQ --work DIR --jail hq-sandbox-run.py [--budget-s N] [--slots N] [--cap N] [--targets N] [--fsize-mb N]
+     hq-mutate.py sweep --tree HQ --state ARQ --work DIR --jail hq-sandbox-run.py [--budget-s N] [--slots N] [--slots-max N --slots-file ARQ] [--cap N] [--targets N] [--fsize-mb N] [--data-mb N]
   A última linha do stdout do `sweep` é UM json: result (completo | parcial | sem-novidade | sem-cobertura | interrompido | sem-jaula | sem-alvos | estado-ilegivel | gravacao-falhou), contagens, skipped{motivo: n},
   survivors[] (até 15; `survivors_cortados` conta o resto). `sem-novidade` = tudo o que havia já estava coberto e igual; `sem-cobertura` = nada foi examinado. `nao_sei` = alvos em que o `bash -n` não decidiu; `falhas` = execuções
   que falharam por infra (disco cheio, slot que não limpa): nenhum veredito, o resultado nunca é `completo`; `restam` = candidatos conhecidos ainda sem veredito (nao_sei e falhas: a próxima varredura tenta de novo).
@@ -30,6 +30,12 @@ TETO DE ESCRITA (ga-e6ug8gq): código alterado pode virar laço de escrita (27/1
   (o python o ignora e o filho herdaria o ignorar: o write falharia com EFBIG e um laço de shell giraria até o prazo do mutante; por isso `bash -c 'ulimit -f …'` não basta) e RECUSA (rc 70, nunca roda sem teto) se não consegue fixar e reler o limite: a baseline fica vermelha e o alvo é pulado. Arquivo que estoura o teto mata o laço
   (rc 153) e o mutante é MORTO como qualquer rc != 0, nunca falha de infra; stdout e stderr dos filhos vão para /dev/null (nada a cortar). --fsize-mb < 1 é uso (rc 2): não existe varredura sem teto. NÃO coberto: o teto é por
   ARQUIVO, um laço que grava MUITOS arquivos abaixo dele passa (a soma do slot é o TETO DO SLOT, logo abaixo); e um selftest que engole o rc do filho morto pelo teto e sai 0 deixa o mutante sobreviver (o disco, ao menos, está salvo).
+TETO DE DADOS (ga-2hd02v.5.11): um mutante que aloca sem parar leva o escopo inteiro ao limite de memória (04/11, madrugada: sete rodadas SEGUIDAS do wa-mutants morreram por teto-memoria e a rodada seguinte retomava no mesmo ponto). --data-mb N (0 = sem teto, o padrão) fixa RLIMIT_DATA (heap e mapas
+  anônimos privados) em N MB no mesmo lançador do teto de escrita: passou do teto o alocador recebe ENOMEM (MemoryError) e o mutante MORRE como qualquer rc != 0, sem derrubar a rodada. Como o de escrita, é fixado e RELIDO (rc 70 se não consegue, nunca roda sem o teto pedido) e vale o menor entre o pedido e o limite
+  duro do sistema. O virtual não é o que se limita (VmPeak de um pytest do WA chega a 3,4 GB com 224 MB de RSS), e sim o `data` (VmData até 1,2 GB nos medidos). SÓ o kernel Linux impõe (>= 4.7): no macOS o limite não pega.
+SLOTS DINÂMICOS (ga-2hd02v.5.11): o lastro do nó sobe e desce quantos mutantes rodam conforme a CPU, a RAM e o disco do nó naquele minuto. --slots N é o começo (>= 1); com --slots-file ARQ e --slots-max M existem M slots (pastas e threads) e o motor relê ARQ a cada 5 s (HQM_SLOTS_POLL_S) e o limite vira o
+  inteiro que ele traz, de 1 a M (acima de M vale M). ARQ ausente, vazio, de texto, 0 ou negativo NÃO muda nada (o limite fica onde estava; `slots_bad` conta a leitura que não valeu): o 3º estado nunca vira "0 slots" (nada rodaria) nem "o máximo". Quem espera vaga não começa depois do prazo ou do TERM.
+  O resumo ganha slots_peak (o máximo de mutantes ao mesmo tempo), slots_last (o limite no fim) e slots_bad. Sem --slots-file nada muda.
 ESTADO (--state, json, trocado por arquivo temporário): por alvo o hash do conteúdo (e da revisão do scanner), o veredito de cada id e os sobreviventes. Hash igual e tudo coberto = `sem-novidade` (varrer o mesmo seria queima disfarçada). Ordem: arquivo mudado nos últimos 7 dias (git log),
   depois selftests SEM mutante embutido, depois o menos recente; --cap limita os mutantes por alvo por varredura. O motor NÃO trava o --state: UM sweep por vez é de quem chama. Estado que lê mas tem forma errada = estado-ilegivel (rc 3, nunca se zera).
 TETO DO SLOT (ga-2d14tow): o teto por arquivo não pega o laço que grava MUITOS arquivos pequenos (cada um passa por baixo dele; 50 mil arquivos de 100 KB são 5 GB). Enquanto cada selftest da família roda, o motor mede o slot (`du -sk`) a cada 2 s e, se ele cresceu
@@ -72,22 +78,35 @@ DENY = r"\b(?:sudo|doas|systemctl|launchctl|pkill|killall|osascript|docker|podma
 PASS_ENV = ("PATH", "LANG", "LC_ALL", "LC_CTYPE", "USER", "LOGNAME")
 MAX_LINE = 6000
 FSIZE_MB = 512   # teto de escrita por arquivo de cada filho, ver TETO DE ESCRITA
-# lançador do teto: fixa e RELÊ o RLIMIT_FSIZE, devolve o SIGXFSZ ao padrão (o python o ignora e o exec herda o ignorar) e só então roda o resto; vazio/não-inteiro → ValueError, falhou/ilegível (setrlimit recusa, getrlimit relê outra coisa) → rc 70 e nada roda (nunca sem teto). -I -c CAPPER BYTES CMD…
+# lançador dos tetos: fixa e RELÊ o RLIMIT_FSIZE (e, se pedido, o RLIMIT_DATA), devolve o SIGXFSZ ao padrão (o python o ignora e o exec herda o ignorar) e só então roda o resto; vazio/não-inteiro → ValueError, falhou/ilegível (setrlimit recusa, getrlimit relê outra coisa) → rc 70 e nada roda (nunca sem teto). -I -c CAPPER BYTES[,BYTES_DE_DADOS] CMD…
 CAPPER = (
     "import os, resource, signal, sys\n"
     "try:\n"
-    "    n = int(sys.argv[1])\n"
+    "    n, _, dm = sys.argv[1].partition(',')\n"
+    "    n = int(n)\n"
     "    hard = resource.getrlimit(resource.RLIMIT_FSIZE)[1]\n"
     "    n = n if hard == resource.RLIM_INFINITY else min(n, hard)\n"
     "    resource.setrlimit(resource.RLIMIT_FSIZE, (n, n))\n"
     "    if resource.getrlimit(resource.RLIMIT_FSIZE) != (n, n):\n"
     "        raise OSError('o limite fixado nao foi o relido')\n"
+    "    if dm:\n"
+    "        d = int(dm)\n"
+    "        dh = resource.getrlimit(resource.RLIMIT_DATA)[1]\n"
+    "        d = d if dh == resource.RLIM_INFINITY else min(d, dh)\n"
+    "        resource.setrlimit(resource.RLIMIT_DATA, (d, d))\n"
+    "        if resource.getrlimit(resource.RLIMIT_DATA) != (d, d):\n"
+    "            raise OSError('o limite de dados fixado nao foi o relido')\n"
     "    signal.signal(signal.SIGXFSZ, signal.SIG_DFL)\n"
     "except (OSError, ValueError, OverflowError) as e:\n"
-    "    sys.stderr.write('hq-mutate: teto de escrita nao aplicado: %s\\n' % e)\n"
+    "    sys.stderr.write('hq-mutate: teto de escrita ou de dados nao aplicado: %s\\n' % e)\n"
     "    os._exit(70)\n"
     "os.execvp(sys.argv[2], sys.argv[2:])\n"
 )
+
+
+def cap_arg(a):
+    """o argumento do CAPPER: os BYTES do teto de escrita e, com --data-mb, `,BYTES` do teto de dados (0 = sem teto de dados, o padrão)"""
+    return str(a.fsize_mb << 20) + ("," + str(a.data_mb << 20) if a.data_mb else "")
 SHIMS = ("remote-shim", "remote-shim.py")
 
 
@@ -350,9 +369,12 @@ class Ctx:
     def __init__(self, a, tree):
         self.a, self.tree, self.root = a, tree, tree.parent
         self.work = Path(a.work).resolve()
+        self.top = max(a.slots, a.slots_max)   # pastas de slot e threads que EXISTEM; quantas rodam AGORA é `limit` (o --slots-file o muda), contadas em `running`
         self.slots = queue.Queue()
-        for i in range(a.slots):
+        for i in range(self.top):
             self.slots.put(i)
+        self.limit, self.running, self.peak, self.slots_bad = a.slots, 0, 0, 0
+        self.cv, self.done = threading.Condition(), threading.Event()
         self.stop, self.pids, self.lock = threading.Event(), set(), threading.Lock()
         self.deadline = time.time() + a.budget_s
         self.falhas = 0
@@ -373,6 +395,35 @@ try:   # HQM_SLOT_POLL_S: os selftests medem a cada 0.2 s. vazio → 2 s; falhou
         raise ValueError(SLOT_POLL_S)
 except ValueError:
     SLOT_POLL_S = 2.0
+try:   # HQM_SLOTS_POLL_S: de quanto em quanto o motor relê o --slots-file (os selftests usam 0.1). vazio → 5 s; falhou/ilegível (não é número, fora de 0.05..60) → 5 s, nunca um intervalo que não relê
+    SLOTS_POLL_S = float(os.environ.get("HQM_SLOTS_POLL_S", "5"))
+    if not 0.05 <= SLOTS_POLL_S <= 60:
+        raise ValueError(SLOTS_POLL_S)
+except ValueError:
+    SLOTS_POLL_S = 5.0
+
+
+def read_slots(path, top):
+    """quantos mutantes o governo pede AGORA (1..top), ou None. vazio (arquivo vazio) / falhou / ilegível (ausente, texto, número < 1) → None: o limite NUNCA muda por palpite (nem para 0, em que nada rodaria, nem para o máximo); acima de top vale top"""
+    try:
+        with open(path, "r", encoding="ascii") as f:
+            n = int(f.read(32).strip())
+    except (OSError, UnicodeDecodeError, ValueError):
+        return None
+    return None if n < 1 else min(n, top)
+
+
+def poll_slots(ctx):
+    """segue o --slots-file até a varredura acabar: valor válido muda o limite (e acorda quem espera); leitura que não valeu só é contada"""
+    while not ctx.done.is_set():
+        n = read_slots(ctx.a.slots_file, ctx.top)
+        with ctx.cv:
+            if n is None:
+                ctx.slots_bad += 1
+            elif n != ctx.limit:
+                ctx.limit = n
+                ctx.cv.notify_all()
+        ctx.done.wait(SLOTS_POLL_S)
 
 
 def slot_kb(slot):
@@ -420,7 +471,7 @@ def exec_family(ctx, slot_n, tgt, text, tmo):
     kv = ["%s=%s" % (k, os.environ[k]) for k in PASS_ENV if k in os.environ] + ["HOME=%s" % (slot / "home"), "TMPDIR=%s" % (slot / "tmp"), "PYTHONDONTWRITEBYTECODE=1", "GIT_AUTHOR_NAME=gt", "GIT_AUTHOR_EMAIL=gt@no", "GIT_COMMITTER_NAME=gt", "GIT_COMMITTER_EMAIL=gt@no"]
     t0, rc = time.time(), 0
     for st in tgt["family"]:
-        cmd = [sys.executable, "-I", ctx.a.jail, "--rw", str(slot), "--", "env", "-i", *kv, "timeout", "-k", "5", str(tmo), sys.executable, "-I", "-c", CAPPER, str(ctx.a.fsize_mb << 20), "bash", st]
+        cmd = [sys.executable, "-I", ctx.a.jail, "--rw", str(slot), "--", "env", "-i", *kv, "timeout", "-k", "5", str(tmo), sys.executable, "-I", "-c", CAPPER, cap_arg(ctx.a), "bash", st]
         p = subprocess.Popen(cmd, cwd=cd, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
         with ctx.lock:
             ctx.pids.add(p.pid)
@@ -439,7 +490,14 @@ def exec_family(ctx, slot_n, tgt, text, tmo):
 
 
 def run_slot(ctx, tgt, text, tmo):
-    """(rc, segundos), ou None se o TERM chegou antes ou durante a execução (o rc que sobra, -9 do killpg, é do sinal, não de um teste) ou se a execução falhou por infra: nenhum veredito"""
+    """(rc, segundos), ou None se o TERM chegou antes ou durante a execução (o rc que sobra, -9 do killpg, é do sinal, não de um teste), se a execução falhou por infra ou se o prazo da varredura passou enquanto esperava vaga: nenhum veredito"""
+    with ctx.cv:   # o limite de slots (que o governo mexe pelo --slots-file) vale AQUI, antes de pegar uma pasta: espera até caber (o limite nunca é < 1: o uso e a leitura do arquivo o garantem); TERM ou prazo vencido, não começa
+        while ctx.running >= ctx.limit and not ctx.stop.is_set():
+            ctx.cv.wait(1.0)
+        if ctx.stop.is_set() or time.time() > ctx.deadline:
+            return None
+        ctx.running += 1
+        ctx.peak = max(ctx.peak, ctx.running)
     slot_n = ctx.slots.get()
     try:
         r = None if ctx.stop.is_set() else exec_family(ctx, slot_n, tgt, text, tmo)
@@ -450,6 +508,9 @@ def run_slot(ctx, tgt, text, tmo):
         return None
     finally:
         ctx.slots.put(slot_n)
+        with ctx.cv:
+            ctx.running -= 1
+            ctx.cv.notify_all()
 
 
 def one_mutant(ctx, tgt, text, m):
@@ -528,6 +589,8 @@ def sweep(a):
         return 3
     ctx = Ctx(a, tree)
     signal.signal(signal.SIGTERM, on_term(ctx))
+    if a.slots_file:
+        threading.Thread(target=poll_slots, args=(ctx,), daemon=True).start()
     t0, skipped, n = time.time(), {}, dict(run=0, killed=0, survived=0, confirmed=0, flaky=0, invalid=0, swept=0, unknown=0)
     new_surv, lost = [], []
     for t in [t for t in plan if t["skip"]]:
@@ -538,7 +601,7 @@ def sweep(a):
         if ctx.stop.is_set() or time.time() > ctx.deadline:
             break
         batch = todo[i:i + max(2, a.targets)]
-        with ThreadPoolExecutor(a.slots) as ex:
+        with ThreadPoolExecutor(ctx.top) as ex:
             base = list(ex.map(lambda t: run_slot(ctx, t, None, 900), batch))
         if ctx.stop.is_set():
             break
@@ -587,7 +650,7 @@ def sweep(a):
             n["swept"] += 1
             jobs.append([(t, text, m) for m in pick])
         order = [x for grp in itertools.zip_longest(*jobs) for x in grp if x is not None]   # um mutante de cada alvo por vez: o prazo corta todos por igual
-        with ThreadPoolExecutor(a.slots) as ex:
+        with ThreadPoolExecutor(ctx.top) as ex:
             futs = {ex.submit(one_mutant, ctx, t, text, m): (t, m) for t, text, m in order}
             for f in as_completed(futs):
                 t, m = futs[f]
@@ -611,6 +674,7 @@ def sweep(a):
         except OSError as e:
             err = "%s: %s" % (type(e).__name__, e)
             break
+    ctx.done.set()   # o poller do --slots-file para; o que ele contou entra no resumo
     done = not ctx.stop.is_set() and err is None and time.time() <= ctx.deadline and not ctx.falhas
     ents = [(t, state["targets"].get(t["rel"], {})) for t in plan]
     cur = [e for t, e in ents if e.get("hash") == t["hash"]]
@@ -619,7 +683,7 @@ def sweep(a):
               else "sem-novidade" if not todo else "completo" if done else "parcial")
     summary(result, targets_swept=n["swept"], mutants_run=n["run"], killed=n["killed"], survived=n["survived"], confirmed=n["confirmed"], flaky=n["flaky"], invalid=n["invalid"], nao_sei=n["unknown"], falhas=ctx.falhas,
             restam=sum(max(0, e.get("total", 0) - len(e.get("verdicts", {}))) for e in cur), skipped=skipped, open_n=sum(len(e.get("survivors", {})) for e in cur), survivors=new_surv,
-            perdidos=lost[:5], recent="ok" if recent is not None else "indisponivel", secs=int(time.time() - t0), jail=proof[:120], **({"erro": err[:160]} if err else {}))
+            perdidos=lost[:5], recent="ok" if recent is not None else "indisponivel", secs=int(time.time() - t0), jail=proof[:120], slots_peak=ctx.peak, slots_last=ctx.limit, slots_bad=ctx.slots_bad, **({"erro": err[:160]} if err else {}))
     return 143 if ctx.stop.is_set() else 3 if err else 0
 
 
@@ -685,11 +749,16 @@ def main(argv=None):
     s.add_argument("--work", required=True)
     s.add_argument("--slot-mb", type=int, default=SLOT_MB)
     s.add_argument("--jail", required=True)
-    for k, d in (("budget-s", 3600), ("slots", 4), ("cap", 40), ("targets", 8), ("fsize-mb", FSIZE_MB)):
+    for k, d in (("budget-s", 3600), ("slots", 4), ("cap", 40), ("targets", 8), ("fsize-mb", FSIZE_MB), ("slots-max", 0), ("data-mb", 0)):
         s.add_argument("--" + k, type=int, default=d)
+    s.add_argument("--slots-file")
     a = ap.parse_args(argv)
     if a.cmd == "sweep" and a.fsize_mb < 1:   # sem teto não há varredura
         ap.error("--fsize-mb tem de ser um inteiro >= 1 (MB por arquivo)")
+    if a.cmd == "sweep" and a.slots < 1:   # sem um slot nada roda (e o motor esperaria a vaga para sempre)
+        ap.error("--slots tem de ser um inteiro >= 1")
+    if a.cmd == "sweep" and a.data_mb < 0:   # 0 = sem teto de dados (o padrão)
+        ap.error("--data-mb tem de ser um inteiro >= 0 (MB de dados por processo do mutante; 0 = sem teto)")
     if a.cmd == "gen":
         try:
             rel = Path(a.file).resolve().relative_to(Path(a.tree).resolve()).as_posix() if a.tree else Path(a.file).name   # com --tree o id é o que o sweep grava

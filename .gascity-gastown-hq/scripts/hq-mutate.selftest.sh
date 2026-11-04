@@ -364,6 +364,90 @@ fp_slot_semdu() {  # du que FALHA (rc 1 e saída que não é número): sem medid
 }
 EXP_SLOT_SEMDU="rc=0 completo run=6 k=2 c=4 f=0 inv=0 open=4 falhas=0 terminou=SIM n=3000 left=0"
 peq "du que falha (rc 1, saída ilegível) com o teto de slot ligado: sem medida não há veredito, o laço grava até o fim, nenhum mutante é cortado e nada vira falha de infra" "$EXP_SLOT_SEMDU" fp_slot_semdu
+# SLOTS DINÂMICOS (ga-2hd02v.5.11). O governo do lastro mede a CPU que sobra a cada minuto e escreve em --slots-file quantos mutantes podem rodar AGORA (1..--slots-max); o motor relê o arquivo a cada HQM_SLOTS_POLL_S (5 s) e segue.
+# Arquivo ausente, vazio, de texto, 0 ou negativo NÃO muda nada: o limite fica onde estava e `slots_bad` conta a leitura que não valeu (o 3º estado nunca vira "0 slots", em que nada rodaria, nem "o máximo"); acima de --slots-max vale o máximo.
+# O fixture é o foo com SEGUNDOS por execução (a concorrência aparece em slots_peak) e, na PRIMEIRA execução (a baseline, sozinha), grava VALOR no arquivo e espera 0,3 s (3 leituras do motor): o caminho vai no TEXTO do selftest (o env -i apagaria uma variável).
+mkslow() {  # mkslow SEGUNDOS [VALOR]
+  mkfoo; mkst foo 'sleep '"$1"'
+v="'"${2:-}"'"; if [ -n "$v" ] && [ ! -e "'"$F"'/done" ]; then echo "$v" > "'"$F"'/slots"; : > "'"$F"'/done"; sleep 0.3; fi
+[ "$(bash "$H/foo.sh" 9)" = big ] || exit 1
+[ "$(bash "$H/foo.sh" 1)" = small ] || exit 1'
+}
+swb() {  # swb ARGS…: o sweep com um VIGIA de 40 s (a varredura normal leva ~3 s): o motor que trava (um limite de 0 aceito, um contador que não desce) é morto aos 40 s, RC 137, e a bateria segue
+  local pid wd; HQM_SLOTS_POLL_S=0.1 python3 -I "${ENG:-$HM}" sweep --tree "$TREE" --state "$F/state.json" --work "$F/work" --jail "$W/fakejail.py" --slots 2 "$@" > "$F/out" 2> "$F/err" & pid=$!
+  ( sleep 40; kill -9 "$pid" 2> /dev/null ) & wd=$!
+  wait "$pid"; RC=$?; kill "$wd" 2> /dev/null; wait "$wd" 2> /dev/null
+}
+fp_slots() {  # fp_slots SLOTS MAX ARQUIVO PROXIMO [SEGUNDOS]: --slots SLOTS --slots-max MAX; o arquivo começa com ARQUIVO (- = não existe) e a baseline grava PROXIMO (- = nada)
+  newfx; mkslow "${5:-0.4}" "$([ "$4" = - ] || echo "$4")"; [ "$3" = - ] || printf '%s\n' "$3" > "$F/slots"
+  swb --slots "$1" --slots-max "$2" --slots-file "$F/slots"
+  echo "$(cnt) peak=$(jf 'd["slots_peak"]') last=$(jf 'd["slots_last"]') bad=$(jf 'd["slots_bad"] > 0' | sed 's/True/sim/; s/False/nao/')"
+}
+EXP_SLU="$EXP_SW0 peak=4 last=4 bad=nao"; EXP_SLD="$EXP_SW0 peak=1 last=1 bad=nao"; EXP_SLA="$EXP_SW0 peak=3 last=3 bad=nao"; EXP_SLJ="$EXP_SW0 peak=2 last=2 bad=sim"; EXP_SLS="$EXP_SW0 peak=3 last=3 bad=sim"
+fp_sl_up()        { fp_slots 1 4 4 -; }
+fp_sl_down()      { fp_slots 3 4 1 -; }
+fp_sl_live_up()   { fp_slots 1 4 1 3; }
+fp_sl_live_down() { fp_slots 3 3 3 1; }
+fp_sl_junk()      { fp_slots 2 4 "$1" - 0.1; }
+fp_sl_abs()       { fp_slots 2 4 - - 0.1; }
+fp_sl_max()       { fp_slots 1 3 99 - 0.1; }
+fp_sl_menor()     { fp_slots 3 1 - - 0.1; }
+fp_sl_prazo() {   # o prazo vence com mutantes ESPERANDO vaga (1 vaga e 3 threads, 3 s por execução, 5 s de prazo: o 1º mutante ainda roda quando o prazo vence): ao acordar eles veem o prazo vencido e desistem; sem isso rodariam todos
+  newfx; mkslow 3; swb --slots 1 --slots-max 3 --slots-file "$F/slots" --budget-s 5
+  echo "$(jf 'd["result"]') pouco=$(jf 'd["mutants_run"] <= 1')"
+}
+fp_sl_uso() { newfx; mkfoo; local o="" v; for v in 0 -2 abc ""; do swb --slots "$v" --slots-max 4; o="$o $RC"; done; sw --slots 1; echo "$o | $(cnt)"; }
+peq "slots dinâmicos: o arquivo (4) vale desde o início, com --slots 1: 4 mutantes ao mesmo tempo, o veredito é o de sempre" "$EXP_SLU" fp_sl_up
+peq "slots dinâmicos: o arquivo (1) vale desde o início, com --slots 3: um de cada vez" "$EXP_SLD" fp_sl_down
+peq "slots dinâmicos: o governo SOBE no meio da varredura (a baseline grava 3, com --slots 1): o motor segue e chega a 3" "$EXP_SLA" fp_sl_live_up
+peq "slots dinâmicos: o governo DESCE no meio da varredura (a baseline grava 1, com --slots 3): os mutantes seguintes rodam um de cada vez" "$EXP_SLD" fp_sl_live_down
+for v in abc 0 -3 4x ''; do
+  peq "slots dinâmicos: arquivo ilegível ('$v'): o limite fica no --slots (2) e a leitura que não valeu é contada" "$EXP_SLJ" fp_sl_junk "$v"
+done
+peq "slots dinâmicos: arquivo que não existe: o limite fica no --slots (2) e a leitura que não valeu é contada" "$EXP_SLJ" fp_sl_abs
+peq "slots dinâmicos: valor acima de --slots-max (99 com 3) vale o máximo" "$EXP_SLA" fp_sl_max
+peq "slots dinâmicos: --slots-max menor que --slots não encolhe o pool (3 slots rodam)" "$EXP_SLS" fp_sl_menor
+peq "slots dinâmicos: prazo vencido com mutantes esperando vaga: eles desistem ao acordar (parcial, no máximo 1 mutante rodou), nada continua além do prazo" "parcial pouco=True" fp_sl_prazo
+peq "--slots que não é um inteiro >= 1 (0, negativo, texto, vazio) é uso (rc 2), mesmo com --slots-max: sem um slot nada rodaria; 1 roda como qualquer outro" " 2 2 2 2 | $EXP_SW0" fp_sl_uso
+# TETO DE DADOS por mutante (ga-2hd02v.5.11). Na madrugada de 04/11 sete rodadas SEGUIDAS do wa-mutants morreram por teto-memoria: um mutante que aloca sem parar leva o escopo inteiro ao limite do cgroup e a rodada seguinte retoma no mesmo ponto. --data-mb fixa
+# RLIMIT_DATA (heap e mapas anônimos privados) em cada processo do mutante; passou do teto o alocador recebe ENOMEM (MemoryError) e o mutante MORRE como qualquer outro, sem derrubar a rodada. O fixture é o mesmo mutante do teto de escrita: com o `-gt` virado o caminho
+# do 9 cai numa alocação de 300 MB (um segundo e some: limitada por construção) e o resultado dela vai FORA do slot (a jaula falsa deixa). Sem o teto (0) a alocação passa: é o controle do mesmo caminho.
+mkbig() {
+  cat > "$TREE/scripts/bigmem.sh" << 'EOF'
+#!/bin/bash
+# bigmem.sh: fixture
+n=${1:-0}; ev=${2:-/dev/null}
+if [ "$n" -gt 5 ]; then echo big; exit 0; fi
+if python3 -c 'x = bytearray(300 << 20)' 2> /dev/null; then echo alloc=ok > "$ev"; else echo alloc=falhou > "$ev"; fi
+echo small
+exit 0
+EOF
+  mkst bigmem 'out=$(bash "$H/bigmem.sh" 9 "'"$F"'/ev"); [ "$out" = big ] || exit 1'
+}
+fp_data() {  # fp_data MB: a varredura do fixture com o teto de dados de MB (0 = sem teto)
+  newfx; mkbig; sw --data-mb "$1"; echo "$(cnt) falhas=$(jf 'd["falhas"]') $(head -n 1 "$F/ev" 2> /dev/null) left=$(ls "$F/work" | wc -l | tr -d ' ')"
+}
+fp_data_uso() { newfx; mkfoo; local o="" v; for v in -1 abc ""; do sw --data-mb "$v"; o="$o $RC"; done; sw --data-mb 0; echo "$o | $(cnt)"; }
+peq "--data-mb que não é um inteiro >= 0 (negativo, texto, vazio) é uso (rc 2); 0 (sem teto) roda como qualquer outro" " 2 2 2 | $EXP_SW0" fp_data_uso
+# o bigmem.sh tem 7 candidatos: os 4 do `if [ "$n" -gt 5 ]` (cmp-lim, cmp-neg, neg-if, num+1), os 2 `exit 0` (exit-rc) e o `if python3` (neg-if, inalcançável com n=9). Morrem os que viram o `-gt` (cmp-neg, neg-if) e caem na alocação: 2 mortos, 5 sobreviventes.
+EXP_DATA="rc=0 completo run=7 k=2 c=5 f=0 inv=0 open=5 falhas=0"
+# O RLIMIT_DATA só é IMPOSTO pelo kernel Linux (>= 4.7); no macOS o alocador passa do teto e o caso ficaria vermelho por acidente. Só roda se a sonda PROVAR que o kernel impõe o limite (o setrlimit passou e a alocação de 300 MB sob 128 MB levantou MemoryError);
+# qualquer outra coisa (a sonda não rodou, o limite não pega) pula o caso e o seu mutante COM AVISO (AMBIENTE, exit 97), nunca verde nem vermelho por acidente.
+SKIP_DATA=1; [ "$(python3 -I -c 'import resource
+d = 128 << 20
+resource.setrlimit(resource.RLIMIT_DATA, (d, d))
+try:
+    bytearray(300 << 20)
+except MemoryError:
+    print("imposto")' 2> /dev/null)" = imposto ] && SKIP_DATA=0
+[ "$SKIP_DATA" = 1 ] || peq "teto de dados: com --data-mb 128 a alocação de 300 MB do mutante falha (MemoryError), o mutante é MORTO e a varredura segue sem falha de infra" "$EXP_DATA alloc=falhou left=0" fp_data 128
+peq "controle do mesmo caminho sem o teto (--data-mb 0): a alocação passa e o veredito é o mesmo" "$EXP_DATA alloc=ok left=0" fp_data 0
+# limite DURO do sistema (256 MB) menor que o pedido (4096): vale o menor (como no teto de escrita), a alocação de 300 MB falha igual e o setrlimit não vira recusa
+fp_data_duro() { ( ulimit -d 262144 || exit 1; fp_data 4096 ); }
+[ "$SKIP_DATA" = 1 ] || peq "limite duro de dados do sistema (256 MB) menor que o --data-mb pedido (4096): vale o menor, a varredura roda e a alocação falha" "$EXP_DATA alloc=falhou left=0" fp_data_duro
+# teto que o lançador não consegue fixar (aqui: maior que o rlimit aceita) = nada roda, nunca roda SEM teto: a baseline fica vermelha e o alvo é pulado
+fp_data_enorme() { newfx; mkfoo; sw --data-mb 99999999999999999999; echo "rc=$RC res=$(jf 'd["result"]') run=$(jf 'd["mutants_run"]') skipped=$(jf '",".join("%s=%d" % kv for kv in sorted(d["skipped"].items()))')"; }
+peq "teto de dados que o lançador não consegue fixar: rc 70 do lançador, baseline vermelha, nenhum mutante roda (nunca roda sem teto)" "$EXP_FSIZE_ENORME" fp_data_enorme
 peq "sweep: mortos, sobreviventes confirmados, original intacto, HOME/TMPDIR no slot, slots limpos; os ids do gen --tree são os que ele grava" "$EXP_SWEEP" fp_sweep
 fp_semvalid() {  # bash -n que sai com rc estranho: nenhum veredito (nem "i"), nao_sei, e a varredura seguinte tenta de novo
   newfx; mkfoo; mkdir "$F/bin"; printf '#!/bin/sh\n[ "$1" = -n ] && exit 5\nexec /bin/bash "$@"\n' > "$F/bin/bash"; chmod +x "$F/bin/bash"
@@ -609,16 +693,16 @@ par kill_it heredoc-e-codigo     fp_gen     "$EXP_GEN" '                    here
 par kill_it here-string-e-heredoc fp_gen    "$EXP_GEN" ' and line[i - 1:i] != "<"' ''
 par kill_it aritmetica-e-heredoc fp_gen     "$EXP_GEN" ' and line[:i].count("((") <= line[:i].count("))")' ''
 par kill_it jail-relativo        fp_jailrel "$EXP_SW0" '    a.jail = str(Path(a.jail).resolve())' '    pass'
-par kill_it head-teto-ausente    fp_fsize_head "$EXP_SW0 teto=sim" 'sys.executable, "-I", "-c", CAPPER, str(ctx.a.fsize_mb << 20), "bash", st]' '"bash", st]'
-par kill_it head-teto-fixo       fp_fsize_head "$EXP_SW0 teto=sim" 'str(ctx.a.fsize_mb << 20)' '"536870912"'
+par kill_it head-teto-ausente    fp_fsize_head "$EXP_SW0 teto=sim" 'sys.executable, "-I", "-c", CAPPER, cap_arg(ctx.a), "bash", st]' '"bash", st]'
+par kill_it head-teto-fixo       fp_fsize_head "$EXP_SW0 teto=sim" 'cap_arg(ctx.a)' '"536870912"'
 par kill_it symlink-gravado      fp_symlink "$EXP_SYM" '        if subj.resolve() != subj:' '        if False:'
 par kill_it falha-derruba        fp_falha   "$EXP_FALHA" '    except (OSError, RuntimeError):' '    except ZeroDivisionError:'
 par kill_it falha-calada         fp_falha   "$EXP_FALHA" '            ctx.falhas += 1' '            pass'
 par kill_it falha-e-completo     fp_falha   "$EXP_FALHA" ' and not ctx.falhas' ''
 par kill_it base-nula-cai        fp_falha   "$EXP_FALHA" '            if r is None:' '            if False:'
 par kill_it gen-sem-tree         fp_sweep   "$EXP_SWEEP" 'Path(a.file).resolve().relative_to(Path(a.tree).resolve()).as_posix() if a.tree else Path(a.file).name' 'Path(a.file).name'
-par kill_it teto-ausente         fp_fsize   "$EXP_FSIZE" 'sys.executable, "-I", "-c", CAPPER, str(ctx.a.fsize_mb << 20), "bash", st]' '"bash", st]'
-par kill_it teto-em-bytes        fp_fsize   "$EXP_FSIZE" 'str(ctx.a.fsize_mb << 20)' 'str(ctx.a.fsize_mb)'
+par kill_it teto-ausente         fp_fsize   "$EXP_FSIZE" 'sys.executable, "-I", "-c", CAPPER, cap_arg(ctx.a), "bash", st]' '"bash", st]'
+par kill_it teto-em-bytes        fp_fsize   "$EXP_FSIZE" 'return str(a.fsize_mb << 20) + (' 'return str(a.fsize_mb) + ('
 par kill_it teto-nao-fixa        fp_fsize   "$EXP_FSIZE" '    resource.setrlimit(resource.RLIMIT_FSIZE, (n, n))\n' '    pass\n'
 par kill_it sigxfsz-ignorado     fp_fsize   "$EXP_FSIZE" '    signal.signal(signal.SIGXFSZ, signal.SIG_DFL)\n' '    pass\n'
 par kill_it teto-so-no-soft      fp_fsize   "$EXP_FSIZE" 'resource.setrlimit(resource.RLIMIT_FSIZE, (n, n))' 'resource.setrlimit(resource.RLIMIT_FSIZE, (n, resource.RLIM_INFINITY))'
@@ -631,6 +715,28 @@ par kill_it slot-unidade         fp_slot "$EXP_SLOT" 'kb - base_kb >= ctx.a.slot
 par kill_it slot-sem-medida      fp_slot "$EXP_SLOT" 'if kb is not None and kb - base_kb >= ctx.a.slot_mb * 1024:' 'if False:'
 par kill_it slot-uso-zero        fp_slot_uso " 2 2 2 2 | $EXP_SW0" 'if a.slot_mb < 1:' 'if a.slot_mb < 0:'
 par kill_it slot-du-ilegivel     fp_slot_semdu "$EXP_SLOT_SEMDU" 'if kb is not None and kb - base_kb >= ctx.a.slot_mb * 1024:' 'if (1 << 40 if kb is None else kb) - base_kb >= ctx.a.slot_mb * 1024:'
+# slots dinâmicos e teto de dados (ga-2hd02v.5.11)
+par kill_it slots-arquivo-ignorado   fp_sl_up        "$EXP_SLU" '                ctx.limit = n' '                pass'
+par kill_it slots-lido-uma-vez       fp_sl_live_up   "$EXP_SLA" $'    while not ctx.done.is_set():\n        n = read_slots(' $'    if not ctx.done.is_set():\n        n = read_slots('
+par kill_it slots-sem-teto-max       fp_sl_max       "$EXP_SLA" 'return None if n < 1 else min(n, top)' 'return None if n < 1 else n'
+par kill_it slots-zero-aceito        fp_sl_junk      "$EXP_SLJ" 'return None if n < 1 else min(n, top)' 'return None if n < 0 else min(n, top)' 0
+par kill_it slots-lixo-vira-um       fp_sl_junk      "$EXP_SLJ" $'    except (OSError, UnicodeDecodeError, ValueError):\n        return None\n    return None if n < 1' $'    except (OSError, UnicodeDecodeError, ValueError):\n        return 1\n    return None if n < 1' abc
+par kill_it slots-lixo-nao-contado   fp_sl_junk      "$EXP_SLJ" '                ctx.slots_bad += 1' '                pass' abc
+par kill_it slots-pool-so-slots      fp_sl_up        "$EXP_SLU" $'        with ThreadPoolExecutor(ctx.top) as ex:\n            futs' $'        with ThreadPoolExecutor(a.slots) as ex:\n            futs'
+par kill_it slots-top-so-max         fp_sl_menor     "$EXP_SLS" 'self.top = max(a.slots, a.slots_max)' 'self.top = a.slots_max or a.slots'
+par kill_it slots-inicio-no-top      fp_sl_abs       "$EXP_SLJ" 'self.limit, self.running, self.peak, self.slots_bad = a.slots, 0, 0, 0' 'self.limit, self.running, self.peak, self.slots_bad = self.top, 0, 0, 0'
+par kill_it slots-sem-espera         fp_sl_down      "$EXP_SLD" '        while ctx.running >= ctx.limit and not ctx.stop.is_set():' '        while False and not ctx.stop.is_set():'
+par kill_it slots-peak-calado        fp_sl_up        "$EXP_SLU" '        ctx.peak = max(ctx.peak, ctx.running)' '        pass'
+par kill_it slots-contador-nao-desce fp_sl_up        "$EXP_SLU" '            ctx.running -= 1' '            pass'
+par kill_it slots-sem-prazo-na-vaga  fp_sl_prazo     "parcial pouco=True" $'        if ctx.stop.is_set() or time.time() > ctx.deadline:\n            return None\n        ctx.running += 1' $'        if ctx.stop.is_set():\n            return None\n        ctx.running += 1'
+par kill_it slots-last-fixo          fp_sl_live_up   "$EXP_SLA" 'slots_last=ctx.limit' 'slots_last=a.slots'
+par kill_it slots-uso-aceita-zero    fp_sl_uso       " 2 2 2 2 | $EXP_SW0" 'if a.cmd == "sweep" and a.slots < 1:' 'if a.cmd == "sweep" and a.slots < 0:'
+[ "$SKIP_DATA" = 1 ] || par kill_it dados-nao-fixa       fp_data "$EXP_DATA alloc=falhou left=0" '        resource.setrlimit(resource.RLIMIT_DATA, (d, d))\n' '        pass\n' 128
+[ "$SKIP_DATA" = 1 ] || par kill_it dados-em-bytes       fp_data "$EXP_DATA alloc=falhou left=0" '("," + str(a.data_mb << 20) if a.data_mb else "")' '("," + str(a.data_mb) if a.data_mb else "")' 128
+[ "$SKIP_DATA" = 1 ] || par kill_it dados-fora-do-argumento fp_data "$EXP_DATA alloc=falhou left=0" 'if a.data_mb else ""' 'if False else ""' 128
+[ "$SKIP_DATA" = 1 ] || par kill_it dados-sem-minimo     fp_data_duro "$EXP_DATA alloc=falhou left=0" '        d = d if dh == resource.RLIM_INFINITY else min(d, dh)\n' '        d = d\n'
+par kill_it dados-falha-e-roda       fp_data_enorme "$EXP_FSIZE_ENORME" '    os._exit(70)\n' '    pass\n'
+par kill_it dados-uso-aceita-negativo fp_data_uso    " 2 2 2 | $EXP_SW0" 'if a.cmd == "sweep" and a.data_mb < 0:' 'if a.cmd == "sweep" and a.data_mb < -5:'
 par kill_it autoteste-ligado     fp_emb_gen   "$EXP_EMB_FP" '    return [(min([n.lineno]' '    return []  # [n.lineno]'
 par kill_it autoteste-no-apply   fp_emb_apply "$EXP_EMB_APPLY" '    return [(min([n.lineno]' '    return []  # [n.lineno]'
 par kill_it autoteste-no-sweep   fp_emb_sweep "$EXP_EMB_SWEEP" '    return [(min([n.lineno]' '    return []  # [n.lineno]'
@@ -686,8 +792,9 @@ else
   eq "mutante jaula-nao-usada com a jaula real: a escrita passa (o caso reprova se a contenção cair)" "$EXP_SW0 vazou=SIM" "$(ENG="$W/eng-jaula-nao-usada.py" vz "$HERE/hq-sandbox-run.py")"
 fi
 
+[ "$SKIP_DATA" = 0 ] || echo "AMBIENTE: este kernel não impõe o RLIMIT_DATA (ou a sonda não rodou): os casos do teto de dados e os seus mutantes não rodaram (o nó, Linux, roda)"
 [ "$SKIP_FS" = 0 ] || echo "AMBIENTE: limite duro de escrita finito aqui ($(ulimit -H -f 2> /dev/null)): o caso do teto que o lançador não fixa e o seu mutante não rodaram (rode sem teto: heavy-guard.sh --max-file-mb 0, ou direto no nó)"
-echo "hq-mutate selftest: $PASS passed, $FAIL failed$([ "$SKIP" = 1 ] && echo ", caso da jaula real NÃO rodou (AMBIENTE)")$([ "$SKIP_FS" = 1 ] && echo ", caso do teto não fixável NÃO rodou (AMBIENTE)")"
+echo "hq-mutate selftest: $PASS passed, $FAIL failed$([ "$SKIP" = 1 ] && echo ", caso da jaula real NÃO rodou (AMBIENTE)")$([ "$SKIP_FS" = 1 ] && echo ", caso do teto não fixável NÃO rodou (AMBIENTE)")$([ "$SKIP_DATA" = 1 ] && echo ", casos do teto de dados NÃO rodaram (AMBIENTE)")"
 [ "$FAIL" -eq 0 ] || exit 1
-[ "$SKIP" -eq 0 ] && [ "$SKIP_FS" -eq 0 ] || exit 97
+[ "$SKIP" -eq 0 ] && [ "$SKIP_FS" -eq 0 ] && [ "$SKIP_DATA" -eq 0 ] || exit 97
 exit 0

@@ -6,7 +6,7 @@ POR QUÊ: o lastro do nó Hetzner (ga-2hd02v.5) já varre mutantes dos selftests
   dele; se todos passam, o mutante SOBREVIVEU e o teste é fraco naquela linha. Só o código do ESPELHO do nó (filtrado) entra: nenhum dado de lead, nenhum arquivo de fora da árvore.
 USO: hq-mutate-wa.py plan  --tree WA --state ARQ [--fam-cap N]                                  alvos na ordem em que a varredura os pegaria, e por que pula os que pula
      hq-mutate-wa.py gen ARQUIVO [--tree WA]                                                    candidatos de UM arquivo, TAB (id, linha, operador, antes, depois), sem os de linha de log/print
-     hq-mutate-wa.py sweep --tree WA --state ARQ --work DIR --jail hq-sandbox-run.py --python PY [--fam-cap N] [--pytest-timeout N] [--budget-s N] [--slots N] [--cap N] [--targets N] [--fsize-mb N] [--slot-mb N]
+     hq-mutate-wa.py sweep --tree WA --state ARQ --work DIR --jail hq-sandbox-run.py --python PY [--fam-cap N] [--pytest-timeout N] [--budget-s N] [--slots N] [--slots-max N --slots-file ARQ] [--cap N] [--targets N] [--fsize-mb N] [--slot-mb N] [--data-mb N]
   Os argumentos de sempre (--budget-s, --slots, --cap, --targets, --fsize-mb, --slot-mb) e o resumo (a última linha do stdout, UM json) são os do hq-mutate.py: este arquivo CARREGA aquele motor (tem de estar na mesma pasta) e troca só o que é do hq:
   o plano (de onde vêm os alvos e a família) e a execução (um pytest no lugar de `bash selftest`). A varredura, os operadores, o veredito, o teto de escrita, o teto do slot, a prova da jaula e o estado são os do motor.
 ALVOS E FAMÍLIA: alvo = `lib/**/*.py` e `daemons/**/*.py` (fora de tests/, crew/, archive/, venv, __pycache__, pastas `.bak`, `__init__.py`, conftest e arquivos de teste). A família do alvo `x.py` = os `tests/**/test_*.py` cujo nome é `test_x.py` ou `test_x_*.py` MAIS os que o importam
@@ -160,7 +160,7 @@ def wa_exec_family(ctx, slot_n, tgt, text, tmo):
     kv = ["%s=%s" % (k, os.environ[k]) for k in hqm.PASS_ENV if k in os.environ] + ["HOME=%s" % (slot / "home"), "TMPDIR=%s" % (slot / "tmp"), "PYTHONDONTWRITEBYTECODE=1", "PYTHONHASHSEED=0",
                                                                                       "GIT_AUTHOR_NAME=gt", "GIT_AUTHOR_EMAIL=gt@no", "GIT_COMMITTER_NAME=gt", "GIT_COMMITTER_EMAIL=gt@no"]
     pytest = [PYTHON, "-m", "pytest", "-p", "no:cacheprovider", "-p", "no:randomly", "-q", "-x", "--tb=no", "--no-header", "--timeout=%d" % PYTEST_TMO, *tgt["family"]]
-    cmd = [sys.executable, "-I", ctx.a.jail, "--rw", str(slot), "--", "env", "-i", *kv, "timeout", "-k", "5", str(tmo), sys.executable, "-I", "-c", hqm.CAPPER, str(ctx.a.fsize_mb << 20), *pytest]
+    cmd = [sys.executable, "-I", ctx.a.jail, "--rw", str(slot), "--", "env", "-i", *kv, "timeout", "-k", "5", str(tmo), sys.executable, "-I", "-c", hqm.CAPPER, hqm.cap_arg(ctx.a), *pytest]
     t0 = time.time()
     p = subprocess.Popen(cmd, cwd=clone, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
     with ctx.lock:
