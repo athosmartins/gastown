@@ -10,7 +10,7 @@ O QUE PROVA:
   A. o parser incremental conta certo em QUALQUER tamanho de bloco (1 byte inclusive) e REJEITA todo dump truncado,
      com lixo, com vírgula sobrando ou não-UTF-8 — a varredura de truncamento cobre cada prefixo possível de um dump válido;
      só os 4 espaços de JSON valem como espaço (NBSP, U+2028, VT, FF são lixo);
-  B2. peças por dia: o build junta as peças <db>/<tabela>/AAAA-MM-DD.jsonl de volta no documento único do pacote (mesmos bytes do layout antigo) e falha fechado
+  B2. peças por dia: o build junta as peças <db>/<tabela>/AAAA-MM-DD.jsonl de volta no documento único do pacote (as mesmas linhas, em ordem de dia, no envelope do Dolt) e falha fechado
       sem --tree, em layout misto, com peça faltando, fora de ordem, de tamanho diferente ou fora do formato do Dolt;
   B. build/inspect: só entram <db>/<tabela>.jsonl, o artefato é determinístico, lixo de export abortado fica de fora, symlink/
      hardlink é NOMEADO em skipped, tar de entrada cortado num limite de membro falha (rc != 0) e tabela ilegível vira erro;
@@ -543,8 +543,13 @@ with tempfile.TemporaryDirectory(prefix="jhst2.") as T2:
     shas = {f["path"]: f["sha256"] for f in (built or {"files": []})["files"]}
     check("peças: rc 0 e o pacote tem os 6 <db>/<tabela>.jsonl de sempre (as peças viram o documento único)",
           rc == 0 and sorted(shas) == sorted(n for n, _ in LEGACY) and not built["skipped"], "rc=%s %s %s" % (rc, se, built))
-    check("peças: o documento de cada tabela tem os MESMOS bytes do layout antigo (mesmo sha256 que o build do tar legado)",
+    check("peças: com as linhas já em ordem de dia, o documento de cada tabela tem os MESMOS bytes do layout antigo (mesmo sha256 que o build do tar legado)",
           lrc == 0 and shas == {f["path"]: f["sha256"] for f in lbuilt["files"]}, repr((shas, lse)))
+    # em dado real a ordem do export é a da chave, não a do dia: o documento sai em ordem de dia, com as MESMAS linhas (o que a doc do pacote promete, e só isso)
+    ZZ = [{"id": "a", "created_at": "2026-11-02 09:00:00"}, {"id": "b", "created_at": "2026-11-01 09:00:00"}]
+    zrc, zse, _, zart = pbuild([("hq/comments/2026-11-01.jsonl", piece(ZZ[1:])), ("hq/comments/2026-11-02.jsonl", piece(ZZ[:1]))])
+    zdoc = json.loads(tarfile.open(zart).extractfile("hq/comments.jsonl").read()) if zrc == 0 else {"rows": []}
+    check("peças: linhas fora da ordem de dia saem em ordem de dia, as mesmas linhas", zrc == 0 and [r["id"] for r in zdoc["rows"]] == ["b", "a"] and zdoc["rows"] == [ZZ[1], ZZ[0]], zse)
     irc, iso, _ = run("inspect", art)
     check("peças: inspect conta as linhas de todas as peças como uma tabela só", irc == 0 and json.loads(iso)["databases"]["hq"]["comments"] == 4
           and json.loads(iso)["databases"]["hq"]["issues"] == 3, iso)
