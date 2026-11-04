@@ -27,14 +27,14 @@ CAUSA, DEGRAUS E NÚMERO DO DIA  (ga-2hd02v.5.10; 04/11, das 10h às 14h: CPU em
            `nucleos` = {sessoes, lastro, sistema, espera, livres} (núcleos MÉDIOS na janela; somam o ncpu): lastro = ballast.slice, sessoes = o resto do user-<uid>.slice (sessões e o que o mbp-run lança por ssh), sistema = o que sobra do
            ocupado (kernel, serviços do root), espera = iowait, livres = o que nem trabalha nem espera; `ram_mb` (MemAvailable); `lixo` = sessões do tmux do nó que a cidade não reconhece; e `causa`, UMA entre
            lixo > RAM > lastro-sem-trabalho > fila-sem-elegível > cego, só com a CPU lida e abaixo da régua (acima dela é null). A ordem é de PRIORIDADE, não prova de culpa: o que prova é o `efeito` medido na leitura seguinte.
-           lixo = há sessão do tmux do nó (nome com -remote-) que a cidade não lista (em nenhum estado), não segura bead e está quieta há >= 30 min (HETZNER_OCC_D1_IDLE_S); RAM = MemAvailable abaixo do piso de partida do lastro (14336 MB,
+           lixo = há sessão do tmux do nó (nome com -remote-) que a cidade não lista (em nenhum estado), não segura bead (no hq NEM em rig nenhum) e está quieta há >= 30 min (HETZNER_OCC_D1_IDLE_S), quieta = input E saída (a maior entre session_activity e window_activity, de todas as janelas); RAM = MemAvailable abaixo do piso de partida do lastro (14336 MB,
            HETZNER_OCC_RAM_START_MB) mais um slot (1024 MB): subir o lastro é inútil; lastro-sem-trabalho = sobram >= 2 núcleos livres e há RAM para mais lastro; fila-sem-elegível = a fila elegível do Pilot (hq) lida e vazia;
            cego = o que falta para dizer a causa não foi lido (CPU, cgroup, RAM, fila) OU nenhuma das quatro explica. Leitura cega NUNCA vira "ocioso" nem dispara degrau (os 3 estados valem aqui também).
   degraus  só com a CPU abaixo da régua há >= 30 min (a sequência de `baixa`) e a causa dizendo qual: lixo → D1, lastro-sem-trabalho → D2, fila-sem-elegível → D3; um degrau que não resolve (tentativas esgotadas) deixa o seguinte agir. UM degrau por
            leitura e no mínimo 30 min (HETZNER_OCC_ACT_COOLDOWN_S) entre duas ações, para o efeito de cada uma ser medível. Cada degrau tem SUA chave em <cidade>/.gc (sem ela o degrau só mede: INERTE) e grava na leitura seguinte o `efeito` medido
            (CPU antes/depois da ação). Nada aqui liga a queima (burn.on) nem despacha bead de P2 ao mini (Athos, 12/10).
-    D1 lixo     hetzner-occupancy-d1.on: mata a sessão do tmux do nó que a cidade não reconhece (precedente ga-vg16lk; caso real gate-reviewer-remote-adhoc-033f7bd5c1, 4 h parada em 04/11). Nunca mata sessão que a cidade lista, nem a que segura bead, nem a
-                que mexeu nos últimos 30 min: o ssh que mata confere a quietude de novo no próprio nó (TOCTOU) e a lista da cidade e a dos donos de bead têm de ter sido LIDAS (ilegível = não mata). No máximo 2 por leitura.
+    D1 lixo     hetzner-occupancy-d1.on: mata a sessão do tmux do nó que a cidade não reconhece (precedente ga-vg16lk; caso real gate-reviewer-remote-adhoc-033f7bd5c1, 4 h parada em 04/11). Nunca mata sessão que a cidade lista, nem a que segura bead (em qualquer loja: hq e rigs), nem a
+                que mexeu nos últimos 30 min, em input OU em saída: o ssh que mata confere a quietude de novo no próprio nó (TOCTOU, com as duas atividades) e a lista da cidade (toda entrada com nome), a lista de rigs e a dos donos de bead de cada loja têm de ter sido LIDAS (ilegível = não mata). No máximo 2 por leitura.
     D2 lastro   hetzner-occupancy-d2.on: PEDE mais lastro gravando ~/gt-remote/ballast/lastro-pedido.json no nó ({v, epoch, ate, slots_extra, livres, ram_mb, quem}); quem consome é o governo do lastro (ga-2hd02v.5.11), que também aplica os pisos de RAM
                 dele: o vigia só pede com MemAvailable >= piso + 1 slot, e o pedido vence em 2 leituras (ate). Sem consumidor o efeito medido é zero e a escada segue.
     D3 fila     hetzner-occupancy-d3.on: tira da memória de vereditos do Pilot (<cidade>/.gc/wa-node-pass-memo.tsv) as linhas `unknown` ainda frescas, e a passada seguinte reclassifica essas beads de WA; o «Só no ocioso» (P2+ só ocupa o nó quando
@@ -76,12 +76,14 @@ BEGIN, END = "@@OCC-BEGIN@@", "@@OCC-END@@"
 S_CG, S_MEM, S_TMUX, S_NOW = "@@OCC-CG@@", "@@OCC-MEM@@", "@@OCC-TMUX@@", "@@OCC-NOW@@"
 # A MESMA ssh traz o /proc/stat e o resto (ga-2hd02v.5.10): cada parte tem o seu marcador e a falha de uma não derruba as outras. `u` = cpu.stat do user-<uid>.slice, `l` = o do ballast.slice (some quando nada do lastro roda),
 # `m 1` = o gerenciador de usuário existe (sem ele a ausência do `l` não quer dizer "lastro parado"). O tmux diz o rc antes da lista: "sem servidor" (rc 1) é lista vazia, qualquer outra falha NÃO é.
+# A lista é por JANELA (list-windows -a) com as DUAS atividades: o session_activity só anda com input (start/nudge) e a saída do claude anda o window_activity (o precedente do ga-2hd02v.11, scripts/gc-session-ssh). Medido no nó
+# real em 04/11 17h50: dog-remote-gawispvtzl0 com session_activity parado há 10921 s e window_activity de 275 s atrás. "Quieta" é a MAIOR das duas, de todas as janelas.
 REMOTE_CMD = (
     "echo " + BEGIN + "; grep '^cpu' /proc/stat; U=$(id -u); B=/sys/fs/cgroup/user.slice/user-$U.slice; "
     "echo " + S_CG + "; [ -d \"$B/user@$U.service\" ] && echo m 1; "
     "for p in \"u:$B\" \"l:$B/user@$U.service/ballast.slice\"; do awk -v k=\"${p%%:*}\" '/^usage_usec/{print k, $2}' \"${p#*:}/cpu.stat\" 2>/dev/null; done; "
     "echo " + S_MEM + "; grep -E '^(MemAvailable|MemTotal):' /proc/meminfo; "
-    "echo " + S_TMUX + "; o=$(tmux -L gc-remote list-sessions -F '#{session_name}|#{session_activity}' 2>&1); echo \"rc=$?\"; echo \"$o\"; "
+    "echo " + S_TMUX + "; o=$(tmux -L gc-remote list-windows -a -F '#{session_name}|#{session_activity}|#{window_activity}' 2>&1); echo \"rc=$?\"; echo \"$o\"; "
     "echo " + S_NOW + "; date +%s; echo " + END
 )
 RUNGS = ("d1", "d2", "d3")  # a ordem da escada; o D4 (esgotou) é o aviso, não um degrau que age
@@ -284,10 +286,10 @@ def _owners(s):
     return [s[k] for k in ("session_name", "name", "alias") if isinstance(s.get(k), str) and s[k]]
 
 
-def read_holders(c):
-    """(donos, None, None) ou (None, motivo, detalhe). donos = os assignees das beads in_progress: a sessão que segura uma delas é a que trabalha. Uma leitura, só `list`."""
+def read_holders(c, store=None):
+    """(donos, None, None) ou (None, motivo, detalhe). donos = os assignees das beads in_progress: a sessão que segura uma delas é a que trabalha. Uma leitura, só `list`. store = a pasta da loja (padrão: a da cidade, o hq)."""
     # vazio → lista [] = ninguém segura bead (leu); falhou/ilegível/travou → (None, motivo): o chamador deixa 'ocupadas' null e a sessão viva não prova nada (nunca "ocioso")
-    rc, out, err, why = run_cmd([c.bd_bin, "-C", c.city, "list", "--status", "in_progress", "--json", "--limit", "0"], c.bd_timeout_s)
+    rc, out, err, why = run_cmd([c.bd_bin, "-C", store or c.city, "list", "--status", "in_progress", "--json", "--limit", "0"], c.bd_timeout_s)
     motivo = _failed(rc, why, "bd")
     if motivo:
         return None, motivo, _oneline(err)
@@ -321,13 +323,15 @@ def read_sessions(c):
         r["motivo"] = "sem-lista-sessions"
         return r
     other = re.compile(r"-remote-(%s)(-|$)" % "|".join(re.escape(h) for h in c.other_hosts)) if c.other_hosts else None
-    active, live, bad_entry, bad_state, known = [], [], 0, 0, set()
+    active, live, bad_entry, bad_state, known, unnamed = [], [], 0, 0, set(), 0
     for s in lst:
         ident = _ident(s)
         if isinstance(s, dict):
             known.update(_owners(s))  # o que a cidade conhece por nome, qualquer estado (viva, dormindo, fechada, de outro host): o D1 só mata o que NÃO está aqui
             if ident:
                 known.add(ident)
+            if not _owners(s):
+                unnamed += 1  # só `template` (sem session_name/name/alias): o nome que o tmux do nó usa pode ser o desta entrada, e não o tenho
         if ident is None:
             bad_entry += 1
         elif "-remote-" not in "-%s-" % ident or (other and other.search(ident)):
@@ -339,7 +343,7 @@ def read_sessions(c):
             live.append((ident, _owners(s)))
         elif not (isinstance(s.get("state"), str) and s["state"] in DEAD):
             bad_state += 1  # state ausente ou fora do vocabulário (draining, start-pending...): não dá para dizer que trabalha nem que dorme
-    if not bad_entry:  # uma entrada sem nome pode ser justamente a sessão que o tmux tem: com ela ilegível a lista não prova que "a cidade não conhece" nada
+    if not bad_entry and not unnamed:  # uma entrada sem nome (ilegível, ou só com `template`) pode ser justamente a sessão que o tmux tem: com ela a lista não prova que "a cidade não conhece" nada
         r["_reconhecidas"] = known
     if bad_entry + bad_state:
         r["ilegiveis"] = bad_entry + bad_state
@@ -495,14 +499,14 @@ def parse_extra(out):
         else:
             rc, body = int(tm[0][3:]), [x for x in tm[1:] if x]
             if rc == 0:
-                ses, bad = [], 0
+                by, bad = {}, 0
                 for ln in body:
-                    name, sep, act = ln.rpartition("|")
-                    if sep and name and re.fullmatch(r"[0-9]+", act):
-                        ses.append((name, int(act)))
+                    f = ln.rsplit("|", 2)  # nome|session_activity|window_activity: uma linha por janela; a sessão vale pela MAIS recente de todas
+                    if len(f) == 3 and f[0] and re.fullmatch(r"[0-9]+", f[1]) and re.fullmatch(r"[0-9]+", f[2]):
+                        by[f[0]] = max(by.get(f[0], 0), int(f[1]), int(f[2]))
                     else:
                         bad += 1
-                t.update(lido=not bad, sessoes=ses if not bad else [], motivo="linha-ilegivel" if bad else None)
+                t.update(lido=not bad, sessoes=sorted(by.items()) if not bad else [], motivo="linha-ilegivel" if bad else None)
             elif rc == 1 and body and re.match(r"(no server running|error connecting to .*No such file or directory)", body[0]):
                 t.update(lido=True, sessoes=[], motivo=None)  # sem servidor tmux no nó = nenhuma sessão (leu); qualquer outra falha do tmux NÃO é lista vazia
             else:
@@ -571,9 +575,37 @@ def read_nucleos(c, base, ex, raw, now):
     return n, cur
 
 
+def read_rig_holders(c):
+    """(donos, None) ou (None, motivo): os assignees de bead in_progress das lojas dos RIGS (wa, ps, gt...; `gc rig list`), além da do hq. O `bd list` da cidade só traz as beads ga-: uma sessão que segura bead de rig também trabalha.
+    A lista de rigs, ou QUALQUER loja, ilegível = (None, motivo): o D1 não mata. Rig suspenso conta também (a bead dele pode estar em andamento)."""
+    rc, out, err, why = run_cmd([c.gc_bin, "--city", c.city, "rig", "list", "--json"], c.gc_timeout_s)
+    motivo = _failed(rc, why, "gc")
+    if motivo:
+        return None, "rigs-" + motivo
+    try:
+        d = json.loads(out)
+    except ValueError:
+        return None, "rigs-json-ilegivel" if out.strip() else "rigs-saida-vazia"
+    rigs = d.get("rigs") if isinstance(d, dict) and d.get("ok") is True else None
+    if not isinstance(rigs, list) or not rigs:  # o próprio hq é um rig da lista: lista vazia é leitura que falhou, não "cidade sem rig"
+        return None, "rigs-forma-desconhecida"
+    donos, hq = set(), os.path.realpath(c.city)
+    for rg in rigs:
+        path = rg.get("path") if isinstance(rg, dict) else None
+        if not isinstance(path, str) or not path:
+            return None, "rigs-forma-desconhecida"
+        if os.path.realpath(path) == hq:
+            continue  # a loja do hq já foi lida (read_holders)
+        h, why2, _d = read_holders(c, path)
+        if h is None:
+            return None, "loja-ilegivel:%s:%s" % (os.path.basename(path), why2)
+        donos |= h
+    return donos, None
+
+
 def find_lixo(c, sess, ex):
-    """O lixo do D1: sessão do tmux do nó (nome com -remote-) que a cidade NÃO lista em estado nenhum, não segura bead e está quieta há >= HETZNER_OCC_D1_IDLE_S. Três estados: o tmux, a lista da cidade,
-    o relógio do nó e os donos de bead têm de ter sido LIDOS; o que não li dá lido False (e o D1 não mata nada). `_alvos` (interno) = os nomes a matar, os mais quietos primeiro."""
+    """O lixo do D1: sessão do tmux do nó (nome com -remote-) que a cidade NÃO lista em estado nenhum, não segura bead (em loja nenhuma: hq e rigs) e está quieta há >= HETZNER_OCC_D1_IDLE_S (a maior entre a atividade de
+    input e a de saída). Três estados: o tmux, a lista da cidade, o relógio do nó e os donos de bead têm de ter sido LIDOS; o que não li dá lido False (e o D1 não mata nada). `_alvos` (interno) = os nomes a matar, os mais quietos primeiro."""
     r = {"lido": False, "n": 0, "nomes": [], "ocioso_max_s": None, "motivo": None, "_alvos": []}
     t = ex["tmux"]
     if not t["lido"]:
@@ -601,6 +633,11 @@ def find_lixo(c, sess, ex):
             if donos is None:
                 r["motivo"] = "donos-ilegivel:" + str(why)
                 return r
+        rig_donos, why = read_rig_holders(c)  # bead de rig (wa, ps...) também prova que a sessão trabalha: o hq sozinho não basta
+        if rig_donos is None:
+            r["motivo"] = "donos-ilegivel:" + str(why)
+            return r
+        donos = donos | rig_donos
         cand = [(i, n) for i, n in cand if n not in donos]
     cand.sort(key=lambda x: (-x[0], x[1]))
     r.update(lido=True, n=len(cand), nomes=[n for _i, n in cand[:3]], ocioso_max_s=cand[0][0] if cand else None, _alvos=[n for _i, n in cand[:c.d1_max]])
@@ -914,12 +951,14 @@ def _ssh_verdict(c, script, ok_word):
 
 
 def kill_idle_session(c, name):
-    """(ok, rótulo). O ssh confere DE NOVO, no próprio nó, que a sessão existe e segue quieta há >= d1_idle_s (a leitura que a achou é de minutos atrás: uma sessão que voltou a trabalhar não morre). Só nome
-    seguro e com -remote- chega aqui."""
+    """(ok, rótulo). O ssh confere DE NOVO, no próprio nó, que a sessão existe e segue quieta há >= d1_idle_s, pela MAIOR entre session_activity e window_activity de todas as janelas (a leitura que a achou é de minutos
+    atrás: uma sessão que voltou a trabalhar, em input ou em saída, não morre). Só nome seguro e com -remote- chega aqui."""
     if not SAFE_NAME.fullmatch(name) or "-remote-" not in "-%s-" % name:
         return False, "nome-recusado"
     script = ('S=%s; T="tmux -L gc-remote"; $T has-session -t "=$S" 2>/dev/null || { echo ausente; exit 0; }; '
-              'a=$($T display-message -p -t "=$S:" "#{session_activity}" 2>/dev/null); n=$(date +%%s); '
+              'r=$($T list-windows -t "=$S" -F "#{session_activity} #{window_activity}" 2>/dev/null); n=$(date +%%s); '
+              '[ -n "$r" ] && [ -z "$(printf %%s "$r" | tr -d "0-9 \\n")" ] || { echo ilegivel; exit 0; }; '
+              'a=$(printf %%s "$r" | tr " " "\\n" | sort -n | tail -n 1); '
               'case "$a" in ""|*[!0-9]*) echo ilegivel; exit 0;; esac; '
               '[ $((n - a)) -lt %d ] && { echo ativa; exit 0; }; '
               '$T kill-session -t "=$S" 2>/dev/null && echo morta || echo falhou' % (name, c.d1_idle_s))

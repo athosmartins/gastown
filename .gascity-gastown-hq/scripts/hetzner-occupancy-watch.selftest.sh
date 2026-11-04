@@ -56,10 +56,10 @@ last_line() { tail -n 1 "$1" > "$T/last.json" 2>/dev/null; }
 # ---- stubs ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------
 cat > "$T/bin/gc" <<'EOF'
 #!/usr/bin/env bash
-# gc de mentira: `session list --json` devolve $STUB_GC_FILE (ou falha com $STUB_GC_RC; com $STUB_OUTFAIL imprime o JSON COMPLETO antes de falhar; com $STUB_GC_HOLD fica PRESO, avisando em hold.in, até o teste criar hold.go); `mail send` grava o mail; o resto é PROIBIDO (rc 99, marcado)
+# gc de mentira: `rig list --json` devolve $STUB_DIR/rig.json (ou o padrão: o hq + os rigs wa e ps em <cidade>/rigs; falha com o rc que estiver em $STUB_DIR/rig.rc); `session list --json` devolve $STUB_GC_FILE (ou falha com $STUB_GC_RC; com $STUB_OUTFAIL imprime o JSON COMPLETO antes de falhar; com $STUB_GC_HOLD fica PRESO, avisando em hold.in, até o teste criar hold.go); `mail send` grava o mail; o resto é PROIBIDO (rc 99, marcado)
 echo "gc $*" >> "$STUB_DIR/gc.calls"
 args=("$@")
-if [ "${args[0]:-}" = "--city" ]; then args=("${args[@]:2}"); fi
+CITY_ARG=""; if [ "${args[0]:-}" = "--city" ]; then CITY_ARG="${args[1]:-}"; args=("${args[@]:2}"); fi
 case "${args[0]:-} ${args[1]:-}" in
   "session list")
     [ -n "${STUB_GC_SLEEP:-}" ] && sleep "$STUB_GC_SLEEP"
@@ -67,6 +67,10 @@ case "${args[0]:-} ${args[1]:-}" in
     if [ "${STUB_GC_RC:-0}" != 0 ]; then echo "gc: erro injetado" >&2; [ -n "${STUB_OUTFAIL:-}" ] && [ -n "${STUB_GC_FILE:-}" ] && cat "$STUB_GC_FILE"; exit "$STUB_GC_RC"; fi
     [ -n "${STUB_GC_FILE:-}" ] && cat "$STUB_GC_FILE"
     exit 0 ;;
+  "rig list")
+    [ -f "$STUB_DIR/rig.rc" ] && { echo "gc: erro injetado (rig list)" >&2; exit "$(cat "$STUB_DIR/rig.rc")"; }
+    if [ -f "$STUB_DIR/rig.json" ]; then cat "$STUB_DIR/rig.json"; exit 0; fi
+    cty="${CITY_ARG:-}"; printf '{"city_path":"%s","ok":true,"rigs":[{"name":"gascity","path":"%s","hq":true},{"name":"wa","path":"%s/rigs/wa"},{"name":"ps","path":"%s/rigs/ps"}]}\n' "$cty" "$cty" "$cty" "$cty"; exit 0 ;;
   "mail send")
     c=$(( $(cat "$STUB_DIR/mail.count" 2>/dev/null || echo 0) + 1 )); echo "$c" > "$STUB_DIR/mail.count"
     to="${args[2]:-}"; subj=""; body=""; i=3
@@ -87,7 +91,7 @@ cat > "$T/bin/ssh" <<'EOF'
 echo "$*" >> "$STUB_DIR/ssh.calls"
 # AÇÃO no nó (ga-2hd02v.5.10: matar sessão, gravar o pedido de lastro): a chamada que NÃO é a leitura (a leitura leva o marcador @@OCC-BEGIN@@). Vai também para ssh.act; o último argumento é o script que o servidor rodaria.
 # $STUB_ACT_RC falha a chamada; $STUB_ACT_SLEEP a trava; $STUB_ACT_OUT força o veredito (a palavra que o script diria). Sem nenhum, o script RODA DE VERDADE (bash local) contra o "nó" de mentira: tmux e date falsos em $STUB_NODEBIN
-# (a sessões em $STUB_DIR/node.tmux, linhas nome|atividade; o relógio em node.now) e HOME em $STUB_NODE_HOME. Isso confere o shell do vigia (aspas, $(), a ordem do mata-depois-de-conferir), não só o texto dele.
+# (as sessões em $STUB_DIR/node.tmux, linhas nome|session_activity|window_activity: o D1 só mata o que está quieto nas DUAS; o relógio em node.now) e HOME em $STUB_NODE_HOME. Isso confere o shell do vigia (aspas, $(), a ordem do mata-depois-de-conferir), não só o texto dele.
 case "$*" in
   *@@OCC-BEGIN@@*) ;;
   *)
@@ -110,6 +114,7 @@ cat > "$T/bin/bd" <<'EOF'
 # bd de mentira: duas formas permitidas. (1) a leitura de quem segura bead (`-C <cidade> list --status in_progress --json --limit 0`): devolve $STUB_BD_FILE (ou falha com $STUB_BD_RC; com $STUB_OUTFAIL imprime o JSON COMPLETO antes de falhar;
 # com $STUB_BD_SLEEP trava esses segundos). (2) a bead do aviso D4 (`-C <cidade> create --silent -t task -p 2 -l area:infra,hetzner-ocupacao --title <t> -d <d>`, 14 argumentos, a forma EXATA): grava create.N.title/.desc, imprime
 # $STUB_BD_CREATE_ID (padrão ga-d4test; VAZIO = não imprime nada) e sai com $STUB_BD_CREATE_RC. Qualquer outra forma é PROIBIDA (rc 99, marcada).
+# A forma (1) com -C <cidade>/rigs/<rig> lê a loja de um RIG: devolve $STUB_DIR/bd.rig.<rig> (padrão: []), ou falha se $STUB_DIR/bd.rig.<rig>.rc existir.
 echo "bd $*" >> "$STUB_DIR/bd.calls"
 if [ "$#" -eq 14 ] && [ "$1" = "-C" ] && [ "$3 $4 $5 $6 $7 $8 $9 ${10} ${11}" = "create --silent -t task -p 2 -l area:infra,hetzner-ocupacao --title" ] && [ "${13}" = "-d" ]; then
   c=$(( $(cat "$STUB_DIR/create.count" 2>/dev/null || echo 0) + 1 )); echo "$c" > "$STUB_DIR/create.count"
@@ -118,6 +123,10 @@ if [ "$#" -eq 14 ] && [ "$1" = "-C" ] && [ "$3 $4 $5 $6 $7 $8 $9 ${10} ${11}" = 
   case "${STUB_BD_CREATE_ID:-}" in VAZIO) ;; "") echo ga-d4test ;; *) echo "$STUB_BD_CREATE_ID" ;; esac; exit 0
 fi
 if [ "$#" -ne 8 ] || [ "$1" != "-C" ] || [ "$3 $4 $5 $6 $7 $8" != "list --status in_progress --json --limit 0" ]; then echo "FORBIDDEN bd $*" >> "$STUB_DIR/forbidden.calls"; exit 99; fi
+case "$2" in */rigs/*)
+  rig=$(basename "$2"); [ -f "$STUB_DIR/bd.rig.$rig.rc" ] && { echo "bd: erro injetado (rig $rig)" >&2; exit 1; }
+  if [ -f "$STUB_DIR/bd.rig.$rig" ]; then cat "$STUB_DIR/bd.rig.$rig"; else echo "[]"; fi; exit 0 ;;
+esac
 [ -n "${STUB_BD_SLEEP:-}" ] && sleep "$STUB_BD_SLEEP"
 if [ "${STUB_BD_RC:-0}" != 0 ]; then echo "bd: erro injetado" >&2; [ -n "${STUB_OUTFAIL:-}" ] && [ -n "${STUB_BD_FILE:-}" ] && cat "$STUB_BD_FILE"; exit "$STUB_BD_RC"; fi
 [ -n "${STUB_BD_FILE:-}" ] && cat "$STUB_BD_FILE"
@@ -138,14 +147,19 @@ EOF
 mkdir -p "$T/bin/node"
 cat > "$T/bin/node/tmux" <<'EOF'
 #!/usr/bin/env bash
-# tmux do nó: só o que o script de matar usa (-L gc-remote has-session / display-message / kill-session), sobre $STUB_DIR/node.tmux (nome|atividade). $STUB_TMUX_ACT_BAD: a atividade vem ilegível; $STUB_TMUX_KILL_FAIL: o kill falha
+# tmux do nó: só o que o script de matar usa (-L gc-remote has-session / list-windows -t -F / kill-session), sobre $STUB_DIR/node.tmux (uma linha por janela: nome|session_activity|window_activity); o -F é respeitado (só os campos pedidos saem).
+# $STUB_TMUX_ACT_BAD: a atividade vem ilegível (1 = "xx", 2 = só um espaço); $STUB_TMUX_KILL_FAIL: o kill falha
 f="$STUB_DIR/node.tmux"
 [ "$1" = "-L" ] && [ "$2" = "gc-remote" ] || { echo "tmux falso: esperava -L gc-remote: $*" >&2; exit 2; }
 shift 2
-name=""; [ "$2" = "-t" ] && name="${3#=}"; [ "$1" = "display-message" ] && name="${4#=}"; name="${name%:}"
+name=""; [ "$2" = "-t" ] && name="${3#=}"; name="${name%:}"
 case "$1" in
   has-session) grep -q "^${name}|" "$f" ;;
-  display-message) [ -n "${STUB_TMUX_ACT_BAD:-}" ] && { echo "xx"; exit 0; }; grep "^${name}|" "$f" | head -n 1 | sed 's/^.*|//' ;;
+  list-windows) case "${STUB_TMUX_ACT_BAD:-}" in 1) echo "xx"; exit 0;; 2) echo " "; exit 0;; esac
+    # o tmux de verdade imprime SÓ o que o -F pede: quem pede só session_activity não recebe a saída (window_activity)
+    fmt=""; while [ $# -gt 0 ]; do [ "$1" = "-F" ] && fmt="$2"; shift; done
+    [ -n "$fmt" ] || { echo "tmux falso: list-windows sem -F" >&2; exit 2; }
+    grep "^${name}|" "$f" | while IFS='|' read -r _n sa wa; do printf '%s\n' "$fmt" | sed "s/#{session_activity}/$sa/; s/#{window_activity}/$wa/"; done ;;
   kill-session) [ -n "${STUB_TMUX_KILL_FAIL:-}" ] && exit 1; grep -q "^${name}|" "$f" || exit 1; grep -v "^${name}|" "$f" > "$f.new"; mv "$f.new" "$f"; echo "$name" >> "$STUB_DIR/node.killed" ;;
   *) echo "tmux falso: subcomando $1" >&2; exit 2 ;;
 esac
@@ -287,7 +301,7 @@ xtick() {   # xtick <segundos> <sessões> <lastro> <sistema> <espera> : como o t
 }
 xone() { xtick 900 "$@" >/dev/null; xtick 900 "$@"; }   # xone <4 partes>: a semente do baseline e UMA janela lida (a que o teste examina)
 xdue() { xtick 900 "$@" >/dev/null; xtick 900 "$@" >/dev/null; xtick 900 "$@"; }   # a semente, a 1ª janela baixa e a 2ª (30 min medidos): a 1ª leitura em que a escada pode agir
-node_add() { printf '%s|%s\n' "$1" "$((NOW + ${3:-1800} - $2))" >> "$T/stub/node.tmux"; }   # node_add <nome> <parada_há_s> [segundos_até_a_leitura=1800]: uma sessão no tmux do nó, parada há <parada_há_s> NO MOMENTO DA LEITURA (a atividade é fixa e o relógio corre: 1800 s = o xone, 2700 s = o xdue)
+node_add() { printf '%s|%s|%s\n' "$1" "$((NOW + ${3:-1800} - $2))" "$((NOW + ${3:-1800} - ${4:-$2}))" >> "$T/stub/node.tmux"; }   # node_add <nome> <parada_há_s> [segundos_até_a_leitura=1800] [janela_parada_há_s=igual]: uma janela de uma sessão no tmux do nó, com input parado há <parada_há_s> (session_activity) e saída parada há <janela_parada_há_s> (window_activity) NO MOMENTO DA LEITURA (a atividade é fixa e o relógio corre: 1800 s = o xone, 2700 s = o xdue). Repetir o nome = outra janela da mesma sessão
 after_read() { printf '%s\n' "$1" > "$T/stub/after-read.sh"; }   # after_read <comando>: roda no nó DEPOIS da próxima leitura (a janela entre achar e agir); $STUB_DIR e o relógio em $STUB_DIR/node.now
 node_has() { grep -q "^$1|" "$T/stub/node.tmux" && echo 1 || echo 0; }
 keys_on() { local k; for k in "$@"; do : > "$C/.gc/hetzner-occupancy-$k.on"; done; }
@@ -1314,6 +1328,26 @@ g_causa() {
   xfresh; X_TMUX=semrc; xone $LOWW >/dev/null; eq "tmux sem o rc= antes da lista: ilegível" "false/tmux-ilegivel:rc-ausente" "$(reading lixo.lido)/$(reading lixo.motivo)"
   xfresh; X_OMIT="tmux"; xone $LOWW >/dev/null; eq "seção do tmux ausente (a ssh cortou): ilegível, não vazia" "false/tmux-ilegivel:sem-secao" "$(reading lixo.lido)/$(reading lixo.motivo)"
 
+  # ---- "quieta" é a MAIOR entre a atividade de input e a de saída, de todas as janelas (nó, 04/11: dog-remote-gawispvtzl0 com input de 2 h 23 atrás e saída de agora) -----------------------------
+  xfresh; node_add "$GHOST" 14400 1800 60; xone $LOWW >/dev/null; eq "input parado há 4 h mas a SAÍDA (window_activity) mexeu há 1 min: a sessão trabalha, não é lixo" "0/true" "$(reading lixo.n)/$(reading lixo.lido)"
+  xfresh; node_add "$GHOST" 60 1800 14400; xone $LOWW >/dev/null; eq "o contrário, input há 1 min e saída parada há 4 h: também não é lixo (vale a mais recente)" 0 "$(reading lixo.n)"
+  xfresh; node_add "$GHOST" 14400 1800 60; node_add "$GHOST" 14400; xone $LOWW >/dev/null; eq "duas janelas da mesma sessão, a 1ª recente e a 2ª parada: vale a mais recente de TODAS (não a última linha)" 0 "$(reading lixo.n)"
+  xfresh; node_add "$GHOST" 14400 1800 12000; node_add "$GHOST" 14400 1800 9000; xone $LOWW >/dev/null; eq "tudo parado (janelas de 12000 s e 9000 s, input de 14400 s): é lixo, parado há 9000 s (a atividade mais recente)" "1/9000" "$(reading lixo.n)/$(reading lixo.ocioso_max_s)"
+  xfresh; node_add "$GHOST" 14400; sessions_are '{"sessions":[{"id":"s1","template":"dog-remote","state":"asleep"}]}'; xone $LOWW >/dev/null
+  eq "a cidade com uma entrada só com template (sem session_name, name nem alias): não sei com que nome o tmux a conhece, então NÃO há lixo" "false/cidade-ilegivel" "$(reading lixo.lido)/$(reading lixo.motivo)"
+
+  # ---- quem segura bead é lido em TODAS as lojas (hq e rigs): o `bd list` da cidade só traz as beads ga- ------------------------------------------------------------------------------------
+  xfresh; node_add "$GHOST" 14400; printf '[{"id":"wa-1","status":"in_progress","assignee":"%s"}]' "$GHOST" > "$T/stub/bd.rig.wa"; xone $LOWW >/dev/null
+  eq "sessão fora da lista da cidade que segura bead de um RIG (wa), parada há 4 h: não é lixo" "0/true" "$(reading lixo.n)/$(reading lixo.lido)"
+  xfresh; node_add "$GHOST" 14400; xone $LOWW >/dev/null; eq "... e sem bead em loja nenhuma é lixo (o mesmo cenário sem o dono)" "1/true" "$(reading lixo.n)/$(reading lixo.lido)"
+  xfresh; node_add "$GHOST" 14400; : > "$T/stub/bd.rig.ps.rc"; xone $LOWW >/dev/null; eq "a loja de UM rig ilegível (bd falha): não sei quem segura bead lá, então o lixo NÃO é lido" "false/donos-ilegivel:loja-ilegivel:ps:bd-falhou" "$(reading lixo.lido)/$(reading lixo.motivo)"
+  xfresh; node_add "$GHOST" 14400; echo 3 > "$T/stub/rig.rc"; xone $LOWW >/dev/null; eq "gc rig list que falha: não sei quais lojas existem, lixo NÃO lido" "false/donos-ilegivel:rigs-gc-falhou" "$(reading lixo.lido)/$(reading lixo.motivo)"
+  xfresh; node_add "$GHOST" 14400; printf '{"city_path":"x","ok":true,"rigs":[]}' > "$T/stub/rig.json"; xone $LOWW >/dev/null; eq "lista de rigs vazia (o próprio hq é um rig): leitura que falhou, não 'cidade sem rig'" "false/donos-ilegivel:rigs-forma-desconhecida" "$(reading lixo.lido)/$(reading lixo.motivo)"
+  xfresh; node_add "$GHOST" 14400; printf '{"ok":false,"rigs":[{"name":"wa","path":"x/rigs/wa"}]}' > "$T/stub/rig.json"; xone $LOWW >/dev/null; eq "envelope de erro do gc rig list (ok false): a lista que vier junto não vale" "false/donos-ilegivel:rigs-forma-desconhecida" "$(reading lixo.lido)/$(reading lixo.motivo)"
+  xfresh; node_add "$GHOST" 14400; printf 'isto nao e json' > "$T/stub/rig.json"; xone $LOWW >/dev/null; eq "gc rig list que não é JSON: ilegível" "false/donos-ilegivel:rigs-json-ilegivel" "$(reading lixo.lido)/$(reading lixo.motivo)"
+  xfresh; node_add "$GHOST" 14400; printf '{"ok":true,"rigs":[{"name":"wa"}]}' > "$T/stub/rig.json"; xone $LOWW >/dev/null; eq "rig sem caminho: não sei onde está a loja dele, lixo NÃO lido" "false/donos-ilegivel:rigs-forma-desconhecida" "$(reading lixo.lido)/$(reading lixo.motivo)"
+  xfresh; node_add gate-reviewer-remote-young 600; xone $LOWW >/dev/null; check "sem candidata (parada há só 10 min) as lojas dos rigs nem são lidas" "$([ "$(cat "$T/stub/bd.calls" 2>/dev/null | grep -c 'rigs/')" = 0 ] && [ "$(cat "$T/stub/gc.calls" 2>/dev/null | grep -c 'rig list')" = 0 ] && [ "$(reading lixo.lido)" = true ] && echo 1 || echo 0)"
+
   # ---- o que não foi lido nunca vira causa: cego, sem degrau, sem ação -------------------------------------------------------------------------------------------------------
   local why
   for why in "cg:cgroup-ilegivel" "u:cgroup-ilegivel" "m l:sem-gerenciador-de-usuario"; do
@@ -1425,9 +1459,14 @@ g_escada() {
   ghost3; node_add gate-reviewer-remote-b 20000 2700; TENV=(HETZNER_OCC_D1_MAX=1); xtick 900 $LOWW; eq "D1_MAX=1: só a mais quieta" "1/gate-reviewer-remote-b" "$(wc -l < "$T/stub/node.killed" | tr -d ' ')/$(cat "$T/stub/node.killed")"
   ghost3; after_read ': > "$STUB_DIR/node.tmux"'; xtick 900 $LOWW
   eq "a sessão SUMIU entre a leitura e a ação: o nó diz 'ausente', nada é morto, a tentativa gasta a vez e não há efeito a medir" "false/$GHOST=ausente/falhou/1/[]" "$(verd)"
-  ghost3; after_read 'printf "%s|%s\n" '"$GHOST"' "$(cat "$STUB_DIR/node.now")" > "$STUB_DIR/node.tmux"'; xtick 900 $LOWW
+  ghost3; after_read 'n=$(cat "$STUB_DIR/node.now"); printf "%s|%s|%s\n" '"$GHOST"' "$n" "$n" > "$STUB_DIR/node.tmux"'; xtick 900 $LOWW
   eq "a sessão VOLTOU a trabalhar entre a leitura e a ação: o nó diz 'ativa' e ela não morre" "false/$GHOST=ativa/falhou/1/[]/1" "$(verd)/$(node_has "$GHOST")"
-  ghost3; STUB_TMUX_ACT_BAD=1; xtick 900 $LOWW; eq "atividade que o nó não consegue ler: 'ilegivel', não mata" "false/$GHOST=ilegivel/falhou/1/[]/1" "$(verd)/$(node_has "$GHOST")"
+  ghost3; after_read 'n=$(cat "$STUB_DIR/node.now"); printf "%s|1|%s\n" '"$GHOST"' "$n" > "$STUB_DIR/node.tmux"'; xtick 900 $LOWW
+  eq "a SAÍDA voltou entre a leitura e a ação (input parado, window_activity de agora): o nó diz 'ativa' e ela não morre" "false/$GHOST=ativa/falhou/1/[]/1" "$(verd)/$(node_has "$GHOST")"
+  ghost3; after_read 'n=$(cat "$STUB_DIR/node.now"); printf "%s|1|1\n%s|1|%s\n" '"$GHOST $GHOST"' "$n" > "$STUB_DIR/node.tmux"'; xtick 900 $LOWW
+  eq "duas janelas no nó, só a 2ª mexeu: vale a mais recente de todas e a sessão não morre" "false/$GHOST=ativa/falhou/1/[]/1" "$(verd)/$(node_has "$GHOST")"
+  xfresh; X_OMIT="tmux"; xone $LOWW >/dev/null; eq "seção do tmux ausente (a ssh cortou): ilegível, não vazia" "false/tmux-ilegivel:sem-secao" "$(reading lixo.lido)/$(reading lixo.motivo)"
+  ghost3; STUB_TMUX_ACT_BAD=2; xtick 900 $LOWW; eq "atividade que vem só em branco: 'ilegivel' (nunca uma conta com número vazio), não mata" "false/$GHOST=ilegivel/falhou/1/[]/1" "$(verd)/$(node_has "$GHOST")"
   ghost3; STUB_TMUX_KILL_FAIL=1; xtick 900 $LOWW; eq "o tmux recusa o kill: 'falhou'" "false/$GHOST=falhou/falhou/1/[]" "$(verd)"
   ghost3; STUB_ACT_RC=255; xtick 900 $LOWW; eq "ssh de ação que cai (rc 255): 'rc-255' e não há sucesso" "false/$GHOST=rc-255/falhou/1/[]" "$(verd)"
   ghost3; STUB_ACT_SLEEP=8; TENV=(HETZNER_OCC_SSH_TIMEOUT_S=3); xtick 900 $LOWW; eq "ssh de ação que trava além do prazo: 'timeout'" "false/$GHOST=timeout/falhou/1/[]" "$(verd)"
@@ -1920,6 +1959,17 @@ g_mutantes() {
   mutante d1-nome-sem-remote "escada" $'if not SAFE_NAME.fullmatch(name) or "-remote-" not in "-%s-" % name:\n        return False, "nome-recusado"' $'if False:\n        return False, "nome-recusado"'
   mutante d1-morta-qualquer-palavra "escada" $'return (words[-1] == ok_word, words[-1]) if words else (False, "sem-saida")' $'return (True, words[-1]) if words else (False, "sem-saida")'
   mutante d1-rc-ignorado "escada" $'    if rc != 0:\n        return False, "rc-%s" % rc\n    return (words' $'    return (words'
+  # D1, o sinal de "quieta" e o que prova que ninguém a segura (achados da revisão de segurança)
+  mutante d1-so-session-activity "causa" $'by[f[0]] = max(by.get(f[0], 0), int(f[1]), int(f[2]))' $'by[f[0]] = max(by.get(f[0], 0), int(f[1]))'
+  mutante d1-janela-ultima-vence "causa" $'by[f[0]] = max(by.get(f[0], 0), int(f[1]), int(f[2]))' $'by[f[0]] = max(0, int(f[1]), int(f[2]))'
+  mutante d1-reconferencia-so-session "escada" $'-F "#{session_activity} #{window_activity}"' $'-F "#{session_activity}"'
+  mutante d1-reconferencia-minimo "escada" $'sort -n | tail -n 1' $'sort -n | head -n 1'
+  mutante d1-sem-guarda-numerica "escada" $'\'case "$a" in ""|*[!0-9]*) echo ilegivel; exit 0;; esac; \'' $'\'\''
+  mutante d1-reconhecidas-sem-nome "causa" $'if not bad_entry and not unnamed:' $'if not bad_entry:'
+  mutante d1-sem-donos-dos-rigs "causa escada" $'donos = donos | rig_donos' $'donos = donos'
+  mutante d1-rig-ilegivel-segue "causa" $'if h is None:\n            return None, "loja-ilegivel:%s:%s" % (os.path.basename(path), why2)' $'if h is None:\n            continue'
+  mutante d1-rigs-vazia-vale "causa" $'if not isinstance(rigs, list) or not rigs:' $'if not isinstance(rigs, list):'
+  mutante d1-rigs-envelope-erro-vale "causa" $'if isinstance(d, dict) and d.get("ok") is True else None' $'if isinstance(d, dict) else None'
   # D2: o pedido vence e respeita os pisos
   mutante pedido-sem-validade "escada" $'"ate": now + 2 * c.interval_s' $'"ate": now + 2000 * c.interval_s'
   mutante pedido-sem-teto "escada" $'min(int(nuc["livres"]), (ram_mb - c.ram_start_mb) // c.ram_slot_mb, 4)' $'min(int(nuc["livres"]), (ram_mb - c.ram_start_mb) // c.ram_slot_mb, 400)'
