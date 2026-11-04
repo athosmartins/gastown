@@ -277,15 +277,23 @@ fp_symlink() {
   newfx; mkfoo; mkdir "$F/ext"; mv "$TREE/scripts/foo.sh" "$F/ext/foo.sh"; ln -s "$F/ext/foo.sh" "$TREE/scripts/foo.sh"; local a; a=$(cks "$F/ext/foo.sh"); sw
   echo "rc=$RC $(jf 'd["result"]') run=$(jf 'd["mutants_run"]') skipped=$(jf '",".join("%s=%d" % kv for kv in sorted(d["skipped"].items()))') ext=$([ "$(cks "$F/ext/foo.sh")" = "$a" ] && echo intacto || echo MUDOU)"
 }
-fp_falha() {   # um ARQUIVO no lugar da pasta do slot: a execução falha por infra
-  newfx; mkfoo; : > "$F/work/slot-0"; : > "$F/work/slot-1"; sw; local a="rc=$RC $(jf 'd["result"]') run=$(jf 'd["mutants_run"]') falhas=$(jf 'd["falhas"]')"
-  rm -f "$F/work/slot-0" "$F/work/slot-1"; sw; echo "$a | $(cnt)"
+fp_falha() {   # a execução falha por infra: um tar que copia tudo mas sai com rc 2 (nenhuma ponta pode ser calada); com o tar de volta, a varredura seguinte roda os 6
+  newfx; mkfoo; mkdir "$F/bin"; printf '#!/bin/sh\n"%s" "$@"\nexit 2\n' "$(command -v tar)" > "$F/bin/tar"; chmod +x "$F/bin/tar"; PATH="$F/bin:$PATH" sw; local a="rc=$RC $(jf 'd["result"]') run=$(jf 'd["mutants_run"]') falhas=$(jf 'd["falhas"]')"
+  sw; echo "$a | $(cnt)"
 }
 fp_jailrel() { newfx; mkfoo; cd "$W" && JAIL=fakejail.py sw; cnt; }   # --jail relativo (a forma do USO): resolvido uma vez, senão toda baseline vira vermelha
+fp_copy() {   # a cópia do slot (a raiz do fixture) chega ao selftest sem nenhum .git (na raiz e aninhado), com o link simbólico e o modo 0666 (o -p do tar: sem ele a umask tira 022)
+  newfx; mkfoo; mkdir -p "$F/root/.git" "$TREE/sub/.git"; : > "$F/root/.git/x"; : > "$TREE/sub/.git/y"; ln -s foo.sh "$TREE/scripts/lnk"; : > "$TREE/m"; chmod 666 "$TREE/m"
+  mkst foo '[ "$(bash "$H/foo.sh" 9)" = big ] || exit 1
+[ "$(bash "$H/foo.sh" 1)" = small ] || exit 1
+R="$(cd "$H/../.." && pwd)"; [ ! -e "$R/.git" ] && [ ! -e "$R/hq/sub/.git" ] && [ -L "$H/lnk" ] && [ "$(stat -c %a "$R/hq/m" 2> /dev/null || stat -f %Lp "$R/hq/m")" = 666 ] || exit 1'
+  sw; cnt
+}
 EXP_SW0="rc=0 completo run=6 k=2 c=4 f=0 inv=0 open=4"; EXP_SYM="rc=0 sem-cobertura run=0 skipped=symlink=1 ext=intacto"; EXP_FALHA="rc=0 parcial run=0 falhas=1 | $EXP_SW0"
 peq "sujeito symlink: pulado (symlink=1), nada rodou e o arquivo de fora não mudou" "$EXP_SYM" fp_symlink
-peq "execução que falha por infra: rc 0, parcial, falhas=1, nenhum veredito; consertado o slot a varredura seguinte roda os 6" "$EXP_FALHA" fp_falha
+peq "execução que falha por infra (tar que copia tudo mas sai com rc 2): rc 0, parcial, falhas=1, nenhum veredito; com o tar de volta a varredura seguinte roda os 6" "$EXP_FALHA" fp_falha
 peq "--jail relativo funciona como o absoluto" "$EXP_SW0" fp_jailrel
+peq "a cópia do slot não leva nenhum .git (raiz e aninhado) e mantém o link simbólico e o modo 0666" "$EXP_SW0" fp_copy
 fp_fsize_head() {   # (ga-2hd02v.5.6.3) o selftest escreve 3 MB num arquivo do slot com o teto em 1 MB: o laço de escrita para no teto (aqui são 3 MB, nunca GB)
   newfx; mkfoo; mkdir "$F/fora"
   mkst foo '( head -c 3000000 /dev/zero > "$TMPDIR/big" ) 2> /dev/null
@@ -731,6 +739,10 @@ par kill_it slots-contador-nao-desce fp_sl_up        "$EXP_SLU" '            ctx
 par kill_it slots-sem-prazo-na-vaga  fp_sl_prazo     "parcial pouco=True" $'        if ctx.stop.is_set() or time.time() > ctx.deadline:\n            return None\n        ctx.running += 1' $'        if ctx.stop.is_set():\n            return None\n        ctx.running += 1'
 par kill_it slots-last-fixo          fp_sl_live_up   "$EXP_SLA" 'slots_last=ctx.limit' 'slots_last=a.slots'
 par kill_it slots-uso-aceita-zero    fp_sl_uso       " 2 2 2 2 | $EXP_SW0" 'if a.cmd == "sweep" and a.slots < 1:' 'if a.cmd == "sweep" and a.slots < 0:'
+par kill_it copia-leva-git           fp_copy         "$EXP_SW0" 'copy_tree(ctx.root, clone, (".git",))' 'copy_tree(ctx.root, clone, ())'
+par kill_it copia-sem-modo           fp_copy         "$EXP_SW0" '"-xpf", "-"' '"-xf", "-"'
+par kill_it tar-rc-calado            fp_falha        "$EXP_FALHA" '    if r1 or r2:' '    if False:'
+par kill_it wipe-nao-apaga           fp_sweep        "$EXP_SWEEP" '["rm", "-rf", str(p)]' '["true"]'
 [ "$SKIP_DATA" = 1 ] || par kill_it dados-nao-fixa       fp_data "$EXP_DATA alloc=falhou left=0" '        resource.setrlimit(resource.RLIMIT_DATA, (d, d))\n' '        pass\n' 128
 [ "$SKIP_DATA" = 1 ] || par kill_it dados-em-bytes       fp_data "$EXP_DATA alloc=falhou left=0" '("," + str(a.data_mb << 20) if a.data_mb else "")' '("," + str(a.data_mb) if a.data_mb else "")' 128
 [ "$SKIP_DATA" = 1 ] || par kill_it dados-fora-do-argumento fp_data "$EXP_DATA alloc=falhou left=0" 'if a.data_mb else ""' 'if False else ""' 128

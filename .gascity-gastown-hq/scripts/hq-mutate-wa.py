@@ -24,7 +24,6 @@ import hashlib
 import importlib.util
 import os
 import re
-import shutil
 import signal
 import subprocess
 import sys
@@ -48,7 +47,7 @@ NOT_WA_SUBJECT = re.compile(r"^(?:test_|conftest|__init__\.py$|setup\.py$)|_test
 WA_DENY = re.compile(r"\bos\.kill(?:pg)?\b|\bpthread_kill\b|\braise_signal\b|\bpsutil\b")
 NOISE = re.compile(r"^\s*(?:print|logger\.\w+|logging\.\w+|log\.\w+|_?log\w*)\(")
 IMPORT = re.compile(r"^[ \t]*(?:from[ \t]+([\w.]+)[ \t]+import[ \t]+(\([^)]*\)|[^\n]*)|import[ \t]+([\w., \t]+))", re.M)
-COPY_IGNORE = shutil.ignore_patterns(".git", "__pycache__", "*.pyc", "crew", "node_modules", "*.bak-*")
+COPY_IGNORE = (".git", "__pycache__", "*.pyc", "crew", "node_modules", "*.bak-*")
 FAM_CAP = 12
 PYTEST_TMO = 120
 PYTHON = ""   # o python do venv do WA (--python): só o sweep o usa
@@ -152,7 +151,7 @@ def wa_exec_family(ctx, slot_n, tgt, text, tmo):
     (slot / "tmp").mkdir(parents=True)
     (slot / "home").mkdir()
     clone = slot / "clone"
-    shutil.copytree(ctx.tree, clone, symlinks=True, ignore=COPY_IGNORE)
+    hqm.copy_tree(ctx.tree, clone, COPY_IGNORE)
     if text is not None:
         (clone / tgt["rel"]).write_text(text, encoding="utf-8")
     base_kb = hqm.slot_kb(slot) or 0   # vazio/falhou (du não mediu) → 0: o limite passa a valer sobre o slot inteiro, nunca sem limite

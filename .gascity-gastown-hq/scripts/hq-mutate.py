@@ -385,7 +385,21 @@ def wipe(ctx, p):
         if ctx.work not in p.resolve().parents:
             raise RuntimeError("recuso apagar fora do --work: %s" % p)
         subprocess.run(["chmod", "-R", "u+rwX", str(p)], capture_output=True)
-        shutil.rmtree(p, ignore_errors=True)
+        subprocess.run(["rm", "-rf", str(p)], capture_output=True)   # rm e não shutil.rmtree, pelo mesmo motivo do copy_tree
+
+
+def copy_tree(src, dst, ignore):
+    """copia src para dst (links simbólicos como links, modo e datas mantidos) sem os nomes de `ignore` em nenhum nível: dois `tar` em cadeia, e não o shutil.copytree/rmtree. Esses são Python puro e, com 12 threads, o ciclo apagar+copiar de um slot
+    (a árvore do WA: 9.350 arquivos, 166 MB) passou de 1 s para 120 s (GIL + travas do tmpfs, medido no nó em 04/11) e os slots esperavam a cópia em vez de rodar teste; com `tar` os mesmos 12 fazem 17 ciclos/s (0,7 s cada). Falhou (tar ausente, rc != 0 de qualquer
+    ponta: disco cheio, arquivo ilegível) → OSError: infra, conta em `falhas`, nunca um veredito sobre uma cópia pela metade"""
+    dst.mkdir()
+    send = subprocess.Popen(["tar", "-C", str(src), *("--exclude=" + g for g in ignore), "-cf", "-", "."], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+    recv = subprocess.Popen(["tar", "-C", str(dst), "-xpf", "-"], stdin=send.stdout, stderr=subprocess.DEVNULL)
+    send.stdout.close()
+    r2 = recv.wait()
+    r1 = send.wait()
+    if r1 or r2:
+        raise OSError("tar rc %s/%s ao copiar %s" % (r1, r2, src))
 
 
 SLOT_MB = 1024   # crescimento máximo de um slot (MB) desde a cópia da árvore, ver TETO DO SLOT
@@ -462,7 +476,7 @@ def exec_family(ctx, slot_n, tgt, text, tmo):
     (slot / "tmp").mkdir(parents=True)
     (slot / "home").mkdir()
     clone = slot / "clone"
-    shutil.copytree(ctx.root, clone, symlinks=True, ignore=shutil.ignore_patterns(".git"))
+    copy_tree(ctx.root, clone, (".git",))
     cd = clone / ctx.tree.relative_to(ctx.root)
     if text is not None:
         (cd / tgt["rel"]).write_text(text, encoding="utf-8")
