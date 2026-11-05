@@ -10406,6 +10406,9 @@ def _selftest():
     _ls_rc_src = _ls_inspect.getsource(run_cycle)
     check("LS-8 (drift guard): run_cycle still hands the bead's own update age to session_is_live — dropped, bead_update_age=None switches the rule off without a sound",
           "has_live_session = session_is_live(\n                assignee, sessions, now, bead_update_age," in _ls_rc_src)
+    import re as _ls_re
+    check("LS-9 (drift guard): list_live_sling_source_beads (sling-wrapper liveness) still hands the sling's own update age to session_is_live — dropped, the rule is off for wrappers with no sound",
+          _ls_re.search(r"session_is_live\(\s*assignee,\s*sessions,\s*now,\s*bead_update_age\s*,", _ls_inspect.getsource(list_live_sling_source_beads)) is not None)
 
     print(f"\nResults: {PASS} passed, {FAIL} failed")
     return FAIL == 0
