@@ -22,6 +22,9 @@
 #   não consegui ler (repo, arquivo > 1 MB) ou tudo é novo -> a palavra volta a barrar, com a nota. Código só das irmãs é palpite (informa); o que a bead NOMEIA barra; node:ok, exec:manual, PII e freio de envio não mudam.
 #   · TESTE IMPORTADOR (regra 6b): código sem teste de nome ganha os testes que o IMPORTAM (import estático que resolve para o mesmo arquivo; string/comentário não conta — em JS, require em comentário não conta e require em string conta; não parseia
 #   é pulado e contado; mais de 60 candidatos: o excesso não é lido e a nota avisa; git que falha = unknown com a nota).
+#   · ORÁCULO = TESTE VERMELHO EM MAIN (ga-2hd02v.5.13, regra 9): BUG que cita >=1 teste (que existe em origin/main) e nenhum código, com a palavra de vermelho (reprova/falha/vermelho/quebrado/fail) na MESMA frase de um `main` (origin/main, «em main») -> node derivado
+#   (6 casos com o texto de beads WA reais); tarefa, sem a palavra, frase cortada, negação colada («não reprova»), «passa em main», «main thread», sem teste citado e teste ausente de main (com a nota) = unknown; envio = mini; banco fixado no teste = mini (moles);
+#   as regras 5, 7 e 8 vencem a 9 e a leitura que falhou (regra 7 ou 8) a impede de rodar (nunca node).
 #   · ÂNCORA DO DADO (regra 3): a bead que cita só dado e NOMEIA o módulo é ancorada pelo código derivado (mesmos filtros); sem âncora/fora do nó/leitura que falha o dado segue duro; PII e item que não é evidência impedem a tentativa.
 # CONTROLE NEGATIVO: cada mutante abaixo troca UMA linha do classificador numa cópia e o caso designado tem de reprovar; mutante que sobrevive reprova esta bateria. Um mutante só vale se o
 #   ORIGINAL passa o mesmo caso no mesmo ambiente e se ele não morre por causa do ambiente (ver as 3 regras acima de mk_mutant); caso e mutante de rsync usam stubs que só o mutante separa do original.
@@ -372,6 +375,8 @@ wf lib/impt_many.py $'# impt_many'; for i in $(seq -w 1 61); do wf "tests/test_z
 wf lib/anchor_mod.py $'# anchor_mod'; wf tests/test_anchor_mod.py $'anchor_mod'
 wf shared/anchor_out.py $'# anchor_out'; wf tests/test_anchor_out.py $'anchor_out'
 wf lib/anchor_db.py $'D = "queue.db"'; wf tests/test_anchor_db.py $'anchor_db'
+# oráculo (ga-2hd02v.5.13, regra 9): testes que EXISTEM em origin/main e não importam nada do repo (a regra 8 lê e não acha código). orc_mole tem um banco de produção fixado no código (a regra 4 lê o teste e manda ao mini)
+wf tests/test_orc_a.py $'import os\nimport pytest\n\ndef test_a():\n    assert os.sep'; wf tests/test_orc_b.py $'import json\n'; wf tests/test_orc_mole.py $'P = "shared/data/orc.db"\n'
 gw add -A && gw commit -q -m 1 && gw update-ref refs/remotes/origin/main HEAD || bad "repo de mentira do WA não montado"
 wf tests/test_late_mod.py "late_mod"; wf tests/test_imp_head.py "from lib.imp_alpha import x"; gw add -A && gw commit -q -m 2   # o teste de late_mod só existe no HEAD, não em origin/main
 git_ok=$(gw rev-parse --verify -q refs/remotes/origin/main >/dev/null && gw ls-tree -r --name-only origin/main | grep -c 'test_foo_parser'); [ "$git_ok" = 3 ] && ok "repo de mentira do WA montado (origin/main tem 3 testes de foo_parser; o HEAD tem um a mais em late_mod)" || bad "repo de mentira do WA errado ($git_ok)"
@@ -647,6 +652,64 @@ expect "r8: teste citado que não foi lido (novo) é nomeado em info; o motivo c
 expect "r8: mais de 3 testes não lidos -> 3 nomeados e o resto contado (teste-nao-lido-mais)" "$(DESC 'Corrigir o caso de borda; testes em tests/test_imp_a.py, tests/test_n1.py, tests/test_n2.py, tests/test_n3.py e tests/test_n4.py')" 0 "$C8_OK"'1-teste\(s\)\+1-codigo\(s\).*"teste-nao-lido:tests/test_n1\.py", "teste-nao-lido:tests/test_n2\.py", "teste-nao-lido:tests/test_n3\.py", "teste-nao-lido-mais:1"\]\}$'
 export WA_NODE_REPO="$T/wa-repo-ausente" WA_NODE_MIRROR="$T/espelho-ausente"
 
+# ---- oráculo = teste vermelho em main (ga-2hd02v.5.13, regra 9 / A1): BUG que cita >=1 teste (que existe em origin/main), nenhum código (as regras 7 e 8 LERAM e não derivaram nada) e DIZ que o teste reprova/falha/está vermelho em main -> o
+# teste vermelho é o oráculo: node, basis `derivado`. Os 6 casos positivos usam o texto das 6 beads WA reais (wa-9b70jk, wa-appaph, wa-jzaa2w, wa-kjwmcv, wa-sb1jyl, wa-xy301a) com os nomes de teste trocados pelos do repo de mentira.
+export WA_NODE_REPO="$RP" WA_NODE_MIRROR="$T/mirror-ok"
+C9_OK='"verdict": "node", "basis": "derivado", "reasons": \["prova-oraculo-teste-vermelho:'
+U9='"verdict": "unknown", "basis": "", "reasons": \["sem-prova-de-codigo-e-teste"\]'
+DESCB() { printf '{"id":"wa-t9","title":"t","issue_type":"bug","description":"%s"}' "$1"; }                              # DESCB <texto>: bug
+DESCBT() { printf '{"id":"wa-t9","title":"%s","issue_type":"bug","description":"%s"}' "$1" "$2"; }                      # DESCBT <título> <texto>: bug com título (a palavra vermelha às vezes está nele)
+DESCBI() { printf '{"id":"%s","title":"t","issue_type":"bug","description":"%s"}' "$1" "$2"; }                          # DESCBI <id> <texto>: bug com id explícito (o das irmãs vem do id)
+DESCTY() { printf '{"id":"wa-t9","title":"t","issue_type":"%s","description":"%s"}' "$1" "$2"; }                        # DESCTY <tipo> <texto>
+O9_9B70JK="$(DESCBT 'Teste y52af0 test_quadradinhos_voltam_para_cima_do_lote reprova em main: não conhece a camada celulas-lote-line (f24163488)' 'Pré-existente em main (visto em 25/10 durante a wa-qb10p3): tests/test_orc_a.py:628 espera a lista logo depois do pbh-fill, mas desde f24163488 a pilha tem celulas-lote-line no meio. Conserto provável: atualizar a lista esperada no teste.')"
+O9_APPAPH="$(DESCBT 'Teste e2e affr0: selo de saldo estoura a largura da tabela de Proprietários em 375px' 'Achado em wa-qb10p3 (25/10): tests/test_orc_a.py::test_o_selo_de_saldo_cabe_na_linha_da_tabela_sem_rolagem_horizontal[375] FALHA também em origin/main 19bd9cb66 (não é do qb10p3). Medir se é regressão real de layout no celular ou teste desatualizado.')"
+O9_JZAA2W="$(DESCBT '12 testes de Chromium vermelhos na main: casa (rv1qkk43, 11) ficou velha + 1 de layout do affr0 [375]' '12 testes de Chromium estão VERMELHOS na main (medido em 03/11 contra c8990da7f, sem nenhuma mudança minha) e ninguém os acusou. Quais: tests/test_orc_a.py (11 testes test_casa_) e tests/test_orc_b.py::test_o_selo_de_saldo_cabe[375] (causa NÃO investigada).')"
+O9_KJWMCV="$(DESCBT 'Teste quebrado no main: test_faixa_da_ficha_na_tela_real procura Vendido para construtora na linha Estado do lote, que saiu da ficha em 12/10' 'Medido 22/10 por thies: tests/test_orc_a.py::test_faixa_da_ficha_na_tela_real[computador-1280|celular-390] reprova no origin/main e também ANTES da wa-2ifrhk.1. Conserto: decidir onde o Estado do lote mora hoje e atualizar o teste. Não é regressão nova.')"
+O9_SB1JYL="$(DESCBT '4 testes do mapa vermelhos em main sem dono: REG_VIVO não definido nos arnês (3) + ficha diretriz (1)' '4 testes do mapa estão vermelhos em main (base 1df200427) e nenhuma bead aberta é dona deles: tests/test_orc_a.py::test_resposta_ok e tests/test_orc_b.py::test_cenario[recarga]. Causa provável: templates/map_viewer.html cria REG_VIVO e os arnês não o declaram.')"
+O9_XY301A="$(DESCBT 'Teste de tela do mapa falha com a máquina carregada: prazo de 800 ms estoura antes da 1ª leitura' 'tests/test_orc_a.py::test_mapa_que_nao_responde le o texto esperando Carregando, mas com load 64 a página leva mais que o prazo. Falha igual com o template do origin/main (medido por batista na wa-2msnb5.1) — não é regressão.')"
+expect "oráculo: wa-9b70jk (reprova em main no título; teste com :linha) -> node derivado, o teste é a prova" "$O9_9B70JK" 0 "$C9_OK"'1-teste\(s\)"\].*"tests": \["tests/test_orc_a\.py"\]'
+expect "oráculo: wa-appaph (FALHA também em origin/main; id de pytest com [375])" "$O9_APPAPH" 0 "$C9_OK"'1-teste\(s\)"\]'
+expect "oráculo: wa-jzaa2w (VERMELHOS na main, maiúsculas; 2 testes citados) -> 2-teste(s)" "$O9_JZAA2W" 0 "$C9_OK"'2-teste\(s\)"\]'
+expect "oráculo: wa-kjwmcv (quebrado no main + reprova no origin/main; |celular no id)" "$O9_KJWMCV" 0 "$C9_OK"'1-teste\(s\)"\]'
+expect "oráculo: wa-sb1jyl (vermelhos em main; 2 testes e um .html que não é código nem teste)" "$O9_SB1JYL" 0 "$C9_OK"'2-teste\(s\)"\]'
+expect "oráculo: wa-xy301a (a falha está no título e na frase do origin/main; 'não é regressão' DEPOIS não nega)" "$O9_XY301A" 0 "$C9_OK"'1-teste\(s\)"\]'
+# cada palavra vermelha, sozinha
+expect "oráculo: palavra «reprova»" "$(DESCB 'tests/test_orc_a.py reprova em main')" 0 "$C9_OK"
+expect "oráculo: palavra «falha»" "$(DESCB 'tests/test_orc_a.py falha em main')" 0 "$C9_OK"
+expect "oráculo: palavra «vermelho»" "$(DESCB 'tests/test_orc_a.py está vermelho em main')" 0 "$C9_OK"
+expect "oráculo: palavra «quebrado»" "$(DESCB 'tests/test_orc_a.py ficou quebrado em main')" 0 "$C9_OK"
+expect "oráculo: palavra «fails» (inglês)" "$(DESCB 'tests/test_orc_a.py fails in origin/main')" 0 "$C9_OK"
+# o oráculo é do BUG que DIZ que o teste está vermelho em main; sem isso a bead segue unknown, SEM nota (vazio é legítimo)
+expect "oráculo não vale para TAREFA (wa-jhblfa: achados do gate pedem testes novos)" "$(DESCTY task 'tests/test_orc_a.py reprova em main')" 11 "$U9.*$SEMNOTA"
+expect "oráculo não vale sem a palavra vermelha perto do main («falha silenciosa» de outra coisa)" "$(DESCB 'Os achados fecham os buracos de falha silenciosa que a feature deixou; tests/test_orc_a.py cobre o caso')" 11 "$U9.*$SEMNOTA"
+expect "oráculo não vale se o vermelho e o main estão em frases diferentes" "$(DESCB 'A falha silenciosa do sync. Depois do merge em main a ordem muda; tests/test_orc_a.py cobre o caso')" 11 "$U9.*$SEMNOTA"
+expect "oráculo não vale com negação colada («não reprova em main»)" "$(DESCB 'tests/test_orc_a.py não reprova em main; o problema aparece só no tablet')" 11 "$U9.*$SEMNOTA"
+expect "oráculo não vale se a mesma frase diz que passa em main" "$(DESCB 'tests/test_orc_a.py passa em main mas falha no tablet')" 11 "$U9.*$SEMNOTA"
+expect "oráculo não vale para «main thread» (não é a branch)" "$(DESCB 'tests/test_orc_a.py falha na main thread do worker')" 11 "$U9.*$SEMNOTA"
+expect "oráculo não vale para «main()» (a função, não a branch)" "$(DESCB 'tests/test_orc_a.py falha em main() do worker')" 11 "$U9.*$SEMNOTA"
+expect "oráculo não vale sem teste citado (nada que reproduzir)" "$(DESCB 'O teste do modulo reprova em main')" 11 "$U9.*$SEMNOTA"
+# teste citado que NÃO está em origin/main não pode estar vermelho «em main»: unknown, e a nota nomeia o teste (até 3)
+expect "oráculo: teste que não está em origin/main (novo) -> unknown com a nota" "$(DESCB 'tests/test_orc_novo.py reprova em main')" 11 "$U9"'.*"info": \["oraculo-teste-fora-de-main:tests/test_orc_novo\.py"\]\}$'
+expect "oráculo: UM dos testes citados ausente de main basta para não provar nada" "$(DESCB 'tests/test_orc_a.py e tests/test_orc_novo.py reprovam em main')" 11 "$U9"'.*"info": \["oraculo-teste-fora-de-main:tests/test_orc_novo\.py"\]\}$'
+expect "oráculo: mais de 3 testes ausentes -> 3 nomeados e o resto contado" "$(DESCB 'tests/test_orc_a.py, tests/test_n1.py, tests/test_n2.py, tests/test_n3.py e tests/test_n4.py reprovam em main')" 11 "$U9"'.*"oraculo-teste-fora-de-main:tests/test_n1\.py", "oraculo-teste-fora-de-main:tests/test_n2\.py", "oraculo-teste-fora-de-main:tests/test_n3\.py", "oraculo-teste-fora-de-main-mais:1"\]\}$'
+# os freios e a ordem das regras não mudam
+expect "freio: envio no texto manda o oráculo ao mini (a prova é mais fraca que o teste+código citados)" "$(DESCB 'Corrigir o envio da mensagem: tests/test_orc_a.py reprova em main')" 10 '"reasons": \["freio-derivado:envio-acao"\]'
+expect "mole: o teste vermelho com banco de produção fixado no código vai ao mini (a regra 4 lê o teste)" "$(DESCB 'tests/test_orc_mole.py reprova em main')" 10 'moles:banco-de-dados'
+expect "duro: telefone no texto vence o oráculo" "$(DESCB 'Cliente (31) 98876-5432: tests/test_orc_a.py reprova em main')" 10 '"reasons": \["dado-no-texto"\]'
+expect "ordem: código + teste citados -> a regra 5 (basis text); o oráculo nem roda" "$(DESCB 'lib/foo_parser.py: tests/test_orc_a.py reprova em main')" 0 '"basis": "text".*prova-no-texto:1-teste\(s\)\+1-codigo'
+expect "ordem: o teste importa código do repo -> a regra 8 vence o oráculo" "$(DESCB 'tests/test_imp_a.py reprova em main')" 0 '"reasons": \["prova-codigo-derivado-do-teste:'
+expect "ordem: o teste importa módulos demais (regra 8 diz «demais») -> unknown, o oráculo não passa por cima" "$(DESCB 'tests/test_imp_onze.py reprova em main')" 11 'sem-prova-de-codigo-e-teste.*"info": \["codigo-do-teste-demais:11"\]\}$'
+export WA_NODE_CACHE="$T/cache-orp"   # o caso legível GRAVA o cache das irmãs; o das falhas (abaixo) tem pasta própria e nunca é gravado
+expect "ordem: irmãs legíveis derivam código -> a regra 7 vence o oráculo" "$(DESCBI wa-par1.2 'tests/test_orc_a.py reprova em main')" 0 '"reasons": \["prova-caminho-derivado:'
+# falhou/ilegível: o oráculo NÃO roda atrás de uma leitura que falhou (nunca node, nunca o mesmo resultado do vazio)
+expect "ilegível: o teste não parseia (regra 8 falhou) -> unknown com a nota da regra 8; o oráculo não decide" "$(DESCB 'tests/test_imp_quebrado.py reprova em main')" 11 "$(NOTA8 teste-nao-parseia)"
+export WA_NODE_REPO="$T/wa-repo-ausente"; expect "ilegível: repo inexistente -> unknown com a nota da regra 8, nunca node pelo oráculo" "$(DESCB 'tests/test_orc_a.py reprova em main')" 11 "$(NOTA8 repo-git-rc-128)"; export WA_NODE_REPO="$RP"
+export WA_NODE_CACHE="$T/cache-orq"   # nunca gravado (a falha do git não grava): um cache válido das irmãs esconderia a falha
+export WA_NODE_GIT="$T/git-log-quebra"; expect "ilegível: git log das irmãs com rc 2 (regra 7 falhou) -> unknown com a nota da regra 7; o oráculo não decide" "$(DESCBI wa-par1.2 'tests/test_orc_a.py reprova em main')" 11 "$(NOTA7 irmas-git-rc-2)"; unset WA_NODE_GIT
+[ ! -e "$T/cache-orq" ] && ok "ilegível: a falha do git das irmãs não gravou cache" || bad "ilegível: a falha do git das irmãs gravou cache"
+export WA_NODE_CACHE="$T/cache"
+export WA_NODE_REPO="$T/wa-repo-ausente" WA_NODE_MIRROR="$T/espelho-ausente"
+
 # ---- moles por EVIDÊNCIA (ga-qkc02kk, regra 4): a palavra mole escrita na bead é PROSA; quem decide é o CÓDIGO dos arquivos de prova, lido em origin/main. Três estados: leu e achou -> `moles:` (mesmo sem palavra); leu e não achou -> a
 # palavra só informa (`mole-so-em-prosa:`); NÃO consegui ler / nada existente para ler -> volta a palavra (`mole-ilegivel:` / `mole-sem-arquivo-lido`). node:ok, PII, freio de envio e node:mini seguem como eram.
 export WA_NODE_REPO="$RP" WA_NODE_MIRROR="$T/mirror-ok"
@@ -864,7 +927,7 @@ mutant freio-sem-underscore      '(?<![\w/.])' '(?<![/.])' "$FB_ROTA" 0 "$FB_NOD
 mutant freio-sem-ponto-antes     '(?<![\w/.])' '(?<![\w/])' "$(DESC 'Corrigir lib/foo_parser.py no rotulo com.envio')" 0 "$FB_NODE" "$DV"
 mutant freio-sem-ponto-depois    'baileys)(?![\w/]|\.\w)' 'baileys)(?![\w/])' "$(DESC 'Corrigir lib/foo_parser.py e o servico envio.worker')" 0 "$FB_NODE" "$DV"
 mutant freio-tag-larga-some      '("envio-whatsapp", r"\b(whatsapp|' '("envio-wa-x", r"\b(whatsapp|' "$(DESC 'Corrigir lib/foo_parser.py; o daemon com.whatsapp.db-sync reinicia no deploy')" 0 "$FB_NODE.*\"envio-whatsapp\"" "$DV"
-mutant derivado-basis-text      'basis = "derivado" if any(w.startswith(("prova-teste-derivado:", "prova-caminho-derivado:", "prova-codigo-derivado-do-teste:")) for w in why) else "text"' 'basis = "text"' "$D_FOO" 0 '"basis": "derivado"' "$DV"
+mutant derivado-basis-text      'basis = "derivado" if any(w.startswith(("prova-teste-derivado:", "prova-caminho-derivado:", "prova-codigo-derivado-do-teste:", "prova-oraculo-teste-vermelho:")) for w in why) else "text"' 'basis = "text"' "$D_FOO" 0 '"basis": "derivado"' "$DV"
 mutant derivado-sem-maior       ' and not any(rest == m or rest.startswith(m + "_") for m in longer))' ')' "$(DESC 'ajustar lib/bar_service.py')" 0 'prova-teste-derivado:1-teste\(s\)' "$DV"
 mutant derivado-sem-generico    ' and s not in GENERIC_STEMS'          ''                                           "$(DESC 'ajustar lib/utils.py')" 11 'sem-prova-de-codigo-e-teste' "$DV"
 mutant derivado-sem-minimo      ' and len(s) >= MIN_STEM'              ''                                           "$(DESC 'ajustar lib/abcd.py')" 11 'sem-prova-de-codigo-e-teste' "$DV"
@@ -900,7 +963,7 @@ mutant codigo-sem-mac-only       'hard.append("codigo-do-teste-so-no-mac:" + p)'
 mutant codigo-sem-teto           'if len(dpaths) > MAX_DERIVED_CODE:' 'if False:'                           "$(T8M tests/test_imp_onze.py)" 11 'codigo-do-teste-demais:11' "$C8"
 mutant codigo-sem-teto-pares     'extra += pairs[:6] + (["codigo-do-teste-mais:%d"' 'extra += pairs + (["codigo-do-teste-mais:%d"' "$(T8M tests/test_imp_sete.py)" 0 'lib/limcap_06\.py", "codigo-do-teste-mais:1"\]\}$' "$C8"
 mutant codigo-sem-par-em-info    'extra += pairs[:6] + (["codigo-do-teste-mais:%d"' 'extra += [] + (["codigo-do-teste-mais:%d"' "$(T8M tests/test_imp_a.py)" 0 'codigo-do-teste:tests/test_imp_a\.py=lib/imp_alpha\.py' "$C8"
-mutant codigo-basis-text         '"prova-caminho-derivado:", "prova-codigo-derivado-do-teste:"))' '"prova-caminho-derivado:"))' "$(T8M tests/test_imp_a.py)" 0 '"basis": "derivado"' "$C8"
+mutant codigo-basis-text         '"prova-codigo-derivado-do-teste:", "prova-oraculo-teste-vermelho:"))' '"prova-oraculo-teste-vermelho:"))' "$(T8M tests/test_imp_a.py)" 0 '"basis": "derivado"' "$C8"
 mutant codigo-regra7-primeiro    'if res is None and tests and not r7_failed:' 'if tests and not r7_failed:'                             "$(DESC 'Corrigir ficha_donos; teste em tests/test_imp_a.py')" 0 '"reasons": \["prova-caminho-derivado:' "$C8"
 mutant codigo-falha-vira-vazio   'extra.append("codigo-do-teste-ilegivel:" + str(e))' 'pass'                  "$(T8M tests/test_imp_a.py)" 11 'codigo-do-teste-ilegivel:teste-git-rc-2' "$C8 WA_NODE_GIT=$T/git-show-quebra"
 mutant codigo-parse-vira-vazio   'raise Unreadable("teste-nao-parseia")' 'return []'                         "$(T8M tests/test_imp_quebrado.py)" 11 'codigo-do-teste-ilegivel:teste-nao-parseia' "$C8"
@@ -922,6 +985,36 @@ mutant codigo-r7-falha-libera-r8 'if res is None and tests and not r7_failed:' '
 mutant codigo-r7-falha-sem-flag  'r7_failed = True'  'r7_failed = False' "$(DESCI wa-par1.2 'Corrigir o caso de borda; teste em tests/test_imp_a.py')" 11 "$(NOTA7 irmas-git-rc-2)" "$C8 WA_NODE_GIT=$T/git-log-quebra WA_NODE_CACHE=$T/cache-r8q-m"
 mutant codigo-teste-nao-lido-mudo 'unread.append(t)' 'pass' "$(DESC 'Corrigir o caso de borda; testes em tests/test_imp_a.py e tests/test_imp_novo.py')" 0 'teste-nao-lido:tests/test_imp_novo\.py' "$C8"
 mutant codigo-sem-teto-nao-lidos 'unread[:3]' 'unread' "$(DESC 'Corrigir o caso de borda; testes em tests/test_imp_a.py, tests/test_n1.py, tests/test_n2.py, tests/test_n3.py e tests/test_n4.py')" 0 'teste-nao-lido:tests/test_n3\.py", "teste-nao-lido-mais:1"\]\}$' "$C8"
+# oráculo = teste vermelho em main (ga-2hd02v.5.13, regra 9): um mutante por linha da regra; repo e espelho de mentira por envspec ($DV); cada caso designado só reprova com a mutação dele
+C9="$DV"
+C9_RX='"verdict": "node", "basis": "derivado", "reasons": \["prova-oraculo-teste-vermelho:'
+mutant oraculo-tipo-qualquer     'b.get("issue_type") != "bug" or '    ''                                       "$(DESCTY task 'tests/test_orc_a.py reprova em main')" 11 "$U9" "$C9"
+mutant oraculo-sem-vermelho      ' or not red_in_main(ntext)'          ''                                       "$(DESCB 'Os achados fecham os buracos de falha silenciosa que a feature deixou; tests/test_orc_a.py cobre o caso')" 11 "$U9" "$C9"
+mutant oraculo-sem-main          'for m in MAIN_RE.finditer(ntext):'   'for m in re.finditer(r"\w+", ntext):' "$(DESCB 'Os achados fecham os buracos de falha silenciosa que a feature deixou; tests/test_orc_a.py cobre o caso')" 11 "$U9" "$C9"
+mutant oraculo-sem-frase         'SENT_SPLIT_RE = re.compile(r"\n|\. |; ")' 'SENT_SPLIT_RE = re.compile(r"\n")' "$(DESCB 'A falha silenciosa do sync. Depois do merge em main a ordem muda; tests/test_orc_a.py cobre o caso')" 11 "$U9" "$C9"
+mutant oraculo-sem-negacao       'any(not NEG_PRE_RE.search(seg[max(0, r.start() - 30):r.start()]) for r in RED_RE.finditer(seg))' 'any(True for r in RED_RE.finditer(seg))' "$(DESCB 'tests/test_orc_a.py não reprova em main; o problema aparece só no tablet')" 11 "$U9" "$C9"
+mutant oraculo-sem-verde         'if GREEN_RE.search(seg):'            'if False:'                              "$(DESCB 'tests/test_orc_a.py passa em main mas falha no tablet')" 11 "$U9" "$C9"
+mutant oraculo-main-solto        '|\s+(?:thread|loop|process|function|funcao))'  ')'                            "$(DESCB 'tests/test_orc_a.py falha na main thread do worker')" 11 "$U9" "$C9"
+mutant oraculo-main-parenteses   '(?![\w/\-(]|\.\w|'                  '(?![\w/\-]|\.\w|'                       "$(DESCB 'tests/test_orc_a.py falha em main() do worker')" 11 "$U9" "$C9"
+mutant oraculo-sem-reprova       'reprov(?:a|am|ando|ou)|'             ''                                       "$(DESCB 'tests/test_orc_a.py reprova em main')" 0 '"reasons": \["prova-oraculo-teste-vermelho:1-teste\(s\)"\]' "$C9"
+mutant oraculo-sem-falha         '|falh(?:a|am|ando|ou)|'              '|'                                      "$(DESCB 'tests/test_orc_a.py falha em main')" 0 '"reasons": \["prova-oraculo-teste-vermelho:1-teste\(s\)"\]' "$C9"
+mutant oraculo-sem-vermelho-palavra '|vermelh[oa]s?|'                  '|'                                      "$(DESCB 'tests/test_orc_a.py está vermelho em main')" 0 '"reasons": \["prova-oraculo-teste-vermelho:1-teste\(s\)"\]' "$C9"
+mutant oraculo-sem-quebrado      '|quebrad[oa]s?|'                     '|'                                      "$(DESCB 'tests/test_orc_a.py ficou quebrado em main')" 0 '"reasons": \["prova-oraculo-teste-vermelho:1-teste\(s\)"\]' "$C9"
+mutant oraculo-sem-fails         '|fail(?:s|ing|ed)?)'                 ')'                                      "$(DESCB 'tests/test_orc_a.py fails in origin/main')" 0 '"reasons": \["prova-oraculo-teste-vermelho:1-teste\(s\)"\]' "$C9"
+mutant oraculo-sem-teste         'if res is None and tests and not r7_failed and not r8_failed' 'if res is None and not r7_failed and not r8_failed' "$(DESCB 'O teste do modulo reprova em main')" 11 "$U9" "$C9"
+mutant oraculo-sobrepoe-regra8   'if res is None and tests and not r7_failed and not r8_failed' 'if tests and not r7_failed and not r8_failed' "$(DESCB 'tests/test_imp_a.py reprova em main')" 0 '"reasons": \["prova-codigo-derivado-do-teste:' "$C9"
+mutant oraculo-r7-falha-libera   'and not r7_failed and not r8_failed and not any(' 'and not r8_failed and not any(' "$(DESCBI wa-par1.2 'tests/test_orc_a.py reprova em main')" 11 "$(NOTA7 irmas-git-rc-2)" "$C9 WA_NODE_GIT=$T/git-log-quebra WA_NODE_CACHE=$T/cache-orq-m"
+mutant oraculo-r8-falha-libera   'and not r8_failed and not any('      'and not any('                           "$(DESCB 'tests/test_imp_quebrado.py reprova em main')" 11 "$(NOTA8 teste-nao-parseia)" "$C9"
+mutant oraculo-r8-falha-sem-flag 'r8_failed = True'                    'r8_failed = False'                      "$(DESCB 'tests/test_imp_quebrado.py reprova em main')" 11 "$(NOTA8 teste-nao-parseia)" "$C9"
+mutant oraculo-demais-libera     ' and not any(x.startswith("codigo-do-teste-demais") for x in extra)' '' "$(DESCB 'tests/test_imp_onze.py reprova em main')" 11 'sem-prova-de-codigo-e-teste.*"info": \["codigo-do-teste-demais:11"\]\}$' "$C9"
+mutant oraculo-ausente-vale      '    if absent:'                      '    if False:'                          "$(DESCB 'tests/test_orc_novo.py reprova em main')" 11 "$U9"'.*"oraculo-teste-fora-de-main:tests/test_orc_novo\.py"' "$C9"
+mutant oraculo-ausente-so-se-todos '    if absent:'                    '    if len(absent) == len(tests):'     "$(DESCB 'tests/test_orc_a.py e tests/test_orc_novo.py reprovam em main')" 11 "$U9"'.*"oraculo-teste-fora-de-main:tests/test_orc_novo\.py"' "$C9"
+mutant oraculo-ausente-mudo      'for t in absent[:3]]'                'for t in []]'                           "$(DESCB 'tests/test_orc_novo.py reprova em main')" 11 "$U9"'.*"oraculo-teste-fora-de-main:tests/test_orc_novo\.py"' "$C9"
+mutant oraculo-sem-teto-ausentes '"oraculo-teste-fora-de-main:" + t for t in absent[:3]]' '"oraculo-teste-fora-de-main:" + t for t in absent]' "$(DESCB 'tests/test_orc_a.py, tests/test_n1.py, tests/test_n2.py, tests/test_n3.py e tests/test_n4.py reprovam em main')" 11 'oraculo-teste-fora-de-main:tests/test_n3\.py", "oraculo-teste-fora-de-main-mais:1"\]\}$' "$C9"
+mutant oraculo-sem-freio         $'return "mini", ["freio-derivado:" + ",".join(blocked)], paths, tests, info + extra\n    return "node", ["prova-oraculo-teste-vermelho' $'pass\n    return "node", ["prova-oraculo-teste-vermelho' "$(DESCB 'Corrigir o envio da mensagem: tests/test_orc_a.py reprova em main')" 10 '"reasons": \["freio-derivado:envio-acao"\]' "$C9"
+mutant oraculo-basis-text        ', "prova-oraculo-teste-vermelho:")) for w in why)' ')) for w in why)'       "$O9_9B70JK" 0 '"basis": "derivado"' "$C9"
+mutant oraculo-texto-cru         'oracle_derivation(b, ntext, tests, paths, info, extra)' 'oracle_derivation(b, text, tests, paths, info, extra)' "$O9_JZAA2W" 0 "$C9_RX" "$C9"
+mutant oraculo-conta-um          '"prova-oraculo-teste-vermelho:%d-teste(s)" % len(tests)' '"prova-oraculo-teste-vermelho:%d-teste(s)" % 1' "$O9_JZAA2W" 0 "$C9_RX"'2-teste\(s\)"\]' "$C9"
 # nome solto (ga-2hd02v.3.17): um mutante por linha da regra
 SV="WA_NODE_REPO=$RP WA_NODE_MIRROR=$T/mirror-ok"
 S_HTML=$(DESC "lib/x.py e $SOLTO_TESTE: ajustar loose_page.html")
@@ -958,7 +1051,7 @@ mutant caminho-citado-vale      'if tests:   # a bead cita o teste'    'if False
 mutant caminho-teste-de-mentira 'found = derived_tests(dpaths, globs)' 'found = dict((p, ["tests/x.py"]) for p in dpaths)' "$(DESC 'revisar sem_teste_mod quando vem vazio')" 11 'sem-prova-de-codigo-e-teste' "$R7"
 mutant caminho-falha-vira-vazio 'extra.append("caminho-derivado-ilegivel:" + str(e))' 'pass'                          "$FD" 11 'caminho-derivado-ilegivel:repo-git-rc-128' "WA_NODE_REPO=$T/wa-repo-ausente WA_NODE_MIRROR=$T/mirror-ok WA_NODE_CACHE=/dev/null/sem-cache"
 mutant caminho-com-codigo-citado 'if not [c for c in code if c not in ghosts]:' 'if True:'                         "$(DESC 'ajustar lib/sem_teste_mod.py e a ficha_donos')" 11 "$SEMNOTA" "$R7"
-mutant caminho-basis-text       'w.startswith(("prova-teste-derivado:", "prova-caminho-derivado:", "prova-codigo-derivado-do-teste:"))' 'w.startswith("prova-teste-derivado:")' "$FD" 0 '"basis": "derivado"' "$R7"
+mutant caminho-basis-text       'w.startswith(("prova-teste-derivado:", "prova-caminho-derivado:", "prova-codigo-derivado-do-teste:", "prova-oraculo-teste-vermelho:"))' 'w.startswith("prova-teste-derivado:")' "$FD" 0 '"basis": "derivado"' "$R7"
 mutant caminho-sem-freio        'if blocked:'                          'if False:'                                  "$(DESC 'revisar ficha_donos antes de enviar a mensagem')" 10 'freio-derivado:envio-acao.*caminho-derivado:nome:ficha_donos' "$R7"
 mutant caminho-custo-zero       '"derivacao_ms": COST["derivacao_ms"]' '"derivacao_ms": 0'                          "$FD" 0 '"derivacao_ms": [1-9][0-9]*' "$R7"
 mutant irmas-sem-campo-parent   'if isinstance(p, str) and PARENT_RE.match(p):' 'if False:'                         "$(printf '{"id":"wa-zzz9","parent":"wa-par1","title":"t","description":"corrigir o caso de borda"}')" 0 'caminho-derivado:irmas=lib/irma_mod' "$R7"

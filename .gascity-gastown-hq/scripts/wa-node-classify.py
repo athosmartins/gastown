@@ -78,12 +78,22 @@ COMO DECIDE (a 1ª regra que casa vale; tudo é lido da bead, nada é gravado ne
      Os arquivos achados passam pelos MESMOS filtros do citado, sem afrouxar nada: um que o filtro do rsync nega -> mini `codigo-do-teste-fora-do-filtro:<p>`; um da lista mac-only -> mini `codigo-do-teste-so-no-mac:<p>` (o teste não roda no nó sem
      o módulo que importa); mais de 10 -> nenhum (`codigo-do-teste-demais:N`); o freio de envio da regra 6 vale. Achou e passou -> node, basis `derivado`, motivo `prova-codigo-derivado-do-teste:N-teste(s)+M-codigo(s)` (`info`: codigo-do-teste:<teste>=<código>).
      Nada importado do repo -> unknown SEM nota (vazio é legítimo). Falha de leitura (repo, git show, teste que não parseia, rsync, mac-only) -> unknown com `info` `codigo-do-teste-ilegivel:<motivo>`; "falhou" nunca é "vazio" e nunca é node.
+  9. ORÁCULO = TESTE VERMELHO EM MAIN (ga-2hd02v.5.13, A1; só quando a bead é do tipo `bug`, cita >=1 teste e NENHUM código, e as regras 7 e 8 LERAM e não derivaram código algum): o texto DIZ que o teste reprova em main, então o teste
+     vermelho é a prova — quem constrói tem o que reproduzir e o que fazer ficar verde, sem módulo nomeado. "Diz" = na MESMA frase de um `main` (`origin/main` ou «em/no/na/do/da/de/ao main»; `main thread`, `main.py` e `main()` não são a branch) há uma palavra
+     de vermelho (reprova, falha, vermelho/a(s), quebrado/a(s), fail(s)); a frase que nega colado antes da palavra («não reprova em main») ou que diz que passa/está verde/corrigido NÃO vale. Lê-se o texto normalizado (minúsculo, sem acento) e só ele.
+     Cada teste citado tem de existir em origin/main (a árvore, uma leitura só: «vermelho em main» de teste que nem está em main é palpite); algum ausente -> unknown e `info` nomeia até 3 (`oraculo-teste-fora-de-main:<teste>`, o resto em `-mais:N`). Os testes passam
+     pelos mesmos filtros do citado (rsync, mac-only, espelho: já passaram na regra 3), pelo freio de envio da regra 6 (mini `freio-derivado:envio-acao`) e, já em PROOF por serem citados, o portão das moles (regra 4) os lê: um e2e que abre o banco real vai ao mini.
+     Achou -> node, basis `derivado`, motivo `prova-oraculo-teste-vermelho:N-teste(s)`. Tarefa/feature/chore (o epic nem chega aqui: é `mini` na regra 2), bug que não diz que está vermelho em main, sem teste citado ou com código (citado ou derivado) -> unknown SEM nota (vazio é legítimo).
+     Se a regra 7 ou a 8 NÃO CONSEGUIU LER (`caminho-derivado-ilegivel`, `codigo-do-teste-ilegivel`) a regra 9 NÃO roda: o código que a leitura que falhou não viu pode existir. "Falhou" nunca é "vazio" e nunca é node; a leitura da árvore da própria regra 9, se falhar,
+     dá unknown com `oraculo-ilegivel:<motivo>` (rede de segurança: é a árvore que a regra 8 já leu e guardou, então hoje não é alcançável; sem caso no selftest). MEDIDO (05/11, as 171 beads WA abertas no wa-worker, classificador de antes × este, bead a bead): node 5 -> 11, unknown 64 -> 58, mini 102 -> 102; as únicas 6 mudanças são bugs com teste vermelho em main (wa-9b70jk, wa-appaph, wa-jzaa2w, wa-kjwmcv, wa-sb1jyl, wa-xy301a); wa-jhblfa (tarefa de achados do gate) segue unknown. Ver o runbook hetzner-wa-node.md.
 
 CÓDIGOS DE SAÍDA: 0 node · 10 mini · 11 unknown · 2 uso. A linha de stdout é um JSON: {"verdict","basis","reasons":[...],"paths":[...],"tests":[...],"custo":{"ms","derivacao_ms","cache"},"info":[...]}; basis = label | text | derivado | "" (só o node tem).
 O QUE NÃO FAZ: não lê dado, não abre o nó, não toca o Dolt, não escreve na bead. Lê só stdin (o JSON do `bd show --json`), o filtro, a lista mac-only, (só com `.md` fora do rsync) o filtro que o espelho serve e (só com código citado sem teste citado) a árvore e o conteúdo dos TESTES do repo do WA em origin/main, por `git ls-tree`/`git grep`: nunca a árvore de trabalho; (só sem código citado, regra 7) a árvore de código do repo e o `git log` dos commits das beads irmãs; (só com teste citado e sem código, regra 8) o texto dos testes citados, por `git show` em REPO_REF; (só quando há `node` com prova, regra 4) o texto dos arquivos da prova, por `git show` em REPO_REF, e (regra 6b) os testes que citam o módulo. ESCREVE uma única coisa: o cache do `git log` das irmãs (WA_NODE_CACHE, padrão <cidade>/.gc/cache/wa-node-classify; escrita atômica, opcional: sem ele o classificador só fica mais lento).
 LIMITES: a evidência das moles é heurística de TEXTO sobre o código dos arquivos da prova: não segue import em cadeia (um módulo limpo que importa outro que abre o banco passa; o teste vermelho no nó devolve a bead ao mini pelo gate), não vê `sqlite3.connect(variavel)` cujo valor vem de fora, nem evidência depois do 4000º caractere de UMA string; no Python que parseia também não vê o comando do cofre no MEIO de uma linha de shell (`env X=1 secret k`: só vale no começo da string ou depois de `; | & (`, para a prosa "the secret key…" não virar cofre), literal bytes, o binário numa variável montada fora do arquivo nem argv montado em pedaços (medido nos 6202 .py do WA: ver o runbook, "Limites"); nome de banco solto é lido como banco de produção (pode ser um banco temporário do módulo: erra para o lado do mini). A exceção do espelho confia na varredura de conteúdo (>=20 telefones ou >=3 CPFs distintos por arquivo): lista pequena, nome, e-mail e CNPJ num `.md` passam; vale o mesmo resíduo do bloco 3b do filtro. É heurística de TEXTO sobre a bead; o texto pode omitir que o teste abre um banco. NÃO são extraídos: pasta sem arquivo (`data/`), arquivo sem nome (`.env`), extensão fora da lista, nome com
   sufixo (`x.py.bak` não vira `x.py`). Para esses a regra 3a não age; quem segura o dado é o filtro do rsync (o nó nunca o recebe) e, no caso de `.env`/`.db`, a palavra mole da regra 4. O resíduo cai no nó como teste vermelho e a bead volta ao mini pelo gate (custo, não vazamento:
   o dado não chega ao nó de qualquer jeito). A lista de palavras moles é deliberadamente larga (o vocabulário do WA é todo de lead/terreno): na dúvida a bead fica no mini, como hoje.
+  A regra 9 prova que o texto da bead AFIRMA que o teste está vermelho em main (e que o teste existe lá), não que ele esteja: se o nó o rodar verde, quem decide o que acontece é o worker e o gate, não este classificador. O teste vermelho também pode precisar de algo que o nó não
+  tem (Chromium, rede): o que o teste mostra de banco/credencial/host Mac o portão das moles barra; o resto aparece como teste vermelho no nó. Não contam (a bead fica unknown): o teste citado só pelo nome da função, sem o caminho `tests/…` (wa-ls9sk), e «em `main`» escrito com crase.
   A regra 8 prova que o teste citado IMPORTA o módulo, não que o módulo seja o que a bead quer mudar nem que o teste cubra a mudança; também não segue import em cadeia (o que o módulo importa), nem o `__init__.py` do pacote pai, nem carga dinâmica
   (`importlib`, `__import__`, `spec_from_file_location`, `subprocess`): o que faltar no nó cai como teste vermelho e a bead volta ao mini pelo gate. A regra 6 prova que existe um teste do módulo que o cita; NÃO prova que ele cobre a mudança da bead, nem que roda sem recurso vivo (pode abrir banco, rede ou Chrome, ou dar skip e ficar verde sem provar nada): isso cai no nó como teste
   vermelho/skip e a bead volta ao mini pelo gate. Por isso o basis é `derivado` e não `text`: quem for ligar o modo auto pode tratar os dois de um jeito diferente. Plano, comentário e ctx-check NÃO entram: o plano (design/notes/acceptance_criteria)
@@ -177,6 +187,13 @@ MAX_TEST_BYTES = 1_000_000                                           # teste mai
 IMPORT_ROOTS = ("", "lib", "daemons", "scripts")                     # onde um `import x` do WA procura: a raiz e lib/ (pytest.ini: pythonpath = . lib) e daemons/ e scripts/ (os sys.path.insert dos testes); mais a pasta do teste e a de cima
 JS_TEST_EXT = ("js", "cjs", "mjs", "ts")                             # testes de que se lê `require`/`import`; teste .sh e o resto não têm o que ler (vazio legítimo)
 JS_IMPORT_RE = re.compile(r"""(?:\brequire\s*\(|\bimport\s*\(|\bfrom\s+|\bimport\s+)\s*(['"])([^'"\n]+)\1""")   # require('x') / import('x') / import a from 'x' / import 'x' / export … from 'x'
+# regra 9 (oráculo = teste vermelho em main, ga-2hd02v.5.13): a bead é um BUG que diz que o teste citado reprova em main. O texto é lido normalizado (norm: minúsculo, sem acento)
+MAIN_RE = re.compile(r"(?<![\w/.\-])(?:origin/main|(?:em|no|na|do|da|de|ao)\s+main)(?![\w/\-(]|\.\w|\s+(?:thread|loop|process|function|funcao))")   # "origin/main" ou "<preposição> main"; main solto (main thread, main.py, main()) não é a branch
+RED_RE = re.compile(r"\b(?:reprov(?:a|am|ando|ou)|falh(?:a|am|ando|ou)|vermelh[oa]s?|quebrad[oa]s?|fail(?:s|ing|ed)?)\b")   # "falhas" (substantivo plural) e "quebra" (substantivo) ficam de fora de propósito
+NEG_PRE_RE = re.compile(r"(?:\bnao|\bnunca|\bjamais|\bsem|\bnem|\bdeixou de|\bdeixa de)\s+(?:[\w\-]+\s+){0,2}$")   # negação colada ANTES da palavra vermelha ("não reprova em main")
+GREEN_RE = re.compile(r"\b(?:passa|passam|passou|passando|verde|verdes|corrigid[oa]s?|resolvid[oa]s?|consertad[oa]s?)\b")   # a mesma frase diz que está verde: não é prova de vermelho
+SENT_SPLIT_RE = re.compile(r"\n|\. |; ")
+ORACLE_WINDOW = (80, 40)                                             # caracteres lidos antes e depois do "main" (cortados no fim da frase): a palavra vermelha tem de estar na MESMA frase
 PARENT_RE = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*(?:\.[0-9]+)*$")    # id de bead (com níveis `.N`): o pai vai no padrão do `git log --grep`, então só esta forma entra
 SIBLING_MAX_COMMITS = 40                                             # commits das irmãs lidos (o git para de andar no histórico ao achar tantos)
 SIBLING_MAX_NAMES = 200                                              # arquivos guardados no cache por pai
@@ -964,6 +981,45 @@ def import_derivation(tests, paths, info, extra):
     return judged_derived(found, "prova-codigo-derivado-do-teste", paths, tests, info, extra)
 
 
+def red_in_main(ntext):
+    """True se o texto (já normalizado por `norm`) diz, NA MESMA FRASE de um "main" (origin/main, "em/no/na main"), que algo reprova/falha/está vermelho. Só texto da bead: nada é lido fora dela, não há o que falhar.
+    Frase com negação colada antes da palavra vermelha ("não reprova em main") ou com palavra de verde (passa, verde, corrigido...) não vale. Nenhuma frase assim -> False (a bead segue unknown como antes)."""
+    for m in MAIN_RE.finditer(ntext):
+        before = SENT_SPLIT_RE.split(ntext[max(0, m.start() - ORACLE_WINDOW[0]):m.start()])[-1]   # a frase do "main": do último fim de frase antes dele...
+        after = SENT_SPLIT_RE.split(ntext[m.end():m.end() + ORACLE_WINDOW[1]])[0]                  # ...até o primeiro depois
+        seg = before + " main " + after
+        if GREEN_RE.search(seg):
+            continue
+        if any(not NEG_PRE_RE.search(seg[max(0, r.start() - 30):r.start()]) for r in RED_RE.finditer(seg)):
+            return True
+    return False
+
+
+def judged_oracle(tests, paths, info, extra):
+    """o veredito da regra 9: node `prova-oraculo-teste-vermelho:N-teste(s)`; mas envio no texto (DERIVED_BLOCK_INFO) manda ao mini, porque o teste vermelho é uma prova mais fraca que o teste citado com o código (o mesmo freio das regras 6-8).
+    Os testes já estão em PROOF desde a citação (classify_core): é neles que as moles (regra 4) procuram evidência de banco, credencial e host Mac, e o e2e que abre o banco real vai ao mini por ali."""
+    blocked = [s for s in DERIVED_BLOCK_INFO if s in info]
+    if blocked:
+        return "mini", ["freio-derivado:" + ",".join(blocked)], paths, tests, info + extra
+    return "node", ["prova-oraculo-teste-vermelho:%d-teste(s)" % len(tests)], paths, tests, info + extra
+
+
+def oracle_derivation(b, ntext, tests, paths, info, extra):
+    """regra 9 (ga-2hd02v.5.13, A1): a bead é um BUG que cita >=1 teste, nenhum código (as regras 7 e 8 já LERAM e não derivaram nada) e DIZ que o teste reprova em main. O teste vermelho é o oráculo: quem constrói
+    tem o que reproduzir e o que fazer ficar verde, mesmo sem código nomeado. Devolve a tupla do classify, ou None (segue unknown). `extra` recebe o que vai em `info`. Só a palavra "bug" no tipo vale: tarefa
+    ou achado de gate que cita teste não afirma que ele está vermelho."""
+    if b.get("issue_type") != "bug" or not red_in_main(ntext):
+        return None
+    # vazio (algum teste citado não está em origin/main: é novo, não pode estar vermelho "em main") -> None, segue unknown e `info` nomeia o teste (até 3); falhou/ilegível (repo, git, árvore) -> Unreadable sobe e a
+    # bead fica unknown com `oraculo-ilegivel:<motivo>`, nunca node: "não consegui ver a árvore" não é "o teste existe em main" nem "não existe"
+    present = set(repo_tree())
+    absent = sorted(t for t in tests if t not in present)
+    if absent:
+        extra += ["oraculo-teste-fora-de-main:" + t for t in absent[:3]] + (["oraculo-teste-fora-de-main-mais:%d" % (len(absent) - 3)] if len(absent) > 3 else [])
+        return None
+    return judged_oracle(tests, paths, info, extra)
+
+
 def exec_base(t):
     """o nome do executável de UMA string de Python usada como argv[0]: a própria string (sem "/"), ou o basename quando ela tem cara de caminho de executável (`/Users/x/.local/bin/secret`, `~/bin/bw`, `$HOME/…`,
     `_/secret` de um f-string, `…/bin/…`). Com espaço (linha de shell, o CRED_SHELL_RE/HOST_SHELL_RE cuidam) ou caminho comum (`lib/security`: módulo, não o binário do Mac) -> "" (não é argv[0])."""
@@ -1291,12 +1347,23 @@ def classify_core(b):
             res = None
             r7_failed = True
             extra.append("caminho-derivado-ilegivel:" + str(e))
+        r8_failed = False
         if res is None and tests and not r7_failed:
             try:
                 res = import_derivation(tests, paths, info, extra)
             except Unreadable as e:
                 res = None
+                r8_failed = True
                 extra.append("codigo-do-teste-ilegivel:" + str(e))
+        # regra 9 (ga-2hd02v.5.13): bug que cita teste, sem código, e diz que o teste reprova em main -> o teste vermelho é o oráculo. Só roda se as regras 7 e 8 LERAM e não acharam código (a 8 que achou código demais não
+        # é "sem código": o módulo existe e a bead não é sobre um só). vazio (não é bug, não diz que reprova em main) -> segue unknown, SEM nota; teste ausente de main -> unknown com `oraculo-teste-fora-de-main`; falhou/ilegível ->
+        # unknown + nota `oraculo-ilegivel`, nunca node e nunca "vazio". O `except` é rede de segurança: a árvore é a que a regra 8 (que roda antes, sempre que esta roda) já leu e guardou, então hoje esta leitura não falha sozinha (sem caso no selftest)
+        if res is None and tests and not r7_failed and not r8_failed and not any(x.startswith("codigo-do-teste-demais") for x in extra):
+            try:
+                res = oracle_derivation(b, ntext, tests, paths, info, extra)
+            except Unreadable as e:
+                res = None
+                extra.append("oraculo-ilegivel:" + str(e))
         COST["derivacao_ms"] = int((time.monotonic() - t0) * 1000)
         if res:
             return res
@@ -1344,7 +1411,7 @@ def main(argv):
     if "etiqueta-node:ok" in why:
         basis = "label"
     elif v == "node":
-        basis = "derivado" if any(w.startswith(("prova-teste-derivado:", "prova-caminho-derivado:", "prova-codigo-derivado-do-teste:")) for w in why) else "text"
+        basis = "derivado" if any(w.startswith(("prova-teste-derivado:", "prova-caminho-derivado:", "prova-codigo-derivado-do-teste:", "prova-oraculo-teste-vermelho:")) for w in why) else "text"
     else:
         basis = ""
     # custo: ms da execução inteira e da regra 7 (0 se ela não rodou) + o estado do cache das irmãs; vem ANTES de info (quem lê o fim da linha continua achando `"info": [...]}`)
