@@ -59,8 +59,8 @@ printf '%s\n' "$out" | sed 's/^/    /'
 printf '%s' "$out" | grep -q '^controle: a cópia sem mutação passa'
 check "controle: a cópia sem mutação passa o --selftest do guard, com os checks LS-*" $?
 total="$(printf '%s' "$out" | sed -n 's/^MUTANTES: [0-9]*\/\([0-9]*\) mortos$/\1/p')"
-[ "$rc" = 0 ] && [ -n "$total" ] && [ "$total" -ge 13 ] && printf '%s' "$out" | grep -q "^MUTANTES: $total/$total mortos"
-check "todos os mutantes mortos pelo check LS-* que prende a guarda (rc=0, >= 13 mutantes)" $? "rc=$rc total=${total:-?}"
+[ "$rc" = 0 ] && [ -n "$total" ] && [ "$total" -ge 14 ] && printf '%s' "$out" | grep -q "^MUTANTES: $total/$total mortos"
+check "todos os mutantes mortos pelo check LS-* que prende a guarda (rc=0, >= 14 mutantes)" $? "rc=$rc total=${total:-?}"
 
 echo "RESULT: $PASS passed, $FAIL failed"
 [ "$FAIL" = 0 ]

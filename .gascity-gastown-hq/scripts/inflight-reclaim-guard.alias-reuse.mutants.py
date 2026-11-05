@@ -8,7 +8,7 @@ O QUE FAZ: cada mutante troca UM trecho numa CÓPIA (o original nunca é tocado)
   que prendem aquela guarda reprovarem (ou, nos dois mutantes que tiram uma checagem de "não consegui ler", se o selftest quebrar com Traceback: sem a checagem a comparação com None estoura).
   Reprovar por OUTRO motivo (cópia que nem abre, SyntaxError) NÃO mata: sem isto, um mutante quebrado contaria como pego. Antes dos mutantes roda um CONTROLE: a cópia sem mutação tem de passar,
   senão "todos mortos" seria o harness quebrado reprovando tudo. O trecho trocado tem de aparecer EXATAMENTE uma vez no arquivo-alvo (senão o executor para: o alvo mudou e o mutante ficou velho).
-COMO RODA: python3 -I scripts/inflight-reclaim-guard.alias-reuse.mutants.py   (13 mutantes + 1 controle, 3 cópias por vez; cada filho com teto de 512 MB por arquivo e 120 s; ~35 s no nó Linux)
+COMO RODA: python3 -I scripts/inflight-reclaim-guard.alias-reuse.mutants.py   (14 mutantes + 1 controle, 3 cópias por vez; cada filho com teto de 512 MB por arquivo e 120 s; ~35 s no nó Linux)
   ALIAS_MUTANTS_GUARD=<arquivo>   aponta para outro guard (o selftest usa isto para provar o FATAL de guard ausente)
   ALIAS_MUTANTS_LIB=<arquivo>     aponta para outra bead_state.py (idem, para o FATAL de lib ausente ou de trecho velho nela)
   Cada filho roda com GC_SELFTEST=1 e GC_LEDGER_DIR num diretório descartável: nenhuma linha vai para os ledgers de produção.
@@ -52,6 +52,7 @@ MUTANTS = [
     # só o LS-7a prende o `continue`: no LS-7b a incarnação velha vem PRIMEIRO, devolve True antes de a linha mutada ser alcançada (o 7b prova a simetria de ordem, e passa com os dois códigos)
     ("return-no-lugar-de-continue", "guard", _CALL, _CALL.replace("continue", "return False"), ["LS-7a"]),
     ("regra-desligada-no-session-is-live", "guard", _CALL, _CALL.replace("alias_claim_predates_session(assignee, s, bead_update_age, now)", "False"), ["LS-1", "LS-3c"]),
+    ("sling-nao-passa-a-idade-da-bead", "guard", "        if session_is_live(assignee, sessions, now, bead_update_age,\n", "        if session_is_live(assignee, sessions, now, None,\n", ["LS-9"]),
     ("run-cycle-nao-passa-a-idade-da-bead", "guard",
      "has_live_session = session_is_live(\n                assignee, sessions, now, bead_update_age,",
      "has_live_session = session_is_live(\n                assignee, sessions, now, None,", ["LS-8"]),
@@ -121,7 +122,7 @@ def main():
 
     rc0, out0 = run_selftest(texts["guard"], texts["lib"], "controle")
     ls_pass = sum(1 for line in (out0 or "").splitlines() if line.startswith("PASS: LS-"))
-    if rc0 != 0 or ls_pass < 16 or "FAIL:" in (out0 or ""):
+    if rc0 != 0 or ls_pass < 17 or "FAIL:" in (out0 or ""):
         fatal("controle vermelho (cópia SEM mutação: rc=%r, checks LS passando=%d): %s" % (rc0, ls_pass, (out0 or "")[-300:].replace("\n", " | ")))
     print("controle: a cópia sem mutação passa (%d checks LS-*)" % ls_pass)
 
