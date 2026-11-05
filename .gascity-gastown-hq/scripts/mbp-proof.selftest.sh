@@ -6,10 +6,10 @@
 # Contents
 #   Grupos · Controle negativo · Variáveis · O que NÃO prova
 #
-# GRUPOS: unit — host padrão do MBP sem MBP_PROOF_SSH (ga-bmmxka: Tailscale, LAN só com a porta 22 respondendo, saída ilegível = Tailscale, a variável vale como está), judge_tree (todo processo com folga tem de ser rebaixado, e ao menos um tinha folga), PAUSE/CLEAN/SWEEP rodados de verdade, pedido de start, identidade, padrões de segredo ·
+# GRUPOS: unit — host padrão do MBP sem MBP_PROOF_SSH (ga-bmmxka: Tailscale, LAN só com a porta 22 respondendo, saída ilegível = Tailscale, a variável vale como está), judge_tree (todo processo com folga tem de ser rebaixado, e ao menos um tinha folga), PAUSE/CLEAN/SWEEP rodados de verdade (CLEAN também tira o cache do zsh, zdot/.zcompdump*, que a rodada criou e só ele — ga-w7qwl1.2.4.5), judge_blobs (o clone depois do commit confere por NOME), pre_zcomp, pedido de start, identidade, padrões de segredo ·
 #   cli — argumento com cara de comando, sessão real, install sem --apply (nada conecta), plan contra o dry-run do provider (pula sem scripts/gc-session-ssh, p.ex. no nó Linux) ·
 #   install — instalação com o builder real: bundle conferido LÁ, run/ preservada, cliente + links + config, spool 0700, nada em ~/.claude nem ~/.ssh, config do wrapper diferente = não sobrescreve, transferência adulterada = reprova sem trocar, ssh fora / MBP não livre = 3 ·
-#   e2e — a prova inteira (a–g) contra o MBP falso (o provider falso recusa o que o de verdade recusa: host que dorme sem gui_agent, teto de 2 sessões; deixa a marca .stop em run/; (f) o agente do domínio gráfico e (g) 2 sessões, parar a 1ª, a 2ª vive), com modos de falha: cada prova reprova sozinha, o diálogo NUNCA é respondido, a sessão é parada em todo caminho, a pausa do Athos nunca é removida por nós, e o MBP volta ao que era (arquivos, ~/.claude.json, ~/.ssh, spool, bundle)
+#   e2e — a prova inteira (a–g) contra o MBP falso (o provider falso recusa o que o de verdade recusa: host que dorme sem gui_agent, teto de 2 sessões; deixa a marca .stop em run/; (f) o agente do domínio gráfico e (g) 2 sessões, parar a 1ª, a 2ª vive), com modos de falha: cada prova reprova sozinha, o diálogo NUNCA é respondido, a sessão é parada em todo caminho, a pausa do Athos nunca é removida por nós, e o MBP volta ao que era (arquivos, ~/.claude.json, ~/.ssh, spool, bundle); o origin de isca tem .gitignore e .gitattributes na RAIZ, então o clone esparso termina com 3 blobs nomeados (como o vivo), e a sessão falsa grava o cache do zsh no zdot/ (a limpeza o tira; arquivo novo que não é cache, link e blob de dado/sem nome reprovam)
 # CONTROLE NEGATIVO: cada guarda é trocada numa cópia (python, uma ocorrência exata) e os casos que a cobrem TÊM que passar a falhar.
 # VARIÁVEIS: MBPT_UNDER_TEST (script a testar) · MBPT_ONLY (grupos separados por vírgula; ou --only=a,b) · MBPT_CASES (casos; ou --cases=a,b) · MBPT_NO_MUTANTS=1 (ou --no-mutants) · MBPT_DEBUG=1 (ou --debug: mostra a saída do driver em cada e2e)
 # O QUE NÃO PROVA: o MBP de verdade (macOS, tmux, claude, a biblioteca de presença, o git/ssh com a credencial dele) — isso é o `e2e` ao vivo. Aqui o vigia falso olha o arquivo PAUSE e dá `renice`; a árvore de processos, o ps, o nice e o julgamento são reais.
@@ -180,10 +180,16 @@ agent() {  # a "sessão": os 6 passos do prompt, com o modo de falha pedido
   if [ $mode = wrongcontent ]; then echo "outro conteudo" > "mbp-proof/$run.txt"; else echo "mbp-proof $run" > "mbp-proof/$run.txt"; fi
   git add "mbp-proof/$run.txt"
   git $idopt commit -q -m "chore(mbp-proof): $run (sem dado, descartavel)" || { echo "commit falhou" >> "$S/screen"; return; }
+  [ $mode = nozcomp ] || echo "#files: 1	version: 5.9" > "$BUNDLE/zdot/.zcompdump"  # o zsh da sessão (medido ao vivo: zdot/.zcompdump de 49 KB depois de uma rodada)
   [ $mode != evilpush ] || git push -q origin HEAD:refs/heads/evil 2>> "$S/pusherr"
   [ $mode = nopush ] || git push -q origin "HEAD:refs/heads/worker/$run" 2>> "$S/pusherr"
   [ $mode != shamismatch ] || git commit -q --amend -m "outra mensagem"
   case $mode in
+    zextra) echo "x" > "$BUNDLE/zdot/.zshrc.local";;
+    zbundle) echo "x" > "$BUNDLE/novo.txt";;
+    zlink) rm -f "$BUNDLE/zdot/.zcompdump"; ln -s /etc/hosts "$BUNDLE/zdot/.zcompdump";;
+    blobdata) git cat-file -p HEAD:data/leads.csv > /dev/null 2>&1;;
+    blobstray) echo "bytes-soltos" | git hash-object -w --stdin > /dev/null;;
     secret) printf 'token ghp_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n' > "$G/shim/vazou.txt";;
     leadfile) echo "joao@example.com" > "$wd/leads.csv";;
     badclaudejson) echo "isto nao e json" > "$SRV/.claude.json";;
@@ -334,6 +340,7 @@ chmod +x "$T/bin/"* "$T/fakeprov" "$T/fake/"* "$T/fake-remote-shim.py"
 # origin de isca: tem dado de "lead" que NUNCA pode aparecer no MBP
 git init -q "$T/seed" 2>/dev/null; mkdir -p "$T/seed/data" "$T/seed/.beads"
 echo "LEAD-DATA-9981,joao@example.com" > "$T/seed/data/leads.csv"; echo '{"id":"ga-x"}' > "$T/seed/.beads/issues.jsonl"; echo "# repo" > "$T/seed/README.md"
+echo "*.pyc" > "$T/seed/.gitignore"; echo "* text=auto" > "$T/seed/.gitattributes"  # na RAIZ, como no repositório real: sob sparse-checkout o `git add` os busca no remoto promisor (ga-w7qwl1.2.4.5)
 git -C "$T/seed" add -A; git -C "$T/seed" -c user.name=t -c user.email=t@t commit -q -m seed
 # o mini: ~/.claude e a cidade com o mínimo que o builder de verdade exige
 printf '#!/bin/sh\nexit 0\n' > "$MINI/.claude/hooks/ntfy-on-stop.sh"; chmod +x "$MINI/.claude/hooks/ntfy-on-stop.sh"
@@ -505,6 +512,60 @@ os.mkdir(run+"/remote-test-remote-mbp-2.stop"); open(run+"/remote-test-remote-mb
 r=clean()
 assert not r["ok"] and any("run/" in e for e in r["errors"]), r
 assert sorted(os.listdir(run))==["outro.txt","remote-test-remote-mbp-2.stop"], os.listdir(run)'; ok $? "unit: CLEAN — marca que some entre o listdir e o unlink não para o laço (as outras saem), a que não dá para apagar vira erro e \`ok\` falso sem impedir as seguintes, e outro arquivo de run/ nunca sai"; }
+  c judgeblobs && { py 'R="mbp-20260101-000000"; T=f"mbp-proof/{R}.txt"
+def b(o, *paths): return {"oid": o*40, "paths": list(paths)}
+ok, why = M.judge_blobs([b("a",".gitignore"), b("b",".gitattributes"), b("c",T)], R); assert ok, why                # o clone vivo (05/11): 3 blobs, todos nomeados e permitidos
+assert M.judge_blobs([], R)[0] and M.judge_blobs([b("c",T)], R)[0] and M.judge_blobs([b("a",".gitignore")], R)[0]  # 0, 1 ou 2 também valem: não se exige ter todos
+ok, why = M.judge_blobs([b("d","data/leads.csv")], R)                                                              # 1 blob de DADO no lugar do arquivo de teste: a contagem (<= 1) deixava passar
+assert not ok and "data/leads.csv" in why and "NÃO permitidos" in why, why
+ok, why = M.judge_blobs([b("a",".gitignore"), b("c",T), b("d","data/leads.csv")], R); assert not ok and "data/leads.csv" in why, why
+ok, why = M.judge_blobs([b("e")], R); assert not ok and "sem nome na árvore do HEAD" in why, why                       # blob que não se sabe de que arquivo é
+ok, why = M.judge_blobs([b("c","mbp-proof/OUTRA-RODADA.txt")], R); assert not ok, why                                # o arquivo de teste de OUTRA rodada não é o desta
+ok, why = M.judge_blobs([b("a","sub/.gitignore")], R); assert not ok, why                                            # .gitignore de subpasta não é o da raiz
+ok, why = M.judge_blobs([b("a","sub/x.csv",".gitignore")], R); assert ok, why                                        # mesmo oid = mesmos bytes de um arquivo permitido
+for bad in (None, "x", [{"oid": "a"}], [{"paths": []}], [1]): assert not M.judge_blobs(bad, R)[0], bad               # "não sei" (git falhou, forma errada) nunca é "só o do teste"
+assert "não consegui listar" in M.judge_blobs(None, R)[1]'; ok $? "unit: judge_blobs — o clone depois do commit confere por NOME (arquivo de teste desta rodada + .gitignore/.gitattributes da raiz); blob de dado no lugar do de teste, sem nome, de outra rodada, de subpasta, e o git que falhou, reprovam"; }
+  c prezcomp && { py 'f=lambda *n: {"roots": {"bundle": {"files": {x: [1, "h"] for x in n}, "truncated": False}}}
+assert M.pre_zcomp(f("manifest.json", "zdot/.zshrc"))==[], M.pre_zcomp(f("manifest.json"))
+assert M.pre_zcomp(f("zdot/.zcompdump", "zdot/.zcompdump-mbp-5.9", "zdot/.zshrc", "zdot/", "x/.zcompdump"))==["zdot/.zcompdump", "zdot/.zcompdump-mbp-5.9"]
+t=f("zdot/.zshrc"); t["roots"]["bundle"]["truncated"]=True; assert M.pre_zcomp(t) is None          # a varredura truncou: não sei o que havia
+for bad in ({}, {"roots": {}}, {"roots": {"bundle": None}}, {"roots": {"bundle": {"files": None, "truncated": False}}}, None): assert M.pre_zcomp(bad) is None, bad  # sem bundle/ilegível: não sei'; ok $? "unit: pre_zcomp — lista os caches do zsh que o bundle já tinha; bundle ausente, ilegível ou varredura truncada = None (não sei), nunca []"; }
+  c cleanzcomp && { UD="$T/u6" py 'import subprocess,json,os
+U=os.environ["UD"]; B=U+"/gt-remote/bundle"; Z=B+"/zdot"
+os.makedirs(Z); os.makedirs(U+"/gt-remote/proof"); open(U+"/.claude.json","w").write("{}")
+for n in (".zshenv", ".zshrc", "env.sh"): open(Z+"/"+n,"w").write("export PATH=x\n")
+open(B+"/manifest.json","w").write("{}")
+def clean(drop=False, **kw):  # drop=True: sem a chave pre_zcomp (como os outros testes de CLEAN a chamam)
+    a={"workdir":U+"/gt-remote/proof/mbp-20260101-000000","proofs":U+"/gt-remote/proof","home":U,"bundle":B,"socket":"gc-test-x","proofs_new":False,"run_new":False,"socket_new":False,"stop_rx":M.STOP_RX,"zcomp_rx":M.ZCOMP_RX,"pre_zcomp":[]}; a.update(kw)
+    if drop: del a["pre_zcomp"]
+    return json.loads(subprocess.run(["python3","-I","-",json.dumps(a)],input=M.CLEAN.encode(),capture_output=True).stdout.decode().strip().split("\n")[-1])
+names=lambda: sorted(os.listdir(Z))
+# 1) o cache desta rodada (não estava antes) sai, e SÓ ele: os arquivos do bundle ficam, e a remoção aparece em `removed`
+open(Z+"/.zcompdump","w").write("cache"); open(Z+"/.zcompdump-mbp-5.9","w").write("cache"); open(Z+"/.zcompdump.zwc","w").write("cache")
+r=clean(); assert r["ok"] and "errors" not in r, r
+assert names()==[".zshenv",".zshrc","env.sh"] and os.path.exists(B+"/manifest.json"), names()
+assert sorted(x for x in r["removed"] if "zdot/" in x)==["zdot/.zcompdump (cache do zsh desta rodada)","zdot/.zcompdump-mbp-5.9 (cache do zsh desta rodada)","zdot/.zcompdump.zwc (cache do zsh desta rodada)"], r
+# 2) repetir é inofensivo
+r=clean(); assert r["ok"] and not [x for x in r["removed"] if "zdot/" in x], r
+# 3) o que JÁ estava no snapshot de antes fica (a limpeza não apaga o que não criou)
+open(Z+"/.zcompdump","w").write("cache"); open(Z+"/.zcompdump-mbp-5.9","w").write("cache")
+r=clean(pre_zcomp=["zdot/.zcompdump"]); assert r["ok"], r
+assert names()==[".zcompdump",".zshenv",".zshrc","env.sh"], names()
+os.unlink(Z+"/.zcompdump")
+# 4) não sei o que havia (None, ou a chave ausente como nos outros testes de CLEAN): nada é apagado
+open(Z+"/.zcompdump","w").write("cache")
+for r in (clean(pre_zcomp=None), clean(drop=True)):
+    assert r["ok"] and ".zcompdump" in names() and not [x for x in r["removed"] if "zdot/" in x], r
+# 5) link com nome de cache e pasta com nome de cache NÃO são apagados: erro, ok falso, e as outras saem
+os.unlink(Z+"/.zcompdump"); open(Z+"/.zcompdump-b","w").write("cache"); os.symlink("/etc/hosts", Z+"/.zcompdump"); os.mkdir(Z+"/.zcompdump-dir")
+r=clean(); assert not r["ok"] and sum("não é arquivo comum" in e for e in r["errors"])==2, r
+assert os.path.islink(Z+"/.zcompdump") and os.path.isdir(Z+"/.zcompdump-dir") and not os.path.exists(Z+"/.zcompdump-b"), names()
+# 6) nenhuma outra coisa sai: nome parecido que não é de cache fica
+os.unlink(Z+"/.zcompdump"); os.rmdir(Z+"/.zcompdump-dir")
+for n in ("zcompdump", ".zcomp", ".zcompdump!x", ".zshrc.local"): open(Z+"/"+n,"w").write("x")
+r=clean(); assert r["ok"] and sorted(os.listdir(Z))==sorted([".zshenv",".zshrc","env.sh","zcompdump",".zcomp",".zcompdump!x",".zshrc.local"]), (names(), r)
+# 7) sem zdot/ (bundle sem ZDOTDIR): nada a fazer
+os.rename(Z, Z+".fora"); r=clean(); assert r["ok"] and "errors" not in r, r'; ok $? "unit: CLEAN — o cache do zsh (zdot/.zcompdump*) que NÃO estava antes sai e só ele; o que já havia, link, pasta, nome parecido e os arquivos do bundle ficam; sem a lista do antes (None/ausente) não apaga nada; sem zdot/ é inofensivo"; }
   c sweeppy && { mkdir -p "$T/u3/ok" "$T/u3/g/.git/objects/ab" "$T/u3/glob1"; echo "tudo limpo" > "$T/u3/ok/a.txt"; printf 'ghp_%s\n' "$(printf 'b%.0s' 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31 32 33 34 35 36)" > "$T/u3/ok/leak.txt"
     echo x > "$T/u3/ok/.env"; echo ghp_cccccccccccccccccccccccccccccccccccccc > "$T/u3/g/.git/objects/ab/pack"; echo "-----BEGIN RSA PRIVATE KEY-----" > "$T/u3/glob1/t.jsonl"
     UD="$T/u3" py 'import subprocess,json,os
@@ -724,6 +785,8 @@ g_e2e() {
     [ ! -e "$SRV/gt-remote/PAUSE" ] && [ ! -e "$SRV/gt-remote/proof" ] && [ ! -e "$SRV/gt-remote/bundle/run" ] && [ ! -e "$SRV/tmp/tmux-$(id -u)/gc-remote" ]; ok $? "e2e: sem PAUSE, sem gt-remote/proof, sem bundle/run e sem socket do tmux depois"
     [ "$(cd "$SRV" && find . -type f -not -path './.claude/projects/*' -not -path './Library/Caches/*' | sort | cksum)" = "$(cd "$GOLD" && find . -type f -not -path './Library/Caches/*' | sort | cksum)" ]; ok $? "e2e: a lista de arquivos do MBP é a da instalação (a transcrição do claude é a única novidade; o cache de bytecode do python no macOS não conta)"
     [ "$(dsig "$SRV/.ssh")" = "$(dsig "$GOLD/.ssh")" ] && [ "$(dsig "$SRV/gt-remote/bundle" "$SRV/gt-remote/shim-bin")" = "$(dsig "$GOLD/gt-remote/bundle" "$GOLD/gt-remote/shim-bin")" ]; ok $? "e2e: ~/.ssh, o bundle e o atalho ficaram byte a byte iguais"
+    grep -F "PASS (d) clone continua sem dado depois do commit" "$T/out" | grep -qF "=.gitignore" && grep -F "PASS (d) clone continua sem dado depois do commit" "$T/out" | grep -qF "=.gitattributes" && grep -F "PASS (d) clone continua sem dado depois do commit" "$T/out" | grep -qF "=mbp-proof/$run.txt" && grep -F "PASS (d) clone continua sem dado depois do commit" "$T/out" | grep -qF "3 blob(s)"; ok $? "e2e: o clone esparso termina com 3 blobs, TODOS nomeados — o arquivo de teste e o .gitignore/.gitattributes da raiz que o git buscou ao ler o índice (o que o MBP vivo mostrou) — e a prova passa"
+    has "$T/out" "zdot/.zcompdump (cache do zsh desta rodada)"; ok $? "e2e: o cache de completion que o zsh da sessão gravou no zdot/ (o que o MBP vivo mostrou) é tirado pela limpeza, e a remoção aparece no relatório"
     ! grep -rq "LEAD-DATA-9981" "$SRV"; ok $? "e2e: o dado de lead do origin NÃO existe em lugar nenhum do MBP"
   }
   c keep && { FAKE_MODE=ok ep --keep; wd=$(ls -d "$SRV"/gt-remote/proof/mbp-* 2>/dev/null | head -1); [ $RC = 0 ] && has "$T/out" "--keep" && [ -d "$wd" ] && has "$SRV/.claude.json" "hasTrustDialogAccepted"; ok $? "e2e: --keep deixa a pasta de teste e a marca de confiança (e diz) (rc=$RC)"; }
@@ -847,6 +910,13 @@ assert pr.interrupted is False, "gate que não responde não é o Athos voltando
   c lostpause && { FAKE_MODE=lostpause ep; [ $RC = 1 ] && has "$T/out" "FAIL (b) pausa do Athos ligada" && [ ! -e "$SRV/gt-remote/PAUSE" ] && [ "$(calls stop)" -ge 1 ]; ok $? "e2e: a resposta do \"ligar a pausa\" se perde DEPOIS de o arquivo ser criado → reprova (b), mas tenta o \"desligar\": nenhuma pausa da prova fica no MBP (rc=$RC)"; }
   c badjson && { e2e_fixture; echo "isto nao e json" > "$SRV/.claude.json"; python3 -I "$P" e2e --repo-url "$URL" > "$T/out" 2> "$T/err"; RC=$?; [ $RC = 3 ] && [ "$(calls start)" = 0 ] && has "$T/out" "nunca rodou aqui" && [ "$(cat "$SRV/.claude.json")" = "isto nao e json" ]; ok $? "e2e: ~/.claude.json ilegível → não começa e não o reescreve (rc=$RC)"; }
   c gitblobs && { FAKE_GITFAIL=cat-file FAKE_MODE=ok ep; [ $RC = 1 ] && has "$T/out" "FAIL clone sem dado" && has "$T/out" "FAIL (d) clone continua sem dado"; ok $? "e2e: git cat-file que falha (no clone e depois do commit) → NÃO é \"0 blobs\": as duas provas de \"clone sem dado\" reprovam (rc=$RC)"; }
+  c gittree && { FAKE_GITFAIL=ls-tree FAKE_MODE=ok ep; [ $RC = 1 ] && grep -F "FAIL (d) clone continua sem dado depois do commit" "$T/out" | grep -qF "não consegui listar os blobs do clone com o nome"; ok $? "e2e: git ls-tree que falha → os blobs ficam SEM NOME e a prova reprova dizendo que não conseguiu listar (não \"só o do teste\") (rc=$RC)"; }
+  c blobdata && { FAKE_MODE=blobdata ep; [ $RC = 1 ] && grep -F "FAIL (d) clone continua sem dado depois do commit" "$T/out" | grep -qF "data/leads.csv" && grep -F "FAIL (d) clone continua sem dado depois do commit" "$T/out" | grep -qF "NÃO permitidos" && [ "$(calls stop)" -ge 1 ]; ok $? "e2e: a sessão busca um blob de DADO (data/leads.csv, via o remoto promisor) → (d) reprova nomeando o arquivo (rc=$RC)"; }
+  c blobstray && { FAKE_MODE=blobstray ep; [ $RC = 1 ] && grep -F "FAIL (d) clone continua sem dado depois do commit" "$T/out" | grep -qF "sem nome na árvore do HEAD" && [ "$(calls stop)" -ge 1 ]; ok $? "e2e: um blob que a árvore do HEAD não nomeia (objeto solto no clone) → (d) reprova (rc=$RC)"; }
+  c nozcomp && { FAKE_MODE=nozcomp ep; [ $RC = 0 ] && ! has "$T/out" "cache do zsh desta rodada"; ok $? "e2e: sessão que não gravou cache do zsh → nada a tirar, a limpeza não inventa remoção (rc=$RC)"; }
+  c zextra && { FAKE_MODE=zextra ep; [ $RC = 1 ] && grep -F "FAIL (c)(d) varredura depois" "$T/out" | grep -qF "bundle mudou" && [ -e "$SRV/gt-remote/bundle/zdot/.zshrc.local" ] && ! has "$T/out" "FAIL (a) pasta de teste" && [ "$(calls stop)" -ge 1 ]; ok $? "e2e: um arquivo NOVO em zdot/ que não é cache do zsh → a limpeza NÃO o apaga e a varredura final reprova 'bundle mudou' (rc=$RC)"; }
+  c zbundle && { FAKE_MODE=zbundle ep; [ $RC = 1 ] && grep -F "FAIL (c)(d) varredura depois" "$T/out" | grep -qF "bundle mudou" && [ -e "$SRV/gt-remote/bundle/novo.txt" ] && ! has "$T/out" "FAIL (a) pasta de teste"; ok $? "e2e: um arquivo novo na RAIZ do bundle → a limpeza o deixa e a varredura final reprova 'bundle mudou' (rc=$RC)"; }
+  c zlink && { FAKE_MODE=zlink ep; [ $RC = 1 ] && has "$T/out" "FAIL (a) pasta de teste" && grep -F "FAIL (c)(d) varredura depois" "$T/out" | grep -qF "bundle mudou" && [ -L "$SRV/gt-remote/bundle/zdot/.zcompdump" ] && grep -F "NÃO tirado" "$T/out" | grep -qF "zdot/.zcompdump: não é arquivo comum"; ok $? "e2e: um LINK com nome de cache do zsh no zdot/ → a limpeza não o apaga (diz 'não é arquivo comum'), (a) e a varredura final reprovam (rc=$RC)"; }
   c githead && { FAKE_GITFAIL="rev-parse HEAD" FAKE_MODE=ok ep; [ $RC = 3 ] && [ "$(calls start)" = 0 ] && has "$T/out" "o MBP não preparou a pasta de teste"; ok $? "e2e: git rev-parse HEAD que falha → sem o commit de partida a prova não começa (rc=$RC)"; }
   c snapwalk && { e2e_fixture; find "$SRV/gt-remote/shim-bin" -delete; : > "$SRV/gt-remote/shim-bin"; python3 -I "$P" e2e --repo-url "$URL" > "$T/out" 2> "$T/err"; RC=$?; [ $RC = 3 ] && [ "$(calls start)" = 0 ] && has "$T/out" "não consegui ler o estado do MBP"; ok $? "e2e: shim-bin que não dá para varrer (é um arquivo) → NÃO é \"pasta vazia\": não começa, saída 3 (rc=$RC)"; }
   c staleproof && { e2e_fixture; mkdir -p "$SRV/gt-remote/proof/velho"; python3 -I "$P" e2e --repo-url "$URL" > "$T/out" 2> "$T/err"; RC=$?; [ $RC = 3 ] && [ "$(calls start)" = 0 ] && has "$T/out" "sobrou algo em gt-remote/proof" && [ -d "$SRV/gt-remote/proof/velho" ]; ok $? "e2e: sobra de uma rodada anterior em gt-remote/proof → não começa e não apaga o que não é dela (rc=$RC)"; }
@@ -1008,6 +1078,22 @@ def new_run() -> str:'
   mutant e2e shadow "um gc real escondendo o atalho passa" '        if shadow:' '        if False:'
   mutant e2e badjson "~/.claude.json ilegível passa" '        if not s["claude_json"]["ok"]:' '        if False:'
   mutant e2e badclaudejson "~/.claude.json ilegível depois da limpeza passa por limpo" ' or not post["claude_json"]["ok"]' ''
+  mutant unit judgeblobs "judge_blobs aceita qualquer nome" '        elif not allowed.intersection(paths):' '        elif False:'
+  mutant unit judgeblobs "judge_blobs aceita blob sem nome" '        if not paths:
+            bad.append(f"{b['"'"'oid'"'"'][:12]} sem nome na árvore do HEAD")' '        if not paths:
+            pass'
+  mutant unit,e2e judgeblobs,gitblobs,gittree "judge_blobs lê a lista que não veio como \"nenhum blob\"" '        return False, "não consegui listar os blobs do clone com o nome (git cat-file/ls-tree falhou)"' '        return True, "sem lista"'
+  mutant unit judgeblobs "qualquer arquivo de mbp-proof/ vale, não só o desta rodada" '    allowed = {f"mbp-proof/{run}.txt", *CLONE_ROOT_BLOBS}' '    allowed = {*CLONE_ROOT_BLOBS, *[x for b in blobs for x in b["paths"] if x.startswith("mbp-proof/")]}'
+  mutant e2e gittree "o GITSEE segue sem a árvore (ls-tree que falhou)" '    if objs is None or tree is None:' '    if objs is None:'
+  mutant e2e blobdata,blobstray "o (d) volta a contar blobs (<= 3) em vez de nomear" '        bok, bwhy = judge_blobs(g.get("blob_names"), self.run)' '        bok, bwhy = (g["blobs"] in (0, 1, 2, 3)), "contagem"'
+  mutant unit cleanzcomp "CLEAN apaga qualquer arquivo do zdot/ que não estava antes (sem o padrão do cache)" '        if not re.fullmatch(C["zcomp_rx"], n) or "zdot/" + n in pz:' '        if "zdot/" + n in pz:'
+  mutant unit cleanzcomp "CLEAN apaga o cache do zsh que JÁ estava antes" '        if not re.fullmatch(C["zcomp_rx"], n) or "zdot/" + n in pz:' '        if not re.fullmatch(C["zcomp_rx"], n):'
+  mutant unit,e2e cleanzcomp,zlink "CLEAN apaga link/pasta com nome de cache" '        if os.path.islink(zp) or not os.path.isfile(zp):' '        if False:'
+  mutant unit cleanzcomp "CLEAN sem a lista do antes apaga tudo que parece cache" '    pz = C.get("pre_zcomp")' '    pz = C.get("pre_zcomp") or []'
+  mutant unit prezcomp "pre_zcomp lê varredura truncada como \"o que havia\"" '    if not isinstance(b, dict) or b.get("truncated") or not isinstance(b.get("files"), dict):' '    if not isinstance(b, dict) or not isinstance(b.get("files"), dict):'
+  mutant e2e ok "a limpeza da prova não recebe o que havia antes (o cache do zsh fica no bundle)" '"zcomp_rx": ZCOMP_RX, "pre_zcomp": pre_zcomp(self.pre), ' '"zcomp_rx": ZCOMP_RX, '
+  mutant e2e ok,zlink "a remoção do cache do zsh no bundle sai calada (sem a linha própria)" '            if zr or ze:  # linha própria' '            if False:  # linha própria'
+  mutant e2e zextra,zbundle "a varredura final não compara o bundle" '        for k in ("bundle", "shimbin"):' '        for k in ("shimbin",):'
   mutant e2e gitblobs,gitstatus "git que falha vira saída vazia (status limpo, 0 blobs)" 'return r.stdout.strip() if r.returncode == 0 else None' 'return r.stdout.strip()'
   mutant e2e gitblobs "o clone lê git que falhou como 0 blobs" ' if objs.returncode == 0 else None,' ','
   mutant e2e githead "git rev-parse que falha deixa a prova começar" 'ok=head.returncode == 0 and len(head.stdout.strip()) == 40,' 'ok=True,'

@@ -27,7 +27,7 @@ O QUE A PROVA CONFERE (os critérios do ga-w7qwl1.1; cada linha vira PASS/FAIL n
       chegam ao mini pelo atalho com lista de permissões (cliente → spool → puxador do mini → wrapper); os hooks gc do city disparam; o MBP não ganha credencial de
       bd/Dolt nem chave (varredura antes/depois). A sessão abre com o zdot LIMPO do bundle (ZDOTDIR + PATH explícito, ga-w7qwl1.1.5): o bd/dolt do usuário não entra.
   (d) um branch de teste comitado no MBP chega ao origin DIRETO do MBP (credencial que o MBP já tem; nenhuma nova) e aparece no mini; varredura: nenhum dado de lead
-      (o clone é raso, sem blobs e sem checkout fora de mbp-proof/) nem segredo novo no MBP depois; a varredura olha também DENTRO do base64 do
+      (o clone é raso, sem blobs e sem checkout fora de mbp-proof/; depois do commit só o arquivo de teste e o .gitignore/.gitattributes da raiz têm blob, conferidos por NOME) nem segredo novo no MBP depois; a varredura olha também DENTRO do base64 do
       spool (stdin_b64/stdout_b64/stderr_b64 e o cmd `rs1 <base64>`), e o que não decodifica é "sem verificar", que reprova
   (e) o bundle está instalado e CONFERIDO no MBP (verify lá) e a sessão roda `claude` com o --settings do bundle até o prompt de partida
   (f) a sessão nasceu num LaunchAgent do domínio gráfico (ga-w7qwl1.1.8): com a sessão de pé, lido NO MBP — o agente está carregado em gui/<uid>, o veredito que ELE gravou é `ok` (o
@@ -41,7 +41,8 @@ O QUE TOCA NO MBP (tudo sob ~/gt-remote, e só o que está aqui) E O QUE DESFAZ
   install: gt-remote/bundle (o OUT do builder com --session-path, zdot/ incluído, igual ao que o verify confere), gt-remote/shim-bin (cliente do atalho; links bd, gc,
            gate-done e dolt, este recusado), gt-remote/shim (spool 0700),
            gt-remote/bin/remote-bundle-build.py. Nada em ~/.claude, ~/.config nem ~/.ssh.
-  e2e:     gt-remote/proof/<rodada> (clone raso, sem blobs; apagado no fim), uma entrada em ~/.claude.json (projects[<pasta>], a mesma que o claude gravaria ao aceitar
+  e2e:     gt-remote/proof/<rodada> (clone raso, sem blobs; apagado no fim), zdot/.zcompdump* do bundle SE o zsh da sessão o gravou nesta rodada (cache de completion, artefato de runtime: só o que não existia antes,
+           arquivo comum; dito no relatório; qualquer outro arquivo novo no bundle reprova a varredura final), uma entrada em ~/.claude.json (projects[<pasta>], a mesma que o claude gravaria ao aceitar
            a confiança; REMOVIDA no fim), gt-remote/PAUSE (só a desta rodada; só removida se a primeira linha ainda for a marca dela), gt-remote/bundle/run (apagada se
            não existia), as sessões leves de (g) (remote-test-remote-mbp-91 e -92, com os agentes delas, só entre o start e o stop). O branch worker/<rodada> no origin FICA (apagá-lo é decisão: --delete-branch).
   run/*.stop: o provider deixa `<nome>.stop` em run/ depois de TODO stop (ga-0k82lw; o start seguinte do nome o apaga, o stop poda as de > 24 h) e o `verify` do bundle conta qualquer arquivo de run/
@@ -127,7 +128,37 @@ SESSION_RE = re.compile(r"remote-test-remote-mbp-[0-9]{1,3}")
 # resíduo de sessão nem de lançador, é contrato do provider. A prova a tolera onde olha run/ e a REMOVE ao limpar (só estas, só de nome de teste: nunca outro arquivo de run/).
 STOP_RX = r"remote-test-remote-mbp-[0-9]{1,3}\.stop"
 STOP_RE = re.compile(STOP_RX)
-AGENT_PFX = "com.gascity.remote-session."  # o prefixo FIXO dos labels do agente do domínio gráfico (scripts/gc-session-ssh, AGENT_PFX); label = prefixo + nome da sessão
+# O clone de teste é esparso (--filter=blob:none + sparse /mbp-proof/), mas o `git add` lê o .gitignore e o .gitattributes da RAIZ do índice e os busca no remoto promisor (medido 05/11, rodada viva 5 e
+# reprodução no mini: 0 blobs até o add, 3 depois). São os únicos blobs de fora do arquivo de teste que o clone pode ter; qualquer outro, ou um blob que não se sabe de que arquivo é, é dado.
+CLONE_ROOT_BLOBS = (".gitignore", ".gitattributes")
+# O cache de completion que o zsh da sessão grava no ZDOTDIR (bundle/zdot): artefato de runtime, não configuração (medido 05/11: zdot/.zcompdump de 49 KB depois de uma rodada; os .zshenv/.zprofile/.zshrc do
+# bundle só fixam o PATH, e QUEM chama o compinit não foi medido). O `verify` do builder segue estrito de propósito (o zsh CARREGA esse arquivo, então ele não entra numa allowlist do builder, compartilhado
+# com o Hetzner): quem o tira do bundle é a limpeza desta prova.
+ZCOMP_RX = r"\.zcompdump[-.A-Za-z0-9_]*"
+def judge_blobs(blobs, run: str) -> tuple:
+    """(ok, detalhe) para os blobs do clone depois do commit: cada um tem de ser NOMEADO (o caminho na árvore do HEAD) e um dos permitidos — o arquivo de teste desta rodada e o .gitignore/.gitattributes da
+    raiz. `blobs` é [{"oid", "paths"}] ou None (o git falhou: "não sei" não é "só o do teste"). Um blob sem nome na árvore reprova; um com nome fora da lista reprova (contar blobs deixaria passar
+    1 blob de dado no lugar do arquivo de teste). Conteúdo igual ao de um arquivo permitido tem o mesmo oid, então o oid vale se QUALQUER nome dele for permitido: são os mesmos bytes."""
+    if not isinstance(blobs, list) or not all(isinstance(b, dict) and isinstance(b.get("oid"), str) and isinstance(b.get("paths"), list) for b in blobs):
+        return False, "não consegui listar os blobs do clone com o nome (git cat-file/ls-tree falhou)"
+    allowed = {f"mbp-proof/{run}.txt", *CLONE_ROOT_BLOBS}
+    rows, bad = [], []
+    for b in sorted(blobs, key=lambda b: b["oid"]):
+        paths = sorted(str(p) for p in b["paths"])
+        rows.append(f"{b['oid'][:12]}={'|'.join(paths) or '?'}")
+        if not paths:
+            bad.append(f"{b['oid'][:12]} sem nome na árvore do HEAD")
+        elif not allowed.intersection(paths):
+            bad.append(f"{b['oid'][:12]} é {'|'.join(paths)}")
+    return not bad, f"{len(blobs)} blob(s): {', '.join(rows) or 'nenhum'}" + (f" · NÃO permitidos: {'; '.join(bad)}" if bad else "")
+def pre_zcomp(pre: dict):
+    """Os nomes de cache do zsh que o bundle JÁ tinha no snapshot de antes (relativos ao bundle), ou None se não sei (bundle ausente, ilegível ou a varredura truncou): sem saber o que havia, a limpeza
+    não apaga nada, e a varredura final reprova o que sobrou (visível, não calado)."""
+    b = (pre.get("roots") or {}).get("bundle") if isinstance(pre, dict) else None
+    if not isinstance(b, dict) or b.get("truncated") or not isinstance(b.get("files"), dict):
+        return None
+    return sorted(k for k in b["files"] if re.fullmatch("zdot/" + ZCOMP_RX, k))
+AGENT_PFX ="com.gascity.remote-session."  # o prefixo FIXO dos labels do agente do domínio gráfico (scripts/gc-session-ssh, AGENT_PFX); label = prefixo + nome da sessão
 MULTI = ("remote-test-remote-mbp-91", "remote-test-remote-mbp-92")  # as duas sessões LEVES de (g), fora do nome da sessão da prova (a 1ª, a que roda o claude) e dentro do SESSION_RE e do teto (cap 2)
 BEAD_RE = re.compile(r"[a-z]{2,8}-[a-z0-9]{2,16}(\.[0-9]{1,4}){0,3}")
 MARK, NMARK = "E2E-42-OK", "NUDGE-25-OK"  # o prompt só traz `$((6*7))`/`$((5*5))`: ver o número na tela quer dizer que o comando RODOU, não que o texto foi ecoado
@@ -486,10 +517,22 @@ def git(*a):  # a saída, ou None se o git falhou: "não sei" não vira "vazio" 
     r = subprocess.run(["git", "-C", C["workdir"]] + list(a), env=env, capture_output=True, text=True, timeout=120)
     return r.stdout.strip() if r.returncode == 0 else None
 objs = git("cat-file", "--batch-all-objects", "--batch-check")
+tree = git("ls-tree", "-r", "-z", "HEAD")  # só árvores (o clone tem todas as do commit raso): dá o NOME de cada blob sem baixar nenhum
+def blobs_named():  # [{"oid", "paths"}] dos blobs que o clone TEM, com os caminhos deles no HEAD; None se o git falhou ("não sei" não vira "nenhum blob")
+    if objs is None or tree is None:
+        return None
+    names = {}
+    for ent in tree.split("\0"):
+        meta, _, path = ent.partition("\t")
+        f = meta.split()
+        if len(f) == 3 and f[1] == "blob":
+            names.setdefault(f[2], []).append(path)
+    have = [l.split()[0] for l in objs.split("\n") if l.split()[1:2] == ["blob"]]
+    return [{"oid": o, "paths": sorted(names.get(o, []))} for o in sorted(set(have))]
 out = {"log": git("log", "-1", "--format=%H|%an|%s") or "", "status": git("status", "--porcelain"),
        "changed": [l for l in (git("diff", "--name-only", "HEAD~1", "HEAD") or "").split("\n") if l],
        "remote_sha": (git("ls-remote", C["url"], "refs/heads/worker/" + C["run"]) or "").split("\t")[0],
-       "blobs": None if objs is None else sum(1 for l in objs.split("\n") if " blob " in l),
+       "blobs": None if objs is None else sum(1 for l in objs.split("\n") if " blob " in l), "blob_names": blobs_named(),
        "wtfiles": sorted(os.path.relpath(os.path.join(d, n), C["workdir"]) for d, ds, ns in os.walk(C["workdir"], onerror=lambda e: sys.exit("não consegui listar " + str(e.filename))) if ".git" not in d.split(os.sep) for n in ns)}
 print(json.dumps(out))
 '''
@@ -595,6 +638,33 @@ for m in marks:
         pass
     except OSError as e:
         res.setdefault("errors", []).append("run/%s: %s" % (m, e.strerror))
+# o cache de completion que o zsh da sessão gravou no ZDOTDIR do bundle (zdot/.zcompdump*): artefato de runtime DESTA rodada, o `verify` do bundle o acusa como sobra. Só sai o que (1) NÃO estava no snapshot de antes
+# (pre_zcomp = os que já havia; ausente/None = não sei o que havia → não apago), (2) tem nome de cache do zsh e (3) é arquivo comum: link, pasta ou qualquer outro arquivo fica, e a varredura final reprova.
+# Falhou (não listou ou não apagou) → errors, e `ok` fica falso. A remoção sai em `removed` (visível no relatório).
+pz = C.get("pre_zcomp")
+if isinstance(pz, list):
+    zd = C["bundle"] + "/zdot"
+    try:
+        zn = sorted(os.listdir(zd))
+    except FileNotFoundError:
+        zn = []
+    except OSError as e:
+        zn = []
+        res.setdefault("errors", []).append("zdot/: %s" % e.strerror)
+    for n in zn:
+        if not re.fullmatch(C["zcomp_rx"], n) or "zdot/" + n in pz:
+            continue
+        zp = zd + "/" + n
+        if os.path.islink(zp) or not os.path.isfile(zp):
+            res.setdefault("errors", []).append("zdot/%s: não é arquivo comum, deixei" % n)
+            continue
+        try:
+            os.unlink(zp)
+            res["removed"].append("zdot/" + n + " (cache do zsh desta rodada)")
+        except FileNotFoundError:
+            pass
+        except OSError as e:
+            res.setdefault("errors", []).append("zdot/%s: %s" % (n, e.strerror))
 for d, flag in ((C["proofs"], C["proofs_new"]), (C["bundle"] + "/run", C["run_new"])):
     try:
         if flag and os.path.isdir(d) and not os.listdir(d):
@@ -1052,8 +1122,9 @@ class Proof:
         sha = self.sha = (re.match(r"^(\w{40})\|", g["log"]) or [None, ""])[1]
         self.check("(d) commit no MBP, com a identidade da sessão, só do arquivo de teste", bool(sha) and sha != self.head0 and f"|{SESSION}|" in g["log"] and self.run in g["log"]
                    and g["changed"] == [f"mbp-proof/{self.run}.txt"] and g["status"] == "", f"{g['log']} · mudou {g['changed']} · status {g['status']!r}")
-        self.check("(d) clone continua sem dado depois do commit: 1 blob (o do teste) e só o arquivo de teste no checkout", g["blobs"] in (0, 1) and g["wtfiles"] == [f"mbp-proof/{self.run}.txt"],
-                   f"{g['blobs']} blobs, arquivos {g['wtfiles']}")
+        bok, bwhy = judge_blobs(g.get("blob_names"), self.run)
+        self.check("(d) clone continua sem dado depois do commit: todo blob nomeado e só o arquivo de teste (mais .gitignore/.gitattributes da raiz, que o git busca ao ler o índice) e só o arquivo de teste no checkout",
+                   bok and g["wtfiles"] == [f"mbp-proof/{self.run}.txt"], f"{bwhy} · arquivos {g['wtfiles']}")
         got = ""
         for _ in range(12):
             r = subprocess.run(["git", "ls-remote", self.url, f"refs/heads/worker/{self.run}"], capture_output=True, timeout=90)
@@ -1261,8 +1332,11 @@ class Proof:
         q = subprocess.run([sys.executable, "-I", PUMP, "stop", "--host", HOST], capture_output=True, env=self.env, timeout=60)
         self.say(f"puxador do mini parado: rc {q.returncode} {self.out(q)[:120]}")
         if not self.a.keep and self.pre is not None:
-            c = self.rpy(CLEAN, {"workdir": self.wd, "proofs": PROOFS, "home": MHOME, "bundle": BUNDLE, "socket": SOCKET, "stop_rx": STOP_RX, **self.created})
+            c = self.rpy(CLEAN, {"workdir": self.wd, "proofs": PROOFS, "home": MHOME, "bundle": BUNDLE, "socket": SOCKET, "stop_rx": STOP_RX, "zcomp_rx": ZCOMP_RX, "pre_zcomp": pre_zcomp(self.pre), **self.created})
             self.say(f"limpeza no MBP: {json.dumps(c, ensure_ascii=False)[:400]}")
+            zr, ze = [x for x in c.get("removed", []) if x.startswith("zdot/")], [x for x in c.get("errors", []) if x.startswith("zdot/")]
+            if zr or ze:  # linha própria: o relatório acima é cortado, e tirar um arquivo do bundle não pode ficar calado
+                self.say(f"cache do zsh no bundle (artefato de runtime desta rodada): tirado {zr}" + (f" · NÃO tirado {ze}" if ze else ""))
             self.check("(a) pasta de teste, marca de confiança no ~/.claude.json e diretórios criados pela prova removidos", bool(c.get("ok")), json.dumps(c, ensure_ascii=False)[:200])
             post = self.snap(self.wd)
             self.compare(self.pre, post) if "_erro" not in post else self.check("(c)(d) varredura depois: li o estado do MBP", False, post["_erro"])  # sem leitura não há "nada novo"
