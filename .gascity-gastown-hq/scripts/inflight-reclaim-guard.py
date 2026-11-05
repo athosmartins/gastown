@@ -2052,6 +2052,12 @@ def session_is_live(assignee, sessions, now=None, bead_update_age=None,
     straight through to session_owner_is_healthy; default False so a caller
     that hasn't computed the multi-assignment set keeps prior behavior.
 
+    ga-lotseol: a matched live session that matches ONLY through a reused
+    pool-slot alias and was born after the bead was last touched is skipped as
+    the alias-twin of the (dead) claimer (alias_claim_predates_session, in
+    bead_state.py since ga-d63o9n1: the Pilot applies the same rule). Needs
+    bead_update_age: without it the rule is off and the old answer stands.
+
     CORRECTNESS-CRITICAL: this is the primary guard against reclaiming
     a bead that a live builder actually owns.
     """
