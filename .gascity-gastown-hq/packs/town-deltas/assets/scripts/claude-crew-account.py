@@ -91,7 +91,8 @@ What it does, every run (launchd StartInterval, single instance via flock):
      FILE (the Background cannot write the item). So (a) the NEWEST of the two (refresh expiry, then access expiry; a full login beats a half one;
      "cannot tell" is said and never decided) is the login in use: it is what sync-back saves to its owner and what the profile is asked about, and a
      /login done in the file clears the no-login alarm like one done in the item. (b) A switch writes the FILE first (atomic, 0600, read back), then
-     the item (read back), and puts the file back if the item failed - the stores never disagree about the account. (c) With nothing to switch, the
+     the item (read back), and puts the file back if the item failed (unless a session refreshed it since: that newer login is left and the push says
+     so, the next run looks at both again). (c) With nothing to switch, the
      store that is behind is healed from the one that is ahead (a missing file is created; a file that cannot be read as a login is NOT overwritten).
      (d) A FULL login a write would destroy - one this job did not write itself (`wrote`), that the profile cannot place as an older login of the same
      account - is PARKED first in an item nothing reads ("...CREW-RESERVE-PARKED-<fingerprint>"); a park that fails stops the write. (e) notify's push
@@ -707,23 +708,30 @@ def put_cred_file(login: dict, base: Optional[dict]) -> bool:
     return False
 
 
-def restore_cred_file(raw: Optional[bytes], written: dict) -> bool:
+# What became of the credentials file when the item write failed after it. THREE outcomes, and the caller says which: a rollback that was refused is not
+# a rollback that happened (gate fix 1: the push said "put back" while the log said "NOT put back").
+RESTORED, LEFT_AS_IS, NOT_RESTORED = "restored", "left-as-is", "not-restored"
+
+
+def restore_cred_file(raw: Optional[bytes], written: dict) -> str:
     """Put the file back as it was (raw None = it did not exist) - but only if it still holds what THIS run wrote: a session may have refreshed it in the
-    meantime, and that newer login is never overwritten by a rollback."""
+    meantime, and that newer login is never overwritten by a rollback. Returns RESTORED (put back), LEFT_AS_IS (it no longer holds what this run wrote,
+    or cannot be read now: refused, untouched) or NOT_RESTORED (the write back failed)."""
     state, back, _ = read_cred_file()
+    # vazio (no file / no login in it) → LEFT_AS_IS: what this run wrote is not there to undo; falhou/ilegível → LEFT_AS_IS too: a file that cannot be looked at is not overwritten
     if state != "ok" or back is None or not same_login(back, written):
-        log("WARN", "credentials file NOT put back: it no longer holds what this run wrote (a session refreshed it?) - it is left as it is; the next run reconciles")
-        return False
+        log("WARN", "credentials file NOT put back: it no longer holds what this run wrote (a session refreshed it?) - it is left as it is; the next run looks at both stores again")
+        return LEFT_AS_IS
     try:
         if raw is None:
             cred_file().unlink()
         else:
             _atomic_write(cred_file(), raw)
     except OSError as e:
-        log("ERROR", f"credentials file could NOT be put back ({type(e).__name__}): it holds the new login while the item holds the old one; the next run reconciles")
-        return False
+        log("ERROR", f"credentials file could NOT be put back ({type(e).__name__}): it holds the new login while the item holds the old one; the next run looks at both stores again")
+        return NOT_RESTORED
     log("WARN", "credentials file put back as it was (the item write failed)")
-    return True
+    return RESTORED
 
 
 def _cmp(a, b) -> Optional[int]:
@@ -805,8 +813,9 @@ def park(login: dict, store: str) -> bool:
 def put_default(st: dict, acct: str, item: dict, cur: dict, ident: Optional[str], fs: str, fblob: Optional[dict], fraw: Optional[bytes],
                 login: dict, target: str, t: float) -> Tuple[bool, str]:
     """Move the default account to `login`: the credentials file FIRST (the one the sessions read; atomic, read back), then the item (read back). If
-    the item fails the file is put back, so the stores never disagree about the account. A full login either write would destroy is parked first.
-    Returns (done, why-not)."""
+    the item fails the file is put back - unless a session has refreshed it since (that newer login is left, and the stores then name different
+    accounts until the next run looks at both again). A full login either write would destroy is parked first.
+    Returns (done, why-not); when the item failed, the why-not says what became of the file."""
     why = cred_refusal()
     if why:
         return False, why
@@ -821,8 +830,17 @@ def put_default(st: dict, acct: str, item: dict, cur: dict, ident: Optional[str]
     if not put_cred_file(login, base):
         return False, "the credentials file could not be written or did not read back (see the log)"
     if not verified_write(DEFAULT_SERVICE, acct, with_login(item, login)):
-        restore_cred_file(fraw, with_login(base, login))
-        return False, "the Keychain item could not be written or did not read back (see the log); the credentials file was put back"
+        outcome = restore_cred_file(fraw, with_login(base, login))
+        head = "the Keychain item could not be written or did not read back (see the log); "
+        if outcome == RESTORED:
+            return False, head + "the credentials file was put back as it was"
+        if outcome == LEFT_AS_IS:
+            return False, (head + "the credentials file was NOT put back: it no longer holds what this run wrote (a session refreshed it?), so it and the item "
+                           "may name different accounts until the next run looks at both again")
+        if outcome == NOT_RESTORED:
+            return False, (head + "the credentials file could NOT be put back: it holds the new login while the item holds the old one, until the next run "
+                           "looks at both again")
+        return False, head + "what became of the credentials file is not known (see the log)"          # an outcome this code does not know: never 'put back'
     note_wrote(st, new_rfp, target, t)
     return True, ""
 
@@ -854,7 +872,7 @@ def heal_stores(st: dict, ident: str, cur: dict, cur_store: str, acct: str, item
         return
     behind = f"the default {store} is behind the {src} (it holds an older login, or none) and could not be brought up to date"
     if needs_park(st, loser, cur, ident, t) and not park(loser, store):
-        alert(st, "write-failed", f"{behind}: the full login it holds could not be parked first, so it is NOT overwritten (see the log)", t)
+        alert(st, "heal-failed", f"{behind}: the full login it holds could not be parked first, so it is NOT overwritten (see the log)", t)   # not the switch's key: 6 h of dedupe must not hide the second condition
         return
     if store == "file":
         done = put_cred_file(cur, fblob if fs == "ok" and isinstance(fblob, dict) else None)
@@ -865,7 +883,7 @@ def heal_stores(st: dict, ident: str, cur: dict, cur_store: str, acct: str, item
         log("INFO", f"healed the default {store} from the {src}: {ident}'s login (refresh fp {rfp}) - the {store} held "
                     f"{'refresh fp ' + str(fp(loser['claudeAiOauth'].get('refreshToken'))) if loser else 'nothing'}")
     else:
-        alert(st, "write-failed", f"{behind} (see the log): a session that reads it runs on a login the other store has already outlived", t)
+        alert(st, "heal-failed", f"{behind} (see the log): a session that reads it runs on a login the other store has already outlived", t)
 
 
 # ── state / alerts ───────────────────────────────────────────────────────
@@ -2266,7 +2284,7 @@ def _follow(st: dict, dec: dict, user: str, t: float, dry: bool) -> int:
                    f"{len(pv['pids'])} Remote Control bridges to verify" if not pv["blind"] else
                    f"{len(pv['pids'])} Remote Control bridges listed, but the pending check was blind: it cannot be fully verified"))
     if deferred:
-        alert(st, deferred[0], deferred[1], t)
+        alert(st, deferred[0], deferred[1], t, urgent=False)       # news after the fact ("crews fall to X", "healed from X"): nothing for Athos to decide, so no 'waits for you' route
     return 0
 
 

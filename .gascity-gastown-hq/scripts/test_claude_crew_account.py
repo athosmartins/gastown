@@ -3031,9 +3031,9 @@ def test_a_login_done_in_the_file_is_seen_and_clears_the_alarm_with_nobody_touch
 
 
 @pytest.mark.parametrize("fault", ["FAKE_SEC_WFAIL", "FAKE_SEC_DROP"])
-def test_an_item_write_that_fails_puts_the_file_back_so_the_two_stores_never_disagree(w, fault):
+def test_an_item_write_that_fails_puts_the_file_back_and_the_push_says_it_was_put_back(w, fault):
     """Breaks if the file is left on the new account while the item (the next run's `current`) says the old one: a half switch. The file is
-    written FIRST (a local write that cannot half-fail), the item second, and a failed item puts the file back as it was."""
+    written FIRST (a local write that cannot half-fail), the item second, and a failed item puts the file back as it was - and the push says so."""
     cur = blob("crypto")
     _in_both(w, "crypto", cur)
     w.account("crypto", cur)
@@ -3044,8 +3044,79 @@ def test_an_item_write_that_fails_puts_the_file_back_so_the_two_stores_never_dis
     w.run()
     assert w.cred.read_bytes() == before and _rt(w.get(crew.DEFAULT_SERVICE)) == _rt(cur)
     assert "credentials file put back" in w.log()                 # it WAS written, and restored: not merely never touched
-    assert len([n for n in w.notified() if "write-failed" in n]) == 1 and w.state()["current"] == EMAIL["crypto"]
+    said = [n for n in w.notified() if "write-failed" in n]
+    assert len(said) == 1 and w.state()["current"] == EMAIL["crypto"]
+    assert "put back as it was" in said[0] and "NOT put back" not in said[0] and "could NOT" not in said[0]      # true here: the file really went back
     assert os.listdir(w.cred.parent) == [".credentials.json"]
+
+
+def _item_write_fails(w):
+    """The world of a switch crypto -> amb whose item write is going to fail: both stores hold crypto's login, the pool wants amb."""
+    cur = blob("crypto")
+    _in_both(w, "crypto", cur)
+    w.account("crypto", cur)
+    w.account("amb", blob("amb"))
+    w.decide("amb")
+    return cur
+
+
+def test_a_failed_item_write_does_not_say_the_file_was_put_back_when_a_session_refreshed_it_first(w):
+    """Breaks if the push claims a rollback that did not happen (gate review of ga-i4t0lzx, attempt 1). The item write can take up to 20 s to fail (the
+    timeout of the `security` call) and claude re-reads the credentials file about every 30 s (module docstring): a session can refresh the freshly
+    written copy before the rollback looks. Then the file holds a NEWER login than the one this run wrote and the rollback REFUSES (log: 'NOT put
+    back'). The state is file = the session's rotated login of the new account, item = the old one; the push must say that, not 'put back'."""
+    cur = _item_write_fails(w)
+    rotated = _vouched(w, "amb", blob("amb", rt="amb-rotated-by-a-session", rexp_days=29.9))
+    real = crew.verified_write
+
+    def item_fails_after_a_session_rotated_the_file(service, acct, b):
+        if service == crew.DEFAULT_SERVICE:
+            w.put_file(rotated)                                   # the session got there first
+            return False
+        return real(service, acct, b)
+    w.mp.setattr(crew, "verified_write", item_fails_after_a_session_rotated_the_file)
+    w.run()
+    assert w.get_file() == rotated                                # the newer login is never rolled back over
+    assert _rt(w.get(crew.DEFAULT_SERVICE)) == _rt(cur) and w.state()["current"] == EMAIL["crypto"]
+    said = [n for n in w.notified() if "write-failed" in n]
+    assert len(said) == 1 and "NOT put back" in said[0] and "different accounts" in said[0]
+    assert "put back as it was" not in said[0]                    # the claim that was false
+    assert "credentials file NOT put back" in w.log() and "credentials file put back as it was" not in w.log()
+    assert secrets_in("\n".join(w.notified()) + w.log(), w) == []
+    # what the push promises ("until the next run looks at both again"): with the item writable again, the next run brings the item up to the file
+    w.mp.setattr(crew, "verified_write", real)
+    w.run(at=w.now + 600)
+    assert _rt(w.get(crew.DEFAULT_SERVICE)) == _rt(rotated) and w.get_file() == rotated
+
+
+def test_a_failed_item_write_whose_rollback_also_fails_says_so(w):
+    """The third outcome of the rollback: the file still holds what this run wrote but the write BACK fails (OSError). Not 'put back', and not the
+    'a session refreshed it' text either: the push says the file holds the new login while the item holds the old one."""
+    _item_write_fails(w)
+    w.mp.setenv("FAKE_SEC_WFAIL", crew.DEFAULT_SERVICE)
+    real, calls = crew._atomic_write, []
+
+    def second_write_fails(p, data):
+        calls.append(p)
+        if len(calls) > 1:                                        # the first is the switch's write of the file, the second the rollback
+            raise OSError(5, "Input/output error")
+        return real(p, data)
+    w.mp.setattr(crew, "_atomic_write", second_write_fails)
+    w.run()
+    assert len(calls) == 2 and _rt(w.get_file()) == "sk-ant-ort01-amb-ref"        # the file stayed on the new account
+    said = [n for n in w.notified() if "write-failed" in n]
+    assert len(said) == 1 and "could NOT be put back" in said[0] and "put back as it was" not in said[0]
+    assert "credentials file could NOT be put back" in w.log()
+
+
+def test_a_rollback_outcome_this_code_does_not_know_is_never_reported_as_put_back(w):
+    """Breaks if an unknown answer of restore_cred_file lands on the happy text: the third state is 'not known', and it is said."""
+    _item_write_fails(w)
+    w.mp.setenv("FAKE_SEC_WFAIL", crew.DEFAULT_SERVICE)
+    w.mp.setattr(crew, "restore_cred_file", lambda raw, written: "something-new")
+    w.run()
+    said = [n for n in w.notified() if "write-failed" in n]
+    assert len(said) == 1 and "not known" in said[0] and "put back" not in said[0]
 
 
 def test_a_credentials_file_that_is_a_symlink_is_refused_and_nothing_at_all_is_written(w):
@@ -3121,7 +3192,10 @@ def test_a_park_that_fails_stops_the_overwrite(w):
     w.mp.setenv("FAKE_SEC_WFAIL", crew.parked_service(crew.fp(_rt(item))))
     w.run()
     assert _rt(w.get(crew.DEFAULT_SERVICE)) == _rt(item) and _parked(w) == {}      # the only copy of that login was not touched
-    assert len([n for n in w.notified() if "write-failed" in n]) == 1
+    # this is the HEAL (two stores that disagree, no switch): it has its own push key, so it cannot use up the 6 h of a failed SWITCH
+    # (gate review of ga-i4t0lzx, attempt 1) - the same key for two different events let the second one go unannounced
+    assert len([n for n in w.notified() if "heal-failed" in n]) == 1 and [n for n in w.notified() if "write-failed" in n] == []
+    assert set(w.state().get("alerts", {})) == {"heal-failed"}     # the switch's key ('write-failed') is still unspent
 
 
 def test_two_full_logins_that_cannot_be_compared_are_never_synchronised_blind_but_a_switch_parks_the_loser(w):
@@ -3168,6 +3242,22 @@ def test_the_forecast_of_an_expiring_login_is_not_escalated_past_the_cap(w):
     w.mp.setenv("FAKE_NOTIFY_CAP", "1")
     w.run()
     assert len([n for n in w.notified() if "ends in" in n]) == 1 and w.notify_envs() == ["1/1"]
+    assert "aguardando" not in "\n".join(w.notified())
+
+
+def test_the_news_that_the_crews_fell_to_another_account_is_not_escalated_past_the_cap(w):
+    """Negative control (gate review of ga-i4t0lzx, attempt 1: the old script asks it again as 'aguardando você'): 'crews fall to X' is news after
+    the fact - the switch already happened and there is nothing for Athos to decide - so a held push stays held and is tried again later; it
+    does not jump the cap that exists to protect the phone."""
+    w.default("crypto", blob("crypto"))
+    w.account("crypto", blob("crypto"))
+    w.account("b85", blob("b85"))
+    w.decide("terr", exhausted=["crypto"])                        # the pool is on terrenos: no login for it, so the crews fall to b85
+    w.mp.setenv("FAKE_NOTIFY_CAP", "1")
+    w.run()
+    assert w.state()["current"] == EMAIL["b85"] and w.state()["last_switch"]["reason"] == "fallback"       # the switch itself happened
+    said = [n for n in w.notified() if "fall to" in n]
+    assert len(said) == 1 and w.notify_envs() == ["1/1"]          # asked once, forced, and held by the cap: no second 'decision' ask
     assert "aguardando" not in "\n".join(w.notified())
 
 
