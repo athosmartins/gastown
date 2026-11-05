@@ -44,7 +44,7 @@ out="$(ALIAS_MUTANTS_GUARD="$SCRATCH/inflight-reclaim-guard.py" ALIAS_MUTANTS_LI
 [ "$rc" = 2 ] && printf '%s' "$out" | grep -q 'velho' && ! printf '%s' "$out" | grep -q 'MUTANTES:'
 check "executor: trecho que sumiu do guard = FATAL rc 2 ('velho'), sem 'MUTANTES:'" $? "rc=$rc saída=$(printf '%s' "$out" | head -c 160)"
 
-# 2b. A lib (onde mora o corpo da regra) vale o mesmo: ausente = FATAL; trecho que sumiu dela = FATAL 'velho'. Sem isto, mover a regra de novo deixaria os mutantes de corpo mirando o vazio.
+# 2b. A lib (onde mora o corpo da regra) vale o mesmo para o open() do inflight-reclaim-guard.alias-reuse.mutants.py: ausente = FATAL; trecho que sumiu dela = FATAL 'velho'. Sem isto, mover a regra de novo deixaria os mutantes de corpo mirando o vazio.
 out="$(ALIAS_MUTANTS_GUARD="$GUARD" ALIAS_MUTANTS_LIB=/nonexistent/bead_state.py python3 -I "$MUT" 2>&1)"; rc=$?
 [ "$rc" = 2 ] && printf '%s' "$out" | grep -q '^FATAL' && ! printf '%s' "$out" | grep -q 'MUTANTES:'
 check "executor: lib que não abre = FATAL rc 2, sem 'MUTANTES:'" $? "rc=$rc saída=$(printf '%s' "$out" | head -c 120)"
