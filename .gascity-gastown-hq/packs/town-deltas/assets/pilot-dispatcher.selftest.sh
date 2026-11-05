@@ -207,6 +207,7 @@ _st_tick() {
 #                          same failure mode as FAKE_SUPPRESS_INFLIGHT, but for the
 #                          lane tag's own retry+verify loop)
 #   FAKE_SLING_STATUS      status returned for `show <…sling…>` (default open)
+#   FAKE_SLING_UPDATED_AT  JSON map {"<slingid>":"<iso>"} → `updated_at` of `show <…sling…>` (ga-d63o9n1; only emitted for ids the map names)
 #   FAKE_STORY_COMMENTS_JSON  JSON array returned for `comments <id> --json`
 #                          (ga-pd7j mayor-hold-grace seam; default [])
 cat > "$SHIMBIN/bd" <<'SHIM'
@@ -390,8 +391,13 @@ case "$args" in
           _msb=$(printf '%s' "$FAKE_STORY_SLING_BEAD_MAP" | jq -r --arg id "$id" '.[$id] // ""' 2>/dev/null || echo "")
           [ -n "$_msb" ] && meta_kv=$(printf ',"metadata":{"pilot.sling_bead":"%s"}' "$_msb")
         fi
-        printf '{"id":"%s","status":"%s","assignee":"%s","labels":[%s],"description":%s%s}' \
-          "$id" "$st" "$asg" "$lbls" "$(printf '%s' "$desc" | jq -Rs .)" "$meta_kv" ;;
+        upd_kv=""
+        if [ -n "${FAKE_SLING_UPDATED_AT:-}" ]; then
+          _upd=$(printf '%s' "$FAKE_SLING_UPDATED_AT" | jq -r --arg id "$id" '.[$id] // ""' 2>/dev/null || echo "")
+          [ -n "$_upd" ] && upd_kv=$(printf ',"updated_at":"%s"' "$_upd")
+        fi
+        printf '{"id":"%s","status":"%s","assignee":"%s","labels":[%s],"description":%s%s%s}' \
+          "$id" "$st" "$asg" "$lbls" "$(printf '%s' "$desc" | jq -Rs .)" "$meta_kv" "$upd_kv" ;;
     esac ;;
   *"-l ctx:ready"*)
     # ctx:ready chore/task/debt candidate query (PILOT_CTX_READY_QUERIES). MUST be
@@ -667,6 +673,7 @@ run_step0() { # FAKE_STALE_JSON
 #   $8 = FAKE_SLING_LABELS              (sling→extra-label map — ga-d2jil sling gate-marker guard seam)
 #   $9 = PILOT_TEST_DEAD_SLINGS         (space-list of sling ids treated as STALE by _sling_is_live — ga-l7pp)
 #   $10 = FAKE_SLING_STATUS             (bd-native status the shim reports for any *sling* id; default "open" — ga-brnlfa)
+#   $11 = FAKE_SLING_UPDATED_AT         (sling→updated_at map — ga-d63o9n1 alias-twin seam)
 run_neverstarted() {
   : > "$FIXCITY/.gc/logs/pilot-dispatcher.log"
   reset_state
@@ -685,6 +692,7 @@ run_neverstarted() {
     PILOT_TEST_BRANCH_BEADS="${2:-}" \
     FAKE_SESSIONS_JSON="${3:-}" \
     FAKE_SLING_STATUS="${10:-}" \
+    FAKE_SLING_UPDATED_AT="${11:-}" \
     FAKE_SLING_ASSIGNEES="${4:-}" \
     PILOT_TEST_CREW_PROGRESSED="${5:-}" \
     PILOT_TEST_CREW_BRANCH_BEADS="${6:-}" \
@@ -1006,6 +1014,7 @@ run_dedup_wrapper() { # $1=pilot.sling_bead on the story  $2=PILOT_TEST_DEAD_SLI
 #   $4 = FAKE_BUGS_JSON            (override the default 2-bug fixture)
 #   $5 = FAKE_SESSIONS_JSON        (ga-e5yw2 live-session roster; default empty)
 #   $6 = FAKE_SLING_ASSIGNEES      (ga-e5yw2 sling→assignee map; default empty)
+#   $7 = FAKE_SLING_UPDATED_AT     (ga-d63o9n1 sling→updated_at map; default empty)
 run_capacity() {
   : > "$FIXCITY/.gc/logs/pilot-dispatcher.log"
   rm -f "$FIXCITY/.gc/pilot-dispatcher.jsonl"
@@ -1034,6 +1043,7 @@ run_capacity() {
     FAKE_BUGS_JSON="${4:-}" \
     FAKE_SESSIONS_JSON="${5:-}" \
     FAKE_SLING_ASSIGNEES="${6:-}" \
+    FAKE_SLING_UPDATED_AT="${7:-}" \
     FAKE_BLOCKED_IDS="" \
     bash "$DISPATCHER" >/dev/null 2>&1 || true
   cat "$FIXCITY/.gc/logs/pilot-dispatcher.log"
@@ -3063,6 +3073,23 @@ else
   ok "live + no-assignee beads correctly kept as live occupants"
 fi
 
+# ── Scenario 12c (ga-d63o9n1): o gêmeo de alias do slot não segura a bead do dog morto ───────────────────────
+# O dog que era gastown.dog-2 morreu com a bead A in-flight; a sessão nova do slot (nasceu há 300 s) reaproveitou o alias e pegou a bead B (tocada há 120 s, DEPOIS de nascer).
+# Antes: as duas pareciam em mãos (o gêmeo casa o alias) e o slot da A ficava preso. Agora só a A (parada há 1 h, desde ANTES do nascimento) é fantasma — a B segue ocupando o dela.
+iso_ago() { python3 -c 'import datetime as d,sys; print((d.datetime.now(d.timezone.utc)-d.timedelta(seconds=int(sys.argv[1]))).strftime("%Y-%m-%dT%H:%M:%SZ"))' "$1"; }
+echo "Scenario 12c: alias-twin frees the dead claimer's slot and keeps the twin's own bead (ga-d63o9n1)"
+TWIN_SESS='{"sessions":[{"id":"ga-new","name":"gastown.dog-2","alias":"gastown.dog-2","session_name":"dog-galsnew","agent_name":"gastown.dog-2","template":"gastown.dog","state":"active","closed":false,"created_at":"'"$(iso_ago 300)"'"}]}'
+TWIN_SLINGS='{"tt-sling-ghost":"gastown.dog-2","tt-sling-mine":"gastown.dog-2"}'
+TWIN_UPDATED='{"tt-sling-ghost":"'"$(iso_ago 3600)"'","tt-sling-mine":"'"$(iso_ago 120)"'"}'
+INFLIGHT12C="[\
+{\"id\":\"if-ghost\",\"labels\":[\"story:in-flight\"],\"updated_at\":\"$NOW_ISO12\",\"metadata\":{\"pilot.sling_bead\":\"tt-sling-ghost\"}},\
+{\"id\":\"if-mine\",\"labels\":[\"story:in-flight\"],\"updated_at\":\"$NOW_ISO12\",\"metadata\":{\"pilot.sling_bead\":\"tt-sling-mine\"}}]"
+LOG12C="$(run_capacity 10 "$INFLIGHT12C" 1 "" "$TWIN_SESS" "$TWIN_SLINGS" "$TWIN_UPDATED")"
+if echo "$LOG12C" | grep "Dead ids: if-ghost" >/dev/null; then ok "the ghost bead (quiet since before the twin was born) is freed from the slot count"
+else bad "alias-twin: the dead claimer's bead still holds its slot (expected 'Dead ids: if-ghost')"; fi
+if echo "$LOG12C" | grep -E "Dead ids:.*if-mine" >/dev/null; then bad "REGRESSION: freed the twin's OWN bead (touched after it was born) — would over-dispatch"
+else ok "the bead touched AFTER the twin was born keeps its slot"; fi
+
 # ── Scenario 12b: roster unreadable/empty → dead-worker check DISABLED ─────────
 # (ga-e5yw2 fail-safe) Same in-flight set, but the session roster comes back
 # EMPTY (a failed/racy `session list`). The dead-worker check must switch OFF
@@ -3648,6 +3675,15 @@ if echo "$LOG16F" | grep "releasing never-started in-flight bead tt-ns-dead" >/d
 else
   bad "did NOT release the dead-worker never-started bead tt-ns-dead"
 fi
+
+# 16AT (ga-d63o9n1): same roster/claims as Scenario 12c. A never-started bead whose only matching session is the alias-TWIN (born after the bead was last touched) is RELEASED;
+# the bead the twin touched itself stays in its hands.
+NS_TWIN='[{"id":"tt-ns-ghost","description":"fixture body — context for veto test","status":"open","labels":["story:in-flight","pilot:dispatched"],"metadata":{"pilot.dispatched_at":"'"$NS_OLD"'","pilot.sling_bead":"tt-sling-ghost"}},{"id":"tt-ns-mine","description":"fixture body — context for veto test","status":"open","labels":["story:in-flight","pilot:dispatched"],"metadata":{"pilot.dispatched_at":"'"$NS_OLD"'","pilot.sling_bead":"tt-sling-mine"}}]'
+LOG16AT="$(run_neverstarted "$NS_TWIN" "" "$TWIN_SESS" "$TWIN_SLINGS" "" "" "" "" "" "" "$TWIN_UPDATED")"
+if echo "$LOG16AT" | grep "releasing never-started in-flight bead tt-ns-ghost" >/dev/null; then ok "alias-twin: the dead claimer's never-started bead is released (the twin is not its builder)"
+else bad "alias-twin: tt-ns-ghost stayed pinned by the twin — NEVERSTARTED did not release it"; fi
+if echo "$LOG16AT" | grep "releasing never-started in-flight bead tt-ns-mine" >/dev/null; then bad "REGRESSION: released the bead the twin touched itself (double-dispatch)"
+else ok "the bead touched after the twin was born stays kept"; fi
 
 # 16g: legacy bead with NO pilot.dispatched_at stamp → stamp-now, NOT released
 # (the ga-2azzj Defect-A discipline: never release on first sight).
