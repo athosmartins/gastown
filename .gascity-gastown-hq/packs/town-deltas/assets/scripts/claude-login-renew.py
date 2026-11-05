@@ -10,9 +10,14 @@
 
 When the scheduled run acts (one account per run, the forecast first by nearest end, then the outage with the pool's pick first):
   * FORECAST: the best login of a config-dir account (its own item, its reserve) ends within EXPIRY_WARN_S (7 days) or already ended. The account that HOLDS the
-    default item is left alone while the default is a full login: the CLI rotates that login and a fresh login of the same account could cost the default its
-    refresh token (not measured).
-  * OUTAGE: the crew job has had NO full login in the default item for NO_LOGIN_WARN_S (10 min) AND no config-dir account has a usable one stored.
+    default is left alone while the default is a full login - in the default ITEM or in the credentials FILE the tmux sessions read and rotate in (ga-i4t0lzx): the CLI
+    rotates that login and a fresh login of the same account could cost the default its refresh token (not measured).
+  * OUTAGE: the crew job has had NO full login in the default item for NO_LOGIN_WARN_S (10 min) AND no account has a stored login the CREW JOB WOULD WRITE. "Usable" is
+    the crew job's own judge (its source_refusal): a login it holds back after an unverified switch, quarantined, knows to be another account's, or has burned is NOT usable.
+    On 04/11 this job called such logins usable, saw no outage, and stayed silent for the whole of it. The credentials file counts like the default item (a full login in it is
+    a login the sessions have); an item or the file that cannot be READ means "unknown": no outage is judged.
+  EVERY scheduled run leaves one `scheduled run:` line in the log (accounts looked at, the verdict on the outage, what was launched, who was passed over and why): silence
+  means the job did not run, never "nothing to say".
   An account whose mark says "wait" (`recheck_at`, `next_at`) is not touched before that time. Off switch: GC_LOGIN_RENEW=0 or <city>/.gc/no-login-renew.
   Whatever the run cannot KNOW launches nothing (and says so): an unreadable state file or crew state, an item that cannot be read.
 
@@ -28,7 +33,7 @@ What it does NOT do (Anthropic's anti-abuse is not ours to beat; ga-yyltfk 04/10
 a password / a phone tap / a security key, or the profile has no session for that Google account, or the browser is signed in as another account, the
 driver STOPS (verdict `puzzle`, `needs_password`, `needs_device`, `no_google_session`, `wrong_account`) and nothing is retried. Slice 2: the account is
 then marked "inviavel por automacao" in the state and Athos gets ONE push with the exact step (retried every PUSH_RETRY_S until delivered, never
-repeated); a wall fixed in the BROWSER (CHROME_FIX) is to be looked at again after RECHECK_S (`recheck_at`), a transient failure after RETRY_S (`next_at`),
+repeated; notify's exit 12 - the push cap holding a forced push - is answered ONCE with the same text as a decision that waits for Athos, the route the cap exempts); a wall fixed in the BROWSER (CHROME_FIX) is to be looked at again after RECHECK_S (`recheck_at`), a transient failure after RETRY_S (`next_at`),
 the 3rd failure in a row is the same mark; a login made by hand (HAND_LOGIN_GAIN_S more life) lifts the mark. Slice 3: the scheduled run READS `recheck_at` and `next_at`.
 
 Secrets: tokens never leave this process except through `security -i` stdin (the crew module's kc_write); the OAuth URL never reaches argv, log or stdout;
@@ -257,23 +262,16 @@ def attempt(email: str, reason: str, t: float) -> Tuple[str, str, Optional[dict]
 
 
 # ── the state: what each account has, its marks, the one push ──────────────────────────────────
-def push(title: str, text: str) -> bool:
-    """One `notify -p 4` under notify's STRICT contract (the crew module's push, ga-xoe5ao.4): delivered = exit 0, 10 (held for 07:00) or 11 (same title < 30 min)."""
+def push(title: str, text: str, urgent: bool = True) -> bool:
+    """One `notify -p 4` under notify's STRICT contract (the crew module's `deliver`, ga-xoe5ao.4): delivered = exit 0, 10 (held for 07:00) or 11 (same title < 30 min).
+    ga-i4t0lzx: exit 12 is notify's push CAP holding a FORCED push; a wall (only a person ends it - `urgent`, the default here: every push of this job is one) that comes
+    back 12 is asked once more as a decision that waits for Athos, the route the cap exempts. The same function as the crew job's: one escalation, not two copies of it."""
     n = os.environ.get("CLAUDE_CREW_NOTIFY") or shutil.which("notify")
     if not n:
         rlog("ERROR", f"no notify binary: the push '{title}' could not be sent")
         return False
-    env = {**os.environ, "NOTIFY_STRICT_EXIT": "1", "NOTIFY_FORCE_PUSH": "1"}
-    try:
-        # vazio (nothing printed) → fine, only the exit code counts; falhou/ilegível (cannot run, any exit but 0/10/11) → NOT delivered, said, retried
-        r = subprocess.run([n, "-t", title, "-p", "4", f"job falhou: claude-login-renew — {text}"], env=env, capture_output=True, text=True, timeout=30, check=False)
-    except (OSError, subprocess.SubprocessError) as e:
-        rlog("ERROR", f"notify could not run ({type(e).__name__}): the push '{title}' was not delivered")
-        return False
-    if r.returncode not in C.NOTIFY_DELIVERED:
-        rlog("ERROR", f"notify exit={r.returncode}: the push '{title}' was not delivered")
-        return False
-    return True
+    # vazio (nothing printed) → fine, only the exit code counts; falhou/ilegível (cannot run, any exit but 0/10/11) → NOT delivered, said, retried
+    return C.deliver(n, title, f"job falhou: claude-login-renew — {text}", urgent, say=rlog)
 
 
 def state_path() -> Path:
@@ -330,14 +328,26 @@ def holder_of(crew: dict) -> Optional[str]:
     return h if isinstance(h, str) else None
 
 
-def survey(email: str, crew: dict, t: float) -> dict:
-    """What `email` has: best_left (seconds to the end of its best refresh token, None = no end recorded anywhere), full (a usable full login is stored: one the crew job
-    has not called dead), default_full (the default item holds such a login), unread (an item that could not be read: the account is not judged), no_object (its OWN item parses but holds
-    no login object: it says nothing about a login, yet attempt() will not launch for it - what cannot be put back is not touched)."""
-    best, full, default_full, unread, no_object = None, False, False, False, False
+def cred_view(crew: dict, t: float) -> dict:
+    """The credentials file of the default config dir, as the survey needs it (ga-i4t0lzx): the Mayor's and the crews' sessions run in the launchd Background session,
+    where the Keychain cannot be read, so they read - and rotate - THIS file. {'full': a full login that is not dead is in it, 'unread': it may hold one and cannot be looked
+    at (unreadable, or a path the crew job refuses: a symlink...), 'state': the crew module's word for it}. A file with no login object, or none at all, says nothing."""
+    state, fb, _ = C.read_cred_file()
+    full = state == "ok" and C.full_login(fb, t)[0] and C.dead_login(crew, C.fp(fb["claudeAiOauth"].get("refreshToken"))) is None
+    return {"full": bool(full), "unread": state in ("unreadable", "refused"), "state": state}
+
+
+def survey(email: str, crew: dict, t: float, file: Optional[dict] = None) -> dict:
+    """What `email` has: best_left (seconds to the end of its best refresh token, None = no end recorded anywhere), full (a usable full login is stored: one the CREW JOB WOULD
+    WRITE - its own judge, source_refusal, so the two jobs cannot disagree on 'usable' as they did on 04/11 - or, for the holder of the default, the default item or the
+    credentials file holds a full login that is not dead), default_full (the holder's default item or file holds such a login), unread (an item - or, for the holder, the file - that
+    could not be read: the account is not judged), no_object (its OWN item parses but holds no login object: it says nothing about a login, yet attempt() will not launch for it -
+    what cannot be put back is not touched), refused (the logins that exist but the crew job would not write, with its reason: what the log says when an outage is not fixed by them)."""
+    best, full, default_full, unread, no_object, refused = None, False, False, False, False, []
+    holder = email == holder_of(crew)
     d = acct_dir(email)
     own = C.dir_service(str(d)) if d else None
-    for svc in list(C.source_services(email)) + ([C.DEFAULT_SERVICE] if email == holder_of(crew) else []):
+    for svc in list(C.source_services(email)) + ([C.DEFAULT_SERVICE] if holder else []):
         s, _, b = C.kc_read(svc)
         # vazio (missing item, an item with no login object) → says nothing; falhou/ilegível (locked keychain, crashed security: 'unknown' with no blob) → NOT judged this run
         if s == "unknown" and b is None:
@@ -347,11 +357,23 @@ def survey(email: str, crew: dict, t: float) -> dict:
             left = C._ms_left(o, "refreshTokenExpiresAt", t)
             if left is not None:
                 best = left if best is None else max(best, left)
-            if C.full_login(b, t)[0] and not C.dead_login(crew, C.fp(o.get("refreshToken"))):
+            if svc == C.DEFAULT_SERVICE:                       # the LIVE login of the holder, not a source: the crew job's rule for it is full and not dead
+                why = None if C.full_login(b, t)[0] and not C.dead_login(crew, C.fp(o.get("refreshToken"))) else "not a usable full login"
+            else:
+                why = C.source_refusal(crew, email, svc, b, t)
+            if why is None:
                 full, default_full = True, default_full or svc == C.DEFAULT_SERVICE
+            elif svc != C.DEFAULT_SERVICE and C.full_login(b, t)[0]:
+                refused.append(f"{svc}: {why}")                # a full login that exists and that the crew job would not write: said, it is why an outage is not mended by it
         elif s == "unknown" and svc == own:
             no_object = True
-    return {"best_left": best, "full": full, "default_full": default_full, "unread": unread, "no_object": no_object}
+    only_file = False
+    if holder and file is not None:
+        if file["unread"]:
+            only_file, unread = not unread, True
+        elif file["full"]:
+            full = default_full = True
+    return {"best_left": best, "full": full, "default_full": default_full, "unread": unread, "no_object": no_object, "refused": refused, "unread_file": only_file}
 
 
 def release_marks(st: dict, crew: dict, t: float) -> None:
@@ -471,46 +493,86 @@ def disabled() -> Optional[str]:
     return str(c / ".gc" / "no-login-renew") if c and (c / ".gc" / "no-login-renew").exists() else None
 
 
-def candidates(st: dict, crew: dict, dec, t: float) -> List[Tuple[str, str]]:
-    """(email, reason) in the order they should be tried: the forecast by nearest end, then the outage with the pool's pick first."""
+def candidates(st: dict, crew: dict, dec, t: float, facts: Optional[dict] = None) -> List[Tuple[str, str]]:
+    """(email, reason) in the order they should be tried: the forecast by nearest end, then the outage with the pool's pick first.
+    `facts`, when given, is filled with what the run's summary line says (ga-i4t0lzx: a run that judges nothing to do must still say so): accounts (how many were looked at),
+    outage (the verdict on the outage, in words) and passed (the accounts that were DUE and not launched, each with why)."""
+    facts = facts if facts is not None else {}
+    passed = facts.setdefault("passed", [])
     holder = holder_of(crew)
-    surveys = {e: survey(e, crew, t) for e in C.accounts()}      # ALL of them: an account with no config dir (a backup or reserve item) is a login the crew job heals from
+    cf = cred_view(crew, t)                                    # read ONCE: the file is the holder's second store (the sessions read and rotate in it), not an account's
+    surveys = {e: survey(e, crew, t, cf) for e in C.accounts()}      # ALL of them: an account with no config dir (a backup or reserve item) is a login the crew job heals from
+    facts["accounts"] = len(surveys)
     forecast, outage = [], []
     ep = crew.get("no_login")
-    in_outage = (isinstance(ep, dict) and isinstance(ep.get("since"), (int, float)) and not isinstance(ep.get("since"), bool)
-                 and not ep.get("ending") and t - ep["since"] >= C.NO_LOGIN_WARN_S)
-    none_usable = in_outage and all(not v["full"] and not v["unread"] for v in surveys.values())
+    since = ep.get("since") if isinstance(ep, dict) and isinstance(ep.get("since"), (int, float)) and not isinstance(ep.get("since"), bool) else None
+    in_outage = since is not None and not ep.get("ending") and t - since >= C.NO_LOGIN_WARN_S
+    mins = int((t - since) // 60) if since is not None else 0
+    unknown = cf["unread"] or any(v["unread"] for v in surveys.values())      # an item or the file that may hold a login and cannot be looked at: "no login anywhere" cannot be said
+    has_login = [e for e, v in surveys.items() if v["full"]] + (["the credentials file"] if cf["full"] and holder is None else [])
+    none_usable = in_outage and not unknown and not cf["full"] and all(not v["full"] for v in surveys.values())
+    if cf["unread"]:
+        rlog("WARN", f"the credentials file {C.cred_file()} could not be read ({cf['state']}): whether the sessions have a login is unknown, so no outage is judged"
+                     + (f" and {holder} is not judged this run" if holder else ""))
+    if since is None or (isinstance(ep, dict) and ep.get("ending")):
+        facts["outage"] = "no outage"
+    elif not in_outage:
+        facts["outage"] = f"an outage of {mins} min, younger than {C.NO_LOGIN_WARN_S // 60} min: no outage is judged yet"
+    elif unknown:
+        facts["outage"] = f"an outage of {mins} min, but whether any account has a login is unknown (an item or the credentials file could not be read): no outage is judged"
+    elif has_login or cf["full"]:
+        facts["outage"] = (f"an outage of {mins} min, but a login the crew job will write is stored ({', '.join(has_login) or 'the credentials file'}): it heals from it, no outage is judged")
+    else:
+        why = [r for v in surveys.values() for r in v["refused"]]
+        facts["outage"] = f"an outage of {mins} min and no stored login the crew job would write" + (f" (it refuses: {'; '.join(why)})" if why else "")
     pick = str((dec or {}).get("current") or "").strip().lower() if isinstance(dec, dict) else ""
     for email, v in surveys.items():
         a = (st.get("accounts") or {}).get(email) or {}
+        due = "forecast" if v["best_left"] is not None and v["best_left"] <= C.EXPIRY_WARN_S else "outage" if none_usable else None
         if v["unread"]:
-            rlog("WARN", f"{email}: an item could not be read - the account is not judged this run" + ("" if acct_dir(email) else " (and whether any account has a login is unknown, so no outage is judged)"))
+            what = "the credentials file" if v["unread_file"] else "an item"
+            rlog("WARN", f"{email}: {what} could not be read - the account is not judged this run" + ("" if acct_dir(email) else " (and whether any account has a login is unknown, so no outage is judged)"))
+            if due:
+                passed.append(f"{email} ({what} could not be read)")
             continue
         if not acct_dir(email):                                # nothing to log into: it only counts as a login that may exist (none_usable above), never as a candidate
             continue
         if email == holder and v["default_full"]:
             rlog("INFO", f"{email} holds the default and it is a full login - not touched (its rotation keeps it alive)")
+            if due:
+                passed.append(f"{email} (holds the default, a full login)")
             continue
         # vazio (no mark) → candidate; a mark whose recheck_at has come → looked at again; falhou/ilegível (a mark that is no object, a recheck_at that is no number) → stays marked, SAID
         if "infeasible" in a:
             mk = a["infeasible"]
             if not isinstance(mk, dict):
                 rlog("WARN", f"{email}: the mark is not an object - the account is not touched until the state is fixed")
+                if due:
+                    passed.append(f"{email} (its mark in the state file is damaged)")
                 continue
             if "recheck_at" in mk and (not isinstance(mk["recheck_at"], (int, float)) or isinstance(mk["recheck_at"], bool)):
                 rlog("WARN", f"{email}: the mark's recheck_at is not a number - the account is not touched until the state is fixed")
+                if due:
+                    passed.append(f"{email} (its mark in the state file is damaged)")
                 continue
             if not t >= C._num(mk.get("recheck_at"), float("inf")):    # a wall with no recheck_at waits for a login by hand; one with a recheck_at waits for it
+                if due:
+                    again = f"looked at again after {C._iso(mk['recheck_at'])}" if "recheck_at" in mk else "waits for a login by hand"
+                    passed.append(f"{email} (marked '{mk.get('verdict', '?')}', {again})")
                 continue
         wait = a.get("next_at", 0.0)
         if not isinstance(wait, (int, float)) or isinstance(wait, bool):
             rlog("WARN", f"{email}: next_at is not a number - the account is not touched until the state is fixed")
+            if due:
+                passed.append(f"{email} (its wait in the state file is damaged)")
             continue
         if t < wait:
+            if due:
+                passed.append(f"{email} (waits until {C._iso(wait)})")
             continue
-        due = "forecast" if v["best_left"] is not None and v["best_left"] <= C.EXPIRY_WARN_S else "outage" if none_usable else None
         if due and v["no_object"]:                             # the SAME precondition attempt() has: an account it would refuse must not be first in line and starve the ones behind it
             rlog("WARN", f"{email}: due ({due}) but its item holds no login object (a logged-out CLI), so nothing can be launched for it - by hand: {C.relogin_cmd(email)}")
+            passed.append(f"{email} (a logged-out CLI: nothing to launch for)")
         elif due == "forecast":
             forecast.append((v["best_left"], email))
         elif due == "outage":
@@ -576,20 +638,27 @@ def housekeeping() -> int:
         rlog("ERROR", f"nothing launched, pushed or written until {state_path()} is fixed or removed: without its marks the job would push the same wall again")
         return 1
     crew, crew_status = C.load_state()
-    todo = []
+    todo, facts, launched = [], {}, None
     if crew_status == "ok":
         release_marks(st, crew, t)
-        todo = candidates(st, crew, C.load_json(C.decision_path()), t)
+        todo = candidates(st, crew, C.load_json(C.decision_path()), t, facts)
     else:                                                      # who holds the default and who has no login is unknown: no login is judged, only the pending pushes go
         rlog("ERROR", f"the crew state {C.state_path()} is {crew_status}: no login is judged and nothing is launched")
     if todo and DRY:
         rlog("INFO", f"{todo[0][0]}: would be renewed now ({todo[0][1]}) - nothing launched" + (f"; then, in later runs: {', '.join(e for e, _ in todo[1:])}" if todo[1:] else ""))
+        launched = f"would launch {todo[0][0]} ({todo[0][1]})"
     else:
         for email, reason in todo:
             verdict, _, _ = run_account(st, crew, email, reason, t)
             t = C.now()
             if verdict != "skipped":                           # a try that launched NOTHING (skipped) does not use up the run: the next in line gets it, so one account that cannot be tried never starves the rest
+                launched = f"launched {email} ({reason}): {verdict}"
                 break
+            facts.setdefault("passed", []).append(f"{email} (nothing could be launched for it)")
+    if crew_status == "ok":                                    # ga-i4t0lzx: EVERY scheduled run leaves a line - 04/11 13:48Z-15:00Z the log stood still and silence looked the same as a job that was not running
+        passed = facts.get("passed") or []
+        rlog("INFO", f"scheduled run: {facts.get('accounts', 0)} account(s) looked at; {facts.get('outage', 'no outage')}; " + (launched or "nothing launched")
+             + (f"; passed over: {', '.join(passed)}" if passed else ""))
     err = None if DRY or not st.get("accounts") else settle(st, list(st["accounts"]), t)
     if err:
         rlog("ERROR", f"the state could not be written ({type(err).__name__}): this run's marks, tries and pushes are NOT recorded")

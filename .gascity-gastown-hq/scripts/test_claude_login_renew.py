@@ -94,8 +94,14 @@ json.dump(store, open(store_p, "w"))
 '''
 
 FAKE_NOTIFY = r'''#!/usr/bin/env python3
-import json, os, sys
-open(os.path.join(os.environ["FAKE_SEC_DIR"], "notify.log"), "a").write(json.dumps({"argv": sys.argv[1:], "strict": os.environ.get("NOTIFY_STRICT_EXIT")}) + "\n")
+import json, os, re, sys
+open(os.path.join(os.environ["FAKE_SEC_DIR"], "notify.log"), "a").write(json.dumps({"argv": sys.argv[1:], "strict": os.environ.get("NOTIFY_STRICT_EXIT"), "force": os.environ.get("NOTIFY_FORCE_PUSH")}) + "\n")
+# FAKE_NOTIFY_CAP: the real notify's push cap (8/h): a FORCED push is the "push forced" rule and the cap holds it (12); only the "decisao" rule - the text says it waits
+# for Athos - is exempt (notify: global_rate_limited, classify_route_detail rule 2), and it is not forced
+if os.environ.get("FAKE_NOTIFY_CAP"):
+    if not os.environ.get("NOTIFY_FORCE_PUSH") and re.search("aguardando voc\u00ea|needs-human", " ".join(sys.argv[1:]), re.I):
+        sys.exit(0)
+    sys.exit(12)
 sys.exit(int(os.environ.get("FAKE_NOTIFY_RC", "0")))
 '''
 
@@ -141,9 +147,12 @@ def _nothing_real_was_touched(tmp_path_factory):
     for n in ("security", "claude", "open", "xdg-open", "gmail-totp", "notify"):
         (guard / n).write_text(f'#!/bin/sh\necho "$0 $*" >> "{hits}"\nexit 99\n')
         (guard / n).chmod(0o700)
+    real = Path(os.path.expanduser("~/.claude/.credentials.json"))
+    snap = (real.stat().st_mtime_ns, real.stat().st_size) if real.exists() else None       # ga-i4t0lzx: the file the sessions read must not be touched by a test either
     _GUARD.update(dir=guard, hits=hits)
     yield
     assert not hits.exists(), "a test reached a REAL security/claude/open/gmail-totp (sentinel executed):\n" + hits.read_text()
+    assert snap == ((real.stat().st_mtime_ns, real.stat().st_size) if real.exists() else None), "a test touched the REAL ~/.claude/.credentials.json"
 
 
 @pytest.fixture(autouse=True)
@@ -152,7 +161,8 @@ def _pin_env(monkeypatch, tmp_path):
     for k, v in {"CLAUDE_CREW_SECURITY": g / "security", "CLAUDE_RENEW_CLAUDE": g / "claude", "CLAUDE_RENEW_DRIVER": json.dumps([str(g / "gmail-totp")]),
                  "GC_CITY_PATH": tmp_path / "pinned-city", "CLAUDE_CREW_STATE": tmp_path / "pinned-crew-state.json",
                  "CLAUDE_CREW_ACCOUNTS_DIR": tmp_path / "pinned-accts", "HOME": tmp_path / "pinned-home", "CLAUDE_CREW_NOTIFY": g / "notify",
-                 "CLAUDE_RENEW_STATE": tmp_path / "pinned-renew-state.json", "CLAUDE_CREW_DECISION": tmp_path / "pinned-decision.json"}.items():
+                 "CLAUDE_RENEW_STATE": tmp_path / "pinned-renew-state.json", "CLAUDE_CREW_DECISION": tmp_path / "pinned-decision.json",
+                 "CLAUDE_CREW_CRED_FILE": tmp_path / "pinned-home" / ".claude" / ".credentials.json"}.items():
         monkeypatch.setenv(k, str(v))
     monkeypatch.setenv("PATH", f"{g}:/usr/bin:/bin")
 
@@ -185,9 +195,10 @@ class World:
                      "CLAUDE_RENEW_DRIVER": json.dumps([str(self.d / "driver"), "drive"]), "CLAUDE_CREW_STATE": str(self.d / "crew_state.json"),
                      "CLAUDE_CREW_NOTIFY": str(self.d / "notify"), "CLAUDE_RENEW_STATE": str(self.d / "renew_state.json"), "CLAUDE_CREW_DECISION": str(self.d / "pool_decision.json"),
                      "CLAUDE_CREW_ACCOUNTS_DIR": str(self.d / "accts"), "CLAUDE_CREW_USER": "athos", "GC_CITY_PATH": str(self.d / "city"),
+                     "CLAUDE_CREW_CRED_FILE": str(self.d / "claude-home" / ".credentials.json"),
                      "CLAUDE_CREW_PROFILE_URL": f"http://127.0.0.1:{self.srv.server_address[1]}/profile", "CLAUDE_CREW_NOW": str(T0)}.items():
             monkeypatch.setenv(k, v)
-        for k in ("CLAUDE_CREW_ACCOUNTS", "FAKE_SEC_FAIL", "FAKE_CLAUDE_MODE", "FAKE_DRIVER_VERDICT", "FAKE_CLAUDE_BLOB", "FAKE_NOTIFY_RC", "GC_LOGIN_RENEW"):
+        for k in ("CLAUDE_CREW_ACCOUNTS", "FAKE_SEC_FAIL", "FAKE_CLAUDE_MODE", "FAKE_DRIVER_VERDICT", "FAKE_CLAUDE_BLOB", "FAKE_NOTIFY_RC", "FAKE_NOTIFY_CAP", "GC_LOGIN_RENEW"):
             monkeypatch.delenv(k, raising=False)
         monkeypatch.setattr(renew, "DRY", False, raising=False)  # main() sets it for the whole process: no test leaves a dry run behind
         self.mp = monkeypatch
@@ -212,6 +223,16 @@ class World:
 
     def crew_state(self, **kw):
         (self.d / "crew_state.json").write_text(json.dumps(kw))
+
+    @property
+    def cred(self):
+        return Path(os.environ["CLAUDE_CREW_CRED_FILE"])
+
+    def put_file(self, b):
+        """The credentials file of the default config dir (ga-i4t0lzx): what the sessions of the tmux server read, and rotate the token in."""
+        self.cred.parent.mkdir(parents=True, exist_ok=True)
+        self.cred.write_text(json.dumps(b))
+        self.cred.chmod(0o600)
 
     def decide(self, key):
         (self.d / "pool_decision.json").write_text(json.dumps({"current": EMAIL[key], "updated": crew._iso(T0), "schema": 1, "exhausted": {}}))
@@ -662,6 +683,38 @@ def test_a_notify_that_cannot_run_is_not_delivered_and_said(w):
     assert renew.push("t", "x") is False and "could not run" in w.log()
 
 
+def test_a_wall_push_held_by_the_push_cap_is_asked_once_more_as_a_decision_that_waits_for_athos(w):
+    """04/11: notify said 12 (the cap holds a FORCED push) once per retry window and the wall went unannounced. The 'decisao' route is exempt from the cap and is not forced."""
+    w.own("b85", blob("b85-old", rexp_days=3.0))
+    w.mp.setenv("FAKE_NOTIFY_CAP", "1")
+    script(w, ("puzzle", "at the page", None))
+    assert w.run() == 2
+    first, second = w.calls("notify")
+    assert first["force"] == "1" and second["force"] is None and second["strict"] == "1"
+    assert crew.WAITS_FOR_ATHOS in second["argv"][1] and crew.WAITS_FOR_ATHOS in second["argv"][4] and second["argv"][1] != first["argv"][1]
+    assert "job falhou: claude-login-renew" in second["argv"][4] and crew.relogin_cmd(EMAIL["b85"]) in second["argv"][4]
+    assert w.mark()["pushed"] == T0 and "notify exit=12" in w.log()
+
+
+def test_a_push_the_cap_holds_twice_is_not_delivered_and_the_bare_run_asks_again_later(w):
+    w.own("b85", blob("b85-old", rexp_days=3.0))
+    w.mp.setenv("FAKE_NOTIFY_RC", "12")                                                         # even the decision route comes back 12: nothing was told
+    script(w, ("puzzle", "s", None))
+    w.run()
+    assert len(w.calls("notify")) == 2 and "pushed" not in w.mark()
+    w.at(renew.PUSH_RETRY_S)
+    renew.housekeeping()
+    assert len(w.calls("notify")) == 4 and "pushed" not in w.mark()
+
+
+def test_a_push_that_goes_through_the_first_time_is_not_asked_twice(w):
+    w.own("b85", blob("b85-old", rexp_days=3.0))
+    script(w, ("puzzle", "s", None))
+    w.run()
+    (n,) = w.calls("notify")
+    assert n["force"] == "1" and crew.WAITS_FOR_ATHOS not in n["argv"][1]
+
+
 def test_the_same_wall_is_not_pushed_again_but_a_different_wall_is(w):
     w.own("b85", blob("b85-old", rexp_days=3.0))
     script(w, ("puzzle", "s", None), ("puzzle", "s", None), ("needs_password", "p", None))
@@ -945,6 +998,170 @@ def test_the_forecast_goes_before_the_outage_and_the_dry_run_says_the_whole_orde
     err = capsys.readouterr().err
     assert (f"{EMAIL['b85']}: would be renewed now (forecast) - nothing launched; then, in later runs: "
             f"{EMAIL['amb']}, {EMAIL['crypto']}, {EMAIL['terr']}") in err
+
+
+# ── ga-i4t0lzx: ONE judge of "a usable login", the file the sessions read, and a run that is never silent ───────────────
+# 04/11: the default died at 13:56Z and the job ran every 15 minutes - and wrote NOTHING for the rest of the outage. Its survey called a login "usable" that the
+# crew job refuses (held after an unverified switch, quarantined, known to be another account's), so it never saw an outage; it never looked at the credentials file
+# the tmux sessions read and rotate in; and a run that judged nothing to do left no line, so silence could not be told from a job that was not running.
+ALL = ("crypto", "b85", "terr", "amb")
+
+
+def refused(w, kind, keys=ALL):
+    """The crew-state keys that make the crew job REFUSE the login stored in each key's own item (healthy() stores blob(f"{k}-ok"))."""
+    st = {}
+    for k in keys:
+        rfp = fps(blob(f"{k}-ok"))[1]
+        if kind == "held":
+            st.setdefault("unverified_logins", {})[rfp] = {"svc": "Claude Code-credentials-x", "target": EMAIL[k], "at": T0 - 3600}
+        elif kind == "quarantined":
+            st.setdefault("bad_sources", {})[w.svc(k)] = {"rfp": rfp, "owner": EMAIL["martins"]}
+        elif kind == "owned_by_another_account":
+            st.setdefault("owners", {})[rfp] = {"email": EMAIL["martins"], "at": T0 - 60}
+    return st
+
+
+@pytest.mark.parametrize("kind", ["held", "quarantined", "owned_by_another_account"])
+def test_logins_the_crew_job_refuses_are_not_usable_so_the_outage_renews_the_pool_pick(w, kind):
+    healthy(w)
+    outage(w, **refused(w, kind))
+    w.decide("terr")
+    seen = record(w)
+    assert renew.housekeeping() == 0
+    assert seen == [(EMAIL["terr"], "outage")]
+
+
+@pytest.mark.parametrize("kind", ["none", "held", "quarantined", "owned_by_another_account"])
+def test_the_renew_job_and_the_crew_job_agree_on_whether_an_account_has_a_usable_login(w, kind):
+    healthy(w)
+    w.crew_state(**refused(w, kind))
+    st, _ = crew.load_state()
+    for k in ALL:
+        crew_says = crew.load_source(EMAIL[k], T0, st)[0] is not None
+        assert renew.survey(EMAIL[k], st, T0)["full"] is crew_says, (kind, k)
+
+
+def test_one_account_with_a_login_the_crew_job_will_write_means_there_is_no_outage_however_many_are_refused(w):
+    healthy(w)
+    outage(w, **refused(w, "held", ("crypto", "b85", "amb")))                                   # terr's is fine: the crew job heals the default from it
+    seen = record(w)
+    assert renew.housekeeping() == 0 and seen == []
+
+
+def test_a_hold_that_has_lapsed_is_a_usable_login_again(w):
+    healthy(w)
+    st = refused(w, "held")
+    for rec in st["unverified_logins"].values():
+        rec["at"] = T0 - crew.UNVERIFIED_HOLD_S - 1
+    outage(w, **st)
+    seen = record(w)
+    assert renew.housekeeping() == 0 and seen == []
+
+
+def test_the_holders_full_login_in_the_credentials_file_is_a_login_the_sessions_use_so_there_is_no_outage(w):
+    outage(w, current=EMAIL["crypto"])                                                          # nothing stored anywhere: the only login is the one in the file
+    w.put_file(blob("crypto-file", rexp_days=25.0))
+    seen = record(w)
+    assert renew.housekeeping() == 0 and seen == []
+
+
+@pytest.mark.parametrize("what", ["a_login_that_is_not_full", "a_burned_login", "no_file", "a_file_with_no_login_object"])
+def test_a_credentials_file_without_a_usable_login_does_not_stop_the_outage(w, what):       # negative controls: these launch on HEAD too
+    extra = {}
+    if what == "a_login_that_is_not_full":
+        w.put_file({"claudeAiOauth": {"accessToken": "sk-ant-oat01-setup-acc", "expiresAt": int((T0 + DAY) * 1000), "scopes": ["user:inference"]}})
+    elif what == "a_burned_login":
+        w.put_file(blob("crypto-file"))
+        extra = {"burned": {fps(blob("crypto-file"))[1]: {"n": crew.BURN_LIMIT}}}
+    elif what == "a_file_with_no_login_object":
+        w.cred.parent.mkdir(parents=True, exist_ok=True)
+        w.cred.write_text("{}")
+    outage(w, current=EMAIL["crypto"], **extra)
+    w.decide("amb")
+    seen = record(w)
+    renew.housekeeping()
+    assert seen == [(EMAIL["amb"], "outage")]
+
+
+def test_the_holder_whose_login_lives_in_the_file_is_left_alone_like_one_whose_login_is_in_the_item(w):
+    healthy(w)
+    w.own("crypto", blob("crypto-own", rexp_days=2.0))
+    w.crew_state(current=EMAIL["crypto"])                                                       # the default ITEM is blank; the sessions run on the file
+    w.put_file(blob("crypto-file", rexp_days=25.0))
+    seen = record(w)
+    renew.housekeeping()
+    assert seen == []
+    assert f"{EMAIL['crypto']} holds the default and it is a full login" in w.log()
+
+
+@pytest.mark.parametrize("how", ["mode_000", "symlink"])
+def test_a_credentials_file_that_cannot_be_read_may_hold_a_login_so_no_outage_is_judged_and_the_log_says_why(w, how):
+    if how == "mode_000" and os.geteuid() == 0:
+        pytest.skip("root reads a mode-000 file")
+    outage(w, current=EMAIL["crypto"])
+    w.put_file(blob("crypto-file", rexp_days=25.0))
+    if how == "mode_000":
+        w.cred.chmod(0)
+    else:
+        real = w.d / "elsewhere.json"
+        real.write_bytes(w.cred.read_bytes())
+        w.cred.unlink()
+        w.cred.symlink_to(real)
+    try:
+        seen = record(w)
+        assert renew.housekeeping() == 0 and seen == []
+        assert "the credentials file" in w.log() and "no outage is judged" in w.log()
+    finally:
+        if how == "mode_000":
+            w.cred.chmod(0o600)
+
+
+def summary_lines(w):
+    return [x for x in w.log().splitlines() if " renew INFO " in x and "scheduled run" in x]
+
+
+def test_every_scheduled_run_leaves_a_line_even_when_there_is_nothing_to_do(w):
+    healthy(w)
+    seen = record(w)
+    assert renew.housekeeping() == 0 and renew.housekeeping() == 0 and seen == []
+    lines = summary_lines(w)
+    assert len(lines) == 2 and all("nothing launched" in x and "no outage" in x for x in lines)
+
+
+def test_a_run_that_launches_says_which_account_and_why_in_the_same_line(w):
+    healthy(w)
+    w.own("b85", blob("b85-x", rexp_days=2.0))
+    record(w)
+    renew.housekeeping()
+    (line,) = summary_lines(w)
+    assert f"launched {EMAIL['b85']} (forecast)" in line
+
+
+def test_an_outage_where_nobody_can_be_launched_says_who_was_passed_over_and_why_every_run(w):
+    healthy(w)
+    outage(w, **refused(w, "held"))
+    (w.d / "renew_state.json").write_text(json.dumps({"accounts": {
+        EMAIL["crypto"]: {"next_at": T0 + 3600},
+        EMAIL["b85"]: {"infeasible": {"verdict": "puzzle", "step": "s", "at": T0 - 60, "left": 29 * DAY, "pushed": T0 - 60}},
+        EMAIL["terr"]: {"next_at": T0 + 7200},
+        EMAIL["amb"]: {"infeasible": {"verdict": "needs_device", "step": "s", "at": T0 - 60, "left": 29 * DAY, "pushed": T0 - 60}}}}))     # "left" = what healthy() stores: a hand login would have MORE
+    seen = record(w)
+    for _ in range(2):
+        assert renew.housekeeping() == 0
+    assert seen == []
+    first, second = summary_lines(w)
+    assert first.split(" renew INFO ")[1] == second.split(" renew INFO ")[1]
+    assert "outage" in first and "nothing launched" in first
+    for k in ALL:
+        assert EMAIL[k] in first
+    assert "waits until" in first and "puzzle" in first and "needs_device" in first
+    assert "not an object" not in first and "not a number" not in first                      # the quiet-wall rule: a normal wall is not a damaged record
+
+
+def test_a_dry_run_says_the_summary_on_stderr_and_writes_no_log_file(w, capsys):
+    healthy(w)
+    assert renew.main(["--dry-run"]) == 0
+    assert "scheduled run" in capsys.readouterr().err and w.log() == ""
 
 
 # ── waits and marks ──────────────────────────────────────────────────────────────

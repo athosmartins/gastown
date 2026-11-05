@@ -937,7 +937,7 @@ def _notify_once(n: str, title: str, text: str, forced: bool, say=None) -> Optio
 
 
 def deliver(n: str, title: str, body: str, urgent: bool, say=None) -> bool:
-    """The push itself, written to be shared by this job and claude-login-renew (which adopts it in ga-i4t0lzx.1; until then it keeps its own copy - two copies of the 04/11 swallow is how it survived the first fix). `body` is sent as is.
+    """The push itself, written to be shared by this job and claude-login-renew (which adopted it in ga-i4t0lzx.1 and no longer keeps its own copy - two copies of the 04/11 swallow is how it survived the first fix). `body` is sent as is.
     Forced first; on exit 12 (notify's push cap) an `urgent` one is asked ONCE more, unforced, as a decision that waits for Athos (the route the cap exempts):
     the marker leads the title and the text. Delivered = notify's strict 0 / 10 / 11; anything else, or notify not running, is NOT delivered and said."""
     say = say or log
