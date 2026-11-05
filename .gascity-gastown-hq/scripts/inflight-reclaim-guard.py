@@ -81,6 +81,8 @@ Safety invariants (CRITICAL — actuates on real work beads):
     Checks any remote branch whose final segment matches <bead-id> (incl.
     crew/<pool>/<bead-id>, feat/<id>*, fix/<id>*, feature/<id>*, polecat/<id>*)
     in both HQ and WA repos. Fails safe on git error (→ branch-might-exist).
+  - ga-s90p58a: NEVER reclaims a bead whose WORKTREE shows progress either (get_worktree_progress: a commit at the HEAD or a changed file in a worktree named for the bead, in any rig repo from
+    `gc rig list`, within RECLAIM_TTL) — the rail for rigs WITHOUT a remote (traco-bim). Fails safe: unreadable → progress-might-exist, warned and counted; held for 2h → [WORKTREE-RAIL-BLIND].
   - NEVER reclaims beads with a gate-status:ready|dispatching|queued|claimed
     marker (bead is actively being processed by the gate pipeline; "ready" is
     the fresh-marker state /gate-done writes before a separate sweep promotes
@@ -2896,6 +2898,180 @@ def get_branch_recent(bead_id, fetch=True, window_seconds=None):
     return False
 
 
+# ga-s90p58a: trilho de progresso do WORKTREE, irmão do get_branch_recent. Ele só lê refs/remotes/origin/ dos REPOS: uma bead de rig SEM remote (traco-bim) não tinha trilho de progresso, e o trabalho
+# vivo e não commitado do worktree dela (~/gt/<rig>-wt/<bead>) não segurava o reclaim: com o ga-lotseol (que tirou a bead do dog morto de debaixo do gêmeo de alias) o dog seguinte a recebia sem saber do
+# worktree (wa-6g3m49: 3 arquivos não commitados). Três estados: WT_RECENT (um worktree da bead tem o commit do HEAD ou um arquivo alterado dentro da janela), WT_QUIET (lido e parado, ou sem worktree:
+# reclaim normal) e WT_UNREADABLE (não consegui ler: "pode haver progresso", tratado como RECENT, com aviso e contagem). Quieto é SÓ o que foi lido e está parado.
+WT_RECENT, WT_QUIET, WT_UNREADABLE = "recent", "quiet", "unreadable"
+WORKTREE_GIT_TIMEOUT = 30            # s por chamada de git do trilho: o teto das outras chamadas de git deste arquivo
+WORKTREE_FUTURE_SKEW_SECS = 300      # carimbo (commit ou mtime) além de agora + isto não prova trabalho recente, é data torta: vira dúvida, não "recente para sempre"
+WORKTREE_DOUBT_ALERT_SECS = int(os.environ.get("IRG_WORKTREE_DOUBT_ALERT_SEC", str(POOL_ZOMBIE_TTL)))   # dúvida de pé por tanto tempo vira alerta: a bead segue segura, mas deixa de ser silenciosa
+WT_RAIL_COUNTS = {"recent": 0, "unreadable": 0}   # consultas (uma por bead) por veredito; o run_cycle zera no começo do ciclo e o resumo do ciclo as mostra
+_WT_RAIL_WHY = None                  # por que a ÚLTIMA consulta terminou em WT_UNREADABLE (None = não terminou assim)
+
+
+class _WtUnreadable(Exception):
+    """O trilho do worktree não conseguiu ler algo; get_worktree_progress converte em WT_UNREADABLE, nunca em "quieto"."""
+
+
+def _wt_git(path, verb, *args, ok_rcs=(0,)):
+    """(rc, stdout em bytes) de `git -C path <verb> <args>`; _WtUnreadable se não roda, estoura o prazo ou sai com rc fora de ok_rcs. Somente leitura: --no-optional-locks (o `git status` comum REESCREVE o
+    índice do worktree de um dog vivo: medido, mtime e hash mudam) e core.fsmonitor=false (o fsmonitor embutido, se a config global o liga, inicia um daemon por worktree olhado: documentado no git, não medido aqui)."""
+    try:
+        r = subprocess.run(["git", "-C", path, "--no-optional-locks", "-c", "core.fsmonitor=false", verb] + list(args),
+                           capture_output=True, timeout=WORKTREE_GIT_TIMEOUT)
+    except subprocess.TimeoutExpired:
+        raise _WtUnreadable(f"git {verb} estourou {WORKTREE_GIT_TIMEOUT}s em {path}")
+    except OSError as exc:
+        raise _WtUnreadable(f"git {verb} não rodou em {path}: {exc}")
+    if r.returncode not in ok_rcs:
+        raise _WtUnreadable(f"git {verb} rc={r.returncode} em {path}: {r.stderr.decode(errors='replace').strip()[:160]}")
+    return r.returncode, r.stdout
+
+
+def _worktree_rail_repos():
+    """Repos cujos worktrees o trilho olha: os das rigs do `gc rig list`, a lista de onde o resto do guard tira as lojas de bead (não um caminho escrito aqui). O HQ não entra: tem remote (o trilho de branch
+    o cobre) e o worktree list dele tem centenas de árvores do gate (ver o laço por rig do worktree-reaper.sh)."""
+    # vazio ([] = cidade sem rig) → nada a olhar, quieto; falhou/ilegível (None) → _WtUnreadable: sem a lista não sei onde olhar, e isso não é "não há worktree"
+    stores = _list_rig_stores()
+    if stores is None:
+        raise _WtUnreadable(f"gc rig list falhou ({_RIG_LIST_ERR or 'sem motivo registrado'})")
+    return [path for _name, path in stores]
+
+
+def _list_worktrees(repo):
+    """[{"path", "branch"}] dos worktrees que o git registra em `repo` (`git worktree list --porcelain`); branch vazio = HEAD solto."""
+    # vazio → o git SEMPRE lista ao menos o worktree principal: saída vazia com rc 0 não é "nenhum worktree", é resposta que não consigo usar → _WtUnreadable; falhou/ilegível (rc≠0, prazo) → _WtUnreadable
+    _rc, out = _wt_git(repo, "worktree", "list", "--porcelain")
+    found = []
+    for line in os.fsdecode(out).split("\n"):
+        if line.startswith("worktree "):
+            found.append({"path": line[len("worktree "):], "branch": ""})
+        elif found and line.startswith("branch refs/heads/"):
+            found[-1]["branch"] = line[len("branch refs/heads/"):]
+    if not found:
+        raise _WtUnreadable(f"git worktree list sem nenhum worktree em {repo}")
+    return found
+
+
+def _worktree_activity(wt_path, now):
+    """Epoch do sinal de vida mais novo do worktree (commit do HEAD ou mtime de arquivo alterado), None se não há nenhum; _WtUnreadable se não consegui ler ou há carimbo além de agora + a margem.
+    "Alterado" = o que o `git status` lista (modificado, em stage, novo, apagado); o que o .gitignore esconde não é olhado. "Commit do HEAD" = a data da PONTA, como no trilho de branch: um worktree
+    cortado de um main de 10 min atrás mostra essa idade até envelhecer (no máximo um RECLAIM_TTL a mais)."""
+    # falhou/ilegível (registrado no git, mas o diretório não está no disco): _WtUnreadable — não sei se havia trabalho; quem limpa o registro é `git worktree prune`
+    if not os.path.isdir(wt_path):
+        raise _WtUnreadable(f"worktree registrado em {wt_path} mas o diretório não existe")
+    stamps = []
+    # vazio (HEAD sem commit: `rev-parse --verify -q HEAD` sai com rc 1) → sem sinal de commit, os arquivos ainda contam; falhou/ilegível (log com rc≠0, ou saída que não é número com o HEAD resolvendo) → _WtUnreadable
+    try:
+        _rc, out = _wt_git(wt_path, "log", "-1", "--format=%ct")
+        try:
+            stamps.append(int(out.strip()))
+        except ValueError:
+            raise _WtUnreadable(f"git log devolveu {out[:40]!r} em {wt_path}, não uma data")
+    except _WtUnreadable:
+        if _wt_git(wt_path, "rev-parse", "--verify", "-q", "HEAD", ok_rcs=(0, 1))[0] != 1:
+            raise
+    # vazio (status limpo) → só o commit conta; falhou/ilegível (status com rc≠0, mtime que o lstat não entrega) → _WtUnreadable
+    for entry in _wt_git(wt_path, "status", "--porcelain=v1", "-z", "--no-renames", "--untracked-files=all")[1].split(b"\0"):
+        if len(entry) < 4:
+            continue
+        probe = os.path.join(wt_path, os.fsdecode(entry[3:]))
+        while True:
+            try:
+                stamps.append(os.lstat(probe).st_mtime)
+                break
+            except FileNotFoundError:   # apagado: o rastro da remoção é o mtime do diretório de cima
+                if probe == wt_path:
+                    raise _WtUnreadable(f"o worktree {wt_path} sumiu enquanto eu lia")
+                probe = os.path.dirname(probe)
+            except OSError as exc:
+                raise _WtUnreadable(f"não li o mtime de {probe}: {exc}")
+    if any(t - now > WORKTREE_FUTURE_SKEW_SECS for t in stamps):
+        raise _WtUnreadable(f"carimbo no futuro em {wt_path} (commit ou mtime além de agora + {WORKTREE_FUTURE_SKEW_SECS}s)")
+    return max(stamps) if stamps else None
+
+
+def get_worktree_progress(bead_id, repos=None, window_seconds=None, now=None):
+    """WT_RECENT, WT_QUIET ou WT_UNREADABLE para `bead_id` (estados: comentário acima). Um worktree é "da bead" se o nome do diretório OU o último segmento do branch a nomeia (o casamento do trilho de
+    branch: `tb-1` não casa `tb-12`). `repos` None = a config (_worktree_rail_repos); window_seconds (padrão RECLAIM_TTL) e o `<` estrito são os do get_branch_recent. Somente leitura e nunca levanta: o
+    inesperado também é WT_UNREADABLE. O RECENT de um worktree ganha da dúvida vinda de OUTRO repo ou worktree; com dúvida e sem progresso o veredito é UNREADABLE, com um aviso por consulta e a contagem
+    em WT_RAIL_COUNTS."""
+    global _WT_RAIL_WHY
+    now = time.time() if now is None else now
+    window = RECLAIM_TTL if window_seconds is None else window_seconds
+    why = []
+    _WT_RAIL_WHY = None
+    try:
+        if repos is None:
+            try:
+                repos = _worktree_rail_repos()
+            except _WtUnreadable as exc:
+                repos = []
+                why.append(str(exc))
+        for repo in repos:
+            # vazio (diretório SEM .git: rig que não é repo) → não tem worktree, pulo; falhou/ilegível (o diretório do repo não existe mais) → dúvida
+            if not os.path.isdir(repo):
+                why.append(f"o repo da rig {repo} não existe")
+                continue
+            if not os.path.exists(os.path.join(repo, ".git")):
+                continue
+            try:
+                worktrees = _list_worktrees(repo)
+            except _WtUnreadable as exc:
+                why.append(str(exc))
+                continue
+            for wt in worktrees:
+                if not (_branch_segment_matches_bead(os.path.basename(wt["path"]), bead_id)
+                        or _branch_segment_matches_bead(wt["branch"].rsplit("/", 1)[-1], bead_id)):
+                    continue
+                try:
+                    newest = _worktree_activity(wt["path"], now)
+                except _WtUnreadable as exc:
+                    why.append(str(exc))
+                    continue
+                if newest is not None and now - newest < window:
+                    WT_RAIL_COUNTS["recent"] += 1
+                    print(f"[INFLIGHT-RECLAIM] worktree-rail: bead={bead_id} {wt['path']} com sinal de vida há {now - newest:.0f}s (< {window}s) — progresso recente, segura o reclaim", flush=True)
+                    return WT_RECENT
+    except Exception as exc:   # o trilho nunca levanta para o run_cycle: o inesperado também é "não sei"
+        why.append(f"erro inesperado ({type(exc).__name__}: {exc})")
+    if not why:
+        return WT_QUIET
+    _WT_RAIL_WHY = "; ".join(why[:3])
+    WT_RAIL_COUNTS["unreadable"] += 1
+    print(f"[INFLIGHT-RECLAIM] worktree-rail: bead={bead_id} não consegui ler: {_WT_RAIL_WHY} — tratando como progresso-pode-existir (fail-safe: NÃO reclama)", flush=True)
+    return WT_UNREADABLE
+
+
+def worktree_rail_holds(bead_id, bead_state, now):
+    """O trilho do worktree como o run_cycle o usa: True = a bead conta como tendo progresso recente (progresso num worktree dela, OU dúvida: não consegui ler = pode haver progresso). Segurar por dúvida não
+    pode ser silencioso para sempre (um worktree que o git nunca lê a seguraria só com linha de log; a lição do [GUARD-BLIND]): a dúvida contínua é cronometrada em bead_state e, ao completar
+    WORKTREE_DOUBT_ALERT_SECS, sai UM alerta [WORKTREE-RAIL-BLIND] (repetido no mesmo ritmo enquanto durar). `now` (o do ciclo) é só do relógio de dúvida: o trilho lê o relógio na hora da consulta,
+    porque a passada 1 do run_cycle faz 2 git fetch por bead e leva minutos, e uma atividade de DEPOIS do `now` do ciclo não pode parecer data no futuro."""
+    verdict = get_worktree_progress(bead_id)
+    if verdict != WT_UNREADABLE:
+        bead_state.pop("wt_doubt_since", None)
+    else:
+        since = bead_state.setdefault("wt_doubt_since", now)
+        # vazio (nunca alertada: sem wt_doubt_alerted_at) → 0, o 1º alerta sai quando a dúvida completa o horizonte; falhou/ilegível: não se aplica (dict em memória)
+        if now - since >= WORKTREE_DOUBT_ALERT_SECS and now - bead_state.get("wt_doubt_alerted_at", 0) >= WORKTREE_DOUBT_ALERT_SECS:
+            emit(f"[INFLIGHT-RECLAIM] [WORKTREE-RAIL-BLIND] bead={bead_id} segura há {(now - since) / 3600:.1f}h SEM saber: o trilho do worktree não consegue ler ({_WT_RAIL_WHY}) — a bead NÃO é "
+                 f"reclamada enquanto isso durar; confira `git worktree list` e `git status` no repo da rig e no worktree dela, ou solte a bead à mão")
+            bead_state["wt_doubt_alerted_at"] = now
+    return verdict != WT_QUIET
+
+
+def has_recent_progress(bead_id, bead_state, now, consult_rails):
+    """O `has_recent_branch` do run_cycle: o trilho de branch OU o do worktree. Extraído do run_cycle como o should_fetch_branch_for_reclaim (o run_cycle não roda no _selftest: fiação errada ficaria atrás
+    de uma suíte verde). consult_rails = o should_fetch_branch_for_reclaim do ciclo: falso = a decisão não depende de progresso e nenhum trilho (o de branch faz git fetch) é pago. O de branch vai primeiro;
+    se segurou, o do worktree nem é consultado. Ciclo sem consulta ao trilho do worktree zera a dúvida dele: dúvida só vale se contínua."""
+    if consult_rails and not get_branch_recent(bead_id):
+        return worktree_rail_holds(bead_id, bead_state, now)
+    bead_state.pop("wt_doubt_since", None)
+    return bool(consult_rails)
+
+
 def _sling_has_unmerged_branch(bead_id):
     """Return the first matching remote branch name (any REPOS entry, any
     naming convention recognized by _branch_segment_matches_bead) whose tip
@@ -4745,6 +4921,7 @@ def run_cycle(state, escalated_alerted):
     Returns (inflight_count, stranded_count) for diagnostics.
     """
     now = time.time()
+    WT_RAIL_COUNTS.update(recent=0, unreadable=0)   # ga-s90p58a: as contagens do trilho do worktree são do ciclo (o resumo do ciclo as mostra)
 
     # --- Query in-flight beads (fail-safe: skip cycle on error) ---
     beads, _why = _list_with_reason(list_inflight_beads, "bd list failed")
@@ -4984,16 +5161,16 @@ def run_cycle(state, escalated_alerted):
         # ga-vu718 gate-fix-2: see should_fetch_branch_for_reclaim()'s
         # docstring for why has_live_session=True alone is no longer
         # sufficient to skip this safely.
-        has_recent_branch = False
-        if should_fetch_branch_for_reclaim(
-                has_live_session=has_live_session,
-                has_needs_human=has_needs_human,
-                has_dispatching_marker=has_dispatching_marker,
-                has_suspended_owner=has_suspended_owner,
-                has_explicit_refusal=has_explicit_refusal,
-                refusal_count=refusal_count,
-                refusal_age_secs=refusal_age_secs):
-            has_recent_branch = get_branch_recent(bead_id)
+        # ga-s90p58a: has_recent_branch agora é o trilho de branch OU o do worktree (uma bead de rig sem remote só tem o segundo); ver has_recent_progress().
+        consult_progress_rails = should_fetch_branch_for_reclaim(
+            has_live_session=has_live_session,
+            has_needs_human=has_needs_human,
+            has_dispatching_marker=has_dispatching_marker,
+            has_suspended_owner=has_suspended_owner,
+            has_explicit_refusal=has_explicit_refusal,
+            refusal_count=refusal_count,
+            refusal_age_secs=refusal_age_secs)
+        has_recent_branch = has_recent_progress(bead_id, bead_state, now, consult_progress_rails)
 
         # --- Update stranded timestamp in state ---
         is_currently_stranded = (
@@ -5754,6 +5931,345 @@ def _selftest():
     finally:
         time.time = _orig_time_fn
         subprocess.run = _orig_run_br
+
+    # -----------------------------------------------------------------------
+    # Section 4b: ga-s90p58a — o trilho do WORKTREE (WT-*)
+    # O trilho de branch (BR-* acima) só lê refs/remotes/origin/ dos REPOS: uma bead de rig SEM remote (traco-bim) não tinha trilho de progresso, e o trabalho vivo e não commitado do worktree
+    # ~/gt/<rig>-wt/<bead> não segurava o reclaim. get_worktree_progress() olha os worktrees que o git registra nos repos das rigs: commit do HEAD ou alteração no working tree dentro de RECLAIM_TTL =
+    # progresso; não conseguir ler = "pode haver progresso" (segura), nunca "quieto". Git REAL em diretórios temporários (repos sem remote, worktrees de verdade, datas e mtimes fixados): sem repo de produção, sem rede.
+    # -----------------------------------------------------------------------
+    import contextlib as _wt_contextlib
+    import inspect as _wt_inspect
+    import io as _wt_io
+
+    _wt_real_run, _wt_real_lstat, _wt_g = subprocess.run, os.lstat, globals()
+    _wt_env_saved = {k: os.environ.get(k) for k in ("HOME", "XDG_CONFIG_HOME", "GIT_CONFIG_NOSYSTEM", "GIT_TERMINAL_PROMPT", "GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE")}
+    _wt_root = _tempfile.mkdtemp(prefix="irg-wt-rail-")
+    _wt_now = int(time.time())   # relógio de verdade: datas de commit e mtimes são fixados em relação a ele, e as chamadas passam now=_wt_now
+    _wt_unset = object()
+    try:
+        for _k in _wt_env_saved:   # o git do teste (e o do guard, no mesmo processo) lê só a config do diretório temporário: nada da máquina entra no resultado
+            os.environ.pop(_k, None)
+        os.environ.update(HOME=_wt_root, XDG_CONFIG_HOME=os.path.join(_wt_root, "xdg"), GIT_CONFIG_NOSYSTEM="1", GIT_TERMINAL_PROMPT="0")
+
+        def _wt_git(cwd, *args, date=None):
+            env = dict(os.environ, GIT_AUTHOR_NAME="t", GIT_AUTHOR_EMAIL="t@example.invalid", GIT_COMMITTER_NAME="t", GIT_COMMITTER_EMAIL="t@example.invalid")
+            if date is not None:
+                env["GIT_AUTHOR_DATE"] = env["GIT_COMMITTER_DATE"] = "%d +0000" % date
+            r = _wt_real_run(["git", "-C", cwd] + list(args), env=env, capture_output=True)
+            if r.returncode != 0:
+                raise RuntimeError("git %s: %s" % (" ".join(args), r.stderr.decode(errors="replace")[:200]))
+            return r.stdout.decode(errors="replace")
+
+        def _wt_put(path, text="x\n", age=None):
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "w") as f:
+                f.write(text)
+            if age is not None:
+                os.utime(path, (_wt_now - age, _wt_now - age))
+
+        def _wt_mkrig(name):
+            d = os.path.join(_wt_root, name)
+            os.makedirs(d)
+            _wt_git(d, "init", "-q")
+            _wt_git(d, "symbolic-ref", "HEAD", "refs/heads/main")
+            _wt_put(os.path.join(d, "a.txt"), "a\n")
+            _wt_put(os.path.join(d, "sub", "b.txt"), "b\n")
+            _wt_git(d, "add", ".")
+            _wt_git(d, "commit", "-q", "-m", "base", date=_wt_now - 3 * 3600)
+            return d
+
+        def _wt_addwt(rig, name, branch=None, commit_age=None, files=()):
+            """Worktree <rig>-wt/<name> em branch novo; commit_age = idade (s) de um commit de trabalho (None = só o commit-base de 3 h); files = (caminho, texto, idade s) já escritos nele."""
+            path = os.path.join(rig + "-wt", name)
+            _wt_git(rig, "worktree", "add", "-q", "-b", branch or name, path)
+            if commit_age is not None:
+                _wt_put(os.path.join(path, "c.txt"), "c\n")
+                _wt_git(path, "add", "c.txt")
+                _wt_git(path, "commit", "-q", "-m", "work", date=_wt_now - commit_age)
+            for rel, text, age in files:
+                _wt_put(os.path.join(path, rel), text, age)
+            return path
+
+        def _wt_prog(bead, repos=_wt_unset, now=None, inject=None, lstat_fault=None, rigs=_wt_unset, record=None, **kw):
+            """get_worktree_progress com a saída capturada → (veredito, texto impresso). repos omitido = o rig principal, None = a config; rigs = o que o `gc rig list` devolveria; lstat_fault = (trecho do caminho,
+            exceção): o os.lstat falha ali; inject = (tokens, como): só as chamadas de git que levam todos os tokens falham (rc|timeout|oserror|garbage|empty|boom), o resto vai ao git de verdade;
+            record = lista que recebe cada linha de comando de git que o trilho rodou."""
+            def run(cmd, *a, **k):
+                if record is not None:
+                    record.append(list(cmd))
+                if inject and isinstance(cmd, (list, tuple)) and all(m in cmd for m in inject[0]):
+                    if inject[1] == "timeout":
+                        raise subprocess.TimeoutExpired(cmd, 1)
+                    if inject[1] == "oserror":
+                        raise OSError("simulated: git cannot be started")
+                    if inject[1] == "boom":
+                        raise RuntimeError("simulated bug inside the rail")
+                    if inject[1] in ("garbage", "empty"):
+                        return subprocess.CompletedProcess(cmd, 0, b"not-a-number\n" if inject[1] == "garbage" else b"", b"")
+                    return subprocess.CompletedProcess(cmd, 128, b"", b"fatal: simulated failure\n")
+                return _wt_real_run(cmd, *a, **k)
+
+            def lstat(p, *a, **k):
+                if lstat_fault and lstat_fault[0] in str(p):
+                    raise lstat_fault[1](2 if lstat_fault[1] is FileNotFoundError else 13, "simulated", str(p))
+                return _wt_real_lstat(p, *a, **k)
+            saved_rigs = _wt_g["_list_rig_stores"]
+            subprocess.run, os.lstat = run, lstat
+            if rigs is not _wt_unset:
+                _wt_g["_list_rig_stores"] = lambda: rigs
+            buf = _wt_io.StringIO()
+            try:
+                with _wt_contextlib.redirect_stdout(buf):
+                    v = get_worktree_progress(bead, repos=[_wt_rig] if repos is _wt_unset else repos, now=_wt_now if now is None else now, **kw)
+            finally:
+                subprocess.run, os.lstat, _wt_g["_list_rig_stores"] = _wt_real_run, _wt_real_lstat, saved_rigs
+            return v, buf.getvalue()
+
+        def _wt_with(stubs, fn):
+            """Roda fn() com `stubs` no lugar das funções do módulo de mesmo nome (o guard as acha pelo nome na hora da chamada); restaura no fim."""
+            saved = {k: _wt_g[k] for k in stubs}
+            _wt_g.update(stubs)
+            try:
+                return fn()
+            finally:
+                _wt_g.update(saved)
+
+        # --- o mundo: um rig sem remote com um worktree por cena (idade do commit de trabalho; arquivos (caminho, texto, idade s): negativa = mtime no futuro) ---
+        _wt_rig = _wt_mkrig("rigA")
+        for _n, _b, _age in (("tb-recent1", None, 300), ("tb-old1", None, 2 * 3600), ("tb-edge1", None, RECLAIM_TTL), ("tb-coll12", None, 60), ("tb-sepa-base", "zz-a", 60), ("tb-sepb_x", "zz-b", 60),
+                             ("tb-sepc.y", "zz-c", 60), ("worker-9", "crew/wa-worker/tb-branch1", 60), ("tb-future1", None, -400 * 86400), ("tb-gone1", None, 60)):
+            _wt_addwt(_wt_rig, _n, _b, _age)
+        _shutil.rmtree(os.path.join(_wt_rig + "-wt", "tb-gone1"))   # registrado no git, mas o diretório sumiu
+        for _n, _files in (("tb-fresh1", ()), ("tb-untrk1", (("scratch.txt", "s\n", 120),)), ("tb-modif1", (("a.txt", "changed\n", 120),)), ("tb-nested1", (("deep/er/x.py", "x\n", 120),)),
+                           ("tb-skew1", (("s.txt", "s\n", -5),)), ("tb-futfile1", (("t.txt", "t\n", -400 * 86400),)), ("tb-lstat1", (("scratch.txt", "s\n", 3 * 3600),)),
+                           ("tb-stale1", (("a.txt", "old\n", 3 * 3600), ("old.txt", "o\n", 3 * 3600))), ("tb-staged1", (("new.txt", "n\n", 120),)), ("tb-ign1", ((".gitignore", "*.log\n", None),))):
+            _wt_p = _wt_addwt(_wt_rig, _n, files=_files)
+        _wt_git(os.path.join(_wt_rig + "-wt", "tb-staged1"), "add", "new.txt")
+        _wt_p = os.path.join(_wt_rig + "-wt", "tb-ign1")
+        _wt_git(_wt_p, "add", ".gitignore")
+        _wt_git(_wt_p, "commit", "-q", "-m", "ignore logs", date=_wt_now - 3 * 3600)
+        _wt_put(os.path.join(_wt_p, "run.log"), "log\n", 60)
+        for _d in ("deep/er", "deep"):   # os diretórios do arquivo novo são velhos, só o ARQUIVO é novo
+            os.utime(os.path.join(_wt_rig + "-wt", "tb-nested1", _d), (_wt_now - 3 * 3600,) * 2)
+        for _n, _age in (("tb-del1", 120), ("tb-del2", 3 * 3600)):   # apagar um rastreado muda o mtime do diretório de cima: o único rastro de um arquivo que não existe mais
+            _wt_p = _wt_addwt(_wt_rig, _n)
+            os.remove(os.path.join(_wt_p, "sub", "b.txt"))
+            os.utime(os.path.join(_wt_p, "sub"), (_wt_now - _age,) * 2)
+        for _n, _files in (("tb-unborn1", ()), ("tb-unborn2", (("u.txt", "u\n", 60),))):   # HEAD sem commit nenhum e árvore vazia
+            _wt_p = _wt_addwt(_wt_rig, _n)
+            _wt_git(_wt_p, "symbolic-ref", "HEAD", "refs/heads/unborn-" + _n)
+            _wt_git(_wt_p, "read-tree", "--empty")
+            os.remove(os.path.join(_wt_p, "a.txt"))
+            _shutil.rmtree(os.path.join(_wt_p, "sub"))
+            for _rel, _text, _age in _files:
+                _wt_put(os.path.join(_wt_p, _rel), _text, _age)
+        _wt_rig2 = _wt_mkrig("rigB")
+        _wt_addwt(_wt_rig2, "tb-other1", commit_age=60)
+        _wt_notrepo = os.path.join(_wt_root, "notarepo")
+        os.makedirs(_wt_notrepo)
+        _wt_broken = os.path.join(_wt_root, "brokenrepo")   # tem .git, mas o git não consegue ler
+        os.makedirs(_wt_broken)
+        _wt_put(os.path.join(_wt_broken, ".git"), "gitdir: /nonexistent/irg-wt-rail\n")
+        _wt_gone = os.path.join(_wt_root, "nao-existe")
+        _wt_warn = ("[INFLIGHT-RECLAIM] worktree-rail", "fail-safe")
+
+        # (id, descrição, bead, veredito esperado, argumentos de _wt_prog, trechos que o aviso impresso tem de conter). Cada linha também confere a CONTAGEM: recent/unreadable sobem 1 só no veredito
+        # correspondente, e quieto não conta em nada.
+        for _id, _why, _bead, _want, _kw, _txts in (
+                ("WT-1 (THE bug)", "rig SEM remote, worktree <rig>-wt/<bead> com commit de 5 min → recent (segura o reclaim; pré-fix não havia trilho)", "tb-recent1", WT_RECENT, {}, ()),
+                ("WT-2a", "o único commit tem 2 h (> RECLAIM_TTL) → quieto: reclaim normal", "tb-old1", WT_QUIET, {}, ()),
+                ("WT-2b (borda)", "idade EXATAMENTE RECLAIM_TTL → quieto (< estrito, como o BR-7)", "tb-edge1", WT_QUIET, {}, ()),
+                ("WT-2c (borda)", "1 s mais novo que RECLAIM_TTL → recent", "tb-edge1", WT_RECENT, {"now": _wt_now - 1}, ()),
+                ("WT-3", "bead sem worktree nenhum → quieto: o trilho não inventa segurar", "tb-nowt1", WT_QUIET, {}, ()),
+                ("WT-4a", "arquivo NOVO não rastreado de 2 min, nenhum commit novo → recent", "tb-untrk1", WT_RECENT, {}, ()),
+                ("WT-4b", "arquivo rastreado MODIFICADO há 2 min → recent", "tb-modif1", WT_RECENT, {}, ()),
+                ("WT-4c", "arquivo rastreado APAGADO, diretório de cima mexido há 2 min (o rastro de uma remoção) → recent", "tb-del1", WT_RECENT, {}, ()),
+                ("WT-4d", "worktree SUJO mas parado há 3 h (modificado + novo, mtimes velhos) → quieto: sujo não é vivo", "tb-stale1", WT_QUIET, {}, ()),
+                ("WT-4e", "arquivo apagado há 3 h (diretório de cima velho) → quieto", "tb-del2", WT_QUIET, {}, ()),
+                ("WT-4f", "arquivo novo num subdiretório não rastreado de diretórios velhos → recent (o status lista ARQUIVOS)", "tb-nested1", WT_RECENT, {}, ()),
+                ("WT-4g", "worktree recém-criado (arquivos do checkout com mtime de agora, status limpo) → quieto: checkout não é trabalho", "tb-fresh1", WT_QUIET, {}, ()),
+                ("WT-4h", "arquivo novo já em stage (git add) de 2 min → recent", "tb-staged1", WT_RECENT, {}, ()),
+                ("WT-4i", "arquivo com mtime 5 s à frente (dentro da margem de relógio) é atividade → recent, não dúvida", "tb-skew1", WT_RECENT, {}, ()),
+                ("WT-5a", "o worktree tb-coll12 NÃO é da bead tb-coll1 (sem separador depois do id) → quieto", "tb-coll1", WT_QUIET, {}, ()),
+                ("WT-5b", "diretório <id>-base (separador '-'), branch de outro nome → recent", "tb-sepa", WT_RECENT, {}, ()),
+                ("WT-5c", "diretório <id>_x (separador '_') → recent", "tb-sepb", WT_RECENT, {}, ()),
+                ("WT-5d", "diretório <id>.y (separador '.') → recent", "tb-sepc", WT_RECENT, {}, ()),
+                ("WT-5e", "só o BRANCH (crew/wa-worker/<id>) nomeia a bead, o diretório é worker-9 → recent", "tb-branch1", WT_RECENT, {}, ()),
+                ("WT-6b", "o commit de 2 h com window_seconds=3 h → recent (mesmo parâmetro do get_branch_recent)", "tb-old1", WT_RECENT, {"window_seconds": 3 * 3600}, ()),
+                ("WT-7a", "o worktree da bead está no SEGUNDO repo da lista → recent", "tb-other1", WT_RECENT, {"repos": [_wt_rig, _wt_rig2]}, ()),
+                ("WT-7b", "diretório SEM .git na lista (rig que não é repo): pulado, não é dúvida → quieto", "tb-nowt1", WT_QUIET, {"repos": [_wt_notrepo, _wt_rig]}, ()),
+                ("WT-7c", "repos=[] (cidade sem nenhuma rig não é falha) → quieto", "tb-recent1", WT_QUIET, {"repos": []}, ()),
+                ("WT-8a", "`git worktree list` falha (rc≠0) → unreadable, NÃO quieto; aviso visível com a bead e o motivo, e contado", "tb-old1", WT_UNREADABLE,
+                 {"inject": (("worktree", "list"), "rc")}, _wt_warn + ("tb-old1", "fatal: simulated failure")),
+                ("WT-8b", "`git worktree list` estoura o prazo → unreadable", "tb-old1", WT_UNREADABLE, {"inject": (("worktree", "list"), "timeout")}, ()),
+                ("WT-8c", "git não consegue ser executado (OSError) ao listar → unreadable", "tb-old1", WT_UNREADABLE, {"inject": (("worktree", "list"), "oserror")}, ()),
+                ("WT-8d", "`git status` falha (commit velho, nada mais a dizer) → unreadable", "tb-old1", WT_UNREADABLE, {"inject": (("status",), "rc")}, ()),
+                ("WT-8d2", "`git status` estoura o prazo → unreadable, não 'sem arquivos alterados'", "tb-old1", WT_UNREADABLE, {"inject": (("status",), "timeout")}, ()),
+                ("WT-8d3", "`git status` não consegue ser executado (OSError) → unreadable", "tb-old1", WT_UNREADABLE, {"inject": (("status",), "oserror")}, ()),
+                ("WT-8d4", "erro INESPERADO dentro do trilho (bug, não erro do git) → unreadable com o aviso 'erro inesperado'; nunca levanta para o run_cycle", "tb-old1", WT_UNREADABLE,
+                 {"inject": (("log",), "boom")}, ("erro inesperado", "RuntimeError")),
+                ("WT-8e", "`git log` falha com o HEAD resolvendo (não é HEAD sem commit) → unreadable", "tb-old1", WT_UNREADABLE, {"inject": (("log",), "rc")}, ()),
+                ("WT-8f", "`git log` devolve lixo (não é um número) → unreadable", "tb-old1", WT_UNREADABLE, {"inject": (("log",), "garbage")}, ()),
+                ("WT-8g", "worktree REGISTRADO cujo diretório sumiu → unreadable, e o aviso diz que o diretório não existe", "tb-gone1", WT_UNREADABLE, {}, ("diretório não existe",)),
+                ("WT-8h", "commit datado no FUTURO (idade negativa leria 'recente' para sempre) → unreadable, com aviso", "tb-future1", WT_UNREADABLE, {}, ("carimbo no futuro",)),
+                ("WT-8i", "arquivo alterado com mtime no futuro → unreadable", "tb-futfile1", WT_UNREADABLE, {}, ("carimbo no futuro",)),
+                ("WT-8j", "não consigo ler o mtime de um arquivo alterado (EACCES) → unreadable, não 'pulo o arquivo'", "tb-lstat1", WT_UNREADABLE, {"lstat_fault": ("scratch.txt", PermissionError)}, ()),
+                ("WT-8j2", "o worktree some NO MEIO da leitura (lstat dos arquivos e do próprio diretório dá ENOENT) → unreadable, 'sumiu enquanto eu lia'", "tb-untrk1", WT_UNREADABLE,
+                 {"lstat_fault": ("tb-untrk1", FileNotFoundError)}, ("sumiu enquanto eu lia",)),
+                ("WT-8k", "repo com .git que o git não consegue ler → unreadable mesmo para bead sem worktree (o trilho não sabe)", "tb-nowt1", WT_UNREADABLE, {"repos": [_wt_broken]}, ()),
+                ("WT-8l", "progresso vence a dúvida: repo ilegível ANTES do repo com worktree recente → recent", "tb-other1", WT_RECENT, {"repos": [_wt_broken, _wt_rig2]}, ()),
+                ("WT-8l2", "...e na ordem inversa → recent", "tb-other1", WT_RECENT, {"repos": [_wt_rig2, _wt_broken]}, ()),
+                ("WT-8m", "dúvida num repo + quieto no outro → unreadable (o quieto de um não apaga a dúvida do outro)", "tb-old1", WT_UNREADABLE, {"repos": [_wt_rig, _wt_broken]}, ()),
+                ("WT-8o", "o diretório de um repo da lista sumiu → unreadable (não vira 'sem .git' nem 'quieto')", "tb-recent1", WT_UNREADABLE, {"repos": [_wt_gone]}, ()),
+                ("WT-8p", "`git worktree list` com rc 0 e saída VAZIA (o git sempre lista o worktree principal) → unreadable, não 'nenhum worktree'", "tb-old1", WT_UNREADABLE,
+                 {"inject": (("worktree", "list"), "empty")}, ()),
+                ("WT-9a", "HEAD SEM commit nenhum e árvore limpa → quieto, não erro", "tb-unborn1", WT_QUIET, {}, ()),
+                ("WT-9b", "HEAD sem commit mas com arquivo novo de 1 min → recent (o arquivo basta)", "tb-unborn2", WT_RECENT, {}, ()),
+                ("WT-9c", "arquivo que o .gitignore esconde, mexido há 1 min → quieto (o trilho olha o que o git vê)", "tb-ign1", WT_QUIET, {}, ()),
+                ("WT-12a", "repos=None e o gc rig list falhou (None) → unreadable, com aviso que diz que foi o gc rig list", "tb-recent1", WT_UNREADABLE, {"repos": None, "rigs": None}, ("gc rig list falhou",)),
+                ("WT-12b", "repos=None → os repos vêm do gc rig list (a lista que o guard já usa)", "tb-recent1", WT_RECENT, {"repos": None, "rigs": [("traco-bim", _wt_rig)]}, ()),
+                ("WT-12c", "gc rig list devolve [] (zero rigs: resposta, não falha) → quieto", "tb-recent1", WT_QUIET, {"repos": None, "rigs": []}, ())):
+            _c0 = dict(WT_RAIL_COUNTS)
+            _v, _t = _wt_prog(_bead, **_kw)
+            _dc = {k: WT_RAIL_COUNTS[k] - _c0[k] for k in _c0}
+            check(f"{_id}: {_why}", _v == _want and _dc == {"recent": int(_want == WT_RECENT), "unreadable": int(_want == WT_UNREADABLE)} and all(s in _t for s in _txts + ((_bead,) if _txts else ())),
+                  f"veredito={_v!r} contagens+={_dc!r} texto={_t!r}")
+        check("WT-12d: nenhum caminho de rig escrito no código do trilho, e o REPOS do trilho de branch segue o mesmo",
+              "traco" not in "".join(_wt_inspect.getsource(f) for f in (_worktree_rail_repos, _list_worktrees, _worktree_activity, _wt_git, get_worktree_progress)) and "traco" not in "".join(_wt_g["REPOS"]))
+
+        # --- o trilho só LÊ: o git status comum reescreve o índice do worktree de um dog vivo (mtime+hash mudam); o do trilho não pode, nem subir um daemon de fsmonitor por worktree ---
+        _wt_p = _wt_addwt(_wt_rig, "tb-idx1")
+        _wt_git(_wt_p, "status", "--porcelain=v1")
+        os.utime(os.path.join(_wt_p, "a.txt"), (_wt_now - 60, _wt_now - 60))   # conteúdo igual, stat diferente: o status comum refaria e gravaria o índice
+        _wt_idx = _wt_git(_wt_p, "rev-parse", "--git-path", "index").strip()
+        _wt_idx = _wt_idx if os.path.isabs(_wt_idx) else os.path.join(_wt_p, _wt_idx)
+
+        def _wt_idx_snap():
+            with open(_wt_idx, "rb") as f:
+                return (os.stat(_wt_idx).st_mtime_ns, f.read())
+        _wt_snap0, _wt_cmds = _wt_idx_snap(), []
+        _wt_prog("tb-idx1", record=_wt_cmds)
+        check("WT-10: o trilho não reescreve o índice do worktree (git --no-optional-locks): o de um dog vivo segue intocado", _wt_idx_snap() == _wt_snap0)
+        check("WT-10b: TODA chamada de git do trilho leva --no-optional-locks e core.fsmonitor=false, e o status lê -z --no-renames --untracked-files=all (um caminho por entrada; arquivo, não pasta)",
+              len(_wt_cmds) >= 3 and all("--no-optional-locks" in c and "core.fsmonitor=false" in c for c in _wt_cmds)
+              and any("status" in c and "-z" in c and "--no-renames" in c and "--untracked-files=all" in c for c in _wt_cmds), f"comandos={_wt_cmds!r}")
+
+        # --- o relógio de dúvida: segurar por dúvida não pode ser silencioso para sempre. Linha do tempo de UMA bead (t em s; TH = WORKTREE_DOUBT_ALERT_SECS) ---
+        _wt_th, _wt_emitted, _wt_verdict, _wt_bs = WORKTREE_DOUBT_ALERT_SECS, [], [WT_QUIET], {}
+        _wt_saved_why, _wt_g["_WT_RAIL_WHY"] = _wt_g["_WT_RAIL_WHY"], "motivo-de-teste"
+        for _id, _why, _t, _verdict, _held, _alerts in (
+                ("WT-14a", "recent → segura", 0, WT_RECENT, True, 0), ("WT-14b", "quiet → não segura", 60, WT_QUIET, False, 0),
+                ("WT-14c", "unreadable → segura, e no começo da dúvida sem alerta", 120, WT_UNREADABLE, True, 0),
+                ("WT-14d", "um segundo antes de TH em dúvida → ainda sem alerta", 120 + _wt_th - 1, WT_UNREADABLE, True, 0),
+                ("WT-14e", "ao completar TH em dúvida → UM alerta [WORKTREE-RAIL-BLIND] com a bead e o motivo, e a bead segue segura", 120 + _wt_th, WT_UNREADABLE, True, 1),
+                ("WT-14f", "a varredura seguinte (a dúvida continua) NÃO repete o alerta", 120 + _wt_th + 600, WT_UNREADABLE, True, 1),
+                ("WT-14g", "passado outro TH com a dúvida de pé → repete (segurar sem saber continua sendo dito)", 120 + 2 * _wt_th, WT_UNREADABLE, True, 2),
+                ("WT-14h", "a dúvida acabou (quiet) e voltou depois do intervalo de repetição → conta de novo do zero, sem alerta (só o reset segura)", 120 + 2 * _wt_th + 60, WT_QUIET, False, 2),
+                ("WT-14i", "...a nova dúvida, vencido o intervalo de repetição → sem alerta: recomeçou do zero", 120 + 3 * _wt_th + 70, WT_UNREADABLE, True, 2)):
+            _wt_verdict[0] = _verdict
+            _r = _wt_with({"get_worktree_progress": lambda bead_id, **kw: _wt_verdict[0], "emit": _wt_emitted.append}, lambda: worktree_rail_holds("tb-x1", _wt_bs, 10_000.0 + _t))
+            check(f"{_id}: {_why}", _r is _held and len(_wt_emitted) == _alerts
+                  and (_alerts == 0 or ("[WORKTREE-RAIL-BLIND]" in _wt_emitted[0] and "tb-x1" in _wt_emitted[0] and "motivo-de-teste" in _wt_emitted[0])), f"segura={_r!r} alertas={_wt_emitted!r}")
+        _wt_g["_WT_RAIL_WHY"] = _wt_saved_why
+
+        # --- a fiação: trilho de branch OU de worktree, só quando a decisão depende disso ---
+        _wt_calls = []
+
+        def _wt_hrp(branch, verdict, consult):
+            _wt_calls.clear()
+            bs = {"wt_doubt_since": 1.0}
+            r = _wt_with({"get_branch_recent": lambda bead_id, **kw: (_wt_calls.append("branch"), branch)[1],
+                          "get_worktree_progress": lambda bead_id, **kw: (_wt_calls.append("worktree"), verdict)[1], "emit": lambda m: None},
+                         lambda: has_recent_progress("tb-x1", bs, 1000.0, consult))
+            return r, list(_wt_calls), bs
+        for _id, _why, _args, _want in (
+                ("WT-15a", "a decisão não depende do trilho (should_fetch_branch_for_reclaim falso) → False e NENHUM trilho é consultado", (True, WT_RECENT, False), (False, [])),
+                ("WT-15b", "trilho de branch com progresso → True sem pagar o do worktree", (True, WT_RECENT, True), (True, ["branch"])),
+                ("WT-15c", "sem branch recente mas worktree recent → True (o caso da bead: rig sem remote)", (False, WT_RECENT, True), (True, ["branch", "worktree"])),
+                ("WT-15d", "sem branch e worktree quieto → False (reclaim normal)", (False, WT_QUIET, True), (False, ["branch", "worktree"])),
+                ("WT-15e", "sem branch e worktree unreadable → True (dúvida segura)", (False, WT_UNREADABLE, True), (True, ["branch", "worktree"]))):
+            _r = _wt_hrp(*_args)
+            check(f"{_id}: {_why}", _r[:2] == _want, f"{_r[:2]!r}")
+        check("WT-15f: ciclo em que o trilho do worktree não foi consultado (decisão não depende dele, ou o branch já segurou) zera a dúvida dele: dúvida só vale se contínua",
+              "wt_doubt_since" not in _wt_hrp(True, WT_UNREADABLE, False)[2] and "wt_doubt_since" not in _wt_hrp(True, WT_UNREADABLE, True)[2])
+
+        # --- o run_cycle REAL de ponta a ponta (bd, gc, sessões e gate trocados por leitores simulados) ---
+        def _wt_iso(epoch):
+            return _irg_datetime.datetime.fromtimestamp(epoch, tz=_irg_datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+        def _wt_cycle(bead_id, live=False, fail_git=None, stale_cycle_now=0):
+            """run_cycle de verdade: dono `gastown.dog-2` (alias de slot de dog, o do ga-lotseol) encalhado há RECLAIM_TTL + 10 min, trilho de branch real e SEM remote (REPOS=[]), `gc rig list` no rig de
+            teste. stale_cycle_now: o `now` que o run_cycle lê no começo fica tantos s para trás (passada 1 lenta). Devolve (state, reclaims pedidos ao do_reclaim, texto impresso)."""
+            now = time.time()
+            reclaims = []
+            state = {bead_id: {"first_seen_stranded": now - RECLAIM_TTL - 600, "last_assignee": "gastown.dog-2"}}
+            roster = [{"id": "ga-wtother", "name": "mayor", "session_name": "mayor", "alias": "mayor", "template": "mayor", "state": "active", "last_active": _wt_iso(now),
+                       "created_at": _wt_iso(now - 86400), "closed": False}]
+            if live:
+                roster.append({"id": "ga-wtdog2", "name": "gastown.dog-2", "session_name": "dog-gawtdog2", "alias": "gastown.dog-2", "agent_name": "gastown.dog-2", "template": "gastown.dog",
+                               "state": "active", "last_active": _wt_iso(now - 30), "created_at": _wt_iso(now - 86400), "closed": False})
+            bead = {"id": bead_id, "title": "e2e do trilho do worktree", "issue_type": "task", "status": "in_progress", "assignee": "gastown.dog-2", "rig_root": _wt_rig,
+                    "labels": ["story:in-flight", "pilot:dispatched"], "metadata": {}, "updated_at": _wt_iso(now - (60 if live else 7200))}
+            none = lambda *a, **k: None
+            stubs = dict(list_stranded_inprogress_beads=lambda: [], heal_orphan_sweep_false_resets=none, _note_query_failure=none, _note_query_success=none, _check_pool_dead=none, emit=none,
+                         list_suspended_agents=lambda: set(), list_gate_active_source_beads=lambda: frozenset(), list_live_sling_source_beads=lambda *a: frozenset(),
+                         list_refused_sling_source_beads=lambda: {}, account_is_rate_limited=lambda: False, session_awaiting_human_input=lambda *a, **k: False, do_escalate=lambda *a, **k: [],
+                         list_inflight_beads=lambda: [dict(bead)], list_active_sessions=lambda: roster, compute_multi_assigned_assignees=lambda beads, parent_reader=None, notes=None: set(),
+                         do_reclaim=lambda bid, title, rc, idle, labels, **kw: reclaims.append(bid) or True, _list_rig_stores=lambda: [("traco-bim", _wt_rig)], REPOS=[])
+            saved, real_time, reads = {k: _wt_g[k] for k in stubs}, time.time, [0]
+
+            def slow_clock():
+                reads[0] += 1
+                return real_time() - (stale_cycle_now if reads[0] == 1 else 0)
+            _wt_g.update(stubs)
+            if fail_git:   # só as chamadas de git que levam todos estes tokens falham (rc 128); o resto vai ao git de verdade
+                subprocess.run = lambda cmd, *a, **k: (subprocess.CompletedProcess(cmd, 128, b"", b"fatal: simulated failure\n") if all(m in cmd for m in fail_git) else _wt_real_run(cmd, *a, **k))
+            if stale_cycle_now:
+                time.time = slow_clock
+            buf = _wt_io.StringIO()
+            try:
+                with _wt_contextlib.redirect_stdout(buf):
+                    run_cycle(state, {})
+            finally:
+                time.time, subprocess.run = real_time, _wt_real_run
+                _wt_g.update(saved)
+            return state, reclaims, buf.getvalue()
+
+        _wt_st, _wt_rec, _wt_t = _wt_cycle("tb-recent1")
+        check("WT-E1 (O ACEITE): bead de rig SEM remote, dono morto, encalhada há 35 min, worktree com commit de 5 min → o run_cycle NÃO reclama e zera o relógio de encalhe",
+              _wt_rec == [] and "first_seen_stranded" not in _wt_st["tb-recent1"] and WT_RAIL_COUNTS == {"recent": 1, "unreadable": 0}, f"reclaims={_wt_rec!r} estado={_wt_st!r} contagens={WT_RAIL_COUNTS!r}")
+        _wt_st, _wt_rec, _wt_t = _wt_cycle("tb-old1")
+        check("WT-E2: a mesma cena com o worktree PARADO há 2 h (> RECLAIM_TTL) → reclaim normal", _wt_rec == ["tb-old1"] and WT_RAIL_COUNTS == {"recent": 0, "unreadable": 0}, f"reclaims={_wt_rec!r}")
+        _wt_st, _wt_rec, _wt_t = _wt_cycle("tb-old1", fail_git=("worktree", "list"))
+        check("WT-E3: erro do git ao listar os worktrees → o run_cycle NÃO reclama, zera o relógio, avisa (linha visível) e conta",
+              _wt_rec == [] and "first_seen_stranded" not in _wt_st["tb-old1"] and WT_RAIL_COUNTS == {"recent": 0, "unreadable": 1} and "[INFLIGHT-RECLAIM] worktree-rail: bead=tb-old1" in _wt_t,
+              f"reclaims={_wt_rec!r} contagens={WT_RAIL_COUNTS!r} texto={_wt_t[-250:]!r}")
+        _wt_st, _wt_rec, _wt_t = _wt_cycle("tb-nowt1")
+        check("WT-E4: bead sem worktree nenhum → reclaim normal (o trilho não inventa segurar)", _wt_rec == ["tb-nowt1"])
+        check("WT-E5: as contagens são do CICLO (o E3 deixou unreadable=1; este ciclo, limpo, começa de zero)", WT_RAIL_COUNTS == {"recent": 0, "unreadable": 0})
+        _wt_st, _wt_rec, _wt_t = _wt_cycle("tb-recent1", live=True)
+        check("WT-E6: dono com sessão VIVA → noop sem consultar o trilho (a decisão não depende dele): nada reclamado, contagens em zero", _wt_rec == [] and WT_RAIL_COUNTS == {"recent": 0, "unreadable": 0})
+        _wt_st, _wt_rec, _wt_t = _wt_cycle("tb-recent1", stale_cycle_now=1000)
+        check("WT-E7: o `now` do ciclo ficou 1000 s para trás (passada 1 lenta: 2 git fetch por bead) → atividade de 5 min atrás segue 'recent', não 'carimbo no futuro' (o trilho lê o relógio na hora)",
+              _wt_rec == [] and WT_RAIL_COUNTS == {"recent": 1, "unreadable": 0}, f"reclaims={_wt_rec!r} contagens={WT_RAIL_COUNTS!r} texto={_wt_t[-250:]!r}")
+
+        _wt_rc_src = _wt_inspect.getsource(run_cycle)
+        check("WT-16a (deriva): run_cycle monta has_recent_branch por has_recent_progress(...) — tirada a chamada, o trilho some e todo teste de unidade segue verde",
+              "has_recent_branch = has_recent_progress(bead_id, bead_state, now," in _wt_rc_src)
+        check("WT-16b (deriva): run_cycle zera as contagens do trilho no começo do ciclo", "WT_RAIL_COUNTS.update(recent=0, unreadable=0)" in _wt_rc_src)
+        check("WT-16c (deriva): o laço principal imprime o resumo do ciclo por _cycle_summary (as contagens aparecem no log do launchd)", "_cycle_summary(inflight_count, stranded_count)" in _wt_inspect.getsource(main))
+        WT_RAIL_COUNTS.update(recent=3, unreadable=2)
+        check("WT-17: o resumo do ciclo mostra quantas consultas seguraram e quantas não souberam ler",
+              _cycle_summary(7, 2) == "[INFLIGHT-RECLAIM] cycle: inflight=7 stranded=2 worktree_held=3 worktree_unreadable=2", _cycle_summary(7, 2))
+        WT_RAIL_COUNTS.update(recent=0, unreadable=0)
+    finally:
+        for _k, _v in _wt_env_saved.items():
+            if _v is None:
+                os.environ.pop(_k, None)
+            else:
+                os.environ[_k] = _v
+        _shutil.rmtree(_wt_root, ignore_errors=True)
 
     # -----------------------------------------------------------------------
     # Section 5: ga-hkpwv gap fix — concrete wa-worker-adhoc-<hex> scenarios
@@ -10223,7 +10739,7 @@ def _selftest():
             "heal_orphan_sweep_false_resets": lambda *a, **k: None, "list_suspended_agents": lambda: set(),
             "list_gate_active_source_beads": lambda: frozenset(), "list_live_sling_source_beads": lambda *a, **k: frozenset(),
             "list_refused_sling_source_beads": lambda: ({"ga-dup1": list(bridged)} if bridged else {}),
-            "account_is_rate_limited": lambda: False, "get_branch_recent": lambda *a, **k: False,
+            "account_is_rate_limited": lambda: False, "get_branch_recent": lambda *a, **k: False, "get_worktree_progress": lambda *a, **k: WT_QUIET,   # ga-s90p58a: o trilho do worktree é mais uma consulta do ciclo (gc rig list + git)
             "_check_pool_dead": lambda *a, **k: None, "_irg_ledger": lambda *a, **k: None, "emit": lambda msg: None,
             "do_reclaim": _rec("reclaim", reclaim_ok), "do_escalate": _rec("escalate", []), "alert_mayor_refusal_parked": _rec("alert", True),
         }
@@ -10451,6 +10967,13 @@ def _selftest():
 # Entry point
 # ---------------------------------------------------------------------------
 
+def _cycle_summary(inflight_count, stranded_count):
+    """A linha de resumo de cada ciclo (vai para o .out do launchd). worktree_held / worktree_unreadable = quantas consultas do trilho do worktree, neste ciclo, seguraram uma bead / não souberam
+    ler (ga-s90p58a): um unreadable que não some é o que o aviso por bead e o [WORKTREE-RAIL-BLIND] vigiam; aqui ele é contado."""
+    return (f"[INFLIGHT-RECLAIM] cycle: inflight={inflight_count} stranded={stranded_count} "
+            f"worktree_held={WT_RAIL_COUNTS['recent']} worktree_unreadable={WT_RAIL_COUNTS['unreadable']}")
+
+
 def main():
     _install_timestamped_streams()
     emit(
@@ -10476,10 +10999,7 @@ def main():
             inflight_count, stranded_count = run_cycle(state, escalated_alerted)
             save_state(state)
             # Per-cycle summary (goes to launchd .out log — low noise, high observability)
-            print(
-                f"[INFLIGHT-RECLAIM] cycle: inflight={inflight_count} "
-                f"stranded={stranded_count}",
-                flush=True)
+            print(_cycle_summary(inflight_count, stranded_count), flush=True)
         except Exception as exc:
             # Never crash the guard loop
             print(f"[INFLIGHT-RECLAIM] cycle exception: {exc}", flush=True)

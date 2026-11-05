@@ -117,6 +117,7 @@ class World:
         g.list_refused_sling_source_beads = lambda: {}
         g.account_is_rate_limited = lambda: False
         g.get_branch_recent = lambda *a, **k: False
+        g.get_worktree_progress = lambda *a, **k: g.WT_QUIET     # ga-s90p58a: o trilho do worktree (gc rig list + git) é mais uma leitura do ciclo; aqui o mundo não tem worktree
         g.session_awaiting_human_input = lambda *a, **k: False   # o peek do pane vai por ssh: sem ssh, "não está esperando resposta"
         g._note_query_failure = lambda *a, **k: None
         g._note_query_success = lambda *a, **k: None
