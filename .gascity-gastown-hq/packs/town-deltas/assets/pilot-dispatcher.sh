@@ -3023,7 +3023,7 @@ _pilot_hold_or_escalate() {
   # defaults to "[]", every field below comes back "", no condition below
   # matches, and the ORIGINAL hold/escalate behavior proceeds unchanged) —
   # never a second, divergent verification idiom in the same file.
-  local _phe_live_json _phe_live_labels _phe_live_status _phe_live_assignee
+  local _phe_live_json _phe_live_labels _phe_live_status _phe_live_assignee _phe_live_updated_at
   _phe_live_json=$(bd -C "$_phe_db" show "$_phe_id" --json 2>/dev/null || echo "[]")
   _phe_live_labels=$(printf '%s' "$_phe_live_json" \
     | jq -r 'if type=="array" then .[0] else . end | (.labels // [])[]' 2>/dev/null || echo "")
@@ -3032,13 +3032,16 @@ _pilot_hold_or_escalate() {
   _phe_live_assignee=$(printf '%s' "$_phe_live_json" \
     | jq -r 'if type=="array" then .[0] else . end | (.assignee // "")' 2>/dev/null || echo "")
   [ "$_phe_live_assignee" = "null" ] && _phe_live_assignee=""
+  # ga-d63o9n1 — vazio → "" (a regra do gêmeo de alias não roda: "dono vivo", como antes); falhou/ilegível → "" (idem)
+  _phe_live_updated_at=$(printf '%s' "$_phe_live_json" \
+    | jq -r 'if type=="array" then .[0] else . end | (.updated_at // "")' 2>/dev/null || echo "")
 
   if printf '%s\n' "$_phe_live_labels" | grep -E '^gate:(queued|reviewing)$' >/dev/null; then
     log "[pilot-hold] $_phe_slug: $_phe_id already built (gate:queued/reviewing per live re-check) — skipping hold/escalation entirely (ga-230cyn)"
     return 0
   fi
   if [ "$_phe_live_status" = "in_progress" ] && [ -n "$_phe_live_assignee" ] \
-     && _session_is_live_builder "$_phe_live_assignee"; then
+     && _session_is_live_builder "$_phe_live_assignee" "$_phe_live_updated_at"; then
     log "[pilot-hold] $_phe_slug: $_phe_id has a live claim ($_phe_live_assignee actively building per live re-check) — skipping hold/escalation entirely (ga-230cyn)"
     return 0
   fi
@@ -6413,7 +6416,7 @@ _session_is_asleep() {
   printf '%s\n' "$_ASLEEP_SESSION_IDS" | grep -Fx -- "$1" >/dev/null
 }
 
-# _session_is_live_builder <identifier> — exit 0 iff the session is a worker that
+# _session_is_live_builder <identifier> [<bead_updated_at>] — exit 0 iff the session is a worker that
 # is ACTIVELY building right now: non-closed AND not a drained ephemeral pool
 # worker. A …-adhoc-… worker that has gone asleep has drain-acked (wake_mode=fresh
 # → it will never resume the in-flight build it was dispatched for); treating it as
@@ -6430,21 +6433,21 @@ _session_is_asleep() {
 # tri-state None (bridge didn't consult / genuinely can't tell) — falls back to
 # the pre-existing bash check unchanged, never a half-trusted result.
 #
-# session_meta here is built LOCALLY from $_LIVE_SESSION_IDS/$_ASLEEP_SESSION_IDS
-# (this function's own pre-existing dependencies), deliberately NOT reusing the
-# sweep-global $_SESSION_META_JSON that _session_is_active_owner consumes: that
-# global is computed further down the file, after this function's own
-# definition, and pilot-dispatcher.session-liveness.selftest.sh's awk extraction
-# (by design, per its own header) only pulls the range up through this
-# function's closing brace — reaching for a not-yet-extracted global here would
-# make the selftest silently exercise an empty/undefined meta dict instead of
-# the real bridge, the same class of test/reality mismatch ga-9e8ks's gate-fix
-# attempt 1 hit via a different mechanism (BASH_SOURCE resolution inside an
-# eval'd extraction). Building the (small) rich dict locally keeps this
-# function's dependency footprint identical to before this slice.
+# ga-d63o9n1: the session_meta is no longer built HERE from the flat $_LIVE_SESSION_IDS/$_ASLEEP_SESSION_IDS: the bridge hands bead_state.live_builder_report the
+# RAW roster ($_SESSIONS_JSON, assigned before this function and already a dependency of the awk extraction the selftests do, so the footprint is the same).
+# Still NOT the sweep-global $_SESSION_META_JSON, computed further down the file, after this function: reaching for a not-yet-extracted global would make the
+# selftests exercise an empty meta instead of the real bridge (the test/reality mismatch ga-9e8ks's gate-fix attempt 1 hit). The flat dict could not carry the
+# new rule anyway: it keys by identifier, so it folds two incarnations of one alias into a single key.
+#
+# ga-d63o9n1: the optional 2nd argument is the `updated_at` of the bead the identifier holds. A session that matches the identifier ONLY through the reused
+# alias of a pool slot ('gastown.dog-2') and was born AFTER that bead was last touched is the alias-TWIN of the dead claimer, not its builder (the reclaim
+# guard's rule, ga-lotseol: bead_state.alias_claim_predates_session): it is dropped before matching and logged to stderr (stdout carries JSON at one of the
+# callers). No 2nd argument, or one that cannot be read -> nothing changes ("dono vivo", as before). ⚠️ Every caller must pass it — a dropped argument
+# switches the rule off with no sound (session-liveness.selftest AT-14 pins the three call sites). Known limit (the ga-lotseol gate's medium finding): a
+# successor that ADOPTS the predecessor's bead without a `bd update` reads as a twin; `bd comment`/`bd label` do not move updated_at (bd 1.1.0).
 _session_is_live_builder() {
   [ -n "${1:-}" ] || return 1
-  local _slb_asg="$1"
+  local _slb_asg="$1" _slb_upd="${2:-}"
 
   local _slb_bsp _slb_sd
   _slb_bsp="${PILOT_BEAD_STATE_PY_OVERRIDE:-}"
@@ -6454,25 +6457,36 @@ _session_is_live_builder() {
   fi
 
   if command -v python3 >/dev/null 2>&1 && [ -f "$_slb_bsp" ]; then
-    local _slb_pydir _slb_meta _slb_payload _slb_out _slb_rc
+    local _slb_pydir _slb_roster _slb_out _slb_rc _slb_verdict _slb_twins
     _slb_pydir="$(dirname "$_slb_bsp")"
-    _slb_meta=$(jq -n --arg live "${_LIVE_SESSION_IDS:-}" --arg asleep "${_ASLEEP_SESSION_IDS:-}" '
-      ($live | split("\n") | map(select(length>0))) as $l
-      | ($asleep | split("\n") | map(select(length>0))) as $a
-      | [$l[] as $id | {($id): {state: (if ($a | index($id)) then "asleep" else "active" end)}}]
-      | add // {}' 2>/dev/null)
-    [ -n "$_slb_meta" ] || _slb_meta='{}'
-    _slb_payload=$(jq -n --arg asg "$_slb_asg" --argjson meta "$_slb_meta" \
-      '{assignee: $asg, session_meta: $meta}' 2>/dev/null)
-    if [ -n "$_slb_payload" ]; then
-      _slb_out=$(printf '%s' "$_slb_payload" | PYTHONPATH="$_slb_pydir" python3 -c '
+    # Reads: the raw roster ($_SESSIONS_JSON) — vazio → nem chama o python ("não consultei": decide a checagem bash de baixo, como antes); ilegível → o python devolve None (idem).
+    # $2 (updated_at da bead) — vazio/ilegível → a regra do gêmeo não roda ("dono vivo"). `date +%s` que falhe → float() estoura → ponte "quebrada" (aviso + checagem bash).
+    # Saída do python: "True|False|None" + opcional " twins=<session_name,…>" (as sessões que a regra descartou).
+    _slb_roster="${_SESSIONS_JSON:-}"
+    if [ -n "$_slb_roster" ]; then
+      _slb_out=$(printf '%s' "$_slb_roster" | PYTHONPATH="$_slb_pydir" python3 -c '
 import sys, json
-from bead_state import is_live_builder
-p = json.load(sys.stdin)
-print(is_live_builder(p["assignee"], p["session_meta"]))
-' 2>/dev/null)
+from bead_state import live_builder_report
+asg, upd, now = sys.argv[1], sys.argv[2], float(sys.argv[3])
+try:
+    roster = json.load(sys.stdin).get("sessions")
+except Exception:
+    roster = None
+r = live_builder_report(asg, roster, upd, now)
+print(r["verdict"], end="")
+if r["twins"]:
+    print(" twins=" + ",".join(x.replace(",", "_").replace(" ", "_") for x in r["twins"]), end="")
+' "$_slb_asg" "$_slb_upd" "$(date +%s)" 2>/dev/null)
       _slb_rc=$?
+      _slb_verdict="?"; _slb_twins=""
       case "$_slb_out" in
+        True|False|None) _slb_verdict="$_slb_out" ;;
+        "True twins="*|"False twins="*) _slb_verdict="${_slb_out%% *}"; _slb_twins="${_slb_out#* twins=}" ;;
+      esac
+      if [ -n "$_slb_twins" ]; then
+        log "[pilot] alias-twin: assignee=$_slb_asg — session(s) $_slb_twins match only through the pool slot's reused alias and were born after the bead's last update ($_slb_upd): not counted as its builder (ga-d63o9n1)" >&2 || true
+      fi
+      case "$_slb_verdict" in
         True)  return 0 ;;
         False) return 1 ;;
         None)
@@ -6500,8 +6514,8 @@ print(is_live_builder(p["assignee"], p["session_meta"]))
     fi
   fi
 
-  # Bridge indisponível, payload vazio, ou None/saída inesperada acima —
-  # checagem bash original, byte-idêntica à de antes desta fatia.
+  # Bridge indisponível, roster vazio, ou None/saída inesperada acima —
+  # checagem bash original (ignora o updated_at: a regra do gêmeo só existe na ponte).
   _session_is_live "$_slb_asg" || return 1
   case "$_slb_asg" in
     *-adhoc-*) _session_is_asleep "$_slb_asg" && return 1 ;;
@@ -6928,7 +6942,7 @@ _target_session_state() {
 # its slot can only admit OTHER pending work, never re-run the phantom. Falls
 # back to the input on any jq error, so the worst case is the pre-fix count.
 _inflight_drop_dead_workers() {
-  local _arr _n _i _bead _sling _asg _kept _ddw_bid _ddw_bead_db _ddw_sling_db
+  local _arr _n _i _bead _sling _asg _kept _ddw_bid _ddw_bead_db _ddw_sling_db _ddw_json _ddw_upd
   _arr=$(cat)
   { [ "${PILOT_DEADWORKER_CHECK:-1}" = "1" ] && [ "${_DEADWORKER_OK:-0}" = "1" ]; } \
     || { printf '%s' "$_arr"; return 0; }
@@ -6951,9 +6965,13 @@ _inflight_drop_dead_workers() {
       _ddw_bid=$(echo "$_bead" | jq -r '.id // ""' 2>/dev/null || echo "")
       _ddw_bead_db=$(echo "$_bead" | jq -r '._rig_db // ""' 2>/dev/null || echo "")
       [ -n "$_ddw_bead_db" ] && [ -n "$_ddw_bid" ] && [ "$_sling" = "$_ddw_bid" ] && _ddw_sling_db="$_ddw_bead_db"
-      _asg=$(bd -C "$_ddw_sling_db" show "$_sling" --json 2>/dev/null \
+      _ddw_json=$(bd -C "$_ddw_sling_db" show "$_sling" --json 2>/dev/null || echo "")
+      _asg=$(printf '%s' "$_ddw_json" \
         | jq -r 'if type=="array" then .[0] else . end | (.assignee // "")' 2>/dev/null || echo "")
-      if [ -n "$_asg" ] && ! _session_is_live_builder "$_asg"; then
+      # ga-d63o9n1 — updated_at da MESMA leitura. vazio → "" (a regra do gêmeo de alias não roda: "dono vivo"); falhou/ilegível → "" (idem)
+      _ddw_upd=$(printf '%s' "$_ddw_json" \
+        | jq -r 'if type=="array" then .[0] else . end | (.updated_at // "")' 2>/dev/null || echo "")
+      if [ -n "$_asg" ] && ! _session_is_live_builder "$_asg" "$_ddw_upd"; then
         continue   # confirmed dead worker (incl. drained-asleep adhoc) → free this slot
       fi
     fi
@@ -8884,7 +8902,7 @@ _neverstarted_recover_db() {
   [ "${_count:-0}" -le "0" ] 2>/dev/null && return 0
 
   echo "$_json" | jq -c '.[]' | while IFS= read -r _bead; do
-    local _bid _labels _stamp _age _sling _sling_json _sling_labels _asg _crew_owner
+    local _bid _labels _stamp _age _sling _sling_json _sling_labels _asg _crew_owner _sling_upd
     _bid=$(echo "$_bead" | jq -r '.id // ""' 2>/dev/null || echo "")
     [ -z "$_bid" ] && continue
     _labels=$(echo "$_bead" | jq -r '(.labels // []) | join(",")' 2>/dev/null || echo "")
@@ -8939,6 +8957,8 @@ _neverstarted_recover_db() {
       _ns_label_blocks_release "$_sling_labels" && continue
 
       _asg=$(echo "$_sling_json" | jq -r '(.assignee // "")' 2>/dev/null || echo "")
+      # ga-d63o9n1 — vazio → "" (a regra do gêmeo de alias não roda: "dono vivo"); falhou/ilegível ("null" do jq) → "" (idem)
+      _sling_upd=$(echo "$_sling_json" | jq -r '(.updated_at // "")' 2>/dev/null || echo "")
       if [ -z "$_asg" ]; then
         # ga-l7pp: an UNCLAIMED sling (no assignee yet) means the dispatch already
         # materialized a task bead — it is QUEUED in its target pool, not "never
@@ -8978,7 +8998,7 @@ _neverstarted_recover_db() {
         esac
       elif [ "${_DEADWORKER_OK:-0}" != "1" ]; then
         continue   # roster untrustworthy → cannot prove worker dead → KEEP.
-      elif _session_is_live_builder "$_asg"; then
+      elif _session_is_live_builder "$_asg" "$_sling_upd"; then
         continue   # worker actively building → not never-started (asleep adhoc = drained/dead).
       fi
     fi
