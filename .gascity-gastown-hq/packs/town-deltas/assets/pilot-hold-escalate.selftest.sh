@@ -418,13 +418,13 @@ echo "Scenario J (ga-230cyn AC1): live dog claim at cap (3rd refusal) skips hold
     printf 'bd\t%s\n' "$*" >> "$CALLS"
     case "$*" in
       *"show ga-bt1hjs --json"*)
-        printf '[{"status":"in_progress","assignee":"gastown.dog-2","labels":[]}]' ;;
+        printf '[{"status":"in_progress","assignee":"gastown.dog-2","labels":[],"updated_at":"2026-11-05T12:00:00Z"}]' ;;
     esac
   }
   gc()   { printf 'gc\t%s\n'   "$*" >> "$CALLS"; }
   log()  { printf 'log\t%s\n'  "$*" >> "$CALLS"; }
   warn() { printf 'warn\t%s\n' "$*" >> "$CALLS"; }
-  _session_is_live_builder() { [ "$1" = "gastown.dog-2" ]; }
+  _session_is_live_builder() { printf 'slb\t%s|%s\n' "$1" "${2-<absent>}" >> "$CALLS"; [ "$1" = "gastown.dog-2" ]; }
   eval "$HOLD_FN"
   _pilot_hold_or_escalate "db1" "ga-bt1hjs" "ga-jazy9" "no idle crew" "map a crew" '["pilot:held-count:ga-jazy9:2"]' 3
 )
@@ -447,6 +447,12 @@ if has_call "live claim"; then
   ok "logs the live-claim skip reason"
 else
   bad "did not log why the live-claimed bead was skipped (dump: $(cat "$CALLS" | tr '\n' '|'))"
+fi
+# ga-d63o9n1: the liveness check gets the bead's own updated_at (from the same live `bd show`) — dropped, the alias-twin rule switches off with no sound
+if has_call "slb"$'\t'"gastown.dog-2|2026-11-05T12:00:00Z"; then
+  ok "the live re-check hands _session_is_live_builder the bead's updated_at (alias-twin rule input)"
+else
+  bad "ga-d63o9n1: _session_is_live_builder did not receive the bead's updated_at (dump: $(cat "$CALLS" | tr '\n' '|'))"
 fi
 
 echo "Scenario K (ga-230cyn AC2): gate:queued bead — hold/escalation path never runs"
