@@ -2016,6 +2016,50 @@ def session_awaiting_human_input(session_ref, lines=40):
         return False
 
 
+# ga-lotseol: a pool slot's alias ('gastown.dog-2') is reused by every new incarnation of the slot, and a pool-pull claim (`gc bd update --claim`) writes
+# that alias as the assignee and no per-incarnation identity (it leaves gc.session_name as it was — measured on a live claim 05/11 — and BEADS_ACTOR is the alias too).
+# A dog that died mid-claim therefore left a bead that its
+# alias-twin vouched for. The fact a reused alias cannot fake: a claim never predates the session that made it, and a claim bumps the bead's updated_at.
+# So a bead last touched BEFORE the matched session was born (by more than this skew margin) is not that session's bead.
+ALIAS_CLAIM_BIRTH_MARGIN_SECS = 60
+
+
+def alias_claim_predates_session(assignee, session, bead_update_age, now):
+    """True sse a session que casou com o assignee SÓ por um alias de slot de pool não pode ser quem reivindicou a bead (ga-lotseol).
+
+    Três condições, todas necessárias; qualquer dúvida devolve False (= segue valendo "dono", como antes desta regra):
+      1. o assignee NÃO é o id nem o session_name da sessão — esses são por encarnação, nunca reaproveitados, e casar por eles é dono de verdade;
+      2. a sessão é um slot de pool: o template existe e o nome começa por "<template>-" (template gastown.dog, nome gastown.dog-2). Uma crew persistente
+         (template == nome, alias estável) NÃO entra: a bead dela parada há semanas é trabalho estacionado, não órfã. O que casa por id/session_name já saiu na 1.;
+      3. a bead está parada há MAIS tempo do que a sessão existe, mais a margem de relógio: updated_at < created_at - ALIAS_CLAIM_BIRTH_MARGIN_SECS.
+    Cobertura parcial, de propósito: um comentário/label de terceiro DEPOIS do nascimento da sessão leva o updated_at para frente e a bead volta a valer
+    como "do dono" — erra para o lado de não reclamar. Pura, sem I/O.
+    """
+    # vazio → False (sem bead_update_age não há o que comparar: segue "dono"); falhou/ilegível → False (idem — nunca reclama na força de um campo ausente)
+    if bead_update_age is None:
+        return False
+    # vazio → False (sem assignee não há alias a desmentir); falhou/ilegível → False
+    if not assignee:
+        return False
+    # id e session_name são por encarnação: casou por eles, é dono de verdade
+    if assignee in (session.get("id", ""), session.get("session_name", "")):
+        return False
+    # vazio → False (sem template não sei distinguir slot de pool de crew: segue "dono"); falhou/ilegível → False
+    template = session.get("template", "") or ""
+    name = session.get("name", "") or ""
+    if not template or not name.startswith(template + "-"):
+        return False
+    # vazio → False (sem created_at não sei quando a sessão nasceu); falhou/ilegível → False (parse_iso_epoch devolve None em qualquer falha)
+    born = parse_iso_epoch(session.get("created_at", ""))
+    if born is None:
+        return False
+    session_age = now - born
+    # nascimento no futuro (relógio torto) daria idade negativa e faria QUALQUER bead parecer "mais velha": não é prova → False
+    if session_age < 0:
+        return False
+    return bead_update_age > session_age + ALIAS_CLAIM_BIRTH_MARGIN_SECS
+
+
 def session_is_live(assignee, sessions, now=None, bead_update_age=None,
                      session_multi_assigned=False):
     """Return True if assignee matches a live (active/awake) BUILDER session.
@@ -2077,6 +2121,10 @@ def session_is_live(assignee, sessions, now=None, bead_update_age=None,
             # owning builder, even if the assignee string itself is opaque.
             if any(is_coordinator(idv) for idv in identifiers):
                 return False
+            # ga-lotseol: matched ONLY through a reused pool-slot alias and the bead was last touched before this session was born → this session is an
+            # alias-twin of the (dead) claimer, not the claimer. Keep scanning: an older live incarnation of the same alias may still be the real owner.
+            if alias_claim_predates_session(assignee, s, bead_update_age, now):
+                continue
             # ga-64usm: a matched live-state session is only a HEALTHY owner if
             # it isn't a frozen/credit-limited zombie. Gate on activity freshness
             # (+ recent bead progress as a secondary signal).
@@ -10331,6 +10379,69 @@ def _selftest():
           and "cross-rig-framework" in " ".join(_alr_calls[0]) and "pilot:refused-reason" in " ".join(_alr_calls[0]), f"ok={_alr_ok!r} calls={_alr_calls!r}")
     check("DUP-A2 (ga-32a4bo item 2): a mail that fails (rc≠0) or cannot even start is reported as False and never raises (an alert must not break the cycle)",
           _alr_rc1 is False and _alr_exc is False, f"rc1={_alr_rc1!r} exc={_alr_exc!r}")
+
+    # -----------------------------------------------------------------------
+    # LS-*: ga-lotseol — a pool slot's alias (gastown.dog-N) is REUSED by every new incarnation of the slot. A pool-pull claim writes assignee=<alias> and
+    # nothing that tells incarnations apart, so a dog that died mid-claim left a bead that its alias-twin (a later, live session) vouched for: no reclaim,
+    # for hours (wa-6g3m49, wa-25odi9.1, wa-e4ca55.3 on 05/11). The one fact a reused alias cannot fake: a claim never predates the session that made it,
+    # and a claim bumps updated_at — so a bead last touched BEFORE the session was born is not that session's.
+    # -----------------------------------------------------------------------
+    T_ls = 1_782_900_000.0
+
+    def _ls_iso(epoch):
+        return _irg_datetime.datetime.fromtimestamp(
+            epoch, tz=_irg_datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    def _ls_dog(**kw):
+        # The shape `gc session list --json` returns for a dog slot (measured 05/11): name = alias = agent_name = the slot alias; id and session_name
+        # are the per-incarnation ones.
+        s = {"id": "ga-lsnew", "name": "gastown.dog-2", "alias": "gastown.dog-2", "session_name": "dog-galsnew",
+             "agent_name": "gastown.dog-2", "template": "gastown.dog", "state": "active",
+             "last_active": _ls_iso(T_ls - 30), "created_at": _ls_iso(T_ls - 300)}
+        s.update(kw)
+        return s
+
+    _ls_alias = "gastown.dog-2"
+    check("LS-1 (THE bug): the slot alias matches a live, fresh session born 300s ago, but the bead has been quiet for 3600s (since BEFORE that session existed) "
+          "→ not the owner → False. Pre-fix: True, and the dead predecessor's bead was never reclaimed",
+          session_is_live(_ls_alias, [_ls_dog()], now=T_ls, bead_update_age=3600) is False)
+    check("LS-2 (no regression): the bead was touched 120s ago, AFTER the session was born (300s ago) → the session can be its claimer → True",
+          session_is_live(_ls_alias, [_ls_dog()], now=T_ls, bead_update_age=120) is True)
+    check("LS-3a (margin): bead last touched 30s BEFORE the session's birth is inside the 60s clock-skew margin → cannot prove → True",
+          session_is_live(_ls_alias, [_ls_dog()], now=T_ls, bead_update_age=300 + 30) is True)
+    check("LS-3b (margin, exact edge): touched exactly 60s before the birth is not 'more than' the margin → True",
+          session_is_live(_ls_alias, [_ls_dog()], now=T_ls, bead_update_age=300 + 60) is True)
+    check("LS-3c (margin): touched 61s before the birth is provably older → False",
+          session_is_live(_ls_alias, [_ls_dog()], now=T_ls, bead_update_age=300 + 61) is False)
+    check("LS-4a (a per-incarnation identifier is never second-guessed): assignee == session_name, bead quiet since before birth → still True",
+          session_is_live("dog-galsnew", [_ls_dog()], now=T_ls, bead_update_age=3600) is True)
+    check("LS-4b (same for the session id)",
+          session_is_live("ga-lsnew", [_ls_dog()], now=T_ls, bead_update_age=3600) is True)
+    _ls_crew = {"id": "ga-lscrew", "name": "thies-wa", "alias": "thies", "session_name": "thies-wa-galscrew",
+                "agent_name": "thies-wa", "template": "thies-wa", "state": "active",
+                "last_active": _ls_iso(T_ls - 30), "created_at": _ls_iso(T_ls - 16 * 86400)}
+    check("LS-5 (a persistent crew's alias is stable, not reused): a bead quiet for 30 days under a crew session born 16 days ago stays owned → True "
+          "(the rule is scoped to pool slots; a crew's long-quiet bead is parked work, not an orphan)",
+          session_is_live("thies", [_ls_crew], now=T_ls, bead_update_age=30 * 86400) is True)
+    check("LS-6a (could not read the bead's age): bead_update_age=None → the old rule → True",
+          session_is_live(_ls_alias, [_ls_dog()], now=T_ls, bead_update_age=None) is True)
+    check("LS-6b (could not read the session's birth): created_at empty → True",
+          session_is_live(_ls_alias, [_ls_dog(created_at="")], now=T_ls, bead_update_age=3600) is True)
+    check("LS-6c (unparseable birth) → True",
+          session_is_live(_ls_alias, [_ls_dog(created_at="ontem")], now=T_ls, bead_update_age=3600) is True)
+    check("LS-6d (birth in the FUTURE — clock skew gives a negative session age, which would make any bead look 'older') → True",
+          session_is_live(_ls_alias, [_ls_dog(created_at=_ls_iso(T_ls + 600))], now=T_ls, bead_update_age=30) is True)
+    check("LS-6e (roster gives no template, so we cannot tell a pool slot from a crew) → True",
+          session_is_live(_ls_alias, [_ls_dog(template="")], now=T_ls, bead_update_age=3600) is True)
+    _ls_old = _ls_dog(id="ga-lsold", session_name="dog-galsold", created_at=_ls_iso(T_ls - 7200))
+    check("LS-7a (scan all): the bead was last touched 3600s ago, so the OLDER live incarnation (born 7200s ago) could be its claimer even though the newer one cannot → True",
+          session_is_live(_ls_alias, [_ls_dog(), _ls_old], now=T_ls, bead_update_age=3600) is True)
+    check("LS-7b (order does not matter)",
+          session_is_live(_ls_alias, [_ls_old, _ls_dog()], now=T_ls, bead_update_age=3600) is True)
+    import inspect as _ls_inspect
+    _ls_rc_src = _ls_inspect.getsource(run_cycle)
+    check("LS-8 (drift guard): run_cycle still hands the bead's own update age to session_is_live — dropped, bead_update_age=None switches the rule off without a sound",
+          "has_live_session = session_is_live(\n                assignee, sessions, now, bead_update_age," in _ls_rc_src)
 
     print(f"\nResults: {PASS} passed, {FAIL} failed")
     return FAIL == 0
