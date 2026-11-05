@@ -9,7 +9,7 @@
 # GRUPOS: unit — host padrão do MBP sem MBP_PROOF_SSH (ga-bmmxka: Tailscale, LAN só com a porta 22 respondendo, saída ilegível = Tailscale, a variável vale como está), judge_tree (todo processo com folga tem de ser rebaixado, e ao menos um tinha folga), PAUSE/CLEAN/SWEEP rodados de verdade (CLEAN também tira o cache do zsh, zdot/.zcompdump*, que a rodada criou e só ele — ga-w7qwl1.2.4.5), judge_blobs (o clone depois do commit confere por NOME), pre_zcomp, pedido de start, identidade, padrões de segredo ·
 #   cli — argumento com cara de comando, sessão real, install sem --apply (nada conecta), plan contra o dry-run do provider (pula sem scripts/gc-session-ssh, p.ex. no nó Linux) ·
 #   install — instalação com o builder real: bundle conferido LÁ, run/ preservada, cliente + links + config, spool 0700, nada em ~/.claude nem ~/.ssh, config do wrapper diferente = não sobrescreve, transferência adulterada = reprova sem trocar, ssh fora / MBP não livre = 3 ·
-#   e2e — a prova inteira (a–g) contra o MBP falso (o provider falso recusa o que o de verdade recusa: host que dorme sem gui_agent, teto de 2 sessões; deixa a marca .stop em run/; (f) o agente do domínio gráfico e (g) 2 sessões, parar a 1ª, a 2ª vive), com modos de falha: cada prova reprova sozinha, o diálogo NUNCA é respondido, a sessão é parada em todo caminho, a pausa do Athos nunca é removida por nós, e o MBP volta ao que era (arquivos, ~/.claude.json, ~/.ssh, spool, bundle); o origin de isca tem .gitignore e .gitattributes na RAIZ, então o clone esparso termina com 3 blobs nomeados (como o vivo), e a sessão falsa grava o cache do zsh no zdot/ (a limpeza o tira; arquivo novo que não é cache, link e blob de dado/sem nome reprovam)
+#   e2e — a prova inteira (a–g) contra o MBP falso (o provider falso recusa o que o de verdade recusa: host que dorme sem gui_agent, teto de 2 sessões; deixa a marca .stop em run/; (f) o agente do domínio gráfico e (g) 2 sessões, parar a 1ª, a 2ª vive), com modos de falha: cada prova reprova sozinha, o diálogo NUNCA é respondido, a sessão é parada em todo caminho, a pausa do Athos nunca é removida por nós, e o MBP volta ao que era (arquivos, ~/.claude.json, ~/.ssh, spool, bundle); o origin de isca tem .gitignore e .gitattributes na RAIZ, então o clone esparso termina com 3 blobs nomeados (como o vivo), e a sessão falsa grava o cache do zsh no zdot/ (a limpeza o tira; arquivo novo que não é cache, link e blob de dado/sem nome reprovam); no nó compartilhado (ga-azo0gm3) o censo de processos do (a) olha SÓ este host — um vigia PRESENCE_LIB_ONLY de OUTRO home (outro mbp-proof, o WATCH do gc-session-ssh) vivo durante a prova não reprova e vem contado no (a); `ps` do censo que falha ou volta vazio REPROVA (nunca "nenhum processo"); e o kill_leftovers só mata os brinquedos DESTA rodada (`$T/toysleep`), nunca um `sleep 6007` qualquer
 # CONTROLE NEGATIVO: cada guarda é trocada numa cópia (python, uma ocorrência exata) e os casos que a cobrem TÊM que passar a falhar.
 # VARIÁVEIS: MBPT_UNDER_TEST (script a testar) · MBPT_ONLY (grupos separados por vírgula; ou --only=a,b) · MBPT_CASES (casos; ou --cases=a,b) · MBPT_NO_MUTANTS=1 (ou --no-mutants) · MBPT_DEBUG=1 (ou --debug: mostra a saída do driver em cada e2e)
 # O QUE NÃO PROVA: o MBP de verdade (macOS, tmux, claude, a biblioteca de presença, o git/ssh com a credencial dele) — isso é o `e2e` ao vivo. Aqui o vigia falso olha o arquivo PAUSE e dá `renice`; a árvore de processos, o ps, o nice e o julgamento são reais.
@@ -20,7 +20,8 @@ P="${MBPT_UNDER_TEST:-$HERE/mbp-proof.py}"
 BUILDER="$HERE/remote-bundle-build.py"
 for v in $(env | sed -n 's/^\(GC_[A-Za-z0-9_]*\|MBP_PROOF_[A-Za-z0-9_]*\|FAKE_[A-Za-z0-9_]*\)=.*/\1/p') GIT_AUTHOR_NAME GIT_AUTHOR_EMAIL GIT_COMMITTER_NAME GIT_COMMITTER_EMAIL GIT_DIR GIT_WORK_TREE TMUX_TMPDIR; do unset "$v"; done
 if [ -n "${MBPT_T:-}" ]; then T=$MBPT_T; OWNER=0; else T=$(mktemp -d "${TMPDIR:-/tmp}/mbpt.XXXXXX") || exit 2; T=$(cd "$T" && pwd -P); OWNER=1; fi  # (o controle negativo reaproveita o mundo do pai)
-kill_leftovers() { pkill -f -- "$T/srv/gt-remote" > /dev/null 2>&1; pkill -f -- 'sleep 6007' > /dev/null 2>&1; return 0; }
+ln -sf "$(command -v sleep)" "$T/toysleep" 2> /dev/null   # o brinquedo da sessão dorme POR ESTE caminho (único desta rodada): o `pkill -f 'sleep 6007'` de antes, a cada fim de caso, matava os brinquedos de qualquer outro mbp-proof rodando no nó (ga-azo0gm3)
+kill_leftovers() { pkill -f -- "$T/srv/gt-remote" > /dev/null 2>&1; pkill -f -- "$T/toysleep 6007" > /dev/null 2>&1; return 0; }
 trap 'if [ "$OWNER" = 1 ]; then kill_leftovers; find "$T" -delete 2>/dev/null; fi' EXIT  # (sem `exit`: o trap não pode trocar o código de saída do teste)
 n=0; fails=0; skipped=0
 ok() { n=$((n+1)); if [ "$1" = 0 ]; then echo "ok   $2"; else echo "FAIL $2"; fails=$((fails+1)); fi; }
@@ -262,7 +263,7 @@ elif h.get("gui_agent") and not (h.get("session_env") or {}).get("claude"):
       [ $mode != startfail2 ] || [ "$NAME" != remote-test-remote-mbp-92 ] || { echo "gc-session-ssh: start recusado: falha falsa (2ª sessão leve)" >&2; exit 1; }
       [ $mode != startdiag2 ] || [ "$NAME" != remote-test-remote-mbp-92 ] || refuse_diag
       mkdir -p "$(dirname "$SOCK")"; : > "$SOCK"
-      nohup sh -c 'sleep 6007; : sessao-leve' > /dev/null 2>&1 < /dev/null &
+      nohup sh -c "$T/toysleep 6007; : sessao-leve" > /dev/null 2>&1 < /dev/null &
       echo $! > "$S/panepid$sx"; touch "$S/running$sx"; agent_up; echo "$NAME" >> "$S/order"
       [ $mode != tmuxbad ] || touch "$S/tmuxbad"  # a partir daqui o tmux responde com erro de versão: o estado das sessões vira "não sei"
       exit 0
@@ -275,7 +276,7 @@ elif h.get("gui_agent") and not (h.get("session_env") or {}).get("claude"):
     cat > "$L" <<EOS
 #!/bin/bash
 bash -c "\$(cat '$T/watch.body')" _ \$\$ '$PAUSE' '$nw' '$kc' &
-nice -n 10 sh -c 'sleep 6007; : --settings $BUNDLE/city/settings.json' &
+nice -n 10 sh -c '$T/toysleep 6007; : --settings $BUNDLE/city/settings.json' &
 wait
 EOS
     nohup bash "$L" > /dev/null 2>&1 < /dev/null &
@@ -357,7 +358,7 @@ srv_skeleton() {  # o "MBP" antes da instalação: o que o Athos já tem (claude
   find "$SRV" -mindepth 1 -delete 2> /dev/null; mkdir -p "$SRV/fakebin" "$SRV/tmp" "$SRV/gt-remote/bin" "$SRV/.ssh" "$SRV/.claude"
   cp "$T/fake/tmux" "$T/fake/claude" "$T/fake/launchctl" "$SRV/fakebin/"
   for t in python3 git; do [ -x "/usr/bin/$t" ] || [ -x "/bin/$t" ] || ln -s "$(command -v $t)" "$SRV/fakebin/$t"; done
-  find "$SRV/fakebin/git" -delete 2> /dev/null; printf '#!/bin/sh\n[ -z "${FAKE_GITFAIL:-}" ] || case " $* " in *" $FAKE_GITFAIL "*) echo "git: boom" >&2; exit 128;; esac\nexec %s "$@"\n' "$(command -v git)" > "$SRV/fakebin/git"; chmod +x "$SRV/fakebin/git"; rp=$(command -v ps); printf '#!/bin/sh\ncase "$*" in *nice=*) [ -z "${FAKE_PSNICE:-}" ] || { %s "$@" | sed "s/^\\( *[0-9]* *[0-9]* *\\)[-0-9]*/\\1-/"; exit 0; };; esac\nexec %s "$@"\n' "$rp" "$rp" > "$SRV/fakebin/ps"; chmod +x "$SRV/fakebin/ps"  # git que falha só no subcomando pedido (FAKE_GITFAIL); ps que não dá o nice (FAKE_PSNICE), como o "-" das tarefas de tempo real no nó Linux
+  find "$SRV/fakebin/git" -delete 2> /dev/null; printf '#!/bin/sh\n[ -z "${FAKE_GITFAIL:-}" ] || case " $* " in *" $FAKE_GITFAIL "*) echo "git: boom" >&2; exit 128;; esac\nexec %s "$@"\n' "$(command -v git)" > "$SRV/fakebin/git"; chmod +x "$SRV/fakebin/git"; rp=$(command -v ps); printf '#!/bin/sh\ncase "$*" in *nice=*) [ -z "${FAKE_PSNICE:-}" ] || { %s "$@" | sed "s/^\\( *[0-9]* *[0-9]* *\\)[-0-9]*/\\1-/"; exit 0; };; "-axo pid=,args=") case "${FAKE_PSCENSUS:-}" in fail) echo "ps: boom" >&2; exit 1;; empty) exit 0;; esac;; esac\nexec %s "$@"\n' "$rp" "$rp" > "$SRV/fakebin/ps"; chmod +x "$SRV/fakebin/ps"  # git que falha só no subcomando pedido (FAKE_GITFAIL); ps que não dá o nice (FAKE_PSNICE), como o "-" das tarefas de tempo real no nó Linux; ps do censo de processos que falha (rc 1) ou volta vazio (rc 0) só nessa chamada (FAKE_PSCENSUS=fail|empty)
   printf '#!/bin/sh\n' > "$SRV/gt-remote/bin/mbp-presence.sh"
   printf '{"projects": {}, "numStartups": 3}\n' > "$SRV/.claude.json"
   echo "github.com ssh-ed25519 AAAAfake" > "$SRV/.ssh/known_hosts"; echo "ssh-ed25519 AAAAfake athos@mbp" > "$SRV/.ssh/authorized_keys"
@@ -821,6 +822,15 @@ g_e2e() {
   fail1 leavesession leavesession "FAIL (a) o stop deixa o MBP limpo" "stop que não derruba a sessão (o tmux ainda a lista) → (a) reprova"
   fail1 leavefile leavefile "FAIL (a) o stop deixa o MBP limpo" "stop que deixa o arquivo do lançador em run/ → reprova"
   fail1 leaveproc leaveproc "FAIL (a) o stop deixa o MBP limpo" "stop que deixa processos da sessão → reprova"
+  # ga-azo0gm3: o censo de processos do (a) olha SÓ este host. Num nó compartilhado vivem vigias de outros mundos (outro mbp-proof, o WATCH do gc-session-ssh): não são sobra DESTE MBP, e o (a) diz que os viu e ignorou
+  c foreignwatch && { mkfifo "$T/foreign.fifo"; bash -c 'export PRESENCE_LIB_ONLY=1; read x < "$1"' _ "$T/foreign.fifo" & fw=$!   # vigia de OUTRO mundo: leva PRESENCE_LIB_ONLY e nada do $SRV deste
+    FAKE_MODE=ok ep; kill "$fw" 2> /dev/null; wait "$fw" 2> /dev/null; rm -f "$T/foreign.fifo"
+    [ $RC = 0 ] && grep -F "PASS (a) o stop deixa o MBP limpo" "$T/out" | grep -qE 'vigias de OUTRO home ignorados [1-9]'; ok $? "e2e: um vigia PRESENCE_LIB_ONLY de OUTRO home vivo durante a prova NÃO reprova o (a), e o (a) diz que o viu e ignorou (rc=$RC)"; }
+  FAKE_PSCENSUS=fail fail1 psfail ok "FAIL (a) o stop deixa o MBP limpo" "o ps do censo falha (rc 1, sem saída) → NÃO é \"nenhum processo\": o (a) reprova (terceiro estado)"
+  FAKE_PSCENSUS=empty fail1 psempty ok "FAIL (a) o stop deixa o MBP limpo" "o ps do censo volta vazio (rc 0, nenhuma linha: há sempre ao menos o próprio ps) → também \"não consegui ver\": o (a) reprova"
+  c killscope && { kill_leftovers; sleep 6007 & by=$!; ln -sf "$(command -v sleep)" "$T/toyoutro"; "$T/toyoutro" 6007 & ot=$!; "$T/toysleep" 6007 & mine=$!; sleep 0.3
+    kill_leftovers; sleep 0.3; kill -0 "$mine" 2> /dev/null; r1=$?; kill -0 "$by" 2> /dev/null; r2=$?; kill -0 "$ot" 2> /dev/null; r3=$?; kill "$by" "$ot" "$mine" 2> /dev/null; wait "$by" "$ot" "$mine" 2> /dev/null
+    [ $r1 != 0 ] && [ $r2 = 0 ] && [ $r3 = 0 ]; ok $? "e2e: o kill_leftovers derruba o brinquedo DESTA rodada ($T/toysleep) e poupa um 'sleep 6007' qualquer e o de outro mbp-proof no nó (vivos: seu=$r1 alheio=$r2 outro=$r3, 0 = vivo)"; }
   fail1 stopfail stopfail "FAIL (a) sessão parada pelo provider" "stop que falha → reprova"
   fail1 secret secret "FAIL (d) varredura (antes de apagar a pasta de teste)" "segredo no spool → a varredura reprova"
   fail1 secretb64 secretb64 "FAIL (d) varredura (antes de apagar a pasta de teste)" "segredo dentro do stdout_b64 de uma resposta do spool (base64) → a varredura reprova"
@@ -1056,6 +1066,9 @@ def new_run() -> str:'
   mutant e2e stalesocket "o antes/depois acusa o socket que já existia" '(post["tmux_socket"] and not pre["tmux_socket"])' 'post["tmux_socket"]'
   mutant e2e leavefile "o arquivo do lançador sobrando não conta" '[x for x in (s["run_dir"] or []) if not STOP_RE.fullmatch(x)] == [] and s["procs"] == [])' 's["procs"] == [])'
   mutant e2e leaveproc "processo sobrando não conta" ' and s["procs"] == [])' ')'
+  mutant e2e foreignwatch "vigia de OUTRO home conta como sobra deste MBP" '("PRESENCE_LIB_ONLY" in f[1] and home.rstrip("/") + "/" in f[1])' '"PRESENCE_LIB_ONLY" in f[1]'
+  mutant e2e psfail "ps do censo com rc != 0 e sem saída vira \"nenhum processo\"" 'if r.returncode != 0 or not any(f[0].isdigit() for f in rows):' 'if False:'
+  mutant e2e psempty "ps do censo vazio (rc 0, nenhuma linha) vira \"nenhum processo\"" 'if r.returncode != 0 or not any(f[0].isdigit() for f in rows):' 'if r.returncode != 0:'
   mutant unit sweepb64 "SWEEP não decodifica os campos *_b64" '            if key.endswith("_b64"):' '            if False:'
   mutant unit sweepb64 "SWEEP não decodifica o cmd rs1" '            elif key == "cmd" and isinstance(v, str) and v.startswith("rs1 "):' '            elif False:'
   mutant unit sweepb64 "SWEEP perde o que não decodificou" '            unv += badb' '            pass'

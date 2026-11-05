@@ -16,6 +16,8 @@
 #     rede dos órfãos (ga-2hd02v.5.8): cada selftest roda em grupo próprio e o que sobra no grupo depois de 1 s de graça é morto com KILL e anotado em leaks.tsv (leaked/leak_names no resumo; o que acaba dentro da graça, o brief, não conta) ·
 #     ps que falha, volta vazio, volta lixo ou sem nenhuma linha numérica, ou só falha na 2ª leitura = leaked null com `nome:?` em leak_names, nada morto, nunca "0" (vazio → 0; falhou/ilegível → null) · linha `?` e linha que o resumo não entende em
 #     leaks.tsv = leaked null · vazamento que não consegue ser anotado (leaks.tsv é pasta) = rodada incompleta, exit 3, nada gravado · o timeout de brinquedo não deixa `sleep DUR` órfão, estouro dá 124, prazo não inteiro dá 125.
+#     MUNDO da rodada (ga-azo0gm3, só no Linux): o selftest que solta um processo com setsid + duplo fork (FORA do grupo) é varrido pelo PAI (o bash do run-one.sh é o subreaper, via world-run.py), na MESMA linha de leaks.tsv (both: 1 do grupo + 1 do
+#     mundo = :2), poupa o sentinela de OUTRO mundo, e o helper recusa varrer abaixo de um pid que não o chamou · sweep que quebra ou devolve lixo = leaked null com `nome:?`, nada morto · HQ_WORLD=off, o arquivo hq-selftests.noworld ou a sonda que recusa = só a rede do grupo.
 #   queima (g_burn): sobe BALLAST_CORES laços, avisa o resumo na partida e sai no TERM sem deixar filho · passado BALLAST_BURN_SECS termina SOZINHA com rc 0 (o `timeout` do prazo a mataria com 124 e o
 #     governo cobraria >= 600 s de cooldown de falha) · BALLAST_BURN_SECS inválido = exit 2 · o relógio (sleep) que falha dá rc 1, não 0 · o tempo padrão fica >= 60 s abaixo do prazo da linha `queima` do registro. Toda corrida de entrada inválida
 #     leva prazo (o queima agora dorme BALLAST_BURN_SECS: um que aceitasse a entrada ruim penduraria o teste).
@@ -32,7 +34,7 @@
 # CONTROLE NEGATIVO: (wa-mutants.sh: cada comportamento acima trocado numa cópia do item — o motor tirado do clone do WA em vez do main do HQ, o marcador que ignora uma das pontas ou o relógio ou guarda a ponta lida antes em vez da testada, o rig errado, o python errado, a árvore que fica, o guarda da árvore velha que some ou lê só metade, a leitura que falha vista como limpa, o HEAD ilegível vestido de ponta lida, o pull falho que deixa o marcador valer, o TERM que não espera ·
 #   a lista inteira está nas linhas do bloco MUT) · sem a rodada de reprovadas · ambiente/prazo contados como reprovados · lista só-macOS ignorada ou aceita vazia · comparação sem a rodada anterior · ponta não gravada · árvore
 #   não removida (nem no TERM) · pull/wt-add que falham ignorados · queima que não leva os laços no TERM · queima que espera o prazo (rc 124), sai com rc 1 no fim normal ou toma o relógio que falhou por fim normal · tempo padrão acima do prazo do registro ·
-#   BALLAST_BURN_SECS inválido aceito · falha do passo final vista como rc 0 · alvo de estado que é pasta sem a checagem prévia · passo do resumo que morre sem resumo · padrão só-macOS não aparado · a rede dos órfãos: 1ª ou 2ª leitura do grupo ilegível vista como 0, `members` que ignora o rc do ps, que aceita saída sem linha numérica ou resposta não numérica, linha `?` que some ou que o resumo ignora,
+#   BALLAST_BURN_SECS inválido aceito · falha do passo final vista como rc 0 · alvo de estado que é pasta sem a checagem prévia · passo do resumo que morre sem resumo · padrão só-macOS não aparado · o mundo da rodada (sweep desligado, bash que não vira subreaper, sweep que falha ou devolve lixo visto como 0, contagem que substitui em vez de somar, mundo varrido com o ps ilegível, interruptor ou sonda ignorados, raiz que não é antepassado aceita), a rede dos órfãos: 1ª ou 2ª leitura do grupo ilegível vista como 0, `members` que ignora o rc do ps, que aceita saída sem linha numérica ou resposta não numérica, linha `?` que some ou que o resumo ignora,
 #   leaked contado em vez de null, nomes sem `:?`, anotação que falha ignorada (|| true), 2ª leitura sem a 1 s de graça (o `[ -n "$o" ] || return 1` de `members` é EQUIVALENTE — o guarda de linha numérica do awk e o case cobrem o mesmo caso — e por isso não é mutado) —
 #   cada um é aplicado numa cópia e a bateria TEM que falhar.
 # VARIÁVEIS: HBI_PY (python do teste; padrão /usr/bin/python3) · HBI_ONLY=<grupo> (hq mut burn wam) · HBI_NO_MUTANTS=1 · HBI_JOBS (mutantes em paralelo; padrão 4)
@@ -51,12 +53,13 @@ killtree() {
   done
   return 0
 }
+ESCSEC=$((60000 + $$ % 4000)); ESC2SEC=$((64000 + $$ % 1000)); SENSEC=$((65000 + $$ % 500)); DECSEC=$((65500 + $$ % 30))   # ga-azo0gm3 (mundo da rodada): o que foge do grupo, o 2º do selftest "both", o sentinela de OUTRO mundo e o filho do chamariz
 LEAKSEC=$((20000 + $$ % 20000)); TOYSEC=$((40000 + $$ % 20000))   # durações de `sleep` ÚNICAS desta execução: só os MEUS órfãos são contados (o 7777/4242 fixos viravam falso positivo entre duas baterias ao mesmo tempo)
 # sleeps_of DUR — quantos `sleep DUR` vivem. vazio → 0; falhou/ilegível (ps que falha ou volta sem nada: sempre há ao menos o próprio ps) → "ilegivel:ps", nunca 0 (não consegui ler ≠ nenhum)
 sleeps_of() { local o; o=$(ps -axo command= 2>/dev/null) || { echo "ilegivel:ps"; return 0; }; [ -n "$o" ] || { echo "ilegivel:ps"; return 0; }; printf '%s\n' "$o" | grep -c "^sleep $1\$"; }
 # kill_sleeps DUR — termina, por PID, cada `sleep DUR` vivo (por PID e não por `pkill -f`: o pkill é bloqueado nas sessões de agente e um padrão mal escrito derruba o que não devia). vazio → nada a matar; ps que falha → nada
 kill_sleeps() { local p; for p in $(ps -axo pid=,command= 2>/dev/null | awk -v d="$1" '$2 == "sleep" && $3 == d && NF == 3 {print $1}'); do kill "$p" 2>/dev/null; done; return 0; }
-cleanup() { killtree "$T/"; pkill -f "$T/" 2>/dev/null; kill_sleeps "$LEAKSEC"; kill_sleeps "$TOYSEC"; sleep 0.2; chmod -R u+rwX "$T" 2>/dev/null; find "$T" -mindepth 1 -delete 2>/dev/null; rmdir "$T" 2>/dev/null; }
+cleanup() { killtree "$T/"; pkill -f "$T/" 2>/dev/null; kill_sleeps "$LEAKSEC"; kill_sleeps "$TOYSEC"; kill_sleeps "$ESCSEC"; kill_sleeps "$ESC2SEC"; kill_sleeps "$SENSEC"; kill_sleeps "$DECSEC"; sleep 0.2; chmod -R u+rwX "$T" 2>/dev/null; find "$T" -mindepth 1 -delete 2>/dev/null; rmdir "$T" 2>/dev/null; }
 trap cleanup EXIT
 trap 'exit 143' TERM INT HUP   # sem isto um TERM/INT (TaskStop, ctrl-c) pula o EXIT e deixa processos órfãos
 fails=0; n=0
@@ -112,7 +115,11 @@ if [ -z "${HBI_MUTANT:-}" ]; then
 fi
 cat > "$W/bin/python3" <<'EOF'
 #!/bin/sh
-# python3 de brinquedo: o real, salvo que COM o arquivo $HBI_PY_CRASH o passo do RESUMO final (o único cujo texto tem "res1, res2, prev_p", "erc, short, pull" no hq-mutants ou "erc, short, hqshort" no wa-mutants) quebra — rc 1 e nada na saída, como um OOM ou um erro do interpretador
+# python3 de brinquedo: o real, salvo o helper world-run.py (ga-azo0gm3: com $HBI_SWEEP_MODE = fail o --sweep quebra com rc 1, = garbage devolve `xx`; com o arquivo $HBI_PROBE_FAIL o --probe recusa) e que COM o arquivo $HBI_PY_CRASH o passo do RESUMO final (o único cujo texto tem "res1, res2, prev_p", "erc, short, pull" no hq-mutants ou "erc, short, hqshort" no wa-mutants) quebra — rc 1 e nada na saída, como um OOM ou um erro do interpretador
+case "$*" in
+  *world-run.py*--sweep*) case "$(cat "$HBI_SWEEP_MODE" 2>/dev/null)" in fail) echo "python3 (brinquedo): sweep quebrou" >&2; exit 1 ;; garbage) echo xx; exit 0 ;; esac ;;
+  *world-run.py*--probe*) [ ! -f "$HBI_PROBE_FAIL" ] || exit 1 ;;
+esac
 case "$1:$2" in
   -I:-) src=$(cat)
         if [ -f "$HBI_PY_CRASH" ] && printf '%s' "$src" | grep -q -e 'res1, res2, prev_p' -e 'erc, short, pull' -e 'erc, short, hqshort'; then echo "python3 (brinquedo): quebrou" >&2; exit 1; fi
@@ -121,7 +128,7 @@ esac
 exec "$HBI_REAL_PY" "$@"
 EOF
 chmod +x "$W/bin/python3"
-export HBI_REAL_PY="$PY" HBI_PY_CRASH="$W/py.crash"   # o python3 de brinquedo acima lê os dois (todo filho herda)
+export HBI_REAL_PY="$PY" HBI_PY_CRASH="$W/py.crash" HBI_SWEEP_MODE="$W/sweep.mode" HBI_PROBE_FAIL="$W/probe.fail"   # o python3 de brinquedo acima lê os quatro (todo filho herda)
 cat > "$W/bin/git" <<'EOF'
 #!/bin/sh
 # git de brinquedo: o real, salvo que COM o arquivo $HBI_GIT_BAD a leitura de uma branch worker/* (rev-parse -q --verify) sai com rc 128, como um repo que não abre — o terceiro estado (não consegui ler), que um repo de verdade não dá no meio da rodada
@@ -174,7 +181,7 @@ newrig() {  # repo-fonte com a árvore do hq de mentira + o repo bare que o stub
   printf '# só-macOS\nscripts/mac.selftest.sh\n' > "$c/scripts/hetzner-mac-only.hq.txt"
   git -C "$SRC" add -A && git -C "$SRC" commit -q -m um && git clone -q --bare "$SRC" "$GR/gascity/repo.git" 2>/dev/null
   git -C "$GR/gascity/repo.git" update-ref refs/remotes/origin/main "$(git -C "$SRC" rev-parse HEAD)"
-  rm -f "$W/rg.pull.fail" "$W"/rg.pull.fail.* "$W/rg.wtadd.fail" "$W/rg.wtadd.race" "$W/rg.wtadd.at" "$W/rg.wtadd.badhead" "$W/rg.wtrm.fail" "$W/git.bad"; : > "$W/rg.calls"
+  rm -f "$W/rg.pull.fail" "$W"/rg.pull.fail.* "$W/rg.wtadd.fail" "$W/rg.wtadd.race" "$W/rg.wtadd.at" "$W/rg.wtadd.badhead" "$W/rg.wtrm.fail" "$W/git.bad" "$W/sweep.mode" "$W/probe.fail"; : > "$W/rg.calls"
 }
 newcommit() {  # newcommit ARQUIVO RC — um selftest novo no main (e o espelho avança)
   mkst "$SRC/.gascity-gastown-hq/scripts/$1" "$2"; git -C "$SRC" add -A && git -C "$SRC" commit -q -m novo
@@ -253,6 +260,45 @@ g_hq() {
   # a anotação que não grava (aqui: leaks.tsv é uma PASTA) com um vazamento de verdade: o selftest do leak fica sem resultado, a rodada sai INCOMPLETA (exit 3, nada gravado) em vez de completa com o vazamento sumido
   leakrig; PRE_RD='mkdir "$RD/leaks.tsv"' runhq; sleep 0.3
   check "hq: vazamento que não consegue ser anotado em leaks.tsv → rodada incompleta (exit 3), a ponta NÃO é gravada, e o sleep saiu com KILL do mesmo jeito" "3 incompleto 0 0" "$RC $(sj result) $(sleeps_of "$LEAKSEC") $([ -s "$BH/hq-selftests.last" ] && echo 1 || echo 0)"
+
+  # ga-azo0gm3 — o MUNDO da rodada. O que o selftest solta com setsid + duplo fork (servidor tmux, agente, vigia) sai do GRUPO e a rede por grupo não o vê; o bash do run-one.sh é o SUBREAPER (world-run.py) e o varre pelo PAI.
+  # Só no Linux (sem prctl/proc a sonda recusa e fica só a rede do grupo). O sentinela de OUTRO mundo (setsid, pai fora da árvore do item) tem de sobreviver: nunca padrão global.
+  wx=0; [ "$(uname -s)" = Linux ] || wx=1   # 0 = o escapado tem de sair · 1 = sem subreaper: sobra (a rede do grupo não o vê)
+  ESCPY='import os,sys; os.setsid(); os.execvp("sleep", ["sleep", sys.argv[1]])'   # um sleep em sessão própria (setsid), como um servidor que se desliga do grupo
+  escrig() {  # o rig padrão + esc (um sleep FORA do grupo) + both (um sleep NO grupo e um FORA)
+    newrig
+    mkst "$SRC/.gascity-gastown-hq/scripts/esc.selftest.sh" 0 "( python3 -I -c '$ESCPY' $ESCSEC > /dev/null 2>&1 < /dev/null & )"
+    mkst "$SRC/.gascity-gastown-hq/scripts/both.selftest.sh" 0 "sleep $LEAKSEC > /dev/null 2>&1 & ( python3 -I -c '$ESCPY' $ESC2SEC > /dev/null 2>&1 < /dev/null & )"
+    git -C "$SRC" add -A && git -C "$SRC" commit -q -m esc && git -C "$GR/gascity/repo.git" fetch -q "$SRC" "+HEAD:refs/remotes/origin/main"
+  }
+  kill_world_sleeps() { kill_sleeps "$ESCSEC"; kill_sleeps "$ESC2SEC"; kill_sleeps "$LEAKSEC"; sleep 0.2; }
+  escrig; ( python3 -I -c "$ESCPY" "$SENSEC" > /dev/null 2>&1 < /dev/null & ); runhq; sleep 0.3
+  check "hq: o que o selftest solta com setsid + duplo fork (FORA do grupo) é varrido pelo mundo da rodada: nem o do esc nem o do both sobram (Linux: 0 0; sem subreaper: 1 1)" "$wx $wx" "$(sleeps_of "$ESCSEC") $(sleeps_of "$ESC2SEC")"
+  check "hq: ...o mundo entra na MESMA linha de leaks.tsv do grupo (both: 1 do grupo + 1 do mundo = :2; esc = :1) e a rodada é completa, rc 0" "0 completo $([ $wx = 0 ] && echo '2 scripts/both.selftest.sh:2 scripts/esc.selftest.sh:1' || echo '1 scripts/both.selftest.sh:1 null')" "$RC $(sj result) $(sj leaked) $(sj leak_names.0) $(sj leak_names.1)"
+  check "hq: ...e o sentinela de OUTRO mundo (setsid, pai fora da árvore do item) segue vivo: o mundo é achado pelo PAI, não por padrão global" "1" "$(sleeps_of "$SENSEC")"
+  kill_sleeps "$SENSEC"; kill_world_sleeps
+  escrig; runhq HQ_WORLD=off; sleep 0.3
+  check "hq: com HQ_WORLD=off o escapado SOBRA (ele de fato sai do grupo: a rede do grupo não o vê; só o mundo o derruba) e a linha de leaks é só a do grupo (both:1)" "1 1 1 scripts/both.selftest.sh:1" "$(sleeps_of "$ESCSEC") $(sleeps_of "$ESC2SEC") $(sj leaked) $(sj leak_names.0)"
+  kill_world_sleeps
+  escrig; : > "$BH/hq-selftests.noworld"; runhq; sleep 0.3
+  check "hq: o arquivo hq-selftests.noworld (interruptor de emergência) desliga o mundo: o escapado sobra" "1" "$(sleeps_of "$ESCSEC")"
+  kill_world_sleeps; rm -f "$BH/hq-selftests.noworld"
+  if [ $wx = 0 ]; then
+    for _m in fail garbage; do   # o sweep que quebra (rc 1) ou devolve lixo (rc 0): "não consegui varrer" ≠ "ninguém sobrou" → leaked null, esc:?, e nada é morto (estado inerte)
+      escrig; echo "$_m" > "$W/sweep.mode"; runhq; sleep 0.3
+      check "hq: sweep do mundo ilegível ($_m) → leaked null (nunca 0), esc aparece como :? e o escapado segue vivo; rodada completa, rc 0" "0 completo null 1 1" "$RC $(sj result) $(sj leaked) $(sj leak_names | grep -c 'scripts/esc.selftest.sh:?') $(sleeps_of "$ESCSEC")"
+      kill_world_sleeps
+    done
+    escrig; : > "$W/probe.fail"; runhq; sleep 0.3
+    check "hq: a sonda do subreaper que recusa → só a rede do grupo (o escapado sobra), rodada completa rc 0" "0 completo 1" "$RC $(sj result) $(sleeps_of "$ESCSEC")"
+    kill_world_sleeps
+    # o helper, extraído do item: --sweep de um pid que NÃO é antepassado de quem varre recusa ('?', rc 2) e não derruba o filho do chamariz (um pid errado ou reciclado nunca vira "varra abaixo de qualquer um")
+    sed -n "/^cat > \"\$RD\/world-run.py\" << 'PY'\$/,/^PY\$/p" "$ITEMS/hq-selftests.sh" | sed '1d;$d' > "$W/wr.py"
+    bash -c "sleep $DECSEC & wait" & dec=$!; sleep 0.3
+    o=$("$PY" -I -S "$W/wr.py" --sweep "$dec" 2> /dev/null); r=$?
+    check "hq: o helper recusa varrer abaixo de um pid que não o chamou (saída '?', rc 2) e o filho do chamariz segue vivo" "? 2 1" "$o $r $(sleeps_of "$DECSEC")"
+    kill "$dec" 2> /dev/null; wait "$dec" 2> /dev/null; kill_sleeps "$DECSEC"
+  fi
 
   newrig; runhq
   check "hq: rodada completa → rc 0" "0" "$RC"
@@ -766,6 +812,15 @@ hq-selftests.sh@@falha do passo final (resumo e gravação do estado) vira rc 0@
 hq-selftests.sh@@alvo de estado que é pasta só falha na troca, DEPOIS do resumo (sem a checagem antes)@@    if os.path.isdir(path):@@    if False:
 hq-selftests.sh@@o passo do resumo que morre sem imprimir não deixa resumo nenhum@@summary resumo-falhou main="${tested:0:9}" pull="$pull" python_rc="$prc"@@:
 hq-selftests.sh@@a lista só-macOS não é aparada nas pontas@@pat=${pat#"${pat%%[![:space:]]*}"}; pat=${pat%"${pat##*[![:space:]]}"}@@:
+hq-selftests.sh@@o mundo da rodada nunca é varrido (o escapado do grupo fica)@@if [ "${WORLD:-0}" = 1 ] && [ "$unread" = 0 ]; then@@if false; then
+hq-selftests.sh@@o bash do run-one.sh não vira subreaper (o órfão vai para o init e a varredura não o acha)@@RUNNER=(python3 -I -S "$RD/world-run.py" --exec bash)@@RUNNER=(bash)
+hq-selftests.sh@@o sweep que falha vira 0 (não consegui varrer = ninguém sobrou)@@--sweep "$$" 2> /dev/null) || w="?"@@--sweep "$$" 2> /dev/null) || w=0
+hq-selftests.sh@@a saída do sweep que não é número é ignorada@@case "$w" in 0) ;; ''|*[!0-9]*) row="?" ;; *) row=$(( ${row:-0} + w )) ;; esac@@case "$w" in 0) ;; ''|*[!0-9]*) ;; *) row=$(( ${row:-0} + w )) ;; esac
+hq-selftests.sh@@a contagem do mundo substitui a do grupo em vez de somar@@*) row=$(( ${row:-0} + w )) ;; esac@@*) row=$w ;; esac
+hq-selftests.sh@@o mundo corre com o ps ilegível (ignora o estado inerte)@@if [ "${WORLD:-0}" = 1 ] && [ "$unread" = 0 ]; then@@if [ "${WORLD:-0}" = 1 ]; then
+hq-selftests.sh@@o interruptor de emergência (hq-selftests.noworld) é ignorado@@ || [ -e "$BH/hq-selftests.noworld" ]@@
+hq-selftests.sh@@a sonda do subreaper que recusa é ignorada@@ || ! python3 -I -S "$RD/world-run.py" --probe > /dev/null 2>&1 ||@@ ||
+hq-selftests.sh@@o sweep aceita uma raiz que não é antepassado de quem varre@@    if x != root:   # root@@    if False:   # root
 hq-mutants.sh@@o marcador de ocioso nunca é reconhecido@@if [ "$main" = "$(cat "$IDLE" 2> /dev/null)" ] &&@@if false &&
 hq-mutants.sh@@o marcador de ocioso vale para sempre (sem o prazo de 6 h)@@ && [ -n "$(find "$IDLE" -mmin -360 2> /dev/null)" ]; then@@; then
 hq-mutants.sh@@o marcador é gravado em qualquer resultado@@if rec["result"] == "sem-novidade" and erc == 0:@@if True:

@@ -17,8 +17,10 @@
 #   resumo `gravacao-falhou`, nada trocado. O passo do resumo que morre sem imprimir: exit 3 com o resumo `resumo-falhou`. Nos dois a rodada NÃO conta como feita (a ponta é o último arquivo gravado) e a
 #   próxima refaz e diz de novo as falhas novas: repetir um aviso é o lado seguro; nunca rc 0 sem resumo. Caso raro, só depois de todos os .tmp gravados: uma TROCA que falha (exit 3, sem o resumo de erro): o
 #   resumo `completo` já saiu uma vez e a ponta, por ser a última, fica sem gravar — a rodada refaz, mas as falhas novas dessa rodada podem já estar na linha de base.
-# ESCOPO DA REDE DOS ÓRFÃOS: pega quem fica no GRUPO do selftest (`set -m` dá o grupo; o que o selftest solta com setsid/nohup/`set -m` próprio vai para OUTRO grupo e não é visto). Esses continuam contando na sessão do item
-#   e o teto de RSS do governo (hetzner-ballast.py) segue sendo a última barreira: o sintoma de um vazamento fora do grupo é why=rss de novo, e a sonda hetzner-ballast-hq-selftests-mem-probe.py mostra de quem é.
+# ESCOPO DA REDE DOS ÓRFÃOS: (1) o GRUPO do selftest (`set -m` dá o grupo; fica vivo 1 s depois do fim = KILL). (2) o MUNDO da rodada (ga-azo0gm3): o que o selftest solta com setsid/nohup/duplo fork (servidor tmux, agente, vigia) sai do grupo,
+#   mas o kernel o entrega ao subreaper mais próximo, e o bash de cada run-one.sh é um (world-run.py --exec: prctl PR_SET_CHILD_SUBREAPER, que sobrevive ao exec): ao fim do selftest o que vive abaixo dele sai com TERM e depois KILL, achado pelo PAI
+#   e nunca por padrão global (o nó é compartilhado), e entra na MESMA linha de leaks.tsv (grupo + mundo somados). Só com o ps lido (ps ilegível segue inerte). Sem Linux/prctl/proc, com HQ_WORLD=off ou com o arquivo $BALLAST_HOME/hq-selftests.noworld
+#   (interruptor de emergência) fica só (1). O teto de RSS do governo (hetzner-ballast.py) segue sendo a última barreira; a sonda hetzner-ballast-hq-selftests-mem-probe.py mostra de quem é.
 # LIMITES: roda no nó como `runner`, sem rede de saída garantida (os selftests do hq são herméticos com stubs; é o mesmo ambiente do gate via mbp-run.sh --repo hq); a lista só-macOS APRENDIDA pela
 #   sombra mora no mini e não chega aqui (alguns reprovados por ambiente podem aparecer); nenhum dado sai do nó além deste resumo (nomes de arquivo de código e contagens).
 set -u
@@ -117,16 +119,100 @@ unread=0; left=0
 left=$(members "$tp") || { left=0; unread=1; }
 if [ "$unread" = 0 ] && [ "$left" -gt 0 ]; then sleep 1; left=$(members "$tp") || { left=0; unread=1; }; fi
 if [ "$unread" = 1 ]; then row="?"; elif [ "$left" -gt 0 ]; then row=$left; kill -KILL -- "-$tp" 2> /dev/null; else row=""; fi
+# O MUNDO da rodada (ga-azo0gm3): este bash é o SUBREAPER (world-run.py --exec), então o órfão que fugiu do GRUPO com setsid, nohup ou duplo fork (o servidor tmux, o agente, o vigia de um selftest) é filho DELE e sai agora, TERM e depois KILL:
+# identificado pelo pai, nunca por padrão global (o nó é compartilhado). Só com o ps lido (unread=0): ps ilegível segue inerte, como na rede do grupo. vazio → 0; falhou/ilegível (o sweep morreu, ou não leu o /proc) → "?" (não sei), nunca 0.
+if [ "${WORLD:-0}" = 1 ] && [ "$unread" = 0 ]; then
+  w=$(python3 -I -S "$RD/world-run.py" --sweep "$$" 2> /dev/null) || w="?"
+  case "$w" in 0) ;; ''|*[!0-9]*) row="?" ;; *) row=$(( ${row:-0} + w )) ;; esac
+fi
 # a anotação que não grava (pasta no lugar do arquivo, disco cheio) faz o selftest ficar SEM resultado: a rodada sai incompleta (exit 3), nunca completa com leaked 0 por um vazamento que sumiu do registro
 [ -z "$row" ] || printf '%s\t%s\n' "$rel" "$row" >> "$RD/leaks.tsv" || exit 0
 printf '%s\t%s\t%s\n' "$rel" "$rc" "$(( $(date +%s) - s ))" >> "$out"
 [ "$rc" -ne 0 ] || rm -f "$RD/out/$name.log"
 exit 0
 EOS
-export TREE RD PER
+# o subreaper (ga-azo0gm3): prctl PR_SET_CHILD_SUBREAPER no PRÓPRIO bash do run-one.sh (o atributo sobrevive ao exec). Sem Linux/prctl/proc (a sonda diz) ou com HQ_WORLD=off, fica só a rede do grupo.
+cat > "$RD/world-run.py" << 'PY'
+import os, signal, sys, time
+def arm():
+    try:
+        import ctypes
+        return ctypes.CDLL(None, use_errno=True).prctl(36, 1, 0, 0, 0) == 0   # PR_SET_CHILD_SUBREAPER
+    except (ImportError, OSError, AttributeError):
+        return False
+def table():  # pid → (ppid, estado) dos meus processos. Nunca vazia (eu apareço): vazia = nada lido; falhou/ilegível (o /proc não abre, ou nada lido) → None, nunca uma tabela vazia que pareça "ninguém"
+    t = {}
+    try:
+        names = os.listdir("/proc")
+    except OSError:
+        return None
+    for d in names:
+        try:
+            if d.isdigit() and os.stat("/proc/" + d).st_uid == os.getuid():
+                s = open("/proc/%s/stat" % d).read()
+                f = s[s.rindex(")") + 2:].split()
+                t[int(d)] = (int(f[1]), f[0])
+        except (OSError, ValueError, IndexError):
+            pass   # sumiu entre o listdir e a leitura
+    return t or None
+def below(root, t):
+    kids, out, todo = {}, [], []
+    for p, (pp, _s) in t.items():
+        kids.setdefault(pp, []).append(p)
+    todo = list(kids.get(root, []))
+    while todo:
+        x = todo.pop()
+        if x not in out:
+            out.append(x)
+            todo.extend(kids.get(x, []))
+    return out
+def sweep(root):  # quantos eram (cada um recebe TERM e, se resiste 3 s, KILL; a morte de quem resiste ao KILL não é confirmada), ou None se o /proc não abriu ou root não é antepassado
+    t = table()
+    if t is None:
+        return None
+    keep, x = set(), os.getpid()
+    while x > 1 and x != root:   # eu e quem me chamou (o $( ) do run-one.sh) não são o mundo
+        keep.add(x)
+        x = t.get(x, (0, ""))[0]
+    if x != root:   # root não é antepassado de quem varre (pid errado ou reciclado): nunca varre abaixo de um pid que não me chamou
+        return None
+    left = lambda t: [p for p in below(root, t) if p not in keep and t[p][1] != "Z"]
+    vic = left(t)
+    n = len(vic)
+    for sig in (signal.SIGTERM, signal.SIGKILL):
+        for p in vic:
+            try:
+                os.kill(p, sig)
+            except OSError:
+                pass   # já saiu
+        end = time.time() + 3.0
+        while vic and time.time() < end:
+            time.sleep(0.1)
+            t = table()
+            vic = left(t) if t is not None else []
+    return n
+a = sys.argv[1:]
+try:
+    if a[:1] == ["--probe"]:
+        sys.exit(0 if arm() and table() is not None else 1)
+    if a[:1] == ["--exec"] and len(a) > 1:
+        arm()
+        os.execvp(a[1], a[1:])
+    if a[:1] == ["--sweep"] and len(a) == 2 and a[1].isdigit():
+        n = sweep(int(a[1]))
+        print("?" if n is None else n)
+        sys.exit(2 if n is None else 0)
+except Exception as e:   # nunca um Traceback solto: no nó a exceção não capturada gasta 20 s de CPU no hook do apport
+    sys.stderr.write("world-run.py: %s: %s\n" % (type(e).__name__, e))
+    sys.exit(127)
+sys.exit(64)
+PY
+WORLD=0; [ "${HQ_WORLD:-on}" = off ] || [ -e "$BH/hq-selftests.noworld" ] || ! python3 -I -S "$RD/world-run.py" --probe > /dev/null 2>&1 || WORLD=1   # o arquivo é o interruptor de EMERGÊNCIA (o governo monta o ambiente do item do zero: só BALLAST_*)
+RUNNER=(bash); [ "$WORLD" = 0 ] || RUNNER=(python3 -I -S "$RD/world-run.py" --exec bash)
+export TREE RD PER WORLD
 load0=$(cut -d' ' -f1 /proc/loadavg 2> /dev/null || echo 0)
 : > "$RD/results.tsv"
-tr '\n' '\0' < "$RD/order.txt" | xargs -0 -r -P "$CORES" -I{} bash "$RD/run-one.sh" {} "$RD/results.tsv"
+tr '\n' '\0' < "$RD/order.txt" | xargs -0 -r -P "$CORES" -I{} "${RUNNER[@]}" "$RD/run-one.sh" {} "$RD/results.tsv"
 done1=$(wc -l < "$RD/results.tsv" | tr -d ' ')
 if [ "$done1" != "$total" ]; then say "incompleto: $done1 de $total resultados"; summary incompleto main="${tested:0:9}" pull=$pull total="$total" feitos="$done1"; exit 3; fi
 
@@ -134,7 +220,7 @@ if [ "$done1" != "$total" ]; then say "incompleto: $done1 de $total resultados";
 awk -F'\t' '$2 != 0 && $2 != 97 && $2 != 124 && $2 != 137 {print $1}' "$RD/results.tsv" > "$RD/retry.txt"
 : > "$RD/results2.tsv"
 retry_cores=$(( (CORES + 1) / 2 ))
-tr '\n' '\0' < "$RD/retry.txt" | xargs -0 -r -P "$retry_cores" -I{} bash "$RD/run-one.sh" {} "$RD/results2.tsv"
+tr '\n' '\0' < "$RD/retry.txt" | xargs -0 -r -P "$retry_cores" -I{} "${RUNNER[@]}" "$RD/run-one.sh" {} "$RD/results2.tsv"
 
 python3 -I - "$RD/results.tsv" "$RD/results2.tsv" "$PREV" "$DUR" "$LAST" "${tested:0:9}" "$tested" "$pull" "$skipped" "$(( $(date +%s) - t0 ))" "$(cut -d' ' -f1 /proc/loadavg 2> /dev/null || echo 0)" "$load0" "$RD/leaks.tsv" << 'PY'
 import json, os, sys

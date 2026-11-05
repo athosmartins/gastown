@@ -427,15 +427,26 @@ try:
         out["client_conf"] = json.load(f)
 except (OSError, ValueError):
     pass
-procs = []
+# vazio (o ps leu e nenhum processo é da sessão ou do vigia DESTE host) → procs = [] (limpo); falhou/ilegível (ps que não abre, rc != 0, ou sem NENHUMA linha de processo: há sempre ao menos o próprio ps) → procs = None e o (a) reprova:
+# "não consegui ver" nunca vira "MBP limpo". O vigia (PRESENCE_LIB_ONLY) só conta se o home DESTE host aparece na linha dele (a biblioteca de presença mora em <home>/gt-remote/bin, a pausa em <home>/gt-remote/PAUSE): num nó
+# compartilhado há vigias de outras rodadas e de outros selftests (ga-azo0gm3); os de fora não reprovam, são contados em procs_foreign e ditos no (a).
+procs, foreign = [], 0
 try:
-    for l in subprocess.run(["ps", "-axo", "pid=,args="], capture_output=True, text=True, timeout=20).stdout.split("\n"):
-        f = l.strip().split(None, 1)
-        if len(f) == 2 and f[0].isdigit() and ("--settings " + C["bundle"] + "/city/settings.json" in f[1] or "PRESENCE_LIB_ONLY" in f[1]):
+    r = subprocess.run(["ps", "-axo", "pid=,args="], capture_output=True, text=True, timeout=20)
+    rows = [l.strip().split(None, 1) for l in r.stdout.split("\n") if l.strip()]
+    if r.returncode != 0 or not any(f[0].isdigit() for f in rows):
+        raise OSError("ps sem leitura")
+    for f in rows:
+        if len(f) != 2 or not f[0].isdigit():
+            continue
+        if "--settings " + C["bundle"] + "/city/settings.json" in f[1] or ("PRESENCE_LIB_ONLY" in f[1] and home.rstrip("/") + "/" in f[1]):
             procs.append([int(f[0]), f[1][:100]])
+        elif "PRESENCE_LIB_ONLY" in f[1]:
+            foreign += 1
 except (OSError, subprocess.SubprocessError):
     procs = None
 out["procs"] = procs
+out["procs_foreign"] = foreign
 out["spool_mode"] = oct(os.stat(C["spool"]).st_mode & 0o777) if os.path.isdir(C["spool"]) else None
 out["plib"] = os.path.isfile(C["plib"])
 out["pause"] = os.path.exists(C["pause"])
@@ -1319,7 +1330,7 @@ class Proof:
                 # o tmux deixa o ARQUIVO do socket quando a última sessão morre e o servidor sai (medido, 3.7c): sem servidor respondendo ele é inerte e uma sessão nova sobe por cima
                 clean = (tmux_state(s) == "livre" and [x for x in (s["run_dir"] or []) if not STOP_RE.fullmatch(x)] == [] and s["procs"] == [])  # a marca .stop do provider não é lançador: a limpeza a remove
                 self.check("(a) o stop deixa o MBP limpo: nenhuma sessão e nenhum servidor do tmux respondendo, sem arquivo do lançador em run/, nenhum processo da sessão nem o vigia", clean,
-                           f"tmux {s['tmux']} · socket {s['tmux_socket']} · run {s['run_dir']} · processos {s['procs']}")
+                           f"tmux {s['tmux']} · socket {s['tmux_socket']} · run {s['run_dir']} · processos {s['procs']} · vigias de OUTRO home ignorados {s['procs_foreign']}")
                 sw = self.rpy(SWEEP, {"roots": [self.wd, SPOOL, SHIMBIN, BUNDLE], "globs": [f"{MHOME}/.claude/projects/*{self.run}*"], "secret_rx": SECRET_RX, "forbidden": FORBIDDEN,
                                     "skip": {f"{BUNDLE}/manifest.json": [SECRET_KV]}})
                 self.check("(d) varredura (antes de apagar a pasta de teste): nenhum segredo e nenhum arquivo de dado/credencial no clone, no spool, no atalho, no bundle nem na transcrição da sessão",

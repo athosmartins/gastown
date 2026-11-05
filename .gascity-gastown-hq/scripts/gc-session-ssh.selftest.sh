@@ -62,14 +62,18 @@
 #   fato; arquivo torto/ilegível/vazio/de outra geração/do futuro = pergunta ao host (nunca um "fora" inventado); dry-run não usa; list_down_cache_s validada (o resto recusa a config).
 #   abort (ga-0k82lw) — o start que o mini ABANDONOU (prazo do provider estourado; provider morto com kill -9 na parte lenta) não deixa tmux no host, com o ssh falso dos dois jeitos: plain (fecha o canal ao matar o provider) e orphan (deixa o
 #   script do host gravável, como o sshd com ControlMaster); o stop que chega na parte lenta do start com o provider vivo faz o start desistir dizendo que foi abandonado; controles: start lento dentro do prazo abre, stop e depois start novo do mesmo nome abre.
-# CONTROLE NEGATIVO: cada guarda é removida do script (sed numa cópia) e o grupo que a cobre TEM que passar a falhar: teto do host, nome
+#   term (ga-azo0gm3) — a rodada que morre por TERM do `timeout` do lastro não deixa o MUNDO dela (servidor tmux, agente setsid do launchd falso, vigia, pasta): o bloco TERMSAFE deste arquivo é EXTRAÍDO e dirigido numa instância sintética com mundo de
+#   verdade, na estrutura da campanha de mutantes (raiz → `$(bash instância | tail -1)` → aninhada): (a) o leitor do pipe morre ANTES do TERM e a aninhada ainda limpa, com o controle do harness (o cleanup ANTIGO deixa o mundo) · (b) a raiz só sai depois da
+#   aninhada que limpa devagar e ignora o TERM repetido · (c) TERM em dobro numa raiz sem filhas, 8 vezes. Só no Linux (a corrida foi medida no nó: bash 5.2, timeout 9.4).
+# CONTROLE NEGATIVO: (bloco TERMSAFE, grupo term, `smutant` = cópia DESTE arquivo: sem `trap : PIPE`, a raiz que não espera as aninhadas, o cleanup que não ignora o sinal repetido, a aninhada que sai do registro antes de limpar; sem mutante para os traps de
+#   TERM/INT/HUP: a corrida do TERM em dobro é probabilística, 12 de 40 sem eles) · cada guarda é removida do script (sed numa cópia) e o grupo que a cobre TEM que passar a falhar: teto do host, nome
 #   exato (sessão, is-running, start), alvo de painel =nome:, guarda de /Users/, filtro de env, exit 2 das desconhecidas, marcador de fim,
 #   erro de ssh, flock, "tmux sem acesso" tolerado como "sem servidor", o `has` que engole o erro do tmux, melhor esforço da sessão
 #   ausente, o stop que não confere que a sessão sumiu, e o portão (sem a liberação, liberação de qualquer tipo, nome de teste frouxo ou sem
 #   âncora, sem conferir o sha do guarda, sem rodar o --selfcheck, script do host que sai 0, guarda irmão ilegível), e a regra de presença do MBP (grupo mbp: guarda de /Users/, validação da config, recusa/pausa/slot_cap, vigia, PATH extra,
 #   registro de sessões do list-running); a camada da sessão (grupo lay: o último --settings, o guarda e o settings do bundle no lugar do ~/.claude, o PATH da sessão na conferência, o padrão por host que dorme, a recusa do home num host que dorme, a validação do valor, a chave guard do dry-run); um mutante por trava, a conta sai no resumo da rodada; no grupo gui são 33 (gui: bootout/arquivos/prova de ausência do stop e da recusa, a varredura de órfãs e a ordem dela, o veredito do `auth status` (ilegível, rc, contraditório), plist fora de run/, label sem prefixo, KeepAlive, Aqua, validação da config, e os do start em duas chamadas: o piso da 2ª chamada, o rc 14 do abandonado contra o 15 do gui_agent, as funções do agente na 2ª, e o de sucesso que também grava diag; 15 do grupo diag: o diag nunca gravado, gravado depois do veredito, não impresso na recusa (e a recusa calada sobre o diag que não deu para gravar), ilegível sem diag, deixado em run/ pelo agent_down, com a saída crua do claude, com o conteúdo da credencial, o cofre com -w, sem prazo, qualquer rc lido como 'existe', CLAUDE_CONFIG_DIR ignorada, stat que falha lido como 'ausente', arquivo ilegível dito legível, valor sem sanitizar; 5 do grupo abort: a marca <nome>.stop do stop, ga-0k82lw — o stop não a grava, o preparo do start não a apaga, a 2ª chamada não olha para ela, o stop não poda as marcas antigas (> 24 h), a poda sem limite de idade leva a marca recém-gravada; 20 do grupo lr: o cache nunca lido, start sem invalidar antes / depois, stop sem invalidar, gravação sem conferir a geração, prazo e relógio, geração e forma do arquivo, dry-run, list_cache_s em cinco formas, geração ilegível ou ausente, registro acertado com lista do cache, falha ao invalidar derrubando o start; 26 do grupo wt: wt-add/wt-rm do provider, o guarda DEPOIS do wt-add, o recolhimento só do que não perde trabalho e os nomes do engine; 9 do ambiente limpo da sessão, grupo mbp: session_env, ZDOTDIR, PATH explícito e claude absoluto, ga-w7qwl1.1.5).
 #   Mais: contra um stub que só sai 0, quase tudo falha.
-# VARIÁVEIS: GCSSH_UNDER_TEST (script a testar) · GCSSH_ONLY (grupos separados por vírgula) · GCSSH_NO_MUTANTS=1 · GCSSH_MUTANTS_ONLY=<grupo> (pula os casos e roda só os mutantes desse grupo) · GCSSH_SHARD=K/N (pula os casos e roda só os mutantes de ordem ≡ K mod N; K e N decimais sem sinal nem zero à esquerda, N de 1 a 9999, K de 0 a N-1, senão exit 2; o stub só no K=0: a campanha de mutantes em N processos). Rodar ZERO casos e ZERO mutantes (grupo que não existe em GCSSH_ONLY/GCSSH_MUTANTS_ONLY, fatia K/N sem mutante nenhum) FALHA com 'NADA RODOU' (exit 1), nunca sai como '0/0 ok'; o grupo `shard` prova isso
+# VARIÁVEIS: GCSSH_REG (INTERNA: a rodada raiz cria o registro das instâncias ainda limpando e as aninhadas herdam o caminho; não a defina) · GCSSH_UNDER_TEST (script a testar) · GCSSH_ONLY (grupos separados por vírgula) · GCSSH_NO_MUTANTS=1 · GCSSH_MUTANTS_ONLY=<grupo> (pula os casos e roda só os mutantes desse grupo) · GCSSH_SHARD=K/N (pula os casos e roda só os mutantes de ordem ≡ K mod N; K e N decimais sem sinal nem zero à esquerda, N de 1 a 9999, K de 0 a N-1, senão exit 2; o stub só no K=0: a campanha de mutantes em N processos). Rodar ZERO casos e ZERO mutantes (grupo que não existe em GCSSH_ONLY/GCSSH_MUTANTS_ONLY, fatia K/N sem mutante nenhum) FALHA com 'NADA RODOU' (exit 1), nunca sai como '0/0 ok'; o grupo `shard` prova isso
 set -u
 HERE="$(cd "$(dirname "$0")" && pwd)"
 P="${GCSSH_UNDER_TEST:-$HERE/gc-session-ssh}"
@@ -77,8 +81,30 @@ for v in $(env | sed -n 's/^\(GC_[A-Za-z0-9_]*\)=.*/\1/p') TMUX TMUX_PANE GC_SSH
 T=$(cd "$(mktemp -d /tmp/gcs.XXXXXX)" && pwd -P)  # curto: o caminho do socket do tmux tem limite de ~100 caracteres
 SOCK="gct$$"
 export TMUX_TMPDIR="$T/tmux"; mkdir -p "$TMUX_TMPDIR" "$T/bin" "$T/home" "$T/remote/home" "$T/state"
-cleanup() { for f in "$T"/lc/loaded/*.pid; do [ -e "$f" ] && kill -s TERM -- "-$(cat "$f")" 2>/dev/null; done; for s in "$SOCK" "${SOCK}b" "${SOCK}m"; do tmux -L "$s" kill-server 2>/dev/null; done; chmod -R u+rwX "$T" 2>/dev/null; find "$T" -mindepth 1 -delete 2>/dev/null; rmdir "$T" 2>/dev/null; }
+# TERMSAFE:BEGIN (ga-azo0gm3) — o mundo desta rodada (pasta, servidores tmux, agentes do launchd falso e seus vigias) tem que sair TAMBÉM quando o `timeout` do lastro a mata. Medido no nó (bash 5.2, timeout 9.4): a rodada
+# ANINHADA do laço de mutantes (`$(bash "$0" 2>&1 | tail -1)`) escreve num pipe cujo leitor (o `tail`) morreu no TERM em grupo; ao colher o filho morto o bash escreve "Terminated" no stderr, leva SIGPIPE NO MEIO do
+# cleanup e o corta (0/15 completos com o leitor morto antes do TERM); e o `timeout` manda o TERM DUAS vezes ao filho direto, que então morre sem rodar o trap em ~30 % (12/40). Por isso: `trap : PIPE` (handler vazio:
+# ao contrário de `trap '' PIPE` os executáveis filhos NÃO herdam o "ignorar"), TERM/INT/HUP viram `exit` (que roda o trap EXIT), e a RAIZ só apaga o mundo dela depois das aninhadas (o `timeout` que a viu sair não pode
+# deixar para trás uma rodada ainda limpando). O grupo `term` extrai ESTE bloco e o dirige.
+[ -n "${GCSSH_REG:-}" ] || { GCSSH_REG="$T/instances"; ROOT=1; export GCSSH_REG; }   # a raiz cria o registro (uma pasta, um arquivo por instância ainda limpando); as aninhadas herdam o caminho (variável interna)
+mkdir -p "$GCSSH_REG" 2>/dev/null; : > "$GCSSH_REG/$$" 2>/dev/null   # falhou → a instância não consta e a raiz não a espera: a rede do item varre o que sobrar
+cleanup() {
+  local p i f s
+  trap '' TERM INT HUP   # sinal repetido não corta o cleanup
+  if [ "${ROOT:-0}" = 1 ]; then   # vazio → nada a esperar; falhou/ilegível (ls) → idem; instância ainda viva depois de 30 s → segue sem ela, nunca espera para sempre
+    for p in $(ls "$GCSSH_REG" 2>/dev/null); do
+      [ "$p" = "$$" ] && continue
+      i=0; while kill -0 "$p" 2>/dev/null && [ "$i" -lt 150 ]; do sleep 0.2; i=$((i+1)); done
+    done
+  fi
+  for f in "$T"/lc/loaded/*.pid; do [ -e "$f" ] && kill -s TERM -- "-$(cat "$f")" 2>/dev/null; done
+  for s in "$SOCK" "${SOCK}b" "${SOCK}m"; do tmux -L "$s" kill-server 2>/dev/null; done
+  chmod -R u+rwX "$T" 2>/dev/null; find "$T" -mindepth 1 -delete 2>/dev/null; rmdir "$T" 2>/dev/null
+  [ "${ROOT:-0}" = 1 ] || rm -f "$GCSSH_REG/$$" 2>/dev/null   # a aninhada sai do registro por ÚLTIMO: a raiz só segue quando o mundo dela já não existe
+}
 trap cleanup EXIT
+trap : PIPE; trap 'exit 143' TERM; trap 'exit 130' INT; trap 'exit 129' HUP
+# TERMSAFE:END
 fails=0; n=0
 ok() { n=$((n+1)); if [ "$1" = 0 ]; then echo "ok   $2"; else echo "FAIL $2"; fails=$((fails+1)); fi; }
 has() { grep -qF -- "$2" "$1" 2>/dev/null; }
@@ -1542,6 +1568,87 @@ g_abort() {  # ga-0k82lw: o start que o mini ABANDONOU (prazo do provider estour
   pv stop abort-3 </dev/null; rm -f "$bin/sha256sum" "$T/state/a/running/"* 2>/dev/null; cfg 3
 }
 
+g_term() {  # ga-azo0gm3: a rodada que morre por TERM do `timeout` não deixa o MUNDO dela (servidor tmux, agente setsid, pasta). O bloco TERMSAFE deste arquivo é EXTRAÍDO e dirigido numa instância sintética com um mundo de verdade, na MESMA
+  # estrutura da campanha de mutantes (raiz → `$(bash instância | tail -1)` → aninhada). (a) o leitor do pipe morre ANTES do TERM: o "Terminated" do filho morto não pode cortar o cleanup (com o cleanup ANTIGO e lento o mundo sobra 24 de 24, medido com a máquina cheia);
+  # (b) a aninhada limpa devagar (tmux de brinquedo, 1 s por kill-server) e a raiz, que recebe o TERM em dobro e um terceiro no meio da espera, só pode sair DEPOIS dela; (c) TERM em dobro numa raiz sem filhas, 8 vezes (como o
+  # `timeout` faz: um ao filho, um ao grupo; sem o trap de TERM a raiz perdia o cleanup em 12 de 40 envios): não há mutante para (c), a corrida é probabilística. Falha deste grupo desmonta o mundo que sobrou (nó compartilhado).
+  local blk="$T/termsafe.sh" inst="$T/term.inst.sh" rdy="$T/term.ready" shim="$T/term.shim" k bad ip tp r1 r2 tn1 tn2 ts1 ts2 tt ss
+  [ "$(uname -s)" = Linux ] || { ok 0 "term: pulado fora do Linux (a corrida do SIGPIPE e do TERM em dobro foi medida no nó: bash 5.2, timeout 9.4)"; return 0; }
+  sed -n '/^# TERMSAFE:BEGIN/,/^# TERMSAFE:END/p' "$0" > "$blk"
+  [ "$(grep -c '^cleanup() {' "$blk")" = 1 ] && [ "$(grep -c '^trap : PIPE; ' "$blk")" = 1 ]; ok $? "term: o bloco TERMSAFE está neste arquivo (cleanup + trap : PIPE)"
+  mkdir -p "$shim"; printf '#!/bin/sh\ncase "$*" in *kill-server*) [ -z "${SLOWKILL:-}" ] || sleep 1;; esac\nexec %s "$@"\n' "$(command -v tmux)" > "$shim/tmux"; chmod +x "$shim/tmux"
+  cat > "$inst" <<'EOF'
+#!/bin/bash
+# instância sintética: o bloco TERMSAFE de verdade + um mundo de verdade (servidor tmux no socket dela, agente que sai do grupo com setsid, pasta), e o corpo do MODO
+set -u
+BLK=$1; RDY=$2; MODE=$3
+T=$(cd "$(mktemp -d /tmp/gcs.XXXXXX)" && pwd -P); SOCK="gct$$"
+export TMUX_TMPDIR="$T/tmux"; mkdir -p "$TMUX_TMPDIR" "$T/lc/loaded"
+. "$BLK"
+tmux -L "$SOCK" new-session -d -s w "sleep 600"
+python3 -I -c 'import os,sys; os.setsid(); os.execvp("sh", ["sh", "-c", "while :; do sleep 1; done", "agente:" + sys.argv[1]])' "$T" < /dev/null > /dev/null 2>&1 &
+echo $! > "$T/lc/loaded/ag.pid"
+echo "UP $$ $T $SOCK" >> "$RDY"
+case $MODE in
+  root)   r=$(SLOWKILL=${NSLOW:-} bash "$0" "$BLK" "$RDY" nested 2>&1 | tail -1) ;;   # a estrutura do laço de mutantes
+  nested) sleep 100; echo depois ;;                                                    # filho em primeiro plano morto pelo TERM, e uma escrita depois
+  solo)   r=$(sleep 100 | tail -1) ;;
+esac
+EOF
+  up_n() { local c=0; while [ "$(grep -c '^UP ' "$rdy" 2>/dev/null)" -lt "$1" ] && [ "$c" -lt 100 ]; do sleep 0.2; c=$((c+1)); done; [ "$(grep -c '^UP ' "$rdy" 2>/dev/null)" -ge "$1" ]; }   # até 20 s: o mundo da instância subiu
+  # gone T SOCK — a pasta saiu e nada vivo leva a pasta ou o socket dela. vazio (ps leu e ninguém casa) → saiu; falhou/ilegível (ps rc != 0 ou sem nenhuma linha: há sempre ao menos o próprio ps) → "não sei" = NÃO saiu
+  gone() { local o; o=$(ps -axo command= 2>/dev/null) || return 1; [ -n "$o" ] || return 1; [ ! -e "$1" ] && ! printf '%s\n' "$o" | grep -qF -e "$1" -e "-L $2 "; }
+  down() {  # desmonta o que sobrou de um mundo sintético (o teste vermelho não deixa órfão no nó): servidor, grupo do agente, pasta
+    [ -d "$1" ] || return 0
+    TMUX_TMPDIR="$1/tmux" tmux -L "$2" kill-server 2>/dev/null; [ ! -s "$1/lc/loaded/ag.pid" ] || kill -s TERM -- "-$(cat "$1/lc/loaded/ag.pid")" 2>/dev/null
+    chmod -R u+rwX "$1" 2>/dev/null; find "$1" -mindepth 1 -delete 2>/dev/null; rmdir "$1" 2>/dev/null; return 0
+  }
+  # case_a BLOCO — a aninhada com o leitor do pipe morto ANTES do TERM. Devolve 0 = o mundo dela saiu · 1 = sobrou (e é desmontado aqui) · 2 = o mundo nem subiu; CA_SEEN=1 se a leitura o viu de pé antes do TERM
+  case_a() {
+    local b=$1 cr cn ct cs; CA_SEEN=0; : > "$rdy"; rm -f "$T/term.fifo"; mkfifo "$T/term.fifo"
+    cat "$T/term.fifo" > /dev/null & cr=$!
+    env -u GCSSH_REG SLOWKILL=1 PATH="$shim:$PATH" bash "$inst" "$b" "$rdy" nested > "$T/term.fifo" 2>&1 & cn=$!   # cleanup LENTO (1 s por kill-server): o SIGPIPE cai sempre DENTRO dele (cleanup antigo: o mundo sobra 24 de 24 sob carga; sem isto, 8 de 10 quieto e bem menos com a máquina cheia)
+    up_n 1 || { kill -KILL "$cr" "$cn" 2>/dev/null; return 2; }
+    read -r _ _ ct cs < <(grep '^UP ' "$rdy" | head -n 1)
+    ! gone "$ct" "$cs" && CA_SEEN=1
+    kill -KILL "$cr" 2>/dev/null; wait "$cr" 2>/dev/null; sleep 0.2
+    kill -TERM "$cn" 2>/dev/null; pkill -TERM -x -P "$cn" sleep 2>/dev/null; wait "$cn" 2>/dev/null; sleep 0.3   # só o `sleep` em primeiro plano (filho do PID da instância), não o agente
+    gone "$ct" "$cs" && return 0; down "$ct" "$cs"; return 1
+  }
+  # (a)
+  case_a "$blk"; r1=$?
+  ok $([ "$CA_SEEN" = 1 ] && echo 0 || echo 1) "term: (a) controle positivo: o mundo da aninhada existe antes do prazo e a leitura o enxerga"
+  ok $([ $r1 = 0 ] && echo 0 || echo 1) "term: (a) o leitor do pipe morreu antes do TERM: a aninhada ainda limpa o mundo dela (pasta, servidor e agente) (rc=$r1)"
+  # controle do HARNESS: com o cleanup ANTIGO (uma linha, sem `trap : PIPE`) o mesmo caso DEIXA o mundo (medido: 24 de 24 com o cleanup lento); em 3 tentativas basta UMA
+  cat > "$T/term.old.sh" <<'EOF'
+cleanup() { for f in "$T"/lc/loaded/*.pid; do [ -e "$f" ] && kill -s TERM -- "-$(cat "$f")" 2>/dev/null; done; for s in "$SOCK" "${SOCK}b" "${SOCK}m"; do tmux -L "$s" kill-server 2>/dev/null; done; chmod -R u+rwX "$T" 2>/dev/null; find "$T" -mindepth 1 -delete 2>/dev/null; rmdir "$T" 2>/dev/null; }
+trap cleanup EXIT
+EOF
+  bad=1; for k in 1 2 3; do case_a "$T/term.old.sh"; [ $? = 1 ] && { bad=0; break; }; done
+  ok $bad "term: (a) controle do harness: com o cleanup ANTIGO o mesmo caso DEIXA o mundo (o caso reproduz o defeito de campo)"
+  # (b)
+  : > "$rdy"
+  set -m; ( exec env -u GCSSH_REG PATH="$shim:$PATH" NSLOW=1 bash "$inst" "$blk" "$rdy" root ) > "$T/term.out" 2>&1 < /dev/null & tp=$!; set +m
+  up_n 2; ok $? "term: (b) a raiz e a aninhada sobem os mundos delas"
+  read -r _ _ tn1 ts1 < <(grep '^UP ' "$rdy" | sed -n 1p); read -r _ _ tn2 ts2 < <(grep '^UP ' "$rdy" | sed -n 2p)
+  kill -TERM "$tp" 2>/dev/null; kill -TERM -- "-$tp" 2>/dev/null; sleep 0.5; kill -TERM "$tp" 2>/dev/null   # o `timeout` manda um TERM ao filho e outro ao grupo; um terceiro chega com a raiz já esperando a aninhada
+  wait "$tp" 2>/dev/null
+  gone "$tn2" "$ts2"; r2=$?; gone "$tn1" "$ts1"; r1=$?
+  [ $r2 = 0 ] || down "$tn2" "$ts2"; [ $r1 = 0 ] || down "$tn1" "$ts1"
+  ok $r2 "term: (b) quando a raiz sai, o mundo da aninhada (que limpa devagar) JÁ não existe: ninguém vê a raiz sair com uma rodada ainda limpando"
+  ok $r1 "term: (b) ...e o mundo da própria raiz também saiu"
+  # (c)
+  bad=0
+  for k in 1 2 3 4 5 6 7 8; do
+    : > "$rdy"; set -m; ( exec env -u GCSSH_REG PATH="$shim:$PATH" bash "$inst" "$blk" "$rdy" solo ) > /dev/null 2>&1 < /dev/null & ip=$!; set +m
+    up_n 1 || { bad=$((bad+1)); kill -KILL "$ip" 2>/dev/null; continue; }
+    read -r _ _ tt ss < <(grep '^UP ' "$rdy" | head -n 1)
+    kill -TERM "$ip" 2>/dev/null; kill -TERM -- "-$ip" 2>/dev/null; wait "$ip" 2>/dev/null
+    gone "$tt" "$ss" || { bad=$((bad+1)); down "$tt" "$ss"; }
+  done
+  [ "$bad" = 0 ]; ok $? "term: (c) TERM em dobro numa raiz sem filhas, 8 vezes: o mundo sai em todas (falhas: $bad)"
+}
+
 g_shard() {  # o filtro do PRÓPRIO selftest (GCSSH_SHARD, GCSSH_ONLY, GCSSH_MUTANTS_ONLY): fatia inválida, ou filtro que não pega nada, não pode sair verde (gate de 23/10 da ga-w7qwl1.1.8: GCSSH_SHARD=10/10 rodava zero e saía 0)
   # cada filho é ESTE arquivo com um filtro; os de recusa levam GCSSH_NO_MUTANTS=1: se a validação voltar a deixar passar, o filho roda "zero casos" e não a campanha de mutantes
   local s oo rr
@@ -1566,7 +1673,7 @@ g_shard() {  # o filtro do PRÓPRIO selftest (GCSSH_SHARD, GCSSH_ONLY, GCSSH_MUT
   [ $rr = 0 ] && [ "$(printf '%s\n' "$oo" | grep -c '^ok   mutante .* pego')" = 1 ] && printf '%s\n' "$oo" | grep -q '^== final: 1/1 ok ==$' && ! printf '%s\n' "$oo" | grep -q 'NADA RODOU'; ok $? "shard: (controle) GCSSH_SHARD=1/9999 roda exatamente 1 mutante, pego, e sai 0 (rc=$rr: $(printf '%s' "$oo" | tail -c 110))"
 }
 
-all() { group proto && g_proto; group dry && g_dry; group live && g_live; group cap && g_cap; group down && g_down; group meta && g_meta; group conf && g_conf; group guard && g_guard; group terr && g_terr; group gate && g_gate; group lay && g_lay; group prep && g_prep; group wt && g_wt; group mbp && g_mbp; group gui && g_gui; group diag && g_diag; group acct && g_acct; group gacct && g_gacct; group prof && g_prof; group lr && g_lr; group lrd && g_lrd; group abort && g_abort; group shard && g_shard; return 0; }
+all() { group proto && g_proto; group dry && g_dry; group live && g_live; group cap && g_cap; group down && g_down; group meta && g_meta; group conf && g_conf; group guard && g_guard; group terr && g_terr; group gate && g_gate; group lay && g_lay; group prep && g_prep; group wt && g_wt; group mbp && g_mbp; group gui && g_gui; group diag && g_diag; group acct && g_acct; group gacct && g_gacct; group prof && g_prof; group lr && g_lr; group lrd && g_lrd; group abort && g_abort; group term && g_term; group shard && g_shard; return 0; }
 
 if [ -n "${GCSSH_MUTANT:-}" ]; then all; echo "RESULT $fails/$n"; exit $((fails > 0)); fi
 # GCSSH_SHARD=K/N: dois decimais canônicos (sem sinal, sem espaço, sem zero à esquerda: `[ 3 = 03 ]` é falso e $((mn % 010)) é octal, então a fatia ficaria vazia ou trocada sem aviso), N de 1 a 9999 e K de 0 a N-1
@@ -1836,6 +1943,22 @@ case "$shn" in [1-9]*) ;; *) shard_bad;; esac
   mutant gui,gacct "o evento 'started' do host sem gui_agent também carrega login_check" 's/\*\*({"login_check": lmode} if cfg.gui else {}))/**({"login_check": lmode} if True else {}))/'
   mutant gui,gacct "a recusa do caminho da chave manda logar no MBP (remédio errado)" 's/GM_DESLOGADO\["lancador" if lmode == "lancador" else "agente"\]/GM_DESLOGADO["agente"]/'
   mutant gui,gacct "a recusa sem chave diz que o claude não aceitou a chave" 's/GM_DESLOGADO\["lancador" if lmode == "lancador" else "agente"\]/GM_DESLOGADO["lancador"]/'
+  # bloco TERMSAFE (ga-azo0gm3): o mutante é uma cópia DESTE arquivo rodada só com o grupo `term` (o provider em teste segue o de verdade); só no Linux, onde o grupo roda. Sem mutante para os traps de TERM/INT/HUP: a corrida do TERM em dobro
+  # é probabilística (12 de 40 sem o trap de TERM) e um mutante que às vezes sobrevive é pior que nenhum.
+  smutant() {  # smutant GRUPO DESCRIÇÃO SED-EXPR…  (mesma contagem de ordem/fatia do `mutant`)
+    mn=$((mn+1)); [ $((mn % ${GCSSH_SHARD#*/})) = "${GCSSH_SHARD%/*}" ] || return
+    [ -z "${GCSSH_MUTANTS_ONLY:-}" ] || case ",$1," in *",$GCSSH_MUTANTS_ONLY,"*) ;; *) return;; esac
+    [ "$(uname -s)" = Linux ] || return 0
+    local g=$1 d=$2 m="$T/smut.$RANDOM" r e; shift 2; mkdir -p "$m"; cp "$0" "$m/self.sh"
+    for e in "$@"; do sed -i.bak -e "$e" "$m/self.sh"; done; rm -f "$m/self.sh.bak"
+    if cmp -s "$0" "$m/self.sh"; then ok 1 "mutante '$d': o sed não mudou nada (o teste do mutante está errado)"; return; fi
+    r=$(GCSSH_MUTANT=1 GCSSH_ONLY="$g" GCSSH_UNDER_TEST="$P" bash "$m/self.sh" 2>&1 | tail -1)
+    case "$r" in "RESULT 0/"*) ok 1 "mutante '$d' NÃO foi pego ($r)";; "RESULT "*) ok 0 "mutante '$d' pego ($r)";; *) ok 1 "mutante '$d': execução sem resultado ($r)";; esac
+  }
+  smutant term "sem o trap : PIPE (o Terminated do filho morto corta o cleanup da aninhada)" 's/^trap : PIPE; //'
+  smutant term "a raiz não espera as aninhadas (o timeout vê a raiz sair com uma rodada ainda limpando)" 's/^  if \[ "\${ROOT:-0}" = 1 \]; then   # vazio/  if false; then   # vazio/'
+  smutant term "o cleanup não ignora o sinal repetido (um TERM no meio da espera o corta)" "/^  trap '' TERM INT HUP   # sinal repetido/d"
+  smutant term "a aninhada se tira do registro ANTES de limpar (a raiz não a vê e não espera)" '/^  \[ "\${ROOT:-0}" = 1 \] || rm -f "\$GCSSH_REG\/\$\$"/d' 's/^  local p i f s$/  local p i f s; [ "${ROOT:-0}" = 1 ] || rm -f "$GCSSH_REG\/$$" 2>\/dev\/null/'
   [ -n "${GCSSH_MUTANTS_ONLY:-}" ] || [ "${GCSSH_SHARD%/*}" != 0 ] || {
   echo "-- contra um stub que só sai 0 (a versão 'anterior' não tinha provider nenhum)"
   printf '#!/bin/sh\nexit 0\n' > "$T/stub"; chmod +x "$T/stub"
