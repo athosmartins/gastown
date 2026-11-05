@@ -44,6 +44,7 @@ from __future__ import annotations
 
 import os as _os
 import sys as _sys
+import time as _time
 _sys.path.insert(0, _os.path.dirname(_os.path.abspath(__file__)))
 # park_labels.py (ga-hzt8s) já resolveu "label X casa com base Y, incluindo
 # variante :sufixo ou -sufixo" para outra consolidação (approved-state-
@@ -457,6 +458,53 @@ def session_owner_is_healthy(matched_live, activity_age, bead_update_age,
     return False
 
 
+# ga-lotseol (movido do inflight-reclaim-guard.py por ga-d63o9n1: o guard e o Pilot usam a MESMA regra): o alias de um slot de pool ('gastown.dog-2') é
+# reaproveitado por toda encarnação nova do slot, e um claim de pool (`gc bd update --claim`) grava esse alias como assignee e nenhuma identidade da
+# encarnação (deixa o gc.session_name como estava — medido num claim vivo 05/11 — e o BEADS_ACTOR também é o alias). Um dog que morreu no meio do claim deixa,
+# então, uma bead que o seu gêmeo de alias abona. O fato que um alias reaproveitado não forja: um claim nunca antecede a sessão que o fez e move o updated_at.
+# Logo, uma bead tocada pela última vez ANTES de a sessão casada nascer (por mais que esta margem de relógio) não é dessa sessão.
+ALIAS_CLAIM_BIRTH_MARGIN_SECS = 60
+
+
+def alias_claim_predates_session(assignee, session, bead_update_age, now):
+    """True sse a session que casou com o assignee SÓ por um alias de slot de pool não pode ser quem reivindicou a bead (ga-lotseol).
+
+    Três condições, todas necessárias; qualquer dúvida devolve False (= segue valendo "dono", como antes desta regra):
+      1. o assignee NÃO é o id nem o session_name da sessão — esses são por encarnação, nunca reaproveitados, e casar por eles é dono de verdade;
+      2. a sessão é um slot de pool: o template existe e o nome começa por "<template>-" (template gastown.dog, nome gastown.dog-2). Uma crew persistente
+         (template == nome, alias estável) NÃO entra: a bead dela parada há semanas é trabalho estacionado, não órfã. O que casa por id/session_name já saiu na 1.;
+      3. a bead está parada há MAIS tempo do que a sessão existe, mais a margem de relógio: updated_at < created_at - ALIAS_CLAIM_BIRTH_MARGIN_SECS.
+    Cobertura parcial, de propósito: um `bd update` de terceiro DEPOIS do nascimento da sessão (metadata, status, assignee…) leva o updated_at para frente e a bead volta a
+    valer como "do dono" — erra para o lado de não reclamar. ⚠️ `bd comment` e `bd label add/remove` NÃO movem o updated_at (medido, bd 1.1.0; ver o README do
+    merged-bead-janitor): comentar na bead NÃO re-arma o voucher.
+    Limite conhecido (finding medium do gate da ga-lotseol): a regra não distingue FANTASMA de bead ADOTADA pelo sucessor — o dog novo acha a bead por
+    `bd list --assignee $GC_ALIAS` e a retoma sem escrever nela, e assim segue lido como gêmeo até algum `bd update` tocar a bead. Pura, sem I/O.
+    """
+    # vazio → False (sem bead_update_age não há o que comparar: segue "dono"); falhou/ilegível → False (idem — nunca reclama na força de um campo ausente)
+    if bead_update_age is None:
+        return False
+    # vazio → False (sem assignee não há alias a desmentir); falhou/ilegível → False
+    if not assignee:
+        return False
+    # id e session_name são por encarnação: casou por eles, é dono de verdade
+    if assignee in (session.get("id", ""), session.get("session_name", "")):
+        return False
+    # vazio → False (sem template não sei distinguir slot de pool de crew: segue "dono"); falhou/ilegível → False
+    template = session.get("template", "") or ""
+    name = session.get("name", "") or ""
+    if not template or not name.startswith(template + "-"):
+        return False
+    # vazio → False (sem created_at não sei quando a sessão nasceu); falhou/ilegível → False (parse_iso_epoch devolve None em qualquer falha)
+    born = parse_iso_epoch(session.get("created_at", ""))
+    if born is None:
+        return False
+    session_age = now - born
+    # nascimento no futuro (relógio torto) daria idade negativa e faria QUALQUER bead parecer "mais velha": não é prova → False
+    if session_age < 0:
+        return False
+    return bead_update_age > session_age + ALIAS_CLAIM_BIRTH_MARGIN_SECS
+
+
 def claimant_provably_dead(assignee, sessions,
                             dead_states=DEAD_SESSION_STATES) -> bool:
     """True sse o detentor do bead está PROVADAMENTE morto (gt-fppb0):
@@ -763,6 +811,69 @@ def is_live_builder(assignee: str, live_sessions) -> bool | None:
         if (record.get("state") or "") == "asleep":
             return False
     return True
+
+
+def _session_identifiers(session) -> set:
+    """Os identificadores de uma sessão de `gc session list --json` (id, name, session_name, alias, agent_name) —
+    só strings não vazias (o `gc` as emite como string)."""
+    return {i for i in (session.get("id"), session.get("name"), session.get("session_name"),
+                        session.get("alias"), session.get("agent_name"))
+            if isinstance(i, str) and i}
+
+
+def session_meta_from_roster(sessions) -> dict:
+    """dict[identificador → {"state": "asleep"|"active"}] das sessões NÃO fechadas do roster de `gc session list
+    --json` — a forma rica que is_live_builder() consome (ga-d63o9n1).
+
+    Porta 1:1 do que o pilot-dispatcher.sh monta com jq: _LIVE_SESSION_IDS = todo identificador de sessão com
+    closed != true; _ASLEEP_SESSION_IDS = os das que estão em state == "asleep". Um identificador repartido por duas
+    sessões (o alias de um slot reaproveitado) é "asleep" se QUALQUER delas dorme. O estado é grosso de propósito
+    (asleep | active): é só o que a regra "-adhoc- + asleep = morto" lê."""
+    live, asleep = set(), set()
+    for s in sessions:
+        if not isinstance(s, dict) or s.get("closed") is True:
+            continue
+        ids = _session_identifiers(s)
+        live |= ids
+        if s.get("state") == "asleep":
+            asleep |= ids
+    return {i: {"state": "asleep" if i in asleep else "active"} for i in live}
+
+
+def live_builder_report(assignee, sessions, bead_updated_at=None, now=None) -> dict:
+    """is_live_builder() sobre o roster CRU de `gc session list --json`, já sem os gêmeos de alias (ga-d63o9n1).
+
+    É a ponte do Pilot (`_session_is_live_builder`) para a regra do ga-lotseol: o dict achatado por identificador que
+    is_live_builder() recebe colapsa duas sessões do mesmo alias numa chave só, e então não dá para dizer "a mais nova
+    é gêmea, a mais velha ainda pode ser a dona". Por isso a regra roda ANTES de achatar: descarta do roster as
+    sessões que casam o assignee por pertencimento EXATO (como o guard) e para as quais alias_claim_predates_session()
+    é True, e entrega o resto a is_live_builder() — que segue dono do casamento por prefixo, de "-adhoc-"+asleep e do
+    tri-state. Assignee de template nu ('gastown.dog') não casa por pertencimento exato com ninguém: nunca é alias de
+    claim, então nunca descarta sessão (o dog que vai atender o carimbo nasce DEPOIS dele, por construção).
+
+    bead_updated_at: o `updated_at` da bead que o assignee segura (ISO-8601; 'Z' do bd ou offset local). Ausente/
+    ilegível → a regra não roda e o veredito é o de antes (vazio → "dono vivo"; falhou/ilegível → "dono vivo").
+
+    Devolve {"verdict": True|False|None, "twins": [session_name, ...]}. verdict é o de is_live_builder() (None = não
+    consultei: roster que não é lista, ou assignee de coordenador). twins são as sessões que a regra descartou: o
+    Pilot as LOGA — uma sessão descartada sem rastro seria o terceiro estado invisível que o gate da ga-lotseol pediu
+    para aparecer. Pura, sem I/O."""
+    # vazio/falhou → None: um roster que não é lista é "não consultei", nunca "ninguém vivo" (que seria False)
+    if not isinstance(sessions, list):
+        return {"verdict": None, "twins": []}
+    if now is None:
+        now = _time.time()
+    # vazio → None (a regra desliga); falhou/ilegível → None (parse_iso_epoch devolve None em qualquer falha)
+    updated = parse_iso_epoch(bead_updated_at)
+    bead_update_age = None if updated is None else now - updated
+    kept, twins = [], []
+    for s in sessions:
+        if (isinstance(s, dict) and s.get("closed") is not True and assignee in _session_identifiers(s)
+                and alias_claim_predates_session(assignee, s, bead_update_age, now)):
+            twins.append(s.get("session_name") or s.get("name") or s.get("id") or "?")
+        else:
+            kept.append(s)
+    return {"verdict": is_live_builder(assignee, session_meta_from_roster(kept)), "twins": twins}
 
 
 def derive(bead: dict, live_sessions=None,

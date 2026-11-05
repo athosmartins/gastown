@@ -294,6 +294,8 @@ from bead_state import (
     EPHEMERAL_POOL_TEMPLATES as EPHEMERAL_POOL_ASSIGNEES,
     is_coordinator, parse_iso_epoch, session_activity_age,
     session_owner_is_healthy, claimant_provably_dead, is_needs_human,
+    # ga-lotseol's alias-twin rule (used by session_is_live below): defined in bead_state.py since ga-d63o9n1, so the Pilot applies the SAME one
+    ALIAS_CLAIM_BIRTH_MARGIN_SECS, alias_claim_predates_session,
 )
 
 # ---------------------------------------------------------------------------
@@ -2014,50 +2016,6 @@ def session_awaiting_human_input(session_ref, lines=40):
         return "AskUserQuestion" in data.get("output", "")
     except Exception:
         return False
-
-
-# ga-lotseol: a pool slot's alias ('gastown.dog-2') is reused by every new incarnation of the slot, and a pool-pull claim (`gc bd update --claim`) writes
-# that alias as the assignee and no per-incarnation identity (it leaves gc.session_name as it was — measured on a live claim 05/11 — and BEADS_ACTOR is the alias too).
-# A dog that died mid-claim therefore left a bead that its
-# alias-twin vouched for. The fact a reused alias cannot fake: a claim never predates the session that made it, and a claim bumps the bead's updated_at.
-# So a bead last touched BEFORE the matched session was born (by more than this skew margin) is not that session's bead.
-ALIAS_CLAIM_BIRTH_MARGIN_SECS = 60
-
-
-def alias_claim_predates_session(assignee, session, bead_update_age, now):
-    """True sse a session que casou com o assignee SÓ por um alias de slot de pool não pode ser quem reivindicou a bead (ga-lotseol).
-
-    Três condições, todas necessárias; qualquer dúvida devolve False (= segue valendo "dono", como antes desta regra):
-      1. o assignee NÃO é o id nem o session_name da sessão — esses são por encarnação, nunca reaproveitados, e casar por eles é dono de verdade;
-      2. a sessão é um slot de pool: o template existe e o nome começa por "<template>-" (template gastown.dog, nome gastown.dog-2). Uma crew persistente
-         (template == nome, alias estável) NÃO entra: a bead dela parada há semanas é trabalho estacionado, não órfã. O que casa por id/session_name já saiu na 1.;
-      3. a bead está parada há MAIS tempo do que a sessão existe, mais a margem de relógio: updated_at < created_at - ALIAS_CLAIM_BIRTH_MARGIN_SECS.
-    Cobertura parcial, de propósito: um comentário/label de terceiro DEPOIS do nascimento da sessão leva o updated_at para frente e a bead volta a valer
-    como "do dono" — erra para o lado de não reclamar. Pura, sem I/O.
-    """
-    # vazio → False (sem bead_update_age não há o que comparar: segue "dono"); falhou/ilegível → False (idem — nunca reclama na força de um campo ausente)
-    if bead_update_age is None:
-        return False
-    # vazio → False (sem assignee não há alias a desmentir); falhou/ilegível → False
-    if not assignee:
-        return False
-    # id e session_name são por encarnação: casou por eles, é dono de verdade
-    if assignee in (session.get("id", ""), session.get("session_name", "")):
-        return False
-    # vazio → False (sem template não sei distinguir slot de pool de crew: segue "dono"); falhou/ilegível → False
-    template = session.get("template", "") or ""
-    name = session.get("name", "") or ""
-    if not template or not name.startswith(template + "-"):
-        return False
-    # vazio → False (sem created_at não sei quando a sessão nasceu); falhou/ilegível → False (parse_iso_epoch devolve None em qualquer falha)
-    born = parse_iso_epoch(session.get("created_at", ""))
-    if born is None:
-        return False
-    session_age = now - born
-    # nascimento no futuro (relógio torto) daria idade negativa e faria QUALQUER bead parecer "mais velha": não é prova → False
-    if session_age < 0:
-        return False
-    return bead_update_age > session_age + ALIAS_CLAIM_BIRTH_MARGIN_SECS
 
 
 def session_is_live(assignee, sessions, now=None, bead_update_age=None,

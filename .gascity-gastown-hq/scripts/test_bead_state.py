@@ -17,6 +17,8 @@ from bead_state import (  # noqa: E402
     derive, holder_is_alive, is_athos_page, is_ephemeral, is_needs_human,
     claimant_provably_dead, session_owner_is_healthy, session_activity_age,
     parse_iso_epoch, is_coordinator, is_active_owner, is_live_builder,
+    alias_claim_predates_session, live_builder_report, session_meta_from_roster,
+    ALIAS_CLAIM_BIRTH_MARGIN_SECS,
     EPHEMERAL_POOL_TEMPLATES,
     STALE_ACTIVITY_TTL,
 )
@@ -320,6 +322,192 @@ def test_live_builder_registro_ausente_ou_none_para_match_nao_quebra():
     mesma proteção de is_active_owner, aqui aplicada ao check de state."""
     assert is_live_builder("ps-worker-adhoc-x1", {"ps-worker-adhoc-x1": {}}) is True
     assert is_live_builder("ps-worker-adhoc-x1", {"ps-worker-adhoc-x1": None}) is True
+
+
+# ── alias de slot de pool reaproveitado (ga-lotseol no guard, ga-d63o9n1 no Pilot) ──
+# O claim de pool (`gc bd update --claim`) grava o ALIAS do slot (gastown.dog-2) como assignee e nada que
+# distinga encarnações; a sessão seguinte do slot herda o alias. Um dog que morreu no meio do claim deixa a
+# bead com um "gêmeo de alias" vivo que a segura sem reclaim (wa-6g3m49, wa-25odi9.1, 05/11). O fato que um
+# alias reaproveitado não forja: o claim nunca antecede a sessão que o fez, e `bd update` move o updated_at.
+# ⚠️ MEDIDO (bd 1.1.0, merged-bead-janitor.README.md): `bd comment` e `bd label add/remove` NÃO movem o
+# updated_at — só `bd update` (claim, --set-metadata…). Não conte comentário como "toque" da bead.
+
+T0 = 1_782_900_000.0     # relógio fixo, o mesmo dos LS-* do guard
+ALIAS = "gastown.dog-2"
+
+
+def _iso(epoch, offset_h=None):
+    """ISO-8601 de `epoch`: 'Z' (dialeto do `bd`) ou offset local '-03:00' (dialeto do `gc session list`)."""
+    import datetime
+    if offset_h is None:
+        return datetime.datetime.fromtimestamp(epoch, tz=datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    tz = datetime.timezone(datetime.timedelta(hours=offset_h))
+    return datetime.datetime.fromtimestamp(epoch, tz=tz).replace(microsecond=0).isoformat()
+
+
+def _dog(**kw):
+    """Slot de dog como o `gc session list --json` o devolve (medido 05/11): name = alias = agent_name = o alias do slot;
+    id e session_name são os da encarnação."""
+    s = {"id": "ga-lsnew", "name": ALIAS, "alias": ALIAS, "session_name": "dog-galsnew", "agent_name": ALIAS,
+         "template": "gastown.dog", "state": "active", "created_at": _iso(T0 - 300)}
+    s.update(kw)
+    return s
+
+
+def _toque(age):
+    """updated_at ('Z') de uma bead tocada há `age` segundos."""
+    return _iso(T0 - age)
+
+
+def test_alias_gemeo_bead_parada_desde_antes_do_nascimento_nao_e_dono():
+    assert alias_claim_predates_session(ALIAS, _dog(), 3600, T0) is True
+
+
+def test_alias_bead_tocada_depois_do_nascimento_pode_ser_da_sessao():
+    assert alias_claim_predates_session(ALIAS, _dog(), 120, T0) is False
+
+
+def test_alias_margem_de_relogio_e_aberta_na_borda():
+    m = ALIAS_CLAIM_BIRTH_MARGIN_SECS
+    assert m == 60
+    assert alias_claim_predates_session(ALIAS, _dog(), 300 + m - 1, T0) is False
+    assert alias_claim_predates_session(ALIAS, _dog(), 300 + m, T0) is False   # na borda NÃO é "mais que" a margem
+    assert alias_claim_predates_session(ALIAS, _dog(), 300 + m + 1, T0) is True
+
+
+def test_alias_identificador_por_encarnacao_nunca_e_desmentido():
+    for ident in ("dog-galsnew", "ga-lsnew"):
+        assert alias_claim_predates_session(ident, _dog(), 3600, T0) is False, ident
+
+
+def test_alias_crew_persistente_fica_de_fora_da_regra():
+    """Alias de crew é estável, não reaproveitado: bead parada há semanas sob ela é trabalho estacionado, não órfã."""
+    crew = {"id": "ga-lscrew", "name": "thies-wa", "alias": "thies", "session_name": "thies-wa-galscrew",
+            "agent_name": "thies-wa", "template": "thies-wa", "state": "active",
+            "created_at": _iso(T0 - 16 * 86400)}
+    assert alias_claim_predates_session("thies", crew, 30 * 86400, T0) is False
+
+
+def test_alias_dado_ausente_ou_ilegivel_segue_valendo_dono():
+    """vazio → False e falhou/ilegível → False em CADA entrada: nunca se reclama na força de um campo que faltou."""
+    assert alias_claim_predates_session(ALIAS, _dog(), None, T0) is False      # idade da bead não lida
+    assert alias_claim_predates_session("", _dog(), 3600, T0) is False         # sem assignee
+    for ruim in ("", None, "ontem"):
+        assert alias_claim_predates_session(ALIAS, _dog(created_at=ruim), 3600, T0) is False, ruim
+    assert alias_claim_predates_session(ALIAS, _dog(template=""), 3600, T0) is False   # sem template não se distingue slot de crew
+    assert alias_claim_predates_session(ALIAS, _dog(created_at=_iso(T0 + 600)), 30, T0) is False  # nascimento no futuro
+
+
+def test_alias_aceita_o_dialeto_de_offset_local_do_gc_session_list():
+    """finding low do gate da ga-lotseol: os fixtures só tinham 'Z', e o `gc session list` emite offset local."""
+    assert alias_claim_predates_session(ALIAS, _dog(created_at=_iso(T0 - 300, -3)), 3600, T0) is True
+    assert alias_claim_predates_session(ALIAS, _dog(created_at=_iso(T0 - 300, -3)), 120, T0) is False
+
+
+def test_roster_gemeo_de_alias_nao_segura_a_bead_do_morto():
+    r = live_builder_report(ALIAS, [_dog()], _toque(3600), T0)
+    assert r["verdict"] is False
+    assert r["twins"] == ["dog-galsnew"]
+
+
+def test_roster_bead_tocada_depois_do_nascimento_segue_viva():
+    r = live_builder_report(ALIAS, [_dog()], _toque(120), T0)
+    assert r["verdict"] is True and r["twins"] == []
+
+
+def test_roster_sem_dado_da_bead_e_o_comportamento_de_antes():
+    for upd in (None, "", "ontem"):
+        r = live_builder_report(ALIAS, [_dog()], upd, T0)
+        assert r["verdict"] is True and r["twins"] == [], upd
+
+
+def test_roster_assignee_por_encarnacao_nunca_vira_gemeo():
+    for ident in ("dog-galsnew", "ga-lsnew"):
+        r = live_builder_report(ident, [_dog()], _toque(3600), T0)
+        assert r["verdict"] is True and r["twins"] == [], ident
+
+
+def test_roster_crew_com_alias_estavel_segue_dona():
+    crew = {"id": "ga-lscrew", "name": "thies-wa", "alias": "thies", "session_name": "thies-wa-galscrew",
+            "agent_name": "thies-wa", "template": "thies-wa", "state": "active",
+            "created_at": _iso(T0 - 16 * 86400)}
+    r = live_builder_report("thies", [crew], _toque(30 * 86400), T0)
+    assert r["verdict"] is True and r["twins"] == []
+
+
+def test_roster_encarnacao_mais_velha_do_mesmo_alias_ainda_pode_ser_a_dona():
+    """`continue`, não `return`: a bead parada há 3600 s é posterior ao nascimento da incarnação de 7200 s — ela segura."""
+    velha = _dog(id="ga-lsold", session_name="dog-galsold", created_at=_iso(T0 - 7200))
+    for roster in ([_dog(), velha], [velha, _dog()]):
+        r = live_builder_report(ALIAS, roster, _toque(3600), T0)
+        assert r["verdict"] is True and r["twins"] == ["dog-galsnew"]
+
+
+def test_roster_template_nu_nao_e_alias_de_claim():
+    """Assignee 'gastown.dog' é carimbo de pool, não claim de alias: o dog que vai atender nasce DEPOIS do carimbo,
+    por construção — descartá-lo como gêmeo soltaria uma bead que ele vai pegar."""
+    r = live_builder_report("gastown.dog", [_dog()], _toque(3600), T0)
+    assert r["verdict"] is True and r["twins"] == []
+
+
+def test_roster_sessao_fechada_nao_segura_nem_conta_como_gemeo():
+    velha_fechada = _dog(id="ga-lsold", session_name="dog-galsold", created_at=_iso(T0 - 7200), closed=True)
+    r = live_builder_report(ALIAS, [velha_fechada, _dog()], _toque(3600), T0)
+    assert r["verdict"] is False and r["twins"] == ["dog-galsnew"]
+
+
+def test_roster_regras_antigas_do_is_live_builder_seguem_intactas():
+    adhoc_dormindo = {"session_name": "wa-worker-adhoc-8ba5", "name": "wa-worker-adhoc-8ba5", "state": "asleep"}
+    assert live_builder_report("wa-worker-adhoc-8ba5", [adhoc_dormindo], None, T0)["verdict"] is False   # ga-mrfb
+    mayor = {"session_name": "gastown__mayor", "name": "gastown.mayor", "state": "active"}
+    assert live_builder_report("mayor", [mayor], None, T0)["verdict"] is None   # coordenador: nunca confirma nem nega
+
+
+def test_roster_ilegivel_e_nao_consultei_nunca_nenhum_vivo():
+    for ruim in (None, "nao-e-lista", {"sessions": []}):
+        assert live_builder_report(ALIAS, ruim, _toque(3600), T0)["verdict"] is None, ruim
+    assert live_builder_report(ALIAS, [], _toque(3600), T0)["verdict"] is False   # lista legível e vazia: ninguém vivo
+
+
+def test_meta_do_roster_fechada_fora_e_asleep_vence_no_identificador_repartido():
+    roster = [{"name": "x", "alias": "slot-1", "state": "active"},
+              {"name": "y", "alias": "slot-1", "state": "asleep"},
+              {"name": "z", "closed": True},
+              {"name": "", "alias": None, "session_name": "w"}]
+    assert session_meta_from_roster(roster) == {
+        "x": {"state": "active"}, "y": {"state": "asleep"}, "slot-1": {"state": "asleep"}, "w": {"state": "active"}}
+
+
+def _meta_de_antes(sessions):
+    """O que o jq do pilot-dispatcher.sh (_LIVE_SESSION_IDS/_ASLEEP_SESSION_IDS) monta, escrito aqui do zero a
+    partir da especificação — o teste não herda um erro do código sob teste."""
+    live, asleep = [], []
+    for s in sessions:
+        if s.get("closed") is True:
+            continue
+        ids = [i for i in (s.get(k) for k in ("session_name", "name", "alias", "id", "agent_name")) if i]
+        live += ids
+        if s.get("state") == "asleep":
+            asleep += ids
+    return {i: {"state": "asleep" if i in asleep else "active"} for i in set(live)}
+
+
+def test_roster_sem_dado_da_bead_e_identico_ao_is_live_builder_de_antes():
+    """A prova de que a regra desligada não muda NENHUM veredito do Pilot: mesmo roster, mesmos assignees."""
+    roster = [
+        {"id": "ga-1", "name": "mila-wa", "session_name": "mila-wa-awispm94omdp", "template": "mila-wa", "state": "active"},
+        {"id": "ga-2", "name": "thies-wa", "session_name": "thies-wa-x", "template": "thies-wa", "state": "asleep"},
+        {"id": "ga-3", "name": "oracle-wa", "session_name": "oracle-wa-x", "template": "oracle-wa", "state": "active", "closed": True},
+        {"id": "ga-4", "name": "ps-worker-adhoc-AWAKE01", "session_name": "ps-worker-adhoc-AWAKE01", "template": "ps-worker", "state": "active"},
+        {"id": "ga-5", "name": "wa-worker-adhoc-8ba5", "session_name": "wa-worker-adhoc-8ba5", "template": "wa-worker", "state": "asleep"},
+        _dog(), _dog(id="ga-lsold", session_name="dog-galsold", created_at=_iso(T0 - 7200)),
+        {"id": "ga-9", "name": "gastown.mayor", "session_name": "gastown__mayor", "template": "gastown.mayor", "state": "active"},
+    ]
+    assignees = ["mila-wa", "mila-wa-awispm94omdp", "thies-wa", "oracle-wa", "ps-worker-adhoc-AWAKE01", "wa-worker-adhoc-8ba5",
+                 ALIAS, "dog-galsnew", "gastown.dog", "gastown.mayor", "mayor", "ghost-xyz", "mila"]
+    for asg in assignees:
+        quer = is_live_builder(asg, _meta_de_antes(roster))
+        assert live_builder_report(asg, roster, None, T0)["verdict"] is quer, asg
 
 
 # ── de quem é a vez ──────────────────────────────────────────────────────────
