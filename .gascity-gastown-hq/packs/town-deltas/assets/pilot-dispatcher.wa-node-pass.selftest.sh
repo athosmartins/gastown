@@ -820,13 +820,15 @@ for i in 1 2 3; do T_HOLD_STATE="$WORK/city/.gc/notadir/h.tsv" T_WAIT=wa-w1 swee
 [ "$(d1)" = "-" ] && ok "(d) estado que não grava (pasta impossível): a P2 NUNCA é solta por isso — o contador não anda e o hold segura (o comportamento anterior)" || bad "(d) estado sem escrita soltou a P2: d1=$(d1)"
 grep -q 'WARN.*escrita do estado do hold falhou' "$WORK/lines" 2>/dev/null && ok "(d) …e AVISA que não gravou (sem isso o congelamento voltaria em silêncio)" || bad "(d) escrita falha sem aviso: $(cut -c1-200 "$WORK/lines" 2>/dev/null | tr '\n' '|')"
 rm -f "$WORK/city/.gc/notadir"
-# (e) o waiter é sondado ANTES de qualquer P2+ (a lista é [P2, waiter]; a ordem de trabalho da cidade põe P0/P1 antes na pista real, e o stub do teste não)
+# (e) o waiter é sondado ANTES de qualquer P2+ (a lista é [P2, waiter]). O waiter aqui é P2 (W1P2), da MESMA classe da candidata: com um waiter P1 a ordem por classe (ga-7xd8g8f) já o poria à frente
+# sozinha e o mutante '3.18: o waiter nao e sondado primeiro' sobrevivia (equivalente nesse teste); sendo P2, só a precedência do waiter explica a sonda ir para ele.
+W1P2="$(jbp 2 wa-w1 U1 wa-worker story:approved)"
 reset; chk wa-w1 11; chk wa-p2a 0; setok wa-p2a
-T_PROBES=1 T_WAIT=wa-w1 pass "[$P2A,$W1]" >/dev/null
+T_PROBES=1 T_WAIT=wa-w1 pass "[$P2A,$W1P2]" >/dev/null
 [ "$(wnd_calls)" = 1 ] && grep -q 'wa-w1' "$WORK/wnd.calls" && ok "(e) 1 sonda no orçamento e a P2 vem antes na lista: a sonda vai para o WAITER (não para a P2)" || bad "(e) a sonda não foi ao waiter: $(cat "$WORK/wnd.calls" 2>/dev/null | tr '\n' '|')"
 summ | jq -e '.waiter_verdict=="blind" and .probed==1' >/dev/null 2>&1 && ok "(e) resumo: waiter_verdict=blind (ele foi olhado, não ficou unseen por falta de orçamento)" || bad "(e) resumo: $(summ | cut -c1-300)"
 reset; chk wa-w1 0; chk wa-p2a 0; setok wa-w1 wa-p2a
-T_PROBES=1 T_WAIT=wa-w1 pass "[$P2A,$W1]" >/dev/null
+T_PROBES=1 T_WAIT=wa-w1 pass "[$P2A,$W1P2]" >/dev/null
 [ "$(d1)" = "wa-w1 small feature pass=1;" ] && ok "(e) waiter com veredito node e a P2 antes na lista, 1 sonda: o waiter fica com a vaga do nó" || bad "(e) waiter perdeu a vaga para a P2: $(d1)"
 reset; chk wa-w1 0; chk wa-p2a 0; setok wa-w1 wa-p2a
 T_WAIT=ps-zz pass "[$P2A,$P2B]" >/dev/null
