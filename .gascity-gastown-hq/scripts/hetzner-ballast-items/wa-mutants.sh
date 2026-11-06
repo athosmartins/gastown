@@ -18,7 +18,7 @@
 #   o que foi varrido), o motor que morre sem imprimir o resumo (motor-sem-resumo), o estado que o motor não lê (estado-ilegivel, do motor: nunca é zerado) → exit 3 e nada de "sem novidade" gravado. O marcador de ocioso só é escrito quando o
 #   motor DISSE sem-novidade com rc 0, e guarda a ponta do WA que a ÁRVORE testou (git rev-parse HEAD) com a do hq de onde veio o motor, nunca a ponta do WA lida antes do wt-add: ilegível/ausente/velho/de outra ponta → roda a rodada (pior caso é repetir uma, nunca pular uma).
 # LIMITES: roda no nó como `runner`; o motor só escreve no --work ($BALLAST_RUN_DIR/work) e no estado; cada mutante roda numa cópia da árvore do WA (~150 MB, sem .git, crew/ e node_modules/) na jaula (escrita só no slot e no máximo 512 MB
-#   por arquivo, TCP cortado, provada pelo pai antes de qualquer mutante); alvo que cita sudo, tmux, pkill, os.kill… fica FORA (denylist do motor e do wrapper, contada em `skipped`), e o que tem mais de 12 testes na família também.
+#   por arquivo, TCP cortado, provada pelo pai antes de qualquer mutante); alvo que cita sudo, tmux, pkill, os.kill… fica FORA (denylist do motor e do wrapper, contada em `skipped`), e o que tem mais de 30 testes na família também (--fam-cap, ga-ek7ndez: o wrapper sozinho corta em 12; o resumo diz `fam_cap`).
 #   O registro exige `noflag:wa-suite.leak`: vazamento medido pelo wa-suite tranca TODO código do WA no nó. Nenhum dado sai do nó além deste resumo.
 set -u
 BH=${BALLAST_HOME:?BALLAST_HOME}; RD=${BALLAST_RUN_DIR:?BALLAST_RUN_DIR}; CORES=${BALLAST_CORES:-2}
