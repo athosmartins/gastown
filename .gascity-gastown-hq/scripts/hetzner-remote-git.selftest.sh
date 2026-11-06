@@ -15,7 +15,7 @@
 #   com valor sem relação, e nesse caso o objeto chega do mesmo jeito (medido no git 2.43: a atualização da ref é recusada, rc 1 do fetch avulso, que o reparo ignora, e o objeto fica no clone) e a ref é apagada logo depois.
 set -u
 HERE=$(cd "$(dirname "$0")" && pwd -P); RG=${HRG_S:-$HERE/hetzner-remote-git.sh}
-T=$(mktemp -d "${TMPDIR:-/tmp}/hrg.XXXXXX"); T=$(cd "$T" && pwd -P); chmod 700 "$T"; N=0; F=0; HRG_EXPECT=229
+T=$(mktemp -d "${TMPDIR:-/tmp}/hrg.XXXXXX"); T=$(cd "$T" && pwd -P); chmod 700 "$T"; N=0; F=0; HRG_EXPECT=237
 export GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null GIT_AUTHOR_NAME=t GIT_AUTHOR_EMAIL=t@t GIT_COMMITTER_NAME=t GIT_COMMITTER_EMAIL=t@t GIT_TERMINAL_PROMPT=0
 export GT_REMOTE_GIT=$T/node GT_REMOTE_SSH=$T/bin/ssh GT_REMOTE_NOMUX=1 FAKE_SRV=$T/srv.git FAKE_SPEC=$T/spec REAL_GIT REAL_MKTEMP; REAL_GIT=$(command -v git); REAL_MKTEMP=$(command -v mktemp)
 ok() { N=$((N+1)); echo "ok   $N - $1"; }
@@ -257,16 +257,14 @@ fresh adv; OUT=$(env FAKE_SSH_FAIL=spec "$RG" pull gascity 2>&1); RC=$?   # falh
 grep -qF 'spec indisponível' "$LPE" && ok "espelho sem filtro: o stderr do ssh fica no last-pull-error" || bad "espelho sem filtro: stderr" "$(cat "$LPE" 2>&1)"
 
 # ── lastro hq-mutants (ga-0qhveri): o que as seções acima não pisam — o filtro que MUDA, o bootstrap, a idade (lag), status, wt-add/wt-rm e scan ──────────────────────────────────────
-# Cada caso abaixo mata uma troca de `&&`/`||`/`-n`/`!`/limite que deixava o selftest verde. EQUIVALENTES (provados por leitura, sem caso): o `|| true` -> `&& true` das duas leituras `rev-parse -q --verify` do status (sem `set -e`
-# o rc de uma atribuição por $( ) nunca é lido); o `|| return 2` do `mktemp -d` dentro de denied (sem ele o `git init /r` falha na raiz do disco para quem não é root e o rc continua 2); o `&&` -> `||` entre o `tr` e a conferência de contagem do `find` do scan
-# (se o `find` falha o `tr` não roda, $t/files não existe e a conferência é sempre falsa).
-# EQUIVALENTES do rodízio de 03/11 (ga-59jrj3d, provados por leitura): o `return 0` -> `return 1` do lag_fields (c5c184d44d: os três chamadores o chamam com `;`, e sem `set -e` o status nunca é lido) e o `|| true` -> `&& true` do
-# `old=$(g config gtremote.sparseoid || true)` do pull (fe123d753c: o status da atribuição nunca é lido; o valor é o mesmo).
-# EQUIVALENT 5572d3e5d6 6a099af2c5: o `|| true` -> `&& true` das duas leituras `rev-parse -q --verify` do status: sem `set -e` o rc de uma atribuicao por $( ) nunca e lido
-# EQUIVALENT 6c2726b5e0: o `&&` -> `||` entre o `tr` e a conferencia de contagem do `find` do scan: se o `find` falha o `tr` nao roda, $t/files nao existe e a conferencia e sempre falsa
-# EQUIVALENT 3e96e45c69: o `|| return 2` do `mktemp -d` dentro de denied: sem ele o `git init /r` falha na raiz do disco para quem nao e root e o rc continua 2
-# EQUIVALENT c5c184d44d: o `return 0` -> `return 1` do lag_fields: os tres chamadores (pull, wt-add, status) o chamam com `;` e nenhum le o $? depois (o script so tem `set -u`: sem `set -e` e sem trap ERR, o status solto nao derruba nada)
-# EQUIVALENT fe123d753c: o `|| true` -> `&& true` do `old=$(g config gtremote.sparseoid || true)` do pull: a saida do $( ) e a mesma (o `true` nao imprime) e o status da atribuicao nunca e lido (so ha `set -u`: sem `set -e` e sem trap ERR, e o comando seguinte nao olha o $?)
+# Cada caso abaixo mata uma troca de `&&`/`||`/`-n`/`!`/limite que deixava o selftest verde. EQUIVALENTES (provados por leitura, sem caso): o `|| true` -> `&& true` das duas leituras `rev-parse -q --verify` do status e o do `old=$(g config gtremote.sparseoid || true)` do pull
+# (sem `set -e` o rc de uma atribuição por $( ) nunca é lido; a saída do $( ) é a mesma) e o `return 0` -> `return 1` do lag_fields (os três chamadores o chamam com `;`, e sem `set -e` o status nunca é lido).
+# O id leva a linha: quando se insere linha acima (ga-kzwlkhh, ga-eivvcus) a declaração envelhece e o mutante volta à lista com id novo. ga-9twwdmk trocou os ids abaixo (211be6fe01 era c5c184d44d, 70e8d9bd68 era fe123d753c, 9c05845b12 e a81c597348 eram
+# 6a099af2c5 e 5572d3e5d6) depois de provar com o candidates() do motor, no commit anterior ao ga-kzwlkhh, que são o mesmo token na mesma linha de código.
+# O `|| return 2` do `mktemp -d` de denied e o `&&` entre o `tr` e a conferência de contagem do `find` do scan estavam declarados equivalentes aqui; NÃO são (a razão só olhava o ramo «o find falha»): os casos do fim do arquivo (ga-9twwdmk) os matam.
+# EQUIVALENT 9c05845b12 a81c597348: o `|| true` -> `&& true` das duas leituras `rev-parse -q --verify` do status: sem `set -e` o rc de uma atribuicao por $( ) nunca e lido
+# EQUIVALENT 211be6fe01: o `return 0` -> `return 1` do lag_fields: os tres chamadores (pull, wt-add, status) o chamam com `;` e nenhum le o $? depois (o script so tem `set -u`: sem `set -e` e sem trap ERR, o status solto nao derruba nada)
+# EQUIVALENT 70e8d9bd68: o `|| true` -> `&& true` do `old=$(g config gtremote.sparseoid || true)` do pull: a saida do $( ) e a mesma (o `true` nao imprime) e o status da atribuicao nunca e lido (so ha `set -u`: sem `set -e` e sem trap ERR, e o comando seguinte nao olha o $?)
 mkdir -p "$T/shim2" "$T/home"; export REAL_DATE; REAL_DATE=$(command -v date)
 printf '%s\n' '#!/bin/sh' '[ -n "${FAKE_NOW:-}" ] && [ "${1:-}" = +%s ] && { echo "$FAKE_NOW"; exit 0; }' 'exec "$REAL_DATE" "$@"' > "$T/shim2/date"   # FAKE_NOW fixa o `date +%s` do script: a idade sai exata
 printf '%s\n' '#!/bin/sh' 'case "${SHIM2_MODE:-}:${1:-}" in' '  mktempfail:-d) echo "shim: mktemp -d falhou (de proposito)" >&2; exit 1 ;;' \
@@ -447,6 +445,33 @@ fresh adv; git -C "$S" hash-object -w --stdin < "$T/spec19" > /dev/null; OUT=$(e
 mkdir -p "$T/node4/lixo"; OUT=$(env HOME="$T/home" GT_REMOTE_GIT="$T/node4" "$RG" scan 2>&1); RC=$?
 [ "$RC" = 2 ] && has 'scan: nenhum clone para varrer' "scan sem nenhum clone: NÃO consegui (rc 2), nunca limpo" || bad "scan sem clone: rc=$RC" "$OUT"
 hasnt 'scan credenciais' "scan sem nenhum clone: nem chega às credenciais"
+
+# ── lastro hq-mutants (ga-9twwdmk): três trocas do scan que o rodízio de 06/11 achou vivas (duas estavam declaradas equivalentes, com razão que só olhava um ramo) ────────────────────────────────────────
+# (a) nome de arquivo com quebra de linha na ÁRVORE: o `find -print0` e o `tr` passam, e só a conferência de contagem (NULs x linhas) percebe que o parse por linha forjaria dois nomes; com o `&&` antes dela virando `||` o scan diz «limpo» (3 arquivos conferidos para 2 reais)
+# (b) o `mktemp -d` de denied falha: sem o `|| return 2` o `git init` roda com $t vazio, isto é, em /r (como root criaria /r); o rc continua 2, então só o registro dos `git init` separa os dois
+# (c) o `grep -v` do MANIFEST falha (rc 2) DEPOIS de imprimir o recorte bom: a lista fica como estava (o banco liberado segue achado); `[ $? -le 2 ]` aceitaria o recorte de uma filtragem que falhou
+mkdir -p "$N3/nl" "$T/shim4" "$T/shim5"; git clone -q --bare "$W4" "$N3/nl/repo.git" 2>/dev/null; git -C "$N3/nl/repo.git" config gtremote.mirrorurl "$(git -C "$N3/nl/repo.git" config remote.origin.url)"; printf '%s\n' '/data/x1' > "$N3/nl/deny"
+SCANRIGS=nl; sc
+[ "$RC" = 0 ] && has 'scan nl: limpo (' "controle (nome com quebra de linha): o clone sem arquivo estranho na árvore é limpo, rc 0" || bad "controle (nome com quebra de linha): rc=$RC" "$OUT"
+NLF="$N3/nl/$(printf 'a\nb')"; : > "$NLF"; sc
+[ "$RC" = 2 ] && has 'find falhou ou há nome de arquivo com quebra de linha' "scan: arquivo com quebra de linha no NOME na árvore → NÃO consegui varrer (rc 2), o parse por linha não é seguro" || bad "scan com nome com quebra de linha na árvore: rc=$RC" "$OUT"
+hasnt 'scan nl: limpo' "scan: ...e o clone não é dado por limpo"; rm -f "$NLF"
+# o log dos `git init`: um scan normal CHAMA git init (o filtro de nomes cria um repo vazio em $t/r); o shim recusa o de /r (o selftest nunca cria nada na raiz do disco, nem rodando como root)
+printf '%s\n' '#!/bin/sh' 'case "${1:-}" in init) echo "$*" >> "$SHIM4_LOG"; for last; do :; done; [ "$last" != /r ] || { echo "shim: git init /r recusado (de proposito)" >&2; exit 128; } ;; esac' 'exec "$REAL_GIT" "$@"' > "$T/shim4/git"; chmod 755 "$T/shim4/git"
+: > "$T/gitinit.log"; sc PATH="$T/shim4:$PATH" SHIM4_LOG="$T/gitinit.log"
+# vazio → o shim não registrou nada e o controle FALHA (nunca vira «sem git init»); ilegível → o grep -c não imprime número e o controle falha do mesmo jeito
+[ "$RC" = 0 ] && [ "$(grep -c '^init -q /..*/r$' "$T/gitinit.log" 2> /dev/null)" -ge 1 ] && ok "controle (git init): um scan normal chama git init (em <tmp>/r, nunca em /r) e o shim o registra" || bad "controle (git init): rc=$RC" "$(cat "$T/gitinit.log" 2>&1)"
+: > "$T/gitinit.log"; rm -f "$T/cnt"; sc PATH="$T/shim4:$T/shim2:$PATH" SHIM4_LOG="$T/gitinit.log" SHIM2_MODE=mktemp2fail SHIM2_CNT="$T/cnt"
+[ "$RC" = 2 ] && has 'avaliar os nomes do hist' "denied: o mktemp -d falha → o scan diz NÃO consegui (rc 2)" || bad "denied com mktemp -d falhando: rc=$RC" "$OUT"
+# vazio → nenhum git init (o esperado, e o controle acima prova que o mesmo log é escrito quando há); ilegível → o arquivo acabou de ser criado vazio, então só um shim que não escreve o deixaria assim
+[ ! -s "$T/gitinit.log" ] && ok "denied: o mktemp -d que falha volta na hora e NÃO roda git init com \$t vazio (seria em /r)" || bad "denied: git init depois do mktemp -d falhar" "$(cat "$T/gitinit.log" 2>&1)"
+# o grep -v do MANIFEST sai com rc 2 DEPOIS de imprimir o recorte certo (o banco do MANIFEST some dele): a lista de achados fica como estava, o banco liberado continua VIOLAÇÃO
+export REAL_GREP; REAL_GREP=$(command -v grep)
+printf '%s\n' '#!/bin/sh' 'case "${1:-} ${2:-} ${3:-}" in "-v -E ^wt/"*) "$REAL_GREP" "$@"; exit 2 ;; esac' 'exec "$REAL_GREP" "$@"' > "$T/shim5/grep"; chmod 755 "$T/shim5/grep"
+SCANRIGS=sd; printf 'shared/data/queue.db\n' > "$N3/schema-dbs/sd/MANIFEST"; sc
+[ "$RC" = 0 ] && has 'scan sd: limpo (' "controle (grep do MANIFEST): com o MANIFEST bom o banco liberado (e o -wal/-shm) passa, rc 0" || bad "controle (grep do MANIFEST): rc=$RC" "$OUT"
+sc PATH="$T/shim5:$PATH"
+[ "$RC" = 1 ] && has 'wt/w1/shared/data/queue.db' "schema-dbs: o grep do MANIFEST que falha (rc 2) depois de imprimir o recorte bom → a lista fica como estava: o banco liberado segue VIOLAÇÃO, rc 1" || bad "schema-dbs: grep do MANIFEST falhando: rc=$RC" "$OUT"
 
 [ "$N" = "$HRG_EXPECT" ] || bad "casos rodados: $N, esperava $HRG_EXPECT (algum caso sumiu, ou foi acrescentado sem atualizar HRG_EXPECT)"
 echo; echo "hetzner-remote-git selftest: $((N-F))/$N ok"; [ "$F" = 0 ] && exit 0 || { echo "FAIL=$F"; exit 1; }
