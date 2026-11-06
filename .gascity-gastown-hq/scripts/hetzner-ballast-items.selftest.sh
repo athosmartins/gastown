@@ -642,8 +642,8 @@ g_wam() {
   newwam; oldeng; : > "$W/engine.log"; runwam FAKE_MODE=completo BALLAST_CORES_MAX=6
   check "wam: motor ANTIGO (sem as opções) → só os slots de sempre, nenhuma opção nova é passada (o item não quebra o motor que ainda não as conhece)" "1 0 0 0" "$(eng "--slots 2 ") $(eng "--slots-max ") $(eng "--slots-file ") $(eng "--data-mb")"
 
-  # TETO DE FAMÍLIA (ga-ek7ndez): o invólucro pula como `familia-grande` o alvo com mais de 12 testes na família, e o WA tem 148 deles (~50 mil mutantes que o lastro nunca varreu) — de madrugada, sem commit novo, o wa-mutants
-  # dava sem-novidade e dormia. O item passa --fam-cap (padrão 30) SÓ a um invólucro que a conhece; WA_MUTANTS_FAM_CAP muda o número (em produção o governo monta o ambiente do zero: vale à mão e em teste) e o
+  # TETO DE FAMÍLIA (ga-ek7ndez): o invólucro pula como `familia-grande` o alvo com mais de 12 testes na família, e o WA tem 148 deles (115 fora da denylist, ~34,7 mil mutantes que o lastro nunca julgou) — de madrugada, sem commit
+  # novo, o wa-mutants dava sem-novidade e dormia. O item passa --fam-cap (padrão 30) SÓ a um invólucro que a conhece; WA_MUTANTS_FAM_CAP muda o número (em produção o governo monta o ambiente do zero: vale à mão e em teste) e o
   # arquivo wa-mutants.nofamcap na pasta do lastro devolve o 12 do invólucro. `famcap` lê o log do motor: `-` é "chamou e NÃO levou a opção", nunca "não chamou".
   newwam; runwam FAKE_MODE=completo
   check "wam: o padrão do item é --fam-cap 30 (o invólucro sozinho pula os alvos de 13 a 30 testes) e o resumo diz fam_cap 30" "30 30" "$(famcap) $(sj fam_cap)"
