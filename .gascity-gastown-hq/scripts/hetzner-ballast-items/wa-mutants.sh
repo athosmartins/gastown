@@ -34,8 +34,8 @@ case "$SLOTS_MAX" in ''|*[!0-9]*) SLOTS_MAX=$SLOTS ;; esac
 DATA_MB=${WA_MUTANTS_DATA_MB:-3072}   # teto de dados (RLIMIT_DATA) por processo de mutante: o legítimo mede até 1,2 GB de VmData (RSS 224 MB), o que aloca sem parar morre aos 3 GB em vez de derrubar a rodada. 0 desliga
 case "$DATA_MB" in ''|*[!0-9]*) DATA_MB=3072 ;; esac
 # teto de FAMÍLIA (ga-ek7ndez): o invólucro pula como `familia-grande` o alvo com mais de 12 testes na família (148 no WA em 06/11) e, sem commit novo, a rodada dava sem-novidade e dormia. Com 30 o plano real (árvore e estado do nó) solta 83 alvos e ~15,4 mil mutantes;
-# quantos têm baseline verde na jaula só a rodada diz (amostra de 14 alvos: 4 verdes; o resto vira `base-vermelha` e volta em 2 dias). O teste numérico basta: texto, zero, negativo e número grande demais para o `[` dão falso (ou erro, que o 2>/dev/null cala) e voltam
-# ao 30; o invólucro recusa 0 com rc 2 e nenhuma rodada varreria nada
+# medido na jaula do nó, ~1/3 deles tem baseline verde (o resto tem testes quebrados por ambiente na jaula e vira `base-vermelha`, que volta em 2 dias; ver "Medido" no runbook). O teste numérico basta: texto, zero, negativo e número grande demais para o `[` dão falso
+# (ou erro, que o 2>/dev/null cala) e voltam ao 30; o invólucro recusa 0 com rc 2 e nenhuma rodada varreria nada
 FAM_CAP=${WA_MUTANTS_FAM_CAP:-30}
 [ "$FAM_CAP" -ge 1 ] 2> /dev/null || FAM_CAP=30
 SHM=${WA_MUTANTS_SHM-/dev/shm}   # onde moram os slots: tmpfs. Vazio desliga (slots no disco)
