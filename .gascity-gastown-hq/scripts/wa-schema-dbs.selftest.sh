@@ -2,12 +2,14 @@
 # wa-schema-dbs.selftest.sh — hermético: um "WA" de mentira (repo git com origin/main + shared/data com bancos de todos os feitios) e um `ssh` de mentira que roda o programa do NÓ num HOME temporário. (ga-kzwlkhh)
 #
 # ## Contents
-#   Build · Falhas do build · Entrega · O nó não confia no mini · Interruptor, lock e run · Consistência · Controle negativo (mutantes)
+#   Build · Falhas do build · Entrega · O nó não confia no mini · Interruptor, lock e run · Consistência · Limites exatos (em processo) · Controle negativo (mutantes)
 #
 # BUILD: o banco citado e existente vira cópia só-schema (zero linha, mesmo DDL, user_version); DuckDB, banco vazio, PII no DDL e nome de segredo ficam de fora COM motivo; o dado nunca aparece no stage; o banco real não muda (nem sobra -wal/-shm).
 # FALHAS: git, varredor de PII, banco travado e "nenhum banco" não entregam nada (rc 3), nunca "nenhum banco" apagando o que o nó tem. ENTREGA: o nó instala, o recibo só nasce depois do sha256 conferido e o placement vem do script do nó;
 #   ssh que cai, resposta ilegível ou sha256 diferente do enviado = rc 2 e o recibo antigo fica. NÓ: adulteração (sha256, linhas, caminho com .., link, lixo) é recusada e a loja que existia NÃO muda.
-# WSD_S=<script> (caminho ABSOLUTO) testa outra cópia do gerador. Leva ~30 s.
+# LIMITES (ga-mf5b4ak): um bloco em processo importa o gerador e põe cada entrada EXATAMENTE na borda (prazo do git e do ssh, tamanho máximo, cópia com linha, SQLite sem URI por padrão), onde o git e o ssh de mentira não chegam;
+#   o resto fecha o que só aparece de ponta a ponta (rc de cada recusa, relatório, chaves em ordem, stage que não sai).
+# WSD_S=<script> (caminho ABSOLUTO) testa outra cópia do gerador. Leva ~15 s.
 set -u
 HERE=$(cd "$(dirname "$0")" && pwd -P); WS=${WSD_S:-$HERE/wa-schema-dbs.py}; PII=$HERE/hetzner-pii-scan.py; CLS=$HERE/wa-node-classify.py; RG=$HERE/hetzner-remote-git.sh
 T=$(mktemp -d "${TMPDIR:-/tmp}/wsd.XXXXXX"); T=$(cd "$T" && pwd -P); N=0; F=0
@@ -77,7 +79,7 @@ prog = ws.NODE_PROG + "\nPAYLOAD = %r\nmain()\n" % base64.b64encode(payload).dec
 r = subprocess.run(["python3", "-I", "-", "whatsapp_automation"], input=prog, capture_output=True, text=True, env=dict(os.environ, HOME=home, GT_REMOTE_GIT=home + "/gt-remote/git", GT_REMOTE_BIN=home + "/gt-remote/bin"))
 print(r.stdout.strip().splitlines()[-1] if r.stdout.strip() else "SEM-SAIDA", "RC=%d" % r.returncode)
 PY
-printf '%s\n' '#!/bin/sh' 'echo "$*" >> "$SSH_LOG"' '[ -n "${SSH_FAIL:-}" ] && { echo "ssh: Connection refused" >&2; exit 255; }' '[ -n "${SSH_FAKE_FILE:-}" ] && { cat > /dev/null; cat "$SSH_FAKE_FILE"; exit 0; }' \
+printf '%s\n' '#!/bin/sh' 'echo "$*" >> "$SSH_LOG"' '[ -n "${SSH_LOCK_STAGE:-}" ] && chmod 555 "$WA_SCHEMA_STATE"/stage-*/shared/data' '[ -n "${SSH_FAIL:-}" ] && { echo "ssh: Connection refused" >&2; exit 255; }' '[ -n "${SSH_FAKE_FILE:-}" ] && { cat > /dev/null; cat "$SSH_FAKE_FILE"; exit "${SSH_FAKE_RC:-0}"; }' \
   'while [ $# -gt 0 ]; do case "$1" in -o) shift 2 ;; *) break ;; esac; done' 'shift' 'exec env HOME="$NODE_HOME" GT_REMOTE_GIT="$NODE_HOME/gt-remote/git" GT_REMOTE_BIN="$NODE_HOME/gt-remote/bin" "$@"' > "$T/ssh"
 printf '%s\n' '#!/bin/sh' 'echo "git de mentira: falha" >&2' 'exit 128' > "$T/git-quebra"; chmod 755 "$T/ssh" "$T/git-quebra"
 
@@ -89,6 +91,13 @@ newout() { O=$(mktemp -d "$T/o.XXXXXX"); }
 sha() { py 'import hashlib,sys;print(hashlib.sha256(open(sys.argv[1],"rb").read()).hexdigest())' "$1"; }
 rows() { py 'import sqlite3,sys;c=sqlite3.connect("file:"+sys.argv[1]+"?mode=ro",uri=True);print(sum(c.execute("select count(*) from "+n).fetchone()[0] for (n,) in c.execute("select name from sqlite_master where type=\"table\" and name not like \"sqlite_%\" and name not like \"docs_%\"")))' "$1"; }
 SRC=$T/wa/shared/data
+# vazio (JSON sem objeto) ou ilegível (ausente, torto) -> rc 1 e o caso reprova; só devolve 0 se TODO objeto do arquivo tem as chaves em ordem alfabética (o arquivo é conferido a olho e por diff)
+sorted_json() { py 'import json,sys
+ok=[]
+def hook(pairs):
+    ks=[k for k,_ in pairs]; ok.append(ks==sorted(ks)); return dict(pairs)
+json.loads(open(sys.argv[1]).read(), object_pairs_hook=hook)
+sys.exit(0 if ok and all(ok) else 1)' "$1"; }
 
 # ── build ─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
 [ "$(rows "$SRC/queue.db")" = 3 ] && grep -qa 5511987654321 "$SRC/queue.db" && ok "controle: o banco real tem 3 linhas e o telefone (senão 'sem dado no stage' não prova nada)" || bad "controle: fixture"
@@ -96,6 +105,7 @@ reset; newout; B0=$O; B_SHA=$(sha "$SRC/queue.db"); W_SHA=$(sha "$SRC/webhook.db
 [ "$RC" = 0 ] && has 'WASCHEMA ok shared/data/queue.db tabelas=1' "build: rc 0 e a linha do banco (tabelas, bytes)" || bad "build: rc=$RC" "$OUT"
 KEYS=$(py 'import json,sys;print(" ".join(sorted(json.load(open(sys.argv[1]))["dbs"])))' "$B0/MANIFEST.json")
 [ "$KEYS" = "shared/data/fts.db shared/data/locked.db shared/data/queue.db shared/data/testonly.db shared/data/webhook.db" ] && ok "build: só entram os CITADOS pelo código que existem e passam (uncited.db fora; testonly.db entra: fixado em teste)" || bad "build: chaves do manifesto = $KEYS"
+sorted_json "$B0/MANIFEST.json" && ok "build: MANIFEST.json com as chaves em ordem alfabética (texto canônico, conferível por diff)" || bad "build: MANIFEST.json fora de ordem"   # mata fdcdfb3bc8
 [ "$(rows "$B0/shared/data/queue.db")" = 0 ] && [ "$(rows "$B0/shared/data/webhook.db")" = 0 ] && ok "build: as cópias têm ZERO linha" || bad "build: cópia com linha"
 SQ=$(py 'import sqlite3,sys;[print(sorted(r[0] for r in sqlite3.connect(p).execute("select sql from sqlite_master where sql is not null and name not like \"sqlite_%\"").fetchall()), sqlite3.connect(p).execute("pragma user_version").fetchone()) for p in sys.argv[1:]]' "$SRC/queue.db" "$B0/shared/data/queue.db")
 [ "$(printf '%s\n' "$SQ" | sort -u | wc -l | tr -d ' ')" = 1 ] && printf '%s' "$SQ" | grep -qF '(7,)' && ok "build: mesmo DDL (tabela, índice, view, trigger) e user_version=7 na cópia" || bad "build: DDL ou user_version diferem" "$SQ"
@@ -110,7 +120,8 @@ reset; newout; EXTRA="WA_SCHEMA_PII=/nonexistent/pii.py"; wsrun build --out "$O"
 [ "$RC" = 3 ] && has 'varredor-pii-ilegivel' "varredor de PII ilegível: rc 3, nada sai sem varredura" && [ ! -e "$O/MANIFEST.json" ] && ok "varredor ilegível: nenhum manifesto" || bad "varredor ilegível: rc=$RC" "$OUT"
 reset; newout; EXTRA="WA_SCHEMA_REF=HEAD~5"; wsrun build --out "$O"; EXTRA=
 [ "$RC" = 3 ] && ok "ref que não existe: rc 3" || bad "ref inexistente: rc=$RC" "$OUT"
-reset; newout; py 'import sqlite3,sys,time;c=sqlite3.connect(sys.argv[1]);c.execute("BEGIN EXCLUSIVE");open(sys.argv[2],"w").write("1");time.sleep(12)' "$SRC/locked.db" "$T/lockflag" & LP=$!
+# os seguradores de lock em 2º plano chamam python3 DIRETO (não a função py): com a função, o `kill $LP` mata só o subshell e o python segue segurando o lock até o fim do sleep (medido: 11,5 s só no mutante travado-vira-ok, o selftest inteiro de 24 s para 10 s)
+reset; newout; python3 -I -c 'import sqlite3,sys,time;c=sqlite3.connect(sys.argv[1]);c.execute("BEGIN EXCLUSIVE");open(sys.argv[2],"w").write("1");time.sleep(12)' "$SRC/locked.db" "$T/lockflag" & LP=$!
 i=0; while [ ! -e "$T/lockflag" ] && [ $i -lt 100 ]; do sleep 0.1; i=$((i+1)); done
 wsrun build --out "$O"; kill $LP 2>/dev/null; wait $LP 2>/dev/null
 has 'WASCHEMA fora shared/data/locked.db: ilegivel:OperationalError' "banco travado: fica de fora como ilegível (nunca 'sem schema') e o build segue com os outros"
@@ -118,11 +129,14 @@ has 'WASCHEMA fora shared/data/locked.db: ilegivel:OperationalError' "banco trav
 reset; wsrun deliver --from "$B0"
 store=$NH/gt-remote/git/schema-dbs/whatsapp_automation
 [ "$RC" = 0 ] && has 'placement=absent' "entrega: rc 0 e o placement vem do script do nó (sem o wt-add novo = absent)" || bad "entrega: rc=$RC" "$OUT"
+has '(o hetzner-remote-git.sh do no ainda nao tem o wt-add novo: o classificador segue sem relaxar)' "entrega com placement absent: o relatório avisa que o classificador segue sem relaxar"   # mata 09e69cf4a3
 [ "$(sha "$store/shared/data/queue.db")" = "$(sha "$B0/shared/data/queue.db")" ] && [ "$(wc -l < "$store/MANIFEST" | tr -d ' ')" = 5 ] && ok "entrega: a loja do nó tem os 5 bancos (mesmo sha256) e o MANIFEST" || bad "entrega: loja" "$(find "$store" -type f | head)"
 REC=$(py 'import json,sys;r=json.load(open(sys.argv[1]));print(r["v"],r["placement"],len(r["dbs"]),r["rig"])' "$ST/delivered.json")
 [ "$REC" = "1 absent 5 whatsapp_automation" ] && ok "entrega: recibo v1, placement absent, 5 bancos" || bad "entrega: recibo = $REC"
+sorted_json "$ST/delivered.json" && ok "entrega: delivered.json com as chaves em ordem alfabética (o recibo é conferido a olho e por diff)" || bad "entrega: delivered.json fora de ordem"   # mata b96edf7bdb
 printf '# schema-dbs-v1\n' > "$NH/gt-remote/bin/hetzner-remote-git.sh"; mkdir -p "$store/shared/data"; : > "$store/shared/data/velho.db"; wsrun deliver --from "$B0"
 [ "$(py 'import json,sys;print(json.load(open(sys.argv[1]))["placement"])' "$ST/delivered.json")" = ok ] && has 'placement=ok' "entrega com o marcador schema-dbs-v1 no script do nó: placement ok" || bad "entrega: placement" "$OUT"
+hasnt 'ainda nao tem o wt-add novo' "entrega com placement ok: sem o aviso de que o classificador segue sem relaxar"   # mata 09e69cf4a3 (o outro lado)
 [ ! -e "$store/shared/data/velho.db" ] && [ -z "$(ls -A "$NH/gt-remote/git/schema-dbs" | grep -e '^\.new' -e '\.old')" ] && ok "entrega: a loja é trocada INTEIRA (o que sumiu da lista some do nó) e não sobra .new/.old" || bad "entrega: loja velha ou resíduo" "$(ls -A "$NH/gt-remote/git/schema-dbs")"
 R1=$(sha "$ST/delivered.json")
 EXTRA="SSH_FAIL=1"; wsrun deliver --from "$B0"; EXTRA=
@@ -131,6 +145,29 @@ echo "lixo sem a linha esperada" > "$T/reply.txt"; EXTRA="SSH_FAKE_FILE=$T/reply
 [ "$RC" = 2 ] && [ "$(sha "$ST/delivered.json")" = "$R1" ] && ok "resposta sem a linha SCHEMA-INSTALL: rc 2, recibo intacto" || bad "resposta ilegível: rc=$RC" "$OUT"
 echo 'SCHEMA-INSTALL {"ok": true}' > "$T/reply.txt"; EXTRA="SSH_FAKE_FILE=$T/reply.txt"; wsrun deliver --from "$B0"; EXTRA=
 [ "$RC" = 2 ] && ok "resposta ok sem bancos: rc 2" || bad "resposta ok sem bancos: rc=$RC" "$OUT"
+# ssh que nem executa (binário inexistente): subprocess.run levanta OSError -> "não confirmei": rc 2 e o recibo antigo fica   # mata 169f24b1ce
+EXTRA="MBP_SSH=/nonexistent/ssh"; wsrun deliver --from "$B0"; EXTRA=
+[ "$RC" = 2 ] && [ "$OUT" = "WASCHEMA FALHOU: ssh-sem-resposta" ] && [ "$(sha "$ST/delivered.json")" = "$R1" ] && ok "ssh que nem executa: rc 2 (ssh-sem-resposta) e o recibo antigo fica" || bad "ssh inexistente: rc=$RC" "$OUT"
+# o nó recusa (ok=false) com um erro de 61 caracteres: rc 4, só os 60 primeiros no relatório, recibo intacto   # mata 250f597c70 54789dbee4 f5f60876b1
+py 'import json;print("SCHEMA-INSTALL " + json.dumps({"ok": False, "erro": "x" * 59 + "AB"}))' > "$T/reply.txt"; EXTRA="SSH_FAKE_FILE=$T/reply.txt"; wsrun deliver --from "$B0"; EXTRA=
+WANT=$(py 'print("WASCHEMA FALHOU: no-recusou:" + "x" * 59 + "A")')
+[ "$RC" = 4 ] && [ "$OUT" = "$WANT" ] && [ "$(sha "$ST/delivered.json")" = "$R1" ] && ok "nó recusa (ok=false): rc 4, erro cortado nos 60 primeiros caracteres, recibo intacto" || bad "nó recusa: rc=$RC" "$OUT"
+# resposta ok com "dbs" vazio (um dict sem nada): nenhum banco confirmado -> rc 2, nunca recibo de nada   # mata 98925f8aa8
+echo 'SCHEMA-INSTALL {"ok": true, "dbs": {}, "placement": "ok", "rejected": {}}' > "$T/reply.txt"; EXTRA="SSH_FAKE_FILE=$T/reply.txt"; wsrun deliver --from "$B0"; EXTRA=
+[ "$RC" = 2 ] && [ "$OUT" = "WASCHEMA FALHOU: resposta-diferente-do-enviado" ] && [ "$(sha "$ST/delivered.json")" = "$R1" ] && ok "resposta ok com dbs vazio: rc 2 e o recibo antigo fica" || bad "resposta com dbs vazio: rc=$RC" "$OUT"
+# resposta ok e COMPLETA (os mesmos sha256 do enviado), mas o ssh sai com rc 7: não confirmei (o nó pode ter caído no meio) -> rc 4, recibo intacto; o controle com rc 0 aceita a MESMA resposta   # mata f5f60876b1
+# vazio (manifesto sem bancos) -> dbs {} e o controle reprova; falhou/ilegível (manifesto ausente ou torto) -> py sai != 0, reply.txt fica vazio e o caso reprova (o rc vira 2, não 4)
+py 'import json,sys;m=json.load(open(sys.argv[1]));print("SCHEMA-INSTALL " + json.dumps({"ok": True, "dbs": dict((k, v["sha256"]) for k, v in m["dbs"].items()), "placement": "ok", "rejected": {}}))' "$B0/MANIFEST.json" > "$T/reply.txt"
+EXTRA="SSH_FAKE_FILE=$T/reply.txt SSH_FAKE_RC=7"; wsrun deliver --from "$B0"; EXTRA=
+[ "$RC" = 4 ] && [ "$(sha "$ST/delivered.json")" = "$R1" ] && ok "resposta boa mas ssh com rc 7: rc 4 e o recibo antigo fica" || bad "ssh rc 7 com resposta boa: rc=$RC" "$OUT"
+EXTRA="SSH_FAKE_FILE=$T/reply.txt"; wsrun deliver --from "$B0"; EXTRA=
+[ "$RC" = 0 ] && has 'WASCHEMA ENTREGUE 5 bancos' "controle: a MESMA resposta com ssh rc 0 é aceita (o rc 7 era o único defeito do caso anterior)" || bad "controle da resposta boa: rc=$RC" "$OUT"
+# MANIFEST.json que o gerador não entende (outra versão, ou sem bancos): rc 2 e nada chega ao ssh   # mata 464e7f927b 8c45d73235
+# vazio (cópia do stage sem MANIFEST.json) / falhou (cp ou py com erro) -> return 1 e o caso reprova: um manifesto que não pôde ser montado nunca conta como "manifesto recusado"
+c_man() { reset; S2=$T/stg$K; cp -R "$B0" "$S2" || return 1; py 'import json,sys;p=sys.argv[1]+"/MANIFEST.json";m=json.load(open(p));m["v"]=int(sys.argv[2]);m["dbs"]=m["dbs"] if sys.argv[3]=="keep" else {};json.dump(m,open(p,"w"))' "$S2" "$1" "$2" || return 1
+  wsrun deliver --from "$S2"; [ "$RC" = 2 ] && [ "$OUT" = "WASCHEMA FALHOU: manifesto-ilegivel" ] && [ ! -s "$T/ssh.log" ]; }
+c_man 2 keep && ok "MANIFEST de outra versão (v=2, com bancos): rc 2 manifesto-ilegivel e o ssh nem é chamado" || bad "manifesto v=2: rc=$RC" "$OUT"
+c_man 1 empty && ok "MANIFEST v=1 sem bancos: rc 2 manifesto-ilegivel e o ssh nem é chamado" || bad "manifesto sem bancos: rc=$RC" "$OUT"
 c_sha_diff() { reset; py 'import json;print("SCHEMA-INSTALL " + json.dumps({"ok": True, "dbs": {"shared/data/queue.db": "0" * 64}, "placement": "ok", "rejected": {}}))' > "$T/reply.txt"; EXTRA="SSH_FAKE_FILE=$T/reply.txt"; wsrun deliver --from "$B0"; EXTRA=; [ "$RC" = 2 ] && [ ! -e "$ST/delivered.json" ]; }
 c_sha_diff && ok "o nó diz ok mas com sha256 diferente do enviado: rc 2 e NENHUM recibo" || bad "sha256 diferente do enviado: rc=$RC" "$OUT"
 # ── o nó não confia no mini: cada adulteração é recusada e a loja que existia não muda ──────────────────────────────────────────────────────────────────────────────────────────────────────
@@ -144,11 +181,17 @@ reset; wsrun run
 [ "$RC" = 0 ] && [ -e "$ST/delivered.json" ] && [ -e "$ST/last/schema.sql" ] && [ -e "$ST/last/MANIFEST.json" ] && [ -z "$(ls "$ST" | grep '^stage-')" ] && ok "run: build + entrega, recibo gravado, o último stage fica em last/ e não sobra stage-*" || bad "run: rc=$RC" "$OUT"
 R2=$(sha "$ST/delivered.json"); EXTRA="WA_SCHEMA_GIT=$T/git-quebra"; : > "$T/ssh.log"; wsrun run; EXTRA=
 [ "$RC" = 3 ] && [ "$(sha "$ST/delivered.json")" = "$R2" ] && [ ! -s "$T/ssh.log" ] && [ -z "$(ls "$ST" | grep '^stage-')" ] && ok "run com build que falha: rc 3, o ssh nem é chamado, recibo intacto, sem stage-* de sobra" || bad "run com git quebrado: rc=$RC" "$OUT"
+# stage que o run não consegue recolher (o ssh de mentira tranca shared/data antes de cair): o rc segue sendo o da falha (2), sem traceback   # mata ed99d6ec8e
+# vazio (nenhum stage-* sobrou) -> LEFT=0, o cenário não aconteceu e o caso reprova; falhou/ilegível (ls sem o diretório) -> o grep -c também dá LEFT=0 e o caso reprova
+if [ "$(id -u)" = 0 ]; then ok "stage trancado: pulado (root remove o stage mesmo sem permissão)"; else
+  reset; EXTRA="SSH_FAIL=1 SSH_LOCK_STAGE=1"; wsrun run; EXTRA=; LEFT=$(ls "$ST" | grep -c '^stage-'); chmod -R u+rwx "$ST"
+  [ "$LEFT" = 1 ] && [ "$RC" = 2 ] && printf '%s' "$OUT" | grep -qF 'ssh-rc-255-sem-resposta' && ! printf '%s' "$OUT" | grep -qF Traceback && ok "stage que não sai: o rc continua o da falha do ssh (2), sem traceback" || bad "stage trancado: rc=$RC stage-*=$LEFT" "$OUT"
+fi
 c_off() { reset; wsrun run; : > "$T/ssh.log"; : > "$ST/off"; wsrun run; [ "$RC" = 0 ] && printf '%s' "$OUT" | grep -qF 'desligado' && [ ! -e "$ST/delivered.json" ] && [ ! -s "$T/ssh.log" ]; }
 c_off && ok "interruptor off: rc 0, o recibo é APAGADO (o classificador volta a tratar o banco como mole) e o ssh não é chamado" || bad "interruptor off: rc=$RC" "$OUT"
 reset; wsrun build --out "$T/o.off"; : > "$ST/off"; wsrun build --out "$T/o.off2"
 [ "$RC" = 0 ] && [ -e "$T/o.off2/MANIFEST.json" ] && ok "interruptor off não impede o build local (só a entrega)" || bad "off + build: rc=$RC" "$OUT"
-reset; py 'import fcntl,sys,time;f=open(sys.argv[1]+"/lock","w");fcntl.flock(f,fcntl.LOCK_EX);open(sys.argv[1]+"/flag","w").write("1");time.sleep(8)' "$ST" & LP=$!
+reset; python3 -I -c 'import fcntl,sys,time;f=open(sys.argv[1]+"/lock","w");fcntl.flock(f,fcntl.LOCK_EX);open(sys.argv[1]+"/flag","w").write("1");time.sleep(8)' "$ST" & LP=$!
 i=0; while [ ! -e "$ST/flag" ] && [ $i -lt 100 ]; do sleep 0.1; i=$((i+1)); done; wsrun run; kill $LP 2>/dev/null; wait $LP 2>/dev/null
 [ "$RC" = 0 ] && has 'outro run em curso' "lock ocupado: rc 0, não faz nada" && [ ! -s "$T/ssh.log" ] && ok "lock ocupado: o ssh não é chamado" || bad "lock ocupado: rc=$RC" "$OUT"
 # ── consistência com o classificador, com o wt-add do nó e com o Python 3.9 do mini ──────────────────────────────────────────────────────────────────────────────────────────────────────────────
@@ -163,6 +206,126 @@ py 'import plistlib,sys
 d=plistlib.load(open(sys.argv[1],"rb")); a=d["ProgramArguments"]
 ok_=d["Label"]=="com.gascity.wa-schema-dbs" and a[:2]==["/usr/bin/python3","-I"] and a[2].endswith("/scripts/wa-schema-dbs.py") and a[-1]=="run" and "RunAtLoad" not in d and d["Nice"]==19 and d["StartCalendarInterval"]=={"Hour":5,"Minute":17}
 sys.exit(0 if ok_ else 1)' "$HERE/../packs/town-deltas/assets/com.gascity.wa-schema-dbs.plist" && ok "plist: label, python3 -I + wa-schema-dbs.py run, diário 05:17, nice 19, SEM RunAtLoad (fora do escopo do wait-for-dolt)" || bad "plist com.gascity.wa-schema-dbs fora do combinado"
+
+# ── limites exatos, em processo: o gerador importado e cada entrada posta EXATAMENTE na borda (o git e o ssh de mentira não chegam lá) ───────────────────────────────────────────────────────────────────
+# mata 2ee7437f9a b91522cfd3 (prazos de 180 s do git e 300 s do ssh) · 545961a6ef (tamanho = MAX_BYTES) · 29ebf20c72 883f17c88b 813543467f bcfd13284b (cópia com linha / sem tabela) · 6aea432ef0 b7cd6ceeae (user_version e application_id) · 7339aa6014 (URI)
+# O PYT vive entre aspas simples: só ASCII e nenhuma aspa simples dentro; este bloco não usa heredoc (o bash 3.2.57 GNU grava o here-document num /tmp fixo, que a jaula do gate não deixa escrever).
+PYT='
+import importlib.util, json, os, sqlite3, subprocess, sys
+sys.dont_write_bytecode = True
+src, tmp, pii = sys.argv[1], sys.argv[2], sys.argv[3]
+os.environ["WA_SCHEMA_PII"] = pii
+os.makedirs(tmp)
+spec = importlib.util.spec_from_file_location("wsin", src)
+ws = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(ws)
+nfail = 0
+def chk(name, fn, want):
+    global nfail
+    try:
+        got = fn()
+    except Exception as e:
+        got = "raised %s: %s" % (type(e).__name__, e)
+    if got == want:
+        print("ok " + name)
+    else:
+        nfail += 1
+        print("FAIL %s :: got %r want %r" % (name, got, want))
+# vazio -> o trecho esperado nao esta e o chk reprova; falhou/ilegivel -> a excecao vira "raised ..." no chk e ele reprova (nunca vira "vazio")
+def rd(p):
+    with open(p) as fh:
+        return fh.read()
+def falha(e):
+    return "Falha:%s:%d" % (e, e.rc)
+real_run, real_connect = subprocess.run, sqlite3.connect
+def fake_run(hang, out):
+    def run(cmd, **kw):
+        t = kw.get("timeout")
+        if t is not None and hang > t:
+            raise subprocess.TimeoutExpired(cmd, t)
+        return subprocess.CompletedProcess(cmd, 0, out, "")
+    return run
+def git_apos(hang):
+    subprocess.run = fake_run(hang, "shared/data/q.db\n")
+    try:
+        return sorted(ws.cited("repo", "origin/main"))
+    except ws.Falha as e:
+        return falha(e)
+    finally:
+        subprocess.run = real_run
+chk("git que responde em 179.5 s entra", lambda: git_apos(179.5), ["shared/data/q.db"])
+chk("git que passa de 180 s e cortado (git-sem-resposta, rc 3)", lambda: git_apos(180.5), "Falha:git-sem-resposta:3")
+root = os.path.join(tmp, "root")
+os.makedirs(os.path.join(root, "shared", "data"))
+def mk(name, ddls):
+    con = sqlite3.connect(os.path.join(root, "shared", "data", name))
+    for d in ddls:
+        con.execute(d)
+    con.commit()
+    con.close()
+mk("a.db", ["CREATE TABLE t (x)", "PRAGMA user_version=7", "PRAGMA application_id=3"])
+mk("b.db", ["CREATE TABLE t (x)", "CREATE TABLE u (y)"])
+def sem_uri(name, *a, **kw):
+    if not kw.get("uri") and str(name).startswith("file:"):
+        raise sqlite3.OperationalError("unable to open database file")
+    return real_connect(name, *a, **kw)
+def schema_sem_uri():
+    sqlite3.connect = sem_uri
+    try:
+        return len(ws.schema_of(os.path.join(root, "shared", "data", "a.db"))[0])
+    finally:
+        sqlite3.connect = real_connect
+chk("origem abre por URI (uri=True) mesmo num SQLite que nao liga URI por padrao", schema_sem_uri, 1)
+def mc(rows):
+    p = os.path.join(tmp, "mc.db")
+    if os.path.exists(p):
+        os.unlink(p)
+    try:
+        return ws.make_copy(p, rows, (0, 0))
+    except ws.Falha as e:
+        return "Falha:%s" % e
+chk("copia que nasce com linha (CREATE TABLE AS SELECT) e recusada", lambda: mc([("table", "t", "CREATE TABLE t AS SELECT 1 AS a")]), "Falha:copia-com-linha")
+chk("copia sem nenhuma tabela (so uma view) e recusada", lambda: mc([("view", "v", "CREATE VIEW v AS SELECT 1 AS a")]), "Falha:copia-sem-tabela")
+chk("copia de uma tabela vazia entra e devolve 1 tabela", lambda: mc([("table", "t", "CREATE TABLE t (a)")]), 1)
+ws.cited = lambda repo, ref: {"shared/data/a.db", "shared/data/b.db"}
+ws.MAX_BYTES = 10 ** 9
+man, _rep = ws.build(os.path.join(tmp, "big"), root, root, "origin/main")
+def cp(stage, name):
+    return os.path.join(tmp, stage, "shared", "data", name)
+# vazio (copia de 0 byte) -> a checagem pre abaixo e a do limite reprovam; falhou (copia ausente) -> a excecao sobe, o bloco termina sem DONE e o shell reprova
+sa, sb = os.path.getsize(cp("big", "a.db")), os.path.getsize(cp("big", "b.db"))
+chk("pre: a copia de 2 tabelas ocupa mais bytes que a de 1 tabela", lambda: sb > sa, True)
+def pragmas(p):
+    con = real_connect(p)
+    try:
+        return (con.execute("PRAGMA user_version").fetchone()[0], con.execute("PRAGMA application_id").fetchone()[0])
+    finally:
+        con.close()
+chk("a copia leva o user_version (7) e o application_id (3) do original", lambda: pragmas(cp("big", "a.db")), (7, 3))
+chk("schema.sql registra o user_version do banco, nao o application_id", lambda: "-- shared/data/a.db (user_version=7)\n" in rd(os.path.join(tmp, "big", "schema.sql")), True)
+def build_no_limite():
+    ws.MAX_BYTES = sa
+    m, _r = ws.build(os.path.join(tmp, "eq"), root, root, "origin/main")
+    return (sorted(m["dbs"]), m["excluded"])
+chk("copia com exatamente MAX_BYTES entra e a maior sai (grande)", build_no_limite, (["shared/data/a.db"], {"shared/data/b.db": "grande"}))
+reply = "SCHEMA-INSTALL " + json.dumps({"ok": True, "dbs": dict((k, v["sha256"]) for k, v in man["dbs"].items()), "placement": "ok", "rejected": {}})
+def ssh_apos(hang):
+    subprocess.run = fake_run(hang, reply)
+    try:
+        rec, _rej = ws.deliver(os.path.join(tmp, "big"), man)
+        return ("recibo", sorted(rec["dbs"]))
+    except ws.Falha as e:
+        return falha(e)
+    finally:
+        subprocess.run = real_run
+chk("ssh que responde em 299.5 s entrega os 2 bancos", lambda: ssh_apos(299.5), ("recibo", ["shared/data/a.db", "shared/data/b.db"]))
+chk("ssh que passa de 300 s e cortado (ssh-sem-resposta, rc 2)", lambda: ssh_apos(300.5), "Falha:ssh-sem-resposta:2")
+print("DONE %d" % nfail)
+'
+python3 -I -c "$PYT" "$WS" "$T/inproc" "$PII" > "$T/inproc.out" 2>&1
+# vazio (nenhuma linha ok/FAIL) ou falhou (traceback) -> falta a linha DONE e o caso reprova mostrando a cauda; cada linha FAIL do bloco vira um bad
+while IFS= read -r l; do case "$l" in "ok "*) ok "${l#ok }" ;; "FAIL "*) bad "${l#FAIL }" ;; esac; done < "$T/inproc.out"
+grep -q '^DONE ' "$T/inproc.out" || bad "bloco em processo: terminou sem a linha DONE" "$(tail -n 6 "$T/inproc.out")"
 
 # ── controle negativo: UMA troca por mutante, o caso designado tem de reprovar (e passar no original) ─────────────────────────────────────────────────────────────────────────────────────────
 mut() { # mut <nome> <trecho> <novo> <função do caso>
@@ -179,7 +342,7 @@ c_mix() { nodet mixed; printf '%s' "$NT" | grep -q '"rejected": {"shared/data/b.
 c_sha() { nodet sha; printf '%s' "$NT" | grep -q '"ok": false.*RC=1'; }
 c_trav() { nodet traversal; printf '%s' "$NT" | grep -q '"erro": "membro-invalido"'; }
 c_sw() { reset; wsrun run >/dev/null 2>&1; : > "$ST/off"; wsrun run >/dev/null 2>&1; [ ! -e "$ST/delivered.json" ]; }
-c_lock() { reset; py 'import sqlite3,sys,time;c=sqlite3.connect(sys.argv[1]);c.execute("BEGIN EXCLUSIVE");open(sys.argv[2],"w").write("1");time.sleep(6)' "$SRC/locked.db" "$T/lockflag2" & LP=$!
+c_lock() { reset; python3 -I -c 'import sqlite3,sys,time;c=sqlite3.connect(sys.argv[1]);c.execute("BEGIN EXCLUSIVE");open(sys.argv[2],"w").write("1");time.sleep(6)' "$SRC/locked.db" "$T/lockflag2" & LP=$!
   i=0; while [ ! -e "$T/lockflag2" ] && [ $i -lt 100 ]; do sleep 0.1; i=$((i+1)); done; newout; wsrun build --out "$O"; kill $LP 2>/dev/null; wait $LP 2>/dev/null; rm -f "$T/lockflag2"; printf '%s' "$OUT" | grep -qF 'locked.db: ilegivel'; }
 mut git-rc-ignorado   'if r.returncode not in (0, 1):'             'if False:'                                       c_git
 mut pii-desligado     '            if ph or cpf:'                 '            if False:'                           c_pii
