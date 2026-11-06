@@ -42,8 +42,9 @@ COMO DECIDE (a 1ª regra que casa vale; tudo é lido da bead, nada é gravado ne
      Arquivo NOVO (ainda não está em origin/main) não soma evidência e não bloqueia, se ao menos UM existente foi lido (`mole-arquivo-novo:N`). Código que só as IRMÃS tocaram (regra 7b) é palpite: é lido e a evidência dele só INFORMA
      (`mole-evidencia-irma:`), e se não der para lê-lo é só a nota `mole-irma-ilegivel`. Sem prova nenhuma o veredito é `unknown` (antes a palavra o fazia `mini`) e a palavra vai em `info` (`palavra-mole:<slug>`).
      BANCO COM SCHEMA NO NÓ (ga-kzwlkhh): se TODA evidência de banco da prova é o caminho fixado `shared/data/x.db` ou o nome solto `x.db` de um banco do recibo do wa-schema-dbs.py (cópia só-schema, sem linha, que o nó
-     confirmou ter e o wt-add põe no worktree; recibo fresco, `WA_NODE_SCHEMA_MAX_AGE_H`), o banco deixa de ser mole e vai em `info` (`mole-banco-com-schema:<db>`); a prova de teste segue exigida. `md:`, `.duckdb`, `/Users/…`, `~/…`,
-     nome montado em f-string e banco sem cópia seguem `moles:banco-de-dados`; recibo ausente = como antes, sem nota; velho, do futuro, ilegível ou sem `placement: ok` = como antes, com a nota `schema-recibo-*` (a `-ilegivel` é a leitura que falhou, que o Pilot soma em `leitura`).
+     confirmou ter e o wt-add põe no worktree; recibo fresco, `WA_NODE_SCHEMA_MAX_AGE_H`), o banco deixa de ser mole e vai em `info` (`mole-banco-com-schema:<db>`); a prova de teste segue exigida. Vale também o caminho ABSOLUTO `/Users/<u>/…/shared/data/x.db` ou `~/…/shared/data/x.db`
+     (ga-t00j8kf; decisão do Mayor, 06/11): o custo é só tempo — o teste que de fato abrir o caminho fica vermelho no nó e a bead volta —, nenhum dado muda e o filtro do espelho segue o mesmo; o caminho TEM de acabar em `shared/data/<banco do recibo>`
+     (pasta que não é shared/data, `xshared/data/…` e `/Users/…/x.db` sem esse miolo seguem moles). `md:`, `.duckdb`, nome montado em f-string e banco sem cópia seguem `moles:banco-de-dados`; recibo ausente = como antes, sem nota; velho, do futuro, ilegível ou sem `placement: ok` = como antes, com a nota `schema-recibo-*` (a `-ilegivel` é a leitura que falhou, que o Pilot soma em `leitura`).
      INFORMATIVAS (produção/deploy, tela, lead, cliente, terreno, envio...): vocabulário do produto e da entrega, NÃO bloqueiam; vão para `info`, que o Pilot grava no jsonl da sombra
      para medir o acerto antes de ligar. MEDIDO (19/10, 400 beads WA fechadas): bloqueando por elas, 0 de 400 passavam; sem bloquear, ~4% citam teste + código sem caminho duro.
      Quem segura o resíduo é o que não depende de palavra: caminho pelo filtro real, telefone/CPF no texto, e o gate depois.
@@ -224,6 +225,12 @@ SCAN_EXT = ("py", "sh", "js", "mjs", "cjs", "ts")                    # extensõe
 MAX_STR_LEN = 4000                                                   # limite de custo do regex: de UMA string só os primeiros 4000 caracteres são lidos (dado embutido, SQL gigante). PONTO CEGO conhecido: um `.db`/`osascript` depois do 4000º caractere de uma mesma string não é visto
 MOLE_SLUGS = ("banco-de-dados", "credencial", "host-mac")
 MOLE_INFO_MAX = 6                                                    # pares slug=arquivo nomeados em `info`; o resto vira `mole-evidencia-mais:N`
+EVID_CLIP = 48                                                       # o que cada evidência mostra em `info` (corte só da SAÍDA)
+EVID_DB_KEEP = 300                                                   # o que a evidência de banco guarda para a cobertura do recibo; acima disso ela é cortada e ganha "…" no fim (hit), que nenhum caminho do recibo tem: o banco segue mole (inerte). Sem a marca, o corte podia cair justo no fim de um banco do recibo
+
+
+def evid_clip(w):
+    return w[:EVID_CLIP]
 # banco COM SCHEMA NO NÓ (ga-kzwlkhh): o recibo que o wa-schema-dbs.py (mini) grava depois que o nó confirmou a instalação das cópias só-schema E que o wt-add dele as põe no worktree
 SCHEMA_RECEIPT = os.environ.get("WA_NODE_SCHEMA_RECEIPT", os.path.join(HERE, "..", ".gc", "wa-schema-dbs", "delivered.json"))
 try:
@@ -231,6 +238,7 @@ try:
 except ValueError:
     SCHEMA_MAX_AGE = 48 * 3600
 SCHEMA_KEY_RE = re.compile(r"^shared/data/(?:[A-Za-z0-9_][A-Za-z0-9_.\-]*/)*[A-Za-z0-9_][A-Za-z0-9_.\-]*\.(?:db|sqlite3?)$")   # o único formato de caminho que o recibo pode ter
+SCHEMA_ABS_RE = re.compile(r"^(?:/Users/[\w.\-]+|~)/(?:[^\s\"']+/)?(shared/data/[^\s\"']+)$")   # caminho ABSOLUTO (/Users/x/…) ou ~/… que TERMINA em shared/data/<banco> (ga-t00j8kf); o grupo é a chave relativa, e a pasta antes dela só vale se acaba em barra ("xshared" não é shared)
 CRED_CLI = frozenset(("secret", "bw", "bws", "bitwarden"))           # argv do CLI do cofre: ["secret", "motherduck-token"] é UMA das formas do WA (87 linhas com argv exato, 57 com o CAMINHO do binário -> exec_base; linha de shell -> CRED_SHELL_RE; wrapper secret_bin()/lib.secret_cli -> CRED_CALL_RE/CRED_MOD_RE)
 CRED_CALL_RE = re.compile(r"^_*(?:get_|load_|read_|fetch_|resolve_)?secret(?:_bin|_cli)?$|^_*(?:bw|bws|bitwarden)(?:_\w+)?$", re.I)   # `_secret("x")`, `secret(...)`, `bw_get`; `secrets.token_hex` (stdlib) não casa
 CRED_MOD_RE = re.compile(r"(?:^|\.)(?:_?bitwarden\w*|keychain\w*|credentials?\w*|_?secret(?:_bin|_cli)?)(?:\.|$)", re.I)   # módulo do cofre/chaveiro; `secrets` (stdlib: números aleatórios) NÃO casa
@@ -1130,10 +1138,14 @@ def schema_receipt():
 
 
 def schema_cover(what, dbs):
-    """o banco do recibo que a evidência `what` nomeia, ou "": o caminho fixado igual a um do recibo, ou o nome solto (sem pasta) igual ao final de um. `md:`, `.duckdb`, `/Users/…`, pasta que não é shared/data e o
+    """o banco do recibo que a evidência `what` nomeia, ou "": o caminho fixado igual a um do recibo, o caminho absoluto (`/Users/x/…`) ou `~/…` que TERMINA em `shared/data/<banco do recibo>` (ga-t00j8kf: o teste que abre esse caminho
+    fica vermelho no nó, custo de tempo e não de dado), ou o nome solto (sem pasta) igual ao final de um. `md:`, `.duckdb`, absoluto/`~` que não termina em shared/data/<banco do recibo>, pasta que não é shared/data e o
     nome montado em f-string (`shared/data/_.db`) não casam com nada."""
     if what in dbs:
         return what
+    ab = SCHEMA_ABS_RE.match(what)   # regex puro sobre a string (nada a ler do disco): não é absoluto/~ que termina em shared/data/… -> None, segue; é, mas o banco não está no recibo -> segue e acaba "" (mole)
+    if ab and ab.group(1) in dbs:
+        return ab.group(1)
     return next((p for p in sorted(dbs) if "/" not in what and p.rsplit("/", 1)[-1] == what), "")
 
 
@@ -1146,8 +1158,9 @@ def scan_evidence(path, text, is_test):
 
     def hit(slug, what):
         out.setdefault(slug, [])
-        if what not in out[slug]:
-            out[slug].append(what[:48])
+        keep = (what if len(what) <= EVID_DB_KEEP else what[:EVID_DB_KEEP] + "…") if slug == "banco-de-dados" else what[:EVID_CLIP]   # o banco guarda o caminho INTEIRO (até 300): o absoluto passa de 48 e cortado perde o `.db` que a cobertura do recibo lê; o corte de 48 é da saída (evid_clip). Acima de 300 o "…" marca o corte: o pedaço nunca casa o recibo (vazio -> mole)
+        if keep not in out[slug]:
+            out[slug].append(keep)
 
     parts = py_exec_parts(text) if path.endswith(".py") else None
     if parts is not None:
@@ -1236,10 +1249,10 @@ def mole_gate(proof, prose, soft_files=()):
         elif nota:
             sch = [nota]
     hard = ["moles:" + s for s in MOLE_SLUGS if s in ev]
-    pairs = ["mole-evidencia:%s=%s[%s]" % (s, f, w) for s in MOLE_SLUGS for f, w in ev_all.get(s, [])]
+    pairs = ["mole-evidencia:%s=%s[%s]" % (s, f, evid_clip(w)) for s in MOLE_SLUGS for f, w in ev_all.get(s, [])]
     info = pairs[:MOLE_INFO_MAX] + (["mole-evidencia-mais:%d" % (len(pairs) - MOLE_INFO_MAX)] if len(pairs) > MOLE_INFO_MAX else [])
     info += ["mole-so-em-prosa:" + s for s in prose if s not in ev_all] + sch
-    soft_pairs = ["mole-evidencia-irma:%s=%s[%s]" % (s, f, w) for s in MOLE_SLUGS for f, w in evsoft.get(s, [])]
+    soft_pairs = ["mole-evidencia-irma:%s=%s[%s]" % (s, f, evid_clip(w)) for s in MOLE_SLUGS for f, w in evsoft.get(s, [])]
     info += soft_pairs[:MOLE_INFO_MAX] + (["mole-evidencia-irma-mais:%d" % (len(soft_pairs) - MOLE_INFO_MAX)] if len(soft_pairs) > MOLE_INFO_MAX else [])
     info += softbad[:MOLE_INFO_MAX]
     if novos and (prose or ev or evsoft):   # só quando a regra das moles teve o que decidir; sem palavra e sem evidência o arquivo novo não muda nada e a resposta fica como era

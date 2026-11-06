@@ -364,6 +364,8 @@ wf lib/mole_sibdb.py $'P = "shared/data/y.db"'; wf tests/test_mole_sibdb.py $'mo
 gw add lib/mole_sibdb.py tests/test_mole_sibdb.py && gw commit -q -m "feat(wa-molp1.1): mole_sibdb" || bad "commit da irma do mole nao montado"
 wf lib/mole_sibbig.py "# x"; { printf '# '; head -c 1100000 /dev/zero | tr '\0' x; printf '\n'; } > "$RP/lib/mole_sibbig.py"; wf tests/test_mole_sibbig.py $'mole_sibbig'
 gw add lib/mole_sibbig.py tests/test_mole_sibbig.py && gw commit -q -m "feat(wa-molp2.1): mole_sibbig" || bad "commit da irma grande do mole nao montado"   # wa-molp2.2 herda um palpite que NÃO dá para ler (> 1 MB)   # wa-molp1.2 herda mole_sibdb pelas irmãs (palpite: só informa)
+wf lib/mole_sibabs.py $'P = "/Users/athos/gt/whatsapp_automation/shared/data/y.db"'; wf tests/test_mole_sibabs.py $'mole_sibabs'   # ga-t00j8kf: palpite das irmãs com caminho absoluto (> 48 caracteres): a nota em info é cortada, a evidência não
+gw add lib/mole_sibabs.py tests/test_mole_sibabs.py && gw commit -q -m "feat(wa-molp3.1): mole_sibabs" || bad "commit da irma com caminho absoluto do mole nao montado"
 # teste IMPORTADOR (regra 6b): impt_target só tem teste que o IMPORTA (nome sem relação); impt_ghost só é CITADO por um teste (string, sem import); impt_jsx é requerido por um teste .cjs; impt_unparse só tem um teste que não parseia
 wf lib/impt_target.py $'# impt_target'; wf tests/test_other_area.py $'from lib.impt_target import x'
 wf lib/impt_ghost.py $'# impt_ghost'; wf tests/test_mentions_ghost.py $'# impt_ghost\nX = "impt_ghost"'
@@ -378,7 +380,7 @@ wf shared/anchor_out.py $'# anchor_out'; wf tests/test_anchor_out.py $'anchor_ou
 wf lib/anchor_db.py $'D = "queue.db"'; wf tests/test_anchor_db.py $'anchor_db'
 # oráculo (ga-2hd02v.5.13, regra 9): testes que EXISTEM em origin/main e não importam nada do repo (a regra 8 lê e não acha código). orc_mole tem um banco de produção fixado no código (a regra 4 lê o teste e manda ao mini)
 wf tests/test_orc_a.py $'import os\nimport pytest\n\ndef test_a():\n    assert os.sep'; wf tests/test_orc_b.py $'import json\n'; wf tests/test_orc_mole.py $'P = "shared/data/orc.db"\n'
-# banco COM SCHEMA NO NÓ (ga-kzwlkhh, regra 4). sch_ok fixa shared/data/queue.db, sch_bare só tem o nome solto, sch_two/sch_att fixam um banco do recibo e um que não é, sch_md/sch_duck/sch_abs/sch_fstr/sch_dir são evidências que NUNCA casam
+# banco COM SCHEMA NO NÓ (ga-kzwlkhh, regra 4). sch_ok fixa shared/data/queue.db, sch_bare só tem o nome solto, sch_two/sch_att fixam um banco do recibo e um que não é, sch_md/sch_duck/sch_fstr/sch_dir são evidências que NUNCA casam (sch_abs/sch_tilde casam desde a ga-t00j8kf: caminho absoluto ou ~/ que TERMINA em shared/data/<banco do recibo>)
 # com o recibo, sch_txt1/sch_txt2 são Python que não parseia (o texto tem de ver TODOS os bancos), sch_sh é shell, sch_tpin fixa o banco só no TESTE, sch_cred junta um banco do recibo com o cofre, sch_many tem 7 bancos
 wf lib/sch_ok.py $'P = "shared/data/queue.db"'; wf tests/test_sch_ok.py $'from lib.sch_ok import P'; wf lib/sch_bare.py $'DB = "queue.db"'; wf tests/test_sch_bare.py $'from lib.sch_bare import DB'
 wf lib/sch_two.py $'A = "shared/data/queue.db"\nB = "shared/data/outro.db"'; wf tests/test_sch_two.py $'from lib.sch_two import A'
@@ -386,6 +388,20 @@ wf lib/sch_att.py $'SQL = "ATTACH \'shared/data/queue.db\' AS a; ATTACH \'shared
 wf lib/sch_md.py $'A = "shared/data/queue.db"\nCON = "md:analytics"'; wf tests/test_sch_md.py $'from lib.sch_md import A'; wf lib/sch_duck.py $'D = "shared/data/analytics.duckdb"'; wf tests/test_sch_duck.py $'from lib.sch_duck import D'
 wf lib/sch_abs.py $'P = "/Users/athos/gt/whatsapp_automation/shared/data/queue.db"'; wf tests/test_sch_abs.py $'from lib.sch_abs import P'; wf lib/sch_dir.py $'P = "data/queue.db"'; wf tests/test_sch_dir.py $'from lib.sch_dir import P'
 wf lib/sch_fstr.py $'def c(n):\n    return f"shared/data/{n}.db"'; wf tests/test_sch_fstr.py $'from lib.sch_fstr import c'
+# ga-t00j8kf: caminho ABSOLUTO (/Users/…) ou ~/ que termina em shared/data/<banco do recibo> conta como o banco do recibo. sch_tilde = ~/; sch_abs_out = banco FORA do recibo; sch_abs_dir = pasta colada ("xshared"), sch_abs_data = pasta que não é shared/data;
+# sch_abs_two/sch_abs_mix = absoluto + relativo na mesma prova (todos têm de estar cobertos); sch_abs_sh = shell; sch_abs_txt = Python que não parseia (ramo de texto)
+wf lib/sch_tilde.py $'P = "~/gt/whatsapp_automation/shared/data/queue.db"'; wf tests/test_sch_tilde.py $'from lib.sch_tilde import P'
+wf lib/sch_abs_out.py $'P = "/Users/athos/gt/whatsapp_automation/shared/data/outro.db"'; wf tests/test_sch_abs_out.py $'from lib.sch_abs_out import P'
+wf lib/sch_abs_dir.py $'P = "/Users/athos/gt/whatsapp_automation/xshared/data/queue.db"'; wf tests/test_sch_abs_dir.py $'from lib.sch_abs_dir import P'
+wf lib/sch_abs_data.py $'P = "/Users/athos/gt/whatsapp_automation/data/queue.db"'; wf tests/test_sch_abs_data.py $'from lib.sch_abs_data import P'
+wf lib/sch_abs_two.py $'A = "/Users/athos/gt/whatsapp_automation/shared/data/queue.db"\nB = "shared/data/outro.db"'; wf tests/test_sch_abs_two.py $'from lib.sch_abs_two import A'
+wf lib/sch_abs_mix.py $'A = "/Users/athos/gt/whatsapp_automation/shared/data/queue.db"\nB = "shared/data/x.db"'; wf tests/test_sch_abs_mix.py $'from lib.sch_abs_mix import A'
+wf lib/sch_abs_sh.sh $'#!/bin/sh\nsqlite3 /Users/athos/gt/whatsapp_automation/shared/data/queue.db .tables'; wf tests/test_sch_abs_sh.py $'sch_abs_sh'
+wf lib/sch_abs_txt.py $'def (:\nA = "/Users/athos/gt/whatsapp_automation/shared/data/queue.db"'; wf tests/test_sch_abs_txt.py $'sch_abs_txt'
+# ga-t00j8kf: a evidência de banco é guardada até 300 caracteres. sch_abs_300 = absoluto de EXATOS 300 que acaba no banco do recibo (vale); sch_abs_long = o mesmo prefixo de 300 + "/mais/y.db" (o caminho real passa de 300 e NÃO é o banco do recibo: o corte cai
+# justo no fim de queue.db e, sem a marca "…", seria lido como ele)
+wf lib/sch_abs_300.py "P = \"$("$PY" -I -c 'b="/Users/athos/"; t="/shared/data/queue.db"; print(b+"a"*(300-len(b)-len(t))+t)')\""; wf tests/test_sch_abs_300.py $'from lib.sch_abs_300 import P'
+wf lib/sch_abs_long.py "P = \"$("$PY" -I -c 'b="/Users/athos/"; t="/shared/data/queue.db"; print(b+"a"*(300-len(b)-len(t))+t+"/mais/y.db")')\""; wf tests/test_sch_abs_long.py $'from lib.sch_abs_long import P'
 wf lib/sch_txt2.py $'def (:\nA = "shared/data/queue.db"\nB = "shared/data/outro.db"'; wf tests/test_sch_txt2.py $'sch_txt2'; wf lib/sch_txt1.py $'def (:\nA = "shared/data/queue.db"'; wf tests/test_sch_txt1.py $'sch_txt1'
 wf lib/sch_sh.sh $'#!/bin/sh\nsqlite3 shared/data/queue.db .tables'; wf tests/test_sch_sh.py $'sch_sh'; wf lib/sch_tpin.py $'X = 1'; wf tests/test_sch_tpin.py $'from lib.sch_tpin import X\nDB = "shared/data/x.db"'
 wf lib/sch_cred.py $'import subprocess\nP = "shared/data/queue.db"\nsubprocess.run(["secret", "k"])'; wf tests/test_sch_cred.py $'from lib.sch_cred import P'
@@ -780,6 +796,7 @@ expect "mole: palavra mole SEM nenhuma prova de código+teste fica unknown (ante
 expect "mole: evidência em código derivado só das irmãs (palpite) informa e não barra" "$(DESCI wa-molp1.2 'corrigir o caso de borda')" 0 'prova-caminho-derivado.*mole-evidencia-irma:banco-de-dados=lib/mole_sibdb\.py\[shared/data/y\.db\]'
 expect "mole: palpite das irmãs que NÃO dá para ler (> 1 MB) só vira NOTA: um palpite que informa não vira a palavra que barra ao falhar" "$(DESCI wa-molp2.2 'corrigir o caso de borda que abre um sqlite')" 0 'prova-caminho-derivado.*mole-so-em-prosa:banco-de-dados", "mole-irma-ilegivel:arquivo-grande"'
 expect_not "mole: ...e esse palpite não vira \`moles:\`" "$(DESCI wa-molp1.2 'corrigir o caso de borda')" 0 'moles:'
+expect "mole: palpite das irmãs com caminho absoluto: a nota em info é cortada em 48 (ga-t00j8kf)" "$(DESCI wa-molp3.2 'corrigir o caso de borda')" 0 'mole-evidencia-irma:banco-de-dados=lib/mole_sibabs\.py\[/Users/athos/gt/whatsapp_automation/shared/data/\]'
 expect "mole: evidência em código que a bead NOMEIA (mole_db) bloqueia" "$(DESC 'ajustar mole_db quando vem vazio')" 10 'moles:banco-de-dados.*mole-evidencia:banco-de-dados=lib/mole_db\.py'
 # as travas de exposição não mudam: freio de envio vale também para a prova pelo teste IMPORTADOR
 expect "freio: envio de WhatsApp ainda manda ao mini na prova pelo teste importador" "$(DESC 'ajustar lib/impt_target.py e o envio por whatsapp')" 10 'freio-derivado:envio-acao'
@@ -803,7 +820,18 @@ expect "schema: um banco do recibo + um SEM cópia (outro.db) -> segue mole" "$(
 expect "schema: os dois bancos na MESMA string (ATTACH) -> segue mole" "$(DESC 'ajustar lib/sch_att.py')" 10 "$SM"
 expect "schema: md:analytics junto com banco do recibo -> segue mole (MotherDuck é duro)" "$(DESC 'ajustar lib/sch_md.py')" 10 "$SM"
 expect "schema: DuckDB (.duckdb) -> segue mole" "$(DESC 'ajustar lib/sch_duck.py')" 10 "$SM"
-expect "schema: caminho absoluto /Users/… do banco -> segue mole (o nó não tem esse caminho)" "$(DESC 'ajustar lib/sch_abs.py')" 10 "$SM"
+expect "schema: caminho absoluto /Users/…/shared/data/queue.db de banco do recibo -> node (ga-t00j8kf; o teste que abre o caminho fica vermelho no nó, custo de tempo e não de dado)" "$(DESC 'ajustar lib/sch_abs.py')" 0 "$SA"
+expect "schema: ...o absoluto tem 56 caracteres (a evidência é guardada inteira; só a nota em info é cortada em 48)" "$(DESC 'ajustar lib/sch_abs.py')" 0 '\[/Users/athos/gt/whatsapp_automation/shared/data/\]", "mole-banco-com-schema:shared/data/queue\.db"\]\}$'
+expect "schema: ~/…/shared/data/queue.db de banco do recibo -> node" "$(DESC 'ajustar lib/sch_tilde.py')" 0 "$SA"
+expect "schema: absoluto de banco que NÃO está no recibo (outro.db) -> segue mole" "$(DESC 'ajustar lib/sch_abs_out.py')" 10 "$SM"
+expect "schema: absoluto com pasta colada (xshared/data/queue.db) -> segue mole (a fronteira é a barra)" "$(DESC 'ajustar lib/sch_abs_dir.py')" 10 "$SM"
+expect "schema: absoluto em pasta que não é shared/data (…/data/queue.db) -> segue mole, não vira o banco do recibo" "$(DESC 'ajustar lib/sch_abs_data.py')" 10 "$SM"
+expect "schema: absoluto do recibo + relativo que não é (outro.db) na mesma prova -> segue mole" "$(DESC 'ajustar lib/sch_abs_two.py')" 10 "$SM"
+expect "schema: absoluto + relativo, os dois do recibo -> node, com os dois nomeados" "$(DESC 'ajustar lib/sch_abs_mix.py')" 0 'mole-banco-com-schema:shared/data/queue\.db", "mole-banco-com-schema:shared/data/x\.db"'
+expect "schema: shell com absoluto (sqlite3 /Users/…/shared/data/queue.db) de banco do recibo -> node" "$(DESC 'ajustar lib/sch_abs_sh.sh')" 0 "$SA"
+expect "schema: Python que não parseia com absoluto de banco do recibo -> node (o ramo de texto também relaxa)" "$(DESC 'ajustar lib/sch_abs_txt.py')" 0 "$SA"
+expect "schema: absoluto de EXATOS 300 caracteres que acaba no banco do recibo -> node (o teto da evidência é 300, inclusive)" "$(DESC 'ajustar lib/sch_abs_300.py')" 0 "$SA"
+expect "schema: absoluto > 300 cujo corte cai no fim de queue.db (…/queue.db/mais/y.db) -> segue mole, o pedaço cortado não vira o banco do recibo" "$(DESC 'ajustar lib/sch_abs_long.py')" 10 "$SM"
 expect "schema: pasta que não é shared/data (data/queue.db) -> segue mole, não vira o nome solto" "$(DESC 'ajustar lib/sch_dir.py')" 10 "$SM"
 expect "schema: nome montado em f-string (shared/data/{n}.db) -> segue mole" "$(DESC 'ajustar lib/sch_fstr.py')" 10 "$SM"
 expect "schema: Python que não parseia com 2 bancos (1 do recibo, 1 não) -> o texto vê os DOIS: segue mole" "$(DESC 'ajustar lib/sch_txt2.py')" 10 "$SM"
@@ -1225,6 +1253,17 @@ mutant schema-texto-so-o-primeiro 'for w in db_refs(blob, is_test):'            
 mutant schema-ast-so-o-primeiro   'for w in db_refs(t, is_test):'                   'for w in db_refs(t, is_test)[:1]:'               "$(DESC 'ajustar lib/sch_att.py')" 10 'moles:banco-de-dados' "$SR"
 mutant schema-prosa-reaparece     'if s not in ev_all] + sch'                        'if s not in ev] + sch'                           "$(DESC 'ajustar lib/sch_ok.py que abre um sqlite')" 0 '\[shared/data/queue\.db\]", "mole-banco-com-schema:shared/data/queue\.db"\]\}$' "$SR"
 mutant schema-info-sem-teto       'names[:MOLE_INFO_MAX]'                            'names'                                           "$(DESC 'ajustar lib/sch_many.py')" 0 'm6\.db", "mole-banco-com-schema-mais:1"' "$MD WA_NODE_SCHEMA_RECEIPT=$T/rcpt-sete.json"
+# ga-t00j8kf: caminho absoluto / ~/ que TERMINA em shared/data/<banco do recibo>. (sch_abs_data — …/data/queue.db — e sch_abs_two são casos de regressão, sem mutante próprio)
+mutant schema-abs-nao-chega       'if ab and ab.group(1) in dbs:'                     'if False:'                                       "$(DESC 'ajustar lib/sch_abs.py')" 0 "$SA" "$SR"
+mutant schema-abs-ignora-recibo   'if ab and ab.group(1) in dbs:'                     'if ab:'                                          "$(DESC 'ajustar lib/sch_abs_out.py')" 10 'moles:banco-de-dados' "$SR"
+mutant schema-abs-sem-fronteira   $'(?:[^\\s\\"\']+/)?(shared/data/'                   $'(?:[^\\s\\"\']+)?(shared/data/'                   "$(DESC 'ajustar lib/sch_abs_dir.py')" 10 'moles:banco-de-dados' "$SR"
+mutant schema-abs-sem-til         '(?:/Users/[\w.\-]+|~)/(?:'                         '(?:/Users/[\w.\-]+)/(?:'                         "$(DESC 'ajustar lib/sch_tilde.py')" 0 "$SA" "$SR"
+mutant schema-abs-sem-users       '(?:/Users/[\w.\-]+|~)/(?:'                         '(?:~)/(?:'                                       "$(DESC 'ajustar lib/sch_abs.py')" 0 "$SA" "$SR"
+mutant schema-evid-corta-48       'if slug == "banco-de-dados" else what[:EVID_CLIP]' 'if False else what[:EVID_CLIP]'          "$(DESC 'ajustar lib/sch_abs.py')" 0 "$SA" "$SR"
+mutant schema-info-sem-corte      'evid_clip(w)) for s in MOLE_SLUGS for f, w in ev_all.get(s, [])]' 'w) for s in MOLE_SLUGS for f, w in ev_all.get(s, [])]' "$(DESC 'ajustar lib/sch_abs.py')" 0 '\[/Users/athos/gt/whatsapp_automation/shared/data/\]", "mole-banco-com-schema:shared/data/queue\.db"\]\}$' "$SR"
+mutant schema-irma-sem-corte      'evid_clip(w)) for s in MOLE_SLUGS for f, w in evsoft.get(s, [])]' 'w) for s in MOLE_SLUGS for f, w in evsoft.get(s, [])]' "$(DESCI wa-molp3.2 'corrigir o caso de borda')" 0 'mole-evidencia-irma:banco-de-dados=lib/mole_sibabs\.py\[/Users/athos/gt/whatsapp_automation/shared/data/\]' "$MD"
+mutant schema-evid-sem-marca     'what[:EVID_DB_KEEP] + "…")' 'what[:EVID_DB_KEEP])'  "$(DESC 'ajustar lib/sch_abs_long.py')" 10 "$SM" "$SR"
+mutant schema-evid-teto-299       'len(what) <= EVID_DB_KEEP' 'len(what) <= EVID_DB_KEEP - 1'  "$(DESC 'ajustar lib/sch_abs_300.py')" 0 "$SA" "$SR"
 # o resíduo no TMPDIR: o mutante que não apaga a árvore tem de deixar item para trás (senão o teste de "sem resíduo" passaria mesmo sem a limpeza)
 if mk_mutant sem-limpeza 'shutil.rmtree(root, ignore_errors=True)' 'pass'; then
   left=$(tmp_residue "$T/mut-sem-limpeza.py")
