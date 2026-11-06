@@ -18,7 +18,7 @@
 #   o que foi varrido), o motor que morre sem imprimir o resumo (motor-sem-resumo), o estado que o motor não lê (estado-ilegivel, do motor: nunca é zerado) → exit 3 e nada de "sem novidade" gravado. O marcador de ocioso só é escrito quando o
 #   motor DISSE sem-novidade com rc 0, e guarda a ponta do WA que a ÁRVORE testou (git rev-parse HEAD) com a do hq de onde veio o motor, nunca a ponta do WA lida antes do wt-add: ilegível/ausente/velho/de outra ponta → roda a rodada (pior caso é repetir uma, nunca pular uma).
 # LIMITES: roda no nó como `runner`; o motor só escreve no --work ($BALLAST_RUN_DIR/work) e no estado; cada mutante roda numa cópia da árvore do WA (~150 MB, sem .git, crew/ e node_modules/) na jaula (escrita só no slot e no máximo 512 MB
-#   por arquivo, TCP cortado, provada pelo pai antes de qualquer mutante); alvo que cita sudo, tmux, pkill, os.kill… fica FORA (denylist do motor e do wrapper, contada em `skipped`), e o que tem mais de 12 testes na família também.
+#   por arquivo, TCP cortado, provada pelo pai antes de qualquer mutante); alvo que cita sudo, tmux, pkill, os.kill… fica FORA (denylist do motor e do wrapper, contada em `skipped`), e o que tem mais de 30 testes na família também (--fam-cap, ga-ek7ndez: o wrapper sozinho corta em 12; o resumo diz `fam_cap`).
 #   O registro exige `noflag:wa-suite.leak`: vazamento medido pelo wa-suite tranca TODO código do WA no nó. Nenhum dado sai do nó além deste resumo.
 set -u
 BH=${BALLAST_HOME:?BALLAST_HOME}; RD=${BALLAST_RUN_DIR:?BALLAST_RUN_DIR}; CORES=${BALLAST_CORES:-2}
@@ -33,10 +33,17 @@ case "$SLOTS_MAX" in ''|*[!0-9]*) SLOTS_MAX=$SLOTS ;; esac
 [ "$SLOTS_MAX" -ge "$SLOTS" ] || SLOTS_MAX=$SLOTS
 DATA_MB=${WA_MUTANTS_DATA_MB:-3072}   # teto de dados (RLIMIT_DATA) por processo de mutante: o legítimo mede até 1,2 GB de VmData (RSS 224 MB), o que aloca sem parar morre aos 3 GB em vez de derrubar a rodada. 0 desliga
 case "$DATA_MB" in ''|*[!0-9]*) DATA_MB=3072 ;; esac
+# teto de FAMÍLIA (ga-ek7ndez): o invólucro pula como `familia-grande` o alvo com mais de 12 testes na família (148 no WA em 06/11) e, sem commit novo, a rodada dava sem-novidade e dormia. Com 30 o plano real (árvore e estado do nó) solta 83 alvos e ~15,4 mil mutantes;
+# medido na jaula do nó, ~1/3 deles tem baseline verde (o resto tem testes quebrados por ambiente na jaula e vira `base-vermelha`, que volta em 2 dias; ver "Medido" no runbook). O teste numérico basta: texto, zero, negativo e número grande demais para o `[` dão falso
+# (ou erro, que o 2>/dev/null cala) e voltam ao 30; o invólucro recusa 0 com rc 2 e nenhuma rodada varreria nada
+FAM_CAP=${WA_MUTANTS_FAM_CAP:-30}
+[ "$FAM_CAP" -ge 1 ] 2> /dev/null || FAM_CAP=30
 SHM=${WA_MUTANTS_SHM-/dev/shm}   # onde moram os slots: tmpfs. Vazio desliga (slots no disco)
-# interruptores de EMERGÊNCIA = arquivos na pasta do lastro (o governo monta o ambiente do item do zero, só BALLAST_*: as WA_MUTANTS_* acima valem em teste e à mão, não em produção): wa-mutants.noshm devolve os slots ao disco, wa-mutants.nodata desliga o teto de dados
+# interruptores de EMERGÊNCIA = arquivos na pasta do lastro (o governo monta o ambiente do item do zero, só BALLAST_*: as WA_MUTANTS_* acima valem em teste e à mão, não em produção): wa-mutants.noshm devolve os slots ao disco, wa-mutants.nodata desliga o teto de dados,
+# wa-mutants.nofamcap devolve o teto de família do próprio invólucro (12: a opção deixa de ir ao motor; 0 aqui = não passar)
 [ ! -e "$BH/wa-mutants.noshm" ] || SHM=""
 [ ! -e "$BH/wa-mutants.nodata" ] || DATA_MB=0
+[ ! -e "$BH/wa-mutants.nofamcap" ] || FAM_CAP=0
 BUDGET=${WA_MUTANTS_BUDGET_S:-1800}   # o prazo da linha do registro tem de passar disto em >= 1000 s: um mutante em voo leva até 900 s + 30 (o motor só olha o relógio entre mutantes)
 case "$BUDGET" in ''|*[!0-9]*) BUDGET=1800 ;; esac
 [ "$BUDGET" -ge 60 ] || BUDGET=60
@@ -141,6 +148,9 @@ mkdir -p "$WORK" || { say "não criei $WORK"; summary sem-work main="${tested:0:
 EXTRA=()
 if [ "$SLOTS_MAX" -gt "$SLOTS" ] && grep -q -e '--slots-file' "$ENGDIR/hq-mutate.py" 2> /dev/null; then EXTRA+=(--slots-max "$SLOTS_MAX" --slots-file "$RD/slots"); fi
 if [ "$DATA_MB" -gt 0 ] && grep -q -e '--data-mb' "$ENGDIR/hq-mutate.py" 2> /dev/null; then EXTRA+=(--data-mb "$DATA_MB"); fi
+# o teto de família é do INVÓLUCRO (é o hq-mutate-wa.py que lê --fam-cap; um que não o conhece recusa a linha com rc 2). vazio (o texto dele não traz a opção) / falhou (não abre) → a opção não vai e vale o 12 dele, nunca "conhece"; FAMPASSED é o que o motor recebeu (vazio = nada) e vai ao resumo
+FAMPASSED=""
+if [ "$FAM_CAP" -gt 0 ] && grep -q -e '--fam-cap' "$ENGDIR/hq-mutate-wa.py" 2> /dev/null; then EXTRA+=(--fam-cap "$FAM_CAP"); FAMPASSED=$FAM_CAP; fi
 
 t0=$(date +%s)
 python3 -I "$ENGDIR/hq-mutate-wa.py" sweep --tree "$TREE" --state "$STATE" --work "$WORK" --jail "$ENGDIR/hq-sandbox-run.py" --python "$PYV" --slots "$SLOTS" --budget-s "$BUDGET" ${EXTRA[@]+"${EXTRA[@]}"} > "$RD/engine.out" 2> "$RD/engine.err" < /dev/null &
@@ -148,9 +158,9 @@ ep=$!
 wait "$ep"; erc=$?; ep=""
 
 # a ÚLTIMA linha JSON do motor com "result" vira o resumo (o motor já a limita a 6000 caracteres; o puxador do governo troca por null o que passa de ~8000). Sem ela o item NÃO fica mudo: motor-sem-resumo, exit 3.
-python3 -I - "$RD/engine.out" "$RD/engine.err" "$erc" "${tested:0:9}" "${hqmain:0:9}" "$pull" "$hqpull" "$SLOTS" "$BUDGET" "$IDLE" "$tested:$hqmain" "$(( $(date +%s) - t0 ))" "$WORKAT" "$SLOTS_MAX" << 'PY'
+python3 -I - "$RD/engine.out" "$RD/engine.err" "$erc" "${tested:0:9}" "${hqmain:0:9}" "$pull" "$hqpull" "$SLOTS" "$BUDGET" "$IDLE" "$tested:$hqmain" "$(( $(date +%s) - t0 ))" "$WORKAT" "$SLOTS_MAX" "$FAMPASSED" << 'PY'
 import json, os, sys
-out_p, err_p, erc, short, hqshort, pull, hqpull, slots, budget, idle_p, key, secs, workat, slots_max = sys.argv[1:15]
+out_p, err_p, erc, short, hqshort, pull, hqpull, slots, budget, idle_p, key, secs, workat, slots_max, fam_cap = sys.argv[1:16]
 erc = int(erc)
 rec = None
 try:
@@ -174,7 +184,7 @@ if rec is None:
     rc = 3
 else:
     rc = erc if erc in (0, 97, 143) else 3
-rec.update(main=short, hq=hqshort, pull=pull, hqpull=hqpull, slots=int(slots), slots_max=int(slots_max), work=workat, budget_s=int(budget), engine_rc=erc, secs_item=int(secs))
+rec.update(main=short, hq=hqshort, pull=pull, hqpull=hqpull, slots=int(slots), slots_max=int(slots_max), work=workat, budget_s=int(budget), engine_rc=erc, secs_item=int(secs), fam_cap=int(fam_cap) if fam_cap else None)   # fam_cap null = a opção não foi ao motor (vale o 12 do invólucro)
 if rec["result"] == "sem-novidade" and erc == 0:
     # tmp + troca; falhar aqui só repete uma rodada na seguinte, mas fica dito no resumo
     try:
