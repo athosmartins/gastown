@@ -43,7 +43,7 @@ COMO DECIDE (a 1ª regra que casa vale; tudo é lido da bead, nada é gravado ne
      (`mole-evidencia-irma:`), e se não der para lê-lo é só a nota `mole-irma-ilegivel`. Sem prova nenhuma o veredito é `unknown` (antes a palavra o fazia `mini`) e a palavra vai em `info` (`palavra-mole:<slug>`).
      BANCO COM SCHEMA NO NÓ (ga-kzwlkhh): se TODA evidência de banco da prova é o caminho fixado `shared/data/x.db` ou o nome solto `x.db` de um banco do recibo do wa-schema-dbs.py (cópia só-schema, sem linha, que o nó
      confirmou ter e o wt-add põe no worktree; recibo fresco, `WA_NODE_SCHEMA_MAX_AGE_H`), o banco deixa de ser mole e vai em `info` (`mole-banco-com-schema:<db>`); a prova de teste segue exigida. `md:`, `.duckdb`, `/Users/…`, `~/…`,
-     nome montado em f-string e banco sem cópia seguem `moles:banco-de-dados`; recibo ausente, velho, do futuro, ilegível ou sem `placement: ok` = como antes (as três últimas causas deixam uma nota `schema-recibo-*`).
+     nome montado em f-string e banco sem cópia seguem `moles:banco-de-dados`; recibo ausente = como antes, sem nota; velho, do futuro, ilegível ou sem `placement: ok` = como antes, com a nota `schema-recibo-*` (a `-ilegivel` é a leitura que falhou, que o Pilot soma em `leitura`).
      INFORMATIVAS (produção/deploy, tela, lead, cliente, terreno, envio...): vocabulário do produto e da entrega, NÃO bloqueiam; vão para `info`, que o Pilot grava no jsonl da sombra
      para medir o acerto antes de ligar. MEDIDO (19/10, 400 beads WA fechadas): bloqueando por elas, 0 de 400 passavam; sem bloquear, ~4% citam teste + código sem caminho duro.
      Quem segura o resíduo é o que não depende de palavra: caminho pelo filtro real, telefone/CPF no texto, e o gate depois.

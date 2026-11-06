@@ -105,8 +105,8 @@ cmd_wt_add() {   # worktree por bead; ANTES atualiza o clone e GRAVA a idade do 
   # sparse no worktree = os mesmos padrões do filtro; sem isto o checkout pediria ao espelho um blob de dado que ele recusa
   git -C "$path" sparse-checkout set --no-cone --stdin < "$GR/$RIG/sparse" && git -C "$path" checkout -q -f HEAD || die 3 "checkout esparso falhou em $path"
   # schema-dbs-v1: bancos só-schema (ga-kzwlkhh; wa-schema-dbs.py os instala em $GR/schema-dbs/<rig>) entram no worktree NOVO no mesmo caminho relativo (shared/ é ignorado pelo git no WA). vazio (nada instalado) → worktree como sempre;
-  # falhou (cp) → o worktree segue SEM o banco: o teste fica vermelho e a bead volta ao mini; nunca aborta o wt-add
-  [ -d "$GR/schema-dbs/$RIG/shared" ] && cp -R "$GR/schema-dbs/$RIG/shared" "$path/" 2>/dev/null
+  # falhou (cp) → o worktree segue SEM o banco (o teste fica vermelho e a bead volta ao mini) e o AVISO vai ao stderr; nunca aborta o wt-add
+  if [ -d "$GR/schema-dbs/$RIG/shared" ]; then cp -R "$GR/schema-dbs/$RIG/shared" "$path/" 2>/dev/null || echo "wt-add: AVISO: não copiei a loja de schema-dbs para $path (o worktree segue sem os bancos só-schema)" >&2; fi
   lag_fields; line=$(printf '{"ts":"%s","rig":"%s","bead":"%s","branch":"worker/%s","base":"%s","main":"%s","main_age_min":%s,"lag_min":%s,"pull":"%s"}' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$RIG" "$bead" "$bead" "$base" "$LAG_MAIN" "$MAIN_AGE" "$LAG_MIN" "$pull")
   echo "$line" >> "$GR/worktrees.jsonl"; echo "$line"
 }

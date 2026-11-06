@@ -292,7 +292,7 @@ wt wt-add gascity sd-a
 echo mexido >> "$WTA/sd-a/shared/data/queue.db"; { cmp -s "$T/queue.db.orig" "$SD/shared/data/queue.db" && [ ! -L "$WTA/sd-a/shared/data/queue.db" ]; } && ok "schema-dbs: a cópia é arquivo próprio: escrever nela não suja a loja" || bad "schema-dbs: a loja mudou ou o arquivo é link"
 mv "$SD" "$SD.off"; wt wt-add gascity sd-b; { [ "$RC" = 0 ] && [ -e "$WTA/sd-b/lib/m2.txt" ] && [ ! -e "$WTA/sd-b/shared" ]; } && ok "schema-dbs: sem loja instalada o wt-add é o de sempre (nenhum shared/ aparece)" || bad "schema-dbs: wt-add sem loja: rc=$RC" "$OUT"; mv "$SD.off" "$SD"
 printf '%s\n' '#!/bin/sh' 'exit 1' > "$T/shim3/cp"; chmod 755 "$T/shim3/cp"; OUT=$(env PATH="$T/shim3:$PATH" "$RG" wt-add gascity sd-c 2>&1); RC=$?
-{ [ "$RC" = 0 ] && [ -e "$WTA/sd-c/lib/m2.txt" ] && [ ! -e "$WTA/sd-c/shared" ]; } && ok "schema-dbs: cp que falha não aborta o wt-add (rc 0, o worktree vem sem o banco)" || bad "schema-dbs: wt-add com cp falhando: rc=$RC" "$OUT"
+{ [ "$RC" = 0 ] && [ -e "$WTA/sd-c/lib/m2.txt" ] && [ ! -e "$WTA/sd-c/shared" ] && printf '%s' "$OUT" | grep -qF 'AVISO: não copiei a loja de schema-dbs'; } && ok "schema-dbs: cp que falha não aborta o wt-add (rc 0, o worktree vem sem o banco) e o AVISO aparece" || bad "schema-dbs: wt-add com cp falhando: rc=$RC" "$OUT"
 
 # scan: clones de história conhecida, uma lista de dados e um HOME de mentira (nada de /home real nem de GH_TOKEN)
 N3=$T/node3; W3=$T/w3; mkdir -p "$N3/lixo"; git init -q "$W3"; mkdir -p "$W3/lib" "$W3/data"; echo a > "$W3/lib/a.txt"; echo b > "$W3/README"; git -C "$W3" add -A; git -C "$W3" commit -qm c1

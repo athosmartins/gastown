@@ -10,9 +10,9 @@ SUBCOMANDOS: build --out DIR (acha os bancos citados pelo código do WA em origi
   e uma linha WASCHEMA por banco) · deliver --from DIR (ssh ao nó: o nó RECONFERE tudo e troca ~/gt-remote/git/schema-dbs/<rig> de forma atômica; só então grava o recibo .gc/wa-schema-dbs/delivered.json) · run (build + deliver; é o que o launchd chama
   1x por dia). Interruptor: o arquivo .gc/wa-schema-dbs/off desliga o job E apaga o recibo (o classificador volta a tratar o banco como mole na hora).
 SEGURANÇA: só lê sqlite_master e user_version do banco real (mode=rw + PRAGMA query_only=ON: o sqlite 3.51 do mini não abre WAL sem -wal/-shm em mode=ro), nunca uma linha. O DDL passa pelo hetzner-pii-scan.py com limiar 1 telefone / 1 CPF
-  (o espelho usa 20/3): achou = aquele banco não vai. Fora também: não-SQLite (DuckDB), nome com cara de segredo, DDL que não reproduz, cópia com linha, arquivo grande. O nó não confia no mini (ver NODE_PROG).
+  (o espelho usa 20/3): achou = aquele banco não vai. Fora também: não-SQLite (DuckDB), nome com cara de segredo, DDL que não reproduz, cópia com linha, arquivo grande. O nó reconfere o que chega, sem aceitar a palavra do mini (ver NODE_PROG).
 TRÊS ESTADOS: banco ilegível/travado/sem permissão FICA DE FORA com o motivo (nunca "sem schema"); git, varredor de PII ou ssh que falham não entregam nada (nunca "nenhum banco" apagando o que o nó já tem); recibo só depois do nó confirmar cada sha256.
-CÓDIGOS: 0 ok (ou desligado/outro run em curso) · 2 não consegui confirmar a entrega (ssh caiu, resposta ilegível) · 3 não consegui montar (git, varredor, nenhum banco) · 4 o nó recusou · 64 uso errado."""
+CÓDIGOS: 0 ok (ou desligado/outro run em curso) · 2 não consegui confirmar a entrega (ssh caiu, resposta ilegível; o argparse também sai 2 em uso errado) · 3 não consegui montar (git, varredor, nenhum banco) · 4 o nó recusou."""
 import argparse
 import base64
 import fcntl
@@ -338,7 +338,7 @@ def main(argv):
         if a.cmd == "deliver":
             stage = a.src
         else:
-            stage = a.out or tempfile.mkdtemp(prefix="stage-", dir=STATE)
+            stage = (a.out if a.cmd == "build" else None) or tempfile.mkdtemp(prefix="stage-", dir=STATE)   # --out só vale no build; o run usa (e depois recolhe) um stage-* próprio
             tmp = stage if a.cmd == "run" else None
             os.makedirs(stage, exist_ok=True)
             _man, rep = build(stage, WA_ROOT, WA_ROOT, REF)
