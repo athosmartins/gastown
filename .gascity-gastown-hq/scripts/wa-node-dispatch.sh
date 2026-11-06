@@ -28,6 +28,7 @@
 # Env: WA_NODE_SPAWN (pool|pilot, padrão pool; outro valor = pool), WA_NODE_SLOTS (1..9, padrão 1; vazio ou ilegível = 1), WA_NODE_ALIAS_PREFIX (wa-worker-remote-), WA_NODE_CAPACITY (hetzner-capacity.py), WA_NODE_CAPACITY_TIMEOUT (45 s), WA_NODE_IDLE_SECS (300 s: quanto tempo uma sessão sem bead fica quieta antes de valer como vaga; só modo pilot).
 # Env (identidade, para o wrapper de OUTRA loja — o ps-node-dispatch.sh da bead de PS): WA_NODE_SELF (nome que as mensagens e o comentário da bead usam, padrão wa-node-dispatch.sh), WA_NODE_STORY (bead que o comentário cita, padrão ga-2hd02v.1.10).
 # Env (ga-2hd02v.3.26): WA_NODE_SKIP_ALIASES (aliases separados por espaço ou vírgula que o apply NÃO escolhe nesta chamada: o gancho do Pilot achou a sessão do alias viva e ocupada entre a leitura do script e a dele e repete o apply sem ele; vazio ou só lixo = nenhum, o de sempre).
+# Env (ga-31u0zl7): WA_NODE_ACCEPT_UNKNOWN=sem-prova (check E apply): o veredito `unknown` cujo ÚNICO motivo é `sem-prova-de-codigo-e-teste` e cuja leitura não falhou (nenhum `*ilegiv*` no info) sai como `node` com base `sem-prova`. Só a passada de WA do Pilot a põe; qualquer outro valor, vazio ou ausente = desligado (o de sempre). Ver promote_sem_prova.
 # Env (teste): GC_CITY, WA_NODE_BD (bd), WA_NODE_GC (gc), WA_NODE_CLASSIFY, WA_NODE_PY, WA_NODE_ALIAS (alias único: ganha de SLOTS e do prefixo; padrão <prefixo>1), WA_NODE_ROUTE_TEMPLATE (wa-worker-remote), WA_NODE_LOG, WA_NODE_TIMEOUT (20 s), WA_NODE_SESSION_TIMEOUT (60 s, só para `gc session list`).
 set -u
 HERE="$(cd "$(dirname "$0")" && pwd)"
@@ -62,6 +63,9 @@ case "$TMO" in ''|*[!0-9]*) TMO=20 ;; esac     # prazo ilegível volta ao padrã
 # `gc session list --json` levou 14–22 s na mini carregada (medido 19/10) — com o prazo de 20 s a leitura estourava e o despacho nunca passava; esta leitura tem prazo próprio
 STMO="${WA_NODE_SESSION_TIMEOUT:-60}"
 case "$STMO" in ''|*[!0-9]*) STMO=60 ;; esac
+# ga-31u0zl7: WA_NODE_ACCEPT_UNKNOWN. vazio (variável ausente ou vazia) → desligado, o de sempre; ilegível (qualquer valor que não seja exatamente `sem-prova`) → desligado também: a promoção de unknown a node
+# NUNCA liga por erro de digitação. Ver promote_sem_prova.
+ACCEPT_UNKNOWN="${WA_NODE_ACCEPT_UNKNOWN:-}"; [ "$ACCEPT_UNKNOWN" = sem-prova ] || ACCEPT_UNKNOWN=""
 # ga-2hd02v.3.12: quietude mínima de uma sessão sem bead para valer como vaga (só modo pilot). vazio → 300 s; ilegível (letra, sinal, ponto, espaço, mais de 9 dígitos) → 300 s também: o erro cai no prazo mais LONGO,
 # nunca no mais curto. 0 vale (qualquer sessão sem bead). Zero à esquerda é decimal (0300 = 300: o bash o leria como octal sem o 10#).
 IDLE="${WA_NODE_IDLE_SECS:-300}"; case "$IDLE" in ''|*[!0-9]*) IDLE=300 ;; *) if [ "${#IDLE}" -le 9 ]; then IDLE=$((10#$IDLE)); else IDLE=300; fi ;; esac
@@ -124,16 +128,35 @@ classify_checked() {
   jlog classify "$id" 11 "classificador-incoerente rc=$rc verdict=${v:-?}"
   out='{"verdict":"unknown","basis":"","reasons":["classificador-incoerente"],"paths":[],"tests":[],"info":[]}'; rc=11
 }
+# promote_sem_prova — ga-31u0zl7: só com WA_NODE_ACCEPT_UNKNOWN=sem-prova (a passada de WA do Pilot a põe, e só ali), o veredito `unknown` cujo ÚNICO motivo é `sem-prova-de-codigo-e-teste` vira `node` com base
+# `sem-prova` (rc 0). É a ausência de prova, não a presença de motivo DURO para o mini: o que prende a bead ao mini com certeza (caminho fora do filtro, caminho absoluto, PII/dado no texto, node:mini) sai `mini`
+# ANTES de chegar aqui e continua saindo. O que NÃO prende é sinal fraco, e ele PASSA: palavra mole em prosa sem código citado (banco, credencial, host-mac), menção a lead, tela ao vivo, produção ou envio ficam no `info`
+# do classificador (`palavra-mole:*`, `dado-de-lead:*`, `envio-*`...) e a bead continua `unknown`, então É promovida (medido 06/11: 25 de 28 unknown carregavam algum). O worker do nó confere ("isto se
+# constrói e testa aqui?") e devolve a bead em minutos se não; o Pilot registra esses sinais (campo `sinais` da sonda) para a taxa de devolução poder ser cruzada com eles, e refinar o critério é decisão com dado.
+# TRÊS estados, e só o primeiro promove: (a) motivos == exatamente [sem-prova-de-codigo-e-teste] E `info` é uma lista SEM nenhuma entrada de leitura que falhou (qualquer `*ilegiv*`) → promove; (b) a leitura que o
+# classificador não conseguiu fazer (info com `ilegiv`: repo, git, espelho, filtro ilegíveis) → "não consegui saber", fica unknown (rc 11): ausência de prova que veio de erro NÃO é ausência de prova; (c) qualquer outro
+# motivo (inclusive o `classificador-incoerente` de classify_checked), `info` ausente ou que não é lista, saída que o jq não lê → fica como veio. vazio (ACCEPT_UNKNOWN desligado) → não faz nada: o de sempre.
+promote_sem_prova() {
+  [ -n "$ACCEPT_UNKNOWN" ] || return 0   # (já saneado no topo: só chega aqui o valor exato `sem-prova`)
+  [ "$rc" = 11 ] || return 0
+  local p
+  # vazio (jq sem saída: a condição não vale) → p vazio, fica unknown; falhou/ilegível (jq que erra, saída que não é JSON) → o `|| return 0` deixa out/rc como vieram: unknown, o inerte
+  p=$(printf '%s' "$out" | jq -c 'if (.verdict == "unknown") and (.reasons == ["sem-prova-de-codigo-e-teste"]) and ((.info | type) == "array") and ((.info | map(tostring | select(test("ilegiv"))) | length) == 0) then (.verdict = "node" | .basis = "sem-prova" | .promoted_from = "unknown") else empty end' 2>/dev/null) || return 0
+  [ -n "$p" ] || return 0
+  out="$p"; rc=0
+}
 
 case "$cmd" in
 check)
   classify_checked
+  promote_sem_prova
   printf '%s\n' "$out"; exit "$rc" ;;
 
 apply)
   st=$(printf '%s' "$B" | jq -r '.status // ""'); as=$(printf '%s' "$B" | jq -r '.assignee // ""'); rt=$(printf '%s' "$B" | jq -r '.metadata["gc.routed_to"] // ""')
   [ "$st" = open ] && [ -z "$as" ] && [ -z "$rt" ] || { jlog apply "$id" 12 "nao-elegivel status=$st assignee=$as rota=$rt"; die 12 "$id não está livre (status=$st assignee=${as:-—} rota=${rt:-—}) — não mexo"; }
   classify_checked
+  promote_sem_prova
   if [ "$rc" != 0 ]; then jlog apply "$id" "$rc" "classificador:$(printf '%s' "$out" | jq -r '(.verdict // "?") + " " + ((.reasons // []) | join(","))' 2>/dev/null)"; say "veredito não é 'roda no nó' (rc=$rc): $out"; exit "$rc"; fi
   b=$(printf '%s' "$out" | jq -r '.basis // ""')
   if [ "$basis" = label ] && [ "$b" != label ]; then jlog apply "$id" 10 "base=$b, modo exige etiqueta"; die 10 "veredito node por '$b', e este modo só aceita a etiqueta node:ok — fica no mini"; fi
@@ -238,6 +261,8 @@ apply)
   if [ "$SPAWN" = pilot ]; then who="atribuída a $PICK (marca pilot.wa_node_alias, sem rota) — veredito node (base $b: $(printf '%s' "$out" | jq -r '(.reasons // []) | join(", ")')). O Pilot abre a sessão do alias; sem gc session new à mão."
   else who="atribuída a $PICK, rota $ROUTE — veredito node (base $b: $(printf '%s' "$out" | jq -r '(.reasons // []) | join(", ")')). O pool cria a sessão; sem gc session new à mão (a duplicata é derrubada pelo dedup)."; fi
   [ "$REUSED" = 1 ] && who="$who A sessão do alias já está viva e ociosa (reaproveitada): o Pilot só a avisa."
+  # ga-31u0zl7: base sem-prova = o classificador NÃO achou o teste que prove que o nó basta (e não achou motivo para o mini). O worker confere antes de começar e, se não cabe, devolve em minutos.
+  [ "$b" = sem-prova ] && who="$who SEM PROVA de que o nó basta (o classificador não achou motivo para o mini, só não achou o teste): confira primeiro se isto se constrói e testa aqui; se não, devolva em até 10 min (prompt do worker remoto, «Primeiro passo»)."
   T "$BD" -C "$store" comment "$id" "nó ($STORY): $who Ao fim da entrega: $SELF release $id." >/dev/null 2>&1 || say "aviso: comentário em $id não gravado"
   wn=""; [ "$w" = 0 ] || wn=" [bd update rc=$w, a releitura confere]"   # o rc do bd mentiu (resposta perdida): fica no log
   jlog apply "$id" 0 "despachada para $PICK ($b)$wn$rn"; say "$id → $PICK ($([ "$SPAWN" = pilot ] && echo sessão-do-pilot || echo "$ROUTE")), base=$b$wn$rn"; printf '%s\n' "$out"; exit 0 ;;

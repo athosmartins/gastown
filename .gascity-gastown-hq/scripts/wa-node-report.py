@@ -66,7 +66,7 @@ SHADOW_PAR = {0: ("node", "node-sombra"), 10: ("mini", "mini"), 11: ("unknown", 
 EVENTOS_ROTA = ("apply", "release", "read", "classify", "pilot-node-route")
 # wa-node-exempt.jsonl (a passada do Pilot que manda WA ao nó, ga-2hd02v.3.17): `wa-node-pass-probe` é UMA sonda do classificador (veredito + motivos); o resumo e a sombra são da mesma passada e ficam FORA do agregado de motivos
 EXEMPT_SONDA = "wa-node-pass-probe"
-EXEMPT_CONHECIDOS = ("wa-node-pass-summary", "wa-node-pass-shadow")
+EXEMPT_CONHECIDOS = ("wa-node-pass-summary", "wa-node-pass-shadow", "wa-node-pass-shadow-unknown")  # -unknown: ga-31u0zl7, a sombra do unknown→nó (uma linha por bead que IRIA ao nó)
 # os vereditos que a sonda grava: os três do classificador (trazem motivos) e os três em que não houve saída dele (prazo, erro, script ausente)
 SONDA_VEREDITOS = ("node", "mini", "unknown", "timeout", "error", "missing")
 SONDA_CLASSIFICADOS = ("node", "mini", "unknown")

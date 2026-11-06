@@ -570,6 +570,63 @@ cmt_ok "identidade de 64 caracteres passa (o teto é inclusivo)" "$L64" "$L64"
 fresh; WA_NODE_SELF=ps_node-dispatch.v2.sh WA_NODE_STORY=ga-2hd02v.4.1 d apply wa-t1
 cmt_ok "identidade com _ - . e dígitos passa" ga-2hd02v.4.1 ps_node-dispatch.v2.sh
 
+# ---- ga-31u0zl7: WA_NODE_ACCEPT_UNKNOWN=sem-prova — o `unknown` cujo ÚNICO motivo é a falta de prova (e cuja leitura não falhou) sai como node, base sem-prova. Três estados: promove / lê-mas-falhou (fica unknown) /
+#      qualquer outro motivo (fica como veio). Sem a variável, ou com qualquer valor que não seja exatamente `sem-prova`, o de sempre (os casos «unknown -> 11» lá de cima).
+UNK_INFO_OK='{"verdict":"unknown","basis":"","reasons":["sem-prova-de-codigo-e-teste"],"paths":[],"tests":[],"info":["palavra-mole:banco","evidencia-de-doc:docs/x.md"]}'
+UNK_READFAIL='{"verdict":"unknown","basis":"","reasons":["sem-prova-de-codigo-e-teste"],"paths":[],"tests":[],"info":["caminho-derivado-ilegivel:git-log-falhou"]}'
+UNK_READFAIL2='{"verdict":"unknown","basis":"","reasons":["sem-prova-de-codigo-e-teste"],"paths":[],"tests":[],"info":["palavra-mole:banco","teste-derivado-ilegivel:rsync"]}'
+UNK_MOLES='{"verdict":"unknown","basis":"","reasons":["sem-prova-de-codigo-e-teste","moles:credencial"],"paths":[],"tests":[],"info":[]}'
+UNK_OTHER='{"verdict":"unknown","basis":"","reasons":["json-ilegivel"],"paths":[],"tests":[],"info":[]}'
+UNK_DUP='{"verdict":"unknown","basis":"","reasons":["sem-prova-de-codigo-e-teste","sem-prova-de-codigo-e-teste"],"paths":[],"tests":[],"info":[]}'
+UNK_NOINFO='{"verdict":"unknown","basis":"","reasons":["sem-prova-de-codigo-e-teste"],"paths":[],"tests":[]}'
+UNK_INFOSTR='{"verdict":"unknown","basis":"","reasons":["sem-prova-de-codigo-e-teste"],"paths":[],"tests":[],"info":"caminho-derivado-ilegivel:x"}'
+UNK_INFONULL='{"verdict":"unknown","basis":"","reasons":["sem-prova-de-codigo-e-teste"],"paths":[],"tests":[],"info":null}'
+UNK_INFOOBJ='{"verdict":"unknown","basis":"","reasons":["sem-prova-de-codigo-e-teste"],"paths":[],"tests":[],"info":{}}'
+UNK_NOREASON='{"verdict":"unknown","basis":"","paths":[],"tests":[],"info":[]}'
+export WA_NODE_ACCEPT_UNKNOWN=sem-prova
+fresh; cls "$UNK" 11; d check wa-t1;               expect_rc "accept-unknown: check de unknown só por falta de prova -> 0 (node)" 0 w0
+printf '%s' "$OUT" | jq -e '.verdict == "node" and .basis == "sem-prova" and .promoted_from == "unknown" and .reasons == ["sem-prova-de-codigo-e-teste"]' >/dev/null 2>&1 && ok "accept-unknown: check imprime node/base sem-prova/promoted_from e CONSERVA o motivo original" || bad "accept-unknown: JSON promovido errado ($OUT)"
+fresh; cls "$UNK_INFO_OK" 11; d check wa-t1;       expect_rc "accept-unknown: info com palavra-mole e evidência (nenhuma leitura falhou) ainda promove -> 0" 0 w0
+fresh; cls "$MINI" 10; d check wa-t1;              expect_rc "accept-unknown: mini continua mini (10)" 10 w0
+fresh; cls "$NODE_TEXT" 0; d check wa-t1;          expect_rc "accept-unknown: node de verdade continua node, base intacta (0)" 0 w0
+printf '%s' "$OUT" | jq -e '.basis == "text" and (has("promoted_from") | not)' >/dev/null 2>&1 && ok "accept-unknown: o node de verdade NÃO ganha promoted_from nem muda de base" || bad "accept-unknown: node de verdade foi alterado ($OUT)"
+fresh; cls "$UNK_READFAIL" 11; d check wa-t1;      expect_rc "accept-unknown: leitura que FALHOU (caminho-derivado-ilegivel) NÃO promove -> 11" 11 w0
+fresh; cls "$UNK_READFAIL2" 11; d check wa-t1;     expect_rc "accept-unknown: leitura que falhou misturada com palavra-mole NÃO promove -> 11" 11 w0
+fresh; cls "$UNK_MOLES" 11; d check wa-t1;         expect_rc "accept-unknown: motivo EXTRA (moles:credencial) NÃO promove -> 11" 11 w0
+fresh; cls "$UNK_OTHER" 11; d check wa-t1;         expect_rc "accept-unknown: outro motivo de unknown (json-ilegivel) NÃO promove -> 11" 11 w0
+fresh; cls "$UNK_DUP" 11; d check wa-t1;           expect_rc "accept-unknown: motivo repetido não é «exatamente o motivo» -> 11" 11 w0
+fresh; cls "$UNK_NOINFO" 11; d check wa-t1;        expect_rc "accept-unknown: info AUSENTE (não sei se leu) NÃO promove -> 11" 11 w0
+fresh; cls "$UNK_INFOSTR" 11; d check wa-t1;       expect_rc "accept-unknown: info que não é lista NÃO promove -> 11" 11 w0
+fresh; cls "$UNK_INFONULL" 11; d check wa-t1;      expect_rc "accept-unknown: info null NÃO promove -> 11" 11 w0
+fresh; cls "$UNK_INFOOBJ" 11; d check wa-t1;       expect_rc "accept-unknown: info que é OBJETO (o map do jq o aceitaria) NÃO promove -> 11" 11 w0
+fresh; cls "$UNK_NOREASON" 11; d check wa-t1;      expect_rc "accept-unknown: unknown sem motivo NÃO promove -> 11" 11 w0
+fresh; cls "$UNK" 0; d check wa-t1;                expect_rc "accept-unknown: classificador incoerente (unknown com rc 0) NÃO promove -> 11" 11 w0
+fresh; cls "not json" 11; d check wa-t1;           expect_rc "accept-unknown: saída ilegível NÃO promove -> 11" 11 w0
+fresh; cls "" 11; d check wa-t1;                   expect_rc "accept-unknown: saída vazia NÃO promove -> 11" 11 w0
+# apply
+fresh; cls "$UNK" 11; d apply wa-t1;               expect_rc "accept-unknown: apply de unknown só por falta de prova -> 0 e ESCREVE" 0
+[ "$(bead '."wa-t1".assignee')" = wa-worker-remote-1 ] && [ "$(bead '."wa-t1".status')" = in_progress ] && ok "accept-unknown: apply atribuiu ao alias, em andamento" || bad "accept-unknown: apply não atribuiu"
+bead '."wa-t1".comments[0]' | grep -q 'SEM PROVA' && ok "accept-unknown: o comentário da bead diz SEM PROVA e manda conferir/devolver" || bad "accept-unknown: comentário sem o aviso: $(bead '."wa-t1".comments')"
+bead '."wa-t1".comments[0]' | grep -q 'base sem-prova' && ok "accept-unknown: o comentário cita a base sem-prova" || bad "accept-unknown: comentário sem a base"
+jq -r 'select(.event=="apply") | .detail' "$CITY/.gc/wa-node-route.jsonl" | tail -n 1 | grep -q '(sem-prova)' && ok "accept-unknown: o log do apply guarda a base (sem-prova): é o que o relatório conta" || bad "accept-unknown: log sem a base: $(cat "$CITY/.gc/wa-node-route.jsonl")"
+fresh; cls "$NODE_TEXT" 0; d apply wa-t1;          expect_rc "accept-unknown: apply de node de verdade -> 0" 0
+bead '."wa-t1".comments[0]' | grep -q 'SEM PROVA' && bad "accept-unknown: node de verdade ganhou o aviso SEM PROVA" || ok "accept-unknown: node de verdade NÃO ganha o aviso SEM PROVA"
+fresh; cls "$UNK" 11; d apply wa-t1 --basis label; expect_rc "accept-unknown: modo label NUNCA aceita sem-prova -> 10 sem escrita" 10 w0
+fresh; cls "$UNK_READFAIL" 11; d apply wa-t1;      expect_rc "accept-unknown: apply com leitura que falhou -> 11 sem escrita" 11 w0
+fresh; cls "$UNK_MOLES" 11; d apply wa-t1;         expect_rc "accept-unknown: apply com motivo extra -> 11 sem escrita" 11 w0
+fresh; cls "$MINI" 10; d apply wa-t1;              expect_rc "accept-unknown: apply de mini -> 10 sem escrita" 10 w0
+fresh; cls "$UNK" 11; d apply wa-t1 --dry-run;     expect_rc "accept-unknown: apply --dry-run de unknown promovido -> 0 SEM escrita" 0 w0
+fresh; jq -c '. + {"wa-busy":{"id":"wa-busy","status":"in_progress","assignee":"wa-worker-remote-1","metadata":{}}}' "$STATE" > "$STATE.n" && mv "$STATE.n" "$STATE"; cls "$UNK" 11
+d apply wa-t1; expect_rc "accept-unknown: a promoção NÃO fura o slot do nó (ocupado -> 12 sem escrita)" 12 w0
+# valor ilegível = desligado, NUNCA ligado por erro de digitação
+for v in semprova Sem-Prova "sem-prova " " sem-prova" 1 true on sem-prova,x ""; do
+  fresh; cls "$UNK" 11; WA_NODE_ACCEPT_UNKNOWN="$v" d check wa-t1; expect_rc "accept-unknown: valor '$v' = desligado -> 11 (check)" 11 w0
+done
+fresh; cls "$UNK" 11; WA_NODE_ACCEPT_UNKNOWN="sem-prova;rm" d apply wa-t1; expect_rc "accept-unknown: valor com ; = desligado -> 11 sem escrita (apply)" 11 w0
+unset WA_NODE_ACCEPT_UNKNOWN
+fresh; cls "$UNK" 11; d check wa-t1;               expect_rc "accept-unknown: variável AUSENTE = o de sempre -> 11 (check)" 11 w0
+fresh; cls "$UNK" 11; d apply wa-t1;               expect_rc "accept-unknown: variável AUSENTE = o de sempre -> 11 sem escrita (apply)" 11 w0
+
 # ---- 1 caso de ponta a ponta com o classificador REAL (mesma bead que o selftest dele manda ao nó)
 fresh; unset WA_NODE_CLASSIFY
 jq -c '."wa-t1" += {"description":"Em lib/foo_parser.py a funcao quebra com string vazia. Teste em tests/test_foo_parser.py."}' "$STATE" > "$STATE.n" && mv "$STATE.n" "$STATE"
@@ -769,6 +826,30 @@ mutant pulo-lixo-entra "case \"\$_sk\" in ''|*[!A-Za-z0-9._-]*) continue ;; esac
 fresh; WA_NODE_SKIP_ALIASES="wa-worker-remote-1 wa-worker-remote-2 wa-worker-remote-3 ;rm" pm apply wa-t1; case "$OUT" in *';rm'*) killed ;; *) survived ;; esac
 mutant pulo-sai-da-conta 'if [ $((live - n_reuse)) -ge "$SLOTS" ]; then jlog apply' 'if [ $((live - n_reuse - $(printf '"'"'%s\n'"'"' "$live_al" | grep -cxF -- "${SKIP# }" || true))) -ge "$SLOTS" ]; then jlog apply'
 fresh; sessions "[$(live 1),$(live 2),$(live 3)]"; WA_NODE_SKIP_ALIASES=wa-worker-remote-3 pm apply wa-t1; if [ "$RC" != 12 ]; then survived; else killed; fi
+
+# ---- ga-31u0zl7: mutantes de WA_NODE_ACCEPT_UNKNOWN. Cada um desliga UMA defesa; o caso designado tem de falhar.
+mutant au-sem-variavel '  [ -n "$ACCEPT_UNKNOWN" ] || return 0   # (já saneado' '  : # (já saneado'
+fresh; cls "$UNK" 11; d check wa-t1; if [ "$RC" = 11 ]; then survived; else killed; fi
+mutant au-valor-ilegivel '[ "$ACCEPT_UNKNOWN" = sem-prova ] || ACCEPT_UNKNOWN=""' ':'
+fresh; cls "$UNK" 11; WA_NODE_ACCEPT_UNKNOWN=true d check wa-t1; if [ "$RC" = 11 ]; then survived; else killed; fi
+mutant au-motivo-extra '(.reasons == ["sem-prova-de-codigo-e-teste"])' '(.reasons | index("sem-prova-de-codigo-e-teste") != null)'
+fresh; cls "$UNK_MOLES" 11; WA_NODE_ACCEPT_UNKNOWN=sem-prova d check wa-t1; if [ "$RC" = 11 ]; then survived; else killed; fi
+mutant au-leitura-falhou ' and ((.info | map(tostring | select(test("ilegiv"))) | length) == 0)' ''
+fresh; cls "$UNK_READFAIL" 11; WA_NODE_ACCEPT_UNKNOWN=sem-prova d check wa-t1; if [ "$RC" = 11 ]; then survived; else killed; fi
+mutant au-leitura-so-um-sufixo 'test("ilegiv")' 'test("-ilegivel:")'
+fresh; cls '{"verdict":"unknown","basis":"","reasons":["sem-prova-de-codigo-e-teste"],"paths":[],"tests":[],"info":["labels-ilegiveis"]}' 11; WA_NODE_ACCEPT_UNKNOWN=sem-prova d check wa-t1; if [ "$RC" = 11 ]; then survived; else killed; fi
+mutant au-info-nao-lista ' and ((.info | type) == "array")' ''
+fresh; cls "$UNK_INFOOBJ" 11; WA_NODE_ACCEPT_UNKNOWN=sem-prova d check wa-t1; if [ "$RC" = 11 ]; then survived; else killed; fi
+mutant au-base-text '.basis = "sem-prova"' '.basis = "text"'
+fresh; cls "$UNK" 11; WA_NODE_ACCEPT_UNKNOWN=sem-prova d check wa-t1; if printf '%s' "$OUT" | jq -e '.basis == "sem-prova"' >/dev/null 2>&1; then survived; else killed; fi
+mutant au-rc-continua-11 'out="$p"; rc=0' 'out="$p"; rc=11'
+fresh; cls "$UNK" 11; WA_NODE_ACCEPT_UNKNOWN=sem-prova d check wa-t1; if [ "$RC" = 0 ]; then survived; else killed; fi
+mutant au-check-sem-promocao $'  classify_checked\n  promote_sem_prova\n  printf' $'  classify_checked\n  printf'
+fresh; cls "$UNK" 11; WA_NODE_ACCEPT_UNKNOWN=sem-prova d check wa-t1; if [ "$RC" = 0 ]; then survived; else killed; fi
+mutant au-apply-sem-promocao $'  classify_checked\n  promote_sem_prova\n  if [ "$rc" != 0 ]' $'  classify_checked\n  if [ "$rc" != 0 ]'
+fresh; cls "$UNK" 11; WA_NODE_ACCEPT_UNKNOWN=sem-prova d apply wa-t1; if [ "$RC" = 0 ]; then survived; else killed; fi
+mutant au-sem-aviso '[ "$b" = sem-prova ] && who="$who SEM PROVA' ': # SEM PROVA'
+fresh; cls "$UNK" 11; WA_NODE_ACCEPT_UNKNOWN=sem-prova d apply wa-t1; if bead '."wa-t1".comments[0]' | grep -q 'SEM PROVA'; then survived; else killed; fi
 
 echo "---"; echo "$((n-fails))/$n ok"
 [ $fails -eq 0 ] && echo "SELFTEST OK" || { echo "SELFTEST FALHOU ($fails)"; exit 1; }

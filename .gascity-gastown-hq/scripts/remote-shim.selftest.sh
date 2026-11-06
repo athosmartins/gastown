@@ -261,14 +261,57 @@ denied "devolver: sem id" "faltam argumentos" bd update "${RL[@]}"
 for x in "--set-metadata story.x=y" "--unset-metadata gc.routed_to" "--notes x" "--claim" "--force" "--priority 0" "--title x" "--set-labels x" "--actor mayor" "-a x" "-s open" "--status=open" "--assignee=" "--if-assignee=gastown.dog-1"; do
   rel_denied "flag a mais: $x" "flag fora da lista" "${RL[@]}" $x
 done
-denied "devolver: bead de RIG (-C <rig>) não se devolve por aqui (o veto node:never é do HQ)" "só vale na cidade" bd -C wa_rig update wa-1 "${RL[@]}"
+denied "devolver: bead de OUTRO rig (-C wa_rig: não é o whatsapp_automation) não se devolve por aqui" "só vale na cidade" bd -C wa_rig update wa-1 "${RL[@]}"
 denied "devolver: -C com o caminho real do rig" "só vale na cidade" bd -C "$WA" update wa-1 "${RL[@]}"
 for _lk in "remove pilot:dispatched" "remove pilot:dispatching" "remove story:in-flight" "add node:never"; do
   denied "devolver NÃO abre o bd label: bd label $_lk" "comando fora da lista" bd label "${_lk%% *}" ga-r1 "${_lk#* }"
 done
+# ---- ga-31u0zl7: o worker remoto de WA devolve a PRÓPRIA bead do rig whatsapp_automation, pela MESMA forma exata (nenhum outro rig, nenhuma flag a mais). Sem isto a bead de WA que o nó recebe e não
+#      cabe só voltava ao mini quando o Mayor soltava à mão: o worker comentava, gravava athos.node_recusa e esperava.
+r0=-1; [ -r "$FB/reads.log" ] && r0=$(wc -l < "$FB/reads.log" | tr -d ' ')
+allowed "devolver bead do WA: bd -C whatsapp_automation (a forma mínima)" bd -C whatsapp_automation update wa-r1 "${RL[@]}"
+lastis "bd	cwd=$WAR	actor=gastown.dog-1	alias=gastown.dog-1"; ok $? "  cwd=rig whatsapp_automation, BEADS_ACTOR=alias"
+lastis "argv=[update][wa-r1][--if-assignee][gastown.dog-1][--if-status][in_progress][--assignee][][--status][open][--add-label][node:never]"; ok $? "  argv canônico: o do cliente, na ordem dele, sem o -C (o cwd faz o papel)"
+r1=-1; [ -r "$FB/reads.log" ] && r1=$(wc -l < "$FB/reads.log" | tr -d ' ')
+[ "$r0" -ge 1 ] 2>/dev/null && [ "$r1" = "$r0" ]; ok $? "  e NÃO lê a bead antes: a guarda é o --if-assignee/--if-status do próprio bd"
+allowed "devolver bead do WA com os 3 rótulos de despacho, --json e as flags ANTES do id" bd -C whatsapp_automation update --json --remove-label pilot:dispatched --remove-label pilot:dispatching --remove-label story:in-flight "${RL[@]}" wa-r2
+allowed "devolver bead do WA com o caminho real do rig" bd -C "$WAR" update wa-r3 "${RL[@]}"; lastis "cwd=$WAR"; ok $? "  cwd=rig"
+wr_denied() {  # wr_denied "descrição" "trecho do motivo" ARG... → `bd -C whatsapp_automation update wa-r1 ARG...` recusado (77, o falso NÃO é chamado)
+  local d=$1 w=$2; shift 2; denied "devolver (WA): $d" "$w" bd -C whatsapp_automation update wa-r1 "$@"
+}
+wr_denied "--if-assignee de OUTRO alias (só se devolve a PRÓPRIA bead)" "só se devolve a PRÓPRIA bead" --if-assignee gastown.dog-2 "${RS[@]}" "${RO[@]}" "${RT[@]}" "${RV[@]}"
+wr_denied "sem --if-assignee (a escrita não seria guardada)" "falta --if-assignee" "${RS[@]}" "${RO[@]}" "${RT[@]}" "${RV[@]}"
+wr_denied "sem --if-status" "falta --if-status" "${RA[@]}" "${RO[@]}" "${RT[@]}" "${RV[@]}"
+wr_denied "--if-status open (não reabre bead que não está em andamento)" "--if-status sem valor ou com valor fora do formato in_progress" "${RA[@]}" --if-status open "${RO[@]}" "${RT[@]}" "${RV[@]}"
+wr_denied "sem o veto node:never (o Pilot a mandaria de volta ao nó)" "falta --add-label" "${RA[@]}" "${RS[@]}" "${RO[@]}" "${RT[@]}"
+wr_denied "--add-label verdict:PASS (o gate aprovaria código sem revisão)" "--add-label sem valor ou com valor fora do formato node:never" "${RA[@]}" "${RS[@]}" "${RO[@]}" "${RT[@]}" --add-label verdict:PASS
+wr_denied "--status closed" "--status sem valor ou com valor fora do formato open" "${RA[@]}" "${RS[@]}" "${RO[@]}" --status closed "${RV[@]}"
+wr_denied "--assignee de outra pessoa (devolver não é passar a bead adiante)" "--assignee sem valor ou com valor fora do formato ''" "${RA[@]}" "${RS[@]}" --assignee gastown.dog-2 "${RT[@]}" "${RV[@]}"
+wr_denied "--remove-label node:never (tirar o veto)" "--remove-label sem valor ou com valor fora do formato <pilot:dispatched|pilot:dispatching|story:in-flight>" "${RL[@]}" --remove-label node:never
+wr_denied "--remove-label gate:needs-fix (outro rótulo)" "--remove-label sem valor ou com valor fora do formato <pilot:dispatched|pilot:dispatching|story:in-flight>" "${RL[@]}" --remove-label gate:needs-fix
+wr_denied "--set-metadata na mesma chamada" "flag fora da lista" "${RL[@]}" --set-metadata athos.node_recusa=x
+wr_denied "--unset-metadata (a marca do nó)" "flag fora da lista" "${RL[@]}" --unset-metadata pilot.wa_node_alias
+wr_denied "--claim" "flag fora da lista" "${RL[@]}" --claim
+denied "devolver (WA): outro rig continua de fora mesmo com a forma exata (wr = whatsapp_automation, wa_rig não é)" "ou no rig whatsapp_automation (-C whatsapp_automation)" bd -C wa_rig update wa-r1 "${RL[@]}"
+denied "devolver (WA): -C com o caminho real de OUTRO rig" "só vale na cidade" bd -C "$WA" update wa-r1 "${RL[@]}"
+denied "devolver (WA): -C com um caminho que não é rig nenhum" "não é a cidade nem um rig" bd -C "$T/evil" update wa-r1 "${RL[@]}"
+allowed "controle: bd -C whatsapp_automation update --set-metadata segue valendo (a outra forma)" bd -C whatsapp_automation update wa-r1 --set-metadata athos.node_recusa=x
+denied "controle: bd -C whatsapp_automation update --status closed segue recusado" "flag fora da lista" bd -C whatsapp_automation update wa-r1 --status closed
+denied "controle: bd -C whatsapp_automation label add node:never segue fora da lista (ga-6auslu)" "comando fora da lista" bd -C whatsapp_automation label add wa-r1 node:never
+# o comando que o PROMPT do worker remoto de WA ensina é o que o wrapper aceita (sem isto o prompt e a lista andam cada um para um lado, e o worker só descobre na hora de devolver uma bead)
+python3 -I - "$HERE/../agents/wa-worker-remote/prompt.template.md" gastown.dog-1 wa-r9 > "$T/prompt-cmd-wa.bin" <<'EOF3'
+import shlex, sys
+lines = [l.strip() for l in open(sys.argv[1], encoding="utf-8").read().splitlines() if l.strip().startswith("bd -C whatsapp_automation update <id> --if-assignee")]
+if len(lines) != 1:  # UM comando de devolver no prompt: zero ou dois é o prompt que mudou de forma
+    sys.exit(3)
+sys.stdout.write("\0".join(shlex.split(lines[0].replace("<id>", sys.argv[3]).replace('"$GC_ALIAS"', sys.argv[2]))) + "\0")
+EOF3
+PCMD_WA=(); while IFS= read -r -d '' _a; do PCMD_WA+=("$_a"); done < "$T/prompt-cmd-wa.bin"
+[ "${#PCMD_WA[@]}" -ge 14 ] && [ "${PCMD_WA[0]}" = bd ] && [ "${PCMD_WA[1]}" = -C ] && [ "${PCMD_WA[2]}" = whatsapp_automation ] && [ "${PCMD_WA[3]}" = update ] && [ "${PCMD_WA[4]}" = wa-r9 ]; ok $? "o prompt do wa-worker-remote traz UM comando de devolver, e o <id> e o \$GC_ALIAS dele foram trocados (${#PCMD_WA[@]} palavras)"
+[ "${#PCMD_WA[@]}" -ge 14 ] && allowed "o comando de devolver que o PROMPT do wa-worker-remote ensina é aceito pelo wrapper" "${PCMD_WA[@]}"
 # o TEXTO que a regra mostra (no log e na recusa) vem por último: um mutante que alarga uma guarda também muda esse texto, e o caso da própria guarda tem que ser o 1º a reprovar
-has "$LOGF" "gastown.dog-1	ok	bd [-C .] update <id> [--json] --if-assignee <alias> --if-status in_progress --assignee '' --status open --add-label node:never"; ok $? "o log de auditoria guarda a regra de devolver (a linha pode ser cortada nos 200 caracteres do campo; o começo basta)"
-FORMA="bd [-C .] update <id> [--json] --if-assignee <alias> --if-status in_progress --assignee '' --status open --add-label node:never [--remove-label <pilot:dispatched|pilot:dispatching|story:in-flight>]..."
+has "$LOGF" "gastown.dog-1	ok	bd [-C .|whatsapp_automation] update <id> [--json] --if-assignee <alias> --if-status in_progress --assignee '' --status open --add-label node:never"; ok $? "o log de auditoria guarda a regra de devolver (a linha pode ser cortada nos 200 caracteres do campo; o começo basta)"
+FORMA="bd [-C .|whatsapp_automation] update <id> [--json] --if-assignee <alias> --if-status in_progress --assignee '' --status open --add-label node:never [--remove-label <pilot:dispatched|pilot:dispatching|story:in-flight>]..."
 rel_denied "a receita SEM a guarda (--status open --assignee '') não é aceita, e a recusa mostra a forma inteira" "$FORMA" "${RT[@]}" "${RO[@]}"
 rel_denied "  a mesma recusa ainda diz o que a forma de --set-metadata achou" "flag fora da lista: '--status'" "${RT[@]}" "${RO[@]}"
 allowed "controle: bd update --set-metadata segue valendo ao lado da forma nova" bd update ga-r1 --set-metadata story.a=b

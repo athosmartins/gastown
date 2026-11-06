@@ -106,16 +106,16 @@ timeout vira ilegivel	else ["sem-saida"] end)	else ["ilegivel"] end)
 classes saem so da lista cortada	(.reasons | map(tostring | split(":")[0] | gsub("[[:space:]]"; "_")) | unique)	(.reasons[:12] | map(tostring | split(":")[0] | gsub("[[:space:]]"; "_")) | unique)
 sem linha de sonda	_pilot_wa_node_pass_probe_note "$_pw_id" "$_pw_lane" "$(_pilot_priority_class_of "$_pw_pick")"; _pw_rsn="$_pw_rsn $_PWP_TOKENS"	:
 falha ao gravar a sonda nao avisa	|| warn "ga-2hd02v.3.17:	|| true "ga-2hd02v.3.17:
-resumo sem os motivos	stopped:$stop,reasons:$rs}	stopped:$stop}
+resumo sem os motivos	stopped:$stop,reasons:$rs,node_from_unknown	stopped:$stop,node_from_unknown
 log sem os motivos	motivos: ${_pw_rs:-nenhum}	x
 padrao de sondas volta a 12	_pw_cap="${PILOT_WA_NODE_PASS_PROBES:-30}"	_pw_cap="${PILOT_WA_NODE_PASS_PROBES:-12}"
 leitura guarda toda entrada do info	map(tostring | select(test("-ilegivel")))	map(tostring)
 leitura sem teto de entradas	select(test("-ilegivel"))) | .[:6] | map(.[:80])	select(test("-ilegivel"))) | map(.[:80])
 leitura sem corte de caracteres	| .[:6] | map(.[:80])	| .[:6]
-info que nao e lista vira leitura limpa	map(.[:80])) else null end), custo:	map(.[:80])) else [] end), custo:
+info que nao e lista vira leitura limpa	map(.[:80])) else null end), sinais:	map(.[:80])) else [] end), sinais:
 info ausente vira leitura limpa	leitura: (if (.info | type) == "array" then (.info | map(	leitura: (if true then ((.info // []) | map(
-sonda sem a leitura	,paths:$d.paths,leitura:$d.leitura,custo:$d.custo}'	,paths:$d.paths,custo:$d.custo}'
-sonda sem o custo	,leitura:$d.leitura,custo:$d.custo}'	,leitura:$d.leitura}'
+sonda sem a leitura	,paths:$d.paths,leitura:$d.leitura,sinais:$d.sinais,custo:$d.custo}'	,paths:$d.paths,sinais:$d.sinais,custo:$d.custo}'
+sonda sem o custo	,leitura:$d.leitura,sinais:$d.sinais,custo:$d.custo}'	,leitura:$d.leitura,sinais:$d.sinais}'
 custo que nao e objeto vira objeto zerado	else null end)} else null end)}'	else null end)} else {ms:0,derivacao_ms:0,cache:null} end)}'
 custo ms que nao e numero vira 0	if (.custo.ms | type) == "number" then .custo.ms else null end	if (.custo.ms | type) == "number" then .custo.ms else 0 end
 custo derivacao_ms que nao e numero vira 0	if (.custo.derivacao_ms | type) == "number" then .custo.derivacao_ms else null end	if (.custo.derivacao_ms | type) == "number" then .custo.derivacao_ms else 0 end
@@ -157,7 +157,7 @@ custo cache que nao e texto passa	if (.custo.cache | type) == "string" then	if t
 3.26: o portao so-no ignora a reserva	  if _pilot_node_reserved_for "$_ph_b"; then _PNH_WHY=reserved; return 0; fi	  :
 3.26: o portao so-no ignora o waiter da cessao	  if [ "$_ph_rc" = 0 ]; then _PNH_WHY=waiter; return 0; fi	  :
 3.26: o portao so-no segura tambem o hold expirado	  if [ "$_ph_rc" = 0 ]; then _PNH_WHY=waiter; return 0; fi	  if [ "$_ph_rc" != 1 ]; then _PNH_WHY=waiter; return 0; fi
-3.25: a passada nao zera o conjunto do no	  _PWP_NODE_BOUND=""\n  _pilot_wa_node_pass_mode	  _pilot_wa_node_pass_mode
+3.25: a passada nao zera o conjunto do no	  _PWP_NODE_BOUND=""\n  _PWP_U2N=off;	  _PWP_U2N=off;
 3.25: a retida pelo waiter nao entra no conjunto	_pw_held=$((_pw_held + 1)); case "$_pw_id" in *[!A-Za-z0-9._-]*) ;; *) _PWP_NODE_BOUND="$_PWP_NODE_BOUND $_pw_id" ;; esac; continue ;;	_pw_held=$((_pw_held + 1)); continue ;;
 3.25: o Dolt saturado nao deixa a node no conjunto	then case "$_pw_id" in *[!A-Za-z0-9._-]*) ;; *) _PWP_NODE_BOUND="$_PWP_NODE_BOUND $_pw_id" ;; esac; _pw_stop="dolt-saturated"; break; fi	then _pw_stop="dolt-saturated"; break; fi
 3.25: o apply fora da tabela nao deixa a bead no conjunto	case "$_pw_id" in *[!A-Za-z0-9._-]*) ;; *) _PWP_NODE_BOUND="$_PWP_NODE_BOUND $_pw_id" ;; esac; _pw_stop="hook-held"; break ;;	_pw_stop="hook-held"; break ;;
@@ -174,7 +174,35 @@ custo cache que nao e texto passa	if (.custo.cache | type) == "string" then	if t
 6g: sem a biblioteca ainda filtra por classe	_pw_rounds="all"	_pw_rounds="hot rest"
 6g: sem a biblioteca, sem aviso	warn "ga-7xd8g8f: a biblioteca de ordem (WORK_ORDER_JQ_DEFS)	: "ga-7xd8g8f: a biblioteca de ordem (WORK_ORDER_JQ_DEFS)
 6g: pista ilegivel avisa em cada rodada	[ "$_pw_round" != "${_pw_rounds%% *}" ] || 	: ; 
-6g: prioridade ilegivel na sonda vira 0	then ($pc | tonumber) else null end	then ($pc | tonumber) else 0 end
+6g: prioridade ilegivel na sonda vira 0	then ($pc | tonumber) else null end),reasons:$d.reasons	then ($pc | tonumber) else 0 end),reasons:$d.reasons
 6g: a sonda nao recebe a classe	"$_pw_lane" "$(_pilot_priority_class_of "$_pw_pick")"; _pw_rsn=	"$_pw_lane" ""; _pw_rsn=
 6g: a rodada sem filtro filtra rest	*)    _pw_rf='' ;;	*)    _pw_rf='| select(wo_prio_class > 1)' ;;
 6g: o filtro vai sem as definicoes da biblioteca	"$([ "$_pw_round" = all ] || printf '%s' "$_pw_defs")"	""
+u2n: o check nao pede a promocao	_pilot_wa_node_pass_check "$_pw_id" "" "$_pw_acc"	_pilot_wa_node_pass_check "$_pw_id" ""
+u2n: pede a promocao mesmo desligado	if [ "$_PWP_U2N" != off ]; then _pw_acc=sem-prova; fi	_pw_acc=sem-prova
+u2n: promove em shadow	if [ "$_PWP_U2N" = on ] && [ "$_PWP_MODE" = on ]; then _pw_uh=1; else _PWP_V=unknown; _pw_uh=2; fi	if [ "$_PWP_U2N" != off ]; then _pw_uh=1; else _PWP_V=unknown; _pw_uh=2; fi
+u2n: sem-prova com o botao off passa a node	else _PWP_V=unknown; _pw_uh=2; fi	else _pw_uh=2; fi
+u2n: export sempre	if [ "$_pw_uh" = 1 ]; then export WA_NODE_ACCEPT_UNKNOWN=sem-prova; fi	export WA_NODE_ACCEPT_UNKNOWN=sem-prova
+u2n: export com outro valor	export WA_NODE_ACCEPT_UNKNOWN=sem-prova; fi	export WA_NODE_ACCEPT_UNKNOWN=true; fi
+u2n: o ambiente nao e limpo	unset WA_NODE_ACCEPT_UNKNOWN	:
+u2n: a sombra memoriza 1 h (unknown)	: u2n-shadow-memo\n        _pilot_wa_node_pass_released_memo "$_pw_pick" "$_pw_id" "$_pw_upd"	: u2n-shadow-memo\n        _pilot_wa_node_pass_memo_put "$_pw_id" "$_pw_upd" unknown
+u2n: a sombra memoriza a P0/P1	: u2n-shadow-memo\n        _pilot_wa_node_pass_released_memo "$_pw_pick" "$_pw_id" "$_pw_upd"	: u2n-shadow-memo\n        _pilot_wa_node_pass_memo_put "$_pw_id" "$_pw_upd" released
+u2n: marcador sem sonda	if [ "$_PWP_U2N_AUTO" = 1 ] && [ "$_pw_probed" -ge 1 ] && [ "$_pw_stop" != check-missing ]; then	if [ "$_PWP_U2N_AUTO" = 1 ] && [ "$_pw_stop" != check-missing ]; then
+u2n: marcador com o script do check ausente	if [ "$_PWP_U2N_AUTO" = 1 ] && [ "$_pw_probed" -ge 1 ] && [ "$_pw_stop" != check-missing ]; then	if [ "$_PWP_U2N_AUTO" = 1 ] && [ "$_pw_probed" -ge 1 ]; then
+u2n: marcador escrito fora do auto	if [ "$_PWP_U2N_AUTO" = 1 ] && [ "$_pw_probed" -ge 1 ]	if true && [ "$_pw_probed" -ge 1 ]
+u2n: auto liga sem marcador	if [ -f "$_um_f" ] && [ -r "$_um_f" ]; then _PWP_U2N=on;	if true; then _PWP_U2N=on;
+u2n: valor ilegivel liga	*) _PWP_U2N=off ;;	*) _PWP_U2N=on ;;
+u2n: rota que nao e auto liga	[ "${PILOT_WA_NODE_ROUTE:-}" = auto ] || return 0	:
+u2n: variavel ausente vira off	_um_v="${PILOT_WA_NODE_UNKNOWN_TO_NODE-auto}"	_um_v="${PILOT_WA_NODE_UNKNOWN_TO_NODE:-off}"
+u2n: variavel vazia vira auto	_um_v="${PILOT_WA_NODE_UNKNOWN_TO_NODE-auto}"	_um_v="${PILOT_WA_NODE_UNKNOWN_TO_NODE:-auto}"
+u2n: passada em shadow liga	if [ "$_PWP_MODE" != on ] && [ "$_PWP_U2N" = on ]; then _PWP_U2N=shadow; fi	:
+u2n: kept_from_unknown conta toda despachada	if [ "$_pw_uh" = 1 ]; then _pw_u2nk=$((_pw_u2nk + 1)); fi	_pw_u2nk=$((_pw_u2nk + 1))
+u2n: o waiter da sombra fica out	_pw_wv=blind; fi\n        continue\n      fi\n      [ "$_pw_uh" != 1 ] ||	_pw_wv=out; fi\n        continue\n      fi\n      [ "$_pw_uh" != 1 ] ||
+u2n: a promovida nao e contada	[ "$_pw_uh" != 1 ] || _pw_u2n=$((_pw_u2n + 1))	:
+u2n: a sombra nao grava a linha	event:"wa-node-pass-shadow-unknown"	event:"x"
+u2n: o argumento do check nao e sanitizado	[ "$_pc_acc" = sem-prova ] || _pc_acc=""	:
+u2n: sinais sem o prefixo	map(tostring | split(":")[0] | .[:40]) | unique	map(tostring | .[:40]) | unique
+u2n: sinais repetidos	map(tostring | split(":")[0] | .[:40]) | unique | .[:12]	map(tostring | split(":")[0] | .[:40]) | .[:12]
+u2n: sinais ausente vira lista vazia	| unique | .[:12]) else null end), custo:	| unique | .[:12]) else []  end), custo:
+u2n: a sonda nao guarda os sinais	leitura:$d.leitura,sinais:$d.sinais,custo:$d.custo}	leitura:$d.leitura,custo:$d.custo}
+u2n: a sombra nao guarda os sinais	u2n_mode:$m,sinais:$d.sinais,prio:	u2n_mode:$m,prio:

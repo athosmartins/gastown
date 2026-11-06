@@ -2,7 +2,7 @@
 
 ## Contents
 
-• Onde você está · Como pegar a bead · O que o atalho deixa passar · Trabalhar e entregar · Bead que voltou do gate, ou 2ª bead da sessão · Write-time doctrine — experiment E12 (ga-4q2zo5) · Se a bead não cabe aqui · Sem bead · O que nunca fazer
+• Onde você está · Como pegar a bead · Primeiro passo: isto se constrói e testa aqui? · O que o atalho deixa passar · Trabalhar e entregar · Bead que voltou do gate, ou 2ª bead da sessão · Write-time doctrine — experiment E12 (ga-4q2zo5) · Se a bead não cabe aqui: devolva em minutos · Sem bead · O que nunca fazer
 
 > **Recuperação**: depois de compactar, limpar ou reiniciar, rode `gc prime` (o atalho deixa passar).
 
@@ -32,14 +32,22 @@ Veio uma bead? É sua: `bd -C whatsapp_automation show <id> --json` e comece. Ve
 
 Não existe sonda de pool aqui. `bd ready`, `bd query`, `bd update --claim` e `gc runtime drain-ack` **não passam** pelo atalho: voltam recusados (rc 77) sem executar nada. Não tente outro caminho para fazê-los passar.
 
+## Primeiro passo: isto se constrói e testa aqui?
+
+Antes de escrever uma linha, responda esta pergunta, gastando no máximo uns 10 minutos. Parte das beads que chegam ao nó vem **sem prova** de que ele basta: o comentário do despachante diz «SEM PROVA de que o nó basta» (o classificador não achou motivo para o mini, só não achou o teste que prove a mudança). Nessas, a conferência é sua e decide onde a bead roda. Isso importa porque o pool do mini é pequeno: uma bead que fica aqui meia hora para descobrir que precisava do banco custa essa meia hora ao mini também, e quanto mais cedo ela volta, mais cedo o mini a pega.
+
+1. Leia a bead (`bd -C whatsapp_automation show <id> --json`) e ache no worktree o código que ela nomeia (`git ls-files`, `grep -rn`).
+2. Ache o teste que prova a mudança: um que já existe para esse código, ou um que você consegue escrever só com fixture sintética. Rode o que já existe com limite de tempo (por exemplo `timeout 120 python3 -m pytest <arquivo> -x -q`) para ver se ele sequer roda aqui.
+3. O código existe e o teste roda (ou você consegue escrevê-lo) sem banco real, credencial, aparelho, serviço do Mac nem envio de mensagem? Siga para «Trabalhar e entregar». Falta qualquer um desses? **Devolva agora**, pela seção «Se a bead não cabe aqui: devolva em minutos», sem construir uma parte. Dúvida que 10 minutos não resolveram conta como «não cabe»: a bead não se perde, só volta para a fila certa.
+
 ## O que o atalho deixa passar
 
-`bd show`, `bd list` (com `--status`, `--assignee`, `--label`, `--parent`, `--limit` até 200, `--id`), `bd update <id> --set-metadata` (só chaves `athos.*` e `story.*`), `bd comment`, `bd close`, `gc prime --hook`, `gc handoff --auto`, `gc mail check|inbox|read|peek|archive`, `gc session nudge`, e `gate-done`. Recusa tem motivo na mensagem; leia-o antes de repetir.
+`bd show`, `bd list` (com `--status`, `--assignee`, `--label`, `--parent`, `--limit` até 200, `--id`), `bd update <id> --set-metadata` (só chaves `athos.*` e `story.*`), `bd update <id> --if-assignee …` **só na forma exata de devolver a PRÓPRIA bead** (seção «Se a bead não cabe aqui»), `bd comment`, `bd close`, `gc prime --hook`, `gc handoff --auto`, `gc mail check|inbox|read|peek|archive`, `gc session nudge`, e `gate-done`. Recusa tem motivo na mensagem; leia-o antes de repetir.
 
 ## Trabalhar e entregar
 
 1. Trabalhe no diretório atual. Registre o andamento com `bd comment <id> "..."`.
-2. Rode só testes que não precisam de banco, rede de produção nem do Mac. Se um teste pedir arquivo que o nó não tem, **isso é sinal de que a bead não cabe aqui**: veja a próxima seção, não crie dado falso para passar. Alguns bancos de produção existem no nó **só como schema** (`shared/data/<x>.db`: tabelas e índices, **zero linha**; a classificação os nomeia em `mole-banco-com-schema:`): teste que só precisa do caminho e do schema roda; teste que lê DADO desse banco vê tabela vazia e fica vermelho, e isso também é sinal de que a bead não cabe aqui. Não escreva linhas nesses bancos para passar.
+2. Rode só testes que não precisam de banco, rede de produção nem do Mac. Se um teste pedir arquivo que o nó não tem, **isso é sinal de que a bead não cabe aqui**: veja a seção «Se a bead não cabe aqui: devolva em minutos», não crie dado falso para passar. Alguns bancos de produção existem no nó **só como schema** (`shared/data/<x>.db`: tabelas e índices, **zero linha**; a classificação os nomeia em `mole-banco-com-schema:`): teste que só precisa do caminho e do schema roda; teste que lê DADO desse banco vê tabela vazia e fica vermelho, e isso também é sinal de que a bead não cabe aqui. Não escreva linhas nesses bancos para passar.
 3. Os commits saem com o autor `<seu nome de sessão>@gastown.invalid`; não mude a identidade git.
 4. `git push origin HEAD` leva o branch ao espelho do mini, que só aceita `worker/*` e `crew/*`. Merge é do gate, nunca seu.
 5. Bead de código: ao terminar, rode `gate-done` e deixe um `bd comment <id> "entregue: <resumo>"`. **Não feche** a bead; o gate fecha. O skill de mesmo nome não existe nesta sessão: o que vale é o atalho. `gate-done` sem argumentos serve só para a ÚNICA bead `in_progress` sua e submete o que o ESPELHO tem em `worker/<seu nome de sessão>`; para a bead que voltou do gate, veja a seção "Bead que voltou do gate".
@@ -63,15 +71,24 @@ Duas beads na mesma sessão seguem a mesma regra: cada uma com o seu ref e o seu
 - Before you run the gate-done skill, re-read every comment in your own diff and ask "does the code next to it do exactly this?" A comment that promises more than the code does (32% of the findings) makes the next reader stop looking for the hole; fix the code or the comment.
 {{/* e12-doctrine:end */}}
 
-## Se a bead não cabe aqui
+## Se a bead não cabe aqui: devolva em minutos
 
-Cabe aqui o que se prova só com código e testes. **Não cabe** (pare, não tente contornar): precisa ler o banco real, uma planilha ou dump, a tela ao vivo, uma credencial, um serviço do Mac, ou enviar mensagem. Nesse caso:
+Cabe aqui o que se prova só com código e testes. **Não cabe** (pare, não tente contornar): precisa ler o banco real, uma planilha ou dump, a tela ao vivo, uma credencial, um serviço do Mac (launchd, aparelho), enviar mensagem, ou não existe teste que prove a mudança sem esses recursos. Devolver é uma entrega correta, não uma falha, e é você quem devolve: ninguém mais solta a bead por você, e enquanto ela fica aqui parada o mini não a pega.
 
-1. `bd comment <id> "nó: não cabe aqui — <o que faltou, sem copiar dado>"`.
-2. `bd update <id> --set-metadata athos.node_recusa="<motivo curto>"` (a chave `athos.*` passa pelo atalho).
-3. `gc session nudge gastown.mayor "wa-worker-remote devolveu <id>: não cabe no nó"` e termine o turno. Quem despachou devolve a bead ao mini (rota normal de wa-worker).
+Nesta ordem (o 3º passo é UM comando, e é ele que tira a bead de você):
 
-Devolver é uma entrega correta, não uma falha.
+1. `bd -C whatsapp_automation comment <id> "nó: não cabe aqui — <o que faltou, sem copiar dado>"`.
+2. `bd -C whatsapp_automation update <id> --set-metadata athos.node_recusa="<motivo curto>"` (a chave `athos.*` passa pelo atalho). É a marca que o relatório conta como devolução; sem ela a taxa de acerto do nó fica errada.
+3. A devolução, com o seu alias (`$GC_ALIAS`). Deixe um `--remove-label` para cada um destes rótulos que aparece em `LABELS` no `bd show <id>` e apague os que não aparecem:
+
+   ```bash
+   bd -C whatsapp_automation update <id> --if-assignee "$GC_ALIAS" --if-status in_progress --assignee '' --status open --add-label node:never --remove-label pilot:dispatched --remove-label pilot:dispatching --remove-label story:in-flight
+   ```
+
+   O `--add-label node:never` é obrigatório: é o veto que impede o Pilot de mandar a bead de volta ao nó. `--if-assignee` e `--if-status` fazem o `bd` recusar a escrita se a bead não for mais sua ou não estiver em andamento. Nenhum outro `bd update` muda dono, status ou rótulo pelo atalho, e `bd label` continua fora.
+4. Confira com `bd -C whatsapp_automation show <id>`: o cabeçalho diz `OPEN`, não há `Assignee` e `node:never` está em `LABELS`. Termine o turno: o Pilot manda a bead a um worker do mini.
+
+Se o atalho recusar (77), a mensagem diz o motivo e mostra a forma inteira: não repita às cegas e não tente outro caminho. Se a devolução não sair, deixe a bead como está, escreva o motivo num `bd comment` e avise com `gc session nudge gastown.mayor "wa-worker-remote não conseguiu devolver <id>: <motivo da recusa>"`.
 
 ## Sem bead
 

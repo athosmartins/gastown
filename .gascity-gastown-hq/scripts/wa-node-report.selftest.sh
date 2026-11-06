@@ -346,6 +346,7 @@ mt_linhas = [
     resumo(-3 * H, 0, 0, "none", mode="on", kept=ABSENT, released=5),
     resumo(-25 * H, 99, 9, "budget-probes", kept=0, released=0),
     {"ts": iso(-1 * H), "event": "wa-node-pass-shadow", "bead": "wa-m1", "lane": "wa-worker-remote", "basis": "text", "stamped": False, "prio": 2},
+    {"ts": iso(-1 * H), "event": "wa-node-pass-shadow-unknown", "bead": "wa-m1", "lane": "small", "basis": "sem-prova", "u2n_mode": "shadow", "sinais": ["palavra-mole"], "prio": 2},
     {"ts": iso(-1 * H), "event": "wa-node-pass-novo", "bead": "wa-m1"},
     {"ts": iso(-1 * H), "bead": "wa-m1"},
 ]
@@ -1024,7 +1025,7 @@ chk_motivos_fora_das_contas() { # sem hora, sem bead/veredito, evento desconheci
   jrun UTC "$MT" --hours 24 &&
   eq "$(mf sem_hora)" 2 "sem ts e ts 'ontem'" && eq "$(mf fora_do_formato)" 4 "sem bead, bead que não é texto, veredito 'talvez', sem veredito" &&
   eq "$(mf 'eventos_desconhecidos|to_entries|map("\(.key)=\(.value)")|sort|join(",")')" "?=1,wa-node-pass-novo=1" "evento novo e sem event" &&
-  eq "$(mf 'outros_conhecidos|to_entries|map("\(.key)=\(.value)")|sort|join(",")')" "wa-node-pass-shadow=1,wa-node-pass-summary=4" "resumo (4 na janela) e sombra contados à parte" &&
+  eq "$(mf 'outros_conhecidos|to_entries|map("\(.key)=\(.value)")|sort|join(",")')" "wa-node-pass-shadow-unknown=1,wa-node-pass-shadow=1,wa-node-pass-summary=4" "resumo (4 na janela), sombra e sombra do unknown→nó contados à parte (o evento novo NÃO vira «desconhecido»)" &&
   eq "$(mm mini:fora-do-filtro beads)" 2 "as sondas fora do formato não viram motivo"
 }
 chk_motivos_passadas() { # o resumo das passadas: quantas, sondaram, ao nó, por que pararam; número ilegível fica fora da soma e avisado

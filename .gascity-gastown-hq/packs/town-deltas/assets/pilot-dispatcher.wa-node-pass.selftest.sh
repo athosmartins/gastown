@@ -71,6 +71,8 @@ F_HPRIOR="$(need_fn _pilot_wa_node_pass_hold_prior)"; F_HPUT="$(need_fn _pilot_w
 # caso nos testes (6f), não abortar com FATAL — é o controle negativo que diz QUAIS casos o conserto muda
 F_RMEMO="$(fn_src _pilot_wa_node_pass_released_memo)"; F_RSON="$(fn_src _pilot_node_reserve_on)"; F_RSSET="$(fn_src _pilot_node_reserve_set)"; F_RSCLR="$(fn_src _pilot_node_reserve_clear)"
 F_RSFOR="$(fn_src _pilot_node_reserved_for)"; F_P2HOLD="$(fn_src _pilot_node_p2_hold_for)"
+# ga-31u0zl7: o modo do botão unknown→nó. fn_src, não need_fn, DE PROPÓSITO: num dispatcher sem a fatia o arquivo tem de reprovar caso a caso nos testes (6h), não abortar com FATAL
+F_U2N="$(fn_src _pilot_wa_node_pass_u2n_mode)"
 VETO_LINE="$(grep -E '^PILOT_NODE_FIRST_VETO_LABELS="' "$DISPATCHER" | head -1)"
 PWP_INIT="$(grep -E '^(_PWP_[A-Z_]+|_PNR_[A-Z_]+|_PNH_[A-Z_]+|_PILOT_WA_NODE_PASS|_PWN_APPLY_RC|_PWN_BJ)=' "$DISPATCHER")"
 EXEMPT_LINE="$(grep -E '^PILOT_WA_NODE_EXEMPT="' "$DISPATCHER" | head -1)"
@@ -88,18 +90,25 @@ cat > "$WORK/scripts/wa-node-dispatch.sh" <<'EOF'
 W="${SELFTEST_WORK:?}"
 echo "$*" >> "$W/wnd.calls"
 cmd="$1"; id="$2"
+# ga-31u0zl7: o que o script recebeu em WA_NODE_ACCEPT_UNKNOWN nesta chamada (UNSET = nem existe no ambiente; vazio = existe e vazio)
+echo "$cmd $id ACCEPT=${WA_NODE_ACCEPT_UNKNOWN-UNSET}" >> "$W/wnd.accept"
 [ -f "$W/chk.sleep" ] && sleep "$(cat "$W/chk.sleep")"
 if [ "$cmd" = apply ]; then rc=12; [ -f "$W/apply.rc" ] && rc=$(cat "$W/apply.rc"); exit "$rc"; fi
 rc=11; [ -f "$W/chk.$id" ] && rc=$(cat "$W/chk.$id")
 basis=text; [ -f "$W/chk.$id.basis" ] && basis=$(cat "$W/chk.$id.basis")
+# ga-31u0zl7: chk.<id>.promote = «a bead é unknown só por falta de prova»: com WA_NODE_ACCEPT_UNKNOWN=sem-prova no ambiente o script de verdade a promove (rc 0, base sem-prova); sem ele continua unknown
+promoted=0
+if [ "$rc" = 11 ] && [ -f "$W/chk.$id.promote" ] && [ "${WA_NODE_ACCEPT_UNKNOWN:-}" = sem-prova ]; then rc=0; basis=sem-prova; promoted=1; fi
 # ga-2hd02v.3.17: chk.<id>.reasons / chk.<id>.paths trazem a lista JSON que o classificador daria; chk.<id>.raw substitui a saída inteira (o que o jq não lê)
 rs='["x"]'; [ -f "$W/chk.$id.reasons" ] && rs=$(cat "$W/chk.$id.reasons")
 ps='[]'; [ -f "$W/chk.$id.paths" ] && ps=$(cat "$W/chk.$id.paths")
 if [ -f "$W/chk.$id.raw" ]; then cat "$W/chk.$id.raw"; exit "$rc"; fi
+# ga-31u0zl7: chk.<id>.info = a lista JSON do `info` do classificador (os sinais fracos e as leituras que falharam); sem o arquivo a chave nem existe na saída
+ik=""; [ -f "$W/chk.$id.info" ] && ik=",\"info\":$(cat "$W/chk.$id.info")"
 case "$rc" in
-  0)  rs='[]'; [ -f "$W/chk.$id.reasons" ] && rs=$(cat "$W/chk.$id.reasons"); echo "{\"verdict\":\"node\",\"basis\":\"$basis\",\"reasons\":$rs,\"paths\":$ps}" ;;
-  10) echo "{\"verdict\":\"mini\",\"basis\":\"\",\"reasons\":$rs,\"paths\":$ps}" ;;
-  11) echo "{\"verdict\":\"unknown\",\"basis\":\"\",\"reasons\":$rs,\"paths\":$ps}" ;;
+  0)  rs='[]'; [ "$promoted" = 1 ] && rs='["sem-prova-de-codigo-e-teste"]'; [ -f "$W/chk.$id.reasons" ] && rs=$(cat "$W/chk.$id.reasons"); echo "{\"verdict\":\"node\",\"basis\":\"$basis\",\"reasons\":$rs,\"paths\":$ps$ik}" ;;
+  10) echo "{\"verdict\":\"mini\",\"basis\":\"\",\"reasons\":$rs,\"paths\":$ps$ik}" ;;
+  11) echo "{\"verdict\":\"unknown\",\"basis\":\"\",\"reasons\":$rs,\"paths\":$ps$ik}" ;;
   99) echo 'isto nao e json' ; rc=0 ;;
 esac
 exit "$rc"
@@ -136,7 +145,7 @@ exit 0
 EOF
 chmod +x "$WORK/bin/bd"
 sandbox_path_init "$WORK" jq date timeout mkdir dirname cat rm sh awk mv wc tr sleep grep sort || exit 2
-reset() { rm -f "$WORK"/chk.* "$WORK"/apply.rc "$WORK"/wnd.calls "$WORK"/bd.calls "$WORK"/bd.show.rc "$WORK"/bd.show.n "$WORK"/bd.show.failafter "$WORK"/bd.update.rc "$WORK"/bd.update.partial "$WORK"/bd.noeffect "$WORK"/d1.* "$WORK"/notes "$WORK"/city/.gc/*.tsv "$WORK"/city/.gc/*.jsonl "$WORK"/block.rel "$WORK"/lines; }
+reset() { rm -f "$WORK"/chk.* "$WORK"/apply.rc "$WORK"/wnd.calls "$WORK"/bd.calls "$WORK"/bd.show.rc "$WORK"/bd.show.n "$WORK"/bd.show.failafter "$WORK"/bd.update.rc "$WORK"/bd.update.partial "$WORK"/bd.noeffect "$WORK"/d1.* "$WORK"/notes "$WORK"/city/.gc/*.tsv "$WORK"/city/.gc/*.jsonl "$WORK"/block.rel "$WORK"/lines "$WORK"/wnd.accept "$WORK"/city/.gc/wa-node-unknown-shadow.done; }
 chk() { echo "$2" > "$WORK/chk.$1"; }
 wnd_calls() { [ -f "$WORK/wnd.calls" ] && wc -l < "$WORK/wnd.calls" | tr -d ' ' || echo 0; }
 bd_writes() { [ -f "$WORK/bd.calls" ] || { echo 0; return; }; grep -c ' update ' "$WORK/bd.calls" || true; }
@@ -159,10 +168,12 @@ PRELUDE='
   [ -z "${T_FAILS+x}" ] || PILOT_WA_NODE_PASS_MAX_FAILS="$T_FAILS"
   [ -z "${T_MEMO_TTL+x}" ] || PILOT_WA_NODE_PASS_MINI_TTL="$T_MEMO_TTL"
   eval "$VETO_LINE"; eval "$PWP_INIT"
+  PILOT_WA_NODE_UNKNOWN_MARKER="$WORK/city/.gc/wa-node-unknown-shadow.done"
+  if [ -n "${T_U2N_UNSET:-}" ]; then unset PILOT_WA_NODE_UNKNOWN_TO_NODE; else PILOT_WA_NODE_UNKNOWN_TO_NODE="${T_U2N-off}"; fi
   PILOT_WA_NODE_PASS_MEMO="$WORK/city/.gc/wa-node-pass-memo.tsv"; PILOT_WA_NODE_PASS_LOG="$WORK/city/.gc/wa-node-exempt.jsonl"
   PILOT_WA_NODE_PASS_HOLD_STATE="${T_HOLD_STATE-$WORK/city/.gc/wa-node-pass-hold.tsv}"
   [ -z "${T_HOLD_MAX+x}" ] || PILOT_WA_NODE_PASS_HOLD_MAX_SWEEPS="$T_HOLD_MAX"
-  eval "$F_VETO"; eval "$F_SPAWN"; eval "$F_MODE"; eval "$F_PRE"; eval "$F_MHIT"; eval "$F_MPUT"; eval "$F_CHECK"; eval "$F_STATE"; eval "$F_ADOPT"; eval "$F_UNADOPT"; eval "$F_CLASS"; eval "$F_HOLD"; eval "$F_WLANE"; eval "$F_WHYV"; eval "$F_HPRIOR"; eval "$F_HPUT"; eval "$F_RMEMO"; eval "$F_RSON"; eval "$F_RSSET"; eval "$F_RSCLR"; eval "$F_RSFOR"; eval "$F_P2HOLD"; eval "$F_PASS"; eval "$F_PNOTE"
+  eval "$F_VETO"; eval "$F_SPAWN"; eval "$F_MODE"; eval "$F_PRE"; eval "$F_MHIT"; eval "$F_MPUT"; eval "$F_CHECK"; eval "$F_STATE"; eval "$F_ADOPT"; eval "$F_UNADOPT"; eval "$F_CLASS"; eval "$F_HOLD"; eval "$F_WLANE"; eval "$F_WHYV"; eval "$F_U2N"; eval "$F_HPRIOR"; eval "$F_HPUT"; eval "$F_RMEMO"; eval "$F_RSON"; eval "$F_RSSET"; eval "$F_RSCLR"; eval "$F_RSFOR"; eval "$F_P2HOLD"; eval "$F_PASS"; eval "$F_PNOTE"
   _PY_WAIT_ID="${T_WAIT-}"; _PY_WAIT_PRIO=1   # o waiter da cessão (ga-5fn5p3), como a varredura do waiter o deixa antes da passada; vazio = nenhum P0/P1 espera
   # T_REFUSAL vale para toda bead; com T_REFUSAL_ID, SÓ para a bead desse id (as demais: ninguém recusa) — é como o waiter tem a recusa ilegível e a P2 não
   _pilot_priority_refusal_of() { local _ri=""; if [ -n "${T_REFUSAL_ID-}" ]; then _ri=$(printf "%s" "$1" | jq -r ".id // empty" 2>/dev/null) || _ri=""; [ "$_ri" = "$T_REFUSAL_ID" ] || return 0; fi; case "${T_REFUSAL-}" in FAIL) return 1 ;; *) printf "%s" "${T_REFUSAL-}"; return 0 ;; esac; }
@@ -174,6 +185,7 @@ PRELUDE='
   dispatch_one() {
     local _i; _i=$(printf "%s" "$1" | jq -r .id)
     echo "$_i $2 $3 pass=${_PILOT_WA_NODE_PASS:-?}" >> "$WORK/d1.calls"
+    echo "$_i ${WA_NODE_ACCEPT_UNKNOWN-UNSET}" >> "$WORK/d1.accept"   # ga-31u0zl7: o ambiente que o apply real herdaria
     _PWN_APPLY_RC=""; [ ! -f "$WORK/d1.apply.$_i" ] || _PWN_APPLY_RC=$(cat "$WORK/d1.apply.$_i")
     # ga-2hd02v.3.26: o gancho real (decide→open) registra a reserva do nó quando a sessão não abre; d1.reserve.<id> (o rc do open) faz o stub fazer o mesmo, com a bead JSON que a passada entregou
     [ ! -f "$WORK/d1.reserve.$_i" ] || _pilot_node_reserve_set "$1" "$_i" "stub: a sessão do nó não abriu" "$(cat "$WORK/d1.reserve.$_i")"
@@ -999,6 +1011,129 @@ T_SPAWN=pilot T_SLOTS=3 pass "[$P3S]" "[$H0B]" >/dev/null
 reset; chk wa-h1b 0; chk wa-h0s 0; setok wa-h1b wa-h0s; H0S="$(jbp 0 wa-h0s U1 wa-worker story:approved)"
 T_WAIT=wa-h1b pass "[$H0S]" "[$H1B]" >/dev/null
 [ "$(d1)" = "wa-h1b big feature pass=1;" ] && ok "(l) waiter P1 na big + P0 não-waiter na small, 1 vaga: a pista do waiter vai primeiro dentro da rodada hot (a regra do 6b segue valendo)" || bad "(l) waiter: $(d1)"
+
+echo "── (6h) ga-31u0zl7: o unknown que é só falta de prova vai ao nó (PILOT_WA_NODE_UNKNOWN_TO_NODE off|shadow|on|auto)"
+MARK="$WORK/city/.gc/wa-node-unknown-shadow.done"
+promote() { local i; for i in "$@"; do : > "$WORK/chk.$i.promote"; done; }
+u2m() { run_t '_pilot_wa_node_pass_mode; _pilot_wa_node_pass_u2n_mode; echo "$_PWP_U2N $_PWP_U2N_AUTO"'; }
+# (a) a tabela do botão: três estados, e o duvidoso cai no inerte (off), nunca no «ligado por engano»
+reset; r=$(T_U2N_UNSET=1 u2m);          [ "$r" = "shadow 1" ] && ok "botão AUSENTE e sem marcador: shadow (a sombra que falta; auto=1)" || bad "botão ausente: '$r'"
+reset; : > "$MARK"; r=$(T_U2N_UNSET=1 u2m); [ "$r" = "on 0" ] && ok "botão AUSENTE e marcador presente: on" || bad "botão ausente + marcador: '$r'"
+reset; r=$(T_U2N=auto u2m);             [ "$r" = "shadow 1" ] && ok "auto sem marcador: shadow" || bad "auto sem marcador: '$r'"
+reset; : > "$MARK"; r=$(T_U2N=auto u2m);    [ "$r" = "on 0" ] && ok "auto com marcador: on" || bad "auto com marcador: '$r'"
+reset; mkdir "$MARK"; r=$(T_U2N=auto u2m);  [ "$r" = "shadow 1" ] && ok "auto com marcador que NÃO se lê (diretório): shadow — ligar sem a prova de que a sombra rodou é o que não se faz" || bad "marcador diretório: '$r'"
+rmdir "$MARK" 2>/dev/null
+for combo in "on|on 0" "shadow|shadow 0" "off|off 0" "|off 0" "ON|off 0" "bogus|off 0" "true|off 0" "1|off 0" " on|off 0"; do
+  v="${combo%%|*}"; want="${combo#*|}"; reset
+  r=$(T_U2N="$v" u2m); [ "$r" = "$want" ] && ok "botão='$v' → $want (vazio e erro de digitação = off)" || bad "botão='$v' deu '$r' (esperado $want)"
+done
+reset; r=$(T_ROUTE=label T_U2N=on u2m);                [ "$r" = "off 0" ] && ok "rota label: off (o apply do modo label recusa base que não é label)" || bad "rota label: '$r'"
+reset; r=$(T_ROUTE=shadow T_EXEMPT=shadow T_U2N=on u2m); [ "$r" = "off 0" ] && ok "rota shadow: off" || bad "rota shadow: '$r'"
+reset; r=$(T_EXEMPT=shadow T_U2N=on u2m);              [ "$r" = "shadow 0" ] && ok "passada em modo shadow (nada despacha) com botão on: shadow, nunca on" || bad "passada shadow: '$r'"
+reset; r=$(T_EXEMPT=off T_U2N=on u2m);                 [ "$r" = "off 0" ] && ok "passada desligada: off" || bad "passada off: '$r'"
+reset; r=$(T_DRY=1 T_U2N=on u2m);                      [ "$r" = "off 0" ] && ok "DRY_RUN: off" || bad "dry-run: '$r'"
+# (b) o 3º argumento do check: o ambiente só existe quando se pede, e só com o valor exato
+ckacc() { ( eval "$PRELUDE"; _pilot_wa_node_pass_check "$1" "$WORK/store" "${2-}"; echo "$_PWP_V ${_PWP_BASIS:-}" ) 2>&1 | tail -1; }
+accept_seen() { awk -v i="$1" '$2 == i {print $3}' "$WORK/wnd.accept" 2>/dev/null | tail -1; }
+reset; chk wa-a 11; promote wa-a
+r=$(ckacc wa-a sem-prova); [ "$r" = "node sem-prova" ] && [ "$(accept_seen wa-a)" = "ACCEPT=sem-prova" ] && ok "check com o 3º argumento sem-prova: o script recebe WA_NODE_ACCEPT_UNKNOWN=sem-prova e a bead promovida volta node/sem-prova" || bad "check com sem-prova: '$r' / $(accept_seen wa-a)"
+reset; chk wa-a 11; promote wa-a
+r=$(ckacc wa-a); [ "$r" = "unknown " ] && [ "$(accept_seen wa-a)" = "ACCEPT=" ] && ok "check SEM o argumento: o script recebe a variável VAZIA e a bead segue unknown (o de sempre)" || bad "check sem argumento: '$r' / $(accept_seen wa-a)"
+reset; chk wa-a 11; promote wa-a
+r=$(ckacc wa-a true); [ "$r" = "unknown " ] && [ "$(accept_seen wa-a)" = "ACCEPT=" ] && ok "check com argumento ilegível (true): tratado como ausente — o valor exato é o único que liga" || bad "check com true: '$r' / $(accept_seen wa-a)"
+reset; chk wa-a 0
+r=$(ckacc wa-a sem-prova); [ "$r" = "node text" ] && ok "node de verdade com o argumento: continua node/text (a base não muda)" || bad "node de verdade: '$r'"
+# (c) a passada inteira
+U1="$(jb wa-u1 U1 wa-worker story:approved)"; U2="$(jb wa-u2 U1 wa-worker story:approved)"; G1="$(jb wa-g1 U1 wa-worker story:approved)"
+SU="[$U1,$U2,$G1]"
+passenv() { SJ="$1" run_t 'SMALL_CANDIDATES="$SJ"; BIG_CANDIDATES="[]"; SMALL_COUNT=$(echo "$SMALL_CANDIDATES"|jq length); BIG_COUNT=0; _pilot_wa_node_pass; echo "D=$DISPATCHED ENV=${WA_NODE_ACCEPT_UNKNOWN-UNSET}"'; }
+acc_of() { awk -v i="$1" '$1 == i {print $2}' "$WORK/d1.accept" 2>/dev/null | tail -1; }
+# T1 — shadow explícito: grava «iria ao nó», não despacha, memoriza 15 min (released) e não 1 h, e NÃO escreve o marcador
+reset; chk wa-u1 11; promote wa-u1; chk wa-u2 11; chk wa-g1 10
+r=$(T_U2N=shadow passenv "$SU")
+[ "$r" = "D=0 ENV=UNSET" ] && [ "$(d1)" = "-" ] && ok "shadow: nenhuma bead despachada e o ambiente fica limpo — $r" || bad "shadow despachou ou vazou o ambiente: $r / d1=$(d1)"
+jq -e 'select(.event=="wa-node-pass-shadow-unknown" and .bead=="wa-u1" and .basis=="sem-prova" and .u2n_mode=="shadow" and .prio==2)' "$PLOG" >/dev/null 2>&1 && ok "shadow: grava wa-node-pass-shadow-unknown da wa-u1 (base sem-prova, modo, prioridade lida)" || bad "shadow: linha ausente: $(cat "$PLOG" 2>/dev/null | cut -c1-300)"
+[ "$(jq -c 'select(.event=="wa-node-pass-shadow-unknown")' "$PLOG" | wc -l | tr -d ' ')" = 1 ] && ok "shadow: SÓ a wa-u1 gera a linha (a wa-u2, unknown por outro caminho, não)" || bad "shadow: linhas demais"
+jq -e 'select(.event=="wa-node-pass-probe" and .bead=="wa-u1" and .verdict=="unknown" and .basis=="sem-prova")' "$PLOG" >/dev/null 2>&1 && ok "shadow: a linha da sonda guarda verdict=unknown com basis=sem-prova (é o «iria ao nó» da sombra)" || bad "shadow: sonda: $(jq -c 'select(.event=="wa-node-pass-probe" and .bead=="wa-u1")' "$PLOG" | cut -c1-300)"
+[ "$(memo_of)" = "wa-g1:mini,wa-u1:released,wa-u2:unknown," ] && ok "shadow: a sombra memoriza released (15 min), o unknown comum segue unknown (1 h)" || bad "shadow: memória '$(memo_of)'"
+summ | jq -e '.unknown_shadow==1 and .node_from_unknown==0 and .kept_from_unknown==0 and .u2n_mode=="shadow" and .unknown==2 and .kept==0' >/dev/null 2>&1 && ok "shadow: resumo com unknown_shadow=1 node_from_unknown=0 kept_from_unknown=0 u2n_mode=shadow" || bad "shadow: resumo $(summ | cut -c1-400)"
+[ "$(accept_seen wa-u1)" = "ACCEPT=sem-prova" ] && [ ! -e "$MARK" ] && ok "shadow explícito: o check pediu a promoção e o marcador NÃO foi escrito (só o auto escreve)" || bad "shadow: accept=$(accept_seen wa-u1) marcador=$([ -e "$MARK" ] && echo sim || echo nao)"
+grep -q 'unknown→nó (modo shadow): promovidas=0 despachadas=0 sombra=1' "$WORK/lines" && ok "shadow: o log da varredura diz «unknown→nó (modo shadow): promovidas=0 despachadas=0 sombra=1»" || bad "shadow: log $(grep 'passada de WA' "$WORK/lines" | cut -c1-500)"
+# T2 — on: a promovida vai ao despacho COM o ambiente; a node de verdade vai SEM; o ambiente é limpo depois
+reset; chk wa-u1 11; promote wa-u1; chk wa-u2 11; chk wa-g1 0; setok wa-u1 wa-g1
+r=$(T_U2N=on T_SPAWN=pilot T_SLOTS=3 passenv "$SU")
+[ "$r" = "D=2 ENV=UNSET" ] && ok "on: duas despachadas e o ambiente limpo depois — $r" || bad "on: $r"
+[ "$(d1)" = "wa-u1 small feature pass=1;wa-g1 small feature pass=1;" ] && ok "on: dispatch_one para wa-u1 (promovida) e wa-g1 (node de verdade), nessa ordem; wa-u2 (unknown comum) não" || bad "on: chamadas $(d1)"
+[ "$(acc_of wa-u1)" = sem-prova ] && ok "on: o apply da promovida herda WA_NODE_ACCEPT_UNKNOWN=sem-prova" || bad "on: ambiente da wa-u1 = '$(acc_of wa-u1)'"
+[ "$(acc_of wa-g1)" = UNSET ] && ok "on: o apply da node de VERDADE NÃO recebe a variável (só a promovida a carrega)" || bad "on: ambiente da wa-g1 = '$(acc_of wa-g1)'"
+summ | jq -e '.node_from_unknown==1 and .kept_from_unknown==1 and .kept==2 and .node==2 and .unknown_shadow==0 and .u2n_mode=="on"' >/dev/null 2>&1 && ok "on: resumo node_from_unknown=1 kept_from_unknown=1 (kept=2 node=2)" || bad "on: resumo $(summ | cut -c1-400)"
+jq -e 'select(.event=="wa-node-pass-probe" and .bead=="wa-u1" and .verdict=="node" and .basis=="sem-prova" and (.classes == ["sem-prova-de-codigo-e-teste"]))' "$PLOG" >/dev/null 2>&1 && ok "on: a linha da sonda guarda verdict=node basis=sem-prova com o motivo original" || bad "on: sonda $(jq -c 'select(.event=="wa-node-pass-probe" and .bead=="wa-u1")' "$PLOG" | cut -c1-300)"
+[ "$(memo_of)" = "wa-u2:unknown," ] && ok "on: só o unknown comum entra na memória (a promovida despachada e a node não)" || bad "on: memória '$(memo_of)'"
+# T3 — on, mas o apply desmente (rc 11): a bead volta a unknown na memória, conta falha, e o ambiente também é limpo
+reset; chk wa-u1 11; promote wa-u1; echo 1 > "$WORK/d1.rc.wa-u1"; echo 11 > "$WORK/d1.apply.wa-u1"
+r=$(T_U2N=on passenv "[$U1]")
+[ "$r" = "D=0 ENV=UNSET" ] && [ "$(memo_of)" = "wa-u1:unknown," ] && summ | jq -e '.node_from_unknown==1 and .kept_from_unknown==0 and .released==1' >/dev/null 2>&1 && ok "on, apply rc 11: ambiente limpo, memória unknown, node_from_unknown=1 kept_from_unknown=0 released=1" || bad "on com apply 11: $r / $(memo_of) / $(summ | cut -c1-300)"
+# T4 — botão off: o check NÃO pede a promoção, nada é registrado, a bead é o unknown de sempre
+reset; chk wa-u1 11; promote wa-u1
+r=$(T_U2N=off passenv "[$U1]")
+[ "$r" = "D=0 ENV=UNSET" ] && [ "$(accept_seen wa-u1)" = "ACCEPT=" ] && [ "$(memo_of)" = "wa-u1:unknown," ] && ! grep -q shadow-unknown "$PLOG" && summ | jq -e '.u2n_mode=="off" and .unknown_shadow==0 and .node_from_unknown==0' >/dev/null 2>&1 && ok "off: o check vai com a variável VAZIA, a bead é o unknown de sempre (memória 1 h), sem linha-sombra" || bad "off: $r / accept=$(accept_seen wa-u1) / $(memo_of) / $(summ | cut -c1-300)"
+# T5 — auto sem marcador: esta passada é a sombra e ESCREVE o marcador; a passada seguinte (marcador presente) liga
+reset; chk wa-u1 11; promote wa-u1; chk wa-u2 11
+r=$(T_U2N_UNSET=1 passenv "[$U1,$U2]")
+[ "$r" = "D=0 ENV=UNSET" ] && [ -s "$MARK" ] && ok "auto sem marcador: a passada é sombra (nada despachado) e GRAVA o marcador (com a hora)" || bad "auto/sombra: $r / marcador=$([ -e "$MARK" ] && echo sim || echo nao)"
+grep -q 'a passada-sombra rodou (sondadas=2, unknown que iria ao nó=1)' "$WORK/lines" && ok "auto: o log diz que a sombra rodou (sondadas=2, iria ao nó=1) e onde está o marcador" || bad "auto: log $(grep 'ga-31u0zl7' "$WORK/lines" | cut -c1-400)"
+summ | jq -e '.u2n_mode=="shadow" and .unknown_shadow==1' >/dev/null 2>&1 && ok "auto/sombra: resumo u2n_mode=shadow unknown_shadow=1" || bad "auto/sombra: resumo $(summ | cut -c1-300)"
+reset; chk wa-u1 11; promote wa-u1; chk wa-u2 11; setok wa-u1; : > "$MARK"
+r=$(T_U2N_UNSET=1 passenv "[$U1,$U2]")
+[ "$r" = "D=1 ENV=UNSET" ] && [ "$(acc_of wa-u1)" = sem-prova ] && summ | jq -e '.u2n_mode=="on" and .node_from_unknown==1 and .kept_from_unknown==1' >/dev/null 2>&1 && ok "auto COM marcador: a passada seguinte é on — a promovida despacha com o ambiente" || bad "auto/on: $r / $(summ | cut -c1-300)"
+# T6 — auto sem sonda NÃO conta como sombra: marcador não é escrito
+reset; r=$(T_U2N_UNSET=1 passenv "[]"); [ ! -e "$MARK" ] && ok "auto, passada sem candidata: NENHUMA sonda → sem marcador (a sombra não rodou)" || bad "auto sem sonda escreveu o marcador"
+reset; OW="$(jb wa-o1 U1 wa-worker story:approved mila-wa)"; r=$(T_U2N_UNSET=1 passenv "[$OW]"); [ ! -e "$MARK" ] && ok "auto, só bead com dono (pulada antes da sonda): sem marcador" || bad "auto, bead com dono escreveu o marcador"
+reset; chk wa-u1 11; promote wa-u1
+r=$(T_U2N_UNSET=1 SJ="[$U1]" run_t 'PILOT_WA_NODE_SCRIPTS="$WORK/nao-existe"; SMALL_CANDIDATES="$SJ"; BIG_CANDIDATES="[]"; SMALL_COUNT=1; BIG_COUNT=0; _pilot_wa_node_pass; echo "stop=$_PWP_LAST_STOP"')
+[ "$r" = "stop=check-missing" ] && [ ! -e "$MARK" ] && ok "auto com o script do check ausente (check-missing): a sonda não provou nada → sem marcador" || bad "auto/check-missing: $r / marcador=$([ -e "$MARK" ] && echo sim || echo nao)"
+# T7 — marcador que não grava: avisa e a passada seguinte é sombra de novo
+reset; chk wa-u1 11; promote wa-u1; : > "$WORK/notadir"
+r=$(T_U2N_UNSET=1 SJ="[$U1]" run_t 'PILOT_WA_NODE_UNKNOWN_MARKER="$WORK/notadir/sub/x.done"; SMALL_CANDIDATES="$SJ"; BIG_CANDIDATES="[]"; SMALL_COUNT=1; BIG_COUNT=0; _pilot_wa_node_pass; echo "D=$DISPATCHED"')
+[ "$r" = "D=0" ] && grep -q 'WARN ga-31u0zl7: não consegui gravar o marcador da sombra' "$WORK/lines" && [ ! -e "$WORK/notadir/sub/x.done" ] && ok "marcador que não grava: AVISA, nada é despachado e a próxima passada será sombra de novo" || bad "marcador que não grava: $r / $(grep ga-31u0zl7 "$WORK/lines" | cut -c1-300)"
+rm -f "$WORK/notadir"
+# T8 — a P0/P1 da sombra NÃO é memorizada (tentada de novo na próxima passada), a P2 é
+reset; V1="$(jbp 1 wa-v1 U1 wa-worker story:approved)"; chk wa-v1 11; promote wa-v1
+r=$(T_U2N=shadow passenv "[$V1]")
+[ "$(memo_of)" = "-" ] && jq -e 'select(.event=="wa-node-pass-shadow-unknown" and .bead=="wa-v1" and .prio==1)' "$PLOG" >/dev/null 2>&1 && ok "sombra de P1: a linha sai com prio=1 e a bead NÃO entra na memória (P0/P1 é tentada na varredura seguinte)" || bad "sombra de P1: memória '$(memo_of)' / $(cat "$PLOG" 2>/dev/null | cut -c1-200)"
+# T9 — o waiter da cessão que a sombra olha fica blind (não se sabe se irá), como com qualquer unknown
+reset; chk wa-w1 11; promote wa-w1
+T_WAIT=wa-w1 T_U2N=shadow passenv "[$W1]" >/dev/null
+summ | jq -e '.waiter=="wa-w1" and .waiter_verdict=="blind"' >/dev/null 2>&1 && ok "waiter promovido pela sombra: veredito blind (a retenção da P2+ segue valendo)" || bad "waiter na sombra: $(summ | cut -c1-300)"
+# T10 — rota label: o botão é off e o check vai sem a promoção
+reset; L1="$(jb wa-l1 U1 wa-worker story:approved,node:ok)"; chk wa-l1 11; promote wa-l1
+r=$(T_ROUTE=label T_U2N=on passenv "[$L1]")
+[ "$(accept_seen wa-l1)" = "ACCEPT=" ] && [ "$r" = "D=0 ENV=UNSET" ] && ok "rota label com o botão on: o check vai sem a promoção (o apply do modo label recusaria)" || bad "rota label: $r / accept=$(accept_seen wa-l1)"
+# T11 — o script promoveu (node/sem-prova) mas o botão está off: NÃO despacha (o inerte), e deixa a linha-sombra
+reset; chk wa-u1 0; echo sem-prova > "$WORK/chk.wa-u1.basis"; setok wa-u1
+r=$(T_U2N=off passenv "[$U1]")
+[ "$r" = "D=0 ENV=UNSET" ] && [ "$(d1)" = "-" ] && jq -e 'select(.event=="wa-node-pass-shadow-unknown" and .bead=="wa-u1" and .u2n_mode=="off")' "$PLOG" >/dev/null 2>&1 && ok "node/sem-prova com o botão off (o script promoveu sem ser pedido): NÃO despacha e deixa a linha-sombra" || bad "sem-prova com botão off: $r / d1=$(d1)"
+# T10b — `sinais`: o que o classificador pôs no info (só o prefixo, sem repetição), em três estados: lista / [] / null
+reset; chk wa-u1 11; promote wa-u1; echo '["palavra-mole:banco-de-dados","dado-de-lead:leads","palavra-mole:credencial","envio-whatsapp:x"]' > "$WORK/chk.wa-u1.info"
+chk wa-u2 11; promote wa-u2; echo '[]' > "$WORK/chk.wa-u2.info"
+chk wa-u3 11; promote wa-u3
+U3="$(jb wa-u3 U1 wa-worker story:approved)"
+T_U2N=shadow passenv "[$U1,$U2,$U3]" >/dev/null
+jq -e 'select(.event=="wa-node-pass-probe" and .bead=="wa-u1" and .sinais == ["dado-de-lead","envio-whatsapp","palavra-mole"])' "$PLOG" >/dev/null 2>&1 && ok "sinais: a sonda guarda os PREFIXOS do info, sem repetir e em ordem (palavra-mole 2x vira 1)" || bad "sinais da wa-u1: $(jq -c 'select(.event=="wa-node-pass-probe" and .bead=="wa-u1")' "$PLOG" | cut -c1-300)"
+jq -e 'select(.event=="wa-node-pass-shadow-unknown" and .bead=="wa-u1" and .sinais == ["dado-de-lead","envio-whatsapp","palavra-mole"])' "$PLOG" >/dev/null 2>&1 && ok "sinais: a linha-sombra também os carrega (é o que se cruza com a taxa de devolução)" || bad "sinais na sombra: $(jq -c 'select(.event=="wa-node-pass-shadow-unknown" and .bead=="wa-u1")' "$PLOG" | cut -c1-300)"
+jq -e 'select(.event=="wa-node-pass-probe" and .bead=="wa-u2" and (has("sinais")) and .sinais == [])' "$PLOG" >/dev/null 2>&1 && ok "sinais: info [] = o classificador NÃO pôs sinal nenhum -> []" || bad "sinais da wa-u2 (info vazio): $(jq -c 'select(.event=="wa-node-pass-probe" and .bead=="wa-u2")' "$PLOG" | cut -c1-300)"
+jq -e 'select(.event=="wa-node-pass-probe" and .bead=="wa-u3" and (has("sinais")) and .sinais == null)' "$PLOG" >/dev/null 2>&1 && ok "sinais: info AUSENTE = não li -> null (nunca [] nem «sem sinal»)" || bad "sinais da wa-u3 (sem info): $(jq -c 'select(.event=="wa-node-pass-probe" and .bead=="wa-u3")' "$PLOG" | cut -c1-300)"
+reset; chk wa-u1 11; echo '"palavra-mole:x"' > "$WORK/chk.wa-u1.info"; T_U2N=off passenv "[$U1]" >/dev/null
+jq -e 'select(.event=="wa-node-pass-probe" and .bead=="wa-u1" and .sinais == null)' "$PLOG" >/dev/null 2>&1 && ok "sinais: info que não é lista -> null" || bad "sinais com info texto: $(jq -c 'select(.event=="wa-node-pass-probe" and .bead=="wa-u1")' "$PLOG" | cut -c1-300)"
+# T12 — passada em modo shadow com o botão on: sombra, nunca despacho
+reset; chk wa-u1 11; promote wa-u1; setok wa-u1
+r=$(T_EXEMPT=shadow T_U2N=on passenv "[$U1]")
+[ "$r" = "D=0 ENV=UNSET" ] && [ "$(d1)" = "-" ] && jq -e 'select(.event=="wa-node-pass-shadow-unknown" and .u2n_mode=="shadow")' "$PLOG" >/dev/null 2>&1 && ok "passada em modo shadow + botão on: só sombra (nada é despachado)" || bad "passada shadow + botão on: $r / d1=$(d1)"
+# (d) o escopo do ambiente, no texto do dispatcher: UM export, depois do check; UM unset depois do dispatch_one; o outro chamador do check (passo do MBP) não pede a promoção
+[ "$(grep -c 'export WA_NODE_ACCEPT_UNKNOWN' "$DISPATCHER")" = 1 ] && ok "o dispatcher exporta WA_NODE_ACCEPT_UNKNOWN em UM lugar só" || bad "export de WA_NODE_ACCEPT_UNKNOWN: $(grep -c 'export WA_NODE_ACCEPT_UNKNOWN' "$DISPATCHER") lugares"
+L_EXP=$(grep -n 'export WA_NODE_ACCEPT_UNKNOWN' "$DISPATCHER" | head -1 | cut -d: -f1); L_D1=$(awk -v s="$L_EXP" 'NR > s && /dispatch_one "\$_pw_pick"/ {print NR; exit}' "$DISPATCHER"); L_UN=$(awk -v s="$L_EXP" 'NR > s && /^      unset WA_NODE_ACCEPT_UNKNOWN$/ {print NR; exit}' "$DISPATCHER")
+{ [ -n "$L_EXP" ] && [ -n "$L_D1" ] && [ -n "$L_UN" ] && [ "$L_EXP" -lt "$L_D1" ] && [ "$L_D1" -lt "$L_UN" ]; } && ok "export ($L_EXP) → dispatch_one ($L_D1) → unset ($L_UN): a variável existe só durante o despacho" || bad "escopo do export: export=$L_EXP dispatch=$L_D1 unset=$L_UN"
+grep -qE '^  _pilot_wa_node_pass_check "\$\{1:-\}" "\$\{2:-\}"$' "$DISPATCHER" && ok "o OUTRO chamador do check (passo do MBP) segue sem o 3º argumento: a promoção é só da passada de WA" || bad "o passo do MBP mudou a chamada do check"
 
 echo "── (7) dispatch_one: o bloco do yield e o braço do pool (regiões VERBATIM)"
 run_block() {

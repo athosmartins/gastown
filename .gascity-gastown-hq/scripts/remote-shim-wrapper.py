@@ -30,7 +30,7 @@ LISTA PERMITIDA
   tem o rótulo `type:quality-gate-verdict`, só passam quando o assignee é o alias declarado da sessão (o dispatcher lê o `VERDICT:` dos comentários dela, PASS antes de FAIL: uma sessão
   do nó que comentasse na bead de um revisor morto forjaria o veredito). Bead sem esse rótulo passa como antes. Leitura que falhou ou veio fora da forma = recusa (77, "nada foi executado, pode repetir").
   DEVOLVER A BEAD (ga-dxszii): `bd update <id> --if-assignee <alias> --if-status in_progress --assignee '' --status open --add-label node:never [--remove-label <rótulo do despacho>]...`.
-  Cada flag leva o valor EXATO (F(lit=…)); `<alias>` tem que ser o da sessão (Rule.apply); só na cidade (`city_only`); a guarda de dono é o compare-and-swap do próprio bd, então o wrapper
+  Cada flag leva o valor EXATO (F(lit=…)); `<alias>` tem que ser o da sessão (Rule.apply); só na cidade (`city_only`) e no rig whatsapp_automation (`also_rigs`, ga-31u0zl7); a guarda de dono é o compare-and-swap do próprio bd, então o wrapper
   NÃO lê a bead antes. É a ÚNICA forma de `bd` da lista que muda dono ou rótulo e o único `bd update` que muda status (o `bd close` fecha por outro caminho; o `gate-done` solta a bead por conta própria, no mini). Um pedido que nenhuma forma de um comando aceita é
   recusado com o motivo de CADA forma (decide), não só o da primeira.
 
@@ -150,16 +150,17 @@ class F:  # uma flag: val = nome em VAL (ou None se não leva valor), lit = os v
 
 
 class Rule:
-    def __init__(self, tool, words, pos=(), flags=None, owner_lock=False, hint="", city_only=False):
+    def __init__(self, tool, words, pos=(), flags=None, owner_lock=False, hint="", city_only=False, also_rigs=()):
         self.tool, self.words, self.pos, self.flags = tool, tuple(words), list(pos), dict(flags or {})
         self.short = {f.short: n for n, f in self.flags.items() if f.short}
         self.owner_lock = owner_lock  # escreve na bead <id>: em bead de veredito (VERDICT_LABEL) só passa para o dono (owner_gate); o serve() lê o estado antes
         self.hint = f" (forma: {hint})" if hint else ""  # só entra na recusa por contagem de posicionais: a mensagem diz a forma inteira, não só o 1º grupo que faltou
         self.city_only = city_only  # só vale na cidade (sem -C, ou -C . / o nome da cidade): bead de rig fica de fora (decide)
+        self.also_rigs = tuple(also_rigs)  # ga-31u0zl7: com city_only, além da cidade SÓ estes rigs, pelo NOME na routes.jsonl (nunca "qualquer rig"); vazio = só a cidade, como era
 
     def label(self) -> str:  # a linha que o runbook mostra: gerada da regra, então não há duas verdades
         w = " ".join(shlex.quote(x) if " " in x else x for x in self.words)
-        s = [self.tool + (" [-C .]" if self.city_only else " [-C <rig>]" if self.tool == "bd" else ""), w] if w else [self.tool]
+        s = [self.tool + ((" [-C ." + "".join("|" + n for n in self.also_rigs) + "]") if self.city_only else " [-C <rig>]" if self.tool == "bd" else ""), w] if w else [self.tool]
         for val, lo, hi in self.pos:
             s.append(f"<{val}>" + ("..." if hi > 1 else ""))
         for n, f in self.flags.items():
@@ -228,11 +229,11 @@ RULES = [
     Rule("bd", ["update"], [("id", 1, 1)], {**_J, "--set-metadata": F("kv", rep=True, req=True)}),
     # ga-dxszii: o dog do nó DEVOLVE ao mini a bead que não pode construir (ela só roda lá), numa escrita só e guardada pelo próprio bd: --if-assignee = o alias DESTA sessão e --if-status
     # in_progress (compare-and-swap: sem ler antes, então sem janela), dono vazio, status open, o veto node:never (sem ele o Pilot a manda de volta ao nó a cada varredura) e, se quiser, os rótulos
-    # do despacho. Cada flag tem o valor EXATO; nada mais passa (metadata, outro rótulo, outro status). Só na cidade: o veto node:never é do HQ. Fica DEPOIS da regra de --set-metadata: na recusa
+    # do despacho. Cada flag tem o valor EXATO; nada mais passa (metadata, outro rótulo, outro status). Só na cidade E no rig whatsapp_automation (ga-31u0zl7: o worker remoto de WA devolve a bead que não cabe no nó; o Pilot lê o veto node:never da bead do WA do mesmo jeito, nos dois lugares; nenhum outro rig). Fica DEPOIS da regra de --set-metadata: na recusa
     # de um pedido torto o motivo daquela vem primeiro e o desta vem junto (decide), com a forma inteira
     Rule("bd", ["update"], [("id", 1, 1)], {**_J, "--if-assignee": F("alias", req=True), "--if-status": F(lit=("in_progress",), req=True), "--assignee": F(lit=("",), req=True),
                                            "--status": F(lit=("open",), req=True), "--add-label": F(lit=("node:never",), req=True), "--remove-label": F(lit=DISPATCH_LABELS, rep=True)},
-         city_only=True),
+         city_only=True, also_rigs=("whatsapp_automation",)),
     Rule("bd", ["comment"], [("id", 1, 1), ("text", 1, 50)], {}, owner_lock=True),
     Rule("bd", ["comment"], [("id", 1, 1)], {"--stdin": F(req=True)}, owner_lock=True),
     Rule("bd", ["close"], [("id", 1, 1)], {**_J, "--reason": F("text", short="-r")}, owner_lock=True),
@@ -337,6 +338,7 @@ def decide(cfg: dict, tool: str, argv: list[str], env: dict) -> tuple[Rule, list
         if k in env and not cfg["identity_re"].fullmatch(env[k]):
             raise Refused(f"{k} não casa com identity_pattern da config")
     cwd = os.path.realpath(cfg["city"])
+    dirs: dict[str, str] = {}  # vazio (sem -C) → nenhum rig foi pedido; só o `-C` preenche (e uma routes.jsonl ilegível já levantou Refused acima)
     if tool == "bd" and argv[:1] == ["-C"]:
         if len(argv) < 2:
             raise Refused("-C sem valor")
@@ -354,8 +356,8 @@ def decide(cfg: dict, tool: str, argv: list[str], env: dict) -> tuple[Rule, list
             args = argv[len(r.words):]
             out, pos = r.apply(args, alias)
             final = list(r.words) + out
-            if r.city_only and cwd != os.path.realpath(cfg["city"]):
-                raise Refused("esta forma só vale na cidade (sem -C, ou -C .): bead de rig fica de fora")
+            if r.city_only and cwd != os.path.realpath(cfg["city"]) and not any(dirs.get(n) == cwd for n in r.also_rigs):
+                raise Refused("esta forma só vale na cidade (sem -C, ou -C .)" + "".join(f" ou no rig {n} (-C {n})" for n in r.also_rigs) + ": bead de outro rig fica de fora")
             if r.words == ("session", "nudge") and not (cfg["nudge_re"] and cfg["nudge_re"].fullmatch(pos[0])):  # pos[0] é o alvo que o gc usa; args[0] podia ser uma flag
                 raise Refused("alvo do nudge fora do nudge_pattern da config (sem a chave na config, nudge não roda)")
             return r, final, cwd, env

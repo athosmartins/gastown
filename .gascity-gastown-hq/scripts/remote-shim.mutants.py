@@ -91,9 +91,14 @@ MUTANTS = [
     ("devolver-sem-if-status", "w", '"--if-status": F(lit=("in_progress",), req=True)', '"--if-status": F(lit=("in_progress",))', r"devolver: sem --if-status"),
     ("devolver-reabre-bead-fechada", "w", '"--if-status": F(lit=("in_progress",), req=True)', '"--if-status": F(lit=("in_progress", "open", "closed"), req=True)', r"--if-status open"),
     ("devolver-sem-veto", "w", '"--add-label": F(lit=("node:never",), req=True)', '"--add-label": F(lit=("node:never",))', r"devolver: sem --add-label"),
-    ("devolver-em-bead-de-rig", "w", 'if r.city_only and cwd != os.path.realpath(cfg["city"]):', "if False:", r"bead de RIG"),
+    ("devolver-em-bead-de-rig", "w", 'if r.city_only and cwd != os.path.realpath(cfg["city"]) and not any(dirs.get(n) == cwd for n in r.also_rigs):', "if False:", r"bead de OUTRO rig"),
     ("devolver-aceita-metadata", "w", '"--remove-label": F(lit=DISPATCH_LABELS, rep=True)},', '"--remove-label": F(lit=DISPATCH_LABELS, rep=True), "--set-metadata": F("kv", rep=True)},', r"flag a mais: --set-metadata"),
-    ("devolver-le-a-bead-antes", "w", "city_only=True),", "city_only=True, owner_lock=True),", r"NÃO faz a leitura de estado do bd show"),  # ler e depois escrever deixa uma janela: a guarda é o compare-and-swap do bd
+    ("devolver-le-a-bead-antes", "w", 'also_rigs=("whatsapp_automation",)),', 'also_rigs=("whatsapp_automation",), owner_lock=True),', r"NÃO faz a leitura de estado do bd show"),  # ler e depois escrever deixa uma janela: a guarda é o compare-and-swap do bd
+    # ga-31u0zl7: a devolução vale no rig whatsapp_automation (e SÓ nele): o worker remoto de WA devolve a PRÓPRIA bead
+    ("devolver-wa-desligado", "w", 'city_only=True, also_rigs=("whatsapp_automation",)),', "city_only=True),", r"devolver bead do WA: bd -C whatsapp_automation"),
+    ("devolver-wa-qualquer-rig", "w", "and not any(dirs.get(n) == cwd for n in r.also_rigs):", "and False:", r"bead de OUTRO rig"),
+    ("devolver-wa-rig-errado", "w", 'also_rigs=("whatsapp_automation",)),', 'also_rigs=("wa_rig",)),', r"bead de OUTRO rig"),
+    ("devolver-wa-so-o-nome-existir", "w", "any(dirs.get(n) == cwd for n in r.also_rigs)", "any(dirs.get(n) is not None for n in r.also_rigs)", r"bead de OUTRO rig"),
     ("recusa-so-a-primeira-forma", "w", "for r, why in reasons[1:] if why != reasons[0][1])", "for r, why in reasons[:0] if why != reasons[0][1])", r"devolver: sem --if-assignee"),  # o 1º caso que lê o motivo da 2ª forma (o "falta --if-assignee" só vem junto)
     # ga-2hd02v.1.18: `gate-done <bead> <ref> <sha>`: a regra, o formato do sha e do ref (o executável confere o resto) e a recusa que diz a forma
     ("gate-done-3-args-sem-regra", "w", '    Rule("gate-done", [], [("id", 1, 1), ("ref", 1, 1), ("sha", 1, 1)], hint="gate-done <bead> <ref> <sha>, ou gate-done sem argumento"),\n', "", r"gate-done <bead> <ref> <sha>"),

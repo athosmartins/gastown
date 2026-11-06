@@ -26,9 +26,9 @@ skip() { skipped=$((skipped+1)); echo "SKIP $1"; }
 has() { grep -qF -- "$2" "$1" 2>/dev/null; }
 tmo() { perl -e 'alarm shift; exec @ARGV' "$@"; }  # ssh que "funciona demais" (restrict apagado) ficaria pendurado: teto de tempo
 
-CITY="$T/city"; WA="$T/wa_rig"; FB="$T/fakebin"; LOGF="$T/audit.log"; CONF="$T/conf.json"
-mkdir -p "$CITY/.beads" "$WA" "$FB" "$FB/beads" "$T/evil"
-printf '{"prefix":"ga","path":"."}\n{"prefix":"wa","path":"../wa_rig"}\n' > "$CITY/.beads/routes.jsonl"
+CITY="$T/city"; WA="$T/wa_rig"; WAR="$T/whatsapp_automation"; FB="$T/fakebin"; LOGF="$T/audit.log"; CONF="$T/conf.json"
+mkdir -p "$CITY/.beads" "$WA" "$WAR" "$FB" "$FB/beads" "$T/evil"
+printf '{"prefix":"ga","path":"."}\n{"prefix":"wa","path":"../wa_rig"}\n{"prefix":"wr","path":"../whatsapp_automation"}\n' > "$CITY/.beads/routes.jsonl"   # ga-31u0zl7: wr = o rig whatsapp_automation de verdade (único rig onde a devolução vale, além da cidade)
 printf 'touch "%s/PWNED-bashenv"\n' "$T" > "$T/planted.sh"
 printf 'open("%s/PWNED-pythonpath","w")\n' "$T" > "$T/evil/json.py"
 for tool in bd gc gatedone; do cat > "$FB/$tool" <<'EOF'

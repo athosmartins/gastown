@@ -4,7 +4,7 @@
 
 • Regra e estado (INERTE) · O que há no repositório · Como o classificador decide
 • A escada de modos do Pilot · N slots: o modo `pilot` (ga-2hd02v.3)
-• A vaga do P0/P1 quando o gancho falha (ga-2hd02v.3.26) · A passada de WA no nó: `PILOT_WA_NODE_EXEMPT` (ga-2hd02v.9) · Auditoria dos `wa-worker*` do Pilot
+• A vaga do P0/P1 quando o gancho falha (ga-2hd02v.3.26) · A passada de WA no nó: `PILOT_WA_NODE_EXEMPT` (ga-2hd02v.9) · O `unknown` só por falta de prova vai ao nó: `PILOT_WA_NODE_UNKNOWN_TO_NODE` (ga-31u0zl7) · Auditoria dos `wa-worker*` do Pilot
 • Banco só-schema no nó (ga-kzwlkhh) · Como ligar, passo a passo · Como desligar · O que depende de outras histórias
 • A prova do dia seguinte: `wa-node-report.py` (ga-2hd02v.3) · O que não foi provado
 
@@ -199,6 +199,41 @@ jq -s '[.[] | select(.event=="wa-node-pass-shadow")] | {beads_distintas: (map(.b
 ```
 
 Antes de passar para `on`: (1) `shadow` por pelo menos um dia inteiro, com `node` > 0 em beads que um humano confere uma a uma (a regra do dado de lead continua sendo do classificador e do filtro do rsync; esta passada não a afrouxa); (2) `PILOT_WA_NODE_ROUTE` em `label` com `node:ok` posto à mão em poucas beads reais, ou `auto` por decisão de uma pessoa; (3) preferir `PILOT_WA_NODE_SPAWN=pilot` (o modo `pool` depende de o pool criar a sessão de uma bead da loja do WA, o ponto 3 de "Como ligar", nunca provado).
+
+## O `unknown` só por falta de prova vai ao nó: `PILOT_WA_NODE_UNKNOWN_TO_NODE` (ga-31u0zl7)
+
+**Por quê.** Medido em 06/11 (`.gc/wa-node-exempt.jsonl`, última leitura por bead, 278 beads de WA): mini 193 · `unknown` 61 · node 24. As 61 `unknown` são todas `sem-prova-de-codigo-e-teste`: o classificador **não achou motivo para o mini** (dado, credencial, aparelho, caminho duro, PII saem `mini` antes e continuam saindo), só não achou o teste que prove que o nó basta. Antes, `unknown` = mini, ou seja, a bead esperava a vaga mais escassa da cidade (o pool do mini em 2 por causa do disco, o nó com teto de 10 sessões e 3 em uso).
+
+**O que muda.** Só dentro da passada de WA (`_pilot_wa_node_pass`), com `PILOT_WA_NODE_ROUTE=auto`: a bead cujo veredito é `unknown` com **motivo único** `sem-prova-de-codigo-e-teste` **e nenhuma leitura que falhou** (nenhum `*ilegiv*` no `info` do classificador) é promovida a `node` com base `sem-prova`, na ordem normal (prioridade > tipo > idade; P0/P1 antes de P2+). A promoção mora em `scripts/wa-node-dispatch.sh` (`promote_sem_prova`, ligada por `WA_NODE_ACCEPT_UNKNOWN=sem-prova`), e **o Pilot só a liga durante o `check` da passada e durante o `dispatch_one` da bead promovida** (o `export` existe em UM lugar e é desfeito logo depois): o `apply` reclassifica a bead e aplica a MESMA regra, então um `apply` sem a variável continua devolvendo 11. Três estados, só o primeiro promove: **só falta de prova** (promove) · **a leitura falhou** (`caminho-derivado-ilegivel`, `teste-derivado-ilegivel`, repo/git/espelho ilegíveis: continua `unknown`, "não consegui saber" não é "não há prova") · **qualquer outro motivo** (`moles:*`, `dado-no-texto`, `json-ilegivel`, `info` ausente ou que não é lista: fica como veio). O modo `label` nunca aceita `sem-prova` (o `apply --basis label` exige base `label`).
+
+**O botão** (`PILOT_WA_NODE_UNKNOWN_TO_NODE`, lido a cada passada; não tem padrão atribuído no arquivo):
+
+| valor | efeito |
+|---|---|
+| **ausente** (padrão) ou `auto` | a 1ª passada é **sombra**; quando ela sondou ao menos uma bead com o botão ligado, grava o marcador `.gc/wa-node-unknown-shadow.done` e a passada **seguinte** já é `on`. Marcador que não grava ou não se lê = sombra de novo (ligar sem prova de que a sombra rodou é o que não se faz). |
+| `shadow` | só REGISTRA: a sonda sai com `verdict:"unknown", basis:"sem-prova"` e a passada grava `wa-node-pass-shadow-unknown`; nada é despachado. A memória é a de 15 min (`released`), não a de 1 h do `unknown`, para a bead olhada poder ir ao nó na passada em que o botão ligar; P0/P1 nem isso. |
+| `on` | FAZ (só com a passada em `on`: com `PILOT_WA_NODE_EXEMPT=shadow` o botão `on` vira `shadow`). |
+| `off`, vazio, ou qualquer outra coisa (`ON`, `true`, erro de digitação) | desligado: o `check` vai sem a promoção e a bead é o `unknown` de sempre. |
+
+Desligar na hora: `PILOT_WA_NODE_UNKNOWN_TO_NODE=off` no `com.gascity.pilot.plist` (e recarregar), ou apagar o marcador para voltar à sombra. O plist **não** precisa ser editado para ligar: o `auto` liga sozinho depois da sombra.
+
+**O caminho de volta.** O prompt do `wa-worker-remote` agora abre com «Primeiro passo: isto se constrói e testa aqui?» (≤ ~10 min) e, se não cabe, o worker **devolve a PRÓPRIA bead** em 3 escritas: `bd comment`, `bd update --set-metadata athos.node_recusa=…` e UM `bd -C whatsapp_automation update <id> --if-assignee "$GC_ALIAS" --if-status in_progress --assignee '' --status open --add-label node:never --remove-label …` (a forma da ga-dxszii, que o `remote-shim-wrapper.py` passou a aceitar também no rig `whatsapp_automation`; ver `remote-shim.md`, item 6). O `node:never` é o veto que o Pilot lê; a bead volta `open`, sem dono, e o mini a pega. O comentário que o `apply` deixa na bead promovida traz «SEM PROVA de que o nó basta».
+
+**Como medir o acerto** (a taxa de devolução; se for > 50 %, abrir fatia para refinar o critério, não reverter sem medir):
+
+```bash
+cd "$GC_CITY_PATH"
+# a IDA: beads despachadas ao nó pela via sem-prova (a base fica no detalhe do apply)
+jq -r 'select(.event=="apply" and .rc==0 and (.detail | test("\\(sem-prova\\)"))) | .bead' .gc/wa-node-route.jsonl | sort -u
+# a passada: quantas foram promovidas, despachadas e quantas só na sombra
+jq -c 'select(.event=="wa-node-pass-summary") | {ts,u2n_mode,node_from_unknown,kept_from_unknown,unknown_shadow,probed,kept}' .gc/wa-node-exempt.jsonl | tail -20
+# a VOLTA: dessas, as que o worker devolveu (athos.node_recusa preenchido) — wa-node-evidence-return.py faz a mesma conta para todas as beads do nó
+for b in $(jq -r 'select(.event=="apply" and .rc==0 and (.detail | test("\\(sem-prova\\)"))) | .bead' .gc/wa-node-route.jsonl | sort -u); do
+  bd -C ~/gt/whatsapp_automation show "$b" --json 2>/dev/null | jq -r --arg b "$b" '(if type=="array" then .[0] else . end) | "\($b)\t\(.status)\t\(.metadata["athos.node_recusa"] // "-")"'
+done
+```
+
+**O que não foi provado.** O `check`/`apply` promovem com o classificador de verdade só em simulação (selftest com classificador falso e 1 caso com o real); a taxa de devolução real só existe depois de dias de `on`. A forma de devolver com o `bd` de verdade em bead de rig herda a inferência da ga-dxszii ("cada parte está em produção, a combinação não foi rodada"): conferir a 1ª devolução real de WA com `bd show`.
 
 ## Auditoria dos `wa-worker*` do Pilot
 
