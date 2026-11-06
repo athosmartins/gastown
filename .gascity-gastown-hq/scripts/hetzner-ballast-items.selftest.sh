@@ -424,6 +424,7 @@ addengine() {  # motor e jaula de MENTIRA no main de brinquedo (o que o motor im
   cat > "$s/hq-mutate.py" <<'PYE'
 # suporta: --slots-file --slots-max
 # suporta: --data-mb
+# suporta: --fam-cap
 import json, os, signal, sys, time
 open(os.environ["FAKE_LOG"], "a").write(" ".join(sys.argv[1:]) + "\n")
 mode = os.environ.get("FAKE_MODE", "completo")
@@ -550,6 +551,18 @@ oldeng() {  # oldeng — o main do hq passa a ter o motor ANTIGO (sem a marca da
   local s="$SRC/.gascity-gastown-hq/scripts"; grep -v 'suporta:' "$s/hq-mutate.py" > "$s/hq-mutate.py.novo" && mv "$s/hq-mutate.py.novo" "$s/hq-mutate.py"; cp "$s/hq-mutate.py" "$s/hq-mutate-wa.py"
   git -C "$SRC" add -A && git -C "$SRC" commit -q -m motor-antigo && git -C "$GR/gascity/repo.git" fetch -q "$SRC" "+HEAD:refs/remotes/origin/main"
 }
+oldwrap() {  # oldwrap — só o INVÓLUCRO (hq-mutate-wa.py) do main do hq perde a marca --fam-cap; o hq-mutate.py a mantém (a opção é do invólucro, é nele que o item procura)
+  local s="$SRC/.gascity-gastown-hq/scripts"; grep -v -e 'suporta: --fam-cap' "$s/hq-mutate-wa.py" > "$s/hq-mutate-wa.py.novo" && mv "$s/hq-mutate-wa.py.novo" "$s/hq-mutate-wa.py"
+  git -C "$SRC" add -A && git -C "$SRC" commit -q -m involucro-antigo && git -C "$GR/gascity/repo.git" fetch -q "$SRC" "+HEAD:refs/remotes/origin/main"
+}
+oldcore() {  # oldcore — o contrário: só o hq-mutate.py perde a marca --fam-cap e o invólucro a mantém
+  local s="$SRC/.gascity-gastown-hq/scripts"; grep -v -e 'suporta: --fam-cap' "$s/hq-mutate.py" > "$s/hq-mutate.py.novo" && mv "$s/hq-mutate.py.novo" "$s/hq-mutate.py"
+  git -C "$SRC" add -A && git -C "$SRC" commit -q -m motor-sem-a-marca && git -C "$GR/gascity/repo.git" fetch -q "$SRC" "+HEAD:refs/remotes/origin/main"
+}
+famcap() {  # famcap — o valor depois de --fam-cap na última chamada do motor; `-` se a chamada existe e NÃO levou a opção; `sem-chamada` se o motor nem foi chamado (log vazio não prova "não passou")
+  local v; [ -s "$W/engine.log" ] || { echo sem-chamada; return 0; }
+  v=$(sed -n 's/.* --fam-cap \([^ ]*\).*/\1/p' "$W/engine.log" | tail -n 1); echo "${v:--}"
+}
 wanew() {  # wanew ARQUIVO — commit novo no main do WA (o espelho do nó avança)
   echo 'x = 2' > "$WSRC/lib/$1"; git -C "$WSRC" add -A && git -C "$WSRC" commit -q -m novo-wa && git -C "$GR/whatsapp_automation/repo.git" fetch -q "$WSRC" "+HEAD:refs/remotes/origin/main"
 }
@@ -618,7 +631,7 @@ g_wam() {
   : > "$W/engine.log"; runwam FAKE_MODE=completo WA_MUTANTS_DATA_MB=abc
   check "wam: WA_MUTANTS_DATA_MB que não é inteiro volta ao padrão (3072)" "1" "$(eng "--data-mb 3072")"
   : > "$W/engine.log"; runwam FAKE_MODE=completo WA_MUTANTS_DATA_MB=512
-  check "wam: WA_MUTANTS_DATA_MB=512 vale (o último argumento do motor: a linha acaba em --data-mb 512)" "1" "$(grep -c -e '--data-mb 512$' "$W/engine.log")"
+  check "wam: WA_MUTANTS_DATA_MB=512 vale (512 EXATO: depois do valor vem espaço ou o fim da linha, não mais dígitos; a posição da opção na linha não conta)" "1" "$(grep -c -E -e ' --data-mb 512( |$)' "$W/engine.log")"
   # os interruptores de EMERGÊNCIA são arquivos na pasta do lastro (o governo monta o ambiente do item do zero: só BALLAST_*, as variáveis WA_MUTANTS_* não chegam ao item em produção)
   newwam; mkdir -p "$T/shm"; : > "$BH/wa-mutants.noshm"; : > "$W/engine.log"; runwam FAKE_MODE=completo WA_MUTANTS_SHM="$T/shm"
   check "wam: o arquivo wa-mutants.noshm na pasta do lastro devolve os slots ao disco mesmo com o tmpfs disponível (e a rodada não cria a pasta dela lá)" "1 disco 0" "$(eng "--work $RD/work ") $(sj work) $([ -e "$T/shm/ballast-wam-$(basename "$RD")" ] && echo 1 || echo 0)"
@@ -626,6 +639,30 @@ g_wam() {
   check "wam: o arquivo wa-mutants.nodata na pasta do lastro liga o teto de dados OFF (a opção não vai ao motor) e os slots elásticos seguem" "0 1" "$(eng "--data-mb") $(eng "--slots-file $RD/slots")"
   newwam; oldeng; : > "$W/engine.log"; runwam FAKE_MODE=completo BALLAST_CORES_MAX=6
   check "wam: motor ANTIGO (sem as opções) → só os slots de sempre, nenhuma opção nova é passada (o item não quebra o motor que ainda não as conhece)" "1 0 0 0" "$(eng "--slots 2 ") $(eng "--slots-max ") $(eng "--slots-file ") $(eng "--data-mb")"
+
+  # TETO DE FAMÍLIA (ga-ek7ndez): o invólucro pula como `familia-grande` o alvo com mais de 12 testes na família, e o WA tem 148 deles (~50 mil mutantes que o lastro nunca varreu) — de madrugada, sem commit novo, o wa-mutants
+  # dava sem-novidade e dormia. O item passa --fam-cap (padrão 30) SÓ a um invólucro que a conhece; WA_MUTANTS_FAM_CAP muda o número (em produção o governo monta o ambiente do zero: vale à mão e em teste) e o
+  # arquivo wa-mutants.nofamcap na pasta do lastro devolve o 12 do invólucro. `famcap` lê o log do motor: `-` é "chamou e NÃO levou a opção", nunca "não chamou".
+  newwam; runwam FAKE_MODE=completo
+  check "wam: o padrão do item é --fam-cap 30 (o invólucro sozinho pula os alvos de 13 a 30 testes) e o resumo diz fam_cap 30" "30 30" "$(famcap) $(sj fam_cap)"
+  : > "$W/engine.log"; runwam FAKE_MODE=completo WA_MUTANTS_FAM_CAP=45
+  check "wam: WA_MUTANTS_FAM_CAP=45 vale (o motor recebe 45 e o resumo repete)" "45 45" "$(famcap) $(sj fam_cap)"
+  : > "$W/engine.log"; runwam FAKE_MODE=completo WA_MUTANTS_FAM_CAP=1
+  check "wam: WA_MUTANTS_FAM_CAP=1 vale (o menor teto que o invólucro aceita)" "1 1" "$(famcap) $(sj fam_cap)"
+  : > "$W/engine.log"; runwam FAKE_MODE=completo WA_MUTANTS_FAM_CAP=99999999999999999999999
+  check "wam: WA_MUTANTS_FAM_CAP grande demais para o teste numérico do bash (o '[' dá erro, não falso) volta ao padrão 30" "30 30" "$(famcap) $(sj fam_cap)"
+  for bad in abc 0 00 -3 2x 1.5 ""; do
+    : > "$W/engine.log"; runwam FAKE_MODE=completo WA_MUTANTS_FAM_CAP="$bad"
+    check "wam: WA_MUTANTS_FAM_CAP='$bad' (texto, zero ou negativo: o invólucro recusaria com rc 2 e a rodada sairia sem varrer nada) volta ao padrão 30" "30 30" "$(famcap) $(sj fam_cap)"
+  done
+  newwam; oldeng; runwam FAKE_MODE=completo
+  check "wam: motor ANTIGO (sem a marca --fam-cap) → a opção NÃO é passada (um invólucro que não a conhece recusaria a linha com rc 2) e o resumo diz fam_cap null" "- null" "$(famcap) $(sj fam_cap)"
+  newwam; oldwrap; runwam FAKE_MODE=completo
+  check "wam: a opção é do INVÓLUCRO: com a marca só no hq-mutate.py (o invólucro antigo a recusaria) o item NÃO a passa" "- null" "$(famcap) $(sj fam_cap)"
+  newwam; oldcore; runwam FAKE_MODE=completo
+  check "wam: com a marca no invólucro e sem ela no hq-mutate.py o item a passa (é o invólucro quem lê --fam-cap)" "30 30" "$(famcap) $(sj fam_cap)"
+  newwam; : > "$BH/wa-mutants.nofamcap"; runwam FAKE_MODE=completo WA_MUTANTS_FAM_CAP=45 BALLAST_CORES_MAX=6
+  check "wam: o arquivo wa-mutants.nofamcap na pasta do lastro devolve o teto do invólucro mesmo com WA_MUTANTS_FAM_CAP (a opção não vai, o resumo diz fam_cap null) e as outras opções seguem" "- null 1 1" "$(famcap) $(sj fam_cap) $(eng "--data-mb 3072") $(eng "--slots-file $RD/slots")"
 
   newwam; runwam FAKE_MODE=novidade; tip=$(git -C "$GR/whatsapp_automation/repo.git" rev-parse refs/remotes/origin/main); hqtip=$(git -C "$GR/gascity/repo.git" rev-parse refs/remotes/origin/main)
   check "wam: motor sem-novidade (rc 0) → rc 0 e o marcador de ocioso guarda o PAR de pontas (WA:hq)" "0 sem-novidade $tip:$hqtip" "$RC $(sj result) $(cat "$BH/wa-mutants.idle" 2>/dev/null)"
@@ -954,6 +991,20 @@ wa-mutants.sh@@as opções novas nunca chegam ao motor@@${EXTRA[@]+"${EXTRA[@]}"
 wa-mutants.sh@@o resumo repete o slots no lugar do máximo@@slots=int(slots), slots_max=int(slots_max), work=workat@@slots=int(slots), slots_max=int(slots), work=workat
 wa-mutants.sh@@a bandeira wa-mutants.noshm não devolve os slots ao disco@@[ ! -e "$BH/wa-mutants.noshm" ] || SHM=""@@:
 wa-mutants.sh@@a bandeira wa-mutants.nodata não desliga o teto de dados@@[ ! -e "$BH/wa-mutants.nodata" ] || DATA_MB=0@@:
+wa-mutants.sh@@o teto de família padrão volta ao 12 do invólucro@@FAM_CAP=${WA_MUTANTS_FAM_CAP:-30}@@FAM_CAP=${WA_MUTANTS_FAM_CAP:-12}
+wa-mutants.sh@@o teto de família inválido vale como veio (texto, zero, negativo: o invólucro recusa com rc 2)@@[ "$FAM_CAP" -ge 1 ] 2> /dev/null || FAM_CAP=30@@:
+wa-mutants.sh@@o teto de família inválido cai no 12 e não no 30@@[ "$FAM_CAP" -ge 1 ] 2> /dev/null || FAM_CAP=30@@[ "$FAM_CAP" -ge 1 ] 2> /dev/null || FAM_CAP=12
+wa-mutants.sh@@o teto de família 0 vale (a opção não vai e o padrão some)@@[ "$FAM_CAP" -ge 1 ] 2> /dev/null@@[ "$FAM_CAP" -ge 0 ] 2> /dev/null
+wa-mutants.sh@@o teto de família 1 é recusado (a fronteira do >= vira >)@@[ "$FAM_CAP" -ge 1 ] 2> /dev/null@@[ "$FAM_CAP" -gt 1 ] 2> /dev/null
+wa-mutants.sh@@a bandeira wa-mutants.nofamcap não devolve o teto do invólucro@@[ ! -e "$BH/wa-mutants.nofamcap" ] || FAM_CAP=0@@:
+wa-mutants.sh@@a opção --fam-cap vai a um invólucro que não a conhece@@grep -q -e '--fam-cap' "$ENGDIR/hq-mutate-wa.py" 2> /dev/null; then EXTRA+=(--fam-cap@@true; then EXTRA+=(--fam-cap
+wa-mutants.sh@@a opção --fam-cap é procurada no hq-mutate.py e não no invólucro@@grep -q -e '--fam-cap' "$ENGDIR/hq-mutate-wa.py"@@grep -q -e '--fam-cap' "$ENGDIR/hq-mutate.py"
+wa-mutants.sh@@o teto 0 da bandeira vai ao motor (--fam-cap 0: o invólucro recusa com rc 2)@@if [ "$FAM_CAP" -gt 0 ] && grep -q -e '--fam-cap'@@if [ "$FAM_CAP" -ge 0 ] && grep -q -e '--fam-cap'
+wa-mutants.sh@@o motor recebe um teto de família fixo e não o pedido@@EXTRA+=(--fam-cap "$FAM_CAP")@@EXTRA+=(--fam-cap 30)
+wa-mutants.sh@@o resumo não guarda o teto que foi ao motor@@; FAMPASSED=$FAM_CAP; fi@@; fi
+wa-mutants.sh@@o resumo diz o teto pedido e não o que foi ao motor@@"$SLOTS_MAX" "$FAMPASSED" << 'PY'@@"$SLOTS_MAX" "$FAM_CAP" << 'PY'
+wa-mutants.sh@@o resumo não traz o fam_cap@@secs_item=int(secs), fam_cap=int(fam_cap) if fam_cap else None)@@secs_item=int(secs))
+wa-mutants.sh@@o resumo diz fam_cap 0 quando a opção não foi ao motor (e não null)@@fam_cap=int(fam_cap) if fam_cap else None)@@fam_cap=int(fam_cap or 0))
 MUT
   "$PY" -I - "$ITEMS" "$T/mutants.txt" "$T" > "$T/mutants.idx" <<'PYEOF'
 import os, re, shutil, sys
