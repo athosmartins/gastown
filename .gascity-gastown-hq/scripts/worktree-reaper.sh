@@ -26,7 +26,8 @@
 # gate protects anything touched recently (ga-m5i7e6: a tree's age is its FRESHEST sign of life — index, HEAD commit, any
 # file inside — not its root directory's mtime, and a tree a live process has its cwd or an open file in is never removed).
 # Pressure mode lowers the age gate when disk is genuinely low, but only MERGED trees go under it: an unmerged tree is kept
-# and logged with its size (kept_pressure_unmerged). Branch deletion is merged-only. Kill switch: WORKTREE_REAPER_ENABLED=0.
+# and logged with its size (kept_pressure_unmerged) — except (ga-ggj1wnv) a CLEAN, unlocked, unused tree whose beads are ALL closed for BEAD_CLOSED_HOURS: it goes
+# with no merge proof, its branch is kept, and the reaped event carries proof/beads/size_kb/reason. Branch deletion is merged-only. Kill switch: WORKTREE_REAPER_ENABLED=0.
 # ga-k0mose6: "merged" for an UNLOCKED pool tree is also a tree the gate REBASED (its sha is never an ancestor of main): clean, every
 # commit in main as an equivalent patch (`git cherry`, no merge commit) and its bead(s) closed for BEAD_CLOSED_HOURS
 # (_pool_shipped_and_closed). Any of those unanswerable keeps the tree; the event carries "proof":"patch_equivalent bead_closed".
@@ -34,6 +35,8 @@
 # git does not count ignored files as dirt, so a plain `worktree remove` would take them (battery outputs under an ignored pesquisa/).
 # ga-1bfcda7: the settings files a pool session writes into its own tree (.claude/settings*.json, .bak.<epoch> copies) are tool state, junk by path;
 # an ignored .claude/ FOLDER is opened to see them, so a tree is no longer kept for a 4 KB .claude/settings.json.
+# ga-ggj1wnv: a repo with NO remote (traco-bim) has no origin/<default>, so none of its trees was ever "merged", and the per-bead trees it keeps in ~/gt/<rig>-wt/<bead> were listed
+# only when their branch happened to be crew/* or their directory worker-*. Every tree directly under <rig>-wt/ is listed now, and for such a repo "merged" is HEAD in its local trunk.
 # The one exception to "WITHOUT --force" is a LOCKED worktree (`remove -f -f`); it is reaped only
 # under the LOCK CONTRACT stated at ZOMBIE-LOCK DETECTION below, never because of its age alone.
 # A second, narrower exception (ga-he2c1u, town .gc-worktrees roots only): an UNLOCKED tree dirty with nothing but generated
@@ -76,6 +79,9 @@ ACTIVITY_SCAN="${WORKTREE_REAPER_ACTIVITY_SCAN:-1}"
 # ga-m5i7e6: under disk pressure the age gate used to drop to PRESSURE_HOURS for EVERY tree. Now pressure removes only
 # MERGED trees (their work is in main); an unmerged one is kept and logged with its size. Only 1 = the old behavior.
 PRESSURE_REAP_UNMERGED="${WORKTREE_REAPER_PRESSURE_REAP_UNMERGED:-0}"
+# ga-ggj1wnv: ...except a CLEAN, unlocked, unused tree whose beads are ALL closed (for BEAD_CLOSED_HOURS): it goes without a merge proof, because `worktree remove` keeps its branch,
+# so no commit is lost, and the pool no longer starves for disk behind the trees of finished beads. Only 0 = the ga-m5i7e6 rule (every unmerged tree kept under pressure).
+PRESSURE_REAP_CLOSED="${WORKTREE_REAPER_PRESSURE_REAP_CLOSED:-1}"
 PRESSURE_SIZE_BUDGET=20     # du runs for at most this many pressure keeps per sweep (a huge tree costs seconds); the rest log size_kb null
 # vazio/falhou → treated as GNU stat (-c %Y); if that is wrong too, every freshness read fails and every tree is KEPT
 case "$(stat -f %m / 2>/dev/null)" in ''|*[!0-9]*) _STAT_BSD=0 ;; *) _STAT_BSD=1 ;; esac
@@ -170,6 +176,7 @@ _BC_FAILED_SEEN=""                # ga-yw18yk: repos whose failed lookup is alre
 _BC_PROOF_IDS=""                  # ga-yw18yk: _bead_closed_proof's answer, handed to its caller: the closed bead ids it relied on
 _BC_PROOF_FIRST=""                # ... and the first of them (the label of a rescue/ branch)
 _BC_ROWS=""; _BC_FOUND_IDS=""; _BC_FOUND_PFX=""   # ga-yw18yk: _bead_ask's working set while one proof is being decided
+_KU_PROOF_JSON=""                 # ga-ggj1wnv: _keep_unsafe's answer to its caller: the event fields of a tree it let through on the closed-bead proof ("" = it did not)
 # ga-pdrij: the rig-worktree backlog is LARGE (704 observed — the legacy loop used
 # `git -C $GT` and could never remove rig-owned worktrees, so they piled up). Bound the
 # per-sweep pool reaping so a single run is never a massive destructive operation; the
@@ -230,6 +237,27 @@ _worktree_head_merged() {
   [ -n "$def" ] || def="main"
   git -C "$repo" rev-parse --verify -q "refs/remotes/origin/$def" >/dev/null 2>&1 || return 1
   git -C "$repo" merge-base --is-ancestor "$head" "refs/remotes/origin/$def" 2>/dev/null
+}
+
+# ── _head_in_local_trunk <repo> <wt> — ga-ggj1wnv: the delivery proof of a repo with NO remote at all (traco-bim): true iff the tree's HEAD is an ancestor of the repo's local
+# trunk, refs/heads/master or refs/heads/main — exactly ONE of them must exist, both or neither is "cannot tell". Without a remote there is no origin/<default> for
+# _worktree_head_merged to read, so no tree of such a repo was ever "merged". Never for a repo that HAS a remote, even one whose origin/<default> is missing: there the
+# proof is origin's (a local branch may be ahead of what was pushed). Every doubt (git remote or rev-parse failing, no HEAD, no or two trunks, not an ancestor) → NOT merged.
+_head_in_local_trunk() {
+  local repo="$1" wt="$2" remotes head m n trunk
+  # vazio → no remote: the local trunk is the only integration branch; falhou (git rc != 0) → unknown, NOT merged
+  remotes="$(git -C "$repo" remote 2>/dev/null)" || return 1
+  [ -z "$remotes" ] || return 1
+  # vazio/falhou → no HEAD to prove, NOT merged
+  head="$(git -C "$wt" rev-parse HEAD 2>/dev/null)"
+  [ -n "$head" ] || return 1
+  # vazio (ref absent) / falhou → that trunk does not exist for this purpose: NOT merged on its account
+  m="$(git -C "$repo" rev-parse --verify -q refs/heads/master 2>/dev/null)"
+  n="$(git -C "$repo" rev-parse --verify -q refs/heads/main 2>/dev/null)"
+  if [ -n "$m" ] && [ -z "$n" ]; then trunk="refs/heads/master"
+  elif [ -n "$n" ] && [ -z "$m" ]; then trunk="refs/heads/main"
+  else return 1; fi
+  git -C "$repo" merge-base --is-ancestor "$head" "$trunk" 2>/dev/null
 }
 
 # ── _ref_patch_equivalent <repo> <ref> — ga-1md7na: the SECOND proof that <ref>'s content is
@@ -463,21 +491,55 @@ _keep_ignored_data() {
   return 0
 }
 
+# ── _pressure_closed_proof <repo> <wt> <br> — ga-ggj1wnv: 0 iff an UNMERGED tree may still go under disk pressure: `git status` ran and printed nothing (clean), and every bead the
+# tree is named for is closed for BEAD_CLOSED_HOURS (_bead_closed_proof: it also refuses a rebase/merge/... under way, and a lookup that fails, times out or prints junk is "could not
+# tell", logged as bead_lookup_failed). No merge proof is asked: `worktree remove` keeps the branch, so no commit is lost (a DETACHED HEAD is parked on a rescue branch first, see
+# _pressure_closed_prepare). A tree that turns dirty after this check is refused by git: a pool tree then takes the preserve-then-reap path, a town tree is left (skipped_dirty). Callers
+# reach it only for an UNLOCKED tree (a locked unmerged one goes to the lock contract). Main shell only: on 0 the closed beads are in $_BC_PROOF_IDS / $_BC_PROOF_FIRST.
+_pressure_closed_proof() {
+  local repo="$1" wt="$2" br="$3" st
+  # vazio → clean, the proof goes on; falhou (status could not run) → NOT clean: the tree stays
+  st="$(git -C "$wt" status --porcelain 2>/dev/null)" || return 1
+  [ -z "$st" ] || return 1
+  _bead_closed_proof "$repo" "$wt" "$br"
+}
+
+# ── _pressure_closed_prepare <repo> <wt> <br> <age_h> — ga-ggj1wnv: the last step before a tree that _pressure_closed_proof cleared is removed. A DETACHED HEAD is parked on
+# rescue/<bead>-<sha9> first (ENABLED=1 only: a dry run creates no ref), and the event fields (proof, beads, size_kb, reason) are left in $_KU_PROOF_JSON for the caller's reaped /
+# would_reap line. 0 = go on; 1 = KEEP: the rescue failed, the commit would be the only copy (logged here).
+_pressure_closed_prepare() {
+  local repo="$1" wt="$2" br="$3" age="$4" kb
+  # vazio/falhou (symbolic-ref rc != 0: detached, or git cannot say) → read as detached: a rescue that fails keeps the tree, one that works on a branch tree only costs an extra branch
+  if [ "$ENABLED" = "1" ] && ! git -C "$wt" symbolic-ref -q HEAD >/dev/null 2>&1 && ! _rescue_detached_head "$repo" "$wt" "$_BC_PROOF_FIRST"; then
+    _log_lock_event bead_closed_rescue_failed "$repo" "$wt" "$br" "$age" "pressure" "bead_closed $_BC_PROOF_IDS"
+    return 1
+  fi
+  # vazio/falhou → size_kb null: a log field only, the tree goes either way
+  kb="$(du -sk "$wt" 2>/dev/null | awk '{print $1}')"; case "$kb" in ''|*[!0-9]*) kb=null ;; esac
+  _KU_PROOF_JSON=",\"proof\":\"bead_closed\",\"beads\":\"$(_json_esc "$_BC_PROOF_IDS")\",\"size_kb\":$kb,\"reason\":\"disk pressure: clean tree of closed bead(s), branch kept\""
+  return 0
+}
+
 # ── _keep_unsafe <repo> <wt> <br> <age_h> <merged> — ga-m5i7e6: the checks every tree passes before the plain remove and the
 # dirty-preserve force-remove (callers skip it for a LOCKED unmerged tree: the lock contract asks _worktree_in_use itself, and
 # reap_zombie_locked has its own check). 0 = KEEP it (the event is logged here), 1 = go on.
 #   (1) a live process has its cwd, its executable or any open file inside → kept_in_use (kept_merged_in_use when the tree is
 #       merged: the name older scenarios and dashboards know), merged or not;
 #   (2) disk pressure removes only MERGED trees (PRESSURE_REAP_UNMERGED=1 restores the old rule; "merged" is the caller's call:
-#       an ancestor of origin/<default>, or for an unlocked pool tree shipped-by-rebase and closed, ga-k0mose6): an unmerged one is
-#       kept_pressure_unmerged with its size_kb (null once PRESSURE_SIZE_BUDGET du calls were spent in the sweep, or when du
-#       fails), so what pressure no longer takes is visible, not silent. Literal reading of the
-#       bead's decision: an unmerged tree idle past STALE_HOURS is kept under pressure too, though normal mode would reap it
-#       (its age_h on the event says which); a disk that stays low for days therefore stops reclaiming unmerged trees.
+#       an ancestor of origin/<default>, or for an unlocked pool tree shipped-by-rebase and closed, ga-k0mose6, or HEAD in the
+#       local trunk of a repo with no remote, ga-ggj1wnv) and, ga-ggj1wnv, a CLEAN tree whose beads are all closed
+#       (_pressure_closed_proof: no merge proof asked, the branch stays; PRESSURE_REAP_CLOSED=0 restores the ga-m5i7e6 rule): any
+#       other unmerged one is kept_pressure_unmerged with its size_kb (null once PRESSURE_SIZE_BUDGET du calls were spent in the
+#       sweep, or when du fails), so what pressure no longer takes is visible, not silent. Literal reading of the bead's decision:
+#       an unmerged tree the closed-bead proof does not clear (bead open, lookup failed, dirt, ...) and idle past STALE_HOURS is kept
+#       under pressure too, though normal mode would reap it (its age_h on the event says which); a disk that stays low for days
+#       therefore stops reclaiming those.
 #   (3) ga-xpoj67: the tree holds files git IGNORES that are not junk by name (_keep_ignored_data) → kept_ignored_data, merged or not: the plain
 #       remove and the dirty-preserve force-remove below both take ignored files with the tree.
+# On "go on" for a tree let through on the closed-bead proof, $_KU_PROOF_JSON holds its event fields (proof, beads, size_kb, reason); "" for any other tree.
 _keep_unsafe() {
-  local repo="$1" wt="$2" br="$3" age="$4" merged="$5" ev kb
+  local repo="$1" wt="$2" br="$3" age="$4" merged="$5" ev kb why closed=0
+  _KU_PROOF_JSON=""
   if _worktree_in_use "$wt"; then
     ev="kept_in_use"; [ "$merged" = "1" ] && ev="kept_merged_in_use"
     printf '{"ts":"%s","event":"%s","repo":"%s","wt":"%s","branch":"%s","age_h":%s,"mode":"%s"}\n' \
@@ -485,17 +547,23 @@ _keep_unsafe() {
     return 0
   fi
   if [ "$mode" = "pressure" ] && [ "$merged" != "1" ] && [ "$PRESSURE_REAP_UNMERGED" != "1" ]; then
-    kb=null
-    if [ "$PRESSURE_SIZE_BUDGET" -gt 0 ]; then
-      PRESSURE_SIZE_BUDGET=$((PRESSURE_SIZE_BUDGET-1))
-      # vazio/falhou → size_kb null: a log field only, the tree is kept either way
-      kb="$(du -sk "$wt" 2>/dev/null | awk '{print $1}')"; case "$kb" in ''|*[!0-9]*) kb=null ;; esac
+    if [ "$PRESSURE_REAP_CLOSED" != "0" ] && _pressure_closed_proof "$repo" "$wt" "$br"; then
+      closed=1   # not unmerged WORK: it goes on to the ignored-data check below like a merged tree
+    else
+      kb=null
+      if [ "$PRESSURE_SIZE_BUDGET" -gt 0 ]; then
+        PRESSURE_SIZE_BUDGET=$((PRESSURE_SIZE_BUDGET-1))
+        # vazio/falhou → size_kb null: a log field only, the tree is kept either way
+        kb="$(du -sk "$wt" 2>/dev/null | awk '{print $1}')"; case "$kb" in ''|*[!0-9]*) kb=null ;; esac
+      fi
+      why="disk pressure removes only merged trees"; [ "$PRESSURE_REAP_CLOSED" = "0" ] || why="$why and clean trees of closed beads"
+      printf '{"ts":"%s","event":"kept_pressure_unmerged","repo":"%s","wt":"%s","branch":"%s","age_h":%s,"size_kb":%s,"reason":"%s"}\n' \
+        "$(ts)" "$(_json_esc "$(basename "$repo")")" "$(_json_esc "$(basename "$wt")")" "$(_json_esc "$br")" "$age" "$kb" "$why" >> "$LOG" 2>/dev/null
+      return 0
     fi
-    printf '{"ts":"%s","event":"kept_pressure_unmerged","repo":"%s","wt":"%s","branch":"%s","age_h":%s,"size_kb":%s,"reason":"disk pressure removes only merged trees"}\n' \
-      "$(ts)" "$(_json_esc "$(basename "$repo")")" "$(_json_esc "$(basename "$wt")")" "$(_json_esc "$br")" "$age" "$kb" >> "$LOG" 2>/dev/null
-    return 0
   fi
   _keep_ignored_data "$repo" "$wt" "$br" "$age" && return 0
+  if [ "$closed" = "1" ]; then _pressure_closed_prepare "$repo" "$wt" "$br" "$age" || return 0; fi
   return 1
 }
 
@@ -1334,6 +1402,7 @@ reap_pool_worktrees() {
   local repo="$1"
   [ -d "$repo/.git" ] || [ -f "$repo/.git" ] || return 0
   local main_wt; main_wt="$(git -C "$repo" rev-parse --show-toplevel 2>/dev/null)" || return 0
+  local rig_wt; rig_wt="$(dirname "$main_wt")/$(basename "$main_wt")-wt"   # ga-ggj1wnv: ~/gt/<rig>-wt, where a rig keeps one tree per bead
   local wt="" br=""
   # --porcelain emits blocks: "worktree <path>" / "HEAD <sha>" / "branch refs/heads/<b>"
   while IFS= read -r line; do
@@ -1346,14 +1415,15 @@ reap_pool_worktrees() {
         [ -n "$wt" ] || continue
         [ "$wt" = "$main_wt" ] && { wt=""; br=""; lock=""; continue; }   # never the repo root
         # ephemeral FRAMEWORK worktrees ONLY — never durable feature trees (.wt-*, clones):
-        #   basename worker-*  OR  crew/* branch  OR  under .claude/worktrees/  OR  under .gc-worktrees/
-        # (.claude/worktrees = native agent trees like wa-8y45; .gc-worktrees = gate-review trees)
+        #   basename worker-*  OR  crew/* branch  OR  under .claude/worktrees/  OR  under .gc-worktrees/  OR  directly under <rig>-wt/
+        # (.claude/worktrees = native agent trees like wa-8y45; .gc-worktrees = gate-review trees; <rig>-wt/<bead> = ga-ggj1wnv: a rig's per-bead
+        # trees, e.g. traco-bim's, which matched the other arms only when their branch happened to be crew/* or their directory worker-*)
         case "$(basename "$wt")" in
           *worker-*) : ;;
           *) case "$br" in
                crew/*) : ;;
                *) case "$wt" in
-                    */.claude/worktrees/*|*/.gc-worktrees/*) : ;;
+                    */.claude/worktrees/*|*/.gc-worktrees/*|"$rig_wt"/*) : ;;
                     *) wt=""; br=""; lock=""; continue ;;
                   esac ;;
              esac ;;
@@ -1385,9 +1455,13 @@ reap_pool_worktrees() {
         # _pool_shipped_and_closed proves it shipped and finished: every commit in main as an equivalent patch, tree clean,
         # its bead(s) closed for BEAD_CLOSED_HOURS. Unlocked trees only, and only after the ancestry test said no; the
         # reap/would-reap event then carries the proof, and the orphan branch goes on the same patch-equivalence proof.
+        # ga-ggj1wnv: and a tree of a repo with NO remote (traco-bim: no origin/<default> to be an ancestor of) is "merged" when its HEAD is in the repo's local
+        # trunk (_head_in_local_trunk); unlocked trees only; mproof stays empty, so no branch is ever deleted on it.
         local merged=0 mproof="" mproof_json=""
         if [ "$age_min" -ge "$MERGED_MIN_AGE_MIN" ]; then
           if _worktree_head_merged "$repo" "$wt"; then merged=1
+          elif [ -z "$lock" ] && _head_in_local_trunk "$repo" "$wt"; then
+            merged=1; mproof_json=",\"proof\":\"local_trunk\""
           elif [ -z "$lock" ] && _pool_shipped_and_closed "$repo" "$wt" "$br"; then
             merged=1; mproof="patch_equivalent"
             mproof_json=",\"proof\":\"patch_equivalent bead_closed\",\"beads\":\"$(_json_esc "$_BC_PROOF_IDS")\""
@@ -1402,6 +1476,8 @@ reap_pool_worktrees() {
             kept=$((kept+1))
             wt=""; br=""; lock=""; continue
           fi
+          # ga-ggj1wnv: a tree let through on the closed-bead proof carries it (proof, beads, size_kb, reason) on its event; set only when _keep_unsafe ran for THIS tree
+          [ -z "$_KU_PROOF_JSON" ] || mproof_json="$_KU_PROOF_JSON"
         fi
         # ── LOCKED worktree — the LOCK CONTRACT (see ZOMBIE-LOCK DETECTION): a pid-confirmed zombie is
         # reaped; a pid-confirmed live holder is always kept; any other lock goes to
@@ -1492,20 +1568,22 @@ for WT_DIR in $WT_DIRS; do
     # ga-m5i7e6: in use / disk-pressure-unmerged for every tree about to go (was: merged only). A LOCKED unmerged tree is left
     # to the lock contract below instead: its own proofs (zombie holder, closed bead) are what frees disk under pressure.
     lock_reason="$(_wt_lock_reason "$GT" "$d")"
+    tproof_json=""   # ga-ggj1wnv: the closed-bead proof's event fields, set only when _keep_unsafe ran for THIS tree and let it through on that proof
     if [ "$merged" = "1" ] || [ -z "$lock_reason" ]; then
       if _keep_unsafe "$GT" "$d" "" "$age" "$merged"; then
         kept=$((kept+1))
         continue
       fi
+      tproof_json="$_KU_PROOF_JSON"
     fi
     if [ "$ENABLED" != "1" ]; then
-      printf '{"ts":"%s","event":"would_reap","wt":"%s","age_h":%s,"mode":"%s","merged":%s}\n' "$(ts)" "$(basename "$d")" "$age" "$mode" "$merged" >> "$LOG" 2>/dev/null
+      printf '{"ts":"%s","event":"would_reap","wt":"%s","age_h":%s,"mode":"%s","merged":%s%s}\n' "$(ts)" "$(basename "$d")" "$age" "$mode" "$merged" "$tproof_json" >> "$LOG" 2>/dev/null
       continue
     fi
     # no --force: a worktree with uncommitted WIP (a live build) is REFUSED → protected.
     if git -C "$GT" worktree remove "$d" 2>/dev/null; then
       reaped=$((reaped+1))
-      printf '{"ts":"%s","event":"reaped","wt":"%s","age_h":%s,"mode":"%s","merged":%s}\n' "$(ts)" "$(basename "$d")" "$age" "$mode" "$merged" >> "$LOG" 2>/dev/null
+      printf '{"ts":"%s","event":"reaped","wt":"%s","age_h":%s,"mode":"%s","merged":%s%s}\n' "$(ts)" "$(basename "$d")" "$age" "$mode" "$merged" "$tproof_json" >> "$LOG" 2>/dev/null
     elif _reap_dirty_generated_only "$GT" "$d" "" "$age" "town"; then
       # ga-he2c1u: refused only because of generated files, delivered, bead closed — see the function
       reaped=$((reaped+1))
@@ -1549,8 +1627,9 @@ done
 # checkout path — <rig>/crew/worker-*, $GT/worker-<bead> (owned by the rig), <rig>/.claude/
 # worktrees/agent-* (native agent trees, e.g. wa-8y45), AND <rig>/.gc-worktrees/<bead>-*
 # (gate-review trees). The pattern filter (basename *worker-*, OR crew/* branch, OR a path
-# under .claude/worktrees / .gc-worktrees) keeps it to ephemeral FRAMEWORK worktrees and
-# never touches durable feature trees. Best-effort; a missing/garbage repo is skipped.
+# under .claude/worktrees / .gc-worktrees, OR directly under the rig's <rig>-wt/ — ga-ggj1wnv)
+# keeps it to ephemeral FRAMEWORK worktrees and never touches durable feature trees.
+# Best-effort; a missing/garbage repo is skipped.
 for _repo in "$GT"/*/; do
   _repo="${_repo%/}"
   [ -d "$_repo/.git" ] || [ -f "$_repo/.git" ] || continue

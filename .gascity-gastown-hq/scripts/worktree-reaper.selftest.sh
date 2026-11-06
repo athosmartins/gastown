@@ -22,6 +22,9 @@
 # files (.gc/system, run markers, caches) is removed with a single --force by loop 1 — and kept for any other dirt (a modified or
 # staged tracked file, an untracked source file, an edited pack.toml), an open/young/unknown bead, an unshipped commit, a live
 # process, a lock (no -f -f there), the dry-run, and a narrowed list;
+# ga-ggj1wnv: under DISK PRESSURE a clean, unlocked, unused tree whose beads are all closed is reaped with no merge proof (its branch kept; the event carries proof/beads/size_kb/reason), and
+# kept for an open bead, a lookup that cannot answer, dirt, a lock, a process inside, a failing status, a merge under way, ignored data or the kill switch (a detached HEAD gets a rescue/
+# branch first); a repo with NO remote (traco-bim) reads "merged" against its local master/main and has its <rig>-wt/<bead> trees in the list;
 # the SIGTERM guard kills a crew claude proc
 # but never a supervisor/pilot; kill is default-OFF; the feature has a kill-switch + dry-run.
 # Process probes are faked so it's hermetic. Exit 0 iff all hold.
@@ -1273,11 +1276,13 @@ cat > "$PE_BIN/git" <<'PEGIT'
 # garbage = rc 0 and output that is not cherry's format; partial = a '-' line, THEN rc 1.
 # And `git rev-list --merges` (the merge-commit check), which PE_REVLIST=fail breaks: rc 128, no output.
 # ga-k0mose6: `git rev-parse HEAD` (PE_REVPARSE=fail) and `git status` (PE_STATUS=fail) break the same way: rc 128, no output.
+# ga-ggj1wnv: so does `git remote` (PE_REMOTE=fail), the read that says whether a repo has a remote at all.
 rp=0
 for a in "$@"; do
   [ "$a" = "rev-parse" ] && rp=1
   if [ "$a" = "HEAD" ] && [ "$rp" = "1" ] && [ "${PE_REVPARSE:-}" = "fail" ]; then exit 128; fi
   if [ "$a" = "status" ] && [ "${PE_STATUS:-}" = "fail" ]; then exit 128; fi
+  if [ "$a" = "remote" ] && [ "${PE_REMOTE:-}" = "fail" ]; then exit 128; fi
   if [ "$a" = "cherry" ]; then
     case "${PE_CHERRY:-}" in
       fail)    exit 128 ;;
@@ -1290,6 +1295,9 @@ done
 exec "$PE_REAL_GIT" "$@"
 PEGIT
 chmod +x "$PE_BIN/git"
+# ga-ggj1wnv: the size a reap event carries comes from `du`; PE_DU=fail makes it exit 1 with no output (a log field must not stop the reap).
+export PE_REAL_DU="$(command -v du)"
+printf '#!/bin/sh\n[ "${PE_DU:-}" = "fail" ] && exit 1\nexec "$PE_REAL_DU" "$@"\n' > "$PE_BIN/du"; chmod +x "$PE_BIN/du"
 : > "$TMP/pe_nolsof.txt"
 
 pe_age() { touch -t "$(date -v-"${2:-3}"H +%Y%m%d%H%M 2>/dev/null || date -d "${2:-3} hours ago" +%Y%m%d%H%M)" "$1" 2>/dev/null || true; }
@@ -2406,6 +2414,9 @@ kz_kept() { # kz_kept <name> <label> [<event that must be logged once>] — tree
   else bad "ga-k0mose6: $2 → NOT kept (wt=$(kz_wt "$1" && echo y || echo n) br=$(kz_br "$1" && echo y || echo n) reaped_pool=$(events "$1" reaped_pool) ${3:-event}=$([ -n "${3:-}" ] && events "$1" "$3" || echo -))"; fi
 }
 KZ_CLOSED="[$(bc_bead "$KZ_ID" closed 10)]"
+# ga-ggj1wnv: pressure now ALSO reaps a clean tree of a closed bead with no merge proof, so the scenarios below that pin the MERGE proof on its own
+# (d, j, p1-p5: closed bead, tree clean but not provably merged) run with that rule OFF; the ga-ggj1wnv section at the end pins it ON.
+KZ_OLD=WORKTREE_REAPER_PRESSURE_REAP_CLOSED=0
 
 # (a) the measured bug, under pressure: closed 10h ago, clean, rebased → REAPED, and its orphan branch with it
 kz_mk kz_a
@@ -2432,7 +2443,7 @@ kz_mk kz_b2; run_kz kz_b2 "[$(bc_bead "$KZ_ID" in_progress)]" "$PRESS"; kz_kept 
 kz_mk kz_c; run_kz kz_c "[$(bc_bead "$KZ_ID" closed 1)]" "$PRESS";      kz_kept kz_c "bead closed only 1h ago (grace 6h)" kept_pressure_unmerged
 # (d) one commit of the tree is NOT in main (`git cherry` prints '+') → real work, KEPT
 kz_mk kz_d 'echo unshipped > unshipped.txt && git add unshipped.txt && git commit -qm unshipped'
-run_kz kz_d "$KZ_CLOSED" "$PRESS";                                       kz_kept kz_d "a commit main lacks (cherry '+')" kept_pressure_unmerged
+run_kz kz_d "$KZ_CLOSED" "$PRESS" "$KZ_OLD";                             kz_kept kz_d "a commit main lacks (cherry '+')" kept_pressure_unmerged
 # (e)(f) the bead lookup could not answer: unknown is not closed
 kz_mk kz_e; run_kz kz_e "@missing" "$PRESS";                             kz_kept kz_e "bead lookup FAILED" kept_pressure_unmerged
 [ "$(events kz_e bead_lookup_failed)" = "1" ] && ok "ga-k0mose6 (e): the failed lookup is logged (bead_lookup_failed), not read as 'not closed' silently" \
@@ -2441,11 +2452,11 @@ kz_mk kz_f; run_kz kz_f 'this is not json' "$PRESS";                     kz_kept
 kz_mk kz_f2; run_kz kz_f2 '[]' "$PRESS";                                 kz_kept kz_f2 "bead NOT FOUND (nothing says the work is over)" kept_pressure_unmerged
 # (p) a git read the proof leans on FAILS (the PE_BIN stub: rc 128, no output). A failed cherry is not an empty one, and a failed
 # rev-parse / status / rev-list is not "no HEAD to worry about" / "clean" / "no merge commits": every one keeps the tree, branch included.
-kz_mk kz_p1; run_kz kz_p1 "$KZ_CLOSED" "$PRESS" PE_CHERRY=fail;     kz_kept kz_p1 "git cherry FAILS (rc 128, no output)" kept_pressure_unmerged
-kz_mk kz_p2; run_kz kz_p2 "$KZ_CLOSED" "$PRESS" PE_CHERRY=garbage;  kz_kept kz_p2 "git cherry prints something that is not its format" kept_pressure_unmerged
-kz_mk kz_p3; run_kz kz_p3 "$KZ_CLOSED" "$PRESS" PE_CHERRY=partial;  kz_kept kz_p3 "git cherry prints a '-' line and THEN fails" kept_pressure_unmerged
-kz_mk kz_p4; run_kz kz_p4 "$KZ_CLOSED" "$PRESS" PE_REVLIST=fail;    kz_kept kz_p4 "the merge-commit check (rev-list --merges) FAILS" kept_pressure_unmerged
-kz_mk kz_p5; run_kz kz_p5 "$KZ_CLOSED" "$PRESS" PE_REVPARSE=fail;   kz_kept kz_p5 "git rev-parse HEAD FAILS (no HEAD to prove)" kept_pressure_unmerged
+kz_mk kz_p1; run_kz kz_p1 "$KZ_CLOSED" "$PRESS" "$KZ_OLD" PE_CHERRY=fail;     kz_kept kz_p1 "git cherry FAILS (rc 128, no output)" kept_pressure_unmerged
+kz_mk kz_p2; run_kz kz_p2 "$KZ_CLOSED" "$PRESS" "$KZ_OLD" PE_CHERRY=garbage;  kz_kept kz_p2 "git cherry prints something that is not its format" kept_pressure_unmerged
+kz_mk kz_p3; run_kz kz_p3 "$KZ_CLOSED" "$PRESS" "$KZ_OLD" PE_CHERRY=partial;  kz_kept kz_p3 "git cherry prints a '-' line and THEN fails" kept_pressure_unmerged
+kz_mk kz_p4; run_kz kz_p4 "$KZ_CLOSED" "$PRESS" "$KZ_OLD" PE_REVLIST=fail;    kz_kept kz_p4 "the merge-commit check (rev-list --merges) FAILS" kept_pressure_unmerged
+kz_mk kz_p5; run_kz kz_p5 "$KZ_CLOSED" "$PRESS" "$KZ_OLD" PE_REVPARSE=fail;   kz_kept kz_p5 "git rev-parse HEAD FAILS (no HEAD to prove)" kept_pressure_unmerged
 kz_mk kz_p6; run_kz kz_p6 "$KZ_CLOSED" "$PRESS" PE_STATUS=fail;     kz_kept kz_p6 "git status FAILS (an empty listing from a failed status is not 'clean')" kept_pressure_unmerged
 # (p0) the same stub with every knob OFF forwards to the real git: the failures above come from the knob, not from the stub
 kz_mk kz_p0; run_kz kz_p0 "$KZ_CLOSED" "$PRESS"
@@ -2463,7 +2474,7 @@ kz_mk kz_i 'echo "$(git rev-parse main)" > "$(git rev-parse --git-path MERGE_HEA
 run_kz kz_i "$KZ_CLOSED" "$PRESS";                                       kz_kept kz_i "a merge is under way (MERGE_HEAD)" kept_pressure_unmerged
 # (j) the tip is a merge commit carrying content of its own: `git cherry` cannot see merges, so it blocks the proof
 kz_mk kz_j 'git checkout -q -b side main && echo own > own.txt && git add own.txt && git commit -qm own && git checkout -q "crew/kz/wa-kz1xyz" && git merge -q --no-ff side -m "merge side"'
-run_kz kz_j "$KZ_CLOSED" "$PRESS";                                       kz_kept kz_j "a merge commit with content of its own" kept_pressure_unmerged
+run_kz kz_j "$KZ_CLOSED" "$PRESS" "$KZ_OLD";                             kz_kept kz_j "a merge commit with content of its own" kept_pressure_unmerged
 # (o) younger than MERGED_MIN_AGE_MIN (30 min): a tree nobody has started on is not proof of anything
 kz_mk kz_o '' 0; run_kz kz_o "$KZ_CLOSED" "$PRESS"
 kz_wt kz_o && kz_br kz_o && [ "$(events kz_o reaped_pool)" = "0" ] && ok "ga-k0mose6 (o): a tree younger than MERGED_MIN_AGE_MIN is KEPT even with the proofs" \
@@ -2489,6 +2500,195 @@ kz_mk kz_m; git -C "$TMP/kz_m/rig" worktree lock --reason "$KZ_ID active build" 
 run_kz kz_m "$KZ_CLOSED" "$PRESS"
 [ "$(events kz_m reaped_pool)" = "0" ] && ok "ga-k0mose6 (m): a locked tree never takes the new unlocked reap (reaped_pool = 0)" \
   || bad "ga-k0mose6 (m): a LOCKED tree was reaped by the unlocked path ($(events kz_m reaped_pool))"
+
+# ══ ga-ggj1wnv: under disk pressure a CLEAN, unlocked, unused tree whose beads are ALL closed goes with no merge proof — its branch stays ══
+# ga-m5i7e6 kept EVERY unmerged tree under pressure, so the tree of a bead closed long ago (abandoned, or squash-merged with local commits: neither an ancestor of main
+# nor patch-equivalent) sat there until the pool starved for disk (a hand removal by the Mayor was the only way out). `worktree remove` keeps the branch, so no commit is
+# lost. Open bead, a lookup that cannot answer, dirt, a lock, a process inside, a failing status and ignored data keep the tree, as before. Second half: a repo with NO
+# remote (traco-bim) has no origin/<default>, so "HEAD in main" is read against its local trunk, and the per-bead trees under <rig>-wt/ are in the list.
+echo "── ga-ggj1wnv: pressure reaps a clean tree of a CLOSED bead with no merge proof (branch kept); <rig>-wt and the local trunk of a repo with no remote ──"
+# gg_mk <name> [<setup run inside the tree>] [<age h, default 14>] [<dir name, default worker-kz>] — kz_mk's names (kz_wt/kz_br/kz_kept/KZ_CLOSED apply), but the tree's ONE commit
+# is never cherry-picked into main. A DETACHED tree has no branch to name its bead, only its directory does (worker-$KZ_ID, as in ga-yw18yk): gg_dwt looks for that one.
+gg_mk() {
+  local name="$1" extra="${2:-}" dir="${4:-worker-kz}" root="$TMP/$1"; mkdir -p "$root"
+  git init -q --bare "$root/remote.git"; git init -q -b main "$root/rig"
+  ( cd "$root/rig" || exit 1
+    git remote add origin "$root/remote.git"
+    echo base > base.txt; git add base.txt; git commit -qm base
+    git push -q origin main; git fetch -q origin; git remote set-head origin main 2>/dev/null || true
+    echo 'pesquisa/' >> .git/info/exclude
+    mkdir -p crew
+    git worktree add -q "crew/$dir" -b "crew/kz/$KZ_ID" main
+    ( cd "crew/$dir" && echo built > built.txt && git add built.txt && git commit -qm "built, never merged" )
+    if [ -n "$extra" ]; then ( cd "crew/$dir" && eval "$extra" ); fi
+  ) >/dev/null 2>&1
+  pe_age "$root/rig/crew/$dir" "${3:-14}"
+}
+gg_dwt() { git -C "$TMP/$1/rig" worktree list --porcelain 2>/dev/null | grep -E "/crew/worker-$KZ_ID\$" >/dev/null; }
+gg_tip() { git -C "$TMP/$1/rig" rev-parse "refs/heads/crew/kz/$KZ_ID" 2>/dev/null; }
+GG_DETACH='git checkout -q --detach && echo orphan > orphan.txt && git add orphan.txt && git commit -qm "detached-only work"'
+
+# (a) the measured leak: bead closed 10 h ago, tree clean + 14 h idle + not merged (a commit main lacks), pressure → REAPED, the branch and its unmerged commit KEPT
+gg_mk gg_a; GG_A_TIP="$(gg_tip gg_a)"
+run_kz gg_a "$KZ_CLOSED" "$PRESS"
+kz_wt gg_a && bad "ga-ggj1wnv (a): clean unmerged tree of a CLOSED bead NOT reaped under pressure — the measured leak" \
+           || ok "ga-ggj1wnv (a): clean unmerged tree of a CLOSED bead REAPED under pressure"
+{ kz_br gg_a && [ -n "$GG_A_TIP" ] && [ "$(gg_tip gg_a)" = "$GG_A_TIP" ]; } && ok "ga-ggj1wnv (a): the branch survives at its unmerged tip (only the tree goes)" \
+  || bad "ga-ggj1wnv (a): the branch (or its unmerged commit) was lost"
+[ "$(events gg_a reaped_pool)" = "1" ] && [ "$(events gg_a kept_pressure_unmerged)" = "0" ] \
+  && ok "ga-ggj1wnv (a): logged as one reaped_pool and no kept_pressure_unmerged" \
+  || bad "ga-ggj1wnv (a): expected 1 reaped_pool and 0 kept_pressure_unmerged, saw $(events gg_a reaped_pool)/$(events gg_a kept_pressure_unmerged)"
+GG_A_EV="$(grep '"event":"reaped_pool"' "$TMP/gg_a.jsonl" 2>/dev/null | head -1)"
+printf '%s' "$GG_A_EV" | grep -E "\"proof\":\"bead_closed\",\"beads\":\"$KZ_ID\",\"size_kb\":[0-9]+,\"reason\":\"disk pressure" >/dev/null \
+  && ok "ga-ggj1wnv (a): the event carries the proof, the bead, a numeric size_kb and the reason" \
+  || bad "ga-ggj1wnv (a): the reap event lacks proof/bead/size_kb/reason: $GG_A_EV"
+# (a2) the tip is a merge commit with content of its own: the tree goes all the same, and that content survives on the branch
+gg_mk gg_a2 'git checkout -q -b side main && echo own > own.txt && git add own.txt && git commit -qm own && git checkout -q "crew/kz/wa-kz1xyz" && git merge -q --no-ff side -m "merge side"'
+run_kz gg_a2 "$KZ_CLOSED" "$PRESS"
+{ ! kz_wt gg_a2 && [ "$(git -C "$TMP/gg_a2/rig" show "refs/heads/crew/kz/$KZ_ID:own.txt" 2>/dev/null)" = "own" ]; } \
+  && ok "ga-ggj1wnv (a2): a merge commit with content of its own → tree reaped, that content still on the branch" \
+  || bad "ga-ggj1wnv (a2): merge-commit tree — wt=$(kz_wt gg_a2 && echo y || echo n), content on branch: $(git -C "$TMP/gg_a2/rig" show "refs/heads/crew/kz/$KZ_ID:own.txt" 2>&1 | head -1)"
+# (a3) the merge proof cannot answer (git cherry fails): irrelevant to this rule, the tree goes on the bead proof alone, never as "delivered" (no proof=patch_equivalent, branch kept)
+gg_mk gg_a3; run_kz gg_a3 "$KZ_CLOSED" "$PRESS" PE_CHERRY=fail
+{ ! kz_wt gg_a3 && kz_br gg_a3 && grep '"event":"reaped_pool"' "$TMP/gg_a3.jsonl" | grep -F '"proof":"bead_closed"' >/dev/null; } \
+  && ok "ga-ggj1wnv (a3): git cherry failing does not stop the reap, and the proof stays bead_closed (never patch_equivalent)" \
+  || bad "ga-ggj1wnv (a3): cherry-failure tree — wt=$(kz_wt gg_a3 && echo y || echo n) br=$(kz_br gg_a3 && echo y || echo n)"
+
+# (b) the bead is still OPEN / IN_PROGRESS (the worker may be mid-build) → KEPT, and the pressure keep is what says so
+gg_mk gg_b; run_kz gg_b "[$(bc_bead "$KZ_ID" open)]" "$PRESS";          kz_kept gg_b "ga-ggj1wnv bead OPEN" kept_pressure_unmerged
+gg_mk gg_b2; run_kz gg_b2 "[$(bc_bead "$KZ_ID" in_progress)]" "$PRESS"; kz_kept gg_b2 "ga-ggj1wnv bead IN_PROGRESS" kept_pressure_unmerged
+# (c) dirt → KEPT, file intact: an untracked file, an edited tracked file
+gg_mk gg_c 'echo wip > wip.txt';        run_kz gg_c "$KZ_CLOSED" "$PRESS";  kz_kept gg_c "ga-ggj1wnv bead closed but an untracked file in the tree" kept_pressure_unmerged
+[ -f "$TMP/gg_c/rig/crew/worker-kz/wip.txt" ] && ok "ga-ggj1wnv (c): the uncommitted file is still on disk" || bad "ga-ggj1wnv (c): uncommitted work was destroyed"
+gg_mk gg_c2 'echo edit >> built.txt';   run_kz gg_c2 "$KZ_CLOSED" "$PRESS"; kz_kept gg_c2 "ga-ggj1wnv bead closed but a tracked file is edited" kept_pressure_unmerged
+# (d) LOCKED, holder a live pid → KEPT (the lock contract, not this rule, decides a locked tree)
+gg_mk gg_d; git -C "$TMP/gg_d/rig" worktree lock --reason "claude agent agent-gg pid 1001 start x" crew/worker-kz >/dev/null 2>&1
+echo "1001 alive 100 10" > "$TMP/gg_ps.txt"
+run_kz gg_d "$KZ_CLOSED" "$PRESS" WORKTREE_REAPER_FAKE_PS="$TMP/gg_ps.txt"; kz_kept gg_d "ga-ggj1wnv bead closed but the tree is LOCKED by a live pid" kept_locked_live
+# (e) a live process has its cwd inside → KEPT
+gg_mk gg_e; ( cd "$TMP/gg_e/rig/crew/worker-kz" && pwd -P ) > "$TMP/gg_e.lsof"
+run_kz gg_e "$KZ_CLOSED" "$PRESS" WORKTREE_REAPER_FAKE_LSOF="$TMP/gg_e.lsof"; kz_kept gg_e "ga-ggj1wnv bead closed but a process has the tree as its cwd" kept_in_use
+# (f) the bead lookup cannot answer (failed, junk, bead not found) → KEPT; the failure is logged, not read as "not closed" in silence
+gg_mk gg_f1; run_kz gg_f1 "@missing" "$PRESS";          kz_kept gg_f1 "ga-ggj1wnv bead lookup FAILED" kept_pressure_unmerged
+[ "$(events gg_f1 bead_lookup_failed)" = "1" ] && ok "ga-ggj1wnv (f): the failed lookup is logged (bead_lookup_failed)" || bad "ga-ggj1wnv (f): no bead_lookup_failed event ($(events gg_f1 bead_lookup_failed))"
+gg_mk gg_f2; run_kz gg_f2 'this is not json' "$PRESS";  kz_kept gg_f2 "ga-ggj1wnv bead lookup printed JUNK" kept_pressure_unmerged
+gg_mk gg_f3; run_kz gg_f3 '[]' "$PRESS";                kz_kept gg_f3 "ga-ggj1wnv bead NOT FOUND" kept_pressure_unmerged
+# (g) git status cannot run (an empty listing from a failed status is not "clean") → KEPT
+gg_mk gg_g; run_kz gg_g "$KZ_CLOSED" "$PRESS" PE_STATUS=fail;  kz_kept gg_g "ga-ggj1wnv git status FAILS" kept_pressure_unmerged
+# (h) closed only 1 h ago (grace BEAD_CLOSED_HOURS=6) → KEPT; the knob is honoured (0 → the same bead qualifies)
+gg_mk gg_h; run_kz gg_h "[$(bc_bead "$KZ_ID" closed 1)]" "$PRESS";  kz_kept gg_h "ga-ggj1wnv bead closed only 1h ago (grace 6h)" kept_pressure_unmerged
+gg_mk gg_h2; run_kz gg_h2 "[$(bc_bead "$KZ_ID" closed 1)]" "$PRESS" WORKTREE_REAPER_CLOSED_BEAD_HOURS=0
+kz_wt gg_h2 && bad "ga-ggj1wnv (h): WORKTREE_REAPER_CLOSED_BEAD_HOURS=0 was ignored" || ok "ga-ggj1wnv (h): WORKTREE_REAPER_CLOSED_BEAD_HOURS=0 → a bead closed 1h ago qualifies"
+# (i) a merge under way (its state is in the git dir, not in `git status`) → KEPT
+gg_mk gg_i 'echo "$(git rev-parse main)" > "$(git rev-parse --git-path MERGE_HEAD)"'; run_kz gg_i "$KZ_CLOSED" "$PRESS"; kz_kept gg_i "ga-ggj1wnv a merge is under way (MERGE_HEAD)" kept_pressure_unmerged
+# (j) detached HEAD with a commit no branch holds → a rescue/ branch FIRST, then the tree goes; (j2) the rescue cannot be created → the tree is KEPT
+gg_mk gg_j "$GG_DETACH" 14 "worker-$KZ_ID"; GG_J_HEAD="$(git -C "$TMP/gg_j/rig/crew/worker-$KZ_ID" rev-parse HEAD 2>/dev/null)"; GG_J_RESCUE="rescue/$KZ_ID-$(printf '%s' "$GG_J_HEAD" | cut -c1-9)"
+run_kz gg_j "$KZ_CLOSED" "$PRESS"
+{ ! gg_dwt gg_j && [ -n "$GG_J_HEAD" ] && [ "$(git -C "$TMP/gg_j/rig" rev-parse --verify -q "refs/heads/$GG_J_RESCUE" 2>/dev/null)" = "$GG_J_HEAD" ]; } \
+  && ok "ga-ggj1wnv (j): detached tree reaped only after $GG_J_RESCUE holds its commit" \
+  || bad "ga-ggj1wnv (j): detached tree — wt=$(gg_dwt gg_j && echo y || echo n), no $GG_J_RESCUE at HEAD (the commit is lost with the tree)"
+gg_mk gg_j2 "$GG_DETACH" 14 "worker-$KZ_ID"; GG_J2_HEAD="$(git -C "$TMP/gg_j2/rig/crew/worker-$KZ_ID" rev-parse HEAD 2>/dev/null)"
+git -C "$TMP/gg_j2/rig" branch "rescue/$KZ_ID-$(printf '%s' "$GG_J2_HEAD" | cut -c1-9)/blocker" main >/dev/null 2>&1
+run_kz gg_j2 "$KZ_CLOSED" "$PRESS"
+{ gg_dwt gg_j2 && [ "$(events gg_j2 reaped_pool)" = "0" ] && [ "$(events gg_j2 bead_closed_rescue_failed)" = "1" ]; } \
+  && ok "ga-ggj1wnv (j2): the rescue branch could not be created → tree KEPT, bead_closed_rescue_failed logged" \
+  || bad "ga-ggj1wnv (j2): rescue failed but wt=$(gg_dwt gg_j2 && echo y || echo n) reaped_pool=$(events gg_j2 reaped_pool) rescue_failed=$(events gg_j2 bead_closed_rescue_failed)"
+# (k) the kill switch: WORKTREE_REAPER_PRESSURE_REAP_CLOSED=0 gives the ga-m5i7e6 rule back
+gg_mk gg_k; run_kz gg_k "$KZ_CLOSED" "$PRESS" "$KZ_OLD"; kz_kept gg_k "ga-ggj1wnv WORKTREE_REAPER_PRESSURE_REAP_CLOSED=0 (the ga-m5i7e6 rule)" kept_pressure_unmerged
+# the reason on the keep says what that run really does: with the rule on, closed-bead trees are also named as the way out; with it off they are not
+grep '"event":"kept_pressure_unmerged"' "$TMP/gg_k.jsonl" | grep -F '"reason":"disk pressure removes only merged trees"}' >/dev/null \
+  && grep '"event":"kept_pressure_unmerged"' "$TMP/gg_b.jsonl" | grep -F '"reason":"disk pressure removes only merged trees and clean trees of closed beads"}' >/dev/null \
+  && ok "ga-ggj1wnv (k): the keep's reason names closed-bead trees as a way out only while that rule is on" \
+  || bad "ga-ggj1wnv (k): kept_pressure_unmerged reason — off: $(grep kept_pressure "$TMP/gg_k.jsonl" | head -1 | cut -c1-200) on: $(grep kept_pressure "$TMP/gg_b.jsonl" | head -1 | cut -c1-200)"
+# (l) dry-run: says what it would do (with the proof), does nothing — not even the rescue branch of a detached tree
+gg_mk gg_l "$GG_DETACH" 14 "worker-$KZ_ID"; run_kz gg_l "$KZ_CLOSED" "$PRESS" WORKTREE_REAPER_ENABLED=0
+if gg_dwt gg_l && [ "$(events gg_l would_reap_pool)" = "1" ] && [ "$(events gg_l reaped_pool)" = "0" ] && [ -z "$(git -C "$TMP/gg_l/rig" for-each-ref refs/heads/rescue 2>/dev/null)" ] \
+   && grep '"event":"would_reap_pool"' "$TMP/gg_l.jsonl" | grep -F '"proof":"bead_closed"' >/dev/null; then ok "ga-ggj1wnv (l): dry-run logs would_reap_pool with the proof; tree intact, no rescue ref created"
+else bad "ga-ggj1wnv (l): dry-run — wt=$(gg_dwt gg_l && echo y || echo n) would=$(events gg_l would_reap_pool) reaped=$(events gg_l reaped_pool) rescue refs=$(git -C "$TMP/gg_l/rig" for-each-ref refs/heads/rescue 2>/dev/null | wc -l | tr -d ' ')"; fi
+# (m) ignored data that is not junk (a battery output under an ignored pesquisa/) → KEPT by the ignored-data guard, which still comes after this rule
+gg_mk gg_m 'mkdir -p pesquisa && echo r1 > pesquisa/battery.csv'; run_kz gg_m "$KZ_CLOSED" "$PRESS" WORKTREE_REAPER_IGNORED_DATA_GUARD=1
+kz_kept gg_m "ga-ggj1wnv bead closed but the tree holds ignored non-junk data" kept_ignored_data
+[ -f "$TMP/gg_m/rig/crew/worker-kz/pesquisa/battery.csv" ] && ok "ga-ggj1wnv (m): the battery output is still on disk" || bad "ga-ggj1wnv (m): the ignored battery output was destroyed"
+# (n) control, normal mode: no pressure, 14 h < the 24 h age gate → KEPT (this rule is for pressure only)
+gg_mk gg_n; run_kz gg_n "$KZ_CLOSED"
+{ kz_wt gg_n && kz_br gg_n && [ "$(events gg_n reaped_pool)" = "0" ]; } && ok "ga-ggj1wnv (n): normal mode is unchanged (age gate keeps a 14 h tree)" || bad "ga-ggj1wnv (n): a normal-mode tree under the age gate was reaped"
+# (o) du fails: the size is a log field, so the tree still goes and the event says size_kb null
+gg_mk gg_o; run_kz gg_o "$KZ_CLOSED" "$PRESS" PE_DU=fail
+{ ! kz_wt gg_o && grep '"event":"reaped_pool"' "$TMP/gg_o.jsonl" | grep -F '"size_kb":null' >/dev/null; } \
+  && ok "ga-ggj1wnv (o): du failing → tree reaped, size_kb null (a log field never stops the reap)" || bad "ga-ggj1wnv (o): du failing — wt=$(kz_wt gg_o && echo y || echo n)"
+
+# (p) loop 1 (the town's own .gc-worktrees) has the same rule: a closed bead → reaped with the proof on a `reaped` event; an open one → kept
+gg_town() { # <name> — the TOWN is the repo (origin/main); .gc-worktrees/wa-kz1xyz-x holds a commit main lacks, and z-merged (swept AFTER it, glob order) sits at main: both 14 h idle
+  local t="$TMP/$1"; mkdir -p "$t"; git init -q --bare "$TMP/$1-remote.git"; git init -q -b main "$t"
+  ( cd "$t" && git remote add origin "$TMP/$1-remote.git" && echo a > a.txt && git add a.txt && git commit -qm base \
+    && git push -q origin main && git fetch -q origin && git remote set-head origin main && mkdir -p .gc-worktrees \
+    && git worktree add -q ".gc-worktrees/z-merged" -b w/z-merged main \
+    && git worktree add -q ".gc-worktrees/$KZ_ID-x" -b "w/$KZ_ID-x" main && cd ".gc-worktrees/$KZ_ID-x" && echo b > b.txt && git add b.txt && git commit -qm ahead ) >/dev/null 2>&1
+  pe_age "$t/.gc-worktrees/$KZ_ID-x" 14; pe_age "$t/.gc-worktrees/z-merged" 14
+}
+gg_town gg_p1; run_kz gg_p1 "$KZ_CLOSED" "$PRESS"
+{ [ ! -d "$TMP/gg_p1/.gc-worktrees/$KZ_ID-x" ] && git -C "$TMP/gg_p1" rev-parse --verify -q "refs/heads/w/$KZ_ID-x" >/dev/null 2>&1 \
+  && grep '"event":"reaped"' "$TMP/gg_p1.jsonl" | grep -E "\"proof\":\"bead_closed\",\"beads\":\"$KZ_ID\",\"size_kb\":[0-9]+" >/dev/null; } \
+  && ok "ga-ggj1wnv (p): town loop — clean unmerged tree of a closed bead reaped, branch kept, the reaped event carries proof/bead/size" \
+  || bad "ga-ggj1wnv (p): town loop closed-bead — dir=$([ -d "$TMP/gg_p1/.gc-worktrees/$KZ_ID-x" ] && echo y || echo n) event=$(grep '"event":"reaped"' "$TMP/gg_p1.jsonl" 2>/dev/null | head -1)"
+# the MERGED tree swept right after it is reaped on its own merit: its event must not inherit the proof of the tree before it
+grep '"event":"reaped","wt":"z-merged"' "$TMP/gg_p1.jsonl" 2>/dev/null | grep -v '"proof"' >/dev/null \
+  && ok "ga-ggj1wnv (p): the merged tree swept after it is reaped with NO closed-bead proof on its event (no state carried over)" \
+  || bad "ga-ggj1wnv (p): the merged tree's event is missing or carries a stale proof: $(grep '"wt":"z-merged"' "$TMP/gg_p1.jsonl" 2>/dev/null | head -1)"
+gg_town gg_p2; run_kz gg_p2 "[$(bc_bead "$KZ_ID" open)]" "$PRESS"
+{ [ -d "$TMP/gg_p2/.gc-worktrees/$KZ_ID-x" ] && [ "$(events gg_p2 kept_pressure_unmerged)" = "1" ]; } \
+  && ok "ga-ggj1wnv (p): town loop — open bead → KEPT, kept_pressure_unmerged logged" || bad "ga-ggj1wnv (p): town loop open-bead — dir=$([ -d "$TMP/gg_p2/.gc-worktrees/$KZ_ID-x" ] && echo y || echo n)"
+# dry-run: would_reap names the proof, nothing is removed
+gg_town gg_p3; run_kz gg_p3 "$KZ_CLOSED" "$PRESS" WORKTREE_REAPER_ENABLED=0
+{ [ -d "$TMP/gg_p3/.gc-worktrees/$KZ_ID-x" ] && grep '"event":"would_reap","wt":"'"$KZ_ID"'-x"' "$TMP/gg_p3.jsonl" | grep -F '"proof":"bead_closed"' >/dev/null; } \
+  && ok "ga-ggj1wnv (p): town loop dry-run — would_reap names the proof, the tree stays" || bad "ga-ggj1wnv (p): town loop dry-run — event=$(grep '"event":"would_reap"' "$TMP/gg_p3.jsonl" 2>/dev/null | head -1)"
+
+# (q) a repo with NO remote (the traco-bim shape): a per-bead tree in ../<rig>-wt/<bead> on a branch that is neither crew/* nor worker-*; "merged" = HEAD in its local trunk
+gg_nr() { # <name> <trunk> [<setup run inside the tree>] [<age h, default 14>] [<container dir, default rig-wt>] — $TMP/<name>/rig has NO remote; tree <container>/tb-gg1xyz on work/tb-gg1xyz cut from <trunk>
+  local name="$1" trunk="$2" extra="${3:-}" root="$TMP/$1" box="${5:-rig-wt}"; mkdir -p "$root/$box"
+  git init -q -b "$trunk" "$root/rig"
+  ( cd "$root/rig" || exit 1
+    echo base > base.txt; git add base.txt; git commit -qm base
+    git worktree add -q "$root/$box/tb-gg1xyz" -b work/tb-gg1xyz "$trunk"
+    if [ -n "$extra" ]; then ( cd "$root/$box/tb-gg1xyz" && eval "$extra" ); fi
+  ) >/dev/null 2>&1
+  pe_age "$root/$box/tb-gg1xyz" "${4:-14}"
+}
+gg_nwt() { git -C "$TMP/$1/rig" worktree list --porcelain 2>/dev/null | grep -E "/${2:-rig-wt}/tb-gg1xyz\$" >/dev/null; }
+gg_nkept() { # <name> <label> [<event logged once>] [<container>] — tree intact, nothing reaped
+  if gg_nwt "$1" "${4:-rig-wt}" && [ "$(events "$1" reaped_pool)" = "0" ] && { [ -z "${3:-}" ] || [ "$(events "$1" "$3")" = "1" ]; }; then ok "ga-ggj1wnv: $2 → KEPT${3:+ ($3 logged once)}"
+  else bad "ga-ggj1wnv: $2 → NOT kept (present=$(gg_nwt "$1" "${4:-rig-wt}" && echo y || echo n) reaped_pool=$(events "$1" reaped_pool) ${3:-event}=$([ -n "${3:-}" ] && events "$1" "$3" || echo -))"; fi
+}
+gg_ngone() { # <name> <label> <fragment of the reap event> — tree gone, ONE reaped_pool event holding <fragment>, branch work/tb-gg1xyz kept
+  if ! gg_nwt "$1" && [ "$(events "$1" reaped_pool)" = "1" ] && grep '"event":"reaped_pool"' "$TMP/$1.jsonl" | grep -F "$3" >/dev/null \
+     && git -C "$TMP/$1/rig" rev-parse --verify -q refs/heads/work/tb-gg1xyz >/dev/null 2>&1; then ok "ga-ggj1wnv: $2 → REAPED ($3), branch kept"
+  else bad "ga-ggj1wnv: $2 → NOT reaped as expected (present=$(gg_nwt "$1" && echo y || echo n) event=$(grep '"event":"reaped_pool"' "$TMP/$1.jsonl" 2>/dev/null | head -1))"; fi
+}
+GG_TB=tb-gg1xyz; GG_TB_CLOSED="[$(bc_bead "$GG_TB" closed 10)]"; GG_TB_OPEN="[$(bc_bead "$GG_TB" open)]"
+GG_AHEAD='echo built > built.txt && git add built.txt && git commit -qm built'
+# (q1) HEAD in master (nothing diverged), bead OPEN → merged by the local trunk: reaped under pressure, and in normal mode too after 30 min idle (merged bypasses the age gate)
+gg_nr gg_q1 master;                 run_kz gg_q1 "$GG_TB_OPEN" "$PRESS"; gg_ngone gg_q1 "(q1) no remote, HEAD in master, pressure" '"proof":"local_trunk"'
+gg_nr gg_q1b master '' 1;           run_kz gg_q1b "$GG_TB_OPEN";         gg_ngone gg_q1b "(q1b) no remote, HEAD in master, normal mode, 1 h idle" '"proof":"local_trunk"'
+# (q2) HEAD ahead of master + bead CLOSED → the closed-bead rule, with no origin anywhere; (q3) the same tree with an OPEN bead → KEPT
+gg_nr gg_q2 master "$GG_AHEAD";     run_kz gg_q2 "$GG_TB_CLOSED" "$PRESS"; gg_ngone gg_q2 "(q2) no remote, HEAD ahead of master, bead closed, pressure" '"proof":"bead_closed"'
+gg_nr gg_q3 master "$GG_AHEAD";     run_kz gg_q3 "$GG_TB_OPEN" "$PRESS";   gg_nkept gg_q3 "(q3) no remote, HEAD ahead of master, bead open, pressure" kept_pressure_unmerged
+# (q4) control: the same tree outside <rig>-wt (and not crew/*, not worker-*) is not in the list at all — untouched, silent — though everything else says "reapable"
+gg_nr gg_q4 master '' 14 other;     run_kz gg_q4 "$GG_TB_CLOSED" "$PRESS"
+{ gg_nwt gg_q4 other && [ "$(events gg_q4 reaped_pool)" = "0" ] && [ "$(events gg_q4 kept_pressure_unmerged)" = "0" ]; } \
+  && ok "ga-ggj1wnv (q4): a tree outside <rig>-wt/ with an ordinary name stays out of the list (no event, still there)" || bad "ga-ggj1wnv (q4): an unlisted tree was touched or logged"
+# (q5) `git remote` cannot answer → "does this repo have a remote?" is unknown → not merged: KEPT (bead open, so nothing else frees it)
+gg_nr gg_q5 master;                 run_kz gg_q5 "$GG_TB_OPEN" "$PRESS" PE_REMOTE=fail; gg_nkept gg_q5 "(q5) git remote FAILS" kept_pressure_unmerged
+# (q6) the repo HAS a remote (never fetched, so no origin/<default>): the local trunk is NOT used — a local branch may be ahead of what was pushed → KEPT
+gg_nr gg_q6 master; git -C "$TMP/gg_q6/rig" remote add origin "$TMP/gg_q6-no-such.git" >/dev/null 2>&1
+run_kz gg_q6 "$GG_TB_OPEN" "$PRESS"; gg_nkept gg_q6 "(q6) a remote is configured: no local-trunk proof" kept_pressure_unmerged
+# (q7) master AND main both exist: which is the trunk is ambiguous → KEPT
+gg_nr gg_q7 master; git -C "$TMP/gg_q7/rig" branch main master >/dev/null 2>&1
+run_kz gg_q7 "$GG_TB_OPEN" "$PRESS"; gg_nkept gg_q7 "(q7) master and main both exist: trunk ambiguous" kept_pressure_unmerged
+# (q8) dirty tree with HEAD in master: plain remove refused, nothing to preserve to (no origin) → KEPT with the file, preserve_failed_dirty_kept logged
+gg_nr gg_q8 master 'echo wip > wip.txt'; run_kz gg_q8 "$GG_TB_OPEN" "$PRESS"
+{ gg_nwt gg_q8 && [ -f "$TMP/gg_q8/rig-wt/tb-gg1xyz/wip.txt" ] && [ "$(events gg_q8 reaped_pool)" = "0" ] && [ "$(events gg_q8 preserve_failed_dirty_kept)" = "1" ]; } \
+  && ok "ga-ggj1wnv (q8): dirty tree with HEAD in master → KEPT with its file, preserve_failed_dirty_kept logged" \
+  || bad "ga-ggj1wnv (q8): dirty tree — present=$(gg_nwt gg_q8 && echo y || echo n) reaped_pool=$(events gg_q8 reaped_pool) preserve_failed=$(events gg_q8 preserve_failed_dirty_kept)"
 
 echo ""
 echo "── RESULTS: $PASS passed, $FAIL failed ──"
