@@ -1,0 +1,26 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <!-- ga-kzwlkhh. 1x por dia (05:17), nice 19: recria o DDL (SEM nenhuma linha) dos bancos SQLite de produção que o código do WA cita e o entrega ao nó Hetzner (scripts/wa-schema-dbs.py run). O nó reconfere tudo e só então o recibo
+       .gc/wa-schema-dbs/delivered.json deixa o classificador (wa-node-classify.py) tratar o banco como "com schema no nó". Sem RunAtLoad de propósito (fora do escopo do wait-for-dolt: não lê bd/gc/dolt). Cada rodada imprime
+       linhas WASCHEMA (um banco por linha, depois o resumo); exit 0 ok/desligado, 2 não confirmei a entrega, 3 não consegui montar, 4 o nó recusou. Desligar: touch .gc/wa-schema-dbs/off (apaga o recibo na próxima rodada);
+       ou launchctl bootout + disable. Instalar, conferir e retirar: docs/runbooks/hetzner-wa-node.md (seção Banco só-schema no nó). O deploy instala plist novo de packs/town-deltas/assets sozinho. -->
+  <key>Label</key><string>com.gascity.wa-schema-dbs</string>
+  <key>ProgramArguments</key><array>
+    <string>/usr/bin/python3</string>
+    <string>-I</string>
+    <string>/Users/athos/gt/.gascity-gastown-hq/scripts/wa-schema-dbs.py</string>
+    <string>run</string>
+  </array>
+  <key>WorkingDirectory</key><string>/Users/athos/gt/.gascity-gastown-hq</string>
+  <key>StartCalendarInterval</key><dict><key>Hour</key><integer>5</integer><key>Minute</key><integer>17</integer></dict>
+  <key>Nice</key><integer>19</integer>
+  <key>LowPriorityIO</key><true/>
+  <key>StandardOutPath</key><string>/Users/athos/gt/.gascity-gastown-hq/.gc/logs/wa-schema-dbs.out</string>
+  <key>StandardErrorPath</key><string>/Users/athos/gt/.gascity-gastown-hq/.gc/logs/wa-schema-dbs.err</string>
+  <key>EnvironmentVariables</key><dict>
+    <key>PATH</key><string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    <key>HOME</key><string>/Users/athos</string>
+    <key>GC_CITY_PATH</key><string>/Users/athos/gt/.gascity-gastown-hq</string>
+  </dict>
+</dict></plist>

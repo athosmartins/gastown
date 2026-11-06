@@ -158,6 +158,10 @@ a,b=L(sys.argv[1],"ws"),L(sys.argv[2],"cls")
 sys.exit(0 if a.KEY_RE.pattern==b.SCHEMA_KEY_RE.pattern else 1)' "$WS" "$CLS" && ok "KEY_RE do gerador == SCHEMA_KEY_RE do classificador (o recibo só tem caminhos que os dois entendem)" || bad "KEY_RE diverge do classificador"
 grep -qF 'schema-dbs-v1' "$RG" && grep -qF 'schema-dbs-v1' "$WS" && ok "o marcador de placement (schema-dbs-v1) está no wt-add do nó E no programa do nó" || bad "marcador de placement ausente de um dos lados"
 py 'import ast,sys;ast.parse(open(sys.argv[1]).read(), feature_version=(3,9))' "$WS" && ok "gramática do Python 3.9 (o /usr/bin/python3 do mini)" || bad "o gerador usa gramática pós-3.9"
+py 'import plistlib,sys
+d=plistlib.load(open(sys.argv[1],"rb")); a=d["ProgramArguments"]
+ok_=d["Label"]=="com.gascity.wa-schema-dbs" and a[:2]==["/usr/bin/python3","-I"] and a[2].endswith("/scripts/wa-schema-dbs.py") and a[-1]=="run" and "RunAtLoad" not in d and d["Nice"]==19 and d["StartCalendarInterval"]=={"Hour":5,"Minute":17}
+sys.exit(0 if ok_ else 1)' "$HERE/../packs/town-deltas/assets/com.gascity.wa-schema-dbs.plist" && ok "plist: label, python3 -I + wa-schema-dbs.py run, diário 05:17, nice 19, SEM RunAtLoad (fora do escopo do wait-for-dolt)" || bad "plist com.gascity.wa-schema-dbs fora do combinado"
 
 # ── controle negativo: UMA troca por mutante, o caso designado tem de reprovar (e passar no original) ─────────────────────────────────────────────────────────────────────────────────────────
 mut() { # mut <nome> <trecho> <novo> <função do caso>

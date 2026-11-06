@@ -39,7 +39,7 @@ Não existe sonda de pool aqui. `bd ready`, `bd query`, `bd update --claim` e `g
 ## Trabalhar e entregar
 
 1. Trabalhe no diretório atual. Registre o andamento com `bd comment <id> "..."`.
-2. Rode só testes que não precisam de banco, rede de produção nem do Mac. Se um teste pedir arquivo que o nó não tem, **isso é sinal de que a bead não cabe aqui**: veja a próxima seção, não crie dado falso para passar.
+2. Rode só testes que não precisam de banco, rede de produção nem do Mac. Se um teste pedir arquivo que o nó não tem, **isso é sinal de que a bead não cabe aqui**: veja a próxima seção, não crie dado falso para passar. Alguns bancos de produção existem no nó **só como schema** (`shared/data/<x>.db`: tabelas e índices, **zero linha**; a classificação os nomeia em `mole-banco-com-schema:`): teste que só precisa do caminho e do schema roda; teste que lê DADO desse banco vê tabela vazia e fica vermelho, e isso também é sinal de que a bead não cabe aqui. Não escreva linhas nesses bancos para passar.
 3. Os commits saem com o autor `<seu nome de sessão>@gastown.invalid`; não mude a identidade git.
 4. `git push origin HEAD` leva o branch ao espelho do mini, que só aceita `worker/*` e `crew/*`. Merge é do gate, nunca seu.
 5. Bead de código: ao terminar, rode `gate-done` e deixe um `bd comment <id> "entregue: <resumo>"`. **Não feche** a bead; o gate fecha. O skill de mesmo nome não existe nesta sessão: o que vale é o atalho. `gate-done` sem argumentos serve só para a ÚNICA bead `in_progress` sua e submete o que o ESPELHO tem em `worker/<seu nome de sessão>`; para a bead que voltou do gate, veja a seção "Bead que voltou do gate".
