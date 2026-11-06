@@ -104,6 +104,9 @@ cmd_wt_add() {   # worktree por bead; ANTES atualiza o clone e GRAVA a idade do 
   else g worktree add -q --no-checkout -b "worker/$bead" "$path" "refs/remotes/origin/$base" || die 3 "worktree add falhou"; fi
   # sparse no worktree = os mesmos padrões do filtro; sem isto o checkout pediria ao espelho um blob de dado que ele recusa
   git -C "$path" sparse-checkout set --no-cone --stdin < "$GR/$RIG/sparse" && git -C "$path" checkout -q -f HEAD || die 3 "checkout esparso falhou em $path"
+  # schema-dbs-v1: bancos só-schema (ga-kzwlkhh; wa-schema-dbs.py os instala em $GR/schema-dbs/<rig>) entram no worktree NOVO no mesmo caminho relativo (shared/ é ignorado pelo git no WA). vazio (nada instalado) → worktree como sempre;
+  # falhou (cp) → o worktree segue SEM o banco: o teste fica vermelho e a bead volta ao mini; nunca aborta o wt-add
+  [ -d "$GR/schema-dbs/$RIG/shared" ] && cp -R "$GR/schema-dbs/$RIG/shared" "$path/" 2>/dev/null
   lag_fields; line=$(printf '{"ts":"%s","rig":"%s","bead":"%s","branch":"worker/%s","base":"%s","main":"%s","main_age_min":%s,"lag_min":%s,"pull":"%s"}' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$RIG" "$bead" "$bead" "$base" "$LAG_MAIN" "$MAIN_AGE" "$LAG_MIN" "$pull")
   echo "$line" >> "$GR/worktrees.jsonl"; echo "$line"
 }
@@ -157,6 +160,10 @@ cmd_scan() {
     ( cd "$GR/$RIG" && find . -type f -not -path './repo.git/*' -print0 ) > "$t/files0" 2>/dev/null && tr '\0' '\n' < "$t/files0" > "$t/files" && [ "$(tr -cd '\0' < "$t/files0" | wc -c | tr -d ' ')" = "$(wc -l < "$t/files" | tr -d ' ')" ] \
       || { echo "scan $RIG: find falhou ou há nome de arquivo com quebra de linha: NÃO consegui varrer a árvore"; rc=2; continue; }
     sed -e 's|^\./||' "$t/files" | grep -v -e '^sparse$' -e '^deny$' -e '^last-pull-error$' -e '/\.git$' | denied > "$t/hit-tree" || { echo "scan $RIG: não consegui avaliar a árvore"; rc=2; continue; }
+    # schema-dbs-v1: o caminho EXATO <wt>/<rel> de um banco só-schema do MANIFEST instalado (e os -wal/-shm/-journal dele) não é achado; qualquer outro .db segue sendo. vazio (sem MANIFEST) → nada liberado; falhou (sed/grep rc > 1) → a lista fica como estava
+    if [ -s "$GR/schema-dbs/$RIG/MANIFEST" ] && rx=$(sed -e 's/\./\\./g' "$GR/schema-dbs/$RIG/MANIFEST" | paste -sd'|' -) && [ -n "$rx" ]; then
+      grep -v -E "^wt/[^/]+/($rx)(-wal|-shm|-journal)?\$" "$t/hit-tree" > "$t/hit-tree.ok"; [ $? -le 1 ] && mv "$t/hit-tree.ok" "$t/hit-tree"
+    fi
     u=$(g config --get-regexp '^remote\..*\.url$' | awk '{print $2}' | grep -v -x -F "$(g config gtremote.mirrorurl)"; true)
     n="$(wc -l < "$t/pairs" | tr -d ' ') pares blob/caminho, $(wc -l < "$t/present" | tr -d ' ') blobs presentes ($(cat "$t/expl" 2>/dev/null || echo ?) deles com os mesmos bytes sob caminho permitido), $(wc -l < "$t/files" | tr -d ' ') arquivos"
     if [ -s "$t/hit-obj" ] || [ -s "$t/hit-tree" ] || [ -n "$u" ] || g config --get-regexp '^remote\..*\.url$' | grep -qi github; then

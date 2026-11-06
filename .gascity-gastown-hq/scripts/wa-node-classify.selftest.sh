@@ -43,6 +43,7 @@ PY=${WA_NODE_SELFTEST_PY:-python3}
 export WA_NODE_MIRROR="$T/espelho-ausente"   # os casos antigos valem SEM espelho (cai no filtro do rsync); o espelho entra só nos casos da seção "espelho git", com um stub
 export WA_NODE_REPO="$T/wa-repo-ausente"     # idem o repo do WA (regra 6): os casos antigos nunca olham o repo de verdade desta máquina; a seção "teste derivado" monta um de mentira
 export WA_NODE_CACHE="$T/cache"            # cache das irmãs (regra 7): nunca o do .gc/ de verdade; os casos que precisam de cache limpo/proibido trocam por env
+export WA_NODE_SCHEMA_RECEIPT="$T/receipt-ausente.json"   # banco com schema no nó (ga-kzwlkhh): os casos antigos valem SEM recibo (nunca o do .gc/ de verdade); a seção "banco com schema" liga recibos de mentira
 
 CLS="$CLS_REAL"; OUT=""; RC=0
 run() { OUT=$(printf '%s' "$1" | "$PY" -I "$CLS" 2>/dev/null); RC=$?; }
@@ -377,6 +378,18 @@ wf shared/anchor_out.py $'# anchor_out'; wf tests/test_anchor_out.py $'anchor_ou
 wf lib/anchor_db.py $'D = "queue.db"'; wf tests/test_anchor_db.py $'anchor_db'
 # oráculo (ga-2hd02v.5.13, regra 9): testes que EXISTEM em origin/main e não importam nada do repo (a regra 8 lê e não acha código). orc_mole tem um banco de produção fixado no código (a regra 4 lê o teste e manda ao mini)
 wf tests/test_orc_a.py $'import os\nimport pytest\n\ndef test_a():\n    assert os.sep'; wf tests/test_orc_b.py $'import json\n'; wf tests/test_orc_mole.py $'P = "shared/data/orc.db"\n'
+# banco COM SCHEMA NO NÓ (ga-kzwlkhh, regra 4). sch_ok fixa shared/data/queue.db, sch_bare só tem o nome solto, sch_two/sch_att fixam um banco do recibo e um que não é, sch_md/sch_duck/sch_abs/sch_fstr/sch_dir são evidências que NUNCA casam
+# com o recibo, sch_txt1/sch_txt2 são Python que não parseia (o texto tem de ver TODOS os bancos), sch_sh é shell, sch_tpin fixa o banco só no TESTE, sch_cred junta um banco do recibo com o cofre, sch_many tem 7 bancos
+wf lib/sch_ok.py $'P = "shared/data/queue.db"'; wf tests/test_sch_ok.py $'from lib.sch_ok import P'; wf lib/sch_bare.py $'DB = "queue.db"'; wf tests/test_sch_bare.py $'from lib.sch_bare import DB'
+wf lib/sch_two.py $'A = "shared/data/queue.db"\nB = "shared/data/outro.db"'; wf tests/test_sch_two.py $'from lib.sch_two import A'
+wf lib/sch_att.py $'SQL = "ATTACH \'shared/data/queue.db\' AS a; ATTACH \'shared/data/outro.db\' AS b"'; wf tests/test_sch_att.py $'from lib.sch_att import SQL'
+wf lib/sch_md.py $'A = "shared/data/queue.db"\nCON = "md:analytics"'; wf tests/test_sch_md.py $'from lib.sch_md import A'; wf lib/sch_duck.py $'D = "shared/data/analytics.duckdb"'; wf tests/test_sch_duck.py $'from lib.sch_duck import D'
+wf lib/sch_abs.py $'P = "/Users/athos/gt/whatsapp_automation/shared/data/queue.db"'; wf tests/test_sch_abs.py $'from lib.sch_abs import P'; wf lib/sch_dir.py $'P = "data/queue.db"'; wf tests/test_sch_dir.py $'from lib.sch_dir import P'
+wf lib/sch_fstr.py $'def c(n):\n    return f"shared/data/{n}.db"'; wf tests/test_sch_fstr.py $'from lib.sch_fstr import c'
+wf lib/sch_txt2.py $'def (:\nA = "shared/data/queue.db"\nB = "shared/data/outro.db"'; wf tests/test_sch_txt2.py $'sch_txt2'; wf lib/sch_txt1.py $'def (:\nA = "shared/data/queue.db"'; wf tests/test_sch_txt1.py $'sch_txt1'
+wf lib/sch_sh.sh $'#!/bin/sh\nsqlite3 shared/data/queue.db .tables'; wf tests/test_sch_sh.py $'sch_sh'; wf lib/sch_tpin.py $'X = 1'; wf tests/test_sch_tpin.py $'from lib.sch_tpin import X\nDB = "shared/data/x.db"'
+wf lib/sch_cred.py $'import subprocess\nP = "shared/data/queue.db"\nsubprocess.run(["secret", "k"])'; wf tests/test_sch_cred.py $'from lib.sch_cred import P'
+wf lib/sch_many.py "$(for i in 1 2 3 4 5 6 7; do printf 'D%s = "shared/data/m%s.db"\n' $i $i; done)"; wf tests/test_sch_many.py $'from lib.sch_many import D1'
 gw add -A && gw commit -q -m 1 && gw update-ref refs/remotes/origin/main HEAD || bad "repo de mentira do WA não montado"
 wf tests/test_late_mod.py "late_mod"; wf tests/test_imp_head.py "from lib.imp_alpha import x"; gw add -A && gw commit -q -m 2   # o teste de late_mod só existe no HEAD, não em origin/main
 git_ok=$(gw rev-parse --verify -q refs/remotes/origin/main >/dev/null && gw ls-tree -r --name-only origin/main | grep -c 'test_foo_parser'); [ "$git_ok" = 3 ] && ok "repo de mentira do WA montado (origin/main tem 3 testes de foo_parser; o HEAD tem um a mais em late_mod)" || bad "repo de mentira do WA errado ($git_ok)"
@@ -772,6 +785,45 @@ expect "mole: evidência em código que a bead NOMEIA (mole_db) bloqueia" "$(DES
 expect "freio: envio de WhatsApp ainda manda ao mini na prova pelo teste importador" "$(DESC 'ajustar lib/impt_target.py e o envio por whatsapp')" 10 'freio-derivado:envio-acao'
 expect "freio 5.12: whatsapp no RÓTULO NÃO freia a prova pelo teste importador" "$(DESC 'ajustar lib/impt_target.py e o daemon com.whatsapp.painel')" 0 '"verdict": "node", "basis": "derivado"'
 expect "pii: telefone no texto segue duro mesmo com a âncora derivada" "$(DESC 'Medido em queue.db (31) 98876-5432; ajustar anchor_mod quando vem vazio')" 10 'caminho-fora-do-filtro:queue\.db.*dado-no-texto'
+# ---- banco COM SCHEMA NO NÓ (ga-kzwlkhh, regra 4): o recibo do wa-schema-dbs.py diz quais bancos o nó TEM (cópia só-schema); só a evidência de banco que é SÓ caminho fixado/nome solto de um deles deixa de ser mole. Sem recibo, ou com
+# recibo velho / do futuro / ilegível / sem placement ok, tudo segue como era (moles:banco-de-dados); recibo ausente não deixa nota, as outras causas deixam.
+NOW=$(date +%s)
+rcpt() { local f=$1 ts=$2 pl=$3 sep= d; shift 3; { printf '{"v":1,"delivered_at":%s,"placement":"%s","dbs":{' "$ts" "$pl"; for d in "$@"; do printf '%s"%s":"%064d"' "$sep" "$d" 0; sep=,; done; printf '}}\n'; } > "$f"; }   # rcpt <arquivo> <delivered_at> <placement> <db>...
+rcpt "$T/rcpt-ok.json" "$NOW" ok shared/data/queue.db shared/data/x.db; rcpt "$T/rcpt-velho.json" $((NOW - 11 * 86400)) ok shared/data/queue.db; rcpt "$T/rcpt-futuro.json" $((NOW + 86400)) ok shared/data/queue.db
+rcpt "$T/rcpt-semcol.json" "$NOW" absent shared/data/queue.db; rcpt "$T/rcpt-2h.json" $((NOW - 7200)) ok shared/data/queue.db; rcpt "$T/rcpt-sete.json" "$NOW" ok shared/data/m1.db shared/data/m2.db shared/data/m3.db shared/data/m4.db shared/data/m5.db shared/data/m6.db shared/data/m7.db
+printf '{"v":1,"delivered_at":%s,"placement":"ok","dbs":{"../etc/x.db":"0"}}\n' "$NOW" > "$T/rcpt-chave.json"; printf 'nao e json' > "$T/rcpt-lixo.json"; printf '[1,2]' > "$T/rcpt-lista.json"; printf '{"v":1,"delivered_at":%s,"placement":"ok","dbs":{}}\n' "$NOW" > "$T/rcpt-vazio.json"
+SA='"verdict": "node", "basis": "derivado".*mole-banco-com-schema:shared/data/queue\.db'   # relaxou: node derivado + o banco nomeado em info
+SM='"verdict": "mini".*moles:banco-de-dados'                                                  # não relaxou: segue mole
+SEMNOTA_SCH='"mole-evidencia:banco-de-dados=lib/sch_ok\.py\[shared/data/queue\.db\]"\]\}$'         # recibo AUSENTE: nenhuma nota depois da evidência
+export WA_NODE_SCHEMA_RECEIPT="$T/rcpt-ok.json"
+expect "schema: caminho fixado (shared/data/queue.db) de banco do recibo deixa de ser mole: node, com o banco nomeado em info" "$(DESC 'ajustar lib/sch_ok.py')" 0 "$SA"
+expect "schema: nome solto (\"queue.db\") de banco do recibo também" "$(DESC 'ajustar lib/sch_bare.py')" 0 "$SA"
+expect "schema: a palavra de banco na prosa + evidência coberta: node e a palavra NÃO vira só-em-prosa" "$(DESC 'ajustar lib/sch_ok.py que abre um sqlite')" 0 '\[shared/data/queue\.db\]", "mole-banco-com-schema:shared/data/queue\.db"\]\}$'
+expect "schema: um banco do recibo + um SEM cópia (outro.db) -> segue mole" "$(DESC 'ajustar lib/sch_two.py')" 10 "$SM"
+expect "schema: os dois bancos na MESMA string (ATTACH) -> segue mole" "$(DESC 'ajustar lib/sch_att.py')" 10 "$SM"
+expect "schema: md:analytics junto com banco do recibo -> segue mole (MotherDuck é duro)" "$(DESC 'ajustar lib/sch_md.py')" 10 "$SM"
+expect "schema: DuckDB (.duckdb) -> segue mole" "$(DESC 'ajustar lib/sch_duck.py')" 10 "$SM"
+expect "schema: caminho absoluto /Users/… do banco -> segue mole (o nó não tem esse caminho)" "$(DESC 'ajustar lib/sch_abs.py')" 10 "$SM"
+expect "schema: pasta que não é shared/data (data/queue.db) -> segue mole, não vira o nome solto" "$(DESC 'ajustar lib/sch_dir.py')" 10 "$SM"
+expect "schema: nome montado em f-string (shared/data/{n}.db) -> segue mole" "$(DESC 'ajustar lib/sch_fstr.py')" 10 "$SM"
+expect "schema: Python que não parseia com 2 bancos (1 do recibo, 1 não) -> o texto vê os DOIS: segue mole" "$(DESC 'ajustar lib/sch_txt2.py')" 10 "$SM"
+expect "schema: Python que não parseia com 1 banco do recibo -> node (o ramo de texto também relaxa)" "$(DESC 'ajustar lib/sch_txt1.py')" 0 "$SA"
+expect "schema: shell (sqlite3 shared/data/queue.db) de banco do recibo -> node" "$(DESC 'ajustar lib/sch_sh.sh')" 0 "$SA"
+expect "schema: banco fixado só no TESTE (x.db do recibo) -> node" "$(DESC 'ajustar lib/sch_tpin.py')" 0 '"verdict": "node".*mole-banco-com-schema:shared/data/x\.db'
+expect "schema: banco do recibo + cofre no mesmo arquivo -> mini só por credencial (o banco não entra nos motivos)" "$(DESC 'ajustar lib/sch_cred.py')" 10 '"reasons": \["moles:credencial"\]'
+export WA_NODE_SCHEMA_RECEIPT="$T/rcpt-sete.json"
+expect "schema: 7 bancos do recibo -> 6 nomeados em info e o resto contado" "$(DESC 'ajustar lib/sch_many.py')" 0 'mole-banco-com-schema:shared/data/m6\.db", "mole-banco-com-schema-mais:1"'
+expect_not "schema: ...e o 7º não é nomeado" "$(DESC 'ajustar lib/sch_many.py')" 0 'schema:shared/data/m7\.db'
+export WA_NODE_SCHEMA_RECEIPT=/nonexistent/recibo.json
+expect "schema: recibo AUSENTE (nunca houve entrega) -> segue mole e SEM nota (o estado de hoje)" "$(DESC 'ajustar lib/sch_ok.py')" 10 "$SM.*$SEMNOTA_SCH"
+export WA_NODE_SCHEMA_RECEIPT="$T/rcpt-velho.json"; expect "schema: recibo VELHO (11 dias) -> segue mole, com a nota" "$(DESC 'ajustar lib/sch_ok.py')" 10 "$SM.*schema-recibo-velho"
+export WA_NODE_SCHEMA_RECEIPT="$T/rcpt-futuro.json"; expect "schema: recibo datado do FUTURO (relógio torto) -> segue mole, com a nota ilegível" "$(DESC 'ajustar lib/sch_ok.py')" 10 "$SM.*schema-recibo-ilegivel"
+export WA_NODE_SCHEMA_RECEIPT="$T/rcpt-semcol.json"; expect "schema: recibo sem placement ok (o wt-add do nó ainda não põe o arquivo) -> segue mole, com a nota" "$(DESC 'ajustar lib/sch_ok.py')" 10 "$SM.*schema-recibo-sem-colocacao"
+for r in chave lixo lista vazio; do export WA_NODE_SCHEMA_RECEIPT="$T/rcpt-$r.json"; expect "schema: recibo ilegível ou de forma estranha ($r) -> segue mole, com a nota" "$(DESC 'ajustar lib/sch_ok.py')" 10 "$SM.*schema-recibo-ilegivel"; done
+export WA_NODE_SCHEMA_RECEIPT="$T"; expect "schema: o recibo é uma PASTA (IsADirectoryError) -> segue mole, com a nota" "$(DESC 'ajustar lib/sch_ok.py')" 10 "$SM.*schema-recibo-ilegivel"
+export WA_NODE_SCHEMA_RECEIPT="$T/rcpt-2h.json" WA_NODE_SCHEMA_MAX_AGE_H=1; expect "schema: WA_NODE_SCHEMA_MAX_AGE_H=1 e recibo de 2 h -> velho" "$(DESC 'ajustar lib/sch_ok.py')" 10 "$SM.*schema-recibo-velho"
+export WA_NODE_SCHEMA_RECEIPT="$T/rcpt-ok.json" WA_NODE_SCHEMA_MAX_AGE_H=abc; expect "schema: WA_NODE_SCHEMA_MAX_AGE_H ilegível -> vale o padrão de 48 h e o recibo fresco relaxa" "$(DESC 'ajustar lib/sch_ok.py')" 0 "$SA"
+unset WA_NODE_SCHEMA_MAX_AGE_H; export WA_NODE_SCHEMA_RECEIPT="$T/receipt-ausente.json"
 # ---- teste IMPORTADOR (regra 6b, ga-qkc02kk): código citado SEM teste de nome ganha os testes de tests/ que o IMPORTAM (import estático que resolve para o mesmo arquivo)
 expect "importador: o teste de nome sem relação que IMPORTA o módulo é a prova (basis derivado, par nomeado como teste-importador)" "$(DESC 'ajustar lib/impt_target.py')" 0 "$ME, \"reasons\": \[\"prova-teste-derivado:1-teste\(s\)\+1-codigo\(s\)\"\].*\"teste-importador:lib/impt_target\.py=tests/test_other_area\.py\""
 expect "importador: teste que só CITA o nome numa string/comentário (sem import) não prova nada" "$(DESC 'ajustar lib/impt_ghost.py')" 11 'sem-prova-de-codigo-e-teste'
@@ -858,6 +910,7 @@ mutant() { # mutant <nome> <trecho original> <trecho novo> <json> <rc> <regex> [
   export WA_NODE_MIRROR="$T/espelho-ausente"   # o padrão da bateria (um envspec pode ter trocado e desarmado)
   export WA_NODE_REPO="$T/wa-repo-ausente"     # idem o repo do WA (a regra 6 só vê o repo de mentira nos casos que o pedem por envspec)
   export WA_NODE_CACHE="$T/cache"              # idem o cache das irmãs (um envspec que o troca o desarmou; sem isto o mutante gravaria no .gc/ de verdade)
+  export WA_NODE_SCHEMA_RECEIPT="$T/receipt-ausente.json"   # idem o recibo do banco com schema (um envspec que o trocou o desarmou: o seguinte leria o .gc/ de verdade)
 }
 mutant_pre() { MUTANT_PRE="$1"; shift; mutant "$@"; MUTANT_PRE=""; }   # mutant_pre '<comando>' <args do mutant>: o comando roda antes de CADA execução (original e mutante)
 mutant sem-node-mini     '"node:mini" in labels'                       'False'                                  "$(labels "$GOOD" '["node:mini"]')" 10 'etiqueta-node:mini'
@@ -1109,8 +1162,8 @@ mutant mole-sem-base-vira-vazio  '    if nread == 0:'                           
 mutant mole-novo-bloqueia        'novos.append(f)'                                      'raise Unreadable("novo")'                          "$(DESC 'lib/mole_clean.py e lib/novo_zz.py abrem um sqlite; tests/test_mole_clean.py')" 0 'mole-arquivo-novo:1' "$MD"
 mutant mole-docstring-conta      ' and id(n) not in docs and id(n) not in pieces:'     ' and id(n) not in pieces:'                    "$(DESC 'ajustar lib/mole_clean.py')" 0 '"verdict": "node"' "$MD"
 mutant mole-sem-ast              'parts = py_exec_parts(text) if path.endswith(".py") else None' 'parts = None'                                 "$(DESC 'ajustar lib/mole_clean.py')" 0 '"verdict": "node"' "$MD"
-mutant mole-teste-bare-conta     'm = DB_PINNED_RE.search(t) or (None if is_test else DB_BARE_RE.search(t))' 'm = DB_PINNED_RE.search(t) or DB_BARE_RE.search(t)' "$(DESC 'ajustar lib/mole_tbare.py')" 0 '"verdict": "node"' "$MD"
-mutant mole-texto-teste-bare     '    if not is_test and "banco-de-dados" not in out:'  '    if "banco-de-dados" not in out:'                 "$(DESC 'ajustar lib/mole_tbare2.py')" 0 '"verdict": "node"' "$MD"
+mutant mole-teste-bare-conta     'for w in db_refs(t, is_test):'                   'for w in db_refs(t, False):'                   "$(DESC 'ajustar lib/mole_tbare.py')" 0 '"verdict": "node"' "$MD"
+mutant mole-texto-teste-bare     'for w in db_refs(blob, is_test):'                'for w in db_refs(blob, False):'                "$(DESC 'ajustar lib/mole_tbare2.py')" 0 '"verdict": "node"' "$MD"
 mutant mole-stdlib-secrets       '|_?secret(?:_bin|_cli)?)(?:\.|$)", re.I)'            '|_?secrets?(?:_bin|_cli)?)(?:\.|$)", re.I)'                       "$(DESC 'ajustar lib/mole_stdsec.py')" 0 '"verdict": "node"' "$MD"
 mutant mole-cofre-argv-ignorado  '            if b in CRED_CLI:'                        '            if False:'                             "$(DESC 'ajustar lib/mole_cred.py')" 10 'moles:credencial' "$MD"
 mutant mole-cofre-chamada        '            if CRED_CALL_RE.match(c):'               '            if False:'                             "$(DESC 'ajustar lib/mole_credfn.py')" 10 'moles:credencial' "$MD"
@@ -1157,6 +1210,21 @@ mutant ancora-sem-filtro         '    if any(p not in dsent or any(fnmatch.fnmat
 mutant ancora-falha-sem-nota     '        info += anotes'                              '        pass'                                          "$(DESC 'Medido em queue.db; ajustar anchor_mod quando vem vazio')" 10 'ancora-derivada-ilegivel:repo-git-rc-128' "$MR"
 mutant ancora-ignora-pii         'if not has_code and blocked and not hard and all('    'if not has_code and blocked and all('              "$(DESC 'Medido em queue.db (31) 98876-5432; ajustar anchor_mod quando vem vazio')" 10 'caminho-fora-do-filtro:queue\.db.*dado-no-texto' "$MD"
 mutant ancora-sem-exigir-evid    'for _, p, _ in blocked):'                            'for _, p, _ in []):'                               "$(DESC 'Medido em queue.db e ~/Library/LaunchAgents/x.plist; ajustar anchor_mod quando vem vazio')" 10 'caminho-fora-do-filtro:queue\.db.*caminho-fora-do-formato' "$MD"
+# ---- controle negativo do banco COM SCHEMA NO NÓ (ga-kzwlkhh): cada guarda do recibo e da cobertura tem um mutante e um caso que só o original passa
+SR="$MD WA_NODE_SCHEMA_RECEIPT=$T/rcpt-ok.json"; SOK="$(DESC 'ajustar lib/sch_ok.py')"
+mutant schema-velho-vale          'if age > SCHEMA_MAX_AGE:'                         'if False:'                                       "$SOK" 10 'schema-recibo-velho' "$MD WA_NODE_SCHEMA_RECEIPT=$T/rcpt-velho.json"
+mutant schema-futuro-vale         'if age < -300:'                                   'if False:'                                       "$SOK" 10 'schema-recibo-ilegivel' "$MD WA_NODE_SCHEMA_RECEIPT=$T/rcpt-futuro.json"
+mutant schema-sem-colocacao-vale  'if rec.get("placement") != "ok":'                'if False:'                                       "$SOK" 10 'schema-recibo-sem-colocacao' "$MD WA_NODE_SCHEMA_RECEIPT=$T/rcpt-semcol.json"
+mutant schema-chave-frouxa        ' or not all(isinstance(k, str) and SCHEMA_KEY_RE.match(k) for k in dbs)' '' "$SOK" 10 'schema-recibo-ilegivel' "$MD WA_NODE_SCHEMA_RECEIPT=$T/rcpt-chave.json"
+mutant schema-ausente-com-nota    'except FileNotFoundError:'                        'except ZeroDivisionError:'                       "$SOK" 10 "$SM.*$SEMNOTA_SCH" "$MD WA_NODE_SCHEMA_RECEIPT=/nonexistent/recibo.json"
+mutant schema-prazo-fixo          'int(os.environ.get("WA_NODE_SCHEMA_MAX_AGE_H", "48"))' '48'                                         "$SOK" 10 'schema-recibo-velho' "$MD WA_NODE_SCHEMA_RECEIPT=$T/rcpt-2h.json WA_NODE_SCHEMA_MAX_AGE_H=1"
+mutant schema-nao-tira-do-hard    'ev = {s: v for s, v in ev.items() if s != "banco-de-dados"}' 'pass'                                  "$SOK" 0 "$SA" "$SR"
+mutant schema-todos-ou-nenhum     'if cover and all(cover):'                          'if cover and any(cover):'                        "$(DESC 'ajustar lib/sch_two.py')" 10 'moles:banco-de-dados' "$SR"
+mutant schema-pasta-vira-solto    'out.append(t[i:m.end()] if t[i:m.start()].endswith("/") else m.group(0))' 'out.append(m.group(0))' "$(DESC 'ajustar lib/sch_dir.py')" 10 'moles:banco-de-dados' "$SR"
+mutant schema-texto-so-o-primeiro 'for w in db_refs(blob, is_test):'                 'for w in db_refs(blob, is_test)[:1]:'            "$(DESC 'ajustar lib/sch_txt2.py')" 10 'moles:banco-de-dados' "$SR"
+mutant schema-ast-so-o-primeiro   'for w in db_refs(t, is_test):'                   'for w in db_refs(t, is_test)[:1]:'               "$(DESC 'ajustar lib/sch_att.py')" 10 'moles:banco-de-dados' "$SR"
+mutant schema-prosa-reaparece     'if s not in ev_all] + sch'                        'if s not in ev] + sch'                           "$(DESC 'ajustar lib/sch_ok.py que abre um sqlite')" 0 '\[shared/data/queue\.db\]", "mole-banco-com-schema:shared/data/queue\.db"\]\}$' "$SR"
+mutant schema-info-sem-teto       'names[:MOLE_INFO_MAX]'                            'names'                                           "$(DESC 'ajustar lib/sch_many.py')" 0 'm6\.db", "mole-banco-com-schema-mais:1"' "$MD WA_NODE_SCHEMA_RECEIPT=$T/rcpt-sete.json"
 # o resíduo no TMPDIR: o mutante que não apaga a árvore tem de deixar item para trás (senão o teste de "sem resíduo" passaria mesmo sem a limpeza)
 if mk_mutant sem-limpeza 'shutil.rmtree(root, ignore_errors=True)' 'pass'; then
   left=$(tmp_residue "$T/mut-sem-limpeza.py")

@@ -13,7 +13,7 @@
 #   de `cat-file --batch-all-objects` é redundante onde a saída já vem ordenada (git >= 2.19); o `LC_ALL=C` só vale com git traduzido (a frase que dispara o retry é em inglês).
 set -u
 HERE=$(cd "$(dirname "$0")" && pwd -P); RG=${HRG_S:-$HERE/hetzner-remote-git.sh}
-T=$(mktemp -d "${TMPDIR:-/tmp}/hrg.XXXXXX"); T=$(cd "$T" && pwd -P); chmod 700 "$T"; N=0; F=0; HRG_EXPECT=165
+T=$(mktemp -d "${TMPDIR:-/tmp}/hrg.XXXXXX"); T=$(cd "$T" && pwd -P); chmod 700 "$T"; N=0; F=0; HRG_EXPECT=174
 export GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null GIT_AUTHOR_NAME=t GIT_AUTHOR_EMAIL=t@t GIT_COMMITTER_NAME=t GIT_COMMITTER_EMAIL=t@t GIT_TERMINAL_PROMPT=0
 export GT_REMOTE_GIT=$T/node GT_REMOTE_SSH=$T/bin/ssh GT_REMOTE_NOMUX=1 FAKE_SRV=$T/srv.git FAKE_SPEC=$T/spec REAL_GIT REAL_MKTEMP; REAL_GIT=$(command -v git); REAL_MKTEMP=$(command -v mktemp)
 ok() { N=$((N+1)); echo "ok   $N - $1"; }
@@ -284,6 +284,15 @@ wt wt-rm gascity bead-a; [ "$RC" = 2 ] && has 'sem worktree bead-a' "wt-rm: bead
 wt wt-rm gascity 'Bead Ruim'; [ "$RC" = 2 ] && has 'bead inv' "wt-rm: bead que o regex recusa → rc 2" || bad "wt-rm bead ruim: rc=$RC" "$OUT"
 wt wt-add gascity bead-a; [ "$RC" = 0 ] && [ -e "$WTA/bead-a/lib/m2.txt" ] && ok "wt-add depois do wt-rm: a branch worker/bead-a que ficou é reaproveitada" || bad "wt-add depois do wt-rm: rc=$RC" "$OUT"
 rm -f "$T/node/gascity/sparse"; wt wt-add gascity bead-c; [ "$RC" = 3 ] && has 'clone sem filtro de dados' "wt-add: clone sem o arquivo sparse (nenhum pull deu certo) → rc 3" || bad "wt-add sem sparse: rc=$RC" "$OUT"
+# schema-dbs-v1 (ga-kzwlkhh): a loja de bancos só-schema ($GR/schema-dbs/<rig>, instalada pelo wa-schema-dbs.py) entra no worktree NOVO no mesmo caminho relativo, como CÓPIA (o teste escreve sem sujar a loja); sem loja o wt-add é o
+# de sempre; cp que falha não aborta o wt-add (o worktree segue sem o banco: o teste fica vermelho e a bead volta ao mini)
+fresh adv; SD=$T/node/schema-dbs/gascity; mkdir -p "$SD/shared/data/sub" "$T/shim3"; printf 'SQLite format 3\0' > "$SD/shared/data/queue.db"; : > "$SD/shared/data/sub/x.db"; cp "$SD/shared/data/queue.db" "$T/queue.db.orig"
+wt wt-add gascity sd-a
+{ [ "$RC" = 0 ] && cmp -s "$T/queue.db.orig" "$WTA/sd-a/shared/data/queue.db" && [ -f "$WTA/sd-a/shared/data/sub/x.db" ]; } && ok "schema-dbs: o wt-add NOVO copia a loja para o mesmo caminho relativo (shared/data/queue.db e a subpasta)" || bad "schema-dbs: wt-add com loja: rc=$RC" "$(ls -R "$WTA/sd-a/shared" 2>&1 | head -n 6)"
+echo mexido >> "$WTA/sd-a/shared/data/queue.db"; { cmp -s "$T/queue.db.orig" "$SD/shared/data/queue.db" && [ ! -L "$WTA/sd-a/shared/data/queue.db" ]; } && ok "schema-dbs: a cópia é arquivo próprio: escrever nela não suja a loja" || bad "schema-dbs: a loja mudou ou o arquivo é link"
+mv "$SD" "$SD.off"; wt wt-add gascity sd-b; { [ "$RC" = 0 ] && [ -e "$WTA/sd-b/lib/m2.txt" ] && [ ! -e "$WTA/sd-b/shared" ]; } && ok "schema-dbs: sem loja instalada o wt-add é o de sempre (nenhum shared/ aparece)" || bad "schema-dbs: wt-add sem loja: rc=$RC" "$OUT"; mv "$SD.off" "$SD"
+printf '%s\n' '#!/bin/sh' 'exit 1' > "$T/shim3/cp"; chmod 755 "$T/shim3/cp"; OUT=$(env PATH="$T/shim3:$PATH" "$RG" wt-add gascity sd-c 2>&1); RC=$?
+{ [ "$RC" = 0 ] && [ -e "$WTA/sd-c/lib/m2.txt" ] && [ ! -e "$WTA/sd-c/shared" ]; } && ok "schema-dbs: cp que falha não aborta o wt-add (rc 0, o worktree vem sem o banco)" || bad "schema-dbs: wt-add com cp falhando: rc=$RC" "$OUT"
 
 # scan: clones de história conhecida, uma lista de dados e um HOME de mentira (nada de /home real nem de GH_TOKEN)
 N3=$T/node3; W3=$T/w3; mkdir -p "$N3/lixo"; git init -q "$W3"; mkdir -p "$W3/lib" "$W3/data"; echo a > "$W3/lib/a.txt"; echo b > "$W3/README"; git -C "$W3" add -A; git -C "$W3" commit -qm c1
@@ -313,6 +322,17 @@ rm -f "$T/cnt"; sc PATH="$T/shim2:$PATH" SHIM2_MODE=mktemp2fail SHIM2_CNT="$T/cn
 [ "$RC" = 2 ] && has 'avaliar os nomes do hist' "scan: o mktemp -d de dentro do filtro de nomes falha → o clone é NÃO consegui, não limpo" || bad "scan com o 2º mktemp -d falhando: rc=$RC" "$OUT"
 SCANRIGS=sc; sc PATH="$T/shim2:$PATH" SHIM2_MODE=mktempfail   # o 1º mktemp -d (o do próprio scan) falha: volta antes do laço, sem varrer clone nem credencial (sem o `|| return 2` o laço rodava com $t vazio)
 hasnt 'scan sc:' "scan: mktemp -d do scan falha → nenhum clone é varrido (nem 'limpo' nem 'NÃO consegui' por clone)"; hasnt 'scan credenciais' "scan: mktemp -d do scan falha → as credenciais também não são varridas"
+# schema-dbs-v1 (ga-kzwlkhh): o scan libera SÓ o caminho EXATO <wt>/<rel> de um banco do MANIFEST instalado (e -wal/-shm/-journal dele); outro .db, o mesmo nome fora de wt/<x>/ e o MANIFEST ausente seguem VIOLAÇÃO
+W4=$T/w4; git init -q "$W4"; mkdir -p "$W4/lib"; echo a > "$W4/lib/a.txt"; git -C "$W4" add -A; git -C "$W4" commit -qm c1; mkdir -p "$N3/sd/wt/w1/shared/data" "$N3/schema-dbs/sd"
+git clone -q --bare "$W4" "$N3/sd/repo.git" 2>/dev/null; git -C "$N3/sd/repo.git" config gtremote.mirrorurl "$(git -C "$N3/sd/repo.git" config remote.origin.url)"; printf '%s\n' '*.db' '*.db-*' 'data/' > "$N3/sd/deny"
+: > "$N3/sd/wt/w1/shared/data/queue.db"; printf 'shared/data/queue.db\n' > "$N3/schema-dbs/sd/MANIFEST"; SCANRIGS=sd; sc
+[ "$RC" = 0 ] && has 'scan sd: limpo (' "schema-dbs: o banco do MANIFEST dentro de um worktree (wt/w1/shared/data/queue.db) não é achado: limpo, rc 0" || bad "schema-dbs: scan com o banco liberado: rc=$RC" "$OUT"
+: > "$N3/sd/wt/w1/shared/data/queue.db-wal"; : > "$N3/sd/wt/w1/shared/data/queue.db-shm"; sc; [ "$RC" = 0 ] && ok "schema-dbs: o -wal e o -shm do banco liberado também passam" || bad "schema-dbs: scan com -wal/-shm: rc=$RC" "$OUT"
+: > "$N3/sd/wt/w1/shared/data/outro.db"; sc; [ "$RC" = 1 ] && has 'arvore=[wt/w1/shared/data/outro.db ]' "schema-dbs: outro .db no worktree (fora do MANIFEST) segue VIOLAÇÃO, rc 1" || bad "schema-dbs: scan com outro.db: rc=$RC" "$OUT"
+find "$N3/sd/wt/w1/shared/data/outro.db" -delete; mkdir -p "$N3/sd/shared/data"; : > "$N3/sd/shared/data/queue.db"; sc
+[ "$RC" = 1 ] && has 'arvore=[shared/data/queue.db ]' "schema-dbs: o MESMO nome fora de wt/<x>/ segue VIOLAÇÃO (a exceção é o caminho exato dentro de um worktree)" || bad "schema-dbs: scan com queue.db fora de wt/: rc=$RC" "$OUT"
+find "$N3/sd/shared" -depth -delete; mv "$N3/schema-dbs/sd/MANIFEST" "$N3/schema-dbs/sd/MANIFEST.off"; sc
+[ "$RC" = 1 ] && has 'arvore=[wt/w1/shared/data/queue.db' "schema-dbs: sem MANIFEST nada é liberado (VIOLAÇÃO, rc 1)" || bad "schema-dbs: scan sem MANIFEST: rc=$RC" "$OUT"
 
 # ── lastro hq-mutants (ga-59jrj3d): o que o rodízio de 03/11 ainda achou vivo ─────────────────────────────────────────────────────────────────────────────────────────────
 # rig_of: o nome tem de passar no regex E ter repo.git. Nome válido sem clone → rc 2 (com `||` no lugar do `&&` o regex bastava e o erro virava o rc 3 do pull); nome que o regex recusa, mesmo com pasta → rc 2 também.

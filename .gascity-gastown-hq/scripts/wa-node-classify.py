@@ -41,6 +41,9 @@ COMO DECIDE (a 1ª regra que casa vale; tudo é lido da bead, nada é gravado ne
      vai em `info` (`mole-so-em-prosa:<slug>`); NÃO consegui ler (git, arquivo > 1 MB: `mole-ilegivel:<motivo>`) ou nada que exista em origin/main para ler (tudo novo: `mole-sem-arquivo-lido`) -> volta a palavra e ela bloqueia, como antes.
      Arquivo NOVO (ainda não está em origin/main) não soma evidência e não bloqueia, se ao menos UM existente foi lido (`mole-arquivo-novo:N`). Código que só as IRMÃS tocaram (regra 7b) é palpite: é lido e a evidência dele só INFORMA
      (`mole-evidencia-irma:`), e se não der para lê-lo é só a nota `mole-irma-ilegivel`. Sem prova nenhuma o veredito é `unknown` (antes a palavra o fazia `mini`) e a palavra vai em `info` (`palavra-mole:<slug>`).
+     BANCO COM SCHEMA NO NÓ (ga-kzwlkhh): se TODA evidência de banco da prova é o caminho fixado `shared/data/x.db` ou o nome solto `x.db` de um banco do recibo do wa-schema-dbs.py (cópia só-schema, sem linha, que o nó
+     confirmou ter e o wt-add põe no worktree; recibo fresco, `WA_NODE_SCHEMA_MAX_AGE_H`), o banco deixa de ser mole e vai em `info` (`mole-banco-com-schema:<db>`); a prova de teste segue exigida. `md:`, `.duckdb`, `/Users/…`, `~/…`,
+     nome montado em f-string e banco sem cópia seguem `moles:banco-de-dados`; recibo ausente, velho, do futuro, ilegível ou sem `placement: ok` = como antes (as três últimas causas deixam uma nota `schema-recibo-*`).
      INFORMATIVAS (produção/deploy, tela, lead, cliente, terreno, envio...): vocabulário do produto e da entrega, NÃO bloqueiam; vão para `info`, que o Pilot grava no jsonl da sombra
      para medir o acerto antes de ligar. MEDIDO (19/10, 400 beads WA fechadas): bloqueando por elas, 0 de 400 passavam; sem bloquear, ~4% citam teste + código sem caminho duro.
      Quem segura o resíduo é o que não depende de palavra: caminho pelo filtro real, telefone/CPF no texto, e o gate depois.
@@ -221,6 +224,13 @@ SCAN_EXT = ("py", "sh", "js", "mjs", "cjs", "ts")                    # extensõe
 MAX_STR_LEN = 4000                                                   # limite de custo do regex: de UMA string só os primeiros 4000 caracteres são lidos (dado embutido, SQL gigante). PONTO CEGO conhecido: um `.db`/`osascript` depois do 4000º caractere de uma mesma string não é visto
 MOLE_SLUGS = ("banco-de-dados", "credencial", "host-mac")
 MOLE_INFO_MAX = 6                                                    # pares slug=arquivo nomeados em `info`; o resto vira `mole-evidencia-mais:N`
+# banco COM SCHEMA NO NÓ (ga-kzwlkhh): o recibo que o wa-schema-dbs.py (mini) grava depois que o nó confirmou a instalação das cópias só-schema E que o wt-add dele as põe no worktree
+SCHEMA_RECEIPT = os.environ.get("WA_NODE_SCHEMA_RECEIPT", os.path.join(HERE, "..", ".gc", "wa-schema-dbs", "delivered.json"))
+try:
+    SCHEMA_MAX_AGE = min(14 * 24, max(1, int(os.environ.get("WA_NODE_SCHEMA_MAX_AGE_H", "48")))) * 3600   # recibo mais velho que isto vale como ausente (o nó pode ter sido refeito); a entrega é diária
+except ValueError:
+    SCHEMA_MAX_AGE = 48 * 3600
+SCHEMA_KEY_RE = re.compile(r"^shared/data/(?:[A-Za-z0-9_][A-Za-z0-9_.\-]*/)*[A-Za-z0-9_][A-Za-z0-9_.\-]*\.(?:db|sqlite3?)$")   # o único formato de caminho que o recibo pode ter
 CRED_CLI = frozenset(("secret", "bw", "bws", "bitwarden"))           # argv do CLI do cofre: ["secret", "motherduck-token"] é UMA das formas do WA (87 linhas com argv exato, 57 com o CAMINHO do binário -> exec_base; linha de shell -> CRED_SHELL_RE; wrapper secret_bin()/lib.secret_cli -> CRED_CALL_RE/CRED_MOD_RE)
 CRED_CALL_RE = re.compile(r"^_*(?:get_|load_|read_|fetch_|resolve_)?secret(?:_bin|_cli)?$|^_*(?:bw|bws|bitwarden)(?:_\w+)?$", re.I)   # `_secret("x")`, `secret(...)`, `bw_get`; `secrets.token_hex` (stdlib) não casa
 CRED_MOD_RE = re.compile(r"(?:^|\.)(?:_?bitwarden\w*|keychain\w*|credentials?\w*|_?secret(?:_bin|_cli)?)(?:\.|$)", re.I)   # módulo do cofre/chaveiro; `secrets` (stdlib: números aleatórios) NÃO casa
@@ -1078,6 +1088,55 @@ def strip_comment_lines(text):
     return "\n".join(l for l in text.splitlines() if not l.strip().startswith(("#", "//", "*", "/*")))
 
 
+def db_refs(t, is_test):
+    """TODAS as referências de banco de uma string/texto (ga-kzwlkhh): os caminhos fixados e, fora de teste, os nomes soltos que não fazem parte de um caminho fixado. O nome solto que vem depois de uma pasta
+    (`data/queue.db`, `/var/db/x.db`) sai com a pasta (`data/queue.db`): não é o banco de `shared/data/` e não pode ser tomado por ele. Antes só a PRIMEIRA ficava: provar que a evidência é SÓ de bancos com cópia exige todas."""
+    pins = list(DB_PINNED_RE.finditer(t))
+    out = [m.group(0) for m in pins]
+    if not is_test:
+        for m in DB_BARE_RE.finditer(t):
+            if any(p.start() <= m.start() and m.end() <= p.end() for p in pins):
+                continue
+            i = m.start()
+            while i > 0 and m.start() - i < 200 and t[i - 1] not in " \t\r\n\"'`=(,;":   # a pasta colada antes do nome, se houver (volta no máximo 200 caracteres: o custo é linear)
+                i -= 1
+            out.append(t[i:m.end()] if t[i:m.start()].endswith("/") else m.group(0))
+    return out
+
+
+def schema_receipt():
+    """(caminhos dos bancos só-schema que o nó TEM, nota). Fonte: o recibo do wa-schema-dbs.py. TRÊS estados: recibo AUSENTE (nunca houve entrega: o estado de hoje) -> (None, "") sem nota; ilegível, de forma estranha, sem
+    `placement: ok` (o wt-add do nó ainda não põe o arquivo no worktree), velho ou datado do futuro -> (None, nota) e o banco segue mole; nunca "recibo ruim cobre tudo"."""
+    # vazio (arquivo ausente) -> sem recibo e sem nota; falhou/ilegível (permissão, JSON torto, forma estranha, velho) -> sem recibo COM nota: o banco segue mole
+    try:
+        with open(SCHEMA_RECEIPT, encoding="utf-8") as fh:
+            rec = json.loads(fh.read(1_000_001))
+    except FileNotFoundError:
+        return None, ""
+    except (OSError, ValueError):
+        return None, "schema-recibo-ilegivel"
+    rec = rec if isinstance(rec, dict) else {}
+    dbs, ts = rec.get("dbs"), rec.get("delivered_at")
+    if rec.get("v") != 1 or not isinstance(dbs, dict) or not dbs or not all(isinstance(k, str) and SCHEMA_KEY_RE.match(k) for k in dbs) or isinstance(ts, bool) or not isinstance(ts, (int, float)):
+        return None, "schema-recibo-ilegivel"
+    if rec.get("placement") != "ok":
+        return None, "schema-recibo-sem-colocacao"
+    age = time.time() - ts
+    if age > SCHEMA_MAX_AGE:
+        return None, "schema-recibo-velho"
+    if age < -300:
+        return None, "schema-recibo-ilegivel"   # datado do futuro (relógio torto): não confio
+    return set(dbs), ""
+
+
+def schema_cover(what, dbs):
+    """o banco do recibo que a evidência `what` nomeia, ou "": o caminho fixado igual a um do recibo, ou o nome solto (sem pasta) igual ao final de um. `md:`, `.duckdb`, `/Users/…`, pasta que não é shared/data e o
+    nome montado em f-string (`shared/data/_.db`) não casam com nada."""
+    if what in dbs:
+        return what
+    return next((p for p in sorted(dbs) if "/" not in what and p.rsplit("/", 1)[-1] == what), "")
+
+
 def scan_evidence(path, text, is_test):
     """{slug: [o que achou]} das moles que o CÓDIGO de `path` mostra (regra 4, ga-qkc02kk). Só o que a lista do Mayor nomeia: (credencial) o cofre em QUALQUER forma do WA — argv exato ou com caminho do binário, linha de shell/f-string ("secret x"), wrapper do repo (secret_bin(), lib.secret_cli),
     chamada `secret`/`bw`, módulo do cofre —, arquivo de credencial (.env, credentials*.json, token.json...); (banco-de-dados) caminho de banco de PRODUÇÃO — `shared/data/x.db`, `md:`, `~/`/`/Users/…/x.db` e, só fora de teste, nome de banco solto (`"queue.db"`: o WA monta o caminho por
@@ -1119,19 +1178,16 @@ def scan_evidence(path, text, is_test):
                 m = HOST_RE.search(t) or HOST_SHELL_RE.search(t)
                 if m:
                     hit("host-mac", m.group(0).strip(" ;|&(`"))
-            m = DB_PINNED_RE.search(t) or (None if is_test else DB_BARE_RE.search(t))
-            if m:
-                hit("banco-de-dados", m.group(0))
+            for w in db_refs(t, is_test):
+                hit("banco-de-dados", w)
         return out
     blob = strip_comment_lines(text)
-    for rx, slug in ((CRED_TEXT_RE, "credencial"), (HOST_RE, "host-mac"), (DB_PINNED_RE, "banco-de-dados")):
+    for rx, slug in ((CRED_TEXT_RE, "credencial"), (HOST_RE, "host-mac")):
         m = rx.search(blob)
         if m:
             hit(slug, m.group(0).strip())
-    if not is_test and "banco-de-dados" not in out:
-        m = DB_BARE_RE.search(blob)
-        if m:
-            hit("banco-de-dados", m.group(0))
+    for w in db_refs(blob, is_test):
+        hit("banco-de-dados", w.strip())
     return out
 
 
@@ -1169,10 +1225,20 @@ def mole_gate(proof, prose, soft_files=()):
         return fallback, ["mole-ilegivel:" + str(e)]   # `-ilegivel` é o que o Pilot soma em `leitura` (a leitura que FALHOU): sai MESMO sem palavra, porque "não consegui varrer" não pode parecer "varri e não achei"
     if nread == 0:
         return fallback, (["mole-sem-arquivo-lido"] if prose else [])
+    ev_all, sch = ev, []
+    if "banco-de-dados" in ev:   # banco COM SCHEMA NO NÓ (ga-kzwlkhh): só se TODA evidência de banco é de um banco do recibo; uma só que não é (md:, .duckdb, /Users, banco sem cópia) mantém `moles:banco-de-dados`
+        dbs, nota = schema_receipt()
+        cover = [schema_cover(w, dbs) for _, w in ev["banco-de-dados"]] if dbs else []
+        if cover and all(cover):
+            names = sorted(set(cover))
+            sch = ["mole-banco-com-schema:" + n for n in names[:MOLE_INFO_MAX]] + (["mole-banco-com-schema-mais:%d" % (len(names) - MOLE_INFO_MAX)] if len(names) > MOLE_INFO_MAX else [])
+            ev = {s: v for s, v in ev.items() if s != "banco-de-dados"}
+        elif nota:
+            sch = [nota]
     hard = ["moles:" + s for s in MOLE_SLUGS if s in ev]
-    pairs = ["mole-evidencia:%s=%s[%s]" % (s, f, w) for s in MOLE_SLUGS for f, w in ev.get(s, [])]
+    pairs = ["mole-evidencia:%s=%s[%s]" % (s, f, w) for s in MOLE_SLUGS for f, w in ev_all.get(s, [])]
     info = pairs[:MOLE_INFO_MAX] + (["mole-evidencia-mais:%d" % (len(pairs) - MOLE_INFO_MAX)] if len(pairs) > MOLE_INFO_MAX else [])
-    info += ["mole-so-em-prosa:" + s for s in prose if s not in ev]
+    info += ["mole-so-em-prosa:" + s for s in prose if s not in ev_all] + sch
     soft_pairs = ["mole-evidencia-irma:%s=%s[%s]" % (s, f, w) for s in MOLE_SLUGS for f, w in evsoft.get(s, [])]
     info += soft_pairs[:MOLE_INFO_MAX] + (["mole-evidencia-irma-mais:%d" % (len(soft_pairs) - MOLE_INFO_MAX)] if len(soft_pairs) > MOLE_INFO_MAX else [])
     info += softbad[:MOLE_INFO_MAX]
