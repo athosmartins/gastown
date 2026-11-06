@@ -160,8 +160,8 @@ cmd_scan() {
     ( cd "$GR/$RIG" && find . -type f -not -path './repo.git/*' -print0 ) > "$t/files0" 2>/dev/null && tr '\0' '\n' < "$t/files0" > "$t/files" && [ "$(tr -cd '\0' < "$t/files0" | wc -c | tr -d ' ')" = "$(wc -l < "$t/files" | tr -d ' ')" ] \
       || { echo "scan $RIG: find falhou ou há nome de arquivo com quebra de linha: NÃO consegui varrer a árvore"; rc=2; continue; }
     sed -e 's|^\./||' "$t/files" | grep -v -e '^sparse$' -e '^deny$' -e '^last-pull-error$' -e '/\.git$' | denied > "$t/hit-tree" || { echo "scan $RIG: não consegui avaliar a árvore"; rc=2; continue; }
-    # schema-dbs-v1: o caminho EXATO <wt>/<rel> de um banco só-schema do MANIFEST instalado (e os -wal/-shm/-journal dele) não é achado; qualquer outro .db segue sendo. vazio (sem MANIFEST) → nada liberado; falhou (sed/grep rc > 1) → a lista fica como estava
-    if [ -s "$GR/schema-dbs/$RIG/MANIFEST" ] && rx=$(sed -e 's/\./\\./g' "$GR/schema-dbs/$RIG/MANIFEST" | paste -sd'|' -) && [ -n "$rx" ]; then
+    # schema-dbs-v1: o caminho EXATO <wt>/<rel> de um banco só-schema do MANIFEST instalado (e os -wal/-shm/-journal dele) não é achado; qualquer outro .db segue sendo. vazio (sem MANIFEST, ou linha que não é caminho de banco: nunca vira regex) → nada liberado; falhou (grep rc > 1) → a lista fica como estava
+    if [ -s "$GR/schema-dbs/$RIG/MANIFEST" ] && rx=$(grep -E '^shared/data/[A-Za-z0-9_./-]+\.(db|sqlite3?)$' "$GR/schema-dbs/$RIG/MANIFEST" | sed -e 's/\./\\./g' | paste -sd'|' -) && [ -n "$rx" ]; then
       grep -v -E "^wt/[^/]+/($rx)(-wal|-shm|-journal)?\$" "$t/hit-tree" > "$t/hit-tree.ok"; [ $? -le 1 ] && mv "$t/hit-tree.ok" "$t/hit-tree"
     fi
     u=$(g config --get-regexp '^remote\..*\.url$' | awk '{print $2}' | grep -v -x -F "$(g config gtremote.mirrorurl)"; true)

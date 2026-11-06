@@ -13,7 +13,7 @@
 #   de `cat-file --batch-all-objects` é redundante onde a saída já vem ordenada (git >= 2.19); o `LC_ALL=C` só vale com git traduzido (a frase que dispara o retry é em inglês).
 set -u
 HERE=$(cd "$(dirname "$0")" && pwd -P); RG=${HRG_S:-$HERE/hetzner-remote-git.sh}
-T=$(mktemp -d "${TMPDIR:-/tmp}/hrg.XXXXXX"); T=$(cd "$T" && pwd -P); chmod 700 "$T"; N=0; F=0; HRG_EXPECT=174
+T=$(mktemp -d "${TMPDIR:-/tmp}/hrg.XXXXXX"); T=$(cd "$T" && pwd -P); chmod 700 "$T"; N=0; F=0; HRG_EXPECT=175
 export GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null GIT_AUTHOR_NAME=t GIT_AUTHOR_EMAIL=t@t GIT_COMMITTER_NAME=t GIT_COMMITTER_EMAIL=t@t GIT_TERMINAL_PROMPT=0
 export GT_REMOTE_GIT=$T/node GT_REMOTE_SSH=$T/bin/ssh GT_REMOTE_NOMUX=1 FAKE_SRV=$T/srv.git FAKE_SPEC=$T/spec REAL_GIT REAL_MKTEMP; REAL_GIT=$(command -v git); REAL_MKTEMP=$(command -v mktemp)
 ok() { N=$((N+1)); echo "ok   $N - $1"; }
@@ -333,6 +333,7 @@ find "$N3/sd/wt/w1/shared/data/outro.db" -delete; mkdir -p "$N3/sd/shared/data";
 [ "$RC" = 1 ] && has 'arvore=[shared/data/queue.db ]' "schema-dbs: o MESMO nome fora de wt/<x>/ segue VIOLAÇÃO (a exceção é o caminho exato dentro de um worktree)" || bad "schema-dbs: scan com queue.db fora de wt/: rc=$RC" "$OUT"
 find "$N3/sd/shared" -depth -delete; mv "$N3/schema-dbs/sd/MANIFEST" "$N3/schema-dbs/sd/MANIFEST.off"; sc
 [ "$RC" = 1 ] && has 'arvore=[wt/w1/shared/data/queue.db' "schema-dbs: sem MANIFEST nada é liberado (VIOLAÇÃO, rc 1)" || bad "schema-dbs: scan sem MANIFEST: rc=$RC" "$OUT"
+printf '[^%%]*\n../x\n' > "$N3/schema-dbs/sd/MANIFEST"; sc; [ "$RC" = 1 ] && has 'arvore=[wt/w1/shared/data/queue.db' "schema-dbs: MANIFEST com linha que não é caminho de banco ([^%]*) não vira regex que libera tudo: VIOLAÇÃO, rc 1" || bad "schema-dbs: scan com MANIFEST hostil: rc=$RC" "$OUT"
 
 # ── lastro hq-mutants (ga-59jrj3d): o que o rodízio de 03/11 ainda achou vivo ─────────────────────────────────────────────────────────────────────────────────────────────
 # rig_of: o nome tem de passar no regex E ter repo.git. Nome válido sem clone → rc 2 (com `||` no lugar do `&&` o regex bastava e o erro virava o rc 3 do pull); nome que o regex recusa, mesmo com pasta → rc 2 também.
