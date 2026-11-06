@@ -32,8 +32,9 @@ P = "5511987654321"
 db("queue.db", ["CREATE TABLE messages (id INTEGER PRIMARY KEY AUTOINCREMENT, phone TEXT DEFAULT '', body TEXT)", "CREATE INDEX ix_phone ON messages(phone)", "CREATE VIEW v_recent AS SELECT id FROM messages ORDER BY id DESC LIMIT 10",
    "CREATE TRIGGER t_ins AFTER INSERT ON messages BEGIN SELECT 1; END"], ["INSERT INTO messages(phone, body) VALUES ('%s', 'oi %s')" % (P, P)] * 3, ver=7)
 db("webhook.db", ["CREATE TABLE ev (id INTEGER PRIMARY KEY, payload TEXT)"], ["INSERT INTO ev(payload) VALUES ('%s')" % P], wal=True)
-try: db("fts.db", ["CREATE VIRTUAL TABLE docs USING fts5(body)", "CREATE TABLE meta (k TEXT)"], ["INSERT INTO docs(body) VALUES ('dados de %s')" % P])
-except sqlite3.OperationalError: db("fts.db", ["CREATE VIRTUAL TABLE docs USING fts4(body)", "CREATE TABLE meta (k TEXT)"], ["INSERT INTO docs(body) VALUES ('dados de %s')" % P])
+for mod in ("fts5(body)", "fts4(body)", None):   # o sqlite do Python do mini pode não ter FTS5: cai para FTS4 e, sem módulo nenhum, para uma tabela comum (o caso das tabelas-sombra então só prova a cópia comum)
+    try: db("fts.db", ["CREATE VIRTUAL TABLE docs USING " + mod if mod else "CREATE TABLE docs (body)", "CREATE TABLE meta (k TEXT)"], ["INSERT INTO docs(body) VALUES ('dados de %s')" % P]); break
+    except sqlite3.OperationalError: pass
 db("piiddl.db", ["CREATE TABLE t (phone TEXT DEFAULT '5511987654321')"]); db("tokens.db", ["CREATE TABLE t (x TEXT)"]); db("empty.db", [], [], ver=1)
 db("locked.db", ["CREATE TABLE t (x TEXT)"], ["INSERT INTO t VALUES ('a')"]); db("uncited.db", ["CREATE TABLE t (x TEXT)"]); db("testonly.db", ["CREATE TABLE t (x TEXT)"])
 open(D("analytics.db"), "wb").write(b"\x00" * 8 + b"DUCK" + b"\x00" * 200)
