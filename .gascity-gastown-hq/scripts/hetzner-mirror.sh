@@ -196,20 +196,27 @@ cmd_status() {
   done; node_check || rc=1; return $rc
 }
 # O script do servidor (hetzner-remote-git.sh) é uma CÓPIA: o merge no repo não o instala (ga-eivvcus: o fix da ga-yo1n1zg foi mergeado e o nó seguiu com o script velho; o pull dele falha desde 05/11 23:10Z). Então o status compara o sha256 do arquivo
-#   INSTALADO em cada nó (um por túnel configurado: $MH/tunnel-<host>.pid) com o do repo. igual · DIFERENTE (rc 1; a linha diz o comando de instalação) · desconhecido (não consegui ler o nó: rc 1, nunca "igual" por falta de leitura). Sem túnel configurado não há nó a conferir.
+#   INSTALADO em cada nó REGISTRADO com o do repo. Nó registrado = um $MH/tunnel-<host>.pid, que `tunnel start` e `tunnel run` (o do launchd) gravam (o `run` avisa no stderr se não conseguir). igual · DIFERENTE (rc 1; a linha diz o comando de instalação) · DESCONHECIDO (não consegui ler o nó, ou o registro tem nome que não é de host: rc 1, nunca "igual" por falta de leitura).
+#   NENHUM registro NÃO é "não há nó", é "não sei quais nós existem" (ex.: um túnel de `tunnel run` subido antes do ga-eivvcus não gravava o pid): a linha diz que NÃO conferi e o rc é 1. Calar com rc 0 fazia o status parecer "em dia" sem ter olhado o nó (achado do gate de 06/11).
 #   Só para teste: HETZNER_MIRROR_NODE_SSH (o comando ssh), HETZNER_MIRROR_NODE_SRC (o script do repo), HETZNER_MIRROR_NODE_PATH (onde ele fica no nó, relativo ao HOME de lá).
 sha256_of() { if command -v sha256sum > /dev/null; then sha256sum; else shasum -a 256; fi | awk '{ print $1 }'; }
 node_check() {
-  local f h want got rc=0 src=${HETZNER_MIRROR_NODE_SRC:-$(dirname "$SELF")/hetzner-remote-git.sh} np=${HETZNER_MIRROR_NODE_PATH:-gt-remote/bin/hetzner-remote-git.sh} sshc=${HETZNER_MIRROR_NODE_SSH:-"ssh -o BatchMode=yes -o ConnectTimeout=10"} nm
+  local f h want got rc=0 n=0 src=${HETZNER_MIRROR_NODE_SRC:-$(dirname "$SELF")/hetzner-remote-git.sh} np=${HETZNER_MIRROR_NODE_PATH:-gt-remote/bin/hetzner-remote-git.sh} sshc=${HETZNER_MIRROR_NODE_SSH:-"ssh -o BatchMode=yes -o ConnectTimeout=10 -o ServerAliveInterval=5 -o ServerAliveCountMax=3"} nm
   nm=${np##*/}
-  for f in "$MH"/tunnel-*.pid; do [ -e "$f" ] || continue; h=${f##*/tunnel-}; h=${h%.pid}; [[ "$h" =~ ^[A-Za-z0-9_.-]+$ ]] || continue
-    want=$(sha256_of < "$src" 2> /dev/null); got=""
+  # registro: nenhum arquivo → o aviso NENHUM abaixo (rc 1); arquivo com nome que não é de host → DESCONHECIDO (rc 1), nunca pulado em silêncio
+  for f in "$MH"/tunnel-*.pid; do [ -e "$f" ] || continue; n=$((n+1)); h=${f##*/tunnel-}; h=${h%.pid}
+    if ! [[ "$h" =~ ^[A-Za-z0-9_.-]+$ ]]; then echo "nó (registro ${f##*/}): $nm = DESCONHECIDO (o nome não é de um host ssh: não conferi)"; rc=1; continue; fi
+    # script do repo: ilegível (ou sem sha256sum/shasum) → want fica vazio, sem 64 hex → DESCONHECIDO abaixo (nunca compara com vazio); o 2> vem ANTES do <, senão o bash imprime o erro de abertura no terminal
+    want=$(sha256_of 2> /dev/null < "$src"); got=""
+    # nó: ssh que falha, sem sha256sum ou arquivo ausente → got sem 64 hex → DESCONHECIDO abaixo (nunca "igual")
     [[ "$np" =~ ^[A-Za-z0-9_./-]+$ ]] && got=$(tmo 30 $sshc "$h" "sha256sum $np" 2> /dev/null | sha256_first)
     if ! [[ "$want" =~ ^[0-9a-f]{64}$ ]] || ! [ -r "$src" ]; then echo "nó $h: $nm = DESCONHECIDO (não li o script do repo: $src)"; rc=1
     elif ! [[ "$got" =~ ^[0-9a-f]{64}$ ]]; then echo "nó $h: $nm = DESCONHECIDO (não consegui ler ~/$np no nó: ssh falhou, sem sha256sum ou arquivo ausente)"; rc=1
     elif [ "$got" = "$want" ]; then echo "nó $h: $nm = igual ao do repo (sha256 ${want:0:12})"
     else echo "nó $h: $nm = DIFERENTE do repo (nó ${got:0:12}, repo ${want:0:12}): instale com  scp -q $src $h:$(dirname "$np")/ && ssh $h 'chmod 755 ~/$np'  (docs/runbooks/hetzner-git-mirror.md)"; rc=1; fi
-  done; return $rc
+  done
+  [ "$n" -gt 0 ] || { echo "nó: NENHUM túnel registrado em $MH/tunnel-*.pid: NÃO conferi o $nm do servidor (túnel do launchd subido antes do ga-eivvcus: o 'tunnel run' não gravava o pid, reinicie-o com  launchctl kickstart -k gui/\$(id -u)/com.gascity.hetzner-mirror-tunnel  · túnel de 'tunnel start': rode  $SELF tunnel start <host>)"; rc=1; }
+  return $rc
 }
 sha256_first() { awk 'NR == 1 { print $1; exit }'; }   # a 1ª palavra da 1ª linha da saída do sha256sum
 
@@ -461,12 +468,17 @@ cmd_sshd() {
     *) die 2 "uso: sshd start|stop|status|run" ;;
   esac
 }
-cmd_tunnel() {   # túnel reverso: a porta do sshd do espelho aparece no loopback do SERVIDOR. start/stop/status guardam um pid; para durar, use `run` num launchd com KeepAlive
+cmd_tunnel() {   # túnel reverso: a porta do sshd do espelho aparece no loopback do SERVIDOR. start, run, stop e status usam o pid de $MH/tunnel-<host>.pid, e é por esse arquivo que o `status` do espelho sabe quais nós conferir; para durar, use `run` num launchd com KeepAlive
   local a=${1:-} h=${2:-} pf p; [[ "$h" =~ ^[A-Za-z0-9_.-]+$ ]] || die 2 "uso: tunnel start|stop|status|run <host-ssh>"
-  local cmd=(ssh -N -R "127.0.0.1:$PORT:127.0.0.1:$PORT" -o ExitOnForwardFailure=yes -o ServerAliveInterval=15 -o ServerAliveCountMax=3 -o BatchMode=yes "$h")
+  local cmd=("${HETZNER_MIRROR_TUNNEL_SSH:-ssh}" -N -R "127.0.0.1:$PORT:127.0.0.1:$PORT" -o ExitOnForwardFailure=yes -o ServerAliveInterval=15 -o ServerAliveCountMax=3 -o BatchMode=yes "$h")   # HETZNER_MIRROR_TUNNEL_SSH: só para teste (o selftest injeta um ssh de mentira que fica de pé)
   pf="$MH/tunnel-$h.pid"; p=$(cat "$pf" 2>/dev/null)
   case "$a" in
-    run) exec "${cmd[@]}" ;;
+    # run (o do launchd) grava o pid ANTES do exec, e o exec o mantém (vira o pid do ssh). Sem isto o túnel durável não tinha registro: `tunnel status` dizia parado e o `status` do espelho não conferia nó nenhum (achado do gate de 06/11, ga-eivvcus)
+    #   pid ausente ou morto → grava o meu · pid VIVO e é o nosso ssh → não troco o registro dele (o ssh deste run deve falhar no -R ocupado, ExitOnForwardFailure, e o launchd repete) · gravar falhou → AVISO no stderr e sobe assim mesmo: o túnel é o serviço, o pid é a testemunha (sendo o único túnel, o `status` passa a dizer que não conferiu; havendo outro registrado, o nó sem registro não aparece nele)
+    run) mkdir -p "$MH"
+      if [ -n "$p" ] && proc_is "$p" "${cmd[*]}"; then echo "túnel $h: já há um rodando (pid $p): não troco o registro dele" >&2
+      else echo $$ > "$pf" || echo "túnel $h: não consegui gravar $pf: o status do espelho não vai ver este túnel" >&2; fi
+      exec "${cmd[@]}" ;;
     start) if [ -n "$p" ] && proc_is "$p" "${cmd[*]}"; then echo "túnel $h: já rodando (pid $p)"; else mkdir -p "$MH"; bg_run "$MH/tunnel-$h.log" "${cmd[@]}"; echo $! > "$pf"; sleep 3; cmd_tunnel status "$h"; fi ;;
     stop) if [ -n "$p" ] && proc_is "$p" "${cmd[*]}"; then kill "$p" && echo "túnel $h: parado"; else echo "túnel $h: não estava rodando"; fi; rm -f "$pf" ;;
     status) if [ -n "$p" ] && proc_is "$p" "${cmd[*]}"; then echo "túnel $h: rodando (pid $p)"; else echo "túnel $h: parado"; return 1; fi ;;
