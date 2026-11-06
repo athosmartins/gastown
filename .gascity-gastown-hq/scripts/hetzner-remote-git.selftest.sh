@@ -1,19 +1,21 @@
 #!/bin/bash
-# hetzner-remote-git.selftest.sh — hermético: tudo em mktemp, o "espelho" é um bare local servido por um `ssh` de mentira (sem rede, sem sshd, sem tocar nos clones reais). Cobre o `pull` de hetzner-remote-git.sh quando o espelho anuncia uma ref cuja ponta NÃO existe no clone (ga-yo1n1zg).
+# hetzner-remote-git.selftest.sh — hermético: tudo em mktemp, o "espelho" é um bare local servido por um `ssh` de mentira (sem rede, sem sshd, sem tocar nos clones reais). Cobre o `pull` de hetzner-remote-git.sh quando o espelho anuncia uma ref cuja ponta NÃO existe no clone (ga-yo1n1zg: a ponta é ancestral de uma presente; ga-eivvcus: a ref é OBSOLETA, o clone já a tem com o valor anunciado), e o gc seguro do clone.
 #
 # ## Contents
-#   Fixture · Controles · Recuperação · Estado visível · Cura · Falha sem contorno · Recusas · Falha que não é essa · Lastro hq-mutants (filtro que muda, bootstrap, lag, status, wt-add/wt-rm, scan)
+#   Fixture · Controles · Recuperação · Estado visível · Cura · Falha sem contorno · Recusas · Ref obsoleta (reparo) · gc seguro · Falha que não é essa · Lastro hq-mutants (filtro que muda, bootstrap, lag, status, wt-add/wt-rm, scan)
 #
 # O CASO: em 02/11 o commit c0cc488b9 sumiu do repo.git do nó; o espelho passou a anunciar uma branch nova nessa ponta e TODO pull/fetch morreu em "did not send all necessary objects" (main parado 70 min), com a causa escondida
 # (last-pull-error guardava só a última linha do stderr). Aqui o commit some do clone da fixture do mesmo jeito (pack reescrito sem ele) e o `pull` de verdade roda contra ele.
 # O `ssh` de mentira serve o bare (FAKE_SRV) e o spec de dados; o shim de git (SHIM_MODE) injeta UMA falha (ls-remote, listagem de objetos, fetch) e repassa o resto ao git de verdade.
-# HRG_S=<script> (caminho ABSOLUTO) testa outra cópia do script (mutantes); HRG_KEEP=1 guarda o tmp. Leva ~5 s.
-# MUTANTES: 34 trocas de uma linha do conserto, 29 mortas. As 5 que sobrevivem são EQUIVALENTES, e por quê: o `--filter=` explícito do fetch (o 1º e o do retry) é redundante, porque o `remote.origin.partialclonefilter` que o pull
-#   grava logo antes já vale para todo fetch de remoto promisor (e o espelho só serve com o filtro vigente); a `--prune` do retry é redundante no git 2.43, onde o fetch poda ANTES de falhar (medido; fica por git mais velho); o `sort -u`
-#   de `cat-file --batch-all-objects` é redundante onde a saída já vem ordenada (git >= 2.19); o `LC_ALL=C` só vale com git traduzido (a frase que dispara o retry é em inglês).
+# HRG_S=<script> (caminho ABSOLUTO) testa outra cópia do script (mutantes); HRG_KEEP=1 guarda o tmp. Leva ~20 s no nó (Linux, bash 5).
+# ONDE VALE: git 2.43.0 do nó (219/219). No git 2.54 do mini o selftest já estava VERMELHO no HEAD anterior (27 de 165 casos, a partir do caso 8: "could not parse commit") e fica com 55 de 218 vermelhos; não analisei um a um. Prove no nó, não no mini.
+# MUTANTES: 49 trocas de uma linha do conserto (34 do ga-yo1n1zg + 15 do ga-eivvcus), 42 mortas. As 7 que sobrevivem são EQUIVALENTES, e por quê: o `--filter=` explícito do fetch (o 1º e o do retry) é redundante, porque o `remote.origin.partialclonefilter` que o pull
+#   grava logo antes já vale para todo fetch de remoto promisor (e o espelho só serve com o filtro vigente); a `--prune` do retry é redundante no git 2.43, onde o fetch poda ANTES de falhar (medido; fica por git mais velho), e a do fetch final do reparo pelo mesmo motivo; o `sort -u`
+#   de `cat-file --batch-all-objects` é redundante onde a saída já vem ordenada (git >= 2.19); o `LC_ALL=C` só vale com git traduzido (a frase que dispara o retry é em inglês); o `+` (força) do refspec avulso da sonda só importaria se já houvesse uma refs/gt/repair/N de outra rodada
+#   com valor sem relação, e nesse caso o objeto chega do mesmo jeito (medido no git 2.43: a atualização da ref é recusada, rc 1 do fetch avulso, que o reparo ignora, e o objeto fica no clone) e a ref é apagada logo depois.
 set -u
 HERE=$(cd "$(dirname "$0")" && pwd -P); RG=${HRG_S:-$HERE/hetzner-remote-git.sh}
-T=$(mktemp -d "${TMPDIR:-/tmp}/hrg.XXXXXX"); T=$(cd "$T" && pwd -P); chmod 700 "$T"; N=0; F=0; HRG_EXPECT=165
+T=$(mktemp -d "${TMPDIR:-/tmp}/hrg.XXXXXX"); T=$(cd "$T" && pwd -P); chmod 700 "$T"; N=0; F=0; HRG_EXPECT=219
 export GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null GIT_AUTHOR_NAME=t GIT_AUTHOR_EMAIL=t@t GIT_COMMITTER_NAME=t GIT_COMMITTER_EMAIL=t@t GIT_TERMINAL_PROMPT=0
 export GT_REMOTE_GIT=$T/node GT_REMOTE_SSH=$T/bin/ssh GT_REMOTE_NOMUX=1 FAKE_SRV=$T/srv.git FAKE_SPEC=$T/spec REAL_GIT REAL_MKTEMP; REAL_GIT=$(command -v git); REAL_MKTEMP=$(command -v mktemp)
 ok() { N=$((N+1)); echo "ok   $N - $1"; }
@@ -37,6 +39,9 @@ echo "ssh de mentira: comando inesperado: $last" >&2; exit 97
 EOF
 cat > "$T/shim/git" <<'EOF'
 #!/bin/sh
+# o que o git 2.43 do nó imprime no FIM de todo fetch quando o clone tem um gc.log fresco (medido numa cópia do clone de produção, ga-eivvcus)
+gcnoise() { printf '%s\n' "" "warning: The last gc run reported the following. Please correct the root cause" "and remove gc.log" "Automatic cleanup will not be performed until the file is removed." "" "warning: Failed to write bitmap index. Packfile doesn't have full closure (object ef01 is missing)" "fatal: failed to write bitmap index" "fatal: failed to run repack"; } >&2
+case " $* " in *" fetch "*) [ -z "${SHIM_FETCHLOG:-}" ] || echo "$*" >> "$SHIM_FETCHLOG" ;; esac   # registra o argv de todo fetch (o selftest confere o filtro e a contagem)
 case "${SHIM_MODE:-}:$*" in
   lsfail:*" ls-remote "*) echo "shim: ls-remote falhou (de propósito)" >&2; exit 128 ;;
   lsempty:*" ls-remote "*) exit 0 ;;
@@ -45,6 +50,10 @@ case "${SHIM_MODE:-}:$*" in
   retryfail:*"remote.origin.fetch=^"*" fetch "*) echo "error: boom no retry (de propósito)" >&2; exit 1 ;;
   fetchfake:*" fetch "*) echo "error: ssh://x/y.git did not send all necessary objects" >&2; exit 1 ;;
   flood:*" fetch "*) i=0; while [ $i -lt 300 ]; do echo "error: ruido $i" >&2; i=$((i+1)); done; echo "error: ssh://x/y.git did not send all necessary objects" >&2; exit 1 ;;
+  cfgfail:*" config gc.cruftPacks "*) echo "shim: git config falhou (de propósito)" >&2; exit 1 ;;
+  dedupe:*"refs/gt/repair/2"*) echo "shim: 2 refspecs avulsos para a mesma ponta (de propósito)" >&2; exit 1 ;;
+  fetchnoise:*" fetch "*) printf '%s\n' "fatal: bad revision 'abc'" "error: ssh://x/y.git did not send all necessary objects" >&2; gcnoise; exit 1 ;;
+  noiseonly:*" fetch "*) gcnoise; exit 1 ;;
 esac
 exec "$REAL_GIT" "$@"
 EOF
@@ -88,6 +97,8 @@ present "$T/full.git" "$SEG" && ok "controle: SEM filtro o blob negado chega (a 
 # ── recuperação: o pull passa SEM a ref de ponta ausente, e só sem ela ────────────────────────────────────────────────────────────────────────────────────────────
 fresh adv; pull
 [ "$RC" = 0 ] && ok "pull com ref de ponta ausente: rc 0 (recupera sozinho)" || bad "pull com ref de ponta ausente: rc=$RC" "$OUT"
+export SHIM_FETCHLOG=$T/fetchlog; : > "$SHIM_FETCHLOG"; fresh adv; pull fetchlog; unset SHIM_FETCHLOG
+[ "$(grep -c . "$T/fetchlog")" = 2 ] && ! grep -q 'refs/gt/repair' "$T/fetchlog" && ok "ref sem par local (buraco sob um have): 2 fetches (o simples e o retry), nenhum reparo por refspec avulso (o reparo é só da ref OBSOLETA)" || bad "ref sem par local: fetches inesperados" "$(cat "$T/fetchlog")"
 has 'resultado=ok' "pull: resultado=ok"
 [ "$(ref_of refs/remotes/origin/main)" = "$M2" ] && ok "retry: main andou para o commit novo (não ficou velho)" || bad "retry: main não andou" "$(ref_of refs/remotes/origin/main)"
 [ "$(ref_of refs/gt/synced)" = "$M2" ] && ok "retry: refs/gt/* também andou (os refspecs da config seguem valendo)" || bad "retry: refs/gt/synced não andou"
@@ -111,6 +122,9 @@ git -C "$S" update-ref -d refs/remotes/origin/fix/quebrado; pull
 [ ! -e "$LPS" ] && ok "cura: last-pull-skipped some" || bad "cura: last-pull-skipped ficou" "$(cat "$LPS")"
 present "$K" "$SEG" && bad "cura: o blob negado pelo spec chegou no fetch de primeira (o filtro caiu)" || ok "cura: o fetch de primeira também leva o filtro (o blob negado segue fora)"
 OUT=$("$RG" status gascity 2>&1); has 'refs_fora_do_pull=[]' "cura: status volta a refs_fora_do_pull=[]"
+# a ref tem par local, com valor DIFERENTE do anunciado (e presente): não é obsoleta (o git pediu o objeto e o servidor o omitiu) → também sem reparo, 2 fetches
+export SHIM_FETCHLOG=$T/fetchlog; : > "$SHIM_FETCHLOG"; fresh adv; mkdir -p "$K/refs/remotes/origin/fix"; echo "$M" > "$K/refs/remotes/origin/fix/quebrado"; pull fetchlog; unset SHIM_FETCHLOG
+[ "$RC" = 0 ] && [ "$(grep -c . "$T/fetchlog")" = 2 ] && ! grep -q 'refs/gt/repair' "$T/fetchlog" && ok "ref com par local de valor DIFERENTE: 2 fetches e nenhum reparo (só a igualdade com o anunciado faz a ref obsoleta)" || bad "ref com par local diferente: rc=$RC, fetches inesperados" "$(cat "$T/fetchlog")"
 
 # ── falha sem contorno: o stderr INTEIRO fica guardado, a 1ª linha segue sendo o resumo de sempre ──────────────────────────────────────────────────────────────────────
 fresh adv; pull lsfail
@@ -154,6 +168,84 @@ mk 20; fresh q20; pull
 [ "$(wc -l < "$LPS" 2>/dev/null | tr -d ' ')" = 20 ] && ok "20 refs: last-pull-skipped lista as 20" || bad "20 refs: last-pull-skipped" "$(cat "$LPS" 2>&1 | head -n 3)"
 fresh adv; mkdir "$LPS"; pull   # o arquivo de estado não pode ser gravado (é uma pasta): o pull passou do mesmo jeito, e o AVISO diz que o estado não foi guardado
 [ "$RC" = 0 ] && has 'não consegui gravar' "estado não gravável: o pull passa (main andou) e o AVISO diz que não guardou o last-pull-skipped" || bad "estado não gravável: rc=$RC" "$OUT"
+
+# ── ref obsoleta (ga-eivvcus): a ponta falta no clone E o clone tem a MESMA ref com o MESMO valor ─────────────────────────────────────────────────────────────────────────
+# O git dá essa ref por "up to date" e nunca pede o objeto: o pack vem sem a ponta e a checagem de conectividade morre em "did not send all necessary objects" (medido numa cópia do clone do nó: o pull ficou 14 h parado, com
+# refs/gt/synced entre as 4 pontas ausentes). Não é o buraco do ga-yo1n1zg (ancestral de uma ponta presente, que o servidor omite mesmo pedido). O reparo busca a ponta (uma FOLHA: nenhum commit presente a tem por filho) por refspec avulso, com o MESMO filtro.
+echo l > "$W/lib/l.txt"; echo 'SEGREDO-l' > "$W/data/x2"; L=$(cm L); LVIS=$(git -C "$W" rev-parse "$L:lib/l.txt"); LSEG=$(git -C "$W" rev-parse "$L:data/x2"); L2=$(git -C "$W" commit-tree "$L^{tree}" -p "$E" -m L2)
+mksrv() {   # <nome> <ref>...: o espelho "adv" (sem as refs de ponta C) com estas refs na folha L, mais uma folha irmã L2 em fix/folha2 se a ref for essa
+  local n=$1 r; shift; rm -rf "$T/srv.$n.git"; cp -a "$T/srv.adv.git" "$T/srv.$n.git"; git -C "$T/srv.$n.git" update-ref -d refs/remotes/origin/fix/quebrado; git -C "$T/srv.$n.git" update-ref -d refs/heads/fora
+  for r in "$@"; do case $r in */folha2) git -C "$W" push -q -f "$T/srv.$n.git" "$L2:$r" ;; *) git -C "$W" push -q -f "$T/srv.$n.git" "$L:$r" ;; esac; done
+}
+stale_in() { local r; for r in "$@"; do mkdir -p "$(dirname "$K/$r")"; case $r in */folha2) echo "$L2" > "$K/$r" ;; *) echo "$L" > "$K/$r" ;; esac; done; }   # o clone já tem as MESMAS refs com o MESMO valor, escritas à mão (o objeto nunca chegou nele)
+mkstale() { local n=$1; shift; mksrv "$n" "$@"; fresh "$n"; stale_in "$@"; }
+mkstale folha refs/remotes/origin/fix/folha
+[ "$(ref_of refs/remotes/origin/fix/folha)" = "$L" ] && ! present "$K" "$L" && ok "controle (obsoleta): o clone tem fix/folha em L e L não está nele" || bad "controle (obsoleta): estado do clone" "$(ref_of refs/remotes/origin/fix/folha)"
+OUT=$(git -C "$K" fetch -q --prune "--filter=sparse:oid=$(OIDF)" origin 2>&1); R=$?
+[ "$R" != 0 ] && printf '%s' "$OUT" | grep -qF 'did not send all necessary objects' && ok "controle (obsoleta): o fetch simples do pull antigo morre em 'did not send all necessary objects' (a ref 'up to date' não pede o objeto)" || bad "controle (obsoleta): este git NÃO reproduz a falha (rc=$R)" "$OUT"
+printf '%s' "$OUT" | grep -qF "$L" && ok "controle (obsoleta): o stderr do git nomeia a ponta ausente" || bad "controle (obsoleta): o stderr não nomeia L" "$OUT"
+mkstale folha refs/remotes/origin/fix/folha; pull
+[ "$RC" = 0 ] && has 'resultado=ok' "obsoleta (ref lateral): o pull passa (rc 0, resultado=ok)" || bad "obsoleta: rc=$RC" "$OUT"
+has 'REPARO' "obsoleta: o pull diz REPARO"; has 'refs/remotes/origin/fix/folha' "obsoleta: o REPARO nomeia a ref"; has '1 ref(s) estavam obsoletas' "obsoleta: ...e conta uma"; hasnt 'AVISO' "obsoleta: nada ficou de fora (sem AVISO)"
+[ "$(ref_of refs/remotes/origin/fix/folha)" = "$L" ] && present "$K" "$L" && ok "obsoleta: a ponta chegou ao clone (a ref ficou onde estava, agora com objeto)" || bad "obsoleta: a ponta não chegou" "$(ref_of refs/remotes/origin/fix/folha)"
+[ "$(ref_of refs/remotes/origin/main)" = "$M2" ] && [ "$(ref_of refs/gt/synced)" = "$M2" ] && ok "obsoleta: main e refs/gt/synced andaram no mesmo pull" || bad "obsoleta: main/synced não andaram"
+present "$K" "$LVIS" && ok "obsoleta: o blob liberado pelo spec chegou junto" || bad "obsoleta: o blob liberado não chegou"
+present "$K" "$LSEG" && bad "obsoleta: o blob NEGADO pelo spec chegou ao clone (o reparo perdeu o filtro de dados)" || ok "obsoleta: o blob negado pelo spec NÃO chegou (o reparo leva o MESMO filtro)"
+[ -z "$(ref_of refs/gt/repair/1)" ] && ! grep -q 'refs/gt/repair' "$K/packed-refs" 2> /dev/null && [ -z "$(find "$K/refs/gt/repair" -type f 2> /dev/null)" ] && ok "obsoleta: a ref avulsa do reparo não fica no clone" || bad "obsoleta: refs/gt/repair ficou" "$(find "$K/refs/gt/repair" -type f 2>&1)"
+[ ! -e "$LPE" ] && [ ! -e "$LPS" ] && ok "obsoleta: sem last-pull-error e sem last-pull-skipped" || bad "obsoleta: estado de erro/fora ficou"
+tail -n 1 "$T/node/pulls.jsonl" | grep -qF '"pull":"ok"' && ok "obsoleta: pulls.jsonl conta o pull como ok" || bad "obsoleta: pulls.jsonl" "$(tail -n 1 "$T/node/pulls.jsonl")"
+pull; [ "$RC" = 0 ] && hasnt 'REPARO' "obsoleta: o pull seguinte já sai limpo (sem REPARO)" || bad "obsoleta: segundo pull rc=$RC" "$OUT"; hasnt 'AVISO' "obsoleta: ...e sem AVISO"
+# refs/gt/synced obsoleta: no HEAD antigo era recusa certa (a recusa de main/synced), e era o caso do nó
+mkstale sync refs/gt/synced; export SHIM_FETCHLOG=$T/fetchlog; : > "$SHIM_FETCHLOG"; pull fetchlog; unset SHIM_FETCHLOG
+[ "$RC" = 0 ] && has 'resultado=ok' "synced obsoleta: o pull passa (no HEAD antigo a recusa de refs/gt/synced o derrubava)" || bad "synced obsoleta: rc=$RC" "$OUT"
+has 'REPARO' "synced obsoleta: o pull diz REPARO"; has 'refs/gt/synced' "synced obsoleta: o REPARO nomeia a ref"
+[ "$(ref_of refs/gt/synced)" = "$L" ] && present "$K" "$L" && [ "$(ref_of refs/remotes/origin/main)" = "$M2" ] && ok "synced obsoleta: synced tem o objeto e main andou" || bad "synced obsoleta: estado" "$(ref_of refs/gt/synced) $(ref_of refs/remotes/origin/main)"
+present "$K" "$LSEG" && bad "synced obsoleta: o blob negado chegou" || ok "synced obsoleta: o blob negado pelo spec segue fora"
+[ "$(grep -c . "$T/fetchlog")" = 3 ] && [ "$(grep -c 'refs/gt/repair/1' "$T/fetchlog")" = 1 ] && ok "synced obsoleta: 3 fetches (o simples, a sonda da ponta, o final)" || bad "synced obsoleta: contagem de fetches" "$(cat "$T/fetchlog")"
+[ "$(grep -c -- "--filter=sparse:oid=$(OIDF)" "$T/fetchlog")" = 3 ] && ok "synced obsoleta: TODO fetch leva o filtro vigente na linha de comando, a sonda inclusive (nada de dado a mais no clone)" || bad "synced obsoleta: fetch sem o filtro vigente" "$(cat "$T/fetchlog")"
+# main obsoleta com ponta ENTREGÁVEL (folha): o reparo traz, e o main não fica de fora
+mkstale main refs/remotes/origin/main; pull
+[ "$RC" = 0 ] && has 'resultado=ok' "main obsoleta (folha): o pull passa" || bad "main obsoleta: rc=$RC" "$OUT"
+has 'REPARO' "main obsoleta: o pull diz REPARO"; [ "$(ref_of refs/remotes/origin/main)" = "$L" ] && present "$K" "$L" && ok "main obsoleta: main tem o objeto" || bad "main obsoleta: estado" "$(ref_of refs/remotes/origin/main)"
+# main obsoleta com ponta que o servidor NÃO entrega (C: ancestral de M, que o clone tem; o servidor a omite mesmo pedida): continua erro ALTO, nada anda, e o reparo ficou registrado
+fresh mainc; mkdir -p "$K/refs/remotes/origin"; echo "$C" > "$K/refs/remotes/origin/main"; pull
+[ "$RC" = 1 ] && has 'resultado=erro' "main obsoleta SEM entrega: o pull FALHA (rc 1, resultado=erro): a recusa de main segue de pé" || bad "main obsoleta sem entrega: rc=$RC" "$OUT"
+head -n 1 "$LPE" | grep -qF 'retry não feito: a ponta de refs/remotes/origin/main ou de refs/gt/synced falta' && ok "main obsoleta sem entrega: o motivo está na 1ª linha do last-pull-error" || bad "main obsoleta sem entrega: motivo" "$(head -n 2 "$LPE" 2>&1)"
+grep -qF -- '--- reparo' "$LPE" && ok "main obsoleta sem entrega: o last-pull-error registra que o reparo foi tentado" || bad "main obsoleta sem entrega: sem a marca do reparo" "$(head -n 4 "$LPE")"
+[ "$(ref_of refs/remotes/origin/main)" = "$C" ] && [ "$(ref_of refs/gt/synced)" = "$M" ] && [ ! -e "$LPS" ] && ok "main obsoleta sem entrega: nada andou e nada foi gravado como 'fora'" || bad "main obsoleta sem entrega: estado mudou"
+[ -z "$(find "$K/refs/gt/repair" -type f 2> /dev/null)" ] && ok "main obsoleta sem entrega: a ref avulsa do reparo também não fica" || bad "main obsoleta sem entrega: refs/gt/repair ficou"
+# reparo PARCIAL: a folha chega, a ponta C não (hole sob uma ponta presente); sobra o contorno de sempre só para C, e o que chegou fica
+mksrv parc refs/remotes/origin/fix/folha; git -C "$T/srv.parc.git" update-ref refs/remotes/origin/fix/quebrado "$C"; fresh parc; stale_in refs/remotes/origin/fix/folha; mkdir -p "$K/refs/remotes/origin/fix"; echo "$C" > "$K/refs/remotes/origin/fix/quebrado"; pull
+[ "$RC" = 0 ] && has 'resultado=ok' "reparo parcial: o pull passa" || bad "reparo parcial: rc=$RC" "$OUT"
+has 'AVISO' "reparo parcial: a ref que o servidor não entrega vira AVISO (o contorno de sempre)"; has 'refs/remotes/origin/fix/quebrado' "reparo parcial: ...e o AVISO a nomeia"; hasnt 'REPARO' "reparo parcial: sem REPARO (o reparo sozinho não resolveu)"
+[ "$(ref_of refs/remotes/origin/fix/folha)" = "$L" ] && present "$K" "$L" && ok "reparo parcial: a folha que chegou ficou no clone" || bad "reparo parcial: a folha não chegou" "$(ref_of refs/remotes/origin/fix/folha)"
+grep -qF "refs/remotes/origin/fix/quebrado $C" "$LPS" 2> /dev/null && [ "$(wc -l < "$LPS" | tr -d ' ')" = 1 ] && ok "reparo parcial: last-pull-skipped lista só a que não chegou" || bad "reparo parcial: last-pull-skipped" "$(cat "$LPS" 2>&1)"
+# 25 refs obsoletas na MESMA ponta: o objeto é pedido uma vez (1 refspec avulso; o shim derruba o fetch que traga um 2º), e o teto de 20 do contorno não vale para o reparo
+refs25=""; i=1; while [ $i -le 25 ]; do refs25="$refs25 refs/remotes/origin/fix/s$i"; i=$((i+1)); done
+mkstale mil $refs25; pull dedupe
+[ "$RC" = 0 ] && has 'resultado=ok' "25 obsoletas na mesma ponta: o pull passa (um refspec só)" || bad "25 obsoletas: rc=$RC" "$OUT"
+has '25 ref(s) estavam obsoletas' "25 obsoletas: o REPARO conta as 25"; present "$K" "$L" && ok "25 obsoletas: a ponta chegou" || bad "25 obsoletas: a ponta não chegou"
+# duas pontas DISTINTAS: as duas são pedidas
+mkstale duas refs/remotes/origin/fix/folha refs/remotes/origin/fix/folha2; pull
+[ "$RC" = 0 ] && has '2 ref(s) estavam obsoletas' "duas pontas obsoletas distintas: o pull passa e o REPARO conta as 2" || bad "duas obsoletas: rc=$RC" "$OUT"
+present "$K" "$L" && present "$K" "$L2" && ok "duas pontas obsoletas distintas: as duas chegaram" || bad "duas obsoletas: faltou ponta"
+# clone SEM o refspec de refs/gt/*: o --prune do fetch final não varre refs/gt/repair, então a ref avulsa só some se o próprio reparo a apaga
+mkstale folha refs/remotes/origin/fix/folha; git -C "$K" config --unset-all remote.origin.fetch; git -C "$K" config --add remote.origin.fetch '+refs/remotes/origin/*:refs/remotes/origin/*'; pull
+[ "$RC" = 0 ] && printf '%s' "$OUT" | grep -qF 'REPARO' && present "$K" "$L" && [ -z "$(find "$K/refs/gt/repair" -type f 2> /dev/null)" ] && ! grep -q 'refs/gt/repair' "$K/packed-refs" 2> /dev/null && ok "obsoleta sem refspec de refs/gt/*: o reparo passa e a ref avulsa não fica (só o próprio reparo a apaga)" || bad "obsoleta sem refspec de refs/gt/*: rc=$RC" "$OUT $(find "$K/refs/gt/repair" -type f 2>&1)"
+# gc seguro: o gc padrão do git 2.43 num clone parcial(cruft + bitmap) perdeu um commit local e morreu numa cópia do clone do nó. O bootstrap (que faz o 1º pull) e todo pull gravam gc.cruftPacks=false e repack.writeBitmaps=false
+fresh boot; [ "$(git -C "$K" config gc.cruftPacks)" = false ] && [ "$(git -C "$K" config repack.writeBitmaps)" = false ] && ok "gc seguro: o clone do bootstrap nasce com gc.cruftPacks=false e repack.writeBitmaps=false" || bad "gc seguro: o bootstrap não gravou a config do gc" "$(git -C "$K" config --get-regexp 'gc|repack')"
+fresh adv; git -C "$K" config --unset gc.cruftPacks; git -C "$K" config --unset repack.writeBitmaps; git -C "$K" config gc.cruftPacks true; pull
+[ "$RC" = 0 ] && [ "$(git -C "$K" config gc.cruftPacks)" = false ] && [ "$(git -C "$K" config repack.writeBitmaps)" = false ] && ok "gc seguro: um pull conserta o clone que já existia (cruft ligado, bitmap sem config)" || bad "gc seguro: o pull não consertou a config do gc" "rc=$RC $(git -C "$K" config --get-regexp 'gc|repack')"
+fresh adv; pull cfgfail
+[ "$RC" = 0 ] && has 'resultado=ok' "gc seguro: não gravar a config não derruba o pull" || bad "gc seguro: pull com a gravação falhando rc=$RC" "$OUT"
+has 'AVISO: não gravei gc.cruftPacks=false' "gc seguro: ...mas o pull DIZ que o clone ficou sem a config do gc"
+# o resumo do last-pull-error não é o eco do gc.log: com um gc.log velho no clone o git termina TODO fetch repetindo o conteúdo dele, e a causa sumia da 1ª linha (texto medido no git 2.43 do nó)
+fresh boot; pull fetchnoise
+head -n 1 "$LPE" | cut -d' ' -f2- | grep -qF 'did not send all necessary objects' && ok "resumo: o eco do gc.log não vira a 1ª linha do last-pull-error (a causa do git continua nela)" || bad "resumo: 1ª linha" "$(head -n 1 "$LPE")"
+grep -qF 'The last gc run reported the following' "$LPE" && grep -qF 'failed to run repack' "$LPE" && ok "resumo: o eco do gc.log segue guardado no corpo do last-pull-error" || bad "resumo: o corpo perdeu o eco" "$(cat "$LPE")"
+OUT=$("$RG" status gascity 2>&1); has 'último_pull_com_erro=[error: ssh://x/y.git did not send all necessary objects' "resumo: o status mostra a causa, não o eco do gc"
+fresh boot; pull noiseonly
+head -n 1 "$LPE" | cut -d' ' -f2- | grep -qxF 'fatal: failed to run repack' && ok "resumo: stderr só com o eco do gc: cai na última linha (nunca um resumo vazio)" || bad "resumo: só eco" "$(head -n 1 "$LPE")"
 
 # ── falha que não é essa: sem a frase do git não há segunda tentativa ─────────────────────────────────────────────────────────────────────────────────────────────────
 fresh adv; OUT=$(env FAKE_SSH_FAIL=upload-pack "$RG" pull gascity 2>&1); RC=$?

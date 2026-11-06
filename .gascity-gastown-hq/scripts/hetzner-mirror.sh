@@ -193,8 +193,25 @@ cmd_status() {
     echo "$rig: pronto=$rdy · último fetch+varredura bons há $age · caminhos negados por conteúdo=$n · prefixos=[$(echo $pfx)] · filtro=$spec · pendentes ao origin=[${pend# }]"
     for e in lastfetcherror lastpublisherror; do [ -n "$("$GIT" -C "$r" config gtmirror.$e)" ] && { echo "  $e: $("$GIT" -C "$r" config gtmirror.$e)"; rc=1; }; done
     [ -z "$pend" ] && [ -n "$t" ] || rc=1
+  done; node_check || rc=1; return $rc
+}
+# O script do servidor (hetzner-remote-git.sh) é uma CÓPIA: o merge no repo não o instala (ga-eivvcus: o fix da ga-yo1n1zg foi mergeado e o nó seguiu com o script velho; o pull dele falha desde 05/11 23:10Z). Então o status compara o sha256 do arquivo
+#   INSTALADO em cada nó (um por túnel configurado: $MH/tunnel-<host>.pid) com o do repo. igual · DIFERENTE (rc 1; a linha diz o comando de instalação) · desconhecido (não consegui ler o nó: rc 1, nunca "igual" por falta de leitura). Sem túnel configurado não há nó a conferir.
+#   Só para teste: HETZNER_MIRROR_NODE_SSH (o comando ssh), HETZNER_MIRROR_NODE_SRC (o script do repo), HETZNER_MIRROR_NODE_PATH (onde ele fica no nó, relativo ao HOME de lá).
+sha256_of() { if command -v sha256sum > /dev/null; then sha256sum; else shasum -a 256; fi | awk '{ print $1 }'; }
+node_check() {
+  local f h want got rc=0 src=${HETZNER_MIRROR_NODE_SRC:-$(dirname "$SELF")/hetzner-remote-git.sh} np=${HETZNER_MIRROR_NODE_PATH:-gt-remote/bin/hetzner-remote-git.sh} sshc=${HETZNER_MIRROR_NODE_SSH:-"ssh -o BatchMode=yes -o ConnectTimeout=10"} nm
+  nm=${np##*/}
+  for f in "$MH"/tunnel-*.pid; do [ -e "$f" ] || continue; h=${f##*/tunnel-}; h=${h%.pid}; [[ "$h" =~ ^[A-Za-z0-9_.-]+$ ]] || continue
+    want=$(sha256_of < "$src" 2> /dev/null); got=""
+    [[ "$np" =~ ^[A-Za-z0-9_./-]+$ ]] && got=$(tmo 30 $sshc "$h" "sha256sum $np" 2> /dev/null | sha256_first)
+    if ! [[ "$want" =~ ^[0-9a-f]{64}$ ]] || ! [ -r "$src" ]; then echo "nó $h: $nm = DESCONHECIDO (não li o script do repo: $src)"; rc=1
+    elif ! [[ "$got" =~ ^[0-9a-f]{64}$ ]]; then echo "nó $h: $nm = DESCONHECIDO (não consegui ler ~/$np no nó: ssh falhou, sem sha256sum ou arquivo ausente)"; rc=1
+    elif [ "$got" = "$want" ]; then echo "nó $h: $nm = igual ao do repo (sha256 ${want:0:12})"
+    else echo "nó $h: $nm = DIFERENTE do repo (nó ${got:0:12}, repo ${want:0:12}): instale com  scp -q $src $h:$(dirname "$np")/ && ssh $h 'chmod 755 ~/$np'  (docs/runbooks/hetzner-git-mirror.md)"; rc=1; fi
   done; return $rc
 }
+sha256_first() { awk 'NR == 1 { print $1; exit }'; }   # a 1ª palavra da 1ª linha da saída do sha256sum
 
 # ── maint: manutenção diária e leve dos espelhos (ga-pepqfkk) ───────────────────────────────────────────────────────────────────────────────────────────────────
 # POR QUE existe. O fetch do sync chama `git maintenance run --auto`, mas a trava objects/maintenance.lock — órfã desde 13/10, vinda por hardlink no `init --seed` (clone --local) — faz o git sair com rc 0 e CALADO sob --auto: o auto-gc

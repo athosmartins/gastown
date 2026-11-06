@@ -168,6 +168,27 @@ sleep 300 & RP=$!; mkdir -p "$T/mh-reuse"; echo "$RP" > "$T/mh-reuse/sshd.pid"
 HETZNER_MIRROR_HOME=$T/mh-reuse rc_is 1 "sshd status: pid vivo de OUTRO programa não é 'rodando'" "$M" sshd status; has 'parado' "sshd status: diz parado"
 echo "$RP" > "$T/mh/tunnel-reuse.invalid.pid"; rc_is 1 "tunnel status: pid vivo de outro programa → parado, rc 1" "$M" tunnel status reuse.invalid; has 'parado' "tunnel status: diz parado"
 echo "$RP" > "$T/mh/tunnel-reuse.invalid.pid"; rc_is 1 "tunnel start: pid reaproveitado não impede de subir (o host não existe: sobe e cai)" "$M" tunnel start reuse.invalid; hasnt 'já rodando' "tunnel start: não diz 'já rodando' por causa do pid de outro programa"; kill "$RP" 2> /dev/null; rm -f "$T/mh/tunnel-reuse.invalid.pid"
+# nó × repo (ga-eivvcus): o status compara o sha256 do hetzner-remote-git.sh INSTALADO em cada nó (um por túnel configurado) com o do repo. "Mergeado" não é "instalado": o fix da ga-yo1n1zg ficou 7 dias dormente no nó
+printf '#!/bin/bash\necho node-script-v1\n' > "$T/nodesrc"; NSHA=$(sha256sum "$T/nodesrc" 2> /dev/null || shasum -a 256 "$T/nodesrc"); NSHA=${NSHA%% *}
+cat > "$T/fakenode" <<'FNEOF'
+#!/bin/sh
+echo "$1 | $2" >> "$FAKENODE_LOG"
+case "$FAKENODE_MODE" in
+  igual) echo "$FAKENODE_SHA  gt-remote/bin/hetzner-remote-git.sh" ;; outro) echo "0000000000000000000000000000000000000000000000000000000000000000  gt-remote/bin/hetzner-remote-git.sh" ;;
+  lixo) echo "sha256sum: gt-remote/bin/hetzner-remote-git.sh: No such file or directory" ;; cai) exit 255 ;; esac
+FNEOF
+chmod 755 "$T/fakenode"; export HETZNER_MIRROR_NODE_SSH=$T/fakenode HETZNER_MIRROR_NODE_SRC=$T/nodesrc FAKENODE_SHA=$NSHA FAKENODE_LOG=$T/fakenode.log; : > "$FAKENODE_LOG"
+rc_is 0 "nó×repo: sem túnel configurado não há nó a conferir (status segue rc 0)" "$M" status wa; hasnt 'nó ' "nó×repo: sem túnel, nenhuma linha de nó"
+: > "$T/mh/tunnel-nodeA.pid"
+FAKENODE_MODE=igual rc_is 0 "nó×repo: script do nó = o do repo → rc 0" "$M" status wa; has 'nodeA: hetzner-remote-git.sh = igual ao do repo' "nó×repo: diz igual"; grep -qF "nodeA | sha256sum gt-remote/bin/hetzner-remote-git.sh" "$FAKENODE_LOG" && ok "nó×repo: pede ao nó o sha256 do arquivo do caminho de instalação" || bad "nó×repo: o comando que foi ao nó não é o sha256 do caminho de instalação" "$(cat "$FAKENODE_LOG")"
+FAKENODE_MODE=outro rc_is 1 "nó×repo: script do nó ≠ o do repo → rc 1 (o merge não instalou)" "$M" status wa; has 'nodeA: hetzner-remote-git.sh = DIFERENTE do repo' "nó×repo: diz DIFERENTE"; has 'scp -q' "nó×repo: a linha traz o comando de instalação"; has "${NSHA:0:12}" "nó×repo: mostra o hash do repo"
+FAKENODE_MODE=lixo rc_is 1 "nó×repo: arquivo ausente no nó → rc 1, DESCONHECIDO (nunca 'igual')" "$M" status wa; has 'DESCONHECIDO' "nó×repo: diz DESCONHECIDO"; hasnt 'igual ao do repo' "nó×repo: leitura que falha não vira 'igual'"
+FAKENODE_MODE=cai rc_is 1 "nó×repo: ssh caiu → rc 1, DESCONHECIDO" "$M" status wa; has 'DESCONHECIDO' "nó×repo: ssh caiu diz DESCONHECIDO"
+HETZNER_MIRROR_NODE_SRC=$T/nodesrc.nao-existe FAKENODE_MODE=igual rc_is 1 "nó×repo: script do repo ilegível → rc 1, DESCONHECIDO (não compara com vazio)" "$M" status wa; has 'não li o script do repo' "nó×repo: diz que não leu o do repo"
+: > "$T/mh/tunnel-nodeB.pid"; FAKENODE_MODE=outro rc_is 1 "nó×repo: dois nós" "$M" status wa; has 'nodeA:' "nó×repo: lista o nó A"; has 'nodeB:' "nó×repo: lista o nó B"
+grep -q 'ssh -o BatchMode=yes -o ConnectTimeout=10' "$M" && ok "nó×repo: o ssh padrão é BatchMode com prazo (nunca pede senha nem pendura o status)" || bad "nó×repo: o ssh padrão perdeu BatchMode/ConnectTimeout"
+rm -f "$T/mh/tunnel-nodeA.pid" "$T/mh/tunnel-nodeB.pid"; unset HETZNER_MIRROR_NODE_SSH HETZNER_MIRROR_NODE_SRC FAKENODE_SHA FAKENODE_LOG
+rc_is 0 "nó×repo: sem os túneis o status volta a rc 0" "$M" status wa
 # o limiar do varredor do espelho é o do hetzner-pii-scan.py (o main dele, nph/ncp): um muda sem o outro e este caso quebra
 grep -q '^PH_MIN, CP_MIN = 20, 3 ' "$SC" && grep -q 'nph, ncp = None, None, 20, 3$' "$HERE/hetzner-pii-scan.py" && ok "limiares: 20 telefones / 3 CPFs iguais nos dois varredores" || bad "limiares: os dois varredores divergem" "$(grep -n 'PH_MIN, CP_MIN =' "$SC"; grep -n 'nph, ncp =' "$HERE/hetzner-pii-scan.py")"
 # temporário com nome FIXO (.new) em caminho que pode rodar em dobro: dois processos escreveriam no mesmo arquivo
