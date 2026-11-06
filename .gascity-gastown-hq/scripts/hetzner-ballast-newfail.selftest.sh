@@ -286,6 +286,15 @@ for i in range(off, off + n):
     t[f]["survivors"]["w%03d" % i] = {"id": "w%03d" % i, "file": f, "line": 10 + i, "op": "cmp", "old": "çã" * 10 if uni else "==", "new": "óé" * 10 if uni else "!=", "selftest": ["tests/test_a.py"]}
 print(json.dumps({"v": 1, "targets": t}))' "$1" "${2:-0}" "${3:-0}" > "$W/node.confirmed"
 }
+mkwamx() {  # mkwamx EXCL_JSON — como `mkwam 3` (w000 e w002 em lib/a.py, w001 em daemons/b.py), mas o alvo lib/a.py leva "excl": EXCL_JSON (quantos testes e módulos da família ficaram fora do veredito: o motor o grava quando a regra de conjunto de falhas aceitou a baseline do alvo)
+  "$PY" -I -c 'import sys, json
+t = {"lib/a.py": {"hash": "h", "survivors": {}}, "daemons/b.py": {"hash": "h", "survivors": {}}}
+for i in range(3):
+    f = ["lib/a.py", "daemons/b.py"][i % 2]
+    t[f]["survivors"]["w%03d" % i] = {"id": "w%03d" % i, "file": f, "line": 10 + i, "op": "cmp", "old": "==", "new": "!=", "selftest": ["tests/test_a.py"]}
+t["lib/a.py"]["excl"] = json.loads(sys.argv[1])
+print(json.dumps({"v": 1, "targets": t}))' "$1" > "$W/node.confirmed"
+}
 mkwamord() {  # 4 alvos com contagens desiguais (z 3, m 2, lib/a 1, daemons/a 1), na ordem do JSON lib/a · lib/z · daemons/m · daemons/a, e as linhas de cada alvo FORA de ordem
   "$PY" -I -c 'import json
 def r(f, l, i): return {"id": i, "file": f, "line": l, "op": "cmp", "old": "==", "new": "!=", "selftest": ["tests/t.py"]}
@@ -337,6 +346,21 @@ g_wam() {  # a fonte wa-mutants (ga-tmfmvxi): o MESMO formato do hq-mutants, bea
   check "newfail[wam]: o corpo agrupa por arquivo, com linha, troca, id e testes de cada sobrevivente; o alvo sem sobrevivente não aparece" "1 1 1 0" "$(grep -c '^ARQUIVO lib/a.py (2)$' "$W/bd.stdin.1") $(grep -c '^ARQUIVO daemons/b.py (1)$' "$W/bd.stdin.1") $(grep -c '^  L10 \[cmp\] == -> !=  id=w000  (testes: tests/test_a.py)$' "$W/bd.stdin.1") $(grep -c 'lib/c.py' "$W/bd.stdin.1")"
   check "newfail[wam]: o corpo fala do código do WA (lib/, daemons/), diz que não é dado de lead, avisa que a linha pode estar velha e que a bead só muda a cada 6 h" "1 1 1 1" "$(grep -c 'código do WA (lib/, daemons/)' "$W/bd.stdin.1") $(grep -c 'Não é lead nem dado de cliente' "$W/bd.stdin.1") $(grep -c 'pode estar velha' "$W/bd.stdin.1") $(grep -c 'no máximo a cada 6 h' "$W/bd.stdin.1")"
   check "newfail[wam]: a última linha do corpo é a fonte (de onde sai a lista inteira)" "1" "$(tail -n 1 "$W/bd.stdin.1" | grep -c '^Fonte: ~/gt-remote/ballast/wa-mutants.state.json')"
+  # MARCA do alvo com testes fora do veredito (ga-z137atn): com a regra de conjunto de falhas o motor roda os mutantes de um alvo SEM os testes que já quebravam por ambiente na jaula, e grava `excl` (quantos) no alvo. O sobrevivente dele pode ser pego no mini
+  # por um desses testes, então a linha diz quantos ficaram de fora. Sem a chave, com 0 ou com null não ficou nenhum: sem marca. A chave que existe e não se lê (texto, negativo, booleano, decimal, lista) NÃO é «nenhum»: marca com «?» (sabe-se que a regra agiu, não quantos)
+  wamcity; mkwamx 7; nw
+  check "newfail[wam]: alvo com excl 7: as linhas dos sobreviventes DELE (w000 e w002, em lib/a.py) terminam em «[7 teste(s) da família fora do veredito]»; a do alvo sem excl (w001) não leva marca" "2 0" "$(grep -c '^  L[0-9]* .* id=w00[02] .*  \[7 teste(s) da família fora do veredito\]$' "$W/bd.stdin.1") $(grep -c 'id=w001.*fora do veredito' "$W/bd.stdin.1")"
+  check "newfail[wam]: o cabeçalho explica a marca (testes que falham SEM mutante na jaula do nó e NÃO rodaram nos mutantes do alvo: o sobrevivente pode ser pego no mini)" "1" "$(grep -c 'NÃO rodaram nos mutantes' "$W/bd.stdin.1")"
+  wamcity; mkwamx 1; nw
+  check "newfail[wam]: excl 1 (o menor inteiro positivo) já marca: «[1 teste(s) da família fora do veredito]» nas 2 linhas do alvo" "2" "$(grep -c '^  L[0-9]* .* id=w00[02] .*  \[1 teste(s) da família fora do veredito\]$' "$W/bd.stdin.1")"
+  for x in 0 null false; do
+    wamcity; mkwamx "$x"; nw
+    check "newfail[wam]: excl=$x (nenhum teste fora) → sem marca em linha nenhuma e a bead abre do mesmo jeito" "0 0 1" "$RC $(grep -c '^  L[0-9]* .*fora do veredito\]$' "$W/bd.stdin.1") $(calls create bd.calls)"
+  done
+  for x in '"7"' -2 true 2.5 '[7]'; do
+    wamcity; mkwamx "$x"; nw
+    check "newfail[wam]: excl=$x (a chave existe e não é inteiro > 0) → NÃO é «nenhum»: as 2 linhas do alvo levam a marca com «?» e a do outro alvo não, sem traceback" "0 2 0 0" "$RC $(grep -c '^  L[0-9]* .* id=w00[02] .*  \[? teste(s) da família fora do veredito\]$' "$W/bd.stdin.1") $(grep -c 'id=w001.*fora do veredito' "$W/bd.stdin.1") $(printf '%s' "$OUT" | grep -c Traceback)"
+  done
   nw
   check "newfail[wam]: a MESMA lista de novo → nada a fazer (continuam as 2 chamadas: list e create)" "0 1 2" "$RC $(printf '%s' "$OUT" | grep -c 'nada a fazer') $(wc -l < "$W/bd.calls" | tr -d ' ')"
 
@@ -692,7 +716,18 @@ a linha da conta conta os cabeçalhos e as linhas em branco@@    rest = [rel for
 o corpo do wa-mutants esquece a linha da fonte@@    out.append(fonte)@@    pass
 o corpo do wa-mutants diz o intervalo errado@@% (WAM_GAP_S // 3600), ""]@@% 1, ""]
 o corpo do wa-mutants esquece o aviso de linha velha@@"MANTÉM a linha aqui, e ela pode estar velha: confira no arquivo atual antes de agir." % (WAM_GAP_S@@"" % (WAM_GAP_S
-o corpo do wa-mutants esquece o id do sobrevivente@@, sid, "  (testes: %s)" % fam if fam else ""), rel))@@, "", "  (testes: %s)" % fam if fam else ""), rel))
+o corpo do wa-mutants esquece o id do sobrevivente@@, sid, "  (testes: %s)" % fam if fam else "",@@, "", "  (testes: %s)" % fam if fam else "",
+o excl do alvo não chega ao registro do sobrevivente@@            items[sid] = dict(r, excl=mark) if mark else r@@            items[sid] = r
+o excl ilegível vira «nenhum» (sem marca) em vez de «?»@@        mark = x if type(x) is int and x > 0 else None if x in (None, 0) else "?"@@        mark = x if type(x) is int and x > 0 else None
+o excl 0 ou null vira «?» (nenhum teste fora não é «?»)@@else None if x in (None, 0) else "?"@@else "?"
+o excl 0 vira «?» (só o null é «nenhum»)@@else None if x in (None, 0) else "?"@@else None if x is None else "?"
+o excl null vira «?» (só o 0 é «nenhum»)@@else None if x in (None, 0) else "?"@@else None if x == 0 else "?"
+o booleano true conta como inteiro (a marca diria «True teste(s)»)@@mark = x if type(x) is int and x > 0@@mark = x if isinstance(x, int) and x > 0
+o excl 1 não marca (a fronteira do > 0 vira > 1)@@mark = x if type(x) is int and x > 0@@mark = x if type(x) is int and x > 1
+a marca sai em toda linha (também no alvo sem excl)@@"  [%s teste(s) da família fora do veredito]" % r["excl"] if r.get("excl") else ""@@"  [%s teste(s) da família fora do veredito]" % r.get("excl", 0)
+a marca nunca sai@@"  [%s teste(s) da família fora do veredito]" % r["excl"] if r.get("excl") else ""@@""
+a marca diz uma contagem fixa e não a do alvo@@"  [%s teste(s) da família fora do veredito]" % r["excl"]@@"  [%s teste(s) da família fora do veredito]" % 1
+o cabeçalho do wa-mutants esquece de explicar a marca@@    head += ["Linha terminada em@@    head += [] and ["Linha terminada em
 a lista que zera do wa-mutants nunca diz que todos foram julgados@@    if not nao:@@    if False:
 os motivos do wa-mutants não são agrupados (restam 2 de 3 ≠ restam 5 de 9)@@        k = re.sub(r"\d+", "N", why)@@        k = why
 os motivos do wa-mutants só olham a 1ª parte (pulado)@@        k = re.sub(r"\d+", "N", why)@@        k = re.sub(r"\d+", "N", why.split(":")[0])
