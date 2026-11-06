@@ -2,9 +2,11 @@
 # hetzner-remote-git.sh — o lado SERVIDOR do espelho git (ga-2hd02v.1.3, fatia 4). Roda no Hetzner como `runner`, instalado em ~/gt-remote/bin/. Doc: docs/runbooks/hetzner-git-mirror.md
 #
 # ## Contents
-#   Subcomandos · Códigos de saída
+#   Subcomandos · Pull com ponta ausente (reparo / contorno) · gc do clone · Códigos de saída
 #
 # Por rig, um clone BARE parcial (~/gt-remote/git/<rig>/repo.git) cujo ÚNICO remoto é o espelho do mini, e um worktree por bead (…/wt/<bead>). O filtro de dados vem do ESPELHO a cada pull; nenhum remoto aponta para o GitHub.
+# PULL COM PONTA AUSENTE (ga-yo1n1zg, ga-eivvcus): uma ref anunciada pelo espelho cuja ponta não está no clone derruba o fetch inteiro. 1º o REPARO (repair_stale): se a ref tem aqui o MESMO valor que o espelho anuncia (obsoleta), o git nunca pede o objeto; busco a ponta por refspec avulso e repito o fetch, com o mesmo filtro. 2º o CONTORNO (fetch_origin): repito sem as refs que continuam sem ponta. main e refs/gt/synced sem ponta, e mais de PULL_MAX_FORA refs, FALHAM alto. O espelho segue recusando todo pedido sem filtro; nada disso o afrouxa.
+# GC DO CLONE (gc_safe, gravado a cada pull): gc.cruftPacks=false e repack.writeBitmaps=false. Medido numa cópia: com os padrões do git 2.43 o gc morre e perde um commit local; sem eles fecha. Detalhe e números: docs/runbooks/hetzner-git-mirror.md.
 # SUBCOMANDOS: bootstrap <rig> <url-do-espelho> <chave> <known_hosts> [prefixo/]... | pull <rig> | wt-add <rig> <bead> [base] | wt-rm <rig> <bead> | status [rig] | scan [rig...]
 # CÓDIGOS: 0 ok · 1 violação (scan) / pull falhou · 2 uso ou NÃO consegui varrer (nunca "limpo") · 3 recusado por não poder conferir
 set -u
@@ -37,12 +39,30 @@ broken_refs() {   # $1 = dir de trabalho. As refs que o espelho anuncia, dentro 
   grep -q -E '^refs/(remotes/origin/main|gt/synced) ' "$t/bad" && { RETRY_NOTE="a ponta de refs/remotes/origin/main ou de refs/gt/synced falta neste clone: não é ref lateral, não contorno"; return 1; }
   [ "$n" -le "$PULL_MAX_FORA" ] || { RETRY_NOTE="$n refs com ponta ausente (teto $PULL_MAX_FORA): dano grande demais para contornar"; return 1; }
 }
-fetch_origin() {   # o fetch do pull. $1 = oid do filtro · $2 = arquivo que junta o stderr de TODAS as tentativas. rc 0 = passou (SKIPPED ≠ vazio: passou SEM essas refs) · rc 1 = falhou (RETRY_NOTE = por que não houve segunda tentativa, se não houve)
-  local oid=$1 ef=$2 t r; SKIPPED=""; RETRY_NOTE=""
+repair_stale() {   # $1 = dir de trabalho (com o $1/bad de broken_refs) · $2 = oid do filtro · $3 = arquivo do stderr. rc 0 = o fetch passou (REPAIRED = <ref> <oid> por linha) · 1 = nenhuma ref obsoleta · 2 = tentou e não resolveu (o chamador refaz o levantamento: as pontas podem ter chegado)
+  # Ref OBSOLETA = anunciada com a ponta ausente E com o MESMO valor aqui: o git a trata como "up to date" e nunca pede o objeto (sem `want`, o pack não o traz e a checagem de conectividade morre em "did not send all necessary objects"). Medido numa cópia do clone do nó (ga-eivvcus): o pull ficou parado desde 05/11 por isso, com main e refs/gt/synced entre as tentativas.
+  # O reparo busca a ponta por refspec avulso, SEM par local (aí o git pede), com o MESMO filtro, e repete o fetch do pull. Nada é apagado e nada é afrouxado: filtro, varredura e a recusa do espelho valem como sempre; se a ponta não vem, main/synced seguem recusados (broken_refs).
+  local t=$1 oid=$2 ef=$3 r o i=0 n cur; REPAIRED=""; : > "$t/stale"
+  [ -s "$t/bad" ] || return 1   # sem levantamento (broken_refs não chegou a gravar o bad) → nada a reparar
+  # rev-parse não abre o objeto (só lê a ref): num clone parcial, abri-lo dispararia um fetch preguiçoso
+  while read -r r o; do cur=$(g rev-parse -q --verify "$r" 2> /dev/null) && [ "$cur" = "$o" ] && echo "$r $o" >> "$t/stale"; done < "$t/bad"
+  [ -s "$t/stale" ] || return 1
+  set --; while read -r r o; do i=$((i+1)); set -- "$@" "+$r:refs/gt/repair/$i"; done < <(LC_ALL=C sort -u -k2,2 "$t/stale")   # uma ref por ponta: duas refs na mesma ponta pedem o objeto uma vez só
+  n=$i; echo "--- reparo: refs obsoletas, buscando a ponta delas ($(awk '{ printf "%s%s", s, $1; s = " " }' "$t/stale")) ---" >> "$ef"
+  GIT_TERMINAL_PROMPT=0 LC_ALL=C timeout 1800 git -C "$GR/$RIG/repo.git" fetch -q "--filter=sparse:oid=$oid" origin "$@" 2>> "$ef"
+  for i in $(seq 1 "$n"); do g update-ref -d "refs/gt/repair/$i" 2> /dev/null; done   # a ref avulsa só carrega o objeto; não fica nada dela (e o --prune do fetch seguinte também a varreria)
+  if GIT_TERMINAL_PROMPT=0 LC_ALL=C timeout 1800 git -C "$GR/$RIG/repo.git" fetch -q --prune "--filter=sparse:oid=$oid" origin 2>> "$ef"; then REPAIRED=$(cat "$t/stale"); return 0; fi   # o rc do fetch inteiro decide, nunca o do avulso
+  return 2
+}
+fetch_origin() {   # o fetch do pull. $1 = oid do filtro · $2 = arquivo que junta o stderr de TODAS as tentativas. rc 0 = passou (REPAIRED ≠ vazio: passou DEPOIS de rebuscar refs obsoletas · SKIPPED ≠ vazio: passou SEM essas refs) · rc 1 = falhou (RETRY_NOTE = por que não houve segunda tentativa, se não houve)
+  local oid=$1 ef=$2 t r ok; SKIPPED=""; REPAIRED=""; RETRY_NOTE=""
   GIT_TERMINAL_PROMPT=0 LC_ALL=C timeout 1800 git -C "$GR/$RIG/repo.git" fetch -q --prune "--filter=sparse:oid=$oid" origin 2> "$ef" && return 0
   grep -q 'did not send all necessary objects' "$ef" || return 1   # outra falha (rede, filtro recusado, espelho em atualização): não há segunda tentativa
   t=$(mktemp -d) || { RETRY_NOTE="sem tmp"; return 1; }
-  broken_refs "$t" || { rm -rf "$t"; return 1; }
+  # 1º o reparo (ref obsoleta, inclusive main e refs/gt/synced: a recusa deles abaixo só vale para a ponta que o reparo NÃO trouxe); se o fetch ainda falha, refaço o levantamento e sigo o caminho de antes
+  broken_refs "$t"; ok=$?
+  repair_stale "$t" "$oid" "$ef"; case $? in 0) rm -rf "$t"; return 0 ;; 2) broken_refs "$t"; ok=$? ;; esac
+  [ $ok = 0 ] || { rm -rf "$t"; return 1; }
   # -c remote.origin.fetch=^<ref> SOMA-SE aos refspecs da config (os positivos seguem valendo, medido) e não deixa nada gravado se o processo morrer; o MESMO --filter vai junto (o oid vigente, nunca outro)
   set --; while read -r r _; do set -- "$@" -c "remote.origin.fetch=^$r"; done < "$t/bad"
   echo "--- tentativa 2: sem as refs de ponta ausente ($(awk '{ printf "%s%s", s, $1; s = " " }' "$t/bad")) ---" >> "$ef"
@@ -53,8 +73,13 @@ skipped_view() {   # as refs que o último pull deixou de fora, em uma linha. ar
   local f="$GR/$RIG/last-pull-skipped"
   if [ -r "$f" ]; then awk '{ printf "%s%s(%s)", s, $1, substr($2, 1, 7); s = " " }' "$f"; elif [ -e "$f" ]; then printf '?'; fi
 }
+gc_safe() {   # o gc padrão do git 2.43 num clone PARCIAL, medido numa cópia do clone do nó (ga-eivvcus): com cruft (gc.cruftPacks, o padrão) o gc morreu num fetch preguiçoso que o espelho recusa e o commit criado aqui (só num pack local, pai de um commit vindo do espelho) SUMIU do clone;
+  # sem cruft e sem bitmap o MESMO clone fechou o gc (rc 0) e o commit seguiu lá. Por que o cruft o perde é inferência (`repack --exclude-promisor-objects` toma esse commit por objeto do promisor). O bitmap não fecha neste clone parcial (o gc.log diário desde 22/10: "Packfile doesn't have full closure"; na cópia, cruft desligado + bitmap ligado deu "failed to write bitmap index" e deixou os packs como estavam). Idempotente.
+  g config gc.cruftPacks false && g config repack.writeBitmaps false
+}
 cmd_pull() {   # 1) pergunta ao espelho o filtro VIGENTE (gt-mirror-spec; sai com 75 enquanto a varredura de dado não cobre as pontas) 2) confere que é um filtro 3) busca COM esse oid, nunca com outro 4) se o fetch morre em "did not send all necessary objects" por ref de ponta ausente, repete UMA vez sem essas refs (fetch_origin)
-  local ef spec oid old url pre; rig_of "${1:-}"; PULL=erro; rm -f "$GR/$RIG/last-pull-skipped"; ef=$(mktemp) || die 3 "sem tmp"; url=$(g config gtremote.mirrorurl) && pre=$(g config gtremote.ssh) || die 3 "clone sem url/ssh do espelho"
+  local ef spec oid old url pre sum; rig_of "${1:-}"; PULL=erro; rm -f "$GR/$RIG/last-pull-skipped"; ef=$(mktemp) || die 3 "sem tmp"; url=$(g config gtremote.mirrorurl) && pre=$(g config gtremote.ssh) || die 3 "clone sem url/ssh do espelho"
+  gc_safe || echo "pull rig=$RIG AVISO: não gravei gc.cruftPacks=false e repack.writeBitmaps=false no clone: o gc automático dele pode perder commit local e falhar todo dia"
   [[ "$url" =~ ^ssh://([A-Za-z0-9_.-]+)@([A-Za-z0-9_.-]+):([0-9]+)/([a-z][a-z0-9_-]*)\.git$ ]] || die 3 "url do espelho ilegível: $url"
   # shellcheck disable=SC2086  # $pre é a linha de opções do ssh; chave e known_hosts só têm [A-Za-z0-9_./-] (conferido no bootstrap)
   if spec=$(timeout 120 $pre -p "${BASH_REMATCH[3]}" "${BASH_REMATCH[1]}@${BASH_REMATCH[2]}" "gt-mirror-spec '${BASH_REMATCH[4]}'" 2> "$ef") \
@@ -64,6 +89,7 @@ cmd_pull() {   # 1) pergunta ao espelho o filtro VIGENTE (gt-mirror-spec; sai co
       && g config gtremote.sparseoid "$oid" && g config remote.origin.partialclonefilter "sparse:oid=$oid" || die 3 "não gravei o filtro recebido"
     [ -z "$old" ] || [ "$old" = "$oid" ] || echo "pull rig=$RIG AVISO: o filtro do espelho mudou ($old → $oid); rode scan: dado já baixado antes da mudança não some sozinho"
     if fetch_origin "$oid" "$ef"; then PULL=ok; rm -f "$GR/$RIG/last-pull-error"
+      [ -z "$REPAIRED" ] || echo "pull rig=$RIG REPARO: $(printf '%s\n' "$REPAIRED" | wc -l | tr -d ' ') ref(s) estavam obsoletas (anunciadas com a ponta ausente neste clone, que o git dava por 'up to date') e a ponta delas foi buscada com o filtro vigente: $(printf '%s\n' "$REPAIRED" | awk '{ printf "%s%s", s, $1; s = " " }')"
       if [ -n "$SKIPPED" ]; then   # passou, mas SEM refs: o main foi buscado (nunca fica de fora) e o clone segue com buraco. Tem de ficar visível (stdout, status), nunca parecer um pull limpo
         printf '%s\n' "$SKIPPED" > "$GR/$RIG/last-pull-skipped" || echo "pull rig=$RIG AVISO: não consegui gravar $GR/$RIG/last-pull-skipped"
         echo "pull rig=$RIG AVISO: $(printf '%s\n' "$SKIPPED" | wc -l | tr -d ' ') ref(s) ficaram FORA deste pull (ponta ausente neste clone): $(printf '%s\n' "$SKIPPED" | awk '{ printf "%s%s", s, $1; s = " " }'); o main foi buscado, mas o clone precisa de reparo (git fetch --refetch --filter=sparse:oid=<oid>, docs/runbooks/hetzner-git-mirror.md)"
@@ -71,8 +97,10 @@ cmd_pull() {   # 1) pergunta ao espelho o filtro VIGENTE (gt-mirror-spec; sai co
     fi
   fi
   # o last-pull-error é o resumo de sempre na 1ª linha (<epoch> <última linha do git>, + o porquê de não ter havido retry) e, abaixo, o stderr INTEIRO de todas as tentativas (até 200 linhas; o que passar disso é contado, não calado)
+  # o resumo ignora o aviso do gc automático: com um gc.log velho no clone, TODO fetch termina repetindo o conteúdo dele ("fatal: failed to run repack"), e esse eco virava a 1ª linha e escondia a causa do pull (ga-eivvcus)
   [ $PULL = ok ] || { grep -q . "$ef" || echo "o espelho não devolveu um filtro de dados válido (resposta vazia ou sem regras)" > "$ef"
-    { echo "$(now) $(grep . "$ef" | tail -n 1 | tr -d '"')${RETRY_NOTE:+ (retry não feito: $RETRY_NOTE)}"; sed -n '1,200p' "$ef"; [ "$(wc -l < "$ef")" -le 200 ] || echo "(… $(( $(wc -l < "$ef") - 200 )) linhas omitidas)"; } > "$GR/$RIG/last-pull-error"; }; rm -f "$ef"
+    sum=$(awk '/^warning: The last gc run reported the following/ { exit } NF { l = $0 } END { print l }' "$ef"); [ -n "$sum" ] || sum=$(grep . "$ef" | tail -n 1)
+    { echo "$(now) $(printf '%s' "$sum" | tr -d '"')${RETRY_NOTE:+ (retry não feito: $RETRY_NOTE)}"; sed -n '1,200p' "$ef"; [ "$(wc -l < "$ef")" -le 200 ] || echo "(… $(( $(wc -l < "$ef") - 200 )) linhas omitidas)"; } > "$GR/$RIG/last-pull-error"; }; rm -f "$ef"
   lag_fields; echo "pull rig=$RIG resultado=$PULL main=$LAG_MAIN lag_min=$LAG_MIN$([ $PULL = erro ] && echo " erro=\"$(head -n 1 "$GR/$RIG/last-pull-error" | cut -d' ' -f2-)\"")"
   # o atraso fica REGISTRADO a cada pull (não só no wt-add): lag_min = idade da última varredura boa do espelho; null = o clone não tem carimbo (nunca vira 0)
   printf '{"ts":"%s","rig":"%s","pull":"%s","main":"%s","lag_min":%s}\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$RIG" "$PULL" "$LAG_MAIN" "$LAG_MIN" >> "$GR/pulls.jsonl" 2>/dev/null || echo "pull rig=$RIG AVISO: não consegui gravar $GR/pulls.jsonl"
