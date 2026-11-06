@@ -52,6 +52,53 @@ FAM_CAP = 12
 PYTEST_TMO = 120
 PYTHON = ""   # o python do venv do WA (--python): só o sweep o usa
 
+MAX_BAD = 25          # PROTOTIPO: ate quantos testes quebrados a baseline ainda vale
+MAX_BAD_FRAC = 0.05   # PROTOTIPO: e no maximo esta fracao dos testes que rodaram
+FAIL_PLUGIN = """import json, os
+_p = os.environ.get("WAM_FAILS")
+_n = {"passed": 0, "failed": 0}
+def _w(row):
+    if _p:
+        with open(_p, "a", encoding="utf-8") as f:
+            f.write(json.dumps(row) + "\\n")
+def pytest_runtest_logreport(report):
+    if report.when == "call" and report.passed:
+        _n["passed"] += 1
+    if report.failed:
+        _n["failed"] += 1
+        _w(["t", report.nodeid])
+def pytest_collectreport(report):
+    if report.failed:
+        _w(["c", report.nodeid])
+def pytest_sessionfinish(session, exitstatus):
+    _w(["s", _n["passed"], _n["failed"], int(exitstatus)])
+"""
+
+
+def near_green(tgt, fails_path):
+    """0 se a baseline vermelha e PEQUENA (e grava tgt["excl"]); None se nao e. Lido: o arquivo de falhas do plugin. vazio/ausente/ilegivel (o plugin nao rodou, linha que nao e json) -> None: vermelha de verdade, nunca verde por falta de leitura"""
+    import json as _j
+    tests, mods, summ = set(), set(), None
+    try:
+        for line in open(fails_path, encoding="utf-8"):
+            row = _j.loads(line)
+            if row[0] == "t":
+                tests.add(row[1])
+            elif row[0] == "c":
+                mods.add(row[1])
+            elif row[0] == "s":
+                summ = row
+    except (OSError, ValueError, IndexError, TypeError):
+        return None
+    if summ is None:
+        return None
+    bad = len(tests) + len(mods)
+    passed = summ[1]
+    if bad == 0 or passed < 10 or bad > MAX_BAD or bad > MAX_BAD_FRAC * (passed + bad):
+        return None
+    tgt["excl"] = {"tests": sorted(tests), "mods": sorted(mods)}
+    return 0
+
 _candidates = hqm.candidates
 
 
@@ -145,20 +192,30 @@ def wa_make_plan(tree, state, recent):
 
 
 def wa_exec_family(ctx, slot_n, tgt, text, tmo):
-    """copia a árvore para o slot, grava o mutante (text=None: a baseline) e roda UM pytest com a família na jaula; (rc do pytest, segundos). O mesmo desenho do exec_family do motor, com a árvore do WA como raiz e o pytest no lugar do bash"""
+    """PROTOTIPO. copia a árvore para o slot, grava o mutante (text=None: a baseline) e roda UM pytest com a família na jaula; (rc do pytest, segundos).
+    Baseline: família inteira, sem -x, o plugin anota quem falha; vermelho pequeno vira 0 e guarda tgt["excl"]. Mutante: -x, sem os quebrados"""
     slot = ctx.work / ("slot-%d" % slot_n)
     hqm.wipe(ctx, slot)
     (slot / "tmp").mkdir(parents=True)
     (slot / "home").mkdir()
+    (slot / "plug").mkdir()
+    (slot / "plug" / "wam_fails.py").write_text(FAIL_PLUGIN, encoding="utf-8")
+    fails = slot / "tmp" / "fails.jsonl"
     clone = slot / "clone"
     hqm.copy_tree(ctx.tree, clone, COPY_IGNORE)
     if text is not None:
         (clone / tgt["rel"]).write_text(text, encoding="utf-8")
-    base_kb = hqm.slot_kb(slot) or 0   # vazio/falhou (du não mediu) → 0: o limite passa a valer sobre o slot inteiro, nunca sem limite
-    # `env -i` DENTRO da jaula, como no motor: do ambiente de quem chama só passa PASS_ENV; HOME e TMPDIR são do slot (a jaula confere o --rw contra o HOME de verdade). PYTHONHASHSEED=0 é o da suíte do wa-suite (gt-iso-run)
+    base_kb = hqm.slot_kb(slot) or 0
     kv = ["%s=%s" % (k, os.environ[k]) for k in hqm.PASS_ENV if k in os.environ] + ["HOME=%s" % (slot / "home"), "TMPDIR=%s" % (slot / "tmp"), "PYTHONDONTWRITEBYTECODE=1", "PYTHONHASHSEED=0",
+                                                                                      "PYTHONPATH=%s" % (slot / "plug"), "WAM_FAILS=%s" % fails,
                                                                                       "GIT_AUTHOR_NAME=gt", "GIT_AUTHOR_EMAIL=gt@no", "GIT_COMMITTER_NAME=gt", "GIT_COMMITTER_EMAIL=gt@no"]
-    pytest = [PYTHON, "-m", "pytest", "-p", "no:cacheprovider", "-p", "no:randomly", "-q", "-x", "--tb=no", "--no-header", "--timeout=%d" % PYTEST_TMO, *tgt["family"]]
+    excl = tgt.get("excl") if text is not None else None
+    fam = [f for f in tgt["family"] if f not in (excl or {}).get("mods", [])]
+    base = [PYTHON, "-m", "pytest", "-p", "no:cacheprovider", "-p", "no:randomly", "-p", "wam_fails", "-q", "--tb=no", "--no-header", "--timeout=%d" % PYTEST_TMO]
+    if text is None:
+        pytest = base + ["--continue-on-collection-errors", *fam]
+    else:
+        pytest = base + ["-x", *["--deselect=" + n for n in (excl or {}).get("tests", [])], *fam]
     cmd = [sys.executable, "-I", ctx.a.jail, "--rw", str(slot), "--", "env", "-i", *kv, "timeout", "-k", "5", str(tmo), sys.executable, "-I", "-c", hqm.CAPPER, hqm.cap_arg(ctx.a), *pytest]
     t0 = time.time()
     p = subprocess.Popen(cmd, cwd=clone, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
@@ -172,6 +229,9 @@ def wa_exec_family(ctx, slot_n, tgt, text, tmo):
     finally:
         with ctx.lock:
             ctx.pids.discard(p.pid)
+    if text is None and rc == 1:
+        rc = near_green(tgt, fails)
+        rc = 1 if rc is None else rc
     hqm.wipe(ctx, slot)
     return rc, int(time.time() - t0)
 
