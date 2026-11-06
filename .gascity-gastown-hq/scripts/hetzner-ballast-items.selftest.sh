@@ -427,6 +427,7 @@ addengine() {  # motor e jaula de MENTIRA no main de brinquedo (o que o motor im
 # suporta: --slots-file --slots-max
 # suporta: --data-mb
 # suporta: --fam-cap
+# suporta: --max-bad
 import json, os, signal, sys, time
 open(os.environ["FAKE_LOG"], "a").write(" ".join(sys.argv[1:]) + "\n")
 mode = os.environ.get("FAKE_MODE", "completo")
@@ -565,6 +566,18 @@ famcap() {  # famcap — o valor depois de --fam-cap na última chamada do motor
   local v; [ -s "$W/engine.log" ] || { echo sem-chamada; return 0; }
   v=$(sed -n 's/.* --fam-cap \([^ ]*\).*/\1/p' "$W/engine.log" | tail -n 1); echo "${v:--}"
 }
+nomaxwrap() {  # nomaxwrap — só o INVÓLUCRO (hq-mutate-wa.py) do main do hq perde a marca --max-bad; o hq-mutate.py a mantém (a opção é do invólucro, é nele que o item procura)
+  local s="$SRC/.gascity-gastown-hq/scripts"; grep -v -e 'suporta: --max-bad' "$s/hq-mutate-wa.py" > "$s/hq-mutate-wa.py.novo" && mv "$s/hq-mutate-wa.py.novo" "$s/hq-mutate-wa.py"
+  git -C "$SRC" add -A && git -C "$SRC" commit -q -m involucro-sem-max-bad && git -C "$GR/gascity/repo.git" fetch -q "$SRC" "+HEAD:refs/remotes/origin/main"
+}
+nomaxcore() {  # nomaxcore — o contrário: só o hq-mutate.py perde a marca --max-bad e o invólucro a mantém
+  local s="$SRC/.gascity-gastown-hq/scripts"; grep -v -e 'suporta: --max-bad' "$s/hq-mutate.py" > "$s/hq-mutate.py.novo" && mv "$s/hq-mutate.py.novo" "$s/hq-mutate.py"
+  git -C "$SRC" add -A && git -C "$SRC" commit -q -m motor-sem-max-bad && git -C "$GR/gascity/repo.git" fetch -q "$SRC" "+HEAD:refs/remotes/origin/main"
+}
+maxbad() {  # maxbad — o valor depois de --max-bad na última chamada do motor; `-` se a chamada existe e NÃO levou a opção; `sem-chamada` se o motor nem foi chamado (log vazio não prova "não passou")
+  local v; [ -s "$W/engine.log" ] || { echo sem-chamada; return 0; }
+  v=$(sed -n 's/.* --max-bad \([^ ]*\).*/\1/p' "$W/engine.log" | tail -n 1); echo "${v:--}"
+}
 wanew() {  # wanew ARQUIVO — commit novo no main do WA (o espelho do nó avança)
   echo 'x = 2' > "$WSRC/lib/$1"; git -C "$WSRC" add -A && git -C "$WSRC" commit -q -m novo-wa && git -C "$GR/whatsapp_automation/repo.git" fetch -q "$WSRC" "+HEAD:refs/remotes/origin/main"
 }
@@ -665,6 +678,31 @@ g_wam() {
   check "wam: com a marca no invólucro e sem ela no hq-mutate.py o item a passa (é o invólucro quem lê --fam-cap)" "30 30" "$(famcap) $(sj fam_cap)"
   newwam; : > "$BH/wa-mutants.nofamcap"; runwam FAKE_MODE=completo WA_MUTANTS_FAM_CAP=45 BALLAST_CORES_MAX=6
   check "wam: o arquivo wa-mutants.nofamcap na pasta do lastro devolve o teto do invólucro mesmo com WA_MUTANTS_FAM_CAP (a opção não vai, o resumo diz fam_cap null) e as outras opções seguem" "- null 1 1" "$(famcap) $(sj fam_cap) $(eng "--data-mb 3072") $(eng "--slots-file $RD/slots")"
+
+  # REGRA DE CONJUNTO DE FALHAS (ga-z137atn): sem a opção --max-bad a baseline do invólucro tem de dar 0, e a família com UM teste quebrado por ambiente na jaula (PermissionError, duckdb…) pula inteira como base-vermelha: 19,3 mil mutantes do WA ficam sem julgar. O item passa --max-bad
+  # (padrão 25) SÓ a um invólucro que a conhece; WA_MUTANTS_MAX_BAD muda o número (em produção o governo monta o ambiente do zero: vale à mão e em teste) e o arquivo wa-mutants.nofailset na pasta do lastro devolve a regra desligada (a opção não vai). `maxbad` lê o log do motor: `-` é "chamou e NÃO levou a opção".
+  newwam; runwam FAKE_MODE=completo
+  check "wam: o padrão do item é --max-bad 25 (a baseline com poucos testes quebrados por ambiente deixa de pular o alvo) e o resumo diz max_bad 25" "25 25" "$(maxbad) $(sj max_bad)"
+  : > "$W/engine.log"; runwam FAKE_MODE=completo WA_MUTANTS_MAX_BAD=40
+  check "wam: WA_MUTANTS_MAX_BAD=40 vale (o motor recebe 40 e o resumo repete)" "40 40" "$(maxbad) $(sj max_bad)"
+  : > "$W/engine.log"; runwam FAKE_MODE=completo WA_MUTANTS_MAX_BAD=1
+  check "wam: WA_MUTANTS_MAX_BAD=1 vale (o menor teto que liga a regra)" "1 1" "$(maxbad) $(sj max_bad)"
+  : > "$W/engine.log"; runwam FAKE_MODE=completo WA_MUTANTS_MAX_BAD=99999999999999999999999
+  check "wam: WA_MUTANTS_MAX_BAD grande demais para o teste numérico do bash (o '[' dá erro, não falso) volta ao padrão 25" "25 25" "$(maxbad) $(sj max_bad)"
+  for bad in abc 0 00 -3 2x 1.5 ""; do
+    : > "$W/engine.log"; runwam FAKE_MODE=completo WA_MUTANTS_MAX_BAD="$bad"
+    check "wam: WA_MUTANTS_MAX_BAD='$bad' (texto, zero ou negativo: desligar a regra é o arquivo wa-mutants.nofailset, não um valor) volta ao padrão 25" "25 25" "$(maxbad) $(sj max_bad)"
+  done
+  newwam; oldeng; runwam FAKE_MODE=completo
+  check "wam: motor ANTIGO (sem a marca --max-bad) → a opção NÃO é passada (um invólucro que não a conhece recusaria a linha com rc 2) e o resumo diz max_bad null" "- null" "$(maxbad) $(sj max_bad)"
+  newwam; nomaxwrap; runwam FAKE_MODE=completo
+  check "wam: a opção é do INVÓLUCRO: com a marca só no hq-mutate.py (o invólucro antigo a recusaria) o item NÃO a passa" "- null" "$(maxbad) $(sj max_bad)"
+  newwam; nomaxcore; runwam FAKE_MODE=completo
+  check "wam: com a marca no invólucro e sem ela no hq-mutate.py o item a passa (é o invólucro quem lê --max-bad)" "25 25" "$(maxbad) $(sj max_bad)"
+  newwam; : > "$BH/wa-mutants.nofailset"; runwam FAKE_MODE=completo WA_MUTANTS_MAX_BAD=40 BALLAST_CORES_MAX=6
+  check "wam: o arquivo wa-mutants.nofailset na pasta do lastro desliga a regra mesmo com WA_MUTANTS_MAX_BAD (a opção não vai, o resumo diz max_bad null) e as outras opções seguem" "- null 30 1 1" "$(maxbad) $(sj max_bad) $(famcap) $(eng "--data-mb 3072") $(eng "--slots-file $RD/slots")"
+  newwam; : > "$BH/wa-mutants.nofamcap"; runwam FAKE_MODE=completo
+  check "wam: o arquivo wa-mutants.nofamcap devolve o teto de família do invólucro e NÃO desliga a regra (as duas bandeiras são independentes)" "- null 25 25" "$(famcap) $(sj fam_cap) $(maxbad) $(sj max_bad)"
 
   newwam; runwam FAKE_MODE=novidade; tip=$(git -C "$GR/whatsapp_automation/repo.git" rev-parse refs/remotes/origin/main); hqtip=$(git -C "$GR/gascity/repo.git" rev-parse refs/remotes/origin/main)
   check "wam: motor sem-novidade (rc 0) → rc 0 e o marcador de ocioso guarda o PAR de pontas (WA:hq)" "0 sem-novidade $tip:$hqtip" "$RC $(sj result) $(cat "$BH/wa-mutants.idle" 2>/dev/null)"
@@ -1004,9 +1042,23 @@ wa-mutants.sh@@a opção --fam-cap é procurada no hq-mutate.py e não no invól
 wa-mutants.sh@@o teto 0 da bandeira vai ao motor (--fam-cap 0: o invólucro recusa com rc 2)@@if [ "$FAM_CAP" -gt 0 ] && grep -q -e '--fam-cap'@@if [ "$FAM_CAP" -ge 0 ] && grep -q -e '--fam-cap'
 wa-mutants.sh@@o motor recebe um teto de família fixo e não o pedido@@EXTRA+=(--fam-cap "$FAM_CAP")@@EXTRA+=(--fam-cap 30)
 wa-mutants.sh@@o resumo não guarda o teto que foi ao motor@@; FAMPASSED=$FAM_CAP; fi@@; fi
-wa-mutants.sh@@o resumo diz o teto pedido e não o que foi ao motor@@"$SLOTS_MAX" "$FAMPASSED" << 'PY'@@"$SLOTS_MAX" "$FAM_CAP" << 'PY'
-wa-mutants.sh@@o resumo não traz o fam_cap@@secs_item=int(secs), fam_cap=int(fam_cap) if fam_cap else None)@@secs_item=int(secs))
-wa-mutants.sh@@o resumo diz fam_cap 0 quando a opção não foi ao motor (e não null)@@fam_cap=int(fam_cap) if fam_cap else None)@@fam_cap=int(fam_cap or 0))
+wa-mutants.sh@@o resumo diz o teto pedido e não o que foi ao motor@@"$SLOTS_MAX" "$FAMPASSED" "$BADPASSED" << 'PY'@@"$SLOTS_MAX" "$FAM_CAP" "$BADPASSED" << 'PY'
+wa-mutants.sh@@o resumo não traz o fam_cap@@secs_item=int(secs), fam_cap=int(fam_cap) if fam_cap else None, max_bad=@@secs_item=int(secs), max_bad=
+wa-mutants.sh@@o resumo diz fam_cap 0 quando a opção não foi ao motor (e não null)@@fam_cap=int(fam_cap) if fam_cap else None, max_bad=@@fam_cap=int(fam_cap or 0), max_bad=
+wa-mutants.sh@@o teto de falhas padrão vira outro número@@MAX_BAD=${WA_MUTANTS_MAX_BAD:-25}@@MAX_BAD=${WA_MUTANTS_MAX_BAD:-10}
+wa-mutants.sh@@o teto de falhas inválido vale como veio (texto, zero, negativo)@@[ "$MAX_BAD" -ge 1 ] 2> /dev/null || MAX_BAD=25@@:
+wa-mutants.sh@@o teto de falhas inválido cai em 10 e não em 25@@[ "$MAX_BAD" -ge 1 ] 2> /dev/null || MAX_BAD=25@@[ "$MAX_BAD" -ge 1 ] 2> /dev/null || MAX_BAD=10
+wa-mutants.sh@@o teto de falhas 0 vale (a regra desligada por um valor, não pelo arquivo)@@[ "$MAX_BAD" -ge 1 ] 2> /dev/null@@[ "$MAX_BAD" -ge 0 ] 2> /dev/null
+wa-mutants.sh@@o teto de falhas 1 é recusado (a fronteira do >= vira >)@@[ "$MAX_BAD" -ge 1 ] 2> /dev/null@@[ "$MAX_BAD" -gt 1 ] 2> /dev/null
+wa-mutants.sh@@a bandeira wa-mutants.nofailset não desliga a regra@@[ ! -e "$BH/wa-mutants.nofailset" ] || MAX_BAD=0@@:
+wa-mutants.sh@@a opção --max-bad vai a um invólucro que não a conhece@@grep -q -e '--max-bad' "$ENGDIR/hq-mutate-wa.py" 2> /dev/null; then EXTRA+=(--max-bad@@true; then EXTRA+=(--max-bad
+wa-mutants.sh@@a opção --max-bad é procurada no hq-mutate.py e não no invólucro@@grep -q -e '--max-bad' "$ENGDIR/hq-mutate-wa.py"@@grep -q -e '--max-bad' "$ENGDIR/hq-mutate.py"
+wa-mutants.sh@@o teto 0 da bandeira vai ao motor (--max-bad 0)@@if [ "$MAX_BAD" -gt 0 ] && grep -q -e '--max-bad'@@if [ "$MAX_BAD" -ge 0 ] && grep -q -e '--max-bad'
+wa-mutants.sh@@o motor recebe um teto de falhas fixo e não o pedido@@EXTRA+=(--max-bad "$MAX_BAD")@@EXTRA+=(--max-bad 25)
+wa-mutants.sh@@o resumo não guarda o teto de falhas que foi ao motor@@; BADPASSED=$MAX_BAD; fi@@; fi
+wa-mutants.sh@@o resumo diz o teto de falhas pedido e não o que foi ao motor@@"$FAMPASSED" "$BADPASSED" << 'PY'@@"$FAMPASSED" "$MAX_BAD" << 'PY'
+wa-mutants.sh@@o resumo não traz o max_bad@@fam_cap=int(fam_cap) if fam_cap else None, max_bad=int(max_bad) if max_bad else None)@@fam_cap=int(fam_cap) if fam_cap else None)
+wa-mutants.sh@@o resumo diz max_bad 0 quando a opção não foi ao motor (e não null)@@max_bad=int(max_bad) if max_bad else None)@@max_bad=int(max_bad or 0))
 MUT
   "$PY" -I - "$ITEMS" "$T/mutants.txt" "$T" > "$T/mutants.idx" <<'PYEOF'
 import os, re, shutil, sys

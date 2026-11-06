@@ -172,11 +172,15 @@ def items_hq(v):
         surv = ent.get("survivors", {}) if isinstance(ent, dict) else None
         if not isinstance(surv, dict):
             return None
+        # `excl` (ga-z137atn): quantos testes e módulos da família ficaram fora do veredito deste alvo (a regra de conjunto de falhas do hq-mutate-wa.py). vazio (sem a chave, 0 ou null: nenhum teste ficou fora) → sem marca;
+        # falhou/ilegível (a chave existe e não é inteiro > 0: texto, negativo, booleano, decimal, lista) → «?»: a regra agiu e não se sabe quantos ficaram fora, o que NÃO é «nenhum»
+        x = ent.get("excl")
+        mark = x if type(x) is int and x > 0 else None if x in (None, 0) else "?"
         for sid, r in surv.items():
             if not (isinstance(sid, str) and isinstance(r, dict) and isinstance(r.get("file"), str) and type(r.get("line")) is int and all(isinstance(r.get(f, ""), str) for f in ("op", "old", "new"))
                     and isinstance(r.get("selftest", []), list) and all(isinstance(t, str) for t in r.get("selftest", []))):
                 return None
-            items[sid] = r
+            items[sid] = dict(r, excl=mark) if mark else r
     return items
 
 
@@ -425,12 +429,15 @@ def render_wam(items):
             "Para fechar, ponha num teste um caso que reprove com a troca (o id é estável: sha1 de arquivo:linha:operador:antes>depois:ocorrência) ou, se a troca não muda o comportamento, diga qual é a equivalência. "
             "A lista é a do ÚLTIMO rodízio e a bead é atualizada quando ela muda (no máximo a cada %d h). Um id sai quando o motor varre o arquivo de novo e o mutante morre (ou deixa de existir); arquivo apagado, renomeado ou ainda não varrido de novo "
             "MANTÉM a linha aqui, e ela pode estar velha: confira no arquivo atual antes de agir." % (WAM_GAP_S // 3600), ""]
+    head += ["Linha terminada em «[N teste(s) da família fora do veredito]»: N testes da família do arquivo falham SEM mutante na jaula do nó (ambiente: permissão, banco, caminho do mini) e NÃO rodaram nos mutantes dele, então um deles pode pegar a troca no mini: rode os testes completos lá "
+             "antes de escrever um caso novo. N = «?»: o motor marcou o alvo e a contagem não se lê.", ""]
     flat = []   # (texto, arquivo se for linha de mutante, senão None)
     for rel, rows in sorted(files.items(), key=lambda kv: (-len(kv[1]), kv[0])):
         flat.append(("ARQUIVO %s (%d)" % (rel, len(rows)), None))
         for line, sid, r in sorted(rows, key=lambda x: (x[0], x[1])):
             fam = ",".join(r.get("selftest", []))
-            flat.append(("  L%d [%s] %s -> %s  id=%s%s" % (line, r.get("op", ""), r.get("old", "").replace("\n", "\\n"), r.get("new", "").replace("\n", "\\n"), sid, "  (testes: %s)" % fam if fam else ""), rel))
+            flat.append(("  L%d [%s] %s -> %s  id=%s%s%s" % (line, r.get("op", ""), r.get("old", "").replace("\n", "\\n"), r.get("new", "").replace("\n", "\\n"), sid, "  (testes: %s)" % fam if fam else "",
+                                                                "  [%s teste(s) da família fora do veredito]" % r["excl"] if r.get("excl") else ""), rel))
         flat.append(("", None))
     fonte = ("Fonte: ~/gt-remote/ballast/wa-mutants.state.json no nó (hetzner-ballast-newfail.py --fonte wa-mutants, ga-tmfmvxi). Não é lead nem dado de cliente: só trechos do código do próprio WA, tirados do espelho que o wa-suite já usa.")
     teto = WAM_CAP - 700   # a reserva cobre a linha da conta (~230 bytes), a da fonte (~230) e o `lead` que o comentário põe na frente (até ~150); sobra pouco de propósito: o teste prova que sem o cabeçalho na conta o texto passa de 40000

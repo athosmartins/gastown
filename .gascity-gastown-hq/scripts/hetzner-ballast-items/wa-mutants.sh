@@ -4,7 +4,7 @@
 # da jaula scripts/hq-sandbox-run.py, os TRÊS tirados do origin/main do rig do hq no nó (git show, sem árvore). A árvore que se muta é a do WA, a MESMA que o wa-suite usa (o espelho filtrado: nenhum dado de lead).
 #
 # Contents
-#   O que faz · Veredito · Três estados · Limites
+#   O que faz · Veredito · Conjunto de falhas · Três estados · Limites
 #
 # O QUE FAZ: (1) `hetzner-remote-git.sh pull` dos DOIS rigs (falhou = segue com o clone que há e diz pull=falhou / hqpull=falhou) (2) se o motor já deu o par (main do WA : main do hq) por SEM novidade, há menos de 6 h, e os DOIS pulls
 #   deram certo, sai com "sem-novidade" sem criar árvore (com um pull falho o clone velho não prova que não há novidade: pull-falhou, exit 3) (3) `git show` dos três arquivos do motor, do main do hq, para $BALLAST_RUN_DIR/engine/ (4) `wt-add` do WA numa árvore só dele (ballast-wam, e a branch worker/ballast-wam: as duas saem no fim e também no TERM;
@@ -13,6 +13,9 @@
 #   O leitor do sobrevivente (UM bead rolante, sem rota) é o `--fonte wa-mutants` do hetzner-ballast-newfail.py, a fatia ga-tmfmvxi.3: enquanto ela não está no main, o sobrevivente fica só neste resumo e no estado do motor.
 # VEREDITO: o rc do motor passa adiante (0 rodou: completo, parcial, sem-novidade ou sem-cobertura (nada examinado: só ilegível/vermelho/pulado; não grava o marcador) · 97 sem jaula: o kernel não provou o Landlock, nada rodou · 143 interrompido).
 #   Mutante que sobrevive é dado, não falha do item. Alvo cuja família já reprova SEM mutante dentro da jaula (precisa de rede, do config/ real, de /Users…) sai como base-vermelha e volta em 2 dias: é o ambiente, não o código.
+# CONJUNTO DE FALHAS (ga-z137atn): sem a opção --max-bad a baseline do invólucro tem de dar 0, e a família com UM teste quebrado por ambiente na jaula (PermissionError, duckdb, caminho de /Users…) pulava inteira como base-vermelha: 19,3 mil mutantes do WA ficavam sem julgar em 06/11.
+#   O item passa --max-bad 25 SÓ a um invólucro que traz a opção (o texto dele): com 1 a 25 testes quebrados sem mutante, e até 5% dos que rodaram, o alvo ENTRA e cada mutante roda sem esses testes (morre só quem faz falhar um que passava). WA_MUTANTS_MAX_BAD muda o número (texto, zero, negativo e
+#   número grande demais voltam ao 25); o arquivo wa-mutants.nofailset na pasta do lastro devolve a regra desligada (a opção não vai). O resumo diz max_bad (o que foi ao motor, ou null) e, do motor, near_green (alvos que a regra aceitou na rodada).
 # TRÊS ESTADOS: sem origin/main num dos rigs (sem-main), sem um dos três arquivos do motor no main do hq (sem-motor: o main ainda não os tem), sem o python do venv do WA (preparo-ausente), árvore do WA sem tests/ ou sem lib/ e daemons/
 #   (arvore-sem-testes), wt-add que falha, árvore ou branch velha que a limpeza não tirou (arvore-velha: o wt-add real diria "já existe" com rc 0 e a rodada varreria o código de outro dia) ou árvore sem HEAD legível (arvore-sem-head: não sei
 #   o que foi varrido), o motor que morre sem imprimir o resumo (motor-sem-resumo), o estado que o motor não lê (estado-ilegivel, do motor: nunca é zerado) → exit 3 e nada de "sem novidade" gravado. O marcador de ocioso só é escrito quando o
@@ -38,12 +41,17 @@ case "$DATA_MB" in ''|*[!0-9]*) DATA_MB=3072 ;; esac
 # (ou erro, que o 2>/dev/null cala) e voltam ao 30; o invólucro recusa 0 com rc 2 e nenhuma rodada varreria nada
 FAM_CAP=${WA_MUTANTS_FAM_CAP:-30}
 [ "$FAM_CAP" -ge 1 ] 2> /dev/null || FAM_CAP=30
+# regra de CONJUNTO DE FALHAS (ga-z137atn): até quantos testes quebrados por ambiente a baseline tolera e o alvo ainda entra (medido em 06/11 na jaula do nó: mediana de 2 por família vermelha, p90 de 21). O mesmo teste numérico do teto de família: texto, zero, negativo e número
+# grande demais para o `[` dão falso (ou erro, que o 2>/dev/null cala) e voltam ao 25; desligar a regra é o arquivo wa-mutants.nofailset, não um valor
+MAX_BAD=${WA_MUTANTS_MAX_BAD:-25}
+[ "$MAX_BAD" -ge 1 ] 2> /dev/null || MAX_BAD=25
 SHM=${WA_MUTANTS_SHM-/dev/shm}   # onde moram os slots: tmpfs. Vazio desliga (slots no disco)
 # interruptores de EMERGÊNCIA = arquivos na pasta do lastro (o governo monta o ambiente do item do zero, só BALLAST_*: as WA_MUTANTS_* acima valem em teste e à mão, não em produção): wa-mutants.noshm devolve os slots ao disco, wa-mutants.nodata desliga o teto de dados,
-# wa-mutants.nofamcap devolve o teto de família do próprio invólucro (12: a opção deixa de ir ao motor; 0 aqui = não passar)
+# wa-mutants.nofamcap devolve o teto de família do próprio invólucro (12: a opção deixa de ir ao motor; 0 aqui = não passar), wa-mutants.nofailset desliga a regra de conjunto de falhas (a baseline volta a ter de dar 0; 0 aqui = não passar)
 [ ! -e "$BH/wa-mutants.noshm" ] || SHM=""
 [ ! -e "$BH/wa-mutants.nodata" ] || DATA_MB=0
 [ ! -e "$BH/wa-mutants.nofamcap" ] || FAM_CAP=0
+[ ! -e "$BH/wa-mutants.nofailset" ] || MAX_BAD=0
 BUDGET=${WA_MUTANTS_BUDGET_S:-1800}   # o prazo da linha do registro tem de passar disto em >= 1000 s: um mutante em voo leva até 900 s + 30 (o motor só olha o relógio entre mutantes)
 case "$BUDGET" in ''|*[!0-9]*) BUDGET=1800 ;; esac
 [ "$BUDGET" -ge 60 ] || BUDGET=60
@@ -151,6 +159,9 @@ if [ "$DATA_MB" -gt 0 ] && grep -q -e '--data-mb' "$ENGDIR/hq-mutate.py" 2> /dev
 # o teto de família é do INVÓLUCRO (é o hq-mutate-wa.py que lê --fam-cap; um que não o conhece recusa a linha com rc 2). vazio (o texto dele não traz a opção) / falhou (não abre) → a opção não vai e vale o 12 dele, nunca "conhece"; FAMPASSED é o que o motor recebeu (vazio = nada) e vai ao resumo
 FAMPASSED=""
 if [ "$FAM_CAP" -gt 0 ] && grep -q -e '--fam-cap' "$ENGDIR/hq-mutate-wa.py" 2> /dev/null; then EXTRA+=(--fam-cap "$FAM_CAP"); FAMPASSED=$FAM_CAP; fi
+# a regra de conjunto de falhas também é do INVÓLUCRO (--max-bad). vazio (o texto dele não traz a opção) / falhou (não abre) → a opção não vai e a baseline tem de dar 0, como sempre; BADPASSED é o que o motor recebeu (vazio = nada) e vai ao resumo
+BADPASSED=""
+if [ "$MAX_BAD" -gt 0 ] && grep -q -e '--max-bad' "$ENGDIR/hq-mutate-wa.py" 2> /dev/null; then EXTRA+=(--max-bad "$MAX_BAD"); BADPASSED=$MAX_BAD; fi
 
 t0=$(date +%s)
 python3 -I "$ENGDIR/hq-mutate-wa.py" sweep --tree "$TREE" --state "$STATE" --work "$WORK" --jail "$ENGDIR/hq-sandbox-run.py" --python "$PYV" --slots "$SLOTS" --budget-s "$BUDGET" ${EXTRA[@]+"${EXTRA[@]}"} > "$RD/engine.out" 2> "$RD/engine.err" < /dev/null &
@@ -158,9 +169,9 @@ ep=$!
 wait "$ep"; erc=$?; ep=""
 
 # a ÚLTIMA linha JSON do motor com "result" vira o resumo (o motor já a limita a 6000 caracteres; o puxador do governo troca por null o que passa de ~8000). Sem ela o item NÃO fica mudo: motor-sem-resumo, exit 3.
-python3 -I - "$RD/engine.out" "$RD/engine.err" "$erc" "${tested:0:9}" "${hqmain:0:9}" "$pull" "$hqpull" "$SLOTS" "$BUDGET" "$IDLE" "$tested:$hqmain" "$(( $(date +%s) - t0 ))" "$WORKAT" "$SLOTS_MAX" "$FAMPASSED" << 'PY'
+python3 -I - "$RD/engine.out" "$RD/engine.err" "$erc" "${tested:0:9}" "${hqmain:0:9}" "$pull" "$hqpull" "$SLOTS" "$BUDGET" "$IDLE" "$tested:$hqmain" "$(( $(date +%s) - t0 ))" "$WORKAT" "$SLOTS_MAX" "$FAMPASSED" "$BADPASSED" << 'PY'
 import json, os, sys
-out_p, err_p, erc, short, hqshort, pull, hqpull, slots, budget, idle_p, key, secs, workat, slots_max, fam_cap = sys.argv[1:16]
+out_p, err_p, erc, short, hqshort, pull, hqpull, slots, budget, idle_p, key, secs, workat, slots_max, fam_cap, max_bad = sys.argv[1:17]
 erc = int(erc)
 rec = None
 try:
@@ -184,7 +195,7 @@ if rec is None:
     rc = 3
 else:
     rc = erc if erc in (0, 97, 143) else 3
-rec.update(main=short, hq=hqshort, pull=pull, hqpull=hqpull, slots=int(slots), slots_max=int(slots_max), work=workat, budget_s=int(budget), engine_rc=erc, secs_item=int(secs), fam_cap=int(fam_cap) if fam_cap else None)   # fam_cap null = a opção não foi ao motor (vale o 12 do invólucro)
+rec.update(main=short, hq=hqshort, pull=pull, hqpull=hqpull, slots=int(slots), slots_max=int(slots_max), work=workat, budget_s=int(budget), engine_rc=erc, secs_item=int(secs), fam_cap=int(fam_cap) if fam_cap else None, max_bad=int(max_bad) if max_bad else None)   # fam_cap null = a opção não foi ao motor (vale o 12 do invólucro); max_bad null = idem (a baseline tem de dar 0)
 if rec["result"] == "sem-novidade" and erc == 0:
     # tmp + troca; falhar aqui só repete uma rodada na seguinte, mas fica dito no resumo
     try:
