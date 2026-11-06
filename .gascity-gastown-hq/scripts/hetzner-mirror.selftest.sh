@@ -119,6 +119,17 @@ gx "$MR" cat-file -e "$LOCAL_ONLY" 2>/dev/null && ok "init: os objetos do seed f
 [ "$(gx "$MR" config --get-all gtmirror.prefix | tr '\n' ' ')" = "crew/ worker/ feat/ " ] && ok "init: prefixos = crew/ worker/ + o extra" || bad "init: prefixos" "$(gx "$MR" config --get-all gtmirror.prefix)"
 [ -x "$MR/hooks/pre-receive" ] && [ -x "$MR/hooks/post-receive" ] && ok "init: hooks instalados" || bad "init: hooks"
 rc_is 0 "init: de novo é idempotente" "$M" init wa "$O" --seed "$W/.git" --prefix feat/
+# nó × repo (ga-eivvcus): o status compara o sha256 do hetzner-remote-git.sh INSTALADO em cada nó REGISTRADO ($MH/tunnel-<host>.pid) com o do repo. "Mergeado" não é "instalado": o fix da ga-yo1n1zg ficou 7 dias dormente no nó. Sem NENHUM nó registrado o status não fecha em rc 0 (não conferi ≠ em dia).
+#   Daqui até o fim da bateria há UM nó de mentira EM DIA (`base`) registrado: os casos de `status` do espelho medem só o que dizem medir; os casos nó×repo, mais adiante, trocam o modo dele ou o tiram
+printf '#!/bin/bash\necho node-script-v1\n' > "$T/nodesrc"; NSHA=$(sha256sum "$T/nodesrc" 2> /dev/null || shasum -a 256 "$T/nodesrc"); NSHA=${NSHA%% *}
+cat > "$T/fakenode" <<'FNEOF'
+#!/bin/sh
+echo "$1 | $2" >> "$FAKENODE_LOG"
+case "$FAKENODE_MODE" in
+  igual) echo "$FAKENODE_SHA  gt-remote/bin/hetzner-remote-git.sh" ;; outro) echo "0000000000000000000000000000000000000000000000000000000000000000  gt-remote/bin/hetzner-remote-git.sh" ;;
+  lixo) echo "sha256sum: gt-remote/bin/hetzner-remote-git.sh: No such file or directory" ;; cai) exit 255 ;; esac
+FNEOF
+chmod 755 "$T/fakenode"; export HETZNER_MIRROR_NODE_SSH=$T/fakenode HETZNER_MIRROR_NODE_SRC=$T/nodesrc FAKENODE_SHA=$NSHA FAKENODE_LOG=$T/fakenode.log FAKENODE_MODE=igual; : > "$FAKENODE_LOG"; : > "$T/mh/tunnel-base.pid"
 rc_is 1 "status: antes do 1º sync → NÃO pronto" "$M" status wa; has 'pronto=NÃO' "status: diz que não está pronto"
 SSH_ORIGINAL_COMMAND="gt-mirror-spec 'wa'" "$M" serve > /dev/null 2>&1; [ $? = 75 ] && ok "serve: gt-mirror-spec antes da varredura → 75 (em atualização)" || bad "serve: spec serviu sem varredura"
 [ -z "$(gx "$MR" config gtmirror.sparseoid)" ] && ok "init: nenhum filtro gravado ainda" || bad "init: filtro gravado sem varredura"
@@ -168,27 +179,36 @@ sleep 300 & RP=$!; mkdir -p "$T/mh-reuse"; echo "$RP" > "$T/mh-reuse/sshd.pid"
 HETZNER_MIRROR_HOME=$T/mh-reuse rc_is 1 "sshd status: pid vivo de OUTRO programa não é 'rodando'" "$M" sshd status; has 'parado' "sshd status: diz parado"
 echo "$RP" > "$T/mh/tunnel-reuse.invalid.pid"; rc_is 1 "tunnel status: pid vivo de outro programa → parado, rc 1" "$M" tunnel status reuse.invalid; has 'parado' "tunnel status: diz parado"
 echo "$RP" > "$T/mh/tunnel-reuse.invalid.pid"; rc_is 1 "tunnel start: pid reaproveitado não impede de subir (o host não existe: sobe e cai)" "$M" tunnel start reuse.invalid; hasnt 'já rodando' "tunnel start: não diz 'já rodando' por causa do pid de outro programa"; kill "$RP" 2> /dev/null; rm -f "$T/mh/tunnel-reuse.invalid.pid"
-# nó × repo (ga-eivvcus): o status compara o sha256 do hetzner-remote-git.sh INSTALADO em cada nó (um por túnel configurado) com o do repo. "Mergeado" não é "instalado": o fix da ga-yo1n1zg ficou 7 dias dormente no nó
-printf '#!/bin/bash\necho node-script-v1\n' > "$T/nodesrc"; NSHA=$(sha256sum "$T/nodesrc" 2> /dev/null || shasum -a 256 "$T/nodesrc"); NSHA=${NSHA%% *}
-cat > "$T/fakenode" <<'FNEOF'
-#!/bin/sh
-echo "$1 | $2" >> "$FAKENODE_LOG"
-case "$FAKENODE_MODE" in
-  igual) echo "$FAKENODE_SHA  gt-remote/bin/hetzner-remote-git.sh" ;; outro) echo "0000000000000000000000000000000000000000000000000000000000000000  gt-remote/bin/hetzner-remote-git.sh" ;;
-  lixo) echo "sha256sum: gt-remote/bin/hetzner-remote-git.sh: No such file or directory" ;; cai) exit 255 ;; esac
-FNEOF
-chmod 755 "$T/fakenode"; export HETZNER_MIRROR_NODE_SSH=$T/fakenode HETZNER_MIRROR_NODE_SRC=$T/nodesrc FAKENODE_SHA=$NSHA FAKENODE_LOG=$T/fakenode.log; : > "$FAKENODE_LOG"
-rc_is 0 "nó×repo: sem túnel configurado não há nó a conferir (status segue rc 0)" "$M" status wa; hasnt 'nó ' "nó×repo: sem túnel, nenhuma linha de nó"
+# nó × repo, o que muda com o nó (ga-eivvcus). O túnel do launchd é `tunnel run`, que faz exec no ssh e TEM de gravar o pid antes: senão o status não vê o nó e `tunnel status` diz parado (achado do gate de 06/11: mudo, rc 0)
+printf '#!/bin/sh\nwhile :; do sleep 1; done\n' > "$T/tunnel-ssh"; chmod 755 "$T/tunnel-ssh"; export HETZNER_MIRROR_TUNNEL_SSH=$T/tunnel-ssh   # ssh de mentira que FICA de pé (o `tunnel start reuse.invalid` acima usa o de verdade, que cai)
+"$M" tunnel run nodeR > "$T/run-nodeR.out" 2>&1 & RUNPID=$!; wait_for 5 '[ -s "$T/mh/tunnel-nodeR.pid" ]'
+[ "$(cat "$T/mh/tunnel-nodeR.pid" 2> /dev/null)" = "$RUNPID" ] && ok "tunnel run: grava o pid ANTES do exec (o do arquivo é o do processo: o exec o mantém)" || bad "tunnel run: o pid gravado não é o do processo" "arquivo=[$(cat "$T/mh/tunnel-nodeR.pid" 2> /dev/null)] processo=[$RUNPID]"
+rc_is 0 "tunnel status: o túnel do launchd (run) aparece como rodando" "$M" tunnel status nodeR; has "pid $RUNPID" "tunnel status: mostra o pid do run"
+: > "$FAKENODE_LOG"; rc_is 0 "nó×repo: o nó cujo túnel sobe por run entra na conferência" "$M" status wa; has 'nodeR: hetzner-remote-git.sh = igual ao do repo' "nó×repo: lista o nó do run"; grep -qF "nodeR | sha256sum" "$FAKENODE_LOG" && ok "nó×repo: o ssh foi ao nó do run" || bad "nó×repo: o nó do run não foi conferido" "$(cat "$FAKENODE_LOG")"
+kill "$RUNPID" 2> /dev/null; wait "$RUNPID" 2> /dev/null; rm -f "$T/mh/tunnel-nodeR.pid"
+"$M" tunnel start nodeS > /dev/null 2>&1; P1=$(cat "$T/mh/tunnel-nodeS.pid" 2> /dev/null)   # um túnel VIVO e registrado (o do `start`)
+"$M" tunnel run nodeS > "$T/run-nodeS.out" 2>&1 & RUN2=$!; wait_for 5 'ps -o command= -p "$RUN2" 2> /dev/null | grep -qF "tunnel-ssh -N -R"'
+OUT=$(cat "$T/run-nodeS.out"); has 'já há um rodando' "tunnel run: com um túnel VIVO registrado, diz que não troca o registro"
+[ -n "$P1" ] && [ "$(cat "$T/mh/tunnel-nodeS.pid" 2> /dev/null)" = "$P1" ] && ok "tunnel run: não sobrescreve o registro de um túnel vivo (start e run não se pisam)" || bad "tunnel run: sobrescreveu o pid de um túnel vivo" "antes=[$P1] depois=[$(cat "$T/mh/tunnel-nodeS.pid" 2> /dev/null)]"
+kill "$P1" "$RUN2" 2> /dev/null; wait "$RUN2" 2> /dev/null; rm -f "$T/mh/tunnel-nodeS.pid"
+mkdir "$T/mh/tunnel-nodeW.pid"   # um DIRETÓRIO onde vai o arquivo: gravar o pid falha com qualquer uid
+"$M" tunnel run nodeW > "$T/run-nodeW.out" 2>&1 & RUNW=$!; wait_for 5 'grep -q "não consegui gravar" "$T/run-nodeW.out"'
+OUT=$(cat "$T/run-nodeW.out"); has 'não consegui gravar' "tunnel run: gravar o pid falhou → AVISO no stderr"
+wait_for 5 'ps -o command= -p "$RUNW" 2> /dev/null | grep -qF "tunnel-ssh -N -R"' && ok "tunnel run: a falha de gravar o pid NÃO derruba o túnel (o túnel é o serviço, o pid é a testemunha)" || bad "tunnel run: sem gravar o pid o túnel não subiu" "$(cat "$T/run-nodeW.out")"
+kill "$RUNW" 2> /dev/null; wait "$RUNW" 2> /dev/null; rmdir "$T/mh/tunnel-nodeW.pid"; unset HETZNER_MIRROR_TUNNEL_SSH
+rm -f "$T/mh/tunnel-base.pid"; : > "$FAKENODE_LOG"
+rc_is 1 "nó×repo: NENHUM nó registrado → rc 1 (não sei quais nós existem: não é 'em dia')" "$M" status wa; has 'NENHUM túnel registrado' "nó×repo: sem registro, a linha diz NENHUM"; has 'NÃO conferi' "nó×repo: e diz que NÃO conferiu"; hasnt 'igual ao do repo' "nó×repo: sem registro, nenhum 'igual'"; [ ! -s "$FAKENODE_LOG" ] && ok "nó×repo: sem registro o ssh não vai a lugar nenhum" || bad "nó×repo: foi ao nó sem registro" "$(cat "$FAKENODE_LOG")"
 : > "$T/mh/tunnel-nodeA.pid"
 FAKENODE_MODE=igual rc_is 0 "nó×repo: script do nó = o do repo → rc 0" "$M" status wa; has 'nodeA: hetzner-remote-git.sh = igual ao do repo' "nó×repo: diz igual"; grep -qF "nodeA | sha256sum gt-remote/bin/hetzner-remote-git.sh" "$FAKENODE_LOG" && ok "nó×repo: pede ao nó o sha256 do arquivo do caminho de instalação" || bad "nó×repo: o comando que foi ao nó não é o sha256 do caminho de instalação" "$(cat "$FAKENODE_LOG")"
 FAKENODE_MODE=outro rc_is 1 "nó×repo: script do nó ≠ o do repo → rc 1 (o merge não instalou)" "$M" status wa; has 'nodeA: hetzner-remote-git.sh = DIFERENTE do repo' "nó×repo: diz DIFERENTE"; has 'scp -q' "nó×repo: a linha traz o comando de instalação"; has "${NSHA:0:12}" "nó×repo: mostra o hash do repo"
 FAKENODE_MODE=lixo rc_is 1 "nó×repo: arquivo ausente no nó → rc 1, DESCONHECIDO (nunca 'igual')" "$M" status wa; has 'DESCONHECIDO' "nó×repo: diz DESCONHECIDO"; hasnt 'igual ao do repo' "nó×repo: leitura que falha não vira 'igual'"
 FAKENODE_MODE=cai rc_is 1 "nó×repo: ssh caiu → rc 1, DESCONHECIDO" "$M" status wa; has 'DESCONHECIDO' "nó×repo: ssh caiu diz DESCONHECIDO"
-HETZNER_MIRROR_NODE_SRC=$T/nodesrc.nao-existe FAKENODE_MODE=igual rc_is 1 "nó×repo: script do repo ilegível → rc 1, DESCONHECIDO (não compara com vazio)" "$M" status wa; has 'não li o script do repo' "nó×repo: diz que não leu o do repo"
+HETZNER_MIRROR_NODE_SRC=$T/nodesrc.nao-existe FAKENODE_MODE=igual rc_is 1 "nó×repo: script do repo ilegível → rc 1, DESCONHECIDO (não compara com vazio)" "$M" status wa; has 'não li o script do repo' "nó×repo: diz que não leu o do repo"; hasnt 'No such file' "nó×repo: o erro de abertura do bash não vaza para o terminal"
 : > "$T/mh/tunnel-nodeB.pid"; FAKENODE_MODE=outro rc_is 1 "nó×repo: dois nós" "$M" status wa; has 'nodeA:' "nó×repo: lista o nó A"; has 'nodeB:' "nó×repo: lista o nó B"
-grep -q 'ssh -o BatchMode=yes -o ConnectTimeout=10' "$M" && ok "nó×repo: o ssh padrão é BatchMode com prazo (nunca pede senha nem pendura o status)" || bad "nó×repo: o ssh padrão perdeu BatchMode/ConnectTimeout"
-rm -f "$T/mh/tunnel-nodeA.pid" "$T/mh/tunnel-nodeB.pid"; unset HETZNER_MIRROR_NODE_SSH HETZNER_MIRROR_NODE_SRC FAKENODE_SHA FAKENODE_LOG
-rc_is 0 "nó×repo: sem os túneis o status volta a rc 0" "$M" status wa
+: > "$T/mh/tunnel-nome ruim.pid"; FAKENODE_MODE=igual rc_is 1 "nó×repo: registro com nome que não é de host → DESCONHECIDO, rc 1 (não é pulado em silêncio)" "$M" status wa; has 'tunnel-nome ruim.pid' "nó×repo: diz qual registro"; has 'DESCONHECIDO' "nó×repo: diz DESCONHECIDO"; hasnt 'NENHUM' "nó×repo: um registro ruim não vira 'nenhum registrado'"
+grep -q 'ssh -o BatchMode=yes -o ConnectTimeout=10 -o ServerAliveInterval=5 -o ServerAliveCountMax=3' "$M" && ok "nó×repo: o ssh padrão é BatchMode com prazo de conexão e de silêncio (nunca pede senha nem pendura o status)" || bad "nó×repo: o ssh padrão perdeu BatchMode/ConnectTimeout/ServerAlive"
+rm -f "$T/mh/tunnel-nodeA.pid" "$T/mh/tunnel-nodeB.pid" "$T/mh/tunnel-nome ruim.pid"; : > "$T/mh/tunnel-base.pid"
+rc_is 0 "nó×repo: de volta ao nó de base em dia, o status volta a rc 0" "$M" status wa
 # o limiar do varredor do espelho é o do hetzner-pii-scan.py (o main dele, nph/ncp): um muda sem o outro e este caso quebra
 grep -q '^PH_MIN, CP_MIN = 20, 3 ' "$SC" && grep -q 'nph, ncp = None, None, 20, 3$' "$HERE/hetzner-pii-scan.py" && ok "limiares: 20 telefones / 3 CPFs iguais nos dois varredores" || bad "limiares: os dois varredores divergem" "$(grep -n 'PH_MIN, CP_MIN =' "$SC"; grep -n 'nph, ncp =' "$HERE/hetzner-pii-scan.py")"
 # temporário com nome FIXO (.new) em caminho que pode rodar em dobro: dois processos escreveriam no mesmo arquivo
