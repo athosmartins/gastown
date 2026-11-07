@@ -1,0 +1,29 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.gascity.node-ghost-release</string>
+  <!-- Node Ghost Release (2026-11-07, ga-moq226t): a bead in_progress owned by a Hetzner node alias (wa-worker-remote-N / ps-worker-remote-N, mark pilot.wa_node_alias)
+       whose alias has NO live session for 15 min goes back to open/no owner, with a comment on the bead and ONE mail to the Mayor. One guarded write per bead, max 3 per sweep.
+       DRY-RUN IS SHIPPED ON (NODE_GHOST_DRY_RUN=1: logs WOULD-RELEASE, keeps its clock, writes nothing): set it to 0 only after reading one dry-run log. KILL-SWITCH
+       NODE_GHOST_ENABLED=0 or the file .gc/node-ghost-release.off. StartInterval 300 must stay above the duration of one sweep (the lock keeps it single-instance).
+       NOT LOADED BY MERGING THIS FILE: load it (launchctl bootstrap) and register it in daemon-presence-watchdog.sh in the same change; see docs/runbooks/node-ghost-release.md. -->
+  <key>ProgramArguments</key>
+  <array>
+    <string>/usr/bin/python3</string>
+    <string>/Users/athos/gt/.gascity-gastown-hq/scripts/node-ghost-release.py</string>
+  </array>
+  <key>WorkingDirectory</key><string>/Users/athos/gt/.gascity-gastown-hq</string>
+  <key>StartInterval</key><integer>300</integer>
+  <key>StandardOutPath</key><string>/Users/athos/gt/.gascity-gastown-hq/.gc/logs/node-ghost-release.out</string>
+  <key>StandardErrorPath</key><string>/Users/athos/gt/.gascity-gastown-hq/.gc/logs/node-ghost-release.err</string>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key><string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:/Users/athos/go/bin:/Users/athos/.local/bin</string>
+    <key>HOME</key><string>/Users/athos</string>
+    <key>GC_CITY_PATH</key><string>/Users/athos/gt/.gascity-gastown-hq</string>
+    <key>NODE_GHOST_ENABLED</key><string>1</string>
+    <key>NODE_GHOST_DRY_RUN</key><string>1</string>
+  </dict>
+</dict>
+</plist>
