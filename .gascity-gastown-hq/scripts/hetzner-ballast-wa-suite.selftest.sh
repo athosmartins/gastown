@@ -113,7 +113,7 @@ EOF
 cat > "$W/iso" <<'EOF'
 #!/bin/bash
 # gt-iso-run de brinquedo. --canary: imprime $W/iso.canary (padrão: isolado). -- CMD: imprime a linha do canário, a do helper (`ok ns=`) e, no fim, o contador; cada uma some com o seu arquivo
-# (iso.noproof, iso.noegress); $W/iso.runfirst troca a linha do canário DENTRO da rodada por outra (e sai 97, como o real); $W/iso.hang pendura o --canary (grava o pid em iso.pid). Repassa TERM ao filho (o sudo faz isso no nó).
+# (iso.noproof, iso.noegress); $W/iso.runfirst troca a linha do canário DENTRO da rodada por outra (e sai 97, como o real); $W/iso.hang pendura o --canary (grava o pid em iso.pid). Repassa TERM ao filho (o sudo faz isso no nó). Descarta NODE_PATH, como a jaula instalada no nó (ga-iljimem).
 W="$(cd "$(dirname "$0")" && pwd)"; echo "$*" >> "$W/iso.calls"
 if [ "${1:-}" = --canary ]; then
   [ ! -f "$W/iso.hang" ] || { echo $$ > "$W/iso.pid"; exec sleep 60; }
@@ -121,6 +121,9 @@ if [ "${1:-}" = --canary ]; then
   exit 0
 fi
 [ "${1:-}" = -- ] && shift
+# A jaula INSTALADA no nó (gt-iso-run de 16/10, anterior ao ga-yoyyj1) descarta o ambiente de quem chama (sudo + env -i do helper): só passam WA_PYTEST_MAX_WORKERS, PYTHONHASHSEED, PYTHONPATH e PATH. NODE_PATH posta ANTES da
+# jaula não chega ao pytest (medido no nó em 07/11: `Cannot find module 'jsdom'`; a bead ga-iljimem conta 103 testes de jsdom reprovados em 7 arquivos). O brinquedo descarta SÓ o NODE_PATH (o resto do ambiente passa: o `py` e o `rg` dependem dele); sem isto o caso do NODE_PATH passaria até com a variável FORA da jaula.
+unset NODE_PATH
 echo "workers=${GTN_WORKERS:-}" >> "$W/iso.env"
 if [ -f "$W/iso.runfirst" ]; then cat "$W/iso.runfirst"; exit 97; fi
 echo "GTN-ISO: isolado (sonda barrou 6 tentativas)"
@@ -134,10 +137,10 @@ exit $rc
 EOF
 cat > "$W/py" <<'EOF'
 #!/bin/bash
-# "python -m pytest" de brinquedo: anota os argumentos, o diretório e GTN_WORKERS; dorme $W/py.sleep s se existir; com $W/py.waitfrozen espera (até 20 s) o laço de relógio do item gravar o arquivo frozen;
+# "python -m pytest" de brinquedo: anota os argumentos, o diretório, GTN_WORKERS e NODE_PATH (o que o pytest RECEBEU, depois da jaula); dorme $W/py.sleep s se existir; com $W/py.waitfrozen espera (até 20 s) o laço de relógio do item gravar o arquivo frozen;
 # com $W/py.killwatch mata o laço de relógio do item (o filho do item que não é o gt-iso-run); imprime $W/py.out; sai com $W/py.rc (padrão: 1 se há FAILED, senão 0)
 W="$(cd "$(dirname "$0")" && pwd)"
-{ echo "args: $*"; echo "pwd: $(pwd)"; echo "workers: ${GTN_WORKERS:-}"; } > "$W/py.args"
+{ echo "args: $*"; echo "pwd: $(pwd)"; echo "workers: ${GTN_WORKERS:-}"; echo "node_path: ${NODE_PATH:-}"; } > "$W/py.args"
 echo $$ > "$W/py.pid"
 [ ! -f "$W/py.sleep" ] || { : > "$W/py.started"; sleep "$(cat "$W/py.sleep")"; }
 i=0; while [ -f "$W/py.waitfrozen" ] && [ ! -e "$BALLAST_RUN_DIR/frozen" ] && [ "$i" -lt 100 ]; do sleep 0.2; i=$((i+1)); done
@@ -211,6 +214,9 @@ g_run() {
   check "run: o pytest recebe os argumentos da bateria noturna e o -n do governo (2)" "1 1 1 1 1 1" \
     "$(grep -c -- '-m pytest' "$W/py.args") $(grep -c -- 'tests/ -n 2 ' "$W/py.args") $(grep -c -- '-p gtn_stable_ids' "$W/py.args") $(grep -c -- '--timeout=900' "$W/py.args") $(grep -c -- '--continue-on-collection-errors' "$W/py.args") $(grep -c -- '-rfE --tb=line' "$W/py.args")"
   check "run: GTN_WORKERS = BALLAST_CORES (sem ele o conftest do WA limita o xdist a 2 workers)" "workers: 2" "$(grep '^workers:' "$W/py.args")"
+  # ga-iljimem: a jaula do brinquedo descarta o NODE_PATH de quem chama (a instalada no nó descarta o ambiente inteiro), então só um NODE_PATH posto DENTRO do comando jaulado (`env NODE_PATH=… python -m pytest`) chega ao pytest; sem ele todo teste do WA
+  # que faz require('jsdom') morria com «Cannot find module» e o hetzner-ballast-newfail.py o contava como regressão. O valor esperado sai do HOME do teste, não do item.
+  check "run: o NODE_PATH do jsdom do nó chega ao pytest apesar da jaula descartar o ambiente (o env fica DENTRO do comando jaulado, ga-iljimem)" "node_path: $T/home/.local/share/cdp-drive/node_modules" "$(grep '^node_path:' "$W/py.args")"
   check "run: o pytest roda DENTRO da árvore do espelho (ballast-wa)" "1" "$(grep -c "/wt/ballast-wa$" "$W/py.args")"
   check "run: a árvore foi removida ao fim (wt-rm chamado) e nenhuma branch worker/* sobra" "1 0" "$(calls '^wt-rm whatsapp_automation ballast-wa' "$W/rg.calls") $(git -C "$GR/whatsapp_automation/repo.git" branch --list 'worker/*' | wc -l | tr -d ' ')"
   check "run: exatamente UMA linha BALLAST-SUMMARY no stdout" "1" "$(nsum)"
@@ -575,6 +581,9 @@ wa-suite.sh@@state@@falha do passo final vira rc 0@@[ "$prc" -ne 0 ] || exit 0@@
 wa-suite.sh@@state@@o passo que morre sem imprimir não deixa resumo nenhum@@[ "$prc" -eq 3 ] || summary resumo-falhou main="${tested:0:9}" pull="$pull" python_rc="$prc"@@:
 wa-suite.sh@@state@@o TERM não é repassado ao pytest@@[ -z "$PYPID" ] || kill -TERM "$PYPID" 2> /dev/null@@:
 wa-suite.sh@@run@@GTN_WORKERS não chega ao gt-iso-run@@GTN_WORKERS="$CORES" "$ISO" --@@"$ISO" --
+wa-suite.sh@@run@@o NODE_PATH some do comando jaulado (todo teste de jsdom volta a reprovar com «Cannot find module»)@@-- env NODE_PATH="$HOME/.local/share/cdp-drive/node_modules" "$PYV"@@-- "$PYV"
+wa-suite.sh@@run@@o NODE_PATH vai FORA da jaula (ela descarta o ambiente de quem chama: a variável não chega ao pytest)@@GTN_WORKERS="$CORES" "$ISO" -- env NODE_PATH="$HOME/.local/share/cdp-drive/node_modules" "$PYV"@@NODE_PATH="$HOME/.local/share/cdp-drive/node_modules" GTN_WORKERS="$CORES" "$ISO" -- "$PYV"
+wa-suite.sh@@run@@o NODE_PATH aponta para outra pasta (o jsdom do nó mora em ~/.local/share/cdp-drive)@@NODE_PATH="$HOME/.local/share/cdp-drive/node_modules"@@NODE_PATH="$HOME/.local/share/cdp/node_modules"
 wa-suite.sh@@run@@o -n é fixo em vez de seguir o governo@@-n "$CORES" -p gtn_stable_ids@@-n 2 -p gtn_stable_ids
 wa-suite.sh@@prep@@pull que falha é dado como ok@@2>&1 || pull=falhou@@2>&1 || pull=ok
 wa-suite.sh@@run@@falha de prazo de teste não é contada@@Timeout \(?>[0-9.]+s@@NUNCA-CASA

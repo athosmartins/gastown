@@ -7,7 +7,7 @@
 #
 # O QUE FAZ: (1) `hetzner-remote-git.sh pull whatsapp_automation` (falhou = segue com o clone que há e diz pull=falhou: código velho não é código errado) (2) ponta do main = a da última rodada que o item
 #   deu por feita → "sem-novidade" (só com o pull que respondeu; com o pull falho é `pull-falhou`, exit 3: a ponta velha não prova que não há novidade) (3) canário de rede (`gt-iso-run --canary`) ANTES de baixar qualquer coisa (4) `wt-add` numa árvore só dele (ballast-wa; a árvore e a branch worker/ballast-wa saem
-#   no fim e no TERM) (5) `gt-iso-run -- venv-wa/bin/python -m pytest tests/ -n $BALLAST_CORES -p gtn_stable_ids ...` (6) uma linha `BALLAST-SUMMARY: {json}`.
+#   no fim e no TERM) (5) `gt-iso-run -- env NODE_PATH=… venv-wa/bin/python -m pytest tests/ -n $BALLAST_CORES -p gtn_stable_ids ...` (o env DENTRO da jaula: ela descarta o ambiente de quem chama) (6) uma linha `BALLAST-SUMMARY: {json}`.
 # O ROOT NO MEIO: o pytest roda sob `sudo -n gt-netns-run` (root, para cortar a rede). Medido no nó em 24/10, com o lançamento do próprio governo: o sudo NÃO abre sessão nova, então a sessão do item (a que o
 #   governo varre) contém tudo; nice 19, SCHED_IDLE e oom_score_adj 1000 atravessam o sudo; a CARGA (pytest e workers) roda com o uid do `runner`, então o governo a pausa, retoma e mata com os sinais de sempre.
 #   O único processo que o `runner` não sinaliza é o bash do helper, parado em `wait`: sai sozinho quando o filho sai e leva junto o que sobrou no netns. Nada aqui pede sudoers novo.
@@ -112,7 +112,12 @@ tested=$(git -C "$WT" rev-parse HEAD 2> /dev/null) || tested=$main
 cd "$WT" || { say "não entrei em $WT"; summary arvore-sem-testes main="${main:0:9}" pull=$pull; exit 3; }
 mkdir -p logs
 # GTN_WORKERS: o gt-iso-run o põe em WA_PYTEST_MAX_WORKERS (sem ele o conftest do WA limita o xdist a 2 workers). Os argumentos são os da noturna; -p no:cacheprovider como no mbp-run.
-GTN_WORKERS="$CORES" "$ISO" -- "$PYV" -m pytest -p no:cacheprovider tests/ -n "$CORES" -p gtn_stable_ids --timeout="$PERTEST" -q -rfE --tb=line --continue-on-collection-errors \
+# NODE_PATH (ga-iljimem): o helper de root roda o comando com `env -i` e o gt-iso-run INSTALADO no nó (16/10, anterior ao ga-yoyyj1) só repassa WA_PYTEST_MAX_WORKERS, PYTHONHASHSEED, PYTHONPATH e PATH: uma NODE_PATH posta ANTES da jaula
+#   morre nela (medido no nó em 07/11: `Cannot find module 'jsdom'` com a variável fora; com `env NODE_PATH=…` dentro do comando jaulado o jsdom carrega, na jaula instalada e na do repo, que já repassa a variável). Por isso o `env` fica DENTRO do
+#   comando jaulado: o mesmo valor que o mbp-run.sh exporta para o nó (ga-yoyyj1), posto onde a jaula velha não o apaga. Sem ele todo teste do WA que faz require('jsdom') reprova (o jsdom do nó mora em ~/.local/share/cdp-drive, hetzner-nodejs.sh install jsdom)
+#   e o hetzner-ballast-newfail.py o conta como regressão.
+# vazio (a pasta não existe) → o node ignora a entrada e o teste de jsdom reprova como antes; falhou/ilegível (sem permissão, jsdom quebrado) → também o mesmo resultado de antes (o teste de jsdom reprova), sem tocar nos outros
+GTN_WORKERS="$CORES" "$ISO" -- env NODE_PATH="$HOME/.local/share/cdp-drive/node_modules" "$PYV" -m pytest -p no:cacheprovider tests/ -n "$CORES" -p gtn_stable_ids --timeout="$PERTEST" -q -rfE --tb=line --continue-on-collection-errors \
   > "$RD/pytest.out" 2>&1 < /dev/null &
 PYPID=$!
 # salto do relógio: dois `sleep` seguidos (5 s) que distam muito mais que isso = a sessão ficou congelada (SIGSTOP) ou sem CPU. Grava o MAIOR salto, em segundos além do intervalo esperado.
