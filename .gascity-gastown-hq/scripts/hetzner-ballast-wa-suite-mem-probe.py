@@ -141,6 +141,17 @@ def stop_session(sid, why):
             time.sleep(1)
 
 
+def pytest_argv(cores, limit):
+    """a linha de comando que a sonda lança (ga-gvhoi10: separada do main para o selftest ler o que vai DENTRO da jaula).
+    NODE_PATH (ga-iljimem, o mesmo do wa-suite.sh): o helper de root roda o comando com `env -i` e o gt-iso-run INSTALADO no nó (16/10, anterior ao ga-yoyyj1) só repassa WA_PYTEST_MAX_WORKERS, PYTHONHASHSEED, PYTHONPATH e PATH, então uma NODE_PATH posta no
+    ambiente de quem lança (o `env=` do Popen) morre na jaula; com `env NODE_PATH=…` DENTRO do comando jaulado o jsdom carrega. Sem ele todo teste do WA que faz require('jsdom') reprovava e o pico de RSS/PSS media uma suíte que falha cedo (INFERIDO: menos memória que a de verdade; não medi).
+    vazio (a pasta não existe) → o node ignora a entrada e o teste de jsdom reprova como antes; falhou/ilegível (sem permissão, jsdom quebrado) → o mesmo resultado de antes, sem tocar nos outros"""
+    return ["sh", "-c", '{ echo 1000 > /proc/self/oom_score_adj; } 2>/dev/null; "$@"; echo $? > "$MEASURE_DIR/rc"', "ballast-measure:" + NAME,
+            "nice", "-n", "19", "chrt", "-i", "0", "ionice", "-c", "3", "timeout", "-k", "30", str(limit + 120),
+            ISO, "--", "env", "NODE_PATH=" + HOME + "/.local/share/cdp-drive/node_modules", PYV, "-m", "pytest", "-p", "no:cacheprovider", "tests/", "-n", str(cores), "-p", "gtn_stable_ids", "--timeout=900", "-q", "-rfE", "--tb=line",
+            "--continue-on-collection-errors"]
+
+
 def main():
     out = os.path.abspath(sys.argv[1])
     cores = int(sys.argv[2]) if len(sys.argv) > 2 else 8
@@ -166,10 +177,7 @@ def main():
     head = subprocess.run(["git", "-C", wt, "rev-parse", "HEAD"], capture_output=True, text=True).stdout.strip()
     log("árvore %s em %s" % (wt, head[:9]))
     env = dict(os.environ, PATH=HOME + "/.local/bin:" + os.environ["PATH"], PYTHONDONTWRITEBYTECODE="1", GTN_WORKERS=str(cores), MEASURE_DIR=out)
-    argv = ["sh", "-c", '{ echo 1000 > /proc/self/oom_score_adj; } 2>/dev/null; "$@"; echo $? > "$MEASURE_DIR/rc"', "ballast-measure:" + NAME,
-            "nice", "-n", "19", "chrt", "-i", "0", "ionice", "-c", "3", "timeout", "-k", "30", str(limit + 120),
-            ISO, "--", PYV, "-m", "pytest", "-p", "no:cacheprovider", "tests/", "-n", str(cores), "-p", "gtn_stable_ids", "--timeout=900", "-q", "-rfE", "--tb=line",
-            "--continue-on-collection-errors"]
+    argv = pytest_argv(cores, limit)
     global OUT_PYTEST
     OUT_PYTEST = out + "/pytest.out"
     po = open(OUT_PYTEST, "wb")

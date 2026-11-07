@@ -74,12 +74,18 @@ os.execvp(cmd[0], cmd)
 PY
 # python falso: `-m pytest [opções] ARQ.py…` roda cada ARQ.py (relativo ao cwd = a cópia da árvore) como script, com lib/, daemons/ e a raiz no sys.path, e sai com o rc do primeiro que reprova.
 # Registra (TAB): py · cwd · HOME · PYTHONHASHSEED · argumentos · HQM_SECRET (tem de vir vazio: o `env -i` do motor) · TMPDIR · PYTHONPATH · WAM_SKIP · WAM_FAILS (os três últimos são da regra de conjunto de falhas, ga-z137atn)
+#   · NODE_PATH · o que o HOME dele enxerga do jsdom, J/G/D/O/L (ga-gvhoi10): J = ~/.local/share/cdp-drive/node_modules/jsdom existe (0/1) · G = quantos ~/.local/share/cdp-drive-jsdom-*/node_modules/jsdom · D = ~/.local/share/cdp-driver (pasta alheia, de nome parecido) visível · O = ~/.local/share/outro-dado
+#   (um dado qualquer da pasta share do HOME de verdade) visível · L = ~/.local existe. O 1º par diz «o teste de jsdom acha o módulo»; D, O e L dizem «e nada além disso»
 # ctl.json (opcional, escrito pelo caso): na baseline com o plugin (`-p wam_plug`, sem `-x`) da família que cita `match`, o python falso faz o PAPEL DO PLUGIN: grava `out` (objeto ou texto cru) em $WAM_FAILS e sai com `rc`. O plugin de verdade tem os casos dele (fp_plug) e o de ponta a ponta com pytest real (fp_e2e)
 { printf '#!%s\n' "$PY3"; cat << 'PY'
-import json, os, subprocess, sys
+import glob, json, os, subprocess, sys
 a = sys.argv[1:]
 here = os.path.dirname(os.path.abspath(sys.argv[0]))
-open(os.path.join(here, "py.log"), "a").write("\t".join(["py", os.getcwd(), os.environ.get("HOME", ""), os.environ.get("PYTHONHASHSEED", ""), " ".join(a), os.environ.get("HQM_SECRET", ""), os.environ.get("TMPDIR", ""), os.environ.get("PYTHONPATH", ""), os.environ.get("WAM_SKIP", ""), os.environ.get("WAM_FAILS", "")]) + "\n")
+share = os.path.join(os.environ.get("HOME", ""), ".local", "share")
+vis = "%d/%d/%d/%d/%d" % (os.path.isdir(os.path.join(share, "cdp-drive", "node_modules", "jsdom")), len(glob.glob(os.path.join(share, "cdp-drive-jsdom-*", "node_modules", "jsdom"))), os.path.exists(os.path.join(share, "cdp-driver")),
+                         os.path.exists(os.path.join(share, "outro-dado")), os.path.exists(os.path.dirname(share)))
+open(os.path.join(here, "py.log"), "a").write("\t".join(["py", os.getcwd(), os.environ.get("HOME", ""), os.environ.get("PYTHONHASHSEED", ""), " ".join(a), os.environ.get("HQM_SECRET", ""), os.environ.get("TMPDIR", ""), os.environ.get("PYTHONPATH", ""), os.environ.get("WAM_SKIP", ""), os.environ.get("WAM_FAILS", ""),
+                                                      os.environ.get("NODE_PATH", ""), vis]) + "\n")
 if a[:2] != ["-m", "pytest"]:
     sys.exit(5)
 ctl = os.path.join(here, "ctl.json")
@@ -100,6 +106,7 @@ PY
 newfx() {
   F="$(mktemp -d "$W/fx.XXXXXX")"; F="$(cd -P "$F" && pwd)"; TREE="$F/root/wa"; mkdir -p "$TREE" "$F/work"
   : > "$F/jail.log"; : > "$F/py.log"; export FAKE_LOG="$F/jail.log"; cp "$W/fakepy" "$F/fakepy"; chmod +x "$F/fakepy"
+  mkdir -p "$F/realhome"   # o HOME «de verdade» de quem roda a varredura (ga-gvhoi10): vazio, para o resultado de um caso não depender do jsdom que a máquina de quem roda a bateria tem; o mkjsdom o enche
 }
 # a árvore do WA em miniatura: ver o cabeçalho para o que cada arquivo mata. crew/, node_modules/, .git, __pycache__ e *.bak-* existem para NÃO serem copiados (o test_calc confere)
 mkwa() {
@@ -117,7 +124,7 @@ mkwa() {
   printf 'import runner\nassert runner.go(3) is True\n' > "$TREE/tests/test_runner.py"
 }
 tree_ck() { ( cd "$TREE" && find . -type f -not -path './.git/*' | LC_ALL=C sort | while IFS= read -r f; do cat "$f"; done | cksum ); }
-sw() { hm sweep --tree "$TREE" --state "$F/state.json" --work "$F/work" --jail "$W/fakejail.py" --python "${PYBIN:-$F/fakepy}" --slots 2 "$@" > "$F/out" 2> "$F/err"; RC=$?; }
+sw() { HOME="${RH:-$F/realhome}" hm sweep --tree "$TREE" --state "$F/state.json" --work "$F/work" --jail "$W/fakejail.py" --python "${PYBIN:-$F/fakepy}" --slots 2 "$@" > "$F/out" 2> "$F/err"; RC=$?; }
 # eval só de expressões LITERAIS deste arquivo sobre o JSON que o próprio motor imprimiu (nenhuma entrada externa)
 jf() { python3 -I -B -c 'import json,sys; d=json.loads(open(sys.argv[1]).read().strip().splitlines()[-1]); print(eval(sys.argv[2]))' "$F/out" "$1" 2> /dev/null; }
 runs() { grep -c '^run' "$F/jail.log"; }
@@ -151,6 +158,84 @@ fp_sweep() {
 }
 EXP_SWEEP="rc=0 completo run=12 k=9 c=3 f=0 inv=0 open=3 surv=calc.py:lim,calc.py:num,mod.py:lim jail=18 orig=igual left=0 flags=-m pytest -p no:cacheprovider -p no:randomly -q -x --tb=no --no-header --timeout=120 fam=tests/test_calc.py tests/test_calc_edge.py tests/test_users.py|tests/test_pkgs.py|tests/test_runner.py slot=0 seed=0 leak=0"
 peq "sweep: 12 mutantes (9 mortos, 3 sobreviventes confirmados), família = nome + importadores (test_calcify fora), pytest no slot/ambiente limpo, árvore de origem intacta" "$EXP_SWEEP" fp_sweep
+
+# ── o jsdom dentro da jaula (ga-gvhoi10) ───────────────────────────────────────────────────────────
+# A jaula roda `env -i` com HOME do slot: o teste de jsdom do WA não achava o módulo (o que lê NODE_PATH reprovava; o que olha ~/.local/share/cdp-drive pelo Path.home() PULAVA calado) e a baseline contava a falha como do código. O wrapper leva NODE_PATH do HOME de VERDADE
+# (o mesmo valor do wa-suite e do mbp-run.sh) e liga ao HOME do slot SÓ o cdp-drive e os cdp-drive-jsdom-* (que é onde os testes procuram), nunca o resto do HOME. O caso mede, em CADA chamada ao pytest (baseline, mutantes, confirmações), o que o python enxerga.
+mkjsdom() {  # o layout do nó (hetzner-nodejs.sh install jsdom): cdp-drive é um LINK RELATIVO para a instalação cdp-drive-jsdom-<V>-<K> (uma antiga fica ao lado); mais uma pasta de nome parecido, COM node_modules/jsdom (cdp-driver, que um padrão largo ou um «liga tudo» levaria) e um dado alheio, que NÃO podem aparecer no HOME do slot
+  local s="$F/realhome/.local/share"
+  mkdir -p "$s/cdp-drive-jsdom-26.1.0-abc123def456/node_modules/jsdom" "$s/cdp-drive-jsdom-25.0.0-000000000000/node_modules/jsdom" "$s/cdp-driver/node_modules/jsdom"
+  ln -s cdp-drive-jsdom-26.1.0-abc123def456 "$s/cdp-drive"; echo segredo > "$s/outro-dado"
+}
+jsl() {  # a impressão do py.log: quantas chamadas levaram o NODE_PATH esperado ($1, vazio = nenhum) sobre o total, e os valores distintos do que o HOME do slot enxerga (J/G/D/O/L)
+  echo "np=$(awk -F'\t' -v e="$1" '$11 == e' "$F/py.log" | wc -l | tr -d ' ')/$(wc -l < "$F/py.log" | tr -d ' ') vis=$(awk -F'\t' '{print $12}' "$F/py.log" | sort -u | paste -sd'|' -)"
+}
+fp_jsdom() {  # com o jsdom no HOME de verdade: NODE_PATH no cdp-drive/node_modules (o link, não o alvo dele) em TODAS as 18 chamadas, o slot enxerga cdp-drive + os 2 cdp-drive-jsdom-*, e só isso; o HOME de verdade fica como estava (a limpeza do slot não segue o link)
+  newfx; mkwa; mkjsdom; local o; o=$(find "$F/realhome" | LC_ALL=C sort | cksum); sw
+  echo "rc=$RC $(jf 'd["result"]') run=$(jf 'd["mutants_run"]') $(jsl "$F/realhome/.local/share/cdp-drive/node_modules") real=$([ "$(find "$F/realhome" | LC_ALL=C sort | cksum)" = "$o" ] && echo igual || echo MUDOU) jsdom=$(find "$F/realhome" -type d -name jsdom | wc -l | tr -d ' ') left=$(ls "$F/work" | wc -l | tr -d ' ')"
+}
+EXP_JSDOM="rc=0 completo run=12 np=18/18 vis=1/2/0/0/1 real=igual jsdom=3 left=0"
+peq "jsdom na jaula: NODE_PATH do HOME de verdade e o cdp-drive + cdp-drive-jsdom-* ligados ao HOME do slot (nada além, nem o cdp-driver), em toda chamada ao pytest; o HOME de verdade não muda" "$EXP_JSDOM" fp_jsdom
+fp_nojsdom() {  # sem jsdom no HOME de verdade (só um dado alheio): nenhuma variável, nenhum link, nem o ~/.local do slot — a varredura segue como antes
+  newfx; mkwa; mkdir -p "$F/realhome/.local/share"; echo segredo > "$F/realhome/.local/share/outro-dado"; sw
+  echo "rc=$RC $(jf 'd["result"]') run=$(jf 'd["mutants_run"]') $(jsl '')"
+}
+EXP_NOJSDOM="rc=0 completo run=12 np=18/18 vis=0/0/0/0/0"
+peq "sem jsdom no HOME de verdade: nada de NODE_PATH, nenhum link, nenhum ~/.local no slot (a varredura é a de sempre)" "$EXP_NOJSDOM" fp_nojsdom
+fp_semnm() {  # cdp-drive e cdp-drive-jsdom-* SEM node_modules (instalação pela metade): o mesmo que sem jsdom — uma pasta que não carrega o módulo não vira NODE_PATH nem link
+  newfx; mkwa; mkdir -p "$F/realhome/.local/share/cdp-drive/bin" "$F/realhome/.local/share/cdp-drive-jsdom-1-aaaaaaaaaaaa/bin"; sw
+  echo "rc=$RC $(jf 'd["result"]') run=$(jf 'd["mutants_run"]') $(jsl '')"
+}
+peq "cdp-drive sem node_modules: igual a sem jsdom (sem NODE_PATH, sem link)" "$EXP_NOJSDOM" fp_semnm
+fp_semhome() {  # HOME de verdade ilegível/inexistente (HOME aponta para o nada): igual a sem jsdom — a varredura não cai por causa do jsdom
+  newfx; mkwa; RH="$F/nao-existe" sw
+  echo "rc=$RC $(jf 'd["result"]') run=$(jf 'd["mutants_run"]') $(jsl '')"
+}
+peq "HOME de verdade que não existe: igual a sem jsdom (a varredura segue, sem NODE_PATH nem link)" "$EXP_NOJSDOM" fp_semhome
+fp_jsdomfn() {  # jsdom_env no nível da função: o que devolve e o que liga em cada HOME; o NODE_PATH é do cdp-drive (sem ele só os links); o erro do disco devolve [] e avisa UMA vez; o HOME sem jsdom não cria nada
+  newfx; mkjsdom; mkdir -p "$F/realhome2/.local/share/cdp-drive-jsdom-1-aaaaaaaaaaaa/node_modules" "$F/realhome3"
+  python3 -I -B - "${ENG:-$HM}" "$F" << 'PY'
+import contextlib, importlib.util, io, os, sys
+from pathlib import Path
+spec = importlib.util.spec_from_file_location("w", sys.argv[1])
+w = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(w)
+F = Path(sys.argv[2])
+
+
+def slot(n):
+    h = F / ("slot%d" % n) / "home"
+    h.mkdir(parents=True)
+    return h
+
+
+def links(h):
+    d = h / ".local" / "share"
+    return ",".join("%s%s" % (n, "" if os.path.islink(d / n) else "!") for n in sorted(os.listdir(d))) if d.is_dir() else "-"
+
+
+out = []
+os.environ["HOME"] = str(F / "realhome")
+h = slot(1)
+r = w.jsdom_env(h)
+out.append("np=%s links=%s" % ("ok" if r == ["NODE_PATH=%s" % (F / "realhome/.local/share/cdp-drive/node_modules")] else r, links(h)))
+os.environ["HOME"] = str(F / "realhome2")   # só um cdp-drive-jsdom-*, sem o link cdp-drive: o módulo é achado pelo glob dos testes, mas NODE_PATH é do cdp-drive
+h = slot(2)
+out.append("solo=%s links=%s" % (w.jsdom_env(h), links(h)))
+os.environ["HOME"] = str(F / "realhome3")   # HOME sem ~/.local/share
+h = slot(3)
+out.append("vazio=%s links=%s" % (w.jsdom_env(h), links(h)))
+os.environ["HOME"] = str(F / "realhome")
+(F / "arq").write_text("x")   # o «HOME do slot» é um arquivo: o mkdir falha com OSError
+buf = io.StringIO()
+with contextlib.redirect_stderr(buf):
+    a, b = w.jsdom_env(F / "arq"), w.jsdom_env(F / "arq")
+out.append("arq=%s,%s avisos=%d" % (a, b, buf.getvalue().count("jsdom não ligado")))
+print(" ".join(out))
+PY
+}
+EXP_JSDOMFN="np=ok links=cdp-drive,cdp-drive-jsdom-25.0.0-000000000000,cdp-drive-jsdom-26.1.0-abc123def456 solo=[] links=cdp-drive-jsdom-1-aaaaaaaaaaaa vazio=[] links=- arq=[],[] avisos=1"
+peq "jsdom_env: NODE_PATH do cdp-drive e links só dos cdp-drive*/node_modules (sem o cdp-driver nem o dado alheio); sem o cdp-drive só os links; HOME sem jsdom não cria nada; erro de disco devolve [] e avisa uma vez" "$EXP_JSDOMFN" fp_jsdomfn
 
 fp_again() { newfx; mkwa; sw; local j; j=$(runs); sw; echo "$(jf 'd["result"]') run=$(jf 'd["mutants_run"]') novas=$(( $(runs) - j ))"; }
 peq "segunda varredura sem mudança: sem-novidade, nenhuma execução nova (o estado do motor vale pelo hash do wrapper)" "sem-novidade run=0 novas=0" fp_again
@@ -691,6 +776,25 @@ par kill_it controle-sem-ctl-excl fp_ng   "$EXP_NG" '    excl = ctl or tgt.get("
 [ "$SKIP_PYTEST" = 1 ] || par kill_it plug-pythonpath-errado fp_e2e "$EXP_E2E" '"PYTHONPATH=%s" % (slot / "plug")' '"PYTHONPATH=%s" % slot'
 [ "$SKIP_PYTEST" = 1 ] || par kill_it controle-ignorado-e2e fp_e2edep "$EXP_E2EDEP" '            if wa_exec_family(ctx, slot_n, tgt, None, tmo, ctl=got)[0] == 0:' '            if True:'
 [ "$SKIP_PYTEST" = 1 ] || par kill_it plug-skip-so-prefixo fp_e2e "$EXP_E2E" '        items[:] = [i for i in items if i.nodeid not in _skip]' '        items[:] = [i for i in items if not i.nodeid.startswith(tuple(_skip))]'
+# o jsdom na jaula (ga-gvhoi10): a variável, os links e o que NÃO se liga
+par kill_it jsdom-sem-node-path   fp_jsdom "$EXP_JSDOM" '    return ["NODE_PATH=%s" % (share / "cdp-drive" / "node_modules")] if share / "cdp-drive" in found else []' '    return []'
+par kill_it jsdom-np-no-slot      fp_jsdom "$EXP_JSDOM" '["NODE_PATH=%s" % (share / "cdp-drive" / "node_modules")]' '["NODE_PATH=%s" % (slot_home / ".local" / "share" / "cdp-drive" / "node_modules")]'
+par kill_it jsdom-np-sem-link     fp_jsdomfn "$EXP_JSDOMFN" 'if share / "cdp-drive" in found else []' 'if found else []'
+par kill_it jsdom-np-nao-na-kv    fp_jsdom "$EXP_JSDOM" '"GIT_COMMITTER_EMAIL=gt@no"] + jsdom + plugenv' '"GIT_COMMITTER_EMAIL=gt@no"] + plugenv'
+par kill_it jsdom-sem-link        fp_jsdom "$EXP_JSDOM" '            (dst / p.name).symlink_to(p)' '            pass'
+par kill_it jsdom-link-mesmo-nome fp_jsdom "$EXP_JSDOM" '            (dst / p.name).symlink_to(p)' '            (dst / "cdp-drive").symlink_to(p)'
+par kill_it jsdom-so-cdp-drive    fp_jsdom "$EXP_JSDOM" 'JSDOM_DIRS = ("cdp-drive", "cdp-drive-jsdom-*")' 'JSDOM_DIRS = ("cdp-drive",)'
+par kill_it jsdom-so-instalacoes  fp_jsdom "$EXP_JSDOM" 'JSDOM_DIRS = ("cdp-drive", "cdp-drive-jsdom-*")' 'JSDOM_DIRS = ("cdp-drive-jsdom-*",)'
+par kill_it jsdom-glob-largo      fp_jsdom "$EXP_JSDOM" 'JSDOM_DIRS = ("cdp-drive", "cdp-drive-jsdom-*")' 'JSDOM_DIRS = ("cdp-drive", "cdp-drive*")'
+par kill_it jsdom-liga-tudo       fp_jsdom "$EXP_JSDOM" 'JSDOM_DIRS = ("cdp-drive", "cdp-drive-jsdom-*")' 'JSDOM_DIRS = ("*",)'
+par kill_it jsdom-sem-node-modules fp_semnm "$EXP_NOJSDOM" ' if (p / "node_modules").is_dir()]' ']'
+par kill_it jsdom-vazio-cria-pasta fp_nojsdom "$EXP_NOJSDOM" $'        if not found:\n            return []' $'        if False:\n            return []'
+par kill_it jsdom-mkdir-sem-pais  fp_jsdom "$EXP_JSDOM" '        dst.mkdir(parents=True)' '        dst.mkdir()'
+par kill_it jsdom-home-do-slot    fp_jsdom "$EXP_JSDOM" 'share = Path(os.path.expanduser("~")) / ".local" / "share"' 'share = slot_home / ".local" / "share"'
+par kill_it jsdom-oserror-solto   fp_jsdomfn "$EXP_JSDOMFN" $'    except OSError as e:\n        if not _JSDOM_WARNED:' $'    except ValueError as e:\n        if not _JSDOM_WARNED:'
+par kill_it jsdom-aviso-sempre    fp_jsdomfn "$EXP_JSDOMFN" '        if not _JSDOM_WARNED:' '        if True:'
+par kill_it jsdom-aviso-calado    fp_jsdomfn "$EXP_JSDOMFN" '% (type(e).__name__, e), file=sys.stderr)' '% (type(e).__name__, e), file=open(os.devnull, "w"))'
+par kill_it jsdom-erro-devolve-np fp_jsdomfn "$EXP_JSDOMFN" $'file=sys.stderr)\n        return []' $'file=sys.stderr)\n        return ["NODE_PATH=x"]'
 reap
 # controle do controle: o `mut` recusa uma âncora ambígua e uma que não casa
 FAIL0=$FAIL   # o mut recusa e conta uma falha própria: aqui a recusa é o esperado, então só a aceitação reprova

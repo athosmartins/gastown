@@ -12,7 +12,7 @@ USO: hq-mutate-wa.py plan  --tree WA --state ARQ [--fam-cap N] [--max-bad N]    
 ALVOS E FAMÍLIA: alvo = `lib/**/*.py` e `daemons/**/*.py` (fora de tests/, crew/, archive/, venv, __pycache__, pastas `.bak`, `__init__.py`, conftest e arquivos de teste). A família do alvo `x.py` = os `tests/**/test_*.py` cujo nome é `test_x.py` ou `test_x_*.py` MAIS os que o importam
   (`import x`, `from x import …`, `from pkg import x`, `from pkg.x import …`): um sobrevivente é "nenhum destes testes pega", então a família tem de ser inteira, nunca cortada. Pulados (contados em `skipped`): sem-teste (família vazia) · familia-grande (mais de --fam-cap arquivos, 12) ·
   symlink · denylist:<trecho> (o alvo ou um teste cita sudo, systemctl, tmux, docker… — a lista do hq-mutate.py — ou os sinais de processo `os.kill`/`os.killpg`/`pthread_kill`/`raise_signal`/`psutil`: a jaula não barra sinal, e um mutante que muda o pid mataria processo do nó) · base-vermelha / base-ambiente
-  (a família não passa SEM mutante dentro da jaula: sem rede, sem config/ real, HOME de mentira — é a regra do motor, o alvo volta a ser tentado em 2 dias). Candidato numa linha que abre com print( ou logger./logging./log.…( fica fora (trocar o texto de um log nunca reprova teste, só enche a lista).
+  (a família não passa SEM mutante dentro da jaula: sem rede, sem config/ real, HOME de mentira — com o jsdom do nó ligado a ele, ga-gvhoi10 — é a regra do motor, o alvo volta a ser tentado em 2 dias). Candidato numa linha que abre com print( ou logger./logging./log.…( fica fora (trocar o texto de um log nunca reprova teste, só enche a lista).
 O QUE RODA: por mutante, uma cópia da árvore inteira (sem .git, crew/, __pycache__, node_modules, *.bak-*) num slot, o mutante gravado nela e, DENTRO da jaula (escrita só no slot, TCP cortado, `env -i` com HOME e TMPDIR do slot): `PY -m pytest -p no:cacheprovider -p no:randomly -q -x --tb=no --timeout=N ARQUIVOS`, sob o teto de escrita por arquivo.
   rc 0 = os testes passaram = o mutante sobreviveu (confirmado por uma 2ª rodada numa cópia limpa); qualquer outro rc = morto. A baseline é a mesma linha sem mutante. PYTHONHASHSEED=0 e PYTHONDONTWRITEBYTECODE=1, como na suíte do wa-suite.
 CONJUNTO DE FALHAS (ga-z137atn, --max-bad N; 0 = desligado, o padrão): sem a regra a baseline tem de dar 0, e a família com UM teste quebrado por ambiente na jaula (PermissionError, duckdb, caminho de /Users…) vira base-vermelha com TODOS os mutantes dela sem julgar (19,3 mil no WA em 06/11).
@@ -237,6 +237,33 @@ def wa_make_plan(tree, state, recent):
     return plan
 
 
+JSDOM_DIRS = ("cdp-drive", "cdp-drive-jsdom-*")   # dentro de ~/.local/share: onde os testes do WA procuram o jsdom (cdp-drive é o link do hetzner-nodejs.sh para a instalação cdp-drive-jsdom-<versão>-<lock>)
+_JSDOM_WARNED = []
+
+
+def jsdom_env(slot_home):
+    """ga-gvhoi10 — o jsdom dentro da jaula. O `env -i` com HOME do slot esconde o jsdom do nó (~/.local/share/cdp-drive): o teste que lê NODE_PATH reprovava com `Cannot find module 'jsdom'` e o que olha Path.home() PULAVA calado, e a baseline contava a falha como do código.
+    Liga ao HOME do slot, por link, SÓ o cdp-drive e os cdp-drive-jsdom-* do HOME de verdade que têm node_modules (nunca o resto do HOME: a jaula lê o HOME de verdade, mas o teste não tem de ver o que não é dele) e devolve ["NODE_PATH=…/cdp-drive/node_modules"], o mesmo valor
+    do wa-suite e do mbp-run.sh. A limpeza do slot (chmod -R + rm -rf, du -sk) não segue link: o HOME de verdade não é tocado (o selftest confere), e a escrita pelo link a jaula deve negar (INFERIDO: o Landlock resolve o link e só libera o slot; não medi)."""
+    share = Path(os.path.expanduser("~")) / ".local" / "share"
+    # vazio (sem ~/.local/share, sem cdp-drive*, ou sem node_modules dentro: nó sem `hetzner-nodejs.sh install jsdom`) → [] e nenhum link: o teste de jsdom reprova/pula como antes, e os outros não mudam
+    # falhou/ilegível (sem permissão para listar ou ligar) → [] também, avisado UMA vez no stderr: "não consegui dar o jsdom" nunca derruba a varredura, e a baseline da família segue sendo o que mede se o jsdom faltou
+    try:
+        found = [p for pat in JSDOM_DIRS for p in sorted(share.glob(pat)) if (p / "node_modules").is_dir()]
+        if not found:
+            return []
+        dst = slot_home / ".local" / "share"
+        dst.mkdir(parents=True)
+        for p in found:
+            (dst / p.name).symlink_to(p)
+    except OSError as e:
+        if not _JSDOM_WARNED:
+            _JSDOM_WARNED.append(1)
+            print("hq-mutate-wa: jsdom não ligado ao slot (%s: %s): os testes de jsdom vão reprovar/pular na jaula" % (type(e).__name__, e), file=sys.stderr)
+        return []
+    return ["NODE_PATH=%s" % (share / "cdp-drive" / "node_modules")] if share / "cdp-drive" in found else []
+
+
 def wa_exec_family(ctx, slot_n, tgt, text, tmo, ctl=None):
     """copia a árvore para o slot, grava o mutante (text=None: a baseline) e roda UM pytest com a família na jaula; (rc do pytest, segundos). O mesmo desenho do exec_family do motor, com a árvore do WA como raiz e o pytest no lugar do bash.
     Com --max-bad (ga-z137atn): a baseline roda a família INTEIRA, sem -x, e o PLUGIN anota quem quebra; uma vermelha PEQUENA (near_green) vira rc 0 e guarda tgt["excl"]. O mutante desse alvo roda sem os testes anotados (pelo id exato) e sem os módulos
@@ -249,6 +276,7 @@ def wa_exec_family(ctx, slot_n, tgt, text, tmo, ctl=None):
     hqm.copy_tree(ctx.tree, clone, COPY_IGNORE)
     if text is not None:
         (clone / tgt["rel"]).write_text(text, encoding="utf-8")
+    jsdom = jsdom_env(slot / "home")   # antes de medir o slot: as pastas do link entram na base do teto de escrita
     base_kb = hqm.slot_kb(slot) or 0   # vazio/falhou (du não mediu) → 0: o limite passa a valer sobre o slot inteiro, nunca sem limite
     excl = ctl or tgt.get("excl")   # vazio (alvo verde, a regra desligada, ou a própria baseline: o excl só nasce depois dela) → nenhum teste fora; só o controle e o mutante de um alvo que a regra aceitou têm excl
     base = MAX_BAD > 0 and text is None and not ctl   # a baseline da regra: família inteira, sem -x, o plugin anota
@@ -258,9 +286,9 @@ def wa_exec_family(ctx, slot_n, tgt, text, tmo, ctl=None):
         (slot / "plug").mkdir()
         (slot / "plug" / "wam_plug.py").write_text(PLUGIN, encoding="utf-8")
         plugenv = ["PYTHONPATH=%s" % (slot / "plug"), "WAM_FAILS=%s" % (slot / "plug" / "out.json") if base else "WAM_SKIP=%s" % json.dumps(excl["tests"])]
-    # `env -i` DENTRO da jaula, como no motor: do ambiente de quem chama só passa PASS_ENV; HOME e TMPDIR são do slot (a jaula confere o --rw contra o HOME de verdade). PYTHONHASHSEED=0 é o da suíte do wa-suite (gt-iso-run)
+    # `env -i` DENTRO da jaula, como no motor: do ambiente de quem chama só passa PASS_ENV; HOME e TMPDIR são do slot (a jaula confere o --rw contra o HOME de verdade). PYTHONHASHSEED=0 é o da suíte do wa-suite (gt-iso-run). O jsdom do nó (jsdom_env, ga-gvhoi10) entra por NODE_PATH e por link no HOME do slot: o `env -i` o esconderia
     kv = ["%s=%s" % (k, os.environ[k]) for k in hqm.PASS_ENV if k in os.environ] + ["HOME=%s" % (slot / "home"), "TMPDIR=%s" % (slot / "tmp"), "PYTHONDONTWRITEBYTECODE=1", "PYTHONHASHSEED=0",
-                                                                                      "GIT_AUTHOR_NAME=gt", "GIT_AUTHOR_EMAIL=gt@no", "GIT_COMMITTER_NAME=gt", "GIT_COMMITTER_EMAIL=gt@no"] + plugenv
+                                                                                      "GIT_AUTHOR_NAME=gt", "GIT_AUTHOR_EMAIL=gt@no", "GIT_COMMITTER_NAME=gt", "GIT_COMMITTER_EMAIL=gt@no"] + jsdom + plugenv
     fam = [f for f in tgt["family"] if f not in (excl["mods"] if excl else [])]
     pytest = ([PYTHON, "-m", "pytest", "-p", "no:cacheprovider", "-p", "no:randomly"] + (["-p", "wam_plug"] if plug else []) + ["-q"] + ([] if base else ["-x"]) + ["--tb=no", "--no-header", "--timeout=%d" % PYTEST_TMO]
               + (["--continue-on-collection-errors"] if base else []) + fam)
