@@ -44,7 +44,7 @@ eq() { # eq <descrição> <obtido> <esperado>
 [ -f "$DISPATCHER" ] || { echo "FATAL: $DISPATCHER não existe" >&2; exit 2; }
 fn_of() { awk -v n="$1" '$0 ~ "^"n"\\(\\)"{f=1} f{print} f&&/^}$/{exit}' "$DISPATCHER"; }
 FNS=""
-for _f in _pilot_wa_node_decide _pilot_wa_node_spawn_mode _pilot_wa_node_read _pilot_wa_node_open _pilot_wa_node_settle _pilot_node_remote_open _pilot_node_remote_rollback _pilot_slow_spawn_budget_spent _pilot_note_spawn_timing gc_json_or_unknown _pilot_ps_node_open _pilot_node_idle_secs _pilot_wa_node_reapply _pilot_wa_node_rc_uncertain _pilot_node_reserve_on _pilot_node_reserve_set _pilot_node_reserve_clear _pilot_node_reserved_for _pilot_priority_class_of _pilot_dispatch_should_stop; do
+for _f in _pilot_wa_node_decide _pilot_wa_node_spawn_mode _pilot_wa_node_read _pilot_wa_node_open _pilot_wa_node_settle _pilot_node_remote_open _pilot_node_remote_rollback _pilot_slow_spawn_budget_spent _pilot_note_spawn_timing gc_json_or_unknown _pilot_ps_node_open _pilot_node_idle_secs _pilot_wa_node_reapply _pilot_wa_node_rc_uncertain _pilot_node_reserve_on _pilot_node_reserve_set _pilot_node_reserve_clear _pilot_node_reserved_for _pilot_priority_class_of _pilot_dispatch_should_stop _pilot_node_first_veto; do
   _b="$(fn_of "$_f")"
   [ -n "$_b" ] || { echo "FATAL: $_f() não está em $DISPATCHER" >&2; exit 2; }
   FNS="$FNS"$'\n'"$_b"
@@ -149,6 +149,10 @@ PRELUDE='warn(){ echo "WARN $*" >&2; }
 log(){ echo "LOG $*" >&2; }
 timeout(){ shift; "$@"; }
 . "'"$WO_LIB"'" || exit 99'
+# ga-31u0zl7 (gate-fix 1): o gancho lê o veto de rótulo; a lista é a linha de configuração REAL do dispatcher (vazia, o helper não vê veto nenhum)
+VETO_LINE="$(grep -E '^PILOT_NODE_FIRST_VETO_LABELS="' "$DISPATCHER" | head -1)"
+[ -n "$VETO_LINE" ] || { echo "FATAL: a linha PILOT_NODE_FIRST_VETO_LABELS não está em $DISPATCHER" >&2; exit 2; }
+PRELUDE="$PRELUDE"$'\n'"$VETO_LINE"
 
 ID=wa-abc12
 ST=/x/whatsapp_automation
@@ -523,6 +527,11 @@ eq "auto + pilot: base 'any', 5 slots, alias -4" "$r $(cat "$T/calls")" "rc=0 ap
 hasgc 'session|new|wa-worker-remote|--alias|wa-worker-remote-4|--no-attach|--title-hint|build wa-abc12: Título X' && ok "alias -4 aberto" || fail "alias 4: $(cat "$T/gccalls")"
 reset; pilot 3; export FAKE_BEAD2="$T/b.ap2.json" FAKE_SESSIONS="$T/s.asleep.json"; r=$(D label 0)
 eq "alias dormindo: o gancho ACORDA em vez de abrir outra" "$r $(ord)" "rc=0 bd:show script:apply bd:show gc:list gc:wake gc:nudge "
+# ga-31u0zl7 (gate-fix 1): o veto de rótulo vale no modo pilot (o de produção) e ANTES de qualquer escrita ou sessão: a bead que o worker devolveu (node:never) só é relida — nada de apply, de gc nem de update
+reset; pilot 3; jq '. + {labels:["story:approved","node:never"]}' "$T/b.free.json" > "$T/state.json"; r=$(D label 0)
+eq "pilot + bead com node:never: 1, só relê (nem o apply, nem o gc, nem escrita na bead)" "$r|$(ord)|$(nupd)" "rc=1|bd:show |0"
+reset; pilot 3; jq '. + {labels:["story:approved"]}' "$T/b.free.json" > "$T/state.json"; r=$(D label 0)
+eq "pilot + bead com outro rótulo (controle): o caminho de sempre, 0 e abre a sessão" "$r $(ord)" "rc=0 bd:show script:apply bd:show gc:list gc:new gc:nudge "
 
 # o modo é do ambiente: o script sempre recebe a decisão do gancho
 reset; export PILOT_WA_NODE_SLOTS=5; r=$(D label 0)

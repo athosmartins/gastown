@@ -133,15 +133,18 @@ classify_checked() {
 # ANTES de chegar aqui e continua saindo. O que NÃO prende é sinal fraco, e ele PASSA: palavra mole em prosa sem código citado (banco, credencial, host-mac), menção a lead, tela ao vivo, produção ou envio ficam no `info`
 # do classificador (`palavra-mole:*`, `dado-de-lead:*`, `envio-*`...) e a bead continua `unknown`, então É promovida (medido 06/11: 25 de 28 unknown carregavam algum). O worker do nó confere ("isto se
 # constrói e testa aqui?") e devolve a bead em minutos se não; o Pilot registra esses sinais (campo `sinais` da sonda) para a taxa de devolução poder ser cruzada com eles, e refinar o critério é decisão com dado.
-# TRÊS estados, e só o primeiro promove: (a) motivos == exatamente [sem-prova-de-codigo-e-teste] E `info` é uma lista SEM nenhuma entrada de leitura que falhou (qualquer `*ilegiv*`) → promove; (b) a leitura que o
-# classificador não conseguiu fazer (info com `ilegiv`: repo, git, espelho, filtro ilegíveis) → "não consegui saber", fica unknown (rc 11): ausência de prova que veio de erro NÃO é ausência de prova; (c) qualquer outro
-# motivo (inclusive o `classificador-incoerente` de classify_checked), `info` ausente ou que não é lista, saída que o jq não lê → fica como veio. vazio (ACCEPT_UNKNOWN desligado) → não faz nada: o de sempre.
+# TRÊS estados, e só o primeiro promove: (a) motivos == exatamente [sem-prova-de-codigo-e-teste] E `info` é uma lista SEM nenhuma entrada de leitura que falhou ou que ficou pela metade → promove; (b) a leitura que o
+# classificador não conseguiu fazer inteira → "não consegui saber", fica unknown (rc 11): ausência de prova que veio de erro NÃO é ausência de prova. São duas famílias: `*ilegiv*` (repo, git, espelho, filtro ilegíveis) e as duas
+# notas da busca de teste por IMPORTAÇÃO que a deixam incompleta, `teste-importador-truncado:N` (os importadores além do 60º candidato nem foram lidos) e `teste-importador-nao-parseou:N` (candidatos pulados porque
+# não parseiam): o importador que faltou podia ser a prova. `codigo-do-teste-demais:N` e `caminho-derivado-demais|ambiguo` NÃO entram: a leitura foi inteira e o classificador só desistiu de escolher entre muitos arquivos
+# (é sinal fraco, como a palavra mole: o worker do nó confere). (c) qualquer outro motivo (inclusive o `classificador-incoerente` de classify_checked), `info` ausente ou que não é lista, saída que o jq não lê → fica como
+# veio. vazio (ACCEPT_UNKNOWN desligado) → não faz nada: o de sempre.
 promote_sem_prova() {
   [ -n "$ACCEPT_UNKNOWN" ] || return 0   # (já saneado no topo: só chega aqui o valor exato `sem-prova`)
   [ "$rc" = 11 ] || return 0
   local p
   # vazio (jq sem saída: a condição não vale) → p vazio, fica unknown; falhou/ilegível (jq que erra, saída que não é JSON) → o `|| return 0` deixa out/rc como vieram: unknown, o inerte
-  p=$(printf '%s' "$out" | jq -c 'if (.verdict == "unknown") and (.reasons == ["sem-prova-de-codigo-e-teste"]) and ((.info | type) == "array") and ((.info | map(tostring | select(test("ilegiv"))) | length) == 0) then (.verdict = "node" | .basis = "sem-prova" | .promoted_from = "unknown") else empty end' 2>/dev/null) || return 0
+  p=$(printf '%s' "$out" | jq -c 'if (.verdict == "unknown") and (.reasons == ["sem-prova-de-codigo-e-teste"]) and ((.info | type) == "array") and ((.info | map(tostring | select(test("ilegiv") or test("^teste-importador-(truncado|nao-parseou):"))) | length) == 0) then (.verdict = "node" | .basis = "sem-prova" | .promoted_from = "unknown") else empty end' 2>/dev/null) || return 0
   [ -n "$p" ] || return 0
   out="$p"; rc=0
 }

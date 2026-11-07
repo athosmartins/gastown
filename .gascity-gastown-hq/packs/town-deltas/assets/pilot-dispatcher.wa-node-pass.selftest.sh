@@ -1083,7 +1083,7 @@ r=$(T_U2N=off passenv "[$U1]")
 reset; chk wa-u1 11; promote wa-u1; chk wa-u2 11
 r=$(T_U2N_UNSET=1 passenv "[$U1,$U2]")
 [ "$r" = "D=0 ENV=UNSET" ] && [ -s "$MARK" ] && ok "auto sem marcador: a passada é sombra (nada despachado) e GRAVA o marcador (com a hora)" || bad "auto/sombra: $r / marcador=$([ -e "$MARK" ] && echo sim || echo nao)"
-grep -q 'a passada-sombra rodou (sondadas=2, unknown que iria ao nó=1)' "$WORK/lines" && ok "auto: o log diz que a sombra rodou (sondadas=2, iria ao nó=1) e onde está o marcador" || bad "auto: log $(grep 'ga-31u0zl7' "$WORK/lines" | cut -c1-400)"
+grep -q 'a passada-sombra rodou (sondadas=2, respondidas=2, unknown que iria ao nó=1)' "$WORK/lines" && ok "auto: o log diz que a sombra rodou (sondadas=2, respondidas=2, iria ao nó=1) e onde está o marcador" || bad "auto: log $(grep 'ga-31u0zl7' "$WORK/lines" | cut -c1-400)"
 summ | jq -e '.u2n_mode=="shadow" and .unknown_shadow==1' >/dev/null 2>&1 && ok "auto/sombra: resumo u2n_mode=shadow unknown_shadow=1" || bad "auto/sombra: resumo $(summ | cut -c1-300)"
 reset; chk wa-u1 11; promote wa-u1; chk wa-u2 11; setok wa-u1; : > "$MARK"
 r=$(T_U2N_UNSET=1 passenv "[$U1,$U2]")
@@ -1094,6 +1094,17 @@ reset; OW="$(jb wa-o1 U1 wa-worker story:approved mila-wa)"; r=$(T_U2N_UNSET=1 p
 reset; chk wa-u1 11; promote wa-u1
 r=$(T_U2N_UNSET=1 SJ="[$U1]" run_t 'PILOT_WA_NODE_SCRIPTS="$WORK/nao-existe"; SMALL_CANDIDATES="$SJ"; BIG_CANDIDATES="[]"; SMALL_COUNT=1; BIG_COUNT=0; _pilot_wa_node_pass; echo "stop=$_PWP_LAST_STOP"')
 [ "$r" = "stop=check-missing" ] && [ ! -e "$MARK" ] && ok "auto com o script do check ausente (check-missing): a sonda não provou nada → sem marcador" || bad "auto/check-missing: $r / marcador=$([ -e "$MARK" ] && echo sim || echo nao)"
+# T6b — gate-fix 1: sonda SEM resposta (timeout, saída que não é veredito) não prova que a sombra rodou; UMA resposta (node, mini ou unknown) basta
+for rcx in 124 99; do
+  reset; chk wa-u1 "$rcx"; chk wa-u2 "$rcx"
+  r=$(T_U2N_UNSET=1 passenv "[$U1,$U2]"); [ ! -e "$MARK" ] && ok "auto, todas as sondas sem resposta (rc $rcx do check): sondou, mas NÃO escreve o marcador" || bad "auto com sondas sem resposta (rc $rcx) escreveu o marcador"
+done
+reset; chk wa-u1 124; chk wa-u2 11; promote wa-u2
+r=$(T_U2N_UNSET=1 passenv "[$U1,$U2]"); [ -s "$MARK" ] && grep -q 'sondadas=2, respondidas=1,' "$WORK/lines" && ok "auto, 1 timeout + 1 unknown respondido: UMA resposta basta — marcador escrito e o log conta sondadas=2, respondidas=1" || bad "auto misto: marcador=$([ -e "$MARK" ] && echo sim || echo nao) / $(grep 'ga-31u0zl7' "$WORK/lines" | cut -c1-300)"
+reset; chk wa-g1 10
+r=$(T_U2N_UNSET=1 passenv "[$G1]"); [ -s "$MARK" ] && ok "auto, só um mini respondido: o classificador respondeu — marcador escrito" || bad "auto com só um mini: sem marcador"
+reset; chk wa-g1 0; setok wa-g1
+r=$(T_U2N_UNSET=1 passenv "[$G1]"); [ -s "$MARK" ] && ok "auto, só um node respondido: marcador escrito" || bad "auto com só um node: sem marcador"
 # T7 — marcador que não grava: avisa e a passada seguinte é sombra de novo
 reset; chk wa-u1 11; promote wa-u1; : > "$WORK/notadir"
 r=$(T_U2N_UNSET=1 SJ="[$U1]" run_t 'PILOT_WA_NODE_UNKNOWN_MARKER="$WORK/notadir/sub/x.done"; SMALL_CANDIDATES="$SJ"; BIG_CANDIDATES="[]"; SMALL_COUNT=1; BIG_COUNT=0; _pilot_wa_node_pass; echo "D=$DISPATCHED"')
@@ -1251,6 +1262,13 @@ dec() { ( eval "$PRELUDE"; eval "$F_DECIDE"; _pilot_wa_node_open() { return 0; }
 reset; bead "$BEAD_FREE"; echo 12 > "$WORK/apply.rc"; r=$(dec);  [ "$r" = "ret=1 apply_rc=12" ] && ok "apply rc 12: o gancho devolve 1 e deixa _PWN_APPLY_RC=12" || bad "exporta rc 12: $r"
 reset; bead "$BEAD_FREE"; echo 10 > "$WORK/apply.rc"; r=$(dec);  [ "$r" = "ret=1 apply_rc=10" ] && ok "apply rc 10: _PWN_APPLY_RC=10" || bad "exporta rc 10: $r"
 reset; bead "$BEAD_FREE"; echo 0 > "$WORK/apply.rc";  r=$(dec);  [ "$r" = "ret=0 apply_rc=0" ] && ok "apply rc 0 (modo pool): _PWN_APPLY_RC=0 e o gancho devolve 0" || bad "exporta rc 0: $r"
+# ga-31u0zl7 (gate-fix 1): o gancho que o dispatch_one chama lê o MESMO veto de rótulo da passada (PILOT_NODE_FIRST_VETO_LABELS): a bead que o worker do nó devolveu (node:never) não chama o apply e não deixa rc; rótulos que não se leem = 1 também
+reset; bead '{"id":"wa-a","status":"open","labels":["story:approved","node:never"],"metadata":{}}'; echo 0 > "$WORK/apply.rc"; r=$(dec)
+[ "$r" = "ret=1 apply_rc=<vazio>" ] && [ "$(wnd_calls)" = 0 ] && ok "gancho com node:never: 1, o apply NÃO roda e não deixa rc (a bead devolvida pelo worker não volta ao nó)" || bad "gancho com veto: $r / chamadas do script=$(wnd_calls)"
+reset; bead '{"id":"wa-a","status":"open","labels":"node:never","metadata":{}}'; echo 0 > "$WORK/apply.rc"; r=$(dec)
+[ "$r" = "ret=1 apply_rc=<vazio>" ] && [ "$(wnd_calls)" = 0 ] && ok "gancho com rótulos que não se leem: 1, sem apply (na dúvida a bead fica no mini)" || bad "gancho com labels ilegível: $r / chamadas do script=$(wnd_calls)"
+reset; bead '{"id":"wa-a","status":"open","labels":["story:approved"],"metadata":{}}'; echo 0 > "$WORK/apply.rc"; r=$(dec)
+[ "$r" = "ret=0 apply_rc=0" ] && [ "$(wnd_calls)" = 1 ] && ok "gancho com outro rótulo (controle): o apply roda e a bead vai ao nó" || bad "gancho com outro rótulo: $r / chamadas do script=$(wnd_calls)"
 reset; r=$( ( eval "$PRELUDE"; eval "$F_DECIDE"; _PWN_APPLY_RC=12; PILOT_WA_NODE_ROUTE=off; x=0; _pilot_wa_node_decide wa-a "$WORK/store" wa-worker || x=$?; echo "ret=$x apply_rc=${_PWN_APPLY_RC:-<vazio>}" ) 2>&1 | tail -1 )
 [ "$r" = "ret=1 apply_rc=<vazio>" ] && ok "gancho que sai antes do apply (rota off): zera o rc — um rc velho nunca é lido como o desta bead" || bad "rc velho vazou: $r"
 

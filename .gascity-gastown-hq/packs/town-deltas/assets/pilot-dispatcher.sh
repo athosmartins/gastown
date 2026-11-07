@@ -12377,12 +12377,18 @@ _pilot_node_only_wa_route_on() {
 # vazio (sem dono e sem rota; o bd omite chave vazia) → é o estado livre; falhou/ilegível (JSON que o jq não lê) → NÃO. Script ausente ou sonda que não sai 0 (10, 11, 12, 13, 124, 137...) → NÃO.
 _PNW_PROBES=0
 _pilot_node_only_wa_pre() {
-  local _b="${1:-}" _id _own _dir _mode="${PILOT_WA_NODE_ROUTE:-}" _basis=any _cap="${PILOT_WA_NODE_ONLY_PROBES:-6}" _rc=0
+  local _b="${1:-}" _id _own _lb _lv _dir _mode="${PILOT_WA_NODE_ROUTE:-}" _basis=any _cap="${PILOT_WA_NODE_ONLY_PROBES:-6}" _rc=0
   _pilot_node_only_wa_route_on || return 1
   _id=$(printf '%s' "$_b" | jq -r '.id // ""' 2>/dev/null) || return 1
   [ "${_id#wa-}" != "$_id" ] || return 1
   _own=$(printf '%s' "$_b" | jq -r '(.assignee // "") + (.metadata["gc.routed_to"] // "")' 2>/dev/null) || return 1
   [ -z "$_own" ] || return 1
+  # ga-31u0zl7 (gate-fix 1): o rótulo de veto (PILOT_NODE_FIRST_VETO_LABELS; node:never é o que o worker do nó põe ao devolver a bead) tira a bead daqui ANTES da sonda: a vetada gastaria uma das PILOT_WA_NODE_ONLY_PROBES (o teto
+  # da varredura, 1 a ~26 s cada) e a claim + soltura, e as candidatas de verdade ficariam atrás dela. vazio (sem rótulos: o bd omite a chave) → nenhum veto, segue; falhou/ilegível (rótulos que não são lista de textos, jq que
+  # não lê) → NÃO é candidata (nada escrito, nenhuma sonda).
+  _lb=$(printf '%s' "$_b" | jq -r '(.labels // []) | if type == "array" and all(.[]; type == "string") then join(",") else error("labels") end' 2>/dev/null) || return 1
+  _lv=$(_pilot_node_first_veto "$_lb")
+  [ -z "$_lv" ] || return 1
   if [ "$_mode" = label ]; then
     _basis=label
     printf '%s' "$_b" | jq -e '(.labels // []) | index("node:ok")' >/dev/null 2>&1 || return 1
@@ -12974,7 +12980,7 @@ _pilot_kimi_lane_pass() {
 # vazio → n/a (o classificador sempre responde node/mini/unknown); falhou/ilegível antes de escrever (rc 10/11/12) → igual a mini: 1 (a bead já foi lida como "não é do nó"; a que é do nó não chega aqui).
 # A leitura do slot e das sessões tem os três estados dentro do wa-node-dispatch.sh (ocupado ou "não sei" = não vai).
 _pilot_wa_node_decide() {
-  local _id="${1:-}" _store="${2:-}" _tgt="${3:-}" _mode="${PILOT_WA_NODE_ROUTE:-off}" _dir _out="" _rc=0 _basis=any _bj="" _bo=""
+  local _id="${1:-}" _store="${2:-}" _tgt="${3:-}" _mode="${PILOT_WA_NODE_ROUTE:-off}" _dir _out="" _rc=0 _basis=any _bj="" _bo="" _bl="" _bv=""
   # ga-2hd02v.3.26: a cópia da bead que o gancho releu, para a reserva do nó ler a prioridade de quem falhou. vazio (nenhuma releitura: saiu antes) → "" e a classe não se lê → nada é reservado.
   _PWN_BJ=""
   # ga-2hd02v.9: o rc do `apply` DESTA chamada, para a passada de WA decidir por ele (12 = nó cheio; 10/11 = a bead não é do nó). Zerado na entrada: sair antes do apply deixa vazio, nunca o rc de outra bead.
@@ -12992,6 +12998,19 @@ _pilot_wa_node_decide() {
       node) warn "wa-node: $_id já é do nó (dono ou rota wa-worker-remote*) — seguro: sem carimbo do mini e sem sessão do mini; a próxima varredura relê"; return 2 ;;
       *) warn "wa-node: não consegui reler $_id — não sei se já é do nó; seguro: sem carimbo do mini e sem sessão do mini; a próxima varredura relê"; return 2 ;;
     esac
+    # ga-31u0zl7 (gate-fix 1): o veto de rótulo (PILOT_NODE_FIRST_VETO_LABELS) vale AQUI também, não só na passada de WA: o worker do nó devolve a PRÓPRIA bead com node:never (open, sem dono) e o `apply` só confere status, dono e rota
+    # (o classificador não lê node:never), então sem esta leitura a bead voltava ao nó a cada varredura. vazio (sem rótulos: o bd omite a chave) → nenhum veto, segue; falhou/ilegível (rótulos que não são lista de textos, jq que não
+    # lê) → NÃO sei se há veto → 1 (segue no mini, nada escrito): na dúvida a bead fica onde estava. Vem DEPOIS da leitura do dono: a bead que já é do nó segue 2.
+    _bl=$(printf '%s' "$_bj" | jq -r --arg id "$_id" 'if type=="array" then .[0] else . end | select(type=="object" and .id == $id) | "L:" + ((.labels // []) | if type == "array" and all(.[]; type == "string") then join(",") else error("labels") end)' 2>/dev/null) || _bl=""
+    case "$_bl" in
+      L:*) ;;
+      *) warn "wa-node: não consegui ler os rótulos de $_id — não sei se há rótulo de veto; fica no mini, nada escrito"; return 1 ;;
+    esac
+    _bv=$(_pilot_node_first_veto "${_bl#L:}")
+    if [ -n "$_bv" ]; then
+      log "  ga-31u0zl7: $_id NÃO vai ao nó — traz o rótulo de veto $_bv (PILOT_NODE_FIRST_VETO_LABELS); nada escrito, a bead segue no mini"
+      return 1
+    fi
     _PWN_BJ="$_bj"
     # ga-2hd02v.3.26: a P2+ NÃO toma o nó numa varredura em que o gancho de um P0/P1 falhou (a reserva, _pilot_node_reserve_set): a vaga que ele não conseguiu usar é dele na próxima varredura, e não da P3 que chegou depois.
     # vazio (nenhuma reserva nesta varredura) → segue; falhou/ilegível (a classe da bead não se lê) → segue também, com aviso: classe ilegível nunca segura trabalho (a regra do yield). Nada escrito: 1, a bead segue como estava.
@@ -14244,7 +14263,7 @@ _pilot_wa_node_pass() {
   local _pw_lane _pw_pool _pw_slots _pw_wa _pw_n _pw_pick _pw_id _pw_upd _pw_tier _pw_rc _pw_keepmax _pw_cap _pw_secs _pw_maxfail _pw_t0 _pw_log _pw_sk _pw_skj _pw_rsn="" _pw_rsj _pw_rs
   local _pw_total=0 _pw_elig=0 _pw_memo=0 _pw_probed=0 _pw_node=0 _pw_mini=0 _pw_unk=0 _pw_tmo=0 _pw_err=0 _pw_kept=0 _pw_rel=0 _pw_fails=0 _pw_stop="" _pw_skipped=""
   # ga-31u0zl7: o unknown que é só falta de prova. _pw_uh = o que a sonda da bead em mãos disse (0 nada · 1 promovida a node, vai ao despacho · 2 sombra: iria ao nó, não vai) · _pw_u2n = promovidas · _pw_u2nk = despachadas · _pw_shu = sombras · _pw_acc = o 3º argumento do check
-  local _pw_u2n=0 _pw_u2nk=0 _pw_shu=0 _pw_uh=0 _pw_acc="" _pw_mk=""
+  local _pw_u2n=0 _pw_u2nk=0 _pw_shu=0 _pw_uh=0 _pw_ans=0 _pw_acc="" _pw_mk=""
   # ga-2hd02v.3.16: o waiter da cessão. _pw_lanes = a ordem das pistas; _pw_wl = a pista dele; _pw_wv = o veredito dele: "" (não há waiter de WA nas pistas) | unseen (ainda não olhado) | node | out (SABE-SE que não irá ao nó) | blind (NÃO se sabe: sem veredito legível, ou o que impediu o veredito não se leu)
   local _pw_lanes="small big" _pw_wl="" _pw_wv="" _pw_isw=0 _pw_held=0 _pw_p2n=0 _pw_hrc=0 _pw_clsblind=0
   # ga-2hd02v.3.18: _pw_trk = 1 iff o contador do hold é lido e gravado nesta passada · _pw_wreached = 1 iff o waiter foi de fato olhado (saiu da lista) · _pw_hx = 1 iff a bead em mãos é uma P2+ solta pelo fim do hold ·
@@ -14256,8 +14275,8 @@ _pilot_wa_node_pass() {
   # ga-2hd02v.3.26: a reserva do nó e o veredito final do waiter valem POR VARREDURA: zerados aqui, antes do early return do modo off, para que nada de uma varredura anterior (ou de outra bead) segure a P2+ desta.
   _PNR_RESERVED_IDS=""; _PNR_RESERVED_N=0; _PWP_WV_FINAL=""; _PNH_HELD=0
   _PWP_NODE_BOUND=""
-  _PWP_U2N=off; _PWP_U2N_AUTO=0   # ga-31u0zl7: por passada (um early return do modo off não pode deixar o da passada anterior)
   _pilot_wa_node_pass_mode
+  _PWP_U2N=off; _PWP_U2N_AUTO=0   # ga-31u0zl7: por passada (um early return do modo off, logo abaixo, não pode deixar o da passada anterior). Fica DEPOIS da chamada do modo de propósito: o par reset do conjunto + chamada do modo é âncora de mutantes (mbp-stamped e a bateria desta passada) e não se separa
   if [ "$_PWP_MODE" = off ]; then
     case "${PILOT_WA_NODE_EXEMPT:-off}" in
       on|shadow) log "ga-2hd02v.9: PILOT_WA_NODE_EXEMPT=${PILOT_WA_NODE_EXEMPT} está INERTE nesta varredura (rota='${PILOT_WA_NODE_ROUTE:-}', DRY_RUN=${DRY_RUN:-0}) — on pede rota label|auto; shadow, shadow|label|auto." ;;
@@ -14370,6 +14389,8 @@ _pilot_wa_node_pass() {
       if [ $(( SECONDS - _pw_t0 )) -ge "$_pw_secs" ]; then _pw_stop="budget-secs"; break; fi
       _pw_probed=$((_pw_probed + 1))
       _pilot_wa_node_pass_check "$_pw_id" "" "$_pw_acc"
+      # ga-31u0zl7 (gate-fix 1): conta a sonda que o classificador RESPONDEU (node | mini | unknown). timeout, saída que não é veredito (error) e script ausente (missing) não são resposta: o marcador da sombra (no fim) só arma com uma de verdade.
+      case "$_PWP_V" in node|mini|unknown) _pw_ans=$((_pw_ans + 1)) ;; esac
       # ga-31u0zl7: node com base sem-prova = unknown PROMOVIDO pelo script (só falta de prova, nenhuma leitura falhou). Só segue como node com a passada em `on` E o botão em `on`; em qualquer outro caso volta a ser o
       # que a bead era (unknown): a sombra registra «iria ao nó» e não despacha. O default é o inerte: base sem-prova que chega com o botão desligado (o script não devia ter promovido) também NÃO vai ao nó.
       _pw_uh=0
@@ -14474,12 +14495,13 @@ _pilot_wa_node_pass() {
       node|out) _pw_wcount=0; _pilot_wa_node_pass_hold_put "$_PY_WAIT_ID" 0 ;;
     esac
   fi
-  # ga-31u0zl7: auto — esta passada foi a SOMBRA. Só conta se sondou ao menos uma bead com o botão ligado (_pw_probed >= 1) e o script do check existia (check-missing não prova nada). O marcador é o que o botão lê na
-  # PRÓXIMA passada para virar on. Marcador que não grava (pasta ausente, disco cheio) → AVISA e a passada seguinte é sombra de novo: ligar sem a prova de que a sombra rodou é o que não se faz. Só roda no modo auto.
-  if [ "$_PWP_U2N_AUTO" = 1 ] && [ "$_pw_probed" -ge 1 ] && [ "$_pw_stop" != check-missing ]; then
+  # ga-31u0zl7: auto — esta passada foi a SOMBRA. Só conta se o classificador RESPONDEU ao menos uma sonda com o botão ligado (_pw_ans >= 1: node, mini ou unknown; sonda que deu timeout, erro ou script ausente não é resposta, e uma
+  # sombra que só colheu isso não provou nada). O marcador é o que o botão lê na PRÓXIMA passada para virar on. Marcador que não grava (pasta ausente, disco cheio) → AVISA e a passada seguinte é sombra de novo: ligar sem a
+  # prova de que a sombra rodou é o que não se faz. Só roda no modo auto.
+  if [ "$_PWP_U2N_AUTO" = 1 ] && [ "$_pw_ans" -ge 1 ]; then
     _pw_mk="${PILOT_WA_NODE_UNKNOWN_MARKER:-${GC_CITY:-/nonexistent}/.gc/wa-node-unknown-shadow.done}"
     if { mkdir -p "$(dirname "$_pw_mk")" && date -u +%Y-%m-%dT%H:%M:%SZ > "$_pw_mk"; } 2>/dev/null; then
-      log "ga-31u0zl7: PILOT_WA_NODE_UNKNOWN_TO_NODE=auto — a passada-sombra rodou (sondadas=$_pw_probed, unknown que iria ao nó=$_pw_shu); a partir da PRÓXIMA passada o unknown só por falta de prova vai ao nó. Marcador: $_pw_mk (apague-o para repetir a sombra; PILOT_WA_NODE_UNKNOWN_TO_NODE=off desliga)."
+      log "ga-31u0zl7: PILOT_WA_NODE_UNKNOWN_TO_NODE=auto — a passada-sombra rodou (sondadas=$_pw_probed, respondidas=$_pw_ans, unknown que iria ao nó=$_pw_shu); a partir da PRÓXIMA passada o unknown só por falta de prova vai ao nó. Marcador: $_pw_mk (apague-o para repetir a sombra; PILOT_WA_NODE_UNKNOWN_TO_NODE=off desliga)."
     else
       warn "ga-31u0zl7: não consegui gravar o marcador da sombra em $_pw_mk — a próxima passada é sombra de novo (o unknown só por falta de prova NÃO vai ao nó sem esse marcador)"
     fi

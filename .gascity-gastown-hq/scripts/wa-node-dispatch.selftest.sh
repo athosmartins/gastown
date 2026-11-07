@@ -583,6 +583,12 @@ UNK_INFOSTR='{"verdict":"unknown","basis":"","reasons":["sem-prova-de-codigo-e-t
 UNK_INFONULL='{"verdict":"unknown","basis":"","reasons":["sem-prova-de-codigo-e-teste"],"paths":[],"tests":[],"info":null}'
 UNK_INFOOBJ='{"verdict":"unknown","basis":"","reasons":["sem-prova-de-codigo-e-teste"],"paths":[],"tests":[],"info":{}}'
 UNK_NOREASON='{"verdict":"unknown","basis":"","paths":[],"tests":[],"info":[]}'
+# gate-fix 1: a busca de teste por IMPORTAÇÃO do classificador deixa notas que NÃO têm `ilegiv` mas dizem «li só parte» (wa-node-classify.py, importer_tests: MAX_IMPORTER_SCAN e o candidato que não parseia)
+UNK_IMP_TRUNC='{"verdict":"unknown","basis":"","reasons":["sem-prova-de-codigo-e-teste"],"paths":[],"tests":[],"info":["palavra-mole:banco","teste-importador-truncado:12"]}'
+UNK_IMP_PARSE='{"verdict":"unknown","basis":"","reasons":["sem-prova-de-codigo-e-teste"],"paths":[],"tests":[],"info":["teste-importador-nao-parseou:2"]}'
+# leitura INTEIRA que só desistiu de escolher entre muitos arquivos (sinal fraco, o worker confere), e uma nota de importador que é evidência e não leitura incompleta
+UNK_DEMAIS='{"verdict":"unknown","basis":"","reasons":["sem-prova-de-codigo-e-teste"],"paths":[],"tests":[],"info":["codigo-do-teste-demais:12","caminho-derivado-demais:14","caminho-derivado-ambiguo:util=5"]}'
+UNK_IMP_NEAR='{"verdict":"unknown","basis":"","reasons":["sem-prova-de-codigo-e-teste"],"paths":[],"tests":[],"info":["teste-importador:lib/x.py=tests/test_x.py"]}'
 export WA_NODE_ACCEPT_UNKNOWN=sem-prova
 fresh; cls "$UNK" 11; d check wa-t1;               expect_rc "accept-unknown: check de unknown só por falta de prova -> 0 (node)" 0 w0
 printf '%s' "$OUT" | jq -e '.verdict == "node" and .basis == "sem-prova" and .promoted_from == "unknown" and .reasons == ["sem-prova-de-codigo-e-teste"]' >/dev/null 2>&1 && ok "accept-unknown: check imprime node/base sem-prova/promoted_from e CONSERVA o motivo original" || bad "accept-unknown: JSON promovido errado ($OUT)"
@@ -592,6 +598,10 @@ fresh; cls "$NODE_TEXT" 0; d check wa-t1;          expect_rc "accept-unknown: no
 printf '%s' "$OUT" | jq -e '.basis == "text" and (has("promoted_from") | not)' >/dev/null 2>&1 && ok "accept-unknown: o node de verdade NÃO ganha promoted_from nem muda de base" || bad "accept-unknown: node de verdade foi alterado ($OUT)"
 fresh; cls "$UNK_READFAIL" 11; d check wa-t1;      expect_rc "accept-unknown: leitura que FALHOU (caminho-derivado-ilegivel) NÃO promove -> 11" 11 w0
 fresh; cls "$UNK_READFAIL2" 11; d check wa-t1;     expect_rc "accept-unknown: leitura que falhou misturada com palavra-mole NÃO promove -> 11" 11 w0
+fresh; cls "$UNK_IMP_TRUNC" 11; d check wa-t1;     expect_rc "accept-unknown: busca de importador TRUNCADA (importadores além do 60º nem foram lidos) NÃO promove -> 11" 11 w0
+fresh; cls "$UNK_IMP_PARSE" 11; d check wa-t1;     expect_rc "accept-unknown: teste candidato que não parseou (leitura pela metade) NÃO promove -> 11" 11 w0
+fresh; cls "$UNK_DEMAIS" 11; d check wa-t1;        expect_rc "accept-unknown: codigo-do-teste-demais / caminho-derivado-demais|ambiguo (leitura INTEIRA, só desistiu de escolher) promove -> 0" 0 w0
+fresh; cls "$UNK_IMP_NEAR" 11; d check wa-t1;      expect_rc "accept-unknown: nota teste-importador:<codigo>=<teste> (evidência) não é leitura incompleta -> 0" 0 w0
 fresh; cls "$UNK_MOLES" 11; d check wa-t1;         expect_rc "accept-unknown: motivo EXTRA (moles:credencial) NÃO promove -> 11" 11 w0
 fresh; cls "$UNK_OTHER" 11; d check wa-t1;         expect_rc "accept-unknown: outro motivo de unknown (json-ilegivel) NÃO promove -> 11" 11 w0
 fresh; cls "$UNK_DUP" 11; d check wa-t1;           expect_rc "accept-unknown: motivo repetido não é «exatamente o motivo» -> 11" 11 w0
@@ -613,6 +623,7 @@ fresh; cls "$NODE_TEXT" 0; d apply wa-t1;          expect_rc "accept-unknown: ap
 bead '."wa-t1".comments[0]' | grep -q 'SEM PROVA' && bad "accept-unknown: node de verdade ganhou o aviso SEM PROVA" || ok "accept-unknown: node de verdade NÃO ganha o aviso SEM PROVA"
 fresh; cls "$UNK" 11; d apply wa-t1 --basis label; expect_rc "accept-unknown: modo label NUNCA aceita sem-prova -> 10 sem escrita" 10 w0
 fresh; cls "$UNK_READFAIL" 11; d apply wa-t1;      expect_rc "accept-unknown: apply com leitura que falhou -> 11 sem escrita" 11 w0
+fresh; cls "$UNK_IMP_TRUNC" 11; d apply wa-t1;     expect_rc "accept-unknown: apply com a busca de importador truncada -> 11 sem escrita" 11 w0
 fresh; cls "$UNK_MOLES" 11; d apply wa-t1;         expect_rc "accept-unknown: apply com motivo extra -> 11 sem escrita" 11 w0
 fresh; cls "$MINI" 10; d apply wa-t1;              expect_rc "accept-unknown: apply de mini -> 10 sem escrita" 10 w0
 fresh; cls "$UNK" 11; d apply wa-t1 --dry-run;     expect_rc "accept-unknown: apply --dry-run de unknown promovido -> 0 SEM escrita" 0 w0
@@ -834,8 +845,14 @@ mutant au-valor-ilegivel '[ "$ACCEPT_UNKNOWN" = sem-prova ] || ACCEPT_UNKNOWN=""
 fresh; cls "$UNK" 11; WA_NODE_ACCEPT_UNKNOWN=true d check wa-t1; if [ "$RC" = 11 ]; then survived; else killed; fi
 mutant au-motivo-extra '(.reasons == ["sem-prova-de-codigo-e-teste"])' '(.reasons | index("sem-prova-de-codigo-e-teste") != null)'
 fresh; cls "$UNK_MOLES" 11; WA_NODE_ACCEPT_UNKNOWN=sem-prova d check wa-t1; if [ "$RC" = 11 ]; then survived; else killed; fi
-mutant au-leitura-falhou ' and ((.info | map(tostring | select(test("ilegiv"))) | length) == 0)' ''
+mutant au-leitura-falhou ' and ((.info | map(tostring | select(test("ilegiv") or test("^teste-importador-(truncado|nao-parseou):"))) | length) == 0)' ''
 fresh; cls "$UNK_READFAIL" 11; WA_NODE_ACCEPT_UNKNOWN=sem-prova d check wa-t1; if [ "$RC" = 11 ]; then survived; else killed; fi
+mutant au-importador-truncado 'truncado|nao-parseou' 'nao-parseou'
+fresh; cls "$UNK_IMP_TRUNC" 11; WA_NODE_ACCEPT_UNKNOWN=sem-prova d check wa-t1; if [ "$RC" = 11 ]; then survived; else killed; fi
+mutant au-importador-nao-parseou 'truncado|nao-parseou' 'truncado'
+fresh; cls "$UNK_IMP_PARSE" 11; WA_NODE_ACCEPT_UNKNOWN=sem-prova d check wa-t1; if [ "$RC" = 11 ]; then survived; else killed; fi
+mutant au-importador-largo '^teste-importador-(truncado|nao-parseou):' '^teste-importador'
+fresh; cls "$UNK_IMP_NEAR" 11; WA_NODE_ACCEPT_UNKNOWN=sem-prova d check wa-t1; if [ "$RC" = 0 ]; then survived; else killed; fi
 mutant au-leitura-so-um-sufixo 'test("ilegiv")' 'test("-ilegivel:")'
 fresh; cls '{"verdict":"unknown","basis":"","reasons":["sem-prova-de-codigo-e-teste"],"paths":[],"tests":[],"info":["labels-ilegiveis"]}' 11; WA_NODE_ACCEPT_UNKNOWN=sem-prova d check wa-t1; if [ "$RC" = 11 ]; then survived; else killed; fi
 mutant au-info-nao-lista ' and ((.info | type) == "array")' ''

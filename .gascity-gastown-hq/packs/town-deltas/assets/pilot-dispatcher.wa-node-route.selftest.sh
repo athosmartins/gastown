@@ -11,10 +11,11 @@
 #      label/auto chamam `apply` com a base certa · só rc 0 vira "atribuída ao nó" · rc 13/124/137/143 e qualquer rc >= 128 (morto por sinal) = resultado desconhecido (2) ·
 #      alvo que não é wa-worker, id que não é wa-*, script ausente, dry-run → nada escrito, e o log "WOULD route" só para o rc 0 ·
 #      (gate-fix 1, ga-9636op) a função LÊ a bead antes do script, em três estados: bead que já é do nó (dono ou rota wa-worker-remote*) = 2, ilegível = 2, lida e não é do nó = segue; qualquer rc do script.
+#      (gate-fix 1, ga-31u0zl7) o veto de rótulo (PILOT_NODE_FIRST_VETO_LABELS, o node:never que o worker do nó põe ao devolver a bead) vale no gancho: rótulo de veto = 1 sem rodar o script; rótulos que não se leem = 1; token inteiro; lista do ambiente.
 #   B. a fiação no despacho (grep no fonte): o ponto de chamada fica depois do guarda de posse e antes de "deixar sem dono"; o braço
 #      `wa-worker-remote)` do spawn vem antes de `wa-worker*)` e não faz `gc session new` nem carimba gc.routed_to=wa-worker; o rc 2 solta a
 #      claim e não despacha; a função só é chamada num lugar.
-#   C. mutantes: cada quebra abaixo tem de derrubar este selftest (30, a leitura da bead e o modo pool entre eles). Cada um roda o arquivo inteiro e para no 1º FAIL;
+#   C. mutantes: cada quebra abaixo tem de derrubar este selftest (35, a leitura da bead, o modo pool e o veto de rótulo entre eles). Cada um roda o arquivo inteiro e para no 1º FAIL;
 #      rodam em paralelo (--jobs N, padrão 4; o mbp-run.sh repassa argumento, não ambiente).
 #   O MODO `pilot` do gancho (PILOT_WA_NODE_SPAWN=pilot: N slots, abrir/acordar a sessão, desfazer, orçamento de spawn) é provado em pilot-dispatcher.wa-node-spawn.selftest.sh;
 #   aqui só se prova que o padrão (`pool`) é o da 1.10 e que o gancho repassa o modo ao script.
@@ -47,7 +48,7 @@ FN="$(fn_of _pilot_wa_node_decide)"
 [ -n "$FN" ] || { echo "FATAL: _pilot_wa_node_decide() não está em $DISPATCHER" >&2; exit 2; }
 # o gancho chama o modo (pool|pilot), a releitura, a abertura da sessão, o desfazer e o orçamento de spawn lento: as REAIS, extraídas do mesmo arquivo (nada de dublê do código sob teste)
 FNS="$FN"
-for _f in _pilot_wa_node_spawn_mode _pilot_wa_node_read _pilot_wa_node_open _pilot_wa_node_settle _pilot_node_remote_open _pilot_node_remote_rollback _pilot_slow_spawn_budget_spent _pilot_note_spawn_timing gc_json_or_unknown; do
+for _f in _pilot_wa_node_spawn_mode _pilot_wa_node_read _pilot_wa_node_open _pilot_wa_node_settle _pilot_node_remote_open _pilot_node_remote_rollback _pilot_slow_spawn_budget_spent _pilot_note_spawn_timing gc_json_or_unknown _pilot_node_first_veto; do
   _b="$(fn_of "$_f")"
   [ -n "$_b" ] || { echo "FATAL: $_f() não está em $DISPATCHER" >&2; exit 2; }
   FNS="$FNS"$'\n'"$_b"
@@ -69,6 +70,10 @@ chmod +x "$T/scripts/wa-node-dispatch.sh"
 PRELUDE='warn(){ echo "WARN $*" >&2; }
 log(){ echo "LOG $*" >&2; }
 timeout(){ shift; "$@"; }'
+# ga-31u0zl7 (gate-fix 1): o gancho lê o veto de rótulo; a lista é a do dispatcher (a linha de configuração REAL, que respeita PILOT_NODE_FIRST_VETO_LABELS do ambiente), não uma cópia
+VETO_LINE="$(grep -E '^PILOT_NODE_FIRST_VETO_LABELS="' "$DISPATCHER" | head -1)"
+[ -n "$VETO_LINE" ] || { echo "FATAL: a linha PILOT_NODE_FIRST_VETO_LABELS não está em $DISPATCHER" >&2; exit 2; }
+PRELUDE="$PRELUDE"$'\n'"$VETO_LINE"
 
 # bd falso do gancho (ga-9636op, gate-fix 1): só entende `bd -C <loja> show <id> --json`; anota a chamada em $FAKE_BD_LOG e devolve o conteúdo de
 # $FAKE_BEAD, ou falha com $FAKE_BD_RC. Qualquer outro verbo é um erro do teste: o gancho só LÊ a bead.
@@ -93,6 +98,10 @@ export PATH="$T/bin:$PATH" FAKE_BD_LOG="$T/bdcalls" FAKE_GC_LOG="$T/gccalls"
 # bead <arquivo> <status> <assignee> <rota> [id] — grava o JSON da bead falsa (o formato de `bd show --json`: um array com um objeto)
 bead() {
   jq -cn --arg id "${5:-$ID}" --arg s "$2" --arg a "$3" --arg r "$4" '[{id:$id,status:$s,assignee:$a,metadata:(if $r=="" then {} else {"gc.routed_to":$r} end)}]' > "$1"
+}
+# beadl <arquivo> <rótulos em JSON | OMIT> [status] [dono] — ga-31u0zl7: a bead sem rota com o campo labels como o caso o quer (OMIT = a chave nem existe: o bd a omite quando não há rótulo)
+beadl() {
+  jq -cn --arg id "$ID" --arg s "${3:-open}" --arg a "${4:-}" --arg l "$2" '[{id:$id,status:$s,assignee:$a,metadata:{}} + (if $l == "OMIT" then {} else {labels: ($l | fromjson)} end)]' > "$1"
 }
 ID=wa-abc12
 bead "$T/bead.free.json" open "" ""
@@ -228,6 +237,53 @@ export FAKE_BEAD="$T/bead.node-both.json"; SCRIPTS_DIR="$T/nada"; decide auto $I
 [ "$r" = "rc=2" ] && ok "script ausente + bead do nó: 2 (segura), não 1 (o caminho do pool carimbaria o mini por cima)" || fail "script ausente + bead do nó → $r"
 export FAKE_BEAD="$T/bead.free.json"
 
+# --- ga-31u0zl7 (gate-fix 1): o veto de rótulo (PILOT_NODE_FIRST_VETO_LABELS) vale no GANCHO, não só na passada de WA ---
+# O worker do nó devolve a PRÓPRIA bead com `node:never` (open, sem dono; a marca pilot.wa_node_alias fica). Só a passada de WA lia o veto: nas pistas normais o gancho chamava o `apply` de novo (o apply só confere
+# status, dono e rota, e o classificador não lê node:never) e a bead voltava ao nó a cada varredura. O gancho lê os rótulos da bead que ele já relê: rótulo de veto → 1 (segue no mini), o script NEM roda e nada é gravado;
+# rótulos que não se leem → 1 também (na dúvida a bead fica onde estava); sem rótulo ou só com outros → o caminho de sempre. A bead que JÁ é do nó segue 2 (a leitura do dono vem antes). shadow não muda; off nem lê.
+for m in label auto; do
+  for lab in node:never needs:engine-window exec:manual; do
+    for lj in "[\"$lab\"]" "[\"story:approved\",\"$lab\",\"lane:small\"]"; do
+      beadl "$T/bead.veto.json" "$lj"; export FAKE_BEAD="$T/bead.veto.json"
+      for c in 0 12 13; do
+        r=$(decide $m $ID $ST wa-worker $c)
+        [ "$r" = "rc=1" ] && [ "$(ncalls)" = 0 ] && [ ! -e "$T/city/.gc/wa-node-route.jsonl" ] && ok "$m: rótulo de veto $lab em $lj, rc $c do script → 1 (fica no mini), o script nem roda e nada é gravado" || fail "$m veto $lab $lj rc=$c → $r calls=$(ncalls)"
+      done
+      grep -q "rótulo de veto $lab" "$T/err" && ok "$m: $lab em $lj: o log diz qual rótulo de veto segurou a bead" || fail "$m $lab $lj: log: $(cat "$T/err")"
+    done
+  done
+  beadl "$T/bead.veto.json" '["node:never"]'; export FAKE_BEAD="$T/bead.veto.json"
+  decide $m $ID $ST wa-worker 0 >/dev/null
+  grep -q "^-C $ST show $ID --json\$" "$T/bdcalls" && [ "$(wc -l < "$T/bdcalls" | tr -d ' ')" = 1 ] && ok "$m: a bead vetada é lida UMA vez (a releitura do dono é a mesma que traz os rótulos)" || fail "$m: leituras: $(cat "$T/bdcalls")"
+  # token inteiro (node:never-ever não é node:never), outros rótulos, lista vazia e chave ausente: não há veto, o caminho de sempre (o script roda e o rc dele manda)
+  for lj in '["node:never-ever"]' '["story:approved","node:ok"]' '[]' null OMIT; do
+    beadl "$T/bead.nolabel.json" "$lj"; export FAKE_BEAD="$T/bead.nolabel.json"
+    r=$(decide $m $ID $ST wa-worker 0); [ "$r" = "rc=0" ] && [ "$(ncalls)" = 1 ] && ok "$m: rótulos $lj (nenhum é veto) → o gancho segue: o script roda e rc 0 leva ao nó" || fail "$m rótulos $lj → $r calls=$(ncalls)"
+  done
+  # rótulos que NÃO se leem (não é lista de textos): não sei se há veto → 1, o script nem roda, o aviso diz por quê; nunca «sem veto»
+  for lj in '"node:never"' 7 '{"node:never":"x"}' '[3,4]' '["story:approved",null]'; do
+    beadl "$T/bead.badlabel.json" "$lj"; export FAKE_BEAD="$T/bead.badlabel.json"
+    r=$(decide $m $ID $ST wa-worker 0)
+    [ "$r" = "rc=1" ] && [ "$(ncalls)" = 0 ] && grep -q 'não consegui ler os rótulos' "$T/err" && ok "$m: labels $lj não é lista de textos → 1, o script nem roda e o aviso diz por quê" || fail "$m labels $lj → $r calls=$(ncalls) err=$(cat "$T/err")"
+  done
+  # a bead que JÁ é do nó e traz o veto: a leitura do dono vem primeiro (2, segura), o veto não a solta para o mini
+  beadl "$T/bead.vetonode.json" '["node:never"]' in_progress wa-worker-remote-1; export FAKE_BEAD="$T/bead.vetonode.json"
+  r=$(decide $m $ID $ST wa-worker 0); [ "$r" = "rc=2" ] && [ "$(ncalls)" = 0 ] && ok "$m: bead já do nó COM node:never → 2 (segura), como sem o rótulo" || fail "$m bead do nó + veto → $r calls=$(ncalls)"
+  # a lista é a do ambiente (uma só fonte): com outra lista node:never deixa de segurar e o rótulo novo segura
+  beadl "$T/bead.veto.json" '["node:never"]'; export FAKE_BEAD="$T/bead.veto.json"
+  r=$(PILOT_NODE_FIRST_VETO_LABELS="foo:bar" decide $m $ID $ST wa-worker 0); [ "$r" = "rc=0" ] && [ "$(ncalls)" = 1 ] && ok "$m: PILOT_NODE_FIRST_VETO_LABELS=foo:bar → node:never não é mais veto (o gancho lê a lista do ambiente)" || fail "$m lista do ambiente (node:never) → $r calls=$(ncalls)"
+  beadl "$T/bead.veto.json" '["foo:bar"]'
+  r=$(PILOT_NODE_FIRST_VETO_LABELS="foo:bar" decide $m $ID $ST wa-worker 0); [ "$r" = "rc=1" ] && [ "$(ncalls)" = 0 ] && ok "$m: PILOT_NODE_FIRST_VETO_LABELS=foo:bar → foo:bar segura a bead" || fail "$m lista do ambiente (foo:bar) → $r calls=$(ncalls)"
+  # DRY_RUN=1: o plano não promete o que a escrita não faria — nenhum `apply --dry-run`, rc 1
+  beadl "$T/bead.veto.json" '["node:never"]'
+  r=$(decide $m $ID $ST wa-worker 0 1); [ "$r" = "rc=1" ] && [ "$(ncalls)" = 0 ] && ! grep -q 'WOULD route' "$T/err" && ok "$m + DRY_RUN=1 com veto: rc 1, nem o apply --dry-run roda e o log não promete rota" || fail "$m dry + veto → $r calls=$(ncalls) err=$(cat "$T/err")"
+done
+# shadow só observa (o veto não muda o que ele grava); off nem lê a bead
+beadl "$T/bead.veto.json" '["node:never"]'; export FAKE_BEAD="$T/bead.veto.json"
+r=$(decide shadow $ID $ST wa-worker 0); [ "$r" = "rc=1" ] && [ "$(ncalls)" = 1 ] && calls | grep -q '^check ' && ok "shadow com veto: ainda só 'check' (a sombra registra o veredito do classificador, não o veto)" || fail "shadow + veto → $r / $(calls)"
+r=$(decide - $ID $ST wa-worker 0); [ "$r" = "rc=1" ] && [ "$(ncalls)" = 0 ] && [ ! -s "$T/bdcalls" ] && ok "off com veto: nada chamado e nenhuma leitura" || fail "off + veto → $r calls=$(ncalls)"
+export FAKE_BEAD="$T/bead.free.json"
+
 # --- dry-run: nunca escreve ---
 r=$(decide auto $ID $ST wa-worker 0 1)
 [ "$r" = "rc=1" ] && calls | grep -q "^apply $ID --store $ST --basis any --dry-run\$" && ok "DRY_RUN=1: 'apply … --dry-run' e rc 1 (nada vai ao nó)" || fail "dry-run: $r / $(calls)"
@@ -322,6 +378,12 @@ open(p, "w", encoding="utf-8").write(s)
   mutate pool-abre-sessao 's = s.replace("  if [ \"$_PWN_SPAWN\" = pilot ]; then\n    # o apply só escreveu", "  if true; then\n    # o apply só escreveu", 1)'
   mutate rc2-nao-solta    's = s.replace("elif [ \"$_RP_NODE_RC\" = 2 ]; then", "elif false; then", 1)'
   mutate chamada-antes-do-guarda 'a = s.index("        # ── ga-2hd02v.1.10: Hetzner node, DEFAULT OFF"); b = s.index("        : # pool: leave UNASSIGNED"); blk = s[a:b]; s = s[:a] + s[b:]; k = s.index("        if [ \"${PILOT_OWNERSHIP_GUARD:-1}\" = \"1\" ]; then", s.index("      wa-worker*|ps-worker*)")); s = s[:k] + blk + s[k:]'
+  # ga-31u0zl7 (gate-fix 1): o veto de rótulo no gancho — cada peça tem de ser necessária (as âncoras só existem dentro do gancho: o pré-filtro só-nó, acima no arquivo, tem outro jq de rótulos)
+  mutate veto-ignorado          's = s.replace("    if [ -n \"$_bv\" ]; then\n      log \"  ga-31u0zl7:", "    if false; then\n      log \"  ga-31u0zl7:", 1)'
+  mutate veto-ilegivel-vira-livre 's = s.replace("fica no mini, nada escrito\"; return 1 ;;\n    esac", "fica no mini, nada escrito\" ;;\n    esac", 1)'
+  mutate veto-lista-fixa        's = s.replace("_bv=$(_pilot_node_first_veto \"${_bl#L:}\")", "_bv=$(case \",${_bl#L:},\" in *,node:never,*) echo node:never ;; esac)", 1)'
+  mutate veto-sem-validar-itens 's = s.replace("\"L:\" + ((.labels // []) | if type == \"array\" and all(.[]; type == \"string\") then", "\"L:\" + ((.labels // []) | if type == \"array\" then", 1)'
+  mutate veto-separador         's = s.replace("\"L:\" + ((.labels // []) | if type == \"array\" and all(.[]; type == \"string\") then join(\",\")", "\"L:\" + ((.labels // []) | if type == \"array\" and all(.[]; type == \"string\") then join(\" \")", 1)'
   wait
   for n in $MUT_NAMES; do
     if [ "$(cat "$T/res.$n" 2>/dev/null)" = morto ]; then ok "mutante $n morto"; else fail "mutante $n SOBREVIVEU"; fi

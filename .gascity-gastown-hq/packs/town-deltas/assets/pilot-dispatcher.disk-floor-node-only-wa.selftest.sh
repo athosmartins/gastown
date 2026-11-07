@@ -9,7 +9,7 @@
 #   O que prova · Como roda · Controle negativo
 #
 # O QUE PROVA: (1) a decisão pré-claim (_pilot_node_only_candidate_pre + _pilot_node_only_wa_pre), EXECUTADA com um wa-node-dispatch.sh falso: só PILOT_WA_NODE_ROUTE=label|auto move bead (off, shadow, vazio,
-#   valor que não existe e DRY_RUN = NÃO); `label` exige node:ok no JSON antes de gastar a sonda; bead com dono ou rota, de outro prefixo, JSON ilegível, script ausente = NÃO, sem sonda; a sonda é SEMPRE
+#   valor que não existe e DRY_RUN = NÃO); `label` exige node:ok no JSON antes de gastar a sonda; bead com dono ou rota, de outro prefixo, JSON ilegível, script ausente, rótulo de veto (node:never, ga-31u0zl7) ou rótulos que não se leem = NÃO, sem sonda; a sonda é SEMPRE
 #   `apply --dry-run` (nunca escreve) e só o rc 0 vale (10, 11, 12, 13, 124, 137 = NÃO); a sonda tem teto por varredura; a bead de dog continua como era. (2) o braço do pool em dispatch_one (região
 #   verbatim): rc 0 do gancho troca o alvo para wa-worker-remote · rc 2 solta a claim e não despacha · rc 1 fora da passada só-nó segue ao pool (como sempre) · rc 1 NA passada só-nó solta a claim e sai com
 #   disk_floor_node_only, sem chegar ao carimbo wa-worker. (3) o bloco da passada só-nó em dispatch_one (região verbatim): alvo wa-worker + rig-native + rota ligada segue; ps-worker, crew, rota desligada ou
@@ -34,6 +34,8 @@ region() { RA="$1" RB="$2" awk 'f==0 && $0 ~ ENVIRON["RA"] {f=1} f==1 && n>0 && 
 FUNC_ON="$(fn_src _pilot_node_only_wa_route_on)"; FUNC_WA="$(fn_src _pilot_node_only_wa_pre)"; FUNC_NC="$(fn_src _pilot_node_only_candidate_pre)"
 FUNC_TMPL="$(fn_src wa_worker_template)"; FUNC_ISPOOL="$(fn_src _pilot_priority_target_is_pool)"
 PNW_INIT="$(grep -E '^_PNW_PROBES=' "$DISPATCHER")"
+# ga-31u0zl7 (gate-fix 1): _pilot_node_only_wa_pre lê o veto de rótulo: o helper e a linha de configuração REAIS (sem a lista o helper não vê veto nenhum, e as asserções do veto reprovariam)
+FUNC_VETO="$(fn_src _pilot_node_first_veto)"; VETO_LINE="$(grep -E '^PILOT_NODE_FIRST_VETO_LABELS="' "$DISPATCHER" | head -1)"
 # ga-2hd02v.3.26: o portão de retenção que a passada só-nó consulta antes de gastar a sonda (reserva do P0/P1 cujo gancho falhou, ou waiter da cessão). Opcionais de propósito: no dispatcher SEM a fatia vêm vazios e só
 # as asserções novas reprovam, uma a uma (o resto do arquivo segue valendo). A classe de prioridade é a DA CIDADE: a biblioteca de ordem real, não uma cópia.
 FUNC_P2H="$(fn_src _pilot_node_p2_hold_for)"; FUNC_RSVFOR="$(fn_src _pilot_node_reserved_for)"; FUNC_RSVON="$(fn_src _pilot_node_reserve_on)"; FUNC_CLS="$(fn_src _pilot_priority_class_of)"; FUNC_PHF="$(fn_src _pilot_wa_node_pass_hold_for)"
@@ -43,7 +45,7 @@ WO_LIB="${PILOT_WORK_ORDER_LIB:-$SELF_DIR/scripts/work-order.sh}"
 FUNC_PSON="$(fn_src _pilot_node_only_ps_route_on)"; FUNC_PS="$(fn_src _pilot_node_only_ps_pre)"; PNP_INIT="$(grep -E '^_PNP_PROBES=' "$DISPATCHER")"
 ARM_SRC="$(region '^        local _RP_NODE_RC=0$' '^        : # pool: leave UNASSIGNED')"
 BLOCK_SRC="$(region '^  local _PYS_TARGET _PYS_NATIVE=0$' '^  # ── wa-root-worktree-isolation')"
-{ [ -n "$FUNC_NC" ] && [ -n "$FUNC_TMPL" ] && [ -n "$FUNC_ISPOOL" ] && [ -n "$ARM_SRC" ] && [ -n "$BLOCK_SRC" ]; } \
+{ [ -n "$FUNC_NC" ] && [ -n "$FUNC_TMPL" ] && [ -n "$FUNC_ISPOOL" ] && [ -n "$ARM_SRC" ] && [ -n "$BLOCK_SRC" ] && [ -n "$FUNC_VETO" ] && [ -n "$VETO_LINE" ]; } \
   || { echo "FATAL: ga-2hd02v.1.20 não aplicada (função ou região do dispatcher não achada em $DISPATCHER)" >&2; exit 2; }
 
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/pilot-diskfloor-nodeonly-wa-selftest.XXXXXX")"
@@ -83,7 +85,7 @@ run_pre() {
     [ -z "${PR_ROUTE+x}" ] || PILOT_WA_NODE_ROUTE="$PR_ROUTE"
     [ -z "${PR_CAP+x}" ] || PILOT_WA_NODE_ONLY_PROBES="$PR_CAP"
     [ -z "${PR_SCRIPTS+x}" ] || PILOT_WA_NODE_SCRIPTS="$PR_SCRIPTS"
-    eval "$PNW_INIT"
+    eval "$PNW_INIT"; eval "$VETO_LINE"; eval "$FUNC_VETO"
     _pilot_priority_pool_bound_pre() { return 0; }
     _pilot_priority_node_exempt_pre() { return "${PR_DOG_EXEMPT:-1}"; }
     # a retenção: por padrão um falso que responde PR_HOLD (0 = retida, 1 = não retida); com PR_REAL=1 as funções REAIS (reserva em PR_RSV, sem waiter da cessão)
@@ -144,6 +146,35 @@ r=$(PR_ROUTE=auto run_pre 'c "'"$(q "$J_ROUTED")"'"; c "'"$(q "$J_OWNED")"'"; c 
 reset; wnd 0
 r=$(PR_ROUTE=auto PR_SCRIPTS="$WORK/nao-existe" run_pre 'c "'"$(q "$J_LABEL")"'"; echo'); r="${r% }"
 [ "$r" = 1 ] && ok "wa-node-dispatch.sh ausente: NÃO é candidata" || bad "script ausente virou candidata ($r)"
+echo "── (1) ga-31u0zl7 (gate-fix 1): o rótulo de veto tira a bead da passada ANTES da sonda e da claim"
+# O worker do nó devolve a PRÓPRIA bead com node:never (open, sem dono). Sem esta leitura ela passava por aqui a cada varredura: gastava uma das PILOT_WA_NODE_ONLY_PROBES (1 a ~26 s) e, se a sonda dissesse 0, a claim +
+# soltura (o disk floor existe para NÃO escrever), e as candidatas de verdade ficavam atrás dela. vazio (sem rótulos) → segue; rótulos que não se leem → NÃO candidata; token inteiro (node:never-ever não é veto).
+for lab in node:never needs:engine-window exec:manual; do
+  for m in label auto; do
+    reset; wnd 0
+    r=$(PR_ROUTE=$m run_pre 'c "{\"id\":\"wa-v1\",\"labels\":[\"story:approved\",\"'"$lab"'\",\"node:ok\"],\"metadata\":{}}"; echo'); r="${r% }"
+    [ "$r" = 1 ] && [ "$(calls)" = 0 ] && ok "$m: rótulo de veto $lab: NÃO é candidata e a sonda não é gasta (o script falso diria 0)" || bad "$m: $lab deixou a bead de WA passar (rc=$r, sondas=$(calls))"
+  done
+done
+reset; wnd 0
+r=$(PR_ROUTE=auto PR_CAP=1 run_pre 'c "{\"id\":\"wa-v2\",\"labels\":[\"node:never\"],\"metadata\":{}}"; c "'"$(q "$J_LABEL")"'"; echo'); r="${r% }"
+[ "$r" = "1 0" ] && [ "$(calls)" = 1 ] && ok "teto de 1 sonda: a vetada na frente NÃO toma a vez da candidata de verdade (1 0, UMA sonda)" || bad "a vetada gastou a sonda da candidata ($r, sondas=$(calls))"
+for lj in '["node:never-ever"]' '["story:approved"]' '[]' null; do
+  reset; wnd 0
+  r=$(PR_ROUTE=auto run_pre 'c "{\"id\":\"wa-v3\",\"labels\":'"${lj//\"/\\\"}"',\"metadata\":{}}"; echo'); r="${r% }"
+  [ "$r" = 0 ] && [ "$(calls)" = 1 ] && ok "rótulos $lj (nenhum é veto): candidata pela sonda como sempre" || bad "rótulos $lj: rc=$r, sondas=$(calls)"
+done
+reset; wnd 0
+r=$(PR_ROUTE=auto run_pre 'c "{\"id\":\"wa-v4\",\"metadata\":{}}"; echo'); r="${r% }"
+[ "$r" = 0 ] && [ "$(calls)" = 1 ] && ok "bead SEM a chave labels (o bd a omite): candidata pela sonda" || bad "sem labels: rc=$r, sondas=$(calls)"
+for lj in '"node:never"' 7 '{"node:never":"x"}' '[3,4]' '["story:approved",null]'; do
+  reset; wnd 0
+  r=$(PR_ROUTE=auto run_pre 'c "{\"id\":\"wa-v5\",\"labels\":'"${lj//\"/\\\"}"',\"metadata\":{}}"; echo'); r="${r% }"
+  [ "$r" = 1 ] && [ "$(calls)" = 0 ] && ok "labels $lj não é lista de textos: NÃO é candidata e não gasta a sonda (não sei se há veto)" || bad "labels $lj: rc=$r, sondas=$(calls)"
+done
+reset; wnd 0
+r=$(PILOT_NODE_FIRST_VETO_LABELS="foo:bar" PR_ROUTE=auto run_pre 'c "{\"id\":\"wa-v6\",\"labels\":[\"node:never\"],\"metadata\":{}}"; c "{\"id\":\"wa-v7\",\"labels\":[\"foo:bar\"],\"metadata\":{}}"; echo'); r="${r% }"
+[ "$r" = "0 1" ] && [ "$(calls)" = 1 ] && ok "a lista é a de PILOT_NODE_FIRST_VETO_LABELS: com foo:bar, node:never passa (sonda) e foo:bar não" || bad "lista do ambiente: $r, sondas=$(calls)"
 echo "── (1) o helper de WA recusa por conta própria o id que não é wa-* (defesa em profundidade: o candidate_pre só delega wa-*)"
 reset; wnd 0
 r=$(PR_ROUTE=auto run_pre 'cw() { local x=0; _pilot_node_only_wa_pre "$1" || x=$?; printf "%s " "$x"; }; cw "'"$(q "$J_PS")"'"; cw "'"$(q "$J_GA")"'"; cw "'"$(q "$J_LABEL")"'"; echo'); r="${r% }"
@@ -324,6 +355,12 @@ open(sys.argv[4],"w",encoding="utf-8").write(s.replace(sys.argv[2],sys.argv[3]))
   mutant "a retida ainda gasta sonda" $'    return 1\n  fi\n  case "$_cap" in' $'    :\n  fi\n  case "$_cap" in'
   mutant "a retida nao e contada" '    _PNH_HELD=$(( ${_PNH_HELD:-0} + 1 ))' '    :'
   mutant "o rc 1 na passada so-no nao solta a claim" $'          DISPATCH_RESULT="disk_floor_node_only"\n          return 1\n        fi\n        : # pool' $'          DISPATCH_RESULT="disk_floor_node_only"\n        fi\n        : # pool'
+  # ga-31u0zl7 (gate-fix 1): o veto de rótulo antes da sonda (as âncoras do jq de rótulos acabam em `|| return 1`, que só o pré-filtro tem; o do gancho acaba em `|| _bl=""`)
+  mutant "o veto de rotulo nao tira a bead" '  [ -z "$_lv" ] || return 1' '  :'
+  mutant "rotulos ilegiveis viram sem veto" $'else error("labels") end\' 2>/dev/null) || return 1' $'else error("labels") end\' 2>/dev/null) || _lb=""'
+  mutant "o veto nao le a lista do ambiente" '  _lv=$(_pilot_node_first_veto "$_lb")' '  _lv=$(case ",$_lb," in *,node:never,*) echo node:never ;; esac)'
+  mutant "item que nao e texto passa" $'all(.[]; type == "string") then join(",") else error("labels") end\' 2>/dev/null) || return 1' $'true then join(",") else error("labels") end\' 2>/dev/null) || return 1'
+  mutant "rotulos juntados sem virgula" $'then join(",") else error("labels") end\' 2>/dev/null) || return 1' $'then join(" ") else error("labels") end\' 2>/dev/null) || return 1'
 fi
 echo "── $PASS ok, $FAIL falhas"
 [ "$FAIL" = 0 ]

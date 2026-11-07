@@ -157,7 +157,7 @@ custo cache que nao e texto passa	if (.custo.cache | type) == "string" then	if t
 3.26: o portao so-no ignora a reserva	  if _pilot_node_reserved_for "$_ph_b"; then _PNH_WHY=reserved; return 0; fi	  :
 3.26: o portao so-no ignora o waiter da cessao	  if [ "$_ph_rc" = 0 ]; then _PNH_WHY=waiter; return 0; fi	  :
 3.26: o portao so-no segura tambem o hold expirado	  if [ "$_ph_rc" = 0 ]; then _PNH_WHY=waiter; return 0; fi	  if [ "$_ph_rc" != 1 ]; then _PNH_WHY=waiter; return 0; fi
-3.25: a passada nao zera o conjunto do no	  _PWP_NODE_BOUND=""\n  _PWP_U2N=off;	  _PWP_U2N=off;
+3.25: a passada nao zera o conjunto do no	  _PWP_NODE_BOUND=""\n  _pilot_wa_node_pass_mode	  _pilot_wa_node_pass_mode
 3.25: a retida pelo waiter nao entra no conjunto	_pw_held=$((_pw_held + 1)); case "$_pw_id" in *[!A-Za-z0-9._-]*) ;; *) _PWP_NODE_BOUND="$_PWP_NODE_BOUND $_pw_id" ;; esac; continue ;;	_pw_held=$((_pw_held + 1)); continue ;;
 3.25: o Dolt saturado nao deixa a node no conjunto	then case "$_pw_id" in *[!A-Za-z0-9._-]*) ;; *) _PWP_NODE_BOUND="$_PWP_NODE_BOUND $_pw_id" ;; esac; _pw_stop="dolt-saturated"; break; fi	then _pw_stop="dolt-saturated"; break; fi
 3.25: o apply fora da tabela nao deixa a bead no conjunto	case "$_pw_id" in *[!A-Za-z0-9._-]*) ;; *) _PWP_NODE_BOUND="$_PWP_NODE_BOUND $_pw_id" ;; esac; _pw_stop="hook-held"; break ;;	_pw_stop="hook-held"; break ;;
@@ -187,9 +187,8 @@ u2n: export com outro valor	export WA_NODE_ACCEPT_UNKNOWN=sem-prova; fi	export W
 u2n: o ambiente nao e limpo	unset WA_NODE_ACCEPT_UNKNOWN	:
 u2n: a sombra memoriza 1 h (unknown)	: u2n-shadow-memo\n        _pilot_wa_node_pass_released_memo "$_pw_pick" "$_pw_id" "$_pw_upd"	: u2n-shadow-memo\n        _pilot_wa_node_pass_memo_put "$_pw_id" "$_pw_upd" unknown
 u2n: a sombra memoriza a P0/P1	: u2n-shadow-memo\n        _pilot_wa_node_pass_released_memo "$_pw_pick" "$_pw_id" "$_pw_upd"	: u2n-shadow-memo\n        _pilot_wa_node_pass_memo_put "$_pw_id" "$_pw_upd" released
-u2n: marcador sem sonda	if [ "$_PWP_U2N_AUTO" = 1 ] && [ "$_pw_probed" -ge 1 ] && [ "$_pw_stop" != check-missing ]; then	if [ "$_PWP_U2N_AUTO" = 1 ] && [ "$_pw_stop" != check-missing ]; then
-u2n: marcador com o script do check ausente	if [ "$_PWP_U2N_AUTO" = 1 ] && [ "$_pw_probed" -ge 1 ] && [ "$_pw_stop" != check-missing ]; then	if [ "$_PWP_U2N_AUTO" = 1 ] && [ "$_pw_probed" -ge 1 ]; then
-u2n: marcador escrito fora do auto	if [ "$_PWP_U2N_AUTO" = 1 ] && [ "$_pw_probed" -ge 1 ]	if true && [ "$_pw_probed" -ge 1 ]
+u2n: marcador sem sonda	if [ "$_PWP_U2N_AUTO" = 1 ] && [ "$_pw_ans" -ge 1 ]; then	if [ "$_PWP_U2N_AUTO" = 1 ]; then
+u2n: marcador escrito fora do auto	if [ "$_PWP_U2N_AUTO" = 1 ] && [ "$_pw_ans" -ge 1 ]	if true && [ "$_pw_ans" -ge 1 ]
 u2n: auto liga sem marcador	if [ -f "$_um_f" ] && [ -r "$_um_f" ]; then _PWP_U2N=on;	if true; then _PWP_U2N=on;
 u2n: valor ilegivel liga	*) _PWP_U2N=off ;;	*) _PWP_U2N=on ;;
 u2n: rota que nao e auto liga	[ "${PILOT_WA_NODE_ROUTE:-}" = auto ] || return 0	:
@@ -206,3 +205,12 @@ u2n: sinais repetidos	map(tostring | split(":")[0] | .[:40]) | unique | .[:12]	m
 u2n: sinais ausente vira lista vazia	| unique | .[:12]) else null end), custo:	| unique | .[:12]) else []  end), custo:
 u2n: a sonda nao guarda os sinais	leitura:$d.leitura,sinais:$d.sinais,custo:$d.custo}	leitura:$d.leitura,custo:$d.custo}
 u2n: a sombra nao guarda os sinais	u2n_mode:$m,sinais:$d.sinais,prio:	u2n_mode:$m,prio:
+u2n: o marcador conta sonda sem resposta	if [ "$_PWP_U2N_AUTO" = 1 ] && [ "$_pw_ans" -ge 1 ]; then	if [ "$_PWP_U2N_AUTO" = 1 ] && [ "$_pw_probed" -ge 1 ]; then
+u2n: o timeout conta como resposta	case "$_PWP_V" in node|mini|unknown) _pw_ans=	case "$_PWP_V" in node|mini|unknown|timeout) _pw_ans=
+u2n: o erro conta como resposta	case "$_PWP_V" in node|mini|unknown) _pw_ans=	case "$_PWP_V" in node|mini|unknown|error) _pw_ans=
+u2n: so o unknown conta como resposta	case "$_PWP_V" in node|mini|unknown) _pw_ans=	case "$_PWP_V" in unknown) _pw_ans=
+u2n: o node nao conta como resposta	case "$_PWP_V" in node|mini|unknown) _pw_ans=	case "$_PWP_V" in mini|unknown) _pw_ans=
+u2n: o mini nao conta como resposta	case "$_PWP_V" in node|mini|unknown) _pw_ans=	case "$_PWP_V" in node|unknown) _pw_ans=
+u2n: a resposta nunca e contada	_pw_ans=$((_pw_ans + 1)) ;; esac	: ;; esac
+gancho: o veto de rotulo nao vale	    if [ -n "$_bv" ]; then\n      log "  ga-31u0zl7:	    if false; then\n      log "  ga-31u0zl7:
+gancho: rotulos ilegiveis viram sem veto	fica no mini, nada escrito"; return 1 ;;\n    esac	fica no mini, nada escrito" ;;\n    esac
