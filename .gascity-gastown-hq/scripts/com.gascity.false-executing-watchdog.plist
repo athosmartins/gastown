@@ -1,0 +1,47 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.gascity.false-executing-watchdog</string>
+
+  <!-- False-Executing Watchdog (2026-11-07, ga-9exarbg): a bead in_progress that nobody is executing is not "Em
+       execucao" (an idle crew holding beads, a bead waiting for the Athos still owned by a worker, a delivered
+       story:done). Per sweep, in every store: nudges each crew idle for 2h that holds beads untouched for 6h (at most
+       once per 6h) and sends the Mayor ONE aggregated mail (new findings, or a reminder every 24h). DETECTION ONLY:
+       no bead is changed; returning beads to the pool waits for a week of alerts the Mayor has checked.
+       KILL-SWITCH FALSE_EXEC_ENABLED=0. DRY-RUN FALSE_EXEC_DRY_RUN=1 is shipped ON (sends nothing, writes no state):
+       set it to 0 only after reading one dry-run log. StartInterval 899, off the 297/300/318 s tiers. Single instance.
+       NOT LOADED BY MERGING THIS FILE: load it (launchctl bootstrap) and register it in daemon-presence-watchdog.sh in
+       the same change; see docs/runbooks/false-executing-watchdog.md. -->
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>/usr/bin/python3</string>
+    <string>/Users/athos/gt/.gascity-gastown-hq/scripts/false-executing-watchdog.py</string>
+  </array>
+
+  <key>WorkingDirectory</key>
+  <string>/Users/athos/gt/.gascity-gastown-hq</string>
+
+  <key>StartInterval</key><integer>899</integer>
+
+  <key>StandardOutPath</key>
+  <string>/Users/athos/gt/.gascity-gastown-hq/.gc/logs/false-executing-watchdog.out</string>
+  <key>StandardErrorPath</key>
+  <string>/Users/athos/gt/.gascity-gastown-hq/.gc/logs/false-executing-watchdog.err</string>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:/Users/athos/go/bin:/Users/athos/.local/bin</string>
+    <key>HOME</key>
+    <string>/Users/athos</string>
+    <key>GC_CITY_PATH</key>
+    <string>/Users/athos/gt/.gascity-gastown-hq</string>
+    <key>FALSE_EXEC_ENABLED</key>
+    <string>1</string>
+    <key>FALSE_EXEC_DRY_RUN</key>
+    <string>1</string>
+  </dict>
+</dict>
+</plist>
