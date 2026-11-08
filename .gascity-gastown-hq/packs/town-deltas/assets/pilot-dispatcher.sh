@@ -17573,7 +17573,7 @@ _pilot_sweep_emit() {
 # ── ga-59z7oek: a bead que JÁ é do nó não é claimada — pulada antes da claim, sem escrever nada ──────────────────────────────────────────────────────────────────────────────────
 # Medido 07/11 (wa-7tufg6, P1, dono wa-worker-remote-2, sessão fechada às 22:09Z): o filtro de candidatas (ga-46wq5) readmite a bead cujo dono não está vivo, e o alias de um nó morto é exatamente isso; o dispatch_one a claimava
 # (bd update pilot.dispatching_at: move o updated_at), o gate-f (ga-jzye0) deixava passar ("dono inativo") e SÓ o gancho do nó, depois de tudo isso, relia a bead, via que já era do nó, devolvia 2 e a claim era solta com OUTRO
-# bd update. Duas escritas a cada ~21 min: o updated_at nunca envelhecia e o node-ghost-release (que exige ~30 min sem toque) nunca a soltava. Quem devolve ao Pilot a bead de um alias morto do nó é a sessão do nó ou esse job,
+# bd update. Quatro escritas (dois bd update, que movem o updated_at, e dois de rótulo) a cada ~20-30 min: o updated_at nunca envelhecia e o node-ghost-release (que exige ~30 min sem toque) nunca a soltava. Quem devolve ao Pilot a bead de um alias morto do nó é a sessão do nó ou esse job,
 # nunca esta passada: aqui ela só deixa de tocar.
 # _pilot_node_owned_pre <bead-json> — exit 0 iff a candidata JÁ É do nó E o gancho da família dela a seguraria (rc 2) depois da claim (alvo pool): id wa-* com PILOT_WA_NODE_ROUTE=label|auto e dono ou rota wa-worker-remote* (o prefixo cobre
 # o alias do MBP); id ps-* com PILOT_PS_NODE_ROUTE=label|auto e dono ou rota ps-worker-remote*. É a MESMA pergunta de _pilot_wa_node_decide / _pilot_ps_node_decide feita sobre o JSON da candidata: nenhuma leitura de bd,
@@ -17659,7 +17659,7 @@ dispatch_lane() {
     fi
 
     # ── ga-59z7oek: a bead que JÁ é do nó (dono ou rota wa-/ps-worker-remote*) NÃO é claimada: pulada ANTES da claim, sem escrever nada ──
-    # Sem este pulo a claim (bd update → updated_at) e a soltura que o gancho do nó faz depois de reler a bead eram duas escritas por varredura, e o updated_at nunca envelhecia para o node-ghost-release (ver _pilot_node_owned_pre).
+    # Sem este pulo a claim (bd update → updated_at) e a soltura que o gancho do nó faz depois de reler a bead eram quatro escritas por varredura (dois bd update), e o updated_at nunca envelhecia para o node-ghost-release (ver _pilot_node_owned_pre).
     # Mesma forma dos pulos pré-claim daqui e de baixo: zero escrita, só a nota em memória. Não é falha nem espera de capacidade: classe benigna no pilot_sweep (refused_by_guard), fora de NONQUEUE_FAILS e de PRIORITY_YIELDED.
     # vazio (rc 1: nada do nó) → segue ao dispatch_one como sempre; falhou/ilegível (rc 2, com o aviso que o helper escreveu) → segue também: o gancho do nó dentro do dispatch_one rele a bead depois da claim e a segura
     if _pilot_node_owned_pre "$pick"; then

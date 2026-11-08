@@ -2,11 +2,11 @@
 # pilot-dispatcher.node-owned-skip.selftest.sh — ga-59z7oek
 #
 # Achado (07/11, gastown.dog-4, ao ligar o node-ghost-release): a bead cujo dono e um alias do no com a sessao morta
-# (wa-7tufg6, P1, dono wa-worker-remote-2, sessao fechada as 22:09Z) levava uma claim do Pilot a cada ~21 min e o job
+# (wa-7tufg6, P1, dono wa-worker-remote-2, sessao fechada as 22:09Z) levava uma claim do Pilot a cada ~20-30 min e o job
 # nunca a devolvia. O filtro de candidatas (ga-46wq5) readmite bead de dono inativo, o dispatch_one a claima (bd update
 # pilot.dispatching_at: move o updated_at), o gate-f (ga-jzye0) deixa passar ("dono inativo") e SO O GANCHO DO NO,
-# depois de tudo isso, rele a bead, ve que ja e do no e devolve 2; a claim e solta com OUTRO bd update. Duas escritas por
-# varredura: o updated_at nunca envelhece e o node-ghost-release (que exige ~30 min sem toque) fica cego.
+# depois de tudo isso, rele a bead, ve que ja e do no e devolve 2; a claim e solta com OUTRO bd update. Quatro escritas por
+# varredura (dois bd update + dois de rotulo): o updated_at nunca envelhece e o node-ghost-release (que exige ~30 min sem toque) fica cego.
 #
 # Correcao sob teste (pilot-dispatcher.sh): dispatch_lane pula ANTES da claim, sem escrever nada, a candidata que JA e do
 # no (dono ou rota wa-/ps-worker-remote*) quando o gancho da familia dela esta ligado (label|auto): _pilot_node_owned_pre.
@@ -237,7 +237,7 @@ FREE="$(bead wa-free)"
 
 echo "B1: WA auto — [bead do no, bead livre], 1 vaga: so a livre chega ao dispatch_one, a do no nao consome a vaga"
 run_lane auto - 0 "$(pool_of "$GHOST" "$FREE")" 1
-[ "$(attempted)" = "wa-free" ] && ok "B1: dispatch_one alcancado SO para wa-free" || bad "B1: dispatch_one alcancado para '$(attempted)' — a bead do no foi claimada (claim + soltura = duas escritas por varredura)"
+[ "$(attempted)" = "wa-free" ] && ok "B1: dispatch_one alcancado SO para wa-free" || bad "B1: dispatch_one alcancado para '$(attempted)' — a bead do no foi claimada (claim + soltura = quatro escritas por varredura, dois bd update)"
 [ "$(writes)" = "0" ] && ok "B1: zero escritas (nenhuma claim, nenhuma soltura)" || bad "B1: $(writes) escrita(s) de claim/soltura na bead do no"
 [ "$(town_calls)" = "0" ] && ok "B1: o laco nao chamou bd nem gc" || bad "B1: o laco chamou bd/gc $(town_calls) vez(es)"
 [ "$(state_get OUTCOMES)" = "wa-ghost,1,node_owned_skip;wa-free,0,rig_native_ok;" ] && ok "B1: a pulada e a despachada estao na conta da varredura (node_owned_skip / rig_native_ok)" || bad "B1: outcomes='$(state_get OUTCOMES)'"
