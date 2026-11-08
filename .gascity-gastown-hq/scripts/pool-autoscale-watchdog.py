@@ -16,8 +16,6 @@ Poll loop (~60s). Silence = healthy (only emits on actions).
                                      probe says the queue is empty (probe wins)
   [POOL-AUTOSCALE] [PROBE-UNAVAILABLE] the pool's own probe could not be asked, so the
                                      count stands uncross-checked
-  [POOL-AUTOSCALE] [PROBE-WINDOW-FULL] the probe's 20-bead window holds nothing claimable;
-                                     work behind it is invisible to it (and to this count)
   [POOL-AUTOSCALE] [CAP-FALLBACK]    `gc config show` gave no max_active_sessions for a pool;
                                      the last good number (else a hardcoded one) stands in
   [POOL-AUTOSCALE] [CAP-RECOVERED]   `gc config show` answers again after a CAP-FALLBACK
@@ -91,9 +89,15 @@ ASLEEP_STATES = {"asleep", "idle"}
 #     (`gc hook`) before it can wake anyone, and logs [PROBE-DISAGREE] when the
 #     probe says the queue is empty, or [PROBE-UNAVAILABLE] when it cannot be
 #     asked (the count then stands, uncross-checked).
+# What is NOT mirrored: after its jq label filter the probe asks `bd list` about
+# OTHER beads (is the bead's pilot.sling_bead already in progress? does its
+# molecule_id have a live step?) and drops the bead if so. One bead's fields cannot
+# answer that, so a bead the probe drops there is still counted here; when it is the
+# only one, the `gc hook` cross-check above reads an empty queue and no dog is woken.
+# The tests pin the metadata keys those stages read, so a new lookup stage fails them.
 
-# Exact labels the probe excludes. Passed to `bd ready` as --exclude-label, which
-# bd applies BEFORE --limit, so held beads do not use up the candidate window.
+# Exact labels the probe excludes. Passed to `bd ready` as --exclude-label, so bd
+# drops these server-side; probe_would_serve() applies them again in case it stops.
 PROBE_EXCLUDE_LABELS = (
     "story:needs-human", "needs-human", "ctx:thin", "story:needs-approval",
     "story:epic", "needs:engine-window", "pilot:no-auto-dispatch",
@@ -117,6 +121,17 @@ PROBE_EXCLUDE_LABEL_PREFIXES = (
 PROBE_HELD_LABEL = "pilot:held"
 PROBE_HELD_UNTIL_PREFIX = "pilot:held-until:"
 
+# Whole labels the probe's jq stage vetoes outright, on top of bd's --exclude-label.
+# This is vocabulary for the parity test, not a second check: probe_would_serve() already
+# vetoes each of them through PROBE_EXCLUDE_LABELS, and the test fails if one is not there.
+PROBE_JQ_BARE_VETO_LABELS = ("pilot:no-auto-dispatch",)
+
+# next-action:<who> parks a bead on somebody (ga-473mkh). The probe vetoes the whole
+# family EXCEPT a label that ENDS in one of the routing suffixes -- "a builder takes
+# this" -- i.e. jq: test("^next-action:") and (test("(constroi|corrige-gate|corrige)$") | not).
+PROBE_NEXT_ACTION_PREFIX = "next-action:"
+PROBE_NEXT_ACTION_PASS_SUFFIXES = ("constroi", "corrige-gate", "corrige")
+
 # Epic beads are containers, not buildable work.
 PROBE_EPIC_TITLE_RE = re.compile(r"^(EPIC|ÉPICO)[:\s]", re.IGNORECASE)
 
@@ -127,8 +142,10 @@ PROBE_EPIC_TITLE_RE = re.compile(r"^(EPIC|ÉPICO)[:\s]", re.IGNORECASE)
 PROBE_DECISION_TYPE = "decision"
 _ASCII_LOWER = {c: c + 32 for c in range(ord("A"), ord("Z") + 1)}
 
-# The probe asks bd for the 20 oldest candidates; the watchdog looks at the same window.
-PROBE_CANDIDATE_LIMIT = 20
+# What the probe passes to bd as --limit when it fetches the routed-pool candidates:
+# 0 = no limit (ga-9t9acg.7: bd filters, the work-order lib orders, only then does the
+# probe take the head). There is no candidate window; the watchdog asks for the same.
+PROBE_CANDIDATE_LIMIT = 0
 
 # In the watchdog but NOT in the probe (ga-ms1jm / ga-lx7om): a source bead that
 # is already slung or being built is not unmet demand. Counting it would spawn a
@@ -379,9 +396,10 @@ def probe_would_serve(bead, now_ts):
 
     Applies every exclusion in full: exact labels (which `bd ready` also drops
     server-side, so a bd that stops honouring the flag cannot bring the bug
-    back), the jq-stage prefixes, epic titles and Pilot holds, plus
-    WATCHDOG_EXCLUDE_LABELS, and the decision type (ga-rahls6k): the probe drops
-    it after bd answers, so bd's own flags cannot be what keeps it out of the count.
+    back), the jq-stage prefixes, the next-action:* family, epic titles and
+    Pilot holds, plus WATCHDOG_EXCLUDE_LABELS, and the decision type (ga-rahls6k):
+    the probe drops it after bd answers, so bd's own flags cannot be what keeps it
+    out of the count.
 
     A missing or null `labels` key means no labels: bd omits the key for a bead
     nobody has labelled, and the probe's jq reads it the same way. Unreadable
@@ -396,6 +414,9 @@ def probe_would_serve(bead, now_ts):
         return False
     if any(l in PROBE_EXCLUDE_LABELS or l in WATCHDOG_EXCLUDE_LABELS
            or l.startswith(PROBE_EXCLUDE_LABEL_PREFIXES) for l in labels):
+        return False
+    if any(l.startswith(PROBE_NEXT_ACTION_PREFIX)
+           and not l.endswith(PROBE_NEXT_ACTION_PASS_SUFFIXES) for l in labels):
         return False
     title = bead.get("title")
     if isinstance(title, str) and PROBE_EPIC_TITLE_RE.match(title):
@@ -414,7 +435,7 @@ def probe_would_serve(bead, now_ts):
 
 def _ready_candidates(pool_template):
     """Ready, unassigned beads routed to the pool: the probe's own bd query
-    (same exclusions, ordering and 20-bead window) plus WATCHDOG_EXCLUDE_LABELS.
+    (same exclusions, ordering and no limit) plus WATCHDOG_EXCLUDE_LABELS.
     The decision type is NOT a bd flag in the probe (it is dropped after bd answers, ga-rahls6k), so it is
     probe_would_serve() that keeps decisions out of the count, not this query.
 
@@ -426,7 +447,7 @@ def _ready_candidates(pool_template):
             "--unassigned", "--exclude-type=epic"]
     for label in PROBE_EXCLUDE_LABELS + WATCHDOG_EXCLUDE_LABELS:
         argv += ["--exclude-label", label]
-    argv += ["--json", "--sort", "oldest", f"--limit={PROBE_CANDIDATE_LIMIT}"]
+    argv += ["--json", "--sort", "oldest", "--limit", str(PROBE_CANDIDATE_LIMIT)]
     try:
         result = subprocess.run(argv, capture_output=True, text=True, timeout=20)
         if result.returncode != 0 or not result.stdout.strip():
@@ -492,17 +513,14 @@ def get_pool_demand(pool_template):
     Demand is what the pool worker's own probe would hand out, not every ready
     bead routed to the pool (ga-uv4on5): held, vetoed, parked, epic, decision
     and in-flight beads are not demand, because a dog woken for them finds an empty
-    queue and exits. The count is bounded by the probe's candidate window and
-    is a presence signal -- scale_decision() only asks whether it is > 0.
+    queue and exits. The count is a presence signal -- scale_decision() only
+    asks whether it is > 0.
 
     A non-empty count is put to the pool's own probe before it can wake anyone:
     if the probe says the queue is empty, the probe wins. Where the watchdog
     cannot know it says so instead of guessing quietly, once per episode:
       PROBE-UNAVAILABLE  the probe could not be asked; the count stands
       PROBE-DISAGREE     the probe overruled the count
-      PROBE-WINDOW-FULL  the probe's window holds nothing claimable, so work
-                         behind it is invisible to every dog; still 0, because
-                         no dog can claim what its probe cannot see
     """
     candidates = _ready_candidates(pool_template)
     if candidates is None:
@@ -513,13 +531,6 @@ def get_pool_demand(pool_template):
     claimable = [b for b in candidates if probe_would_serve(b, now_ts)]
 
     # `condition and "message"`: a falsy value means the condition does not hold.
-    _report_once("window-full", pool_template,
-                 not claimable and len(candidates) >= PROBE_CANDIDATE_LIMIT and
-                 f"[POOL-AUTOSCALE] [PROBE-WINDOW-FULL] pool={pool_template} the "
-                 f"probe's {PROBE_CANDIDATE_LIMIT}-bead candidate window holds "
-                 f"nothing claimable; work behind it is invisible to the pool's own "
-                 f"probe, so no dog is woken for it")
-
     verdict, why = _pool_probe_verdict(pool_template) if claimable else ("none", "")
     _report_once("probe-unavailable", pool_template,
                  verdict == "unknown" and

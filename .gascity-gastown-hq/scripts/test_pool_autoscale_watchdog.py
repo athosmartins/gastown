@@ -239,6 +239,8 @@ HELD_LABELS = [
     "blocked-reason:decision", "gate:needs-human:technical",
     "pilot:refused-reason:needs-mayor-decision",
     "pilot:text-veto:diagnostic-only-text-pattern",
+    # next-action:<who> parks a bead on somebody; only a builder's own routing suffix lets it through (ga-473mkh)
+    "next-action:mayor", "next-action:athos", "next-action:peter-wa", "next-action:corrige-gate-later",
     # a Pilot hold, bare and with a time box that is still running
     "pilot:held", "pilot:held-until:%d" % FUTURE,
     # already being worked elsewhere: the probe does NOT exclude these, the
@@ -270,6 +272,26 @@ def test_bead_without_hold_labels_is_demand(wd, fake):
     """Break caught: over-filtering that reports 0 while real work waits."""
     fake.beads = [bead("ga-open", labels=["area:infra", "framework", "ctx:ready"])]
     assert wd.get_pool_demand(POOL) == 1
+
+
+@pytest.mark.parametrize("label", ["next-action:batista-constroi", "next-action:peter-corrige-gate",
+                                   "next-action:mila-corrige", "next-action:constroi"])
+def test_next_action_that_routes_to_a_builder_is_still_demand(wd, fake, label):
+    """Break caught: vetoing every next-action:* label. The probe lets through the
+    ones whose suffix says "a builder takes this" (constroi | corrige-gate | corrige)
+    -- vetoing them here would leave real work without a dog."""
+    fake.beads = [bead("ga-routed", labels=["area:infra", label])]
+    assert wd.get_pool_demand(POOL) == 1
+
+
+def test_next_action_suffix_rule_is_anchored_at_the_end_and_scoped_to_its_family(wd):
+    """Break caught: the suffix rule applied to labels outside the next-action: family,
+    or matched in the middle of the label. The probe's rule is two conditions joined by
+    `and`: starts with next-action: AND does not END in a routing suffix."""
+    served = lambda *labels: wd.probe_would_serve(bead("ga-x", labels=labels), NOW)
+    assert served("area:corrige") is True              # not a next-action: label at all
+    assert served("next-action:corrige-first") is False  # the suffix is not at the END
+    assert served("next-action:") is False             # prefix alone, no routing suffix
 
 
 def test_only_claimable_beads_are_counted(wd, fake):
@@ -384,32 +406,36 @@ def test_hold_labelled_beads_do_not_crowd_claimable_work_out_of_the_window(wd, f
     assert wd.get_pool_demand(POOL) == 1
 
 
-def _twenty_refused_then_one_claimable():
-    """20 beads that only the probe's jq stage drops (pool:refused:* is a prefix
-    rule, so bd does not exclude them), all older than one claimable bead."""
-    refused = [bead("ga-r%02d" % i, labels=["pool:refused:engine-rebuild-required"],
-                    created_at="2026-09-01T00:%02d:00Z" % i) for i in range(20)]
-    return refused + [bead("ga-hidden", created_at="2026-09-20T00:00:00Z")]
+WALL_LABELS = ["pool:refused:engine-rebuild-required", "next-action:mayor", "blocked:waiting-on-ga-1"]
 
 
-def test_full_candidate_window_with_nothing_claimable_is_reported_once(wd, fake, capsys):
-    """Break caught: the probe only looks at its 20 oldest candidates, so 20
-    jq-held beads hide any later work from every dog. "Nothing visible" must not
-    pass silently for "nothing there": still 0 (no dog can claim it), but said."""
-    fake.beads = _twenty_refused_then_one_claimable()
-    assert wd.get_pool_demand(POOL) == 0
-    assert wd.get_pool_demand(POOL) == 0
-    assert capsys.readouterr().out.count("PROBE-WINDOW-FULL") == 1
+def _wall_of_vetoed_then_one_claimable(label, wall=25):
+    """`wall` beads that only the probe's jq stage drops (prefix rules, so bd does not
+    exclude them server-side), all older than one claimable bead."""
+    vetoed = [bead("ga-r%02d" % i, labels=[label], created_at="2026-09-01T00:%02d:00Z" % i)
+              for i in range(wall)]
+    return vetoed + [bead("ga-hidden", created_at="2026-09-20T00:00:00Z")]
 
 
-def test_window_that_is_not_full_or_holds_claimable_work_is_not_reported(wd, fake, capsys):
-    fake.beads = _twenty_refused_then_one_claimable()[1:]         # 19 refused + 1 claimable: room left
+@pytest.mark.parametrize("label", WALL_LABELS)
+def test_work_behind_a_wall_of_jq_vetoed_beads_is_still_demand(wd, fake, label):
+    """Break caught: a candidate window. The engine's pool probe asks bd for
+    --limit 0 (ga-9t9acg.7: filter, then order, then take), so 25 vetoed beads in
+    front of a claimable one do not hide it from any dog. Asking bd for only the 20
+    oldest reads that queue as empty and starves the pool -- and, since next-action:*
+    became a jq veto, the wall is the beads parked on the Mayor."""
+    fake.beads = _wall_of_vetoed_then_one_claimable(label)
+    assert wd.get_pool_demand(POOL) == 1
+
+
+def test_the_watchdog_asks_bd_for_the_whole_queue_like_the_probe(wd, fake):
+    """Break caught: the watchdog's bd call drifting back to a window the probe no
+    longer has. Compared as an argv, so it cannot pass by accident of the fake's data."""
+    fake.beads = [bead("ga-ok")]
     wd.get_pool_demand(POOL)
-    fake.beads = _twenty_refused_then_one_claimable()[:19]        # 19 refused, nothing else: room left
-    wd.get_pool_demand(POOL)
-    fake.beads = _twenty_refused_then_one_claimable()[:19] + [bead("ga-ok", created_at="2026-09-02T00:00:00Z")]
-    wd.get_pool_demand(POOL)                                      # 20 candidates, one claimable
-    assert "PROBE-WINDOW-FULL" not in capsys.readouterr().out
+    (argv,) = [c for c in fake.calls if c[:2] == ["bd", "ready"]]
+    assert "--limit" in argv and argv[argv.index("--limit") + 1] == "0"
+    assert not [a for a in argv if a.startswith("--limit=")]
 
 
 # ---------------------------------------------------------------------------
@@ -1265,19 +1291,67 @@ def engine_probe():
     return _rendered_probe()
 
 
+def _tier1(probe):
+    """The routed-pool tier of the rendered probe: everything before the legacy tiers,
+    which run a jq filter of their own on beads nobody routed and have no `bd list` lookup."""
+    head, sep, _ = probe.partition("legacy_candidates=")
+    assert sep, "the engine's pool probe has no legacy tier any more: re-derive the tier split"
+    return head
+
+
+# What tier 1 does AFTER the jq label filter: it asks `bd list` about other beads (is the
+# sling bead already in progress? does the molecule have a live step?). A pure predicate on
+# one bead cannot mirror that, so the watchdog does not: the `gc hook` cross-check in
+# get_pool_demand() is the backstop (a bead counted here but dropped there reads as
+# PROBE-DISAGREE and wakes nobody). The metadata keys those stages read are pinned below,
+# so a third lookup stage added by the engine fails this file instead of drifting in silence.
+UNMIRRORED_LOOKUP_METADATA_KEYS = {"pilot.sling_bead", "molecule_id"}
+
+
 def test_vocabulary_matches_the_engine_probe(wd, engine_probe):
     """Break caught: an engine window that adds or drops a probe exclusion while
     the watchdog keeps counting (or ignoring) it -- the drift behind ga-uv4on5."""
     probe = engine_probe
     exact = set(re.findall(r'--exclude-label "([^"]+)"', probe))
     prefixes = set(re.findall(r'startswith\("([^"]+)"\)', probe))
-    bare_holds = set(re.findall(r'\. == "([^"]+)"', probe))
+    bare_labels = set(re.findall(r'\. == "([^"]+)"', probe))
     epic = {p.replace("\\\\", "\\") for p in re.findall(r'test\("([^"]+)"; *"i"\)', probe)}
-    assert exact and prefixes and bare_holds and epic, "extraction found nothing to compare"
+    assert exact and prefixes and bare_labels and epic, "extraction found nothing to compare"
     assert exact == set(wd.PROBE_EXCLUDE_LABELS)
     assert prefixes == set(wd.PROBE_EXCLUDE_LABEL_PREFIXES) | {wd.PROBE_HELD_UNTIL_PREFIX}
-    assert bare_holds == {wd.PROBE_HELD_LABEL}
+    # Whole labels the jq stage matches with `. == "..."`: the Pilot hold, plus the labels it
+    # vetoes outright. Each of those is also a bd --exclude-label, hence the subset check below:
+    # probe_would_serve() vetoes them through PROBE_EXCLUDE_LABELS, not through a list of their own.
+    assert bare_labels == {wd.PROBE_HELD_LABEL} | set(wd.PROBE_JQ_BARE_VETO_LABELS)
+    assert set(wd.PROBE_JQ_BARE_VETO_LABELS) <= set(wd.PROBE_EXCLUDE_LABELS)
     assert epic == {wd.PROBE_EPIC_TITLE_RE.pattern}
+
+
+def test_next_action_rule_matches_the_engine_probe(wd, engine_probe):
+    """Break caught: the engine changes which next-action:* labels it lets through (the
+    family it vetoes, or the routing suffixes that escape the veto) while the watchdog
+    keeps counting the old set -- the drift behind ga-2ti65ab's `next-action:mayor`."""
+    probe = engine_probe
+    families = set(re.findall(r'test\("\^([a-z-]+:)"\)', probe))
+    suffixes = set(re.findall(r'test\("\(([^")]+)\)\$"\)', probe))
+    assert families == {wd.PROBE_NEXT_ACTION_PREFIX}
+    assert len(suffixes) == 1, "the probe's next-action escape changed shape: re-derive it"
+    assert set(suffixes.pop().split("|")) == set(wd.PROBE_NEXT_ACTION_PASS_SUFFIXES)
+
+
+def test_candidate_fetch_matches_the_engine_probe(wd, engine_probe):
+    """Break caught: the engine's routed-pool tier going back to a candidate window (or
+    the watchdog adopting one): the number bd is asked for is part of what each side sees."""
+    m = re.search(r"--sort oldest --limit (\S+) 2>/dev/null \| jq -c --argjson now_ts", _tier1(engine_probe))
+    assert m, "the engine's routed-pool tier no longer fetches with `--sort oldest --limit N`"
+    assert m.group(1) == str(wd.PROBE_CANDIDATE_LIMIT)
+
+
+def test_lookup_stages_are_the_ones_the_watchdog_knows_it_cannot_mirror(engine_probe):
+    """Break caught: a new engine-side lookup stage (another bead's state decides whether
+    this one is handed out) that the watchdog's one-bead predicate cannot see."""
+    keys = set(re.findall(r'\.metadata\["([^"]+)"\]', _tier1(engine_probe)))
+    assert keys == UNMIRRORED_LOOKUP_METADATA_KEYS
 
 
 def test_predicate_agrees_with_the_engine_probe_on_generated_beads(wd, engine_probe):
@@ -1287,18 +1361,23 @@ def test_predicate_agrees_with_the_engine_probe_on_generated_beads(wd, engine_pr
     own jq program over the same beads can."""
     if shutil.which("jq") is None:
         pytest.skip("jq is not on PATH")
-    m = re.search(r"""--limit=20 2>/dev/null \| jq -c --argjson now_ts "\$\(date \+%s\)" '\\''(.*?)'\\'' 2>/dev/null""",
-                  engine_probe, re.S)
+    m = re.search(r"""--limit \S+ 2>/dev/null \| jq -c --argjson now_ts "\$\(date \+%s\)" '\\''(.*?)'\\'' 2>/dev/null""",
+                  _tier1(engine_probe), re.S)
     assert m, ("the engine's pool probe no longer has the jq stage this test extracts: "
                "re-derive the watchdog's predicate from it")
     program = m.group(1)
 
-    # Labels the jq stage itself is responsible for. Exact labels (bd's own
-    # --exclude-label) and the watchdog-only ones are not part of that stage.
-    benign = ["area:infra", "ctx:ready", "framework", "lane:small", "next-action:mayor", "story:approved"]
+    # Labels for the real jq program to rule on. The ones bd drops server-side (--exclude-label)
+    # and the watchdog-only ones are left out, except pilot:no-auto-dispatch: bd drops it AND
+    # the jq stage vetoes it, so it is in `prefixed` below (the list of labels both sides must veto).
+    benign = ["area:infra", "ctx:ready", "framework", "lane:small", "story:approved",
+              "next-action:batista-constroi", "next-action:peter-corrige-gate", "next-action:mila-corrige",
+              "area:corrige"]
     prefixed = ["pool:refused", "pool:refused:engine-rebuild-required", "blocked:x", "blocked-reason:decision",
                 "gate:needs-human", "gate:needs-human:technical", "pilot:refused-reason:needs-mayor-decision",
-                "pilot:text-veto", "pilot:text-veto:diagnostic-only-text-pattern", "blocked-on:x", "gate:needs-fix"]
+                "pilot:text-veto", "pilot:text-veto:diagnostic-only-text-pattern", "blocked-on:x", "gate:needs-fix",
+                "pilot:no-auto-dispatch", "next-action:mayor", "next-action:athos", "next-action:corrige-first",
+                "next-action:"]
     holds = ["pilot:held", "pilot:held-count:ga-lfvs6:3", "pilot:held-until:0"] + \
             ["pilot:held-until:%d" % (NOW + d) for d in (-3600, -1, 0, 1, 3600)]
     titles = ["fix the thing", "EPIC: consolidate", "ÉPICO: migrar", "épico: minúsculo", "epic lower",
