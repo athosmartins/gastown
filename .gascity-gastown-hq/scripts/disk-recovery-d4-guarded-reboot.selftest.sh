@@ -11,7 +11,9 @@
 #   o mini desfaz a marca e sai 20; UMA linha no stdout; dry-run não escreve nem avisa. A guarda de ligação é um STUB na maioria dos cenários (o código do
 #   leitor tem selftest próprio: disk-recovery-d4-calls-in-flight.selftest.sh); a seção "leitor REAL" (ga-1p1i5jr.4.2) roda o D4 contra o leitor de
 #   verdade e bancos WAL de mentira, e cobre ainda: pré-checagem (textos novos, erros estranhos, dry-run), bordas do estado e do cooldown, número
-#   ruim em DR4_* e sentinela DUPLICADA no reinício noturno.
+#   ruim em DR4_* e sentinela DUPLICADA no reinício noturno. O `gc` de cada cenário é FIEL AO ENGINE no remetente do `mail send` (`--from` só de human, controller ou
+#   de uma sessão que exista; outro nome sai rc 1 "invalid sender"): o stub que aceitava qualquer argv deixou o `--from disk-recovery-d4` passar nos testes e o mail de
+#   reserva do aviso falhar SEMPRE no mini, com o push no teto global o D4 nunca reiniciava (ga-hp9pwtr). `n_mail` conta o mail que o engine ACEITARIA, `n_mail_try` as tentativas.
 # COMO NÃO REINICIA: o D4 só chama DR4_REBOOT_CMD (um stub que anota e, no cenário "o mini cai", mata o próprio D4 como o desligamento mata) ou
 #   DR4_OSASCRIPT_BIN (outro stub); DR4_NO_REAL_REBOOT=1 vale em TODOS os cenários: se uma costura sumir, o comando de verdade é recusado.
 # FILTRO: D4_ST_ONLY='^cool$|^cap$' roda só esses cenários; DR4_ST_SUT aponta outra cópia do D4 (a bateria de mutantes usa os dois).
@@ -50,13 +52,37 @@ stub() {  # $1=nome $2=conteúdo do script em $C/bin (cenário pulado pelo filtr
   [ "$SKIP" = 1 ] && return 0
   printf '#!/bin/bash\n%s\n' "$2" > "$C/bin/$1"; chmod +x "$C/bin/$1"
 }
+gc_stub_body() {  # o `gc` do cenário: FALA O CONTRATO DO ENGINE no remetente do `mail send` (cmd/gc/cmd_mail.go, resolveMailIdentityWithConfigCached).
+  # `--from X` (ou `--from=X`) só vale com X = human | controller | uma sessão/mailbox que EXISTA; o resto sai rc 1 com a mensagem que o mini deu em 08/11 (ga-hp9pwtr).
+  # Sem `--from` o engine usa a identidade padrão do chamador. gc.log = TODA chamada; mail.ok = UMA linha por `mail send` que o engine aceitaria e que o cenário deixou sair (gc.rc 0).
+  # O stub acha o diretório do cenário pelo próprio caminho (sem $C assado no texto), e roda no bash 3.2 do mini.
+  cat <<'EOS'
+C=$(cd "$(dirname "$0")/.." && pwd)
+echo "$*" >> "$C/gc.log"
+if [ "${1:-}" = mail ] && [ "${2:-}" = send ]; then
+  prev=""
+  for a in "$@"; do
+    f=""
+    [ "$prev" = "--from" ] && f=$a
+    case "$a" in --from=*) f=${a#--from=} ;; esac
+    case "$f" in
+      ''|human|controller) ;;
+      *) echo "gc mail send: invalid sender \"\": session not found: \"$f\"" >&2; exit 1 ;;
+    esac
+    prev=$a
+  done
+  [ "$(cat "$C/gc.rc")" = 0 ] && printf 'MAIL %s\n' "$(printf '%s' "$*" | tr '\n' ' ')" >> "$C/mail.ok"
+fi
+exit "$(cat "$C/gc.rc")"
+EOS
+}
 mk_case() {  # $1=nome → C=$T/<nome> com stubs "tudo ok" e o vetor ENVV
   SKIP=0
   if [ -n "$ONLY" ] && ! printf '%s' "$1" | grep -Eq "$ONLY"; then
-    SKIP=1; C="$T/skip"; mkdir -p "$C/rodadas"; : > "$C/notify.log"; : > "$C/gc.log"; : > "$C/reboot.calls"; ENVV=(x=1); return 0
+    SKIP=1; C="$T/skip"; mkdir -p "$C/rodadas"; : > "$C/notify.log"; : > "$C/gc.log"; : > "$C/mail.ok"; : > "$C/reboot.calls"; ENVV=(x=1); return 0
   fi
   C="$T/$1"; rm -rf "$C"; mkdir -p "$C/bin" "$C/city/.gc/logs" "$C/rodadas"
-  : > "$C/notify.log"; : > "$C/gc.log"; : > "$C/reboot.calls"
+  : > "$C/notify.log"; : > "$C/gc.log"; : > "$C/mail.ok"; : > "$C/reboot.calls"
   printf 'FileVault is Off.\n' > "$C/fdesetup.out"; echo 0 > "$C/fdesetup.rc"
   printf 'athos\n' > "$C/autologin.out"; echo 0 > "$C/autologin.rc"
   echo 0 > "$C/launchctl.rc"; echo 1 > "$C/pgrep.rc"; : > "$C/pgrep.out"
@@ -64,7 +90,7 @@ mk_case() {  # $1=nome → C=$T/<nome> com stubs "tudo ok" e o vetor ENVV
   printf 'ok\tpix: nenhuma ligação em curso; voicebot: nenhuma ligação em curso\n' > "$C/calls.out"; echo 0 > "$C/calls.rc"
   echo 0 > "$C/reboot.rc"; echo 5000000 > "$C/df.kb"; echo 0 > "$C/notify.rc"; echo 0 > "$C/gc.rc"; : > "$C/notify.env"
   stub notify "echo \"\$*\" >> $C/notify.log; env | grep -E '^NOTIFY_STRICT_EXIT=' >> $C/notify.env; [ -f $C/notify.hook ] && bash $C/notify.hook \"\$*\"; exit \$(cat $C/notify.rc)"
-  stub gc "echo \"\$*\" >> $C/gc.log; exit \$(cat $C/gc.rc)"
+  stub gc "$(gc_stub_body)"
   stub fdesetup "cat $C/fdesetup.out; exit \$(cat $C/fdesetup.rc)"
   stub defaults "cat $C/autologin.out; exit \$(cat $C/autologin.rc)"
   stub launchctl "echo 'gui/501/x = { state = not running }'; exit \$(cat $C/launchctl.rc)"
@@ -98,7 +124,12 @@ run_sut() {  # args do D4 → RC, OUT, NL (linhas no stdout)
 }
 n_reboot() { wc -l < "$C/reboot.calls" | tr -d ' '; }
 n_notify() { wc -l < "$C/notify.log" | tr -d ' '; }
-n_mail()   { grep -c 'mail send' "$C/gc.log"; }
+n_mail()   { wc -l < "$C/mail.ok" | tr -d ' '; }          # mails que o engine ACEITARIA (e o cenário deixou sair)
+n_mail_try() { grep -c 'mail send' "$C/gc.log"; }          # tentativas de `mail send`, aceitas ou não
+gc_try() {  # args do `gc` do cenário, rodado direto (controle do próprio stub) → GRC; a stderr vai para $C/ctl.err. Cenário pulado = rc 0 sem rodar
+  if [ "$SKIP" = 1 ]; then GRC=0; return 0; fi
+  "$C/bin/gc" "$@" > /dev/null 2> "$C/ctl.err"; GRC=$?
+}
 state_has() { [ -f "$C/state" ] && grep -q "$1" "$C/state"; }
 contains() { case "$OUT" in *"$1"*) return 0 ;; esac; return 1; }
 one_line() { [ "$NL" = 1 ]; }
@@ -213,6 +244,7 @@ chk "push falhou e o mail ao Mayor saiu: reinicia e o log diz 'mail', não 'noti
 mk_case nt_dead; echo 1 > "$C/notify.rc"; echo 1 > "$C/gc.rc"; run_sut --run
 expect_no_reboot "push E mail falharam" 30 "não consegui AVISAR"
 chk "push E mail falharam: sem marca, espera de 10 min gravada e o log NÃO diz que o aviso saiu" '! state_has "reboots=$NOW" && state_has "defer_until=$((NOW + 600))" && ! grep -q "aviso entregue" "$C/log"'
+chk "push E mail falharam: o mail ao Mayor FOI tentado (1 tentativa) e nenhum saiu: desistir sem tentar não é 'não consegui avisar'" '[ "$(n_mail_try)" = 1 ] && [ "$(n_mail)" = 0 ]'
 mk_case nt_to; stub notify "sleep 5"; setenv "DR4_NOTIFY_TIMEOUT_S=1"; echo 1 > "$C/gc.rc"; run_sut --run
 expect_no_reboot "push que estoura o prazo (não sei) E mail falho: prazo estourado não é 'entregue'" 30 "não consegui AVISAR"
 mk_case esc_dead; saved_state $((NOW - 3600)); echo 1 > "$C/notify.rc"; echo 1 > "$C/gc.rc"; run_sut --run
@@ -223,6 +255,27 @@ mk_case thr_dead; echo 1 > "$C/sender.rc"; echo "central_sender_restart_safe: 1 
 chk "adiamento cujo push NÃO saiu: não carimba defer_notify_ts (veio $RC)" '[ "$RC" = 10 ] && state_has "defer_notify_ts=0"'
 mk_case re_dead; echo "echo 1 > '$C/sender.rc'; echo 'central_sender_restart_safe: 1 envio(s) em voo' > '$C/sender.out'" > "$C/notify.hook"; echo 1 > "$C/notify.rc"; run_sut --run
 chk "cancelamento na releitura cujo push NÃO saiu: não carimba defer_notify_ts (veio $RC: $OUT)" '[ "$RC" = 10 ] && no_reboot && state_has "defer_notify_ts=0"'
+
+section "mail ao Mayor: o remetente é o que o engine aceita (ga-hp9pwtr)"
+# O D4 mandava `mail send mayor --from disk-recovery-d4`: o engine só aceita --from de human/controller/sessão que exista, então o mail de reserva do aviso falhava SEMPRE
+# ("invalid sender … session not found") e, com o push no teto global (notify rc 12, 08/11 13:57), o D4 saía rc 30 "não consegui AVISAR" e NUNCA reiniciava.
+mk_case gc_ctl   # controle do PRÓPRIO stub: se ele aceitasse qualquer --from, os cenários abaixo passariam à toa (foi assim que o bug chegou ao mini)
+gc_try mail send mayor --from disk-recovery-d4 -s s -m m
+chk "controle do stub: --from de um nome que não é sessão sai rc 1 com 'invalid sender' e o nome (veio $GRC: $(cat "$C/ctl.err" 2>/dev/null))" '[ "$GRC" = 1 ] && grep -q "invalid sender" "$C/ctl.err" && grep -q "disk-recovery-d4" "$C/ctl.err"'
+gc_try mail send mayor --from=disk-recovery-d4 -s s -m m
+chk "controle do stub: a forma --from=nome também é recusada (veio $GRC)" '[ "$GRC" = 1 ] && grep -q "invalid sender" "$C/ctl.err"'
+gc_try mail send mayor --from human -s s -m m
+check "controle do stub: --from human é aceito" [ "$GRC" = 0 ]
+gc_try mail send mayor --from=controller -s s -m m
+check "controle do stub: --from=controller é aceito" [ "$GRC" = 0 ]
+gc_try mail send mayor -s s -m m
+check "controle do stub: sem --from (identidade padrão do engine) é aceito" [ "$GRC" = 0 ]
+chk "controle do stub: das 5 chamadas só as 3 aceitas viram mail (mail.ok), as 2 recusas não" '[ "$(n_mail)" = 3 ] && [ "$(n_mail_try)" = 5 ]'
+mk_case mail_cap; echo 12 > "$C/notify.rc"; touch "$C/reboot.dies"   # notify rc 12 = "Global rate-capped (>=8 pushes/60min)": o push não saiu, só o mail pode avisar
+run_sut --run
+chk "push no teto global (notify rc 12) e o mail ao Mayor sai: o D4 AVISA por mail e reinicia (kill 143; veio $RC: $OUT)" '[ "$RC" = 143 ] && [ "$(n_mail)" = 1 ] && grep -q "aviso entregue por mail" "$C/log"'
+chk "o mail vai ao Mayor e SEM --from (nem human nem controller): o remetente é a identidade padrão do engine, que funciona no launchd (human) e numa sessão (a própria)" 'grep -q "^mail send mayor -s " "$C/gc.log" && ! grep -q -- "--from" "$C/gc.log"'
+chk "o mail ao Mayor leva o assunto em -s e o texto do aviso em -m, e diz a origem no fim do corpo (sem --from o remetente não o identifica)" 'grep -q -- "-s Disco: reiniciando o mini em 0s (o push NÃO foi confirmado) -m Livre 2000 MB" "$C/mail.ok" && grep -q "Para ABORTAR agora: touch" "$C/mail.ok" && grep -q "origem: disk-recovery-d4-guarded-reboot.sh" "$C/mail.ok"'
 
 # ═══ disco, interruptor ═════════════════════════════════════════════════════════════════════════════════════════════════════════
 section "disco"

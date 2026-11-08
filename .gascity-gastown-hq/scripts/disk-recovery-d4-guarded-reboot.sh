@@ -181,7 +181,11 @@ send_notify() {  # $1=prioridade $2=título $3=mensagem. rc 0 = ENTREGUE; rc 1 =
 }
 send_mail() {  # $1=assunto $2=corpo. rc 0 = entregue; rc 1 = não confirmado (mesmo contrato do send_notify)
   if [ "$DRY" = 1 ]; then log "(mail ao Mayor '$1' — não enviado em dry-run)"; return 0; fi
-  run_bounded "$MAIL_TIMEOUT_S" "$GCBIN" mail send mayor --from disk-recovery-d4 -s "$1" -m "$2"
+  # SEM --from (ga-hp9pwtr): o engine só aceita `--from` de human, controller ou de uma sessão que exista, e "disk-recovery-d4" não é nenhuma. Com ele este mail (o 2º canal do aviso) falhava SEMPRE
+  # ("invalid sender … session not found") e, com o push no teto global (notify rc 12), o D4 saía rc 30 e nunca reiniciava. Sem --from o remetente é a identidade padrão do engine (human sob o launchd,
+  # a própria sessão numa sessão): o mesmo caminho do orquestrador. Também não troque por `--from human|controller`: no fonte do engine (upstream, mailSenderAuthorizedCached; não medido na versão do mini)
+  # uma sessão só pode assumir a identidade DELA, então o D4 rodado à mão de uma sessão falharia de novo. Sem remetente próprio, a origem vai no corpo.
+  run_bounded "$MAIL_TIMEOUT_S" "$GCBIN" mail send mayor -s "$1" -m "$2"$'\n\n'"[origem: disk-recovery-d4-guarded-reboot.sh — D4 da escada de disco]"
   local rc=$?
   [ "$rc" -eq 0 ] || log "WARN: gc mail send mayor NÃO confirmado rc=$rc ($(out_line))"
   rb_clean
