@@ -388,7 +388,11 @@ notify_athos() {
 mail_mayor() {
     local out rc pid wd
     out="$(mktemp -t nightly-reboot-postcheck-mail)"
-    "${GC}" --city "${CITY}" mail send mayor --from nightly-reboot-postcheck.sh -s "$1" -m "$2" >"${out}" 2>&1 &
+    # SEM --from (ga-42bmt8h, mesma classe da ga-hp9pwtr): o engine so aceita `--from` de human, controller ou de uma
+    # sessao/mailbox que exista; "nightly-reboot-postcheck.sh" nao e nenhuma, entao o mail falhava SEMPRE ("invalid
+    # sender ... session not found") e os alarmes do pos-boot e do scraper cortado nunca chegavam ao Mayor. Sem --from o
+    # remetente e a identidade padrao do engine (human sob o launchd); a origem vai no fim do corpo.
+    "${GC}" --city "${CITY}" mail send mayor -s "$1" -m "$2"$'\n\n'"[origem: nightly-reboot-postcheck.sh]" >"${out}" 2>&1 &
     pid=$!
     (
         end=$(( SECONDS + MAIL_TIMEOUT ))

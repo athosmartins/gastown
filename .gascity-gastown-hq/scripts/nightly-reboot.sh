@@ -438,9 +438,13 @@ record_skip() {
   if [ "${n}" -gt 0 ] && [ $((n % ALARM_THRESHOLD)) -eq 0 ]; then
     log "ALARM: ${n} consecutive skipped nights (threshold ${ALARM_THRESHOLD}) — escalating to mayor"
     notify_athos "🚨 Reboot noturno: ${n} noites seguidas sem reiniciar" "Motivo mais recente: ${reason}. Swap pode estar acumulando sem alívio. Ver ${LOG}." 5 push
-    "${GC}" --city "${CITY}" mail send mayor --from nightly-reboot.sh \
+    # SEM --from (ga-42bmt8h, mesma classe da ga-hp9pwtr): o engine so aceita `--from` de human, controller ou de uma
+    # sessao/mailbox que exista, e "nightly-reboot.sh" nao e nenhuma — o mail falhava SEMPRE ("invalid sender ... session
+    # not found") e o `|| true` engolia, entao este alarme de noites sem reiniciar nunca chegava ao Mayor. Sem --from o
+    # remetente e a identidade padrao do engine (human sob o launchd); a origem vai no fim do corpo.
+    "${GC}" --city "${CITY}" mail send mayor \
       -s "nightly-reboot: ${n} noites seguidas sem reiniciar (ga-nnp5b)" \
-      -m "$(printf 'O reboot noturno pulou %s noites seguidas (fail-closed, correto por si so, mas nunca chega a aliviar o swap).\nMotivo mais recente: %s\nLog: %s\nSe isto continuar, investigar se a causa e estrutural (nao so um hiccup transiente) antes que vire ENOSPC de novo.' "${n}" "${reason}" "${LOG}")" \
+      -m "$(printf 'O reboot noturno pulou %s noites seguidas (fail-closed, correto por si so, mas nunca chega a aliviar o swap).\nMotivo mais recente: %s\nLog: %s\nSe isto continuar, investigar se a causa e estrutural (nao so um hiccup transiente) antes que vire ENOSPC de novo.\n\n[origem: nightly-reboot.sh]' "${n}" "${reason}" "${LOG}")" \
       >/dev/null 2>&1 || true
   fi
 }

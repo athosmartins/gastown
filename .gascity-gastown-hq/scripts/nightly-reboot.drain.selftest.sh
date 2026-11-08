@@ -169,7 +169,8 @@ new_world() {
   SHUT="$W/shutdown.calls"; DRAIN_AT_SHUT="$W/drain-at-shutdown"; PEND_AT_SHUT="$W/pending-at-shutdown"
   DRAIN_AT_SENDER="$W/drain-at-sender"; GC_CALLS="$W/gc.calls"; NOTIFY_CALLS="$W/notify.calls"
   NOTIFY_FORCE="$W/notify.force"; NOTIFY_ROUTES="$W/notify.routes"; SUDO_CALLS="$W/sudo.calls"
-  : > "$SHUT"; : > "$GC_CALLS"; : > "$NOTIFY_CALLS"; : > "$NOTIFY_FORCE"; : > "$NOTIFY_ROUTES"; : > "$SUDO_CALLS"
+  GC_REJECTED="$W/gc.rejected"
+  : > "$SHUT"; : > "$GC_CALLS"; : > "$NOTIFY_CALLS"; : > "$NOTIFY_FORCE"; : > "$NOTIFY_ROUTES"; : > "$SUDO_CALLS"; : > "$GC_REJECTED"
   [ "${W_RIG:-0}" = "1" ] && mkdir -p "$CITY/rigx/.beads"
 
   # a linha de "demora" so existe quando o cenario pediu (W_PROBE_SLOW): nenhum fork a mais nos outros
@@ -197,6 +198,25 @@ EOF
   cat > "$W/gc" <<EOF
 #!/usr/bin/env bash
 echo "\$*" >> "$GC_CALLS"
+# O fake FALA O CONTRATO DO ENGINE no remetente do \`mail send\` (cmd/gc/cmd_mail.go): \`--from X\` (ou \`--from=X\`) so vale com X = human |
+# controller | uma sessao/mailbox que EXISTA; o resto sai rc 1 com a mensagem que o mini deu em 08/11 (ga-hp9pwtr, ga-42bmt8h). Antes ele
+# aceitava qualquer argv, e foi assim que o \`--from nightly-reboot.sh\` passou nos testes e o alarme de noites sem reiniciar nunca saiu.
+# gc.rejected = UMA linha por mail recusado por causa do remetente (gc.calls segue com TODA tentativa).
+case " \$* " in
+  *" mail send "*)
+    prev=""
+    for a in "\$@"; do
+      f=""
+      [ "\$prev" = "--from" ] && f=\$a
+      case "\$a" in --from=*) f=\${a#--from=} ;; esac
+      case "\$f" in
+        ''|human|controller) ;;
+        *) echo "gc mail send: invalid sender \"\": session not found: \"\$f\"" >&2; echo "\$*" >> "$GC_REJECTED"; exit 1 ;;
+      esac
+      prev=\$a
+    done
+    ;;
+esac
 if [ "${W_GC_HANG:-0}" = "1" ]; then echo \$\$ >> "$W/gc.pids"; exec /bin/sleep 600; fi
 EOF
   # grava (1) os argumentos, (2) se o aviso veio com NOTIFY_FORCE_PUSH, (3) pra onde o notify DE VERDADE
@@ -729,6 +749,10 @@ grep -q "scraper cortado" "$GC_CALLS" && bad "E13 rc=1: saiu o mail 'scraper cor
 [ "$(grep -c 'mail send' "$GC_CALLS")" = "1" ] && grep 'mail send' "$GC_CALLS" | grep -q "14 noites seguidas sem reiniciar" && ok "E13 rc=1: o unico mail e o da CADEIA de noites puladas (14 sem reiniciar) — verdadeiro: esta noite nao reiniciou" || bad "E13 rc=1: mails inesperados: $(grep 'mail send' "$GC_CALLS" | cut -c1-110 | tr '\n' '|')"
 grep -q '^scraper_cut_alarm=' "$PEND_AT_SHUT" 2>/dev/null && ok "E13 (o aviso do scraper ESTAVA devido na hora do shutdown: sem o ramo de falha ele sairia)" || bad "E13 o aviso do scraper nao estava devido na hora do shutdown — o cenario nao prova a ausencia do mail. pendencia: $(tr '\n' '|' < "$PEND_AT_SHUT" 2>/dev/null)"
 assert_push "E13 rc=1: o aviso de que o reboot FALHOU" "Reboot noturno FALHOU"
+# ga-42bmt8h: o fake de gc recusa --from que o engine recusaria; o mail da cadeia de noites puladas tem de ter passado pelo remetente
+[ ! -s "$GC_REJECTED" ] && ok "E13 rc=1: o engine NAO recusou o remetente do mail da cadeia de noites puladas" || bad "E13 rc=1: o engine recusou o remetente: $(cat "$GC_REJECTED")"
+grep 'mail send' "$GC_CALLS" | grep -q -- '--from' && bad "E13 rc=1: o mail ao mayor leva --from (o engine so aceita de human/controller/sessao que exista): $(grep 'mail send' "$GC_CALLS" | cut -c1-120)" || ok "E13 rc=1: o mail ao mayor vai SEM --from"
+grep -qF "[origem: nightly-reboot.sh]" "$GC_CALLS" && ok "E13 rc=1: sem remetente proprio, a origem vai no fim do corpo" || bad "E13 rc=1: o corpo do mail nao diz a origem"
 log_has "counters: skip streak put back to 13" && ok "E13 rc=1: o log diz que o streak voltou a 13" || bad "E13 rc=1: sem 'skip streak put back to 13' no log"
 log_has "counters: scraper-cut counter put back to 1" && ok "E13 rc=1: o log diz que o contador do scraper voltou a 1" || bad "E13 rc=1: sem 'scraper-cut counter put back to 1' no log"
 log_has "skip streak: 14 consecutive night" && ok "E13 rc=1: a noite foi registrada como pulada (streak 14)" || bad "E13 rc=1: a noite nao foi registrada como pulada"
@@ -820,6 +844,7 @@ log_has "recording the skip .*TIMED OUT" && ok "E15 dreno: o log diz que o alarm
 kill_pids "$W/gc.pids"
 assert_push "E15 dreno: aviso de noite pulada" "Reboot noturno pulado"
 assert_push "E15 dreno: alarme de 2 noites seguidas" "noites seguidas sem reiniciar"
+[ ! -s "$GC_REJECTED" ] && [ "$(grep -c 'mail send' "$GC_CALLS")" -ge 1 ] && ok "E15 dreno: o mail do alarme chegou ao gc e o remetente passou (nao foi recusado)" || bad "E15 dreno: mail do alarme ausente ou recusado pelo remetente: tentativas=$(grep -c 'mail send' "$GC_CALLS") recusados=$(cat "$GC_REJECTED")"
 # legado (01:05): um construtor vivo bloqueia pra sempre — nenhuma versao do script chega ao reboot
 W_HQ_BUSY=1 W_GC_HANG=1 new_world e15b; printf '1\n' > "$STREAK"
 T0=$(/bin/date +%s)
@@ -833,6 +858,7 @@ log_has "recording the skip .*TIMED OUT" && ok "E15 legado: TIMED OUT registrado
 kill_pids "$W/gc.pids"
 assert_push "E15 legado: aviso de noite pulada" "Reboot noturno pulado"
 assert_push "E15 legado: alarme de 2 noites seguidas" "noites seguidas sem reiniciar"
+[ ! -s "$GC_REJECTED" ] && [ "$(grep -c 'mail send' "$GC_CALLS")" -ge 1 ] && ok "E15 legado: o mail do alarme chegou ao gc e o remetente passou (nao foi recusado)" || bad "E15 legado: mail do alarme ausente ou recusado pelo remetente: tentativas=$(grep -c 'mail send' "$GC_CALLS") recusados=$(cat "$GC_REJECTED")"
 
 # ═══ E16: os guards de seguranca sao lidos DE NOVO logo antes do shutdown ════════════════
 # O defeito (gate FAIL 2/3, achado medio): o veredito dos guards de seguranca era lido uma vez, e entre

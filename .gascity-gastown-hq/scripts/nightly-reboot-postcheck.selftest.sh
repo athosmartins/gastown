@@ -82,7 +82,8 @@ new_world() {
   DRAIN="$W/run/city-drain.level"
   NOTIFY_CALLS="$W/notify.calls"; GC_CALLS="$W/gc.calls"; PROBE_ARGS="$W/probe.args"
   NOTIFY_FORCE="$W/notify.force"; NOTIFY_ROUTES="$W/notify.routes"
-  : > "$NOTIFY_CALLS"; : > "$GC_CALLS"; : > "$PROBE_ARGS"; : > "$NOTIFY_FORCE"; : > "$NOTIFY_ROUTES"
+  GC_REJECTED="$W/gc.rejected"
+  : > "$NOTIFY_CALLS"; : > "$GC_CALLS"; : > "$PROBE_ARGS"; : > "$NOTIFY_FORCE"; : > "$NOTIFY_ROUTES"; : > "$GC_REJECTED"
   touch "$W/vm/swapfile0" "$W/vm/swapfile1" "$W/vm/notaswap"
 
   # grava os argumentos, se veio NOTIFY_FORCE_PUSH, e pra onde o notify DE VERDADE mandaria esta chamada exata
@@ -98,6 +99,25 @@ EOF
 echo "\$*" >> "$GC_CALLS"
 if [ "${W_GC_HANG:-0}" = "1" ]; then echo \$\$ >> "$W/gc.pids"; exec /bin/sleep 600; fi
 if [ "${W_GC_HANG:-0}" = "2" ]; then echo \$\$ >> "$W/gc.pids"; trap '' TERM; while :; do /bin/sleep 1; done; fi
+# O fake FALA O CONTRATO DO ENGINE no remetente do \`mail send\` (cmd/gc/cmd_mail.go): \`--from X\` (ou \`--from=X\`) so vale com X = human |
+# controller | uma sessao/mailbox que EXISTA; o resto sai rc 1 com a mensagem que o mini deu em 08/11 (ga-hp9pwtr, ga-42bmt8h). Antes ele
+# aceitava qualquer argv, e foi assim que o \`--from nightly-reboot-postcheck.sh\` passou nos testes e o mail falhava sempre no mini.
+# gc.rejected = UMA linha por mail recusado por causa do remetente.
+case " \$* " in
+  *" mail send "*)
+    prev=""
+    for a in "\$@"; do
+      f=""
+      [ "\$prev" = "--from" ] && f=\$a
+      case "\$a" in --from=*) f=\${a#--from=} ;; esac
+      case "\$f" in
+        ''|human|controller) ;;
+        *) echo "gc mail send: invalid sender \"\": session not found: \"\$f\"" >&2; echo "\$*" >> "$GC_REJECTED"; exit 1 ;;
+      esac
+      prev=\$a
+    done
+    ;;
+esac
 echo "gc: simulated output"
 exit ${W_GC_RC:-0}
 EOF
@@ -254,6 +274,22 @@ notify_has "-p 4" && ok "P5 prioridade 4 (alta)" || bad "P5 prioridade: $(cat "$
 notify_has "dolt FAIL" && ok "P5 o notify diz QUAL check caiu e como (dolt FAIL)" || bad "P5 notify sem 'dolt FAIL': $(cat "$NOTIFY_CALLS")"
 assert_push "P5 COM PROBLEMA (Dolt caido)" "COM PROBLEMA"
 grep -qF "mail send mayor" "$GC_CALLS" && ok "P5 mail ao mayor (best-effort, secundario)" || bad "P5 sem mail ao mayor: $(cat "$GC_CALLS")"
+# ga-42bmt8h: o fake de gc agora recusa --from que o engine recusaria; "tentou" nao basta, o mail tem de ter sido ACEITO
+[ ! -s "$GC_REJECTED" ] && ok "P5 o mail ao mayor NAO foi recusado pelo remetente (gc.rejected vazio)" || bad "P5 o engine recusou o remetente: $(cat "$GC_REJECTED")"
+log_has "mail to mayor: sent" && ok "P5 o log diz que o mail ao mayor SAIU ('sent')" || bad "P5 sem 'mail to mayor: sent' no log: $(grep -i mail "$LOGF" | tr '\n' '|')"
+grep -q -- '--from' "$GC_CALLS" && bad "P5 o mail ao mayor leva --from (o engine so aceita de human/controller/sessao que exista): $(cut -c1-120 "$GC_CALLS" | tr '\n' '|')" || ok "P5 o mail ao mayor vai SEM --from"
+grep -qF "[origem: nightly-reboot-postcheck.sh]" "$GC_CALLS" && ok "P5 sem remetente proprio, a origem vai no fim do corpo" || bad "P5 o corpo nao diz a origem: $(cut -c1-200 "$GC_CALLS" | tr '\n' '|')"
+
+# ── P5-ctl: controle do PROPRIO fake. Se ele aceitasse qualquer --from, os testes acima passariam à toa (foi assim que o bug chegou ao mini) ──
+"$W/gc" --city "$W/city" mail send mayor --from nightly-reboot-postcheck.sh -s s -m m >"$W/ctl.out" 2>"$W/ctl.err"; CTL=$?
+[ "$CTL" = "1" ] && grep -q 'invalid sender' "$W/ctl.err" && grep -q 'nightly-reboot-postcheck.sh' "$W/ctl.err" && ok "P5-ctl o fake recusa --from de um nome que nao e sessao (rc 1, 'invalid sender' e o nome)" || bad "P5-ctl o fake aceitou --from invalido (rc=$CTL): $(cat "$W/ctl.err")"
+"$W/gc" --city "$W/city" mail send mayor --from=nightly-reboot-postcheck.sh -s s -m m >/dev/null 2>"$W/ctl.err"; CTL=$?
+[ "$CTL" = "1" ] && ok "P5-ctl a forma --from=nome tambem e recusada" || bad "P5-ctl --from=nome aceito (rc=$CTL)"
+"$W/gc" --city "$W/city" mail send mayor --from human -s s -m m >/dev/null 2>&1; CTL=$?
+[ "$CTL" = "0" ] && ok "P5-ctl --from human e aceito" || bad "P5-ctl --from human recusado (rc=$CTL)"
+"$W/gc" --city "$W/city" mail send mayor -s s -m m >/dev/null 2>&1; CTL=$?
+[ "$CTL" = "0" ] && ok "P5-ctl sem --from (identidade padrao do engine) e aceito" || bad "P5-ctl sem --from recusado (rc=$CTL)"
+: > "$GC_REJECTED"
 [ "$(cat "$W/n.probe")" = "3" ] && ok "P5 esgotou as 3 rodadas (MAX_ATTEMPTS) antes de desistir" || bad "P5 rodadas=$(cat "$W/n.probe") (esperado 3)"
 [ ! -e "$PENDING" ] && ok "P5 pendencia removida mesmo com problema" || bad "P5 pendencia ficou"
 notify_has "sender ok" && bad "P5 listou o que esta OK como problema" || ok "P5 o notify de problema lista so o que NAO esta ok"
@@ -557,6 +593,7 @@ grep -F 'mail send mayor' "$GC_CALLS" | grep -qF "scraper cortado 2 noites segui
 grep -qF "rodada rod-test (scraping) em andamento" "$GC_CALLS" && ok "P17a o corpo traz o motivo registrado pelo reboot" || bad "P17a o corpo nao traz o motivo: $(cut -c1-140 "$GC_CALLS" | tr '\n' '|')"
 log_has "ALARM: the scraper was cut 2 nights in a row" && ok "P17a o log diz que o aviso esta sendo mandado" || bad "P17a sem 'ALARM: the scraper was cut 2 nights' no log"
 log_has "mail to mayor: sent" && ok "P17a o desfecho do mail e registrado ('sent')" || bad "P17a sem 'mail to mayor: sent' no log"
+[ ! -s "$GC_REJECTED" ] && ok "P17a o engine NAO recusou o remetente do mail do scraper" || bad "P17a o engine recusou o remetente: $(cat "$GC_REJECTED")"
 notify_has "Reboot noturno OK" && ok "P17a o 'Reboot noturno OK' de rotina saiu tambem" || bad "P17a sem o notify de OK: $(cat "$NOTIFY_CALLS")"
 [ ! -e "$PENDING" ] && ok "P17a pendencia removida" || bad "P17a pendencia ficou (reenviaria o aviso a cada login)"
 
@@ -564,6 +601,7 @@ W_DOLT_RC=1 new_world p17b; write_pending_alarm "$(( $(now_s) - 300 ))" 4 "rodad
 [ "$RC" = "1" ] && ok "P17b noite com problema + aviso devido: exit 1" || bad "P17b exit=$RC"
 [ "$(grep -c 'mail send mayor' "$GC_CALLS")" = "2" ] && ok "P17b 2 mails: o do problema E o do scraper (um nao come o outro)" || bad "P17b mails: $(grep -c 'mail send mayor' "$GC_CALLS") (esperado 2): $(cut -c1-100 "$GC_CALLS" | tr '\n' '|')"
 grep -F 'mail send mayor' "$GC_CALLS" | grep -qF "scraper cortado 4 noites seguidas" && ok "P17b o mail do scraper diz 4 noites" || bad "P17b sem o mail do scraper de 4 noites"
+[ ! -s "$GC_REJECTED" ] && ok "P17b o engine NAO recusou o remetente de nenhum dos 2 mails" || bad "P17b o engine recusou o remetente: $(cat "$GC_REJECTED")"
 [ ! -e "$PENDING" ] && ok "P17b pendencia removida" || bad "P17b pendencia ficou"
 
 new_world p17c; write_pending_alarm "$(( $(now_s) - 300 ))" "abc" "x"; run_pc

@@ -238,8 +238,8 @@ else
   ISO_STREAK_FILE="$TMP/iso.streak"
   ISO_LOG="$TMP/iso.log"
   ISO_NOTIFY_LOG="$TMP/iso-notify.log"
-  ISO_MAIL_LOG="$TMP/iso-mail.log"
-  : > "$ISO_LOG"; : > "$ISO_NOTIFY_LOG"; : > "$ISO_MAIL_LOG"
+  ISO_MAIL_LOG="$TMP/iso-mail.log"; ISO_MAIL_REJECTED="$TMP/iso-mail.rejected"
+  : > "$ISO_LOG"; : > "$ISO_NOTIFY_LOG"; : > "$ISO_MAIL_LOG"; : > "$ISO_MAIL_REJECTED"
   rm -f "$ISO_STREAK_FILE"
 
   # Minimal stubs for the two functions record_skip() calls that live
@@ -248,9 +248,28 @@ else
   log() { echo "$*" >> "$ISO_LOG"; }
   notify_athos() { echo "$1 :: $2 (p${3:-3})" >> "$ISO_NOTIFY_LOG"; }
   GC="$TMP/iso-gc"
+  # O fake FALA O CONTRATO DO ENGINE no remetente do `mail send` (cmd/gc/cmd_mail.go): `--from X` (ou `--from=X`) so vale com X = human |
+  # controller | uma sessao/mailbox que EXISTA; o resto sai rc 1 com a mensagem que o mini deu em 08/11 (ga-hp9pwtr, ga-42bmt8h). Antes ele
+  # so gravava o argv, e foi assim que o `--from nightly-reboot.sh` passou nos testes e o alarme nunca saiu. iso-mail.log = TODA tentativa;
+  # iso-mail.rejected = UMA linha por mail recusado por causa do remetente.
   cat > "$GC" <<EOF
 #!/usr/bin/env bash
 echo "\$*" >> "$ISO_MAIL_LOG"
+case " \$* " in
+  *" mail send "*)
+    prev=""
+    for a in "\$@"; do
+      f=""
+      [ "\$prev" = "--from" ] && f=\$a
+      case "\$a" in --from=*) f=\${a#--from=} ;; esac
+      case "\$f" in
+        ''|human|controller) ;;
+        *) echo "gc mail send: invalid sender \"\": session not found: \"\$f\"" >&2; echo "\$*" >> "$ISO_MAIL_REJECTED"; exit 1 ;;
+      esac
+      prev=\$a
+    done
+    ;;
+esac
 EOF
   chmod +x "$GC"
   # shellcheck disable=SC2034  # consumed by the dynamically-sourced snippet below, invisible to static analysis
@@ -272,6 +291,18 @@ EOF
   record_skip "isolated test reason B"
   [ "$(cat "$ISO_STREAK_FILE" 2>/dev/null)" = "2" ] && ok "4b: second record_skip -> streak=2" || bad "4b: expected streak=2"
   grep -q "nightly-reboot: 2 noites seguidas" "$ISO_MAIL_LOG" && ok "4b: mayor-mail escalation fired at threshold" || bad "4b: mayor-mail did not fire at streak=2"
+  [ ! -s "$ISO_MAIL_REJECTED" ] && ok "4b: the engine did NOT refuse the mail's sender (ga-42bmt8h)" || bad "4b: the engine refused the sender: $(cat "$ISO_MAIL_REJECTED")"
+  grep -q -- '--from' "$ISO_MAIL_LOG" && bad "4b: the mayor mail carries --from (the engine only takes it from human/controller/an existing session): $(cut -c1-120 "$ISO_MAIL_LOG")" || ok "4b: the mayor mail goes WITHOUT --from"
+  grep -qF "[origem: nightly-reboot.sh]" "$ISO_MAIL_LOG" && ok "4b: without a sender of its own, the origin closes the body" || bad "4b: the body does not say where it came from"
+  # control of the FAKE itself: if it took any --from, the checks above would pass for nothing (that is how the bug reached the mini)
+  "$GC" --city x mail send mayor --from nightly-reboot.sh -s s -m m >/dev/null 2>"$TMP/iso-ctl.err"; ISO_CTL=$?
+  [ "$ISO_CTL" = "1" ] && grep -q 'invalid sender' "$TMP/iso-ctl.err" && grep -q 'nightly-reboot.sh' "$TMP/iso-ctl.err" && ok "4b-ctl: the fake refuses a --from that is not a session (rc 1, 'invalid sender' and the name)" || bad "4b-ctl: the fake accepted an invalid --from (rc=$ISO_CTL)"
+  "$GC" --city x mail send mayor --from=nightly-reboot.sh -s s -m m >/dev/null 2>&1; ISO_CTL=$?
+  [ "$ISO_CTL" = "1" ] && ok "4b-ctl: the --from=name form is refused too" || bad "4b-ctl: --from=name accepted (rc=$ISO_CTL)"
+  "$GC" --city x mail send mayor --from human -s s -m m >/dev/null 2>&1; ISO_CTL=$?
+  [ "$ISO_CTL" = "0" ] && ok "4b-ctl: --from human is accepted" || bad "4b-ctl: --from human refused (rc=$ISO_CTL)"
+  "$GC" --city x mail send mayor -s s -m m >/dev/null 2>&1; ISO_CTL=$?
+  [ "$ISO_CTL" = "0" ] && ok "4b-ctl: no --from (the engine's default identity) is accepted" || bad "4b-ctl: no --from refused (rc=$ISO_CTL)"
   grep -q "🚨" "$ISO_NOTIFY_LOG" && ok "4b: high-priority push fired alongside the mail" || bad "4b: escalation push missing"
 
   reset_streak
