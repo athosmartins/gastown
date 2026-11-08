@@ -2549,6 +2549,53 @@ fi
 rm -rf "$FAKE_CITY"
 
 echo ""
+echo "=== _reap_dead_scratch: the bound outlasts 'gc session list'; TIMEOUT and FAILURE do not read alike (ga-7jtyqjy) ==="
+# WHY: 08/11 at load 26 `gc session list` was measured at 58-90s and this lever still ran the reaper under `timeout 60`: the reaper could be
+# killed before it had listed one session, in the very cycle the lever exists for (disk CRITICAL), logged as the generic "FAILED or aborted". The transcript
+# lever got the same fix on 2026-08-01 (300s, TIMED OUT vs FAILED, rows above); this lever had kept the old 60.
+FAKE_CITY_S="$(mktemp -d /tmp/dolt-disk-floor-guard-selftest-city4.XXXXXX)"; mkdir -p "$FAKE_CITY_S/scripts"
+REAL_CITY="$CITY"; REAL_LOG="$LOG"
+run_scratch() {  # run_scratch <was_critical> <logfile>: _reap_dead_scratch against the fake city, its log lines in <logfile>
+  LOG="$2"; : > "$LOG"; CITY="$FAKE_CITY_S"; _reap_dead_scratch "$1"; CITY="$REAL_CITY"; LOG="$REAL_LOG"
+}
+printf '%s\n' '#!/bin/bash' 'sleep 5' 'exit 0' > "$FAKE_CITY_S/scripts/scratchpad-reaper.sh"; chmod +x "$FAKE_CITY_S/scripts/scratchpad-reaper.sh"
+for wc in 0 1; do
+  SCRATCH_REAP_TIMEOUT_SECS=1 run_scratch "$wc" "$FAKE_CITY_S/timeout$wc.log"
+  if grep -qE "TIMED OUT after [1-9][0-9]*s \(bound=1s\)" "$FAKE_CITY_S/timeout$wc.log" && ! grep -qE "FAILED|scratch-reap OK" "$FAKE_CITY_S/timeout$wc.log"; then
+    ok "_reap_dead_scratch(was_critical=$wc): a run killed by the bound logs TIMED OUT, not FAILED and not OK"
+  else
+    bad "_reap_dead_scratch(was_critical=$wc): bound-kill misreported — got: $(tr '\n' ';' < "$FAKE_CITY_S/timeout$wc.log" | cut -c1-200)"
+  fi
+done
+printf '%s\n' '#!/bin/bash' 'exit 3' > "$FAKE_CITY_S/scripts/scratchpad-reaper.sh"
+SCRATCH_REAP_TIMEOUT_SECS=30 run_scratch 1 "$FAKE_CITY_S/failed.log"
+if grep -q "FAILED after" "$FAKE_CITY_S/failed.log" && ! grep -q "TIMED OUT" "$FAKE_CITY_S/failed.log"; then
+  ok "_reap_dead_scratch: a genuine nonzero exit (the reaper's own ABORT) logs FAILED after Ns, not TIMED OUT"
+else
+  bad "_reap_dead_scratch: genuine failure misreported — got: $(tr '\n' ';' < "$FAKE_CITY_S/failed.log" | cut -c1-200)"
+fi
+printf '%s\n' '#!/bin/bash' 'exit 0' > "$FAKE_CITY_S/scripts/scratchpad-reaper.sh"
+unset SCRATCH_REAP_TIMEOUT_SECS; run_scratch 0 "$FAKE_CITY_S/default.log"
+grep -qE "scratch-reap OK \([0-9]+s, bound=300s\)" "$FAKE_CITY_S/default.log" && ok "_reap_dead_scratch: default bound is 300s (it was 60) and the OK line says how long the run took" || bad "_reap_dead_scratch: default bound/OK line wrong — got: $(tr '\n' ';' < "$FAKE_CITY_S/default.log" | cut -c1-200)"
+for v in abc 0; do
+  SCRATCH_REAP_TIMEOUT_SECS="$v" run_scratch 1 "$FAKE_CITY_S/bad$v.log"
+  grep -q "bound=300s" "$FAKE_CITY_S/bad$v.log" && ok "_reap_dead_scratch: SCRATCH_REAP_TIMEOUT_SECS='$v' falls back to 300s ('timeout 0' would mean no limit, text makes timeout refuse to run)" || bad "_reap_dead_scratch: SCRATCH_REAP_TIMEOUT_SECS='$v' not handled — got: $(tr '\n' ';' < "$FAKE_CITY_S/bad$v.log" | cut -c1-200)"
+done
+# The coupling that makes the reaper's own gc deadline reachable: the guard must not kill the reaper BEFORE that deadline expires.
+GC_DEF="$(env -u SCRATCHPAD_REAPER_GC_TIMEOUT_SECS SCRATCHPAD_REAPER_LIB=1 bash -c '. "$1" >/dev/null 2>&1; printf %s "${GC_TIMEOUT_SECS:-}"' _ "$HERE/scratchpad-reaper.sh")"
+BOUND_DEF="$(sed -n 's/.*bound=\([0-9][0-9]*\)s.*/\1/p' "$FAKE_CITY_S/default.log" | head -1)"
+case "$GC_DEF" in ''|*[!0-9]*) GC_DEF="" ;; esac
+case "$BOUND_DEF" in ''|*[!0-9]*) BOUND_DEF="" ;; esac
+if [ -z "$GC_DEF" ] || [ -z "$BOUND_DEF" ]; then
+  bad "_reap_dead_scratch: could not read the two defaults (reaper gc deadline='$GC_DEF', guard bound='$BOUND_DEF')"
+elif [ "$BOUND_DEF" -ge $(( GC_DEF + 60 )) ]; then
+  ok "_reap_dead_scratch: guard bound (${BOUND_DEF}s) outlasts the reaper's own gc deadline (${GC_DEF}s) by 60s+ — the reaper gets to log WHY it gave up"
+else
+  bad "_reap_dead_scratch: guard bound ${BOUND_DEF}s is not 60s over the reaper's gc deadline ${GC_DEF}s"
+fi
+LOG="$REAL_LOG"; rm -rf "$FAKE_CITY_S"
+
+echo ""
 echo "=== _reap_dead_transcripts: production sentinel wiring (ga-lfj05) ==="
 # Same proof as _reap_dead_scratch above, for the sibling lever: transcript-
 # reaper.sh's own header names _reap_dead_transcripts as the ONLY allowed

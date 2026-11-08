@@ -21,7 +21,7 @@
 #   2. STALE — directory mtime is older than MIN_AGE_HOURS (default 24h), OR
 #      (ga-rjhfz) the caller signals SCRATCHPAD_REAPER_PRESSURE=CRITICAL and
 #      the directory is BOTH at least CRITICAL_MIN_AGE_HOURS old (default 1h)
-#      AND at least LARGE_GB large (default 2GB). Either way this is a grace
+#      AND large enough (ga-7jtyqjy: LARGE_PCT% of the free space, at most LARGE_GB=2GB — see RELATIVE SIZE BAR). Either way this is a grace
 #      buffer on top of the liveness check, not the primary safety mechanism —
 #      it protects against a session that died moments ago and whose
 #      disappearance from the live list hasn't propagated yet.
@@ -58,7 +58,8 @@
 # single largest recoverable item during a crisis, and the faster a session
 # fills disk the MORE certain it is to still be under 24h old when pressure
 # hits. Fix: when the caller sets SCRATCHPAD_REAPER_PRESSURE=CRITICAL, a dead
-# candidate that is at least LARGE_GB (default 2GB) may reap once it clears
+# candidate that is at least LARGE_GB (default 2GB; since ga-7jtyqjy the CEILING
+# of a bar that follows the free space, see below) may reap once it clears
 # the much shorter CRITICAL_MIN_AGE_HOURS (default 1h) instead of the full
 # MIN_AGE_HOURS — see `_should_reap_size_escape`. This NEVER touches the
 # liveness/self-protection gate (`_is_dead`, shared verbatim with the normal
@@ -106,6 +107,25 @@
 # that has died is not detected — the scratchpad it uses goes away under it,
 # which only fails work nobody is waiting for anymore.
 #
+# RELATIVE SIZE BAR (ga-7jtyqjy, 2026-11-08): the size escape above compared against a FIXED LARGE_GB. On 2026-11-08 the disk fell to
+# 2.0GB free and a dead wa-worker's 923MB scratchpad (13 repo copies) sat under that bar — nearly half of everything left —
+# because a fixed whole number of GB cannot follow how little is left. Under CRITICAL the bar is now LARGE_PCT% (default 10) of
+# the volume's FREE space, never above the static LARGE_GB ceiling and never under LARGE_FLOOR_MB (default 10: at 0 free no dir may
+# count as "large" by arithmetic alone; a floor set above the ceiling wins — the larger bar is the safer one). Free space is read ONCE at the start of the cycle (reaping frees space; a bar that rose
+# mid-cycle would treat equal dirs differently). A reading that fails keeps the OLD rule — the static LARGE_GB — with a WARN, and
+# LARGE_PCT=0 switches the relative rule off. ONLY the size bar moves: liveness, self-protection, the CRITICAL_MIN_AGE_HOURS buffer
+# and the production sentinel are untouched, and outside CRITICAL none of this runs (free space is not even read).
+#
+# GC DEADLINE (ga-7jtyqjy): `gc session list` is the liveness source and slow under load (58-90s at load 26 on 2026-11-08), but this
+# script had no deadline of its own, so the only limit was the caller's kill: the disk-floor guard's old `timeout 60` could end the run
+# before the list came back — with no line from the reaper — in exactly the cycle it exists for. The call now runs under timeout/gtimeout
+# (SCRATCHPAD_REAPER_GC_TIMEOUT_SECS, default 150s, the same ceiling node-ghost-release and the gate's session spawn use for `gc`), and an
+# expired deadline is a logged ABORT with nothing reaped, like any other failure to list. No timeout/gtimeout on PATH = the unbounded
+# call exactly as before, reported as bound=none in the cycle summary (a missing tool must not switch the sweep off). Callers must
+# outlast the deadline — the guard's bound and the sweep order's timeout are both 300s today, and both selftests pin them at least
+# 60s over it. A cache of the last
+# good list was considered and NOT added: a list a few minutes old calls a session born since then "dead".
+#
 # Kill switch: SCRATCHPAD_REAPER_ENABLED=0 -> dry-run regardless of
 # SCRATCHPAD_REAPER_DRY_RUN (logs candidates, deletes nothing).
 #
@@ -143,6 +163,12 @@ PROD="${SCRATCHPAD_REAPER_PROD:-0}"
 LARGE_GB="${SCRATCHPAD_REAPER_LARGE_GB:-2}"
 CRITICAL_MIN_AGE_HOURS="${SCRATCHPAD_REAPER_CRITICAL_MIN_AGE_HOURS:-1}"
 PRESSURE="${SCRATCHPAD_REAPER_PRESSURE:-}"
+# ga-7jtyqjy: under CRITICAL the size bar is LARGE_PCT% of the FREE space, clamped to [LARGE_FLOOR_MB, LARGE_GB]; LARGE_PCT=0 = off
+# (the static LARGE_GB bar of ga-rjhfz). GC_TIMEOUT_SECS bounds `gc session list`; GC_LIST_* are filled by _fetch_live_keys for the summary.
+LARGE_PCT="${SCRATCHPAD_REAPER_LARGE_PCT:-10}"
+LARGE_FLOOR_MB="${SCRATCHPAD_REAPER_LARGE_FLOOR_MB:-10}"
+GC_TIMEOUT_SECS="${SCRATCHPAD_REAPER_GC_TIMEOUT_SECS:-150}"
+GC_LIST_ELAPSED=""; GC_LIST_BOUND=""
 # ga-hynohs: always-on sweep. MIN_IDLE_MINUTES 0/unset = the path is OFF and a
 # caller that never heard of it (dolt-disk-floor-guard) behaves exactly as
 # before; only the scratchpad-sweep order opts in.
@@ -252,22 +278,52 @@ _should_reap() {
 
 # _should_reap_size_escape <session_id> <live_keys_file> <mtime_epoch>
 #     <now_epoch> <critical_min_age_hours> <self_session_id> <size_kb>
-#     <large_gb>
+#     <limit_kb>
 # → 0 (true) iff: dead (SAME _is_dead as _should_reap — self/liveness are
 # NEVER loosened by pressure) AND at/past critical_min_age_hours old AND
-# at/past large_gb in size. ga-rjhfz: under CRITICAL disk pressure, a large
+# at/past limit_kb in size. ga-rjhfz: under CRITICAL disk pressure, a large
 # dead scratchpad shouldn't have to wait out the FULL MIN_AGE_HOURS grace
 # window — but it still needs SOME age buffer (protects a session that died
 # moments ago, same reasoning as MIN_AGE_HOURS itself) and it still needs to
 # actually be large enough to matter. Unreadable/non-numeric size_kb NEVER
-# authorizes (fails toward keep, same idiom as _is_stale's mtime handling).
+# authorizes (fails toward keep, same idiom as _is_stale's mtime handling) —
+# not even against a limit of 0 (0 >= 0) — and neither does a limit that is
+# missing or not a number. ga-7jtyqjy: limit_kb replaces the whole-GB large_gb
+# argument; _size_escape_limit_kb works it out from the free space.
 _should_reap_size_escape() {
-  local sid="$1" keyfile="$2" mtime="$3" now="$4" critical_min_hours="$5" self="$6" size_kb="$7" large_gb="$8"
+  local sid="$1" keyfile="$2" mtime="$3" now="$4" critical_min_hours="$5" self="$6" size_kb="$7" limit_kb="$8"
   _is_dead "$sid" "$keyfile" "$self" || return 1
   _is_stale "$mtime" "$now" "$critical_min_hours" || return 1
   case "$size_kb" in ''|*[!0-9]*) return 1 ;; esac
+  case "$limit_kb" in ''|*[!0-9]*) return 1 ;; esac
+  [ "$size_kb" -ge "$limit_kb" ]
+}
+
+# _size_escape_limit_kb <large_gb> <avail_kb> <pct> <floor_mb> → prints the size in KB from which a dead scratchpad counts as "large"
+# for the CRITICAL size escape (ga-7jtyqjy): pct% of the free space clamped to [floor_mb, large_gb] — the less is left, the smaller a
+# dir has to be to matter. Third state, on purpose: free space or pct that cannot be read (empty, not a number, pct outside 1..100)
+# prints the STATIC ceiling large_gb, the rule before ga-7jtyqjy — never 0, never the floor — and pct 0 is the explicit off switch.
+# A free-space reading of 0 is a REAL zero (a full disk): it gives the floor, which is why the floor exists. An unreadable floor means
+# the default (10MB), an explicit 0 is honoured. A ceiling that cannot be read prints NOTHING (rc 1): with no limit
+# _should_reap_size_escape never authorizes.
+_size_escape_limit_kb() {
+  local large_gb="$1" avail_kb="$2" pct="$3" floor_mb="$4" cap_kb rel_kb floor_kb
   case "$large_gb" in ''|*[!0-9]*) return 1 ;; esac
-  [ "$size_kb" -ge $(( large_gb * 1024 * 1024 )) ]
+  cap_kb=$(( 10#$large_gb * 1024 * 1024 ))
+  case "$avail_kb" in ''|*[!0-9]*) printf '%s' "$cap_kb"; return 0 ;; esac
+  case "$pct" in ''|*[!0-9]*) printf '%s' "$cap_kb"; return 0 ;; esac
+  if [ "$((10#$pct))" -lt 1 ] || [ "$((10#$pct))" -gt 100 ]; then printf '%s' "$cap_kb"; return 0; fi
+  case "$floor_mb" in ''|*[!0-9]*) floor_mb=10 ;; esac
+  rel_kb=$(( 10#$avail_kb * 10#$pct / 100 ))
+  [ "$rel_kb" -le "$cap_kb" ] || rel_kb=$cap_kb
+  floor_kb=$(( 10#$floor_mb * 1024 ))
+  [ "$rel_kb" -ge "$floor_kb" ] || rel_kb=$floor_kb
+  printf '%s' "$rel_kb"
+}
+
+# _kb_mb <kb> → whole MB for the log lines; "?" when kb is not a number (an unreadable figure is never printed as 0).
+_kb_mb() {
+  case "$1" in ''|*[!0-9]*) printf '?' ;; *) printf '%s' $(( 10#$1 / 1024 )) ;; esac
 }
 
 # _prod_sentinel_active <resolved_root> <real_default_root> <prod_flag> → 0
@@ -285,6 +341,13 @@ _prod_sentinel_active() {
 # EXECUTION (side-effecting; NOT exercised by the selftest)
 # ════════════════════════════════════════════════════════════════════════════
 
+# _timeout_bin → prints the path of timeout, else gtimeout (Homebrew coreutils on macOS), else nothing. Thin wrapper so the
+# selftest can stand in for either (or for neither).
+_timeout_bin() {
+  # vazio → nada impresso: _fetch_live_keys roda o gc sem prazo, como antes (e o resumo diz bound=none); falhou/ilegível → idem, `command -v` só acha ou não acha
+  command -v timeout 2>/dev/null || command -v gtimeout 2>/dev/null || true
+}
+
 # _fetch_live_keys <out_file> → writes one session_key per line to out_file.
 # Returns nonzero on ANY failure to positively confirm liveness data (nonzero
 # exit, empty stdout, or JSON with no `.sessions` key) — a failure here must
@@ -293,10 +356,31 @@ _prod_sentinel_active() {
 # listing (active + suspended + anything not closed) is exactly ga-02pnu's
 # stated dead-session criterion ("session-id NAO aparece em 'gc session
 # list'").
+# ga-7jtyqjy: the call has its own deadline (GC_TIMEOUT_SECS, see the GC DEADLINE note in the header). Three outcomes that never
+# read alike in the log: answered, FAILED (rc/empty/no .sessions), DID NOT ANSWER IN TIME (rc 124 from timeout, 137 when it had to KILL
+# gc). Only an integer >= 1 is a deadline: text makes timeout refuse to run, and `timeout 0` means NO limit. How long the call took and
+# under which bound go to GC_LIST_ELAPSED / GC_LIST_BOUND for the cycle summary.
 _fetch_live_keys() {
-  local out="$1" raw rc
-  raw="$("$GC" session list --json 2>/dev/null)"
+  local out="$1" raw rc secs tmo t0
+  secs="$GC_TIMEOUT_SECS"
+  case "$secs" in ''|*[!0-9]*) secs=150 ;; esac
+  [ "$((10#$secs))" -ge 1 ] || secs=150
+  tmo="$(_timeout_bin)"
+  GC_LIST_BOUND="none"; GC_LIST_ELAPSED=""
+  t0=$(date +%s)
+  # vazio → ABORT "failed (rc=0) or returned empty" (uma resposta vazia não é cidade quieta); falhou/ilegível → ABORT (rc≠0, sem .sessions) ou, estourado o prazo, ABORT "did not answer": nada é apagado
+  if [ -n "$tmo" ]; then
+    GC_LIST_BOUND="$((10#$secs))s"
+    raw="$("$tmo" -k 10 "$((10#$secs))" "$GC" session list --json 2>/dev/null)"
+  else
+    raw="$("$GC" session list --json 2>/dev/null)"
+  fi
   rc=$?
+  GC_LIST_ELAPSED=$(( $(date +%s) - t0 ))
+  if [ -n "$tmo" ] && { [ $rc -eq 124 ] || [ $rc -eq 137 ]; }; then
+    log "ABORT: 'gc session list --json' did not answer within ${GC_LIST_BOUND} (timeout rc=$rc) — cannot verify liveness, nothing is reaped this cycle (raise SCRATCHPAD_REAPER_GC_TIMEOUT_SECS only if this repeats)"
+    return 1
+  fi
   if [ $rc -ne 0 ] || [ -z "$raw" ]; then
     log "ABORT: 'gc session list --json' failed (rc=$rc) or returned empty — cannot verify liveness"
     return 1
@@ -315,6 +399,17 @@ _fetch_live_keys() {
 # inline `gc session list` call.
 _dir_size_kb() {
   du -sk "$1" 2>/dev/null | awk '{print $1}'
+}
+
+# _avail_kb <path> → free KB on the filesystem that hosts <path> (ga-7jtyqjy). The same `df -k … NR==2 $4` read the disk-floor
+# guard's _avail_gb makes, so both see the same number; EMPTY when df fails or prints something that is not a number, never a 0 (a
+# full disk prints a real 0). Its own function so the selftest can stub it, like _dir_size_kb.
+_avail_kb() {
+  local kb
+  # vazio → "" (o df sempre imprime um número); falhou/ilegível → "": o ciclo mantém a barra estática LARGE_GB (regra antiga) e loga WARN
+  kb="$(df -k "$1" 2>/dev/null | awk 'NR==2 {print $4}')"
+  case "$kb" in ''|*[!0-9]*) return 0 ;; esac
+  printf '%s' "$kb"
 }
 
 # _ps_claude_lines → prints "<pid> <command line>" for every process whose
@@ -477,6 +572,15 @@ _reap_cycle() {
   fi
 
   now=$(date +%s)
+  # ga-7jtyqjy: the CRITICAL size bar, worked out ONCE for the whole cycle (see RELATIVE SIZE BAR in the header). Free space is only read
+  # when the CRITICAL signal makes the size escape relevant; an unreadable reading keeps the static LARGE_GB bar and says so.
+  local avail_kb="" limit_kb="" size_ctx="large_gb=${LARGE_GB}GB"
+  if [ "$PRESSURE" = "CRITICAL" ]; then
+    avail_kb="$(_avail_kb "$SCRATCH_ROOT")"
+    limit_kb="$(_size_escape_limit_kb "$LARGE_GB" "$avail_kb" "$LARGE_PCT" "$LARGE_FLOOR_MB")"
+    [ -n "$avail_kb" ] || log "WARN: could not read the free space of $SCRATCH_ROOT (df failed or unparseable) — the size escape keeps the static ${LARGE_GB}GB bar this cycle"
+    size_ctx="size_limit=$(_kb_mb "$limit_kb")MB avail=$(_kb_mb "$avail_kb")MB large_pct=${LARGE_PCT} floor=${LARGE_FLOOR_MB}MB ceiling=${LARGE_GB}GB"
+  fi
   shopt -s nullglob
   local dir sid proj mtime kb reap_reason age_h
   local scanned=0 skipped=0
@@ -505,7 +609,8 @@ _reap_cycle() {
       # actually makes it relevant — a dir already reaping via the normal
       # age path, or with no CRITICAL signal at all, never needs it here.
       kb="$(_dir_size_kb "$dir")"
-      if _should_reap_size_escape "$sid" "$keyfile" "$mtime" "$now" "$CRITICAL_MIN_AGE_HOURS" "$SELF_SESSION_ID" "${kb:-0}" "$LARGE_GB"; then
+      # vazio/ilegível → $kb vazio vai CRU: o tamanho ilegível nunca autoriza, nem contra um limite 0 (antes era ${kb:-0}, que virava 0 >= limite)
+      if _should_reap_size_escape "$sid" "$keyfile" "$mtime" "$now" "$CRITICAL_MIN_AGE_HOURS" "$SELF_SESSION_ID" "$kb" "$limit_kb"; then
         reap_reason="size-escape"
       fi
     fi
@@ -536,7 +641,7 @@ _reap_cycle() {
         ''|*[!0-9]*) age_h="?" ;;
         *) age_h=$(( (now - mtime) / 3600 )) ;;
       esac
-      log "scratch-reap: candidato morto PULADO: $proj/$sid/scratchpad (${kb:-?}KB, idade=${age_h}h, min_age_hours=${MIN_AGE_HOURS}h, min_idle_minutes=${MIN_IDLE_MINUTES}, pressure=${PRESSURE:-none}, critical_min_age_hours=${CRITICAL_MIN_AGE_HOURS}h, large_gb=${LARGE_GB}GB)"
+      log "scratch-reap: candidato morto PULADO: $proj/$sid/scratchpad (${kb:-?}KB, idade=${age_h}h, min_age_hours=${MIN_AGE_HOURS}h, min_idle_minutes=${MIN_IDLE_MINUTES}, pressure=${PRESSURE:-none}, critical_min_age_hours=${CRITICAL_MIN_AGE_HOURS}h, ${size_ctx})"
     fi
   done
 
@@ -555,11 +660,12 @@ _reap_cycle() {
   local elapsed=$(( $(date +%s) - t0 )) live_n proj_n
   live_n="$(grep -c . "$keyfile" 2>/dev/null || true)"
   proj_n="$(grep -c . "$projfile" 2>/dev/null || true)"
-  local ctx="live_ids=${live_n:-?} protected_projects=${proj_n:-?} elapsed=${elapsed}s"
+  # gc_list: how long `gc session list` took and under which bound — the next pane's log says how slow it was (ga-7jtyqjy)
+  local ctx="live_ids=${live_n:-?} protected_projects=${proj_n:-?} elapsed=${elapsed}s gc_list=${GC_LIST_ELAPSED:-?}s(bound=${GC_LIST_BOUND:-?})"
   if [ "$candidates" -eq 0 ]; then
     log "cycle complete: nada encontrado (scanned=$scanned dead_candidates=0) root=$SCRATCH_ROOT min_age_hours=$MIN_AGE_HOURS min_idle_minutes=$MIN_IDLE_MINUTES pressure=${PRESSURE:-none} $ctx"
   elif [ "$eligible" -eq 0 ]; then
-    log "cycle complete: nada elegivel ($candidates candidato(s) morto(s), 0 elegivel — ver PULADO acima) scanned=$scanned root=$SCRATCH_ROOT min_age_hours=$MIN_AGE_HOURS min_idle_minutes=$MIN_IDLE_MINUTES pressure=${PRESSURE:-none} critical_min_age_hours=$CRITICAL_MIN_AGE_HOURS large_gb=$LARGE_GB $ctx"
+    log "cycle complete: nada elegivel ($candidates candidato(s) morto(s), 0 elegivel — ver PULADO acima) scanned=$scanned root=$SCRATCH_ROOT min_age_hours=$MIN_AGE_HOURS min_idle_minutes=$MIN_IDLE_MINUTES pressure=${PRESSURE:-none} critical_min_age_hours=$CRITICAL_MIN_AGE_HOURS ${size_ctx} $ctx"
   else
     log "cycle complete: candidates=$candidates eligible=$eligible reaped=$reaped failed=$failed skipped=$skipped freed_kb=$freed_kb scanned=$scanned root=$SCRATCH_ROOT min_age_hours=$MIN_AGE_HOURS min_idle_minutes=$MIN_IDLE_MINUTES pressure=${PRESSURE:-none} enabled=$ENABLED dry_run=$DRY_RUN $ctx"
   fi
