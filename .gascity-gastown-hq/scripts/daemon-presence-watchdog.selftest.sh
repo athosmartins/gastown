@@ -156,21 +156,24 @@ expect_reprova "occupancy watch: label removed from DPW_CRITICAL" "$W/occ-no-cri
 expect_reprova "occupancy watch: label handed over empty" "$DPW" "$OCC_PLIST" "no label to prove" ""
 
 # ga-ki02nmt: the two JSONL backup jobs that run from launchd instead of the order dispatcher. One function, run once per job:
-#   jsonl_job_cases <label> <plist> <heartbeat-limit> <cap> <out-basename> <err-basename> [<own-log-basename> <writer-script>]
+#   jsonl_job_cases <label> <plist> <heartbeat-limit> <cap> <out-basename> <err-basename> [<own-log-basename> <writer-script> [<low-limit>]]
+# <low-limit> (9th, default 1000) is the "threshold too low" mutation: it must sit BELOW 2x the plist's StartInterval or the mutation would still pass (ga-yaoer2f: node-ghost-release, interval 311, 2x = 622, so 1000 proves nothing; it uses 500).
 # With the last two, the heartbeat is the job's OWN log (the exporter), not the plist's .out: the cases that lean on StandardOutPath are replaced by the ones that prove
 # the watchdog names that log and the script really writes it.
 # Each mutation below edits a COPY of the watchdog script (or of the plist) and the case must reprove FOR ITS OWN REASON (the needle). A sed that matches
 # nothing leaves the copy intact, the wiring passes, and the case fails as "passed (rc 0)": a mutation that misses cannot pass silently.
 jsonl_job_cases() {
-  local lbl="$1" plist="$2" lim="$3" cap="$4" outb="$5" errb="$6" ownlog="${7-}" writer="${8-}" tag="${1#com.gascity.}" lre o
+  local lbl="$1" plist="$2" lim="$3" cap="$4" outb="$5" errb="$6" ownlog="${7-}" writer="${8-}" low="${9-1000}" tag="${1#com.gascity.}" lre o
+  # a low-limit that is not a whole number is a bad call: the sed below would write garbage into the copy and every case would reprove for the wrong reason
+  case "$low" in ''|*[!0-9]*) nope "$tag: low-limit is not a whole number ([$low])"; return ;; esac
   lre="$(printf '%s' "$lbl" | sed 's/\./\\./g')"
   if [ -n "$ownlog" ]; then echo "== $tag: in the DPW default, its heartbeat is the log its own script writes =="; else echo "== $tag: in the DPW default, its heartbeat is the file its plist writes =="; fi
   if o="$(wiring "$DPW" "$plist" "$lbl" "$cap" "$ownlog" "$writer" 2>&1)"; then ok "$tag: real default wiring proven"; else nope "$tag: real default wiring NOT proven"; fi
   printf '%s\n' "$o" | sed 's/^/        | /'
   grep -v "^$lbl|" "$DPW" > "$W/$tag-no-entry.sh"
   expect_reprova "$tag: heartbeat entry removed" "$W/$tag-no-entry.sh" "$plist" "no heartbeat entry" "$lbl" "$cap" "$ownlog" "$writer"
-  sed "/^$lre|/s/|$lim\$/|1000/;/^$lre|/s/|$lim}\"\$/|1000}\"/" "$DPW" > "$W/$tag-low.sh"
-  expect_reprova "$tag: threshold 1000 s (< 2x StartInterval)" "$W/$tag-low.sh" "$plist" "threshold" "$lbl" "$cap" "$ownlog" "$writer"
+  sed "/^$lre|/s/|$lim\$/|$low/;/^$lre|/s/|$lim}\"\$/|$low}\"/" "$DPW" > "$W/$tag-low.sh"
+  expect_reprova "$tag: threshold $low s (< 2x StartInterval)" "$W/$tag-low.sh" "$plist" "threshold" "$lbl" "$cap" "$ownlog" "$writer"
   sed "/^$lre|/s/|$lim\$/|$((cap + 600))/;/^$lre|/s/|$lim}\"\$/|$((cap + 600))}\"/" "$DPW" > "$W/$tag-high.sh"
   expect_reprova "$tag: threshold $((cap + 600)) s (> ${cap} s)" "$W/$tag-high.sh" "$plist" "threshold" "$lbl" "$cap" "$ownlog" "$writer"
   sed "/^DPW_CRITICAL=/s/ $lre\([ }]\)/\1/" "$DPW" > "$W/$tag-no-critical.sh"
@@ -196,7 +199,8 @@ jsonl_job_cases() {
     sed "/^$lre|/s|$outb|$errb|" "$DPW" > "$W/$tag-err-file.sh"
     expect_reprova "$tag: heartbeat on the plist's $errb, not its $outb" "$W/$tag-err-file.sh" "$plist" "StandardOutPath" "$lbl" "$cap"
     # the plist's StandardOutPath points somewhere else: the heartbeat file is then one launchd never writes (the watchdog reads "file absent" = no verdict, forever)
-    sed "/<key>StandardOutPath<\\/key>/{n;s|$outb|some-other-file.out|;}" "$plist" > "$W/$tag-other-out.plist"
+    # the <string> sits on the line after the key (janitor, offsite) OR on the key's own line (node-ghost-release, occupancy watch): rewrite both, or a mutation that misses leaves the plist intact and the case fails as "passed (rc 0)"
+    sed "/<key>StandardOutPath<\\/key>/{s|$outb|some-other-file.out|;n;s|$outb|some-other-file.out|;}" "$plist" > "$W/$tag-other-out.plist"
     expect_reprova "$tag: plist StandardOutPath is another file" "$DPW" "$W/$tag-other-out.plist" "StandardOutPath" "$lbl" "$cap"
   fi
 }
@@ -219,6 +223,42 @@ if [ -n "$jo_out" ] && [ "$jo_out" = "$jo_err" ]; then
 else
   nope "jsonl-hourly-offsite: StandardErrorPath [$jo_err] != StandardOutPath [$jo_out]: the heartbeat would never advance (the script logs to stderr)"
 fi
+
+# ga-yaoer2f: node-ghost-release. The job runs on launchd with no entry here. Loaded, so PRESENCE-DRIFT stays quiet (it fires only for a plist that is NOT loaded: it did, 19:38-20:17Z, before the
+# install); but with no entry nothing reloads the job if it goes absent and nothing kickstarts it if it wedges. 311 s cycle (off the 300 s step) -> limit 900 s (> 2x 311 = 622,
+# under the 3000 s cap); its heartbeat is the plist's .out. The "threshold too low" mutation uses 500: 1000 would still pass above 2x 311 and prove nothing.
+NG_LBL="com.gascity.node-ghost-release"
+NG_PLIST="${NODE_GHOST_PLIST_PATH:-$HERE/$NG_LBL.plist}"
+NG_SCRIPT="${NODE_GHOST_SCRIPT_PATH:-$HERE/node-ghost-release.py}"
+jsonl_job_cases "$NG_LBL" "$NG_PLIST" 900 3000 "node-ghost-release.out" "node-ghost-release.err" "" "" 500
+
+# The heartbeat is the .out, so the script must log a line on EVERY run, kill-switch included: `_log("start ...` has to come BEFORE the kill-switch test in main(), or a deliberately
+# disabled job would stop advancing its .out and the watchdog would read it as WEDGED (kickstart -k + alert on a job somebody switched off on purpose).
+# prints "OK ..."/"BAD ..."; rc 1 on BAD. unreadable → BAD; read ok but a marker absent → BAD "not found" (another state); both present → compared. Never OK on a blank.
+ng_start_first() {
+  local s="$1" a b
+  if [ ! -r "$s" ]; then echo "BAD node-ghost-release.py unreadable or missing ($s)"; return 1; fi
+  # vazio (sem a linha) → a/b vazios → BAD "not found"; falhou (grep rc != 0) → mesma saída vazia → BAD, nunca OK
+  a="$(grep -n '_log("start enabled=' "$s" 2>/dev/null | head -1 | cut -d: -f1)"
+  b="$(grep -n 'if not ENABLED or os.path.exists(OFF_PATH)' "$s" 2>/dev/null | head -1 | cut -d: -f1)"
+  if [ -z "$a" ] || [ -z "$b" ]; then echo "BAD start-log line or kill-switch test not found (start=[$a] kill=[$b])"; return 1; fi
+  if [ "$a" -lt "$b" ]; then echo "OK the script logs start (line $a) before the kill-switch test (line $b): the .out advances on every run"; return 0; fi
+  echo "BAD the start log (line $a) comes AFTER the kill-switch test (line $b): a switched-off job would stop its heartbeat"; return 1
+}
+if o="$(ng_start_first "$NG_SCRIPT" 2>&1)"; then ok "node-ghost-release: the script logs start before the kill-switch"; else nope "node-ghost-release: start-before-kill-switch NOT proven"; fi
+printf '%s\n' "$o" | sed 's/^/        | /'
+ng_expect_reprova() {  # <name> <script> <needle>
+  local o2; o2="$(ng_start_first "$2" 2>&1)"
+  if [ $? -eq 0 ]; then nope "$1 — passed (rc 0); a broken script must reprove"; return; fi
+  if ! printf '%s\n' "$o2" | grep -q "$3"; then nope "$1 — reproved, but not for the expected reason ($3): $o2"; return; fi
+  ok "$1 → rc != 0 ($3)"
+}
+ng_expect_reprova "node-ghost-release: script missing" "$W/nonexistent-ng.py" "unreadable or missing"
+sed '/_log("start enabled=/d' "$NG_SCRIPT" > "$W/ng-no-start.py"
+ng_expect_reprova "node-ghost-release: start log removed" "$W/ng-no-start.py" "not found"
+# awk, not `sed i\`: the one-line form is GNU-only and BSD sed (the mini) wants a newline after the backslash
+awk '/_log\("start enabled=/{print "    if not ENABLED or os.path.exists(OFF_PATH): return 0"} {print}' "$NG_SCRIPT" > "$W/ng-kill-first.py"
+ng_expect_reprova "node-ghost-release: kill-switch test moved above the start log" "$W/ng-kill-first.py" "AFTER the kill-switch"
 
 echo
 echo "PASS=$PASS FAIL=$FAIL"

@@ -5,16 +5,18 @@
   <key>Label</key><string>com.gascity.node-ghost-release</string>
   <!-- Node Ghost Release (2026-11-07, ga-moq226t): a bead in_progress owned by a Hetzner node alias (wa-worker-remote-N / ps-worker-remote-N, mark pilot.wa_node_alias)
        whose alias has NO live session for 15 min goes back to open/no owner, with a comment on the bead and ONE mail to the Mayor. One guarded write per bead, max 3 per sweep.
-       DRY-RUN IS SHIPPED ON (NODE_GHOST_DRY_RUN=1: logs WOULD-RELEASE, keeps its clock, writes nothing): set it to 0 only after reading one dry-run log. KILL-SWITCH
-       NODE_GHOST_ENABLED=0 or the file .gc/node-ghost-release.off. StartInterval 300 must stay above the duration of one sweep (the lock keeps it single-instance).
-       NOT LOADED BY MERGING THIS FILE: load it (launchctl bootstrap) and register it in daemon-presence-watchdog.sh in the same change; see docs/runbooks/node-ghost-release.md. -->
+       LIVE (ga-yaoer2f, 07/11): NODE_GHOST_DRY_RUN=0 writes. It was shipped as 1 (logs WOULD-RELEASE, keeps its clock, writes nothing) and flipped only after the dry-run log
+       showed real ghosts (wa-or1xlf: 91 min without a session, then re-dispatched by the Pilot; wa-7tufg6: session closed 22:09Z). Only an exact "0" writes; anything else is a dry run.
+       KILL-SWITCH NODE_GHOST_ENABLED=0 or the file .gc/node-ghost-release.off. StartInterval 311, not 300: off the 300 s step the other daemons share, and still above one sweep
+       (22-107 s measured over 46 sweeps, median 36 s; the lock keeps it single-instance). Registered in daemon-presence-watchdog.sh (DPW_CRITICAL + heartbeat on the .out, 900 s).
+       NOT LOADED BY MERGING THIS FILE: ~/Library/LaunchAgents/ holds the live copy; reload it (launchctl bootstrap) after editing; see docs/runbooks/node-ghost-release.md. -->
   <key>ProgramArguments</key>
   <array>
     <string>/usr/bin/python3</string>
     <string>/Users/athos/gt/.gascity-gastown-hq/scripts/node-ghost-release.py</string>
   </array>
   <key>WorkingDirectory</key><string>/Users/athos/gt/.gascity-gastown-hq</string>
-  <key>StartInterval</key><integer>300</integer>
+  <key>StartInterval</key><integer>311</integer>
   <key>StandardOutPath</key><string>/Users/athos/gt/.gascity-gastown-hq/.gc/logs/node-ghost-release.out</string>
   <key>StandardErrorPath</key><string>/Users/athos/gt/.gascity-gastown-hq/.gc/logs/node-ghost-release.err</string>
   <key>EnvironmentVariables</key>
@@ -23,7 +25,7 @@
     <key>HOME</key><string>/Users/athos</string>
     <key>GC_CITY_PATH</key><string>/Users/athos/gt/.gascity-gastown-hq</string>
     <key>NODE_GHOST_ENABLED</key><string>1</string>
-    <key>NODE_GHOST_DRY_RUN</key><string>1</string>
+    <key>NODE_GHOST_DRY_RUN</key><string>0</string>
   </dict>
 </dict>
 </plist>

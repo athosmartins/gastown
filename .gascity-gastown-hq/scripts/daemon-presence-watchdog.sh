@@ -98,7 +98,7 @@ _deliberately_disabled() {
 # system sleep, NOT to a hung daemon); 0 = legacy behaviour (flag regardless).
 DPW_WAKE_GRACE="${DPW_WAKE_GRACE:-1}"
 
-DPW_CRITICAL="${DPW_CRITICAL:-com.gascity.pilot com.gascity.context-check-dispatcher com.gascity.quality-gate-dispatcher com.gascity.auto-refino-dispatcher com.gascity.refino-gate-dispatcher com.gascity.story-delivery com.gascity.supervisor com.gascity.supervisor-config-guard com.gascity.inflight-reclaim-guard com.gascity.gate-recovery-watchdog com.gascity.dolt-hang-watchdog com.gascity.production-stall-watchdog com.gascity.crew-hang-detector com.gascity.lifecycle-coherence-janitor com.gascity.crew-autopin-guard com.gascity.lifecycle-correctness-auditor com.gascity.throughput-stall-watchdog com.gascity.gate-throughput-stall-watchdog com.gascity.git-lock-hygiene com.gascity.crew-liveness-probe com.gascity.agent-stuck-escalation com.gascity.quorum-convergence-watchdog com.gascity.approved-state-reconciler com.gascity.auto-rehome-janitor com.gascity.sling-task-janitor com.gascity.gate-marker-rehome-janitor com.gascity.silent-ignorance-watch com.gascity.child-priority-janitor com.gascity.hetzner-occupancy-watch com.gascity.jsonl-hourly-offsite-age com.gascity.jsonl-export com.gascity.jsonl-hourly-offsite}"
+DPW_CRITICAL="${DPW_CRITICAL:-com.gascity.pilot com.gascity.context-check-dispatcher com.gascity.quality-gate-dispatcher com.gascity.auto-refino-dispatcher com.gascity.refino-gate-dispatcher com.gascity.story-delivery com.gascity.supervisor com.gascity.supervisor-config-guard com.gascity.inflight-reclaim-guard com.gascity.gate-recovery-watchdog com.gascity.dolt-hang-watchdog com.gascity.production-stall-watchdog com.gascity.crew-hang-detector com.gascity.lifecycle-coherence-janitor com.gascity.crew-autopin-guard com.gascity.lifecycle-correctness-auditor com.gascity.throughput-stall-watchdog com.gascity.gate-throughput-stall-watchdog com.gascity.git-lock-hygiene com.gascity.crew-liveness-probe com.gascity.agent-stuck-escalation com.gascity.quorum-convergence-watchdog com.gascity.approved-state-reconciler com.gascity.auto-rehome-janitor com.gascity.sling-task-janitor com.gascity.gate-marker-rehome-janitor com.gascity.silent-ignorance-watch com.gascity.child-priority-janitor com.gascity.hetzner-occupancy-watch com.gascity.jsonl-hourly-offsite-age com.gascity.jsonl-export com.gascity.jsonl-hourly-offsite com.gascity.node-ghost-release}"
 
 HQ="${DPW_HQ:-/Users/athos/gt/.gascity-gastown-hq}"
 
@@ -162,7 +162,8 @@ com.gascity.child-priority-janitor|$HQ/.gc/logs/child-priority-janitor.out|900
 com.gascity.hetzner-occupancy-watch|$HQ/.gc/logs/hetzner-occupancy-watch.out|2700
 com.gascity.jsonl-hourly-offsite-age|$HQ/.gc/logs/jsonl-hourly-offsite-age.out|1500
 com.gascity.jsonl-export|$HQ/.gc/logs/jsonl-export.log|2700
-com.gascity.jsonl-hourly-offsite|$HQ/.gc/logs/jsonl-hourly-offsite-launchd.out|5400}"
+com.gascity.jsonl-hourly-offsite|$HQ/.gc/logs/jsonl-hourly-offsite-launchd.out|5400
+com.gascity.node-ghost-release|$HQ/.gc/logs/node-ghost-release.out|900}"
 
 # ── RECYCLER — memory-bounded restart of known-leaky Python dashboards ────────
 # Knobs (override via env or the launchd plist EnvironmentVariables):
@@ -1681,6 +1682,25 @@ GCSTUB20
     esac
   done
   unset _jx _jx_lbl _jx_rest _jx_want _jx_wantfile _jx_line _jx_max _jx_file
+
+  echo "Scenario 22e (ga-yaoer2f): real default covers node-ghost-release (heartbeat entry on its .out + DPW_CRITICAL + threshold)"
+  # Mesma classe da 22c: o job roda no launchd sem entrada aqui. Carregado, o PRESENCE-DRIFT fica calado (ele só dispara para plist NÃO carregado: disparou de 19:38 a 20:17Z, antes da
+  # instalação), mas sem entrada ninguém o religa se ele sumir nem o reinicia se travar. A metade que LÊ o plist (limite > 2x o StartInterval 311;
+  # arquivo do heartbeat = StandardOutPath; o script loga `start` ANTES do kill-switch) mora em daemon-presence-watchdog.selftest.sh.
+  _ng_lbl="com.gascity.node-ghost-release"
+  # vazio (sem entrada) → _ng_line/_ng_max vazios → os ramos "MISSING"/"not numeric" abaixo reprovam; falhou (awk rc != 0) → mesma saída vazia → reprova, nunca passa
+  _ng_line="$(printf '%s\n' "$_REAL_DEFAULT_HEARTBEAT" | awk -F'|' -v l="$_ng_lbl" '$1==l{print; exit}')"
+  _ng_file="$(printf '%s' "$_ng_line" | awk -F'|' '{n=split($2,a,"/"); print a[n]}')"
+  _ng_max="$(printf '%s' "$_ng_line" | awk -F'|' '{print $3}')"
+  if [ -n "$_ng_line" ]; then ok "DPW_HEARTBEAT default covers $_ng_lbl ($_ng_line)"; else bad "DPW_HEARTBEAT default MISSING an entry for $_ng_lbl"; fi
+  if [ "$_ng_file" = "node-ghost-release.out" ]; then ok "$_ng_lbl heartbeat file is node-ghost-release.out (the plist's StandardOutPath)"; else bad "$_ng_lbl heartbeat file is [$_ng_file], expected node-ghost-release.out"; fi
+  case "$_ng_max" in ''|*[!0-9]*) bad "$_ng_lbl heartbeat threshold is not numeric ([$_ng_max])" ;; *) ok "$_ng_lbl heartbeat threshold is numeric ($_ng_max s)" ;; esac
+  case " $_REAL_DEFAULT_CRITICAL " in
+    *" $_ng_lbl "*) ok "$_ng_lbl is also in DPW_CRITICAL (heartbeat entry is reachable)" ;;
+    *) bad "$_ng_lbl has a heartbeat entry but is NOT in DPW_CRITICAL (dead config)" ;;
+  esac
+  if [ "${_ng_max:-99999}" -le 3000 ] 2>/dev/null; then ok "$_ng_lbl threshold ${_ng_max}s is <= 3000 s (still catches a hang)"; else bad "$_ng_lbl threshold [${_ng_max}] is not a number <= 3000 s"; fi
+  unset _ng_lbl _ng_line _ng_file _ng_max
 
   echo "Scenario 23 (ga-g92h): _exit_class distinguishes OOM-killed (137) from a real failure"
   # Provenance checks off (matches the imp17 block's own convention above) --

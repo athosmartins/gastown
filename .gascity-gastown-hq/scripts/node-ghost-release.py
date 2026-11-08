@@ -253,7 +253,7 @@ def update_argv(f, path):
 
 def format_comment(f, mins, note):
     return ("nó (ga-moq226t): devolvida ao Pilot — o alias %s ficou sem sessão viva há pelo menos %d min (roster: %s; última sessão da bead: %s). Dono e marca do nó soltos, carimbos do Pilot tirados, "
-            "status open: o Pilot redespacha. %sTrabalho não publicado da sessão pode estar no worktree do nó (hetzner-remote-git.sh status lista o PENDENTE; WIP publicado fica em worker/<sessão>-*). "
+            "status open: o Pilot redespacha. %sTrabalho não publicado da sessão pode estar no worktree do nó (hetzner-remote-git.sh status lista só o COMMITADO e ainda não publicado; arquivo novo ou alterado, sem commit, NÃO aparece: só abrindo o worktree no nó; WIP publicado fica em worker/<sessão>-*). "
             "Devoluções desta bead: %d.%s" % (f["alias"], mins, f["detail"], f["sess"] or "—", "Já foi devolvida antes: node:never aplicado, ela vai ao mini. " if f.get("veto") else "", f["n"] + 1,
                                               " ATENÇÃO: " + note if note else ""))
 
@@ -262,7 +262,7 @@ def format_mail(items):
     out = ["node-ghost-release (ga-moq226t): bead(s) de alias do nó Hetzner SEM sessão viva devolvidas ao Pilot (status open, sem dono, sem a marca do nó).", ""]
     out += ["  %s/%s — alias %s, sem sessão há pelo menos %d min%s%s" % (x["store"], x["id"], x["alias"], x["mins"], " (veto node:never: vai ao mini)" if x.get("veto") else "",
                                                            " — ATENÇÃO: " + x["note"] if x.get("note") else "") for x in items]
-    return "\n".join(out + ["", "Trabalho não publicado pode estar no worktree do nó: `hetzner-remote-git.sh status <rig>` lista o PENDENTE.",
+    return "\n".join(out + ["", "Trabalho não publicado pode estar no worktree do nó: `hetzner-remote-git.sh status <rig>` lista só o que foi COMMITADO e não publicado; arquivo novo ou alterado sem commit NÃO aparece (só abrindo o worktree no nó).",
                             "Desligar: NODE_GHOST_ENABLED=0 no plist (recarregar) ou `touch .gc/node-ghost-release.off`."])
 
 
