@@ -13,9 +13,9 @@
 # call to a file has no such combination: `sh <this file> gastown.dog`.
 #
 # Contract. The SAME probe: same bd calls (same flags, same order), same veto filter, same tiers, and
-# the same STDOUT in every case (one JSON array of at most one bead, or `[]`) - except the four deliberate
+# the same STDOUT in every case (one JSON array of at most one bead, or `[]`) - except the five deliberate
 # differences below (the disk floor, ga-vln2py; the sling filter, ga-b97dgq; the gate focus hold, ga-6fkx9je; the mother filter,
-# ga-vdac4cj), each with its own selftest.
+# ga-vdac4cj; the decision type, ga-rahls6k), each with its own selftest.
 # It is read-only (bd ready/list/query/show, gc session list, jq): nothing in here removes anything. The proof
 # is pool-probe.selftest.sh, which runs the engine's own text (pool-probe.golden-1c.txt) and this file against
 # the same fixtures and compares stdout, the argv of every bd call and the exit code.
@@ -140,7 +140,21 @@ pp_minus() {
 # The veto filter every tier ends with (the engine's poolDemandLabelFilterJQ). The engine pastes the
 # same 655-byte program into all three tiers; it is one variable here. Prefix families (bd's
 # --exclude-label is exact, so these cannot be flags), an unexpired pilot hold, EPIC-titled beads.
+# ga-rahls6k (the fifth deliberate difference from the engine's text): issue_type=decision is somebody's call, not a build, so it is
+# dropped like the epic container is (the engine only has --exclude-type=epic). ga-2i4hwda (decision, exec:auto + story:approved) was
+# handed to a dog that spent a turn refusing it. It is its OWN stage (POOL_FILTER = the veto filter, then this drop, in ONE jq program,
+# not a second jq call, so the drop adds no new place for a failure to hide: it fails exactly where the veto filter already could. Tier 1
+# marks that unreadable (|| mark 1); tiers 2 and 3 pipe the jq into drop_slings_for_taken_stories with no mark, as they did before - this
+# change does not alter that), not a clause inside VETO_FILTER and not a second --exclude-type flag, on purpose: VETO_FILTER stays
+# verbatim the engine's text (pool-probe.selftest.sh section 8 checks that) and the bd argv stays byte-identical (section 1 compares it;
+# --live compares the golden with `gc prime`). The cost of dropping after bd: the engine's --limit=20 window can still hold decisions,
+# so 20 routed decisions older than a real story would hide that story until they are gone. The Pilot no longer routes decisions
+# (pilot-dispatcher.sh _filter_candidates), so only hand-slung ones can pile up. A type that is not a string (5, an object) reads as
+# "not a decision": tostring never raises, so one odd bead cannot turn the whole list into the [] a dog reads as "no work".
+# decision-type-not-buildable.selftest.sh pins this stage, the Pilot and both workers.
 VETO_FILTER='[ .[] | select(((.labels // []) | map(select(startswith("pool:refused"))) | length) == 0) | select((((.labels // []) | map(select(. == "pilot:held" or startswith("pilot:held-until:"))) | length) == 0) or (((.labels // []) | map(select(startswith("pilot:held-until:")) | ltrimstr("pilot:held-until:") | tonumber)) | if length > 0 then (max < $now_ts) else false end)) | select(((.title // "") | test("^(EPIC|ÉPICO)[:\\s]"; "i")) | not) | select(((.labels // []) | map(select(startswith("blocked:") or startswith("blocked-reason:") or startswith("gate:needs-human") or startswith("pilot:refused-reason:") or startswith("pilot:text-veto"))) | length) == 0) ]'
+DECISION_DROP_JQ='[ .[] | select(((.issue_type // .type // "") | tostring | ascii_downcase) != "decision") ]'
+POOL_FILTER="$VETO_FILTER | $DECISION_DROP_JQ"
 
 # Tier 1, second half: stdin is the JSON array of routed ready beads; keep the ones whose molecule has
 # no in-progress child (a bead with no molecule_id is always kept; an answer that is not proof of a
@@ -227,7 +241,7 @@ t1_fetch() { # $1 = --limit: the engine asks for 20; the disk hold may ask again
 # The engine asks for 20 in tier 1. The refetch test below compares the size of the answer with this SAME number: one definition.
 t1_window=20
 t1_raw=$(t1_fetch "$t1_window") || mark 1
-t1_kept=$(printf "%s" "$t1_raw" | jq -c --argjson now_ts "$(date +%s)" "$VETO_FILTER" 2>/dev/null) || mark 1
+t1_kept=$(printf "%s" "$t1_raw" | jq -c --argjson now_ts "$(date +%s)" "$POOL_FILTER" 2>/dev/null) || mark 1
 if [ "$disk_state" = low ]; then
   # vazio/falhou/ilegível (no hold text, or jq failed) -> tier 1 answers NOTHING (inert) and is marked unreadable, like any
   # tier that could not be read: if tiers 2 and 3 find nothing either, the exit-3 line on stderr says so. A hold that could
@@ -249,7 +263,7 @@ if [ "$disk_state" = low ]; then
       # vazio/falhou/ilegível (bd failed, the answer is empty or not JSON, or the hold cannot read it) -> tier 1 is marked
       # unreadable and answers NOTHING (inert; exit 3 if tiers 2 and 3 find nothing either); a valid [] is a real "nothing"
       if t1_all=$(t1_fetch 0) \
-        && t1_all_kept=$(printf "%s" "$t1_all" | jq -c --argjson now_ts "$(date +%s)" "$VETO_FILTER" 2>/dev/null) \
+        && t1_all_kept=$(printf "%s" "$t1_all" | jq -c --argjson now_ts "$(date +%s)" "$POOL_FILTER" 2>/dev/null) \
         && t1_all_held=$(printf "%s" "$t1_all_kept" | jq -c "$disk_hold_jq" 2>/dev/null) && [ -n "$t1_all_held" ]; then
         # vazio/falhou/ilegível -> LOG TEXT ONLY (the list itself was read above and is what gets used): a count jq cannot give prints "?", never "0 left"
         n_all=$(pp_len "$t1_all_kept"); n_all_held=$(pp_len "$t1_all_held")
@@ -282,7 +296,7 @@ if [ "$focus_state" = 1 ] && [ "$disk_state" != low ]; then
       # vazio/falhou/ilegível (bd failed, the answer is empty or not JSON, or the hold cannot read it) -> tier 1 is marked unreadable and
       # answers NOTHING (inert; exit 3 if tiers 2 and 3 find nothing either); a valid [] is a real "nothing"
       if t1_all=$(t1_fetch 0) \
-        && t1_all_kept=$(printf "%s" "$t1_all" | jq -c --argjson now_ts "$(date +%s)" "$VETO_FILTER" 2>/dev/null) \
+        && t1_all_kept=$(printf "%s" "$t1_all" | jq -c --argjson now_ts "$(date +%s)" "$POOL_FILTER" 2>/dev/null) \
         && t1_all_held=$(printf "%s" "$t1_all_kept" | jq -c "$focus_hold_jq" 2>/dev/null) && [ -n "$t1_all_held" ]; then
         # vazio/falhou/ilegível -> LOG TEXT ONLY (the list itself was read above and is what gets used): a count jq cannot give prints "?", never "0 left"
         n_all=$(pp_len "$t1_all_kept"); n_all_held=$(pp_len "$t1_all_held")
@@ -307,7 +321,7 @@ found "$r"
 # Tier 2 (legacy): workflow beads that carry gc.run_target=<target> and no gc.routed_to.
 legacy_candidates=$(bd ready --metadata-field "gc.run_target=$target" --metadata-field "gc.kind=workflow" --unassigned --exclude-type=epic --json --sort oldest --limit=20 2>/dev/null) || mark 2
 t2_unrouted=$(printf "%s" "$legacy_candidates" | jq '[.[] | select((.metadata["gc.routed_to"] // "") == "")]' 2>/dev/null) || mark 2
-t2_kept=$(printf "%s" "$t2_unrouted" | jq -c --argjson now_ts "$(date +%s)" "$VETO_FILTER" 2>/dev/null | drop_slings_for_taken_stories)
+t2_kept=$(printf "%s" "$t2_unrouted" | jq -c --argjson now_ts "$(date +%s)" "$POOL_FILTER" 2>/dev/null | drop_slings_for_taken_stories)
 # same three states as tier 1 (ga-vdac4cj): the filter runs before the oldest-pick, and an unreadable look-up marks the tier
 t2_kept=$(printf "%s" "$t2_kept" | drop_mothers_with_children_in_hand) || mark 2
 r=$(printf "%s" "$t2_kept" | jq -c '.[0:1]' 2>/dev/null)
@@ -317,7 +331,7 @@ found "$r"
 # jq that fails leaves "[]" appended to whatever it printed.
 t3_raw=$(bd query --json 'ephemeral=true AND status=open AND assignee=none' --limit=0 2>/dev/null) || mark 3
 legacy_ephemeral_candidates=$(printf "%s" "$t3_raw" | jq --arg target "$target" '[.[] | select((.assignee // "") == "") | select(((.metadata["gc.routed_to"] // "") == $target) or (((.metadata["gc.routed_to"] // "") == "") and ((.metadata["gc.run_target"] // "") == $target) and ((.metadata["gc.kind"] // "") == "workflow"))) | select(((.issue_type // .type // "") != "epic")) | select(([ (.dependencies // [])[] | select((.type // .dep_type // "") as $t | ($t == "blocks" or $t == "waits-for" or $t == "conditional-blocks")) | select((.status // .depends_on_status // "") != "closed") ] | length) == 0)] | sort_by(.created_at // "") | .[:20]' 2>/dev/null) || { mark 3; legacy_ephemeral_candidates="$legacy_ephemeral_candidates[]"; }
-t3_kept=$(printf "%s" "$legacy_ephemeral_candidates" | jq -c --argjson now_ts "$(date +%s)" "$VETO_FILTER" 2>/dev/null | drop_slings_for_taken_stories)
+t3_kept=$(printf "%s" "$legacy_ephemeral_candidates" | jq -c --argjson now_ts "$(date +%s)" "$POOL_FILTER" 2>/dev/null | drop_slings_for_taken_stories)
 # same three states as tier 1 (ga-vdac4cj)
 t3_kept=$(printf "%s" "$t3_kept" | drop_mothers_with_children_in_hand) || mark 3
 r=$(printf "%s" "$t3_kept" | jq -c '.[0:1]' 2>/dev/null)

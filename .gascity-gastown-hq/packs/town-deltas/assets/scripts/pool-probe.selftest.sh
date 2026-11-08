@@ -284,7 +284,11 @@ body = sys.argv[2]
 code = "\n".join(l for l in script.splitlines() if not l.lstrip().startswith("#"))
 lits = re.findall(r"'([^'\n]{20,})'", code)
 # Whole literal, quotes included: a truncated program is still a substring of the original.
-missing = [l for l in lits if ("'" + l + "'") not in body]
+# ga-rahls6k: the ONE literal that is deliberately NOT the engine's text - the decision drop (the fifth deliberate difference, its own stage
+# so VETO_FILTER stays verbatim). Allowed by EXACT text: any edit to it, or any other new literal, still fails here until it is looked at.
+# decision-type-not-buildable.selftest.sh holds the proof of what it does.
+DELIBERATE = [r'''[ .[] | select(((.issue_type // .type // "") | tostring | ascii_downcase) != "decision") ]''']
+missing = [l for l in lits if ("'" + l + "'") not in body and l not in DELIBERATE]
 print(f"{len(lits)} literals checked")
 for l in missing:
     print("NOT IN ENGINE PROBE:", l[:120])

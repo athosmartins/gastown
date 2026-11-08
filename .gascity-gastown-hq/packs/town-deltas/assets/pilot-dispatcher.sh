@@ -3669,6 +3669,17 @@ _filter_candidates() {
         and (.assignee == null or .assignee == ""
              or (($roster_ok == 1) and (.assignee as $a | ($active_owner_ids | index($a)) == null)))
         and ((.issue_type // .type // "") != "epic")
+        # ga-rahls6k: issue_type=decision is a CALL somebody makes, not a build — same class as the epic
+        # container above. ga-2i4hwda (decision + exec:auto + story:approved) went to gastown.dog and
+        # the dog burned a turn to refuse it; wa-7hx7x2 (decision, wa-worker) was saved only by a
+        # title regex, i.e. by accident. A decision keeps going to whoever decides (the panel is
+        # untouched); it just never becomes a pool dispatch. tostring/ascii_downcase: a type that is
+        # not a string (5, an object) is read as "not a decision" and survives — it must neither
+        # raise (the per-element catch would drop the bead on a guess) nor be taken for a decision.
+        # Keep this clause and its reason-trace mirror (search issue_type:decision below) in sync,
+        # and the pool probes (scripts/pool-probe.sh POOL_FILTER, the wa-/ps-worker templates):
+        # decision-type-not-buildable.selftest.sh pins all four.
+        and (((.issue_type // .type // "") | tostring | ascii_downcase) != "decision")
         and (((.labels // []) | index("story:epic-split")) | not)
         # ga-iu9m/ga-enfe: a bead belonging to a graph.v2 formula/workflow is a
         # direct-execution runbook (run the listed commands, close the bead),
@@ -4097,6 +4108,8 @@ _filter_candidates() {
               else "assignee:\($b.assignee):roster-untrustworthy-failsafe" end)
            else empty end),
           (if ((($b.issue_type // $b.type // "")) == "epic") then "issue_type:epic" else empty end),
+          # ga-rahls6k: mirrors the issue_type=decision clause in the select above (same expression).
+          (if ((($b.issue_type // $b.type // "") | tostring | ascii_downcase) == "decision") then "issue_type:decision" else empty end),
           (if ($L | index("story:epic-split")) then "label:story:epic-split" else empty end),
           (if (($b.metadata["gc.root_bead_id"] // "") | test("\\S")) then "graph.v2-step:gc.root_bead_id" else empty end),
           (if (($b.metadata["gc.formula_contract"] // "") | test("\\S")) then "graph.v2-root:gc.formula_contract" else empty end),
