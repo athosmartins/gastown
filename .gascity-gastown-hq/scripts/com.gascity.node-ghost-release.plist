@@ -8,7 +8,13 @@
        LIVE (ga-yaoer2f, 07/11): NODE_GHOST_DRY_RUN=0 writes. It was shipped as 1 (logs WOULD-RELEASE, keeps its clock, writes nothing) and flipped only after the dry-run log
        showed real ghosts (wa-or1xlf: 91 min without a session, then re-dispatched by the Pilot; wa-7tufg6: session closed 22:09Z). Only an exact "0" writes; anything else is a dry run.
        KILL-SWITCH NODE_GHOST_ENABLED=0 or the file .gc/node-ghost-release.off. StartInterval 311, not 300: off the 300 s step the other daemons share, and still above one sweep
-       (22-107 s measured over 46 sweeps, median 36 s; the lock keeps it single-instance). Registered in daemon-presence-watchdog.sh (DPW_CRITICAL + heartbeat on the .out, 900 s).
+       (22-107 s measured over 46 sweeps at normal load, median 36 s; a round that outlasts the interval is not overlapped, the lock refuses a second copy). Registered in
+       daemon-presence-watchdog.sh (DPW_CRITICAL + heartbeat on the .out, 900 s).
+       CALL TIMEOUT (ga-pdyayy2, 08/11): NODE_GHOST_CALL_TIMEOUT=150 is the ceiling of each gc call (rig list, session list; mail send gets +20). The code default is 40, which was enough
+       at normal load (44 of 46 rounds on 07/11); with the mini at load 26 the roster read took 58 s to over 90 s, hit the 40, and the round ended DEGRADED rc 1 with nothing decided,
+       round after round, which the presence watchdog reads as CRASH-LOOP. Fail-closed stays: a read slower than 150 is still DEGRADED. A value that is not an integer, or is below 5,
+       falls back to 40 without a word, so the start line of every round logs call_timeout=N: after a reload, that line (not this file) says what the job runs with. The selftest
+       (section 13) pins this value against the measured latency and the StartInterval.
        NOT LOADED BY MERGING THIS FILE: ~/Library/LaunchAgents/ holds the live copy; reload it (launchctl bootstrap) after editing; see docs/runbooks/node-ghost-release.md. -->
   <key>ProgramArguments</key>
   <array>
@@ -26,6 +32,7 @@
     <key>GC_CITY_PATH</key><string>/Users/athos/gt/.gascity-gastown-hq</string>
     <key>NODE_GHOST_ENABLED</key><string>1</string>
     <key>NODE_GHOST_DRY_RUN</key><string>0</string>
+    <key>NODE_GHOST_CALL_TIMEOUT</key><string>150</string>
   </dict>
 </dict>
 </plist>

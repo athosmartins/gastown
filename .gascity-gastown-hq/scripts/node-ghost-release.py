@@ -56,7 +56,7 @@ MIN_SEEN = 2                                                      # vistas segui
 MAX_PER_RUN = _int_env("NODE_GHOST_MAX_PER_RUN", 3, 1)            # teto de escritas por rodada
 VETO_AFTER = _int_env("NODE_GHOST_VETO_AFTER", 2, 0)              # a N-ésima devolução veta o nó (0 = nunca veta)
 BD_TIMEOUT = _int_env("NODE_GHOST_BD_TIMEOUT", 60, 5)
-CALL_TIMEOUT = _int_env("NODE_GHOST_CALL_TIMEOUT", 40, 5)
+CALL_TIMEOUT = _int_env("NODE_GHOST_CALL_TIMEOUT", 40, 5)         # teto de cada `gc` (rig list, session list; o mail leva +20): 40 bastava em carga normal, o plist põe 150 (sob load 26 o session list levou 58 s a mais de 90 s: ga-pdyayy2)
 
 WORK_TYPES = frozenset({"feature", "bug", "task", "chore"})
 ALIAS_RE = re.compile(r"^((?:wa|ps)-worker-remote)-[1-9]$")       # o MBP (wa-worker-remote-mbp-N) não casa: é do guard
@@ -399,7 +399,7 @@ def run_cycle(now=None):
 
 def main():
     # loga SEMPRE primeiro: o daemon-presence-watchdog lê o .out como batimento
-    _log("start enabled=%s dry_run=%s grace=%ds max=%d veto_after=%d" % (ENABLED, DRY_RUN, GRACE_SEC, MAX_PER_RUN, VETO_AFTER))
+    _log("start enabled=%s dry_run=%s grace=%ds max=%d veto_after=%d call_timeout=%ds" % (ENABLED, DRY_RUN, GRACE_SEC, MAX_PER_RUN, VETO_AFTER, CALL_TIMEOUT))   # o teto que VALE (env ilegível volta a 40 em silêncio: aqui aparece)
     if not ENABLED or os.path.exists(OFF_PATH):
         _log("kill-switch (NODE_GHOST_ENABLED!=1 ou arquivo %s) — no-op" % OFF_PATH)
         return 0

@@ -3,17 +3,20 @@
 
 Funções puras em tabela (vivacidade do alias, quem é fantasma, relógio); run_cycle contra um MUNDO FALSO que aplica de verdade o `bd update` (guardas --if-*, rótulos, metadata) e
 falha de todo jeito (rc 1, lixo, vazio, estouro de tempo, escrita que mente ou que pega e não responde); e o script real como subprocesso. "Não consegui ler" jamais vira "sem sessão".
-Uso:  python3 node-ghost-release.selftest.py      (rc 0 = verde; NODE_GHOST_UNDER_TEST=<copia> roda um mutante)
+Leitura lenta sob carga (ga-pdyayy2): o teto das chamadas `gc` vem do plist (NODE_GHOST_CALL_TIMEOUT); o selftest lê o plist e prova cada elo: plist -> script (linha start) -> teto da chamada.
+Uso:  python3 node-ghost-release.selftest.py      (rc 0 = verde; NODE_GHOST_UNDER_TEST=<copia> e NODE_GHOST_PLIST_UNDER_TEST=<copia> rodam um mutante)
 """
-import fcntl, importlib.util, json, os, subprocess, sys, tempfile, time
+import fcntl, importlib.util, json, os, plistlib, subprocess, sys, tempfile, time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 SCRIPT = os.environ.get("NODE_GHOST_UNDER_TEST", os.path.join(HERE, "node-ghost-release.py"))
+PLIST = os.environ.get("NODE_GHOST_PLIST_UNDER_TEST", os.path.join(HERE, "com.gascity.node-ghost-release.plist"))
 sys.path.insert(0, HERE)
 _spec = importlib.util.spec_from_file_location("node_ghost_under_test", SCRIPT)
 N = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(N)
 N.GC_BIN, N.BD_BIN, N.CITY = "gc", "bd", "/c"   # o ambiente do nó já exporta GC_BIN/BD_BIN: o teste fixa os seus
+CALL_DEFAULT = N.CALL_TIMEOUT                   # o teto das chamadas `gc` como o módulo o calculou ao carregar; as seções 12-14 mexem nele e o devolvem
 
 NOW, H = 1_790_000_000, 3600
 OK, BAD, LOGS = [0], [], []
@@ -175,11 +178,14 @@ class World:
         self.rosters = [R0 if roster is None else roster]
         self.fail, self.cnt, self.calls, self.comments, self.mails, self.mail_argv, self.hooks = {}, {}, [], [], [], [], {}
         self.lie = self.late = self.partial = False   # lie: rc 0 sem aplicar · late: aplica e devolve rc 1 (resposta perdida) · partial: não tira a metadata
+        self.slow, self.timeout = {}, 0               # slow: chave -> segundos que a chamada "demora" (simulados, sem dormir) · timeout: o teto que o script passou a ESTA chamada
 
     def go(self, key, good):
         n = self.cnt[key] = self.cnt.get(key, 0) + 1
         if "%s#%d" % (key, n) in self.hooks:   # alguém mexe na bead NESTE ponto (corrida entre a leitura e a escrita)
             self.hooks["%s#%d" % (key, n)]()
+        if self.slow.get(key, 0) > self.timeout:   # demorou mais que o teto: o subprocess.run estoura e o _sh devolve None (a chamada não chega a responder)
+            return None
         f = self.fail.get("%s#%d" % (key, n)) or self.fail.get(key)
         ok = lambda: good() if callable(good) else good
         if f is None or f == "rcbody":
@@ -190,6 +196,7 @@ class World:
 
     def __call__(self, argv, timeout):
         self.calls.append(argv)
+        self.timeout = timeout
         a, tool = argv[1:], argv[0]
         if tool == "gc" and a[:2] == ["rig", "list"]:
             return self.go("rig", json.dumps({"rigs": [{"name": "whatsapp_automation", "path": "/r/wa"}]}))
@@ -491,6 +498,61 @@ lockf = os.path.join(tempfile.mkdtemp(dir=TMP), "x.lock"); fh = open(lockf, "w")
 r, calls = proc({"NODE_GHOST_LOCK": lockf})
 check("subprocesso: outra instância segura o lock -> sai 0 sem ler nada", r.returncode == 0 and "lock" in r.stdout and calls == "", r.stdout)
 fh.close()
+# 12) leitura LENTA sob carga (ga-pdyayy2): com o mini a load 26 o `gc session list` levou 58 s a mais de 90 s e estourava os 40 s -> DEGRADED, rc 1, de novo a cada rodada (o watchdog lê CRASH-LOOP).
+#     O mundo falso "demora" sem dormir: a chamada que passa do teto devolve None, como o subprocess.run estourado.
+LATENCY = 90   # s, medido em 08/11; a medida à mão estourou os próprios 90 s, então a latência real é >= 90
+for ceiling in (40, 150):
+    N.CALL_TIMEOUT = ceiling
+    w = due(B("wa-4vjmkn.4.2")); w.slow["roster"] = LATENCY
+    rc = cycle(w, 0)
+    if ceiling == 150:
+        check("lento: roster de %d s com o teto de 150 s decide normalmente (solta a fantasma vencida; lê o roster 2x, as duas vezes lento)" % LATENCY,
+              rc == 0 and bead(w, "wa-4vjmkn.4.2")["status"] == "open" and outs() == ["RELEASE"] and w.cnt["roster"] == 2 and not any("DEGRADED" in x for x in LOGS), str(LOGS[-3:]))
+    else:
+        check("lento: roster de %d s com o teto de 40 s (o padrão, sem o env do plist) -> DEGRADED, rc 1, nada escrito, o relógio fica" % LATENCY,
+              rc == 1 and not writes(w) and any("DEGRADED" in x for x in LOGS) and state()["ghosts"][KEY]["seen"] == 9, str(LOGS[-3:]))
+N.CALL_TIMEOUT = 150
+w = due(B("wa-4vjmkn.4.2")); w.slow["roster"] = 160
+check("lento: roster além do teto de 150 s continua DEGRADED (o teto é teto: o que não respondeu nunca vira «sem sessão»)", cycle(w, 0) == 1 and not writes(w) and state()["ghosts"][KEY]["seen"] == 9)
+for ceiling in (40, 150):
+    N.CALL_TIMEOUT = ceiling   # o mesmo teto vale para o rig list: lento demais cai na lista estática (a loja do rig não é lida), dentro do teto lê
+    w = due(B("wa-4vjmkn.4.2")); w.slow["rig"] = LATENCY
+    cycle(w, 0)
+    lida = any(c[0] == "bd" and c[2] == "/r/wa" and "list" in c for c in w.calls)
+    check("lento: rig list de %d s com o teto de %d s -> %s" % (LATENCY, ceiling, "lê a loja do rig" if ceiling == 150 else "DEGRADED stores, a loja do rig não é lida"),
+          lida == (ceiling == 150) and any("DEGRADED stores" in x for x in LOGS) == (ceiling != 150), str(LOGS[:3]))
+N.CALL_TIMEOUT = CALL_DEFAULT
+# 13) o plist de verdade: o teto que o launchd entrega ao script (fonte ≠ o que roda: o código sozinho, com o padrão de 40 s, é justamente o que falhava)
+# vazio → plist sem EnvironmentVariables vira {} e os dois checks do teto reprovam; falhou/ilegível → a exceção derruba o selftest (rc 1): nunca passa em silêncio
+with open(PLIST, "rb") as fh:
+    PL = plistlib.load(fh)
+PE = PL.get("EnvironmentVariables") if isinstance(PL.get("EnvironmentVariables"), dict) else {}
+raw, saved = PE.get("NODE_GHOST_CALL_TIMEOUT"), os.environ.get("NODE_GHOST_CALL_TIMEOUT")
+os.environ["NODE_GHOST_CALL_TIMEOUT"] = raw if isinstance(raw, str) else ""
+resolved = N._int_env("NODE_GHOST_CALL_TIMEOUT", 40, 5)   # o MESMO parser do script: texto ilegível volta em silêncio ao padrão de 40 s
+(os.environ.pop("NODE_GHOST_CALL_TIMEOUT") if saved is None else os.environ.__setitem__("NODE_GHOST_CALL_TIMEOUT", saved))
+check("plist: NODE_GHOST_CALL_TIMEOUT é texto (o launchd só aceita string no env) e o script o lê como o número posto, não como o padrão de 40 s",
+      isinstance(raw, str) and raw.isdigit() and resolved == int(raw) and resolved != 40, repr(raw))
+check("plist: o teto passa da latência medida sob carga (90 s) e uma chamada travada não passa de uma rodada (< StartInterval)",
+      isinstance(PL.get("StartInterval"), int) and 90 < resolved < PL["StartInterval"], "teto=%r StartInterval=%r" % (resolved, PL.get("StartInterval")))
+r, _ = proc(dict((k, v) for k, v in PE.items() if k.startswith("NODE_GHOST_")))
+check("plist -> script: o env do plist chega ao script e a linha start diz o teto que vale (call_timeout=%ss)" % raw, r.returncode == 0 and "call_timeout=%ss" % raw in r.stdout, (r.stdout + r.stderr)[:240])
+for val, want in ((None, 40), ("150", 150), ("150s", 40), ("", 40), ("4", 40), ("5", 5)):
+    r, _ = proc({} if val is None else {"NODE_GHOST_CALL_TIMEOUT": val})
+    check("subprocesso: NODE_GHOST_CALL_TIMEOUT=%r -> call_timeout=%ds na linha start (texto ilegível ou abaixo do mínimo volta ao padrão, e o log DIZ isso)" % (val, want), "call_timeout=%ds" % want in r.stdout, r.stdout[:160])
+# 14) o _sh de verdade, sem a costura: o teto vale no subprocess real (a chamada que passa dele é cortada; a lenta que cabe responde)
+slow_gc = os.path.join(TMP, "slow-gc")
+open(slow_gc, "w").write("#!/usr/bin/env python3\nimport json, os, time\ntime.sleep(float(os.environ['NG_SLOW']))\nprint(json.dumps({'sessions': [{'name': 'a', 'state': 'active'}]}))\n")
+os.chmod(slow_gc, 0o755)
+N._run, N.GC_BIN = None, slow_gc
+os.environ["NG_SLOW"], N.CALL_TIMEOUT = "5", 0.5   # a chamada dorme 5 s e o teto é 0,5 s: cortada
+t0 = time.time(); cortada = N._roster(); gasto = time.time() - t0
+os.environ["NG_SLOW"], N.CALL_TIMEOUT = "0.5", 30   # dorme 0,5 s, o teto é 30 s: lenta mas cabe
+lenta = N._roster()
+check("_sh real: roster que passa do teto é cortado (None, sem esperar a chamada acabar); o lento que cabe no teto responde",
+      cortada is None and gasto < 4 and lenta == [{"name": "a", "state": "active"}], "%r %.1fs %r" % (cortada, gasto, lenta))
+N.GC_BIN, N.CALL_TIMEOUT = "gc", CALL_DEFAULT
+os.environ.pop("NG_SLOW", None)
 
 print("\n%d checagens ok, %d falharam%s" % (OK[0], len(BAD), (": " + "; ".join(BAD)) if BAD else ""))
 sys.exit(1 if BAD else 0)
