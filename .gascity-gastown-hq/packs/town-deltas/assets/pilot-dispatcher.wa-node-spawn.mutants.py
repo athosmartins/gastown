@@ -1,4 +1,4 @@
-# pilot-dispatcher.wa-node-spawn.mutants.py — o mutador do pilot-dispatcher.wa-node-spawn.selftest.sh (ga-2hd02v.3): 110 quebras de UMA linha do pilot-dispatcher.sh, cada uma com um nome.
+# pilot-dispatcher.wa-node-spawn.mutants.py — o mutador do pilot-dispatcher.wa-node-spawn.selftest.sh (ga-2hd02v.3): 118 quebras de UMA linha do pilot-dispatcher.sh, cada uma com um nome.
 #
 # Contents
 #   Uso · Como cada mutante é escrito
@@ -316,6 +316,47 @@ def _():
 @m("aviso-falha-ignorada")
 def _():
     rep('[ "$_ro_rc" -eq 0 ] || _ro_step="o aviso falhou (rc=$_ro_rc)"', ':')
+
+
+# ga-hqtpf34: o aviso à sessão OCIOSA é digitado (immediate) e confirmado (--json, outcome delivered); o padrão só enfileira e a sessão parada morria por idle_timeout com a bead
+@m("ociosa-aviso-padrao")
+def _():
+    rep('session nudge --delivery immediate --json "$_ro_alias"', 'session nudge --json "$_ro_alias"')
+
+
+@m("ociosa-sem-json")
+def _():
+    rep('session nudge --delivery immediate --json "$_ro_alias"', 'session nudge --delivery immediate "$_ro_alias"')
+
+
+@m("ociosa-sem-confirmar")
+def _():
+    rep('[ "$_ro_oc" = delivered ] || _ro_step=', ': || _ro_step=')
+
+
+@m("ociosa-aceita-enfileirada")
+def _():
+    rep('[ "$_ro_oc" = delivered ] || _ro_step=', '[ -n "$_ro_oc" ] || _ro_step=')
+
+
+@m("ociosa-ok-falso-vale")
+def _():
+    rep("jq -er 'select(.ok == true) | .outcome'", "jq -er '.outcome'")
+
+
+@m("todos-digitam")
+def _():
+    rep('    if [ "$_ro_st" = idle ]; then\n      # ga-hqtpf34', '    if [ -n "$_ro_st" ]; then\n      # ga-hqtpf34')
+
+
+@m("ociosa-rc-do-aviso-ignorado")
+def _():
+    rep('"$_ro_msg" 2>/dev/null) || _ro_rc=$?', '"$_ro_msg" 2>/dev/null) || :')
+
+
+@m("ociosa-log-sem-entregue")
+def _():
+    rep('        [ -n "$_ro_step" ] || _ro_how=", entregue (digitada)"\n', '')
 
 
 # ga-2hd02v.4.13: o aviso tem de dar ao worker do nó o MESMO `bd -C <rig> …` que o prompt dele manda (sem -C o atalho lê a cidade e a lista volta vazia)

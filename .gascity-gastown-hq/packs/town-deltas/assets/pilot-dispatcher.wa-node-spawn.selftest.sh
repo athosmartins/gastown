@@ -135,7 +135,16 @@ case "$verb" in
   new) exit "${FAKE_GC_NEW_RC:-0}" ;;
   wake) exit "${FAKE_GC_WAKE_RC:-0}" ;;
   close) exit "${FAKE_GC_CLOSE_RC:-0}" ;;
-  nudge) exit "${FAKE_GC_NUDGE_RC:-0}" ;;
+  nudge) # o CLI de verdade (medido pelo pool-idle-nobead-guard): sai 0 também quando só ENFILEIRA, e só o --json diz qual foi. O provider exec do nó não espera ociosidade, então o padrão (wait-idle)
+         # SEMPRE enfileira e --delivery immediate digita. FAKE_GC_NUDGE_QUEUES=always: até o immediate enfileira. FAKE_GC_NUDGE_JSON: a saída crua do --json (vazia também vale), no lugar da do modelo.
+         rc="${FAKE_GC_NUDGE_RC:-0}"; [ "$rc" = 0 ] || exit "$rc"
+         shift 4; mode=wait-idle; json=""; tgt=""   # o gc aceita as flags em qualquer posição: o alvo é o 1º argumento que não é flag
+         while [ $# -gt 0 ]; do case "$1" in (--delivery) mode="$2"; shift 2 ;; (--json) json=1; shift ;; (*) [ -n "$tgt" ] || tgt="$1"; shift ;; esac; done
+         [ -n "$json" ] || exit 0
+         if [ "${FAKE_GC_NUDGE_JSON+x}" = x ]; then printf '%s' "$FAKE_GC_NUDGE_JSON"; exit 0; fi
+         oc=delivered; if [ "$mode" = wait-idle ] || [ "${FAKE_GC_NUDGE_QUEUES:-}" = always ]; then oc=queued; fi
+         printf '{"schema_version":"1","ok":true,"target":"%s","delivery":"%s","queued":%s,"outcome":"%s"}\n' "$tgt" "$mode" "$([ "$oc" = queued ] && echo true || echo false)" "$oc"
+         exit 0 ;;
 esac
 exit 64
 EOF
@@ -173,7 +182,7 @@ reset() {
   echo 0 > "$T/nshow"; echo 0 > "$T/slow"
   rm -f "$T/city/.gc/wa-node-route.jsonl" "$T/rsv" "$T/pnr" "$T/pnr.done"
   cp "$T/b.free.json" "$T/state.json"
-  unset FAKE_BD_UPDATE_MODE FAKE_BD_UPDATE_RC FAKE_BD_SHOW_FAIL_FROM FAKE_GC_LIST_RC FAKE_GC_NEW_RC FAKE_GC_WAKE_RC FAKE_GC_CLOSE_RC FAKE_GC_NUDGE_RC \
+  unset FAKE_BD_UPDATE_MODE FAKE_BD_UPDATE_RC FAKE_BD_SHOW_FAIL_FROM FAKE_GC_LIST_RC FAKE_GC_NEW_RC FAKE_GC_WAKE_RC FAKE_GC_CLOSE_RC FAKE_GC_NUDGE_RC FAKE_GC_NUDGE_QUEUES FAKE_GC_NUDGE_JSON \
         FAKE_APPLY_WRITES FAKE_RC FAKE_RC_SKIP FAKE_BEAD2_SKIP FAKE_OUT PRE_SLOW PRE_EVAL _PILOT_HALT PWN_SPAWN PWN_SLOTS PWN_BJ PRE_PASS PRE_NODEONLY PRE_RSV PILOT_WA_NODE_RESERVE PILOT_WA_NODE_SPAWN PILOT_WA_NODE_SLOTS PILOT_WA_NODE_ROUTE DRY_RUN PILOT_SLOW_SPAWN_SECS
   export FAKE_SESSIONS="$T/s.empty.json" FAKE_BEAD2="$T/b.ap2.json"
 }
@@ -264,6 +273,8 @@ grep -qF -- "ache com 'bd -C whatsapp_automation list --status in_progress --ass
 grep -qF -- "ache com 'bd list " "$T/gccalls" && fail "o aviso ainda traz o 'bd list' SEM -C (lista vazia no nó): $(cat "$T/gccalls")" || ok "o aviso não traz mais o 'bd list' sem -C"
 eq "sessão aberta sem escrever na bead: o estado segue o do apply" "$(stt)" "$AP2"
 eq "sessão rápida não gasta o orçamento de spawn" "$(slow)" "0"
+# ga-hqtpf34: a sessão NOVA (e a que acorda) recebe o aviso padrão, SEM --delivery: o primeiro prompt dela drena a fila, e o immediate digita antes de ela aceitar entrada (teclas perdidas, ga-noxbv)
+grep '|session|nudge|' "$T/gccalls" | grep -qF -- '--delivery' && fail "sessão nova: o aviso foi com --delivery: $(cat "$T/gccalls")" || ok "sessão nova: o aviso é o padrão, sem --delivery (o hook do 1º prompt drena a fila)"
 
 # --- sem o rig (chamador antigo, 6 argumentos — nem quietude nem rig): o -C leva a pasta da loja, que o atalho também aceita; nunca o comando sem -C ---
 reset; cp "$T/b.ap2.json" "$T/state.json"
@@ -276,6 +287,7 @@ sj "$T/s.asleep.json" '[{"alias":"wa-worker-remote-2","template":"wa-worker-remo
 r=$(O wa-worker-remote-2)
 eq "sessão do alias dormindo: devolve 0" "$r" "rc=0"
 eq "dormindo: ACORDA (wake) e avisa; nada de session new" "$(ord)" "gc:list gc:wake gc:nudge "
+grep '|session|nudge|' "$T/gccalls" | grep -qF -- '--delivery' && fail "dormindo: o aviso foi com --delivery: $(cat "$T/gccalls")" || ok "dormindo: o aviso à sessão que acordou é o padrão, sem --delivery"
 hasgc 'session|wake|wa-worker-remote-2' && ok "o wake leva o alias" || fail "wake: $(cat "$T/gccalls")"
 reset; cp "$T/b.ap2.json" "$T/state.json"
 sj "$T/s.asleep2.json" '[{"alias":"wa-worker-remote-2","template":"wa-worker-remote","state":"asleep"},{"alias":"wa-worker-remote-2","template":"wa-worker-remote","state":"asleep","closed":false}]'; export FAKE_SESSIONS="$T/s.asleep2.json"
@@ -320,7 +332,7 @@ r=$(O wa-worker-remote-2); hasbd "$(UPD wa-worker-remote-2)" && ok "o desfazer �
 reset; cp "$T/b.ap2.json" "$T/state.json"; sj "$T/s.idle.json" "$(qs 600)"; export FAKE_SESSIONS="$T/s.idle.json"
 r=$(OR wa-worker-remote-2); eq "ociosa (quieta há 10 min), reaproveitamento ligado: devolve 0" "$r" "rc=0"
 eq "ociosa: lê as sessões e SÓ avisa — nada de session new nem wake" "$(ord)" "gc:list gc:nudge "
-grep -qF -- "|--city|$T/city|session|nudge|wa-worker-remote-2|Bead nova para você: $ID — Título X. Ela já está atribuída ao seu alias (GC_ALIAS=wa-worker-remote-2)" "$T/gccalls" && ok "ociosa: o aviso é o de sempre (bead, título, alias)" || fail "nudge: $(cat "$T/gccalls")"
+grep -qF -- "|--city|$T/city|session|nudge|--delivery|immediate|--json|wa-worker-remote-2|Bead nova para você: $ID — Título X. Ela já está atribuída ao seu alias (GC_ALIAS=wa-worker-remote-2)" "$T/gccalls" && ok "ociosa: o aviso diz a bead, o título e o alias (as flags do aviso digitado vão antes do alvo)" || fail "nudge: $(cat "$T/gccalls")"
 eq "ociosa: a bead segue como o apply a deixou" "$(stt)" "$AP2"
 eq "ociosa: não gasta o orçamento de spawn (ninguém foi aberto)" "$(slow)" "0"
 grep -q 'alias wa-worker-remote-2 (sessão idle), avisada' "$T/err" && ok "ociosa: o log diz que a sessão do alias era a ociosa" || fail "log: $(cat "$T/err")"
@@ -366,8 +378,23 @@ done
 reset; cp "$T/b.ap2.json" "$T/state.json"; sj "$T/s.idle.json" "$(qs 600)"; export FAKE_SESSIONS="$T/s.idle.json" FAKE_GC_NUDGE_RC=1
 r=$(OR wa-worker-remote-2); eq "ociosa, o aviso falhou: solta a bead e NÃO fecha a sessão que já existia" "$r $(ord)$(stt)" "rc=1 gc:list gc:nudge bd:update bd:show $FREE"
 hasgc 'session|close|wa-worker-remote-2' && fail "ociosa: o desfazer FECHOU a sessão ociosa que já existia" || ok "ociosa: nenhum session close foi chamado"
+grep -q 'o aviso falhou (rc=1)' "$T/err" && ok "ociosa, o aviso falhou: o aviso diz o rc do nudge (não se confunde com 'não entregue')" || fail "ociosa, rc do nudge: aviso: $(cat "$T/err")"
 reset; cp "$T/b.ap2.json" "$T/state.json"; sj "$T/s.idle.json" "$(qs 600)"; export FAKE_SESSIONS="$T/s.idle.json" FAKE_GC_NUDGE_RC=1 FAKE_BD_UPDATE_MODE=noop
 r=$(OR wa-worker-remote-2); eq "ociosa, o aviso falhou e o desfazer não se confirma: 2 (segura), sem fechar a sessão" "$r $(ord)$(stt)" "rc=2 gc:list gc:nudge bd:update bd:show $AP2"
+# ga-hqtpf34: o aviso à sessão OCIOSA tem de ser DIGITADO e CONFIRMADO. No provider do nó o padrão (wait-idle) só ENFILEIRA e sai 0; a fila de uma sessão parada só é drenada por um poller que pode morrer
+# (ga-55jx16q) ou pelo hook do próximo prompt, que ela não dispara: o idle_timeout a matava em minutos, com a bead (aic37 e v7z1t, 08/11). O gc falso modela o CLI real: sem --delivery o outcome é queued.
+reset; cp "$T/b.ap2.json" "$T/state.json"; sj "$T/s.idle.json" "$(qs 600)"; export FAKE_SESSIONS="$T/s.idle.json"
+r=$(OR wa-worker-remote-2); eq "ociosa: aviso DIGITADO e confirmado (outcome delivered): devolve 0, só lê e avisa" "$r $(ord)" "rc=0 gc:list gc:nudge "
+grep -qE -- '\|session\|nudge\|--delivery\|immediate\|--json\|wa-worker-remote-2\|Bead nova para você: [^|]*$' "$T/gccalls" && ok "ociosa: o aviso vai com --delivery immediate --json (nunca o padrão, que só enfileira)" || fail "ociosa: nudge sem --delivery immediate --json: $(cat "$T/gccalls")"
+grep -q 'alias wa-worker-remote-2 (sessão idle), avisada, entregue' "$T/err" && ok "ociosa: o log diz que o aviso foi ENTREGUE" || fail "ociosa: log sem 'entregue': $(cat "$T/err")"
+# o que não for 'entregue' (enfileirou mesmo no immediate, saída lixo, ok falso, sem outcome, outcome fora do enum, saída vazia) NÃO é aviso: desfaz, devolve 1 e a sessão que já existia nunca é fechada
+for spec in "queued-mesmo-immediate|QUEUES=always" "json-lixo|JSON=nudge accepted" 'json-ok-falso|JSON={"ok":false,"outcome":"delivered"}' 'json-sem-outcome|JSON={"ok":true}' 'json-outcome-estranho|JSON={"ok":true,"outcome":"sent"}' "saida-vazia|JSON="; do
+  nm="${spec%%|*}"; kv="${spec#*|}"
+  reset; cp "$T/b.ap2.json" "$T/state.json"; sj "$T/s.idle.json" "$(qs 600)"; export FAKE_SESSIONS="$T/s.idle.json" "FAKE_GC_NUDGE_$kv"
+  r=$(OR wa-worker-remote-2)
+  eq "ociosa ($nm): aviso NÃO entregue -> solta a bead, devolve 1, sem fechar a sessão que já existia" "$r $(ord)$(stt)" "rc=1 gc:list gc:nudge bd:update bd:show $FREE"
+  grep -q 'o aviso à sessão ociosa não foi entregue' "$T/err" && ok "ociosa ($nm): o aviso diz que não foi entregue" || fail "ociosa ($nm): aviso: $(cat "$T/err")"
+done
 reset; cp "$T/b.ap2.json" "$T/state.json"; export FAKE_SESSIONS="$T/s.bad.json" FAKE_GC_LIST_RC=1; printf '' > "$T/s.bad.json"
 r=$(OR wa-worker-remote-2); eq "ociosa: a lista de sessões não leu -> não reaproveita (três estados), desfaz" "$r $(stt)" "rc=1 $FREE"
 # os dois chamadores optam: o gancho do WA e o do PS (o PS usa o mesmo despachante, com um alias só)
@@ -376,7 +403,7 @@ eq "WA, o decide inteiro: o script escolheu o -2 e a sessão dele é a ociosa ->
 mkb "$T/b.ps1.json" in_progress ps-worker-remote-1 ps-worker-remote-1 "Titulo PS"
 reset; cp "$T/b.ps1.json" "$T/state.json"; sj "$T/s.psidle.json" "$(qs 600 ps-worker-remote-1 ps-worker-remote)"; export FAKE_SESSIONS="$T/s.psidle.json"
 r=$(PSO); eq "PS: a sessão ociosa do ps-worker-remote-1 é reaproveitada (relê a bead, lê as sessões, só avisa)" "$r $(ord)" "rc=0 bd:show gc:list gc:nudge "
-grep -qF -- "|session|nudge|ps-worker-remote-1|" "$T/gccalls" && ok "PS: o aviso vai para o alias do PS" || fail "PS: $(cat "$T/gccalls")"
+grep -qF -- "|session|nudge|--delivery|immediate|--json|ps-worker-remote-1|" "$T/gccalls" && ok "PS: o aviso vai para o alias do PS" || fail "PS: $(cat "$T/gccalls")"
 reset; cp "$T/b.ps1.json" "$T/state.json"; sj "$T/s.psbusy.json" "$(qs 60 ps-worker-remote-1 ps-worker-remote)"; export FAKE_SESSIONS="$T/s.psbusy.json"
 r=$(PSO); eq "PS: quieta há só 60 s -> ocupada, desfaz sem fechar" "$r $(ord)" "rc=1 bd:show gc:list bd:update bd:show "
 # a quietude mínima vem do ambiente (WA_NODE_IDLE_SECS), a MESMA variável que o script lê
@@ -814,9 +841,9 @@ fi
 if [ -z "${WA_NODE_SPAWN_SELFTEST_FILE:-}" ] && [ -z "${WA_NODE_SPAWN_ST_NOMUT:-}" ]; then
   echo
   echo "=== G. mutantes (cada um tem de derrubar o selftest) ==="
-  # o mutador mora em arquivo próprio. ausente/ilegível (python falha) → `fail`; vazio (lista sem nomes) ou com menos que o piso de hoje (89) → `fail` também: tirar um mutante tem de ser decisão visível, nunca "todos mortos" por lista curta
+  # o mutador mora em arquivo próprio. ausente/ilegível (python falha) → `fail`; vazio (lista sem nomes) ou com menos que o piso de hoje (118) → `fail` também: tirar um mutante tem de ser decisão visível, nunca "todos mortos" por lista curta
   MUT_LIST="$(python3 -I "$MUTATOR" --list)" || { fail "o mutador não carregou"; MUT_LIST=""; }
-  [ "$(echo "$MUT_LIST" | wc -w | tr -d ' ')" -ge 89 ] || fail "o mutador listou menos de 89 mutantes ($(echo "$MUT_LIST" | wc -w | tr -d ' '))"
+  [ "$(echo "$MUT_LIST" | wc -w | tr -d ' ')" -ge 118 ] || fail "o mutador listou menos de 118 mutantes ($(echo "$MUT_LIST" | wc -w | tr -d ' '))"
   run_mut() { # run_mut <nome> — escreve $T/res.<nome>: morto | SOBREVIVEU | ERRO
     local n="$1"
     if ! python3 -I "$MUTATOR" "$DISPATCHER" "$T/mut.$n.sh" "$n" > "$T/res.$n.apply" 2>&1; then echo ERRO > "$T/res.$n"; return; fi

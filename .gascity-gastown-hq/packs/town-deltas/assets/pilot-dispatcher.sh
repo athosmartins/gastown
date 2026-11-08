@@ -13157,8 +13157,11 @@ _pilot_node_idle_secs() {
 # 8º argumento (ga-2hd02v.4.13, opcional): <rig> é o nome que o worker do nó põe em `bd -C`: o atalho dele, sem -C, lê a loja da CIDADE, onde a bead do rig não existe, e o prompt do worker lê a lista vazia como "bead não atribuída" (avisa o Mayor e para,
 # com a bead presa ao alias). O aviso tem de dar o MESMO comando do prompt. vazio (chamador que não passou o rig) → a pasta da loja, forma que o atalho também aceita (`bd -C <caminho real do rig>`, remote-shim.selftest.sh); a loja
 # aqui nunca vem vazia (o chamador acabou de relê-la).
+# ga-hqtpf34: no ramo "idle" o aviso é DIGITADO (`session nudge --delivery immediate --json`) e SÓ `outcome: delivered` vale; o aviso padrão sai 0 mesmo quando apenas enfileira, e a fila de uma sessão parada pode
+# nunca drenar (o poller que o enqueue sobe pode morrer de SIGPIPE, ga-55jx16q; o hook do próximo prompt ela não dispara), então o idle_timeout matava a sessão com a bead nova. Enfileirou, falhou ou veio ilegível = desfaz como
+# qualquer falha de aviso (a sessão ociosa nunca é fechada). A sessão nova e a que acorda seguem com o aviso padrão: o 1º prompt delas drena a fila, e o immediate digitaria antes de elas aceitarem entrada (ga-noxbv).
 _pilot_node_remote_open() {
-  local _ro_tpl="$1" _ro_alias="$2" _ro_id="$3" _ro_store="$4" _ro_title="$5" _ro_key="$6" _ro_idle="${7:-}" _ro_rig="${8:-}" _ro_sj="" _ro_st="" _ro_rc=0 _ro_t0=0 _ro_step="" _ro_sess=0 _ro_msg=""
+  local _ro_tpl="$1" _ro_alias="$2" _ro_id="$3" _ro_store="$4" _ro_title="$5" _ro_key="$6" _ro_idle="${7:-}" _ro_rig="${8:-}" _ro_sj="" _ro_st="" _ro_rc=0 _ro_t0=0 _ro_step="" _ro_sess=0 _ro_msg="" _ro_out="" _ro_oc="" _ro_how=""
   case "$_ro_idle" in ''|*[!0-9]*) _ro_idle=-1 ;; esac
   # ga-2hd02v.3.26: o QUE falhou, para quem chama decidir se vale outro alias. vazio (abriu, ou ainda não falhou) → "" e alias ""; falhou → "busy" (o alias tinha sessão viva: SÓ este é do alias) ou "other" (lista ilegível,
   # decisão que não saiu, sessão que não abriu, aviso que falhou: nada disso é do alias, outro alias não conserta). Zerado na entrada: ler o que sobrou de outra chamada nunca vira "busy".
@@ -13197,7 +13200,21 @@ _pilot_node_remote_open() {
   if [ -z "$_ro_step" ]; then
     _ro_msg="Bead nova para você: $_ro_id — $_ro_title. Ela já está atribuída ao seu alias (GC_ALIAS=$_ro_alias): ache com 'bd -C $_ro_rig list --status in_progress --assignee \"\$GC_ALIAS\" --json --limit 5' e siga o seu protocolo."
     _ro_rc=0
-    timeout "${PILOT_NODE_NUDGE_TIMEOUT:-60}" gc --city "$GC_CITY" session nudge "$_ro_alias" "$_ro_msg" >/dev/null 2>&1 || _ro_rc=$?
+    if [ "$_ro_st" = idle ]; then
+      # ga-hqtpf34: a sessão parada só acorda se alguém DIGITAR o texto no pane. O aviso padrão (wait-idle) sai 0 mesmo quando só enfileira, e a fila de uma sessão parada pode nunca drenar (o poller pode morrer, ga-55jx16q; o hook
+      # do próximo prompt ela não dispara): o idle_timeout a matava com a bead (aic37 e v7z1t, 08/11). Digitar anda o session_activity que o get-last-activity do provider devolve, então o relógio de ociosidade recomeça; só `outcome: delivered` conta como avisada.
+      # vazio (nada impresso) → rc 0 e sem outcome, tratado abaixo como não entregue; falhou (rc≠0, ex.: sessão que já se foi) → "o aviso falhou", desfaz sem fechar a sessão
+      # (as flags vão ANTES do alvo, que o gc aceita: o ponto de aviso do ramo normal, abaixo, segue único para os mutantes do nudge-timeout.selftest)
+      _ro_out=$(timeout "${PILOT_NODE_NUDGE_TIMEOUT:-60}" gc --city "$GC_CITY" session nudge --delivery immediate --json "$_ro_alias" "$_ro_msg" 2>/dev/null) || _ro_rc=$?
+      if [ "$_ro_rc" -eq 0 ]; then
+        # vazio (sem .outcome) → não entregue; ilegível (JSON que o jq não lê, ok≠true, outcome ≠ delivered, incl. queued) → não entregue: desfaz, nunca "avisada"
+        _ro_oc=$(printf '%s' "$_ro_out" | jq -er 'select(.ok == true) | .outcome' 2>/dev/null) || _ro_oc=""
+        [ "$_ro_oc" = delivered ] || _ro_step="o aviso à sessão ociosa não foi entregue (outcome='${_ro_oc:-ilegível}'; só \"delivered\" vale)"
+        [ -n "$_ro_step" ] || _ro_how=", entregue (digitada)"
+      fi
+    else
+      timeout "${PILOT_NODE_NUDGE_TIMEOUT:-60}" gc --city "$GC_CITY" session nudge "$_ro_alias" "$_ro_msg" >/dev/null 2>&1 || _ro_rc=$?
+    fi
     [ "$_ro_rc" -eq 0 ] || _ro_step="o aviso falhou (rc=$_ro_rc)"
   fi
   if [ -n "$_ro_step" ]; then
@@ -13207,7 +13224,7 @@ _pilot_node_remote_open() {
     if _pilot_node_remote_rollback "$_ro_alias" "$_ro_id" "$_ro_store" "$_ro_sess" "$_ro_key"; then return 1; fi
     return 2
   fi
-  log "  ga-2hd02v.3: $_ro_id foi ao nó — alias $_ro_alias (sessão $_ro_st), avisada"
+  log "  ga-2hd02v.3: $_ro_id foi ao nó — alias $_ro_alias (sessão $_ro_st), avisada$_ro_how"
   return 0
 }
 
