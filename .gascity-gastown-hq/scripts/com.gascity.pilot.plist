@@ -37,7 +37,7 @@
 		<key>PILOT_SUSPENDED_CREWS_OVERRIDE</key>
 		<string>batista-ps</string>
 		<key>PILOT_WA_MBP_ROUTE</key>
-		<string>on</string>
+		<string>shadow</string>
 		<key>PILOT_WA_NODE_EXEMPT</key>
 		<string>on</string>
 		<key>PILOT_WA_NODE_ROUTE</key>
