@@ -78,8 +78,14 @@ CDP_URL = "http://127.0.0.1:9222"
 LOGIN_RE = re.compile(r"^https://(claude\.ai|claude\.com|platform\.claude\.com|console\.anthropic\.com)/[^\s]*$")
 EMAIL_RE = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
 PUZZLE_RE = re.compile(r"drag the|silhouette|verify (?:that )?you(?:'|’)?re (?:a )?human|human verification|prove you(?:'|’)?re|are you a robot|"
-                       r"(?:solve|complete) the captcha|captcha challenge", re.I)         # visible words of a challenge, not the footer of a page that merely mentions reCAPTCHA
-DEVICE_RE = re.compile(r"tap yes|check your (?:phone|device)|security key|passkey|verify it(?:'|’)s you|use your phone|unusual activity", re.I)
+                       r"(?:solve|complete) the captcha|captcha challenge|sharp end of each line|"
+                       r"arraste (?:o|a|os|as) |silhueta|verifi(?:que|car) que voc[êe] [ée] (?:um )?humano|verifica[çc][ãa]o humana|prove que voc[êe] [ée]|"
+                       r"voc[êe] [ée] (?:um )?rob[ôo]|(?:resolva|conclua) o captcha|desafio (?:de )?captcha", re.I)     # visible words of a challenge, not the footer of a page that merely mentions reCAPTCHA. pt-BR (ga-p0nydy4): the same words in Portuguese; "sharp end of each line" is the hCaptcha prompt Anthropic showed on 08/11
+DEVICE_RE = re.compile(r"tap yes|check your (?:phone|device)|security key|passkey|verify it(?:'|’)s you|use your phone|unusual activity|"
+                       r"toque em sim|verifique (?:o )?seu (?:telefone|dispositivo|celular)|chave de seguran[çc]a|chave de acesso|"
+                       r"(?:confirme|verifique) (?:que|se) [ée] voc[êe]|use seu (?:telefone|celular)|atividade incomum", re.I)     # pt-BR (ga-p0nydy4): the same asks, in Portuguese
+CONTINUE_BUTTONS = ("continue", "continuar", "permitir")     # Google's consent screen: "Continue" in English, «Continuar» (and «Permitir») in pt-BR - NEVER «Cancelar»/«Cancel»/«Negar»
+CONTINUE_BTN_RE = re.compile(r"^(?:continue|continuar|permitir)$", re.I)     # the click's name match: the same words as CONTINUE_BUTTONS, anchored, so «Cancelar» can never be the button clicked
 CHROME_FIX = ("no_google_session", "needs_password")     # fixed in the BROWSER: the job can see it worked. The others are fixed by a login by hand (the Keychain shows it)
 PERMANENT = ("puzzle", "no_google_session", "needs_password", "needs_device", "wrong_account")     # a retry cannot change these: a human can
 DRY = False                     # --dry-run: logs go to stderr, nothing is written, nothing is pushed, nothing is launched
@@ -690,7 +696,7 @@ def classify(email: str, url: str, text: str, ids: List[str], has_pw: bool, has_
             return "needs_device"
         if has_email_box:                      # Google asks WHICH e-mail to sign in: the profile has no Google session at all, and the job does not type an e-mail into it
             return "no_google_session"
-        return "click_continue" if "continue" in buttons else "wait"
+        return "click_continue" if any(b in CONTINUE_BUTTONS for b in buttons) else "wait"
     if host in ("claude.ai", "claude.com") or host.endswith((".claude.ai", ".claude.com")):      # exact or a true subdomain (leading dot): "evilclaude.com" is nobody's
         if "authorize" in buttons:
             seen = {x.lower() for x in EMAIL_RE.findall(text)}
@@ -773,7 +779,7 @@ def drive() -> int:
                         elif act == "pick":
                             pg.locator("[data-identifier]").filter(has_text=re.compile(re.escape(email), re.I)).first.click(timeout=5000)
                         elif act == "click_continue":
-                            pg.get_by_role("button", name=re.compile(r"^continue$", re.I)).first.click(timeout=5000)
+                            pg.get_by_role("button", name=CONTINUE_BTN_RE).first.click(timeout=5000)
                         elif act == "click_authorize":
                             pg.get_by_role("button", name=re.compile(r"^authorize", re.I)).first.click(timeout=5000)
                             auth_at = time.monotonic()

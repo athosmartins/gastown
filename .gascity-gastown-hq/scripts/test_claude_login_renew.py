@@ -522,6 +522,44 @@ def test_every_screen_the_driver_can_meet_has_one_answer(args, want):
     assert scr(*args) == want
 
 
+# ga-p0nydy4: the pt-BR screens. 08/11 12:4x the driver met accounts.google.com/signin/oauth/id with the buttons ['cancelar', 'continuar'], classify() only knew 'continue',
+# answered "wait" and the try died as unknown_screen -> failed_3_times. A wall in Portuguese must still be a wall (stop, never click), and «Cancelar» is never the click.
+PT_CONSENT = ("Fazer login em Anthropic Para continuar, o Google compartilhará com Anthropic seu nome, endereço de e-mail, preferência de idioma e foto do perfil. "
+              "Antes de usar este app, leia a Política de Privacidade e os Termos de Serviço da Anthropic.")
+
+
+@pytest.mark.parametrize("args, want", [
+    (("https://accounts.google.com/signin/oauth/id", PT_CONSENT, (), False, False, ["cancelar", "continuar"]), "click_continue"),    # the screen measured on 08/11
+    (("https://accounts.google.com/signin/oauth/id", PT_CONSENT, (), False, False, ["negar", "permitir"]), "click_continue"),
+    (("https://accounts.google.com/signin/oauth/id", PT_CONSENT, (), False, False, ["cancelar"]), "wait"),                              # only the way OUT is on screen: nothing to click
+    (("https://accounts.google.com/signin/oauth/id", PT_CONSENT, (), False, False, ["cancelar", "voltar"]), "wait"),
+    (("https://accounts.google.com/signin/oauth/consent", "Sign in to Claude", (), False, False, ["cancel", "continue"]), "click_continue"),   # English unchanged
+    (("https://accounts.google.com/signin/oauth/consent", "Sign in to Claude", (), False, False, ["cancel"]), "wait"),
+    # a wall in Portuguese stops the driver, even with «Continuar» on screen (the wall is checked before the button)
+    (("https://accounts.google.com/v3/signin/challenge/ipp", "Verifique seu telefone Toque em Sim no seu telefone", (), False, False, ["continuar"]), "needs_device"),
+    (("https://accounts.google.com/v3/signin/challenge/pk", "Use sua chave de acesso", (), False, False, ["continuar"]), "needs_device"),
+    (("https://accounts.google.com/v3/signin/challenge/pk", "Use sua chave de segurança", (), False, False, ["continuar"]), "needs_device"),
+    (("https://accounts.google.com/v3/signin/challenge/dp", "Confirme que é você", (), False, False, ["continuar"]), "needs_device"),
+    (("https://accounts.google.com/v3/signin/challenge/dp", "Verifique se é você. Atividade incomum detectada", (), False, False, ["continuar"]), "needs_device"),
+    (("https://accounts.google.com/signin/oauth/id", "Verifique que você é humano", (), False, False, ["continuar"]), "puzzle"),
+    (("https://claude.ai/login", "Verificação humana: arraste a peça para a silhueta", (), False, False, ["continue with google"]), "puzzle"),
+    (("https://claude.ai/login", "Você é um robô?", (), False, False, ["continue with google"]), "puzzle"),
+    (("https://claude.ai/login", "Resolva o captcha para continuar", (), False, False, ["continue with google"]), "puzzle"),
+    (("https://claude.ai/login", "Click on the sharp end of each line", (), False, False, ["continue with google"]), "puzzle"),         # the hCaptcha prompt seen on 08/11 after «Continue with Google»
+    (("https://accounts.google.com/v3/signin/challenge/pwd", "Digite sua senha", (), True, False, ["continuar"]), "needs_password"),   # a password box still outranks the button
+])
+def test_the_portuguese_google_screens_have_one_answer_and_a_wall_in_portuguese_is_still_a_wall(args, want):
+    assert scr(*args) == want
+
+
+def test_the_continue_click_can_only_ever_match_a_go_on_button_never_cancel():
+    for ok in ("Continue", "continue", "Continuar", "CONTINUAR", "Permitir"):
+        assert renew.CONTINUE_BTN_RE.search(ok), ok
+    for no in ("Cancelar", "Cancel", "Negar", "Deny", "Voltar", "Continuar sem conta", "Não continuar", "", "Continue with Google"):
+        assert not renew.CONTINUE_BTN_RE.search(no), no
+    assert all(renew.CONTINUE_BTN_RE.search(b) for b in renew.CONTINUE_BUTTONS)         # the screen classifier and the click know the same words
+
+
 def test_google_asking_which_email_to_sign_in_is_a_profile_with_no_google_session_and_nothing_is_typed_into_it():
     assert scr("https://accounts.google.com/v3/signin/identifier", "Sign in", email_box=True) == "no_google_session"
     assert scr("https://accounts.google.com/a", "", ids=[E], email_box=True) == "pick"                      # a chooser that also offers "use another account" still picks
@@ -614,6 +652,84 @@ def test_the_driver_follows_only_its_own_tab_never_another_tab_of_the_shared_pro
     assert ctx.listeners == [] and own.handlers == ["popup"]                      # no context-wide listener: only popups of our own tab are adopted
     assert foreign.closed is False and foreign.clicks == []                       # the other flow's tab was neither read, clicked nor closed
     assert own.closed is True                                                    # our own tab is closed on the way out
+
+
+class _Btn:
+    """A fake playwright locator over the buttons of a fake page."""
+    def __init__(self, page, names):
+        self.page, self.names = page, names
+
+    @property
+    def first(self):
+        return self
+
+    def click(self, timeout=0):
+        if not self.names:
+            raise RuntimeError("no such button")
+        self.page.clicked.append(self.names[0])
+        self.page.on_click(self.names[0])
+
+
+class _BtnLoc(_Loc):
+    def __init__(self, page):
+        super().__init__(False)
+        self.page = page
+
+    def all_inner_texts(self):
+        return list(self.page.buttons)
+
+
+class _BtnPage(_FPage):
+    """A page with named buttons: clicking the one called «Continuar» moves the flow on to the local callback, like Google does."""
+    def __init__(self, url, text, buttons):
+        super().__init__(url, text, buttons)
+        self.clicked = []
+
+    def locator(self, sel):
+        return _BtnLoc(self) if sel == "button, [role=button]" else _Loc(False)
+
+    def get_by_role(self, role, name=None):
+        return _Btn(self, [b for b in self.buttons if name.search(b)])
+
+    def on_click(self, which):
+        if which.lower() in ("continuar", "continue", "permitir"):
+            self.url = "http://localhost:5555/callback"
+
+
+def _drive_one_page(monkeypatch, capsys, page):
+    import io
+    import types
+    ctx = types.SimpleNamespace(new_page=lambda: page, on=lambda ev, fn: None)
+    pw = types.SimpleNamespace(chromium=types.SimpleNamespace(connect_over_cdp=lambda *a, **k: types.SimpleNamespace(contexts=[ctx])))
+    mod = types.ModuleType("playwright.sync_api")
+    mod.sync_playwright = lambda: type("SP", (), {"__enter__": lambda s: pw, "__exit__": lambda s, *a: False})()
+    monkeypatch.setitem(sys.modules, "playwright", types.ModuleType("playwright"))
+    monkeypatch.setitem(sys.modules, "playwright.sync_api", mod)
+    monkeypatch.setattr(sys, "stdin", io.StringIO("https://claude.ai/oauth/authorize?x=1"))
+    monkeypatch.setenv("RENEW_EMAIL", EMAIL["b85"])
+    monkeypatch.setattr(renew.time, "sleep", lambda s: None)
+    assert renew.drive() == 0
+    return json.loads(capsys.readouterr().out.strip().splitlines()[-1])
+
+
+def test_the_driver_clicks_continuar_on_the_portuguese_consent_screen_and_never_cancelar(monkeypatch, capsys):
+    page = _BtnPage("https://accounts.google.com/signin/oauth/id", PT_CONSENT, ["Cancelar", "Continuar"])
+    v = _drive_one_page(monkeypatch, capsys, page)
+    assert v["verdict"] == "ok"                                                    # the flow moved on to the callback
+    assert page.clicked == ["Continuar"]                                           # exactly one click, on the right button
+
+
+def test_the_driver_does_not_click_when_only_cancelar_is_on_screen(monkeypatch, capsys):
+    monkeypatch.setattr(renew, "DRIVE_BUDGET_S", 0.05)
+    page = _BtnPage("https://accounts.google.com/signin/oauth/id", PT_CONSENT, ["Cancelar"])
+    v = _drive_one_page(monkeypatch, capsys, page)
+    assert v["verdict"] == "unknown_screen" and page.clicked == []                 # nothing to click is a failed try, never a click on the way out
+
+
+def test_the_driver_stops_on_a_portuguese_puzzle_and_clicks_nothing(monkeypatch, capsys):
+    page = _BtnPage("https://claude.ai/login", "Click on the sharp end of each line", ["Continue with Google"])
+    v = _drive_one_page(monkeypatch, capsys, page)
+    assert v["verdict"] == "puzzle" and page.clicked == []
 
 
 @pytest.mark.parametrize("url, ok", [
