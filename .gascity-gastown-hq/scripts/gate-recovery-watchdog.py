@@ -19,7 +19,8 @@ now also the dispatcher of the fixer, so recovery does not wait on the Mayor.
 DETECTS (gate not producing verdicts — the tonight signature):
   - 2+ "Gate FAILED: TIMEOUT" in the dispatcher log within TIMEOUT_WINDOW, OR
   - a marker stuck gate-status:dispatching past DISPATCH_STUCK_SEC while every
-    gate-reviewer session sits non-active (spawned but never materialized).
+    gate-reviewer session (local or remote) sits non-active (spawned but never
+    materialized) — judged only on a session list that could be READ (ga-fwuo49i).
   Corroborated by Dolt instability lines in the supervisor log (connection reset /
   bead store closed / invalid connection) — the root cause that night.
 
@@ -624,11 +625,85 @@ STUCK_BRANCH_RE = re.compile(r"gate-run \S+ \(branch=([^)\s]+)\)")
 # NOT used by reap_frozen_reviewers(): that one measures the silence of a LOCAL tmux pane, which a remote
 # reviewer does not have, so leaving the remote out there is the inert side.
 ACTIVE_REVIEWER_TEMPLATES = ("gate-reviewer", "gate-reviewer-remote")
+# ga-fwuo49i: "alive" is the city's canonical LIVE set (= bead_state.LIVE_SESSION_STATES, the two words the Hetzner reaper and the
+# occupancy watch read), not the single word `active`.
+LIVE_REVIEWER_STATES = frozenset({"active", "awake"})
+# ga-fwuo49i: how long the roster read waits for `gc session list --json`. The city's other readers of the SAME call wait 30 s (the
+# dispatcher, GATE_SESSION_LIST_TIMEOUT_SECS, which measured 7-10 s) and 40 s (pool-stuck-prompt-alarm), and crew-no-session-alarm
+# MEASURED 5-37 s at load 50-80 — so sh()'s default of 20 s could cut a call that was still going to answer.
+SESSION_LIST_TIMEOUT_SEC = 45
+
+
+def _session_roster():
+    """([session-dict, ...], None) when `gc session list --json` answered with a readable list, (None, why) when it did not.
+
+    ga-fwuo49i: three outcomes, never two. `[]` is a MEASUREMENT ("nothing is running"); `None` is "I could not look" and must never
+    be read as `[]` — stuck_dispatching_detail() used to (`... if rs else []`) and read a timeout of the call as "no reviewer is
+    alive". Unreadable = the call failed or timed out (sh() is None), exited non-zero, printed text that is not JSON, an
+    error envelope ({"ok": false, ...}: a list that comes with one is not to be trusted), a body whose `sessions` is not a list, or a
+    list with an entry that is not an object (it may be the very session being looked for). Same contract as the dispatcher's
+    _gate_variable_session_count and the Hetzner scripts' read_sessions."""
+    # vazio → ([], None), a roster that was read and has nobody in it; falhou/ilegível → (None, why), the caller does nothing on it
+    rs = sh(["gc", "session", "list", "--json"], timeout=SESSION_LIST_TIMEOUT_SEC)
+    if rs is None:
+        return (None, "gc did not answer within %ds (timeout, or it could not be run)" % SESSION_LIST_TIMEOUT_SEC)
+    if rs.returncode != 0:
+        return (None, "gc exited with rc=%s" % rs.returncode)
+    try:
+        d = json.loads(rs.stdout)
+    except (ValueError, TypeError):
+        return (None, "output is not JSON" if (rs.stdout or "").strip() else "output is empty")
+    if isinstance(d, dict) and "ok" in d and d["ok"] is not True:
+        return (None, "error envelope (ok=%r)" % (d["ok"],))
+    lst = d.get("sessions") if isinstance(d, dict) else None
+    if not isinstance(lst, list):
+        return (None, "no `sessions` list in the answer")
+    if not all(isinstance(x, dict) for x in lst):
+        return (None, "an entry of `sessions` is not an object")
+    return (lst, None)
+
+
+def _name_base(name):
+    """`rig/x` and `pack.x` → `x`: the engine qualifies a template or an alias with its rig or pack (the Hetzner reaper tolerates both)."""
+    return name.rsplit("/", 1)[-1].rsplit(".", 1)[-1]
+
+
+def _is_reviewer_session(s):
+    """True when the roster row `s` is a gate reviewer, local or remote. ga-fwuo49i: by TEMPLATE or by NAME. The template alone is not
+    reliable: ga-2hd02v.3.27 found remote reviewers whose session bead is bare — agent_name/session_name/state, no template or alias
+    (e.g. ga-axm0ves) — and inferred that the list then comes out without them (no roster row was captured). So a name that IS a
+    reviewer template, or starts with `<template>-` (gate-reviewer-adhoc-<hex>, gate-reviewer-remote-adhoc-<hex>), counts too."""
+    if not isinstance(s, dict):
+        return False
+    tpl = s.get("template")
+    if isinstance(tpl, str) and _name_base(tpl) in ACTIVE_REVIEWER_TEMPLATES:
+        return True
+    for k in ("session_name", "name", "alias", "agent_name"):
+        v = s.get(k)
+        if isinstance(v, str) and v:
+            b = _name_base(v)
+            if any(b == t or b.startswith(t + "-") for t in ACTIVE_REVIEWER_TEMPLATES):
+                return True
+    return False
 
 
 def _active_reviewer_sessions(sessions):
-    """Sessions that show a reviewer alive for the in-flight run: state=active on a local OR remote reviewer template."""
-    return [s for s in sessions if s.get("template") in ACTIVE_REVIEWER_TEMPLATES and s.get("state") == "active"]
+    """Rows that show a reviewer alive for the in-flight run: a local OR remote reviewer (_is_reviewer_session), not closed, whose
+    state is in the city's LIVE set. A row with no state, or a state that is not a string, is not alive."""
+    return [s for s in sessions
+            if _is_reviewer_session(s) and s.get("closed") is not True
+            and isinstance(s.get("state"), str) and s["state"].lower() in LIVE_REVIEWER_STATES]
+
+
+def _reviewer_rows_summary(sessions, limit=6):
+    """`name:state[/closed]` of every row that looks like a gate reviewer, alive or not — the line a positive detection writes to the log
+    so that the next false alarm can be read off the log instead of off a roster that has moved on. At most `limit` rows."""
+    seen = []
+    for s in sessions:
+        if _is_reviewer_session(s):
+            nm = next((s[k] for k in ("session_name", "name", "alias", "agent_name") if isinstance(s.get(k), str) and s[k]), "?")
+            seen.append("%s:%s%s" % (nm, s.get("state"), "/closed" if s.get("closed") is True else ""))
+    return (", ".join(seen[:limit]) + (" (+%d more)" % (len(seen) - limit) if len(seen) > limit else "")) or "none"
 
 
 def stuck_dispatching():
@@ -642,7 +717,8 @@ def stuck_dispatching_detail():
     True only if the dispatcher is ACTIVELY polling a run that is stuck: the most
     recent dispatcher-log line is a Phase C 'still in flight (0/N verdicts, Ys/Ts)' with
     Y past DISPATCH_STUCK_SEC, the log is fresh (dispatcher still polling, not moved on /
-    between runs), no gate-reviewer session (local or remote, ga-yg3e22c) is active, AND the run has no DELIVERED
+    between runs), no gate-reviewer session (local or remote, ga-yg3e22c; by template or by name, ga-fwuo49i) is alive
+    in a session list that could be READ, AND the run has no DELIVERED
     verdict recorded yet either. Keying on the LIVE poll (not a marker label) means a
     stranded 'gate-status:dispatching' marker — e.g. left by a killed dispatcher during
     maintenance — does NOT false-fire. A slow-but-working run (reviewers still active) is
@@ -669,7 +745,15 @@ def stuck_dispatching_detail():
     clearly showed up and did the work; Phase C just hasn't harvested it yet, which is
     "waiting", not "stuck". Fail-safe: no run id parsed, or the verdict-bead query itself
     fails, falls through to the pre-existing active-reviewer-only verdict — this check can
-    only ever suppress an alarm, never manufacture one the old code wouldn't already give."""
+    only ever suppress an alarm, never manufacture one the old code wouldn't already give.
+
+    ga-fwuo49i: "no active reviewer" is only claimed off a roster that was READ (_session_roster). When `gc session list` times
+    out, exits non-zero or answers something that is not a list, the poll is "unavailable" — logged, no alarm, asked again at
+    the next poll — instead of the fail-open the ga-iodjh7 selftest documented ("rs=None → sessions=[] → fires") and invited a later
+    bead to revisit. Four alarms on 08/11 fired with a live remote reviewer; the roster of those instants is gone, so the hole that
+    did it was not read off the mini. This closes the three the read had (an unreadable list, a reviewer the list spells differently,
+    a live state other than `active`), and the log lines say which one it was if it ever happens again. A run that is truly stuck
+    while gc stays unreadable still ends in the dispatcher's own per-run TIMEOUT; this arm just does not guess in the meantime."""
     try:
         if time.time() - os.path.getmtime(DISPATCH_LOG) > 120:
             return (False, None, None)  # dispatcher not actively writing → between runs (ENGINE-STALL covers dead)
@@ -696,12 +780,14 @@ def stuck_dispatching_detail():
     if not (got == 0 and elapsed > DISPATCH_STUCK_SEC):
         return (False, None, None)
     # corroborate #1: reviewers spawned for this run are NOT active (dead/start-pending)
-    rs = sh(["gc", "session", "list", "--json"])
-    try:
-        sessions = json.loads(rs.stdout).get("sessions", []) if rs else []
-    except Exception:
+    # ga-fwuo49i: only a roster that was READ can say nobody is alive. Unreadable → no alarm this poll, said in the log; empty → a finding.
+    sessions, why = _session_roster()
+    if sessions is None:
+        print("[watchdog] stuck-dispatching unavailable (%s): run %s is %ds in with 0 verdicts, but the session list could not be read, "
+              "so whether a reviewer is alive is unknown — not alarming this poll, asking again at the next one (every %ds)"
+              % (why, run_id or "?", elapsed, POLL_SEC), flush=True)
         return (False, None, None)
-    active = _active_reviewer_sessions(sessions)    # ga-yg3e22c: local AND remote reviewer templates
+    active = _active_reviewer_sessions(sessions)    # ga-yg3e22c: local AND remote reviewers (ga-fwuo49i: by template or by name)
     if active:
         return (False, None, None)
     # corroborate #2 (ga-rzd08j): a reviewer already DELIVERED (closed verdict bead) for
@@ -715,6 +801,8 @@ def stuck_dispatching_detail():
             delivered = -1
         if delivered > 0:
             return (False, None, None)
+    print("[watchdog] stuck-dispatching: run %s (branch %s) is %ds in with 0 verdicts and no live reviewer among the %d session(s) read; "
+          "reviewer-like rows: %s" % (run_id or "?", branch or "?", elapsed, len(sessions), _reviewer_rows_summary(sessions)), flush=True)
     return (True, run_id, branch)
 
 
@@ -1929,14 +2017,11 @@ def notify(msg, prio):
 def _session_list_json():
     """[session-dict, ...] or None on query failure (None is distinct from an empty
     list — the governor treats None as 'cannot verify' and fail-safe SKIPS spawning,
-    so a Dolt/gc outage can never become a blind-spawn amplifier)."""
-    rs = sh(["gc", "session", "list", "--json"])
-    if not rs or rs.returncode != 0:
-        return None
-    try:
-        return json.loads(rs.stdout).get("sessions", [])
-    except Exception:
-        return None
+    so a Dolt/gc outage can never become a blind-spawn amplifier). ga-fwuo49i: the same reader
+    as stuck_dispatching_detail() (_session_roster), so an error envelope, a body with no
+    `sessions` list or an entry that is not an object is None here too, not [] — the hung-run
+    reaper drains sessions off this list."""
+    return _session_roster()[0]
 
 
 def cond_for(kind, reason, marker_id=None, branch=None):

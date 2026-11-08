@@ -87,8 +87,9 @@ def sweep_complete_line(secs_ago=10):
 
 class FakeCompleted:
     """Stand-in for the subprocess.CompletedProcess sh() normally returns."""
-    def __init__(self, stdout):
+    def __init__(self, stdout, returncode=0):
         self.stdout = stdout
+        self.returncode = returncode   # ga-fwuo49i: the roster read checks the exit code; a real CompletedProcess always carries one
 
 def run(lines, mtime_age_s=5, active_reviewers=0, sessions_call_fails=False):
     """Write `lines` to a REAL temp file, point m.DISPATCH_LOG at it with a controlled
@@ -179,19 +180,21 @@ if r7 is False:
 else:
     bad("fired with zero in-flight evidence in the tail: %r" % (r7,))
 
-# ── Scenario 8: session-list call itself fails — documents PRE-EXISTING fail-open ─────
-# Not a new design choice from this fix: this whole tail (lines computing `active` from
-# `sh()`) was UNREACHABLE before ga-iodjh7 (vm was always None), so this is the first time
-# it has ever actually run. `rs=None` → `sessions=[]` → `active=[]` → returns True: the
-# pre-existing code fails OPEN toward alarming when it can't corroborate, rather than
-# silently swallowing a possibly-real stuck state. Documented here, not endorsed or
-# changed — a future bead can revisit if this turns out wrong now that it's reachable.
+# ── Scenario 8: session-list call itself fails — the THIRD state, no alarm (ga-fwuo49i) ───
+# ga-iodjh7 first documented here, as a PRE-EXISTING fail-open it did not endorse, that
+# `rs=None` → `sessions=[]` → `active=[]` → returns True, and invited "a future bead" to
+# revisit it "if this turns out wrong now that it's reachable". It turned out wrong: on 08/11 four
+# "marcador dispatching travado sem revisores ativos" alarms fired with a live remote reviewer, and
+# an answer that never came back was one of the three holes of that read that could do it.
+# "Could not look" is not "nobody is alive": the poll is unavailable (logged), nothing fires, the
+# next poll asks again. The full matrix of unreadable shapes lives in
+# gate-recovery-watchdog.stuck-dispatching-roster.selftest.sh.
 r8 = run([inflight_line(got=0, total=1, elapsed_s=800, timeout_s=1380)],
          sessions_call_fails=True)
-if r8 is True:
-    ok("`gc session list` failure fails OPEN toward alarming (pre-existing, now reachable, behavior)")
+if r8 is False:
+    ok("`gc session list` failure is 'unknown', not 'nobody is alive' — does not fire (ga-fwuo49i)")
 else:
-    bad("session-list failure handling changed from the pre-existing fail-open shape: %r" % (r8,))
+    bad("session-list failure still reads as 'no active reviewer' and fires: %r" % (r8,))
 
 print("")
 print("RESULT: %d passed, %d failed" % (PASS, FAIL))
