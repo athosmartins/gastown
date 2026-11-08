@@ -17443,6 +17443,11 @@ DISPATCH_RESULT=""   # ga-ov3gow: global on purpose — set by dispatch_one(), r
 #                       Also rig_native_spawn_deferred_slow (ga-6hr8p7): the spawn was DEFERRED because an
 #                       earlier spawn this sweep was slow — a deliberate deferral, not a fault; it is still
 #                       counted in NONQUEUE_FAILS so the Step 5 stall streak sees a sweep that spawned nothing.
+#                       And node_owned_skip (ga-59z7oek): a candidate that is ALREADY the node's (owner or route wa-/ps-worker-remote*, with the hook of
+#                       its family on: label|auto), skipped by dispatch_lane BEFORE the claim — zero writes, so its updated_at stays put for the
+#                       node-ghost-release. Noted by the lane itself, never a dispatch_one() result: the in-arm stand-down after a claim (wa_node_unknown /
+#                       ps_node_unknown) stays failed_other on purpose — a hook that cannot tell must stay visible. Not in NONQUEUE_FAILS: a bead left
+#                       alone by design must not turn a saturated sweep into a "stall".
 #                       And kimi_lane_released / kimi_lane_wait (ga-do1ixn.3): a lane:kimi bead the Kimi pass handed to
 #                       dispatch_one() and that dispatch_one() gave back on purpose — released (the lane only takes an HQ
 #                       bead with a dog target) or kept waiting (the Kimi slot was busy or the spawn budget was spent;
@@ -17532,7 +17537,7 @@ _pilot_sweep_emit() {
       elif $o.r == "rig_native_global_session_cap_queued" then "queued_global_cap"
       elif $o.r == "rig_native_spawn_failed" then "spawn_failed"
       elif $o.r == "priority_yield" then "yielded_priority"
-      elif ["pool_ownership_refuse", "rig_native_dog_store_blind", "rig_native_dog_store_migrated", "rig_native_pool_store_blind", "rig_native_pool_store_migrated", "hq_pool_store_blind", "rig_native_pool_target_only", "rig_dedup_skip", "rig_native_spawn_deferred_slow", "disk_floor_node_only", "wa_node_pass_released", "kimi_lane_released", "kimi_lane_wait", "kimi_lane_demoted"]
+      elif ["pool_ownership_refuse", "rig_native_dog_store_blind", "rig_native_dog_store_migrated", "rig_native_pool_store_blind", "rig_native_pool_store_migrated", "hq_pool_store_blind", "rig_native_pool_target_only", "rig_dedup_skip", "rig_native_spawn_deferred_slow", "disk_floor_node_only", "node_owned_skip", "wa_node_pass_released", "kimi_lane_released", "kimi_lane_wait", "kimi_lane_demoted"]
            | any(.[]; . == $o.r) then "refused_by_guard"
       elif $o.r == "" then "unclassified"
       else "failed_other" end;
@@ -17563,6 +17568,40 @@ _pilot_sweep_emit() {
     warn "ga-ov3gow: could not append the pilot_sweep line to $PILOT_LOG — this sweep leaves no aggregate event (its dispatch results are unaffected)."
   fi
   return 0
+}
+
+# ── ga-59z7oek: a bead que JÁ é do nó não é claimada — pulada antes da claim, sem escrever nada ──────────────────────────────────────────────────────────────────────────────────
+# Medido 07/11 (wa-7tufg6, P1, dono wa-worker-remote-2, sessão fechada às 22:09Z): o filtro de candidatas (ga-46wq5) readmite a bead cujo dono não está vivo, e o alias de um nó morto é exatamente isso; o dispatch_one a claimava
+# (bd update pilot.dispatching_at: move o updated_at), o gate-f (ga-jzye0) deixava passar ("dono inativo") e SÓ o gancho do nó, depois de tudo isso, relia a bead, via que já era do nó, devolvia 2 e a claim era solta com OUTRO
+# bd update. Quatro escritas (dois bd update, que movem o updated_at, e dois de rótulo) a cada ~20-30 min: o updated_at nunca envelhecia e o node-ghost-release (que exige ~30 min sem toque) nunca a soltava. Quem devolve ao Pilot a bead de um alias morto do nó é a sessão do nó ou esse job,
+# nunca esta passada: aqui ela só deixa de tocar.
+# _pilot_node_owned_pre <bead-json> — exit 0 iff a candidata JÁ É do nó E o gancho da família dela a seguraria (rc 2) depois da claim (alvo pool): id wa-* com PILOT_WA_NODE_ROUTE=label|auto e dono ou rota wa-worker-remote* (o prefixo cobre
+# o alias do MBP); id ps-* com PILOT_PS_NODE_ROUTE=label|auto e dono ou rota ps-worker-remote*. É a MESMA pergunta de _pilot_wa_node_decide / _pilot_ps_node_decide feita sobre o JSON da candidata: nenhuma leitura de bd,
+# nenhuma escrita; com os dois botões desligados (o padrão) volta antes de ler qualquer coisa. 1 = segue como sempre: livre, dono que não é do nó (a readmissão do gate-f fica como estava), família desligada ou em shadow, id de
+# outro store · 2 = não consegui ler: também segue como sempre, com aviso — o gancho do nó rele a bead depois da claim, com os três estados, e a segura; "não sei" nunca esconde bead do despacho. DRY_RUN não entra: o gancho
+# também segura em DRY_RUN. Pula também quando o alvo seria uma crew nomeada (domínio com dono persistente), onde o gancho não roda: a bead de alias do nó fica com o ciclo do nó até o node-ghost-release devolvê-la. O gancho do MBP
+# só vê esta bead com o mini cheio e sem a rota do Hetzner ligada: fica de fora, nada muda para ele.
+_pilot_node_owned_pre() {
+  local _b="${1:-}" _id _pfx _is _wa=0 _ps=0
+  case "${PILOT_WA_NODE_ROUTE:-}" in label|auto) _wa=1 ;; esac
+  case "${PILOT_PS_NODE_ROUTE:-}" in label|auto) _ps=1 ;; esac
+  [ "$_wa$_ps" != 00 ] || return 1
+  # vazio (bead sem id: o bd omite a chave) → "" → 1, segue como sempre; falhou/ilegível (JSON que o jq não lê) → 2 com aviso, nunca 0: sem leitura não se pula nada
+  _id=$(printf '%s' "$_b" | jq -r '.id // ""' 2>/dev/null) || {
+    warn "ga-59z7oek: não consegui ler o id da candidata — segue como sempre (o gancho do nó relê a bead depois da claim)"
+    return 2
+  }
+  case "$_id" in
+    wa-*) [ "$_wa" = 1 ] || return 1; _pfx=wa-worker-remote ;;
+    ps-*) [ "$_ps" = 1 ] || return 1; _pfx=ps-worker-remote ;;
+    *) return 1 ;;
+  esac
+  # vazio (sem dono e sem rota: o bd omite a chave vazia) → false → 1, segue como sempre; falhou/ilegível (dono ou rota que não são texto, metadata que não é objeto) → 2 com aviso, nunca 0
+  _is=$(printf '%s' "$_b" | jq -r --arg p "$_pfx" '(((.assignee // "") | startswith($p)) or ((.metadata["gc.routed_to"] // "") | startswith($p)))' 2>/dev/null) || {
+    warn "ga-59z7oek: não consegui ler dono e rota de $_id — segue como sempre (o gancho do nó relê a bead depois da claim)"
+    return 2
+  }
+  [ "$_is" = true ]
 }
 
 # dispatch_lane <lane> <candidates_json> <free_slots>
@@ -17616,6 +17655,16 @@ dispatch_lane() {
     # (classe benigna no pilot_sweep, não alimenta NONQUEUE_FAILS nem PRIORITY_YIELDED). Inerte fora da passada só-nó (_PILOT_NODE_ONLY=0).
     if [ "${_PILOT_NODE_ONLY:-0}" = "1" ] && ! _pilot_node_only_candidate_pre "$pick"; then
       _pilot_sweep_note "$pick_id" 1 "disk_floor_node_only"
+      continue
+    fi
+
+    # ── ga-59z7oek: a bead que JÁ é do nó (dono ou rota wa-/ps-worker-remote*) NÃO é claimada: pulada ANTES da claim, sem escrever nada ──
+    # Sem este pulo a claim (bd update → updated_at) e a soltura que o gancho do nó faz depois de reler a bead eram quatro escritas por varredura (dois bd update), e o updated_at nunca envelhecia para o node-ghost-release (ver _pilot_node_owned_pre).
+    # Mesma forma dos pulos pré-claim daqui e de baixo: zero escrita, só a nota em memória. Não é falha nem espera de capacidade: classe benigna no pilot_sweep (refused_by_guard), fora de NONQUEUE_FAILS e de PRIORITY_YIELDED.
+    # vazio (rc 1: nada do nó) → segue ao dispatch_one como sempre; falhou/ilegível (rc 2, com o aviso que o helper escreveu) → segue também: o gancho do nó dentro do dispatch_one rele a bead depois da claim e a segura
+    if _pilot_node_owned_pre "$pick"; then
+      log "  ga-59z7oek: $pick_id já é do nó (dono ou rota wa-/ps-worker-remote*) — NÃO claimada, nenhuma escrita nesta varredura; quem a devolve ao Pilot é a sessão do nó ou o node-ghost-release"
+      _pilot_sweep_note "$pick_id" 1 "node_owned_skip"
       continue
     fi
 
