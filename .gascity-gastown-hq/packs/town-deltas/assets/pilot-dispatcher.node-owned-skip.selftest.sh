@@ -51,12 +51,18 @@ LANE_FN="$(fn_src dispatch_lane)"
 NOTE_FN="$(fn_src _pilot_sweep_note)"
 EMIT_FN="$(fn_src _pilot_sweep_emit)"
 PRE_FN="$(fn_src _pilot_node_owned_pre)"
+CAPQ_FN="$(fn_src _pilot_note_pool_cap_queued)"
+# o predicado de saturacao do fim da varredura (o que separa "saturado" de "estagnado"): trecho marcado SELFTEST-EXTRACT, usado tambem pelo selftest do kimi-lane
+SAT_BLOCK="$(sed -n '/# SELFTEST-EXTRACT pilot-saturation-predicate: BEGIN/,/# SELFTEST-EXTRACT pilot-saturation-predicate: END/p' "$DISPATCHER")"
 [ -n "$LANE_FN" ] || { echo "FATAL: dispatch_lane() not found in $DISPATCHER" >&2; exit 2; }
 [ -n "$NOTE_FN" ] || { echo "FATAL: _pilot_sweep_note() not found in $DISPATCHER" >&2; exit 2; }
 [ -n "$EMIT_FN" ] || { echo "FATAL: _pilot_sweep_emit() not found in $DISPATCHER" >&2; exit 2; }
+[ -n "$CAPQ_FN" ] || { echo "FATAL: _pilot_note_pool_cap_queued() not found in $DISPATCHER" >&2; exit 2; }
+[ -n "$SAT_BLOCK" ] || { echo "FATAL: o trecho SELFTEST-EXTRACT pilot-saturation-predicate nao esta em $DISPATCHER" >&2; exit 2; }
 # a funcao nova pode faltar (dispatcher de antes da correcao): isso reprova a Parte A, nunca derruba a B (que mostra o motivo de verdade)
 FUNCS="$LANE_FN
 $NOTE_FN
+$CAPQ_FN
 $PRE_FN"
 
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/pilot-node-owned-skip-selftest.XXXXXX")" || exit 2
@@ -177,14 +183,16 @@ run_lane() {
     DISPATCH_TO_CAPACITY=1; PILOT_DOLT_SATURATED_AT_START=0
     POOL_CAP_QUEUED=0; POOL_CAP_QUEUED_IDS=""; NONQUEUE_FAILS=0; DISPATCHED=0; PRIORITY_YIELDED=0
     SWEEP_OUTCOMES=""; DISPATCH_RESULT=""; _PCAP_COUNT_UNREADABLE=""; _PCAP_CALL_QUEUED=0; _PILOT_WA_MBP_PASS=0; _PMN_APPLY_RC=""
+    _PCAP_POOL=wa-worker; _PCAP_LIVE=4; _PCAP_MAX=4; KIMI_LANE_WAITING=0
     log()  { printf 'log\t%s\n'  "$*" >> "$WORK/log.txt"; }
     warn() { printf 'warn\t%s\n' "$*" >> "$WORK/log.txt"; }
-    # o que dispatch_lane() chama e este teste nao e sobre
+    # o que dispatch_lane() chama e este teste nao e sobre (CAP_FULL_ID: a bead cujo pool "esta no teto", para o B8)
     _top_candidate() { printf '%s' "$1" | jq -c '.[0]'; }
     _bead_tier() { echo tier1; }
     _pilot_dispatch_should_stop() { return 1; }
     _pilot_priority_pool_bound_pre() { return 1; }
-    _pilot_pool_cap_full_for() { return 1; }
+    _pilot_priority_waiter_note() { return 0; }
+    _pilot_pool_cap_full_for() { [ -n "${CAP_FULL_ID:-}" ] && [ "$(printf '%s' "$1" | jq -r '.id')" = "$CAP_FULL_ID" ]; }
     _pilot_slow_spawn_deferred_for() { return 1; }
     _dolt_saturated() { return 1; }
     dispatch_one() {
@@ -207,9 +215,13 @@ run_lane() {
     }
     eval "$FUNCS"
     dispatch_lane small "$4" "${5:-5}"
+    _pool_saturated_sweep=0
+    eval "$SAT_BLOCK"
     {
       echo "DISP=$DISPATCHED"
       echo "NQ=$NONQUEUE_FAILS"
+      echo "CAPQ=$POOL_CAP_QUEUED"
+      echo "SAT=$_pool_saturated_sweep"
       echo "YIELD=$PRIORITY_YIELDED"
       printf 'OUTCOMES=%s\n' "$(printf '%s' "$SWEEP_OUTCOMES" | tr '\n\t' ';,')"
     } > "$WORK/state.txt"
@@ -268,6 +280,15 @@ run_lane auto - 1 "$(pool_of "$GHOST" "$FREE")" 5
 echo "B7: so a ROTA do no (sem dono) tambem e do no"
 run_lane auto - 0 "$(pool_of "$(bead wa-rt '' wa-worker-remote)" "$FREE")" 5
 [ "$(attempted)" = "wa-free" ] && [ "$(state_get OUTCOMES)" = "wa-rt,1,node_owned_skip;wa-free,0,rig_native_ok;" ] && ok "B7: wa-rt (so rota wa-worker-remote) pulada" || bad "B7: attempted='$(attempted)' outcomes='$(state_get OUTCOMES)'"
+
+echo "B8: a razao de a pulada nao somar em NONQUEUE_FAILS — sweep com [bead do no, bead enfileirada no teto do pool] e SATURADO (backpressure), nao 'estagnado'"
+CAP_FULL_ID=wa-queued run_lane auto - 0 "$(pool_of "$GHOST" "$(bead wa-queued)")" 5
+[ "$(state_get OUTCOMES)" = "wa-ghost,1,node_owned_skip;wa-queued,1,rig_native_pool_session_cap_queued;" ] && [ "$(state_get CAPQ)" = "1" ] && [ "$(state_get DISP)" = "0" ] \
+  && ok "B8: a do no foi pulada e a outra ficou na fila do teto (CAPQ=1, nada despachado)" \
+  || bad "B8: outcomes='$(state_get OUTCOMES)' CAPQ=$(state_get CAPQ) DISP=$(state_get DISP)"
+[ "$(state_get NQ)" = "0" ] && [ "$(state_get SAT)" = "1" ] \
+  && ok "B8: o predicado de saturacao REAL diz saturado (NQ=0, SAT=1): a bead deixada em paz por desenho nao fabrica 'Pilot estagnado'" \
+  || bad "B8: NQ=$(state_get NQ) SAT=$(state_get SAT) — a bead do no virou falha e mascarou a saturacao (o streak do Step 5 contaria o sweep como parado)"
 
 # ── C: a classificacao ────────────────────────────────────────────────────────────────────────────────────────────────
 echo "=== C: _pilot_sweep_emit REAL — node_owned_skip e beneigna; wa_node_unknown segue visivel ==="
