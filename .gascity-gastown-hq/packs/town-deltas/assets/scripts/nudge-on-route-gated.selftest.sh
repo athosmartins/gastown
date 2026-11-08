@@ -381,11 +381,14 @@ if [ "$LEGACY" = "0" ]; then
     jq -cn '{seq:6,type:"bead.updated",payload:{bead:{id:"ga-epic-type",status:"open",issue_type:"epic",labels:[],metadata:{"gc.routed_to":"gastown.dog"}}}}'
     jq -cn '{seq:7,type:"bead.updated",payload:{bead:{id:"ga-epic-title",status:"open",title:"ÉPICO: migrar tudo",labels:[],metadata:{"gc.routed_to":"gastown.dog"}}}}'
     ev 8 ga-onepool   open - gastown.dog '["delivery:pending-restart"]'
+    # ga-rahls6k: a decision is somebody's call, not a build - every pool probe drops it, so the shared lib lists it as refused by all
+    jq -cn '{seq:9,type:"bead.updated",payload:{bead:{id:"ga-decision-type",status:"open",issue_type:"decision",labels:[],metadata:{"gc.routed_to":"gastown.dog"}}}}'
+    jq -cn '{seq:10,type:"bead.updated",payload:{bead:{id:"ga-decision-caps",status:"open",issue_type:"Decision",labels:[],metadata:{"gc.routed_to":"gastown.dog"}}}}'
   } > "$FX/events.jsonl"
   ready_ids ga-ok ga-onepool
   run_script
   LINE="$(tail -1 "$STATE/nudge-on-route-gated.jsonl" 2>/dev/null)"
-  eq "refused by EVERY pool (blocked:, gate:needs-human*, pilot:refused-reason:, pilot:text-veto:, epic type, EPIC title) => not_ready_label; the plain bead and the ONE-pool label stay actionable" "$(echo "$LINE" | jq -r '.suppressed.not_ready_label'):$(echo "$LINE" | jq -r '.gated_pairs')" "6:2"
+  eq "refused by EVERY pool (blocked:, gate:needs-human*, pilot:refused-reason:, pilot:text-veto:, epic type, EPIC title, decision type in either case) => not_ready_label; the plain bead and the ONE-pool label stay actionable" "$(echo "$LINE" | jq -r '.suppressed.not_ready_label'):$(echo "$LINE" | jq -r '.gated_pairs')" "8:2"
   eq "the lib loaded => nothing reported as unavailable" "$(echo "$LINE" | jq -r '.degraded.veto_lib_unavailable')" "0"
 
   echo "== 19b. the veto lib cannot be loaded: NOTHING is suppressed on that guess (legacy wake), and it is COUNTED"

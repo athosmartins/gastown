@@ -284,10 +284,12 @@ body = sys.argv[2]
 code = "\n".join(l for l in script.splitlines() if not l.lstrip().startswith("#"))
 lits = re.findall(r"'([^'\n]{20,})'", code)
 # Whole literal, quotes included: a truncated program is still a substring of the original.
-# ga-rahls6k: the ONE literal that is deliberately NOT the engine's text - the decision drop (the fifth deliberate difference, its own stage
-# so VETO_FILTER stays verbatim). Allowed by EXACT text: any edit to it, or any other new literal, still fails here until it is looked at.
-# decision-type-not-buildable.selftest.sh holds the proof of what it does.
-DELIBERATE = [r'''[ .[] | select(((.issue_type // .type // "") | tostring | ascii_downcase) != "decision") ]''']
+# ga-rahls6k: the TWO literals that are deliberately NOT the engine's text: the decision drop (the fifth deliberate difference, its own stage
+# so VETO_FILTER stays verbatim) and the program that lists the ids it dropped, for the log line (pp_note_decisions: log only, it cannot
+# change the answer). Allowed by EXACT text: any edit to either, or any other new literal, still fails here until it is looked at.
+# decision-type-not-buildable.selftest.sh holds the proof of what they do.
+DELIBERATE = [r'''[ .[] | select(((.issue_type // .type // "") | tostring | ascii_downcase) != "decision") ]''',
+              r'''[ .[] | (.id // "?" | tostring) ] - [ $kept[] | (.id // "?" | tostring) ] | join(",")''']
 missing = [l for l in lits if ("'" + l + "'") not in body and l not in DELIBERATE]
 print(f"{len(lits)} literals checked")
 for l in missing:

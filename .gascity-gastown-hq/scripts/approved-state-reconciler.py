@@ -670,6 +670,28 @@ def _is_epic(bead):
     """
     return (bead.get("issue_type") or bead.get("type") or "") == "epic"
 
+# A decision (ga-rahls6k) is somebody's call to make, not a build: the Pilot, the pool probes and the pilot-missing-route
+# watchdog all leave issue_type=decision out of "buildable". This is the probes' own expression,
+# ((.issue_type // .type // "") | tostring | ascii_downcase) == "decision": jq's `//` falls through on null AND false
+# (not on "" or 0), tostring never raises (a type that is not a string reads as "not a decision", never as an error),
+# and ascii_downcase lowers only A-Z (str.lower() would also fold non-ASCII letters, e.g. a dotted capital I).
+_DECISION_ASCII_LOWER = {c: c + 32 for c in range(ord("A"), ord("Z") + 1)}
+
+
+def _is_decision(bead):
+    """True iff the bead's type reads as "decision" the way the pool probes read it.
+
+    Three states, none collapsed into another: a decision (True); a bead of another type, no type at all, or a type
+    that is not a string (False: the bead is judged on its other fields, exactly as the probes do it).
+    """
+    kind = bead.get("issue_type")
+    if kind is None or kind is False:
+        kind = bead.get("type")
+    if kind is None or kind is False:
+        return False
+    return isinstance(kind, str) and kind.translate(_DECISION_ASCII_LOWER) == "decision"
+
+
 
 def _parse_reclaim_count(labels):
     """Extract pilot:reclaim-count:N from labels. Returns 0 if absent or invalid.
@@ -4898,6 +4920,18 @@ def _process_store(rig_root, now, state, pilot_alive, built_ids, blocked_ids,
                     "note": "keyword match without routing label — flag emitted, "
                             "bead stays approved",
                 }, fail_open=True)
+
+        # ── Step 1c: issue_type == 'decision' → not buildable, so Step 2's "assumed buildable" does not hold ──
+        # (ga-rahls6k). The Pilot no longer dispatches a decision and no pool worker may claim one, so "approved, not
+        # flowing, past STARVE_MIN" is its permanent state, not a sign of "dispatch path failing": alarming on it is the
+        # standing "why has the Pilot not touched it" noise the epic check above exists to prevent (wa-ielq6). It sits AFTER
+        # _classify() and the keyword flag, unlike the epic check, on purpose: a decision that carries a real parking label
+        # (needs-device, needs-human, blocked, gate:passed...) is still parked by Step 1 exactly as before - only the
+        # starvation/dispatch-failing path is skipped. The decision stays with whoever decides it (the panel queue).
+        if _is_decision(bead):
+            _log("  %s: issue_type=decision — somebody's call, not a build (the Pilot does not dispatch it, no pool worker "
+                 "may claim it) — not starving: no alarm" % bead_id)
+            continue
 
         # ── Step 2: no explicit signal → assumed buildable ─────────────────
         # Safety: we NEVER route here. Only flow-or-alarm.
@@ -9159,6 +9193,81 @@ def _selftest():
     else:
         _bad("(ga-2yyez-epic-c)", "expected an alarm but none fired — "
              "mail_calls=%s" % (mail_calls,))
+
+    # ── ga-rahls6k: issue_type=='decision' → not buildable, so a starving one is not "dispatch failing" ──
+    print("\nScenario (ga-rahls6k-a): _is_decision() reads the type the way the pool probes do "
+          "(case-folded A-Z only, legacy .type only when issue_type is null/false, a non-string is not a decision)")
+    _dec_cases = [
+        ({"issue_type": "decision"}, True), ({"issue_type": "Decision"}, True), ({"issue_type": "DECISION"}, True),
+        ({"type": "decision"}, True), ({"issue_type": None, "type": "decision"}, True),
+        ({"issue_type": False, "type": "Decision"}, True),
+        ({"issue_type": "task", "type": "decision"}, False),   # issue_type wins once it is set
+        ({"issue_type": "", "type": "decision"}, False),       # "" is not null/false to jq: no fall-through
+        ({"issue_type": 0, "type": "decision"}, False),        # nor is 0
+        ({"issue_type": "task"}, False), ({"issue_type": "bug"}, False), ({"issue_type": "epic"}, False),
+        ({"issue_type": "decision-record"}, False), ({"issue_type": "decisions"}, False),
+        ({"issue_type": 5}, False), ({"issue_type": ["decision"]}, False), ({"issue_type": {"x": 1}}, False),
+        ({"issue_type": True}, False), ({"issue_type": "d\u0130cision"}, False), ({}, False),
+    ]
+    _dec_bad = [(b, want, _is_decision(b)) for b, want in _dec_cases if _is_decision(b) is not want]
+    if not _dec_bad:
+        _ok("(ga-rahls6k-a): %d type shapes read as the probes read them" % len(_dec_cases))
+    else:
+        _bad("(ga-rahls6k-a)", "mismatches (bead, want, got): %r" % (_dec_bad,))
+
+    print("\nScenario (ga-rahls6k-b): decision + story:approved, starving, pilot alive, zero other signals → NO alarm, "
+          "NOT routed, NOT flagged")
+    _bd_approved = lambda root: [_make_bead(
+        "ga-rahls6k-b", labels=["story:approved"], issue_type="decision")]
+    _read_pilot_log_lines = lambda: _pilot_recent()
+    _read_pilot_sweep_pause_state_file = lambda: {
+        "active": False, "reason": "", "detail": "",
+        "at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(NOW)),
+    }
+    st = _reset()
+    # Aged PAST STARVE_MIN on purpose (as the epic scenario above): left fresh, it would pass on unfixed code too,
+    # for the grace window and not for the decision check.
+    st["first_seen_approved"]["ga-rahls6k-b"] = NOW - (_STARVE + 5) * 60
+    run_cycle(NOW, st)
+    alarmed_rb = any("ga-rahls6k-b" in subj for subj, _ in mail_calls)
+    routed_rb = ("ga-rahls6k-b", "story:approved") in label_removes
+    flagged_rb = any(bid == "ga-rahls6k-b" for bid, _ in comments)
+    if not alarmed_rb and not routed_rb and not flagged_rb:
+        _ok("(ga-rahls6k-b): a starving decision never alarms/routes/flags (the Pilot does not dispatch it, by design)")
+    else:
+        _bad("(ga-rahls6k-b)", "mail_calls=%s label_removes=%s comments=%s" % (mail_calls, label_removes, comments))
+
+    print("\nScenario (ga-rahls6k-c): falsification — a decision AND a task, both starving in the SAME cycle → the task "
+          "STILL alarms, the decision does not (the exclusion is by type, not by store or by cycle)")
+    _bd_approved = lambda root: [
+        _make_bead("ga-rahls6k-cd", labels=["story:approved"], issue_type="Decision"),
+        _make_bead("ga-rahls6k-ct", labels=["story:approved"], issue_type="task"),
+    ]
+    _read_pilot_log_lines = lambda: _pilot_recent()
+    st = _reset()
+    st["first_seen_approved"]["ga-rahls6k-cd"] = NOW - (_STARVE + 5) * 60
+    st["first_seen_approved"]["ga-rahls6k-ct"] = NOW - (_STARVE + 5) * 60
+    run_cycle(NOW, st)
+    alarmed_cd = any("ga-rahls6k-cd" in subj for subj, _ in mail_calls)
+    alarmed_ct = any("ga-rahls6k-ct" in subj for subj, _ in mail_calls)
+    if alarmed_ct and not alarmed_cd:
+        _ok("(ga-rahls6k-c): the task beside the decision still alarms; the decision does not")
+    else:
+        _bad("(ga-rahls6k-c)", "alarmed task=%s alarmed decision=%s mail_calls=%s" % (alarmed_ct, alarmed_cd, mail_calls))
+
+    print("\nScenario (ga-rahls6k-d): a decision that carries a real parking label (story:needs-device) is STILL parked "
+          "by Step 1 — the exclusion only removes the starvation alarm, it does not skip classification")
+    _bd_approved = lambda root: [_make_bead(
+        "ga-rahls6k-d", labels=["story:approved", "story:needs-device"], issue_type="decision")]
+    _read_pilot_log_lines = lambda: _pilot_recent()
+    st = _reset()
+    run_cycle(NOW, st)
+    removed_rd = ("ga-rahls6k-d", "story:approved") in label_removes
+    added_rd = ("ga-rahls6k-d", "story:needs-device") in label_adds
+    if removed_rd and added_rd:
+        _ok("(ga-rahls6k-d): a labelled decision is still routed out of story:approved")
+    else:
+        _bad("(ga-rahls6k-d)", "removes=%s adds=%s" % (label_removes, label_adds))
 
     # ── ga-2yyez case 3 "lane x pool": lane capacity check ───────────────────
     # ga-5d5se gate-fix: this fixture used to omit the trailing

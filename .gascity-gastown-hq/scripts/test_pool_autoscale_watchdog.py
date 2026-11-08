@@ -192,7 +192,9 @@ class FakeCLI:
         rows = [b for b in self.beads
                 if all(b["metadata"].get(k) == v for k, v in meta.items())
                 and (not unassigned or not b.get("assignee"))
-                and b["issue_type"] not in exclude_types
+                # bd compares a stored string type; a type that is not a string (a list or object in a fixture, ga-rahls6k)
+                # is never "epic", and `in <set>` would raise TypeError on it, which the watchdog would then read as bd failing
+                and not (isinstance(b["issue_type"], str) and b["issue_type"] in exclude_types)
                 and not (self.honor_exclude_labels
                          and set(b.get("labels") or []) & exclude_labels)]
         rows.sort(key=lambda b: b["created_at"])
@@ -319,6 +321,57 @@ def test_bead_routed_to_another_pool_is_not_this_pools_demand(wd, fake):
 def test_epic_typed_bead_is_not_demand(wd, fake):
     fake.beads = [bead("ga-epic", issue_type="epic", title="Consolidate everything")]
     assert wd.get_pool_demand(POOL) == 0
+
+
+# ga-rahls6k: the pool probes drop issue_type=decision (a decision is a call for someone to make, not a
+# build), so a routed decision is demand nobody can serve. Counting it would start sessions that find
+# nothing to claim. Each case pairs the decision with a task survivor, so a predicate that over-drops
+# (everything, or a whole store) fails the count of 1 as loudly as one that under-drops fails the 0.
+@pytest.mark.parametrize("decision", [
+    {"issue_type": "decision"},
+    {"issue_type": "Decision"},
+    {"issue_type": "DECISION"},
+    {"issue_type": None, "type": "decision"},       # legacy field, reached when issue_type is null
+    {"issue_type": False, "type": "Decision"},      # jq `//` falls through on false as well
+], ids=["lower", "capitalised", "upper", "legacy-type-field", "false-falls-through"])
+def test_decision_typed_bead_is_not_demand(wd, fake, decision):
+    d = bead("ga-decision")
+    d.update(decision)
+    fake.beads = [d]
+    assert wd.get_pool_demand(POOL) == 0
+    fake.beads = [d, bead("ga-task", issue_type="task")]
+    assert wd.get_pool_demand(POOL) == 1, "a decision must not hide or replace the task beside it"
+
+
+@pytest.mark.parametrize("kind", [
+    "task", "bug", "feature", "chore", "decision-record", "decisions", "",
+    5, ["decision"], {"x": 1}, True,
+], ids=repr)
+def test_non_decision_type_is_still_demand(wd, fake, kind):
+    """Break caught: an over-broad match (substring, truthiness, a type that is not a string raising or
+    reading as a decision) hiding real work. The probe's tostring never raises, so a non-string type
+    reads as "not a decision" and the bead is judged on its other fields."""
+    fake.beads = [bead("ga-real", issue_type=kind)]
+    assert wd.get_pool_demand(POOL) == 1
+
+
+def test_decision_check_follows_the_probe_on_type_edge_cases(wd):
+    """probe_would_serve is the unit the demand count is built from; pin the edge cases directly."""
+    def served(**fields):
+        b = {"id": "ga-x", "labels": [], "title": "plain", "metadata": {}}
+        b.update(fields)
+        return wd.probe_would_serve(b, NOW)
+
+    assert served() is True                                            # no type at all
+    assert served(issue_type="task") is True
+    assert served(issue_type="decision") is False
+    assert served(issue_type="DeCiSiOn") is False
+    assert served(type="decision") is False                            # legacy field alone
+    assert served(issue_type="task", type="decision") is True          # issue_type wins when it is set
+    assert served(issue_type="", type="decision") is True              # "" is not null/false: no fall-through
+    assert served(issue_type=0, type="decision") is True               # 0 is truthy to jq `//`
+    assert served(issue_type=5) is True
+    assert served(issue_type="d\u0130cision") is True                  # ascii_downcase lowers only A-Z
 
 
 def test_hold_labelled_beads_do_not_crowd_claimable_work_out_of_the_window(wd, fake):

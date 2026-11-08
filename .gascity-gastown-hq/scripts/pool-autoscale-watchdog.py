@@ -30,8 +30,8 @@ Poll loop (~60s). Silence = healthy (only emits on actions).
                                      nothing about the lib, and does not end a BROKEN)
 
 Demand (ga-uv4on5) is the beads a pool worker's own probe would hand out, not
-every ready bead routed to the pool: held, vetoed, parked, epic and in-flight
-beads are not demand, because a dog woken for them finds nothing and exits.
+every ready bead routed to the pool: held, vetoed, parked, epic, decision and
+in-flight beads are not demand, because a dog woken for them finds nothing and exits.
 See "Demand predicate" below.
 
 The ceiling (ga-d1q1kn) is re-read from `gc config show` before every cycle, and
@@ -119,6 +119,13 @@ PROBE_HELD_UNTIL_PREFIX = "pilot:held-until:"
 
 # Epic beads are containers, not buildable work.
 PROBE_EPIC_TITLE_RE = re.compile(r"^(EPIC|ÉPICO)[:\s]", re.IGNORECASE)
+
+# A decision (ga-rahls6k) is somebody's call, not a build: the pool probes drop it by TYPE, so it is not demand either.
+# This is the probe's own expression, ((.issue_type // .type // "") | tostring | ascii_downcase) == "decision":
+# jq's `//` falls through on null AND false, tostring never raises (a type that is not a string reads as "not a
+# decision", never as an error), and ascii_downcase lowers only A-Z (str.lower() would also fold non-ASCII letters).
+PROBE_DECISION_TYPE = "decision"
+_ASCII_LOWER = {c: c + 32 for c in range(ord("A"), ord("Z") + 1)}
 
 # The probe asks bd for the 20 oldest candidates; the watchdog looks at the same window.
 PROBE_CANDIDATE_LIMIT = 20
@@ -352,6 +359,20 @@ def save_state(state):
 # Live data queries
 # ---------------------------------------------------------------------------
 
+def _is_decision_bead(bead):
+    """True iff the bead's type reads as "decision" the way the pool probe reads it (see PROBE_DECISION_TYPE).
+
+    Three states, none collapsed into another: a decision (True); a bead of another type, no type at all, or a
+    type that is not a string (False: the bead is judged on its other fields, exactly as the probe does).
+    """
+    kind = bead.get("issue_type")
+    if kind is None or kind is False:
+        kind = bead.get("type")
+    if kind is None or kind is False:
+        return False
+    return isinstance(kind, str) and kind.translate(_ASCII_LOWER) == PROBE_DECISION_TYPE
+
+
 def probe_would_serve(bead, now_ts):
     """True iff the pool probe would hand this bead out and the watchdog does not
     exclude it itself. See "Demand predicate" above.
@@ -359,7 +380,8 @@ def probe_would_serve(bead, now_ts):
     Applies every exclusion in full: exact labels (which `bd ready` also drops
     server-side, so a bd that stops honouring the flag cannot bring the bug
     back), the jq-stage prefixes, epic titles and Pilot holds, plus
-    WATCHDOG_EXCLUDE_LABELS.
+    WATCHDOG_EXCLUDE_LABELS, and the decision type (ga-rahls6k): the probe drops
+    it after bd answers, so bd's own flags cannot be what keeps it out of the count.
 
     A missing or null `labels` key means no labels: bd omits the key for a bead
     nobody has labelled, and the probe's jq reads it the same way. Unreadable
@@ -378,6 +400,8 @@ def probe_would_serve(bead, now_ts):
     title = bead.get("title")
     if isinstance(title, str) and PROBE_EPIC_TITLE_RE.match(title):
         return False
+    if _is_decision_bead(bead):
+        return False
     if any(l == PROBE_HELD_LABEL or l.startswith(PROBE_HELD_UNTIL_PREFIX) for l in labels):
         expiries = [l[len(PROBE_HELD_UNTIL_PREFIX):] for l in labels
                     if l.startswith(PROBE_HELD_UNTIL_PREFIX)]
@@ -391,6 +415,8 @@ def probe_would_serve(bead, now_ts):
 def _ready_candidates(pool_template):
     """Ready, unassigned beads routed to the pool: the probe's own bd query
     (same exclusions, ordering and 20-bead window) plus WATCHDOG_EXCLUDE_LABELS.
+    The decision type is NOT a bd flag in the probe (it is dropped after bd answers, ga-rahls6k), so it is
+    probe_would_serve() that keeps decisions out of the count, not this query.
 
     Returns a list, or None when bd could not be read: "could not tell" must
     never look like "nothing there".
@@ -464,8 +490,8 @@ def get_pool_demand(pool_template):
     -1 could not tell (the caller skips the cycle).
 
     Demand is what the pool worker's own probe would hand out, not every ready
-    bead routed to the pool (ga-uv4on5): held, vetoed, parked, epic and
-    in-flight beads are not demand, because a dog woken for them finds an empty
+    bead routed to the pool (ga-uv4on5): held, vetoed, parked, epic, decision
+    and in-flight beads are not demand, because a dog woken for them finds an empty
     queue and exits. The count is bounded by the probe's candidate window and
     is a presence signal -- scale_decision() only asks whether it is > 0.
 

@@ -60,9 +60,10 @@ mark() {
 # The city's own formula work still flows - it is what gets the city out of the hole: order molecules and their steps
 # (the stale-db cleanup: type molecule / step, gc.pool_demand, gc.step_ref - no gc.kind), gc.kind work, and tiers 2 and 3.
 # What counts as a story is ONE definition, DISK_HOLD_NEW_STORIES_JQ in the lib; a shape it does not recognise flows.
-# This is one of the four places where the answer deliberately differs from the engine's probe (the others are the gate focus
-# hold, ga-6fkx9je, the sling filter, ga-b97dgq, and the mother filter, ga-vdac4cj, all below), and it differs only while the disk is low:
-# with the disk fine (or unreadable) stdout, the bd calls and the exit code are byte-for-byte the engine's.
+# This is one of the five places where the answer deliberately differs from the engine's probe (the others are the gate focus
+# hold, ga-6fkx9je, the sling filter, ga-b97dgq, the mother filter, ga-vdac4cj, and the decision type, ga-rahls6k, all below). The disk floor
+# itself differs only while the disk is low: with the disk fine (or unreadable) it changes nothing (stdout, the bd calls and the exit code
+# are what they would be without it).
 # `[]` from the hold is a real "nothing for you": drain, do not look for a story by another route.
 # The hold runs AFTER the engine's --limit=20 window (ga-nyug12): 20 stories older than a formula bead would fill the window,
 # the hold would empty it and `[]` would say "drain" while formula work waits outside. So when the disk is low, the window was
@@ -148,13 +149,38 @@ pp_minus() {
 # change does not alter that), not a clause inside VETO_FILTER and not a second --exclude-type flag, on purpose: VETO_FILTER stays
 # verbatim the engine's text (pool-probe.selftest.sh section 8 checks that) and the bd argv stays byte-identical (section 1 compares it;
 # --live compares the golden with `gc prime`). The cost of dropping after bd: the engine's --limit=20 window can still hold decisions,
-# so 20 routed decisions older than a real story would hide that story until they are gone. The Pilot no longer routes decisions
-# (pilot-dispatcher.sh _filter_candidates), so only hand-slung ones can pile up. A type that is not a string (5, an object) reads as
-# "not a decision": tostring never raises, so one odd bead cannot turn the whole list into the [] a dog reads as "no work".
+# so 20 routed decisions older than a real story would hide that story until they are gone. Who can still put a routed decision there?
+# Checked and closed (each skips decisions now, and decision-type-not-buildable.selftest.sh / its own battery pins it): the Pilot
+# (pilot-dispatcher.sh _filter_candidates), pilot-missing-route-watchdog.sh (both passes), approved-state-reconciler.py (its alarm) and
+# pool-autoscale-watchdog.py (its demand count). NOT closed, so do not read this as "only hand-slung ones": a manual sling, and the
+# paths that restore an EXISTING route (the gate FAIL path, the Pilot re-routes: pilot-dispatcher.sh has about 15 gc.routed_to writers
+# and quality-gate-dispatcher.sh restores one) were not audited bead type by bead type. That is why the drop is LOGGED
+# (pp_note_decisions below), never silent: a routed decision and "nothing routed" both answer [], and the log line is what tells them apart.
+# A type that is not a string (5, an object) reads as "not a decision": tostring never raises, so one odd bead cannot turn the whole
+# list into the [] a dog reads as "no work".
 # decision-type-not-buildable.selftest.sh pins this stage, the Pilot and both workers.
 VETO_FILTER='[ .[] | select(((.labels // []) | map(select(startswith("pool:refused"))) | length) == 0) | select((((.labels // []) | map(select(. == "pilot:held" or startswith("pilot:held-until:"))) | length) == 0) or (((.labels // []) | map(select(startswith("pilot:held-until:")) | ltrimstr("pilot:held-until:") | tonumber)) | if length > 0 then (max < $now_ts) else false end)) | select(((.title // "") | test("^(EPIC|ÉPICO)[:\\s]"; "i")) | not) | select(((.labels // []) | map(select(startswith("blocked:") or startswith("blocked-reason:") or startswith("gate:needs-human") or startswith("pilot:refused-reason:") or startswith("pilot:text-veto"))) | length) == 0) ]'
 DECISION_DROP_JQ='[ .[] | select(((.issue_type // .type // "") | tostring | ascii_downcase) != "decision") ]'
 POOL_FILTER="$VETO_FILTER | $DECISION_DROP_JQ"
+
+# ga-rahls6k: the decision drop is VISIBLE, as the Pilot makes its exclusions (it logs EXCLUIDO with the reason, ga-i00xl). LOG ONLY: it
+# reads the array exactly as bd gave it (BEFORE any filter), prints nothing to stdout or stderr, and cannot change what the tier answers or
+# the exit code. The ids are "the list minus DECISION_DROP_JQ applied to it", so the rule is still defined in ONE place.
+#   $1 = the tier ("1", "2", "3", or "1 (refetch without a limit)" for the hold's unlimited re-read), $2 = the JSON array as bd gave it
+# vazio / not a JSON array -> NO line: the tier is already marked unreadable by its own read (mark N, exit-3 line on stderr), which owns that state
+# falhou (the array parses but the drop or the id list cannot be computed) -> a line that says it could not tell; never the silence of "none"
+# a decision in the list -> a line with the ids
+pp_note_decisions() {
+  [ -n "$2" ] || return 0
+  printf "%s" "$2" | jq -e 'type == "array"' >/dev/null 2>&1 || return 0
+  if pn_kept=$(printf "%s" "$2" | jq -c "$DECISION_DROP_JQ" 2>/dev/null) \
+     && pn_ids=$(printf "%s" "$2" | jq -r --argjson kept "$pn_kept" '[ .[] | (.id // "?" | tostring) ] - [ $kept[] | (.id // "?" | tostring) ] | join(",")' 2>/dev/null); then
+    [ -z "$pn_ids" ] || pp_log "tier $1 skipped routed decision bead(s) - somebody's call, not a build: $pn_ids (ga-rahls6k)"
+  else
+    pp_log "tier $1: could not tell whether the list holds decision beads (the list parses, the drop did not) - the filter below still decides (ga-rahls6k)"
+  fi
+  return 0
+}
 
 # Tier 1, second half: stdin is the JSON array of routed ready beads; keep the ones whose molecule has
 # no in-progress child (a bead with no molecule_id is always kept; an answer that is not proof of a
@@ -241,6 +267,7 @@ t1_fetch() { # $1 = --limit: the engine asks for 20; the disk hold may ask again
 # The engine asks for 20 in tier 1. The refetch test below compares the size of the answer with this SAME number: one definition.
 t1_window=20
 t1_raw=$(t1_fetch "$t1_window") || mark 1
+pp_note_decisions 1 "$t1_raw"
 t1_kept=$(printf "%s" "$t1_raw" | jq -c --argjson now_ts "$(date +%s)" "$POOL_FILTER" 2>/dev/null) || mark 1
 if [ "$disk_state" = low ]; then
   # vazio/falhou/ilegível (no hold text, or jq failed) -> tier 1 answers NOTHING (inert) and is marked unreadable, like any
@@ -268,6 +295,7 @@ if [ "$disk_state" = low ]; then
         # vazio/falhou/ilegível -> LOG TEXT ONLY (the list itself was read above and is what gets used): a count jq cannot give prints "?", never "0 left"
         n_all=$(pp_len "$t1_all_kept"); n_all_held=$(pp_len "$t1_all_held")
         pp_log "free disk under the floor, the --limit=$t1_window window held nothing but new stories - tier 1 refetched without a limit: $(pp_minus "$n_all" "$n_all_held") new story/stories held back, ${n_all_held:-?} left (ga-nyug12)"
+        pp_note_decisions "1 (refetch without a limit)" "$t1_all"   # ga-rahls6k: the refetch reaches past the window, so a decision out there is dropped by POOL_FILTER above - say so
         t1_kept="$t1_all_held"
       else
         mark 1; t1_kept="[]"
@@ -301,6 +329,7 @@ if [ "$focus_state" = 1 ] && [ "$disk_state" != low ]; then
         # vazio/falhou/ilegível -> LOG TEXT ONLY (the list itself was read above and is what gets used): a count jq cannot give prints "?", never "0 left"
         n_all=$(pp_len "$t1_all_kept"); n_all_held=$(pp_len "$t1_all_held")
         pp_log "gate focus mode ON, the first $t1_window beads held nothing but new stories - tier 1 refetched without a limit:$(pp_minus "$n_all" "$n_all_held") new story/stories held back, ${n_all_held:-?} left (ga-6fkx9je)"
+        pp_note_decisions "1 (refetch without a limit)" "$t1_all"   # ga-rahls6k: same as the disk hold's refetch above
         t1_kept="$t1_all_held"
       else
         mark 1; t1_kept="[]"
@@ -321,6 +350,7 @@ found "$r"
 # Tier 2 (legacy): workflow beads that carry gc.run_target=<target> and no gc.routed_to.
 legacy_candidates=$(bd ready --metadata-field "gc.run_target=$target" --metadata-field "gc.kind=workflow" --unassigned --exclude-type=epic --json --sort oldest --limit=20 2>/dev/null) || mark 2
 t2_unrouted=$(printf "%s" "$legacy_candidates" | jq '[.[] | select((.metadata["gc.routed_to"] // "") == "")]' 2>/dev/null) || mark 2
+pp_note_decisions 2 "$t2_unrouted"
 t2_kept=$(printf "%s" "$t2_unrouted" | jq -c --argjson now_ts "$(date +%s)" "$POOL_FILTER" 2>/dev/null | drop_slings_for_taken_stories)
 # same three states as tier 1 (ga-vdac4cj): the filter runs before the oldest-pick, and an unreadable look-up marks the tier
 t2_kept=$(printf "%s" "$t2_kept" | drop_mothers_with_children_in_hand) || mark 2
@@ -331,6 +361,7 @@ found "$r"
 # jq that fails leaves "[]" appended to whatever it printed.
 t3_raw=$(bd query --json 'ephemeral=true AND status=open AND assignee=none' --limit=0 2>/dev/null) || mark 3
 legacy_ephemeral_candidates=$(printf "%s" "$t3_raw" | jq --arg target "$target" '[.[] | select((.assignee // "") == "") | select(((.metadata["gc.routed_to"] // "") == $target) or (((.metadata["gc.routed_to"] // "") == "") and ((.metadata["gc.run_target"] // "") == $target) and ((.metadata["gc.kind"] // "") == "workflow"))) | select(((.issue_type // .type // "") != "epic")) | select(([ (.dependencies // [])[] | select((.type // .dep_type // "") as $t | ($t == "blocks" or $t == "waits-for" or $t == "conditional-blocks")) | select((.status // .depends_on_status // "") != "closed") ] | length) == 0)] | sort_by(.created_at // "") | .[:20]' 2>/dev/null) || { mark 3; legacy_ephemeral_candidates="$legacy_ephemeral_candidates[]"; }
+pp_note_decisions 3 "$legacy_ephemeral_candidates"
 t3_kept=$(printf "%s" "$legacy_ephemeral_candidates" | jq -c --argjson now_ts "$(date +%s)" "$POOL_FILTER" 2>/dev/null | drop_slings_for_taken_stories)
 # same three states as tier 1 (ga-vdac4cj)
 t3_kept=$(printf "%s" "$t3_kept" | drop_mothers_with_children_in_hand) || mark 3

@@ -52,6 +52,10 @@
 # reason" (so this watchdog doesn't cry wolf on those), confirmed by reading
 # _filter_candidates directly (packs/town-deltas/assets/pilot-dispatcher.sh):
 #   - issue_type == epic                                   → excluded
+#   - issue_type == decision (case-folded; ga-rahls6k)     → excluded: a decision is somebody's
+#     call, not a build, and the Pilot no longer dispatches it. Routing one anyway (this watchdog
+#     stamps gc.routed_to, first pass AND the approved-fix pass) would make it a routed, ready bead
+#     the engine and the autoscale watchdog count as pool demand while no pool worker may claim it.
 #   - gate:needs-human* (startswith, catches the -decision  → excluded
 #     sub-variant too, mirroring _filter_candidates exactly)
 #   - pilot:held WITHOUT an expired pilot:held-until:<epoch> → excluded
@@ -830,6 +834,9 @@ _pmrw_approved_select() {
       | [ $all[]
           | select((.status // "") == "open")
           | select((.issue_type // .type // "") != "epic")
+          # ga-rahls6k: a decision is not buildable (same expression as pilot-dispatcher.sh _filter_candidates). tostring never
+          # raises, so a type that is not a string reads as "not a decision" and the bead stays judged on its other fields.
+          | select(((.issue_type // .type // "") | tostring | ascii_downcase) != "decision")
           | select((.labels // []) | index("story:approved"))
           | select((.labels // []) | index("exec:auto"))
           | select(((.priority | tonumber?) // 9) <= $maxpri)
@@ -1164,6 +1171,8 @@ run_sweep() {
     sel_json=$(printf '%s' "$cand_json" | jq -c --argjson cut "$cutoff" --argjson now_ts "$now" '
         [ .[] | select((.status // "") == "open")
               | select((.issue_type // .type // "") != "epic")
+              # ga-rahls6k: same decision exclusion as _pmrw_approved_select (this pass feeds _pmrw_repair_route, which stamps a route)
+              | select(((.issue_type // .type // "") | tostring | ascii_downcase) != "decision")
               | select((.labels // []) | index("ctx:ready"))
               | select((.labels // []) | index("exec:auto"))
               | select(((.metadata["gc.routed_to"] // "") | test("\\S")) | not)
@@ -1876,6 +1885,30 @@ BDSTUB
   PMRW_TEST_NOTIFIED="$N9" PMRW_TEST_MAILED="$M9" PMRW_TEST_COMMENTS_LOG="$C9" run_sweep
   rc=$?
   [ "$rc" -eq 0 ] && ok "scenario 9: epic excluded (return 0)" || bad "scenario 9: epic should be excluded, got $rc"
+
+  # ── Scenario 9b (ga-rahls6k): decision → excluded, a task beside it is still judged ─────────────────────────────
+  # The decision is paired with an armed task in the SAME store and sweep: a first pass that dropped everything would
+  # not flag the task, and one that ignored the type would comment on the decision. A type that is not a string (5)
+  # is a third bead: it must neither crash the list nor be taken for a decision.
+  echo "Scenario 9b: issue_type=decision (also 'Decision', and type-only) armed+unrouted+aged → excluded; task and unreadable type still flagged"
+  reset_stores
+  {
+    mk ga-9d  open 'ctx:ready,exec:auto' "$OLD_TS" | jq -c '.issue_type = "decision"'
+    mk ga-9dc open 'ctx:ready,exec:auto' "$OLD_TS" | jq -c '.issue_type = "Decision"'
+    mk ga-9dt open 'ctx:ready,exec:auto' "$OLD_TS" | jq -c 'del(.issue_type) | .type = "decision"'
+    mk ga-9t  open 'ctx:ready,exec:auto' "$OLD_TS" | jq -c '.issue_type = "task"'
+    mk ga-9n  open 'ctx:ready,exec:auto' "$OLD_TS" | jq -c '.issue_type = 5'
+  } | jq -s -c . > "$TMP/fixtures/store-a.json"
+  N9b="$TMP/notif9b"; M9b="$TMP/mail9b"; C9b="$TMP/comm9b"; : > "$N9b"; : > "$M9b"; : > "$C9b"
+  PMRW_TEST_NOTIFIED="$N9b" PMRW_TEST_MAILED="$M9b" PMRW_TEST_COMMENTS_LOG="$C9b" run_sweep
+  rc=$?
+  [ "$rc" -eq 1 ] && ok "scenario 9b: the sweep flagged something (return 1: the task beside the decisions was judged)" || bad "scenario 9b: expected return 1 (task flagged), got $rc"
+  for did in ga-9d ga-9dc ga-9dt; do
+    grep -q "comment:$did" "$C9b" 2>/dev/null && bad "scenario 9b: decision $did was commented on (flagged as a missing route)" || ok "scenario 9b: decision $did not flagged"
+  done
+  for tid in ga-9t ga-9n; do
+    grep -q "comment:$tid" "$C9b" 2>/dev/null && ok "scenario 9b: $tid flagged (neighbour still judged)" || bad "scenario 9b: $tid should be flagged (a decision beside it must not hide it)"
+  done
 
   # ── Scenario 10: graph.v2 step (gc.root_bead_id set) → excluded ──────────
   echo "Scenario 10: graph.v2 formula step (gc.root_bead_id) → excluded (different dispatch mechanism)"
@@ -2724,6 +2757,10 @@ CRASHPY
     mka ap-neg-manual    'story:approved,exec:manual'                       "$OLD_TS" 0
     mka ap-neg-nostory   'exec:auto'                                        "$OLD_TS" 0
     mka ap-neg-epic      'story:approved,exec:auto'                         "$OLD_TS" 0 '.issue_type = "epic"'
+    mka ap-neg-decision  'story:approved,exec:auto'                         "$OLD_TS" 0 '.issue_type = "decision"'
+    mka ap-neg-decision-caps 'story:approved,exec:auto'                     "$OLD_TS" 0 '.issue_type = "Decision"'
+    mka ap-neg-decision-type 'story:approved,exec:auto'                     "$OLD_TS" 0 'del(.issue_type) | .type = "decision"'
+    mka ap-pos-type-num  'story:approved,exec:auto'                         "$OLD_TS" 0 '.issue_type = 5'
     mka ap-neg-gatepass  'story:approved,exec:auto,gate:passed'             "$OLD_TS" 0
     mka ap-neg-gatefail  'story:approved,exec:auto,gate:failed'             "$OLD_TS" 0
     mka ap-neg-inflight  'story:approved,exec:auto,story:in-flight'         "$OLD_TS" 0
@@ -2747,7 +2784,7 @@ CRASHPY
   } | to_store "$TMP/fixtures/store-a.json"
   N58="$TMP/notif58"; M58="$TMP/mail58"; C58="$TMP/comm58"; : > "$N58"; : > "$M58"; : > "$C58"
   PMRW_TEST_NOTIFIED="$N58" PMRW_TEST_MAILED="$M58" PMRW_TEST_COMMENTS_LOG="$C58" run_sweep
-  for pid in ap-pos-p1 ap-pos-noctx ap-pos-heldexp ap-pos-dispold ap-pos-depgone ap-pos-parent; do
+  for pid in ap-pos-p1 ap-pos-noctx ap-pos-heldexp ap-pos-dispold ap-pos-depgone ap-pos-parent ap-pos-type-num; do
     grep -q "  ${pid}  " "$M58" && ok "scenario 58: $pid flagged" || bad "scenario 58: $pid should be flagged (missed alarm)"
   done
   for nid in $(grep -o 'ap-neg-[a-z0-9-]*' "$TMP/fixtures/store-a.json" | sort -u); do   # third-state-waiver: lê o fixture que este mesmo teste acabou de escrever; se faltasse, o loop não rodaria e os positivos acima já reprovariam
@@ -2860,15 +2897,21 @@ CRASHPY
     mka fx-neg-engine   'story:approved,exec:auto,needs:engine-window'     "$OLD_TS" 0
     mka fx-neg-refusal  'story:approved,exec:auto,pilot:refusal-count:1'   "$OLD_TS" 0
     mka fx-neg-epic     'story:approved,exec:auto'                         "$OLD_TS" 0 '.issue_type = "epic"'
+    mka fx-neg-decision 'story:approved,exec:auto'                         "$OLD_TS" 0 '.issue_type = "decision"'
+    mka fx-neg-decision-caps 'story:approved,exec:auto'                    "$OLD_TS" 0 '.issue_type = "Decision"'
+    mka fx-neg-decision-type 'story:approved,exec:auto'                    "$OLD_TS" 0 'del(.issue_type) | .type = "decision"'
+    mka fx-pos-type-num 'story:approved,exec:auto'                         "$OLD_TS" 0 '.issue_type = 5'
     mka fx-neg-wrapper  'story:approved,exec:auto'                         "$OLD_TS" 0 '.metadata["pilot.sling_for"] = "wa-1"'
     mka fx-neg-dep      'story:approved,exec:auto'                         "$OLD_TS" 0 '.dependencies = [{"type":"blocks","depends_on_id":"fx-neg-dep-target"}]'
     mka fx-neg-dep-target 'ctx:ready'                                      "$OLD_TS" 3
     mk  fx-neg-closed closed 'story:approved,exec:auto' "$OLD_TS" | jq -c '.priority = 0'
     mk  fx-neg-inprog in_progress 'story:approved,exec:auto' "$OLD_TS" | jq -c '.priority = 0'
   } | to_store "$TMP/fixtures/hq.json"
-  fx_persist fx-pos $(jq -r '.[].id' "$TMP/fixtures/hq.json" | grep '^fx-neg-')   # third-state-waiver: lê o fixture que este mesmo teste acabou de escrever; se viesse vazio, o positivo abaixo reprovaria
+  fx_persist fx-pos fx-pos-type-num $(jq -r '.[].id' "$TMP/fixtures/hq.json" | grep '^fx-neg-')   # third-state-waiver: lê o fixture que este mesmo teste acabou de escrever; se viesse vazio, o positivo abaixo reprovaria
   run_fx 66
   [ "$(hq_route fx-pos)" = "gastown.dog" ] && ok "scenario 66: o positivo da mesma varredura foi carimbado" || bad "scenario 66: fx-pos não foi carimbado (laço não rodou?)"
+  # ga-rahls6k: um issue_type que não é string (5) não é decision: é julgado pelo resto e carimbado, não derruba a lista nem é tomado por decision
+  [ "$(hq_route fx-pos-type-num)" = "gastown.dog" ] && ok "scenario 66: tipo ilegível (5) foi carimbado — não é decision e não derrubou a lista" || bad "scenario 66: fx-pos-type-num não foi carimbado (o jq do seletor falhou com tipo não-string?)"
   for nid in $(jq -r '.[].id' "$TMP/fixtures/hq.json" | grep '^fx-neg-'); do   # third-state-waiver: mesmo fixture escrito acima; vazio faria o positivo reprovar
     if grep -q "^update:${nid}\$" "$TMP/u66"; then bad "scenario 66 (falso positivo): $nid foi escrito"; else ok "scenario 66: $nid não foi tocado"; fi
   done

@@ -78,6 +78,12 @@ def pool_veto_reasons($now; $cfg):
         then ($l[] | select(test("^next-action:") and (test("(constroi|corrige-gate|corrige)$") | not)) | "next-action:" + ltrimstr("next-action:"))
         else empty end ),
       ( if ((.issue_type // .type // "") == "epic") then "type:epic" else empty end ),
+      # ga-rahls6k: the dog, wa-worker and ps-worker probes all drop issue_type=decision (a decision is a call for someone to make, not a build),
+      # so this list, which says what the probes refuse, has to say it too. Without it the priority cession of the Pilot would read a routed
+      # P0 decision as "a worker will take it", hold back sessions for lower priorities, and nobody could ever take it. Same expression
+      # as the probes (case-folded; tostring never raises, so a type that is not a string reads as "not a decision").
+      # NO apostrophes in these comments: this whole program sits inside a single-quoted shell string.
+      ( if (((.issue_type // .type // "") | tostring | ascii_downcase) == "decision") then "type:decision" else empty end ),
       ( if ((.title // "") | test("^(EPIC|ÉPICO)[:\\s]"; "i")) then "title:epic" else empty end ),
       ( if pool_held($now) then "held" else empty end ) ];
 '
