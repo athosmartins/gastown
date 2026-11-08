@@ -1994,6 +1994,13 @@ _safe_reclaim() {
 # guard; best-effort — a failure here must never block the dolt-cleanup lever or
 # the notify decision that follows it.
 #
+# BOUND (ga-7jtyqjy, 2026-11-08): 300s (SCRATCH_REAP_TIMEOUT_SECS), not the 60s it was. The reaper's liveness call, `gc session list`,
+# was measured at 58-90s at load 26, which does not fit under `timeout 60`: the reaper could be killed before the list came back — in
+# the very cycle (disk CRITICAL) this lever exists for — and the log said only "FAILED or aborted". The sibling transcript lever got this fix on 2026-08-01. The reaper
+# now has its own 150s deadline for that call (SCRATCHPAD_REAPER_GC_TIMEOUT_SECS) and this bound has to outlast it, or the reaper never
+# gets to log why it gave up; the selftest pins the pair. The log tells the three outcomes apart: OK, TIMED OUT (killed by this bound),
+# FAILED (the reaper exited nonzero by itself, e.g. its own ABORT).
+#
 # SCRATCHPAD_REAPER_PROD=1 (ga-h565g): this function IS the real, launchd-driven
 # caller scratchpad-reaper.sh's own production-sentinel guard is designed to
 # trust — the ONLY place that should ever set this opt-in. It authorizes
@@ -2023,20 +2030,29 @@ _reap_dead_scratch() {
     log "scratch-reap SKIP — $reaper not found"
     return
   fi
+  # Only an integer >= 1 is a bound: text makes timeout refuse to run, and `timeout 0` means NO limit.
+  local _bound="${SCRATCH_REAP_TIMEOUT_SECS:-300}" _start _elapsed _rc
+  case "$_bound" in ''|*[!0-9]*) _bound=300 ;; esac
+  [ "$((10#$_bound))" -ge 1 ] || _bound=300
+  _bound=$((10#$_bound))
+  _start=$(date +%s)
   if [ "$was_critical" = "1" ]; then
     log "scratch-reap: running dead-session scratchpad cleanup (pressure=CRITICAL, size-escape eligible) …"
-    if SCRATCHPAD_REAPER_PROD=1 SCRATCHPAD_REAPER_PRESSURE=CRITICAL timeout 60 bash "$reaper" >> "$LOG" 2>&1; then
-      log "scratch-reap OK"
-    else
-      log "scratch-reap FAILED or aborted (nonzero exit) — see log lines above"
-    fi
+    SCRATCHPAD_REAPER_PROD=1 SCRATCHPAD_REAPER_PRESSURE=CRITICAL timeout "$_bound" bash "$reaper" >> "$LOG" 2>&1
   else
     log "scratch-reap: running dead-session scratchpad cleanup …"
-    if SCRATCHPAD_REAPER_PROD=1 timeout 60 bash "$reaper" >> "$LOG" 2>&1; then
-      log "scratch-reap OK"
-    else
-      log "scratch-reap FAILED or aborted (nonzero exit) — see log lines above"
-    fi
+    SCRATCHPAD_REAPER_PROD=1 timeout "$_bound" bash "$reaper" >> "$LOG" 2>&1
+  fi
+  _rc=$?
+  _elapsed=$(( $(date +%s) - _start ))
+  # rc 124 = timeout killed the reaper (it ran out of time); any other nonzero = the reaper stopped by itself. Two different
+  # responses (raise the bound / read the reaper's own ABORT line above), so they must not share a line.
+  if [ "$_rc" -eq 0 ]; then
+    log "scratch-reap OK (${_elapsed}s, bound=${_bound}s)"
+  elif [ "$_rc" -eq 124 ]; then
+    log "scratch-reap TIMED OUT after ${_elapsed}s (bound=${_bound}s) — the cleanup did NOT run to completion; raise SCRATCH_REAP_TIMEOUT_SECS if this repeats"
+  else
+    log "scratch-reap FAILED after ${_elapsed}s (rc=${_rc}, not a timeout) — see the reaper's own lines above"
   fi
 }
 

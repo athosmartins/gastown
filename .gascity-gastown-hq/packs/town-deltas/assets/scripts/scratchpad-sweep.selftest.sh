@@ -54,6 +54,13 @@ case "$timeout_s" in *s) timeout_secs=${timeout_s%s} ;; *m) timeout_secs=$(( ${t
 [ "$timeout_secs" -ge 200 ] && ok "order: timeout ${timeout_s} covers the measured worst run (1m50s at load ~60) with margin" || bad "order timeout '${timeout_s}' is under the measured worst-case run"
 [ "$interval_secs" -gt "$timeout_secs" ] && ok "order: interval ${interval} > timeout ${timeout_s} — a run cannot overlap the next even without the lock" || bad "order interval '${interval}' does not exceed timeout '${timeout_s}'"
 [ "$exec_line" = '$PACK_DIR/assets/scripts/scratchpad-sweep.sh' ] && [ -x "$WRAPPER" ] && ok "order: exec points at the (executable) wrapper" || bad "order exec is '$exec_line' or wrapper not executable"
+# ga-7jtyqjy: the reaper bounds `gc session list` itself (150s by default). The engine's timeout for this order has to outlast that
+# deadline, or the run is killed before the reaper can log why it gave up.
+GC_DEF="$(env -u SCRATCHPAD_REAPER_GC_TIMEOUT_SECS SCRATCHPAD_REAPER_LIB=1 bash -c '. "$1" >/dev/null 2>&1; printf %s "${GC_TIMEOUT_SECS:-}"' _ "$REAPER")"
+case "$GC_DEF" in
+  ''|*[!0-9]*) bad "order: could not read the reaper's default gc deadline (got '$GC_DEF')" ;;
+  *) [ "$timeout_secs" -ge $(( GC_DEF + 60 )) ] && ok "order: timeout ${timeout_s} outlasts the reaper's ${GC_DEF}s gc deadline by 60s+" || bad "order: timeout ${timeout_s} is not 60s over the reaper's ${GC_DEF}s gc deadline" ;;
+esac
 
 echo ""
 echo "=== whole chain: wrapper → reaper → safe-clean on a fixture root ==="
@@ -104,6 +111,7 @@ PATH="$SANDBOX_PATH" \
 [ -d "$CHAIN_ROOT/proj/live-in-gc/scratchpad" ] && ok "chain: session listed by gc → kept" || bad "chain: reaped a gc-live session's scratchpad"
 [ -d "$CHAIN_ROOT/proj/$PS_UUID/scratchpad" ] && ok "chain: session known only from a running claude's --session-id → kept" || bad "chain: reaped a scratchpad whose claude process is running"
 grep -q "reaped (idle): proj/dead-45m/scratchpad" "$LOG" && grep -q "elapsed=" "$LOG" && ok "chain: log names the reap reason and carries elapsed=" || bad "chain: log lacks 'reaped (idle)'/elapsed= — got: $(cat "$LOG")"
+grep -q "gc_list=[0-9]*s(bound=" "$LOG" && ok "chain: the summary says how long gc session list took and under which bound (ga-7jtyqjy)" || bad "chain: no gc_list=Ns(bound=…) in the summary — got: $(cat "$LOG")"
 [ ! -d "$WORK/lock.d" ] && ok "chain: the lock is released when the cycle ends" || bad "chain: lock left behind"
 
 echo "=== RESULT: PASS=$PASS FAIL=$FAIL ==="
