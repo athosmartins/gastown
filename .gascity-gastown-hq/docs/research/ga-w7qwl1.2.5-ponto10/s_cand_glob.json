@@ -1,0 +1,21 @@
+{
+  "permissions": {
+    "defaultMode": "manual",
+    "allow": [
+      "Bash(bd show:*)",
+      "Bash(bd comment:*)",
+      "Bash(git add:*)",
+      "Bash(git commit:*)",
+      "Bash(git push origin HEAD:refs/heads/worker/*)",
+      "Edit(//@ROOT@/git/*/wt/*/**)"
+    ],
+    "deny": [
+      "Bash(*--no-verify*)",
+      "Bash(*--force*)",
+      "Bash(*refs/heads/main*)",
+      "Bash(*refs/heads/master*)",
+      "Bash(*+HEAD*)",
+      "Bash(git push*:*:*)"
+    ]
+  }
+}

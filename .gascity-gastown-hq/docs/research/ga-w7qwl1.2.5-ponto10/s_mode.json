@@ -1,0 +1,1 @@
+{"permissions": {"defaultMode": "manual", "allow": ["Bash(bd show:*)", "Bash(bd comment:*)", "Bash(git add:*)", "Bash(git commit:*)", "Bash(git push origin HEAD:refs/heads/worker/*)"]}}

@@ -122,6 +122,17 @@ GUARD, FILE_TOOLS = "remote-clone-guard.py", "Edit|Write|MultiEdit|NotebookEdit"
 # O hook do guarda sai com `onFailure: "block"` (claude >= 2.1.295; o schema do 2.1.302 diz: falha = não iniciou, prazo estourado, saída fora de 0/2 ou JSON inválido, e "block" a conta como saída 2):
 # sem o campo, o prazo do PRÓPRIO claude (600 s no PreToolUse, segundo a documentação; não conferido no binário) estourado deixa a chamada seguir sem conferência (MEDIDO com prazo de 2 s no teste). O `--selfcheck` do guarda aceita o campo (só esse valor) e continua aceitando o hook sem ele.
 GUARD_ON_FAILURE = "block"
+# Permissões da camada da SESSÃO (ga-w7qwl1.2.5, decisão do Mayor 09/11 02:23): o notebook é do dono e a sessão remota roda a bead de um canário. MEDIDO (claude 2.1.319 no mini, ver
+# docs/research/ga-w7qwl1.2.5-ponto10/): sem `--dangerously-skip-permissions` o `defaultMode: manual` + `allow` fecham tudo que não está na lista; COM a flag (como o provider abre a sessão
+# real) só o `deny` e o hook do guarda valem (`allow`, `defaultMode` e `ask` não barram nada). Por isso o que TEM de ser barrado está em `deny`, uma regra por buraco medido.
+# Edit(./**) = o diretório de trabalho da sessão (o worktree da bead); `//caminho/**` absoluto com `*` deixava passar o clone de outra sessão e o `..` (medido).
+SESSION_PERMS = {
+    "defaultMode": "manual",
+    "allow": ["Bash(bd show:*)", "Bash(bd comment:*)", "Bash(git add:*)", "Bash(git commit:*)", "Bash(git push origin HEAD:refs/heads/worker/*)", "Edit(./**)"],
+    "deny": ["Bash(*--no-verify*)", "Bash(*--force*)", "Bash(*refs/heads/main*)", "Bash(*refs/heads/master*)", "Bash(*+HEAD*)", "Bash(git push*:*:*)",
+             # além da lista do Mayor, medido sob a flag: `git push origin main` (sem refs/heads/) e `git push -f` rodavam; o prefixo `refs/heads/` não os pega
+             "Bash(git push*main*)", "Bash(git push*master*)", "Bash(git push* -f*)"],
+}
 # O shim é comparado INTEIRO (fullmatch, sem strip nem normalização): o que o builder decide é a string que vai para o servidor.
 # O PATH é o literal que o gc injeta, não "qualquer coisa entre aspas"; variável só GC_*; nada de caractere de controle (newline = 2º comando).
 GC_PATH = 'export PATH="$HOME/go/bin:$HOME/.local/bin:$PATH" && '
@@ -301,6 +312,16 @@ class Bundle:
         want = [{"matcher": m, "hooks": [gh]} for m in ("Bash", FILE_TOOLS) if not any(g.get("matcher") == m and gh in g.get("hooks", []) for g in pre)]
         pre[:0] = want
         out["disableAllHooks"] = False
+        perms = out.setdefault("permissions", {})
+        if not isinstance(perms, dict):
+            raise Refused("camada da sessão: permissions do city/settings.json não é objeto: sem como juntar a lista da sessão")
+        perms["defaultMode"] = SESSION_PERMS["defaultMode"]
+        for k in ("allow", "deny"):
+            cur = perms.get(k, [])
+            if not isinstance(cur, list):
+                raise Refused(f"camada da sessão: permissions.{k} do city/settings.json não é lista: sem como juntar a lista da sessão")
+            perms[k] = cur + [x for x in SESSION_PERMS[k] if x not in cur]
+        self.session_perms = {"defaultMode": perms["defaultMode"], "allow": perms["allow"], "deny": perms["deny"]}
 
     def keep_script(self, name: str) -> None:
         if self.session_layer:  # o script iria para {remote_home}/.claude/hooks, e a camada da sessão não escreve ali: ausente ≠ descartado
@@ -475,6 +496,7 @@ class Bundle:
                             "city/settings.json": a.remote_root + "/city/settings.json",
                             f"role/{a.role}/.claude": "<diretório de trabalho da sessão>/.claude", **({"zdot": a.remote_root + "/zdot"} if self.session_dirs else {})},
                 **({"guard_layer": "session"} if self.session_layer else {}),
+                **({"session_permissions": self.session_perms} if self.session_layer else {}),
                 "session_path": self.session_dirs,
                 "hooks": self.hooks, "shim_needs": sorted(self.shim_needs), "clone_guard": self.swaps > 0 or self.session_layer,
                 **({"guard_on_failure": GUARD_ON_FAILURE} if self.swaps > 0 or self.session_layer else {}),

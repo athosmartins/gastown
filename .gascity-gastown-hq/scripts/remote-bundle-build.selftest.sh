@@ -912,6 +912,41 @@ sess_keep() {  # sess_keep BUILDER [extra...] — o city ganha um hook keep (fil
 }
 sess_keep "$B"; rc=$?; ok $rc "sessão: (controle) o mesmo city com hook keep em home passa (rc=$rc)"
 sess_keep "$B" --guard-layer session; rc=$?; [ $rc = 3 ] && has "$T/err" "--guard-layer session não instala nada" && [ ! -e "$T/f/out" ]; ok $? "sessão: hook keep no city recusa dizendo que a camada não escreve no .claude do host, e nada é escrito (rc=$rc)"
+# PERMISSÕES DA SESSÃO (ga-w7qwl1.2.5, decisão do Mayor 09/11): defaultMode manual + allow da bead + deny dos buracos medidos, JUNTADOS ao que o city já tem (não no lugar). O que o claude FAZ com isso está
+# medido em docs/research/ga-w7qwl1.2.5-ponto10/perm-edit-test.sh (claude real); aqui só se prova o que o BUILDER entrega e que o servidor (home) não ganha nada disso.
+perm_good() {  # perm_good OUT [DENY_EXTRA_DO_CITY] — 0 só se o city/settings.json e o manifest da camada da sessão trazem a lista inteira; senão o número do que falhou
+  local o=$1 xtra=${2:-}
+  jq -e '.permissions.defaultMode == "manual"' "$o/city/settings.json" >/dev/null || return 1
+  jq -e '(.permissions.deny as $d | ["Bash(*--no-verify*)", "Bash(*--force*)", "Bash(*refs/heads/main*)", "Bash(*refs/heads/master*)", "Bash(*+HEAD*)", "Bash(git push*:*:*)", "Bash(git push*main*)", "Bash(git push*master*)", "Bash(git push* -f*)"] | all(. as $r | $d | index($r) != null))' "$o/city/settings.json" >/dev/null || return 2
+  jq -e '(.permissions.allow as $a | ["Bash(bd show:*)", "Bash(bd comment:*)", "Bash(git add:*)", "Bash(git commit:*)", "Bash(git push origin HEAD:refs/heads/worker/*)", "Edit(./**)"] | all(. as $r | $a | index($r) != null))' "$o/city/settings.json" >/dev/null || return 3
+  jq -e '(.permissions.deny | length) == (.permissions.deny | unique | length) and (.permissions.allow | length) == (.permissions.allow | unique | length)' "$o/city/settings.json" >/dev/null || return 4  # sem regra repetida
+  jq -e --slurpfile c "$o/city/settings.json" '.session_permissions == {defaultMode: $c[0].permissions.defaultMode, allow: $c[0].permissions.allow, deny: $c[0].permissions.deny}' "$o/manifest.json" >/dev/null || return 5  # o manifest diz o que foi aplicado
+  [ -z "$xtra" ] || jq -e --arg x "$xtra" '.permissions.deny | index($x) != null' "$o/city/settings.json" >/dev/null || return 6  # a regra que o city já tinha continua lá
+  jq -e '.permissions.deny | index("Bash(*--force*)") != null and (map(select(. == "Bash(*--force*)")) | length) == 1' "$o/city/settings.json" >/dev/null || return 7
+  python3 -I "$B" verify "$o" >/dev/null 2>&1 || return 8
+  return 0
+}
+fresh; wipe "$T/f/out"; MBR=$MB mbp_build "$B" "$T/f" "$T/f/out" --guard-layer session; rc=$?; [ $rc = 0 ] && { perm_good "$T/f/out"; rc=$?; }
+ok $rc "permissões da sessão: o bundle traz defaultMode manual + allow da bead + deny dos buracos (e o manifest diz o mesmo) (rc=$rc: 1=defaultMode, 2=deny, 3=allow, 4=repetida, 5=manifest, 6=do city, 7=duplicata, 8=verify)" 
+fresh; jq '.permissions = {"deny": ["Bash(sudo:*)", "Bash(*--force*)"], "allow": ["Bash(ls:*)"]}' "$T/f/$CS" > "$T/m.json" && cp "$T/m.json" "$T/f/$CS"; wipe "$T/f/out"; MBR=$MB mbp_build "$B" "$T/f" "$T/f/out" --guard-layer session; rc=$?
+{ [ $rc = 0 ] && perm_good "$T/f/out" 'Bash(sudo:*)' && jq -e '.permissions.allow | index("Bash(ls:*)") != null' "$T/f/out/city/settings.json" >/dev/null; }; ok $? "permissões da sessão: o deny/allow que o city já tem é JUNTADO (continua lá, regra repetida entra uma vez só) (rc=$rc)"
+fresh; jq '.permissions = {"deny": "Bash(sudo:*)"}' "$T/f/$CS" > "$T/m.json" && cp "$T/m.json" "$T/f/$CS"; wipe "$T/f/out"; MBR=$MB mbp_build "$B" "$T/f" "$T/f/out" --guard-layer session; rc=$?
+[ $rc = 3 ] && has "$T/err" "não é lista" && [ ! -e "$T/f/out" ]; ok $? "permissões da sessão: permissions.deny do city que não é lista recusa (rc 3) e nada é escrito (rc=$rc)"
+# o servidor (home) NÃO ganha nada disto: o mesmo city sem a camada não tem defaultMode nem session_permissions
+fresh; wipe "$T/f/out"; build "$T/f" "$T/f/out" --guard-layer home; rc=$?
+{ [ $rc = 0 ] && ! jq -e '.permissions.defaultMode? // empty' "$T/f/out/city/settings.json" >/dev/null 2>&1 && ! jq -e 'has("session_permissions")' "$T/f/out/manifest.json" >/dev/null; }; ok $? "permissões da sessão: o bundle do servidor (home) não ganha defaultMode nem session_permissions (rc=$rc)"
+permmut() {  # permmut DESCRIÇÃO OLD NEW — o builder estragado TEM que reprovar em perm_good
+  pymut "$B" "$T/mutant.py" "$2" "$3"; ok $? "  o builder tem o trecho que o mutante '$1' estraga (não é um no-op)"
+  fresh; jq '.permissions = {"deny": ["Bash(sudo:*)", "Bash(*--force*)"], "allow": ["Bash(ls:*)"]}' "$T/f/$CS" > "$T/m.json" && cp "$T/m.json" "$T/f/$CS"   # city COM regra própria e uma repetida: a juntada e a deduplicação aparecem
+  wipe "$T/f/mut"; MBR=$MB mbp_build "$T/mutant.py" "$T/f" "$T/f/mut" --guard-layer session; local rc=$?
+  { [ $rc != 0 ] || ! perm_good "$T/f/mut" 'Bash(sudo:*)'; }; ok $? "controle negativo: $1 → o bundle reprova"
+}
+permmut "sem defaultMode manual" 'perms["defaultMode"] = SESSION_PERMS["defaultMode"]' 'pass'
+permmut "o deny da sessão não é juntado" 'for k in ("allow", "deny"):' 'for k in ("allow",):'
+permmut "o allow da sessão (o Edit só no worktree) não é juntado" 'for k in ("allow", "deny"):' 'for k in ("deny",):'
+permmut "o manifest não diz o que foi aplicado" '**({"session_permissions": self.session_perms} if self.session_layer else {}),' '**({}),'
+permmut "o deny da sessão SUBSTITUI o do city" 'perms[k] = cur + [x for x in SESSION_PERMS[k] if x not in cur]' 'perms[k] = list(SESSION_PERMS[k])'
+permmut "a regra repetida entra em dobro" 'perms[k] = cur + [x for x in SESSION_PERMS[k] if x not in cur]' 'perms[k] = cur + list(SESSION_PERMS[k])'
 # controle negativo: cada peça da camada tirada do builder, uma de cada vez
 sessmut() {  # sessmut DESCRIÇÃO OLD NEW — o bundle do builder estragado TEM que reprovar em sess_good (ou o build recusar)
   pymut "$B" "$T/mutant.py" "$2" "$3"; ok $? "  o builder tem o trecho que o mutante '$1' estraga (não é um no-op)"

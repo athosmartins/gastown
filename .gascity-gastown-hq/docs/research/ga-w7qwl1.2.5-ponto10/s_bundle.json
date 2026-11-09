@@ -1,0 +1,98 @@
+{
+  "awaySummaryEnabled": false,
+  "disableAllHooks": false,
+  "editorMode": "normal",
+  "env": {
+    "CLAUDE_CODE_MAX_CONCURRENT_SUBAGENTS": "3",
+    "CLAUDE_CODE_MAX_SUBAGENT_SPAWN_DEPTH": "1"
+  },
+  "hooks": {
+    "PreCompact": [
+      {
+        "hooks": [
+          {
+            "command": "export PATH=\"$HOME/go/bin:$HOME/.local/bin:$PATH\" && gc handoff --auto \"context cycle\"",
+            "type": "command"
+          }
+        ],
+        "matcher": ""
+      }
+    ],
+    "PreToolUse": [
+      {
+        "hooks": [
+          {
+            "command": "python3 -I /Users/athos/gt-remote/guard/remote-clone-guard.py || exit 2",
+            "onFailure": "block",
+            "type": "command"
+          }
+        ],
+        "matcher": "Bash"
+      },
+      {
+        "hooks": [
+          {
+            "command": "python3 -I /Users/athos/gt-remote/guard/remote-clone-guard.py || exit 2",
+            "onFailure": "block",
+            "type": "command"
+          }
+        ],
+        "matcher": "Edit|Write|MultiEdit|NotebookEdit"
+      }
+    ],
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "command": "export PATH=\"$HOME/go/bin:$HOME/.local/bin:$PATH\" && GC_MANAGED_SESSION_HOOK=1 GC_HOOK_EVENT_NAME=SessionStart gc prime --hook --hook-format codex",
+            "type": "command"
+          }
+        ],
+        "matcher": "startup"
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "command": "export PATH=\"$HOME/go/bin:$HOME/.local/bin:$PATH\" && gc nudge drain --inject",
+            "timeout": 120,
+            "type": "command"
+          },
+          {
+            "command": "export PATH=\"$HOME/go/bin:$HOME/.local/bin:$PATH\" && gc mail check --inject",
+            "timeout": 120,
+            "type": "command"
+          }
+        ],
+        "matcher": ""
+      }
+    ]
+  },
+  "permissions": {
+    "allow": [
+      "Bash(bd show:*)",
+      "Bash(bd comment:*)",
+      "Bash(git add:*)",
+      "Bash(git commit:*)",
+      "Bash(git push origin HEAD:refs/heads/worker/*)",
+      "Edit(./**)"
+    ],
+    "defaultMode": "manual",
+    "deny": [
+      "Bash(sudo:*)",
+      "Bash(rm -rf:*)",
+      "Bash(*--no-verify*)",
+      "Bash(*--force*)",
+      "Bash(*refs/heads/main*)",
+      "Bash(*refs/heads/master*)",
+      "Bash(*+HEAD*)",
+      "Bash(git push*:*:*)",
+      "Bash(git push*main*)",
+      "Bash(git push*master*)",
+      "Bash(git push* -f*)"
+    ]
+  },
+  "remoteControlAtStartup": false,
+  "skipDangerousModePermissionPrompt": true
+}

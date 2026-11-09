@@ -1,0 +1,1 @@
+{"permissions": {"defaultMode": "manual", "allow": ["Edit(./**)"], "deny": ["Edit(!./**)"]}}
