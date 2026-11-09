@@ -404,8 +404,10 @@ PILOT_NODE_FIRST_LOG="${PILOT_NODE_FIRST_LOG:-$GC_CITY/.gc/logs/node-first-shado
 # Os pontos de uso repetem `:-60` para quem carrega só um pedaço do script (os selftests extraem as funções).
 PILOT_NODE_NUDGE_TIMEOUT="${PILOT_NODE_NUDGE_TIMEOUT:-60}"
 case "$PILOT_NODE_NUDGE_TIMEOUT" in ''|*[!0-9]*|?????*) PILOT_NODE_NUDGE_TIMEOUT=60 ;; *) [ "$((10#$PILOT_NODE_NUDGE_TIMEOUT))" -ge 1 ] || PILOT_NODE_NUDGE_TIMEOUT=60 ;; esac
-# ga-do1ixn.3: a faixa Kimi (teste do Athos 26/10: Claude Code com o Kimi por baixo, só bead sem dado pessoal). Bead com o rótulo lane:kimi vai SÓ ao kimi-worker-remote (Hetzner, perfil Kimi
-# do scripts/gc-session-ssh) e o kimi-worker-remote só recebe lane:kimi. Sem a bandeira (ou com o nó desligado, a vaga ocupada, bead fora do HQ) a bead ESPERA: o Pilot não a manda a pool Claude (a sondagem dos dogs, que é do engine, lê gc.routed_to: a bead que ainda tem rota de pool fica visível a ela até o carimbo da passada — ver o runbook gc-session-ssh).
+# ga-do1ixn.3: a faixa Kimi (teste do Athos 26/10: Claude Code com o Kimi por baixo). Desde 09/11 (ga-fd2ec2h), o Kimi pode ver o mesmo conteúdo dos workers Claude: a triagem por termo e a leitura
+# de comentários caíram; os vetos por rótulo e a validação de texto seguem. Bead com o rótulo lane:kimi vai SÓ ao kimi-worker-remote (Hetzner, perfil Kimi do scripts/gc-session-ssh) e o
+# kimi-worker-remote só recebe lane:kimi. Sem a bandeira (ou com o nó desligado, a vaga ocupada, bead fora do HQ) a bead ESPERA: o Pilot não a manda a pool Claude (a sondagem dos dogs, que é do
+# engine, lê gc.routed_to: a bead que ainda tem rota de pool fica visível a ela até o carimbo da passada — ver o runbook gc-session-ssh).
 # A espera carimba gc.routed_to=kimi-lane, que de propósito NÃO é nome de pool: nem a sondagem dos pools nem a demanda do engine a pegam, e o pilot-missing-route-watchdog não a vê "sem rota".
 PILOT_KIMI_LANE_FLAG="${PILOT_KIMI_LANE_FLAG:-$GC_CITY/.gc/kimi-lane.on}"
 PILOT_KIMI_NODE_FLAG="${PILOT_KIMI_NODE_FLAG:-$GC_CITY/.gc/hetzner-node.on}"
@@ -12744,17 +12746,13 @@ _pilot_kimi_dispatch() {
   return 0
 }
 
-# _pilot_kimi_screen <bead_json> — a triagem de UMA bead lane:kimi, só pelo que o JSON da candidata já traz (nenhuma chamada ao bd). Imprime UMA palavra e devolve 0:
-#   ok             rótulos sem veto e título+descrição (+design, critérios, notas e os textos de metadata story.criterios, story.estrela_guia e story.equilibrios, que o dispatch_one trata como conteúdo da bead) sem termo de dado pessoal → pode ir ao Kimi
+# _pilot_kimi_screen <bead_json> — valida UMA bead lane:kimi só pelo JSON da candidata (nenhuma chamada ao bd). Desde a decisão do Athos de 09/11 (ga-fd2ec2h), o Kimi vê o mesmo conteúdo
+# dos workers Claude: não há mais casamento por termo nem leitura de comentários. Imprime UMA palavra e devolve 0:
+#   ok             rótulos sem veto, campos de texto legíveis e título+descrição preenchidos → pode ir ao Kimi
 #   veto:<rótulo>  a bead traz um rótulo de PILOT_NODE_FIRST_VETO_LABELS (node:never é o que o prompt do kimi-worker põe ao devolver a bead ao mini) → sai da faixa
-#   pii:<termo>    o texto casou com a lista do Mayor (cpf, telefone, conversa, lead, proprietário, chip/frota, Pipedrive, e-mail, shared/data e *.db, dado pessoal) ou com número longo sem máscara
-#                  (CPF, CNPJ e telefone/WhatsApp: 10+ dígitos seguidos; CPF e CNPJ com espaço, ponto, barra ou hífen entre os grupos, mascarados por inteiro ou pela metade; DDD + número com espaço, ponto ou hífen;
-#                  [9 ]NNNN NNNN e [2-5]NNN NNNN com espaço, ponto ou hífen — dois grupos de 4 dígitos (3333 4444, 2026 2027) casam, falso positivo aceito; telefone com (DDD) e o 9 solto ou colado, e +55 com ou sem parênteses, casam pelo termo telefone;
-#                  hífen, travessão e menos Unicode (U+2010 a U+2015, U+2212, U+FF0D) valem como hífen antes de casar) → sai da faixa. Data e hora (2026-10-28 19:15) e versão (1.2.3) não casam: o separador só vale entre grupos de tamanho de documento ou telefone
-#   sem-texto      título ou descrição vazios: não há o que triar → espera
+#   sem-texto      título ou descrição vazios → espera
 #   ilegivel       rótulo ou campo (inclusive os três de metadata story.*) que não é do tipo esperado, metadata que não é objeto, ou JSON que o jq não lê → espera
-# Fail-closed: só `ok` deixa a bead ir ao Kimi. Os termos casam por palavra inteira, sem caixa e sem acento ("leader" e "chipset" não casam). Falso positivo custa a bead voltar ao dog Claude; falso
-# negativo custa dado pessoal num provedor de fora — por isso a lista é larga. O que a triagem imprime é o NOME do termo, nunca o trecho do texto (o comentário na bead não copia dado pessoal).
+# Fail-closed: só `ok` deixa a bead ir ao Kimi. Design, critérios, notas e metadata story.criterios/story.estrela_guia/story.equilibrios continuam validados por tipo, não pelo conteúdo.
 _pilot_kimi_screen() {
   local _ks_bead="$1" _ks_labels="" _ks_veto="" _ks_out=""
   # vazio → "" (bead sem rótulos: nenhum veto a ler); falhou/ilegível (rótulos que não são lista de texto, ou JSON que o jq não lê) → ilegivel
@@ -12764,51 +12762,15 @@ _pilot_kimi_screen() {
   if [ -n "$_ks_veto" ]; then printf 'veto:%s' "$_ks_veto"; return 0; fi
   # vazio/falhou (campo que não é texto, bead que não é objeto, jq que morreu) → ilegivel; o jq imprime sempre um estado, então saída vazia é jq que não rodou
   _ks_out=$(printf '%s' "$_ks_bead" | jq -r '
-    def pats: [
-      ["cpf", "\\bcpfs?\\b|\\b\\d{3}\\.\\d{3}\\.\\d{3}-\\d{2}\\b"],
-      ["telefone", "telefon|celular|\\bfones?\\b|\\bphones?\\b|whats ?app|whapi|\\(\\d{2}\\)\\s*9?[\\s.-]?\\d{4}[\\s.-]?\\d{4}|\\+\\s?55\\s?\\(?\\d{2}\\)?"],
-      ["conversa", "\\bconvers(a|as|a[cç][aã]o|a[cç][oõ]es|ation|ations)\\b"],
-      ["lead", "\\bleads?\\b"],
-      ["proprietario", "propriet[aá]ri[oa]s?"],
-      ["chip/frota", "\\bchips?\\b|\\bfrotas?\\b"],
-      ["pipedrive", "pipedrive"],
-      ["email", "e-?mails?\\b|[a-z0-9._%+-]+@[a-z0-9-]+\\.[a-z]{2,}"],
-      ["dado-pessoal", "dados? pessoa(l|is)|\\bpii\\b|\\blgpd\\b"],
-      ["shared/data", "shared/data|\\.db\\b"],
-      ["numero-longo", "\\b\\d{10,}\\b|\\b\\d{2}[\\s.]?\\d{3}[\\s.]?\\d{3}[\\s./-]?\\d{4}[\\s-]?\\d{2}\\b|\\b\\d{3}[\\s.-]?\\d{3}[\\s.-]?\\d{3}[\\s.-]?\\d{2}\\b|\\b0?\\d{2}[\\s.-]?9?[\\s.-]?\\d{4}[\\s.-]?\\d{4}\\b|\\b9[\\s.-]?\\d{4}[\\s.-]\\d{4}\\b|\\b[2-5]\\d{3}[\\s.-]\\d{4}\\b"]
-    ];
     def txt: if . == null then "" elif type == "string" then . else error("nao-texto") end;
     ([ .title, .description, .design, .acceptance_criteria, .notes, .metadata["story.criterios"], .metadata["story.estrela_guia"], .metadata["story.equilibrios"] ] | map(txt)) as $f
-    | if ($f[0] | test("\\S") | not) or ($f[1] | test("\\S") | not) then "sem-texto"
-      else ($f | join("\n") | gsub("\\p{M}"; "") | gsub("[\u2010-\u2015\u2212\uFF0D]"; "-")) as $text
-        | ([ pats[] | . as $p | select($text | test($p[1]; "i")) | $p[0] ] | .[0] // "") as $hit
-        | if $hit == "" then "ok" else "pii:" + $hit end
-      end' 2>/dev/null) || _ks_out=""
-  case "$_ks_out" in ok|sem-texto|pii:*) printf '%s' "$_ks_out" ;; *) printf 'ilegivel' ;; esac
+    | if ($f[0] | test("\\S") | not) or ($f[1] | test("\\S") | not) then "sem-texto" else "ok" end' 2>/dev/null) || _ks_out=""
+  case "$_ks_out" in ok|sem-texto) printf '%s' "$_ks_out" ;; *) printf 'ilegivel' ;; esac
   return 0
 }
 
-# _pilot_kimi_screen_comments <id> — a triagem dos COMENTÁRIOS de UMA bead do HQ (o worker os lê ao abrir a bead). UMA leitura ao bd (`bd comments <id> --json`) e a mesma lista de termos de
-# _pilot_kimi_screen, aplicada a um texto só com os comentários. Imprime UMA palavra e devolve 0: ok | piic:<termo> (o termo casou num comentário) | ilegivel (a leitura falhou ou não é uma lista de comentários).
-# Fail-closed: só `ok` deixa a bead ir ao Kimi; sem comentário (`[]`) é ok, comentário que não se lê NÃO é. O texto do PAI não é triado (o worker só o vê se abrir o pai de propósito; o prompt manda não abrir).
-# É uma fotografia: comentário posto depois desta leitura (até o worker abrir a bead, ou durante a sessão) não é triado por aqui; o runbook manda só o Pilot e o worker escreverem numa bead lane:kimi e o prompt manda o worker parar.
-_pilot_kimi_screen_comments() {
-  local _kc_id="$1" _kc_json="" _kc_text="" _kc_synth="" _kc_v=""
-  # vazio (bd que sai 0 sem imprimir: não é "sem comentários", isso é `[]`) / falhou (bd que não leu, bead sumida, timeout) → ilegivel
-  _kc_json=$(timeout 15 bd -C "$GC_CITY" comments "$_kc_id" --json 2>/dev/null) || { printf 'ilegivel'; return 0; }
-  [ -n "$_kc_json" ] || { printf 'ilegivel'; return 0; }
-  # vazio → "" (lista sem comentários: nada a casar); falhou/ilegível (não é lista, item que não é objeto, text que não é texto) → ilegivel
-  _kc_text=$(printf '%s' "$_kc_json" | jq -r 'if type == "array" and all(.[]; (.text | type) == "string") then map(.text) | join("\n") else error("comments") end' 2>/dev/null) || { printf 'ilegivel'; return 0; }
-  # título/descrição de enchimento ("-") só para a triagem não responder sem-texto: o que vale aqui são as notas, que levam os comentários
-  _kc_synth=$(jq -cn --arg c "$_kc_text" '{labels: [], title: "-", description: "-", notes: $c}' 2>/dev/null) || { printf 'ilegivel'; return 0; }
-  # vazio/falhou → a própria _pilot_kimi_screen imprime ilegivel (nunca vazio); qualquer palavra que não seja ok/pii: vira ilegivel aqui
-  _kc_v=$(_pilot_kimi_screen "$_kc_synth")
-  case "$_kc_v" in ok) printf 'ok' ;; pii:*) printf 'piic:%s' "${_kc_v#pii:}" ;; *) printf 'ilegivel' ;; esac
-  return 0
-}
-
-# _pilot_kimi_demote <bead_json> <motivo> — tira UMA bead do HQ da faixa Kimi, como se o lane:kimi nunca tivesse sido posto: remove o rótulo e, se a rota é a de espera (kimi-lane), devolve gc.routed_to
-# a gastown.dog (a rota de toda bead do HQ). Sem isto a bead que o kimi-worker devolve ao mini (node:never) ou que a triagem barra voltaria ao Kimi a cada varredura — uma sessão paga por volta.
+# _pilot_kimi_demote <bead_json> <motivo> — tira UMA bead do HQ da faixa Kimi por veto de rótulo, como se o lane:kimi nunca tivesse sido posto: remove o rótulo e, se a rota é a de espera
+# (kimi-lane), devolve gc.routed_to a gastown.dog (a rota de toda bead do HQ). Sem isto a bead que o kimi-worker devolve ao mini (node:never) voltaria ao Kimi a cada varredura — uma sessão paga por volta.
 # DUAS escritas: a atualização (rótulo + rota numa chamada só: pega inteira ou não pega) e o comentário (só diz o porquê; se falhar, o log da passada tem o motivo). Devolve 0 se a atualização pegou, 1 se
 # não pegou (a bead segue na faixa, inerte: a passada a trata como em espera). Só se chama com bead do HQ (ga-) e fora do DRY_RUN.
 _pilot_kimi_demote() {
@@ -12824,17 +12786,17 @@ _pilot_kimi_demote() {
     warn "ga-do1ixn.3: faixa Kimi: não consegui rebaixar $_dm_id ($_dm_why) — ela segue na faixa, sem despachar, e a próxima varredura tenta de novo"
     return 1
   fi
-  timeout 15 bd -C "$GC_CITY" comment "$_dm_id" "ga-do1ixn.3: o Pilot tirou esta bead da faixa Kimi — rótulo lane:kimi removido${_dm_note}. Motivo: $_dm_why. Ela segue como bead normal para os dogs Claude. Se o motivo é um termo, este comentário (que o cita) também passa pela triagem: pôr lane:kimi de volta nesta bead não a traz de volta à faixa, e para isso se abre uma bead nova sem esses termos. Se o motivo é um rótulo de veto, tirar o rótulo e pôr lane:kimi de novo basta." >/dev/null 2>&1 \
+  timeout 15 bd -C "$GC_CITY" comment "$_dm_id" "ga-do1ixn.3: o Pilot tirou esta bead da faixa Kimi — rótulo lane:kimi removido${_dm_note}. Motivo: $_dm_why. Ela segue como bead normal para os dogs Claude. Depois que o rótulo de veto sair, pôr lane:kimi de novo a devolve à faixa." >/dev/null 2>&1 \
     || warn "ga-do1ixn.3: faixa Kimi: $_dm_id rebaixada, mas o comentário com o motivo não gravou — o motivo está só neste log: $_dm_why"
   return 0
 }
 
 # _pilot_kimi_lane_pass — uma vez por varredura, ANTES da passada de WA e das pistas. Sempre devolve 0. (1) Tira das duas pistas TODA bead com o rótulo lane:kimi: o laço normal nunca a vê, então
-# o Pilot não a despacha a um pool Claude, com a faixa aberta ou fechada (fora do Pilot, a sondagem dos dogs lê gc.routed_to: a bead que ainda tem rota gastown.dog fica visível a ela do momento em que ganha lane:kimi até o carimbo desta passada, e uma falha do carimbo a deixa visível — por isso o resumo conta carimbos e falhas, e o certo é o Mayor pôr gc.routed_to=kimi-lane junto com o rótulo); pista que o jq não lê fica VAZIA nesta varredura (não dá para separar as do Kimi, e o estado inerte é não despachar). (1b) Tria cada bead
-# do HQ da faixa (_pilot_kimi_screen no JSON da bead e, se ela passou, _pilot_kimi_screen_comments nos comentários): veto ou dado pessoal → REBAIXA (_pilot_kimi_demote: sai da faixa e volta ao dog); sem texto ou ilegível → espera na faixa. O rebaixamento vale com a faixa aberta ou
+# o Pilot não a despacha a um pool Claude, com a faixa aberta ou fechada (fora do Pilot, a sondagem dos dogs lê gc.routed_to: a bead que ainda tem rota gastown.dog fica visível a ela do momento em que ganha lane:kimi até o carimbo desta passada, e uma falha do carimbo a deixa visível — por isso o resumo conta carimbos e falhas, e o certo é o Mayor pôr gc.routed_to=kimi-lane junto com o rótulo); pista que o jq não lê fica VAZIA nesta varredura (não dá para separar as do Kimi, e o estado inerte é não despachar). (1b) Valida cada bead
+# do HQ da faixa (_pilot_kimi_screen no JSON da bead, sem ler comentários): veto por rótulo → REBAIXA (_pilot_kimi_demote: sai da faixa e volta ao dog); sem texto ou ilegível → espera na faixa. O rebaixamento vale com a faixa aberta ou
 # fechada (a bead devolvida pelo kimi-worker não pode ficar presa em kimi-lane só porque a bandeira foi desligada) e não escreve nada no DRY_RUN. (2) Carimba gc.routed_to=kimi-lane nas do HQ que ainda
-# não o têm (uma rota de pool posta por outro caminho — a volta do gate, o pilot-missing-route-watchdog — chamaria o pool do mini). (3) Com a faixa aberta, leva UMA bead do HQ (ga-) que passou na
-# triagem ao kimi-worker-remote por dispatch_one com _PILOT_KIMI_PASS=1; a de outro rig espera (semana 1: só HQ, o traco-bim não tem espelho no nó).
+# não o têm (uma rota de pool posta por outro caminho — a volta do gate, o pilot-missing-route-watchdog — chamaria o pool do mini). (3) Com a faixa aberta, leva UMA bead do HQ (ga-) validada
+# ao kimi-worker-remote por dispatch_one com _PILOT_KIMI_PASS=1; a de outro rig espera (semana 1: só HQ, o traco-bim não tem espelho no nó).
 _pilot_kimi_lane_pass() {
   local _kl_lane _kl_pool _kl_k _kl_rest _kl_ids _kl_id _kl_pick _kl_rc _kl_tier _kl_closed="" _kl_n=0 _kl_sent=0 _kl_stamped=0 _kl_stampfail=0 _kl_idsfail=0 _kl_tries=0 _kl_rel=0 _kl_rel_max=10 _kl_other=0 _kl_stop="" _kl_unread=0 _kl_dfault=0
   local _kl_small="[]" _kl_big="[]" _kl_held="[]" _kl_keep _kl_bead _kl_verdict _kl_why _kl_next _kl_demoted=0 _kl_demfail=0 _kl_held_n=0 _kl_stamp_txt
@@ -12854,7 +12816,7 @@ _pilot_kimi_lane_pass() {
     _kl_n=$((_kl_n + $(printf '%s' "$_kl_k" | jq 'length' 2>/dev/null || echo 0)))
   done
   [ "$_kl_n" -gt 0 ] || return 0
-  # (1b) a triagem das beads do HQ da faixa — o JSON da candidata e, para a que passou nele, UMA leitura dos comentários. ok e as de outro rig seguem para a lista de despacho; veto/dado pessoal rebaixa (e sai das listas);
+  # (1b) a validação das beads do HQ da faixa — só o JSON da candidata; nenhum comentário é lido. ok e as de outro rig seguem para a lista de despacho; veto por rótulo rebaixa (e sai das listas);
   # sem texto/ilegível, ou rebaixamento que não gravou, fica em _kl_held (espera: recebe o carimbo, não é despachada). Nada aqui escreve no DRY_RUN.
   for _kl_lane in small big; do
     case "$_kl_lane" in small) _kl_pool="$_kl_small" ;; big) _kl_pool="$_kl_big" ;; esac
@@ -12869,22 +12831,15 @@ _pilot_kimi_lane_pass() {
       # vazio (bead sem id) → sem nota: sem id não há o que contar; falhou/ilegível (id que o jq não leu) → o mesmo, sem nota, e a bead segue como "fora do HQ" (o laço de despacho, que também exige id, a deixa esperando como antes)
       [ -z "$_kl_id" ] || _pilot_sweep_note "$_kl_id" 1 kimi_lane_wait
       case "$_kl_id" in
-        ga-*)
-          _kl_verdict=$(_pilot_kimi_screen "$_kl_bead")
-          # os comentários só são lidos (uma chamada ao bd por bead) se o JSON da bead já passou: veto, termo, sem texto e ilegível já decidem sem essa leitura
-          [ "$_kl_verdict" != ok ] || _kl_verdict=$(_pilot_kimi_screen_comments "$_kl_id") ;;
+        ga-*) _kl_verdict=$(_pilot_kimi_screen "$_kl_bead") ;;
         *) _kl_verdict="fora-do-hq" ;;
       esac
       case "$_kl_verdict" in
         ok|fora-do-hq)
           _kl_next=$(printf '%s' "$_kl_keep" | jq -c --argjson b "$_kl_bead" '. + [$b]' 2>/dev/null) && _kl_keep="$_kl_next" \
             || warn "ga-do1ixn.3: faixa Kimi: não consegui listar $_kl_id para o despacho — ela espera nesta varredura" ;;
-        veto:*|pii:*|piic:*)
-          case "$_kl_verdict" in
-            veto:*) _kl_why="rótulo de veto '${_kl_verdict#veto:}' (node:never é o que o kimi-worker põe ao devolver a bead ao mini; os outros dizem que um worker automático não faz esta bead)" ;;
-            piic:*) _kl_why="a triagem de dado pessoal casou com o termo '${_kl_verdict#piic:}' nos comentários da bead (a faixa Kimi é só para bead sem dado pessoal, e o worker lê os comentários)" ;;
-            *) _kl_why="a triagem de dado pessoal casou com o termo '${_kl_verdict#pii:}' no título ou na descrição (a faixa Kimi é só para bead sem dado pessoal)" ;;
-          esac
+        veto:*)
+          _kl_why="rótulo de veto '${_kl_verdict#veto:}' (node:never é o que o kimi-worker põe ao devolver a bead ao mini; os outros dizem que um worker automático não faz esta bead)"
           if [ "${DRY_RUN:-0}" = "1" ]; then
             log "  faixa Kimi: $_kl_id seria rebaixada (dry-run, nada escrito) — $_kl_why"
           elif _pilot_kimi_demote "$_kl_bead" "$_kl_why"; then
@@ -12900,7 +12855,7 @@ _pilot_kimi_lane_pass() {
           [ "$_kl_verdict" = sem-texto ] || _kl_unread=$((_kl_unread + 1))
           # a nota segue a conta acima: sem-texto fica kimi_lane_wait (a de cima); o que não li vira kimi_lane_failed (failed_other)
           [ "$_kl_verdict" = sem-texto ] || _pilot_sweep_note "$_kl_id" 1 kimi_lane_failed
-          _kl_held_n=$((_kl_held_n + 1)); log "  faixa Kimi: $_kl_id espera — triagem '$_kl_verdict' (título ou descrição vazios, ou um campo ou comentário que não leio): não vai ao Kimi sem eu ler o texto"
+          _kl_held_n=$((_kl_held_n + 1)); log "  faixa Kimi: $_kl_id espera — validação '$_kl_verdict' (título ou descrição vazios, ou um campo que não leio): não vai ao Kimi sem eu ler o texto"
           _kl_next=$(printf '%s' "$_kl_held" | jq -c --argjson b "$_kl_bead" '. + [$b]' 2>/dev/null) && _kl_held="$_kl_next" || warn "ga-do1ixn.3: faixa Kimi: não consegui listar $_kl_id para o carimbo — ela segue fora das pistas, sem despachar" ;;
       esac
     done < <(printf '%s' "$_kl_pool" | jq -c '.[]' 2>/dev/null)
