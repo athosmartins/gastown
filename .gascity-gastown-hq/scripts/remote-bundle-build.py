@@ -131,7 +131,10 @@ SESSION_PERMS = {
     "allow": ["Bash(bd show:*)", "Bash(bd comment:*)", "Bash(git add:*)", "Bash(git commit:*)", "Bash(git push origin HEAD:refs/heads/worker/*)", "Edit(./**)"],
     "deny": ["Bash(*--no-verify*)", "Bash(*--force*)", "Bash(*refs/heads/main*)", "Bash(*refs/heads/master*)", "Bash(*+HEAD*)", "Bash(git push*:*:*)",
              # além da lista do Mayor, medido sob a flag: `git push origin main` (sem refs/heads/) e `git push -f` rodavam; o prefixo `refs/heads/` não os pega
-             "Bash(git push*main*)", "Bash(git push*master*)", "Bash(git push* -f*)"],
+             "Bash(git push*main*)", "Bash(git push*master*)", "Bash(git push* -f*)",
+             # revisao de seguranca (09/11), medido sob a flag no mini: `push --all`, `push --mirror`, `commit -n` e `push -uf` PASSAVAM. Isto fecha o que um agente confuso faria por habito;
+             # NAO é fronteira: `sh -c "git push origin HEAD:refs/heads/ma\"\"in"` passa pelo texto e moveu a main no origin de teste. A fronteira é o hook do guarda (ou o origin), ver o runbook.
+             "Bash(git push*--all*)", "Bash(git push*--mirror*)", "Bash(git push*--delete*)", "Bash(git push* -uf*)", "Bash(git push* -fu*)", "Bash(git commit* -n*)"],
 }
 # O shim é comparado INTEIRO (fullmatch, sem strip nem normalização): o que o builder decide é a string que vai para o servidor.
 # O PATH é o literal que o gc injeta, não "qualquer coisa entre aspas"; variável só GC_*; nada de caractere de controle (newline = 2º comando).
