@@ -14,7 +14,7 @@
 #   comando que não existe / que morre → start falha dizendo por quê e não deixa sessão · cap — teto do host (N+1 recusa), existente
 #   recusa, parar libera, outro host conta à parte, 4 starts em paralelo com teto 2 abrem 2, e as execuções remotas não se sobrepõem
 #   (flock) · down — ssh fora do ar/mudo/sem marcadores/com ruído: start recusa dizendo o host, list-running é ERRO (nunca lista vazia),
-#   nada pela metade, meta continua funcionando · meta — set/get/remove/stop, chave inválida, nada no "servidor" · conf — config
+#   nada pela metade, meta continua funcionando · meta — set/get/remove/stop, chave inválida, nada no "servidor" · ident (ga-lghlwgc) — o start grava GC_SESSION_ID, GC_INSTANCE_TOKEN e GC_RUNTIME_EPOCH no meta ANTES de abrir a tmux (é por aí que o motor lê o runtime remoto como da própria sessão): já gravada quando o 1º comando da sessão roda, sem inventar o que o env não trouxe, valor torto fora, start recusado (nome existente, teto) NÃO troca a identidade de quem roda, start que falha na abertura apaga o que gravou, recomeço leva a nova, meta que não grava não derruba o start, stop apaga · conf — config
 #   ausente, cap ausente/0/string, host desconhecido, destino ssh com '-', raiz com espaço, nome de sessão inválido: exit 1, sem ssh ·
 #   guard — caminho do mini que sobra no comando/env/workdir recusa e nada abre · terr — o tmux do host existe mas não consegue olhar
 #   (socket sem permissão): is-running, list-running, process-alive, start, stop, interrupt, nudge, send-keys, peek, clear-scrollback e
@@ -328,6 +328,45 @@ g_meta() {
   pv get-meta m-1 '../x' </dev/null; [ $RC = 1 ]; ok $? "meta: chave com '..' ou '/' recusa"
   pv set-meta m-2 k < <(printf 'v'); pv stop m-2 </dev/null; pv get-meta m-2 k </dev/null; [ ! -s "$T/out" ]; ok $? "meta: stop limpa o meta da sessão"
   pv set-meta m-3 k < <(printf 'SEGREDO-DO-META'); ! grep -rq 'SEGREDO-DO-META' "$T/remote" 2>/dev/null; ok $? "meta: o valor fica no mini, não no 'servidor'"
+}
+
+idreq() {  # idreq COMANDO ID TOKEN ÉPOCA → JSON do start com a identidade que o motor passa no env (texto vazio = o motor não a passa)
+  req "$1" | jq --arg id "$2" --arg tk "$3" --arg ep "$4" '(if $id != "" then .env.GC_SESSION_ID=$id else . end) | (if $tk != "" then .env.GC_INSTANCE_TOKEN=$tk else . end) | (if $ep != "" then .env.GC_RUNTIME_EPOCH=$ep else . end)'
+}
+idmeta() { pv get-meta "$1" "$2" </dev/null; cat "$T/out"; }  # idmeta SESSÃO CHAVE → o que o get-meta devolve (nada = vazio)
+
+g_ident() {  # ga-lghlwgc: o motor lê o runtime remoto pelo get-meta (GC_SESSION_ID, GC_INSTANCE_TOKEN); sem identidade ele reverte o create pendente como «de outra sessão» e a sessão vira órfã
+  local i mdir="$T/state/a/meta"
+  cfg 3; fresh
+  pv start id-1 < <(idreq cat ga-wisp-id1 tok-id1 2); ok $RC "ident: start com identidade no env abre (rc=$RC $(head -c 200 "$T/err"))"
+  [ "$(idmeta id-1 GC_SESSION_ID)" = ga-wisp-id1 ]; ok $? "ident: get-meta GC_SESSION_ID devolve o id da sessão que o start recebeu"
+  [ "$(idmeta id-1 GC_INSTANCE_TOKEN)" = tok-id1 ]; ok $? "ident: get-meta GC_INSTANCE_TOKEN devolve o token do start"
+  [ "$(idmeta id-1 GC_RUNTIME_EPOCH)" = 2 ]; ok $? "ident: get-meta GC_RUNTIME_EPOCH devolve a época do start"
+  # a identidade já está no mini quando o processo da sessão nasce: o motor pode ver a sessão viva antes de o start voltar, e é nesse instante que ele reverte o create
+  pv start id-2 < <(idreq "sh -c 'cat $mdir/id-2/GC_SESSION_ID > $T/idseen.out 2>&1; echo \"\${GC_INSTANCE_TOKEN:-sem}\" > $T/idenv.out; exec cat'" ga-wisp-id2 tok-id2 3)
+  for i in 1 2 3 4 5 6 7 8 9 10; do [ -s "$T/idseen.out" ] && break; sleep 0.3; done
+  [ "$(cat "$T/idseen.out" 2>/dev/null)" = ga-wisp-id2 ]; ok $? "ident: a identidade já estava gravada quando o 1º comando da sessão rodou (viu: $(head -c 80 "$T/idseen.out" 2>/dev/null))"
+  [ "$(cat "$T/idenv.out" 2>/dev/null)" = sem ]; ok $? "ident: o token continua FORA do env da sessão (o filtro de segredo não mudou)"
+  pv start id-3 < <(idreq cat "" "" ""); ok $RC "ident: start sem identidade no env abre"
+  [ -z "$(idmeta id-3 GC_SESSION_ID)$(idmeta id-3 GC_INSTANCE_TOKEN)$(idmeta id-3 GC_RUNTIME_EPOCH)" ]; ok $? "ident: sem identidade no env o provider não inventa nenhuma (o get-meta segue vazio)"
+  pv start id-1 < <(idreq cat ga-wisp-outra tok-outra 9); [ $RC = 1 ] && has "$T/err" 'already exists'; ok $? "ident: nome que já existe recusa (rc=$RC)"
+  [ "$(idmeta id-1 GC_SESSION_ID)" = ga-wisp-id1 ] && [ "$(idmeta id-1 GC_INSTANCE_TOKEN)" = tok-id1 ]; ok $? "ident: o start recusado NÃO troca a identidade da sessão que já roda"
+  pv start id-cap < <(idreq cat ga-wisp-cap tok-cap 1); [ $RC = 1 ] && has "$T/err" 'teto'; ok $? "ident: start recusado pelo teto do host (rc=$RC)"
+  [ -z "$(idmeta id-cap GC_SESSION_ID)$(idmeta id-cap GC_INSTANCE_TOKEN)$(idmeta id-cap GC_RUNTIME_EPOCH)" ]; ok $? "ident: o start recusado pelo teto não deixa identidade"
+  pv stop id-2 </dev/null; pv stop id-3 </dev/null
+  pv start id-nf < <(idreq "nao-existe-xyz --x" ga-wisp-nf tok-nf 1); [ $RC = 1 ] && has "$T/err" 'comando não encontrado'; ok $? "ident: comando que não existe → o start falha (rc=$RC)"
+  [ -z "$(idmeta id-nf GC_SESSION_ID)$(idmeta id-nf GC_INSTANCE_TOKEN)$(idmeta id-nf GC_RUNTIME_EPOCH)" ]; ok $? "ident: o start que falha na abertura apaga a identidade que gravou (não sobra identidade de runtime que não existe)"
+  pv start id-bad < <(idreq cat "ga wisp" 'tok;touch x' 4); ok $RC "ident: start com identidade torta abre"
+  [ -z "$(idmeta id-bad GC_SESSION_ID)$(idmeta id-bad GC_INSTANCE_TOKEN)" ] && [ "$(idmeta id-bad GC_RUNTIME_EPOCH)" = 4 ]; ok $? "ident: valor com espaço ou ';' não é gravado; o valor limpo da mesma chamada é"
+  pv stop id-bad </dev/null
+  pv start id-r < <(idreq cat ga-wisp-r tok-A 1); tmux -L "$SOCK" kill-session -t "=id-r" 2>/dev/null; pv start id-r < <(idreq cat ga-wisp-r tok-B 2)
+  [ "$(idmeta id-r GC_INSTANCE_TOKEN)" = tok-B ] && [ "$(idmeta id-r GC_RUNTIME_EPOCH)" = 2 ]; ok $? "ident: sessão de mesmo nome que recomeça (a tmux caiu sem stop) leva a identidade NOVA"
+  mkdir -p "$mdir"; : > "$mdir/id-ro"  # a pasta de meta da sessão não pode ser criada: já existe um ARQUIVO com o nome dela
+  pv start id-ro < <(idreq cat ga-wisp-ro tok-ro 1); ok $RC "ident: meta que não dá para gravar NÃO derruba o start (rc=$RC $(head -c 200 "$T/err"))"
+  has "$T/state/a/session-ssh.log" 'gravei GC_SESSION_ID'; ok $? "ident: ...e o motivo fica no session-ssh.log"
+  rm -f "$mdir/id-ro"; pv stop id-ro </dev/null
+  pv stop id-r </dev/null; pv stop id-1 </dev/null
+  [ -z "$(idmeta id-1 GC_SESSION_ID)$(idmeta id-1 GC_INSTANCE_TOKEN)$(idmeta id-1 GC_RUNTIME_EPOCH)" ]; ok $? "ident: stop apaga a identidade (o get-meta volta a vazio)"
 }
 
 g_conf() {
@@ -1673,7 +1712,7 @@ g_shard() {  # o filtro do PRÓPRIO selftest (GCSSH_SHARD, GCSSH_ONLY, GCSSH_MUT
   [ $rr = 0 ] && [ "$(printf '%s\n' "$oo" | grep -c '^ok   mutante .* pego')" = 1 ] && printf '%s\n' "$oo" | grep -q '^== final: 1/1 ok ==$' && ! printf '%s\n' "$oo" | grep -q 'NADA RODOU'; ok $? "shard: (controle) GCSSH_SHARD=1/9999 roda exatamente 1 mutante, pego, e sai 0 (rc=$rr: $(printf '%s' "$oo" | tail -c 110))"
 }
 
-all() { group proto && g_proto; group dry && g_dry; group live && g_live; group cap && g_cap; group down && g_down; group meta && g_meta; group conf && g_conf; group guard && g_guard; group terr && g_terr; group gate && g_gate; group lay && g_lay; group prep && g_prep; group wt && g_wt; group mbp && g_mbp; group gui && g_gui; group diag && g_diag; group acct && g_acct; group gacct && g_gacct; group prof && g_prof; group lr && g_lr; group lrd && g_lrd; group abort && g_abort; group term && g_term; group shard && g_shard; return 0; }
+all() { group proto && g_proto; group dry && g_dry; group live && g_live; group cap && g_cap; group down && g_down; group meta && g_meta; group ident && g_ident; group conf && g_conf; group guard && g_guard; group terr && g_terr; group gate && g_gate; group lay && g_lay; group prep && g_prep; group wt && g_wt; group mbp && g_mbp; group gui && g_gui; group diag && g_diag; group acct && g_acct; group gacct && g_gacct; group prof && g_prof; group lr && g_lr; group lrd && g_lrd; group abort && g_abort; group term && g_term; group shard && g_shard; return 0; }
 
 if [ -n "${GCSSH_MUTANT:-}" ]; then all; echo "RESULT $fails/$n"; exit $((fails > 0)); fi
 # GCSSH_SHARD=K/N: dois decimais canônicos (sem sinal, sem espaço, sem zero à esquerda: `[ 3 = 03 ]` é falso e $((mn % 010)) é octal, então a fatia ficaria vazia ou trocada sem aviso), N de 1 a 9999 e K de 0 a N-1
@@ -1743,6 +1782,15 @@ case "$shn" in [1-9]*) ;; *) shard_bad;; esac
   mutant proto "exit 2 das desconhecidas" 's/        return 2$/        return 0/'
   mutant down "marcador de fim" 's/if BEGIN not in lines or END not in lines:/if BEGIN not in lines:/'
   mutant down "erro de ssh (rc 255)" 's/if p.returncode == 255:/if False:/'
+  # identidade do runtime (ga-lghlwgc): cada peça que faz o motor ler a tmux do nó como da própria sessão, uma de cada vez
+  mutant ident "o start não grava a identidade" 's/^                stamped = meta_stamp(cfg, name, req.get("env"))$/                stamped = []/'
+  mutant ident "identidade gravada também com o preparo recusado" 's/^            if rc == 0:  # preparou sem abrir nada/            if True:  # preparou sem abrir nada/'
+  mutant ident "start que falha na abertura deixa a identidade" 's/^            meta_unstamp(cfg, name, stamped)  # recusa clara/            pass  # recusa clara/'
+  mutant ident "valor torto gravado" 's|^IDENT_OK = re.compile(.*$|IDENT_OK = re.compile(r".*")|'
+  mutant ident "o token fica de fora" 's/^IDENT_KEYS = ("GC_SESSION_ID", "GC_INSTANCE_TOKEN", "GC_RUNTIME_EPOCH")/IDENT_KEYS = ("GC_SESSION_ID", "GC_RUNTIME_EPOCH")/'
+  mutant ident "a época fica de fora" 's/^IDENT_KEYS = ("GC_SESSION_ID", "GC_INSTANCE_TOKEN", "GC_RUNTIME_EPOCH")/IDENT_KEYS = ("GC_SESSION_ID", "GC_INSTANCE_TOKEN")/'
+  mutant ident "escrita de meta que falha derruba o start" 's/^            cfg.log(f"start {name}: n.*gravei {k} no meta.*$/            raise/'
+  mutant ident "chave ausente no env derruba o start" 's/^        if not isinstance(v, str) or not IDENT_OK.fullmatch(v):/        if False:/'
   mutant cap "flock no mini" 's/fcntl.flock(lf, fcntl.LOCK_EX)/pass/'
   mutant terr "tmux sem acesso tolerado como 'sem servidor'" 's/\*"error connecting to"\*"(No such file or directory)"\*/*"error connecting to"*/'
   mutant terr "has engole o erro do tmux (vira 'false')" 's/s=\$(sessions) || return 2;/s=$(sessions);/'
@@ -1962,7 +2010,7 @@ case "$shn" in [1-9]*) ;; *) shard_bad;; esac
   [ -n "${GCSSH_MUTANTS_ONLY:-}" ] || [ "${GCSSH_SHARD%/*}" != 0 ] || {
   echo "-- contra um stub que só sai 0 (a versão 'anterior' não tinha provider nenhum)"
   printf '#!/bin/sh\nexit 0\n' > "$T/stub"; chmod +x "$T/stub"
-  r=$(GCSSH_MUTANT=1 GCSSH_ONLY="proto,dry,cap,down,conf,guard,gate,lay,prep,wt,gui,diag,acct,gacct,prof" GCSSH_UNDER_TEST="$T/stub" bash "$0" 2>&1 | tail -1); echo "stub: $r"
+  r=$(GCSSH_MUTANT=1 GCSSH_ONLY="proto,dry,cap,down,ident,conf,guard,gate,lay,prep,wt,gui,diag,acct,gacct,prof" GCSSH_UNDER_TEST="$T/stub" bash "$0" 2>&1 | tail -1); echo "stub: $r"
   case "$r" in "RESULT 0/"*|"") ok 1 "stub deveria falhar quase tudo ($r)";; *) ok 0 "stub falha os casos novos ($r)";; esac
   }
   echo "== final: $((n-fails))/$n ok =="

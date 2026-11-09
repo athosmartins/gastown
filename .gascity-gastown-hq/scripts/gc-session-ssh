@@ -75,7 +75,8 @@ O QUE NÃO FAZ (cada item é de outra fatia ou é recusa de propósito)
   entregue (o provider exec do engine tampouco; quem entrega é o Nudge depois do start). Env: só GC_*, TERM, LANG, LC_*, TZ, e o que
   parece segredo (TOKEN, SECRET, PASSWORD, KEY...) não vai, a menos que o nome esteja em `env_allow` da config. check-image,
   watch-startup, run-live e qualquer operação desconhecida: exit 2 ("não suportado"), sem tocar em sessão nenhuma.
-  Meta (set/get/remove-meta) fica no MINI (<estado>/meta): nada disso vai para o servidor.
+  Meta (set/get/remove-meta) fica no MINI (<estado>/meta): nada disso vai para o servidor. O `start` grava ali GC_SESSION_ID, GC_INSTANCE_TOKEN e GC_RUNTIME_EPOCH que o motor mandou no env, depois do preparo e antes de abrir a tmux
+  (ga-lghlwgc: sem isso o motor lia o runtime remoto como «de outra sessão» e revertia o create com a tmux viva; ver IDENTIDADE DO RUNTIME no código); o env do host segue sem o token.
   SESSÃO REAL NÃO ABRE sem a liberação e sem o guarda de clone (ga-2hd02v.1.5, decisão Q4 do Mayor): só abre o que se chama
   remote-e2e-<x> ou remote-test-<x> (a sessão mínima de teste). Qualquer outro nome exige (1) `real_sessions_released_by` na config do host
   — decisão EXPLÍCITA do Mayor; ausente, vazio ou não-texto = recusa, sem ssh — e (2) conferir NO host, dentro do mesmo script do start,
@@ -1128,16 +1129,20 @@ T has-session -t @TGT@ 2>/dev/null || { echo "sessão @NAME@ terminou logo após
         cfg.mark(name, True)
         lr_invalidate(cfg)  # o list-running guardado deixa de valer ANTES do ssh que muda o host e de novo DEPOIS (mesmo se o ssh falhar ou ficar ambíguo): quem perguntou no meio não grava a lista de antes
         t_start = time.monotonic()
+        stamped = []  # chaves de identidade que ESTE start gravou (meta_stamp): só elas saem se a abertura falhar
         try:
             rc, out, err = remote(cfg, prep_body, start_timeout)
             swept = err  # a varredura de órfãs do agente roda NA 1ª chamada: o que ela disse no stderr não pode se perder quando a 2ª sobrescrever `err`
             if rc == 0:  # preparou sem abrir nada: só agora, com o provider vivo e o que sobrou do prazo, abre a tmux. Mínimo OPEN_MIN; num host gráfico, mais o gui_wait_s: o agente leva até isso para dar o veredito do login (o `claude auth status` + o tmux), e um ssh cortado antes disso deixaria o agente subindo sem ninguém esperando
+                # ga-lghlwgc: a identidade vai para o meta ANTES de a tmux existir e só depois do preparo (que já recusou nome existente e teto: o start recusado ali não toca na identidade da sessão que roda)
+                stamped = meta_stamp(cfg, name, req.get("env"))
                 rc, out2, err = remote(cfg, open_body, max(OPEN_MIN + (cfg.gui_wait if cfg.gui else 0), int(start_timeout - (time.monotonic() - t_start))))
                 out = out if rc == 0 else out2  # ok: o que vale é o worktree que a 1ª imprimiu; falhou: o motivo da abertura
         finally:
             lr_invalidate(cfg)  # depois do ssh do start
         if rc not in (0, EX_EXISTS):
             cfg.mark(name, False)
+            meta_unstamp(cfg, name, stamped)  # recusa clara: não há runtime a que essa identidade pertença (start ambíguo levanta Fail antes daqui e a deixa, como deixa o registro)
     for ln in swept.splitlines():  # agente órfão que este start varreu antes de criar o dele: fica no log, mesmo que o start seja recusado logo depois
         if ln.startswith("gui_agent: varreu"):
             cfg.log(f"start {name}: {ln}")
@@ -1457,6 +1462,47 @@ def meta_clear(cfg: Cfg, name: str) -> None:
         pass
     except OSError as e:
         raise Fail(f"não consegui limpar o meta de {name}: {e}")
+
+
+# IDENTIDADE DO RUNTIME (ga-lghlwgc, 09/11). O motor (lido no v1.1.0 público; o binário do mini não foi inspecionado) decide se o runtime VIVO de um create pendente é da própria sessão
+# lendo o get-meta GC_SESSION_ID / GC_INSTANCE_TOKEN (runningSessionMatchesPendingCreate). No tmux local essas chaves vêm do env da sessão; num provider exec só existe o que um set-meta gravou, e o motor nunca grava essas chaves por
+# set-meta (passa no env, e o filtro de segredo do start tira GC_INSTANCE_TOKEN do env do host). O runtime remoto lia «sem identidade» = «de outra sessão», e o tick do reconciliador que
+# o visse vivo antes de o create fechar o REVERTIA (failed-create, «live runtime belongs to another session») SEM parar a tmux: a sessão do nó seguia trabalhando sem linha no roster
+# (4 casos em 08 e 09/11; no upstream, PR #7653 e #7935 corrigem no motor). O start grava aqui, no mini, a identidade que o motor mandou no env; o env do host não muda.
+IDENT_KEYS = ("GC_SESSION_ID", "GC_INSTANCE_TOKEN", "GC_RUNTIME_EPOCH")
+IDENT_OK = re.compile(r"[A-Za-z0-9._:+=@/-]{1,200}")  # id de bead, token hex, época: nada com espaço, aspa, ; nem quebra de linha
+
+
+def meta_stamp(cfg: Cfg, name: str, env_in) -> list:
+    """Grava no meta de `name` a identidade que o start recebeu no env e devolve as chaves gravadas (para o start que falhar apagar só o que gravou).
+    Sem a chave no env → não grava (o get-meta segue vazio, como era); valor que não é texto ou é torto → ignora a chave; escrita que falha → loga e segue: o start nunca falha por isto."""
+    written = []
+    env_in = env_in if isinstance(env_in, dict) else {}
+    for k in IDENT_KEYS:
+        v = env_in.get(k)  # vazio (sem a chave) → não grava; torto (não é texto, fora do padrão) → não grava, nunca lixo no meta
+        if not isinstance(v, str) or not IDENT_OK.fullmatch(v):
+            continue
+        try:
+            path = meta_file(cfg, name, k)
+            cfg.mkstate("meta", name)
+            tmp = f"{path}.tmp{os.getpid()}"
+            with open(tmp, "w") as f:
+                f.write(v)
+            os.replace(tmp, path)
+            written.append(k)
+        except OSError as e:
+            cfg.log(f"start {name}: não gravei {k} no meta ({e}); o motor vai ler o runtime sem identidade")
+    return written
+
+
+def meta_unstamp(cfg: Cfg, name: str, keys: list) -> None:
+    for k in keys:
+        try:
+            os.unlink(meta_file(cfg, name, k))
+        except FileNotFoundError:
+            pass  # já não estava lá
+        except OSError as e:
+            cfg.log(f"start {name}: não apaguei {k} do meta ({e})")
 
 
 def op_set_meta(cfg: Cfg, name: str, args: list, dry: bool) -> int:
