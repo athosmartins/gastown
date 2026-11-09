@@ -16,6 +16,7 @@ _spec = importlib.util.spec_from_file_location("node_ghost_under_test", SCRIPT)
 N = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(N)
 N.GC_BIN, N.BD_BIN, N.CITY = "gc", "bd", "/c"   # o ambiente do nó já exporta GC_BIN/BD_BIN: o teste fixa os seus
+N.PROBE_BIN = "off"                             # a sonda da tmux do nó (ga-lghlwgc) fica DESLIGADA nas seções antigas, onde o roster decide sozinho; a seção 9b a liga
 CALL_DEFAULT = N.CALL_TIMEOUT                   # o teto das chamadas `gc` como o módulo o calculou ao carregar; as seções 12-14 mexem nele e o devolvem
 
 NOW, H = 1_790_000_000, 3600
@@ -179,6 +180,7 @@ class World:
         self.fail, self.cnt, self.calls, self.comments, self.mails, self.mail_argv, self.hooks = {}, {}, [], [], [], [], {}
         self.lie = self.late = self.partial = False   # lie: rc 0 sem aplicar · late: aplica e devolve rc 1 (resposta perdida) · partial: não tira a metadata
         self.slow, self.timeout = {}, 0               # slow: chave -> segundos que a chamada "demora" (simulados, sem dormir) · timeout: o teto que o script passou a ESTA chamada
+        self.node, self.probe_calls = {}, []          # node: nome da sessão -> última atividade da tmux do nó (texto; "" = a tmux não existe) · probe_calls: (nome, teto) de cada sonda
 
     def go(self, key, good):
         n = self.cnt[key] = self.cnt.get(key, 0) + 1
@@ -208,6 +210,9 @@ class World:
                 self.mails.append((a[4], a[6]))   # assunto, corpo (mail send mayor -s S -m B --notify)
                 self.mail_argv.append(a)
             return r
+        if tool == N.PROBE_BIN and a[:1] == ["get-last-activity"]:   # a sonda: o provider do nó devolve a última atividade da tmux, vazio se ela não existe, rc != 0 se não deu para olhar
+            self.probe_calls.append((a[1], timeout))
+            return self.go("probe", lambda: self.node.get(a[1], ""))
         path, rest = a[1], a[2:]
         store = self.db.get(path)
         if store is None:
@@ -426,6 +431,76 @@ check("mail falhou: a soltura vale e o aviso fica pendente no estado", bead(w, "
 w.fail.pop("mail"); w.cnt.pop("mail")
 cycle(w, 300)
 check("mail pendente sai na rodada seguinte e some do estado", len(w.mails) == 1 and "wa-4vjmkn.4.2" in w.mails[0][1] and state()["unmailed"] == [])
+# 9b) a sonda da tmux do nó (ga-lghlwgc): o roster não vê a sessão ÓRFÃ (create revertido com a tmux viva, 4 casos em 08 e 09/11); antes de soltar, olha-se a tmux do nó pelo nome da última sessão da bead
+PROBE, SESS = "/c/scripts/gc-session-ssh", "wa-worker-remote-gawispu43v0"   # SESS é o gc.session_name que B() grava
+def probed(*beads, node=None, **kw):
+    w = due(*beads, **kw)
+    N.PROBE_BIN = PROBE
+    w.node = dict(node or {})
+    return w
+holds = lambda: [x for x in LOGS if x.startswith("HOLD ")]
+st_of = lambda w, bid="wa-4vjmkn.4.2": bead(w, bid)["status"]
+w = probed(B("wa-4vjmkn.4.2"), node={SESS: iso(60)})
+cycle(w, 0)
+check("sonda: tmux VIVA no nó (atividade há 1 min) e fora do roster = órfã -> NÃO solta: nada escrito, sem comentário nem mail", not writes(w) and not w.comments and not w.mails and st_of(w) == "in_progress", str(LOGS[-3:]))
+check("sonda: ...o relógio segue (10 vistas) e o log diz HOLD com a sessão e que está viva", state()["ghosts"].get(KEY, {}).get("seen") == 10 and len(holds()) == 1 and SESS in holds()[0] and "VIVA" in holds()[0], str(LOGS[-4:]))
+check("sonda: UMA chamada, `<sonda> get-last-activity <sessão da bead>`, com o teto PROBE_TIMEOUT", w.probe_calls == [(SESS, getattr(N, "PROBE_TIMEOUT", None))] and [c for c in w.calls if c[0] == PROBE] == [[PROBE, "get-last-activity", SESS]], str(w.probe_calls))
+check("sonda: a linha-resumo conta as seguradas (seguradas=1)", any("seguradas=1" in x for x in LOGS), str(LOGS[:4]))
+w = probed(B("wa-4vjmkn.4.2"), node={SESS: iso(3600)})
+cycle(w, 0)
+check("sonda: tmux no nó mas QUIETA há 1 h (>= ORPHAN_ACTIVE_SEC) -> solta; o comentário e o mail dizem que a tmux segue no nó, parada",
+      st_of(w) == "open" and not holds() and "ATENÇÃO" in w.comments[0][1] and SESS in w.comments[0][1] and "segue no nó" in w.comments[0][1] and "segue no nó" in w.mails[0][1], str(w.comments) + str(w.mails))
+w = probed(B("wa-4vjmkn.4.2"), node={SESS: iso(1700)})
+cycle(w, 0)
+check("sonda: atividade há 1700 s (< 1800) ainda segura; a 1800 s já não (a fronteira é ORPHAN_ACTIVE_SEC)", st_of(w) == "in_progress" and len(holds()) == 1)
+w = probed(B("wa-4vjmkn.4.2"), node={SESS: iso(1800)})
+cycle(w, 0)
+check("sonda: ...atividade há exatamente 1800 s solta", st_of(w) == "open" and not holds())
+w = probed(B("wa-4vjmkn.4.2"), node={})
+cycle(w, 0)
+check("sonda: tmux AUSENTE no nó (rc 0, resposta vazia) -> solta como antes, sem nota de órfã", st_of(w) == "open" and not holds() and "segue no nó" not in w.comments[0][1] and len(w.probe_calls) == 1, str(w.comments))
+for kind in ("rc1", "garbage", "timeout", "rcbody"):
+    w = probed(B("wa-4vjmkn.4.2"), node={SESS: iso(60)})
+    w.fail["probe"] = kind
+    cycle(w, 0)
+    check("sonda %s: NÃO consegui olhar o nó -> NÃO solta (o inerte): nada escrito, HOLD diz que não consegui, o relógio segue" % kind,
+          not writes(w) and not w.comments and st_of(w) == "in_progress" and state()["ghosts"].get(KEY, {}).get("seen") == 10 and any("não consegui" in x for x in holds()), str(LOGS[-3:]))
+w = probed(B("wa-4vjmkn.4.2"), node={SESS: "ontem de manhã"})
+cycle(w, 0)
+check("sonda: última atividade que não é data (lixo) -> não consegui, NÃO solta", not writes(w) and st_of(w) == "in_progress" and any("não consegui" in x for x in holds()), str(LOGS[-3:]))
+w = probed(B("wa-4vjmkn.4.2"), node={SESS: iso(-3600)})
+cycle(w, 0)
+check("sonda: atividade no FUTURO (relógio do nó adiantado) conta como recente -> viva, NÃO solta", not writes(w) and st_of(w) == "in_progress" and len(holds()) == 1)
+w = probed(B("wa-4vjmkn.4.2", md={"pilot.wa_node_alias": "wa-worker-remote-2"}), node={SESS: iso(60)})
+cycle(w, 0)
+check("sonda: bead SEM gc.session_name -> nada a olhar: nenhuma chamada à sonda, solta como antes", not w.probe_calls and st_of(w) == "open" and not holds())
+w = probed(B("wa-4vjmkn.4.2", md={"pilot.wa_node_alias": "wa-worker-remote-2", "gc.session_name": "nome com espaço"}), node={SESS: iso(60)})
+cycle(w, 0)
+check("sonda: nome que não é nome de tmux (espaço, `?`) NUNCA vai para o argv: sem chamada, solta como antes", not w.probe_calls and st_of(w) == "open")
+for off in ("off", ""):
+    w = probed(B("wa-4vjmkn.4.2"), node={SESS: iso(60)})
+    N.PROBE_BIN = off
+    cycle(w, 0)
+    check("sonda desligada (PROBE_BIN=%r): nenhuma chamada e solta como antes" % off, not w.probe_calls and st_of(w) == "open" and not holds())
+mk = lambda i: B("wa-h%d" % i, alias="wa-worker-remote-%d" % (i + 5), md={"pilot.wa_node_alias": "wa-worker-remote-%d" % (i + 5), "gc.session_name": "wa-worker-remote-gawispo%d" % i})
+w = probed(*[mk(i) for i in range(4)], node=dict(("wa-worker-remote-gawispo%d" % i, iso(60)) for i in range(3)))
+json.dump({"ghosts": dict(("whatsapp_automation|wa-h%d|wa-worker-remote-%d" % (i, i + 5), {"since": NOW - 6000 + 100 * i, "seen": 9}) for i in range(4)), "unmailed": []}, open(N.STATE_PATH, "w"))
+cycle(w, 0)
+check("sonda: as 3 vencidas MAIS ANTIGAS seguradas pela tmux NÃO gastam o teto MAX_PER_RUN: a 4ª, sem tmux, é solta na mesma rodada",
+      [b["id"] for b in w.db["/r/wa"] if b["status"] == "open"] == ["wa-h3"] and len(holds()) == 3 and len(w.probe_calls) == 4, str(LOGS[-6:]))
+w = probed(B("wa-4vjmkn.4.2"), node={SESS: iso(60)}); N.DRY_RUN = True
+cycle(w, 0)
+check("sonda em ensaio: tmux viva -> HOLD, nunca WOULD-RELEASE", len(holds()) == 1 and not any("WOULD-RELEASE" in x for x in LOGS))
+w = probed(B("wa-4vjmkn.4.2"), node={}); N.DRY_RUN = True
+cycle(w, 0)
+check("sonda em ensaio: tmux ausente -> WOULD-RELEASE (e a sonda foi chamada: ela só lê)", any("WOULD-RELEASE" in x for x in LOGS) and len(w.probe_calls) == 1 and not writes(w))
+N.DRY_RUN = False
+w = probed(B("wa-4vjmkn.4.2"), node={SESS: iso(60)})
+cycle(w, 0)
+w.node = {}
+cycle(w, 300)
+check("sonda: a tmux some (ou morre) na rodada seguinte -> a bead é solta nela (HOLD não grava nada que impeça)", st_of(w) == "open" and len(w.mails) == 1 and len(holds()) == 1)
+N.PROBE_BIN = "off"
 # 10) estado: ausente, corrompido, torto, que não grava
 fresh()
 w = World(wa=[B("wa-4vjmkn.4.2")])
@@ -458,17 +533,21 @@ open(os.path.join(bin_dir, "bd"), "w").write(FAKE + 'bs = json.load(open(D + "/b
 for x in ("gc", "bd"):
     os.chmod(os.path.join(bin_dir, x), 0o755)
 
-def proc(extra_env=None, state_json=None, beads=None, off=False):
-    d = tempfile.mkdtemp(dir=TMP)
+def proc(extra_env=None, state_json=None, beads=None, off=False, probe=None):
+    global LASTD
+    d = LASTD = tempfile.mkdtemp(dir=TMP)   # LASTD: a pasta da última chamada (o provider falso grava o que recebeu em <pasta>/probe.calls)
     city = os.path.join(d, "city"); os.makedirs(os.path.join(city, ".gc", "state"))
     json.dump(beads if beads is not None else [], open(os.path.join(d, "beads.json"), "w"))
     if state_json is not None:
         json.dump(state_json, open(os.path.join(city, ".gc", "state", "node-ghost-release.json"), "w"))
     if off:
         open(os.path.join(city, ".gc", "node-ghost-release.off"), "w").write("")
+    if probe is not None:   # o provider do nó (scripts/gc-session-ssh da cidade) como um script falso: o corpo diz o que ele faz com `get-last-activity <sessão>`
+        os.makedirs(os.path.join(city, "scripts")); pf = os.path.join(city, "scripts", "gc-session-ssh")
+        open(pf, "w").write("#!/usr/bin/env python3\nimport sys, time\nopen(%r, 'a').write(' '.join(sys.argv[1:]) + '\\n')\n" % os.path.join(d, "probe.calls") + probe); os.chmod(pf, 0o755)
     env = dict((k, v) for k, v in os.environ.items() if not k.startswith("NODE_GHOST_"))
     env.update(PATH=bin_dir + os.pathsep + os.environ["PATH"], GC_CITY_PATH=city, GC_BIN="gc", BD_BIN="bd", NG_FAKE=d)
-    env.update(extra_env or {})
+    env.update(dict((k, v.replace("@CITY@", city)) for k, v in (extra_env or {}).items()))   # @CITY@ = a pasta da cidade desta chamada (o caminho do provider falso)
     r = subprocess.run([sys.executable, SCRIPT], capture_output=True, text=True, env=env, timeout=60)
     return r, (open(os.path.join(d, "calls")).read() if os.path.exists(os.path.join(d, "calls")) else "")
 
@@ -498,6 +577,35 @@ lockf = os.path.join(tempfile.mkdtemp(dir=TMP), "x.lock"); fh = open(lockf, "w")
 r, calls = proc({"NODE_GHOST_LOCK": lockf})
 check("subprocesso: outra instância segura o lock -> sai 0 sem ler nada", r.returncode == 0 and "lock" in r.stdout and calls == "", r.stdout)
 fh.close()
+# 11b) a sonda da tmux do nó no script de verdade (ga-lghlwgc): o provider da cidade (scripts/gc-session-ssh) como subprocesso, sem a costura do mundo falso
+ALIVE = "import time; print(time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime(time.time() - 30)))\n"   # a tmux do nó respondeu: atividade há 30 s
+GHOST_SESS = ghost["metadata"]["gc.session_name"]
+envr = {"NODE_GHOST_DRY_RUN": "0"}
+envp = dict(envr, NODE_GHOST_PROBE_BIN="@CITY@/scripts/gc-session-ssh")   # a sonda LIGADA (ela é opt-in: o env do plist)
+r, calls = proc(envp, state_json=st_old, beads=[ghost], probe=ALIVE)
+check("subprocesso+sonda: NODE_GHOST_PROBE_BIN=<provider da cidade> e a tmux viva no nó (atividade de 30 s atrás) -> HOLD, nenhum update; rc 0; a linha start diz probe=<caminho do provider>",
+      r.returncode == 0 and "HOLD hq/wa-4vjmkn.4.2" in r.stdout and '"update"' not in calls and "probe=" in r.stdout and "scripts/gc-session-ssh" in r.stdout.split("probe=")[1].split()[0], r.stdout)
+r, calls = proc(envp, state_json=st_old, beads=[ghost], probe="pass\n")
+check("subprocesso+sonda: o provider responde VAZIO (a tmux não existe) -> solta; e a chamada foi `get-last-activity <gc.session_name da bead>`, uma só",
+      r.returncode == 0 and "] RELEASE hq/wa-4vjmkn.4.2" in r.stdout and '"update"' in calls and (open(os.path.join(LASTD, "probe.calls")).read().splitlines() if os.path.exists(os.path.join(LASTD, "probe.calls")) else []) == ["get-last-activity " + GHOST_SESS], r.stdout)
+for name, body, env_x in (("sai 1 (ssh fora do ar)", "sys.exit(1)\n", {}), ("responde lixo", "print('sem data nenhuma')\n", {}),
+                          ("apontada por NODE_GHOST_PROBE_BIN para um caminho que não executa", ALIVE, {"NODE_GHOST_PROBE_BIN": "/nonexistent/gc-session-ssh"})):
+    r, calls = proc(dict(envp, **env_x), state_json=st_old, beads=[ghost], probe=body)   # caminho posto à mão que não roda é «não consegui», nunca «ausente» nem «desligada»
+    check("subprocesso+sonda %s: não consegui olhar -> HOLD, nada escrito" % name, r.returncode == 0 and "HOLD hq/wa-4vjmkn.4.2" in r.stdout and "não consegui" in r.stdout and '"update"' not in calls, r.stdout)
+r, calls = proc(dict(envp, NODE_GHOST_PROBE_TIMEOUT="5"), state_json=st_old, beads=[ghost], probe="time.sleep(30)\n")
+check("subprocesso+sonda: provider que trava passa do NODE_GHOST_PROBE_TIMEOUT (5 s) -> cortado, HOLD 'não consegui', nada escrito (o _sh real mata o filho)", "HOLD hq/wa-4vjmkn.4.2" in r.stdout and "não consegui" in r.stdout and '"update"' not in calls, r.stdout)
+for off in ("off", ""):
+    r, calls = proc(dict(envr, NODE_GHOST_PROBE_BIN=off), state_json=st_old, beads=[ghost], probe=ALIVE)
+    check("subprocesso+sonda: NODE_GHOST_PROBE_BIN=%r -> não olha o nó, solta como antes, e a linha start diz probe=off" % off, "] RELEASE hq/wa-4vjmkn.4.2" in r.stdout and "probe=off" in r.stdout and '"update"' in calls and "HOLD" not in r.stdout, r.stdout)
+r, calls = proc(envr, state_json=st_old, beads=[ghost], probe=ALIVE)
+check("subprocesso+sonda: SEM NODE_GHOST_PROBE_BIN a sonda é DESLIGADA por padrão, mesmo com o provider na cidade (o merge sozinho não muda o job vivo): probe=off e solta como antes",
+      "probe=off" in r.stdout and "] RELEASE hq/wa-4vjmkn.4.2" in r.stdout and "HOLD" not in r.stdout, r.stdout)
+for val, want in ((None, 20), ("45", 45), ("4", 20), ("abc", 20), ("", 20)):
+    r, _ = proc({} if val is None else {"NODE_GHOST_PROBE_TIMEOUT": val}, probe="pass\n")
+    check("subprocesso+sonda: NODE_GHOST_PROBE_TIMEOUT=%r -> probe_timeout=%ds na linha start (ilegível ou abaixo do mínimo volta ao padrão, e o log DIZ isso)" % (val, want), "probe_timeout=%ds" % want in r.stdout, r.stdout)
+for val, want in ((None, 1800), ("600", 600), ("299", 1800), ("abc", 1800)):
+    r, _ = proc({} if val is None else {"NODE_GHOST_ORPHAN_ACTIVE_SEC": val}, probe="pass\n")
+    check("subprocesso+sonda: NODE_GHOST_ORPHAN_ACTIVE_SEC=%r -> orphan_active=%ds na linha start" % (val, want), "orphan_active=%ds" % want in r.stdout, r.stdout)
 # 12) leitura LENTA sob carga (ga-pdyayy2): com o mini a load 26 o `gc session list` levou 58 s a mais de 90 s e estourava os 40 s -> DEGRADED, rc 1, de novo a cada rodada (o watchdog lê CRASH-LOOP).
 #     O mundo falso "demora" sem dormir: a chamada que passa do teto devolve None, como o subprocess.run estourado.
 LATENCY = 90   # s, medido em 08/11; a medida à mão estourou os próprios 90 s, então a latência real é >= 90

@@ -11,7 +11,8 @@ do Pilot (a real já não tem) ou dono de pool e só conhece o alias do MBP; o `
 REGRA  Por rodada lê as in_progress de todas as lojas e o roster (`gc session list`). FANTASMA = dono é alias do nó + marca pilot.wa_node_alias == dono + bead_state.derive, com o dono dado como
 morto, diz stranded (ou gate_failed com devolver_pro_pool) + bead sem update há >= GRACE_SEC + NENHUMA sessão não-morta com o alias (nem pelo gc.session_name da bead) e nenhuma sessão viva do
 template sem alias (não dá para saber de quem é). Relógio no estado: só solta com >= 2 vistas e >= GRACE_SEC desde a 1ª; sessão viva, bead que mudou ou loja ilegível zeram ou seguram o
-relógio; roster ilegível/vazio suspende a rodada. Antes de escrever relê roster e bead; UMA escrita guardada (--if-assignee/--if-status): dono "", status open, tira a marca do nó, os carimbos
+relógio; roster ilegível/vazio suspende a rodada. A vencida só é solta depois de olhar a tmux do nó pelo gc.session_name da bead (sonda, ga-lghlwgc: o roster não vê a sessão ÓRFÃ, create revertido com a tmux viva): viva e recente = HOLD, não consegui olhar = HOLD, ausente ou quieta = solta;
+a sonda é opt-in (DESLIGADA por padrão: NODE_GHOST_PROBE_BIN=<cidade>/scripts/gc-session-ssh no plist). Antes de escrever relê roster e bead; UMA escrita guardada (--if-assignee/--if-status): dono "", status open, tira a marca do nó, os carimbos
 do Pilot e story:in-flight/pilot:dispatched, conta em node:ghost-count:N e, na NODE_GHOST_VETO_AFTER-ésima (2), põe node:never (a bead vai ao mini). Confere relendo, comenta na bead, UM mail ao
 Mayor. NÃO FAZ: não toca sessão, worktree nem branch do nó; não olha dog-remote/kimi (outras marcas), o MBP (é do guard) nem a forma `pool`; não mexe em bead com pilot:dispatching.
 NODE_GHOST_ENABLED≠1 → no-op. NODE_GHOST_DRY_RUN: só "0" exato escreve (ausente/vazio/lixo = ENSAIO: loga WOULD-RELEASE, guarda o relógio, não escreve nem envia). .gc/node-ghost-release.off → no-op.
@@ -57,6 +58,13 @@ MAX_PER_RUN = _int_env("NODE_GHOST_MAX_PER_RUN", 3, 1)            # teto de escr
 VETO_AFTER = _int_env("NODE_GHOST_VETO_AFTER", 2, 0)              # a N-ésima devolução veta o nó (0 = nunca veta)
 BD_TIMEOUT = _int_env("NODE_GHOST_BD_TIMEOUT", 60, 5)
 CALL_TIMEOUT = _int_env("NODE_GHOST_CALL_TIMEOUT", 40, 5)         # teto de cada `gc` (rig list, session list; o mail leva +20): 40 bastava em carga normal, o plist põe 150 (sob load 26 o session list levou 58 s a mais de 90 s: ga-pdyayy2)
+# SONDA DA TMUX DO NÓ (ga-lghlwgc): o create revertido pelo motor deixa a tmux do nó VIVA e sem linha no roster (órfã); o roster diz «ausente» e a bead seria solta com a sessão trabalhando. DESLIGADA por padrão:
+# o merge sozinho não muda nada no job vivo. Ligar é pôr NODE_GHOST_PROBE_BIN=<cidade>/scripts/gc-session-ssh (o provider que o motor já usa para falar com o nó) no env do plist e recarregá-lo (runbook); "off" ou
+# vazio desligam. Caminho posto À MÃO que não roda NÃO desliga a sonda: vira «não consegui olhar» e a bead não é solta.
+PROBE_BIN = os.environ.get("NODE_GHOST_PROBE_BIN", "off")
+PROBE_TIMEOUT = _int_env("NODE_GHOST_PROBE_TIMEOUT", 20, 5)           # teto da sonda (uma chamada ssh ao nó por fantasma vencido)
+ORPHAN_ACTIVE_SEC = _int_env("NODE_GHOST_ORPHAN_ACTIVE_SEC", 1800, 300)   # tmux do nó que mexeu há menos que isto segura a bead; mais quieta que isto não (o D1 do vigia, quando ligado, a mata aos 30 min)
+SESS_RE = re.compile(r"^[A-Za-z0-9._+-]{1,120}$")                      # só nome de tmux vai para o argv da sonda
 
 WORK_TYPES = frozenset({"feature", "bug", "task", "chore"})
 ALIAS_RE = re.compile(r"^((?:wa|ps)-worker-remote)-[1-9]$")       # o MBP (wa-worker-remote-mbp-N) não casa: é do guard
@@ -266,6 +274,42 @@ def format_mail(items):
                             "Desligar: NODE_GHOST_ENABLED=0 no plist (recarregar) ou `touch .gc/node-ghost-release.off`."])
 
 
+def node_session(sess, now):
+    """('off'|'alive'|'quiet'|'absent'|'unknown', detalhe). A tmux do nó pelo NOME da última sessão da bead (gc.session_name): o roster não vê a ÓRFÃ (create revertido com a tmux viva, ga-lghlwgc). Pergunta ao
+    provider do nó (`<provider> get-last-activity <nome>`): uma data = a tmux existe e mexeu nessa hora (alive se há menos de ORPHAN_ACTIVE_SEC, quiet se há mais; data no futuro conta como agora); vazio com rc 0 =
+    a tmux não existe (absent); rc != 0, estouro de prazo, provider que nem roda ou texto que não é data = unknown, NUNCA «ausente». off = sem sonda, sem nome de sessão ou nome que não é de tmux: o roster decide sozinho."""
+    if PROBE_BIN in ("", "off") or not sess or not SESS_RE.match(sess):
+        return "off", ""
+    r = _sh([PROBE_BIN, "get-last-activity", sess], PROBE_TIMEOUT)
+    if r is None or r[0] != 0:
+        return "unknown", "a sonda não respondeu (rc=%s)" % (r[0] if r else "sem resposta")
+    out = r[1].strip()
+    if not out:
+        return "absent", ""  # vazio com rc 0 é a resposta do provider para «essa tmux não existe»
+    ts = BS.parse_iso_epoch(out)
+    if ts is None:
+        return "unknown", "atividade ilegível (%s)" % _safe(out)[:30]
+    age = max(0, int(now - ts))
+    return ("alive" if age < ORPHAN_ACTIVE_SEC else "quiet"), "atividade há %d min" % (age // 60)
+
+
+def hold_for_node(due, now):
+    """(a soltar, seguradas). Das vencidas, a que a tmux do nó segura (viva e recente, ou nó que não deu para olhar) fica de fora desta rodada e NÃO gasta o teto de escritas; a tmux quieta passa, com a nota que vai no
+    comentário e no mail. Só LÊ o nó. O relógio de quem fica segue andando: a rodada seguinte pergunta de novo."""
+    go, held = [], []
+    for f in due:
+        seen, detail = node_session(f["sess"], now)
+        if seen == "alive":
+            held.append((f, "tmux %s VIVA no nó (%s) e fora do roster: órfã; não solto" % (f["sess"], detail)))
+        elif seen == "unknown":
+            held.append((f, "não consegui olhar a tmux %s no nó (%s); não solto" % (f["sess"], detail)))
+        elif seen == "quiet":
+            go.append(dict(f, orphan_note="a tmux %s segue no nó, parada (%s)" % (f["sess"], detail)))
+        else:
+            go.append(f)
+    return go, held
+
+
 # ── estado e ações ──────────────────────────────────────────────────────────────
 def _load_state():
     # ausente → estado vazio (1ª rodada); ilegível/corrompido/torto → None: sem relógio confiável nada é solto naquela rodada
@@ -314,7 +358,7 @@ def release_one(f, path, now):
     if g is None or g["alias"] != f["alias"]:
         return "skip", "mudou entre as leituras: %s" % why
     if DRY_RUN:
-        return "would", ""
+        return "would", f.get("orphan_note", "")
     r = _sh(update_argv(g, path), BD_TIMEOUT)
     rc = r[0] if r else None
     if rc == 13:
@@ -325,7 +369,7 @@ def release_one(f, path, now):
     if after.get("status") == "open" and not after.get("assignee"):
         lbl, md = after.get("labels") or [], after.get("metadata") or {}
         left = [x for x in STRIP if x in lbl] + [k for k in UNSET if k in md] + ([] if "node:ghost-count:%d" % (g["n"] + 1) in lbl else ["contagem"]) + (["node:never"] if g["veto"] and "node:never" not in lbl else [])
-        return "released", ("limpeza incompleta: " + ",".join(left)) if left else ""
+        return "released", " ".join(x for x in (("limpeza incompleta: " + ",".join(left)) if left else "", f.get("orphan_note", "")) if x)
     if after.get("assignee") == f["alias"] and after.get("status") == "in_progress":
         return "fail", "a escrita não pegou (bd update rc=%s)" % rc
     return "lost", "a bead mudou de mãos (dono=%s status=%s)" % (_safe(after.get("assignee")), _safe(after.get("status")))
@@ -367,8 +411,11 @@ def run_cycle(now=None):
         return 0
     ghosts, stats = observe(beads, roster, now)
     state["ghosts"], due = reconcile(state["ghosts"], ghosts, now, set(beads))
+    due, held = hold_for_node(due, now)  # ga-lghlwgc: a tmux do nó que o roster não vê segura a bead e não gasta o teto de escritas
     due = due[:MAX_PER_RUN]
-    _log("lojas=%d ilegiveis=%d fantasmas=%d vencidas=%d kept=%s" % (len(beads), unreadable, len(ghosts), len(due), ",".join("%s:%d" % kv for kv in sorted(stats.items())) or "-"))
+    _log("lojas=%d ilegiveis=%d fantasmas=%d vencidas=%d seguradas=%d kept=%s" % (len(beads), unreadable, len(ghosts), len(due), len(held), ",".join("%s:%d" % kv for kv in sorted(stats.items())) or "-"))
+    for h, why in held:
+        _log("HOLD %s/%s alias=%s %s" % (h["store"], h["id"], h["alias"], why))
     for g in ghosts:
         c = state["ghosts"][key(g)]
         _log("GHOST %s/%s alias=%s roster=%s desde=%dmin vistas=%d" % (g["store"], g["id"], g["alias"], g["detail"], (now - c["since"]) // 60, c["seen"]))
@@ -399,7 +446,7 @@ def run_cycle(now=None):
 
 def main():
     # loga SEMPRE primeiro: o daemon-presence-watchdog lê o .out como batimento
-    _log("start enabled=%s dry_run=%s grace=%ds max=%d veto_after=%d call_timeout=%ds" % (ENABLED, DRY_RUN, GRACE_SEC, MAX_PER_RUN, VETO_AFTER, CALL_TIMEOUT))   # o teto que VALE (env ilegível volta a 40 em silêncio: aqui aparece)
+    _log("start enabled=%s dry_run=%s grace=%ds max=%d veto_after=%d call_timeout=%ds probe=%s probe_timeout=%ds orphan_active=%ds" % (ENABLED, DRY_RUN, GRACE_SEC, MAX_PER_RUN, VETO_AFTER, CALL_TIMEOUT, PROBE_BIN or "off", PROBE_TIMEOUT, ORPHAN_ACTIVE_SEC))   # o teto que VALE (env ilegível volta a 40 em silêncio: aqui aparece)
     if not ENABLED or os.path.exists(OFF_PATH):
         _log("kill-switch (NODE_GHOST_ENABLED!=1 ou arquivo %s) — no-op" % OFF_PATH)
         return 0
