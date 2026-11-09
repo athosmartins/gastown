@@ -140,6 +140,29 @@
 #   • só pula — não força R5 nem chama ninguém: a decisão é do Athos.
 #
 # ────────────────────────────────────────────────────────────────────
+# ⚠️ UM DÉCIMO ESTADO: ESTACIONADA PELO DISPATCHER (ga-ph10ox5, 2026-11-09):
+# o Step 5c do quality-gate-dispatcher.sh (ga-5w2gpw) não manda revisor para um diff que não cabe INTEIRO (6000 linhas E 400000
+# bytes) nem para um que não se lê: ESTACIONA — marker em error, gate:needs-human:technical e o comentário "ga-5w2gpw PARKED
+# before review" na bead —, sem veredito e sem gastar tentativa de conserto. Estacionar não é FAIL: a referência do R2 ("ponta
+# posterior à última reprovação") ficava num FAIL ANTIGO e casava SEMPRE. O R2 tirava a trava que o dispatcher acabara de armar,
+# a bead era re-submetida e o dispatcher estacionava de novo. Medido em wa-nen4us (09/11, 7037 linhas; números da ga-ph10ox5): 4
+# estacionamentos em 67 min (05:38 a 06:45), 8 mails ao Mayor, ninguém agindo por 5 h. Commit novo não encolhe um diff acima do
+# teto: o que decide se re-gatear adianta é o diff ATUAL caber.
+# Agora, quando o ÚLTIMO evento do gate na bead é um desses estacionamentos (o comentário não é mais velho que a última
+# reprovação, ou não há reprovação), decide() mede o diff (merge-base..ponta) com a MESMA régua do dispatcher e só deixa R2, R3
+# e R4 — as três que tiram a trava e mandam a bead de volta — agirem se ele CABE:
+#   acima do teto      → HOLD        (inerte: nenhuma label, nenhum comentário; o Mayor já foi avisado pelo dispatcher)
+#   não deu pra medir  → SEM-MEDIDA  (inerte, e a linha-resumo conta); "não sei" nunca vira "cabe"
+#   cabe               → segue para R2-R5 como antes (o branch encolheu: re-gatear volta a adiantar)
+# R1 (sem trabalho único) vem antes e continua valendo; R5 só comenta e segue alcançável quando o diff cabe.
+# Limites, de propósito: (a) o estacionamento por diff ILEGÍVEL (a outra face do Step 5c) é tratado igual — só um diff medido e
+# inteiro libera; (b) a régua é a gate_build_diff_payload da lib gate-review-task.lib.sh, não uma contagem própria: duas contagens
+# divergem, e quando divergem um diz "cabe" e o outro estaciona de novo; (c) os tetos são os GATE_DIFF_LINE_BUDGET /
+# GATE_DIFF_BYTE_BUDGET DESTE ambiente (padrões da lib): se o Mayor os subir no dispatcher, tem que subir também no plist deste
+# job, senão esta varredura segue segurando uma bead que o dispatcher já aceitaria (o lado inerte); (d) segurar não destrava
+# nada: a bead fica parada até alguém dividir a entrega ou o Mayor decidir.
+#
+# ────────────────────────────────────────────────────────────────────
 # ARMADILHAS MEDIDAS que este script evita POR CONSTRUÇÃO. Todas me
 # pegaram em 2026-08-15; cada uma tem cenário no selftest:
 #
@@ -217,6 +240,11 @@ R5_ALERT_COOLDOWN="${GATE_AUTO_UNBLOCK_R5_COOLDOWN:-21600}"  # 6h, matches gate-
 # when the branch actually moved since the last R4 action on this bead.
 R4_STATE_DIR="${GATE_AUTO_UNBLOCK_R4_STATE_DIR:-$CITY/.gc/runtime/gate-auto-unblock-r4-acted}"
 
+# ga-ph10ox5: o comentário que o Step 5c do dispatcher (ga-5w2gpw) posta na bead-fonte ao ESTACIONAR («ga-5w2gpw PARKED before
+# review (marker <id>): branch … has a diff of … / has no readable diff …»). Ancorado no começo do texto: quem só CITA a frase
+# no meio de outro comentário não conta. O selftest roda o bloco real do dispatcher e prova que o texto dele casa com este padrão.
+GATE_PARK_RE='^[[:space:]]*ga-5w2gpw PARKED before review'
+
 log() { printf '[%s] %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$*" >> "$LOG" 2>/dev/null || true; }
 say() { printf '%s\n' "$*"; log "$*"; }
 
@@ -241,6 +269,19 @@ if ! { type gc_delivery_branch_globs >/dev/null 2>&1 && type gc_delivery_branch_
   exit 2
 fi
 unset _GAU_DBP
+
+# ga-ph10ox5: a régua de "cabe INTEIRO" do Step 5c do dispatcher mora na lib gate-review-task.lib.sh (gate_build_diff_payload).
+# diff_fit() pergunta a ELA em vez de contar linhas aqui: duas contagens divergem, e quando divergem um diz "cabe" e o outro
+# estaciona de novo — o loop de volta. Ao contrário de delivery-branch-patterns.sh acima, a ausência NÃO é fatal: só tira de cena a
+# medição, e quem depende dela (a bead estacionada pelo dispatcher) fica inerte. O stderr do `source` fica de propósito: lib
+# corrompida tem que ser barulhenta.
+# ausente/ilegível → nada é carregado e diff_fit devolve "nolib" (inerte); corrompida → o source reclama no stderr e a função que
+# ele não definiu segue ausente, mesmo desfecho
+_GAU_GRT="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)/gate-review-task.lib.sh"
+if [ -r "$_GAU_GRT" ]; then
+  source "$_GAU_GRT"
+fi
+unset _GAU_GRT
 
 # ⚠️ (revisor, gate-run ga-2ywzoo): trava de instância única — SEM ela,
 # este guard é exatamente o precedente já documentado nesta cidade
@@ -662,11 +703,39 @@ mark_r4_acted() {
   printf '%s' "$tip" > "$R4_STATE_DIR/$id" 2>/dev/null
 }
 
+# diff_fit <rig> <branch-ref> → UMA linha "<estado> <linhas> <bytes> <teto-linhas> <teto-bytes>" (ga-ph10ox5), estado ∈
+#   fits     o diff origin/main...<branch> cabe INTEIRO (DIFF_COVERAGE=full: dentro dos dois tetos e com texto)
+#   over     acima de um dos tetos (partial): o dispatcher estacionaria de novo
+#   unknown  a leitura veio sem texto (git falhou, base ou ref ausente, diff vazio): não dá pra dizer se cabe
+#   nolib    gate-review-task.lib.sh não carregou: não há régua
+# Os números são "?" quando a lib não os deu. Quem decide é gate_build_diff_payload — a MESMA função que o Step 5c do dispatcher
+# chama —, com o teto de linhas deste ambiente (GATE_DIFF_LINE_BUDGET; vazio = o padrão DA LIB, nenhuma cópia do 6000 aqui) e o
+# de bytes que a lib lê do ambiente. A lib engole o rc do `git diff` (|| true): falha e vazio chegam iguais e viram "unknown",
+# nunca "fits". Roda em subshell (decide() chama por $(…)): os globais DIFF_* da lib não vazam para o resto da varredura.
+GAU_DIFF_RIG=""
+gau_git_diff() { "$GIT" -C "$GAU_DIFF_RIG" "$@"; }
+diff_fit() {
+  local rig="$1" br="$2" state
+  # ausente → "nolib" (inerte); a lib existe mas o git diff falhou ou voltou sem texto → "unknown" (inerte); só full vira "fits"
+  type gate_build_diff_payload >/dev/null 2>&1 || { printf 'nolib ? ? ? ?'; return 0; }
+  GAU_DIFF_RIG="$rig"
+  gate_build_diff_payload gau_git_diff "origin/main" "$br" "" 0 "${GATE_DIFF_LINE_BUDGET:-}" "" >/dev/null 2>&1
+  case "${DIFF_COVERAGE:-unknown}" in
+    full)    state=fits ;;
+    partial) state=over ;;
+    *)       state=unknown ;;
+  esac
+  printf '%s %s %s %s %s' "$state" "${DIFF_RAW_TOTAL_LINES:-?}" "${DIFF_RAW_TOTAL_BYTES:-?}" "${DIFF_LIMIT_LINES:-?}" "${DIFF_LIMIT_BYTES:-?}"
+}
+
 # ── as regras ──────────────────────────────────────────────────────────
 # decide <rig> <bead> <labels-multilinha> → imprime "Rn|explicação". Não
 # muta. <labels-multilinha> é a mesma lista já buscada por main() (ver
 # fetch_labels) — reusada aqui pra contar gate-sha-failed:* sem mais uma
 # chamada bd show.
+# Bead estacionada pelo dispatcher (ga-ph10ox5, ver "UM DÉCIMO ESTADO" no topo)
+# imprime "HOLD|…" (diff acima do teto) ou "SEM-MEDIDA|…" (não deu pra medir)
+# em vez de uma regra: nenhuma das duas muta, main() só registra e conta.
 decide() {
   local rig="$1" id="$2" labels="$3" br br_rc=0 tip last_fail_epoch verdict
 
@@ -734,6 +803,40 @@ decide() {
     | { read -r d; [ -n "${d:-}" ] || exit 0; date -j -f '%Y-%m-%dT%H:%M:%SZ' "$d" '+%s' 2>/dev/null || date -d "$d" '+%s' 2>/dev/null; })"
 
   tip="$(branch_tip_epoch "$rig" "$br")"
+
+  # ── ga-ph10ox5: bead ESTACIONADA pelo dispatcher (ga-5w2gpw) — ver "UM DÉCIMO ESTADO" no topo ──
+  # Se o ÚLTIMO evento do gate nesta bead é o estacionamento (o comentário não é mais velho que a última reprovação, ou não há
+  # reprovação), R2, R3 e R4 — as que tiram a trava e mandam a bead de volta — só agem se o diff ATUAL cabe; senão o dispatcher
+  # estacionaria de novo e o loop volta. R1 já passou (sem trabalho único não há o que medir); R5 só comenta e fica fora desta trava.
+  # vazio (nenhum comentário de estacionamento) → segue R2-R5 como antes; falhou/ilegível (jq sobre o JSON do bd show) → o mesmo
+  # vazio, mas a fonte é a MESMA de last_fail_epoch e verdict: o show que falhou já deixou R2 e R3 sem referência. Resta o R4, que
+  # só lê labels e nessa falha rara ainda pode agir — uma vez por ponta (ga-dv2gk) —, e a varredura seguinte já lê o park.
+  local park_ts park_epoch fit f_state f_lines f_bytes f_ll f_lb
+  park_ts="$(printf '%s' "$show_json" \
+    | jq -r --arg re "$GATE_PARK_RE" '[.[0].comments[]?|select((.text//"")|test($re))]|last|.created_at // empty' 2>/dev/null)"
+  if [ -n "$park_ts" ]; then
+    # vazio/ilegível (o date não leu o carimbo) → ordem DESCONHECIDA: o estacionamento conta como o mais recente e o diff é medido;
+    # nunca se presume que ele é antigo. Empate de carimbo (-ge) pelo mesmo motivo.
+    park_epoch="$(date -j -f '%Y-%m-%dT%H:%M:%SZ' "$park_ts" '+%s' 2>/dev/null || date -d "$park_ts" '+%s' 2>/dev/null)"
+    if [ -z "${last_fail_epoch:-}" ] || [ -z "${park_epoch:-}" ] || [ "$park_epoch" -ge "$last_fail_epoch" ] 2>/dev/null; then
+      # vazio/ilegível (diff_fit morreu sem imprimir a linha) → f_state fica vazio e cai no ramo "*" abaixo: SEM-MEDIDA, inerte
+      fit="$(diff_fit "$rig" "$br")"
+      read -r f_state f_lines f_bytes f_ll f_lb <<< "$fit"
+      case "${f_state:-}" in
+        fits) : ;;   # o dispatcher aceitaria de volta: R2-R5 decidem como sempre
+        over)
+          printf 'HOLD|o último evento do gate nesta bead é o estacionamento do dispatcher (ga-5w2gpw), não um veredito, e o diff de %s contra origin/main segue acima do teto (%s linhas / %s bytes medidos, teto %s linhas / %s bytes): R2, R3 e R4 não re-gateiam — o dispatcher estacionaria de novo (ga-ph10ox5); dividir a entrega ou decisão do Mayor' \
+            "$br" "${f_lines:-?}" "${f_bytes:-?}" "${f_ll:-?}" "${f_lb:-?}"
+          return 0 ;;
+        nolib)
+          printf 'SEM-MEDIDA|o último evento do gate nesta bead é o estacionamento do dispatcher (ga-5w2gpw) e não há régua para medir o diff de %s: gate-review-task.lib.sh ausente ou ilegível ao lado do script — R2, R3 e R4 ficam inertes (ga-ph10ox5), a próxima varredura tenta de novo' "$br"
+          return 0 ;;
+        *)
+          printf 'SEM-MEDIDA|o último evento do gate nesta bead é o estacionamento do dispatcher (ga-5w2gpw) e não consegui medir o diff de %s contra origin/main (git diff falhou ou voltou sem texto: base ou ref ausente, lock, rig indisponível) — não dá pra saber se o dispatcher aceitaria de volta; R2, R3 e R4 ficam inertes (ga-ph10ox5), a próxima varredura tenta de novo' "$br"
+          return 0 ;;
+      esac
+    fi
+  fi
 
   # R2 — branch mudou depois da reprovação.
   if [ -n "$tip" ] && [ -n "${last_fail_epoch:-}" ] && [ "$tip" -gt "$last_fail_epoch" ] 2>/dev/null; then
@@ -851,7 +954,7 @@ apply_and_report() {
 
 # ── varredura ──────────────────────────────────────────────────────────
 main() {
-  local rig id variant rule why n=0 acted=0 labels
+  local rig id variant rule why n=0 acted=0 labels held=0 unmeasured=0
   for rig in "$CITY" "${WA_RIG:-/Users/athos/gt/whatsapp_automation}" "${PS_RIG:-/Users/athos/gt/property_scrapers}"; do
     [ -d "$rig" ] || continue
     while IFS= read -r id; do
@@ -961,13 +1064,18 @@ main() {
           else
             say "FALHA R5 $id — bd comment falhou, escalação NÃO registrada no bead; verificar manualmente — $why"
           fi ;;
+        HOLD)
+          # ga-ph10ox5: inerte por desenho — nenhuma label, nenhum comentário; o Mayor já foi avisado pelo dispatcher ao estacionar.
+          say "HOLD $id — $why"; held=$((held+1)) ;;
+        SEM-MEDIDA)
+          say "SEM-MEDIDA $id — $why"; unmeasured=$((unmeasured+1)) ;;
         *)
           say "ERRO $id — decide() não devolveu regra (saída: '$rule')" ;;
       esac
     done < <("$BD" -C "$rig" list --json --limit 0 2>/dev/null \
               | jq -r '.[]|select(.status!="closed")|select((.labels//[])|any(startswith("gate:needs-human")))|.id' 2>/dev/null)
   done
-  say "gate-auto-unblock: $n travadas examinadas, $acted destravadas sem humano"
+  say "gate-auto-unblock: $n travadas examinadas, $acted destravadas sem humano, $held seguradas (estacionadas pelo dispatcher, diff acima do teto), $unmeasured sem medir o diff"
 }
 
 main "$@"

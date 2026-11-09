@@ -168,6 +168,17 @@ case "$SUBCMD" in
     fi
     exit 0
     ;;
+  diff)
+    # git -C <rig> diff origin/main...<branch> — a MEDIÇÃO do diff (ga-ph10ox5): diff.txt é o texto que o git devolveria.
+    # diff_fail (arquivo-gatilho): o git real sai !=0 sem texto (lock, ref ou base ausente) e a lib engole o rc — o terceiro
+    # estado "não consegui medir". Sem diff.txt o diff vem VAZIO, que a lib também lê como "não deu pra medir".
+    [ -f "$FX/diff_fail" ] && exit 128
+    # A FIAÇÃO também é conferida: o script tem que pedir a base E a ponta como refs de origin, com três pontos (merge-base..ponta).
+    # Outra forma sai 128, como um git real diante de um nome que não existe.
+    case "${@: -1}" in origin/main...origin/*) ;; *) exit 128 ;; esac
+    cat "$FX/diff.txt" 2>/dev/null
+    exit 0
+    ;;
 esac
 exit 0
 SH
@@ -1087,6 +1098,300 @@ if [ ! -s "$TMP/fx.ga-fykclp-dry/removed.log" ] && [ ! -s "$TMP/fx.ga-fykclp-dry
   ok "ga-fykclp: DRY_RUN=1 não remove next-action:mayor"
 else
   bad "ga-fykclp: DRY_RUN mutou" "$(cat "$TMP/fx.ga-fykclp-dry/removed.log" "$TMP/fx.ga-fykclp-dry/comments.log" 2>/dev/null)"
+fi
+
+# ── ga-ph10ox5: bead ESTACIONADA pelo dispatcher (ga-5w2gpw) não é re-gateada às cegas ───────────
+# CASO REAL (wa-nen4us, 09/11, 7037 linhas contra o teto de 6000): o Step 5c do dispatcher estaciona — marker em error,
+# gate:needs-human:technical, comentário "ga-5w2gpw PARKED before review" na bead — SEM veredito. O R2 comparava a ponta com o
+# ÚLTIMO FAIL (antigo: estacionar não é FAIL), casava sempre, tirava a trava e re-submetia: 4 voltas em 67 min, 8 mails ao Mayor,
+# ninguém agiu em 5 h. Commit novo não encolhe um diff acima do teto: o que decide se re-gatear adianta é o diff ATUAL caber.
+PK_FAIL_OLD='2026-11-06T10:00:00Z'; PK_FAIL_NEW='2026-11-08T10:00:00Z'; PK_PARK_AT='2026-11-09T05:38:00Z'
+PK_TIP=1794202200      # 2026-11-09T05:30:00Z: depois da reprovação antiga, antes do estacionamento
+PK_TIP_OLD=1793959200  # 2026-11-06T10:00:00Z: ANTES da reprovação de 08/11 (só R3/R4 agem sobre uma ponta que não mudou)
+cj() { jq -cn --arg t "$1" --arg x "$2" '{created_at:$t,text:$x}'; }   # um comentário, no formato do `bd show --json --include-comments`
+set_diff() { awk -v n="$1" -v w="${2:-20}" 'BEGIN { s = "+"; for (j = 1; j < w; j++) s = s "x"; for (i = 1; i <= n; i++) print s }' > "$FX/diff.txt"; }
+pk_inert() { [ ! -s "$FX/removed.log" ] && [ ! -s "$FX/comments.log" ]; }       # nenhuma label tocada, nenhum comentário postado
+pk_regra() { case "$OUT" in *"$1 $2 "*) return 0 ;; esac; return 1; }          # pk_regra R2 <id>: a linha "R2 <id> — …" está na saída
+
+# O texto do estacionamento NÃO é digitado aqui: sai do bloco REAL do Step 5c do dispatcher (as mesmas sentinelas SELFTEST-EXTRACT
+# do gate-e6d), rodado sob stubs. Assim o contrato "o que o dispatcher escreve é o que esta varredura reconhece" quebra AQUI, alto,
+# se alguém reescrever o comentário — e não em silêncio, no dia em que o loop voltar.
+DISPATCHER="$HERE/quality-gate-dispatcher.sh"; TASKLIB="$HERE/gate-review-task.lib.sh"
+sed -n '/^# SELFTEST-EXTRACT gate-diff-budget: BEGIN/,/^# SELFTEST-EXTRACT gate-diff-budget: END/p' "$DISPATCHER" > "$TMP/pk-budget.sh"
+sed -n '/^# SELFTEST-EXTRACT gate-diff-park: BEGIN/,/^# SELFTEST-EXTRACT gate-diff-park: END/p' "$DISPATCHER" > "$TMP/pk-block.sh"
+cat > "$TMP/pk-stubs.sh" <<'STUBS'
+git_rig() {
+  case "$*" in
+    "diff --stat "*) echo " 1 file changed"; return 0 ;;
+    "diff "*"...origin/"*) [ "${PK_GITFAIL:-0}" = "1" ] && return 1; awk -v n="$PK_LINES" 'BEGIN { for (i = 1; i <= n; i++) print "+xxxxxxxxxxxxxxxxxxxx" }'; return 0 ;;
+  esac
+  return 0
+}
+bd() { [ "${3:-}" = comment ] && [ "${4:-}" = "pk-bead" ] && printf '%s' "${@: -1}" > "$PK_OUT"; return 0; }
+gc() { return 0; }
+set_gate_status() { return 0; }
+gate_apply_needs_human() { echo armed; }
+gate_needs_human_clause() { echo "Auto-retry is now DISABLED (label gate:needs-human, verified applied); the Pilot will not re-dispatch it."; }
+log() { :; }; warn() { :; }; err() { :; }
+STUBS
+# pk_dispatcher_comment <linhas do diff> [PK_GITFAIL=1] → o comentário que o dispatcher posta na bead-fonte ao estacionar
+pk_dispatcher_comment() {
+  local out="$TMP/pk-bead-comment.$RANDOM"; : > "$out"
+  env PK_LINES="$1" PK_OUT="$out" ${2:+"$2"} TMP="$TMP" TASKLIB="$TASKLIB" bash -c '
+    set -euo pipefail
+    . "$TMP/pk-stubs.sh"; . "$TASKLIB"; . "$TMP/pk-budget.sh"
+    DEFAULT_BRANCH=main; BRANCH=fix/x; RIG=whatsapp_automation; RIG_PATH=/fake; GIT_DIR_PATH=/fake; IS_CONTAINER_RIG=0
+    MARKER_ID=pk-mk; BEAD_ID=pk-bead; BEAD_CITY=bead-city; GC_CITY=gc-city; AUTHOR=""; QG_LOG="$TMP/pk-qg.log"
+    CHANGED_FILES="f1.py"; DIFF_FILE_COUNT=1
+    . "$TMP/pk-block.sh"
+  ' >/dev/null 2>&1
+  cat "$out"
+}
+PK_TEXT="$(pk_dispatcher_comment 7037)"                       # diff grande demais (os 7037 do caso real)
+PK_TEXT_UNREAD="$(pk_dispatcher_comment 10 PK_GITFAIL=1)"     # a outra face do Step 5c: arquivos listados, diff que não se lê
+case "$PK_TEXT" in
+  "ga-5w2gpw PARKED before review (marker "*"GATE_DIFF_LINE_BUDGET"*)
+    ok "contrato: o bloco REAL do Step 5c posta na bead-fonte «ga-5w2gpw PARKED before review (marker …» (diff grande demais)";;
+  *) bad "contrato: não obtive o comentário de estacionamento do dispatcher (bloco Step 5c ausente ou reescrito) — o que esta varredura reconhece precisa ser o que ele escreve" "$PK_TEXT"
+     PK_TEXT='ga-5w2gpw PARKED before review (marker pk-mk): branch fix/x has a diff of 7037 lines (GATE_DIFF_LINE_BUDGET)';;
+esac
+case "$PK_TEXT_UNREAD" in
+  "ga-5w2gpw PARKED before review (marker "*"no readable diff"*) ok "contrato: o mesmo comentário abre o estacionamento por diff ilegível («has no readable diff»)";;
+  *) bad "contrato: o estacionamento por diff ilegível não começa por «ga-5w2gpw PARKED before review (marker …»" "$PK_TEXT_UNREAD"
+     PK_TEXT_UNREAD='ga-5w2gpw PARKED before review (marker pk-mk): branch fix/x has no readable diff';;
+esac
+
+PK_LABELS='["gate:needs-human","gate:needs-human:technical","gate-sha-failed:aaa:code"]'
+PK_COM="[$(cj "$PK_FAIL_OLD" 'VERDICT: FAIL blocking issue em lib/x.py'),$(cj "$PK_PARK_AT" "$PK_TEXT")]"
+
+# (1) O BUG: park de tamanho + ponta posterior a um FAIL antigo + diff acima do teto → R2 NÃO dispara. Duas varreduras seguidas:
+# a segunda é o loop de 20 min do caso real — tem que continuar segurando, sem consumir nada.
+setup wa-nen4us "$PK_LABELS" 'origin/fix/wa-nen4us-bh' '+ abc1234' "$PK_TIP" "$PK_COM"
+set_diff 21
+OUT="$(GATE_DIFF_LINE_BUDGET=20 run)"; OUT2="$(GATE_DIFF_LINE_BUDGET=20 run)"
+if pk_regra HOLD wa-nen4us && ! pk_regra R2 wa-nen4us && ! pk_regra R3 wa-nen4us && ! pk_regra R4 wa-nen4us && ! pk_regra R5 wa-nen4us \
+   && pk_inert \
+   && printf '%s' "$OUT" | grep -E '[1-9][0-9]* seguradas' >/dev/null && printf '%s' "$OUT" | grep -E ' 0 destravadas sem humano' >/dev/null; then
+  case "$OUT2" in *"HOLD wa-nen4us"*) ok "ga-ph10ox5: park de tamanho + ponta posterior ao FAIL antigo + diff acima do teto → R2 NÃO dispara: HOLD, nada tocado, segue segurando na 2ª varredura (wa-nen4us)";;
+    *) bad "ga-ph10ox5: a 2ª varredura parou de segurar" "OUT2=$OUT2";; esac
+else
+  bad "ga-ph10ox5: bead estacionada por tamanho com ponta posterior ao FAIL antigo foi re-gateada (o loop de wa-nen4us) — esperado HOLD, sem R2/R3/R4/R5 e sem tocar label nem comentário" \
+    "OUT=$OUT REMOVED=$(cat "$FX/removed.log" 2>/dev/null) COMMENT=$(cat "$FX/comments.log" 2>/dev/null)"
+fi
+
+# (2) o MESMO bead com o diff dentro do teto → R2 dispara (a trava só segura enquanto o diff não cabe).
+setup wa-pk-fits "$PK_LABELS" 'origin/fix/wa-pk-fits-x' '+ abc1234' "$PK_TIP" "$PK_COM"
+set_diff 10
+OUT="$(GATE_DIFF_LINE_BUDGET=20 run)"
+if pk_regra R2 wa-pk-fits && ! pk_regra HOLD wa-pk-fits && grep -q '^wa-pk-fits gate:needs-human' "$FX/removed.log"; then
+  ok "ga-ph10ox5: com o diff DENTRO do teto, R2 dispara e tira a trava (o branch encolheu: re-gatear volta a adiantar)"
+else
+  bad "ga-ph10ox5: diff que cabe tem que liberar o R2" "OUT=$OUT REMOVED=$(cat "$FX/removed.log" 2>/dev/null)"
+fi
+
+# (3) diff que NÃO se mede → não re-gateia (inerte) e CONTA como «não consegui medir». Os dois jeitos: o git falha (rc != 0) e o
+# git responde sem texto. "Não sei" nunca vira "cabe".
+setup wa-pk-diffail "$PK_LABELS" 'origin/fix/wa-pk-diffail-x' '+ abc1234' "$PK_TIP" "$PK_COM"
+touch "$FX/diff_fail"
+OUT="$(GATE_DIFF_LINE_BUDGET=20 run)"
+if pk_regra SEM-MEDIDA wa-pk-diffail && ! pk_regra R2 wa-pk-diffail && ! pk_regra HOLD wa-pk-diffail && pk_inert \
+   && printf '%s' "$OUT" | grep -E '[1-9][0-9]* sem medir' >/dev/null; then
+  ok "ga-ph10ox5: git diff FALHANDO → R2 não dispara, nada tocado, conta como «sem medir» (não vira «cabe»)"
+else
+  bad "ga-ph10ox5: diff que falhou ao medir tem que ficar inerte e contado, nunca liberar o R2" "OUT=$OUT"
+fi
+setup wa-pk-nodiff "$PK_LABELS" 'origin/fix/wa-pk-nodiff-x' '+ abc1234' "$PK_TIP" "$PK_COM"
+OUT="$(GATE_DIFF_LINE_BUDGET=20 run)"          # sem diff.txt: o git responde sem texto
+if pk_regra SEM-MEDIDA wa-pk-nodiff && ! pk_regra R2 wa-pk-nodiff && pk_inert; then
+  ok "ga-ph10ox5: git diff SEM texto (base ou ref ausente) → inerte e contado, não vira «cabe»"
+else
+  bad "ga-ph10ox5: diff sem texto não pode liberar o R2" "OUT=$OUT"
+fi
+
+# (4) sem a lib de medição ao lado do script não há como medir → inerte; com a lib, a MESMA cópia libera o R2 (o controle prova que
+# o resultado da cópia sem lib não é artefato da cópia).
+for v in nolib withlib; do mkdir -p "$TMP/$v"; cp "$HERE/gate-auto-unblock.sh" "$HERE/delivery-branch-patterns.sh" "$TMP/$v/"; done
+cp "$HERE/gate-review-task.lib.sh" "$TMP/withlib/"
+SCRIPT_REAL="$SCRIPT"
+setup wa-pk-nolib "$PK_LABELS" 'origin/fix/wa-pk-nolib-x' '+ abc1234' "$PK_TIP" "$PK_COM"
+set_diff 10
+SCRIPT="$TMP/nolib/gate-auto-unblock.sh"; OUT="$(GATE_DIFF_LINE_BUDGET=20 run)"
+if pk_regra SEM-MEDIDA wa-pk-nolib && ! pk_regra R2 wa-pk-nolib && pk_inert && printf '%s' "$OUT" | grep -i 'gate-review-task.lib.sh' >/dev/null; then
+  ok "ga-ph10ox5: sem gate-review-task.lib.sh ao lado → «sem medir» dizendo QUE a lib faltou, R2 não dispara mesmo com o diff pequeno"
+else
+  bad "ga-ph10ox5: sem a lib de medição o script não pode liberar o R2 (nem calar o motivo)" "OUT=$OUT"
+fi
+setup wa-pk-withlib "$PK_LABELS" 'origin/fix/wa-pk-withlib-x' '+ abc1234' "$PK_TIP" "$PK_COM"
+set_diff 10
+SCRIPT="$TMP/withlib/gate-auto-unblock.sh"; OUT="$(GATE_DIFF_LINE_BUDGET=20 run)"
+SCRIPT="$SCRIPT_REAL"
+if pk_regra R2 wa-pk-withlib; then ok "ga-ph10ox5: (controle) a mesma cópia COM a lib libera o R2 com o diff pequeno"; else bad "ga-ph10ox5: controle da cópia com a lib falhou" "OUT=$OUT"; fi
+# lib que carrega mas NÃO entrega a medição (função que falha sem dar cobertura): o terceiro estado de novo — inerte, nunca «cabe»
+mkdir -p "$TMP/badlib"; cp "$HERE/gate-auto-unblock.sh" "$HERE/delivery-branch-patterns.sh" "$TMP/badlib/"
+printf '%s\n' 'gate_build_diff_payload() { return 1; }' > "$TMP/badlib/gate-review-task.lib.sh"
+setup wa-pk-badlib "$PK_LABELS" 'origin/fix/wa-pk-badlib-x' '+ abc1234' "$PK_TIP" "$PK_COM"
+set_diff 10
+SCRIPT="$TMP/badlib/gate-auto-unblock.sh"; OUT="$(GATE_DIFF_LINE_BUDGET=20 run)"
+SCRIPT="$SCRIPT_REAL"
+if pk_regra SEM-MEDIDA wa-pk-badlib && ! pk_regra R2 wa-pk-badlib && pk_inert; then ok "ga-ph10ox5: lib que falha sem dar cobertura → «sem medir», inerte (a ausência de resposta nunca vira «cabe»)"; else bad "ga-ph10ox5: lib inútil liberou o R2" "OUT=$OUT"; fi
+
+# (5) «e qualquer regra que re-gateie»: sem R2 (ponta ANTES da reprovação de 08/11), o R3 redespacharia com a instrução do
+# veredito e o R4 escalaria o escopo — as duas tiram a trava, então o estacionamento tem que segurar as duas também.
+PK_COM_R3="[$(cj "$PK_FAIL_NEW" 'VERDICT: FAIL tests/test_pregao.py precisa da chave nova'),$(cj "$PK_PARK_AT" "$PK_TEXT")]"
+setup wa-pk-r3 '["gate:needs-human:technical","gate-sha-failed:a:code"]' 'origin/fix/wa-pk-r3-x' '+ eaf78abb' "$PK_TIP_OLD" "$PK_COM_R3"
+set_diff 21
+OUT="$(GATE_DIFF_LINE_BUDGET=20 run)"
+if pk_regra HOLD wa-pk-r3 && ! pk_regra R3 wa-pk-r3 && ! pk_regra R2 wa-pk-r3 && pk_inert; then
+  ok "ga-ph10ox5: o R3 também não re-gateia bead estacionada com o diff acima do teto (veredito antigo nomeando arquivo)"
+else
+  bad "ga-ph10ox5: R3 re-gateou uma bead estacionada por tamanho (o loop trocaria de regra, não acabaria)" "OUT=$OUT"
+fi
+setup wa-pk-r3ctl '["gate:needs-human:technical","gate-sha-failed:a:code"]' 'origin/fix/wa-pk-r3ctl-x' '+ eaf78abb' "$PK_TIP_OLD" "$PK_COM_R3"
+set_diff 10
+OUT="$(GATE_DIFF_LINE_BUDGET=20 run)"
+if pk_regra R3 wa-pk-r3ctl; then ok "ga-ph10ox5: (controle) a mesma bead com o diff pequeno cai no R3 — o cenário acima é mesmo território do R3"; else bad "ga-ph10ox5: controle do R3 falhou" "OUT=$OUT"; fi
+PK_LABELS_R4='["gate:needs-human:technical","gate-sha-failed:a:code","gate-sha-failed:b:code","gate-sha-failed:c:code"]'
+setup wa-pk-r4 "$PK_LABELS_R4" 'origin/fix/wa-pk-r4-x' '+ b40be47f' "$PK_TIP_OLD" "$PK_COM_R3"
+set_diff 21
+OUT="$(GATE_DIFF_LINE_BUDGET=20 run)"
+if pk_regra HOLD wa-pk-r4 && ! pk_regra R4 wa-pk-r4 && pk_inert; then
+  ok "ga-ph10ox5: o R4 também não age sobre bead estacionada com o diff acima do teto"
+else
+  bad "ga-ph10ox5: R4 agiu sobre uma bead estacionada por tamanho" "OUT=$OUT"
+fi
+setup wa-pk-r4ctl "$PK_LABELS_R4" 'origin/fix/wa-pk-r4ctl-x' '+ b40be47f' "$PK_TIP_OLD" "$PK_COM_R3"
+set_diff 10
+OUT="$(GATE_DIFF_LINE_BUDGET=20 run)"
+if pk_regra R4 wa-pk-r4ctl; then ok "ga-ph10ox5: (controle) a mesma bead com o diff pequeno cai no R4"; else bad "ga-ph10ox5: controle do R4 falhou" "OUT=$OUT"; fi
+
+# (6) CONTROLE NEGATIVO: o R2 clássico (FAIL de código + commit novo, SEM estacionamento) segue disparando — mesmo com um diff acima
+# do teto: a medição só é consultada quando o último evento do gate é um estacionamento.
+setup wa-pk-classic "$PK_LABELS" 'origin/fix/wa-pk-classic-x' '+ abc1234' "$PK_TIP" "[$(cj "$PK_FAIL_OLD" 'VERDICT: FAIL blocking issue em lib/x.py')]"
+set_diff 21
+OUT="$(GATE_DIFF_LINE_BUDGET=20 run)"
+if pk_regra R2 wa-pk-classic && ! pk_regra HOLD wa-pk-classic; then
+  ok "ga-ph10ox5: (controle negativo) FAIL de código + commit novo, sem estacionamento, segue disparando R2 — mesmo com diff grande"
+else
+  bad "ga-ph10ox5: o R2 clássico parou de disparar" "OUT=$OUT"
+fi
+
+# (7) a ORDEM importa: estacionamento mais VELHO que a última reprovação não segura nada (houve revisão depois dele).
+setup wa-pk-stale "$PK_LABELS" 'origin/fix/wa-pk-stale-x' '+ abc1234' "$PK_TIP" "[$(cj "$PK_FAIL_OLD" "$PK_TEXT"),$(cj "$PK_FAIL_NEW" 'VERDICT: FAIL blocking issue em lib/x.py')]"
+set_diff 21
+OUT="$(GATE_DIFF_LINE_BUDGET=20 run)"
+if pk_regra R2 wa-pk-stale && ! pk_regra HOLD wa-pk-stale; then
+  ok "ga-ph10ox5: estacionamento mais velho que a última reprovação não segura o R2 (o último evento foi um veredito)"
+else
+  bad "ga-ph10ox5: estacionamento VELHO segurou o R2" "OUT=$OUT"
+fi
+# …e no mesmo instante (ordem indecidível) o lado seguro é segurar; carimbo ilegível idem: nunca presumir que o park é antigo.
+setup wa-pk-tie "$PK_LABELS" 'origin/fix/wa-pk-tie-x' '+ abc1234' "$PK_TIP" "[$(cj "$PK_FAIL_NEW" 'VERDICT: FAIL blocking issue em lib/x.py'),$(cj "$PK_FAIL_NEW" "$PK_TEXT")]"
+set_diff 21
+OUT="$(GATE_DIFF_LINE_BUDGET=20 run)"
+if pk_regra HOLD wa-pk-tie && ! pk_regra R2 wa-pk-tie; then ok "ga-ph10ox5: estacionamento e reprovação no MESMO instante → segura (a ordem não se decide, o lado inerte vence)"; else bad "ga-ph10ox5: empate de carimbo liberou o R2" "OUT=$OUT"; fi
+setup wa-pk-garbage "$PK_LABELS" 'origin/fix/wa-pk-garbage-x' '+ abc1234' "$PK_TIP" "[$(cj "$PK_FAIL_OLD" 'VERDICT: FAIL blocking issue em lib/x.py'),$(cj 'ontem de manhã' "$PK_TEXT")]"
+set_diff 21
+OUT="$(GATE_DIFF_LINE_BUDGET=20 run)"
+if pk_regra HOLD wa-pk-garbage && ! pk_regra R2 wa-pk-garbage; then ok "ga-ph10ox5: carimbo do estacionamento ILEGÍVEL → mede e segura (não presume que é antigo)"; else bad "ga-ph10ox5: carimbo ilegível liberou o R2" "OUT=$OUT"; fi
+
+# …o ÚLTIMO estacionamento é o que vale (dois: um de antes da reprovação de 08/11, outro depois) e quem só CITA a frase no meio de
+# outro comentário não estaciona nada (o padrão é ancorado no começo do texto).
+setup wa-pk-two "$PK_LABELS" 'origin/fix/wa-pk-two-x' '+ abc1234' "$PK_TIP" "[$(cj "$PK_FAIL_OLD" "$PK_TEXT"),$(cj "$PK_FAIL_NEW" 'VERDICT: FAIL blocking issue em lib/x.py'),$(cj "$PK_PARK_AT" "$PK_TEXT")]"
+set_diff 21
+OUT="$(GATE_DIFF_LINE_BUDGET=20 run)"
+if pk_regra HOLD wa-pk-two && ! pk_regra R2 wa-pk-two; then ok "ga-ph10ox5: com dois estacionamentos vale o ÚLTIMO (o de depois da reprovação segura)"; else bad "ga-ph10ox5: o estacionamento mais novo tem que valer" "OUT=$OUT"; fi
+setup wa-pk-quote "$PK_LABELS" 'origin/fix/wa-pk-quote-x' '+ abc1234' "$PK_TIP" "[$(cj "$PK_FAIL_OLD" 'VERDICT: FAIL blocking issue em lib/x.py'),$(cj "$PK_PARK_AT" "Mayor: reli o comentário «ga-5w2gpw PARKED before review (marker m): …» da outra bead; esta aqui só mudou de ponta")]"
+set_diff 21
+OUT="$(GATE_DIFF_LINE_BUDGET=20 run)"
+if pk_regra R2 wa-pk-quote && ! pk_regra HOLD wa-pk-quote; then ok "ga-ph10ox5: um comentário que só CITA a frase do estacionamento no meio do texto não conta como estacionamento"; else bad "ga-ph10ox5: citação da frase foi lida como estacionamento" "OUT=$OUT"; fi
+
+# (8) sem NENHUM FAIL na bead (nunca foi revisada): o estacionamento é o último evento. Acima do teto segura (em vez do R5 que
+# diria «nenhum veredito FAIL encontrado… label espúrio», mentira aqui); com diff que cabe, nada muda: R5 como sempre.
+setup wa-pk-nofail '["gate:needs-human:technical"]' 'origin/fix/wa-pk-nofail-x' '+ abc1234' "$PK_TIP" "[$(cj "$PK_PARK_AT" "$PK_TEXT")]"
+set_diff 21
+OUT="$(GATE_DIFF_LINE_BUDGET=20 run)"
+if pk_regra HOLD wa-pk-nofail && ! pk_regra R5 wa-pk-nofail && pk_inert; then ok "ga-ph10ox5: bead nunca revisada e estacionada por tamanho → HOLD, não o R5 com texto de «label espúrio»"; else bad "ga-ph10ox5: bead estacionada sem FAIL tem que segurar" "OUT=$OUT"; fi
+setup wa-pk-nofailfit '["gate:needs-human:technical"]' 'origin/fix/wa-pk-nofailfit-x' '+ abc1234' "$PK_TIP" "[$(cj "$PK_PARK_AT" "$PK_TEXT")]"
+set_diff 10
+OUT="$(GATE_DIFF_LINE_BUDGET=20 run)"
+if pk_regra R5 wa-pk-nofailfit && ! pk_regra HOLD wa-pk-nofailfit; then ok "ga-ph10ox5: (controle) sem FAIL e com diff que cabe o caminho antigo segue: R5"; else bad "ga-ph10ox5: sem FAIL e diff pequeno devia seguir pro R5" "OUT=$OUT"; fi
+
+# (9) a MESMA régua do dispatcher, nos defaults da lib (nenhuma cópia do 6000 aqui): 6000 linhas cabem, 6001 não.
+setup wa-pk-d6000 "$PK_LABELS" 'origin/fix/wa-pk-d6000-x' '+ abc1234' "$PK_TIP" "$PK_COM"
+set_diff 6000
+OUT="$(run)"
+if pk_regra R2 wa-pk-d6000 && ! pk_regra HOLD wa-pk-d6000; then ok "ga-ph10ox5: teto padrão — um diff de EXATAMENTE 6000 linhas cabe (R2 libera)"; else bad "ga-ph10ox5: 6000 linhas é o teto, cabe" "OUT=$OUT"; fi
+setup wa-pk-d6001 "$PK_LABELS" 'origin/fix/wa-pk-d6001-x' '+ abc1234' "$PK_TIP" "$PK_COM"
+set_diff 6001
+OUT="$(run)"
+if pk_regra HOLD wa-pk-d6001 && ! pk_regra R2 wa-pk-d6001; then ok "ga-ph10ox5: teto padrão — 6001 linhas já NÃO cabem (HOLD), a mesma régua do dispatcher"; else bad "ga-ph10ox5: 6001 linhas passam do teto padrão" "OUT=$OUT"; fi
+# o teto de BYTES também conta (poucas linhas, muito largas), e um teto de ambiente ilegível volta ao padrão — nunca a «sem teto»
+setup wa-pk-bytes "$PK_LABELS" 'origin/fix/wa-pk-bytes-x' '+ abc1234' "$PK_TIP" "$PK_COM"
+set_diff 10 200
+OUT="$(GATE_DIFF_BYTE_BUDGET=1000 run)"
+if pk_regra HOLD wa-pk-bytes && ! pk_regra R2 wa-pk-bytes; then ok "ga-ph10ox5: o teto de BYTES também segura (10 linhas de 200 bytes contra GATE_DIFF_BYTE_BUDGET=1000)"; else bad "ga-ph10ox5: teto de bytes ignorado" "OUT=$OUT"; fi
+setup wa-pk-garbbud "$PK_LABELS" 'origin/fix/wa-pk-garbbud-x' '+ abc1234' "$PK_TIP" "$PK_COM"
+set_diff 21
+OUT="$(GATE_DIFF_LINE_BUDGET=abc run)"
+if pk_regra R2 wa-pk-garbbud && ! pk_regra HOLD wa-pk-garbbud; then ok "ga-ph10ox5: GATE_DIFF_LINE_BUDGET ilegível volta ao teto padrão da lib (21 linhas cabem), não vira «teto zero»"; else bad "ga-ph10ox5: teto ilegível tem que cair no padrão" "OUT=$OUT"; fi
+
+# (10) a outra face do Step 5c — estacionada porque o diff NÃO SE LIA: o mesmo critério, só um diff medido e inteiro libera.
+PK_COM_UNREAD="[$(cj "$PK_FAIL_OLD" 'VERDICT: FAIL blocking issue em lib/x.py'),$(cj "$PK_PARK_AT" "$PK_TEXT_UNREAD")]"
+setup wa-pk-unread "$PK_LABELS" 'origin/fix/wa-pk-unread-x' '+ abc1234' "$PK_TIP" "$PK_COM_UNREAD"
+touch "$FX/diff_fail"
+OUT="$(GATE_DIFF_LINE_BUDGET=20 run)"
+if pk_regra SEM-MEDIDA wa-pk-unread && ! pk_regra R2 wa-pk-unread && pk_inert; then ok "ga-ph10ox5: estacionada por diff ilegível e o diff segue ilegível → inerte e contado"; else bad "ga-ph10ox5: park por diff ilegível, ainda ilegível, não pode re-gatear" "OUT=$OUT"; fi
+setup wa-pk-unreadok "$PK_LABELS" 'origin/fix/wa-pk-unreadok-x' '+ abc1234' "$PK_TIP" "$PK_COM_UNREAD"
+set_diff 10
+OUT="$(GATE_DIFF_LINE_BUDGET=20 run)"
+if pk_regra R2 wa-pk-unreadok; then ok "ga-ph10ox5: estacionada por diff ilegível e agora o diff se lê e cabe → R2 libera"; else bad "ga-ph10ox5: diff que voltou a ler e cabe tem que liberar o R2" "OUT=$OUT"; fi
+
+# (11) DRY_RUN não muda nada no caminho do HOLD (a decisão sai no log, a bead fica como está)
+setup wa-pk-dry "$PK_LABELS" 'origin/fix/wa-pk-dry-x' '+ abc1234' "$PK_TIP" "$PK_COM"
+set_diff 21
+OUT="$(DRY_RUN=1 GATE_DIFF_LINE_BUDGET=20 run)"
+if pk_regra HOLD wa-pk-dry && pk_inert; then ok "ga-ph10ox5: DRY_RUN=1 mantém o HOLD sem tocar em nada"; else bad "ga-ph10ox5: DRY_RUN no HOLD" "OUT=$OUT"; fi
+
+# (12) git REAL de ponta a ponta: repo + origin de verdade, com refs/remotes/origin/{main,fix/…} como no rig. O shim devolve o diff
+# pronto e só prova a fiação pela FORMA do argumento; aqui o git é o de verdade (cherry, for-each-ref, git diff A...B) e o diff
+# medido tem que ser o do repo: 30 linhas de arquivo novo = 36 linhas de diff.
+GIT_REAL="$(PATH="$_SANDBOX_SYSTEM_DIRS:/usr/local/bin:/opt/homebrew/bin" command -v git 2>/dev/null)"
+PK_REPO="$TMP/pk-real"; PK_REAL_OK=0
+if [ -n "$GIT_REAL" ]; then
+  pk_git() { "$GIT_REAL" -c user.email=t@example.invalid -c user.name=t -c commit.gpgsign=false "$@"; }
+  mkdir -p "$PK_REPO" \
+    && pk_git init -q --bare "$PK_REPO/origin.git" && pk_git init -q "$PK_REPO/work" \
+    && pk_git -C "$PK_REPO/work" symbolic-ref HEAD refs/heads/main \
+    && echo base > "$PK_REPO/work/base.txt" && pk_git -C "$PK_REPO/work" add -A && pk_git -C "$PK_REPO/work" commit -q -m base \
+    && pk_git -C "$PK_REPO/work" remote add origin "$PK_REPO/origin.git" && pk_git -C "$PK_REPO/work" push -q origin main \
+    && pk_git -C "$PK_REPO/work" checkout -q -b fix/wa-pk-real-x \
+    && awk 'BEGIN { for (i = 1; i <= 30; i++) print "line " i " xxxxxxxxxxxxxxxx" }' > "$PK_REPO/work/big.txt" \
+    && pk_git -C "$PK_REPO/work" add -A && pk_git -C "$PK_REPO/work" commit -q -m big \
+    && pk_git -C "$PK_REPO/work" push -q origin fix/wa-pk-real-x && pk_git -C "$PK_REPO/work" fetch -q origin \
+    && PK_REAL_OK=1
+fi
+run_real() {
+  GC_CITY_PATH="$PK_REPO/work" WA_RIG="$PK_REPO/work" PS_RIG="$PK_REPO/work" \
+  GATE_AUTO_UNBLOCK_LOG="$TMP/log" GATE_AUTO_UNBLOCK_LOCK="$TMP/gate-auto-unblock.lock" \
+  BD=bd GIT="$GIT_REAL" bash "$SCRIPT" 2>&1
+}
+if [ "$PK_REAL_OK" = "1" ]; then
+  setup wa-pk-real "$PK_LABELS" '' '' '' "$PK_COM"
+  OUT="$(GATE_DIFF_LINE_BUDGET=20 run_real)"
+  if pk_regra HOLD wa-pk-real && ! pk_regra R2 wa-pk-real && pk_inert && printf '%s' "$OUT" | grep -F '36 linhas' >/dev/null; then
+    ok "ga-ph10ox5: git REAL — o diff de 30 linhas novas mede 36 e passa do teto 20: HOLD, nada tocado"
+  else
+    bad "ga-ph10ox5: git real, diff acima do teto, tinha que segurar medindo 36 linhas" "OUT=$OUT"
+  fi
+  setup wa-pk-real "$PK_LABELS" '' '' '' "$PK_COM"
+  OUT="$(GATE_DIFF_LINE_BUDGET=100 run_real)"
+  if pk_regra R2 wa-pk-real && ! pk_regra HOLD wa-pk-real && grep -q '^wa-pk-real gate:needs-human' "$FX/removed.log"; then
+    ok "ga-ph10ox5: git REAL — o mesmo branch com o teto em 100 cabe: R2 libera"
+  else
+    bad "ga-ph10ox5: git real, diff dentro do teto, tinha que liberar o R2" "OUT=$OUT"
+  fi
+else
+  bad "ga-ph10ox5: não consegui montar o repo git real (git='$GIT_REAL') — o cenário de ponta a ponta não rodou"
 fi
 
 # ── kill switch ────────────────────────────────────────────────────────
