@@ -6,6 +6,7 @@
 #
 # O QUE É SIMULADO  launchctl (list/kickstart), ps (por PID e a lista -ax do Safari), footprint, top (bw-serve), osascript (quit do Safari), secret (prova do cofre), sleep (modo lento), curl (API do demand-dashboard e as portas), df e sysctl são shims no PATH; os bancos de ligação são sqlite REAIS e temporários (o shim do sqlite3 só impõe a regra do mini: `-readonly` não abre banco WAL sem -wal/-shm)
 #   (pix_call_log e voicebot_call_log); o restart guardado, o deploy_freeze e o relógio do disco (arquivos DR_FREE_MB_FILE / DR_SWAP_MB_FILE) são stubs. Nada real é reiniciado, pausado ou enviado.
+#   A trava da rodada da campanha é um flock REAL: um processo python vivo a toma como o campanha_diaria_loop; o python3 que o D3 chama é o de verdade, atrás de um shim que só injeta falha, lentidão ou mudez.
 # O QUE É VERIFICADO  saída = UMA linha, ASCII, ≤ 290, nada antes dela (stdout+stderr juntos, como o maestro lê) e rc 0/10/20/30/2 em cada cenário · fronteiras (livre 4608/4609, idade 3599/3600 s,
 #   footprint 99/100 MB, janela de ligação 1799/1801 s) · ordem por footprint e parada ao recuperar · só labels da allowlist · cada guarda de ligação (pix dialing/bridged, voicebot live, banco
 #   ausente/corrompido/sem tabela = não sei), e a guarda de novo ENTRE um daemon e o seguinte · freeze (congelado, livre, ilegível) · prova do restart (PID novo + porta; kickstart que falha,
@@ -16,7 +17,9 @@
 #   interruptor · dry-run sem efeito colateral · df/swap lidos do jeito certo (nunca `df /`) e ilegíveis = 30 · variável numérica inválida · rotação do log · bancos só lidos (também WAL sem -wal/-shm, que o sqlite3 do mini não abre com -readonly: shim) ·
 #   (ga-1p1i5jr.7) Safari: só o executável Safari.app/.../Safari, idade 7199/7200 s, prova de que saiu, falha não para o resto e não repete por 6 h, lista de processos vazia/ilegível ≠ fechado ·
 #   bw-serve: MEM+CMPRS 800/801 MB e unidades do top, idade 21599/21600 s, secret antes e depois (valor nunca lido), ordem Safari → bw-serve → daemons ·
-#   label ausente ≠ domínio errado · "D3 retomou o envio" na linha · sobra de pausa desfeita antes de ler o disco · teto de tempo em segundos de relógio.
+#   label ausente ≠ domínio errado · "D3 retomou o envio" na linha · sobra de pausa desfeita antes de ler o disco · teto de tempo em segundos de relógio ·
+#   (ga-13qui1k) rodada da campanha em curso: o demand-dashboard (e só ele) espera a trava; tomada = pula, livre/ausente/dono morto (corpo velho no arquivo) = age, ilegível (diretório, ENOTDIR, python3 quebrado/travado/calado) = pula e conta
+#   como "não consegui ler"; relida imediatamente antes de agir (rodada que começa depois do scan); a leitura não cria nem muda nada e não deixa a trava tomada; caminho padrão; pior caso do orçamento.
 # COMO RODAR      bash scripts/disk-recovery-d3-ram-daemons.selftest.sh        (~1-3 min)
 #   Para testar uma cópia modificada do degrau (mutantes): DR_D3_PATH=/caminho/disk-recovery-d3-ram-daemons.mutN.sh ST_FAILFAST=1 bash scripts/disk-recovery-d3-ram-daemons.selftest.sh  (ST_FAILFAST=1 sai no 1º FAIL com rc 1)
 set -uo pipefail
@@ -35,6 +38,7 @@ trap cleanup EXIT
 SD="$W/sd"; BIN="$W/bin"; CITY="$W/city"; WA="$W/wa"; PIX="$W/pix.db"; VOICE="$W/voice.db"
 LOG="$CITY/.gc/logs/disk-recovery-d3.log"; LOCK="$CITY/.gc/disk-recovery-d3.lock"; OFF="$CITY/.gc/disk-recovery.off"; STAMP="$CITY/.gc/disk-recovery-d3-safari-fail.stamp"
 mkdir -p "$BIN" "$W/tmp" "$W/home" "$WA"
+RLD="$W/rl"; RLOCK="$RLD/round.lock"; HOLDER=""   # a trava (flock) da rodada da campanha: nasce AUSENTE em cada cenario (reset); rl_hold a toma de verdade; todo run_d3 aponta o D3 para ela (nunca para o /tmp real da maquina)
 PASS=0; FAIL=0; OUT=""; RC=0; EXTRA_ENV=""
 ok()   { PASS=$((PASS+1)); printf 'ok   - %s\n' "$1"; }
 nope() {
@@ -215,6 +219,18 @@ if [ "$ro" = 1 ]; then for a in "$@"; do
 done; fi
 PATH="${PATH#"${0%/*}":}" exec sqlite3 "$@"
 SH
+cat > "$BIN/python3" <<'SH'
+#!/bin/bash
+# a trava da rodada e lida por um python3 DE VERDADE (flock real); python3.fail = interpretador quebrado (rc 1), python3.slow = trava (o stub do Xcode CLT pedindo instalacao, por exemplo),
+# python3.mute = sai com o rc do arquivo SEM rodar nem dizer nada (programa vazio, wrapper); python3.trace = nao le nada: anota o caminho da trava que recebeu (ultimo argumento) e diz «livre» (rc 10), para provar o caminho
+# padrao sem tocar no /tmp real da maquina
+S="$STUB_DIR"; echo "python3 probe" >> "$S/calls"
+[ -f "$S/python3.fail" ] && { echo "python3: interpretador quebrado" >&2; exit 1; }
+[ -f "$S/python3.slow" ] && exec /bin/sleep 30
+[ -f "$S/python3.mute" ] && exit "$(cat "$S/python3.mute")"
+[ -f "$S/python3.trace" ] && { echo "python3 trava ${*: -1}" >> "$S/calls"; echo livre; exit 10; }
+PATH="${PATH#"${0%/*}":}" exec python3 "$@"
+SH
 chmod 755 "$BIN"/*
 cat > "$W/guarded" <<'SH'
 #!/bin/bash
@@ -242,6 +258,31 @@ rc=10; [ -f "$STUB_DIR/freeze.$label" ] && rc=$(cat "$STUB_DIR/freeze.$label")
 exit "$rc"
 SH
 chmod 755 "$W/guarded" "$W/freeze"
+# o dono da trava da rodada, como o campanha_diaria_loop (lib/cdp_driver_lock.py do whatsapp_automation): flock EXCLUSIVO num processo vivo e o corpo «pid=… holder=… since=…» no arquivo; quando o dono morre o kernel solta o flock e o corpo FICA
+cat > "$W/holder.py" <<'PY'
+import fcntl, os, sys, time
+path, ready = sys.argv[1], sys.argv[2]
+go = sys.argv[3] if len(sys.argv) > 3 else ""
+try:
+    while go and not os.path.exists(go):
+        time.sleep(0.05)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
+    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    os.ftruncate(fd, 0)
+    os.write(fd, ("pid=%d holder=selftest since=%s\n" % (os.getpid(), time.strftime("%Y-%m-%dT%H:%M:%S"))).encode())
+    open(ready, "w").close()
+    time.sleep(600)
+except Exception:
+    sys.exit(3)
+PY
+cat > "$W/trylock.py" <<'PY'
+import fcntl, sys
+try:
+    fcntl.flock(open(sys.argv[1], "rb"), fcntl.LOCK_EX | fcntl.LOCK_NB)
+except Exception:
+    sys.exit(1)
+PY
 
 # ── cenário ─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
 mkdbs() {
@@ -262,8 +303,17 @@ addbw()     { printf 'com.gastown.bw-serve %s %s 1 MB\n' "$1" "$2" >> "$SD/procs
 hookbw()    { printf '%s\n' "$*" > "$SD/hook.bw.sh"; printf 'hook="bash %s/hook.bw.sh"\n' "$SD" >> "$SD/kick.com.gastown.bw-serve"; }     # efeito colateral depois do kickstart do bw-serve
 seqall()    { printf '%s\n' "$CALLS" | awk '/^osascript/ {printf "O,"} /^secret/ {printf "S,"} /^kickstart/ {sub(/.*gui\/[0-9]+\//, ""); sub(/com\.whatsapp\./, ""); sub(/com\.gastown\./, ""); printf "%s,", $0} /^guarded/ {printf "G,"}'; }
 alloff()    { local l; for l in demand-dashboard map-viewer ficha360 clientes-dashboard; do setproc $l 2 -; done; }                       # todos os daemons da allowlist parados
+rl_drop() { if [ -n "$HOLDER" ]; then kill "$HOLDER" 2>/dev/null; wait "$HOLDER" 2>/dev/null; BG_PIDS="${BG_PIDS/ $HOLDER/}"; fi; HOLDER=""; }   # morrer solta o flock (o corpo do arquivo fica); tira o PID da lista do cleanup (PID reusado)
+rl_wait() { local _; for _ in $(seq 1 100); do [ -f "$W/holder.ready" ] && return 0; sleep 0.1; done; return 1; }
+rl_hold() {  # [$1=arquivo-go]. Sem $1 so volta com a trava TOMADA; com $1 o dono espera o arquivo aparecer para toma-la (uma rodada que comeca no meio do D3)
+  rl_drop; rm -f "$W/holder.ready"
+  python3 -I "$W/holder.py" "$RLOCK" "$W/holder.ready" ${1:+"$1"} </dev/null >/dev/null 2>&1 &
+  HOLDER=$!; BG_PIDS="$BG_PIDS $HOLDER"
+  [ -n "${1:-}" ] || rl_wait || nope "o dono da trava da rodada nao subiu"
+}
+rl_free() { python3 -I "$W/trylock.py" "$RLOCK"; }   # rc 0 = a trava esta LIVRE agora (um flock EXCLUSIVO nao-bloqueante pegou, e foi solto ao sair)
 reset() {
-  rm -rf "$SD" "$CITY"; mkdir -p "$SD" "$CITY/.gc/logs" "$W/tmp"; rm -f "$W/tmp"/* 2>/dev/null
+  rl_drop; rm -rf "$SD" "$CITY" "$RLD"; mkdir -p "$SD" "$CITY/.gc/logs" "$W/tmp"; rm -f "$W/tmp"/* 2>/dev/null
   cat > "$SD/procs" <<'EOF'
 com.whatsapp.demand-dashboard 1001 05:00:00 500 MB
 com.whatsapp.map-viewer 1002 02:10:04 700 MB
@@ -281,7 +331,7 @@ EOF
 run_d3() {
   [ $# -gt 0 ] || set -- --run
   OUT=$(env -i HOME="$W/home" PATH="$BIN:/usr/bin:/bin:/usr/sbin:/sbin" TMPDIR="$W/tmp" STUB_DIR="$SD" \
-      DR_CITY="$CITY" DR_D3_WA="$WA" DR_D3_PIX_DB="$PIX" DR_D3_VOICE_DB="$VOICE" DR_D3_GUARDED="$W/guarded" DR_D3_FREEZE_CMD="$W/freeze" \
+      DR_CITY="$CITY" DR_D3_WA="$WA" DR_D3_PIX_DB="$PIX" DR_D3_VOICE_DB="$VOICE" DR_D3_GUARDED="$W/guarded" DR_D3_FREEZE_CMD="$W/freeze" DR_D3_ROUND_LOCK="$RLOCK" \
       DR_FREE_MB_FILE="$SD/free" DR_SWAP_MB_FILE="$SD/swap" DR_D3_SETTLE_S=0 DR_D3_READY_S=3 DR_D3_DRAIN_S=3 DR_D3_DESPAUSE_S=3 DR_D3_GUARD_SLACK_S=2 DR_D3_CMD_S=5 DR_D3_CURL_S=2 \
       $EXTRA_ENV "$D3" "$@" 2>&1); RC=$?
   # um host sem o locale pedido em EXTRA_ENV (o nó Linux não tem pt_BR.UTF-8) faz o bash avisar 'setlocale: cannot change locale' em stderr antes de o script rodar: ruído do host, não do D3
@@ -440,10 +490,67 @@ reset; printf '1|disk-recovery-d3: restart guardado ga-1p1i5jr.3' > "$SD/dd_conf
 eq "$(cat "$SD/dd_config" | cut -c1-2)" "1|" "dry-run NAO despausa"; eq "$(npatch)" 0 "dry-run: nenhum PATCH"
 reset; printf '1|athos: parada' > "$SD/dd_config"; printf '9000' > "$SD/free"; run_d3; eq "$(cat "$SD/dd_config")" "1|athos: parada" "pausa de outro dono no inicio: nao tocada"
 
+section "rodada da campanha em curso: o demand-dashboard espera a trava (flock) da rodada diaria (ga-13qui1k; 08/11 20:39 o D3 o reiniciou no meio da rodada das 20:15)"
+# trava TOMADA por um processo vivo, como o campanha_diaria_loop a toma: o demand-dashboard fica de fora, os outros agem, a linha e o log dizem por que
+reset; rl_hold; run_d3
+expect 0 "demand-dashboard (rodada da campanha em curso)" "trava da rodada tomada: o demand-dashboard e pulado e a linha diz por que"
+eq "$(kicks)" "map-viewer,ficha360," "trava tomada: so os outros daemons sao reiniciados (nem guardado nem kickstart do demand-dashboard)"
+hasnt "$CALLS" "guarded" "trava tomada: o restart guardado nao e chamado (a fila nem chega a ser pausada)"; eq "$(npatch)" 0 "trava tomada: nenhum PATCH na fila"
+has "$(cat "$LOG")" "pulo demand-dashboard: rodada da campanha em curso" "trava tomada: o motivo vai no log"; lockgone "trava tomada"
+reset; rl_hold; before=$(cksum < "$RLOCK"); run_d3 >/dev/null; after=$(cksum < "$RLOCK")
+case "$before" in *[0-9]*) eq "$after" "$before" "trava tomada: a leitura nao muda um byte do arquivo (o corpo e a identidade do dono)" ;; *) nope "trava tomada: cksum nao devolveu soma (teste vazio)" ;; esac
+if rl_free; then nope "trava tomada: depois da leitura do D3 o dono perdeu a trava"; else ok "trava tomada: o dono segue com a trava depois da leitura do D3"; fi
+# trava LIVRE (o arquivo existe e ninguem o segura; ou o dono morreu e o corpo ficou; ou nunca houve rodada): o comportamento de sempre, e a leitura nao deixa a trava tomada
+reset; mkdir -p "$RLD"; : > "$RLOCK"; run_d3
+expect 0 "reiniciei map-viewer" "arquivo da trava existe e ninguem a segura: livre"; eq "$(kicks)" "map-viewer,G,demand-dashboard,ficha360," "trava livre: o demand-dashboard e reiniciado pelo guardado, na ordem de sempre"
+has "$CALLS" "python3 probe" "trava livre: a trava foi lida (livre por ter olhado, nao por nao ter olhado)"
+if rl_free; then ok "trava livre: a leitura do D3 nao deixa a trava tomada (a rodada das 20:15 nao perde a vez)"; else nope "trava livre: depois do D3 a trava ficou tomada"; fi
+reset; rl_hold; rl_drop
+[ -s "$RLOCK" ] && ok "dono morto: o corpo «pid=… holder=…» ficou no arquivo" || nope "dono morto: o arquivo nao guarda o corpo do dono (teste vazio)"
+run_d3; expect 0 "reiniciei map-viewer" "dono da trava morto (o kernel solta o flock, o corpo fica): livre"; eq "$(kicks)" "map-viewer,G,demand-dashboard,ficha360," "dono morto: o demand-dashboard e reiniciado (corpo velho nao conta como rodada em curso)"
+reset; run_d3; expect 0 "reiniciei map-viewer" "trava ausente (pasta e arquivo; ENOENT): nenhuma rodada a tomou, livre"; eq "$(kicks)" "map-viewer,G,demand-dashboard,ficha360," "trava ausente: o demand-dashboard e reiniciado"
+[ ! -e "$RLD" ] && ok "trava ausente: a leitura nao cria a pasta nem o arquivo" || nope "trava ausente: o D3 criou $RLD"
+reset; mkdir -p "$RLD"; run_d3; has "$(kicks)" "G,demand-dashboard" "pasta da trava sem o arquivo (ENOENT): livre"; [ ! -e "$RLOCK" ] && ok "pasta sem arquivo: a leitura nao cria o arquivo" || nope "o D3 criou $RLOCK"
+# ilegivel NUNCA vira «livre»: o demand-dashboard fica de fora (os outros agem) e a linha diz «trava da rodada ilegivel»
+reset; mkdir -p "$RLOCK"; run_d3
+expect 0 "demand-dashboard (trava da rodada ilegivel)" "trava que e um DIRETORIO (nao e arquivo comum): ilegivel, o demand-dashboard e pulado"; eq "$(kicks)" "map-viewer,ficha360," "trava ilegivel: so os outros daemons sao reiniciados"
+has "$(cat "$LOG")" "trava da rodada ($RLOCK) ilegivel: rc=99 nao e arquivo comum" "diretorio: a causa vai no log"
+reset; : > "$W/arquivo-comum"; EXTRA_ENV="DR_D3_ROUND_LOCK=$W/arquivo-comum/round.lock"; run_d3
+expect 0 "demand-dashboard (trava da rodada ilegivel)" "pasta da trava e um arquivo (ENOTDIR, nao ENOENT): ilegivel, nao «ausente»"; has "$(cat "$LOG")" "rc=99 abrir: ENOTDIR" "ENOTDIR: a causa vai no log"
+reset; touch "$SD/python3.fail"; run_d3
+expect 0 "demand-dashboard (trava da rodada ilegivel)" "python3 quebrado (rc 1): ilegivel"; has "$(cat "$LOG")" "pulo demand-dashboard: trava da rodada ilegivel" "python3 quebrado: o motivo vai no log"
+reset; touch "$SD/python3.slow"; EXTRA_ENV="DR_D3_CMD_S=1"; t0=$SECONDS; run_d3; dt=$((SECONDS - t0))
+expect 0 "demand-dashboard (trava da rodada ilegivel)" "python3 que trava: encerrado no teto (CMD_S), ilegivel"; OUT=$(grep -h 'ilegivel: rc=' "$LOG" | cut -c1-200); has "$OUT" "rc=124" "python3 que trava: o log diz que estourou o tempo (rc=124)"
+[ "$dt" -lt 20 ] && ok "python3 parado por 30 s: a leitura tem teto, o D3 nao espera (${dt} s)" || nope "python3 parado por 30 s: o D3 esperou ${dt} s (a leitura da trava nao tem teto)"
+for m in 0 10; do   # sem a palavra «tomada»/«livre» o rc sozinho nao vale: um programa vazio sai 0, um wrapper pode sair 10
+  reset; echo "$m" > "$SD/python3.mute"; run_d3
+  expect 0 "demand-dashboard (trava da rodada ilegivel)" "python3 que sai $m calado (sem dizer tomada/livre): ilegivel, nao «rodada em curso» nem «livre»"; eq "$(kicks)" "map-viewer,ficha360," "python3 calado (rc $m): o demand-dashboard nao e reiniciado"
+done
+reset; for l in map-viewer ficha360 clientes-dashboard; do setproc $l 2 -; done; touch "$SD/python3.fail"; run_d3
+expect 30 "nao consegui ler e nao agi" "trava ilegivel e nada mais a fazer: 30, nao 10"; eq "$(kicks)" "" "trava ilegivel e nada mais a fazer: nada reiniciado"
+reset; for l in map-viewer ficha360 clientes-dashboard; do setproc $l 2 -; done; rl_hold; run_d3
+expect 10 "demand-dashboard (rodada da campanha em curso)" "trava tomada e nada mais a fazer: 10, a linha diz o pulo"; eq "$(kicks)" "" "trava tomada e nada mais a fazer: nada reiniciado"
+# so o demand-dashboard consulta a trava (a rodada so fala com a :8095); a trava tomada nao muda o que se faz com os demais
+reset; setproc demand-dashboard 2 -; run_d3; hasnt "$CALLS" "python3 probe" "demand-dashboard parado: a trava nem e lida"
+reset; rl_hold; addbw 5001 08:00:00 "700M 300M"; run_d3
+eq "$(seqall)" "S,bw-serve,S,map-viewer,ficha360," "trava tomada: o bw-serve e os outros daemons seguem, so o demand-dashboard fica de fora"
+# a trava lida por padrao e a da rodada (DEFAULT_LOCK_PATH de lib/campanha_diaria/round_lock.py do whatsapp_automation); o python3 de mentira so anota o caminho (nao toca no /tmp real da maquina)
+reset; touch "$SD/python3.trace"; EXTRA_ENV="DR_D3_ROUND_LOCK="; run_d3 --dry-run; has "$CALLS" "python3 trava /tmp/wa_campanha_diaria/round.lock" "sem DR_D3_ROUND_LOCK a trava lida e /tmp/wa_campanha_diaria/round.lock (a da rodada)"
+# dry-run LE a trava (so assim diz a verdade do que o --run faria) e nao faz nada
+reset; rl_hold; run_d3 --dry-run
+expect 10 "faria reiniciar (maior primeiro): map-viewer (700 MB), ficha360 (140 MB)" "dry-run com a trava tomada: o demand-dashboard nao entra no que faria"; has "$OUT" "demand-dashboard (rodada da campanha em curso)" "dry-run com a trava tomada: a linha diz o pulo"
+hasnt "$CALLS" "kickstart" "dry-run com a trava tomada: nenhum kickstart"; has "$CALLS" "python3 probe" "dry-run: a trava foi lida"
+# a rodada comeca DEPOIS do scan (durante o restart do map-viewer, o 1o da ordem): a trava e lida de novo imediatamente antes de agir, nao so no scan
+reset; rm -f "$W/holder.go"; rl_hold "$W/holder.go"; hookfor map-viewer "touch '$W/holder.go'; for _ in \$(seq 1 100); do [ -f '$W/holder.ready' ] && break; sleep 0.1; done"; run_d3
+expect 0 "demand-dashboard (rodada da campanha em curso)" "rodada que comeca depois do scan: o demand-dashboard e pulado (a trava e relida antes de agir)"; eq "$(kicks)" "map-viewer,ficha360," "rodada que comeca no meio do D3: so map-viewer e ficha360"
+# o pior caso do demand-dashboard conta o python3 da trava: 5 comandos de D3_CMD_S (2 sqlite3 + launchctl + freeze + a trava). CMD_S=20 e orcamento 104: 114 s nao cabem (os 94 s de antes cabiam)
+reset; setproc demand-dashboard 4 900; EXTRA_ENV="DR_D3_CMD_S=20 DR_D3_BUDGET_S=104"; run_d3
+expect 10 "sem tempo para demand-dashboard" "orcamento de 104 s: o pior caso do demand-dashboard (114 s, com o python3 da trava) nao cabe"; eq "$(kicks)" "" "sem tempo para o demand-dashboard: nada reiniciado"
+
 section "TERM no meio do guardado despausa a fila"
 reset; setproc map-viewer 4 50; setproc ficha360 4 50; echo slow > "$SD/guarded.mode"
 ( env -i HOME="$W/home" PATH="$BIN:/usr/bin:/bin:/usr/sbin:/sbin" TMPDIR="$W/tmp" STUB_DIR="$SD" DR_CITY="$CITY" DR_D3_WA="$WA" DR_D3_PIX_DB="$PIX" DR_D3_VOICE_DB="$VOICE" \
-    DR_D3_GUARDED="$W/guarded" DR_D3_FREEZE_CMD="$W/freeze" DR_FREE_MB_FILE="$SD/free" DR_SWAP_MB_FILE="$SD/swap" DR_D3_SETTLE_S=0 DR_D3_READY_S=3 DR_D3_DRAIN_S=3 DR_D3_DESPAUSE_S=3 \
+    DR_D3_GUARDED="$W/guarded" DR_D3_FREEZE_CMD="$W/freeze" DR_D3_ROUND_LOCK="$RLOCK" DR_FREE_MB_FILE="$SD/free" DR_SWAP_MB_FILE="$SD/swap" DR_D3_SETTLE_S=0 DR_D3_READY_S=3 DR_D3_DRAIN_S=3 DR_D3_DESPAUSE_S=3 \
     DR_D3_GUARD_SLACK_S=100 DR_D3_CMD_S=5 DR_D3_CURL_S=2 "$D3" --run > "$W/term.out" 2>&1; echo $? > "$W/term.rc" ) &
 BGP=$!; BG_PIDS="$BG_PIDS $BGP"
 for _ in $(seq 1 150); do [ -f "$SD/guarded.started" ] && break; sleep 0.1; done
@@ -497,7 +604,7 @@ term_run() {
   local sig=$1 act=$2 d3pid; shift 2
   rm -f "$W/term.out" "$W/term.rc"
   ( env -i HOME="$W/home" PATH="$BIN:/usr/bin:/bin:/usr/sbin:/sbin" TMPDIR="$W/tmp" STUB_DIR="$SD" DR_CITY="$CITY" DR_D3_WA="$WA" DR_D3_PIX_DB="$PIX" DR_D3_VOICE_DB="$VOICE" \
-      DR_D3_GUARDED="$W/guarded" DR_D3_FREEZE_CMD="$W/freeze" DR_FREE_MB_FILE="$SD/free" DR_SWAP_MB_FILE="$SD/swap" DR_D3_SETTLE_S=0 DR_D3_READY_S=3 DR_D3_DRAIN_S=3 DR_D3_DESPAUSE_S=3 \
+      DR_D3_GUARDED="$W/guarded" DR_D3_FREEZE_CMD="$W/freeze" DR_D3_ROUND_LOCK="$RLOCK" DR_FREE_MB_FILE="$SD/free" DR_SWAP_MB_FILE="$SD/swap" DR_D3_SETTLE_S=0 DR_D3_READY_S=3 DR_D3_DRAIN_S=3 DR_D3_DESPAUSE_S=3 \
       DR_D3_GUARD_SLACK_S=100 DR_D3_CMD_S=5 DR_D3_CURL_S=2 "$@" "$D3" --run > "$W/term.out" 2>&1; echo $? > "$W/term.rc" ) &
   BGP=$!; BG_PIDS="$BG_PIDS $BGP"
   for _ in $(seq 1 150); do [ -f "$SD/$sig" ] && break; sleep 0.1; done

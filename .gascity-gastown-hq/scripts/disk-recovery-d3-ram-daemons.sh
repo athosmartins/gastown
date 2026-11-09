@@ -13,7 +13,7 @@
 #   ordena os elegíveis pelo phys_footprint medido AGORA (`footprint -p`, não RSS: sob compressão o RSS esconde o crescimento), do maior para o menor (empate = ordem da lista acima; footprint
 #   ilegível = o daemon é PULADO e conta como "não consegui ler"), e reinicia UM de cada vez, do maior para o menor. Depois de cada um espera D3_SETTLE_S, re-mede disco e swap e PARA assim que o livre passa de D3_MB + HYST_MB (a mesma histerese do maestro).
 #   · demand-dashboard: SÓ pelo scripts/restart_demand_dashboard_guarded.sh do whatsapp_automation (pausa a fila com system_paused_by, lê de volta, espera o worker drenar, reinicia, espera 200,
-#     despausa). Este degrau não reimplementa nada disso. Depois dele, sempre confere a fila por conta própria: pausa que é nossa (system_paused_by "disk-recovery-d3:...") e ficou para trás
+#     despausa) e SÓ com a trava da rodada da campanha livre (GUARDAS). Este degrau não reimplementa nada disso. Depois dele, sempre confere a fila por conta própria: pausa que é nossa (system_paused_by "disk-recovery-d3:...") e ficou para trás
 #     é despausada e LIDA DE VOLTA; pausa de outro dono nunca é tocada. O notify do guardado é desligado aqui (GUARDED_RESTART_NOTIFY_BIN): aviso de rc 0/20 é do maestro, não se duplica.
 #   · os outros três: `launchctl kickstart -k gui/<uid>/<label>`.
 #   · PROVA de que reiniciou: PID novo (diferente do anterior, vivo) E a porta respondendo HTTP 200..399. Sem os dois = falhou (20), e o degrau PARA (não empilha falha em cima de falha).
@@ -37,18 +37,24 @@
 #   · tamanho — footprint abaixo de D3_MIN_MB (100 MB) não é reiniciado: não devolveria o suficiente para aparecer na re-medição e custaria uma queda de painel à toa.
 #   · tempo — D3_BUDGET_S (600 s) no total, contados da largada. O maestro dá 900 s e depois manda TERM (KILL 2 s depois): nenhum passo (Safari, bw-serve, daemon) começa se o pior caso dele não cabe no que sobrou.
 #   Trade-off aceito da janela de ligação: conversa de corretor ou chamada do voicebot com mais de 30 min cuja linha não é atualizada nesse tempo conta como órfã e NÃO segura o restart.
+#   · rodada da campanha — SÓ o demand-dashboard (a rodada fala só com a :8095: rebuild da fila, portão do prédio, ledger), pulado enquanto a trava da rodada estiver TOMADA (ga-13qui1k: em 08/11 às 20:39 o D3 o reiniciou
+#     no meio da rodada das 20:15 e o portão do prédio, que vale 30 h, não foi regravado). A trava é um flock em DR_D3_ROUND_LOCK (padrão /tmp/wa_campanha_diaria/round.lock = DEFAULT_LOCK_PATH de lib/campanha_diaria/round_lock.py
+#     do whatsapp_automation), a mesma da rodada das 20:15, do botão «Rodar agora» e do bracket do previsao_ledger.py. Lida do jeito dela: flock COMPARTILHADO não-bloqueante tomado e solto na hora, sem gravar nada (o corpo
+#     do arquivo é o ÚLTIMO dono e fica depois que ele sai: existir ou ter corpo não prova nada). Arquivo ou pasta ausentes = livre; não consegui ler (sem python3, sem permissão, não é arquivo comum, estourou o tempo, saída
+#     sem «tomada»/«livre») = pula e conta como "não consegui ler". Relida imediatamente antes de agir (still_same): uma rodada que começa depois do scan também o segura. Limite conhecido: o guardado ainda espera
+#     a fila drenar (até D3_DRAIN_S) depois dessa leitura, e uma rodada que começa nesse intervalo não é vista aqui; fechar isso é do guardado do whatsapp_automation (wa-81n67r, item c).
 #   · instância única (mkdir) e o interruptor do maestro ($CITY/.gc/disk-recovery.off): ligado = sai 10 sem ler nem agir, também quando alguém chama este degrau à mão.
-# TRÊS ESTADOS    tem / não-tem / não-consegui-saber. df, swap, launchctl, ps, footprint, deploy_freeze ou sqlite ilegíveis NUNCA viram "tem bastante disco", "sem ligação", "livre" ou "descongelado":
+# TRÊS ESTADOS    tem / não-tem / não-consegui-saber. df, swap, launchctl, ps, footprint, deploy_freeze, sqlite ou a trava da rodada da campanha ilegíveis NUNCA viram "tem bastante disco", "sem ligação", "livre" ou "descongelado":
 #   o degrau não age naquilo (e, se nada foi feito, sai 30). Depois de já ter agido, uma leitura que falha só PARA o degrau (não reinicia o seguinte às cegas).
 #   A fila do demand-dashboard segue a mesma regra e a linha final NUNCA diz "nada a fazer"/"conferida" por cima de dúvida: sobra de pausa nossa que não consegui desfazer = 20; fila ilegível no
 #   início = 30 se nada foi reiniciado (se algo foi, rc 0 e a linha avisa); no TERM a linha só diz "conferida" se a conferência deu certo, "NAO confirmada" se não, e nada se não havia pausa nossa em aberto.
-# CONTRATO        `--run` (real) ou `--dry-run` (lê o estado dos daemons, do Safari e do bw-serve, e diz o que faria; não lê a fila do demand-dashboard nem o `secret`, não toma trava, não grava log, não reinicia, não fecha, não despausa, sai 10, ou 30 se nao conseguiu ler). stdout = UMA linha (ASCII: o maestro filtra para
+# CONTRATO        `--run` (real) ou `--dry-run` (lê o estado dos daemons, do Safari e do bw-serve e a trava da rodada da campanha, e diz o que faria; não lê a fila do demand-dashboard nem o `secret`, não toma trava, não grava log, não reinicia, não fecha, não despausa, sai 10, ou 30 se nao conseguiu ler). stdout = UMA linha (ASCII: o maestro filtra para
 #   caracteres imprimíveis), e NADA antes dela em stdout/stderr (o maestro lê só a 1ª linha dos dois juntos): tudo o mais vai para $LOG.
 #   Saída 0 = agiu e terminou · 10 = nada a fazer ou uma guarda adiou · 20 = falhou (reinício sem prova, Safari que não fechou, despausa não confirmada, TERM) · 30 = não consegui ler o estado (não agiu) · 2 = uso.
 #   Com falha e sucesso na mesma rodada vale 20 (a linha diz os dois). O maestro dá 900 s e manda TERM→KILL: o TERM despausa a fila rápido (a nossa) antes de sair; KILL não dá para pegar,
 #   por isso o orçamento de tempo é bem menor que 900 s.
 # VARIÁVEIS (teste) DR_CITY · DR_D3_LOG · DR_D3_LOCK · DR_OFF_FILE · DR_FREE_MB_FILE · DR_SWAP_MB_FILE (mesmos nomes do maestro) · DR_D3_WA (checkout do whatsapp_automation) · DR_D3_PIX_DB ·
-#   DR_D3_VOICE_DB · DR_D3_GUARDED (restart guardado) · DR_D3_FREEZE_CMD (no lugar de `python3 scripts/deploy_freeze.py`) · DR_D3_DD_URL (base do demand-dashboard) · DR_D3_SAFARI_STAMP (marca da última falha de quit) · DR_D3_SECRET_ITEM (item que prova o cofre; padrão motherduck-token) ·
+#   DR_D3_VOICE_DB · DR_D3_GUARDED (restart guardado) · DR_D3_FREEZE_CMD (no lugar de `python3 scripts/deploy_freeze.py`) · DR_D3_DD_URL (base do demand-dashboard) · DR_D3_SAFARI_STAMP (marca da última falha de quit) · DR_D3_SECRET_ITEM (item que prova o cofre; padrão motherduck-token) · DR_D3_ROUND_LOCK (trava da rodada da campanha) ·
 #   DR_<NOME> numérico: D3_MB HYST_MB D3_MIN_AGE_S D3_MIN_MB D3_CALL_WINDOW_S D3_BUDGET_S D3_DRAIN_S D3_READY_S D3_DESPAUSE_S D3_SETTLE_S D3_CURL_S D3_CMD_S D3_GUARD_SLACK_S D3_LOG_MAX_KB D3_SAFARI_MIN_AGE_S D3_SAFARI_QUIT_S D3_SAFARI_RETRY_S D3_BW_MIN_MB D3_BW_MIN_AGE_S (lixo cai no padrão e é dito no log).
 #   Os comandos do sistema (launchctl, ps, footprint, top, osascript, secret, curl, df, sysctl) são achados pelo PATH, que aqui só ganha os diretórios padrão e ~/.local/bin no FIM (o launchd entrega um PATH mínimo; sem jq/curl nada age).
 # TESTE           bash scripts/disk-recovery-d3-ram-daemons.selftest.sh   (hermético: launchctl, curl, ps, footprint, df, swap, bancos, guardado e freeze simulados; nada real é reiniciado)
@@ -73,6 +79,7 @@ FREEZE_PY="$WA/scripts/deploy_freeze.py"
 DD_URL="${DR_D3_DD_URL:-http://127.0.0.1:8095}"
 SAFARI_STAMP="${DR_D3_SAFARI_STAMP:-$GCDIR/disk-recovery-d3-safari-fail.stamp}"
 SECRET_ITEM="${DR_D3_SECRET_ITEM:-motherduck-token}"
+ROUND_LOCK="${DR_D3_ROUND_LOCK:-/tmp/wa_campanha_diaria/round.lock}"   # trava (flock) da rodada da campanha diaria: DEFAULT_LOCK_PATH de lib/campanha_diaria/round_lock.py do whatsapp_automation
 BW_LABEL="com.gastown.bw-serve"
 BEAD="ga-1p1i5jr.3"
 AGENT="disk-recovery-d3"            # vira o prefixo do system_paused_by que o guardado grava: é assim que reconheço uma pausa NOSSA
@@ -459,7 +466,7 @@ restart_guarded() {  # demand-dashboard. $1=pid antigo. Roda o guardado, CONFERE
 }
 need_s() {  # pior caso, em segundos, para reiniciar $1 (cabe no que sobra do orçamento?)
   case "$1" in
-    demand-dashboard) printf '%s' $((D3_DRAIN_S + D3_READY_S + D3_GUARD_SLACK_S + D3_DESPAUSE_S + D3_READY_S + D3_SETTLE_S + 4 * D3_CMD_S)) ;;
+    demand-dashboard) printf '%s' $((D3_DRAIN_S + D3_READY_S + D3_GUARD_SLACK_S + D3_DESPAUSE_S + D3_READY_S + D3_SETTLE_S + 5 * D3_CMD_S)) ;;   # 5 comandos de CMD_S antes do restart: 2 sqlite3 das guardas, launchctl, freeze e o python3 da trava da rodada
     safari)           printf '%s' $((D3_SAFARI_QUIT_S + D3_SETTLE_S + 4 * D3_CMD_S)) ;;
     bw-serve)         printf '%s' $((D3_READY_S + D3_SETTLE_S + 5 * D3_CMD_S)) ;;     # + 1 `secret` de antes do restart
     *)                printf '%s' $((D3_READY_S + D3_SETTLE_S + 4 * D3_CMD_S)) ;;
@@ -479,14 +486,74 @@ guards_gate() {  # $1=nome. As DUAS guardas de ligação, imediatamente antes do
   if [ "$grc" -eq 2 ]; then STOP_TXT="nao consegui ler a guarda de ligacao (pix=$G_PIX voicebot=$G_VOICE) antes de $1"; UNK=1; HALT=1; return 1; fi
   return 0
 }
-still_same() {  # $1=label $2=nome $3=pid lido no scan. O mundo mudou desde o scan? PID diferente = alguém acabou de reiniciar; freeze novo = respeita. rc 0 = pode; senão skip() e rc 1
+# a rodada diaria da campanha (20:15; tambem o botao «Rodar agora») so fala com o demand-dashboard (:8095): rebuild da fila, portao do predio, ledger. O flock dela segura a rodada INTEIRA, portao incluido
+# (campanha_diaria_loop.py::main); lido do jeito dela: um flock COMPARTILHADO nao-bloqueante, tomado e solto na hora, sem gravar nada. O corpo do arquivo («pid=… holder=…») e a identidade do ULTIMO dono e
+# fica depois que ele sai: existir ou ter corpo nao prova rodada em curso. Arquivo ou pasta ausentes = livre; so diz «tomada»/«livre» (rc 0/10) com a palavra na saida; o resto e 99 = nao sei
+IFS= read -r -d '' ROUND_PY <<'PYEOF'
+import errno, fcntl, os, stat, sys
+def probe(path):
+    # vazio (arquivo ou pasta ausentes) -> livre; falhou/ilegivel (permissao, ENOTDIR, nao e arquivo comum, flock com erro) -> 99 = nao sei
+    try:
+        fd = os.open(path, os.O_RDONLY)
+    except FileNotFoundError:
+        print("livre")
+        return 10
+    except OSError as e:
+        print("abrir: " + errno.errorcode.get(e.errno, str(e.errno)))
+        return 99
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            print("nao e arquivo comum")
+            return 99
+        try:
+            fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
+        except OSError as e:
+            if e.errno in (errno.EAGAIN, errno.EACCES):
+                print("tomada")
+                return 0
+            print("flock: " + errno.errorcode.get(e.errno, str(e.errno)))
+            return 99
+        print("livre")
+        return 10
+    finally:
+        os.close(fd)   # fechar o unico fd solta o flock que acabamos de tomar
+try:
+    rc = probe(sys.argv[1])
+except Exception as e:
+    print("erro: " + type(e).__name__)
+    rc = 99
+sys.exit(rc)
+PYEOF
+round_check() {  # rc 0 = a trava da rodada está TOMADA · rc 10 = livre · outro = não consegui olhar (sem python3, sem permissão, não é arquivo comum, estourou o tempo, saída que não diz tomada/livre)
+  local rc
+  # vazio (arquivo ou pasta ausentes: nenhuma rodada a tomou) → livre, sem criar nada; falhou/ilegível → 99 = não sei: o chamador pula o demand-dashboard, nunca o trata como livre
+  bcap "$D3_CMD_S" python3 -I -c "$ROUND_PY" "$ROUND_LOCK"; rc=$?
+  case "$rc:$CAP" in
+    0:tomada) return 0 ;;
+    10:livre) return 10 ;;
+  esac
+  log "trava da rodada ($ROUND_LOCK) ilegivel: rc=$rc $(printf '%s' "$CAP" | LC_ALL=C tr -cd '[:print:]' | cut -c1-80)"
+  return 99
+}
+round_gate() {  # $1=nome. Só o demand-dashboard consulta a trava. rc 0 = pode (livre, ou não é ele); senão skip() e rc 1: tomada = pulo; ilegível = pulo + "não consegui ler"
+  local rc
+  [ "$1" = demand-dashboard ] || return 0
+  round_check; rc=$?
+  case "$rc" in
+    10) return 0 ;;
+    0) skip "$1" "rodada da campanha em curso" 0 ;;
+    *) skip "$1" "trava da rodada ilegivel" 1 ;;
+  esac
+  return 1
+}
+still_same() {  # $1=label $2=nome $3=pid lido no scan. O mundo mudou desde o scan? PID diferente = alguém acabou de reiniciar; freeze novo = respeita; rodada da campanha que começou depois do scan = o demand-dashboard espera. rc 0 = pode; senão skip() e rc 1
   local cur crc frc
   cur=$(pid_of "$1"); crc=$?
   if [ "$crc" -ne 0 ] || [ "$cur" != "$3" ]; then skip "$2" "PID mudou ou sumiu desde a leitura" $([ "$crc" -eq 1 ] && echo 1 || echo 0); return 1; fi
   freeze_check "$1"; frc=$?
   if [ "$frc" -eq 0 ]; then skip "$2" "congelado agora (deploy_freeze)" 0; return 1; fi
   if [ "$frc" -ne 10 ]; then skip "$2" "deploy_freeze ilegivel agora" 1; return 1; fi
-  return 0
+  round_gate "$2"
 }
 remeasure_or_halt() {  # depois de agir: espera, re-mede disco e swap. Recuperou → STOP_TXT + HALT. Não consegui medir → UNK + HALT (não segue às cegas)
   [ "$D3_SETTLE_S" -le 0 ] || sleep "$D3_SETTLE_S"

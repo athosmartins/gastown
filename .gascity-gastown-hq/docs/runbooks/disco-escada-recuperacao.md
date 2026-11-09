@@ -114,6 +114,13 @@ O notify e o mail são do maestro. Os degraus não avisam por conta própria. O 
 (o "agiu" não cala um "FALHOU" logo depois), e só é carimbado depois da entrega confirmada (ver "Tentado ≠ entregue"). Cada mail é
 um bead e um commit no Dolt de uma máquina que está sem disco, por isso o limite.
 
+**D3 e a rodada da campanha (ga-13qui1k).** O D3 não reinicia o `demand-dashboard` (:8095) enquanto a trava da rodada diária da campanha estiver tomada. Em 08/11 às 20:39 ele o reiniciou no meio da rodada das
+20:15 e o portão do prédio inteiro (vale 30 h) não foi regravado. A trava é um `flock` em `/tmp/wa_campanha_diaria/round.lock` (`lib/campanha_diaria/round_lock.py` do whatsapp_automation), o mesmo da rodada das
+20:15, do botão «Rodar agora» e do bracket do ledger. O D3 a lê com um `flock` compartilhado não-bloqueante, tomado e solto na hora; o corpo do arquivo (`pid=… holder=…`) é o do último dono e fica depois que ele
+sai, então não prova nada. Tomada: o log (`.gc/logs/disk-recovery-d3.log`) diz `pulo demand-dashboard: rodada da campanha em curso`, o degrau segue com os outros três daemons e sai 10 se não sobrar nada a fazer.
+Ilegível (sem python3, sem permissão, não é arquivo comum): `pulo demand-dashboard: trava da rodada ilegivel`, pula do mesmo jeito e sai 30 se nada mais foi feito. O D3 só lê a trava antes de chamar o guardado:
+o guardado do whatsapp_automation ainda precisa olhar a mesma trava logo antes do kickstart (wa-81n67r, item c).
+
 ## Retomada do D2 (`--resume`)
 
 O `--run` do D2 para um job pesado reiniciável (hoje o `rfb`) quando o disco aperta. Alguém tem de religá-lo quando o disco volta; sem isso ele

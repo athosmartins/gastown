@@ -236,7 +236,7 @@ mkenv() {  # ENVV = o env do plist (PATH, HOME, GC_CITY_PATH, BD_ACTOR) + só as
   ENVV=( "PATH=$BIN:$PATH" "HOME=$W/home" "TMPDIR=$W/tmp" "GC_CITY_PATH=$CITY" "BD_ACTOR=automation" "E2E_W=$W"
     "DR_NOW_FILE=$W/now" "DR_NOTIFY_BIN=$BIN/notify" "DR_GC_BIN=$BIN/gc" "DR_SETTLE_S=0" "DR_RUNG_TIMEOUT_S=120"
     "D2_ALLOWLIST=$HERE/disk-recovery-d2-allowlist.tsv" "D2_PS_BIN=$BIN/ps-d2" "D2_DF_BIN=$BIN/df" "D2_AWS_BIN=$BIN/aws" "D2_LAUNCHCTL_BIN=$BIN/launchctl" "D2_NOW=$NOW_S" "D2_TERM_GRACE_S=10"
-    "DR_D3_PIX_DB=$W/pix.db" "DR_D3_VOICE_DB=$W/vb.db" "DR_D3_GUARDED=$BIN/guarded" "DR_D3_FREEZE_CMD=$BIN/freeze" "DR_D3_SETTLE_S=0" "DR_D3_READY_S=10"
+    "DR_D3_PIX_DB=$W/pix.db" "DR_D3_VOICE_DB=$W/vb.db" "DR_D3_GUARDED=$BIN/guarded" "DR_D3_FREEZE_CMD=$BIN/freeze" "DR_D3_SETTLE_S=0" "DR_D3_READY_S=10" "DR_D3_ROUND_LOCK=$W/round.lock"   # a trava da rodada da campanha: ausente aqui = livre (nunca a do /tmp real da maquina)
     "DR4_NOW=$NOW_S" "DR4_BOOT_EPOCH=$(cat "$WD/boot")" "DR4_FDESETUP_BIN=$BIN/fdesetup" "DR4_DEFAULTS_BIN=$BIN/defaults" "DR4_LAUNCHCTL_BIN=$BIN/launchctl-d4"
     "DR4_PGREP_BIN=$BIN/pgrep" "DR4_SYSCTL_BIN=$BIN/sysctl" "DR4_DF_BIN=$BIN/df" "DR4_OSASCRIPT_BIN=$BIN/osascript" "DR4_CONSOLE_USER=athos"
     "DR4_SENDER_SAFE_PY=$W/sender_stub.py" "DR4_CALLS_PY=$HERE/disk-recovery-d4-calls-in-flight.py" "DR4_NIGHTLY=$HERE/nightly-reboot.sh"
