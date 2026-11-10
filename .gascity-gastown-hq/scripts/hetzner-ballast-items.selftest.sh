@@ -524,7 +524,7 @@ g_mut() {
 
   # o registro REAL (hetzner-ballast.items.txt do repo): a linha hq-mutants
   local R="$HERE/hetzner-ballast.items.txt" cmd rss cores prazo cdn dflt folga ln_w ln_m
-  rf() { awk -F'\t' -v n="$1" -v c="$2" '$1 == n && NF == 8 { print $c }' "$R" 2>/dev/null; }   # campo c da linha n (8 colunas); vazio se a linha falta
+  rf() { awk -F'\t' -v n="$1" -v c="$2" '$1 == n && NF >= 8 { print $c }' "$R" 2>/dev/null; }   # campo c da linha n (8 ou 9 colunas); vazio se a linha falta
   cores=$(rf hq-mutants 3); rss=$(rf hq-mutants 4); prazo=$(rf hq-mutants 5); cdn=$(rf hq-mutants 6); cmd=$(rf hq-mutants 8)
   case "$cores$rss$prazo$cdn" in ''|*[!0-9]*) cores=0 ;; esac
   check "mut: a linha hq-mutants do registro é papel work, de 8 colunas, com núcleos FIXOS (inteiro >= 2: o auto levaria o orçamento inteiro) e o comando $cmd executável na pasta de itens" "work 1 1" "$(rf hq-mutants 2) $([ "$cores" -ge 2 ] && echo 1 || echo 0) $([ -n "$cmd" ] && [ -x "$ITEMS/$cmd" ] && echo 1 || echo 0)"
@@ -809,7 +809,7 @@ g_wam() {
 
   # o registro REAL (hetzner-ballast.items.txt do repo): a linha wa-mutants
   R="$HERE/hetzner-ballast.items.txt"
-  rf() { awk -F'\t' -v n="$1" -v c="$2" '$1 == n && NF == 8 { print $c }' "$R" 2>/dev/null; }   # campo c da linha n (8 colunas); vazio se a linha falta
+  rf() { awk -F'\t' -v n="$1" -v c="$2" '$1 == n && NF >= 8 { print $c }' "$R" 2>/dev/null; }   # campo c da linha n (8 ou 9 colunas); vazio se a linha falta
   cspec=$(rf wa-mutants 3); rss=$(rf wa-mutants 4); prazo=$(rf wa-mutants 5); cdn=$(rf wa-mutants 6); cmd=$(rf wa-mutants 8)
   cores=${cspec%%-*}; cmax=${cspec#*-}   # N-M (slots elásticos): N é a reserva do orçamento e M até onde sobe; sem `-` o item é fixo (M = N)
   [ "$cmax" != "$cspec" ] || cmax=$cores

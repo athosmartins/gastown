@@ -31,6 +31,16 @@
 # CONTROLE NEGATIVO: cada mutante (um trecho do script trocado) TEM que reprovar a bateria. Mutante com descrição `[teto]` roda só os grupos do teto; com `[elastico]`, só o g_elastic.
 # VARIÁVEIS: HB_UNDER_TEST (script a testar) · HB_PY (interpretador; padrão /usr/bin/python3) · HB_NO_MUTANTS=1 · HB_MUTANTS_ONLY=teto|elastico (só os mutantes do teto, ou dos slots elásticos) · HB_ONLY=<grupo> (reg tick run ram reap fill off state logs launch send ceil cgrp elastic; sem mutantes)
 set -u
+# argumentos (o mbp-run.sh --repo hq só leva argumentos ao selftest, não variáveis de ambiente): --only GRUPO = HB_ONLY, --no-mutants = HB_NO_MUTANTS=1, --mutants-only GRUPO = HB_MUTANTS_ONLY, --under-test = HB_UNDER_TEST
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --only) HB_ONLY="${2:?--only GRUPO}"; shift 2 ;;
+    --no-mutants) HB_NO_MUTANTS=1; shift ;;
+    --mutants-only) HB_MUTANTS_ONLY="${2:?--mutants-only GRUPO}"; shift 2 ;;
+    --under-test) HB_UNDER_TEST="$(cd "$(dirname "${2:?--under-test CAMINHO}")" && pwd)/$(basename "$2")"; shift 2 ;;   # o governo a testar (a prova de que um teste novo reprova no anterior)
+    *) echo "uso: $0 [--only GRUPO] [--no-mutants] [--mutants-only teto|elastico|piso] [--under-test CAMINHO]" >&2; exit 2 ;;
+  esac
+done
 HERE="$(cd "$(dirname "$0")" && pwd)"
 P="${HB_UNDER_TEST:-$HERE/hetzner-ballast.py}"
 PY="${HB_PY:-/usr/bin/python3}"
@@ -58,6 +68,9 @@ check() {  # check "DESCRIÇÃO" ESPERADO REAL
 W="$T/w"; mkdir -p "$W/bin"
 LU=$(id -run); mkdir -p "$T/linger"; : > "$T/linger/$LU"   # linger ligado por padrão (o arquivo que `loginctl enable-linger` cria); os casos de linger trocam BALLAST_LINGER_DIR pelo EXTRA_ENV
 printf '#!/bin/sh\n# timeout de brinquedo (o do macOS não existe): descarta "-k K DUR" e roda\nshift 3; exec "$@"\n' > "$W/bin/timeout"; chmod +x "$W/bin/timeout"
+# tmux de brinquedo (ga-03rqsr0): o governo conta as sessões do nó com `tmux -L gc-remote list-sessions`. Sem os arquivos fake-tmux.rc/.out na pasta do lastro ele NÃO LÊ (rc 2, texto que não é o de "sem servidor"): o piso de RAM fica
+# no fixo de sempre e os testes de antes seguem valendo sem mudança; os casos do piso dinâmico escrevem os arquivos (tmux_n / tmux_none). Os argumentos que recebeu vão para fake-tmux.args.
+printf '#!/bin/sh\necho "$*" >> "$BALLAST_HOME/fake-tmux.args"\n[ -f "$BALLAST_HOME/fake-tmux.rc" ] || { echo "tmux de brinquedo: sem leitura" >&2; exit 2; }\ncat "$BALLAST_HOME/fake-tmux.out"\nexit "$(cat "$BALLAST_HOME/fake-tmux.rc")"\n' > "$W/bin/tmux"; chmod +x "$W/bin/tmux"
 NCPU=16
 N=0; H=""; FP=""; NOW=0; U=0; NI=0; ID=0; EXTRA_ENV=""; LP='[]'; PID=""; RUN=""; CEIL=""; SD=""; CGD=""; CGN=""
 
@@ -970,12 +983,162 @@ g_elastic() {
   check "cooldown: parcial com rc 3 é FALHA (espera ao menos 600 s): em 180 s não recomeça" "-" "$PAR_T"
 }
 
+# ── g_floor ───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+# PISO DE RAM DINÂMICO (ga-03rqsr0). O piso fixo de 14336 MB para COMEÇAR item (e subir slots) foi posto para proteger sessões reais do nó, mas o nó roda 0-2 sessões e o piso deixava ~3 núcleos ociosos (wa-mutants parado em 11 de 12 slots com
+# why=sem-ram; hq-selftests e hq-mutants pulados por ram). O governo agora conta as sessões vivas no tmux do provider (`tmux -L gc-remote list-sessions`), guarda o PICO das últimas BALLAST_SESS_WINDOW_S (6 h) e põe o piso em
+# pausa + margem + pico x MB por sessão (10240 + 1024 + pico x 1024), nunca acima do fixo (14336). Três estados: leu N (0 = sem servidor) / não consegui ler (tmux ausente, travado ou erro estranho) → piso FIXO e o histórico não anda / histórico curto
+# (aquecendo: menos de uma janela de leituras contínuas, ou lacuna > BALLAST_SESS_GAP_S) → piso FIXO. A chave ram-floor.fixed na pasta do lastro volta ao fixo. Item que já roda não é afetado: só decide COMEÇAR e SUBIR slots.
+tmux_set() {  # tmux_set RC TEXTO — o que o tmux de brinquedo responde (rc e saída)
+  printf '%s' "$1" > "$H/fake-tmux.rc"; printf '%s' "$2" > "$H/fake-tmux.out"
+}
+tmux_n() {  # tmux_n N — N sessões vivas (uma linha por nome)
+  local i=1 s=""; while [ "$i" -le "$1" ]; do s="${s}dog-remote-$i
+"; i=$((i+1)); done; tmux_set 0 "$s"
+}
+tmux_none() { tmux_set 1 "no server running on /tmp/tmux-1000/gc-remote"; }   # sem servidor = 0 sessões (o texto que o próprio provider trata como vazio)
+tmux_bad() { rm -f "$H/fake-tmux.rc" "$H/fake-tmux.out"; }                      # o tmux de brinquedo não lê
+fl_up() {  # fl_up [JANELA=300] [MEM=13000] [LACUNA=1800] — newhome com o hq (4 núcleos, 1024 MB), janela de sessões curta, 0 sessões e a RAM entre o piso dinâmico (11264 + 1024) e o fixo (14336 + 1024); só a 1ª leitura (semeia) já rodou
+  newhome; EXTRA_ENV="BALLAST_SESS_WINDOW_S=${1:-300} BALLAST_SESS_GAP_S=${3:-1800}"; tmux_none; setmem "${2:-13000}"; seed
+}
+fl_rec() { echo "$(jget ram_floor_mb) $(jget ram_floor_why) $(jget sess) $(jget sess_peak) $(nstart)"; }   # piso, motivo, sessões lidas, pico, itens começados no tick
+g_floor() {
+  local a b c d
+  # aquecendo: a janela (300 s) ainda não encheu de leituras contínuas → piso FIXO, mesmo com 0 sessões; no tick que a janela enche vira dinâmico e o item (RAM 13000) começa
+  fl_up; good 50; good 50; good 50; a=$(fl_rec); good 50; b=$(fl_rec); good 50; c=$(fl_rec)
+  check "piso/aquecendo: com 0 sessões e a janela ainda curta o piso é o FIXO (14336) e a RAM de 13000 MB não deixa o item começar" "14336 fixo-aquecendo 0 0 0" "$a"
+  check "piso/aquecendo: no 4º tick (240 s de 300) segue fixo" "14336 fixo-aquecendo 0 0 0" "$b"
+  check "piso/dinâmico: com a janela cheia (300 s) e 0 sessões o piso cai para pausa + margem (10240 + 1024 = 11264) e o item começa com 13000 MB" "11264 dinamico 0 0 1" "$c"
+  check "piso/dinâmico: o tmux foi chamado com o socket do provider e a listagem de nomes" "-L gc-remote list-sessions -F #{session_name}" "$(head -n 1 "$H/fake-tmux.args")"
+
+  # fronteira: começa quando RAM - rss do item >= piso (inclusive): 12288 - 1024 = 11264 começa, 12287 não
+  fl_up 300 12287; good 50; good 50; good 50; good 50; good 50; a="$(fl_rec) $(jget skipped.0.why)"; setmem 12288; good 50; b=$(fl_rec)
+  check "piso/fronteira: a 12287 MB (12287 - 1024 < 11264) o item não começa e o tick diz que foi a RAM" "11264 dinamico 0 0 0 ram" "$a"
+  check "piso/fronteira: a 12288 MB (exato, inclusive) o item começa" "11264 dinamico 0 0 1" "$b"
+
+  # pico: 2 sessões vistas dentro da janela seguram o piso em 13312 (10240 + 1024 + 2 x 1024) mesmo com 0 agora; passada a janela volta a 11264
+  fl_up; tmux_n 2; good 50; tmux_none; good 50; good 50; good 50; good 50; a=$(fl_rec); good 50; b=$(fl_rec); good 50; c=$(fl_rec)
+  check "piso/pico: 2 sessões vistas há 4 min seguram o piso em 13312 (e com 13000 MB o item não começa), com 0 sessões agora" "13312 dinamico 0 2 0" "$a"
+  check "piso/pico: ainda dentro da janela (+ a granularidade do balde) o pico vale" "13312 dinamico 0 2 0" "$b"
+  check "piso/pico: passada a janela o pico some e o piso volta a 11264 (o item começa)" "11264 dinamico 0 0 1" "$c"
+  fl_up; tmux_n 3; good 50; tmux_none; good 50; good 50; good 50; good 50; a=$(fl_rec)
+  check "piso/teto: com 3 sessões o piso chega ao FIXO (14336) e segue 'dinamico' (a conta é que deu o mesmo número)" "14336 dinamico 0 3 0" "$a"
+  fl_up; tmux_n 9; good 50; tmux_none; good 50; good 50; good 50; good 50; a=$(fl_rec)
+  check "piso/teto: com 9 sessões o piso NUNCA passa do fixo (14336): o dinâmico só pode liberar RAM, nunca pedir mais que antes" "14336 dinamico 0 9 0" "$a"
+
+  # não consegui ler: tmux ausente/estranho → piso FIXO e o histórico não anda; quando volta a ler, recomeça o aquecimento (a leitura que falhou não é 'zero sessões')
+  fl_up 300 13000 100; tmux_bad; good 50; good 50; good 50; good 50; good 50; a=$(fl_rec); tmux_none; good 50; b=$(fl_rec)
+  check "piso/sem leitura: tmux que não lê durante a janela inteira → piso FIXO, 'sem leitura', sessões null (nunca 0) e nada começa" "14336 fixo-sem-leitura null null 0" "$a"
+  check "piso/sem leitura: depois de uma falha maior que a lacuna tolerada (100 s aqui) a história não é contínua: ao voltar a ler (0 sessões) o aquecimento COMEÇA agora e 1 leitura boa não é uma janela" "14336 fixo-aquecendo 0 0 0" "$b"
+  fl_up; good 50; tmux_bad; good 50; tmux_none; good 50; good 50; good 50; a=$(fl_rec)
+  check "piso/sem leitura curta: UMA leitura que falhou (60 s, menos que a lacuna de 1800 s) não derruba a história: a janela enche no tempo e o item começa" "11264 dinamico 0 0 1" "$a"
+  fl_up; tmux_set 1 "protocol version mismatch (client 8, server 7)"; good 50; good 50; good 50; good 50; good 50; a=$(fl_rec)
+  check "piso/sem leitura: erro do tmux que NÃO é 'sem servidor' (versão, socket sem permissão) é não-consegui-ler, não 0 sessões" "14336 fixo-sem-leitura null null 0" "$a"
+  fl_up; tmux_set 0 ""; good 50; good 50; good 50; good 50; good 50; a=$(fl_rec)
+  check "piso/vazio: tmux que lista nada com rc 0 é 0 sessões (lido e vazio), e vale como leitura" "11264 dinamico 0 0 1" "$a"
+  # tmux que NÃO EXECUTA (caminho que não existe = OSError, outro ramo que o rc ≠ 0 do tmux de brinquedo): é não-consegui-ler, nunca 0 sessões (0 liberaria RAM)
+  fl_up; EXTRA_ENV="$EXTRA_ENV BALLAST_TMUX=$W/nao-existe/tmux"; good 50; good 50; good 50; good 50; good 50; a=$(fl_rec)
+  check "piso/sem leitura: tmux que não executa (OSError) é 'sem leitura', sessões null (nunca 0) e, com a janela cheia, nada começa" "14336 fixo-sem-leitura null null 0" "$a"
+  # o pico some do registro no tick em que o tmux não leu (a história guardada tem 2, mas este tick não sabe quantas sessões há): sess_peak null, nunca o pico velho
+  fl_up; tmux_n 2; good 50; tmux_bad; good 50; a=$(fl_rec)
+  check "piso/sem leitura: com 2 sessões na história, o tick em que o tmux não leu registra sess null e sess_peak null (não 2) e o piso FIXO" "14336 fixo-sem-leitura null null 0" "$a"
+  # o mesmo com a chave ram-floor.fixed ligada: o ramo 'fixo-chave' é o único que devolve o pico ao registro, e com o tmux sem leitura ele também é null (não o 2 da história)
+  fl_up; tmux_n 2; good 50; tmux_bad; : > "$H/ram-floor.fixed"; good 50; a=$(fl_rec)
+  check "piso/sem leitura + chave: com 2 sessões na história, tmux sem leitura e ram-floor.fixed ligada, o registro tem 'fixo-chave', sess null e sess_peak null (não 2)" "14336 fixo-chave null null 0" "$a"
+  # o balde guarda a MAIOR contagem: janela de 600 s = baldes de 50 s; 2 sessões e, 10-40 s depois no MESMO balde, 0 → o pico segue 2 até o fim da janela (a última contagem do balde não vale)
+  fl_tk() { adv 50 0 "$1"; bt; }   # um tick $1 s depois, 50% de carga de sessões
+  fl_up 600; tmux_n 2; fl_tk 10; tmux_none; fl_tk 10; fl_tk 10; fl_tk 10; fl_tk 560; a=$(fl_rec)
+  check "piso/pico no mesmo balde: 2 sessões e 0 logo depois, no mesmo balde de 50 s, o balde guarda a MAIOR (2): com a janela de 600 s cheia o piso é 13312, não 11264" "13312 dinamico 0 2 0" "$a"
+
+  # lacuna: sem leitura por mais que BALLAST_SESS_GAP_S (1800 s) a história não é contínua → recomeça o aquecimento (o pico que passou na lacuna ninguém viu)
+  fl_up 300 11000; good 50; good 50; good 50; good 50; good 50; a=$(fl_rec); adv 50 0 2000; bt; b=$(fl_rec)
+  check "piso/lacuna: com a janela cheia o piso é dinâmico (RAM 11000: nada começa)" "11264 dinamico 0 0 0" "$a"
+  check "piso/lacuna: 2000 s sem tick (> 1800 s) → a história não é contínua e o piso volta ao FIXO (aquecendo)" "14336 fixo-aquecendo 0 0 0" "$b"
+
+  # chave: ram-floor.fixed volta ao fixo de uma vez; sem o arquivo volta ao dinâmico
+  fl_up 300 11000; good 50; good 50; good 50; good 50; good 50; : > "$H/ram-floor.fixed"; good 50; a=$(fl_rec); rm -f "$H/ram-floor.fixed"; good 50; b=$(fl_rec)
+  check "piso/chave: com ram-floor.fixed o piso é o FIXO ('fixo-chave') mesmo com a janela cheia; apagado, volta ao dinâmico" "14336 fixo-chave 0 0 0|11264 dinamico 0 0 0" "$a|$b"
+
+  fl_up 300 11000; good 50; good 50; good 50; good 50; good 50; ln -s ram-floor.fixed "$H/ram-floor.fixed"; good 50; a=$(fl_rec); rm -f "$H/ram-floor.fixed"
+  check "piso/chave: ram-floor.fixed que não dá para ler (symlink em laço, ELOOP) vale como chave LIGADA (o lado conservador): piso fixo, nunca o dinâmico" "14336 fixo-chave 0 0 0" "$a"
+
+  # elástico acompanha o piso: a descida por RAM é min(retomada + 1 GB, piso) e a subida usa o piso dinâmico
+  el_fl() {  # el_fl — newhome + o item wam (2-6) rodando com janela de 300 s, 0 sessões; a CPU de sessões a 93% mantém os slots em 2 até o fim do aquecimento
+    newhome; : > "$H/items.tsv"; printf '#!/bin/sh\nsleep 300\n' > "$H/items/wam.sh"; chmod +x "$H/items/wam.sh"; reg 'wam|work|2-6|1024|3600|300|-|wam.sh'
+    EXTRA_ENV="BALLAST_SESS_WINDOW_S=300"; tmux_none; setpsi 1 1; seed; good 50; good 50; good 50; PID=$(started_pid); RUN=$(started_run); alive "$PID" wam "$RUN"
+    eltick 93 0 28000; eltick 93 0 28000
+  }
+  el_fl; eltick 30 0 12000; a=$(slots_now); b=$(jget elastic.0.why)
+  check "piso/elástico: com o piso dinâmico (11264) 12000 MB cabem 1 slot (12000 - 512 >= 11264) e a RAM NÃO manda descer (o piso de descida acompanha o de partida: min(13312, 11264))" "3 up" "$a $b"
+  el_fl; eltick 30 0 12000; eltick 30 0 11200; a=$(slots_now); b=$(jget elastic.0.why)
+  check "piso/elástico: abaixo do piso dinâmico (11200 < 11264) desce 2 por RAM (3 → 2, o mínimo)" "2 ram" "$a $b"
+  el_fl; eltick 30 0 12000; eltick 30 0 11264; a=$(slots_now); b=$(jget elastic.0.why)
+  check "piso/elástico: no piso exato (11264) fica (a descida é estritamente abaixo) e sem 512 MB sobrando não sobe" "3 sem-ram" "$a $b"
+  # com o piso FIXO (tmux sem leitura) o elástico é o de antes: 12000 MB (< 13312) desce
+  el_fl; tmux_bad; eltick 30 0 28000; eltick 30 0 28000; eltick 30 0 12000; a=$(slots_now); b=$(jget elastic.0.why)
+  check "piso/elástico: com o piso FIXO (tmux sem leitura) a 12000 MB o elástico desce por RAM como antes (13312 de descida): de 6 slots vai a 4 (um passo de 2)" "4 ram" "$a $b"
+}
+
+# ── g_carry ───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+# SLOTS QUE ATRAVESSAM A RODADA (ga-03rqsr0). O wa-mutants acaba no prazo (3000 s), espera o cooldown (30 s se `parcial`) e recomeça nos 2 slots do MÍNIMO: a rampa de volta (+2 por minuto) deixava 1-2 núcleos de 12 parados por ~4-5 min a cada ~50 min
+# (02:52-02:56Z de 10/11, idle_cores 12-14). O governo guarda em state.json o último limite de cada item elástico (n, época) e a rodada que recomeça dentro de BALLAST_SLOTS_CARRY_S (900 s) nasce com esse limite, menos o que a RAM não paga
+# (cada slot novo, BALLAST_SLOT_MB; a conta do piso é a da partida). Fora da janela, com elastic.off ou sem o estado: o mínimo de sempre.
+carry_one() {  # carry_one ESPERA_S MEM — el_one 2 6, sobe até 6, a rodada acaba (rc 0) e o item recomeça depois do pulo de ESPERA_S s (3 leituras livres); CR_RUN = a rodada nova (ou vazio), CR_SLOTS = o slots-file dela
+  el_one 2 6; eltick 30 0 28000; eltick 30 0 28000; eltick 30 0 28000
+  gone "$PID"; echo 0 > "$H/runs/$RUN/rc"; adv 50 0 60; bt
+  adv 50 0 "$1"; setmem "$2"; bt; good 50; good 50; good 50
+  CR_RUN=""; CR_SLOTS=""; [ "$(nstart)" = 0 ] || { CR_RUN=$(started_run); CR_SLOTS=$(cat "$H/runs/$CR_RUN/slots" 2> /dev/null | tr -d ' \n'); }
+}
+g_carry() {
+  local a b
+  carry_one 301 28000
+  check "slots/carry: a rodada que recomeça 301 s depois da última escrita de slots (6) já nasce com 6, e o tick diz quantos slots deu" "6 6" "$CR_SLOTS $(jget started.0.slots)"
+  carry_one 1000 28000
+  check "slots/carry: passada a janela de 900 s (1000 s de pulo) volta ao mínimo (2): o limite velho não vale" "2 2" "$CR_SLOTS $(jget started.0.slots)"
+  carry_one 301 15900
+  check "slots/carry: a RAM paga só o que cabe: a 15900 MB (15900 - 1024 - 14336 = 540 MB) cabe 1 slot novo (512 MB) → 3, não 6" "3 3" "$CR_SLOTS $(jget started.0.slots)"
+  el_one 2 6; eltick 30 0 28000; eltick 30 0 28000; eltick 30 0 28000; : > "$H/elastic.off"
+  gone "$PID"; echo 0 > "$H/runs/$RUN/rc"; adv 50 0 60; bt; adv 50 0 301; bt; good 50; good 50; good 50; a=$(cat "$H/runs/$(started_run)/slots" 2> /dev/null | tr -d ' \n')
+  check "slots/carry: com elastic.off o item recomeça no mínimo (2)" "2" "$a"
+  # o limite guardado é o do ÚLTIMO tick elástico, com o carimbo desse tick (state.json: slots_last)
+  el_one 2 6; eltick 30 0 28000; eltick 30 0 28000
+  check "slots/carry: state.json guarda o último limite do item (6) e o carimbo do tick" "6 $NOW" "$("$PY" -I -c 'import json,sys; d=json.load(open(sys.argv[1]))["slots_last"]["wam"]; print(d["n"], d["t"])' "$H/state.json")"
+  # estado de forma errada é estado corrompido (vai para o lado e recomeça), nunca limite inventado
+  el_one 2 6; adv 50 0 60; printf '{"v": 1, "last": null, "free_ticks": 0, "cooldown": {}, "slots_last": {"wam": {"n": "seis", "t": 1}}}' > "$H/state.json"; bt
+  check "slots/carry: slots_last de forma errada (n texto) corrompe o estado: o arquivo vai para o lado" "1" "$(ls "$H" | grep -c '^state.json.corrupt-')"
+  adv 50 0 60; printf '{"v": 1, "last": null, "free_ticks": 0, "cooldown": {}, "sess": {"since": 1, "last": 2, "b": {"x": 1}}}' > "$H/state.json"; bt
+  check "piso/estado: sess de forma errada (balde que não é número) corrompe o estado: o arquivo vai para o lado" "2" "$(ls "$H" | grep -c '^state.json.corrupt-')"
+}
+
+# ── g_startmb ─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+# START_MB (ga-03rqsr0): a conta de PARTIDA descontava de MemAvailable o teto do item (rss_mb), que é o que MATA, não o que o item usa. Medido no nó (results.jsonl desde 03/11, memory.peak do escopo, que ainda inclui cache de arquivo): hq-selftests
+# pico máximo 1584 MB (p90 1482) com teto de 4096; hq-mutants 1048 (p90 1008) com teto de 3072; por isso os dois ficaram `skipped why=ram` em 38% e 26% dos ticks ao lado do wa-suite. A 9ª coluna OPCIONAL do registro, start_mb (1..rss_mb), é o que a partida
+# desconta (ausente = rss_mb, como antes); o teto (rss_mb) continua sendo o que o governo aplica por minuto e o MemoryMax do escopo.
+sm_home() {  # sm_home MEM — newhome com dois itens work de 2 núcleos, teto 4096 e start_mb 1024 (sm1 e sm2); a RAM dada
+  newhome; : > "$H/items.tsv"; reg 'sm1|work|2|4096|3600|300|-|sleeper.sh|1024'; reg 'sm2|work|2|4096|3600|300|-|sleeper.sh|1024'; setmem "$1"; seed; good 50; good 50; good 50
+}
+g_startmb() {
+  local a b
+  sm_home 15400; a=$(nstart); b=$(jget skipped)
+  check "start_mb: a 15400 MB (15400 - 1024 >= 14336) o sm1 começa mesmo com teto de 4096; o sm2 não cabe depois do desconto do sm1 (14376 - 1024 < 14336) e o tick diz que foi a RAM" "1 sm2" "$a $(jget skipped.0.item)"
+  sm_home 15300; a=$(nstart)
+  check "start_mb: a 15300 MB (15300 - 1024 < 14336) nenhum começa" "0" "$a"
+  sm_home 16500; a=$(nstart)
+  check "start_mb: a 16500 MB os dois cabem (o 2º desconta o 1º: 16500 - 1024 - 1024 >= 14336)" "2" "$a"
+  sm_home 16300; a=$(nstart)
+  check "start_mb: a 16300 MB só um (16300 - 1024 - 1024 = 14252 < 14336): o item planejado desconta o start_mb dele" "1" "$a"
+  sm_home 15400; RUN=$(started_run)
+  check "start_mb: a meta da rodada guarda o TETO (4096), que é o que mata e o que vai para o escopo; o start_mb não o rebaixa" "4096" "$("$PY" -I -c 'import json,sys; print(json.load(open(sys.argv[1]))["rss_mb"])' "$H/runs/$RUN/meta.json")"
+  newhome; : > "$H/items.tsv"; reg 'a|work|2|4096|3600|300|-|sleeper.sh|700'; reg 'b|work|2|4096|3600|300|-|sleeper.sh'; reg 'c|work|2|4096|3600|300|-|sleeper.sh|0'; reg 'd|work|2|4096|3600|300|-|sleeper.sh|4097'; reg 'e|work|2|4096|3600|300|-|sleeper.sh|abc'
+  reg 'f|work|2|4096|3600|300|-|sleeper.sh|1000|9'; reg 'g|work|2|4096|3600|300|-|sleeper.sh|4096'; bt status --json
+  check "start_mb: o registro lê a 9ª coluna (700), ausente vale o teto (4096) e 4096 = teto vale; 0, 4097 (> teto), texto e uma 10ª coluna são 4 erros visíveis" "700 4096 4096 4" "$(jget items.0.start_mb) $(jget items.1.start_mb) $(jget items.2.start_mb) $(printf '%s' "$OUT" | "$PY" -I -c 'import sys,json; print(len(json.load(sys.stdin)["registry_errors"]))')"
+}
+
 if [ -n "${HB_MUTANT:-}" ]; then
-  if [ "${HB_MUTANT_GROUPS:-}" = teto ]; then g_ceil; g_cgrp; elif [ "${HB_MUTANT_GROUPS:-}" = elastico ]; then g_elastic; else g_reg; g_tick; g_run; g_ram; g_reap; g_fill; g_off; g_state; g_logs; g_launch; g_send; fi
+  if [ "${HB_MUTANT_GROUPS:-}" = teto ]; then g_ceil; g_cgrp; elif [ "${HB_MUTANT_GROUPS:-}" = elastico ]; then g_elastic; elif [ "${HB_MUTANT_GROUPS:-}" = piso ]; then g_floor; g_carry; g_startmb; else g_reg; g_tick; g_run; g_ram; g_reap; g_fill; g_off; g_state; g_logs; g_launch; g_send; fi
   echo "RESULT $fails/$n"; [ "$fails" = 0 ]; exit $?
 fi
 if [ -n "${HB_ONLY:-}" ]; then "g_$HB_ONLY"; echo "── $((n - fails))/$n ok (só g_$HB_ONLY)"; [ "$fails" = 0 ]; exit $?; fi
-g_reg; g_tick; g_run; g_ram; g_reap; g_fill; g_off; g_state; g_logs; g_launch; g_send; g_ceil; g_cgrp; g_elastic
+g_reg; g_tick; g_run; g_ram; g_reap; g_fill; g_off; g_state; g_logs; g_launch; g_send; g_ceil; g_cgrp; g_elastic; g_floor; g_carry; g_startmb
 
 [ -n "${HB_NO_MUTANTS:-}" ] || {
   echo "── controle negativo: cada mutante tem que reprovar a bateria ──"
@@ -1039,7 +1202,7 @@ estado corrompido não vai para o lado@@            os.replace(path, aside)@@   
 estado de outra forma (lista) passa por válido@@    if not (isinstance(st, dict) and st.get("v") == 1 and@@    if not (True and
 estado ilegível por permissão recomeça@@        raise Fail("%s: não abre (%s)" % (path, e))@@        return fresh_state()
 registro com nome repetido aceito@@if name in seen:@@if False:
-registro com coluna a menos aceito@@        if len(c) != 8:@@        if len(c) < 7:
+registro com coluna a menos aceito@@        if len(c) not in (8, 9):@@        if len(c) < 7:
 predicado de requires desconhecido vira verdadeiro@@            return False, "requires: predicado desconhecido %r" % term.strip()@@            continue
 comando sem permissão de execução aceito@@    if not (os.path.isfile(argv[0]) and os.access(argv[0], os.X_OK)):@@    if not os.path.isfile(argv[0]):
 nice 19 trocado por nice 0 no prefixo@@    pre = ["nice", "-n", "19"]@@    pre = ["nice", "-n", "0"]
@@ -1051,14 +1214,14 @@ stop não devolve o que parou@@        out["stopped"].append({"item": r["item"],
 a marca ballast-item de OUTRA pasta de lastro vale como item nosso@@ and (valid is None or parts[1] in valid):@@ and True:
 RAM de partida do work ignora o teto de RSS do item@@used + cores > budget:
                 continue
-            if mem_left - it["rss_mb"] < cfg.ram_start_mb:@@used + cores > budget:
+            if mem_left - it["start_mb"] < floor:@@used + cores > budget:
                 continue
-            if mem_left < cfg.ram_start_mb:
+            if mem_left < floor:
 RAM de partida do filler ignora o teto de RSS do item@@fill_used + cores > budget):
                 continue
-            if mem_left - it["rss_mb"] < cfg.ram_start_mb:@@fill_used + cores > budget):
+            if mem_left - it["start_mb"] < floor:@@fill_used + cores > budget):
                 continue
-            if mem_left < cfg.ram_start_mb:
+            if mem_left < floor:
 stop não anota o motivo da rodada@@            st["killed"].setdefault(r["run"], "stop")@@            pass
 rodada parada à mão ganha o cooldown de falha@@"preempt", "stop"):@@"preempt"):
 cron.err cresce sem teto@@    trim_log(os.path.join(cfg.home, "cron.err"), 262144, 65536)@@    pass
@@ -1067,8 +1230,8 @@ quem levou TERM e ainda morre é recomeçado em cima@@        running_names = se
 prefixo de lançamento inválido é aceito@@    if not (isinstance(v, list) and all(isinstance(x, str) for x in v)):@@    if False:
 prefixo sem nice aceito fora do selftest@@    if not test and "nice" not in v:@@    if False:
 a RAM lida uma vez: o work planejado não desconta a sobra do seguinte@@            used += cores
-            mem_left -= it["rss_mb"]@@            used += cores
-a RAM lida uma vez: o filler começado não desconta a sobra do seguinte@@                mem_left -= it["rss_mb"]@@                pass
+            mem_left -= it["start_mb"]@@            used += cores
+a RAM lida uma vez: o filler começado não desconta a sobra do seguinte@@                mem_left -= it["start_mb"]@@                pass
 item que roda não ocupa núcleos (running_cores zerado)@@        tot += c@@        tot += 0
 meta.json ausente conta 1 núcleo (errar para menos)@@            c = budget if c == "auto" else c@@            c = 1
 meta.json com núcleos 0 vale@@if not (_int(c) and c >= 1):@@if not _int(c):
@@ -1200,7 +1363,7 @@ a linha da rodada não diz que houve órfãos@@        row["orfaos"] = True@@   
 [elastico] filler elástico é aceito@@                if not 1 <= ncores < cmax or role != "work":@@                if not 1 <= ncores < cmax:
 [elastico] o escopo do item elástico tem o teto do mínimo (não escala pelo máximo)@@    scale = item["cores_max"] / float(item["cores"]) if item.get("cores_max") else 1.0@@    scale = 1.0
 [elastico] o item elástico não recebe o máximo@@        env["BALLAST_CORES_MAX"] = str(item["cores_max"])@@        env["BALLAST_CORES_MAX"] = str(cores)
-[elastico] o arquivo de slots começa em outro valor que o mínimo@@        write_slots(cfg, run, cores)@@        write_slots(cfg, run, item["cores_max"])
+[elastico] o arquivo de slots começa em outro valor que o mínimo@@        write_slots(cfg, run, cores if slots is None else slots)@@        write_slots(cfg, run, item["cores_max"])
 [elastico] a meta não guarda o máximo@@    if item.get("cores_max"):
         meta["cores_max"] = item["cores_max"]@@    if item.get("cores_max"):
         pass
@@ -1209,8 +1372,8 @@ a linha da rodada não diz que houve órfãos@@        row["orfaos"] = True@@   
 [elastico] a leitura ruim (CPU/RAM/ilegível) vale como 'tudo livre' e o limite sobe@@    if mem is None or not ok or room is None:
         return cur, "leitura"@@    if mem is None or not ok or room is None:
         room, mem = 99.0, 99999
-[elastico] RAM baixa não devolve slots@@    if mem < cfg.ram_resume_mb + 1024:@@    if False:
-[elastico] o piso de descida por RAM é o de retomada (sem o 1 GB de margem)@@    if mem < cfg.ram_resume_mb + 1024:@@    if mem < cfg.ram_resume_mb:
+[elastico] RAM baixa não devolve slots@@    if mem < min(cfg.ram_resume_mb + 1024, floor):@@    if False:
+[elastico] o piso de descida por RAM é o de retomada (sem o 1 GB de margem)@@    if mem < min(cfg.ram_resume_mb + 1024, floor):@@    if mem < min(cfg.ram_resume_mb, floor):
 [elastico] RAM baixa desce 1 em vez do passo@@        return max(lo, cur - cfg.elastic_step), "ram"@@        return max(lo, cur - 1), "ram"
 [elastico] RAM baixa desce abaixo do mínimo@@        return max(lo, cur - cfg.elastic_step), "ram"@@        return cur - cfg.elastic_step, "ram"
 [elastico] a pressão de disco acima do teto não desce@@    if io is not None and io > cfg.io_full_max:@@    if False:
@@ -1226,8 +1389,8 @@ a linha da rodada não diz que houve órfãos@@        row["orfaos"] = True@@   
 [elastico] sobe sem limite no máximo@@    if cur >= hi:
         return cur, "max"@@    if False:
         return cur, "max"
-[elastico] sobe sem olhar a RAM que sobra (sem os 512 MB por slot)@@    k = min(cfg.elastic_step, hi - cur, int((mem - cfg.ram_start_mb) // cfg.slot_mb))@@    k = min(cfg.elastic_step, hi - cur)
-[elastico] sobe 1 só em vez do passo@@    k = min(cfg.elastic_step, hi - cur, int((mem - cfg.ram_start_mb) // cfg.slot_mb))@@    k = min(1, hi - cur, int((mem - cfg.ram_start_mb) // cfg.slot_mb))
+[elastico] sobe sem olhar a RAM que sobra (sem os 512 MB por slot)@@    k = min(cfg.elastic_step, hi - cur, int((mem - floor) // cfg.slot_mb))@@    k = min(cfg.elastic_step, hi - cur)
+[elastico] sobe 1 só em vez do passo@@    k = min(cfg.elastic_step, hi - cur, int((mem - floor) // cfg.slot_mb))@@    k = min(1, hi - cur, int((mem - floor) // cfg.slot_mb))
 [elastico] a chave elastic.off não faz nada@@    off = os.path.exists(os.path.join(cfg.home, "elastic.off"))@@    off = False
 [elastico] a chave elastic.off derruba só 1 e não ao mínimo@@        want, why = (lo, "chave") if off else@@        want, why = (max(lo, cur - 1), "chave") if off else
 [elastico] arquivo de slots ilegível vale o máximo (e não o mínimo)@@        return lo, False
@@ -1279,6 +1442,71 @@ def read_cpu_prev(cfg):
 [elastico] só o `parcial` de rc 0 conta mas a falha também encurta@@    if why == "ok" and _int(row["secs"])@@    if _int(row["secs"])
 [elastico] o cooldown do parcial encurta para 0 em vez do ambiente@@        cool = min(cool, cfg.partial_cooldown_s)@@        cool = 0
 [elastico] o resumo completo também encurta o cooldown@@ and summ.get("result") == "parcial":@@ and summ.get("result"):
+[piso] o piso dinâmico ignora o pico de sessões (conta 0)@@cfg.ram_pause_mb + cfg.sess_margin_mb + peak * cfg.sess_mb@@cfg.ram_pause_mb + cfg.sess_margin_mb + 0 * cfg.sess_mb
+[piso] o piso dinâmico passa do fixo (sem o teto)@@return min(cfg.ram_start_mb, cfg.ram_pause_mb + cfg.sess_margin_mb + peak * cfg.sess_mb), "dinamico", peak@@return cfg.ram_pause_mb + cfg.sess_margin_mb + peak * cfg.sess_mb, "dinamico", peak
+[piso] o piso dinâmico perde a margem (pausa + sessões)@@cfg.ram_pause_mb + cfg.sess_margin_mb + peak * cfg.sess_mb@@cfg.ram_pause_mb + peak * cfg.sess_mb
+[piso] o piso dinâmico conta 512 MB por sessão em vez de usar BALLAST_SESS_MB@@cfg.ram_pause_mb + cfg.sess_margin_mb + peak * cfg.sess_mb@@cfg.ram_pause_mb + cfg.sess_margin_mb + peak * 512
+[piso] o aquecimento é ignorado (dinâmico com 1 leitura só)@@    if peak is None or cfg.now - s["since"] < cfg.sess_window_s:@@    if peak is None:
+[piso] o aquecimento conta uma leitura a menos (a janela cheia é exclusiva)@@cfg.now - s["since"] < cfg.sess_window_s:@@cfg.now - s["since"] <= cfg.sess_window_s:
+[piso] tmux que não leu vira 0 sessões@@    except Unreadable:
+        n_sess = None@@    except Unreadable:
+        n_sess = 0
+[piso] o tmux que não lê não deixa o histórico quieto (anota 0)@@    if n is None:
+        return
+    s = st.get("sess")@@    if n is None:
+        n = 0
+    s = st.get("sess")
+[piso] erro do tmux que não é 'sem servidor' vira 0 sessões@@    raise Unreadable("tmux list-sessions: rc %d (%s)" % (p.returncode, out.strip()[:120]))@@    return 0
+[piso] 'sem servidor' deixa de ser 0 sessões (vira não consegui ler)@@    if "no server running" in out or ("error connecting to" in out and "(No such file or directory)" in out):@@    if False:
+[piso] saída do tmux sem linha conta como 1 sessão@@        return len([ln for ln in out.splitlines() if ln.strip()])@@        return len(out.splitlines()) or 1
+[piso] o tmux que não executa é 0 sessões@@        raise Unreadable("tmux list-sessions: não executou (%s)" % e)@@        return 0
+[piso] a lacuna de leituras não recomeça a história@@    if not s or cfg.now < s["last"] or cfg.now - s["last"] > cfg.sess_gap_s:@@    if not s:
+[piso] o balde guarda a última contagem e não a maior@@    s["b"][k] = max(s["b"].get(k, 0), n)@@    s["b"][k] = n
+[piso] o histórico nunca esquece (sem a poda dos baldes velhos)@@    s["b"] = {b: v for b, v in s["b"].items() if int(b) >= lo}@@    s["b"] = s["b"]
+[piso] o pico aparece mesmo quando o tmux não leu neste tick@@    peak = max(s["b"].values()) if (n is not None and s and s["b"]) else None@@    peak = max(s["b"].values()) if (s and s["b"]) else None
+[piso] a chave ram-floor.fixed é ignorada@@    if flag_on(os.path.join(cfg.home, "ram-floor.fixed")):@@    if False:
+[piso] chave que não consigo ler vale como desligada (o lado que libera RAM)@@    except OSError:
+        return True@@    except OSError:
+        return False
+[piso] sem leitura o piso usa o dinâmico de antes@@    if n is None:
+        return cfg.ram_start_mb, "fixo-sem-leitura", None@@    if False:
+        return cfg.ram_start_mb, "fixo-sem-leitura", None
+[piso] os slots guardados não são atualizados a cada tick@@        st["slots_last"][r["item"]] = {"n": want, "t": cfg.now}@@        pass
+[piso] o limite guardado vale para sempre (sem a janela de 900 s)@@or not 0 <= cfg.now - last["t"] <= cfg.slots_carry_s:@@or False:
+[piso] o carry ignora elastic.off@@ or not last or flag_on(os.path.join(cfg.home, "elastic.off")) or not 0 <=@@ or not last or not 0 <=
+[piso] o carry ignora o que a RAM paga@@    extra = max(0, int((mem_left - item["start_mb"] - floor) // cfg.slot_mb))@@    extra = 99
+[piso] o carry começa sempre no máximo do item@@    return max(cores, min(last["n"], item["cores_max"], cores + extra))@@    return item["cores_max"]
+[piso] o item elástico começa no mínimo mesmo com o limite guardado@@        write_slots(cfg, run, cores if slots is None else slots)@@        write_slots(cfg, run, cores)
+[piso] o tick não diz quantos slots deu ao item que começou@@        out["slots"] = cores if slots is None else slots@@        pass
+[piso] a descida por RAM do elástico ignora o piso dinâmico (retomada + 1 GB fixo)@@    if mem < min(cfg.ram_resume_mb + 1024, floor):@@    if mem < cfg.ram_resume_mb + 1024:
+[piso] o elástico sobe pelo piso FIXO e não pelo do tick@@int((mem - floor) // cfg.slot_mb))@@int((mem - cfg.ram_start_mb) // cfg.slot_mb))
+[piso] a partida do work usa o piso fixo e não o do tick@@            if mem_left - it["start_mb"] < floor:
+                rec["skipped"].append({"item": it["name"], "why": "ram"})
+                rec["ram"] = "baixa"
+                continue
+            plan.append(@@            if mem_left - it["rss_mb"] < cfg.ram_start_mb:
+                rec["skipped"].append({"item": it["name"], "why": "ram"})
+                rec["ram"] = "baixa"
+                continue
+            plan.append(
+[piso] o estado aceita balde que não é número@@and all(isinstance(k, str) and k.isdigit() and _int(v) and v >= 0 for k, v in sess["b"].items())@@and all(isinstance(k, str) and _int(v) and v >= 0 for k, v in sess["b"].items())
+[piso] o estado aceita slots_last de n texto@@isinstance(v, dict) and _int(v.get("n")) and v["n"] >= 1 and _int(v.get("t"))@@isinstance(v, dict)
+[piso] a conta de partida do work volta a descontar o teto e não o start_mb@@            if mem_left - it["start_mb"] < floor:
+                rec["skipped"].append({"item": it["name"], "why": "ram"})
+                rec["ram"] = "baixa"
+                continue
+            plan.append(@@            if mem_left - it["rss_mb"] < floor:
+                rec["skipped"].append({"item": it["name"], "why": "ram"})
+                rec["ram"] = "baixa"
+                continue
+            plan.append(
+[piso] o item planejado não desconta o start_mb de mem_left@@            used += cores
+            mem_left -= it["start_mb"]@@            used += cores
+            pass
+[piso] a 9ª coluna do registro é ignorada (start_mb sempre o teto)@@            start_mb = int(c[8]) if len(c) == 9 else rss_mb@@            start_mb = rss_mb
+[piso] start_mb acima do teto é aceito@@            if not 1 <= start_mb <= rss_mb:@@            if not 1 <= start_mb:
+[piso] start_mb 0 é aceito@@            if not 1 <= start_mb <= rss_mb:@@            if not 0 <= start_mb <= rss_mb:
+[piso] uma 10ª coluna é aceita@@        if len(c) not in (8, 9):@@        if len(c) not in (8, 9, 10):
 MUT
   "$PY" -I - "$P" "$T/mutants.txt" "$T" > "$T/mutants.idx" <<'PYEOF'
 import re, sys
@@ -1305,7 +1533,7 @@ PYEOF
   while IFS="$(printf '\t')" read -r idx st desc; do
     if [ "$st" != OK ]; then ok 1 "mutante '$desc': a âncora não casa exatamente 1 vez (o script mudou?)"; continue; fi
     case "$desc" in "[linux]"*) [ -r /proc/self/oom_score_adj ] || { echo "skip mutante '$desc' (sem /proc/self/oom_score_adj neste host)"; continue; };; esac
-    grp=""; case "$desc" in "[teto]"*|"[teto-linux]"*) grp=teto ;; "[elastico]"*) grp=elastico ;; esac
+    grp=""; case "$desc" in "[teto]"*|"[teto-linux]"*) grp=teto ;; "[elastico]"*) grp=elastico ;; "[piso]"*) grp=piso ;; esac
     [ -z "${HB_MUTANTS_ONLY:-}" ] || [ "$grp" = "$HB_MUTANTS_ONLY" ] || continue
     case "$desc" in "[teto-linux]"*) cgrp_ok || { echo "skip mutante '$desc' (sem systemd-run --user utilizável neste host)"; continue; };; esac
     while [ "$(jobs -r | wc -l | tr -d ' ')" -ge "$JOBS" ]; do sleep 0.3; done

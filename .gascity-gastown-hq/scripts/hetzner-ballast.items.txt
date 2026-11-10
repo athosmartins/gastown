@@ -1,7 +1,7 @@
 # hetzner-ballast.items.txt — a fila do lastro do nó Hetzner (ga-2hd02v.5). TSV, 8 colunas separadas por TAB; o hetzner-ballast.sh install a leva para ~/gt-remote/ballast/items.tsv.
 #
 # Contents
-#   Colunas · Itens de hoje · Núcleos e cooldown · O que falta (donos)
+#   Colunas · Itens de hoje · Núcleos e cooldown · Slots elásticos · START_MB · O que falta (donos)
 #
 # COLUNAS: nome · papel (work | filler) · núcleos (inteiro, auto = o resto do orçamento, ou N-M = reserva N e SOBE até M slots conforme a CPU, a RAM e o disco do nó: só `work`, ver SLOTS ELÁSTICOS) · rss_mb (teto da soma de RSS do item; passou, o governo o termina) · prazo_s (o `timeout` do item; o governo
 #   o termina 60 s depois) · cooldown_s (espera entre rodadas; falha espera no mínimo 600 s) · requires (`-` ou lista de path:/exec:/cmd:/flag:/noflag:, todos verdadeiros; predicado desconhecido = item inerte) ·
@@ -29,12 +29,16 @@
 #   (o que faz o item caber ao lado dos outros e o que o `auto`/a partida contam) e deixa o governo mover os slots entre N e M a cada minuto, pela CPU ociosa MEDIDA, a RAM e o PSI de disco (runbook: "Slots elásticos"); `elastic.off` na pasta do lastro volta tudo ao N. Só o wa-mutants é elástico (4-12): o
 #   wa-suite fica fixo em 3 (cada worker cresce até ~3 GB, ga-2hd02v.5.9) e o hq-selftests/hq-mutants não têm trabalho a mais quando o hq está quieto. O rss_mb continua sendo o de N núcleos (4096: a regra de partida não muda) e o governo o escala pelos slots dados (12 slots: 12288 MB; o RSS de pico medido de
 #   um mutante é 224 MB, 82 processos em 04/11) e o escopo systemd leva o teto do M (4096 x 1,25 x 12/4 = 15360 MB). O teto de DADOS por mutante (3072 MB, --data-mb) faz o que aloca sem parar morrer no próprio processo, abaixo do teto de RSS do item.
+# START_MB (ga-03rqsr0, 10/11): a 9ª coluna é OPCIONAL (1..rss_mb; ausente = rss_mb) e é o que a conta de PARTIDA do governo desconta de MemAvailable (começa se MemAvailable - start_mb >= o piso de RAM); o rss_mb segue sendo o teto que MATA o item e o MemoryMax do escopo.
+#   Sem ela, hq-selftests (teto 4096) e hq-mutants (3072) ficavam `skipped why=ram` em 38% e 26% dos 956 ticks de 09-10/11 ao lado do wa-suite, e o que eles realmente usam é bem menos: pico de memory.peak do escopo (inclui cache de arquivo, então é
+#   limite SUPERIOR do RSS) em results.jsonl desde 03/11: hq-selftests 27 rodadas, p90 1482 MB, máx 1584 → start_mb 1792 (máx + 13%); hq-mutants 35 rodadas, p90 1008, máx 1048 → 1280 (máx + 22%). wa-suite e wa-mutants NÃO levam start_mb: o wa-suite já é medido contra o teto
+#   (13312, ver acima) e o wa-mutants tem pico mediano de 4243 MB e máx 6653 com 4-12 slots, acima do 4096 do registro. Item que passa do pico típico continua contido pelo teto e pela pausa/morte por RAM; refazer a conta se o p90 de um item crescer (comando em docs/runbooks/hetzner-ballast.md, "Piso de RAM dinâmico").
 # O QUE FALTA (cada um entra aqui quando o dono entregar um comando que roda sozinho no nó, só com código e dado público que já está lá): calibração do Traço BIM (wa-eqp0dy), backfill do estudo de
 #   viabilidade (wa-ekvjuo).
 #
-# nome	papel	núcleos	rss_mb	prazo_s	cooldown_s	requires	comando
-hq-selftests	work	4	4096	10800	180	exec:~/gt-remote/bin/hetzner-remote-git.sh	hq-selftests.sh
+# nome	papel	núcleos	rss_mb	prazo_s	cooldown_s	requires	comando	[start_mb]
+hq-selftests	work	4	4096	10800	180	exec:~/gt-remote/bin/hetzner-remote-git.sh	hq-selftests.sh	1792
 queima	filler	auto	512	3600	0	flag:burn.on	queima.sh
 wa-suite	work	3	13312	21600	180	exec:~/gt-remote/bin/hetzner-remote-git.sh,exec:~/gt-remote/bin/gt-iso-run,exec:/usr/local/sbin/gt-netns-run,exec:~/gt-remote/venv-wa/bin/python,path:~/gt-remote/bin/gtn_stable_ids.py,noflag:wa-suite.leak	wa-suite.sh
-hq-mutants	work	4	3072	3000	300	exec:~/gt-remote/bin/hetzner-remote-git.sh	hq-mutants.sh
+hq-mutants	work	4	3072	3000	300	exec:~/gt-remote/bin/hetzner-remote-git.sh	hq-mutants.sh	1280
 wa-mutants	work	4-12	4096	3000	300	exec:~/gt-remote/bin/hetzner-remote-git.sh,exec:~/gt-remote/venv-wa/bin/python,noflag:wa-suite.leak	wa-mutants.sh

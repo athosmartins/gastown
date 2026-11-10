@@ -2,7 +2,7 @@
 """hetzner-ballast.py — o lastro do nó Hetzner: trabalho útil de baixa prioridade que ocupa a CPU que sobra e cede na hora. (ga-2hd02v.5) Python 3.9+, só biblioteca padrão.
 
 Contents
-  Para que serve · Roda ONDE · O contrato do nice · Teto de sistema por item · Slots elásticos · Um tick · Itens · Três estados · Arquivos · Uso
+  Para que serve · Roda ONDE · O contrato do nice · Teto de sistema por item · Slots elásticos · Piso de RAM dinâmico e start_mb · Slots que atravessam a rodada · Um tick · Itens · Três estados · Arquivos · Uso
 
 PARA QUE SERVE
   Athos (20/10): "se está 100% ocupado a gente fica feliz; o que não pode é ficar menos". Mesmo com toda bead elegível indo ao nó, a fila tem buracos (madrugada de 20/10: 7 h em 0-15% de CPU).
@@ -27,12 +27,21 @@ SLOTS ELÁSTICOS  (ga-2hd02v.5.11; runbook: "Slots elásticos")
   Leitura que não veio (CPU, RAM) NUNCA muda o limite; PSI que não veio só impede de SUBIR. `elastic.off` na pasta do lastro derruba ao mínimo. O teto de RSS do item sobe na mesma proporção (rss_mb x slots / N) e o do escopo é o do máximo.
   FG LÍQUIDO: o /proc/stat põe o tempo de KERNEL de qualquer processo em `system`, que o governo lê como carga de sessão: copiar árvores e o journal do próprio lastro tiravam núcleos do orçamento. O cpu.stat do escopo de cada item diz
   quanto foi (system_usec) e o governo tira o delta disso do fg (cpu.prev guarda a leitura anterior); sem a leitura, sem correção.
+PISO DE RAM DINÂMICO E START_MB  (ga-03rqsr0; runbook: "Piso de RAM dinâmico")
+  Para COMEÇAR um item (e para subir um slot) o tick exige MemAvailable - start_mb do item >= o PISO. O piso fixo é BALLAST_RAM_START_MB (14336 MB = pausa 10240 + 4096 para sessões que chegam). O governo conta as sessões vivas do nó (`tmux -L gc-remote list-sessions`,
+  o socket do gc-session-ssh), guarda o MAIOR número visto em cada balde de janela/12 s e põe o piso em pausa + margem + pico da janela x MB por sessão (10240 + 1024 + pico x 1024), nunca acima do fixo: só pode LIBERAR RAM. Três estados: leu N ('no server running' = 0)
+  / o tmux não leu (ausente, travado, outro erro) → piso FIXO e o histórico não anda (falha de leitura não é 'zero sessões') / história que não cobre uma janela inteira de leituras contínuas (BALLAST_SESS_WINDOW_S, 21600; lacuna > BALLAST_SESS_GAP_S, 1800, recomeça) → FIXO.
+  O tick registra sess, sess_peak, ram_floor_mb e ram_floor_why (dinamico | fixo-aquecendo | fixo-sem-leitura | fixo-chave); `ram-floor.fixed` na pasta do lastro volta ao fixo. A descida dos slots por RAM é min(retomada + 1 GB, piso): acompanha o piso (sem vai e volta).
+  start_mb é a 9ª coluna OPCIONAL do registro (1..rss_mb; ausente = rss_mb): o que a conta de partida desconta de MemAvailable (o pico típico medido). O rss_mb segue sendo o teto que MATA e o MemoryMax do escopo.
+SLOTS QUE ATRAVESSAM A RODADA  (ga-03rqsr0)
+  Cada tick elástico grava em state.json slots_last[item] = {n, t} (o limite que o motor segue AGORA). A rodada que começa dentro de BALLAST_SLOTS_CARRY_S (900 s) desse t nasce com n slots (menos o que a RAM não paga: slot_mb cada, sobre o que sobra acima do piso
+  depois do start_mb) em vez do mínimo: a rampa de volta (+2 por minuto) deixava 1-2 núcleos parados a cada fim de rodada. Fora da janela, com elastic.off ou sem o estado: o mínimo de sempre. O motor já lê o arquivo de slots ao começar (poll_slots).
 UM TICK  (exit 0 sempre que "não consegui ler" — vira nota no registro; 3 só se não dá para gravar)
   1 lê o registro, /proc/stat, /proc/meminfo e a tabela de processos  2 dá fim aos itens que acabaram (results.jsonl); item que bateu no teto de sistema leva KILL; sobrevivente na sessão de um item que já gravou o rc (órfão) leva TERM depois
   de BALLAST_ORPHAN_GRACE_S (180 s) e a rodada fecha pelo rc do item, com `orfaos` na linha  3 sem a chave `on`: mata o que roda e sai  4 RAM: pausa (SIGSTOP),
   retoma (SIGCONT) ou mata o maior  5 CPU livre = núcleos - carga(nice<=0); a conta de leituras livres seguidas anda ou zera  6 começa itens enquanto couberem no orçamento
   (núcleos livres - reserva): `work` primeiro; `filler` só com o que sobrar e é morto quando um `work` vai começar.
-ITENS  (registro TSV, 8 colunas: nome papel núcleos rss_mb prazo_s cooldown_s requires comando)
+ITENS  (registro TSV, 8 colunas + start_mb opcional: nome papel núcleos rss_mb prazo_s cooldown_s requires comando [start_mb])
   papel work|filler · núcleos inteiro ou `auto` (leva o resto do orçamento) · rss_mb teto da soma de RSS do item · requires `-` ou lista de path:/exec:/cmd:/flag:/noflag: (todos verdadeiros;
   predicado desconhecido = item inerte) · comando relativo vale a partir da pasta de itens. Linha malformada = erro visível em `registry_errors`; o item dela não roda e os outros seguem.
   O que roda é achado na TABELA DE PROCESSOS (o líder da sessão leva a marca `ballast-item:<item>:<rodada>` na linha de comando), não no state.json: perder o estado não duplica o que já roda.
@@ -42,10 +51,10 @@ TRÊS ESTADOS
   state.json corrompido ou de forma errada vai para <arquivo>.corrupt-<época> e recomeça; ilegível por permissão = rc 3 (inerte). A escrita da pasta é conferida ANTES de qualquer efeito.
   O que o tick não leu fica null no registro (running, registry_errors, mode), nunca [].
 ARQUIVOS  (em $BALLAST_HOME, padrão ~/gt-remote/ballast)
-  items.tsv · items/ · on (a chave: presente = ligado) · elastic.off (presente = slots elásticos no mínimo) · state.json · cpu.prev · lock · ticks.jsonl · results.jsonl · runs/<rodada>/{meta.json,log,rc,final,cgroup,ceiling,slots}
+  items.tsv · items/ · on (a chave: presente = ligado) · elastic.off (presente = slots elásticos no mínimo) · ram-floor.fixed (presente = piso de RAM fixo) · state.json · cpu.prev · lock · ticks.jsonl · results.jsonl · runs/<rodada>/{meta.json,log,rc,final,cgroup,ceiling,slots}
 STOP  rc 0 = a sessão de cada item esvaziou (TERM+CONT, KILL 3 s depois no que sobrar) · 3 = não li os processos, nada foi morto · 5 = sobrou processo vivo (`survivors`) ou a tabela ficou
   ilegível depois do TERM (`unverified`): NÃO diz que parou · outro = o stop não rodou. `cgroup_unverified` (rc 0): rodadas com teto cujo cgroup.kill não deu para confirmar (quem fez setsid pode ter sobrado).
-USO  hetzner-ballast.py tick | status [--json] | stop      env: BALLAST_HOME BALLAST_PROC BALLAST_NOW BALLAST_ITEMS BALLAST_ITEMS_DIR BALLAST_LAUNCH_PREFIX (JSON, com `nice`; BALLAST_TEST=1 só no selftest) BALLAST_CEILING (systemd; off só no selftest) BALLAST_TASKS_MAX BALLAST_MEM_FACTOR BALLAST_RUNTIME_DIR BALLAST_LINGER_DIR BALLAST_CGROUP_ROOT BALLAST_SLOT_MB BALLAST_IO_FULL_MAX BALLAST_ELASTIC_STEP BALLAST_ELASTIC_ROOM BALLAST_PARTIAL_COOLDOWN_S BALLAST_PARTIAL_MIN_S e os limites BALLAST_* de load_config
+USO  hetzner-ballast.py tick | status [--json] | stop      env: BALLAST_HOME BALLAST_PROC BALLAST_NOW BALLAST_ITEMS BALLAST_ITEMS_DIR BALLAST_LAUNCH_PREFIX (JSON, com `nice`; BALLAST_TEST=1 só no selftest) BALLAST_CEILING (systemd; off só no selftest) BALLAST_TASKS_MAX BALLAST_MEM_FACTOR BALLAST_RUNTIME_DIR BALLAST_LINGER_DIR BALLAST_CGROUP_ROOT BALLAST_SLOT_MB BALLAST_IO_FULL_MAX BALLAST_ELASTIC_STEP BALLAST_ELASTIC_ROOM BALLAST_PARTIAL_COOLDOWN_S BALLAST_PARTIAL_MIN_S BALLAST_SESS_WINDOW_S BALLAST_SESS_GAP_S BALLAST_SESS_MB BALLAST_SESS_MARGIN_MB BALLAST_TMUX BALLAST_TMUX_SOCKET BALLAST_TMUX_TIMEOUT_S BALLAST_SLOTS_CARRY_S e os limites BALLAST_* de load_config
 """
 import fcntl
 import json
@@ -130,6 +139,9 @@ def load_config(env):
         slot_mb=_num(env, "BALLAST_SLOT_MB", 512, int, 1), io_full_max=_num(env, "BALLAST_IO_FULL_MAX", 25.0, float, 0.0),
         elastic_step=_num(env, "BALLAST_ELASTIC_STEP", 2, int, 1), elastic_room=_num(env, "BALLAST_ELASTIC_ROOM", 2.0, float, 0.0),
         partial_cooldown_s=_num(env, "BALLAST_PARTIAL_COOLDOWN_S", 30, int, 0), partial_min_s=_num(env, "BALLAST_PARTIAL_MIN_S", 600, int, 0),
+        sess_window_s=_num(env, "BALLAST_SESS_WINDOW_S", 21600, int, 1), sess_gap_s=_num(env, "BALLAST_SESS_GAP_S", 1800, int, 1), sess_mb=_num(env, "BALLAST_SESS_MB", 1024, int, 0),
+        sess_margin_mb=_num(env, "BALLAST_SESS_MARGIN_MB", 1024, int, 0), tmux=env.get("BALLAST_TMUX") or "tmux", tmux_socket=env.get("BALLAST_TMUX_SOCKET") or "gc-remote",
+        tmux_timeout_s=_num(env, "BALLAST_TMUX_TIMEOUT_S", 5, int, 1), slots_carry_s=_num(env, "BALLAST_SLOTS_CARRY_S", 900, int, 0),
         launch_prefix=_prefix(prefix, env.get("BALLAST_TEST") == "1"))
 
 
@@ -220,6 +232,24 @@ def scan(root, page_kb):
     return out
 
 
+def read_sessions(cfg):
+    """Quantas sessões vivas o provider tem no nó: `tmux -L <socket> list-sessions`, o MESMO socket e a mesma listagem do gc-session-ssh (ga-03rqsr0).
+    vazio (rc 0 sem linhas; 'no server running'; socket que não existe) → 0; falhou/ilegível (tmux ausente, travado, rc ≠ 0 com qualquer outra mensagem) → Unreadable: NUNCA 0 (0 sessões liberaria RAM)."""
+    argv = [cfg.tmux, "-L", cfg.tmux_socket, "list-sessions", "-F", "#{session_name}"]
+    try:
+        p = subprocess.run(argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=cfg.tmux_timeout_s)
+    except subprocess.TimeoutExpired:
+        raise Unreadable("tmux list-sessions: passou de %d s" % cfg.tmux_timeout_s)
+    except OSError as e:
+        raise Unreadable("tmux list-sessions: não executou (%s)" % e)
+    out = p.stdout.decode("utf-8", "replace")
+    if p.returncode == 0:
+        return len([ln for ln in out.splitlines() if ln.strip()])
+    if "no server running" in out or ("error connecting to" in out and "(No such file or directory)" in out):
+        return 0
+    raise Unreadable("tmux list-sessions: rc %d (%s)" % (p.returncode, out.strip()[:120]))
+
+
 def running_items(procs, known=None, valid=None):
     """{rodada: {item, run, pid, state, rss_kb, members}}. O grupo do item é a SESSÃO do líder (pid == sid): vale o líder com a marca `ballast-item:<item>:<rodada>` na linha de comando
     E uma pasta runs/<rodada> NESTA pasta de lastro (`valid`; a marca sozinha não basta: o selftest do próprio governo roda como item do hq-selftests e deixa processos com a marca de outra pasta,
@@ -269,10 +299,10 @@ def parse_registry(text):
         if not raw.strip() or raw.lstrip().startswith("#"):
             continue
         c = [x.strip() for x in raw.split("\t")]
-        if len(c) != 8:
-            errors.append("linha %d: %d colunas (esperava 8)" % (i, len(c)))
+        if len(c) not in (8, 9):
+            errors.append("linha %d: %d colunas (esperava 8, ou 9 com start_mb)" % (i, len(c)))
             continue
-        name, role, cores, rss, tmo, cool, req, cmd = c
+        name, role, cores, rss, tmo, cool, req, cmd = c[:8]
         try:
             if not NAME_RE.match(name):
                 raise ValueError("nome inválido %r" % name)
@@ -296,11 +326,15 @@ def parse_registry(text):
                 raise ValueError("rss_mb/prazo < 1 ou cooldown < 0")
             if not req or not cmd:
                 raise ValueError("requires ou comando vazio")
+            # 9ª coluna (opcional): start_mb = o que a CONTA DE PARTIDA desconta de MemAvailable (o pico típico MEDIDO do item); ausente = rss_mb. O teto (rss_mb) segue sendo o que mata e o do escopo
+            start_mb = int(c[8]) if len(c) == 9 else rss_mb
+            if not 1 <= start_mb <= rss_mb:
+                raise ValueError("start_mb %d fora de 1..rss_mb (%d)" % (start_mb, rss_mb))
         except ValueError as e:
             errors.append("linha %d: %s" % (i, e))
             continue
         seen.add(name)
-        items.append({"name": name, "role": role, "cores": ncores, "cores_max": cmax, "rss_mb": rss_mb, "timeout_s": tmo_s, "cooldown_s": cool_s, "requires": req, "command": cmd})
+        items.append({"name": name, "role": role, "cores": ncores, "cores_max": cmax, "rss_mb": rss_mb, "start_mb": start_mb, "timeout_s": tmo_s, "cooldown_s": cool_s, "requires": req, "command": cmd})
     return items, errors
 
 
@@ -363,7 +397,7 @@ def eligibility(cfg, item, st, running_names):
 
 # ---- estado -------------------------------------------------------------------------------------------------------------------------------------------
 def fresh_state():
-    return {"v": 1, "last": None, "free_ticks": 0, "cooldown": {}, "term": {}, "killed": {}, "paused": False, "paused_ticks": 0}
+    return {"v": 1, "last": None, "free_ticks": 0, "cooldown": {}, "term": {}, "killed": {}, "paused": False, "paused_ticks": 0, "sess": None, "slots_last": {}}
 
 
 def _int(x):
@@ -378,6 +412,13 @@ def state_ok(st):
     if not (isinstance(st.get("term", {}), dict) and all(_int(x) for x in st.get("term", {}).values())
             and isinstance(st.get("killed", {}), dict) and all(isinstance(x, str) for x in st.get("killed", {}).values())
             and isinstance(st.get("paused", False), bool) and _int(st.get("paused_ticks", 0)) and st.get("paused_ticks", 0) >= 0):
+        return False
+    # sess (histórico de sessões do piso de RAM): None ou {since, last, b{balde: maior contagem}}; slots_last (limite que cada item elástico tinha no último tick): {item: {n >= 1, t}}. Forma errada = estado corrompido (ga-03rqsr0)
+    sess, sl = st.get("sess"), st.get("slots_last", {})
+    if not (sess is None or (isinstance(sess, dict) and _int(sess.get("since")) and _int(sess.get("last")) and isinstance(sess.get("b"), dict)
+                             and all(isinstance(k, str) and k.isdigit() and _int(v) and v >= 0 for k, v in sess["b"].items()))):
+        return False
+    if not (isinstance(sl, dict) and all(isinstance(v, dict) and _int(v.get("n")) and v["n"] >= 1 and _int(v.get("t")) for v in sl.values())):
         return False
     last = st.get("last")
     return (_int(st.get("free_ticks")) and st["free_ticks"] >= 0
@@ -684,7 +725,7 @@ WRAP = ('{ echo 1000 > /proc/self/oom_score_adj; } 2>/dev/null; '
         '{ echo "pids_peak $(cat $c/pids.peak)"; echo "mem_peak $(cat $c/memory.peak)"; sed -n "s/^max /pids_hits /p" $c/pids.events; sed -n "s/^oom_kill /oom_kill /p" $c/memory.events; } > "$BALLAST_RUN_DIR/ceiling"; } 2>/dev/null')
 
 
-def start_item(cfg, item, cores):
+def start_item(cfg, item, cores, slots=None):
     argv, why = resolve_command(cfg, item)
     if argv is None:
         raise Unreadable(why)
@@ -713,7 +754,7 @@ def start_item(cfg, item, cores):
            "BALLAST_RUN_DIR": rundir, "BALLAST_CORES": str(cores), "BALLAST_ITEM": item["name"]}
     if item.get("cores_max"):   # o item elástico recebe o máximo e já encontra o arquivo de slots no mínimo (o motor o lê ao subir; sem gravar, ele segue o --slots dele: o mesmo mínimo)
         env["BALLAST_CORES_MAX"] = str(item["cores_max"])
-        write_slots(cfg, run, cores)
+        write_slots(cfg, run, cores if slots is None else slots)
     prefix = cfg.launch_prefix if cfg.launch_prefix is not None else default_prefix()
     # oom_score_adj 1000: se o nó (sem swap) ficar sem memória, o kernel mata o lastro antes de uma sessão (subir o próprio valor não pede root); sem /proc (macOS) a linha é silenciosa
     wrapper = ["sh", "-c", WRAP, MARK + item["name"] + ":" + run] + prefix + ["timeout", "-k", "30", str(item["timeout_s"])] + argv
@@ -734,7 +775,10 @@ def start_item(cfg, item, cores):
         log.close()
     # o pid na meta: se o líder morrer deixando filho vivo na sessão, a rodada ainda é achada (a marca só vive na linha de comando do líder)
     save_json(os.path.join(rundir, "meta.json"), dict(meta, pid=p.pid))
-    return {"item": item["name"], "run": run, "pid": p.pid, "cores": cores}
+    out = {"item": item["name"], "run": run, "pid": p.pid, "cores": cores}
+    if item.get("cores_max"):
+        out["slots"] = cores if slots is None else slots
+    return out
 
 
 # ---- sinais e fim de rodada ---------------------------------------------------------------------------------------------------------------------------
@@ -954,6 +998,59 @@ def cpu_step(cfg, st, vec, ncpu, rec, notes):
     return ok
 
 
+def flag_on(path):
+    """Chave por arquivo (ram-floor.fixed, elastic.off). vazio (ausente) → desligada; falhou/ilegível (stat negado, laço de symlink, caminho que não é pasta) → LIGADA: nas duas chaves o 'ligado' é o lado conservador (piso fixo, slots no mínimo)."""
+    try:
+        os.stat(path)
+        return True
+    except FileNotFoundError:
+        return False
+    except OSError:
+        return True
+
+
+def sess_note(cfg, st, n):
+    """Anota n sessões vivas no histórico: baldes de janela/12 s, cada um com a MAIOR contagem vista. Passou mais que sess_gap_s desde a última leitura boa (ou o relógio andou para trás) = a história não é contínua e recomeça agora:
+    o pico que passou na lacuna ninguém viu. n None (o tmux não leu) → o histórico não anda: falha de leitura não é 'zero sessões'."""
+    if n is None:
+        return
+    s = st.get("sess")
+    if not s or cfg.now < s["last"] or cfg.now - s["last"] > cfg.sess_gap_s:
+        s = {"since": cfg.now, "last": cfg.now, "b": {}}
+    bsz = max(1, cfg.sess_window_s // 12)
+    k = str(cfg.now // bsz)
+    s["b"][k] = max(s["b"].get(k, 0), n)
+    s["last"] = cfg.now
+    lo = (cfg.now - cfg.sess_window_s) // bsz
+    s["b"] = {b: v for b, v in s["b"].items() if int(b) >= lo}
+    st["sess"] = s
+
+
+def ram_floor(cfg, st, n):
+    """(piso de partida em MB, motivo, pico de sessões na janela ou None). O piso é o que MemAvailable - start_mb do item tem de alcançar para um item COMEÇAR (e para um slot subir). Dinâmico = pausa + margem + pico x MB por sessão, nunca acima do
+    fixo (BALLAST_RAM_START_MB, 14336): só pode liberar RAM, jamais pedir mais que antes. Fixo quando: chave ram-floor.fixed · o tmux não leu neste tick · a história ainda não cobre uma janela inteira (aquecendo). Para item SEM start_mb (start_mb = teto)
+    a conta garante que, começando no limite e crescendo até o teto, MemAvailable fica acima do piso de PAUSA + a margem; item com start_mb só tem essa garantia até o pico típico dele, e acima disso quem contém é o teto (rss_mb) e a pausa por RAM."""
+    s = st.get("sess")
+    peak = max(s["b"].values()) if (n is not None and s and s["b"]) else None
+    if flag_on(os.path.join(cfg.home, "ram-floor.fixed")):
+        return cfg.ram_start_mb, "fixo-chave", peak
+    if n is None:
+        return cfg.ram_start_mb, "fixo-sem-leitura", None
+    if peak is None or cfg.now - s["since"] < cfg.sess_window_s:
+        return cfg.ram_start_mb, "fixo-aquecendo", peak
+    return min(cfg.ram_start_mb, cfg.ram_pause_mb + cfg.sess_margin_mb + peak * cfg.sess_mb), "dinamico", peak
+
+
+def carry_slots(cfg, st, item, cores, mem_left, floor):
+    """Slots com que um item elástico COMEÇA: o último limite que ele tinha (slots_last), se foi há no máximo slots_carry_s, menos o que a RAM não paga (slot_mb cada, sobre o que sobra acima do piso depois do teto do item);
+    senão o mínimo (`cores`). elastic.off, item sem registro, carimbo do futuro ou fora da janela → o mínimo."""
+    last = st.get("slots_last", {}).get(item["name"])
+    if not item.get("cores_max") or not last or flag_on(os.path.join(cfg.home, "elastic.off")) or not 0 <= cfg.now - last["t"] <= cfg.slots_carry_s:
+        return cores
+    extra = max(0, int((mem_left - item["start_mb"] - floor) // cfg.slot_mb))
+    return max(cores, min(last["n"], item["cores_max"], cores + extra))
+
+
 def ram_step(cfg, st, run, mem, rec):
     """RAM: abaixo do piso crítico mata o maior na hora; abaixo do de pausa congela (SIGSTOP) e, se não passar em N leituras, mata o maior; com folga retoma (SIGCONT)."""
     biggest = max(run.values(), key=lambda r: r["rss_kb"]) if run else None
@@ -984,12 +1081,14 @@ def ram_step(cfg, st, run, mem, rec):
     rec["paused"] = st["paused"]
 
 
-def elastic_decide(cfg, st, cur, lo, hi, mem, ok, room, io):
-    """(slots desejados, motivo) de UM item elástico. mem MB (ou None), ok = a leitura da CPU valeu, room = núcleos ociosos além da reserva (ou None), io = io full avg10 (ou None)."""
+def elastic_decide(cfg, st, cur, lo, hi, mem, ok, room, io, floor=None):
+    """(slots desejados, motivo) de UM item elástico. mem MB (ou None), ok = a leitura da CPU valeu, room = núcleos ociosos além da reserva (ou None), io = io full avg10 (ou None). floor = o piso de partida do tick (ram_floor);
+    sem ele, o fixo. A descida por RAM é min(retomada + 1 GB, piso): com o piso dinâmico mais baixo ela o acompanha (subir só com mem >= piso + slot e descer só abaixo do piso: sem vai e volta)."""
+    floor = cfg.ram_start_mb if floor is None else floor
     # vazio/falhou/ilegível: CPU ou RAM que não vieram → o limite FICA ("leitura"); o PSI que não veio só impede de SUBIR (nem sobe nem desce por disco); nada disso vira 'tudo livre' nem 'tudo cheio'
     if mem is None or not ok or room is None:
         return cur, "leitura"
-    if mem < cfg.ram_resume_mb + 1024:   # abaixo do piso de retomada + 1 GB: devolve RAM ANTES de o governo pausar tudo (e, em último caso, matar o maior item)
+    if mem < min(cfg.ram_resume_mb + 1024, floor):   # abaixo do piso de retomada + 1 GB (ou do piso de partida, se menor): devolve RAM ANTES de o governo pausar tudo (e, em último caso, matar o maior item)
         return max(lo, cur - cfg.elastic_step), "ram"
     if io is not None and io > cfg.io_full_max:
         return max(lo, cur - 1), "disco"
@@ -999,11 +1098,11 @@ def elastic_decide(cfg, st, cur, lo, hi, mem, ok, room, io):
         return cur, "fica"
     if cur >= hi:
         return cur, "max"
-    k = min(cfg.elastic_step, hi - cur, int((mem - cfg.ram_start_mb) // cfg.slot_mb))
+    k = min(cfg.elastic_step, hi - cur, int((mem - floor) // cfg.slot_mb))
     return (cur + k, "up") if k >= 1 else (cur, "sem-ram")
 
 
-def elastic_step(cfg, st, run, rec, mem, ok):
+def elastic_step(cfg, st, run, rec, mem, ok, floor=None):
     """escreve o slots-file de cada item elástico que roda. A CPU ociosa vem do tick (rec), a pressão de disco do PSI (lida só se há item elástico)."""
     # vazio (nenhum item elástico roda) → nada; falhou/ilegível (meta sem núcleos, arquivo de slots que não grava) → o que o motor segue continua o de antes
     todo = [(r, read_meta(cfg, r["run"]) or {}) for r in run.values()]
@@ -1023,10 +1122,11 @@ def elastic_step(cfg, st, run, rec, mem, ok):
     for r, m in todo:
         lo, hi = m["cores"], m["cores_max"]
         cur, known = read_slots_file(cfg, r["run"], lo, hi)
-        want, why = (lo, "chave") if off else elastic_decide(cfg, st, cur, lo, hi, mem, ok, room, io)
+        want, why = (lo, "chave") if off else elastic_decide(cfg, st, cur, lo, hi, mem, ok, room, io, floor)
         if want != cur or not known:
             if not write_slots(cfg, r["run"], want):
                 want, why = cur, "escrita-falhou"
+        st["slots_last"][r["item"]] = {"n": want, "t": cfg.now}   # o limite que o motor segue AGORA (escrita que falhou = o de antes): a rodada que recomeçar logo depois nasce com ele
         rec["elastic"].append({"item": r["item"], "run": r["run"], "from": cur, "to": want, "why": why})
 
 
@@ -1091,6 +1191,14 @@ def do_tick(cfg):
     if bad:
         notes.append("leitura-ilegivel")
     rec["ncpu"], rec["mem_avail_mb"] = ncpu, mem
+    # sessões vivas no tmux do provider → piso de RAM do tick. vazio (sem servidor) → 0 sessões; falhou/ilegível (tmux) → None: piso FIXO e o histórico não anda (a razão fica no registro: ram_floor_why)
+    try:
+        n_sess = read_sessions(cfg)
+    except Unreadable:
+        n_sess = None
+    sess_note(cfg, st, n_sess)
+    floor, rec["ram_floor_why"], rec["sess_peak"] = ram_floor(cfg, st, n_sess)
+    rec["sess"], rec["ram_floor_mb"] = n_sess, floor
     seen_names = {r["item"] for r in run.values()}   # o que existia ANTES de qualquer sinal deste tick: quem leva TERM e ainda morre não pode ser recomeçado em cima
     free_ok = False
     if vec is not None:
@@ -1142,7 +1250,7 @@ def do_tick(cfg):
         if mem is not None and on:
             ram_step(cfg, st, run, mem, rec)
         if on:
-            elastic_step(cfg, st, run, rec, mem, free_ok)
+            elastic_step(cfg, st, run, rec, mem, free_ok, floor)
     # vazio (nada roda) → []; falhou/ilegível (tabela de processos) → null, nunca []
     rec["running"] = sorted(r["item"] for r in run.values()) if procs is not None else None
     # começar itens: ligado, tudo lido, CPU livre por idle_ticks leituras seguidas, orçamento = núcleos livres - reserva. `work` primeiro; `filler` só com o que sobrar.
@@ -1167,24 +1275,24 @@ def do_tick(cfg):
             cores = it["cores"] if it["cores"] != "auto" else budget - used
             if not ok or cores < 1 or used + cores > budget:
                 continue
-            if mem_left - it["rss_mb"] < cfg.ram_start_mb:
+            if mem_left - it["start_mb"] < floor:
                 rec["skipped"].append({"item": it["name"], "why": "ram"})
                 rec["ram"] = "baixa"
                 continue
-            plan.append((it, cores))
+            plan.append((it, cores, carry_slots(cfg, st, it, cores, mem_left, floor)))
             used += cores
-            mem_left -= it["rss_mb"]
+            mem_left -= it["start_mb"]
         if plan:   # um work vai começar: os fillers saem da frente (e voltam no tick seguinte com o que sobrar)
             for r in list(run.values()):
                 m = read_meta(cfg, r["run"]) or {}
                 if m.get("role") == "filler" and r["run"] not in st["term"]:
                     terminate(cfg, st, r, "preempt", rec)
                     del run[r["run"]]
-        for it, cores in plan:
+        for it, cores, slots in plan:
             if len(run) + len(rec["started"]) >= cfg.max_items:
                 break
             try:
-                rec["started"].append(start_item(cfg, it, cores))
+                rec["started"].append(start_item(cfg, it, cores, slots))
             except Unreadable as e:
                 notes.append("nao-comecou:%s" % it["name"])
                 print("hetzner-ballast: %s" % e, file=sys.stderr)
@@ -1196,14 +1304,14 @@ def do_tick(cfg):
             cores = it["cores"] if it["cores"] != "auto" else budget - fill_used
             if not ok or cores < 1 or (it["cores"] != "auto" and fill_used + cores > budget):
                 continue
-            if mem_left - it["rss_mb"] < cfg.ram_start_mb:
+            if mem_left - it["start_mb"] < floor:
                 rec["skipped"].append({"item": it["name"], "why": "ram"})
                 rec["ram"] = "baixa"
                 continue
             try:
                 rec["started"].append(start_item(cfg, it, cores))
                 fill_used += cores
-                mem_left -= it["rss_mb"]
+                mem_left -= it["start_mb"]
             except Unreadable as e:
                 notes.append("nao-comecou:%s" % it["name"])
                 print("hetzner-ballast: %s" % e, file=sys.stderr)
@@ -1335,7 +1443,7 @@ def do_status(cfg):
     names = {r["item"] for r in run.values()}
     for it in items:
         ok, why = eligibility(cfg, it, st, names)
-        out["items"].append({"name": it["name"], "role": it["role"], "cores": it["cores"], "cores_max": it.get("cores_max"), "eligible": ok, "why": why})
+        out["items"].append({"name": it["name"], "role": it["role"], "cores": it["cores"], "cores_max": it.get("cores_max"), "rss_mb": it["rss_mb"], "start_mb": it["start_mb"], "eligible": ok, "why": why})
     return out
 
 
