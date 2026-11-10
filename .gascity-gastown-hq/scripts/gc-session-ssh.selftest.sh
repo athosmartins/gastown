@@ -1117,6 +1117,16 @@ g_wt() {
   [ "$(jq -r .worktree.start_timeout "$T/out")" = 150 ]; ok $? "wt: ...e o prazo do start sobe ao piso de 150 s (a config pedia 25 s: o wt-add puxa o espelho antes de criar)"
   cfg 3 400 "$base"; fresh; pv --dry-run start $n1 < <(req cat "$eng"); [ "$(jq -r .worktree.start_timeout "$T/out")" = 400 ]; ok $? "wt: ...e prazo de config MAIOR que o piso vale (400 s)"; cfg 3 25 "$base"
   fresh; pv --dry-run start wa-worker-remote-gaabc12 < <(req cat "$eng"); [ $RC = 0 ] && jq -e 'has("worktree") | not' "$T/out" >/dev/null && [ "$(jq -r .work_dir "$T/out")" = "$RR/city/.gc/agents/dogs/dog-remote-1" ]; ok $? "wt: dry-run de papel SEM mapa não traz 'worktree' e mantém o work_dir de sempre"
+  # --- ga-do1ixn.6.1: UM papel Kimi escolhe o rig pela cauda da bead no nome da sessão ---
+  local knh=kimi-worker-remote-gaabc123 knw=kimi-worker-remote-waabc123 kw warepo="$RH/gt-remote/git/whatsapp_automation/repo.git"
+  git clone -q --bare "$T/seed/s" "$warepo" && git -C "$warepo" update-ref refs/remotes/origin/main "$(git -C "$warepo" rev-parse HEAD)"
+  cfg 3 25 '{"worktree_prepare":true,"worktree_rigs":{"dog":"gascity","kimi-worker":{"ga":"gascity","wa":"whatsapp_automation"}}}'
+  fresh; pv --dry-run start "$knh" < <(req cat "$eng"); [ $RC = 0 ] && [ "$(jq -r .worktree.rig "$T/out")" = gascity ] && [ "$(jq -r .work_dir "$T/out")" = "$(WTD "$knh")" ]; ok $? "wt: Kimi com cauda ga- escolhe worktree do gascity (rc=$RC)"
+  fresh; pv --dry-run start "$knw" < <(req cat "$eng"); kw="$RH/gt-remote/git/whatsapp_automation/wt/$knw"; [ $RC = 0 ] && [ "$(jq -r .worktree.rig "$T/out")" = whatsapp_automation ] && [ "$(jq -r .work_dir "$T/out")" = "$kw" ]; ok $? "wt: Kimi com cauda wa- escolhe worktree do whatsapp_automation (rc=$RC)"
+  fresh; pv start "$knw" < <(req cat "$eng"); ok $RC "wt: start do Kimi para bead WA abre dentro do worktree do whatsapp_automation (rc=$RC $(head -c 200 "$T/err"))"
+  has "$T/rg.log" "wt-add whatsapp_automation $knw" && [ "$(git -C "$kw" rev-parse --is-inside-work-tree 2>/dev/null)" = true ]; ok $? "wt: ...o wt-add recebeu o rig WA e criou o worktree no repositório dele"
+  : > "$T/rg.log"; pv stop "$knw" </dev/null; [ $RC = 0 ] && [ ! -e "$kw" ] && has "$T/rg.log" "wt-rm whatsapp_automation $knw"; ok $? "wt: stop do MESMO Kimi WA reproduz a escolha do rig e recolhe o worktree WA (rc=$RC)"
+  cfg 3 25 "$base"
   # --- start: cria o worktree, abre dentro dele ---
   fresh; pv start $n1 < <(req cat "$eng"); ok $RC "wt: start de sessão de pool com papel mapeado abre (rc=$RC $(head -c 250 "$T/err"))"
   [ "$(git -C "$w" rev-parse --is-inside-work-tree 2>/dev/null)" = true ] && has "$T/rg.log" "wt-add gascity $n1 GR=$RH/gt-remote/git"; ok $? "wt: ...o worktree veio do wt-add, em <home>/gt-remote/git/<rig>/wt/<sessão>, com GT_REMOTE_GIT apontando o mesmo lugar"
@@ -1157,7 +1167,7 @@ g_wt() {
   cfg 3 25 '{"worktree_prepare":true}'; wtmirror; pv start dog-remote-gaplain01 < <(req cat "$eng"); [ $RC = 1 ] && has "$T/err" 'não existe' && ! has "$T/rg.log" wt-add; ok $? "wt: SEM worktree_rigs o start é o de hoje (a pasta tem que existir) e não chama o wt-add (rc=$RC)"
   cfg 3 25 "$base"; pv start wa-worker-remote-gaplain02 < <(req cat "$eng"); [ $RC = 1 ] && has "$T/err" 'não existe' && ! has "$T/rg.log" wt-add; ok $? "wt: papel que não está no mapa (wa-worker) também é o de hoje (rc=$RC)"
   fresh; pv start dog-remote-GAUP < <(req cat "$eng"); [ $RC = 1 ] && has "$T/err" 'worktree' && nossh; ok $? "wt: nome que não serve de nome de worktree (maiúscula) recusa SEM ssh (rc=$RC)"
-  for v in '{"dog":"Bad Rig"}' '["dog"]' '{"dog":1}' '"dog"' '{"Dog":"gascity"}' '{"dog":"gascity/x"}'; do
+  for v in '{"dog":"Bad Rig"}' '["dog"]' '{"dog":1}' '"dog"' '{"Dog":"gascity"}' '{"dog":"gascity/x"}' '{"kimi-worker":{"ga":1}}' '{"kimi-worker":{"wa":"gascity/x"}}' '{"kimi-worker":{"xx":"gascity"}}' '{"kimi-worker":[]}' '{"kimi-worker":{"ga":"gascity","wa":null}}'; do
     cfg 3 25 "$base"; jq ".hosts.a.worktree_rigs=$v" "$T/cfg.json" > "$T/cfg2.json" && mv "$T/cfg2.json" "$T/cfg.json"; fresh; pv start dog-remote-gacf0001 < <(req cat "$eng"); [ $RC = 1 ] && has "$T/err" "'worktree_rigs'" && nossh; ok $? "wt: worktree_rigs=$v → config recusada dizendo a chave, sem ssh (rc=$RC)"
   done
   # --- nomes que o ENGINE gera: <modelo>-<cauda-da-bead> e <modelo>-adhoc-<10>; o pedido de host continua recusando host desconhecido ---
