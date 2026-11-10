@@ -122,6 +122,18 @@
 #                             usage-analytics.jsonl and credit-cache-updater.log
 #                             are only MEASURED (see claude_home_trim.py).
 #
+#                             _reap_low_disk_tmp (ga-1p1i5jr.9) runs only below LOW_DISK_TMP_GB (5), at WARN and
+#                             CRITICAL. Below 5 GB no Chrome updater may run: every GoogleUpdater process (found
+#                             by its command line) gets TERM, then KILL (du cannot see the space it holds in files it
+#                             already deleted: only the process releases it), and once none is left its
+#                             $TMPDIR/com.google.GoogleUpdater.*chrome_url_fetcher_* dirs are deleted. It also
+#                             deletes pytest-of-<user>/pytest-N dirs in which nothing changed for 30 min. No lsof
+#                             (its whole-system dump takes 30-70 s at high load, when this matters). Each decision is
+#                             one log line (google-updater-reap:, pytest-tmp-reap:). _hold_chrome_updater runs on
+#                             EVERY cycle: the updater's launchd job may run only 00-06h with >= 8 GB free, otherwise
+#                             it is disabled and booted out; touch .gc/chrome-updater-hold.off to stop it
+#                             (docs/runbooks/disco-escada-recuperacao.md).
+#
 #   CRITICAL_GB (default 3) — FIRST (started before the photo and the levers, but in
 #                             the BACKGROUND, so they never wait on it) a `gc session
 #                             nudge` to every ACTIVE dog/wa-worker/ps-worker/gate-
@@ -296,7 +308,8 @@
 # Kill switch: DOLT_DISK_FLOOR_GUARD_ENABLED=0 → skip ALL SEVEN reclaim actions
 # (dolt-cleanup, the scratchpad reaper, the transcript reaper, the log
 # reaper, the hf-cache reaper, the gocache reaper, AND the go-build-orphan
-# reaper) only. Notification is NEVER gated by this switch (imp07 CALL
+# reaper) only; the ga-1p1i5jr.9 levers and the Chrome updater hold obey it too.
+# Notification is NEVER gated by this switch (imp07 CALL
 # INVARIANT: alerting is the lowest-blast-radius action here and the one furo
 # #2 just fixed for being wrongly suppressible — don't reintroduce that
 # failure mode one guard over).
@@ -374,6 +387,23 @@ CODE_SIGN_CLONE_ORPHAN_GRACE_SECS="${DOLT_DISK_FLOOR_CODE_SIGN_CLONE_ORPHAN_GRAC
 # untouched >2h were safe to delete (3.4GB freed), preserving the 7 still-
 # active ones with zero side effects (the cache regenerates on next use).
 BASH_EDIT_DIFF_ORPHAN_GRACE_SECS="${DOLT_DISK_FLOOR_BASH_EDIT_DIFF_GRACE_SECS:-7200}"
+
+# ga-1p1i5jr.9: below LOW_DISK_TMP_GB, _reap_low_disk_tmp clears what the levers above cannot see (09/11 20:30-20:51: a Chrome/GoogleUpdater update wrote ~900 MB into
+# $TMPDIR, then held 1.47 GB in files it had already deleted, with 2.27 GB free; pytest basetemp dirs added ~600 MB), and _hold_chrome_updater keeps the updater from
+# starting again outside 00-06h or below CHROME_UPDATER_MIN_GB free. PYTEST_TMP_GRACE_SECS is the bead's "mtime > 30 min"; the rest are bounds and test seams.
+LOW_DISK_TMP_GB="${DOLT_DISK_FLOOR_LOW_DISK_TMP_GB:-5}"
+PYTEST_TMP_GRACE_SECS="${DOLT_DISK_FLOOR_PYTEST_TMP_GRACE_SECS:-1800}"
+GOOGLE_UPDATER_CMD_PATTERN="${DOLT_DISK_FLOOR_GOOGLE_UPDATER_CMD_PATTERN:-/GoogleUpdater.app/Contents/MacOS/GoogleUpdater}"
+GOOGLE_UPDATER_TERM_WAIT_SECS="${DOLT_DISK_FLOOR_GOOGLE_UPDATER_TERM_WAIT_SECS:-5}"
+case "$GOOGLE_UPDATER_TERM_WAIT_SECS" in ''|*[!0-9]*) GOOGLE_UPDATER_TERM_WAIT_SECS=5 ;; esac
+LAUNCHCTL_BIN="${DOLT_DISK_FLOOR_LAUNCHCTL_BIN:-launchctl}"
+LAUNCHCTL_TIMEOUT_SECS="${DOLT_DISK_FLOOR_LAUNCHCTL_TIMEOUT_SECS:-15}"
+CHROME_UPDATER_LABEL="${DOLT_DISK_FLOOR_CHROME_UPDATER_LABEL:-com.google.GoogleUpdater.wake}"
+CHROME_UPDATER_PLIST="${DOLT_DISK_FLOOR_CHROME_UPDATER_PLIST:-${HOME:-/Users/athos}/Library/LaunchAgents/${CHROME_UPDATER_LABEL}.plist}"
+CHROME_UPDATER_WINDOW_START_H="${DOLT_DISK_FLOOR_CHROME_UPDATER_WINDOW_START_H:-0}"
+CHROME_UPDATER_WINDOW_END_H="${DOLT_DISK_FLOOR_CHROME_UPDATER_WINDOW_END_H:-6}"
+CHROME_UPDATER_MIN_GB="${DOLT_DISK_FLOOR_CHROME_UPDATER_MIN_GB:-8}"
+CHROME_UPDATER_HOLD_OFF_FILE="${DOLT_DISK_FLOOR_CHROME_UPDATER_HOLD_OFF_FILE:-$CITY/.gc/chrome-updater-hold.off}"
 
 NOTIFY_COOLDOWN_SECS="${DOLT_DISK_FLOOR_NOTIFY_COOLDOWN_SECS:-3600}"   # 1h — tighter
                         # than disk-pressure-monitor's 6h; this is Dolt-specific
@@ -2593,6 +2623,257 @@ _reap_bash_edit_diff_orphans() {
   fi
 }
 
+# ── ga-1p1i5jr.9: low-disk temp levers (pytest basetemp dirs, the Chrome updater's temp files) and the Chrome updater hold ──
+
+# _low_disk_tmp_wanted <avail_gb> <below_gb> → 0 = low (act), 1 = not low, 2 = a number is unreadable (inert; never read as "not low")
+_low_disk_tmp_wanted() {
+  local a="$1" b="$2" x
+  for x in "$a" "$b"; do case "$x" in ''|*[!0-9]*) return 2 ;; esac; done
+  [ "$a" -lt "$b" ]
+}
+
+# _chrome_updater_wanted <hour> <avail_gb> <observed> <start_h> <end_h> <low_gb> <min_gb> → 0 = allow, 1 = hold, 2 = unknown (inert).
+# Allow = inside [start,end) AND avail >= min. Hold = outside the window, or avail < low. In between (low <= avail < min) the observed state stays
+# (allowed stays allowed, held stays held, a half-done state is completed as a hold), so a disk hovering at 8 GB cannot flap the job.
+_chrome_updater_wanted() {
+  local h="$1" a="$2" obs="$3" s="$4" e="$5" lo="$6" mi="$7" x in_win
+  for x in "$h" "$s" "$e" "$lo" "$mi"; do case "$x" in ''|*[!0-9]*) return 2 ;; esac; done
+  h=$((10#$h)); s=$((10#$s)); e=$((10#$e))
+  if [ "$s" -lt "$e" ]; then [ "$h" -ge "$s" ] && [ "$h" -lt "$e" ]; in_win=$?
+  elif [ "$s" -gt "$e" ]; then [ "$h" -ge "$s" ] || [ "$h" -lt "$e" ]; in_win=$?
+  else in_win=1; fi
+  [ "$in_win" -eq 0 ] || return 1
+  case "$a" in ''|*[!0-9]*) return 2 ;; esac
+  [ "$a" -lt "$lo" ] && return 1
+  [ "$a" -ge "$mi" ] && return 0
+  case "$obs" in allowed) return 0 ;; held|partial) return 1 ;; esac
+  return 2
+}
+
+# _google_updater_pids → one pid per line for every process whose command line contains GOOGLE_UPDATER_CMD_PATTERN (the Chrome updater's app path); nothing when none runs.
+# rc != 0 = the process list could not be read, which a caller must not read as "no updater runs". The pattern goes in through the environment so the awk process
+# does not match itself; an empty pattern matches nothing. Deliberately no lsof: its whole-system dump took 34-72 s at load ~60 (ga-mv896u), exactly when the disk is tight.
+_google_updater_pids() {
+  # vazio → no updater is running; falhou (ps rc != 0, seen through pipefail) → rc != 0 and the lever skips
+  ps -axww -o pid= -o command= 2>/dev/null | PAT="$GOOGLE_UPDATER_CMD_PATTERN" awk '{ p = $1; sub(/^[ \t]*[0-9]+[ \t]*/, ""); if (ENVIRON["PAT"] != "" && index($0, ENVIRON["PAT"]) > 0) { print p } }'
+}
+
+# _is_google_updater_pid <pid> → 0 only while that pid's command line still contains GOOGLE_UPDATER_CMD_PATTERN (a pid read a moment ago may have been reused)
+_is_google_updater_pid() {
+  local cmd
+  # vazio/falhou → ps does not answer: not identified, never signalled
+  cmd="$(ps -p "$1" -o command= 2>/dev/null)"
+  [ -n "$GOOGLE_UPDATER_CMD_PATTERN" ] || return 1
+  case "$cmd" in *"$GOOGLE_UPDATER_CMD_PATTERN"*) return 0 ;; esac
+  return 1
+}
+
+# _pid_alive <pid> → 0 when the process exists and is not a zombie
+_pid_alive() {
+  local st
+  # vazio/falhou → ps does not show it: not alive
+  st="$(ps -p "$1" -o stat= 2>/dev/null)"
+  [ -n "$st" ] || return 1
+  case "$st" in Z*) return 1 ;; esac
+  return 0
+}
+
+# _stop_pid <pid> → prints how it ended: gone | term | kill | alive. TERM, up to GOOGLE_UPDATER_TERM_WAIT_SECS for it to exit, then KILL (the Mayor used kill -9 on 09/11).
+_stop_pid() {
+  local p="$1" i=0 n
+  _pid_alive "$p" || { echo gone; return 0; }
+  kill -TERM "$p" 2>/dev/null
+  n=$(( GOOGLE_UPDATER_TERM_WAIT_SECS * 2 ))
+  while [ "$i" -lt "$n" ]; do
+    _pid_alive "$p" || { echo term; return 0; }
+    sleep 0.5; i=$((i+1))
+  done
+  kill -KILL "$p" 2>/dev/null
+  sleep 0.5
+  if _pid_alive "$p"; then echo alive; else echo kill; fi
+  return 0
+}
+
+# _pytest_dir_idle <dir> <grace_secs> → 0 = nothing in <dir>, itself included and at any depth, changed within the grace window (the bead's "mtime > 30 min", made
+# deep: a write far inside does not move the dir's own mtime); 1 = something did (a live test, or a young dir); 2 = could not tell (the dir is then spared).
+_pytest_dir_idle() {
+  local d="$1" g="$2" recent frc
+  case "$g" in ''|*[!0-9]*) return 2 ;; esac
+  # vazio → nothing changed within the window: idle; falhou (find rc != 0, e.g. an unreadable subdir) → 2
+  recent="$(find "$d" -mmin "-$(( (g + 59) / 60 ))" 2>/dev/null)"; frc=$?
+  [ "$frc" -eq 0 ] || return 2
+  [ -z "$recent" ]
+}
+
+# _reap_tmp_dirs <label> <where> <grace_secs> <idle_fn> <dir>... — the walk the two levers below share, logging like the orphan levers above: a real directory
+# (never a symlink) is deleted when <idle_fn> <dir> <grace_secs> returns 0 (1 = in use, 2 = could not tell: both spare it; `true` = no liveness proof needed).
+# One log line per candidate and a summary; an unmeasured size is counted as unmeasured, never as 0.
+_reap_tmp_dirs() {
+  local label="$1" where="$2" grace="$3" idle="$4" dir base mb rc considered=0 freed_mb=0 unmeasured=0
+  shift 4
+  for dir in "$@"; do
+    [ -d "$dir" ] && [ ! -L "$dir" ] || continue
+    considered=$((considered+1)); base="$(basename "$dir")"
+    # vazio/falhou → "" = unmeasured: the dir is still judged, and the log counts it as unmeasured, never 0 MB
+    mb="$(_dir_size_mb "$dir")"
+    "$idle" "$dir" "$grace"; rc=$?
+    if [ "$rc" -ne 0 ]; then
+      if [ "$rc" -eq 1 ]; then log "${label}: ${base} (${mb:-unmeasured}MB) — SPARED (something inside changed within ${grace}s: in use)"
+      else log "${label}: ${base} (${mb:-unmeasured}MB) — SPARED (could not tell whether it is in use)"; fi
+      continue
+    fi
+    if rm -rf "$dir" 2>>"$LOG"; then
+      if [ -n "$mb" ]; then freed_mb=$(( freed_mb + mb )); else unmeasured=$((unmeasured+1)); fi
+      log "${label}: ${base} (${mb:-unmeasured}MB) — DELETED (idle)"
+    else
+      log "${label}: ${base} (${mb:-unmeasured}MB) — DELETE FAILED (rm nonzero exit)"
+    fi
+  done
+  if [ "$considered" -eq 0 ]; then
+    log "${label}: no matching dirs under ${where}"
+  elif [ "$unmeasured" -gt 0 ]; then
+    log "${label}: considered=${considered} freed=${freed_mb}MB+ (${unmeasured} deleted dir(s) had unmeasured size, not counted in freed total) under ${where}"
+  else
+    log "${label}: considered=${considered} freed=${freed_mb}MB under ${where}"
+  fi
+}
+
+# _pytest_tmp_root → <DARWIN_USER_TEMP_DIR>/pytest-of-<user>, where pytest keeps its basetemp dirs (pytest-1, pytest-2, ... and a pytest-current symlink); "" when the
+# temp dir or the user cannot be resolved (non-macOS host), and the lever then skips: it never guesses /tmp.
+_pytest_tmp_root() {
+  local t u
+  t="$(_go_build_tmp_root)"
+  [ -z "$t" ] && { echo ""; return; }
+  # vazio/falhou → no user name: "" (the lever skips) rather than a wrong dir
+  u="$(id -un 2>/dev/null)"
+  [ -z "$u" ] && { echo ""; return; }
+  echo "$t/pytest-of-$u"
+}
+
+# _reap_pytest_tmp [root] — low-disk lever: pytest basetemp dirs (pytest-of-<user>/pytest-N, ~600 MB on 09/11) in which nothing changed for PYTEST_TMP_GRACE_SECS
+# (_pytest_dir_idle). An open file that is not being written to is not seen. [root] overrides the resolved dir for the selftest; production passes none.
+_reap_pytest_tmp() {
+  local root="${1:-$(_pytest_tmp_root)}"
+  if [ "$ENABLED" != "1" ]; then log "pytest-tmp-reap SKIP — DOLT_DISK_FLOOR_GUARD_ENABLED=0 (notify-only mode)"; return; fi
+  if [ -z "$root" ] || [ ! -d "$root" ]; then log "pytest-tmp-reap SKIP — pytest temp root unresolved or missing (root='${root:-empty}')"; return; fi
+  _reap_tmp_dirs "pytest-tmp-reap" "$root" "$PYTEST_TMP_GRACE_SECS" _pytest_dir_idle "$root"/pytest-*
+}
+
+# _reap_google_updater_tmp [root] — low-disk lever. 09/11 a Chrome update filled <root>/com.google.GoogleUpdater.GoogleUpdater_chrome_url_fetcher_*/ with ~900 MB
+# (delta_patch_out, decoded_xz); when those dirs were deleted by hand the updater kept 1.47 GB in files it had already unlinked: du does not see that space and only the
+# owning process releases it. Below 5 GB no updater may run (the hold says so too), so every process whose command line is the updater's gets TERM (then KILL); only when
+# none is left alive, and the process list could be read, are the fetcher dirs deleted: only the updater uses them, so with no updater they are garbage. [root] overrides the
+# temp dir for the selftest.
+_reap_google_updater_tmp() {
+  local root="${1:-$(_go_build_tmp_root)}" pids pid how left stopped=0
+  if [ "$ENABLED" != "1" ]; then log "google-updater-reap SKIP — DOLT_DISK_FLOOR_GUARD_ENABLED=0 (notify-only mode)"; return; fi
+  # vazio → no updater is running; falhou (rc != 0) → skip: never "none runs"
+  pids="$(_google_updater_pids)" || { log "google-updater-reap SKIP — could not read the process list"; return; }
+  for pid in $pids; do
+    if ! _is_google_updater_pid "$pid"; then log "google-updater-reap: pid=${pid} is no longer the Chrome updater — left alone"; continue; fi
+    how="$(_stop_pid "$pid")"
+    case "$how" in
+      gone) log "google-updater-reap: Chrome updater pid=${pid} was already gone" ;;
+      term) log "google-updater-reap: stopped the Chrome updater pid=${pid} (TERM)"; stopped=$((stopped+1)) ;;
+      kill) log "google-updater-reap: stopped the Chrome updater pid=${pid} (KILL after TERM was ignored)"; stopped=$((stopped+1)) ;;
+      *)    log "google-updater-reap: Chrome updater pid=${pid} STILL ALIVE after TERM and KILL (signal refused or process stuck); its files stay held" ;;
+    esac
+  done
+  # vazio → none left: its temp files are garbage; falhou (rc != 0), or one still alive → the dirs stay, it may still hold them
+  left="$(_google_updater_pids)" || { log "google-updater-reap: could not re-read the process list after stopping ${stopped} updater(s) — fetcher dirs left for the next cycle"; return; }
+  if [ -n "$left" ]; then log "google-updater-reap: a Chrome updater is still running (pid $(printf '%s' "$left" | tr '\n' ',')) — fetcher dirs left"; return; fi
+  if [ -z "$root" ] || [ ! -d "$root" ]; then log "google-updater-reap: temp dir unresolved or missing (root='${root:-empty}') — no fetcher dirs to clear"; return; fi
+  _reap_tmp_dirs "google-updater-reap" "$root" 0 true "$root"/com.google.GoogleUpdater.GoogleUpdater_chrome_url_fetcher_*
+}
+
+# _reap_low_disk_tmp <avail_gb> — runs the two levers above only when avail < LOW_DISK_TMP_GB (the updater first: stopping it releases space the dir walk then sees).
+_reap_low_disk_tmp() {
+  local avail="${1-}" rc
+  _low_disk_tmp_wanted "$avail" "$LOW_DISK_TMP_GB"; rc=$?
+  case "$rc" in
+    0) log "low-disk-tmp: avail=${avail}GB < ${LOW_DISK_TMP_GB}GB — stopping the Chrome updater, clearing its temp dirs and the idle pytest temp dirs"
+       _reap_google_updater_tmp; _reap_pytest_tmp ;;
+    1) log "low-disk-tmp: avail=${avail}GB >= ${LOW_DISK_TMP_GB}GB — pytest/GoogleUpdater temp levers idle" ;;
+    *) log "low-disk-tmp: avail unreadable ('${avail}') or threshold invalid ('${LOW_DISK_TMP_GB}') — pytest/GoogleUpdater temp levers skipped" ;;
+  esac
+}
+
+# _chrome_updater_state → "<disabled 0|1> <loaded 0|1>" from two launchctl reads, or "unknown". A label with no override line is enabled (launchd's default); the
+# older spellings true/false are understood; a value it does not know, a failed read, or any `print` rc but 0/113 ("Could not find service") is unknown, never a guess.
+_chrome_updater_state() {
+  local uid out rc line val dis loaded lrc
+  uid="$(id -u 2>/dev/null)"
+  [ -n "$uid" ] || { echo unknown; return 0; }
+  # vazio → no "disabled services" header: unknown; falhou (rc != 0) → unknown
+  out="$(timeout "$LAUNCHCTL_TIMEOUT_SECS" "$LAUNCHCTL_BIN" print-disabled "gui/${uid}" 2>/dev/null)"; rc=$?
+  case "$out" in *"disabled services"*) ;; *) echo unknown; return 0 ;; esac
+  [ "$rc" -eq 0 ] || { echo unknown; return 0; }
+  dis=0
+  line="$(printf '%s\n' "$out" | grep -F "\"${CHROME_UPDATER_LABEL}\" =>")"
+  if [ -n "$line" ]; then
+    val="$(printf '%s\n' "$line" | sed 's/.*=> *//; s/[[:space:]]*$//')"
+    case "$val" in disabled|true) dis=1 ;; enabled|false) dis=0 ;; *) echo unknown; return 0 ;; esac
+  fi
+  # vazio → nothing to read: only the exit code answers; falhou → rc 113 is "not loaded", any other rc is unknown
+  timeout "$LAUNCHCTL_TIMEOUT_SECS" "$LAUNCHCTL_BIN" print "gui/${uid}/${CHROME_UPDATER_LABEL}" >/dev/null 2>&1; lrc=$?
+  case "$lrc" in 0) loaded=1 ;; 113) loaded=0 ;; *) echo unknown; return 0 ;; esac
+  echo "${dis} ${loaded}"
+}
+
+# _lc <launchctl args...> — one state-changing launchctl call; a failure is logged with its output and returns 1 (the caller verifies by re-reading, never by this rc).
+_lc() {
+  local o rc
+  o="$(timeout "$LAUNCHCTL_TIMEOUT_SECS" "$LAUNCHCTL_BIN" "$@" 2>&1)"; rc=$?
+  [ "$rc" -eq 0 ] && return 0
+  log "chrome-updater-hold: launchctl $* FAILED rc=${rc} (${o})"
+  return 1
+}
+
+# _hold_chrome_updater <avail_gb> [hour] — every cycle (ga-1p1i5jr.9). The Chrome updater (launchd job CHROME_UPDATER_LABEL) may run only 00-06h with >= CHROME_UPDATER_MIN_GB
+# free: it is held (launchctl disable + bootout) outside the window or below LOW_DISK_TMP_GB, allowed (enable + bootstrap) inside it with room, and in between it keeps its state
+# (_chrome_updater_wanted). It acts only on a state it could read, and re-reads after acting: HELD/ALLOWED is logged only when the re-read shows it. ENABLED=0 or the off-file stops it.
+_hold_chrome_updater() {
+  local avail="${1-}" hour="${2:-}" st dis loaded obs want uid goal lab after aw
+  if [ "$ENABLED" != "1" ]; then log "chrome-updater-hold SKIP — DOLT_DISK_FLOOR_GUARD_ENABLED=0 (notify-only mode)"; return 0; fi
+  if [ -e "$CHROME_UPDATER_HOLD_OFF_FILE" ]; then log "chrome-updater-hold SKIP — ${CHROME_UPDATER_HOLD_OFF_FILE} exists (hold switched off)"; return 0; fi
+  # vazio/falhou → hour "": _chrome_updater_wanted answers unknown and nothing changes
+  [ -n "$hour" ] || hour="$(date +%H 2>/dev/null)"
+  command -v "$LAUNCHCTL_BIN" >/dev/null 2>&1 || { log "chrome-updater-hold SKIP — ${LAUNCHCTL_BIN} not found (cannot read or change ${CHROME_UPDATER_LABEL})"; return 0; }
+  st="$(_chrome_updater_state)"
+  if [ "$st" = unknown ]; then log "chrome-updater-hold SKIP — could not read the state of ${CHROME_UPDATER_LABEL} from launchctl; left as it is"; return 0; fi
+  dis="${st% *}"; loaded="${st#* }"; obs=partial
+  [ "${dis}${loaded}" = 01 ] && obs=allowed
+  [ "${dis}${loaded}" = 10 ] && obs=held
+  _chrome_updater_wanted "$hour" "$avail" "$obs" "$CHROME_UPDATER_WINDOW_START_H" "$CHROME_UPDATER_WINDOW_END_H" "$LOW_DISK_TMP_GB" "$CHROME_UPDATER_MIN_GB"; want=$?
+  if [ "$want" -eq 2 ]; then log "chrome-updater-hold SKIP — hour='${hour}' or avail='${avail}'GB unreadable or invalid (observed ${obs}); left as it is"; return 0; fi
+  uid="$(id -u)"
+  if [ "$want" -eq 0 ]; then
+    [ "$obs" = allowed ] && return 0
+    goal=allowed; lab=ALLOWED
+    _lc enable "gui/${uid}/${CHROME_UPDATER_LABEL}"
+    if [ "$loaded" = 0 ]; then
+      if [ -f "$CHROME_UPDATER_PLIST" ]; then _lc bootstrap "gui/${uid}" "$CHROME_UPDATER_PLIST"
+      else log "chrome-updater-hold: ALLOW FAILED — plist ${CHROME_UPDATER_PLIST} missing, not bootstrapped"; fi
+    fi
+  else
+    [ "$obs" = held ] && return 0
+    goal=held; lab=HELD
+    _lc disable "gui/${uid}/${CHROME_UPDATER_LABEL}"
+    [ "$loaded" = 1 ] && _lc bootout "gui/${uid}/${CHROME_UPDATER_LABEL}"
+  fi
+  # vazio/falhou → "unknown": the action is not confirmed
+  after="$(_chrome_updater_state)"; aw=unknown
+  if [ "$after" != unknown ]; then
+    aw=partial
+    case "${after% *}${after#* }" in 01) aw=allowed ;; 10) aw=held ;; esac
+  fi
+  if [ "$aw" = "$goal" ]; then
+    log "chrome-updater-hold: ${lab} (hour=${hour} avail=${avail}GB): was ${obs}, verified by re-reading launchctl"
+  else
+    log "chrome-updater-hold: NOT verified — wanted ${goal} (hour=${hour} avail=${avail}GB), launchctl now reads ${aw}; see the launchctl lines above"
+  fi
+}
+
 # _is_test_dolt_config_path <config_path> — pure classifier (ga-fqj42): true
 # iff <config_path> sits under one of the SIX cmd/bd test-tmp-dir prefixes
 # third_party/beads/scripts/clean-test-tmp.sh already treats as test-only
@@ -3659,6 +3940,9 @@ _main_cycle() {
   now=$(date +%s)
   class="$(_floor_class "$avail" "$FLOOR_WARN_GB" "$FLOOR_CRITICAL_GB")"
 
+  # ga-1p1i5jr.9: main() hands this pre-reclaim reading (possibly '', an unreadable df) to the Chrome updater hold once the cycle's alerts and levers are done.
+  _CYCLE_AVAIL="$avail"
+
   # ga-sfj3i.2: log macOS virtual memory residency as its OWN metric line
   # EVERY cycle, regardless of class or whether avail was even readable —
   # an unmeasurable reading must be a logged "unknown", never silence, so
@@ -3755,6 +4039,7 @@ _main_cycle() {
   _reap_go_build_orphans
   _reap_code_sign_clone_orphans
   _reap_bash_edit_diff_orphans
+  _reap_low_disk_tmp "$avail"
   _reap_orphan_test_dolt_processes
   _reap_backup_residue
   _reap_bloated_backup_staging "$was_critical"
@@ -3977,9 +4262,13 @@ ${growth_txt}"
 # ga-xdj2si: the pool-nudge phase runs in the background from the CRITICAL branch of _main_cycle; whatever way the
 # cycle ends (one of its several early returns, or its end), the join runs here, once, and the exit code is the cycle's.
 main() {
+  _CYCLE_AVAIL=""
   _main_cycle "$@"
   local rc=$?
   _pool_nudge_join
+  # ga-1p1i5jr.9: last, on EVERY cycle and at any class (letting the updater run again needs the healthy readings too): a launchctl that hangs must never delay the
+  # CRITICAL notify and Mayor mail above.
+  _hold_chrome_updater "$_CYCLE_AVAIL"
   return "$rc"
 }
 

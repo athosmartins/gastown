@@ -1205,6 +1205,268 @@ _reap_bash_edit_diff_orphans "/nonexistent/path/$$/bash-edit-diff-does-not-exist
 ok "_reap_bash_edit_diff_orphans: nonexistent root skips cleanly (no crash — this line only runs if it didn't)"
 
 echo ""
+echo "=== low-disk temp levers + Chrome updater hold (ga-1p1i5jr.9): pure decisions ==="
+# 09/11 20:30-20:51: a Chrome (GoogleUpdater) update put ~900 MB in $TMPDIR, then held 1.47 GB in files it had already deleted, at 2.27 GB free; D4 asked for a reboot.
+rc_is() { local want="$1" desc="$2"; shift 2; "$@"; local got=$?; if [ "$got" = "$want" ]; then ok "$desc"; else bad "$desc (want rc=$want, got rc=$got)"; fi; }
+# _low_disk_tmp_wanted <avail_gb> <below_gb>: 0 = low (act), 1 = not low, 2 = unreadable (inert)
+rc_is 0 "low_disk_tmp_wanted: 4 < 5 acts"                                          _low_disk_tmp_wanted 4 5
+rc_is 0 "low_disk_tmp_wanted: 0 acts"                                              _low_disk_tmp_wanted 0 5
+rc_is 1 "low_disk_tmp_wanted: 5 is not < 5 (strict)"                               _low_disk_tmp_wanted 5 5
+rc_is 1 "low_disk_tmp_wanted: 6 does not act"                                      _low_disk_tmp_wanted 6 5
+rc_is 2 "low_disk_tmp_wanted: empty avail (df failed) is unreadable, not 'not low'" _low_disk_tmp_wanted "" 5
+rc_is 2 "low_disk_tmp_wanted: non-numeric avail is unreadable"                     _low_disk_tmp_wanted abc 5
+rc_is 2 "low_disk_tmp_wanted: bad threshold is unreadable"                         _low_disk_tmp_wanted 4 ""
+# _chrome_updater_wanted <hour> <avail_gb> <observed> <start_h> <end_h> <low_gb> <min_gb>: 0 = allow, 1 = hold, 2 = unknown (inert)
+l9_rows=0
+while IFS='|' read -r l9_want l9_h l9_a l9_o l9_s l9_e l9_lo l9_mi l9_desc; do
+  [ -n "$l9_want" ] || continue
+  l9_rows=$((l9_rows+1))
+  rc_is "$l9_want" "chrome_updater_wanted: $l9_desc" _chrome_updater_wanted "$l9_h" "$l9_a" "$l9_o" "$l9_s" "$l9_e" "$l9_lo" "$l9_mi"
+done <<'EOF'
+0|3|20|held|0|6|5|8|in the window with plenty of disk: allow
+0|0|8|held|0|6|5|8|window start (00h) and exactly 8 GB are inclusive
+0|5|20|held|0|6|5|8|05h is inside
+1|6|20|held|0|6|5|8|06h is outside (the end is exclusive)
+1|23|20|allowed|0|6|5|8|outside the window: hold even if allowed now
+1|3|4|allowed|0|6|5|8|below 5 GB: hold even if allowed now
+1|3|5|held|0|6|5|8|5 GB (grey zone) keeps held
+1|3|7|held|0|6|5|8|7 GB (grey zone) keeps held
+0|3|5|allowed|0|6|5|8|5 GB keeps allowed (hysteresis, no flapping)
+0|3|7|allowed|0|6|5|8|7 GB keeps allowed
+1|3|7|partial|0|6|5|8|grey zone + half-done state: hold
+2|3|7|unknown|0|6|5|8|grey zone needs the observed state
+0|3|20|unknown|0|6|5|8|plenty of disk: the observed state is not needed
+2||20|held|0|6|5|8|hour unreadable: unknown
+2|abc|20|held|0|6|5|8|hour not a number: unknown
+2|3||held|0|6|5|8|in the window with avail unreadable: unknown
+1|23||held|0|6|5|8|outside the window the disk does not matter: hold
+2|3|abc|held|0|6|5|8|avail not a number: unknown
+2|3|20|held||6|5|8|bad config (start empty): unknown
+0|08|20|held|8|10|5|8|hour 08 is not an octal error
+0|09|20|held|8|10|5|8|hour 09 is not an octal error
+1|10|20|held|8|10|5|8|10h is the exclusive end
+0|23|20|held|22|6|5|8|window wrapping midnight: 23h inside
+0|3|20|held|22|6|5|8|wrapping window: 03h inside
+1|12|20|held|22|6|5|8|wrapping window: 12h outside
+1|6|20|held|22|6|5|8|wrapping window: 06h is the end
+1|6|20|held|6|6|5|8|empty window (start == end): always hold
+EOF
+[ "$l9_rows" = 27 ] && ok "chrome_updater_wanted: the table ran to its last row (a crash in the loop would skip rows without a FAIL)" || bad "chrome_updater_wanted: the table stopped after $l9_rows of 27 rows"
+
+echo ""
+echo "=== _google_updater_pids / _is_google_updater_pid (ga-1p1i5jr.9): the Chrome updater is found by its command line, never by lsof ==="
+L9_DIR="$(mktemp -d /tmp/dolt-disk-floor-guard-selftest-l9.XXXXXX)"; L9_PID=""; L9_REAL_PATH="$PATH"; L9_REAL_PS="$(command -v ps)"; L9_M=0
+mkdir -p "$L9_DIR/upd/GoogleUpdater.app/Contents/MacOS" "$L9_DIR/f_ps" "$L9_DIR/f_find"
+printf '#!/bin/bash\nexit 1\n' > "$L9_DIR/f_ps/ps"; printf '#!/bin/bash\nexit 1\n' > "$L9_DIR/f_find/find"; chmod +x "$L9_DIR/f_ps/ps" "$L9_DIR/f_find/find"
+# a fixture process: touches <ready>, then sleeps; with "ignoreterm" it ignores TERM
+l9_mkfixture() { printf '%s\n' '#!/bin/bash' '[ "${2:-}" = ignoreterm ] && trap "" TERM' ': > "$1"' 'while :; do sleep 1; done' > "$1"; chmod +x "$1"; }
+L9_UPD="$L9_DIR/upd/GoogleUpdater.app/Contents/MacOS/GoogleUpdater"; L9_HOLD="$L9_DIR/holder"; l9_mkfixture "$L9_UPD"; l9_mkfixture "$L9_HOLD"
+L9_DEFAULT_PATTERN="$GOOGLE_UPDATER_CMD_PATTERN"
+GOOGLE_UPDATER_CMD_PATTERN="$L9_UPD"   # this run's own fixture path: sibling runs of this selftest on the same host never see each other's processes
+l9_start() {   # <fixture> <ready> [ignoreterm] -> $L9_PID
+  local fx="$1" ready="$2" i=0; shift 2
+  rm -f "$ready"; "$fx" "$ready" "$@" >/dev/null 2>&1 &
+  L9_PID=$!; disown "$L9_PID" 2>/dev/null || true
+  while [ ! -e "$ready" ] && [ "$i" -lt 100 ]; do sleep 0.1; i=$((i+1)); done
+  [ -e "$ready" ]
+}
+l9_alive() { local st; st="$(ps -p "$1" -o stat= 2>/dev/null)"; [ -n "$st" ] || return 1; case "$st" in Z*) return 1 ;; esac; return 0; }
+l9_kill() { [ -n "$L9_PID" ] && kill -KILL "$L9_PID" 2>/dev/null; L9_PID=""; return 0; }
+l9_mark() { L9_M=0; [ -f "$LOG" ] && L9_M="$(wc -l < "$LOG" | tr -d ' ')"; return 0; }
+l9_has() { tail -n +"$(( L9_M + 1 ))" "$LOG" 2>/dev/null | grep -E -- "$1" >/dev/null; }   # no -q: grep must read the whole pipe (pipefail + SIGPIPE)
+l9_tail() { tail -n +"$(( L9_M + 1 ))" "$LOG" 2>/dev/null | tail -5 | tr '\n' ';'; }
+l9_age() { find "$1" -exec touch -t "$OLD_TS" {} + ; }
+
+l9_start "$L9_UPD" "$L9_DIR/r1"; L9_P1="$L9_PID"; l9_start "$L9_HOLD" "$L9_DIR/r2"; L9_P2="$L9_PID"
+[ "$(_google_updater_pids)" = "$L9_P1" ] && ok "google_updater_pids: only the process whose command line has the updater's path is listed (a sleeper beside it is not)" || bad "google_updater_pids: got '$(_google_updater_pids | tr '\n' ' ')' (want $L9_P1)"
+GOOGLE_UPDATER_CMD_PATTERN="$L9_DEFAULT_PATTERN"; _google_updater_pids | grep -x "$L9_P1" >/dev/null && ok "google_updater_pids: the default pattern matches an updater-shaped .../GoogleUpdater.app/Contents/MacOS/GoogleUpdater path" || bad "google_updater_pids: the default pattern '$L9_DEFAULT_PATTERN' missed the fixture"
+GOOGLE_UPDATER_CMD_PATTERN=""; [ -z "$(_google_updater_pids)" ] && ok "google_updater_pids: an empty pattern matches nothing" || bad "google_updater_pids: an empty pattern matched processes"
+GOOGLE_UPDATER_CMD_PATTERN="$L9_DIR/no-such/GoogleUpdater"; l9_out="$(_google_updater_pids)"; l9_rc=$?
+[ -z "$l9_out" ] && [ "$l9_rc" = 0 ] && ok "google_updater_pids: no process matches -> empty output and rc 0 (a measured 'none runs')" || bad "google_updater_pids: no-match case gave rc=$l9_rc out='$l9_out'"
+GOOGLE_UPDATER_CMD_PATTERN="$L9_UPD"; PATH="$L9_DIR/f_ps:$PATH"; l9_out="$(_google_updater_pids)"; l9_rc=$?; PATH="$L9_REAL_PATH"
+[ "$l9_rc" != 0 ] && [ -z "$l9_out" ] && ok "google_updater_pids: a ps that fails is rc != 0, never 'none runs'" || bad "google_updater_pids: failing ps gave rc=$l9_rc out='$l9_out'"
+_is_google_updater_pid "$L9_P1"; l9_rc=$?; [ "$l9_rc" = 0 ] && ok "is_google_updater_pid: the updater fixture is identified" || bad "is_google_updater_pid: updater rc=$l9_rc"
+_is_google_updater_pid "$L9_P2"; l9_rc=$?; [ "$l9_rc" = 1 ] && ok "is_google_updater_pid: another process is not" || bad "is_google_updater_pid: holder rc=$l9_rc"
+_is_google_updater_pid 99999999; l9_rc=$?; [ "$l9_rc" = 1 ] && ok "is_google_updater_pid: a pid that does not exist is not" || bad "is_google_updater_pid: missing pid rc=$l9_rc"
+PATH="$L9_DIR/f_ps:$PATH"; _is_google_updater_pid "$L9_P1"; l9_rc=$?; PATH="$L9_REAL_PATH"; [ "$l9_rc" = 1 ] && ok "is_google_updater_pid: a ps that fails identifies nothing (never signalled)" || bad "is_google_updater_pid: failing ps rc=$l9_rc"
+GOOGLE_UPDATER_CMD_PATTERN=""; _is_google_updater_pid "$L9_P1"; l9_rc=$?; GOOGLE_UPDATER_CMD_PATTERN="$L9_UPD"; [ "$l9_rc" = 1 ] && ok "is_google_updater_pid: an empty pattern identifies nothing" || bad "is_google_updater_pid: empty pattern rc=$l9_rc"
+kill -KILL "$L9_P1" "$L9_P2" 2>/dev/null; L9_PID=""
+
+echo ""
+echo "=== _reap_pytest_tmp (ga-1p1i5jr.9): a dir is cleared only when nothing in it changed for the grace window ==="
+PT_BASE="$(mktemp -d /tmp/dolt-disk-floor-guard-selftest-pt.XXXXXX)"; PT_ROOT="$PT_BASE/pytest-of-test"
+mkdir -p "$PT_ROOT/pytest-1" "$PT_ROOT/pytest-10/a/b" "$PT_ROOT/pytest-3" "$PT_ROOT/other-9" "$PT_BASE/outside"
+head -c 5242880 /dev/zero > "$PT_ROOT/pytest-1/blob"; echo keep > "$PT_BASE/outside/keep"; echo fresh > "$PT_ROOT/pytest-3/x"; : > "$PT_ROOT/pytest-7"; : > "$PT_ROOT/pytest-10/a/b/recent"
+ln -s ../outside "$PT_ROOT/pytest-current"
+for l9_d in pytest-1 pytest-10 other-9 pytest-7; do l9_age "$PT_ROOT/$l9_d"; done; l9_age "$PT_BASE/outside"
+touch "$PT_ROOT/pytest-10/a/b/recent"   # a test is writing deep inside an OLD dir: the dir's own mtime stays old
+PYTEST_TMP_GRACE_SECS=1800; l9_mark; _reap_pytest_tmp "$PT_ROOT"
+[ ! -d "$PT_ROOT/pytest-1" ] && ok "_reap_pytest_tmp: an old dir with nothing recent inside is DELETED" || bad "_reap_pytest_tmp: old idle pytest-1 is still there"
+[ -d "$PT_ROOT/pytest-10" ] && ok "_reap_pytest_tmp: an old dir with a file written inside within the window is SPARED (a live test)" || bad "_reap_pytest_tmp: pytest-10 (recent write deep inside) was removed"
+[ -d "$PT_ROOT/pytest-3" ] && l9_has "pytest-tmp-reap: pytest-3 .* SPARED \(something inside changed" && ok "_reap_pytest_tmp: a young dir is SPARED (something inside changed within the grace window)" || bad "_reap_pytest_tmp: young pytest-3 was removed: $(l9_tail)"
+[ -L "$PT_ROOT/pytest-current" ] && [ -s "$PT_BASE/outside/keep" ] && ok "_reap_pytest_tmp: the pytest-current-style symlink is not followed or removed" || bad "_reap_pytest_tmp: symlink removed or its target touched"
+[ -d "$PT_ROOT/other-9" ] && [ -e "$PT_ROOT/pytest-7" ] && ok "_reap_pytest_tmp: a name that is not a pytest-* directory is left alone" || bad "_reap_pytest_tmp: other-9 / the pytest-7 file were removed"
+l9_has "pytest-tmp-reap: considered=3 freed=[1-9][0-9]*MB " && l9_has "pytest-tmp-reap: pytest-1 .* DELETED" && l9_has "pytest-tmp-reap: pytest-10 .* SPARED \(something inside changed within 1800s" \
+  && ok "_reap_pytest_tmp: the log shows each decision and a non-zero measured gain" || bad "_reap_pytest_tmp: log lacks the per-dir lines/summary: $(l9_tail)"
+mkdir -p "$PT_ROOT/pytest-8"; : > "$PT_ROOT/pytest-8/f"; l9_age "$PT_ROOT/pytest-8"; l9_mark
+PATH="$L9_DIR/f_find:$PATH"; _reap_pytest_tmp "$PT_ROOT"; PATH="$L9_REAL_PATH"
+[ -d "$PT_ROOT/pytest-8" ] && l9_has "pytest-tmp-reap: pytest-8 .* SPARED \(could not tell" && ok "_reap_pytest_tmp: a find that fails SPARES the dir (not 'nothing changed')" || bad "_reap_pytest_tmp: deleted when find failed: $(l9_tail)"
+l9_save_enabled="$ENABLED"; ENABLED=0; l9_mark; _reap_pytest_tmp "$PT_ROOT"; ENABLED="$l9_save_enabled"
+[ -d "$PT_ROOT/pytest-8" ] && l9_has "pytest-tmp-reap SKIP — DOLT_DISK_FLOOR_GUARD_ENABLED=0" && ok "_reap_pytest_tmp: the guard's kill switch skips it" || bad "_reap_pytest_tmp: ENABLED=0 still deleted: $(l9_tail)"
+PYTEST_TMP_GRACE_SECS=abc; _reap_pytest_tmp "$PT_ROOT"; PYTEST_TMP_GRACE_SECS=1800
+[ -d "$PT_ROOT/pytest-8" ] && ok "_reap_pytest_tmp: a grace that is not a number fails closed (nothing deleted)" || bad "_reap_pytest_tmp: deleted with an invalid grace"
+du() { echo "not a number"; }; l9_mark; _reap_pytest_tmp "$PT_ROOT"; unset -f du
+[ ! -d "$PT_ROOT/pytest-8" ] && l9_has "freed=0MB\+ \([0-9]+ deleted dir\(s\) had unmeasured size" && ok "_reap_pytest_tmp: an unmeasurable size still reaps and the summary says 'unmeasured' (not 0 MB)" || bad "_reap_pytest_tmp: unmeasured-size case wrong: $(l9_tail)"
+_reap_pytest_tmp "/nonexistent/path/$$/pytest-of-none"; ok "_reap_pytest_tmp: a missing root skips cleanly (this line only runs if it did not crash)"
+l9_save_fn="$(declare -f _go_build_tmp_root)"; _go_build_tmp_root() { echo "/var/folders/zz/abc/T"; }
+[ "$(_pytest_tmp_root)" = "/var/folders/zz/abc/T/pytest-of-$(id -un)" ] && ok "_pytest_tmp_root: <DARWIN_USER_TEMP_DIR>/pytest-of-<user>" || bad "_pytest_tmp_root: got '$(_pytest_tmp_root)'"
+_go_build_tmp_root() { echo ""; }; l9_mark; _reap_pytest_tmp
+[ -z "$(_pytest_tmp_root)" ] && l9_has "pytest-tmp-reap SKIP — pytest temp root unresolved" && ok "_pytest_tmp_root: an unresolved temp dir gives '' and the lever skips (never guesses /tmp)" || bad "_pytest_tmp_root: unresolved temp dir not handled: $(l9_tail)"
+eval "$l9_save_fn"
+
+echo ""
+echo "=== _reap_google_updater_tmp (ga-1p1i5jr.9): below 5 GB no updater runs; its fetcher dirs go once none is left ==="
+GOOGLE_UPDATER_TERM_WAIT_SECS=2; U_NAME="com.google.GoogleUpdater.GoogleUpdater_chrome_url_fetcher_"
+UR1="$(mktemp -d /tmp/dolt-disk-floor-guard-selftest-gu1.XXXXXX)"; U1D="$UR1/${U_NAME}AAA"
+mkdir -p "$U1D" "$UR1/com.google.GoogleUpdater.other_thing" "$UR1/com.google.Chrome.x"; head -c 1048576 /dev/zero > "$U1D/decoded_xz"; head -c 3145728 /dev/zero > "$U1D/delta_patch_out"
+l9_start "$L9_UPD" "$UR1/ready"; U1PID="$L9_PID"; l9_mark; _reap_google_updater_tmp "$UR1"
+l9_alive "$U1PID" && bad "_reap_google_updater_tmp: the running updater is still alive" || ok "_reap_google_updater_tmp: the running Chrome updater is STOPPED"
+[ ! -d "$U1D" ] && ok "_reap_google_updater_tmp: and, with no updater left, its fetcher dir is DELETED" || bad "_reap_google_updater_tmp: the fetcher dir is still there"
+[ -d "$UR1/com.google.GoogleUpdater.other_thing" ] && [ -d "$UR1/com.google.Chrome.x" ] && ok "_reap_google_updater_tmp: other GoogleUpdater/Chrome names in the temp dir are untouched" || bad "_reap_google_updater_tmp: a decoy dir was removed"
+l9_has "google-updater-reap: stopped the Chrome updater pid=$U1PID \(TERM\)" && l9_has "google-updater-reap: ${U_NAME}AAA .* DELETED" && l9_has "google-updater-reap: considered=1 freed=[1-9][0-9]*MB " \
+  && ok "_reap_google_updater_tmp: the log proves it: the pid stopped, the dir DELETED, the MB freed" || bad "_reap_google_updater_tmp: proof lines missing: $(l9_tail)"
+l9_kill; rm -rf "$UR1"
+
+UR2="$(mktemp -d /tmp/dolt-disk-floor-guard-selftest-gu2.XXXXXX)"   # 09/11 20:51 shape: no dir left, 1.47 GB held in files the updater had already deleted
+l9_start "$L9_UPD" "$UR2/ready"; U2PID="$L9_PID"; l9_mark; _reap_google_updater_tmp "$UR2"
+l9_alive "$U2PID" && bad "_reap_google_updater_tmp: the updater with no dir is still alive" || ok "_reap_google_updater_tmp: an updater with no fetcher dir on disk is stopped too (it may be holding already-deleted files)"
+l9_kill; rm -rf "$UR2"
+
+UR3="$(mktemp -d /tmp/dolt-disk-floor-guard-selftest-gu3.XXXXXX)"; l9_start "$L9_HOLD" "$UR3/ready"; U3PID="$L9_PID"; l9_mark; _reap_google_updater_tmp "$UR3"
+l9_alive "$U3PID" && ok "_reap_google_updater_tmp: a process that is not the updater is NOT touched" || bad "_reap_google_updater_tmp: killed a process that is not the updater"
+l9_kill; rm -rf "$UR3"
+
+UR4="$(mktemp -d /tmp/dolt-disk-floor-guard-selftest-gu4.XXXXXX)"; mkdir -p "$UR4/${U_NAME}CCC"; head -c 1048576 /dev/zero > "$UR4/${U_NAME}CCC/decoded_xz"; l9_mark; _reap_google_updater_tmp "$UR4"
+[ ! -d "$UR4/${U_NAME}CCC" ] && ! l9_has "stopped the Chrome updater" && ok "_reap_google_updater_tmp: with no updater running the fetcher dir is garbage and goes, with nothing killed" || bad "_reap_google_updater_tmp: orphan fetcher dir case wrong: $(l9_tail)"
+rm -rf "$UR4"
+
+UR5="$(mktemp -d /tmp/dolt-disk-floor-guard-selftest-gu5.XXXXXX)"; U5D="$UR5/${U_NAME}DDD"; mkdir -p "$U5D"
+l9_start "$L9_UPD" "$UR5/ready" ignoreterm; U5PID="$L9_PID"; l9_mark; _reap_google_updater_tmp "$UR5"
+l9_alive "$U5PID" && bad "_reap_google_updater_tmp: the TERM-ignoring updater is still alive" || ok "_reap_google_updater_tmp: an updater that ignores TERM is KILLed"
+[ ! -d "$U5D" ] && l9_has "pid=$U5PID \(KILL after TERM was ignored\)" && ok "_reap_google_updater_tmp: ... its dir goes and the log says KILL" || bad "_reap_google_updater_tmp: TERM-ignoring case wrong: $(l9_tail)"
+l9_kill; rm -rf "$UR5"
+
+UR6="$(mktemp -d /tmp/dolt-disk-floor-guard-selftest-gu6.XXXXXX)"; U6D="$UR6/${U_NAME}EEE"; mkdir -p "$U6D"
+l9_start "$L9_UPD" "$UR6/ready"; U6PID="$L9_PID"; l9_mark
+kill() { return 0; }; _reap_google_updater_tmp "$UR6"; unset -f kill
+l9_alive "$U6PID" && [ -d "$U6D" ] && l9_has "pid=$U6PID STILL ALIVE" && l9_has "a Chrome updater is still running" && ok "_reap_google_updater_tmp: a signal that does not stop the updater is reported and its dir stays (it may still hold it)" || bad "_reap_google_updater_tmp: unstoppable updater not reported / dir deleted: $(l9_tail)"
+l9_kill; rm -rf "$UR6"
+
+UR7="$(mktemp -d /tmp/dolt-disk-floor-guard-selftest-gu7.XXXXXX)"; U7D="$UR7/${U_NAME}FFF"; mkdir -p "$U7D"
+l9_start "$L9_UPD" "$UR7/ready"; U7PID="$L9_PID"; l9_mark; PATH="$L9_DIR/f_ps:$PATH"; _reap_google_updater_tmp "$UR7"; PATH="$L9_REAL_PATH"
+l9_alive "$U7PID" && [ -d "$U7D" ] && l9_has "google-updater-reap SKIP — could not read the process list" && ok "_reap_google_updater_tmp: a process list that cannot be read stops everything: nothing killed, nothing deleted, said so" || bad "_reap_google_updater_tmp: acted without a process list: $(l9_tail)"
+mkdir -p "$L9_DIR/f_ps2"; rm -f "$L9_DIR/psn"   # a ps whose FIRST process listing works and whose second (after the stop) fails
+cat > "$L9_DIR/f_ps2/ps" <<EOF2
+#!/bin/bash
+case " \$* " in *" -axww "*) n=\$(cat "$L9_DIR/psn" 2>/dev/null || echo 0); echo \$((n+1)) > "$L9_DIR/psn"; [ "\$n" -ge 1 ] && exit 1 ;; esac
+exec "$L9_REAL_PS" "\$@"
+EOF2
+chmod +x "$L9_DIR/f_ps2/ps"
+l9_mark; PATH="$L9_DIR/f_ps2:$PATH"; _reap_google_updater_tmp "$UR7"; PATH="$L9_REAL_PATH"
+l9_alive "$U7PID" && bad "_reap_google_updater_tmp: the updater was not stopped" || { [ -d "$U7D" ] && l9_has "could not re-read the process list" && ok "_reap_google_updater_tmp: if the list cannot be re-read after stopping, the dirs are left for the next cycle" || bad "_reap_google_updater_tmp: re-read failure not handled: $(l9_tail)"; }
+l9_start "$L9_UPD" "$UR7/ready2"; U7PID="$L9_PID"; l9_save_enabled="$ENABLED"; ENABLED=0; l9_mark; _reap_google_updater_tmp "$UR7"; ENABLED="$l9_save_enabled"
+l9_alive "$U7PID" && [ -d "$U7D" ] && l9_has "google-updater-reap SKIP — DOLT_DISK_FLOOR_GUARD_ENABLED=0" && ok "_reap_google_updater_tmp: the guard's kill switch stops it from killing or deleting" || bad "_reap_google_updater_tmp: ENABLED=0 still acted: $(l9_tail)"
+l9_mark; _reap_google_updater_tmp "/nonexistent/path/$$/updater-none"
+! l9_alive "$U7PID" && l9_has "temp dir unresolved or missing" && ok "_reap_google_updater_tmp: with no temp dir the updater is still stopped, and the missing dir is said, not guessed" || bad "_reap_google_updater_tmp: missing temp dir case wrong: $(l9_tail)"
+l9_kill; rm -rf "$UR7"
+
+echo ""
+echo "=== _reap_low_disk_tmp (ga-1p1i5jr.9): only below 5 GB, both levers, unreadable disk = inert ==="
+l9_save_gu="$(declare -f _reap_google_updater_tmp)"; l9_save_pt="$(declare -f _reap_pytest_tmp)"; L9_CALLS=""
+_reap_google_updater_tmp() { L9_CALLS="${L9_CALLS}u"; }; _reap_pytest_tmp() { L9_CALLS="${L9_CALLS}p"; }
+l9_mark; _reap_low_disk_tmp 4;  [ "$L9_CALLS" = "up" ] && l9_has "low-disk-tmp: avail=4GB < 5GB" && ok "_reap_low_disk_tmp: 4 GB runs the updater lever then the pytest lever and logs why" || bad "_reap_low_disk_tmp: 4 GB calls='$L9_CALLS'"
+L9_CALLS=""; l9_mark; _reap_low_disk_tmp 5; [ -z "$L9_CALLS" ] && l9_has "low-disk-tmp: avail=5GB >= 5GB" && ok "_reap_low_disk_tmp: 5 GB runs neither (and the log says they idled)" || bad "_reap_low_disk_tmp: 5 GB calls='$L9_CALLS'"
+L9_CALLS=""; l9_mark; _reap_low_disk_tmp ""; [ -z "$L9_CALLS" ] && l9_has "low-disk-tmp: avail unreadable" && ok "_reap_low_disk_tmp: an unreadable disk runs neither and says so" || bad "_reap_low_disk_tmp: unreadable avail calls='$L9_CALLS'"
+eval "$l9_save_gu"; eval "$l9_save_pt"
+
+echo ""
+echo "=== _hold_chrome_updater (ga-1p1i5jr.9): window + disk, observed through launchctl, verified after acting ==="
+L9_LC="$L9_DIR/lc"; mkdir -p "$L9_LC"; L9_LABEL="com.google.GoogleUpdater.wake"; L9_T="gui/$(id -u)/$L9_LABEL"; L9_PLIST="$L9_DIR/$L9_LABEL.plist"; : > "$L9_PLIST"
+cat > "$L9_LC/launchctl" <<'EOF'
+#!/bin/bash
+S="${FAKE_LC_DIR:?}"; L="com.google.GoogleUpdater.wake"
+echo "$*" >> "$S/calls"
+[ "${FAKE_LC_HANG:-}" = "$1" ] && sleep 5 >/dev/null 2>&1
+case " ${FAKE_LC_FAIL:-} " in *" $1 "*) echo "launchctl: simulated failure" >&2; exit 5 ;; esac
+case "$1" in
+  print-disabled)
+    printf 'disabled services = {\n'
+    [ -s "$S/entry" ] && printf '\t"%s" => %s\n' "$L" "$(cat "$S/entry")"
+    printf '\t"com.apple.other" => enabled\n}\n'; exit "${FAKE_LC_PD_RC:-0}" ;;
+  print)
+    [ -n "${FAKE_LC_PRINT_RC:-}" ] && { echo "launchctl: simulated" >&2; exit "$FAKE_LC_PRINT_RC"; }
+    if [ -e "$S/loaded" ]; then echo "state = running"; exit 0; fi
+    echo "Could not find service \"$L\" in domain for user gui: 501" >&2; exit 113 ;;
+  disable) case " ${FAKE_LC_NOOP:-} " in *" disable "*) ;; *) echo disabled > "$S/entry" ;; esac ;;
+  enable)  case " ${FAKE_LC_NOOP:-} " in *" enable "*) ;; *) echo enabled > "$S/entry" ;; esac ;;
+  bootout) [ -e "$S/loaded" ] || exit 3; case " ${FAKE_LC_NOOP:-} " in *" bootout "*) ;; *) rm -f "$S/loaded" ;; esac ;;
+  bootstrap) { [ "$(cat "$S/entry" 2>/dev/null)" = disabled ] || [ ! -e "$3" ]; } && exit 5; : > "$S/loaded" ;;
+esac
+exit 0
+EOF
+chmod +x "$L9_LC/launchctl"
+l9_hold() {   # <entry|none> <loaded 0|1> <hour> <avail> [VAR=val ...]: one run of the actor against the fake; the state-changing calls land in $L9_MUT
+  local entry="$1" loaded="$2" hour="$3" avail="$4"; shift 4
+  rm -f "$L9_LC/calls" "$L9_LC/entry" "$L9_LC/loaded"
+  [ "$entry" = none ] || echo "$entry" > "$L9_LC/entry"
+  [ "$loaded" = 1 ] && : > "$L9_LC/loaded"
+  l9_mark
+  ( LAUNCHCTL_BIN="$L9_LC/launchctl"; CHROME_UPDATER_LABEL="$L9_LABEL"; CHROME_UPDATER_PLIST="$L9_PLIST"; CHROME_UPDATER_HOLD_OFF_FILE="$L9_LC/off"
+    CHROME_UPDATER_WINDOW_START_H=0; CHROME_UPDATER_WINDOW_END_H=6; CHROME_UPDATER_MIN_GB=8; LOW_DISK_TMP_GB=5; export FAKE_LC_DIR="$L9_LC"
+    [ $# -gt 0 ] && export "$@"
+    if [ "$hour" = - ]; then _hold_chrome_updater "$avail"; else _hold_chrome_updater "$avail" "$hour"; fi )
+  L9_MUT="$(grep -E '^(disable|enable|bootout|bootstrap) ' "$L9_LC/calls" 2>/dev/null | tr '\n' ';')"
+  return 0
+}
+L9_ALLOW="enable $L9_T;bootstrap gui/$(id -u) $L9_PLIST;"; L9_HOLDC="disable $L9_T;bootout $L9_T;"
+l9_hold disabled 0 3 20; [ "$L9_MUT" = "$L9_ALLOW" ] && [ "$(cat "$L9_LC/entry")" = enabled ] && [ -e "$L9_LC/loaded" ] && l9_has "chrome-updater-hold: ALLOWED" \
+  && ok "hold: in the window with 20 GB a held updater is enabled, then bootstrapped, and the new state is verified" || bad "hold: allow case wrong: calls='$L9_MUT' $(l9_tail)"
+l9_hold enabled 1 12 20; [ "$L9_MUT" = "$L9_HOLDC" ] && [ "$(cat "$L9_LC/entry")" = disabled ] && [ ! -e "$L9_LC/loaded" ] && l9_has "chrome-updater-hold: HELD" \
+  && ok "hold: outside the window a running updater is disabled, then booted out, and the new state is verified" || bad "hold: hold case wrong: calls='$L9_MUT' $(l9_tail)"
+l9_hold enabled 1 3 4;  [ "$L9_MUT" = "$L9_HOLDC" ] && ok "hold: inside the window but below 5 GB: held" || bad "hold: low-disk case calls='$L9_MUT'"
+l9_hold enabled 1 3 6;  [ -z "$L9_MUT" ] && ok "hold: 6 GB (grey zone) leaves an allowed updater alone (no flapping)" || bad "hold: grey zone toggled: '$L9_MUT'"
+l9_hold disabled 0 3 6; [ -z "$L9_MUT" ] && ok "hold: 6 GB (grey zone) leaves a held updater alone" || bad "hold: grey zone toggled: '$L9_MUT'"
+l9_hold enabled 1 3 20; [ -z "$L9_MUT" ] && ok "hold: already allowed and wanted: no state-changing call" || bad "hold: not idempotent (allowed): '$L9_MUT'"
+l9_hold disabled 0 12 20; [ -z "$L9_MUT" ] && ok "hold: already held and wanted: no state-changing call" || bad "hold: not idempotent (held): '$L9_MUT'"
+l9_hold enabled 1 3 "";  [ -z "$L9_MUT" ] && l9_has "chrome-updater-hold SKIP" && ok "hold: inside the window with an unreadable disk it does nothing and says so" || bad "hold: unreadable disk acted: '$L9_MUT' $(l9_tail)"
+l9_hold enabled 1 12 ""; [ "$L9_MUT" = "$L9_HOLDC" ] && ok "hold: outside the window the disk reading is not needed to hold" || bad "hold: out-of-window hold with unreadable disk: '$L9_MUT'"
+l9_hold enabled 1 12 20 FAKE_LC_FAIL=print-disabled; [ -z "$L9_MUT" ] && l9_has "chrome-updater-hold SKIP" && ok "hold: launchctl print-disabled failing = state unknown: no change, logged" || bad "hold: acted without reading the state: '$L9_MUT'"
+l9_hold enabled 1 12 20 FAKE_LC_HANG=print-disabled LAUNCHCTL_TIMEOUT_SECS=1; [ -z "$L9_MUT" ] && l9_has "chrome-updater-hold SKIP" && ok "hold: a launchctl that hangs is cut off by the timeout: state unknown, no change" || bad "hold: a hanging launchctl was waited for or acted on: '$L9_MUT'"
+l9_hold enabled 1 12 20 FAKE_LC_HANG=disable LAUNCHCTL_TIMEOUT_SECS=1; l9_has "chrome-updater-hold: launchctl disable .* FAILED rc=124" && l9_has "chrome-updater-hold: NOT verified" && ! l9_has "chrome-updater-hold: HELD" && ok "hold: a state-changing launchctl that hangs is cut off (rc 124) and the re-read says NOT verified" || bad "hold: a hanging disable was waited for or read as success: $(l9_tail)"
+l9_hold enabled 1 12 20 FAKE_LC_PD_RC=7; [ -z "$L9_MUT" ] && l9_has "chrome-updater-hold SKIP" && ok "hold: print-disabled exiting non-zero with a complete listing is still state unknown: no change" || bad "hold: acted on a listing from a failed print-disabled: '$L9_MUT'"
+l9_hold enabled 1 12 20 FAKE_LC_PRINT_RC=1; [ -z "$L9_MUT" ] && l9_has "chrome-updater-hold SKIP" && ok "hold: launchctl print failing other than 'not found' (rc 113) = state unknown: no change" || bad "hold: acted on an unreadable loaded state: '$L9_MUT'"
+l9_hold enabled 1 12 20 FAKE_LC_FAIL=bootout; [ "$L9_MUT" = "$L9_HOLDC" ] && [ -e "$L9_LC/loaded" ] && l9_has "chrome-updater-hold: NOT verified" && ! l9_has "chrome-updater-hold: HELD" \
+  && ok "hold: a bootout that fails is logged 'NOT verified', never 'HELD'" || bad "hold: failed bootout read as success: $(l9_tail)"
+l9_hold enabled 1 12 20 FAKE_LC_NOOP=disable; l9_has "chrome-updater-hold: NOT verified" && ! l9_has "chrome-updater-hold: HELD" && ok "hold: a disable that returns 0 but changes nothing is caught by the re-read" || bad "hold: success claimed on rc alone: $(l9_tail)"
+l9_hold disabled 0 3 20 CHROME_UPDATER_PLIST=/nonexistent/x.plist; [ "$L9_MUT" = "enable $L9_T;" ] && l9_has "chrome-updater-hold: .*FAILED" && ok "hold: allow with the plist missing: enabled, no bootstrap, FAILED logged" || bad "hold: missing plist: calls='$L9_MUT' $(l9_tail)"
+l9_hold none 1 12 20;   [ "$L9_MUT" = "$L9_HOLDC" ] && ok "hold: no override entry means enabled: a loaded updater is held" || bad "hold: absent entry case: '$L9_MUT'"
+l9_hold none 0 12 20;   [ "$L9_MUT" = "disable $L9_T;" ] && ok "hold: no override entry and not loaded is half-done (enabled by default): disabled, no bootout" || bad "hold: absent entry, not loaded: '$L9_MUT'"
+l9_hold true 1 12 20;   [ "$L9_MUT" = "$L9_HOLDC" ] && ok "hold: the older 'true' spelling of disabled is understood (disabled but loaded: held)" || bad "hold: 'true' not read as disabled: '$L9_MUT'"
+l9_hold false 0 3 20;   [ "$L9_MUT" = "$L9_ALLOW" ] && ok "hold: the older 'false' spelling of enabled is understood (enabled but not loaded: allowed)" || bad "hold: 'false' not read as enabled: '$L9_MUT'"
+l9_hold maybe 1 12 20;  [ -z "$L9_MUT" ] && l9_has "chrome-updater-hold SKIP" && ok "hold: an override value it does not know = state unknown: no change" || bad "hold: acted on an unknown value: '$L9_MUT'"
+l9_hold enabled 0 12 20; [ "$L9_MUT" = "disable $L9_T;" ] && ok "hold: half-done state (enabled, not loaded): the hold is completed without a bootout" || bad "hold: half-done hold: '$L9_MUT'"
+l9_hold disabled 1 3 20; [ "$L9_MUT" = "enable $L9_T;" ] && ok "hold: half-done state (disabled, loaded): allow completes with an enable only" || bad "hold: half-done allow: '$L9_MUT'"
+l9_hold enabled 1 12 20 ENABLED=0; [ ! -e "$L9_LC/calls" ] && ok "hold: the guard's kill switch means no launchctl call at all" || bad "hold: ENABLED=0 still called launchctl"
+: > "$L9_LC/off"; l9_hold enabled 1 12 20; rm -f "$L9_LC/off"; [ ! -e "$L9_LC/calls" ] && l9_has "chrome-updater-hold SKIP" && ok "hold: the off-file means no launchctl call at all, logged" || bad "hold: off-file ignored"
+l9_hold enabled 1 12 20 LAUNCHCTL_BIN=/nonexistent/launchctl; [ -z "$L9_MUT" ] && l9_has "chrome-updater-hold SKIP — /nonexistent/launchctl not found" && ok "hold: no launchctl binary: skip, logged, no crash" || bad "hold: missing launchctl: $(l9_tail)"
+date() { if [ "${1:-}" = "+%H" ]; then echo 03; else command date "$@"; fi; }
+l9_hold disabled 0 - 20; [ "$L9_MUT" = "$L9_ALLOW" ] && ok "hold: with no hour argument it reads the clock (03h: allowed)" || bad "hold: the default hour is not read from the clock: '$L9_MUT'"
+date() { if [ "${1:-}" = "+%H" ]; then echo 12; else command date "$@"; fi; }
+l9_hold enabled 1 - 20;  [ "$L9_MUT" = "$L9_HOLDC" ] && ok "hold: with no hour argument it reads the clock (12h: held)" || bad "hold: the default hour (12h) is not read from the clock: '$L9_MUT'"
+unset -f date
+rm -rf "$L9_DIR" "$PT_BASE"
+
+echo ""
 echo "=== _is_test_dolt_config_path (ga-fqj42) ==="
 # Mirrors third_party/beads/scripts/clean-test-tmp.sh's six canonical
 # cmd/bd test-tmp-dir prefixes verbatim (same list disk-pressure-monitor.sh
@@ -3670,6 +3932,13 @@ _reap_bloated_backup_staging() { REAP_BACKUP_STAGING_CALLS=$((REAP_BACKUP_STAGIN
 REAP_PYCACHE_CALLS=0
 _reap_pycache() { REAP_PYCACHE_CALLS=$((REAP_PYCACHE_CALLS+1)); }
 
+# _reap_low_disk_tmp and _hold_chrome_updater are new (ga-1p1i5jr.9), same reasoning as the reap stubs above: EXECUTION code (real lsof, kill, rm, launchctl,
+# proven in isolation earlier in this file) stubbed so main()'s WIRING is what gets proven. Both receive the PRE-reclaim avail as $1.
+REAP_LOW_DISK_TMP_CALLS=0; REAP_LOW_DISK_TMP_LAST_ARG=""
+_reap_low_disk_tmp() { REAP_LOW_DISK_TMP_CALLS=$((REAP_LOW_DISK_TMP_CALLS+1)); REAP_LOW_DISK_TMP_LAST_ARG="${1-}"; }
+HOLD_CHROME_CALLS=0; HOLD_CHROME_LAST_ARG="unset"; HOLD_CHROME_AT_CALL=""
+_hold_chrome_updater() { HOLD_CHROME_CALLS=$((HOLD_CHROME_CALLS+1)); HOLD_CHROME_LAST_ARG="${1-}"; HOLD_CHROME_AT_CALL="notify=$NOTIFY_CALLS/mail=$GC_MAIL_CALLS"; }
+
 # _nudge_pool_heavy_stop is new (ga-vln2py), same reasoning as the reap stubs above: EXECUTION code (a real
 # `gc session list` + `gc session nudge` per pool session, proven in isolation by
 # dolt-disk-floor-guard.pool-nudge.selftest.sh with a fake gc) stubbed here so main()'s WIRING is what gets proven.
@@ -4192,6 +4461,29 @@ if [ "$REAP_LOGS_CALLS" = "1" ]; then
 else
   bad "main(): _reap_growing_logs should run unconditionally every cycle, got REAP_LOGS_CALLS=$REAP_LOGS_CALLS"
 fi
+
+echo ""
+echo "=== main(): low-disk temp levers + Chrome updater hold wiring (ga-1p1i5jr.9) ==="
+l9_wire() { reset_capture; seed_state "" ""; REAP_LOW_DISK_TMP_CALLS=0; REAP_LOW_DISK_TMP_LAST_ARG=""; HOLD_CHROME_CALLS=0; HOLD_CHROME_LAST_ARG="unset"; HOLD_CHROME_AT_CALL=""; }
+l9_wire; seed_critical_sustain 1; queue_avail 2 20; main
+[ "$REAP_LOW_DISK_TMP_CALLS" = 1 ] && [ "$REAP_LOW_DISK_TMP_LAST_ARG" = 2 ] && [ "$HOLD_CHROME_CALLS" = 1 ] && [ "$HOLD_CHROME_LAST_ARG" = 2 ] \
+  && ok "main(): a CRITICAL cycle hands the PRE-reclaim avail (2) to the low-disk levers and to the Chrome hold, once each" \
+  || bad "main(): CRITICAL wiring wrong: low-disk calls=$REAP_LOW_DISK_TMP_CALLS arg='$REAP_LOW_DISK_TMP_LAST_ARG', hold calls=$HOLD_CHROME_CALLS arg='$HOLD_CHROME_LAST_ARG'"
+[ "$HOLD_CHROME_AT_CALL" = "notify=1/mail=1" ] \
+  && ok "main(): the Chrome hold runs AFTER the CRITICAL notify and Mayor mail (a hanging launchctl can never delay them)" \
+  || bad "main(): the hold ran at '$HOLD_CHROME_AT_CALL' (want notify=1/mail=1 already sent)"
+l9_wire; seed_state "$(( $(date +%s) - 100 ))" 6; queue_avail 6 6; main
+[ "$REAP_LOW_DISK_TMP_CALLS" = 1 ] && [ "$REAP_LOW_DISK_TMP_LAST_ARG" = 6 ] && [ "$HOLD_CHROME_CALLS" = 1 ] \
+  && ok "main(): a WARN cycle calls both too (the 5 GB decision lives inside the lever, not in main())" \
+  || bad "main(): WARN wiring wrong: low-disk calls=$REAP_LOW_DISK_TMP_CALLS arg='$REAP_LOW_DISK_TMP_LAST_ARG', hold calls=$HOLD_CHROME_CALLS"
+l9_wire; queue_avail 20; main
+[ "$REAP_LOW_DISK_TMP_CALLS" = 0 ] && [ "$HOLD_CHROME_CALLS" = 1 ] && [ "$HOLD_CHROME_LAST_ARG" = 20 ] \
+  && ok "main(): a healthy cycle (20 GB) skips the low-disk levers but still runs the Chrome hold (it has to allow, too)" \
+  || bad "main(): healthy wiring wrong: low-disk calls=$REAP_LOW_DISK_TMP_CALLS, hold calls=$HOLD_CHROME_CALLS arg='$HOLD_CHROME_LAST_ARG'"
+l9_wire; queue_avail ""; main
+[ "$REAP_LOW_DISK_TMP_CALLS" = 0 ] && [ "$HOLD_CHROME_CALLS" = 1 ] && [ "$HOLD_CHROME_LAST_ARG" = "" ] \
+  && ok "main(): an unreadable df skips the low-disk levers and still reaches the hold, which logs it and stays inert" \
+  || bad "main(): unreadable-df wiring wrong: low-disk calls=$REAP_LOW_DISK_TMP_CALLS, hold calls=$HOLD_CHROME_CALLS arg='$HOLD_CHROME_LAST_ARG'"
 
 echo ""
 echo "=== main(): Dolt resurrection wiring (ga-f4l2z) ==="

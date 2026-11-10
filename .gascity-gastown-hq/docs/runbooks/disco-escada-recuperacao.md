@@ -8,6 +8,7 @@
 - Interruptor, arquivos, saídas
 - Três estados: o que o maestro faz quando não consegue ler
 - Teto de 6 h do reinício (D4)
+- D1: temporários do pytest e do GoogleUpdater, e a trava do Chrome (ga-1p1i5jr.9)
 - Como testar
 - Prova ponta a ponta e canário de 24 h (D5)
 - Medição
@@ -203,6 +204,28 @@ também (defesa em profundidade); o maestro não depende disso.
 O `acted4_ts` também vale quando o estado salvo se perde pela metade (ver "Três estados"): ele passa a ser AGORA. Só se perde com
 o arquivo de estado AUSENTE (apagado à mão). Apagar `.gc/disk-recovery.state` é, de propósito, o jeito de zerar tudo, inclusive o
 teto de 6 h: se o estado se perdeu e o D4 NÃO chegou a disparar, é isso que libera o D4.
+
+## D1: temporários do pytest e do GoogleUpdater, e a trava do Chrome (ga-1p1i5jr.9)
+
+Em 09/11/2026, 20:30–20:51, uma atualização do Chrome (GoogleUpdater) escreveu ~900 MB em `$TMPDIR` com 2,27 GB livres e, depois que o Mayor apagou os diretórios, o updater seguiu SEGURANDO 1,47 GB em
+arquivos já apagados (`lsof +L1`; o `du` não vê). O D4 pediu reinício às 20:44 e às 20:50. Três coisas no D1 (`dolt-disk-floor-guard.sh`):
+
+- **Abaixo de 5 GB livres** (`DOLT_DISK_FLOOR_LOW_DISK_TMP_GB`, em WARN e CRITICAL): `_reap_google_updater_tmp` dá TERM (depois KILL) a todo processo cuja linha de comando contém
+  `/GoogleUpdater.app/Contents/MacOS/GoogleUpdater` (`DOLT_DISK_FLOOR_GOOGLE_UPDATER_CMD_PATTERN`; confira no mini com `ps -axww -o pid=,command= | grep GoogleUpdater`) e, só quando nenhum sobra e a lista de processos
+  foi lida, apaga `$TMPDIR/com.google.GoogleUpdater.GoogleUpdater_chrome_url_fetcher_*`. Parar o processo é o que devolve o espaço de arquivo já apagado. `_reap_pytest_tmp` apaga `pytest-of-<usuário>/pytest-N` com
+  mtime > 30 min e onde nada, em qualquer profundidade, mudou nesse tempo; o symlink `pytest-current` fica. Nenhum dos dois usa `lsof`: o dump do sistema levou 34–72 s com load ≈ 60 (ga-mv896u), justo quando o disco
+  aperta. Limite aceito: um arquivo aberto e parado há mais de 30 min dentro de um `pytest-N` não é visto.
+- **Toda rodada**, qualquer classe, por último na rodada (um `launchctl` pendurado nunca atrasa o aviso crítico nem o mail): `_hold_chrome_updater` deixa o job `com.google.GoogleUpdater.wake` rodar só entre 00:00 e
+  06:00 com ≥ 8 GB livres (`launchctl enable` + `bootstrap`); fora disso, ou abaixo de 5 GB, `launchctl disable` + `bootout` (um download em curso às 06:00 é interrompido). Entre 5 e 8 GB mantém o estado em que está,
+  para não oscilar. Só age num estado que conseguiu ler (cada `launchctl` tem prazo de 15 s) e relê depois de agir: «HELD»/«ALLOWED» só vai ao log se a releitura confirma; senão «NOT verified».
+- **Não toca** nos agentes do sistema (`/Library/LaunchDaemons/com.google.GoogleUpdater.wake.system`, keystone): sem sudo, e eles podem relançar o updater; abaixo de 5 GB o D1 o para de novo a cada rodada.
+
+Prova no log (`.gc/logs/dolt-disk-floor-guard.log`) na próxima ocorrência: `low-disk-tmp: avail=…GB < 5GB`, `google-updater-reap: stopped the Chrome updater pid=… (TERM)`, `google-updater-reap: …chrome_url_fetcher_… — DELETED`,
+`pytest-tmp-reap: pytest-N … — DELETED` e `chrome-updater-hold: HELD` ou `ALLOWED`. Interruptores: `touch .gc/chrome-updater-hold.off` desliga só a trava (apague para voltar); `DOLT_DISK_FLOOR_GUARD_ENABLED=0` desliga
+isto junto com os outros alívios do D1. Para desfazer a trava à mão: `launchctl enable gui/$(id -u)/com.google.GoogleUpdater.wake && launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.google.GoogleUpdater.wake.plist`.
+Estado de partida: o Mayor desligou o agente à mão em 09/11 ~20:53 (desabilitado e fora do launchd); o guarda lê isso como «held» e o religa sozinho na primeira rodada dentro de 00–06 h com ≥ 8 GB, então não o religue à
+mão. A hora é a do relógio local do mini. Teste: as seções «low-disk temp levers + Chrome updater hold» de `dolt-disk-floor-guard.selftest.sh` (processos de brinquedo achados pelo caminho do próprio teste, `launchctl` falso
+com estado, bash 3.2 incluso); o selftest roda no mini (está em `hetzner-mac-only.hq.txt`).
 
 ## Como testar
 
