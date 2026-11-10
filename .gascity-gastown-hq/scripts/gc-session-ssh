@@ -515,15 +515,11 @@ class Cfg:
         if "worktree_prepare" in h and not isinstance(h["worktree_prepare"], bool):
             raise Fail(f"host {self.host}: 'worktree_prepare' tem que ser true ou false ({h['worktree_prepare']!r})")
         self.prepare = h.get("worktree_prepare", not self.gate)
-        # papel → rig dos worktrees que o PROVIDER cria no start e recolhe no stop (ga-2hd02v.1.7). Desde ga-do1ixn.6.1 o valor também pode ser
-        # {ga: rig, wa: rig}: nesse caso a cauda bead-derivada do NOME da sessão escolhe o rig, tanto no start quanto no stop. Forma errada → recusa, nunca "ausente".
+        # papel → rig dos worktrees que o PROVIDER cria no start e recolhe no stop (ga-2hd02v.1.7). Um papel tem UM rig:
+        # GA e WA usam papéis distintos, pois o stop não recebe o id da bead e a cauda gawisp… não identifica a loja. Forma errada → recusa, nunca "ausente".
         wr = h.get("worktree_rigs", {})
-        def wt_rig_value(v):
-            return ((isinstance(v, str) and RIG_RE.fullmatch(v))
-                    or (isinstance(v, dict) and bool(v) and set(v) <= {"ga", "wa"}
-                        and all(isinstance(r, str) and RIG_RE.fullmatch(r) for r in v.values())))
-        if not isinstance(wr, dict) or not all(isinstance(k, str) and ROLE_RE.fullmatch(k) and wt_rig_value(v) for k, v in wr.items()):
-            raise Fail(f"host {self.host}: 'worktree_rigs' tem que ser um objeto papel → rig ou papel → {{ga/wa: rig}}, ex.: {{'dog': 'gascity'}} (papel [a-z][a-z0-9-]*, rig no formato do hetzner-remote-git.sh) ({wr!r})")
+        if not isinstance(wr, dict) or not all(isinstance(k, str) and ROLE_RE.fullmatch(k) and isinstance(v, str) and RIG_RE.fullmatch(v) for k, v in wr.items()):
+            raise Fail(f"host {self.host}: 'worktree_rigs' tem que ser um objeto papel → rig, ex.: {{'dog': 'gascity'}} (papel [a-z][a-z0-9-]*, rig no formato do hetzner-remote-git.sh) ({wr!r})")
         self.wt_rigs = wr
         # conta Claude do pool do mini (ga-2hd02v.7.1): ausente → nada muda; presente e mal formada → recusa a config, nunca "ausente" (a chave que faltasse abriria a sessão no login fixo do nó, em silêncio)
         ca = h.get("claude_account")
@@ -859,9 +855,12 @@ def acct_key(cfg: Cfg, email: str) -> str:
 
 
 def model_profile(cfg: Cfg, name: str) -> dict | None:
-    """O perfil de modelo do papel da sessão (`<papel>-remote-*`), ou None: sem `-remote-` no nome ou papel fora de `model_profiles` = a sessão segue na conta do pool, como sempre."""
+    """O perfil do papel (`<papel>-remote-*`), ou None. Só kimi-worker-wa herda o perfil de kimi-worker; os demais papéis fora do mapa seguem na conta do pool."""
     m = re.match(r"(.+?)-remote-", name)
-    return cfg.profiles.get(m.group(1)) if m else None
+    role = m.group(1) if m else ""
+    if role == "kimi-worker-wa":
+        role = "kimi-worker"
+    return cfg.profiles.get(role) if m else None
 
 
 def profile_key(cfg: Cfg, prof: dict) -> str:
@@ -991,12 +990,9 @@ def prepare_script(cfg: Cfg) -> str:
 
 
 def managed_worktree(cfg: Cfg, name: str) -> dict:
-    """{} = a sessão NÃO ganha worktree do provider (sem `-remote-` no nome, papel fora de `worktree_rigs`, ou mapa por prefixo sem cauda ga/wa reconhecida); senão onde ele fica e o que o start e o stop precisam."""
+    """{} = sem `-remote-` no nome ou papel fora de `worktree_rigs`; senão o único rig do papel, usado igualmente pelo start e pelo stop."""
     m = re.match(r"(.+?)-remote-", name)
     rig = cfg.wt_rigs.get(m.group(1)) if m else None  # vazio (sem papel, papel sem mapa) → {}; config mal formada já recusou no Cfg
-    if isinstance(rig, dict):
-        # A cauda conserva o começo do id da bead (…-remote-gawisp… / …-remote-waabc…). Não há pedido do start no stop: derivar do nome é o que faz os dois escolherem o MESMO rig.
-        rig = rig.get(name[m.end():m.end() + 2], "")
     if not rig:
         return {}
     if not WT_NAME_RE.fullmatch(name):

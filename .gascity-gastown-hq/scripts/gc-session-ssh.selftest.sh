@@ -78,6 +78,7 @@ set -u
 HERE="$(cd "$(dirname "$0")" && pwd)"
 P="${GCSSH_UNDER_TEST:-$HERE/gc-session-ssh}"
 for v in $(env | sed -n 's/^\(GC_[A-Za-z0-9_]*\)=.*/\1/p') TMUX TMUX_PANE GC_SSH_HOST GIT_AUTHOR_NAME GIT_AUTHOR_EMAIL GIT_COMMITTER_NAME GIT_COMMITTER_EMAIL; do unset "$v"; done  # + a identidade git do ambiente: o runner do nó exporta GIT_AUTHOR_*=gt, que vence o config do worktree e fazia o teste 'autor certo' do grupo prep reprovar no Linux (medido 18/10)  # o "servidor" é esta máquina: nada do ambiente de quem roda (ex.: GC_INSTANCE_TOKEN) pode vazar para as sessões de teste
+for v in ANTHROPIC_AUTH_TOKEN ANTHROPIC_API_KEY ANTHROPIC_BASE_URL ANTHROPIC_MODEL ANTHROPIC_DEFAULT_SONNET_MODEL ANTHROPIC_DEFAULT_OPUS_MODEL ANTHROPIC_DEFAULT_HAIKU_MODEL ANTHROPIC_SMALL_FAST_MODEL CLAUDE_CODE_OAUTH_TOKEN CLAUDE_CODE_SUBAGENT_MODEL; do unset "$v"; done  # o claude falso roda neste processo: não herda o fornecedor real da sessão que executa a suíte
 T=$(cd "$(mktemp -d /tmp/gcs.XXXXXX)" && pwd -P)  # curto: o caminho do socket do tmux tem limite de ~100 caracteres
 SOCK="gct$$"
 export TMUX_TMPDIR="$T/tmux"; mkdir -p "$TMUX_TMPDIR" "$T/bin" "$T/home" "$T/remote/home" "$T/state"
@@ -1117,12 +1118,13 @@ g_wt() {
   [ "$(jq -r .worktree.start_timeout "$T/out")" = 150 ]; ok $? "wt: ...e o prazo do start sobe ao piso de 150 s (a config pedia 25 s: o wt-add puxa o espelho antes de criar)"
   cfg 3 400 "$base"; fresh; pv --dry-run start $n1 < <(req cat "$eng"); [ "$(jq -r .worktree.start_timeout "$T/out")" = 400 ]; ok $? "wt: ...e prazo de config MAIOR que o piso vale (400 s)"; cfg 3 25 "$base"
   fresh; pv --dry-run start wa-worker-remote-gaabc12 < <(req cat "$eng"); [ $RC = 0 ] && jq -e 'has("worktree") | not' "$T/out" >/dev/null && [ "$(jq -r .work_dir "$T/out")" = "$RR/city/.gc/agents/dogs/dog-remote-1" ]; ok $? "wt: dry-run de papel SEM mapa não traz 'worktree' e mantém o work_dir de sempre"
-  # --- ga-do1ixn.6.1: UM papel Kimi escolhe o rig pela cauda da bead no nome da sessão ---
-  local knh=kimi-worker-remote-gaabc123 knw=kimi-worker-remote-waabc123 kw warepo="$RH/gt-remote/git/whatsapp_automation/repo.git"
+  # --- ga-do1ixn.6.1: o engine chama TODA sessão automática <template>-gawisp…; o PAPEL escolhe o rig, nunca a cauda da story ---
+  local knh=kimi-worker-remote-gawisp8wtc8 knw=kimi-worker-wa-remote-gawisp8wtc8 kw warepo="$RH/gt-remote/git/whatsapp_automation/repo.git"
   git clone -q --bare "$T/seed/s" "$warepo" && git -C "$warepo" update-ref refs/remotes/origin/main "$(git -C "$warepo" rev-parse HEAD)"
-  cfg 3 25 '{"worktree_prepare":true,"worktree_rigs":{"dog":"gascity","kimi-worker":{"ga":"gascity","wa":"whatsapp_automation"}}}'
-  fresh; pv --dry-run start "$knh" < <(req cat "$eng"); [ $RC = 0 ] && [ "$(jq -r .worktree.rig "$T/out")" = gascity ] && [ "$(jq -r .work_dir "$T/out")" = "$(WTD "$knh")" ]; ok $? "wt: Kimi com cauda ga- escolhe worktree do gascity (rc=$RC)"
-  fresh; pv --dry-run start "$knw" < <(req cat "$eng"); kw="$RH/gt-remote/git/whatsapp_automation/wt/$knw"; [ $RC = 0 ] && [ "$(jq -r .worktree.rig "$T/out")" = whatsapp_automation ] && [ "$(jq -r .work_dir "$T/out")" = "$kw" ]; ok $? "wt: Kimi com cauda wa- escolhe worktree do whatsapp_automation (rc=$RC)"
+  cfg 3 25 '{"worktree_prepare":true,"worktree_rigs":{"dog":"gascity","kimi-worker":"gascity","kimi-worker-wa":"whatsapp_automation"},"model_profiles":{"kimi-worker":{"base_url":"https://openrouter.ai/api","secret":"openrouter-api-key","key_prefix":"sk-or-","model":"moonshotai/kimi-k3.1-pro","small_model":"moonshotai/kimi-k2.7-code"}}}'
+  fresh; pv --dry-run start "$knh" < <(req cat "$eng"); [ $RC = 0 ] && [ "$(jq -r .worktree.rig "$T/out")" = gascity ] && [ "$(jq -r .work_dir "$T/out")" = "$(WTD "$knh")" ]; ok $? "wt: Kimi GA com nome real <template>-gawisp… escolhe worktree do gascity (rc=$RC)"
+  fresh; pv --dry-run start "$knw" < <(req "claude --x" "$eng"); kw="$RH/gt-remote/git/whatsapp_automation/wt/$knw"; [ $RC = 0 ] && [ "$(jq -r .worktree.rig "$T/out")" = whatsapp_automation ] && [ "$(jq -r .work_dir "$T/out")" = "$kw" ] && [ "$(jq -r .model_profile.model "$T/out")" = moonshotai/kimi-k3.1-pro ]; ok $? "wt: Kimi WA com o MESMO formato de nome escolhe o rig WA e herda o perfil Kimi, sem perfil duplicado (rc=$RC)"
+  fresh; pv --dry-run start kimi-worker-wa-remote-adhoc-0fc28155dd < <(req cat "$eng"); [ $RC = 0 ] && [ "$(jq -r .worktree.rig "$T/out")" = whatsapp_automation ]; ok $? "wt: a cauda adhoc do engine NÃO muda o rig do papel WA (rc=$RC)"
   fresh; pv start "$knw" < <(req cat "$eng"); ok $RC "wt: start do Kimi para bead WA abre dentro do worktree do whatsapp_automation (rc=$RC $(head -c 200 "$T/err"))"
   has "$T/rg.log" "wt-add whatsapp_automation $knw" && [ "$(git -C "$kw" rev-parse --is-inside-work-tree 2>/dev/null)" = true ]; ok $? "wt: ...o wt-add recebeu o rig WA e criou o worktree no repositório dele"
   : > "$T/rg.log"; pv stop "$knw" </dev/null; [ $RC = 0 ] && [ ! -e "$kw" ] && has "$T/rg.log" "wt-rm whatsapp_automation $knw"; ok $? "wt: stop do MESMO Kimi WA reproduz a escolha do rig e recolhe o worktree WA (rc=$RC)"
@@ -1167,7 +1169,7 @@ g_wt() {
   cfg 3 25 '{"worktree_prepare":true}'; wtmirror; pv start dog-remote-gaplain01 < <(req cat "$eng"); [ $RC = 1 ] && has "$T/err" 'não existe' && ! has "$T/rg.log" wt-add; ok $? "wt: SEM worktree_rigs o start é o de hoje (a pasta tem que existir) e não chama o wt-add (rc=$RC)"
   cfg 3 25 "$base"; pv start wa-worker-remote-gaplain02 < <(req cat "$eng"); [ $RC = 1 ] && has "$T/err" 'não existe' && ! has "$T/rg.log" wt-add; ok $? "wt: papel que não está no mapa (wa-worker) também é o de hoje (rc=$RC)"
   fresh; pv start dog-remote-GAUP < <(req cat "$eng"); [ $RC = 1 ] && has "$T/err" 'worktree' && nossh; ok $? "wt: nome que não serve de nome de worktree (maiúscula) recusa SEM ssh (rc=$RC)"
-  for v in '{"dog":"Bad Rig"}' '["dog"]' '{"dog":1}' '"dog"' '{"Dog":"gascity"}' '{"dog":"gascity/x"}' '{"kimi-worker":{"ga":1}}' '{"kimi-worker":{"wa":"gascity/x"}}' '{"kimi-worker":{"xx":"gascity"}}' '{"kimi-worker":[]}' '{"kimi-worker":{"ga":"gascity","wa":null}}'; do
+  for v in '{"dog":"Bad Rig"}' '["dog"]' '{"dog":1}' '"dog"' '{"Dog":"gascity"}' '{"dog":"gascity/x"}' '{"kimi-worker":{"ga":"gascity"}}' '{"kimi-worker":{"ga":1}}' '{"kimi-worker":{"wa":"gascity/x"}}' '{"kimi-worker":{"xx":"gascity"}}' '{"kimi-worker":[]}' '{"kimi-worker":{"ga":"gascity","wa":null}}'; do
     cfg 3 25 "$base"; jq ".hosts.a.worktree_rigs=$v" "$T/cfg.json" > "$T/cfg2.json" && mv "$T/cfg2.json" "$T/cfg.json"; fresh; pv start dog-remote-gacf0001 < <(req cat "$eng"); [ $RC = 1 ] && has "$T/err" "'worktree_rigs'" && nossh; ok $? "wt: worktree_rigs=$v → config recusada dizendo a chave, sem ssh (rc=$RC)"
   done
   # --- nomes que o ENGINE gera: <modelo>-<cauda-da-bead> e <modelo>-adhoc-<10>; o pedido de host continua recusando host desconhecido ---
@@ -1181,8 +1183,8 @@ g_wt() {
   python3 -I - "$rx" <<'PY'; ok $? "wt: o identity_pattern casa com alias/template/sessão que o engine gera (dog-remote-1, dog-remote, dog-remote-gapxi4ls, dog-remote-adhoc-…, e o kimi-worker-remote da ga-do1ixn.5) e recusa os locais, os de outro papel e as misturas"
 import re, sys
 rx = re.compile(sys.argv[1])  # vazio ou inválido → o programa cai (rc ≠ 0) e o teste reprova
-yes = ["remote-e2e-1", "kimi-worker-remote", "kimi-worker-remote-1", "kimi-worker-remote-gawispabc12", "kimi-worker-remote-adhoc-0fc28155dd", "dog-remote", "dog-remote-1", "dog-remote-gapxi4ls", "dog-remote-adhoc-0fc28155dd", "gate-reviewer-remote-2", "gate-reviewer-remote-adhoc-48ac5cece9", "wa-worker-remote-adhoc-1254849098", "wa-worker-remote-gawisp79e1", "ps-worker-remote", "ps-worker-remote-1", "ps-worker-remote-gaabc1234", "ps-worker-remote-adhoc-1254849098"]
-no = ["kimi-worker-1", "kimi-remote-1", "kimi-worker-remote-", "kimi-worker-remote-adhoc-", "gastown.dog-4", "dog-gapxi4ls", "gastown.mayor", "dog", "mayor-remote-1", "dog-remote-", "dog-remote-a", "dog-remote-adhoc-", "dog-remote-adhoc-12345678901", "dog-remote-gapxi4ls-x", "dog-remote/../x", "x-dog-remote-1", "remote-e2e-2", "ps-worker-1", "ps-worker", "ps-remote-1", "ps-worker-remote-", "ps-worker-remote-adhoc-"]
+yes = ["remote-e2e-1", "kimi-worker-remote", "kimi-worker-remote-1", "kimi-worker-remote-gawispabc12", "kimi-worker-remote-adhoc-0fc28155dd", "kimi-worker-wa-remote", "kimi-worker-wa-remote-1", "kimi-worker-wa-remote-gawisp8wtc8", "kimi-worker-wa-remote-adhoc-0fc28155dd", "dog-remote", "dog-remote-1", "dog-remote-gapxi4ls", "dog-remote-adhoc-0fc28155dd", "gate-reviewer-remote-2", "gate-reviewer-remote-adhoc-48ac5cece9", "wa-worker-remote-adhoc-1254849098", "wa-worker-remote-gawisp79e1", "ps-worker-remote", "ps-worker-remote-1", "ps-worker-remote-gaabc1234", "ps-worker-remote-adhoc-1254849098"]
+no = ["kimi-worker-1", "kimi-remote-1", "kimi-worker-remote-", "kimi-worker-remote-adhoc-", "kimi-worker-wa-1", "kimi-worker-wa-remote-", "kimi-worker-wa-remote-gawisp8wtc8-x", "gastown.dog-4", "dog-gapxi4ls", "gastown.mayor", "dog", "mayor-remote-1", "dog-remote-", "dog-remote-a", "dog-remote-adhoc-", "dog-remote-adhoc-12345678901", "dog-remote-gapxi4ls-x", "dog-remote/../x", "x-dog-remote-1", "remote-e2e-2", "ps-worker-1", "ps-worker", "ps-remote-1", "ps-worker-remote-", "ps-worker-remote-adhoc-"]
 bad = [x for x in yes if not rx.fullmatch(x)] + [x for x in no if rx.fullmatch(x)]
 print("fora do esperado:", bad, file=sys.stderr) if bad else None
 sys.exit(1 if bad else 0)
@@ -1419,6 +1421,10 @@ EOF
   [ "$(grep -c . "$sl")" = 1 ] && has "$sl" openrouter-api-key && ! has "$sl" claude-oauth-token; ok $? "prof: o cofre foi lido UMA vez, pelo item do perfil — a conta do pool nem foi consultada"
   ! pleaks "$KO"; ok $? "prof: a chave do perfil não aparece no argv do ssh, na saída, no estado do mini, no disco do host, no ps, no scrollback nem no ambiente do tmux"
   printf '%s' "$KO" > "$T/tmp/controle"; pleaks "$KO"; r1=$?; rm -f "$T/tmp/controle"; ok $r1 "prof: (controle positivo) a varredura acusa a chave quando ela está de fato no disco do host"
+  : > "$sl"; fresh; pv --dry-run start kimi-worker-wa-remote-gawisp8wtc8 < <(req "claude $T/pwa.out"); r1=$RC
+  [ $r1 = 0 ] && [ "$(jq -r '.model_profile.model' "$T/out")" = moonshotai/kimi-k3.1-pro ] && [ "$(jq -r '.claude_account' "$T/out")" = null ] && [ ! -s "$sl" ] && ! has "$T/out" "$KO" && nossh; ok $? "prof: o papel kimi-worker-wa herda o MESMO perfil Kimi no dry-run, sem segunda entrada de segredo e sem ler o cofre (rc=$r1)"
+  fresh; TMPDIR="$T/tmp" pv start kimi-worker-wa-remote-gawisp8wtc8 < <(req "claude $T/pwa.out"); r1=$RC
+  [ $r1 = 0 ] && envis "$T/pwa.out" "ANTHROPIC_AUTH_TOKEN=$KO" && envis "$T/pwa.out" ANTHROPIC_MODEL=moonshotai/kimi-k3.1-pro && envis "$T/pwa.out" CLAUDE_CODE_OAUTH_TOKEN= && ! has "$T/pwa.out" "$KA"; ok $? "prof: o start real do papel WA usa a chave e o modelo Kimi, nunca a conta Claude do pool (rc=$r1)"
   for mode in locked notfound noprefix spaced; do
     : > "$sl"; fresh; FAKE_SECRET_MODE=$mode pv start kimi-worker-remote-p2 < <(req "claude $T/p2.out"); r1=$RC
     [ $r1 = 1 ] && nossh && [ ! -e "$T/p2.out" ] && ! has "$T/err" DECOY && ! has "$sl" claude-oauth-token && has "$T/err" 'NÃO cai na conta do pool' && ! ls "$RR/run" 2>/dev/null | grep -q p2; ok $? "prof: secret '$mode' → o start RECUSA (rc 1) sem ssh, sem sessão, sem repetir o que o secret escreveu, e NÃO cai na conta do pool (rc=$r1)"
@@ -1443,7 +1449,7 @@ EOF
     cfg 12 25 "{\"model_profiles\":$bad}"; fresh; pv start kimi-worker-remote-p7 < <(req "claude $T/p7.out"); r1=$RC
     [ $r1 = 1 ] && nossh && has "$T/err" model_profiles; ok $? "prof: model_profiles mal formado ($(printf '%s' "$bad" | head -c 60)…) recusa a config nomeando a chave, sem ssh (rc=$r1)"
   done
-  cfg 12 25 "$extra"; for x in kimi-worker-remote-p1 dog-remote-p3 kimi-worker-remote-p5; do pv stop $x </dev/null; done
+  cfg 12 25 "$extra"; for x in kimi-worker-remote-p1 kimi-worker-wa-remote-gawisp8wtc8 dog-remote-p3 kimi-worker-remote-p5; do pv stop $x </dev/null; done
   rm -f "$T/home/.local/bin/claude" "$T/bin/secret"; unset FAKE_VAULT FAKE_SECRET_LOG; cfg 3
 }
 
@@ -1951,7 +1957,8 @@ case "$shn" in [1-9]*) ;; *) shard_bad;; esac
   mutant prof "perfil não esvazia o OAuth (a Anthropic fica de reserva calada)" 's/"ANTHROPIC_API_KEY": "", OAUTH_ENV: "",/"ANTHROPIC_API_KEY": "",/'
   mutant prof "perfil não esvazia a ANTHROPIC_API_KEY" 's/"ANTHROPIC_API_KEY": "", OAUTH_ENV: "",/OAUTH_ENV: "",/'
   mutant prof "perfil e conta do pool juntos (o elif vira if)" 's/^    elif cfg.acct and runs_claude(p\["command"\]):$/    if cfg.acct and runs_claude(p["command"]):/'
-  mutant prof "qualquer papel ganha o perfil" 's/    return cfg.profiles.get(m.group(1)) if m else None/    return next(iter(cfg.profiles.values()), None) if m else None/'
+  mutant prof "qualquer papel ganha o perfil" 's/    return cfg.profiles.get(role) if m else None/    return next(iter(cfg.profiles.values()), None) if m else None/'
+  mutant prof "Kimi WA sem herdar o perfil do GA" 's/    if role == "kimi-worker-wa":/    if False:/'
   mutant prof "chave sem o key_prefix aceita" 's/ and tok.startswith(prof\["key_prefix"\]) and len(tok) > 16//'
   mutant prof "chave do perfil com rc != 0 aceita" 's/    if r.returncode == 0 and tok.startswith(prof/    if tok.startswith(prof/'
   mutant prof "slot haiku com o modelo grande" 's/"ANTHROPIC_DEFAULT_HAIKU_MODEL": small/"ANTHROPIC_DEFAULT_HAIKU_MODEL": big/'

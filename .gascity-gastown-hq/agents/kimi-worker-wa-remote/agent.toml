@@ -1,0 +1,14 @@
+# kimi-worker-wa-remote: faixa Kimi para beads wa- elegíveis ao nó (ga-do1ixn.6.1).
+# O papel separado faz o provider escolher whatsapp_automation tanto no start quanto no stop;
+# a cauda gawisp… do nome da sessão não identifica o rig.
+# O provider herda somente model_profiles.kimi-worker: mesma chave e mesmos modelos do Kimi GA.
+# Não duplique o segredo nem configure outro modelo aqui. O `model` abaixo cai no slot sonnet
+# que o perfil herdado aponta para o Kimi; a conta Claude do pool não é alternativa.
+# O Pilot compartilha uma vaga entre este template e kimi-worker-remote, mas usa aliases distintos.
+work_dir = ".gc/agents/kimi-worker-wa-remote"
+min_active_sessions = 0
+max_active_sessions = 1
+idle_timeout = "15m"
+wake_mode = "fresh"
+model = "sonnet"
+provider = "claude-headless"
