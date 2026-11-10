@@ -1,6 +1,6 @@
 ## Contents
 
-- O que é · Como ver o que ele decidiu · Como desligar · As guardas · Cooldown e laço · O que ele NÃO faz · Pedido pendente · Limites conhecidos · O que ainda não foi provado · Testar
+- O que é · Como ver o que ele decidiu · Como desligar · As guardas · Cooldown e laço · O que ele NÃO faz · Pedido pendente · Estado terminal · Limites conhecidos · O que ainda não foi provado · Testar
 
 # D4 — reinício guardado do mini (ga-1p1i5jr.4)
 
@@ -8,12 +8,13 @@
 
 O último degrau da escada de recuperação de disco (missão ga-1p1i5jr). Decisão do Athos em 01/11/2026 (AskUserQuestion na sessão do Mayor, citada na ga-1p1i5jr): **"A qualquer hora, com guardas"** — o mini reinicia sozinho se o disco ficar < 3 GB por 60 min (ou < 1,5 GB em duas leituras seguidas), só sem ligação em curso nem envio em voo, e avisa. A causa que motivou: em 01/11 o disco não estava cheio de arquivo, a RAM virou swap (2-4 GB livres por 5 h) e só um reinício devolve o swap.
 
-Quem decide o TEMPO é o orquestrador (`scripts/disk-recovery-ladder.sh`, ga-1p1i5jr.1). **Em 01/11 ele ainda NÃO está na `main`** (a bead estava na fila do gate; o script só existe na branch `feat/ga-1p1i5jr.1-disk-recovery-ladder`): até ele entrar, nada chama o D4 sozinho e ele só roda se alguém o executar à mão. Confira `git ls-tree origin/main --name-only -r | grep disk-recovery-ladder` antes de contar com a escada. O D4 (`scripts/disk-recovery-d4-guarded-reboot.sh`) só roda quando chamado e RECONFERE tudo antes de agir. Contrato: `--run` / `--dry-run`, UMA linha no stdout, saída **0** = agiu · **10** = nada a fazer ou uma guarda adiou · **20** = falhou · **30** = não consegui ler (não age) · **2** = uso. Com `--run` o pedido de reinício derruba o próprio D4, então um reinício que deu certo normalmente NÃO imprime linha (o processo morre por TERM).
+Quem decide o TEMPO é o orquestrador (`scripts/disk-recovery-ladder.sh`, ga-1p1i5jr.1). **Em 01/11 ele ainda NÃO está na `main`** (a bead estava na fila do gate; o script só existe na branch `feat/ga-1p1i5jr.1-disk-recovery-ladder`): até ele entrar, nada chama o D4 sozinho e ele só roda se alguém o executar à mão. Confira `git ls-tree origin/main --name-only -r | grep disk-recovery-ladder` antes de contar com a escada. O D4 (`scripts/disk-recovery-d4-guarded-reboot.sh`) só roda quando chamado e RECONFERE tudo antes de agir. Contrato: `--run` / `--dry-run` / `--resume` (solta a pausa de envio do estado terminal; o maestro o chama a cada rodada), UMA linha no stdout, saída **0** = agiu · **10** = nada a fazer ou uma guarda adiou · **20** = falhou · **30** = não consegui ler (não age) · **2** = uso. Com `--run` o pedido de reinício derruba o próprio D4, então um reinício que deu certo normalmente NÃO imprime linha (o processo morre por TERM).
 
 ## Como ver o que ele decidiu
 
 - Uma linha `resultado rc=… — D4: …` por rodada: `tail -20 $GC_CITY_PATH/.gc/logs/disk-recovery-d4.log` (o log traz também as guardas lidas e, num reinício, a linha `REINÍCIO AUTOMÁTICO … marca=… livre=… swap=…`, que é o que torna o reinício atribuível).
-- Estado: `cat $GC_CITY_PATH/.gc/disk-recovery-d4.state` — `reboots=` (marcas de reinício em epoch, guardadas por 7 dias), `defer_until=` (não tenta antes disto), `defer_notify_ts=` (último aviso de adiamento), `esc_for=` (reinício para o qual a escalada já saiu).
+- Estado: `cat $GC_CITY_PATH/.gc/disk-recovery-d4.state` — `reboots=` (marcas de reinício em epoch, guardadas por 7 dias), `defer_until=` (não tenta antes disto), `defer_notify_ts=` (último aviso de adiamento), `esc_for=` (reinício para o qual a escalada já saiu), `sp_mark=` (epoch da pausa de envio NOSSA ainda em aberto; 0 = nenhuma: ver "Estado terminal").
+- Estado terminal no log: `grep -E 'guarda de envio: o python não respondeu|PAUSANDO|esvaziamento|marca da pausa|retomada' $GC_CITY_PATH/.gc/logs/disk-recovery-d4.log`.
 - O que ele FARIA agora, sem agir, sem avisar e sem gravar estado: `bash scripts/disk-recovery-d4-guarded-reboot.sh --dry-run`. Com o disco acima do limiar ele sai 10 já no passo do disco; para ver as guardas mesmo assim, simule só a leitura do disco: `DR4_FREE_MB_OVERRIDE=2000 DR4_LOG=/tmp/d4.log bash scripts/disk-recovery-d4-guarded-reboot.sh --dry-run`.
 - Estado ilegível = o D4 recusa agir (rc 30) até alguém consertar. Apagar o arquivo vale como "primeira vez" e ZERA o cooldown e o teto: faça só sabendo disso.
 
@@ -28,7 +29,7 @@ Todas precisam estar "ok"; "não consegui ler" nunca reinicia. Todas são avalia
 | Guarda | Fonte | Bloqueia quando |
 |---|---|---|
 | ligação em curso | `disk-recovery-d4-calls-in-flight.py` (pix `dialing`/`bridged`; voicebot `live`) | há linha em curso com menos de 4 h (`DR4_CALL_MAX_AGE_MIN`); mais velha é órfã, não segura mas é contada |
-| envio em voo | `whatsapp_automation/scripts/central_sender_restart_safe.py` | rc 1 COM a mensagem do script (rc 2 e traceback = não sei) |
+| envio em voo | `whatsapp_automation/scripts/central_sender_restart_safe.py`; se ele não responde, a leitura barata (`sqlite3` no `queue.db`: ver "Estado terminal") | rc 1 COM a mensagem do script (rc 2 e traceback = não sei), ou `sending` > 0 na leitura barata |
 | manutenção do Dolt | padrão extraído do `nightly-reboot.sh` (`DOLT-MAINT-PATTERN-*`) | `pgrep` acha `dolt gc/backup/…` |
 | rodada do scraper | `scraper_daily_state` extraída do `nightly-reboot.sh` (`SCRAPER-DAILY-GUARD-*`) | há rodada `running` |
 
@@ -63,10 +64,37 @@ Números ilegíveis em `DR4_*` (letra, mais de 9 dígitos) caem no padrão e o l
 - Estado com `pending_mark` sem `pending_boot` (ou não numérico) = rc 30, NÃO age: sem o boot de referência não há como dizer "mudou" nem "igual". Estado de antes desta fatia (sem as chaves) lê como "sem pendência".
 - Se o D4 não conseguir gravar a pendência, a marca (já gravada e conferida) fica como reinício comum: bloqueia por 6 h, o lado inerte.
 
+## Estado terminal (ga-1p1i5jr.10)
+
+**10/11.** O swap foi de 0,7 para 4,6 GB (05:30 → 07:58) e o livre de 2,6 GB para 167 MB. O D2 (06:30) e o D3 (06:57 e 07:30) estouraram os 900 s do maestro; o D4 (07:25) leu 185 MB livres e devolveu
+rc 30: a guarda de envio (`central_sender_restart_safe.py`, `GUARD_TIMEOUT_S` 60 s) não respondeu sob thrash, "não sei", não age. O mini travou sozinho às 08:01:50 (pânico do watchdog), sem dreno: o estado "não consigo
+ler" era exatamente o estado em que a máquina cai, e o D4 ficava inerte nele.
+
+**Terminal** = livre < 500 MB (`DR4_TERMINAL_MB`) OU livre < 1,5 GB com `DR4_HARD_STREAK` ≥ 2 (as leituras seguidas que o maestro contou e passa ao D4; sem a variável, só vale o piso de 500 MB). O que muda, e só aí:
+
+| Guarda | Em qualquer estado do disco | Em estado terminal |
+|---|---|---|
+| envio em voo | o python primeiro (é o árbitro: descarta a linha `sending` órfã). Se ele não respondeu (prazo, traceback, rc estranho, ausente), a **leitura barata** responde: `sqlite3` direto no `queue.db` (`COUNT` das linhas `sending`; sem python, sem import, sem rede; prazo `DR4_CHEAP_S`, 25 s). 0 = ok; N > 0 = em voo (adia); ilegível = rc 30. Ela conta TODA linha `sending`, inclusive a órfã: nunca devolve menos que o python | se a barata TAMBÉM não leu: **pausa o envio** (`outreach_config.system_paused=1`, `system_paused_by` "disk-recovery-d4: …"), lê a fila (barata) a cada 10 s por até `DR4_DRAIN_S` (150 s) e então reinicia: 0 em voo lido, ou ilegível o tempo todo ("por construção"). Em voo lido até o fim = adia (rc 10) |
+| ligação em curso | ilegível = rc 30 | ilegível = **aviso + reinício** (o travamento derruba a ligação de qualquer jeito). LIDA em curso continua bloqueando |
+| Dolt, scraper | ilegível = rc 30 | idem: não são aceitos ilegíveis. Bloqueio lido bloqueia |
+
+O que isto NÃO muda: a decisão do Athos (01/11) de só reiniciar sem ligação em curso nem envio em voo. Bloqueio LIDO vence qualquer aceitação (um bloqueio + um ilegível = rc 10 e NADA é pausado), e pausa que não leio de volta
+= rc 30, não reinicia.
+
+**A pausa** é uma escrita condicional (só se `system_paused` está 0) na MESMA chave do painel, no `demand_assignments.db`, lida de volta antes de seguir. Ela é NOSSA só se o `system_paused_by` começa com `disk-recovery-d4:`;
+pausa de outro dono e linha ausente (o WA lê ausente como PAUSADO) nunca são tocadas nem soltas. A marca `sp_mark` vai ao estado ANTES da escrita (marca sem pausa é inerte; pausa sem marca seria o envio parado para sempre). O aviso
+-p 5 diz que o envio foi pausado e que só volta depois do boot. **Quem solta:** o próprio D4 em toda saída normal que não pediu o reinício (disco recuperou, interruptor ligado na carência, guarda mudou, pausa não confirmada…); depois do
+pedido de reinício, o `--resume` (o maestro o chama a cada rodada): sem pedido pendente solta na hora (depois do boot); com pedido pendente espera o `kern.boottime` mudar ou a espera de 30 min vencer; só solta o que ainda é nosso, lido de volta.
+rc do `--resume`: 0 soltou · 10 nada a retomar (calado) ou ainda segurando · 20 não soltou (despausar à mão: `outreach_config.system_paused=0` ou o painel) · 30 não li.
+
 ## Limites conhecidos
 
 Os três achados de código do revisor do gate (ga-24wp723) foram fechados na ga-1p1i5jr.4.3 (pedido pendente acima; pré-checagem repetida depois da carência; espera de 10 min depois de cancelar). O que continua valendo:
 
+- **`system_paused` segura só o PRIMEIRO CONTATO** (`source=demand_outreach`): resposta, campanha e manual seguem enviando. "Esvaziado" vale para o primeiro contato; o aviso diz "PRIMEIRO CONTATO". Um envio de outra fonte pode estar em voo quando o D4 reinicia com o envio ilegível. O `queue.db` por inteiro só se prova pela leitura (barata ou do python), e só a leitura LIDA vale como prova.
+- **Estado terminal com o envio LIDO em voo (python ou leitura barata) segue como sempre: adia 10 min e NÃO pausa.** A decisão da ga-1p1i5jr.10 cobre só o envio ILEGÍVEL. Com a fila ocupada o D4 pode adiar mais de uma vez no estado terminal; pausar e esvaziar também nesse caso é uma fatia pequena (a mesma função), mas muda o escopo e fica para quem decide.
+- **O caminho do `queue.db` tem duas fontes:** o `DEFAULT_DB` do `central_sender_restart_safe.py` e o `DR4_QUEUE_DB` do D4 (mesmo padrão, `/Users/athos/shared/data/queue.db`). Se o WA mover o banco, a leitura barata lê um arquivo velho.
+- **Com o interruptor ligado o maestro não roda o `--resume`:** a pausa nossa espera até alguém apagá-lo.
 - **A pendência só é resolvida quando o D4 roda de novo.** Com o interruptor ligado (passo 1) o D4 sai antes de ler o estado; a pendência fica lá, inerte (a marca segura o cooldown), e é resolvida na primeira rodada depois que o interruptor for apagado.
 - **A espera de 10 min depois de um cancelamento vale para o disco crítico (< 1,5 GB) também**: se o disco recuperar durante a carência e voltar a cair logo em seguida, o D4 só reavalia depois dela. É o preço de não repetir o aviso a cada tick.
 - **`kern.boottime` é a única prova de que o mini reiniciou.** Relógio que salta mais de 300 s para qualquer lado conta como "outro boot" (a marca fica e o cooldown vale): o lado inerte.
@@ -78,8 +106,10 @@ Os três achados de código do revisor do gate (ga-24wp723) foram fechados na ga
 - **O postcheck pós-boot depois de um reinício que NÃO foi o noturno:** ele só age com o arquivo de pendência do `nightly-reboot.sh`; depois de um reinício do D4 sai em silêncio. A conferência pós-boot do D4 é o orquestrador reler o disco e escalar se seguir baixo.
 - Medido em 01/11 21:15 (`--dry-run` com só a leitura de disco simulada, tudo mais real): pré-checagem passou e as quatro guardas leram `calls=ok · sender=ok · dolt=ok · scraper=ok`, com o leitor de verdade nos bancos de verdade; nenhum estado, trava ou aviso foi criado.
 
+- **NÃO verificado no mini (ga-1p1i5jr.10):** a leitura barata e a pausa com o `sqlite3` 3.51 de lá e com o `queue.db` e o `demand_assignments.db` de verdade; o selftest usa o `sqlite3` do nó Linux (3.45) em bancos de mentira com o esquema do WA. Prova read-only no mini, sob carga simulada: `for i in 1 2 3 4 5 6 7 8; do yes >/dev/null & done; time /usr/bin/sqlite3 -batch -cmd ".timeout 3000" -cmd "PRAGMA query_only=ON" /Users/athos/shared/data/queue.db "SELECT COUNT(*) FROM message_queue WHERE status='sending';"; time /usr/bin/python3 /Users/athos/gt/whatsapp_automation/scripts/central_sender_restart_safe.py --quiet; kill $(jobs -p)` (a diferença entre os dois tempos é o que a leitura barata ganha; `kill` encerra os `yes`).
+
 ## Testar
 
-`bash scripts/disk-recovery-d4-guarded-reboot.selftest.sh` — shutdown SIMULADO (nunca reinicia; `DR4_NO_REAL_REBOOT=1` vale em todos os cenários), 470 verificações (379 da 4.2 + 81 da ga-1p1i5jr.4.3 + 10 da ga-hp9pwtr), ~8 min no mini a load alto (7m36s medido em 01/11 para as 379; as demais não foram cronometradas no mini: o nó Linux levou ~170 s para as 460). O `gc` do selftest é fiel ao engine no remetente do `mail send` (`--from` só de human, controller ou sessão que exista): o stub antigo aceitava qualquer argv e por isso o `--from disk-recovery-d4` nunca reprovou. Rode com teto de escrita: `$GC_CITY_PATH/scripts/heavy-guard.sh --what selftest-d4 --max-file-mb 512 -- bash scripts/disk-recovery-d4-guarded-reboot.selftest.sh`. No nó Linux (`mbp-run.sh --repo hq`) dá 469 + 1 falha esperada, a trava com pid reaproveitado (o D4 usa o `stat -f %m` do macOS): no macOS, que é onde o D4 roda, passa.
+`bash scripts/disk-recovery-d4-guarded-reboot.selftest.sh` — shutdown SIMULADO (nunca reinicia; `DR4_NO_REAL_REBOOT=1` vale em todos os cenários), 522 verificações (379 da 4.2 + 81 da ga-1p1i5jr.4.3 + 10 da ga-hp9pwtr + 52 da ga-1p1i5jr.10), ~8 min no mini a load alto (7m36s medido em 01/11 para as 379; as demais não foram cronometradas no mini: o nó Linux levou ~175 s para as 470 e ~300 s para as 522 com load 11-20). As 52 novas rodam o SQL da pausa DE VERDADE (o `sqlite3` do cenário delega ao de verdade) em bancos de mentira com o esquema do WA: replay do incidente com o python pendurado de verdade, leitura barata, pausa/esvaziamento/soltura, corridas entre a leitura e a escrita, pedido pendente, diretório do estado somente leitura (a marca vem ANTES) e o `--resume`. O `gc` do selftest é fiel ao engine no remetente do `mail send` (`--from` só de human, controller ou sessão que exista): o stub antigo aceitava qualquer argv e por isso o `--from disk-recovery-d4` nunca reprovou. Rode com teto de escrita: `$GC_CITY_PATH/scripts/heavy-guard.sh --what selftest-d4 --max-file-mb 512 -- bash scripts/disk-recovery-d4-guarded-reboot.selftest.sh`. No nó Linux (`mbp-run.sh --repo hq`) dá 521 + 1 falha esperada, a trava com pid reaproveitado (o D4 usa o `stat -f %m` do macOS): no macOS, que é onde o D4 roda, passa; com um `stat` que fale `-f %m` e `DR4_STAT_BIN` apontando para ele dá 522/0.
 
 Para provar que o teste pega defeito: `DR4_ST_SUT=<cópia mutada do D4> D4_ST_ONLY='^nt_|^cool$' bash scripts/…selftest.sh` roda só esses cenários contra a cópia. Cada mutante (uma quebra na cópia) tem de reprovar. A ga-1p1i5jr.4.3 rodou 32 mutantes sobre o código novo (tolerância e módulo do boottime, espera da pendência, solta/mantém a marca, validação das chaves `pending_*`, gravação no dry-run, pré-checagem depois da carência, espera de 10 min em cada saída de cancelamento): 30 morreram de cara e 2 sobreviveram (o dry-run gravando ao resolver a pendência); o buraco virou os cenários `pd_dry_chg` e `pd_dry_exp` e os 2 morrem agora. Controle sem mutação: FAIL=0.

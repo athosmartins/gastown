@@ -11,6 +11,8 @@
 #   (b) a trava de instância única tem TRÊS estados: peguei / outra instância viva (10, calado) / não consegui tomar nem verificar (30 + aviso -p 4, no máx. 1/h, entregue-depois-carimbado).
 #   Retomada do D2 (ga-1p1i5jr.6): o stub do D2 devolve rc 10 calado a cada `--resume` (o maestro o chama TODA rodada) e o teste manda 0/20/30/99/2/1/estouro/ausente/sem permissão; só o 10 é silêncio, a falha da CHAMADA é alerta,
 #   o aviso sai no máx. 1 por hora por classe e a marca só depois de um canal confirmar; dry-run e saída antecipada não chamam o `--resume`. Mutantes (rc 20 ignorado etc.) em docs/runbooks/disco-escada-recuperacao.md.
+#   ga-1p1i5jr.10: com livre < 1,5 GB e o D4 chamável, D2 e D3 vencidos não têm vez (e o D4 recebe DR4_HARD_STREAK); o `--resume` do D4 a cada rodada (mesmas classes do D2: só o 10 é silêncio, falha da chamada é alerta, 1 aviso por hora);
+#   a foto dos 10 maiores RSS (ps de mentira em $W/rssbin: ordem, corte do comando, limiar do D2, ps que falha/pendura/vem vazio, rotação, e a foto sai ANTES do degrau).
 #   As seções novas ficam logo no começo do arquivo: um mutante rodado com ST_FAILFAST=1 é pego em segundos, sem esperar o arquivo inteiro.
 # COMO RODAR     bash scripts/disk-recovery-ladder.selftest.sh        (~3-5 min sob carga)
 #   O caminho de quem tem o disco apertado é pelo guarda: scripts/heavy-guard.sh --what selftest-hq --max-file-mb 512 -- bash scripts/disk-recovery-ladder.selftest.sh
@@ -31,6 +33,7 @@ mkdir -p "$W/stubs" "$W/sd" "$W/tmp" "$W/bin" "$W/home"
 SD="$W/sd"                                 # STUB_DIR: o que os stubs leem (modos) e escrevem (chamadas)
 CITY="$W/city"
 STATE="$CITY/.gc/disk-recovery.state"; LOG="$CITY/.gc/logs/disk-recovery.log"; OFF="$CITY/.gc/disk-recovery.off"; LOCK="$CITY/.gc/disk-recovery.lock"
+RSSLOG="$CITY/.gc/logs/disk-recovery-rss.log"
 T0=1000000
 PASS=0; FAIL=0; OUT=""; RC=0
 ok()   { PASS=$((PASS+1)); printf 'ok   - %s\n' "$1"; }
@@ -66,6 +69,8 @@ fi
 [ -f "$STUB_DIR/mode.$n" ] && . "$STUB_DIR/mode.$n"
 echo "$n $1" >> "$STUB_DIR/calls"
 echo $$ > "$STUB_DIR/pid.$n"
+echo "${DR4_HARD_STREAK:-unset}" > "$STUB_DIR/hs.$n"                       # o que o maestro passou em DR4_HARD_STREAK (só ao D4)
+cp "$DR_RSS_LOG" "$STUB_DIR/rss_at_call.$n" 2>/dev/null                    # a foto de RSS que já existia quando o degrau foi chamado
 cp "$DR_STATE" "$STUB_DIR/state_at_call.$n" 2>/dev/null
 [ -n "$setfree" ] && printf '%s' "$setfree" > "$DR_FREE_MB_FILE"
 [ "$setswap" = MISSING ] && rm -f "$DR_SWAP_MB_FILE"
@@ -126,10 +131,28 @@ case "${STUB_SYSCTL_MODE:-ok}" in
 esac
 STUB
 chmod 755 "$W/bin/df" "$W/bin/sysctl"
+# ps de mentira (só nos testes da foto de RSS, num diretório à parte): responde `ps -axo rss=,pid=,command=` e manda o resto (ps -p N -o command= da trava) para o de verdade. Modo em $STUB_DIR/ps.mode: ok | fail | empty | hang
+mkdir -p "$W/rssbin"
+cat > "$W/rssbin/ps" <<'STUB'
+#!/bin/bash
+if [ "$1" = "-axo" ] && [ "$2" = "rss=,pid=,command=" ]; then
+  echo x >> "$STUB_DIR/ps.calls"
+  case "$(cat "$STUB_DIR/ps.mode" 2>/dev/null)" in
+    fail) echo "ps: boom" >&2; exit 1 ;;
+    empty) exit 0 ;;
+    hang) sleep 30; exit 0 ;;
+  esac
+  printf '%s\n' "     2048   991 /tiny/two" "  3355443  4242 /usr/bin/python3 /Users/athos/rfb_monthly_refresh.py --token ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789" "   900000    77 /Applications/Google Chrome.app/Contents/MacOS/Google Chrome Helper --type=renderer" \
+    "  1747626   500 /usr/bin/dolt sql-server --config /x" "   800000    12 /bin/b" "   700000    13 /bin/c" "   600000    14 /bin/d" "   500000    15 /bin/e" "   400000    16 /bin/f" "   300000    17 /bin/g" "   200000    18 /bin/h" "     1024   992 /tiny/one"
+  exit 0
+fi
+exec /bin/ps "$@"
+STUB
+chmod 755 "$W/rssbin/ps"
 
 # ── ambiente e helpers ──────────────────────────────────────────────────────────────────────────────────────
-BASE=( "PATH=$PATH" "HOME=$W/home" "TMPDIR=$W/tmp" "STUB_DIR=$SD"
-  "DR_CITY=$CITY" "DR_STATE=$STATE" "DR_LOG=$LOG" "DR_OFF_FILE=$OFF" "DR_LOCK=$LOCK"
+BASE=( "PATH=$W/rssbin:$PATH" "HOME=$W/home" "TMPDIR=$W/tmp" "STUB_DIR=$SD"
+  "DR_CITY=$CITY" "DR_STATE=$STATE" "DR_LOG=$LOG" "DR_RSS_LOG=$RSSLOG" "DR_OFF_FILE=$OFF" "DR_LOCK=$LOCK"
   "DR_FREE_MB_FILE=$W/free" "DR_SWAP_MB_FILE=$W/swap" "DR_NOW_FILE=$W/now"
   "DR_D2_CMD=$W/stubs/d2" "DR_D3_CMD=$W/stubs/d3" "DR_D4_CMD=$W/stubs/d4"
   "DR_NOTIFY_BIN=$W/stubs/notify" "DR_GC_BIN=$W/stubs/gc" "DR_SETTLE_S=0" )
@@ -142,8 +165,9 @@ setfree() { if [ "$1" = MISSING ]; then rm -f "$W/free"; else printf '%s' "$1" >
 setswap() { if [ "$1" = MISSING ]; then rm -f "$W/swap"; else printf '%s' "$1" > "$W/swap"; fi; }
 tick() { setfree "$1"; setswap "$2"; printf '%s' "$3" > "$W/now"; runl --run; }   # livre swap agora
 ncall()  { local n; n=$(grep -c -x -F "$1 $2" "$SD/calls" 2>/dev/null); echo "${n:-0}"; }
-ncallall() { local n; n=$(grep -v -x -F 'd2 --resume' "$SD/calls" 2>/dev/null | grep -c .); echo "${n:-0}"; }   # chamadas de --run/--dry-run; o --resume (toda rodada) conta à parte em nresume
+ncallall() { local n; n=$(grep -v -x -F -e 'd2 --resume' -e 'd4 --resume' "$SD/calls" 2>/dev/null | grep -c .); echo "${n:-0}"; }   # chamadas de --run/--dry-run; o --resume (toda rodada) conta à parte em nresume / nresume4
 nresume() { local n; n=$(grep -c -x -F 'd2 --resume' "$SD/calls" 2>/dev/null); echo "${n:-0}"; }
+nresume4() { local n; n=$(grep -c -x -F 'd4 --resume' "$SD/calls" 2>/dev/null); echo "${n:-0}"; }
 rmode() { printf '%s\n' "$@" > "$SD/mode.d2.resume"; }   # o que o D2 --resume devolve: rmode rrc=20 "rmsg='...'"
 nnotify() { local n; n=$(grep -c -F -- "$1" "$SD/notify.log" 2>/dev/null); echo "${n:-0}"; }
 nmail()   { local n; n=$(grep -c -F -- "$1" "$SD/mail.log" 2>/dev/null); echo "${n:-0}"; }
@@ -205,7 +229,7 @@ eq "$(nnotify p=),$(nmail to=),$(nmarks)" "0,0,0" "rc 10 (nada a retomar): silê
 hasnt "$(logtxt)" "retomada do D2" "rc 10: nem uma linha no log do maestro (rodada a cada 2 min)"
 tick 20000 0 $((T0 + 120)); eq "$(nresume)" 2 "…e de novo na rodada seguinte"
 reset; tick 5000 0 "$T0"; tick 5000 0 $((T0 + 450)); tick 5000 0 $((T0 + 900))
-eq "$(tail -n 2 "$SD/calls" | tr '\n' ',')" "d2 --run,d2 --resume," "escada em degrau: o --run vai primeiro e o --resume depois, na MESMA rodada"
+eq "$(tail -n 3 "$SD/calls" | tr '\n' ',')" "d2 --run,d2 --resume,d4 --resume," "escada em degrau: o --run vai primeiro e os dois --resume (D2, depois D4) depois, na MESMA rodada"
 reset; rmode rrc=0 "rmsg='retomou rfb --resume-run 1700000000-4242: de pé depois de 25s'"
 tick 20000 0 "$T0"
 eq "$RC,$(nnotify "$RN0"),$(nmail to=)" "0,1,0" "rc 0 (retomou): saída 0, 1 notify -p 3 'retomou' sem push forçado, sem mail"
@@ -287,6 +311,102 @@ reset; rmode rrc=0 "rmsg='retomou'"; : > "$LOCK"; tick 20000 0 "$T0"
 eq "$RC,$(nresume)" "30,0" "trava que não consigo tomar: não chama o --resume"
 reset; rmode rrc=0 "rmsg='retomou'"; tick MISSING 0 "$T0"
 eq "$RC,$(nresume)" "30,0" "df ilegível: não chama o --resume"
+
+# ── ga-1p1i5jr.10: sob thrash D2/D3 estouram os 900 s e o D4 espera atrás deles; a pausa de envio do D4 precisa de quem a solte; e a RAM precisa de culpado nomeado ──────────────────────────
+section "piso duro (ga-1p1i5jr.10): livre < 1,5 GB e o D4 chamável → D2 e D3 vencidos NÃO têm vez; o D4 recebe a sequência de leituras"
+reset; mode d2 rc=10; mode d3 rc=10; mode d4 rc=10
+mkstate "$STATE" $((T0 - 4000)) $((T0 - 4000)) $((T0 - 100)) 0 1     # D2 e D3 vencidos; D4 só pelo piso duro (a 1ª leitura baixa foi há 2 min)
+tick 1400 0 $((T0 + 120))
+eq "$(ncall d2 --run)$(ncall d3 --run)$(ncall d4 --run)" 001 "D2 e D3 vencidos + livre 1400 + 2ª leitura seguida: SÓ o D4 (antes: o D2 primeiro, preso até 900 s)"
+eq "$(cat "$SD/hs.d4")" 2 "o D4 recebeu DR4_HARD_STREAK=2 (as leituras seguidas que o maestro contou)"
+has "$(logtxt)" "D2 vencido, mas livre=1400MB < 1536MB" "o log diz por que o D2 não teve vez"
+tick 1400 0 $((T0 + 240))
+eq "$(ncallall)" 1 "2 min depois (o D4 devolveu 10, retry só aos 5 min): D2 e D3 SEGUEM de fora, a rodada espera o D4"
+tick 1400 0 $((T0 + 420))
+eq "$(ncall d4 --run)$(ncall d2 --run)$(ncall d3 --run)" 200 "…e aos 5 min o D4 repete (2ª chamada dele; D2 e D3 seguem fora)"
+for row in "2900 100" "1536 100" "1535 001"; do set -- $row
+  reset; mode d2 rc=10; mode d3 rc=10; mode d4 rc=10; mkstate "$STATE" $((T0 - 4000)) $((T0 - 4000)) $((T0 - 100)) 0 1
+  tick "$1" 0 $((T0 + 120))
+  eq "$(ncall d2 --run)$(ncall d3 --run)$(ncall d4 --run)" "$2" "livre $1: chamadas d2/d3/d4 = $2 (o piso duro é < 1536: em 1536 vale a regra de sempre, o D2 primeiro)"
+done
+reset; mode d2 rc=10; mode d3 rc=10; mode d4 rc=10; mkstate "$STATE" $((T0 - 4000)) $((T0 - 4000)) $((T0 - 100)) $((T0 - 100)) 1
+tick 1400 0 $((T0 + 120))
+eq "$(ncall d2 --run)$(ncall d4 --run)" 10 "D4 no teto de 6 h (não chamável): D2 e D3 SEGUEM como sempre (não há D4 a esperar)"
+reset; mode d2 rc=10; mode d3 rc=10; mode d4 rc=10; mkstate "$STATE" $((T0 - 4000)) $((T0 - 4000)) $((T0 - 100)) 0 0
+tick 1400 0 $((T0 + 120))
+eq "$(ncallall)" 0 "1ª leitura abaixo do piso (o D4 ainda não é elegível): D2 e D3 não têm vez e nada é chamado nesta rodada"
+tick 1400 0 $((T0 + 240))
+eq "$(ncall d4 --run)$(ncall d2 --run)" 10 "…na 2ª leitura seguida o D4 entra"
+reset; mode d2 rc=10; mode d3 rc=10; mode d4 rc=10; walk 5000 0 "$T0" $((T0 + 900)) 300
+eq "$(cat "$SD/hs.d2" 2>/dev/null)" unset "o D2 NÃO recebe DR4_HARD_STREAK (é variável do D4)"
+
+section "retomada do D4 (ga-1p1i5jr.10): --resume a cada rodada, DEPOIS do resume do D2; só o rc 10 é silêncio; falha da CHAMADA é alerta"
+D4N0='p=3 force= t=Disco: D4 soltou a pausa do envio'
+D4N20='p=4 force=1 t=Disco: o D4 NÃO soltou a pausa do envio'
+D4N30='p=4 force=1 t=Disco: o D4 não leu a pausa do envio'
+D4NB='p=4 force=1 t=Disco: a retomada do D4 falhou na chamada'
+rmode4() { printf '%s\n' "$@" > "$SD/mode.d4.resume"; }   # o que o D4 --resume devolve: rmode4 rrc=20 "rmsg='...'"
+reset; tick 20000 0 "$T0"; tick 20000 0 $((T0 + 120))
+eq "$RC,$(nresume4),$(nnotify p=),$(nmail to=)" "0,2,0,0" "rc 10 (nada a retomar): chamado a CADA rodada, silêncio total (nenhum aviso nem mail)"
+hasnt "$(logtxt)" "retomada do D4" "rc 10: nem uma linha no log do maestro"
+reset; rmode rrc=0 "rmsg='o D2 diz algo'"; tick 20000 0 "$T0"
+eq "$(tail -n 2 "$SD/calls" | tr '\n' ',')" "d2 --resume,d4 --resume," "o resume do D4 vem DEPOIS do resume do D2, na mesma rodada"
+reset; rmode4 rrc=0 "rmsg='marca da pausa de envio de 08:01 solta: pausa de envio nossa solta e conferida'"; tick 20000 0 "$T0"
+eq "$RC,$(nnotify "$D4N0"),$(nmail to=)" "0,1,0" "rc 0 (soltou): notify -p 3 'soltou' sem push forçado, sem mail, saída 0"
+has "$(cat "$SD/notify.log")" "pausa de envio nossa solta e conferida" "rc 0: a linha do D4 vai na mensagem"
+reset; rmode4 rrc=20 "rmsg='não consegui soltar a pausa de envio (escrevi e segue pausado)'"; tick 20000 0 "$T0"
+eq "$RC,$(nnotify "$D4N20"),$(nmail 'subj=Disco: o D4 NÃO soltou a pausa do envio')" "20,1,1" "rc 20 (não soltou): saída 20, notify -p 4 FORÇADO + mail ao Mayor"
+has "$(cat "$SD/notify.log")" "despause à mão" "rc 20: o alerta ensina a despausar à mão"
+eq "$(cat "$CITY/.gc/disk-recovery.resume-d4rc20" 2>/dev/null)" "$T0" "rc 20: a marca de 1 h (classe d4rc20) guarda a hora do aviso entregue"
+tick 20000 0 $((T0 + 120)); eq "$RC,$(nnotify "$D4N20"),$(nmail 'subj=Disco: o D4 NÃO soltou a pausa do envio')" "20,1,1" "rc 20 2 min depois: segue saída 20 mas SÓ log (1 aviso e 1 mail por hora)"
+tick 20000 0 $((T0 + 3600)); eq "$(nnotify "$D4N20"),$(nmail 'subj=Disco: o D4 NÃO soltou a pausa do envio')" "2,2" "rc 20 aos 3600 s: avisa de novo"
+reset; rmode4 rrc=30 "rmsg='não consegui ler o banco'"; tick 20000 0 "$T0"
+eq "$RC,$(nnotify "$D4N30"),$(nmail to=)" "30,1,0" "rc 30 (não li): saída 30, notify -p 4 forçado, sem mail"
+for code in 99 2 1; do
+  reset; rmode4 "rrc=$code" "rmsg='saí com $code'"; tick 20000 0 "$T0"
+  eq "$RC,$(nnotify "$D4NB")" "20,1" "rc $code (fora de 0/10/20/30): alerta -p 4 forçado, nunca tratado como rc 10"
+done
+reset; XENV=(DR_RESUME_TIMEOUT_S=1); rmode4 rrc=0 rslp=30 "rmsg='soltou'"
+SECONDS=0; tick 20000 0 "$T0"; el=$SECONDS
+[ "$el" -le 25 ] && ok "estouro: prazo do --resume do D4 limitado (${el}s para um D4 de 30 s e limite 1 s)" || nope "demorou ${el}s"
+eq "$RC,$(nnotify "$D4NB"),$(nnotify "$D4N0")" "20,1,0" "estourou o prazo: alerta de chamada (e NÃO o 'soltou' que o D4 diria se acabasse)"
+reset; XENV=("DR_D4_CMD=$W/nao-existe"); tick 20000 0 "$T0"
+eq "$RC,$(nnotify p=)" "0,0" "D4 ausente: calado aqui (sem o script não há pausa dele; o run_rung já avisa quando o D4 é devido)"
+reset; XENV=("DR_D4_CMD=$W/stubs/noexec"); tick 20000 0 "$T0"
+eq "$RC,$(nnotify p=)" "0,0" "D4 sem permissão de execução: idem"
+reset; rmode4 rrc=0 "rmsg='x'"; setfree 20000; setswap 0; printf '%s' "$T0" > "$W/now"; runl --dry-run
+eq "$RC,$(nresume4)" "0,0" "dry-run: o --resume do D4 NÃO é chamado"
+reset; rmode4 rrc=0 "rmsg='x'"; touch "$OFF"; tick 20000 0 "$T0"
+eq "$RC,$(nresume4)" "10,0" "interruptor ligado: não chama o --resume do D4 (a pausa nossa espera quem apagar o interruptor)"
+reset; rmode4 rrc=0 "rmsg='x'"; tick MISSING 0 "$T0"
+eq "$RC,$(nresume4)" "30,0" "df ilegível: não chama o --resume do D4"
+
+section "foto de RSS (ga-1p1i5jr.10): rodada com livre <= 5120 MB grava os 10 maiores RSS num log próprio; só diagnóstico"
+rssx() { XENV=(); [ "$#" -eq 0 ] || XENV=("$@"); }   # o ps de mentira já está na frente do PATH de toda rodada (BASE): hermético e rápido; aqui só as variáveis extras
+reset; rssx; tick 5000 100 "$T0"
+eq "$RC,$(grep -c 'pid=' "$RSSLOG" 2>/dev/null)" "0,10" "livre 5000 MB: rodada normal (rc 0) e a foto traz 10 processos (de 12)"
+has "$(cat "$RSSLOG")" "livre=5000MB swap=100MB — 10 maiores RSS" "cabeçalho: hora, livre e swap"
+eq "$(sed -n 2p "$RSSLOG" | awk '{print $1, $3}')" "3276 pid=4242" "1ª linha = o MAIOR (3276 MB, pid 4242)"
+eq "$(sed -n 2,11p "$RSSLOG" | awk '{print $1}' | sort -rn | tr '\n' ' ')" "$(sed -n 2,11p "$RSSLOG" | awk '{print $1}' | tr '\n' ' ')" "ordenada do maior para o menor"
+hasnt "$(cat "$RSSLOG")" "pid=991" "os dois MENORES (11º e 12º) ficam de fora"
+hasnt "$(cat "$RSSLOG")" "ABCDEFGHIJ" "só as 3 primeiras palavras do comando: o argumento com cara de segredo (4ª palavra em diante) NÃO vai para o log"
+has "$(cat "$RSSLOG")" "/usr/bin/python3 /Users/athos/rfb_monthly_refresh.py --token" "…mas o programa e o script (quem inchou a RAM) estão lá"
+for row in "5120 1" "5121 0" "20000 0"; do set -- $row; reset; rssx; tick "$1" 0 "$T0"; eq "$([ -s "$RSSLOG" ] && echo 1 || echo 0)" "$2" "livre $1 MB: foto=$2 (o limiar é o do D2: <= 5120)"; done
+reset; rssx; setfree 5000; setswap 0; printf '%s' "$T0" > "$W/now"; runl --dry-run
+eq "$([ -e "$RSSLOG" ] && echo 1 || echo 0),$(grep -c . "$SD/ps.calls" 2>/dev/null || echo 0)" "0,0" "dry-run: nem foto nem chamada ao ps"
+reset; rssx; echo fail > "$SD/ps.mode"; tick 5000 0 "$T0"
+eq "$RC,$([ -e "$RSSLOG" ] && echo 1 || echo 0),$(sv last_free_mb)" "0,0,5000" "ps falha: a rodada SEGUE (rc 0, estado gravado), sem bloco no log de RSS"
+has "$(logtxt)" "foto de RSS não saiu (ps rc=1" "…e o log do maestro diz (1 linha WARN)"
+reset; rssx DR_RSS_TIMEOUT_S=1; echo hang > "$SD/ps.mode"; SECONDS=0; tick 5000 0 "$T0"; el=$SECONDS
+[ "$el" -le 25 ] && ok "ps pendurado: prazo limitado (${el}s com limite de 1 s)" || nope "demorou ${el}s"
+eq "$RC,$(sv last_free_mb)" "0,5000" "ps pendurado: a rodada segue (rc 0, estado gravado)"
+has "$(logtxt)" "foto de RSS não saiu (ps rc=124" "…e o log diz rc=124"
+reset; rssx; echo empty > "$SD/ps.mode"; tick 5000 0 "$T0"
+eq "$(grep -c 'pid=' "$RSSLOG" 2>/dev/null),$(grep -c '10 maiores RSS' "$RSSLOG" 2>/dev/null)" "0,1" "ps sem nenhuma linha: o bloco sai só com o cabeçalho (vazio não é falha)"
+reset; rssx DR_RSS_LOG_MAX_KB=1; head -c 3000 /dev/zero | tr '\0' 'x' > "$RSSLOG"; tick 5000 0 "$T0"
+eq "$([ -e "$RSSLOG.1" ] && echo 1 || echo 0),$(grep -c 'pid=' "$RSSLOG")" "1,10" "log acima de RSS_LOG_MAX_KB gira para .1 e a foto nova abre um log novo"
+reset; rssx; mode d2 rc=10; mkstate "$STATE" $((T0 - 2000)) 0 0; tick 5000 0 $((T0 + 120))
+eq "$(ncall d2 --run),$([ -s "$SD/rss_at_call.d2" ] && echo 1 || echo 0)" "1,1" "a foto é tirada ANTES de chamar o degrau (se o D4 reiniciar a máquina, a desta rodada já está no disco)"
 
 section "interruptor"
 reset; touch "$OFF"; tick MISSING MISSING "$T0"

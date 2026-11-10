@@ -14,6 +14,8 @@
 #   ruim em DR4_* e sentinela DUPLICADA no reinício noturno. O `gc` de cada cenário é FIEL AO ENGINE no remetente do `mail send` (`--from` só de human, controller ou
 #   de uma sessão que exista; outro nome sai rc 1 "invalid sender"): o stub que aceitava qualquer argv deixou o `--from disk-recovery-d4` passar nos testes e o mail de
 #   reserva do aviso falhar SEMPRE no mini, com o push no teto global o D4 nunca reiniciava (ga-hp9pwtr). `n_mail` conta o mail que o engine ACEITARIA, `n_mail_try` as tentativas.
+#   ga-1p1i5jr.10 (estado terminal): replay de 10/11 (guarda de envio estoura o prazo com 185 MB livres → leitura barata de reserva); envio ilegível no estado terminal → pausa REAL (outreach_config de mentira, SQL de verdade
+#   no sqlite3 de verdade; o `sqlite3` do cenário delega a ele e tem modos de falha), esvaziamento, reinício; a pausa é solta pelo emit ou pelo `--resume` (pós-boot, pedido pendente, outro dono); nada disso fora do estado terminal.
 # COMO NÃO REINICIA: o D4 só chama DR4_REBOOT_CMD (um stub que anota e, no cenário "o mini cai", mata o próprio D4 como o desligamento mata) ou
 #   DR4_OSASCRIPT_BIN (outro stub); DR4_NO_REAL_REBOOT=1 vale em TODOS os cenários: se uma costura sumir, o comando de verdade é recusado.
 # FILTRO: D4_ST_ONLY='^cool$|^cap$' roda só esses cenários; DR4_ST_SUT aponta outra cópia do D4 (a bateria de mutantes usa os dois).
@@ -76,6 +78,32 @@ fi
 exit "$(cat "$C/gc.rc")"
 EOS
 }
+sqlite_stub_body() {  # o `sqlite3` do cenário (ga-1p1i5jr.10): delega ao de verdade (o SQL do D4 roda DE VERDADE nos bancos de mentira), salvo o que $C/sqlite.mode pedir (palavras):
+  # queue=hang|fail|seq (a consulta da fila; seq devolve a próxima linha de queue.seq e repete a última) · read=fail (o SELECT de outreach_config) · write=fail (a pausa e a despausa) · unpause=fail (só a despausa) ·
+  # race=pause|unpause (um OUTRO dono muda o banco entre a leitura do D4 e a escrita dele: prova que o SQL é condicional). sqlite.calls = o SQL de cada chamada
+  cat <<'EOS'
+C=$(cd "$(dirname "$0")/.." && pwd)
+for a in "$@"; do last=$a; done
+m=$(cat "$C/sqlite.mode" 2>/dev/null)
+echo "$last" >> "$C/sqlite.calls"
+case "$last" in
+  *message_queue*)
+    case "$m" in
+      *queue=hang*) sleep 30; exit 0 ;;
+      *queue=fail*) echo "Error: database is locked" >&2; exit 5 ;;
+      *queue=seq*) i=$(cat "$C/queue.i" 2>/dev/null || echo 0); i=$((i + 1)); echo "$i" > "$C/queue.i"; v=$(sed -n "${i}p" "$C/queue.seq"); [ -n "$v" ] || v=$(tail -n 1 "$C/queue.seq"); echo "$v"; exit 0 ;;
+    esac ;;
+  *"SET value = '0'"*)
+    case "$m" in *race=unpause*) /usr/bin/sqlite3 "$C/assign.db" "UPDATE outreach_config SET value='thies-wa: corrida' WHERE key='system_paused_by';" ;; esac
+    case "$m" in *unpause=fail*|*write=fail*) echo "Error: database is locked" >&2; exit 5 ;; esac ;;
+  *"BEGIN IMMEDIATE"*)
+    case "$m" in *race=pause*) /usr/bin/sqlite3 "$C/assign.db" "UPDATE outreach_config SET value='1', updated_at='2000-01-01 00:00:00' WHERE key='system_paused'; UPDATE outreach_config SET value='thies-wa: corrida' WHERE key='system_paused_by';" ;; esac
+    case "$m" in *write=fail*) echo "Error: attempt to write a readonly database" >&2; exit 8 ;; esac ;;
+  *"SELECT 'p='"*) case "$m" in *read=fail*) echo "Error: no such table: outreach_config" >&2; exit 1 ;; esac ;;
+esac
+exec /usr/bin/sqlite3 "$@"
+EOS
+}
 mk_case() {  # $1=nome → C=$T/<nome> com stubs "tudo ok" e o vetor ENVV
   SKIP=0
   if [ -n "$ONLY" ] && ! printf '%s' "$1" | grep -Eq "$ONLY"; then
@@ -99,7 +127,8 @@ mk_case() {  # $1=nome → C=$T/<nome> com stubs "tudo ok" e o vetor ENVV
   stub df "echo 'Filesystem 1024-blocks Used Available Capacity iused ifree %iused Mounted on'; echo \"/dev/disk2s5 239362496 202389956 \$(cat $C/df.kb) 98% 1 1 1% /System/Volumes/Data\""
   stub osascript "echo \"\$@\" > $C/osascript.args; env | grep -E '^(LANG|LC_ALL)=' > $C/osascript.env"
   # o desligamento de verdade TERMina o D4: o stub faz o mesmo quando o cenário pede "o mini cai"; antes anota o estado e os avisos que JÁ existiam
-  stub reboot-stub "echo called >> $C/reboot.calls; cp $C/state $C/state.at-reboot 2>/dev/null; cp $C/notify.log $C/notify.at-reboot; env | grep -E '^(LANG|LC_ALL)=' > $C/reboot.env
+  stub sqlite3 "$(sqlite_stub_body)"
+  stub reboot-stub "echo called >> $C/reboot.calls; cp $C/state $C/state.at-reboot 2>/dev/null; cp $C/assign.db $C/assign.at-reboot 2>/dev/null; cp $C/notify.log $C/notify.at-reboot; env | grep -E '^(LANG|LC_ALL)=' > $C/reboot.env
 [ -f $C/reboot.dies ] && { kill -TERM \"\$(cat $C/state.lock.d/pid)\"; sleep 2; }
 exit \$(cat $C/reboot.rc)"
   printf 'import sys\nsys.stdout.write(open("%s/sender.out").read())\nsys.exit(int(open("%s/sender.rc").read()))\n' "$C" "$C" > "$C/sender_stub.py"
@@ -114,6 +143,7 @@ exit \$(cat $C/reboot.rc)"
     "SCRAPER_RODADA_DIR=$C/rodadas" "SCRAPER_BOOT_EPOCH=$REALBOOT"
     "DR4_REBOOT_CMD=$C/bin/reboot-stub" "DR4_NO_REAL_REBOOT=1"
     "DR4_GRACE_S=0" "DR4_WAIT_S=1" "DR4_REBOOT_TIMEOUT_S=15" "DR4_GUARD_TIMEOUT_S=30" "DR4_NOTIFY_TIMEOUT_S=10" "DR4_MAIL_TIMEOUT_S=10"
+    "DR4_SQLITE_BIN=$C/bin/sqlite3" "DR4_QUEUE_DB=$C/queue.db" "DR4_ASSIGN_DB=$C/assign.db" "DR4_CHEAP_S=10" "DR4_DRAIN_S=3" "DR4_DRAIN_POLL_S=1"
   )
 }
 run_sut() {  # args do D4 → RC, OUT, NL (linhas no stdout)
@@ -660,6 +690,171 @@ mk_case osc_unk;  echo "echo 2 > '$C/sender.rc'; echo 'nao sei' > '$C/sender.out
 osc_run osc_unk 30 "echo 0 > '$C/sender.rc'; echo 'central_sender_restart_safe: fila sem envio em voo — pode reiniciar' > '$C/sender.out'"
 mk_case osc_blk;  echo "echo 1 > '$C/sender.rc'; echo 'central_sender_restart_safe: 1 envio(s) em voo' > '$C/sender.out'" > "$C/notify.hook"
 osc_run osc_blk 10 "echo 0 > '$C/sender.rc'; echo 'central_sender_restart_safe: fila sem envio em voo — pode reiniciar' > '$C/sender.out'"
+
+# ═══ ga-1p1i5jr.10 — estado terminal: a guarda de envio que sobrevive a thrash, a pausa do envio e a retomada ═══════════════════════════
+mk_assign() {  # $1=system_paused ("0" | "1" | "absent") [$2=system_paused_by]: assign.db com a outreach_config do WA (o SQL do D4 roda DE VERDADE nele)
+  [ "$SKIP" = 1 ] && return 0
+  rm -f "$C/assign.db"; /usr/bin/sqlite3 "$C/assign.db" "CREATE TABLE outreach_config (key TEXT PRIMARY KEY, value TEXT, updated_at TEXT DEFAULT (datetime('now','localtime')));"
+  [ "$1" = absent ] || /usr/bin/sqlite3 "$C/assign.db" "INSERT INTO outreach_config (key, value) VALUES ('system_paused', '$1'), ('system_paused_by', '${2:-}');"
+}
+mk_queue() {  # $@ = um status por linha ("sending" "scheduled"...): queue.db com a message_queue do WA; sem argumento = tabela vazia
+  [ "$SKIP" = 1 ] && return 0
+  rm -f "$C/queue.db"; /usr/bin/sqlite3 "$C/queue.db" "CREATE TABLE message_queue (id INTEGER PRIMARY KEY, status TEXT, sending_since TIMESTAMP);"
+  local s; for s in "$@"; do /usr/bin/sqlite3 "$C/queue.db" "INSERT INTO message_queue (status) VALUES ('$s');"; done
+}
+spv() { /usr/bin/sqlite3 "${2:-$C/assign.db}" "SELECT value FROM outreach_config WHERE key='$1';" 2>/dev/null; }   # valor de uma chave (vazio = ausente); $2 = outro banco
+spt() { /usr/bin/sqlite3 "$C/assign.db" "SELECT updated_at FROM outreach_config WHERE key='$1';" 2>/dev/null; }   # carimbo de uma chave
+paused_by_us() { [ "$(spv system_paused "${1:-}")" = 1 ] && spv system_paused_by "${1:-}" | grep -q '^disk-recovery-d4:'; }
+no_write() { ! grep -q 'BEGIN IMMEDIATE' "$C/sqlite.calls" 2>/dev/null; }   # nenhuma escrita no banco da pausa
+term_case() {  # $1=nome: disco em 185 MB (terminal), o python do envio sai 124, a fila ilegível (sem queue.db), o envio de primeiro contato LIVRE e o "mini cai" no pedido de reinício
+  mk_case "$1"; setenv "DR4_FREE_MB_OVERRIDE=185"; echo 124 > "$C/sender.rc"; echo "estourou o prazo" > "$C/sender.out"; mk_assign 0 ""; touch "$C/reboot.dies"
+}
+
+section "10/11 replay: a guarda de envio estoura o prazo com o disco em 185 MB — o D4 não pode ficar inerte (leitura barata)"
+mk_case t_inc; setenv "DR4_FREE_MB_OVERRIDE=185"; setenv "DR4_GUARD_TIMEOUT_S=1"; touch "$C/reboot.dies"   # o python pendurado DE VERDADE: prazo de 1 s → rc 124
+printf 'import time\ntime.sleep(60)\n' > "$C/sender_stub.py"; mk_queue
+run_sut --run
+chk "replay: python estoura o prazo (rc 124), livre 185 MB, leitura barata 0 → REINICIA (kill 143; no HEAD de antes: rc 30 'sender: rc=124'; veio $RC: $OUT)" '[ "$RC" = 143 ] && [ "$(n_reboot)" = 1 ]'
+chk "replay: o log diz que o python não respondeu (rc=124) e que a leitura barata respondeu ok" 'grep -q "o python não respondeu (rc=124" "$C/log" && grep -q "a leitura barata: ok" "$C/log"'
+
+section "leitura barata: só 'sending' conta; em voo adia; ilegível fora do estado terminal segue rc 30 e NUNCA pausa"
+mk_case t_cb; echo 124 > "$C/sender.rc"; mk_queue scheduled sent sending sending
+run_sut --run
+chk "python 124 + 2 'sending' na fila: a barata diz EM VOO → adia (rc 10, sem reinício; veio $RC: $OUT)" '[ "$RC" = 10 ] && no_reboot && contains "2 linha(s)" && contains "o python não respondeu"'
+mk_case t_c0; echo 124 > "$C/sender.rc"; mk_queue scheduled sent; touch "$C/reboot.dies"
+run_sut --run
+chk "python 124 + fila só com 'scheduled'/'sent', FORA do estado terminal (2000 MB): a barata libera e REINICIA (kill 143; veio $RC: $OUT)" '[ "$RC" = 143 ]'
+mk_case t_cu; echo 124 > "$C/sender.rc"; mk_assign 0 ""   # sem queue.db: a barata também não lê
+run_sut --run
+chk "python 124 + fila ilegível FORA do estado terminal: rc 30, não reinicia, NÃO pausa (nenhuma escrita; veio $RC: $OUT)" '[ "$RC" = 30 ] && no_reboot && no_write && [ "$(spv system_paused)" = 0 ] && contains "leitura barata"'
+mk_case t_cm; echo 124 > "$C/sender.rc"; mk_queue; echo "queue=hang" > "$C/sqlite.mode"; setenv "DR4_CHEAP_S=1"
+run_sut --run
+chk "a barata também PENDURA (sqlite3 sem resposta no prazo): rc 30, não reinicia — nunca vira '0 em voo' (veio $RC: $OUT)" '[ "$RC" = 30 ] && no_reboot && contains "leitura barata: sqlite3 rc=124"'
+
+section "estado terminal: envio ilegível = PAUSAR, esperar esvaziar e só então reiniciar (a decisão do Athos, sem envio em voo, preservada)"
+term_case t_pz
+run_sut --run
+chk "terminal + fila ilegível: pausa, espera e reinicia (kill 143; veio $RC: $OUT)" '[ "$RC" = 143 ] && [ "$(n_reboot)" = 1 ]'
+chk "…a pausa JÁ estava no banco (nossa, lida de volta) e a marca sp_mark no estado quando o pedido saiu" 'paused_by_us "$C/assign.at-reboot" && grep -q "sp_mark=$NOW" "$C/state.at-reboot"'
+chk "…o aviso (-p 5) diz estado terminal, que o envio de PRIMEIRO CONTATO foi pausado e que só volta depois do boot" 'grep -q "ATENÇÃO, disco em estado terminal" "$C/notify.at-reboot" && grep -q "PRIMEIRO CONTATO" "$C/notify.at-reboot" && grep -q "só volta depois do boot" "$C/notify.at-reboot"'
+chk "…depois do pedido a pausa FICA (a retomada é do --resume) com a marca no estado" 'paused_by_us && state_has "sp_mark=$NOW"'
+setenv "DR4_BOOT_EPOCH=$((NOW + 600))"   # o mini subiu DEPOIS do pedido; o D4 morreu sem soltar a trava (pid morto)
+run_sut --resume
+chk "pós-boot: --resume solta a pausa nossa, confere e limpa a marca (rc 0, UMA linha; veio $RC: $OUT)" '[ "$RC" = 0 ] && one_line && [ "$(spv system_paused)" = 0 ] && spv system_paused_by | grep -q "^disk-recovery-d4: despausa" && state_has "sp_mark=0"'
+run_sut --resume
+chk "…e na rodada seguinte não há nada a retomar: rc 10 e CALADO (o maestro chama a cada rodada)" '[ "$RC" = 10 ] && [ -z "$OUT" ]'
+term_case t_dr1; mk_queue; printf 'x\n2\n0\n' > "$C/queue.seq"; echo "queue=seq" > "$C/sqlite.mode"   # 1ª leitura barata ilegível (entra no estado terminal), depois 2 em voo, depois 0
+run_sut --run
+chk "esvaziamento: 2 em voo depois 0 → segue e reinicia; o aviso diz que a barata deu 0 com o envio pausado (kill 143; veio $RC: $OUT)" '[ "$RC" = 143 ] && grep -q "com o envio pausado a leitura barata deu 0 em voo" "$C/notify.at-reboot"'
+term_case t_dr2; mk_queue; printf 'x\n2\n' > "$C/queue.seq"; echo "queue=seq" > "$C/sqlite.mode"; rm -f "$C/reboot.dies"
+run_sut --run
+chk "esvaziamento que termina com envio EM VOO lido: rc 10, NÃO reinicia, adia 10 min (veio $RC: $OUT)" '[ "$RC" = 10 ] && no_reboot && contains "ainda há envio em voo depois de pausar" && state_has "defer_until=$((NOW + 600))"'
+chk "…e SOLTA a pausa na saída (lida de volta), limpa a marca e a linha diz" '[ "$(spv system_paused)" = 0 ] && ! paused_by_us && state_has "sp_mark=0" && contains "[pausa de envio nossa solta e conferida]"'
+term_case t_off; setenv "DR4_GRACE_S=3"; echo "touch '$C/off'" > "$C/notify.hook"; rm -f "$C/reboot.dies"
+run_sut --run
+chk "interruptor ligado na carência DEPOIS de pausar: rc 10, não reinicia e SOLTA a pausa (veio $RC: $OUT)" '[ "$RC" = 10 ] && no_reboot && [ "$(spv system_paused)" = 0 ] && state_has "sp_mark=0"'
+term_case t_uf; mk_queue; printf 'x\n2\n' > "$C/queue.seq"; echo "queue=seq unpause=fail" > "$C/sqlite.mode"; rm -f "$C/reboot.dies"
+run_sut --run
+chk "saída que NÃO consegue soltar a pausa (a escrita da despausa falha): a linha diz 'NÃO despausado'; pausa e marca ficam (veio $RC: $OUT)" '[ "$RC" = 10 ] && contains "envio NÃO despausado" && paused_by_us && state_has "sp_mark=$NOW"'
+echo "queue=seq" > "$C/sqlite.mode"; run_sut --resume
+chk "…e o --resume seguinte solta (o banco voltou): rc 0 (veio $RC: $OUT)" '[ "$RC" = 0 ] && [ "$(spv system_paused)" = 0 ] && state_has "sp_mark=0"'
+
+section "estado terminal: pausa que não confirmo = NÃO reinicia; pausa de outro dono e linha ausente nunca são tocadas"
+term_case t_pw; echo "write=fail" > "$C/sqlite.mode"
+run_sut --run
+chk "pausa que NÃO grava (banco somente leitura): rc 30, não reinicia, nada pausado, sem marca no estado (veio $RC: $OUT)" '[ "$RC" = 30 ] && no_reboot && [ "$(spv system_paused)" = 0 ] && ! state_has "sp_mark=[1-9]" && contains "não consegui pausar o envio"'
+term_case t_pr; rm -f "$C/assign.db"
+run_sut --run
+chk "banco da pausa ausente: rc 30, não reinicia, sem marca (veio $RC: $OUT)" '[ "$RC" = 30 ] && no_reboot && ! state_has "sp_mark=[1-9]"'
+term_case t_rf; echo "read=fail" > "$C/sqlite.mode"
+run_sut --run
+chk "leitura da pausa que FALHA (sqlite3 rc≠0): rc 30, não reinicia, nada escrito — falhou não é 'livre' (veio $RC: $OUT)" '[ "$RC" = 30 ] && no_reboot && no_write'
+term_case t_po; mk_assign 1 "thies-wa: pausa manual"
+run_sut --run
+chk "envio JÁ pausado por OUTRO dono: não escrevo, reinicia, a pausa dele fica intacta e sem marca nossa (kill 143; veio $RC: $OUT)" '[ "$RC" = 143 ] && [ "$(spv system_paused_by)" = "thies-wa: pausa manual" ] && [ "$(spv system_paused)" = 1 ] && ! state_has "sp_mark=[1-9]" && no_write'
+term_case t_pa; mk_assign absent
+run_sut --run
+chk "linha system_paused AUSENTE (o WA lê como PAUSADO): não escrevo nada, reinicia (kill 143; veio $RC: $OUT)" '[ "$RC" = 143 ] && [ -z "$(spv system_paused)" ] && no_write'
+term_case t_pl; mk_assign 1 "disk-recovery-d4: de uma rodada anterior"; printf 'v=1\nreboots=\nsp_mark=%s\n' $((NOW - 600)) > "$C/state"
+run_sut --run
+chk "sobra de pausa NOSSA de uma rodada anterior: reaproveita (sem nova escrita) e a pausa segue nossa depois do pedido (kill 143; veio $RC: $OUT)" '[ "$RC" = 143 ] && no_write && paused_by_us'
+term_case t_pl2; mk_assign 1 "disk-recovery-d4: de uma rodada anterior"   # o estado se perdeu: pausa nossa SEM marca
+run_sut --run
+chk "sobra de pausa NOSSA SEM marca no estado: ganha a marca (senão o --resume nunca a soltaria) e segue, sem nova escrita no banco (kill 143; veio $RC: $OUT)" '[ "$RC" = 143 ] && no_write && state_has "sp_mark=$NOW"'
+
+section "estado terminal pela sequência do maestro: livre < 1,5 GB com DR4_HARD_STREAK >= 2 (e só então)"
+for t in "st_a 1200 2 143 1" "st_b 1200 1 30 0" "st_c 1200 0 30 0" "st_d 1600 2 30 0"; do
+  set -- $t; ST_RC=$4; ST_P=$5; term_case "$1"; setenv "DR4_FREE_MB_OVERRIDE=$2"; setenv "DR4_HARD_STREAK=$3"
+  run_sut --run
+  chk "livre=$2 sequência=$3: rc $4 e envio pausado=$5 (veio $RC: $OUT)" '[ "$RC" = "$ST_RC" ] && [ "$(spv system_paused)" = "$ST_P" ]'
+done
+
+section "estado terminal: ligação ilegível = aviso + reinício; só envio e ligação podem ser aceitos ilegíveis; o que é LIDO em curso bloqueia"
+mk_case t_ca; setenv "DR4_FREE_MB_OVERRIDE=185"; echo 2 > "$C/calls.rc"; printf 'unknown\tpix: banco ausente\n' > "$C/calls.out"; touch "$C/reboot.dies"
+run_sut --run
+chk "terminal + ligação ilegível (envio ok): reinicia e o aviso diz que a ligação foi aceita ilegível (kill 143; veio $RC: $OUT)" '[ "$RC" = 143 ] && grep -q "ligação: guarda ilegível aceita" "$C/notify.at-reboot"'
+mk_case t_cn; echo 2 > "$C/calls.rc"; printf 'unknown\tpix: banco ausente\n' > "$C/calls.out"
+run_sut --run
+chk "controle: a MESMA ligação ilegível com 2000 MB livres (não terminal) segue rc 30 (veio $RC)" '[ "$RC" = 30 ] && no_reboot'
+mk_case t_cd; setenv "DR4_FREE_MB_OVERRIDE=185"; echo 2 > "$C/calls.rc"; printf 'unknown\tx\n' > "$C/calls.out"; echo 2 > "$C/pgrep.rc"
+run_sut --run
+chk "terminal + ligação ilegível + Dolt ilegível: rc 30, não reinicia (veio $RC: $OUT)" '[ "$RC" = 30 ] && no_reboot && contains "dolt"'
+term_case t_cb2; echo 1 > "$C/calls.rc"; printf 'block\tpix: 1 ligação(ões) em curso\n' > "$C/calls.out"; rm -f "$C/reboot.dies"
+run_sut --run
+chk "terminal + ligação LIDA em curso + envio ilegível: o bloqueio vence (rc 10) e NADA é pausado (veio $RC: $OUT)" '[ "$RC" = 10 ] && no_reboot && no_write && [ "$(spv system_paused)" = 0 ]'
+term_case t_dry
+run_sut --dry-run
+chk "dry-run terminal: rc 0 'reiniciaria', diz que PAUSARIA o envio, e NÃO escreve (banco intacto, sem estado, sem aviso; veio $RC: $OUT)" '[ "$RC" = 0 ] && contains "reiniciaria agora" && contains "PAUSARIA" && no_write && [ ! -e "$C/state" ] && [ "$(n_notify)" = 0 ] && no_reboot'
+
+term_case t_race1; echo "race=pause" > "$C/sqlite.mode"
+run_sut --run
+chk "OUTRO dono pausa entre a leitura e a escrita do D4: a escrita condicional NÃO sobrescreve a identidade dele nem renova o carimbo da pausa dele, o D4 solta a marca e segue (kill 143; veio $RC: $OUT)" '[ "$RC" = 143 ] && [ "$(spv system_paused_by)" = "thies-wa: corrida" ] && [ "$(spv system_paused)" = 1 ] && [ "$(spt system_paused)" = "2000-01-01 00:00:00" ] && state_has "sp_mark=0"'
+term_case t_pend; rm -f "$C/reboot.dies"
+run_sut --run
+chk "pedido ACEITO e o mini NÃO caiu (pendente): a pausa FICA nossa, com a marca no estado — quem decide é o --resume, não a saída 20 (veio $RC: $OUT)" '[ "$RC" = 20 ] && contains "PENDENTE" && paused_by_us && state_has "sp_mark=$NOW" && ! contains "despausado"'
+term_case t_ro; mkdir "$C/lockd"; setenv "DR4_LOCKD=$C/lockd/l"; : > "$C/stdout.last"; : > "$C/stderr.last"; rm -f "$C/reboot.dies"
+[ "$SKIP" = 1 ] || chmod 555 "$C"
+run_sut --run
+[ "$SKIP" = 1 ] || chmod 755 "$C"
+chk "a marca NÃO grava (diretório do estado somente leitura): a pausa NÃO é escrita no banco — a marca vem ANTES (rc 30; veio $RC: $OUT)" '[ "$RC" = 30 ] && no_write && [ "$(spv system_paused)" = 0 ] && contains "não consegui gravar a marca da pausa"'
+
+section "--resume: solta SÓ a pausa nossa, respeita o pedido pendente, e sem nada a retomar fica calado"
+rs_case() {  # $1=nome $2=system_paused $3=system_paused_by [$4=pending_mark $5=pending_boot]: assign.db + estado com sp_mark=NOW-100; sem $4 não há pedido pendente
+  mk_case "$1"; mk_assign "$2" "$3"
+  printf 'v=1\nreboots=%s\ndefer_until=0\ndefer_notify_ts=0\nesc_for=0\npending_mark=%s\npending_boot=%s\nsp_mark=%s\n' "${4:-}" "${4:-0}" "${5:-0}" $((NOW - 100)) > "$C/state"
+}
+mk_case rs_none; run_sut --resume
+chk "sem arquivo de estado: rc 10, CALADO (nem stdout nem log: o maestro chama a cada rodada; veio $RC: '$OUT')" '[ "$RC" = 10 ] && [ -z "$OUT" ] && [ ! -s "$C/log" ]'
+mk_case rs_zero; printf 'v=1\nreboots=\nsp_mark=0\n' > "$C/state"; run_sut --resume
+chk "sp_mark=0: rc 10, calado" '[ "$RC" = 10 ] && [ -z "$OUT" ] && [ ! -s "$C/log" ]'
+rs_case rs_ours 1 "disk-recovery-d4: estado terminal"; run_sut --resume
+chk "pausa nossa e nenhum pedido pendente: solta, confere e limpa a marca (rc 0, UMA linha; veio $RC: $OUT)" '[ "$RC" = 0 ] && one_line && [ "$(spv system_paused)" = 0 ] && state_has "sp_mark=0" && contains "solta e conferida"'
+rs_case rs_oth 1 "thies-wa: pausa manual"; run_sut --resume
+chk "pausa de OUTRO dono: não toca (nenhuma escrita; segue 1, mesmo dono) e só solta a marca; a linha diz (rc 0; veio $RC: $OUT)" '[ "$RC" = 0 ] && no_write && [ "$(spv system_paused)" = 1 ] && [ "$(spv system_paused_by)" = "thies-wa: pausa manual" ] && state_has "sp_mark=0" && contains "outro dono"'
+rs_case rs_race 1 "disk-recovery-d4: x"; echo "race=unpause" > "$C/sqlite.mode"; run_sut --resume
+chk "OUTRO dono assume a pausa entre a leitura e a escrita: a despausa condicional NÃO a solta (segue 1, dono dele); só a marca sai (rc 0; veio $RC: $OUT)" '[ "$RC" = 0 ] && [ "$(spv system_paused)" = 1 ] && [ "$(spv system_paused_by)" = "thies-wa: corrida" ] && state_has "sp_mark=0" && contains "outro dono"'
+rs_case rs_free 0 "disk-recovery-d4: despausa"; run_sut --resume
+chk "o envio já estava livre: rc 0, só limpa a marca (veio $RC: $OUT)" '[ "$RC" = 0 ] && state_has "sp_mark=0" && contains "já estava livre"'
+rs_case rs_pend 1 "disk-recovery-d4: x" $((NOW - 100)) "$BOOT"; run_sut --resume
+chk "pedido de reinício PENDENTE (kern.boottime igual, dentro dos 30 min): a pausa FICA, rc 10 (veio $RC: $OUT)" '[ "$RC" = 10 ] && contains "pendente" && [ "$(spv system_paused)" = 1 ] && state_has "sp_mark=$((NOW - 100))"'
+rs_case rs_pexp 1 "disk-recovery-d4: x" $((NOW - 2000)) "$BOOT"; run_sut --resume
+chk "pedido pendente VENCIDO (marca + 30 min passou e o mini não reiniciou): solta a pendência e a pausa (rc 0; veio $RC: $OUT)" '[ "$RC" = 0 ] && [ "$(spv system_paused)" = 0 ] && state_has "pending_mark=0"'
+rs_case rs_boot 1 "disk-recovery-d4: x" $((NOW - 100)) $((BOOT - 100000)); run_sut --resume
+chk "kern.boottime MUDOU (o mini reiniciou): solta a pausa (rc 0) e a marca do reinício FICA (cooldown; veio $RC: $OUT)" '[ "$RC" = 0 ] && [ "$(spv system_paused)" = 0 ] && state_has "reboots=$((NOW - 100))" && state_has "pending_mark=0"'
+rs_case rs_nodb 1 "disk-recovery-d4: x"; rm -f "$C/assign.db"; run_sut --resume
+chk "banco ilegível: rc 30 e a marca FICA (veio $RC: $OUT)" '[ "$RC" = 30 ] && state_has "sp_mark=$((NOW - 100))"'
+rs_case rs_wf 1 "disk-recovery-d4: x"; echo "write=fail" > "$C/sqlite.mode"; run_sut --resume
+chk "a despausa não grava: rc 20, a linha ensina a despausar à mão, pausa e marca ficam (veio $RC: $OUT)" '[ "$RC" = 20 ] && contains "despausar à mão" && [ "$(spv system_paused)" = 1 ] && state_has "sp_mark=$((NOW - 100))"'
+rs_case rs_lock 1 "disk-recovery-d4: x"; setenv "DR4_BOOT_EPOCH=$(( $(date +%s) - 100000 ))"; mkdir "$C/state.lock.d"; sleep 30 & LP=$!; echo "$LP" > "$C/state.lock.d/pid"
+run_sut --resume
+chk "outro D4 VIVO com a trava: rc 10 e não toca em nada (veio $RC: $OUT)" '[ "$RC" = 10 ] && [ "$(spv system_paused)" = 1 ] && contains "outra instância"'
+kill "$LP" 2>/dev/null; wait "$LP" 2>/dev/null
+mk_case rs_bad; printf 'v=1\nreboots=\nsp_mark=abc\n' > "$C/state"; run_sut --resume
+chk "sp_mark que não é número: rc 30 — lixo nunca vira 'sem pausa' (veio $RC: $OUT)" '[ "$RC" = 30 ] && contains "sp_mark"'
+mk_case rs_bad2; printf 'v=1\nreboots=\nsp_mark=abc\n' > "$C/state"; run_sut --run
+chk "o --run também recusa o sp_mark ilegível (rc 30, sem reinício; veio $RC: $OUT)" '[ "$RC" = 30 ] && contains "sp_mark" && no_reboot'
+mk_case rs_uso; run_sut --resume --run
+check "--resume com outro modo: rc 2" [ "$RC" = 2 ]
 
 echo
 echo "disk-recovery-d4-guarded-reboot.selftest: PASS=$PASS FAIL=$FAIL"

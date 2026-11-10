@@ -12,6 +12,7 @@
 #   aviso, sem reinício). stdout = UMA linha; o resto vai pro log. Saída 0 = agiu (--run: pediu o reinício, e o desligamento costuma matar o
 #   processo antes de imprimir; --dry-run: "reiniciaria") · 10 = nada a fazer ou uma guarda adiou · 20 = falhou · 30 = não consegui ler (NÃO age) · 2 = uso.
 #   O TEMPO do limiar é do orquestrador (disk-recovery-ladder.sh, .1), que também faz notify+mail em rc 0/20; aqui fica só o cooldown PRÓPRIO.
+#   `--resume` (ga-1p1i5jr.10; o maestro o chama a CADA rodada): solta a pausa de envio que ESTE D4 pôs antes de um reinício (ESTADO TERMINAL). 0 = soltou e conferiu · 10 = nada a retomar (calado) ou ainda segurando · 20 = não consegui soltar · 30 = não consegui ler.
 #
 # ORDEM (3 estados em TODA leitura — leu e é / leu e não é / não consegui ler —; "não consegui ler" cai SEMPRE do lado inerte: não reinicia):
 #   1 interruptor `touch .gc/disk-recovery.off` (o do orquestrador)  2 trava de instância única + estado  3 disco ≥ 3 GB agora = recuperou (df do
@@ -33,13 +34,22 @@
 #   Não usa o `nightly-reboot.sh --check-guards` inteiro: o guard3 (beads hq em andamento) bloquearia para sempre (sempre há agente trabalhando; o
 #   próprio noturno em modo dreno decide só pelas guardas de segurança) e ele não tem timeout — Dolt doente é o cenário de disco cheio.
 #
+# ESTADO TERMINAL (ga-1p1i5jr.10). 10/11 o mini travou por pânico (watchdog) com 185 MB livres: a guarda de envio estourou os 60 s sob thrash de swap → "não sei" → rc 30 → o D4 ficou inerte justamente no estado em que a
+#   máquina cai sozinha, sem dreno. TERMINAL = livre < TERMINAL_MB (500) OU livre < HARD_MB com DR4_HARD_STREAK >= 2 (as leituras seguidas que o maestro contou; sem a variável vale 0). Duas mudanças: (1) a guarda de envio ganhou uma
+#   leitura BARATA de reserva (sqlite3 direto no queue.db: sem python, sem import, sem rede) quando o python não dá resposta, em QUALQUER estado do disco: ela conta TODA linha 'sending' (nunca menos que o python, que ainda descarta a
+#   órfã); (2) SÓ no estado terminal: guarda de ligação ilegível = aviso + reinício (o travamento derruba a ligação de qualquer jeito) e guarda de envio ilegível mesmo na leitura barata = PAUSAR o envio (outreach_config.system_paused, a
+#   chave do painel), esperar DRAIN_S e só então reiniciar. ATENÇÃO: o system_paused segura só o PRIMEIRO CONTATO (source=demand_outreach); resposta e campanha seguem, então "esvaziado" vale para o primeiro contato e o texto do aviso diz.
+#   Pausa que não leio de volta = rc 30, NÃO reinicia. Dolt e scraper ilegíveis seguem rc 30; ligação LIDA em curso e envio LIDO em voo seguem bloqueando (adia). A pausa é NOSSA só se o system_paused_by começa com "disk-recovery-d4:"
+#   (pausa de outro dono nunca é solta). Quem solta: o próprio D4 em toda saída normal que não pediu o reinício (emit); depois do pedido, o `--resume` do maestro (depois do boot, ou quando o pedido pendente vence). A marca (sp_mark) vai ao
+#   estado ANTES da escrita no banco: marca sem pausa é inerte; pausa sem marca seria o envio parado para sempre. Com o interruptor ligado o maestro não roda o `--resume`: a pausa nossa espera quem apagar o interruptor.
+#
 # REINÍCIO. Sem sudo (não há sudoers.d; `Bash(sudo:*)` é "ask"): o MESMO AppleEvent dos reinícios manuais do Mayor (osascript → loginwindow
 #   `aevtrrst`), com LANG=en_US.UTF-8 explícito (sob launchd não há LANG e o «» precisa chegar como UTF-8). NÃO verificado: se a Automação do macOS
 #   libera esse envio na cadeia do launchd do orquestrador (de uma sessão de agente a sonda de permissão dá -1744 e o reinício do Mayor funciona
 #   mesmo assim, então ela não serve de preditor). Falha vira rc 20 e desfaz a marca; a prova real é o canário do D5.
 #
 # COSTURAS (DR4_*; o selftest NUNCA reinicia de verdade): DR4_REBOOT_CMD · DR4_NO_REAL_REBOOT=1 (recusa o comando de verdade) · DR4_FREE_MB_OVERRIDE ·
-#   DR4_NOW · DR4_BOOT_EPOCH · DR4_CONSOLE_USER · DR4_*_BIN · DR4_CALLS_PY · DR4_SENDER_SAFE_PY · DR4_NIGHTLY · DR4_STATE/LOG/LOCKD · limites numéricos
+#   DR4_NOW · DR4_BOOT_EPOCH · DR4_CONSOLE_USER · DR4_*_BIN (DR4_SQLITE_BIN inclusive) · DR4_CALLS_PY · DR4_SENDER_SAFE_PY · DR4_QUEUE_DB · DR4_ASSIGN_DB · DR4_HARD_STREAK · DR4_NIGHTLY · DR4_STATE/LOG/LOCKD · limites numéricos
 #   (número ilegível cai no padrão e é dito no log). Compartilhados com o orquestrador DE PROPÓSITO: DR_OFF_FILE, DR_NOTIFY_BIN, DR_GC_BIN. Bash 3.2.
 
 set -uo pipefail
@@ -67,8 +77,13 @@ STATBIN="${DR4_STAT_BIN:-/usr/bin/stat}"
 DFBIN="${DR4_DF_BIN:-/bin/df}"
 POSTCHECK_LABEL="${DR4_POSTCHECK_LABEL:-com.gascity.nightly-reboot-postcheck}"
 OSASCRIPT="${DR4_OSASCRIPT_BIN:-/usr/bin/osascript}"
+SQLITE="${DR4_SQLITE_BIN:-/usr/bin/sqlite3}"
+QUEUE_DB="${DR4_QUEUE_DB:-/Users/athos/shared/data/queue.db}"                  # o mesmo padrão do central_sender_restart_safe.py (DEFAULT_DB): duas fontes do caminho; se o WA o mover, a leitura barata lê um arquivo velho
+ASSIGN_DB="${DR4_ASSIGN_DB:-/Users/athos/shared/data/demand_assignments.db}"   # onde mora outreach_config (system_paused): o mesmo diretório do queue.db
+SP_ID="disk-recovery-d4:"                                                       # prefixo do system_paused_by: é assim que reconheço uma pausa NOSSA (o D3 usa "disk-recovery-d3:")
 
 DRY=0
+MODE=run
 CFG_WARN=""
 LOCK_HELD=0
 EMITTED=0
@@ -101,6 +116,12 @@ cfg CALL_MAX_AGE_MIN 240
 cfg GUARD_TIMEOUT_S 60
 cfg NOTIFY_TIMEOUT_S 20
 cfg MAIL_TIMEOUT_S 30
+cfg TERMINAL_MB 500    # abaixo disto o disco está em estado terminal (10/11: pânico com 185 MB): ver ESTADO TERMINAL
+cfg HARD_STREAK 0      # leituras seguidas < HARD_MB que o maestro contou (DR4_HARD_STREAK); 0 = sem a informação = não vale
+cfg HARD_STREAK_N 2    # com livre < HARD_MB e HARD_STREAK >= isto, também é terminal
+cfg CHEAP_S 25         # prazo de cada chamada do sqlite3 (leitura barata do envio, leitura e escrita da pausa)
+cfg DRAIN_S 150        # com o envio pausado, espera isto para esvaziar (um envio on-device leva ~2 min)
+cfg DRAIN_POLL_S 10    # intervalo entre as leituras baratas durante o esvaziamento
 
 now() { case "${DR4_NOW:-}" in ''|*[!0-9]*) date +%s ;; *) printf '%s' "$DR4_NOW" ;; esac; }
 hhmm() { date -r "$1" '+%H:%M' 2>/dev/null || printf '%s' "$1"; }
@@ -124,9 +145,15 @@ emit() {  # $1=rc; resto=texto. A ÚNICA linha do stdout; sai. Nunca chamar dent
   local rc=$1; shift
   if [ "$EMITTED" = 0 ]; then
     EMITTED=1
-    local line="D4"
+    local line="D4" rel=""
     [ "$DRY" = 1 ] && line="D4 (dry-run)"
-    line="$line: $*"
+    [ "$MODE" = resume ] && line="D4 (retomada)"
+    # pausa de envio NOSSA que esta saída não vai usar (só o pedido de reinício aceito zera SP_HOLD): solta AGORA e diz. Não confirmou = a marca (sp_mark) fica e o --resume do maestro repete
+    if [ "$SP_HOLD" = 1 ]; then
+      SP_HOLD=0
+      if sender_release; then rel=" [$REL_TXT]"; else rel=" [envio NÃO despausado ($SP_ERR): o --resume da próxima rodada repete]"; fi
+    fi
+    line="$line: $*$rel"
     line=$(printf '%s' "$line" | tr '\n\r' '  ')
     printf '%s\n' "$line"
     log "resultado rc=$rc — $line"
@@ -193,7 +220,8 @@ send_mail() {  # $1=assunto $2=corpo. rc 0 = entregue; rc 1 = não confirmado (m
 }
 
 # ── estado (chave=valor, escrito inteiro e trocado com mv) ─────────────────────────────────────────────────────────────────────
-S_REBOOTS=""; S_DEFER_UNTIL=0; S_DEFER_NOTIFY=0; S_ESC_FOR=0; S_PEND_MARK=0; S_PEND_BOOT=0; STATE_ERR=""
+S_REBOOTS=""; S_DEFER_UNTIL=0; S_DEFER_NOTIFY=0; S_ESC_FOR=0; S_PEND_MARK=0; S_PEND_BOOT=0; S_SP_MARK=0; STATE_ERR=""
+SP_HOLD=0   # 1 = pausei o envio e ainda não pedi o reinício: toda saída normal (emit) tem de soltar
 isnum() { case "$1" in ''|*[!0-9]*) return 1 ;; *) [ "${#1}" -le 12 ] ;; esac; }
 valid_list() {  # lista de números separados por vírgula (vazia vale); elemento vazio ou com > 12 dígitos não vale (estouraria a aritmética sem avisar)
   local e IFS=,
@@ -203,7 +231,7 @@ valid_list() {  # lista de números separados por vírgula (vazia vale); element
 }
 
 state_load() {  # rc 0 = lido (arquivo AUSENTE = estado vazio = primeira vez); rc 1 = existe e não consigo ler/entender → STATE_ERR (NÃO age)
-  S_REBOOTS=""; S_DEFER_UNTIL=0; S_DEFER_NOTIFY=0; S_ESC_FOR=0; S_PEND_MARK=0; S_PEND_BOOT=0; STATE_ERR=""
+  S_REBOOTS=""; S_DEFER_UNTIL=0; S_DEFER_NOTIFY=0; S_ESC_FOR=0; S_PEND_MARK=0; S_PEND_BOOT=0; S_SP_MARK=0; STATE_ERR=""
   [ -e "$STATE" ] || return 0
   [ -r "$STATE" ] && [ -f "$STATE" ] || { STATE_ERR="$STATE existe mas não é um arquivo legível"; return 1; }
   local k v
@@ -218,6 +246,8 @@ state_load() {  # rc 0 = lido (arquivo AUSENTE = estado vazio = primeira vez); r
       # chave ausente → 0 = nenhum pedido pendente (estado de antes da ga-1p1i5jr.4.3 lê assim); valor vazio/não numérico → rc 1 e NÃO age (nunca vira "sem pendência")
       pending_mark)    isnum "$v" || { STATE_ERR="pending_mark='$v'"; return 1; };    S_PEND_MARK=$v ;;
       pending_boot)    isnum "$v" || { STATE_ERR="pending_boot='$v'"; return 1; };    S_PEND_BOOT=$v ;;
+      # chave ausente → 0 = nenhuma pausa de envio nossa em aberto (estado de antes da ga-1p1i5jr.10 lê assim); valor vazio/não numérico → rc 1 e NÃO age: nunca vira "sem pausa" (pausa esquecida = envio parado)
+      sp_mark)         isnum "$v" || { STATE_ERR="sp_mark='$v'"; return 1; };         S_SP_MARK=$v ;;
       *) ;;  # chave que não conheço (versão futura do mesmo v=1): ignora
     esac
   done < "$STATE"
@@ -228,8 +258,8 @@ state_load() {  # rc 0 = lido (arquivo AUSENTE = estado vazio = primeira vez); r
 state_save() {  # rc 0 = gravou; rc 1 = não gravou (o chamador decide; antes do reinício, NÃO gravar = NÃO reiniciar)
   local tmp="$STATE.tmp.$$"
   mkdir -p "$(dirname "$STATE")" 2>/dev/null
-  if printf 'v=1\nreboots=%s\ndefer_until=%s\ndefer_notify_ts=%s\nesc_for=%s\npending_mark=%s\npending_boot=%s\n' \
-       "$S_REBOOTS" "$S_DEFER_UNTIL" "$S_DEFER_NOTIFY" "$S_ESC_FOR" "$S_PEND_MARK" "$S_PEND_BOOT" > "$tmp" 2>/dev/null && mv -f "$tmp" "$STATE" 2>/dev/null; then
+  if printf 'v=1\nreboots=%s\ndefer_until=%s\ndefer_notify_ts=%s\nesc_for=%s\npending_mark=%s\npending_boot=%s\nsp_mark=%s\n' \
+       "$S_REBOOTS" "$S_DEFER_UNTIL" "$S_DEFER_NOTIFY" "$S_ESC_FOR" "$S_PEND_MARK" "$S_PEND_BOOT" "$S_SP_MARK" > "$tmp" 2>/dev/null && mv -f "$tmp" "$STATE" 2>/dev/null; then
     return 0
   fi
   rm -f "$tmp" 2>/dev/null
@@ -401,7 +431,7 @@ guard_calls() {  # ligação em curso (pix + voicebot), lida em 3 estados
   esac
   G_WHY=$line; rb_clean; return 0
 }
-guard_sender() {  # envio em voo (central_sender_restart_safe.py: 0 pode · 1 em voo · 2 não sei)
+guard_sender_py() {  # envio em voo, pelo python do WA (central_sender_restart_safe.py: 0 pode · 1 em voo · 2 não sei). É o árbitro: descarta a linha 'sending' órfã
   G_STATE="unknown"; G_WHY=""
   local rc line
   if [ ! -r "$SENDER_PY" ]; then G_WHY="central_sender_restart_safe.py não legível em $SENDER_PY — não sei se há envio em voo"; return 0; fi
@@ -417,6 +447,31 @@ guard_sender() {  # envio em voo (central_sender_restart_safe.py: 0 pode · 1 em
     *) G_STATE="unknown"; G_WHY="rc=$rc: $line" ;;
   esac
   rb_clean; return 0
+}
+sender_cheap() {  # leitura BARATA do envio em voo (ga-1p1i5jr.10): COUNT das linhas 'sending' do queue.db pelo sqlite3, sem python, sem import, sem rede. Conta TODA linha 'sending', inclusive a órfã que o python descarta: nunca menos que ele
+  G_STATE="unknown"; G_WHY=""
+  local rc v
+  # vazio (sem saída) → unknown; falhou/ilegível (banco ausente, travado, rc≠0, prazo estourado, saída que não é um número) → unknown, NUNCA "0 em voo"
+  if [ ! -f "$QUEUE_DB" ]; then G_WHY="$QUEUE_DB não existe"; return 0; fi
+  run_bounded "$CHEAP_S" "$SQLITE" -batch -cmd ".timeout 3000" -cmd "PRAGMA query_only=ON" "$QUEUE_DB" "SELECT COUNT(*) FROM message_queue WHERE status='sending';"; rc=$?
+  v=$(out_raw | tr -d ' \r')
+  if [ "$rc" -ne 0 ]; then G_WHY="sqlite3 rc=$rc: $(out_line)"
+  elif ! isnum "$v"; then G_WHY="saída que não é um número: '$(out_line)'"
+  elif [ "$v" -eq 0 ]; then G_STATE="ok"; G_WHY="leitura barata: 0 envio em voo"
+  else G_STATE="block"; G_WHY="leitura barata: $v linha(s) 'sending' no queue.db (conta também a órfã)"; fi
+  rb_clean; return 0
+}
+guard_sender() {  # o python primeiro; se ele não deu resposta (prazo, traceback, rc estranho, ausente) a leitura barata responde, em qualquer estado do disco. Python que respondeu (ok ou em voo) vale e a barata nem roda
+  guard_sender_py
+  [ "$G_STATE" = unknown ] || return 0
+  local why_py=$G_WHY
+  sender_cheap
+  case "$G_STATE" in
+    unknown) G_WHY="$why_py | leitura barata: $G_WHY" ;;
+    *) G_WHY="$G_WHY (o python não respondeu: $why_py)" ;;
+  esac
+  log "guarda de envio: o python não respondeu ($why_py); a leitura barata: $G_STATE"
+  return 0
 }
 guard_dolt() {  # manutenção do Dolt no meio (gc/backup/push...) — pgrep: 0 achou · 1 não achou · outro = não sei
   G_STATE="unknown"; G_WHY=""
@@ -443,9 +498,9 @@ guard_scraper() {  # rodada do property_scrapers em curso (a função do noturno
   return 0
 }
 
-GUARDS_SUMMARY=""; BLOCK_NAMES=""; BLOCK_WHY=""; UNK_NAMES=""; UNK_WHY=""
-run_guards() {  # avalia TODAS (mesmo depois de uma bloquear: uma linha mostra tudo o que está no caminho). rc 0 = todas ok · 1 = alguma bloqueia · 2 = nenhuma bloqueia mas alguma não deu pra ler
-  GUARDS_SUMMARY=""; BLOCK_NAMES=""; BLOCK_WHY=""; UNK_NAMES=""; UNK_WHY=""
+GUARDS_SUMMARY=""; BLOCK_NAMES=""; BLOCK_WHY=""; UNK_NAMES=""; UNK_WHY=""; UNK_LIST=" "
+run_guards() {  # avalia TODAS (mesmo depois de uma bloquear: uma linha mostra tudo o que está no caminho). rc 0 = todas ok · 1 = alguma bloqueia · 2 = nenhuma bloqueia mas alguma não deu pra ler (UNK_LIST = " calls sender ")
+  GUARDS_SUMMARY=""; BLOCK_NAMES=""; BLOCK_WHY=""; UNK_NAMES=""; UNK_WHY=""; UNK_LIST=" "
   local g
   for g in calls sender dolt scraper; do
     "guard_$g"
@@ -453,7 +508,7 @@ run_guards() {  # avalia TODAS (mesmo depois de uma bloquear: uma linha mostra t
     case "$G_STATE" in
       ok) ;;
       block) BLOCK_NAMES="$BLOCK_NAMES${BLOCK_NAMES:+, }$g"; BLOCK_WHY="$BLOCK_WHY${BLOCK_WHY:+; }$g: $G_WHY" ;;
-      *) UNK_NAMES="$UNK_NAMES${UNK_NAMES:+, }$g"; UNK_WHY="$UNK_WHY${UNK_WHY:+; }$g: $G_WHY" ;;
+      *) UNK_NAMES="$UNK_NAMES${UNK_NAMES:+, }$g"; UNK_WHY="$UNK_WHY${UNK_WHY:+; }$g: $G_WHY"; UNK_LIST="$UNK_LIST$g " ;;
     esac
   done
   log "guardas: $GUARDS_SUMMARY"
@@ -484,27 +539,133 @@ escalate_low_after_reboot() {  # $1=última marca de reinício $2=motivo. UMA ve
   state_save || log "WARN: não gravei esc_for em $STATE — a escalada pode se repetir na próxima rodada"
 }
 
-usage() { echo "uso: $(basename "$0") --run | --dry-run" >&2; exit 2; }
-
-# ═══ principal ═════════════════════════════════════════════════════════════════════════════════════════════════════════════════
-case "${1:-}" in
-  --run) [ "$#" -eq 1 ] || usage ;;
-  --dry-run) [ "$#" -eq 1 ] || usage; DRY=1 ;;
-  *) usage ;;
-esac
-
-mkdir -p "$(dirname "$LOG")" 2>/dev/null
-exec 2>>"$LOG" || exec 2>/dev/null   # stderr nunca suja o stdout (o orquestrador lê a PRIMEIRA linha das duas juntas)
-[ -z "$CFG_WARN" ] || log "WARN: variável(is) DR4_ que não são número caíram no padrão:$CFG_WARN"
-NOW=$(now)
-log "início ($([ "$DRY" = 1 ] && echo dry-run || echo run)) pid=$$"
-
-# 1 — interruptor (o mesmo do orquestrador; vale também no dry-run: é o que o humano usa pra mandar tudo calar)
-if [ -e "$OFF" ]; then emit 10 "interruptor ligado ($OFF) — não leio nem ajo"; fi
-read_boot_epoch || emit 30 "não consegui ler quando o mini subiu ($READ_ERR) — NÃO ajo"
-
-# 2 — instância única (só no --run; o dry-run só lê) + estado
-if [ "$DRY" = 0 ]; then
+# ── estado terminal: pausa do envio para esvaziar antes do reinício, e a retomada (ga-1p1i5jr.10) ─────────────────────────────────
+SP_PAUSED=""; SP_BY=""; SP_ERR=""; SP_RC=30; SP_DRAINED=0; TERM_NOTE=""; REL_TXT=""
+is_terminal() {  # rc 0 = o disco está em estado terminal AGORA (usa FREE_MB, já lido): < TERMINAL_MB, ou < HARD_MB com HARD_STREAK >= HARD_STREAK_N
+  [ "$FREE_MB" -lt "$TERMINAL_MB" ] && return 0
+  [ "$FREE_MB" -lt "$HARD_MB" ] && [ "$HARD_STREAK" -ge "$HARD_STREAK_N" ]
+}
+read_pause() {  # outreach_config → SP_PAUSED (0 | 1 | none: linha ausente, que o WA lê como PAUSADO) e SP_BY. rc 0 = li; rc 1 = ilegível (SP_ERR)
+  SP_PAUSED=""; SP_BY=""
+  local rc
+  # vazio (linha ausente) → none: NÃO é "despausado" e a pausa não é nossa; falhou/ilegível (banco ausente, sem a tabela, travado, rc≠0, prazo, sem a linha p=) → rc 1, quem chama NÃO escreve nem conclui nada
+  if [ ! -f "$ASSIGN_DB" ]; then SP_ERR="$ASSIGN_DB não existe"; return 1; fi
+  run_bounded "$CHEAP_S" "$SQLITE" -batch -cmd ".timeout 3000" -cmd "PRAGMA query_only=ON" "$ASSIGN_DB" \
+    "SELECT 'p=' || COALESCE((SELECT value FROM outreach_config WHERE key='system_paused'), 'none'); SELECT 'b=' || COALESCE((SELECT value FROM outreach_config WHERE key='system_paused_by'), '');"; rc=$?
+  if [ "$rc" -ne 0 ]; then SP_ERR="sqlite3 rc=$rc: $(out_line)"; rb_clean; return 1; fi
+  SP_PAUSED=$(sed -n 's/^p=//p' "$RB_OUT" 2>/dev/null | head -n 1); SP_BY=$(sed -n 's/^b=//p' "$RB_OUT" 2>/dev/null | head -n 1)
+  rb_clean
+  [ -n "$SP_PAUSED" ] || { SP_ERR="a leitura de outreach_config não trouxe a linha p="; return 1; }
+  return 0
+}
+clear_sp_mark() {  # tira a marca da pausa do arquivo de estado SEM regravar o resto: o emit pode rodar com o estado em memória degradado (state_load que falhou zera tudo) e um state_save ali apagaria a marca do reinício (cooldown). rc 1 = não consegui
+  S_SP_MARK=0
+  # vazio (sem arquivo de estado) → nada a limpar, rc 0; falhou/ilegível (sed ou mv erram, disco sem espaço) → rc 1 e a marca FICA no arquivo (o --resume confere de novo: pausa já solta lê "livre")
+  [ -f "$STATE" ] || return 0
+  local tmp="$STATE.tmp.$$"
+  sed 's/^sp_mark=.*$/sp_mark=0/' "$STATE" > "$tmp" 2>/dev/null && mv -f "$tmp" "$STATE" 2>/dev/null && return 0
+  rm -f "$tmp" 2>/dev/null; return 1
+}
+sp_exec() {  # $1=SQL de escrita no ASSIGN_DB (-bail: o 1º erro para e a transação aberta se desfaz). rc do sqlite3 (124 = prazo), SP_ERR diz. rc 0 NÃO prova que a linha mudou: quem chama RELÊ
+  local rc
+  run_bounded "$CHEAP_S" "$SQLITE" -batch -bail -cmd ".timeout 5000" "$ASSIGN_DB" "$1"; rc=$?
+  [ "$rc" -eq 0 ] || SP_ERR="sqlite3 rc=$rc: $(out_line)"
+  rb_clean; return "$rc"
+}
+sender_pause() {  # pausa o envio de primeiro contato com a NOSSA identidade, SÓ se está livre (0). rc 0 = pausado e conferido lendo de volta (SP_HOLD=1 se a pausa é nossa) · rc 1 = não consegui pausar nem conferir (SP_ERR): NÃO reinicia
+  SP_ERR=""
+  read_pause || return 1
+  if [ "$SP_PAUSED" != 0 ]; then
+    log "envio já estava pausado (system_paused=$SP_PAUSED, by='$SP_BY'): não escrevo"
+    case "$SP_BY" in
+      "$SP_ID"*)   # sobra nossa: sem a marca no estado o --resume nunca a soltaria (envio parado para sempre), então ela ganha a marca ou eu não sigo
+        if [ "$S_SP_MARK" -le 0 ]; then
+          S_SP_MARK=$NOW
+          if ! state_save; then S_SP_MARK=0; SP_ERR="a pausa já é nossa mas não consegui gravar a marca dela em $STATE"; return 1; fi
+        fi
+        SP_HOLD=1 ;;
+    esac
+    return 0
+  fi
+  # a marca vai ao estado ANTES da escrita no banco; não gravou = não pausa (pausa sem marca seria o envio parado para sempre)
+  S_SP_MARK=$NOW
+  if ! state_save; then S_SP_MARK=0; SP_ERR="não consegui gravar a marca da pausa em $STATE"; return 1; fi
+  log "PAUSANDO o envio de primeiro contato (system_paused=1; livre=${FREE_MB}MB, estado terminal) para esvaziar antes do reinício"
+  sp_exec "BEGIN IMMEDIATE; INSERT INTO outreach_config (key, value, updated_at) VALUES ('system_paused_by', '$SP_ID estado terminal (ga-1p1i5jr.10), esvaziando o envio antes do reinicio - o D4 despausa sozinho', datetime('now','localtime')) ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at WHERE (SELECT value FROM outreach_config WHERE key = 'system_paused') = '0'; INSERT INTO outreach_config (key, value, updated_at) VALUES ('system_paused', '1', datetime('now','localtime')) ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at WHERE outreach_config.value = '0'; COMMIT;"
+  # o rc da escrita não decide, a releitura sim. Escrevi e não consigo ler = a marca fica e o emit/--resume tentam soltar (SP_HOLD)
+  if ! read_pause; then SP_HOLD=1; SP_ERR="escrevi a pausa e não consegui conferi-la ($SP_ERR)"; return 1; fi
+  if [ "$SP_PAUSED" != 1 ]; then
+    clear_sp_mark || log "WARN: não gravei a marca solta em $STATE"
+    SP_ERR="a pausa não pegou (lido de volta: system_paused=$SP_PAUSED${SP_ERR:+; a escrita disse: $SP_ERR})"; return 1
+  fi
+  case "$SP_BY" in
+    "$SP_ID"*) SP_HOLD=1 ;;
+    *) log "WARN: outro dono pausou ao mesmo tempo (by='$SP_BY'): a pausa é dele, solto a minha marca"; clear_sp_mark || log "WARN: não gravei a marca solta em $STATE" ;;
+  esac
+  return 0
+}
+sender_release() {  # solta a pausa de envio NOSSA e confere lendo de volta. rc 0 = o envio NÃO está pausado por nós (soltei e li 0, já estava livre, ou a pausa é de outro dono: nunca tocada) e a marca saiu do estado · rc 1 = não confirmei (SP_RC: 30 não li · 20 escrevi e segue pausado): a marca FICA
+  SP_ERR=""; SP_RC=30; REL_TXT="o envio já estava livre"
+  # vazio → n/a (as leituras devolvem texto ou rc); falhou/ilegível → rc 1 e a marca fica, NUNCA "soltei"
+  read_pause || return 1
+  if [ "$SP_PAUSED" != 0 ]; then
+    case "$SP_BY" in
+      "$SP_ID"*)
+        sp_exec "BEGIN IMMEDIATE; UPDATE outreach_config SET value = '0', updated_at = datetime('now','localtime') WHERE key = 'system_paused' AND value = '1' AND (SELECT value FROM outreach_config WHERE key = 'system_paused_by') GLOB '${SP_ID}*'; UPDATE outreach_config SET value = '$SP_ID despausa (ga-1p1i5jr.10)', updated_at = datetime('now','localtime') WHERE key = 'system_paused_by' AND value GLOB '${SP_ID}*' AND (SELECT value FROM outreach_config WHERE key = 'system_paused') = '0'; COMMIT;"
+        read_pause || return 1
+        REL_TXT="pausa de envio nossa solta e conferida"
+        case "$SP_PAUSED:$SP_BY" in
+          0:*) ;;
+          *:"$SP_ID"*) SP_RC=20; SP_ERR="escrevi a despausa e o envio segue pausado por nós (system_paused=$SP_PAUSED${SP_ERR:+; a escrita disse: $SP_ERR})"; return 1 ;;
+          *) REL_TXT="o envio está pausado por outro dono (by='$SP_BY'): não toquei" ;;
+        esac ;;
+      *) REL_TXT="o envio está pausado por outro dono (by='$SP_BY'): não toquei" ;;
+    esac
+  fi
+  clear_sp_mark || log "WARN: não gravei a marca solta em $STATE — o --resume confere de novo (o resultado é o mesmo)"
+  log "marca da pausa de envio solta: $REL_TXT (system_paused=$SP_PAUSED)"
+  return 0
+}
+drain_sender() {  # com o envio pausado: lê a fila (barata) a cada DRAIN_POLL_S até DRAIN_S. rc 0 = leu 0 em voo · 1 = leu em voo até o fim (G_STATE=block) · 2 = nunca consegui ler (esperei o DRAIN_S inteiro). Só espera de verdade na 1ª vez: a releitura depois da carência é UMA leitura
+  local t0=$SECONDS lim=$DRAIN_S saw=0 bw=""
+  [ "$SP_DRAINED" = 1 ] && lim=0
+  [ "$DRAIN_POLL_S" -ge 1 ] || DRAIN_POLL_S=1   # 0 viraria laço sem pausa
+  while :; do
+    sender_cheap
+    case "$G_STATE" in
+      ok) SP_DRAINED=1; log "esvaziamento: leitura barata 0 em voo"; return 0 ;;
+      block) saw=1; bw=$G_WHY; log "esvaziamento: $G_WHY" ;;
+      *) log "esvaziamento: leitura barata ilegível ($G_WHY)" ;;
+    esac
+    [ $(( SECONDS - t0 )) -lt "$lim" ] || break
+    sleep "$DRAIN_POLL_S"
+  done
+  SP_DRAINED=1
+  if [ "$saw" = 1 ]; then G_STATE="block"; G_WHY=$bw; return 1; fi
+  return 2
+}
+terminal_resolve() {  # chamada só com run_guards=2 (nada bloqueia, algo ilegível) E is_terminal. rc 0 = pode seguir (TERM_NOTE diz o que foi aceito) · 1 = bloqueia (BLOCK_*) · 2 = segue ilegível (UNK_*): NÃO reinicia
+  local rc note=""
+  case "$UNK_LIST" in *" dolt "*|*" scraper "*) return 2 ;; esac   # só envio e ligação podem ser aceitos ilegíveis; Dolt e scraper seguem rc 30
+  case "$UNK_LIST" in
+    *" sender "*)
+      if [ "$DRY" = 1 ]; then note="envio: guarda ilegível; no --run eu PAUSARIA o envio de primeiro contato e esperaria até ${DRAIN_S}s antes de reiniciar"
+      else
+        if ! sender_pause; then UNK_WHY="$UNK_WHY; não consegui pausar o envio para esvaziá-lo ($SP_ERR)"; return 2; fi
+        drain_sender; rc=$?
+        case "$rc" in
+          0) note="envio: a guarda estava ilegível; com o envio pausado a leitura barata deu 0 em voo" ;;
+          1) BLOCK_NAMES="sender"; BLOCK_WHY="sender: ainda há envio em voo depois de pausar e esperar ${DRAIN_S}s ($G_WHY)"; return 1 ;;
+          *) note="envio: guarda ilegível mesmo depois de pausar; esperei ${DRAIN_S}s com o envio de PRIMEIRO CONTATO pausado (resposta e campanha não pausam)" ;;
+        esac
+      fi ;;
+  esac
+  case "$UNK_LIST" in *" calls "*) note="${note:+$note; }ligação: guarda ilegível aceita (o travamento derruba a ligação de qualquer jeito)" ;; esac
+  TERM_NOTE=$note
+  return 0
+}
+take_lock() {  # instância única (só --run e --resume; o dry-run só lê). Precisa de BOOT_EPOCH. Outra instância viva = emit 10
+  local lp lm
   mkdir -p "$(dirname "$LOCKD")" 2>/dev/null
   if ! mkdir "$LOCKD" 2>/dev/null; then
     lp=$(cat "$LOCKD/pid" 2>/dev/null); lm=$("$STATBIN" -f %m "$LOCKD" 2>/dev/null)
@@ -519,7 +680,49 @@ if [ "$DRY" = 0 ]; then
   fi
   LOCK_HELD=1
   echo $$ > "$LOCKD/pid" 2>/dev/null
-fi
+}
+resume_main() {  # --resume (o maestro chama TODA rodada): solta a pausa de envio que este D4 pôs. Sem pausa nossa em aberto não escreve NADA (nem log nem stdout)
+  local g mk
+  # vazio (sem arquivo de estado, ou sem sp_mark, ou só sp_mark=0) → nada a retomar, calado, rc 10; marca que não é 0 (número ou LIXO), ou o awk que erra (rc >= 2) → segue, e o state_load diz rc 30 do que não entende: lixo nunca vira "sem pausa"
+  [ -e "$STATE" ] || exit 10
+  awk '/^sp_mark/ && $0 != "sp_mark=0" { f = 1 } END { exit f ? 0 : 1 }' "$STATE" 2>/dev/null; g=$?
+  [ "$g" = 1 ] && exit 10
+  NOW=$(now)
+  log "início (retomada da pausa de envio) pid=$$"
+  read_boot_epoch || emit 30 "não consegui ler quando o mini subiu ($READ_ERR) — NÃO retomo"
+  take_lock
+  state_load || emit 30 "não consegui ler o estado do D4 ($STATE_ERR) — NÃO retomo"
+  [ "$S_SP_MARK" -gt 0 ] || emit 10 "a marca da pausa não está mais no estado — nada a retomar"
+  mk=$S_SP_MARK
+  resolve_pending   # o pedido de reinício pendente segura a pausa até o kern.boottime mudar ou a espera vencer: o mini ainda pode cair
+  if [ "$PEND_HOLD_UNTIL" -gt 0 ]; then emit 10 "envio segue pausado: o pedido de reinício de $(hhmm "$S_PEND_MARK") está pendente (confiro depois de $(hhmm "$PEND_HOLD_UNTIL"))"; fi
+  if sender_release; then emit 0 "marca da pausa de envio de $(hhmm "$mk") solta: $REL_TXT"; fi
+  emit "$SP_RC" "não consegui soltar a pausa de envio de $(hhmm "$mk") ($SP_ERR) — a marca fica e repito na próxima rodada; se isto durar, despausar à mão (outreach_config.system_paused=0)"
+}
+
+usage() { echo "uso: $(basename "$0") --run | --dry-run | --resume" >&2; exit 2; }
+
+# ═══ principal ═════════════════════════════════════════════════════════════════════════════════════════════════════════════════
+case "${1:-}" in
+  --run) [ "$#" -eq 1 ] || usage ;;
+  --dry-run) [ "$#" -eq 1 ] || usage; DRY=1 ;;
+  --resume) [ "$#" -eq 1 ] || usage; MODE=resume ;;
+  *) usage ;;
+esac
+
+mkdir -p "$(dirname "$LOG")" 2>/dev/null
+exec 2>>"$LOG" || exec 2>/dev/null   # stderr nunca suja o stdout (o orquestrador lê a PRIMEIRA linha das duas juntas)
+[ "$MODE" = resume ] && resume_main   # nunca volta: sai pelo emit (ou calado, rc 10, sem pausa nossa em aberto)
+[ -z "$CFG_WARN" ] || log "WARN: variável(is) DR4_ que não são número caíram no padrão:$CFG_WARN"
+NOW=$(now)
+log "início ($([ "$DRY" = 1 ] && echo dry-run || echo run)) pid=$$"
+
+# 1 — interruptor (o mesmo do orquestrador; vale também no dry-run: é o que o humano usa pra mandar tudo calar)
+if [ -e "$OFF" ]; then emit 10 "interruptor ligado ($OFF) — não leio nem ajo"; fi
+read_boot_epoch || emit 30 "não consegui ler quando o mini subiu ($READ_ERR) — NÃO ajo"
+
+# 2 — instância única (só no --run; o dry-run só lê) + estado
+[ "$DRY" = 0 ] && take_lock
 state_load || emit 30 "não consegui ler o estado do D4 ($STATE_ERR) — NÃO ajo"
 resolve_pending   # pedido de reinício de uma rodada anterior que não derrubou o mini a tempo: decide pelo kern.boottime ANTES de qualquer cooldown olhar a marca
 
@@ -573,8 +776,9 @@ case "$prc" in
   *) emit 30 "pré-checagem ilegível: $PRE_WHY — NÃO reinicio" ;;
 esac
 
-# 7 — guardas
+# 7 — guardas. Nada bloqueia mas alguma não deu para ler, com o disco em estado TERMINAL: terminal_resolve (ligação ilegível aceita; envio ilegível = pausa + esvaziamento). Fora do estado terminal rc 30, como sempre
 run_guards; grc=$?
+if [ "$grc" = 2 ] && is_terminal; then terminal_resolve; grc=$?; fi
 case "$grc" in
   1)
     if [ "$DRY" = 0 ]; then
@@ -593,13 +797,14 @@ esac
 
 SWAP=$(swap_used)
 if [ "$DRY" = 1 ]; then
-  emit 0 "reiniciaria agora (livre=${FREE_MB}MB ${TIER}, swap=${SWAP}; ${GUARDS_SUMMARY})${HOLD_NOTE}"
+  emit 0 "reiniciaria agora (livre=${FREE_MB}MB ${TIER}, swap=${SWAP}; ${GUARDS_SUMMARY})${TERM_NOTE:+ [estado terminal: $TERM_NOTE]}${HOLD_NOTE}"
 fi
 
 # 8 — o reinício de verdade: aviso → carência → releitura → grava e confere → pede
 # O aviso é CONDIÇÃO do reinício, não cortesia (decisão do Athos: "e AVISA"): sem ninguém avisado a carência para abortar é teatro. Não entregou (notify rc≠0 ou prazo
 # estourado = "não sei") → 2º canal, o mail ao Mayor; os dois falharam → não reinicia (inerte), espera e tenta de novo. Nunca "aviso enviado" sem confirmação.
-WARN_TXT="Livre ${FREE_MB} MB (${TIER}), swap ${SWAP}. Guardas ok: ${GUARDS_SUMMARY}. Volto em ~2 min (auto-login + postcheck). Para ABORTAR agora: touch ${OFF}"
+SP_TXT=""; [ "$SP_HOLD" = 1 ] && SP_TXT=" O envio de primeiro contato só volta depois do boot (o D4 o solta sozinho)."
+WARN_TXT="Livre ${FREE_MB} MB (${TIER}), swap ${SWAP}. Guardas ok: ${GUARDS_SUMMARY}.${TERM_NOTE:+ ATENÇÃO, disco em estado terminal: $TERM_NOTE.}${SP_TXT} Volto em ~2 min (auto-login + postcheck). Para ABORTAR agora: touch ${OFF}"
 WARN_VIA="notify"
 if ! send_notify 5 "Disco: reiniciando o mini em ${GRACE_S}s" "$WARN_TXT"; then
   if send_mail "Disco: reiniciando o mini em ${GRACE_S}s (o push NÃO foi confirmado)" "$WARN_TXT"; then WARN_VIA="mail ao Mayor (o push NÃO foi confirmado)"
@@ -645,6 +850,7 @@ case "$prc" in
     emit 30 "pré-checagem ilegível depois da carência: $PRE_WHY — NÃO reinicio; espera até $(hhmm "$S_DEFER_UNTIL")" ;;
 esac
 run_guards; grc=$?
+if [ "$grc" = 2 ] && is_terminal; then terminal_resolve; grc=$?; fi   # a releitura vale a mesma regra do estado terminal (a pausa já está no ar: o esvaziamento é UMA leitura barata)
 case "$grc" in
   1)
     S_DEFER_UNTIL=$(( NOW + DEFER_S ))
@@ -671,7 +877,7 @@ case ",$S_REBOOTS," in
   *",$MARK,"*) ;;
   *) emit 20 "gravei o estado mas a marca $MARK não está nele quando releio — NÃO reinicio" ;;
 esac
-log "REINÍCIO AUTOMÁTICO (D4, decisão do Athos 01/11) marca=$MARK livre=${FREE_MB}MB ${TIER} swap=${SWAP} no ar há $(( (MARK - BOOT_EPOCH) / 60 )) min; guardas: ${GUARDS_SUMMARY}. Marca gravada e conferida; pedindo o reinício"
+log "REINÍCIO AUTOMÁTICO (D4, decisão do Athos 01/11) marca=$MARK livre=${FREE_MB}MB ${TIER} swap=${SWAP} no ar há $(( (MARK - BOOT_EPOCH) / 60 )) min; guardas: ${GUARDS_SUMMARY}${TERM_NOTE:+; estado terminal: $TERM_NOTE}. Marca gravada e conferida; pedindo o reinício"
 
 if [ -n "${DR4_REBOOT_CMD:-}" ]; then
   run_bounded "$REBOOT_TIMEOUT_S" env LANG=en_US.UTF-8 LC_ALL=en_US.UTF-8 bash -c "$DR4_REBOOT_CMD"; rrc=$?
@@ -691,6 +897,7 @@ if [ "$rrc" -ne 0 ] && [ "$rrc" -ne 124 ]; then
   emit 20 "$why — o mini NÃO reiniciou; desfiz a marca"
 fi
 rb_clean
+SP_HOLD=0   # o pedido foi aceito (ou estourou o prazo: não sei se pegou) e o mini pode cair a qualquer momento: a pausa de envio NÃO é solta aqui, é do --resume (depois do boot, ou quando o pedido pendente vence)
 log "pedido ${REQ_DESC}; esperando até ${WAIT_S}s o mini cair — se este processo continuar vivo, o mini AINDA não caiu (pode estar só lento)"
 w=0
 while [ "$w" -lt "$WAIT_S" ]; do sleep 1; w=$((w + 1)); done

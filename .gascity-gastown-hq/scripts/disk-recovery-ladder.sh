@@ -10,8 +10,10 @@
 #   D2  livre <= 5120 por >= 900 s (15 min)     parar jobs pesados reiniciáveis da allowlist
 #   D3  livre <= 4096 por >= 1800 s (30 min)    restart drenado dos daemons que mais usam RAM
 #   D4  livre <  3072 por >= 3600 s (60 min)    OU livre < 1536 em 2 leituras SEGUIDAS e separadas por >= 100 s (2 rodadas do launchd)   reinício guardado do mini
-#   O 2º caminho do D4 é parte do limiar dele (decisão do Athos: "< 1,5 GB a qualquer momento"), não um atalho: D2 e D3 só entram depois do tempo deles. As 2 leituras seguidas são do
-#   maestro (uma leitura isolada abaixo de 1,5 GB, p.ex. um go build que sobe e solta, não reinicia o mini); duas rodadas coladas (--run à mão ao lado de uma agendada) contam como UMA.
+#   O 2º caminho do D4 é parte do limiar dele (decisão do Athos: "< 1,5 GB a qualquer momento"), não um atalho: D2 e D3 só entram depois do tempo deles, COM UMA EXCEÇÃO (ga-1p1i5jr.10): com livre < 1536 e o D4 chamável (fora do teto de 6 h)
+#   D2 e D3 não têm vez e a rodada espera o D4. 10/11, sob thrash de swap, o D2 (06:30) e o D3 (06:57 e 07:30) estouraram os 900 s (3 chamadas, 45 min do maestro) e a máquina travou às 08:01 (horas do log). As 2 leituras
+#   seguidas são do maestro (uma leitura isolada abaixo de 1,5 GB, p.ex. um go build que sobe e solta, não reinicia o mini); duas rodadas coladas (--run à mão ao lado de uma agendada) contam como UMA. Ao D4 o maestro passa
+#   DR4_HARD_STREAK=<leituras seguidas> (o estado terminal do D4 usa: ver o cabeçalho dele).
 #   HISTERESE: o cronômetro de um nível só ZERA quando o livre volta a limiar + 512 MB; entre os dois ele nem começa nem zera (um disco oscilando em volta de 3 GB por 5 h não reinicia o
 #   relógio de 60 min a cada subida de 100 MB). Só conta tempo de rodadas que EU li: lacuna > 10 min entre duas leituras (máquina parada, launchd fora, df ilegível) zera cronômetros e marcas.
 # TRÊS ESTADOS    tem / não-tem / não-consegui-saber. df ilegível NUNCA vira "tem bastante disco" nem "disco baixo": o maestro NÃO chama degrau nenhum, loga, avisa
@@ -45,6 +47,11 @@
 #   · 30 = não li o estado (notify -p 4; saída 30). Falha da CHAMADA (D2 ausente, sem execução, estouro de RESUME_TIMEOUT_S=120 s, rc fora de 0/10/20/30) é ALERTA (notify -p 4, classe `broken`), nunca o silêncio do 10; a saída é 20 quando o D2 rodou e se comportou mal (estouro, rc estranho) e não muda quando ele nem foi lançado (ausente, sem execução).
 #   20, 30 e a falha da chamada: no máx. 1 aviso por hora por classe (marcas `.gc/disk-recovery.resume-{rc20,rc30,broken}` com o epoch do último aviso ENTREGUE; sem canal confirmando, a marca não grava e a rodada seguinte avisa de novo).
 #   Limite aceito: se nem a marca grava (disco sem espaço nenhum) o aviso, o mail inclusive, repete a cada rodada; o outro lado (calar um job parado que ninguém retoma) é o perigoso.
+# RETOMADA DO D4 (ga-1p1i5jr.10) Toda rodada, depois do resume do D2, chama `disk-recovery-d4-guarded-reboot.sh --resume`: é o que SOLTA a pausa de envio que o D4 pôs antes de um reinício em estado terminal (depois do boot, ou quando o pedido pendente vence).
+#   Mesmo contrato do D2: 0 = soltou (notify -p 3) · 10 = nada a retomar ou ainda segurando (SILÊNCIO) · 20 = não soltou (notify -p 4 + mail; saída 20) · 30 = não li (notify -p 4; saída 30) · falha da chamada (estouro, rc estranho) = alerta; no máx. 1 aviso por
+#   hora por classe (marcas `.gc/disk-recovery.resume-{d4rc20,d4rc30,d4broken}`). D4 ausente ou sem execução: calado aqui (sem o script não há pausa dele; o run_rung já avisa quando o D4 é devido). Com o interruptor ligado nada roda: a pausa nossa espera.
+# FOTO DE RSS (ga-1p1i5jr.10) Rodada com livre <= D2_MB: os 10 maiores RSS (`ps -axo rss=,pid=,command=`: 3 palavras do comando, até 120 caracteres, para não carregar argumento com segredo) em `.gc/logs/disk-recovery-rss.log` (gira em RSS_LOG_MAX_KB). Só diagnóstico: nunca decide nada
+#   nem muda a saída; falha do `ps` (ausente, estouro de RSS_TIMEOUT_S) vira 1 linha WARN no log do maestro. 10/11 não havia como saber QUEM inchou a RAM (swap 0,7 -> 4,6 GB) porque nenhuma foto existia.
 # ESTADO, LOG, INTERRUPTORES
 #   estado  $CITY/.gc/disk-recovery.state (chave=valor, escrito inteiro e trocado com mv)   log  $CITY/.gc/logs/disk-recovery.log (gira em 5 MB)
 #   `touch $CITY/.gc/disk-recovery.off` desliga o maestro (sai 10 sem ler nem agir; apague o arquivo para voltar). Instância única por trava (mkdir) — o `--dry-run` não toma a trava.
@@ -59,7 +66,7 @@
 #   vai em D2→D3→D4; as repetições vão do mais alto para o mais baixo (senão o D2 repetindo a cada 5 min ocuparia toda rodada atrasada e o D3/D4 nunca teriam vez).
 # MODOS           --run (launchd) · --dry-run (lê o estado salvo, aplica a leitura de agora numa cópia, chama os degraus com --dry-run, não grava estado/log, não avisa, não manda mail, não chama o `--resume` do D2).
 #   Sai: 0 rodada feita · 10 interruptor ligado ou outra instância VIVA rodando · 20 um degrau falhou · 30 não consegui ler o disco, o relógio ou gravar o estado, ou não consegui tomar a trava (não agiu) · 2 uso.
-# VARIÁVEIS (teste) DR_CITY · DR_STATE · DR_LOG · DR_OFF_FILE · DR_LOCK · DR_FREE_MB_FILE / DR_SWAP_MB_FILE (arquivo com o livre / o swap em MB, no lugar de df / sysctl) · DR_NOW_FILE (epoch)
+# VARIÁVEIS (teste) DR_CITY · DR_STATE · DR_LOG · DR_RSS_LOG · DR_OFF_FILE · DR_LOCK · DR_FREE_MB_FILE / DR_SWAP_MB_FILE (arquivo com o livre / o swap em MB, no lugar de df / sysctl) · DR_NOW_FILE (epoch)
 #   · DR_D2_CMD/DR_D3_CMD/DR_D4_CMD · DR_NOTIFY_BIN · DR_GC_BIN · DR_<NOME> numérico = os nomes da lista `cfg` abaixo (valor que não é número, ou que fica abaixo do mínimo da regra, cai no padrão e é dito no log).
 # TESTE           bash scripts/disk-recovery-ladder.selftest.sh   (hermético: df, swap, relógio, degraus, notify e mail simulados; nada real é parado nem reiniciado)
 set -uo pipefail
@@ -69,6 +76,7 @@ CITY="${DR_CITY:-${GC_CITY_PATH:-$(cd "$D/.." && pwd)}}"
 GCDIR="$CITY/.gc"
 STATE="${DR_STATE:-$GCDIR/disk-recovery.state}"
 LOG="${DR_LOG:-$GCDIR/logs/disk-recovery.log}"
+RSS_LOG="${DR_RSS_LOG:-$GCDIR/logs/disk-recovery-rss.log}"
 OFF="${DR_OFF_FILE:-$GCDIR/disk-recovery.off}"
 LOCK="${DR_LOCK:-$GCDIR/disk-recovery.lock}"
 NOTIFY="${DR_NOTIFY_BIN:-$HOME/.local/bin/notify}"
@@ -107,6 +115,7 @@ cfg D4_HARD_MB 1536; cfg D4_HARD_N 2 1; cfg D4_HARD_SPACE_S 100
 cfg HYST_MB 512; cfg GAP_S 600; cfg RETRY_S 300; cfg ACTED_REPEAT_S 1800; cfg D4_COOLDOWN_S 21600
 cfg RUNG_TIMEOUT_S 900; cfg SETTLE_S 15; cfg WARN_EVERY_S 3600; cfg HEARTBEAT_S 3600; cfg LOG_MAX_KB 5120
 cfg NOTIFY_TIMEOUT_S 30; cfg MAIL_TIMEOUT_S 60; cfg LOCK_MAX_MIN 60 1; cfg RESUME_TIMEOUT_S 120 1
+cfg RSS_TIMEOUT_S 15 1; cfg RSS_LOG_MAX_KB 1024
 
 log()  { if [ "$DRY" = 1 ]; then printf '[dry-run] %s\n' "$*"; else printf '[%s] %s\n' "$(date '+%F %T')" "$*" >> "$LOG" 2>/dev/null || true; fi; }
 note() { log "$*"; [ "$DRY" = 1 ] || printf '%s\n' "$*"; }
@@ -381,7 +390,8 @@ run_rung() {  # $1=n $2=agora. rc 1 = degrau ausente (não gastou a rodada; o ch
       return 2
     fi
   fi
-  run_bounded "$RUNG_TIMEOUT_S" "$cmd" "$mode"; rc=$?
+  if [ "$n" = 4 ]; then run_bounded "$RUNG_TIMEOUT_S" env "DR4_HARD_STREAK=$HARD_N" "$cmd" "$mode"; rc=$?   # ao D4: quantas leituras seguidas < piso duro eu contei (o estado terminal dele usa)
+  else run_bounded "$RUNG_TIMEOUT_S" "$cmd" "$mode"; rc=$?; fi
   line=$(out_line); rb_clean
   case "$rc" in
     0)   cls=acted ;;
@@ -463,8 +473,12 @@ escalate_d4_cap() {  # $1=agora. D4 já foi disparado há menos de 6 h e o disco
   if [ "$told" = 1 ]; then ESC4=1; else note "ERROR: escalada NÃO entregue (notify e mail sem confirmação): não marco esc4, repito na próxima rodada"; fi
 }
 
+d4_capped() {  # $1=agora → rc 0 se o D4 está dentro do teto de 6 h do último disparo (ou da perda do estado salvo): não é chamável
+  [ "$ACTED4_TS" -gt 0 ] && [ $(( $1 - ACTED4_TS )) -lt "$D4_COOLDOWN_S" ]
+}
+
 try_rung() {  # $1=n $2=agora. rc 0 = chamou o degrau (a rodada acabou); rc 1 = não chamou e a rodada segue (ausente, ou D4 dentro do tempo de espera do reinício); rc 2 = não chamou porque a marca não pôde ser gravada (a rodada acaba)
-  if [ "$1" = 4 ] && [ "$ACTED4_TS" -gt 0 ] && [ $(( $2 - ACTED4_TS )) -lt "$D4_COOLDOWN_S" ]; then escalate_d4_cap "$2"; return 1; fi
+  if [ "$1" = 4 ] && d4_capped "$2"; then escalate_d4_cap "$2"; return 1; fi
   run_rung "$1" "$2"
 }
 
@@ -472,14 +486,19 @@ pick_and_run() {  # $1=agora. UM degrau por rodada, só os que têm o cronômetr
   # Passada 1 — 1ª chamada do degrau neste episódio (estado none/absent), em ordem D2→D3→D4: nenhum degrau é pulado nem passa à frente do anterior. Degrau ausente devolve 1 e a passada segue para o próximo.
   # Passada 2 — repetição (acted: ACTED_REPEAT_S; idle/failed/unknown: RETRY_S), do MAIS ALTO para o mais baixo: se o D2 repetisse primeiro a cada 5 min, com o launchd atrasado (rodadas a 5 min uma da outra)
   #   ele ocuparia toda rodada e o D3/D4 nunca teriam vez. O degrau de cima só chega aqui depois de o tempo dele ter passado, e o de baixo já teve a chance dele antes.
-  local n st at age
+  local n st at age skip23=0
+  # ga-1p1i5jr.10 — livre abaixo do piso duro e o D4 chamável (fora do teto de 6 h): D2 e D3 não têm vez. Sob thrash eles estouram os 900 s (10/11: 3 chamadas = 45 min) e o D4 fica esperando atrás deles; a rodada espera o D4
+  # (as 2 leituras seguidas dele, ou o retry de 5 min). Com o D4 no teto de 6 h não há D4 a esperar e D2/D3 seguem como sempre
+  if [ "$FREE" -lt "$D4_HARD_MB" ] && ! d4_capped "$1"; then skip23=1; fi
   for n in 2 3 4; do
     eligible "$n" "$1" || continue
     case "$(getv ST "$n")" in none|absent) ;; *) continue ;; esac
+    if [ "$skip23" = 1 ] && [ "$n" != 4 ]; then log "D$n vencido, mas livre=${FREE}MB < ${D4_HARD_MB}MB e o D4 é chamável: D$n não tem vez (a rodada espera o D4)"; continue; fi
     try_rung "$n" "$1"; [ $? -eq 1 ] || return 0   # 1 = não chamou e segue para o próximo; 0 (chamou) e 2 (marca não gravável) acabam a rodada
   done
   for n in 4 3 2; do
     eligible "$n" "$1" || continue
+    [ "$skip23" = 1 ] && [ "$n" != 4 ] && continue
     st=$(getv ST "$n"); at=$(getv AT "$n"); age=$(( $1 - at ))
     case "$st" in
       acted) [ "$age" -ge "$ACTED_REPEAT_S" ] || continue ;;
@@ -627,6 +646,56 @@ Log do maestro: $LOG" ;;
   return 0
 }
 
+resume_d4() {  # chamado toda rodada, DEPOIS do resume do D2: o D4 --resume solta a pausa de envio que o D4 pôs antes de um reinício em estado terminal (ga-1p1i5jr.10). rc do D4: 0 soltou · 10 nada a retomar / ainda segurando · 20 não soltou · 30 não li
+  local cmd="$D4_CMD" rc line t why
+  [ "$DRY" = 1 ] && return 0
+  # vazio (D4 ausente ou sem execução) → calado: sem o script não há pausa dele (o run_rung já avisa quando o D4 é devido); falhou/ilegível → alerta, nunca o silêncio do rc 10
+  [ -f "$cmd" ] && [ -x "$cmd" ] || return 0
+  t=$(now) || t=$NOW
+  run_bounded "$RESUME_TIMEOUT_S" "$cmd" --resume; rc=$?
+  line=$(out_line); rb_clean
+  case "$rc" in
+    10) return 0 ;;
+    0)  note "retomada do D4: rc=0: $line"
+        send_notify 3 "Disco: D4 soltou a pausa do envio" "$line" ;;
+    20) note "ERROR: retomada do D4 FALHOU: rc=20: $line"
+        RC_FINAL=20
+        resume_alert d4rc20 "$t" 4 "Disco: o D4 NÃO soltou a pausa do envio" "$line. O envio de primeiro contato pode estar PARADO: despause à mão (outreach_config.system_paused=0, ou o painel). (aviso no máximo 1 por hora)" \
+          "Disco: o D4 NÃO soltou a pausa do envio" "Escada de recuperação de disco (ga-1p1i5jr.10).
+O D4 pausou o envio de primeiro contato antes de um reinício em estado terminal e NÃO conseguiu soltá-lo (rc=20).
+Saída do D4: $line
+Despause à mão (outreach_config.system_paused=0 ou o painel) se isto durar. Log do maestro: $LOG" ;;
+    30) note "WARN: retomada do D4: rc=30 (não consegui ler): $line"
+        [ "$RC_FINAL" = 0 ] && RC_FINAL=30
+        resume_alert d4rc30 "$t" 4 "Disco: o D4 não leu a pausa do envio" "D4 --resume devolveu rc=30 (não consegui ler o estado ou o banco; não soltei nada): $line. O envio de primeiro contato pode estar parado. (aviso no máximo 1 por hora)" ;;
+    *)  case "$rc" in
+          124) why="estourou ${RESUME_TIMEOUT_S}s e foi encerrado (TERM)" ;;
+          125) why="não consegui lançar (mktemp falhou?)" ;;
+          *)   why="rc inesperado $rc" ;;
+        esac
+        note "WARN: retomada do D4 com falha na chamada: $why: $line"
+        [ "$rc" = 125 ] || RC_FINAL=20
+        resume_alert d4broken "$t" 4 "Disco: a retomada do D4 falhou na chamada" "$cmd --resume: $why: $line. Não sei se há pausa de envio em aberto. (aviso no máximo 1 por hora)" ;;
+  esac
+  return 0
+}
+
+log_rss() {  # rodada com livre <= D2_MB: foto dos 10 maiores RSS num log PRÓPRIO que gira (RSS_LOG_MAX_KB). Só diagnóstico: nunca decide nada nem muda a saída. 10/11 não havia como saber QUEM inchou a RAM
+  [ "$DRY" = 1 ] && return 0
+  local rc kb
+  # vazio (ps sem nenhuma linha) → bloco só com o cabeçalho; falhou/ilegível (ps ausente, rc≠0, RSS_TIMEOUT_S estourado) → 1 linha WARN no log do maestro e a rodada SEGUE, sem bloco
+  run_bounded "$RSS_TIMEOUT_S" ps -axo rss=,pid=,command=; rc=$?
+  if [ "$rc" -ne 0 ]; then log "WARN: foto de RSS não saiu (ps rc=$rc: $(out_line))"; rb_clean; return 0; fi
+  kb=$(du -k "$RSS_LOG" 2>/dev/null | awk '{print $1}')
+  isnum "$kb" && [ "$kb" -gt "$RSS_LOG_MAX_KB" ] && mv -f "$RSS_LOG" "$RSS_LOG.1" 2>/dev/null
+  {
+    printf '[%s] livre=%sMB swap=%sMB — 10 maiores RSS:\n' "$(date '+%F %T')" "$FREE" "$SWAP"
+    sort -rn "$RB_OUT" | awk '$1 ~ /^[0-9]+$/ && n < 10 { n++; r = $1; p = $2; printf "  %6d MB  pid=%s  %.120s\n", r / 1024, p, $3 " " $4 " " $5 }'
+  } >> "$RSS_LOG" 2>/dev/null
+  rb_clean
+  return 0
+}
+
 rotate_log() {  # log acima de LOG_MAX_KB vira .1 (um só backup). tamanho ilegível → não gira (log maior que o previsto é melhor que log perdido)
   local kb
   kb=$(du -k "$LOG" 2>/dev/null | awk '{print $1}')
@@ -685,10 +754,12 @@ main() {
     log "ok: livre=${FREE}MB swap=${SWAP}MB (sem episódio; batimento 1/h)$SWAPNOTE"
   fi
 
+  [ "$FREE" -le "$D2_MB" ] && log_rss   # ANTES de chamar um degrau: se o D4 reiniciar a máquina, a foto desta rodada já está no disco
   save_state
   pick_and_run "$NOW"
   save_state
   resume_d2   # sempre DEPOIS do --run: o --resume lê o registro do D2 já com o que o --run acabou de parar; quem decide se o livre voltou é o próprio D2 (resume_above_mb > stop_below_mb: histerese dele, não minha)
+  resume_d4   # idem: o D4 --resume solta a pausa de envio que ele pôs (depois do boot, ou quando o pedido de reinício pendente vence)
   if [ "$SAVE_FAIL" = 1 ]; then [ "$RC_FINAL" = 0 ] && RC_FINAL=30; nosave_warn; fi
   exit "$RC_FINAL"
 }

@@ -5,6 +5,7 @@
 - Como o maestro decide
 - Contrato dos degraus
 - Retomada do D2 (`--resume`)
+- Retomada do D4 (`--resume`) e a foto de RSS (ga-1p1i5jr.10)
 - Interruptor, arquivos, saídas
 - Três estados: o que o maestro faz quando não consegue ler
 - Teto de 6 h do reinício (D4)
@@ -61,7 +62,10 @@ Data em 98% (`docs/runbooks/disk-guards-quem-age.md`).
 | D4, piso duro | < 1536 MB (1,5 GB) | 2 leituras SEGUIDAS, separadas por ≥ 100 s (2 rodadas do launchd), a qualquer hora |
 
 O piso duro é parte do limiar do D4 (decisão do Athos: "< 1,5 GB a qualquer momento"). Não é um atalho para pular D2 e D3 em
-episódio comum: os dois só entram depois do tempo deles. Duas leituras seguidas, e não uma, para que um pico passageiro (um
+episódio comum: os dois só entram depois do tempo deles. **Uma exceção (ga-1p1i5jr.10, 10/11):** com livre < 1536 MB e o D4 chamável
+(fora do teto de 6 h), D2 e D3 vencidos NÃO têm vez e a rodada espera o D4 (as 2 leituras seguidas dele, ou o retry de 5 min). Sob thrash de
+swap o D2 (06:30) e o D3 (06:57 e 07:30) estouraram os 900 s três vezes, 45 min do maestro, e a máquina travou às 08:01. Com o D4 no teto de
+6 h não há D4 a esperar e D2 e D3 seguem como sempre. O maestro passa ao D4 `DR4_HARD_STREAK=<leituras seguidas>` (o estado terminal dele usa). Duas leituras seguidas, e não uma, para que um pico passageiro (um
 `go build` que sobe e solta) não reinicie o mini. Rodadas coladas (um `--run` à mão ao lado de uma agendada, ou o launchd
 atrasado que alcança) contam como UMA leitura: só valem duas leituras separadas por pelo menos `D4_HARD_SPACE_S` (100 s).
 
@@ -147,6 +151,21 @@ O passo **não roda** quando a rodada acaba antes dele: interruptor ligado, trav
 age). E **não roda em `--dry-run`**: o `--resume` não tem modo dry-run, chamá-lo lançaria o job de verdade. Ele também não depende do estado
 salvo: roda mesmo que o estado do maestro não grave.
 
+## Retomada do D4 (`--resume`) e a foto de RSS (ga-1p1i5jr.10)
+
+**Retomada do D4.** Em estado terminal o D4 PAUSA o envio de primeiro contato (`outreach_config.system_paused`, com `system_paused_by` "disk-recovery-d4: …")
+antes de reiniciar (`docs/runbooks/disco-d4-reinicio-guardado.md`, "Estado terminal"). Quem o solta depois do boot é o maestro: **toda rodada**, depois do `--resume` do D2,
+ele chama `scripts/disk-recovery-d4-guarded-reboot.sh --resume`. Mesmos códigos do D2: 0 soltou (`notify -p 3`) · 10 nada a retomar ou ainda segurando (o ÚNICO silêncio:
+nem uma linha de log) · 20 não soltou (`-p 4` forçado + mail; a linha ensina a despausar à mão) · 30 não li (`-p 4`) · falha da chamada (estouro de 120 s, rc estranho) = alerta; no máximo 1 aviso
+por hora por classe (marcas `.gc/disk-recovery.resume-{d4rc20,d4rc30,d4broken}`, entregue-depois-carimbado). D4 ausente ou sem permissão de execução: calado (sem o script não há pausa dele; o degrau
+ausente já avisa quando o D4 é devido). Não roda em `--dry-run`, com o interruptor ligado nem com relógio ou `df` ilegível. **Com o interruptor ligado a pausa nossa espera até alguém apagá-lo**; o D4 em
+`--run` solta sozinho em toda saída normal, inclusive quando o interruptor aborta o reinício na carência.
+
+**Foto de RSS.** 10/11 o swap foi de 0,7 para 4,6 GB entre 05:30 e 07:58 e não havia como saber QUEM inchou a RAM (nenhuma foto existia). Agora, em toda rodada com livre ≤ 5120 MB (o limiar do D2),
+ANTES de chamar um degrau, o maestro grava os 10 maiores RSS (`ps -axo rss=,pid=,command=`) em `.gc/logs/disk-recovery-rss.log` (gira em `RSS_LOG_MAX_KB`, 1 MB, 1 backup `.1`). Cada linha: MB, pid e
+as 3 primeiras palavras do comando, até 120 caracteres (argumento com segredo costuma vir depois do programa e do script). Só diagnóstico: `ps` que falha, estoura `RSS_TIMEOUT_S` (15 s) ou vem vazio
+nunca decide nada nem muda a saída da rodada (1 linha WARN no log do maestro). Para nomear o culpado de um episódio: `grep -A1 'maiores RSS' .gc/logs/disk-recovery-rss.log | tail -40`.
+
 ## Interruptor, arquivos, saídas
 
 | O quê | Onde |
@@ -158,6 +177,8 @@ salvo: roda mesmo que o estado do maestro não grave.
 | Trava | `.gc/disk-recovery.lock` (diretório + pid). Instância única. Trava de pid morto, ou de pid vivo que não é o maestro, é refeita |
 | Marcas de aviso | `.gc/disk-recovery.nosave` (estado que não grava) e `.gc/disk-recovery.nolock` (trava que não tomo): arquivos vazios que limitam o aviso a 1 por hora. Só são tocados depois de o notify confirmar |
 | Marcas da retomada do D2 | `.gc/disk-recovery.resume-{rc20,rc30,broken}`: o epoch do último aviso entregue de cada classe (ver "Retomada do D2"). Apagar uma libera o aviso dela na próxima rodada |
+| Marcas da retomada do D4 | `.gc/disk-recovery.resume-{d4rc20,d4rc30,d4broken}`: o mesmo, para o `--resume` do D4 |
+| Foto de RSS | `.gc/logs/disk-recovery-rss.log` (e `.1`): os 10 maiores RSS de cada rodada com livre ≤ 5120 MB |
 
 Saídas do script: **0** rodada feita · **10** interruptor ligado, ou OUTRA instância VIVA rodando (calado, é o caso normal) · **20**
 um degrau falhou (ou o `--resume` do D2 falhou: ver "Retomada do D2") · **30** não consegui ler o disco ou o relógio, não consegui gravar o estado, ou não consegui tomar nem verificar
@@ -172,7 +193,7 @@ a quebrar o mail junto) e sai 30 sem ler o disco nem chamar degrau, já que sem 
 chamariam o mesmo degrau (o D4, duas vezes).
 
 `--dry-run` lê o estado salvo, aplica a leitura de agora numa cópia em memória e chama os degraus com `--dry-run`. Não grava
-estado nem log, não avisa, não manda mail, não toma a trava e não chama o `--resume` do D2.
+estado nem log, não avisa, não manda mail, não toma a trava, não tira a foto de RSS e não chama o `--resume` do D2 nem o do D4.
 
 ## Três estados: o que o maestro faz quando não consegue ler
 
@@ -243,7 +264,7 @@ o dry-run, configuração inválida, notify e mail com defeito ou travados, rota
 entrega, marca com lixo ou no futuro, dry-run e saídas antecipadas que não chamam o `--resume`).
 
 Resultado da última rodada completa, contra o maestro com o passo `--resume` (ga-1p1i5jr.6, 03/11/2026): **501 verificações, 0 falhas**,
-rc 0, em 452 s no nó Linux de testes. (A rodada anterior, de 02/11/2026, sem o `--resume`: 446 verificações, 0 falhas, 290 s.)
+rc 0, em 452 s no nó Linux de testes. (A rodada anterior, de 02/11/2026, sem o `--resume`: 446 verificações, 0 falhas, 290 s.) Com o piso duro que pula D2/D3, o `--resume` do D4 e a foto de RSS (ga-1p1i5jr.10, 10/11/2026): **553 verificações, 0 falhas**, rc 0, em 944 s no nó Linux com load 11-21 (as 52 novas: ordem e DR4_HARD_STREAK, as classes do `--resume` do D4, e a foto de RSS com ps de mentira: ordem, corte do comando, limiar de 5120, ps que falha, pendura ou vem vazio, rotação, e a foto sai ANTES do degrau).
 Comando: `scripts/mbp-run.sh --repo hq --dir <worktree> -- scripts/disk-recovery-ladder.selftest.sh`; rc
 96..99 do `mbp-run` significa "rode local", não teste reprovado. No mini a bateria é pesada: uma rodada anterior, com 282
 verificações, levou 3 min 13 s com load ≈ 35; por isso o selftest local roda sob o `heavy-guard`, que é da classe `selftest`. O guarda vale para o volume INTEIRO: com o
