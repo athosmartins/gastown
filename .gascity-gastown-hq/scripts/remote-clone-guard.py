@@ -16,6 +16,10 @@ CAMADA DA SESSÃO (ga-w7qwl1.2.7, host `mbp`): num notebook o ~/.claude é PESSO
   (NÃO a <raiz> inteira: o diretório de trabalho de uma sessão pode ficar sob <raiz>/city ou <raiz>/work) passam a ser protegidos de Edit/Write, e o `--selfcheck` exige `disableAllHooks: false` ESCRITO no settings (MEDIDO no claude 2.1.314: `disableAllHooks: true` no ~/.claude/settings.json
   pessoal OU em <pasta>/.claude/settings.json desliga, calado, o hook que vem do `--settings`; `false` no próprio `--settings` vence as duas camadas). Nesse modo os caminhos também são comparados sem
   distinguir caixa nem a forma Unicode (o APFS padrão não distingue: `GUARD/` é `guard/`), no território do clone inclusive. O servidor (~/.claude/hooks/) não muda: comparação exata.
+  REGRAS SÓ DA CAMADA DA SESSÃO (STRICT, ga-w7qwl1.2.5.4): com `--dangerously-skip-permissions` só este hook é fronteira (o `deny` por texto não é, ver gc-session-ssh.md), então ele também exige: Edit/Write/MultiEdit/NotebookEdit só DENTRO do
+  próprio clone · `git push` só como `git push origin HEAD:refs/heads/worker/<bead>` (nenhuma opção, de dentro do clone) · `git commit` sem pular o hook (-n/--no-verify, core.hooksPath, alias, GIT_CONFIG_*) · nenhum git dentro de texto que um shell
+  relê (sh -c, eval, heredoc, here-string) nem sob `xargs` (ele acrescenta palavras ao comando), nem com o nome do comando vindo de variável/glob/alias. Cada recusa diz a forma que passa (HINTS). Fica de fora: script GRAVADO no clone e depois rodado
+  (`bash x.sh`), git de encanamento (`commit-tree`, `update-ref`) e a proteção no origin (C do Mayor): trava contra engano, não sandbox.
 CÓDIGOS: 0 liberado · 2 bloqueado — também o pedido que o guarda não consegue analisar em STEP_LIMIT passos ou TIME_LIMIT segundos (hook estourado no Claude Code, 600 s, NÃO bloqueia: a
   chamada seguiria sem conferência; o guarda se corta antes e fecha, ver Budget). `--selfcheck [settings.json [pasta-do-projeto…]]`: 0 se o guarda decide como deveria numa pasta de teste E (com o settings) todo
   PreToolUse de Bash/Edit/Write/MultiEdit/NotebookEdit é EXATAMENTE `python3 -I <este arquivo> || exit 2`, sem campo que mude QUANDO dispara (só type/command/timeout e `onFailure: "block"`, opcional) e
@@ -137,6 +141,20 @@ def layer_root() -> str:
 
 
 FOLD = bool(layer_root())  # decidido uma vez, de onde ESTE arquivo roda: <raiz>/guard/ → dobra (inside, claude_conf); ~/.claude/hooks/ (servidor, Linux) → comparação exata, como sempre foi
+STRICT = bool(layer_root())  # a mesma decisão, para as regras da sessão do notebook (ga-w7qwl1.2.5.4): escrita de arquivo SÓ no próprio clone, git push SÓ na forma única, git commit sem pular hook, nada de git dentro de sh -c/eval. No servidor (~/.claude/hooks/) nada disso vale: as sessões de lá usam push/commit de outras formas
+PUSH_REF = re.compile(r"HEAD:refs/heads/worker/[A-Za-z0-9][A-Za-z0-9._-]*")  # a ÚNICA ref que a sessão publica: worker/<bead>. Só estes caracteres: sem $, glob, aspa, `{`, `~` (o shell não mexe mais na palavra) e sem `/` depois do worker/ (nada de worker/../main)
+CFG_KEY_BAD = re.compile(r"(?:alias|include|includeif)\..*|core\.hookspath", re.I)  # chave de configuração que faz o git rodar OUTRA coisa no lugar do push/commit que o guarda leu: alias (`alias.p=push --force`), include (traz um arquivo com alias) e core.hooksPath (pula o hook de commit)
+COMMIT_LONG_VAL = ("--message", "--file", "--reuse-message", "--reedit-message", "--fixup", "--squash", "--template", "--author", "--date", "--cleanup", "--trailer", "--pathspec-from-file")  # opções longas do `git commit` que levam valor e aceitam a palavra seguinte como valor
+COMMIT_ARG = "mFcCtuS"  # opções curtas do `git commit` que levam valor: o resto da palavra (ou a palavra seguinte) é o valor, não mais opções (`-minit` é mensagem, `-nm x` é --no-verify)
+HINTS = {  # o que dizer na recusa de cada regra da sessão (a chave vai de terceiro item do veredito)
+    "file": "Na sessão do notebook Edit/Write/MultiEdit/NotebookEdit só escrevem DENTRO do seu clone (o worktree da bead): o caminho já resolvido (symlink e `..` incluídos) tem de ficar nele. Rascunho e arquivo temporário vão para dentro do clone.",
+    "push": "git push só passa na forma única `git push origin HEAD:refs/heads/worker/<bead>`: sem nenhuma opção (--force, --all, --mirror, --delete, -u, --dry-run…), sem -C/-c/GIT_DIR, de dentro do seu clone, nenhuma outra ref (main, +HEAD, worker/a/b) e nada que o shell expanda.",
+    "commit": "git commit não pode pular o hook: sem -n/--no-verify (nem as abreviações --no-v…, nem -an/-nm…) e sem -c core.hooksPath/GIT_CONFIG_*. Mensagem que COMEÇA com `-` confunde a leitura: comece por outra palavra. Uma palavra que o shell expande ($x, $( ), glob) só vale como valor de -m/-F; no lugar de uma opção, escreva a opção por extenso.",
+    "wrap": "git dentro de sh -c / bash -c / eval (e de qualquer texto que um shell relê: here-string, ssh 'cmd', env -S) não passa na sessão do notebook: o texto é lido duas vezes e o guarda não confere as duas. Rode o git direto, sem embrulho.",
+    "cfg": "git com configuração que pode trocar o que ele roda não passa na sessão do notebook: nada de -c/--config-env com chave que não seja só de exibição, GIT_CONFIG_*, `git config alias.*`/`include.*`/`core.hooksPath` nem `git config -e`: um alias pode ser um push fora da forma única, e o hooksPath pula o hook do commit. Escreva o comando do git por extenso.",
+    "dyn": "O nome do comando vem de variável, glob ou $( ) (ou é `alias`): não sei se é git. Escreva o nome do comando por extenso.",
+    "xargs": "git push e git commit não passam por xargs na sessão do notebook: o xargs ACRESCENTA ao fim do comando as palavras que lê da entrada (`echo HEAD:refs/heads/main | xargs git push origin HEAD:refs/heads/worker/x` empurra a main, `echo -n | xargs git commit -m x` pula o hook), e o guarda só lê o que está escrito. Rode o git direto, sem xargs.",
+}
 
 
 def claude_conf(p: str) -> bool:
@@ -145,6 +163,40 @@ def claude_conf(p: str) -> bool:
     root = layer_root()  # vazio → não há camada de sessão e vale só o home (o servidor, como sempre foi)
     hf, pf = (fold(h), fold(p)) if FOLD else (h, p)  # a mesma dobra do inside(): `~/.CLAUDE/Settings.json` é o settings.json pessoal num APFS padrão
     return (pf.startswith(hf) and bool(re.fullmatch(r"hooks/.*|settings[^/]*\.json", pf[len(hf):]))) or (bool(root) and any(inside(p, f"{root}/{d}") for d in LAYER_PATHS))
+
+
+def push_form(rest: list) -> bool:
+    """`origin HEAD:refs/heads/worker/<bead>` e mais nada: duas palavras, a ref só com os caracteres de PUSH_REF, sem `..` nem fim `.`/`.lock` (nome que o git recusa)."""
+    return len(rest) == 2 and rest[0] == "origin" and bool(PUSH_REF.fullmatch(rest[1])) and ".." not in rest[1] and not rest[1].endswith((".", ".lock"))
+
+
+def skips_hooks(rest: list) -> bool:
+    """O `git commit` pula o hook, ou pode pular? Lado fechado: toda palavra com `-` na frente é lida como opção (`-m -n` conta: a mensagem que começa com `-` é falso positivo).
+    `-n` em qualquer posição de um grupo curto até a 1ª letra que leva valor (`-an`, `-nm`); a opção longa que é prefixo de `--no-verify` com ao menos `--n` (o git aceita a abreviação única);
+    palavra que o shell expande e que pode virar OPÇÃO (`git commit $F -m x` com F=-n: começa por `$`, crase, glob ou `{`, ou tem isso dentro do nome da opção) — salvo o VALOR de -m/-F/-c/-C/-t/--message…
+    (`-m "$msg"`, `-m "$(cat <<EOF…)"`). Depois de `--` são caminhos."""
+    val = False  # a palavra seguinte é o valor de uma opção que o git leu
+    for t in rest:
+        isval, val = val, False
+        if t == "--":
+            if isval:
+                continue
+            return False
+        if t.startswith("--"):
+            nm = t.partition("=")[0]
+            if SHELLY.search(nm) or ("--no-verify".startswith(nm) and len(nm) >= 3):
+                return True
+            val = "=" not in t and any(o.startswith(nm) for o in COMMIT_LONG_VAL)
+        elif t.startswith("-"):
+            for k, ch in enumerate(t[1:], 1):
+                if ch == "n" or SHELLY.match(ch):
+                    return True
+                if ch in COMMIT_ARG:
+                    val = k == len(t) - 1  # `-m` no fim do grupo: o valor é a palavra seguinte; `-mfoo`: o valor já veio junto
+                    break
+        elif not isval and SHELLY.match(t):
+            return True
+    return False
 
 
 def lists_only(sub: str, rest: list) -> bool:
@@ -482,19 +534,21 @@ def dests(sub: str, rest: list) -> list:
     return [x for x in out if x and not URL.match(x)]
 
 
-def git_hit(seg: list, env: dict, cwd, terr: str, own):
+def git_hit(seg: list, env: dict, cwd, terr: str, own, xa: bool = False):
+    """xa = o git roda sob `xargs`: o xargs ACRESCENTA ao fim do comando as palavras que lê da entrada, e o guarda só lê o que está escrito (STRICT: push e commit não passam por ele)."""
     gd, wt, i, lost = env.get("GIT_DIR"), env.get("GIT_WORK_TREE"), 1, False
+    cfgx = any(k.startswith("GIT_CONFIG") for k in env)  # STRICT: configuração injetada por variável de ambiente (GIT_CONFIG_COUNT/KEY/VALUE/PARAMETERS/GLOBAL…) pode ser um alias ou um hooksPath
     runs = any(CFG_ENV.fullmatch(k) for k in env)  # o git deste comando pode rodar um programa que o guarda não vê (configuração injetada): leitura deixa de valer como leitura
     while i < len(seg) and seg[i].startswith("-"):
         a = seg[i]
         if a == "-C" and i + 1 < len(seg):
             cwd, i = res(seg[i + 1], cwd), i + 2
         elif a in ("-c", "--config-env") and i + 1 < len(seg):
-            runs, i = runs or not CFG_SAFE.fullmatch(seg[i + 1].partition("=")[0]), i + 2
+            runs, cfgx, i = runs or not CFG_SAFE.fullmatch(seg[i + 1].partition("=")[0]), cfgx or not CFG_SAFE.fullmatch(seg[i + 1].partition("=")[0]), i + 2
         elif a in ("--namespace", "--attr-source") and i + 1 < len(seg):  # valor no token seguinte: sem pular, ele viraria o subcomando e o `-C` depois dele nunca seria lido
             i += 2
         elif a.startswith("--config-env="):
-            runs, i = runs or not CFG_SAFE.fullmatch(a.partition("=")[2].partition("=")[0]), i + 1
+            runs, cfgx, i = runs or not CFG_SAFE.fullmatch(a.partition("=")[2].partition("=")[0]), cfgx or not CFG_SAFE.fullmatch(a.partition("=")[2].partition("=")[0]), i + 1
         elif a in ("-p", "--paginate") or a.startswith("--exec-path"):  # o pager e o diretório de programas do git são programas que o guarda não vê
             runs, i = True, i + 1
         elif a.startswith(("--git-dir", "--work-tree")):
@@ -510,6 +564,17 @@ def git_hit(seg: list, env: dict, cwd, terr: str, own):
     sub, rest = (seg[i] if i < len(seg) else ""), seg[i + 1:]
     if SHELLY.search(sub):  # `git $FLAGS -C x commit`, `git "$@"`: o shell ainda expande a palavra do subcomando, e o que sair pode ser opção (um `-C`) que não leio → diretório "não sei", e vale como escrita
         lost, cwd = True, None
+    if STRICT:  # camada da sessão do notebook: a forma única do push e o commit que não pula hook (ga-w7qwl1.2.5.4)
+        if cfgx or (sub == "config" and any(CFG_KEY_BAD.match(t) or t in ("-e", "--edit") for t in rest)):  # o alias/hooksPath faz `git p` ou `git commit` rodar outra coisa que não a lida abaixo
+            return cwd, "git com configuração que troca o que ele roda (alias, include, hooksPath, -c, GIT_CONFIG_*)", "cfg"
+        if xa and sub in ("push", "commit", "send-pack", "http-push"):  # `echo HEAD:refs/heads/main | xargs git push origin HEAD:refs/heads/worker/x` empurra a main (e `echo -n | xargs git commit -m x` pula o hook): o que o guarda leu é só o começo do comando
+            return cwd, "git " + sub + " sob xargs (ele acrescenta palavras ao comando)", "xargs"
+        if sub in ("send-pack", "http-push"):  # empurram para o remoto como o push (`send-pack origin HEAD:refs/heads/main` moveu a main de teste): não há forma única para eles
+            return cwd, "git " + sub, "push"
+        if sub == "push" and not (i == 1 and not runs and gd is None and wt is None and push_form(rest) and cwd is not None and own and inside(cwd, own)):
+            return cwd, "git push fora da forma única", "push"
+        if sub == "commit" and (runs or skips_hooks(rest)):
+            return cwd, "git commit que pula o hook", "commit"
     read = not lost and is_read(sub, rest)
     if read and not runs:
         return None
@@ -530,19 +595,25 @@ def tick(n: int = 1) -> None:
         raise Budget(f"mais de {STEP_LIMIT} passos de conferência")
 
 
-def scan(cmd: str, cwd, terr: str, own, depth: int = 0, env=None, funcs=None):
-    """O 1º (alvo, operação) de escrita contra clone alheio, ou None (alvo None = não resolvi). env/funcs = contexto de quem chamou: o aninhado nunca começa do zero."""
+def scan(cmd: str, cwd, terr: str, own, depth: int = 0, env=None, funcs=None, wrapped: bool = False):
+    """O 1º (alvo, operação[, regra]) de escrita contra clone alheio, ou None (alvo None = não resolvi; a regra, quando há, é a chave de HINTS). env/funcs = contexto de quem chamou: o aninhado nunca começa do zero.
+    wrapped = o texto já passou por UMA leitura de aspas e um shell vai relê-lo (bash -c, eval, here-string, ssh 'cmd', env -S); o $( ) e a crase NÃO contam, o shell os lê do texto de fora."""
     if depth > 3:
         return None, "comando aninhado fundo demais para conferir"
     st, stack, seg = {"cwd": cwd, "env": dict(env or {}), "funcs": {} if funcs is None else funcs}, [], []
 
-    def sub(text: str, cwd, env: dict):  # trecho aninhado: mesmo contexto (variáveis do trecho de fora + as desta palavra, funções)
-        return scan(text, cwd, terr, own, depth + 1, {**st["env"], **env}, st["funcs"])
+    def sub(text: str, cwd, env: dict, deep: bool = True):  # trecho aninhado: mesmo contexto (variáveis do trecho de fora + as desta palavra, funções); deep = o texto é relido por um shell (vira wrapped)
+        return scan(text, cwd, terr, own, depth + 1, {**st["env"], **env}, st["funcs"], wrapped or deep)
+
+    def ghit(seg: list, env: dict, cwd, xa: bool = False):  # o git de um trecho: na sessão do notebook, texto relido por um shell não pode ter git (o parser de push errou 8 rodadas na segunda leitura de aspas: `sh -c "git push origin HEAD:refs/heads/ma\"\"in"`)
+        if STRICT and wrapped:
+            return None, "git dentro de texto que um shell relê (sh -c, bash -c, eval…)", "wrap"
+        return git_hit(seg, env, cwd, terr, own, xa)
 
     def inner(ws: list):
         for w in ws:  # $(…) e crases dentro de qualquer palavra rodam (até no valor de VAR=…, ou no alvo de um redirecionamento): confere o miolo
             for m in SUBST.finditer(w):
-                r = sub(bytes.fromhex(m.group(1)).decode(), st["cwd"], {})
+                r = sub(bytes.fromhex(m.group(1)).decode(), st["cwd"], {}, False)
                 if r:
                     return r
         return None
@@ -618,11 +689,14 @@ def scan(cmd: str, cwd, terr: str, own, depth: int = 0, env=None, funcs=None):
         w0 = [os.path.basename(x) for x in seg]
         env, seg, b, opq = peel(seg)
         blind, wrapped = blind or b, any(x in WRAP for x in w0[:len(w0) - len(seg)])  # wrapped: `env cd x` roda o cd como PROGRAMA — o shell fica onde estava
+        xa = "xargs" in w0[:len(w0) - len(seg)]  # o xargs entre os embrulhos descascados (também sob sudo/env/time…): ele acrescenta ao git as palavras da entrada (ver git_hit)
         unsure = bool(st.get("lost")) or kw or bool(done) or blk or prev in ("||", "|", "|&", "case)") or term in ("|", "|&", "&", ";;") or (prev == "&&" and term != "&&")  # o trecho pode não ter rodado
         if not seg:
             st["env"].update({k: "$?" if unsure else v for k, v in env.items()})  # `GIT_DIR=x; git …` vale p/ os seguintes; `true || GIT_DIR=x` = "não sei" ($ → não resolve)
             return None
         cwd, c = None if blind else st["cwd"], os.path.basename(seg[0])
+        if STRICT and (SHELLY.search(seg[0]) and seg[0] not in ("[", "[[") and not (term == ")" and not stack) or c == "alias"):  # o nome do comando vem de `$x`, `$( )`, glob ou `{a,b}` (ou é alias): pode ser git, e `x=git; $x push origin HEAD:refs/heads/main` passava pela forma única. `[`/`[[` são o teste; o trecho que o `)` de um case fecha é padrão (`*)`), não comando
+            return None, "comando que não sei qual é (nome por variável, glob, $( ) ou alias)", "dyn"
         if st.pop("or", False) and prev == "||" and c not in ("exit", "return"):
             cwd = st["cwd"] = None  # `cd a || cd b`, `cd a || true`: depois disto o shell pode estar em a OU onde estava; só `|| exit`/`|| return` mantém (se o cd falhou, nada mais roda)
         if " " in seg[0]:  # env -S 'git -C x commit': um comando inteiro numa palavra só
@@ -645,7 +719,7 @@ def scan(cmd: str, cwd, terr: str, own, depth: int = 0, env=None, funcs=None):
         elif c in OPAQUE or opq:  # não modelo o que o lançador faz com diretório e ambiente: o git de dentro (palavra solta ou texto entre aspas) vale com diretório "não sei"
             for j, t in enumerate(seg[1:], 1):
                 if os.path.basename(t) == "git":  # as palavras seguintes são argumentos do git (mensagem de commit…), não outro comando
-                    return git_hit(seg[j:], {**st["env"], **env}, None, terr, own)
+                    return ghit(seg[j:], {**st["env"], **env}, None)
                 if re.search(r"\s", t):
                     r = sub(t, None, env)
                     if r:
@@ -673,12 +747,12 @@ def scan(cmd: str, cwd, terr: str, own, depth: int = 0, env=None, funcs=None):
                 if r:
                     return r
             if c == "git":  # uma função chamada git NÃO isenta a chamada: a definição pode não ter rodado (`false && function git`, subshell, chamada condicional) e `command git`, `env git` e `\git` ignoram a função; o corpo já foi conferido acima, e o git de verdade também
-                return git_hit(seg, {**st["env"], **env}, cwd, terr, own)
+                return ghit(seg, {**st["env"], **env}, cwd, xa)
         elif c == "git":
-            return git_hit(seg, {**st["env"], **env}, cwd, terr, own)
+            return ghit(seg, {**st["env"], **env}, cwd, xa)
         return None
 
-    skip, herestr, prev = False, False, ""
+    skip, herestr, hdoc, prev = False, False, False, ""
     for tok, op in words(cmd) + [(";", True)]:  # o `;` do fim fecha o último trecho
         if skip and not op:  # alvo de redirecionamento: só uma PALAVRA é alvo. Operador logo depois (`git … >` sem alvo, que o shell recusa) segue como operador: engolir o `;` do fim ou o `&&` deixava o trecho sem conferir
             skip = False
@@ -694,6 +768,9 @@ def scan(cmd: str, cwd, terr: str, own, depth: int = 0, env=None, funcs=None):
             skip = herestr = False  # um operador que chega com um redirecionamento esperando alvo não é o alvo
             for pc in PIECE.findall(tok):
                 if pc in SEPS or pc in ("(", ")"):
+                    if STRICT and hdoc and runs_text(seg):  # `bash <<EOF … EOF`: o corpo é texto que o shell relê, e o do heredoc SEM aspas ainda passa pelo `\` e pelo `$` do shell de fora: a mesma segunda leitura do bash -c, e o corpo fica no meio do texto sem marca de onde acaba
+                        return None, "heredoc lido por um shell (bash <<EOF, sh <<EOF…)", "wrap"
+                    hdoc = False
                     r = one(seg, False, prev, pc)
                     if r:
                         return r
@@ -710,6 +787,7 @@ def scan(cmd: str, cwd, terr: str, own, depth: int = 0, env=None, funcs=None):
                     seg, prev = [], pc
                 else:
                     skip, herestr = True, pc == "<<<"  # redirecionamento: a palavra seguinte é o arquivo (ou, no here-string, o texto)
+                    hdoc = hdoc or (pc.startswith("<<") and pc != "<<<")
         else:
             seg.append(tok)
     if st.get("fdepth"):  # o fim da função não fecha (uma `{` entre aspas desconta a conta): a chamada pode ter caído no corpo — confiro o corpo como se rodasse, em diretório "não sei"
@@ -735,15 +813,20 @@ def decide(inp: dict, terr: str, proj):
         p = res(str(ti.get(TOOLS_FILE[tool]) or ""), os.path.realpath(cwd) if cwd else None, shell=False)
         if p is None or claude_conf(p) or (inside(p, terr) and not (own and inside(p, own))):
             return p, "escrita de arquivo (" + tool + ")" + (" em hook/settings do claude" if p and claude_conf(p) else "")
+        if STRICT and not (own and inside(p, own)):  # camada da sessão do notebook: sem --dangerously-skip-permissions o Edit(./**) fecha isto, COM a flag só este hook (medido); sem clone próprio nada é "dentro dele"
+            return p, "escrita de arquivo (" + tool + ") fora do clone da sessão", "file"
     return None
 
 
 def message(hit, terr: str, proj) -> str:
-    target, op = hit
+    target, op = hit[0], hit[1]
     own = own_clone(proj, terr)
-    why = (f"Alvo: {target}\n" if target else "Alvo: não consegui resolver o caminho (variável, glob, crase ou ~usuário)\n")
+    why = (f"Alvo: {target}\n" if target else "" if len(hit) > 2 else "Alvo: não consegui resolver o caminho (variável, glob, crase ou ~usuário)\n")
     mine = own or ("(nenhum: CLAUDE_PROJECT_DIR não definido)" if not proj else "(nenhum: CLAUDE_PROJECT_DIR " + proj
                    + (" está no território " + terr + " mas não tem .git até a raiz dele)" if inside(os.path.realpath(proj), terr) else " fora do território " + terr + ")"))
+    if len(hit) > 2:  # regra da sessão do notebook (STRICT): a recusa diz qual forma passa
+        return ("[HOOK BLOCK: remote-clone-guard] NÃO É CANCELAMENTO DO USUÁRIO — política automática da sessão do notebook.\n"
+                f"BLOQUEADO: {op}.\n{why}Seu clone: {mine}\n{HINTS[hit[2]]}\n")
     return ("[HOOK BLOCK: remote-clone-guard] NÃO É CANCELAMENTO DO USUÁRIO — política automática de isolamento entre sessões.\n"
             f"BLOQUEADO: {op} fora do seu clone.\n{why}Seu clone: {mine}\n"
             "Cada sessão escreve só no PRÓPRIO worktree; o clone de outra sessão, o espelho (repo.git) e os hooks/settings do claude não são seus. Para publicar: faça "

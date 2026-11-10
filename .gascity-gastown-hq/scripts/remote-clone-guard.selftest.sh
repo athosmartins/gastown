@@ -21,9 +21,12 @@
 #   (~/.claude/hooks) e uma pasta que não se chama `guard` NÃO protegem nada disso; o --selfcheck exige `disableAllHooks: false` ESCRITO no settings da camada (ausente/true/null/0/"false"/lista reprovam;
 #   o `true` da camada do projeto reprova em qualquer cópia); outra caixa ou forma Unicode (NFD) do mesmo arquivo cai na mesma regra, também no território do clone (APFS do macOS), e o servidor segue na comparação exata;
 #   o hook via `sh -c` bloqueia (2) e libera (0), e guarda ausente ou com erro de sintaxe sai 2.
+#   strict — (ga-w7qwl1.2.5.4) as regras SÓ da camada da sessão do notebook: Edit/Write só dentro do clone próprio; `git push` só como `git push origin HEAD:refs/heads/worker/<bead>`; `git commit` sem pular o hook; nenhum git dentro de
+#   sh -c/eval/heredoc/here-string, sob `xargs` ou com o nome do comando por variável/alias; e os controles de que o servidor (o MESMO arquivo fora de uma pasta guard/) não ganha nada disso · pfuzz — fuzzer diferencial do push, do commit
+#   e da config contra o bash e o git REAIS (semente fixa; BYPASS=0 e falso-bloqueio=0).
 # CONTROLE NEGATIVO: cada guarda é removida do script (sed numa cópia) e o grupo que a cobre TEM que passar a falhar (um mutante por trava; o resumo da rodada traz a conta); e
 #   contra um stub que só sai 0 (o servidor ANTES desta fatia: o hook do mini era `drop` e nada o substituía), quase tudo falha.
-# VARIÁVEIS: RCG_UNDER_TEST (guarda a testar) · RCG_ONLY (grupos, vírgula) · RCG_NO_MUTANTS=1
+# VARIÁVEIS: RCG_UNDER_TEST (guarda a testar) · RCG_ONLY (grupos, vírgula) · RCG_NO_MUTANTS=1 · ARGUMENTOS (para o mbp-run --repo hq, que não leva variável): `--only GRUPOS` = RCG_ONLY; `--mutants-only GRUPOS` = só o controle negativo desses grupos
 # BUDGET (grupo à parte, ga-tih62nv): o pedido que fazia o guarda girar SEM FIM (e que o hook deixava seguir sem conferência ao estourar o prazo de 600 s do Claude Code) termina;
 #   passou do teto de passos ou de tempo = BLOQUEADO, nunca liberado. Cada caso roda com prazo próprio (o guarda de antes não termina nesse pedido: o caso tem que reprovar, não pendurar).
 #   Tentativa 2 no gate (parecer: a definição aninhada registrava o NOME sem condição e uma função chamada git pulava o git_hit): uma função chamada git NUNCA isenta a chamada (definição
@@ -31,6 +34,8 @@
 #   A CLASSE disso: uma função com nome de comando que o guarda trata ANTES do ramo de função (bash, env, cd, find, eval, export, sudo, ssh…) é chamada como função pelo shell; o corpo
 #   é reexecutado antes dos ramos especiais, e um cd ou export coberto por função vale "não sei".
 set -u
+[ "${1:-}" = "--only" ] && { RCG_ONLY="${2:?--only GRUPOS (ex.: strict,pfuzz)}"; shift 2; }  # = RCG_ONLY, pelo argumento porque o mbp-run --repo hq não leva variável de ambiente
+[ "${1:-}" = "--mutants-only" ] && { RCG_MUTANTS_ONLY="${2:?--mutants-only GRUPOS (ex.: strict)}"; shift 2; }  # só o controle negativo dos grupos nomeados (vírgula)
 HERE="$(cd "$(dirname "$0")" && pwd)"
 P="${RCG_UNDER_TEST:-$HERE/remote-clone-guard.py}"
 T=$(cd "$(mktemp -d /tmp/rcg.XXXXXX)" && pwd -P)
@@ -449,7 +454,7 @@ g_tools() {
 }
 g_layer() {  # camada da SESSÃO (ga-w7qwl1.2.7): no MBP o guarda mora em <raiz>/guard/ e o settings em <raiz>/city/settings.json, NÃO no ~/.claude pessoal. O guarda que roda de lá protege esses
   # arquivos (e o zdot/) como protege o ~/.claude/hooks do servidor; a raiz sai do lugar do PRÓPRIO arquivo (pasta chamada guard), e o servidor, que roda de ~/.claude/hooks, não ganha nada novo.
-  local src="$P" LR="$HOME/gt-remote/bundle" t f s
+  local src="$P" LR="$OWN/bundle" t f s  # a raiz do bundle DENTRO do clone da sessão (ga-w7qwl1.2.5.4): a sessão do notebook só escreve no próprio clone, então "trabalho da sessão passa" só se prova com o trabalho lá dentro; fora do clone quem recusa é a regra `file` (grupo strict)
   mkdir -p "$LR/guard" "$LR/zdot" "$LR/city/.gc/agents/dog" "$LR/work" "$LR/guardx"; cp "$src" "$LR/guard/remote-clone-guard.py"
   ln -sfn "$LR/guard" "$LR/work/glink"; ln -sfn "$LR/city/settings.json" "$LR/work/slink"
   local P="$LR/guard/remote-clone-guard.py"  # a partir daqui o guarda testado roda DA camada da sessão
@@ -475,14 +480,15 @@ g_layer() {  # camada da SESSÃO (ga-w7qwl1.2.7): no MBP o guarda mora em <raiz>
     for f in WORK/x.txt City/Outro.txt GUARDX/f CITY/settings.json.bak; do
       g 0 "layer: $1 em <raiz>/$f (trabalho, em outra caixa) segue passando" "$1" "$2" "$LR/$f"
     done
-    g 2 "layer: $1 em ~/.CLAUDE/Settings.json (o settings pessoal, em outra caixa) é BLOQUEADO" "$1" "$2" "$HOME/.CLAUDE/Settings.json"
-    g 2 "layer: $1 em ~/.claude/HOOKS/x.py (outra caixa) é BLOQUEADO" "$1" "$2" "$HOME/.claude/HOOKS/x.py"
+    # fora do clone da sessão (HOME) a regra `file` (ga-w7qwl1.2.5.4) também sai 2: só o MOTIVO prova que foi a dobra do home que reconheceu o settings/hook do claude (sem o grep, tirar a dobra não mudaria o rc e o mutante sobrevive)
+    g 2 "layer: $1 em ~/.CLAUDE/Settings.json (o settings pessoal, em outra caixa) é BLOQUEADO" "$1" "$2" "$HOME/.CLAUDE/Settings.json"; grep -q "hook/settings do claude" "$T/err"; ok $? "layer: ...e o motivo é hook/settings do claude (a dobra do home), não só 'fora do clone' ($1, ~/.CLAUDE/Settings.json)"
+    g 2 "layer: $1 em ~/.claude/HOOKS/x.py (outra caixa) é BLOQUEADO" "$1" "$2" "$HOME/.claude/HOOKS/x.py"; grep -q "hook/settings do claude" "$T/err"; ok $? "layer: ...e o motivo é hook/settings do claude (a dobra do home), não só 'fora do clone' ($1, ~/.claude/HOOKS/x.py)"
   done
   up="$(printf '%s' "$OTH" | tr a-z A-Z)"; ownup="$(printf '%s' "$OWN" | tr a-z A-Z)"
   b 2 "layer: git -C <clone alheio em outra caixa> commit é BLOQUEADO (o território vale em qualquer caixa)" "git -C $up commit -m x"
   g 2 "layer: Write no clone alheio em outra caixa é BLOQUEADO" Write file_path "$up/f.txt"
   b 0 "layer: git -C <clone PRÓPRIO em outra caixa> commit segue liberado (a dobra vale para o próprio também)" "git -C $ownup commit -m x"
-  lr2="$HOME/gt-remote/bundlé"; mkdir -p "$lr2/guard"; cp "$src" "$lr2/guard/remote-clone-guard.py"  # `é` composto (NFC)
+  lr2="$OWN/bundlé"; mkdir -p "$lr2/guard"; cp "$src" "$lr2/guard/remote-clone-guard.py"  # `é` composto (NFC)
   nfd="$(python3 -c 'import unicodedata,sys; print(unicodedata.normalize("NFD", sys.argv[1]), end="")' "$lr2")"  # o mesmo nome com `e` + acento solto
   [ "$nfd" != "$lr2" ]; ok $? "layer: (preparo) a grafia NFD do nome da raiz difere da NFC"
   local P="$lr2/guard/remote-clone-guard.py"
@@ -836,6 +842,389 @@ FUZZEOF
   [ "$rc" = 0 ]; ok $? "fuzz: nenhum bypass do guarda contra o bash real (${RCG_FUZZ_N:-200} comandos, semente 7)"
 }
 
+g_strict() {  # ga-w7qwl1.2.5.4 (opção B do Mayor, 09/11): na sessão do notebook (o guarda rodando de <raiz>/guard/), com --dangerously-skip-permissions só o hook PreToolUse é fronteira. Quatro regras além do clone alheio:
+  # (1) Edit/Write/MultiEdit/NotebookEdit só DENTRO do clone da própria sessão · (2) git push só na forma única `git push origin HEAD:refs/heads/worker/<bead>` · (3) git commit sem pular o hook (-n/--no-verify e as abreviações,
+  # configuração que troca o hook ou cria alias) · (4) nada de git dentro de texto que um shell relê (sh -c, bash -c, eval, heredoc, here-string) nem com o NOME do comando vindo de variável/glob/alias.
+  # O servidor (~/.claude/hooks, Linux) roda o MESMO arquivo de fora de uma pasta guard/ e NÃO ganha nada disso: as sessões de lá usam push/commit de outras formas (controles no fim).
+  local src="$P" SB="$HOME/gt-remote/sbundle" t f c W=refs/heads/worker
+  mkdir -p "$SB/guard" "$OUT/x"; cp "$src" "$SB/guard/remote-clone-guard.py"; ln -sfn "$OUT" "$OWN/outlink"
+  local P="$SB/guard/remote-clone-guard.py"  # a partir daqui o guarda testado roda DA camada da sessão
+  # --- (1) escrita de arquivo: só dentro do próprio clone ---
+  for t in "Edit file_path" "Write file_path" "MultiEdit file_path" "NotebookEdit notebook_path"; do
+    set -- $t
+    for f in "$OWN/f.txt" "$OWN/sub/g.txt" "$OWN/novo/fundo/h.txt" "f.txt" "sub/../g.txt"; do
+      g 0 "strict: $1 em $f (DENTRO do clone da sessão) passa" "$1" "$2" "$f"
+    done
+    for f in "$OUT/f.txt" "$HOME/f.txt" "/tmp/rcg-strict-f.txt" "$TERR/r/wt/f.txt" "$TERR/f.txt" "$OWN/../f.txt" "../f.txt" "$OWN/sub/../../f.txt" "$OWN/outlink/f.txt" "~/f.txt" "$HOME/.claude/settings.json"; do
+      g 2 "strict: $1 em $f (FORA do clone da sessão) é BLOQUEADO" "$1" "$2" "$f"
+    done
+    g 2 "strict: $1 sem CLAUDE_PROJECT_DIR (nenhum clone próprio → nada é 'dentro dele') é BLOQUEADO" "$1" "$2" "$OWN/f.txt" "$OWN" ""
+    g 2 "strict: $1 com o projeto fora do território (nenhum clone próprio) é BLOQUEADO" "$1" "$2" "$OUT/f.txt" "$OWN" "$OUT"
+  done
+  g 2 "strict: a recusa de escrita fora do clone diz qual é a regra (dentro do clone da sessão)" Write file_path "$OUT/f.txt"; grep -q "DENTRO do seu clone" "$T/err"; ok $? "strict: ...e a mensagem da recusa de arquivo fala em escrever DENTRO do clone"
+  # --- (2) git push: só `git push origin HEAD:refs/heads/worker/<bead>` ---
+  for c in "git push origin HEAD:$W/ga-w7qwl1.2.5.4" "git push origin HEAD:$W/x" "git push origin 'HEAD:$W/x'" "git push origin \"HEAD:$W/x\"" "git push origin HEAD:$W/a.b_c-d" "git push origin HEAD:$W/X9" \
+           "git push origin HEAD:$W/x 2>&1" "git push origin HEAD:$W/x | tail -3" "git push origin HEAD:$W/x && echo ok" "git push origin HEAD:$W/x || echo fail" "cd $OWN/sub && git push origin HEAD:$W/x" \
+           "cd sub && git push origin HEAD:$W/x" "git status; git push origin HEAD:$W/x" "time git push origin HEAD:$W/x" "command git push origin HEAD:$W/x" "x=\$(git push origin HEAD:$W/x)"; do
+    b 0 "strict: push na forma única passa: $c" "$c"
+  done
+  b 0 "strict: push na forma única de um subdiretório do clone passa" "git push origin HEAD:$W/x" "$OWN/sub"
+  for c in "git push" "git push origin" "git push origin HEAD" "git push origin HEAD:main" "git push origin HEAD:refs/heads/main" "git push origin main" "git push origin HEAD:refs/heads/mainx" "git push origin HEAD:refs/heads/workerx/x" "git push origin HEAD:refs/heads/worker" \
+           "git push origin +HEAD:$W/x" "git push origin HEAD:$W/x:y" "git push origin :$W/x" "git push origin HEAD:refs/tags/v1" "git push origin HEAD:$W/" "git push origin HEAD:$W/-x" "git push origin HEAD:$W/.x" "git push origin HEAD:$W/~x" "git push origin HEAD:$W/x@{1}" \
+           "git push origin HEAD:$W/a/b" "git push origin HEAD:$W/../main" "git push origin HEAD:$W/x.lock" "git push origin HEAD:$W/x." "git push origin HEAD:$W/a..b" 'git push origin HEAD:refs/heads/worker/$B' "git push origin 'HEAD:$W/\$B'" "git push origin HEAD:$W/*" "git push origin HEAD:$W/{a,b}" "git push origin HEAD:$W/x\\ y" \
+           "git push -f origin HEAD:$W/x" "git push --force origin HEAD:$W/x" "git push --force-with-lease origin HEAD:$W/x" "git push -u origin HEAD:$W/x" "git push -uf origin HEAD:$W/x" "git push -fu origin HEAD:$W/x" "git push --set-upstream origin HEAD:$W/x" \
+           "git push --all origin" "git push --mirror origin" "git push --delete origin worker/x" "git push -d origin worker/x" "git push --tags origin" "git push -n origin HEAD:$W/x" "git push --dry-run origin HEAD:$W/x" "git push --no-verify origin HEAD:$W/x" \
+           "git push -o ci.skip origin HEAD:$W/x" "git push --receive-pack=x origin HEAD:$W/x" "git push --repo=x HEAD:$W/x" "git push origin HEAD:$W/x --force" "git push origin HEAD:$W/x -f" "git push -- origin HEAD:$W/x" "git push origin -- HEAD:$W/x" \
+           "git push origin HEAD:$W/x HEAD:$W/y" "git push origin HEAD:$W/x origin" "git push upstream HEAD:$W/x" "git push https://github.com/x/y.git HEAD:$W/x" "git push ../outro HEAD:$W/x" "git push . HEAD:$W/x" "git push ORIGIN HEAD:$W/x" \
+           "git -C $OWN push origin HEAD:$W/x" "git -C . push origin HEAD:$W/x" "git -c user.name=x push origin HEAD:$W/x" "git --git-dir=$OWN/.git push origin HEAD:$W/x" "git --no-pager push origin HEAD:$W/x" "GIT_DIR=$OWN/.git git push origin HEAD:$W/x" "GIT_WORK_TREE=$OWN git push origin HEAD:$W/x" \
+           "cd $OUT && git push origin HEAD:$W/x" "cd / && git push origin HEAD:$W/x" "(cd $OUT; git push origin HEAD:$W/x)" "cd $TERR/r/wt && git push origin HEAD:$W/x" "git push origin HEAD:$W/x && git push --force origin HEAD:refs/heads/main" "true && git push origin HEAD:refs/heads/main" \
+           "git send-pack origin HEAD:refs/heads/main" "git send-pack origin HEAD:$W/x" "git http-push origin x" "git -C $OWN send-pack origin x" \
+           "git -c alias.p='push --force origin HEAD:refs/heads/main' p" "git --config-env=alias.p=PUSHALIAS p" "git --config-env alias.p=PUSHALIAS p" "git config alias.p 'push --force origin HEAD:refs/heads/main'" "git config --global alias.p push" "git config --global include.path /tmp/x" "git config -e" "GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=alias.p GIT_CONFIG_VALUE_0=push git p" "GIT_CONFIG_GLOBAL=/tmp/x git push origin HEAD:$W/x" \
+           "command git push --force origin HEAD:$W/x" "env git push --force origin HEAD:$W/x" "time git push origin HEAD:refs/heads/main" "timeout 5 git push origin HEAD:refs/heads/main"; do
+    b 2 "strict: BLOQUEADO: $c" "$c"
+  done
+  b 2 "strict: push na forma única com o cwd FORA do clone da sessão é BLOQUEADO" "git push origin HEAD:$W/x" "$OUT"
+  b 2 "strict: push na forma única com o cwd em $HOME é BLOQUEADO" "git push origin HEAD:$W/x" "$HOME"
+  b 2 "strict: push na forma única sem projeto (nenhum clone próprio) é BLOQUEADO" "git push origin HEAD:$W/x" "$OWN" ""
+  g 2 "strict: a recusa do push diz qual é a forma única" Bash command "git push --force origin HEAD:refs/heads/main"; grep -q "git push origin HEAD:refs/heads/worker/<bead>" "$T/err"; ok $? "strict: ...e a mensagem da recusa traz a forma que passa"
+  # --- (3) git commit: sem pular o hook ---
+  for c in "git commit -m x" "git commit -am x" "git commit -m 'fix -n'" "git commit -m \"it's\"" "git commit --amend --no-edit" "git commit --amend -m x" "git commit -F msg.txt" "git commit --allow-empty -m x" "git commit -S -m x" "git commit -Sn -m x" \
+           "git commit -m x -- f.txt" "git commit -qm x" "git commit -mn" "git commit -m x --no-gpg-sign" "git commit --no-edit" "git commit -m x -- -n" "git -c user.name=x -c user.email=y commit -m x" "git commit -m x && git push origin HEAD:$W/x" \
+           'git commit -m "$msg"' 'git commit -am "$msg"' 'git commit -m "$(cat <<EOF
+mensagem
+EOF
+)"' 'git commit --message "$m"' 'git commit --message=$m' 'git commit -F "$f"' 'git commit --author "$a" -m x' "git commit -m x src/\$F" "command git commit -m x" "cd sub && git commit -m x"; do
+    b 0 "strict: commit que roda o hook passa: $c" "$c"
+  done
+  for c in "git commit -n -m x" "git commit --no-verify -m x" "git commit -m x -n" "git commit -m x --no-verify" "git commit -an -m x" "git commit -na" "git commit -nm x" "git commit -anm x" "git commit -qn" "git commit -m x -qn" \
+           "git commit --no-v -m x" "git commit --no-ve -m x" "git commit --no-ver -m x" "git commit --no-veri -m x" "git commit --no-verif -m x" "git commit --no-verify=1" "git commit --amend -n" "git commit -m -n" "git commit -m -- -n" \
+           "git -c core.hooksPath=/dev/null commit -m x" "git -c core.hooksPath=/x commit -m x" "GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=core.hooksPath GIT_CONFIG_VALUE_0=/dev/null git commit -m x" "git --config-env=core.hooksPath=H commit -m x" "git config core.hooksPath /dev/null" "GIT_CONFIG_GLOBAL=/x git commit -m x" \
+           'git commit $F -m x' 'git commit -m x $F' 'git commit -m x "$F"' 'git commit -m x ${F}' 'git commit -m x $(echo -n)' 'git commit -m x `echo -n`' 'git commit -m x --no-$E' 'git commit -a$X -m x' 'git commit -m x *.txt' 'git commit -m x ?' 'git commit -m x {-n,x}' \
+           "git commit '-n' -m x" 'git commit "-n" -m x' 'git commit \-n -m x' "git commit -'n' -m x" "git commit --no-ver''ify -m x" "git commit \$'-n' -m x" "git commit -m x && git commit -n -m y" "true && git commit -n -m x" "command git commit -n -m x" "time git commit --no-verify -m x"; do
+    b 2 "strict: BLOQUEADO: $c" "$c"
+  done
+  g 2 "strict: a recusa do commit diz como não pular o hook" Bash command "git commit -n -m x"; grep -q "não pode pular o hook" "$T/err"; ok $? "strict: ...e a mensagem da recusa do commit fala em não pular o hook"
+  # --- (4) git dentro de texto relido por um shell, e comando de nome desconhecido ---
+  for c in "bash -c 'git push origin HEAD:$W/x'" "sh -c \"git commit -m x\"" "bash -lc 'git status'" "eval 'git commit -m x'" "eval git status" "sh -c 'ls; git log'" "bash <<EOF
+git commit -m x
+EOF" "bash <<< 'git commit -m x'" "sh <<'EOF'
+git log
+EOF" "ssh h 'git commit -m x'" "env -S 'git commit -m x'" "zsh -c 'git commit -m x'" "bash -c \"\$(printf 'git push --force origin HEAD:refs/heads/main')\"" "timeout 5 bash -c 'git commit -m x'" "x=\$(bash -c 'git log')" \
+           'x=git; $x push origin HEAD:refs/heads/main' 'G=git; $G commit -n -m x' 'g=git; ${g} status' '$(echo git) status' '`echo git` status' 'g*t status' '/usr/bin/g?t status' '{git,x} status' 'alias g=git' "alias p='git push --force'"; do
+    b 2 "strict: BLOQUEADO (git relido por um shell ou nome de comando que não sei qual é): $c" "$c"
+  done
+  # --- (4b) xargs ACRESCENTA ao fim do comando as palavras da entrada: o guarda leria só `git push origin HEAD:worker/x` e o shell empurraria também a main (ga-w7qwl1.2.5.4, achado do dog na segunda passada) ---
+  for c in "echo HEAD:refs/heads/main | xargs git push origin HEAD:$W/x" "echo --force | xargs git push origin HEAD:$W/x" "echo -n | xargs git commit -m x" "echo x | xargs -I{} git commit -m {}" "echo -n | xargs -r -d '\\n' git commit -m x" \
+           "echo -n | sudo -n xargs git commit -m x" "echo -n | env X=1 xargs git commit -m x" "echo -n | time xargs git push origin HEAD:$W/x" "xargs -a f.txt git push origin HEAD:$W/x" "echo -n | xargs git -C $OWN commit -m x" "echo x | xargs git send-pack origin"; do
+    b 2 "strict: BLOQUEADO (git push/commit sob xargs): $c" "$c"
+  done
+  g 2 "strict: a recusa sob xargs diz por que" Bash command "echo -n | xargs git commit -m x"; grep -q "ACRESCENTA ao fim do comando" "$T/err"; ok $? "strict: ...e a mensagem da recusa do xargs explica que ele acrescenta palavras ao comando"
+  for c in "ls | xargs git add" "ls | xargs git status" "git ls-files | xargs wc -l" "echo x | xargs echo" "git ls-files | xargs -n1 git log -1 --"; do
+    b 0 "strict: (controle) xargs com git que não é push/commit, ou sem git, passa: $c" "$c"
+  done
+  b 2 "strict: bash <<EOF (heredoc lido por um shell) é BLOQUEADO mesmo sem git dentro: o corpo fica no meio do texto, sem marca de onde acaba, e o guarda não o confere" "bash <<EOF
+echo oi
+EOF"
+  for c in "bash -c 'ls -la'" "sh -c 'echo oi'" "eval 'echo oi'" "bash script.sh" "ls \$HOME" "FOO=bar git status" "git status" "git log --oneline -3" "git diff HEAD~1" "echo \$(git log -1)" "for f in a b; do echo \$f; done" "[ -f x ] && echo oi" "git add -A" "git checkout -b worker/x" "git rebase origin/main" "git stash" "git fetch origin" "git pull --rebase" "git worktree list" "git branch -a" "git remote -v" \
+           "git config user.name x" "git config --get remote.origin.url" "git --no-pager log -1" "GIT_PAGER=cat git log -1" "git -c user.name=x commit -m x"; do
+    b 0 "strict: (controle) não é push, nem commit sem hook, nem git relido: passa: $c" "$c"
+  done
+  # --- o clone ALHEIO continua valendo, e não ganha exceção por causa da camada ---
+  b 2 "strict: git -C <alheio> commit segue BLOQUEADO (o clone alheio não ganha exceção por causa da camada)" "git -C $OTH commit -m x"
+  b 0 "strict: leitura no clone alheio segue liberada" "git -C $OTH log -1"
+  g 2 "strict: Write no clone alheio segue bloqueado" Write file_path "$OTH/f.txt"
+  # --- o servidor (o MESMO arquivo fora de uma pasta guard/) NÃO ganha nada disto ---
+  local P="$src"
+  for c in "git push --force origin HEAD:refs/heads/main" "git push -u origin HEAD" "git push" "git commit -n -m x" "git commit --no-verify -m x" "bash -c 'git push origin HEAD:refs/heads/main'" "eval 'git commit -n -m x'" 'x=git; $x push origin HEAD:refs/heads/main' "git config alias.p push" "git -c alias.p=push p" "git commit -m x \$F" "echo -n | xargs git commit -m x" "echo x | xargs git push origin HEAD:$W/x"; do
+    b 0 "strict: (servidor) o guarda fora de pasta guard/ não restringe o push/commit do clone PRÓPRIO: $c" "$c"
+  done
+  for t in "Write file_path" "Edit file_path" "MultiEdit file_path" "NotebookEdit notebook_path"; do
+    set -- $t
+    g 0 "strict: (servidor) $1 fora do clone da sessão passa" "$1" "$2" "$OUT/f.txt"
+    g 0 "strict: (servidor) $1 em /tmp passa" "$1" "$2" "/tmp/rcg-strict-f.txt"
+  done
+  b 2 "strict: (servidor) git -C <alheio> push continua BLOQUEADO" "git -C $OTH push origin HEAD:$W/x"
+  g 2 "strict: (servidor) Write no clone alheio continua BLOQUEADO" Write file_path "$OTH/f.txt"
+}
+
+g_pfuzz() {  # fuzzer diferencial do push, do commit e da config da sessão do notebook (ga-w7qwl1.2.5.4; memória text-guard-needs-differential-fuzzer-vs-real-shell: exemplos fixos falharam 8 rodadas no parser de push).
+  # A VERDADE é o bash REAL: o push é medido por um git falso que grava o argv que o shell de fato entregou (aspas, expansão, brace, variável já resolvidos); o commit é medido por um git de verdade num repositório com um hook
+  # pre-commit que anota quando roda (commit criado SEM o hook rodar = pulou). O guarda (rodando de <raiz>/guard/) tem de dar rc 2 em todo comando em que a verdade é "fora da forma única"/"pulou o hook" (BYPASS=0), e rc 0 na forma que
+  # DEVE passar (FALSO-BLOQUEIO=0, só nos geradores diretos, sem embrulho de shell: o guarda recusa de propósito o git dentro de sh -c/eval). Semente fixa; RCG_PFUZZ_N muda o tamanho (padrão 250 de push + 125 de commit).
+  local src="$P" SB="$HOME/gt-remote/pfbundle"
+  mkdir -p "$SB/guard"; cp "$src" "$SB/guard/remote-clone-guard.py"
+  cat > "$T/pfuzz.py" <<'PFEOF'
+#!/usr/bin/env python3
+"""Fuzzer diferencial do push/commit/config do remote-clone-guard na sessão do notebook. Uso: pfuzz.py GUARDA [N] [SEED]."""
+import json, os, random, re, shlex, shutil, subprocess, sys, tempfile
+
+GUARD = sys.argv[1]
+N = int(sys.argv[2]) if len(sys.argv) > 2 else 250
+rnd = random.Random(int(sys.argv[3]) if len(sys.argv) > 3 else 11)
+W = "refs/heads/worker"
+
+t = os.path.realpath(tempfile.mkdtemp(prefix="rcgpf."))
+terr = t + "/gt-remote/git"; own = terr + "/r/wt/own"; oth = terr + "/r/wt/other"; out = t + "/fora"; shim = t + "/bin"; log = t + "/git.log"; hlog = t + "/hook.log"; home = t + "/home"
+for d in (own + "/sub", oth, out, shim, home):
+    os.makedirs(d, exist_ok=True)
+open(oth + "/.git", "w").close()
+GENV = {"PATH": "/usr/bin:/bin:/usr/local/bin:/opt/homebrew/bin", "HOME": home, "GIT_CONFIG_NOSYSTEM": "1", "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t.t", "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t.t"}
+
+
+def sh(*a, **k):
+    return subprocess.run(a, env=GENV, capture_output=True, text=True, **k)
+
+
+sh("git", "init", "-q", own)
+sh("git", "-C", own, "commit", "-q", "--allow-empty", "-m", "init")
+FIRST = sh("git", "-C", own, "rev-parse", "HEAD").stdout.strip()
+hook = own + "/.git/hooks/pre-commit"
+open(hook, "w").write(f"#!/bin/sh\necho ran >> {hlog}\n")
+os.chmod(hook, 0o755)
+with open(shim + "/git", "w") as f:  # o git falso do modo push: grava o argv que chegou, o diretório e as variáveis que mexem no git
+    f.write(f"""#!/usr/bin/env python3
+import json, os, sys
+env = {{k: v for k, v in os.environ.items() if k.startswith("GIT_") and k not in ("GIT_AUTHOR_NAME", "GIT_AUTHOR_EMAIL", "GIT_COMMITTER_NAME", "GIT_COMMITTER_EMAIL", "GIT_CONFIG_NOSYSTEM")}}
+open({log!r}, "a").write(json.dumps({{"argv": sys.argv[1:], "cwd": os.path.realpath(os.getcwd()), "env": env}}) + "\\n")
+""")
+os.chmod(shim + "/git", 0o755)
+
+SAFE_CFG = re.compile(r"(?:color|advice)\.[\w.-]+|core\.(?:quotepath|abbrev|precomposeunicode)|safe\.directory|user\.(?:name|email)")
+GOOD_REF = re.compile(r"HEAD:refs/heads/worker/[A-Za-z0-9][A-Za-z0-9._-]*")
+BAD_KEY = re.compile(r"(?:alias|include|includeif)\..*|core\.hookspath", re.I)
+
+
+def inside(p, root):
+    return p == root or p.startswith(root + "/")
+
+
+def split_git(argv):
+    i = 0
+    while i < len(argv) and argv[i].startswith("-"):
+        i += 2 if argv[i] in ("-C", "-c", "--git-dir", "--work-tree", "--namespace", "--attr-source", "--config-env") else 1
+    return (argv[i] if i < len(argv) else ""), argv[i + 1:], argv[:i]
+
+
+def rec_bad(r):
+    """A verdade da ESPECIFICAÇÃO (não do guarda): este git falso foi chamado fora da forma única / com configuração que troca o que ele roda?"""
+    argv, cwd, env = r["argv"], r["cwd"], r["env"]
+    sub, rest, opts = split_git(argv)
+    if any(k.startswith("GIT_CONFIG") for k in env):
+        return True
+    for j, a in enumerate(opts):
+        key = opts[j + 1].partition("=")[0] if a in ("-c", "--config-env") and j + 1 < len(opts) else a.partition("=")[2].partition("=")[0] if a.startswith("--config-env=") else None
+        if key is not None and not SAFE_CFG.fullmatch(key):
+            return True
+    if sub in ("send-pack", "http-push"):
+        return True
+    if sub == "config" and any(BAD_KEY.match(a) or a in ("-e", "--edit") for a in rest):
+        return True
+    if sub == "push":
+        good = (not opts and len(rest) == 2 and rest[0] == "origin" and bool(GOOD_REF.fullmatch(rest[1])) and ".." not in rest[1] and not rest[1].endswith((".", ".lock"))
+                and inside(cwd, own) and not any(k in env for k in ("GIT_DIR", "GIT_WORK_TREE", "GIT_EXEC_PATH")))
+        return not good
+    return False
+
+
+def lit(w):  # uma palavra LITERAL (sem expansão) com um estilo de aspas ao acaso: o shell entrega a MESMA palavra
+    k = rnd.randrange(6)
+    if k == 0:
+        return w
+    if k == 1:
+        return shlex.quote(w)
+    if k == 2:
+        return '"' + w.replace("\\", "\\\\").replace('"', '\\"').replace("$", "\\$").replace("`", "\\`") + '"'
+    if k == 3 and w[:1].isalpha():
+        return "\\" + w
+    if k == 4:
+        i = rnd.randrange(len(w) + 1)
+        return w[:i] + rnd.choice(["''", '""']) + w[i:]
+    return "$'" + w.replace("\\", "\\\\").replace("'", "\\'").replace("\n", "\\n") + "'"
+
+
+def qq(c):  # o texto inteiro entregue a um shell que o relê
+    k = rnd.randrange(3)
+    if k == 0:
+        return shlex.quote(c)
+    if k == 1:
+        return '"' + c.replace("\\", "\\\\").replace('"', '\\"').replace("$", "\\$").replace("`", "\\`") + '"'
+    return "$'" + c.replace("\\", "\\\\").replace("'", "\\'").replace("\n", "\\n") + "'"
+
+
+WRAPS = ["none"] * 12 + ["bash", "sh", "eval", "subst", "bt", "dq", "if", "brace", "paren", "for", "time", "nohup", "heredoc", "func", "var"]
+
+
+def wrap(c, w):
+    return {"none": lambda: c, "bash": lambda: f"bash -c {qq(c)}", "sh": lambda: f"sh -c {qq(c)}", "eval": lambda: f"eval {qq(c)}", "subst": lambda: f"x=$({c})", "bt": lambda: f"echo `{c}`",
+            "dq": lambda: f'echo "$({c})"', "if": lambda: f"if true; then {c}; fi", "brace": lambda: f"{{ {c}; }}", "paren": lambda: f"( {c} )", "for": lambda: f"for i in 1; do {c}; done",
+            "time": lambda: f"time {c}", "nohup": lambda: f"nohup {c}", "heredoc": lambda: f"bash <<EOF\n{c}\nEOF", "func": lambda: f"f() {{ {c}; }}; f",
+            "var": lambda: (("x=git; " + c.replace("git ", "$x ", 1)) if "git " in c else c)}[w]()
+
+
+def run_bash(cmd, env_extra):
+    env = {**GENV, **env_extra, "B": "x", "R": "origin", "F": "-n", "E": "erify", "X": "n", "M": "msg", "HP": "core.hooksPath=/dev/null"}
+    try:
+        subprocess.run(["bash", "-c", cmd], cwd=own, env=env, capture_output=True, timeout=15)
+    except subprocess.TimeoutExpired:
+        pass
+
+
+def guard_rc(cmd):
+    inp = json.dumps({"tool_name": "Bash", "cwd": own, "tool_input": {"command": cmd}})
+    r = subprocess.run(["python3", "-I", GUARD], input=inp, text=True, capture_output=True, env={**os.environ, "RCG_ROOT": terr, "CLAUDE_PROJECT_DIR": own})
+    return r.returncode
+
+
+def ctx_wrap(clean):  # diretório e fim da linha: o que NÃO muda como o git lê a linha (clean = só o que fica DENTRO do clone)
+    pre, post = rnd.choice([("", "")] * 14 + [("cd sub && ", ""), ("true && ", ""), ("echo ok; ", "")] * 2 + ([] if clean else [(f"cd {out} && ", ""), ("cd .. && ", ""), (f"(cd {out}; ", ")")]))
+    suf = rnd.choice(["", "", " 2>&1", " | tail -1", " && echo ok", " || true", "; echo done", " >/dev/null 2>&1", " & wait"])
+    return pre, suf, post
+
+
+# ---------------------------------------------------------------- push
+BAD_REFS = ["HEAD", "HEAD:refs/heads/main", "main", f"+HEAD:{W}/x", f"HEAD:{W}/a/b", f"HEAD:{W}/../main", f"HEAD:{W}/x.lock", f"HEAD:{W}/x.", f"HEAD:{W}/*", f"HEAD:{W}/{{a,b}}", f"HEAD:{W}/$B", f":{W}/x",
+            f"HEAD:{W}/x:y", "HEAD:refs/tags/v1", "HEAD:refs/heads/workerx", f"HEAD:{W}/", f"HEAD:{W}/-x", f"HEAD:{W}/~x", f"HEAD:{W}/x@{{1}}", f"HEAD:{W}/${{B}}", f"HEAD:{W}/$(echo x)", f"HEAD:{W}/`echo x`"]
+GOOD_REFS = [f"HEAD:{W}/ga-1", f"HEAD:{W}/x", f"HEAD:{W}/a.b_c-d", f"HEAD:{W}/X9", f"HEAD:{W}/ga-w7qwl1.2.5.4"]
+FLAGS = ["-f", "--force", "-u", "-uf", "--all", "--mirror", "-d", "--delete", "-n", "--dry-run", "--force-with-lease", "-o x", "--no-verify", "-q", "--atomic", "--tags", "--follow-tags", "--set-upstream", "--receive-pack=x", "--repo=x", "--"]
+GITS = ["git"] * 30 + ["git -C .", "git -C sub", "git -c user.name=x", "git -c alias.p=push", "git --no-pager", "git --git-dir=.git", "GIT_DIR=.git git", "GIT_WORK_TREE=. git", "GIT_CONFIG_COUNT=0 git", "command git", "env git", "time git", "\\git", "exec git"]
+
+
+def push_case():
+    clean = rnd.random() < 0.3  # a forma única, só com variação de aspas e de fim de linha: o que TEM de passar
+    bad = not clean and rnd.random() < 0.35
+    ref = rnd.choice(BAD_REFS) if bad else rnd.choice(GOOD_REFS)
+    dyn = any(ch in ref for ch in "$*{`") and bad
+    rw = ref if dyn else lit(ref)
+    remote = "origin" if clean else rnd.choice(["origin"] * 14 + ["upstream", ".", "../x", "ORIGIN", "$R"])
+    rem = remote if remote.startswith("$") else lit(remote)
+    flag = "" if clean or rnd.random() < 0.8 else rnd.choice(FLAGS)
+    pos = rnd.randrange(3)
+    parts = ["push"] + ([flag] if flag and pos == 0 else []) + [rem] + ([flag] if flag and pos == 1 else []) + [rw] + ([flag] if flag and pos == 2 else [])
+    git = "git" if clean else rnd.choice(GITS)
+    if not clean and rnd.random() < 0.06:
+        parts = ["config", rnd.choice(["alias.p", "include.path", "core.hooksPath", "user.name"]), "x"]
+    if not clean and rnd.random() < 0.04:
+        parts = [rnd.choice(["send-pack", "http-push"]), "origin", rw]
+    pre, suf, post = ctx_wrap(clean)
+    w = "none" if clean else rnd.choice(WRAPS)
+    c = wrap(pre + git + " " + " ".join(parts) + suf + post, w)
+    plain = git == "git" and w == "none" and not pre.startswith(("cd ..", "cd " + out)) and not dyn and remote != "$R"
+    return c, plain
+
+
+# ---------------------------------------------------------------- commit
+MSGS = [("-m x", True), ("-mx", True), ('-m "a b"', True), ("--message=x", True), ("--message x", True), ("-m $M", True), ('-m "$M"', True), ("-m$M", True), ("-m '-n'", False), ("-am x", True), ("-qm x", True)]
+NOHOOK = ["-n", "--no-verify", "--no-v", "--no-ve", "--no-ver", "--no-veri", "--no-verif", "-an", "-qn", "-nq", "-sn", "$F", '"$F"', "${F}", "$(echo -n)", "`echo -n`", "--no-v$E", "-$X", "-a$X", "$'-n'", '"-n"', "\\-n", "-'n'",
+          "--no-ver''ify", "--no-ver\"\"ify", "--no-verify", "-nm x"]
+BENIGN = ["-q", "-s", "--no-gpg-sign", "--cleanup=strip", "--author='A <a@b.c>'", "--date=now", "--no-edit", "-v"]
+CGITS = ["git"] * 14 + ["git -c user.name=x", "git -C .", "command git", "env git", "time git", "GIT_AUTHOR_NAME=x git", "git -c core.hooksPath=/dev/null", "git -c core.hooksPath=/nonexistent",
+         "GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=core.hooksPath GIT_CONFIG_VALUE_0=/dev/null git", "git --config-env=$HP", "GIT_CONFIG_GLOBAL=/nonexistent git"]
+
+
+def commit_case():
+    clean = rnd.random() < 0.3
+    groups = [["--allow-empty"]]
+    msg, msg_ok = rnd.choice(MSGS[:-3] if clean else MSGS)
+    nohook = not clean and rnd.random() < 0.55
+    if nohook:
+        nh = rnd.choice(NOHOOK)
+        if nh == "-nm x":
+            msg = "-nm x"  # o -n e a mensagem na mesma palavra
+        else:
+            groups.append([nh if nh.startswith(("$", '"', "`", "\\", "-")) else nh])
+    groups.append(msg.split(" ", 1) if " " in msg and not msg.startswith(("-m \"", "-m '")) else [msg])
+    for _ in range(rnd.randrange(3)):
+        groups.append([rnd.choice(BENIGN)])
+    rnd.shuffle(groups)
+    git = "git" if clean else rnd.choice(CGITS)
+    pre, suf, post = ctx_wrap(clean)
+    w = "none" if clean else rnd.choice(WRAPS)
+    c = wrap(pre + git + " commit " + " ".join(" ".join(g) for g in groups) + suf + post, w)
+    dynv = any(("$" in x or "`" in x) for g in groups for x in g if x not in ("$M", '"$M"', "-m$M"))
+    plain = git in ("git", "git -c user.name=x", "git -C .", "GIT_AUTHOR_NAME=x git") and w == "none" and not nohook and msg_ok and not dynv
+    return c, plain
+
+
+def commit_count():
+    return int(sh("git", "-C", own, "rev-list", "--count", "HEAD").stdout.strip() or 0)
+
+
+def commit_truth(cmd):
+    open(hlog, "w").close()
+    before = commit_count()
+    run_bash(cmd, {})
+    made = commit_count() - before
+    ran = len(open(hlog).read().split())
+    sh("git", "-C", own, "update-ref", "HEAD", FIRST)
+    return made, ran
+
+
+def push_truth(cmd):
+    open(log, "w").close()
+    run_bash(cmd, {"PATH": shim + ":" + GENV["PATH"]})
+    recs = [json.loads(l) for l in open(log).read().splitlines() if l.strip()]
+    return recs, any(rec_bad(r) for r in recs)
+
+
+good_push = f"git push origin HEAD:{W}/x"
+if guard_rc(good_push) != 0 or guard_rc("git push --force origin HEAD:refs/heads/main") != 2 or guard_rc("git commit -m x") != 0 or guard_rc("git commit -n -m x") != 2:
+    print("pfuzz: o guarda não passou no controle (push bom=0, push ruim=2, commit bom=0, commit -n=2) — nada medido")
+    sys.exit(2)
+st = {"push": [0, 0, 0, 0], "commit": [0, 0, 0, 0]}  # casos, verdade "ruim", bypass, falso-bloqueio
+musts = {"push": 0, "commit": 0}  # casos em que o guarda TINHA de liberar (forma única/commit com hook, sem embrulho): sem eles o falso-bloqueio não mede nada
+bypass, fps = [], []
+for i in range(N):
+    cmd, plain = push_case()
+    recs, bad = push_truth(cmd)
+    rc = guard_rc(cmd)
+    st["push"][0] += 1
+    if bad:
+        st["push"][1] += 1
+        if rc != 2:
+            st["push"][2] += 1
+            bypass.append(("push", cmd))
+    elif plain and recs:
+        musts["push"] += 1
+    if not bad and plain and recs and rc == 2:
+        st["push"][3] += 1
+        fps.append(("push", cmd))
+for i in range(max(N // 2, 1)):
+    cmd, plain = commit_case()
+    made, ran = commit_truth(cmd)
+    rc = guard_rc(cmd)
+    st["commit"][0] += 1
+    skipped = made > 0 and ran < made
+    cfgbad = bool(re.search(r"core\.hooksPath|GIT_CONFIG|--config-env", cmd)) and made > 0 and ran == 0
+    if skipped or cfgbad:
+        st["commit"][1] += 1
+        if rc != 2:
+            st["commit"][2] += 1
+            bypass.append(("commit", cmd))
+    elif plain and made > 0 and ran >= made:
+        musts["commit"] += 1
+    if not (skipped or cfgbad) and plain and made > 0 and ran >= made and rc == 2:
+        st["commit"][3] += 1
+        fps.append(("commit", cmd))
+for k, (n, bad, by, fp) in st.items():
+    print(f"pfuzz {k}: {n} comandos, {bad} fora da regra (verdade do bash/git real), BYPASS={by}, falso-bloqueio={fp}")
+for k, c in bypass[:10]:
+    print("BYPASS:", k, repr(c.replace(t, "T"))[:200])
+for k, c in fps[:6]:
+    print("FALSO-BLOQUEIO:", k, repr(c.replace(t, "T"))[:200])
+vazio = st["push"][1] < N // 5 or st["commit"][1] < max(N // 2, 1) // 6 or musts["push"] < N // 8 or musts["commit"] < max(N // 2, 1) // 8  # um fuzzer sem caso ruim (ou sem caso bom) não mede nada
+print(f"pfuzz: casos que TINHAM de passar: push={musts['push']} commit={musts['commit']}")
+shutil.rmtree(t, ignore_errors=True)
+if vazio:
+    print("pfuzz: poucos casos fora da regra — fuzzer vazio, nada medido")
+    sys.exit(2)
+sys.exit(1 if bypass or fps else 0)
+PFEOF
+  local n="${RCG_PFUZZ_N:-250}"; [ -z "${RCG_MUTANT:-}" ] || n="${RCG_PFUZZ_N_MUT:-120}"
+  local out rc; out=$(TMPDIR="$T" python3 -I "$T/pfuzz.py" "$SB/guard/remote-clone-guard.py" "$n" 11 2>&1); rc=$?
+  echo "$out" | head -14
+  [ "$rc" = 0 ]; ok $? "pfuzz: nenhum bypass nem falso-bloqueio do guarda da sessão contra o bash/git real ($n comandos de push, $((n/2)) de commit, semente 11)"
+}
+
 g_msg() {
   b 2 "msg: (preparo)" "git -C $OTH commit -m x"
   has() { grep -qF -- "$1" "$T/err"; }
@@ -1106,16 +1495,16 @@ EOF
   r=$(python3 -I "$capy" 10 "$hn" "$P" twice 2>&1); echo "$r" | grep -qF "reset=ok"; ok $? "budget: decide() zera o contador de passos a cada pedido [$r]"
 }
 
-all() { group block && g_block; group pass && g_pass; group evade && g_evade; group closed && g_closed; group shell && g_shell; group wrap && g_wrap; g_lex; g_dest; group cfg && g_cfg; group tools && g_tools; group layer && g_layer; group msg && g_msg; group cond && g_cond; group ctx && g_ctx; group fuzz && g_fuzz
+all() { group block && g_block; group pass && g_pass; group evade && g_evade; group closed && g_closed; group shell && g_shell; group wrap && g_wrap; g_lex; g_dest; group cfg && g_cfg; group tools && g_tools; group layer && g_layer; group strict && g_strict; group pfuzz && g_pfuzz; group msg && g_msg; group cond && g_cond; group ctx && g_ctx; group fuzz && g_fuzz
         group check && g_check; group hook && g_hook; group budget && g_budget; return 0; }
 
 if [ -n "${RCG_MUTANT:-}" ]; then all; echo "RESULT $fails/$n"; exit $((fails > 0)); fi
-all
-echo "== $((n-fails))/$n ok =="
+[ -n "${RCG_MUTANTS_ONLY:-}" ] || { all; echo "== $((n-fails))/$n ok =="; }
 
-[ -n "${RCG_NO_MUTANTS:-}" ] || [ -n "${RCG_ONLY:-}" ] || {
+[ -n "${RCG_NO_MUTANTS:-}" ] || { [ -n "${RCG_ONLY:-}" ] && [ -z "${RCG_MUTANTS_ONLY:-}" ]; } || {
   echo "-- controle negativo: cada guarda removida TEM que fazer o grupo que a cobre falhar"
   mutant() {  # mutant GRUPOS DESCRIÇÃO SED-EXPR
+    [ -z "${RCG_MUTANTS_ONLY:-}" ] || case ",$RCG_MUTANTS_ONLY," in *",$1,"*) ;; *) return;; esac  # --mutants-only GRUPOS: só os mutantes daqueles grupos (iterar num grupo sem refazer a rodada inteira)
     local m="$T/mut.$RANDOM"; mkdir -p "$m"; sed -e "$3" "$P" > "$m/remote-clone-guard.py"
     if cmp -s "$P" "$m/remote-clone-guard.py"; then ok 1 "mutante '$2': o sed não mudou nada (o teste do mutante está errado)"; return; fi
     local r; r=$(RCG_MUTANT=1 RCG_ONLY="$1" RCG_UNDER_TEST="$m/remote-clone-guard.py" bash "$0" 2>&1 | tail -1)
@@ -1139,7 +1528,7 @@ echo "== $((n-fails))/$n ok =="
   mutant cond "{ cd a; } & mantém o diretório do grupo em background" 's/^\( *\)if term == "&":$/\1if False:/'
   mutant evade "bash -c não é aberto" 's/return sub(script\[0\], cwd, env)/pass/'
   mutant evade "eval não é aberto" 's/return sub(" ".join(seg\[1:\]), cwd, env)/pass/'
-  mutant evade "\$( ) não é aberto" 's/r = sub(bytes.fromhex(m.group(1)).decode(), st\["cwd"\], {})/r = None/'
+  mutant evade "\$( ) não é aberto" 's/r = sub(bytes.fromhex(m.group(1)).decode(), st\["cwd"\], {}, False)/r = None/'
   mutant evade "crase não vira \$( )" 's/(cmd.startswith("\$(", k) or cmd\[k\] == "`")/cmd.startswith("$(", k)/'
   mutant evade "parêntese dentro do \$( ) não é contado" 's/            d += 1 if c == "(" else -1/            d -= 1/'
   mutant evade "\$( ) de heredoc sem aspas é ignorado" 's/("" if m.group(2) else/("" if True else/'
@@ -1178,14 +1567,14 @@ echo "== $((n-fails))/$n ok =="
   mutant shell "pushd +N / opção que não conheço vira diretório" 's/ or (args and args\[0\]\[:1\] in ("-", "+")):/ or False:/;s/    return p if p is None or os.path.isdir(p) else None/    return p/'
   mutant shell "<(cmd) engole o comando como se fosse alvo de redirecionamento" 's/^\( *\)skip = False  # `<(cmd)`.*/\1pass/'
   mutant shell "lançador que não modelo (flock/ssh/su/trap…) vira comando comum" 's/        elif c in OPAQUE or opq:/        elif False:/'
-  mutant shell "git atrás de lançador herda o diretório conhecido" 's/{\*\*st\["env"\], \*\*env}, None, terr, own)/{**st["env"], **env}, cwd, terr, own)/'
+  mutant shell "git atrás de lançador herda o diretório conhecido" 's/return ghit(seg\[j:\], {\*\*st\["env"\], \*\*env}, None)/return ghit(seg[j:], {**st["env"], **env}, cwd)/'
   mutant shell "texto entre aspas passado ao lançador não é aberto" 's/                if re.search(r"\\s", t):/                if False:/'
   mutant shell "heredoc para bash/ssh/sh é descartado" 's/^        if not all(data_reader(s) for s in .*:$/        if False:/'
   mutant shell "todo heredoc vira script" 's/^    return bool(s) and (opq or .*/    return True/'
   mutant shell "here-string para bash é ignorado" 's/            if herestr and runs_text(seg):/            if False:/'
   mutant shell "continuação de linha não é juntada" 's/hide(CONT.sub(r"\\1", decomment(heredocs(cmd))))/hide(decomment(heredocs(cmd)))/'
   mutant shell "barra escapada + newline vira continuação" 's/^CONT = re.compile(.*)  #/CONT = re.compile(r"()\\\\\\n")  #/'
-  mutant ctx "trecho aninhado começa sem as variáveis de fora" 's/return scan(text, cwd, terr, own, depth + 1, {\*\*st\["env"\], \*\*env}, st\["funcs"\])/return scan(text, cwd, terr, own, depth + 1, {}, st["funcs"])/'
+  mutant ctx "trecho aninhado começa sem as variáveis de fora" 's/depth + 1, {\*\*st\["env"\], \*\*env}, st\["funcs"\], wrapped or deep)/depth + 1, {}, st["funcs"], wrapped or deep)/'
   mutant ctx "trecho aninhado começa sem as funções de fora" 's/"funcs": {} if funcs is None else funcs}/"funcs": {}}/'
   mutant ctx "função cujo fim não fecha nunca roda" 's/    if st.get("fdepth"):  # o fim da função/    if False:  # o fim da função/'
   mutant ctx "heredoc volta a sumir para qualquer leitor que não é shell" 's/    return not opq and (not seg or os.path.basename(seg\[0\]) in DATA)/    return not opq and (not seg or os.path.basename(seg[0]) not in SHELLS)/'
@@ -1207,8 +1596,8 @@ echo "== $((n-fails))/$n ok =="
   mutant closed "git config chave valor vira leitura" 's/len(rest) - len(flags) == 1 and/len(rest) - len(flags) >= 1 and/'
   mutant closed "git config --unset chave vira leitura" 's/ and all(t in CONFIG_SCOPE for t in flags))/)/'
   mutant cfg "leitura com configuração que roda programa volta a ser leitura (o guarda de antes)" 's/    if read and not runs:/    if read:/'
-  mutant cfg "-c / --config-env com chave que roda programa não conta" 's/runs, i = runs or not CFG_SAFE.fullmatch(seg\[i + 1\].partition("=")\[0\]), i + 2/runs, i = runs, i + 2/'
-  mutant cfg "--config-env=CHAVE=VAR (junto) não conta" 's/runs, i = runs or not CFG_SAFE.fullmatch(a.partition("=")\[2\].partition("=")\[0\]), i + 1/runs, i = runs, i + 1/'
+  mutant cfg "-c / --config-env com chave que roda programa não conta" 's/runs, cfgx, i = runs or not CFG_SAFE.fullmatch(seg\[i + 1\].partition("=")\[0\]), cfgx/runs, cfgx, i = runs, cfgx/'
+  mutant cfg "--config-env=CHAVE=VAR (junto) não conta" 's/runs, cfgx, i = runs or not CFG_SAFE.fullmatch(a.partition("=")\[2\].partition("=")\[0\]), cfgx/runs, cfgx, i = runs, cfgx/'
   mutant cfg "-p / --paginate / --exec-path não contam" 's/            runs, i = True, i + 1/            runs, i = runs, i + 1/'
   mutant cfg "GIT_CONFIG_* / GIT_PAGER / GIT_EXTERNAL_DIFF… não contam" 's/    runs = any(CFG_ENV.fullmatch(k) for k in env)/    runs = False/'
   mutant cfg "toda chave de -c vale como segura" 's/CFG_SAFE = re.compile(r"(?:color|advice)/CFG_SAFE = re.compile(r".*|(?:color|advice)/'
@@ -1317,10 +1706,38 @@ echo "== $((n-fails))/$n ok =="
   mutant layer "o home do claude em outra caixa não é dobrado" 's/    hf, pf = (fold(h), fold(p)) if FOLD else (h, p)/    hf, pf = h, p/'
   mutant layer "a dobra ignora a forma Unicode (só a caixa)" 's/unicodedata.normalize("NFD", s).casefold()/s.casefold()/'
   mutant layer "o own_clone para na raiz do território pela comparação exata (!=), não pela régua do inside()" 's/and not same(p, terr):/and p != terr:/'
+  # --- ga-w7qwl1.2.5.4: um mutante por trava da camada do notebook (STRICT). Cada um tira UMA regra do guarda e o grupo strict TEM que reprovar ---
+  mutant strict "as regras da sessão do notebook nunca ligam (STRICT desligado)" 's/^STRICT = bool(layer_root())/STRICT = False/'
+  mutant strict "Edit/Write/MultiEdit/NotebookEdit fora do clone da sessão passa" 's/        if STRICT and not (own and inside(p, own)):/        if False:/'
+  mutant strict "sem clone próprio a escrita de arquivo passa (o ‘dentro do clone’ vira ‘em qualquer lugar’)" 's/        if STRICT and not (own and inside(p, own)):/        if STRICT and own and not inside(p, own):/'
+  mutant strict "git push livre (nenhuma forma única)" 's/        if sub == "push" and not (i == 1 and not runs and gd is None and wt is None and push_form(rest) and cwd is not None and own and inside(cwd, own)):/        if False:/'
+  mutant strict "push na forma única de fora do clone da sessão (o cwd não é conferido)" 's/ and push_form(rest) and cwd is not None and own and inside(cwd, own)):/ and push_form(rest)):/'
+  mutant strict "push com -C, --git-dir, GIT_DIR, -c ou opção de topo passa" 's/(i == 1 and not runs and gd is None and wt is None and push_form/(push_form/'
+  mutant strict "push de qualquer ref (main, tags…), não só worker/<bead>" 's/^PUSH_REF = re.compile(r"HEAD:refs\/heads\/worker\/\[A-Za-z0-9\]\[A-Za-z0-9._-\]\*")/PUSH_REF = re.compile(r"HEAD:refs\/.*")/'
+  mutant strict "push com uma palavra a mais depois da ref (HEAD:worker/x HEAD:main, --force no fim)" 's/    return len(rest) == 2 and rest\[0\] == "origin" and bool(PUSH_REF.fullmatch(rest\[1\]))/    return rest[:1] == ["origin"] and bool(PUSH_REF.fullmatch(rest[1]))/'
+  mutant strict "ref de push com .. ou terminada em . / .lock (nome que o git recusa) passa" 's/ and ".." not in rest\[1\] and not rest\[1\].endswith((".", ".lock"))//'
+  mutant strict "git send-pack / http-push passam" 's/        if sub in ("send-pack", "http-push"):/        if False:/'
+  mutant strict "git commit livre (pode pular o hook)" 's/        if sub == "commit" and (runs or skips_hooks(rest)):/        if False:/'
+  mutant strict "-n (curto, também agrupado: -an, -nm) não conta como --no-verify" 's/                if ch == "n" or SHELLY.match(ch):/                if SHELLY.match(ch):/'
+  mutant strict "opção do commit escrita por palavra que o shell expande (\$F, glob, crase) passa" 's/                if ch == "n" or SHELLY.match(ch):/                if ch == "n":/'
+  mutant strict "palavra solta que o shell expande no lugar da opção do commit passa (git commit -m x \$F)" 's/        elif not isval and SHELLY.match(t):/        elif False:/'
+  mutant strict "a abreviação --no-v… (única para o git) não conta como --no-verify" 's/ or ("--no-verify".startswith(nm) and len(nm) >= 3):/ or nm == "--no-verify":/'
+  mutant strict "git config alias.*/include.*/core.hooksPath/-e passa" 's/        if cfgx or (sub == "config" and any(CFG_KEY_BAD.match(t) or t in ("-e", "--edit") for t in rest)):/        if cfgx:/'
+  mutant strict "git -c <chave que roda programa> não conta como configuração trocada (alias, hooksPath)" 's/runs, cfgx, i = runs or not CFG_SAFE.fullmatch(seg\[i + 1\].partition("=")\[0\]), cfgx or not CFG_SAFE.fullmatch(seg\[i + 1\].partition("=")\[0\]), i + 2/runs, cfgx, i = runs or not CFG_SAFE.fullmatch(seg[i + 1].partition("=")[0]), cfgx, i + 2/'
+  mutant strict "git --config-env=<chave que roda programa> não conta como configuração trocada" 's/runs, cfgx, i = runs or not CFG_SAFE.fullmatch(a.partition("=")\[2\].partition("=")\[0\]), cfgx or not CFG_SAFE.fullmatch(a.partition("=")\[2\].partition("=")\[0\]), i + 1/runs, cfgx, i = runs or not CFG_SAFE.fullmatch(a.partition("=")[2].partition("=")[0]), cfgx, i + 1/'
+  mutant strict "GIT_CONFIG_* no ambiente não conta como configuração trocada" 's/    cfgx = any(k.startswith("GIT_CONFIG") for k in env)/    cfgx = False/'
+  mutant strict "git dentro de sh -c / bash -c / eval / here-string passa" 's/        if STRICT and wrapped:/        if False:/'
+  mutant strict "bash <<EOF (heredoc lido por um shell) passa" 's/                    if STRICT and hdoc and runs_text(seg):/                    if False:/'
+  mutant strict "comando com nome por variável/glob/\$( ) passa (x=git; \$x push origin HEAD:refs/heads/main)" 's/        if STRICT and (SHELLY.search(seg\[0\])/        if False and (SHELLY.search(seg[0])/'
+  mutant strict "alias passa (alias p='git push --force')" 's/ or c == "alias"):/):/'
+  mutant strict "git push/commit sob xargs passa (ele acrescenta palavras ao comando)" 's/        if xa and sub in ("push", "commit", "send-pack", "http-push"):/        if False:/'
+  mutant strict "o xargs descascado por um embrulho (sudo, env, time) deixa de contar" 's/        xa = "xargs" in w0\[:len(w0) - len(seg)\]/        xa = False/'
   echo "-- contra um stub que só sai 0 (o servidor ANTES desta fatia)"
-  printf '#!/bin/sh\nexit 0\n' > "$T/stub"; chmod +x "$T/stub"; printf '#!/usr/bin/env python3\nimport sys\nsys.exit(0)\n' > "$T/stub.py"
-  r=$(RCG_MUTANT=1 RCG_ONLY="block,evade,closed,shell,wrap,lex,dest,cfg,tools,layer,msg,check,cond" RCG_UNDER_TEST="$T/stub.py" bash "$0" 2>&1 | tail -1); echo "stub: $r"
-  case "$r" in "RESULT 0/"*|"") ok 1 "stub deveria falhar quase tudo ($r)";; *) ok 0 "stub falha os casos ($r)";; esac
+  if [ -z "${RCG_MUTANTS_ONLY:-}" ]; then
+    printf '#!/bin/sh\nexit 0\n' > "$T/stub"; chmod +x "$T/stub"; printf '#!/usr/bin/env python3\nimport sys\nsys.exit(0)\n' > "$T/stub.py"
+    r=$(RCG_MUTANT=1 RCG_ONLY="block,evade,closed,shell,wrap,lex,dest,cfg,tools,layer,msg,check,cond" RCG_UNDER_TEST="$T/stub.py" bash "$0" 2>&1 | tail -1); echo "stub: $r"
+    case "$r" in "RESULT 0/"*|"") ok 1 "stub deveria falhar quase tudo ($r)";; *) ok 0 "stub falha os casos ($r)";; esac
+  fi
   echo "== final: $((n-fails))/$n ok =="
 }
 [ "$fails" = 0 ]

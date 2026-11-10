@@ -7,7 +7,7 @@
 # O QUE PROVA (claude de verdade, API Anthropic de MENTIRA em 127.0.0.1 que sempre pede UMA ferramenta; tudo num HOME/CLAUDE_CONFIG_DIR de mktemp — nada lê ou escreve o ~/.claude de ninguém):
 #   1. um PreToolUse que vem SÓ do `--settings` bloqueia Write e Bash (com --dangerously-skip-permissions, como no pool); o controle sem hook EXECUTA a mesma ferramenta;
 #   2. o bundle que o remote-bundle-build.py gera com `--guard-layer session` (guarda REAL, settings REAL) é o que bloqueia: escrita em zdot/ do bundle e `git -C <clone alheio> commit`;
-#      e uma escrita comum (fora da camada, fora do território) PASSA — o guarda não bloqueia tudo;
+#      e uma escrita comum (fora da camada, DENTRO do clone próprio da sessão: o cwd do claude) PASSA — o guarda não bloqueia tudo (fora do clone próprio ele bloqueia desde ga-w7qwl1.2.5.4: grupo strict do remote-clone-guard.selftest.sh);
 #   3. um `disableAllHooks: true` no config pessoal (CLAUDE_CONFIG_DIR = o ~/.claude do dono) ou na pasta do projeto desliga, CALADO, o hook do `--settings`; só o
 #      `disableAllHooks: false` ESCRITO no próprio arquivo do `--settings` vence os dois — por isso o selfcheck da camada o exige. Os controles negativos (o mesmo settings
 #      SEM o false) provam que o teste enxerga a diferença;
@@ -87,8 +87,8 @@ PORT=$(cat "$T/port" 2>/dev/null)
 
 # ---- o mundo de mentira: HOME, o "~/.claude pessoal" (CLAUDE_CONFIG_DIR), a pasta de trabalho, um clone alheio no território e o bundle REAL da camada da sessão ----
 export HOME="$T/home"; unset CLAUDE_PROJECT_DIR RCG_ROOT
-PERS="$T/personal"; WD="$T/wd"; LR="$T/bundle"; TERR="$HOME/gt-remote/git"; OTH="$TERR/r/wt/other"
-mkdir -p "$HOME" "$PERS" "$WD" "$OTH" "$T/fx/gt/.gascity-gastown-hq/.gc/agents/dog/.claude" "$T/fx/home/.claude"; : > "$OTH/.git"
+PERS="$T/personal"; LR="$T/bundle"; TERR="$HOME/gt-remote/git"; OTH="$TERR/r/wt/other"; WD="$TERR/r/wt/own"  # WD = o clone PRÓPRIO da sessão (ga-w7qwl1.2.5.4): o claude roda com cwd = WD, o guarda lê CLAUDE_PROJECT_DIR = WD e só deixa escrever DENTRO dele; "trabalho comum" é um arquivo dentro do clone
+mkdir -p "$HOME" "$PERS" "$WD" "$OTH" "$T/fx/gt/.gascity-gastown-hq/.gc/agents/dog/.claude" "$T/fx/home/.claude"; : > "$OTH/.git"; : > "$WD/.git"
 for f in "$T/fx/gt/.gascity-gastown-hq/.gc/settings.json" "$T/fx/gt/.gascity-gastown-hq/.gc/agents/dog/.claude/settings.json" "$T/fx/home/.claude/settings.json"; do echo '{}' > "$f"; done
 python3 -I "$BUILDER" build --city "$T/fx/gt/.gascity-gastown-hq" --claude-home "$T/fx/home/.claude" --mini-home "$T/fx/home" --role dog --role-dir "$T/fx/gt/.gascity-gastown-hq/.gc/agents/dog" \
   --remote-root "$LR" --remote-home "$LR/home" --clone-guard "$GUARD" --guard-layer session --out "$LR" >"$T/build.out" 2>"$T/build.err"
