@@ -42,7 +42,7 @@ def flag(name, default=None):
     return default
 def multi(name): return [a[i + 1] for i, x in enumerate(a) if x == name and i + 1 < len(a)]
 cmd = a[0] if a else ""
-if env("FAKE_BD_FAIL") == cmd: sys.stderr.write("fake: bd falhou\n"); sys.exit(1)
+if env("FAKE_BD_FAIL") == cmd or (env("FAKE_BD_FAIL") == "list-wa" and cmd == "list" and db_path.endswith("/db-wa.json")): sys.stderr.write("fake: bd falhou\n"); sys.exit(1)
 if cmd == "list":
     if env("FAKE_BD_BADJSON") == "list": print("isto nao e json"); sys.exit(0)
     st, asg, labels = flag("--status"), flag("--assignee"), multi("--label") + multi("-l")
@@ -498,13 +498,11 @@ reset_ps; run_exe GC_ALIAS="$PSALIAS" BEADS_ACTOR="$PSALIAS"; ok $((RC != 2)) "H
 KSESS="kimi-worker-remote-abc123"; KALIAS="kimi-worker-remote-1"
 MKBEAD=ga-t1 mk_work kimi.txt "worker/$KSESS"; SHAK=$NEWSHA
 kimi_db() { reset_ps; python3 -I -c 'import json,sys; d=json.load(open(sys.argv[1])); d["beads"]["ga-t1"]["assignee"]=sys.argv[2]; json.dump(d,open(sys.argv[1],"w"))' "$DB" "$KALIAS"; }
-run_kimi() { run_exe GC_SESSION_NAME="$KSESS" GC_ALIAS="$KALIAS" BEADS_ACTOR="$KALIAS" GC_TEMPLATE=kimi-worker-remote "$@"; }
-kimi_db; run_kimi GATE_DONE_REMOTE_DRY_RUN=1
-ok $((RC != 0)) "kimi: ensaio da sessão kimi-worker-remote sai 0"; has "$T/out" "bead=ga-t1 worker/$KSESS@${SHAK:0:12}"; ok $? "kimi: a bead é a ga-t1 da loja da cidade (rig gascity), do worker/<sessão> kimi"; [ "$(mut_count)" = 0 ]; ok $? "kimi: ensaio não escreve"
-git --git-dir="$ORIGIN" update-ref -d "refs/heads/$BR" 2>/dev/null; kimi_db; run_kimi
-ok $((RC != 0)) "kimi: o gate-done de verdade sai 0"; [ "$(origin_has "$BR")" = "$SHAK" ]; ok $? "kimi: o origin tem $BR no sha do espelho"
-has "$T/out" "Marker created: ga-mk1"; ok $? "kimi: o marcador foi criado"; [ "$(dbq '.beads["ga-mk1"].metadata["gate.submitted_by"] // ""')" = "$KALIAS" ]; ok $? "kimi: gate.submitted_by = o alias kimi"
-git --git-dir="$ORIGIN" update-ref -d "refs/heads/$BR"
+run_kimi() {
+  cp "$CITY/.beads/routes.jsonl" "$T/routes.keep"; printf '{"prefix":"ga","path":"."}\n{"prefix":"wa","path":"../../rigs/whatsapp_automation"}\n{"prefix":"ps","path":"../../rigs/property_scrapers"}\n' > "$CITY/.beads/routes.jsonl"
+  run_exe GC_SESSION_NAME="$KSESS" GC_ALIAS="$KALIAS" BEADS_ACTOR="$KALIAS" GC_TEMPLATE=kimi-worker-remote "$@"
+  cp "$T/routes.keep" "$CITY/.beads/routes.jsonl"
+}
 kimi_db; run_exe GC_ALIAS="$KALIAS" BEADS_ACTOR="$KALIAS"; ok $((RC != 2)) "kimi identidade mista (alias kimi-worker-remote-1, sessão dog-remote-…): recusa 2, mesmo sendo o MESMO rig"; has "$T/err" "identidade mista"; ok $? "kimi × dog: diz o motivo"; ps_nothing; ok $? "kimi × dog: nada escrito"
 reset_ps; run_exe GC_SESSION_NAME="$KSESS" GC_TEMPLATE=kimi-worker-remote; ok $((RC != 2)) "dog identidade mista (alias dog-remote-1, sessão kimi-worker-remote-…): recusa 2"; has "$T/err" "identidade mista"; ok $? "dog × kimi: diz o motivo"; ps_nothing; ok $? "dog × kimi: nada escrito"
 # o papel da sessão limita o rig: ps-worker-remote com bead ga-…, dog-remote com bead ps-…
@@ -627,6 +625,59 @@ wa_clean; ok $? "WA feliz: worktree, branch local e ref temporária foram recolh
 [ "$(git -C "$WARIG" config core.hooksPath)" = "$WARIG/.git/hooks" ]; ok $? "WA feliz: a config do rig continua apontando para o hook dele (o desligamento vale só dentro da chamada, por ambiente)"
 [ -d "$CITY/.gc/gate-done-remote/no-hooks" ] && [ -z "$(ls -A "$CITY/.gc/gate-done-remote/no-hooks")" ]; ok $? "WA feliz: a pasta sem hooks (da cidade) existe e segue vazia"
 grep -q '^cfg=3$' "$T/git.log" && ! grep -qvE '^cfg=(2|3)$' "$T/git.log"; ok $? "WA feliz: os git dos blocos levam 3 entradas (gc.auto, maintenance.auto e core.hooksPath); nenhum git do exe perde as duas de antes"
+# Kimi sem argumentos agora lê as duas lojas; o controle GA roda com a loja WA presente e sem nenhuma bead do alias Kimi nela.
+kimi_ga_db() { reset_wa; jq --arg a "$KALIAS" '.beads["ga-t1"].assignee=$a' "$DB" > "$T/db-kimi.json" && mv "$T/db-kimi.json" "$DB"; }
+kimi_ga_db; run_kimi GATE_DONE_REMOTE_DRY_RUN=1
+ok $((RC != 0)) "kimi: ensaio da sessão kimi-worker-remote sai 0 com as lojas GA+WA presentes"; has "$T/out" "bead=ga-t1 worker/$KSESS@${SHAK:0:12}"; ok $? "kimi: a bead é a ga-t1 da loja da cidade (rig gascity), do worker/<sessão> kimi"; [ "$(mut_count)" = 0 ]; ok $? "kimi: ensaio não escreve"
+git --git-dir="$ORIGIN" update-ref -d "refs/heads/$BR" 2>/dev/null; kimi_ga_db; run_kimi
+ok $((RC != 0)) "kimi: o gate-done GA de verdade sai 0 procurando a única bead nas duas lojas"; [ "$(origin_has "$BR")" = "$SHAK" ]; ok $? "kimi: o origin GA tem $BR no sha do espelho"
+has "$T/out" "Marker created: ga-mk1"; ok $? "kimi: o marcador foi criado"; [ "$(dbq '.beads["ga-mk1"].metadata["gate.submitted_by"] // ""')" = "$KALIAS" ]; ok $? "kimi: gate.submitted_by = o alias kimi"
+git --git-dir="$ORIGIN" update-ref -d "refs/heads/$BR"
+# ── 11k. ga-do1ixn.6.1: o MESMO papel Kimi que submete ga- também submete wa-, escolhendo loja/espelho/origin pela bead explícita.
+KSESS="kimi-worker-remote-abc123"; KALIAS="kimi-worker-remote-1"
+KWSESS="kimi-worker-remote-waabc123"
+reset_kimi_wa() {
+  reset_wa
+  jq --arg a "$KALIAS" '.beads["wa-t1"].assignee=$a | .beads["wa-t1"].metadata["gc.routed_to"]="kimi-lane" | .beads["wa-t1"].metadata["pilot.wa_node_alias"]=$a' "$WADB" > "$T/db-kimi.json" && mv "$T/db-kimi.json" "$WADB"
+}
+kimi_two_stores() {
+  reset_kimi_wa
+  jq --arg a "$KALIAS" '.beads["ga-t1"].assignee=$a' "$DB" > "$T/db-kimi.json" && mv "$T/db-kimi.json" "$DB"
+  git -C "$OUTER" push -q -f "$MIRROR" "$SHAK:refs/heads/worker/$KWSESS"
+}
+kimi_ps_db() {
+  reset_ps
+  jq --arg a "$KALIAS" '.beads["ps-t1"].assignee=$a | .beads["ps-t1"].metadata["gc.routed_to"]="kimi-lane"' "$PSDB" > "$T/db-kimi.json" && mv "$T/db-kimi.json" "$PSDB"
+  git -C "$PSW" push -q -f "$PSMIRROR" "$PSSHA:refs/heads/worker/$KWSESS"
+}
+run_kimi_wa() {
+  envs=(); while [ $# -gt 0 ] && [ "$1" != "--" ]; do envs+=("$1"); shift; done; [ $# -gt 0 ] && shift
+  cp "$CITY/.beads/routes.jsonl" "$T/routes.keep"; printf '{"prefix":"ga","path":"."}\n{"prefix":"wa","path":"../../rigs/whatsapp_automation"}\n{"prefix":"ps","path":"../../rigs/property_scrapers"}\n' > "$CITY/.beads/routes.jsonl"
+  ( cd "$CITY" && env -i HOME="$T/home" USER=t LOGNAME=t LANG=en_US.UTF-8 PATH="$BIN:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin" \
+      BEADS_ACTOR="$KALIAS" GC_ALIAS="$KALIAS" GC_SESSION_NAME="$KWSESS" GC_TEMPLATE=kimi-worker-remote ${envs[@]+"${envs[@]}"} \
+      "$CITY/scripts/gate-done-remote.py" "$@" ) > "$T/out" 2> "$T/err"; RC=$?
+  cp "$T/routes.keep" "$CITY/.beads/routes.jsonl"
+}
+wa_work kimi.py "worker/$KWSESS" wa-t1; KSHA=$NEWSHA
+reset_kimi_wa; run_kimi_wa -- wa-t1 "worker/$KWSESS" "$KSHA"
+ok $((RC != 0)) "Kimi→WA explícito: sai 0"
+[ "$(wa_origin_has "$WABR")" = "$KSHA" ] && ! origin_has "$WABR" >/dev/null; ok $? "Kimi→WA explícito: branch vai ao origin WA no sha do espelho WA, nunca ao HQ"
+[ "$(dbq '.beads["ga-mk1"].metadata["gate.submitted_by"] // ""')" = "$KALIAS" ] && [ "$(dbq '.beads["ga-mk1"].labels | index("bead-rig:whatsapp_automation") != null')" = true ]; ok $? "Kimi→WA explícito: marcador fica no HQ com o autor Kimi e bead-rig WA"
+[ "$(waq '.beads["wa-t1"].labels | index("gate:queued") != null')" = true ] && [ -z "$(waq '.beads["wa-t1"].assignee // ""')" ]; ok $? "Kimi→WA explícito: bead é marcada e solta na loja WA"
+wa_clean && wa_no_trace; ok $? "Kimi→WA explícito: preserva os guards e a limpeza do caminho WA"
+reset_kimi_wa; run_kimi_wa
+ok $((RC != 0)) "Kimi→WA sem argumentos: encontra a única bead Kimi na loja WA (não procura só no HQ)"
+[ "$(wa_origin_has "$WABR")" = "$KSHA" ] && [ "$(waq '.beads["wa-t1"].labels | index("gate:queued") != null')" = true ]; ok $? "Kimi→WA sem argumentos: submete pela loja e pelo espelho WA"
+kimi_two_stores; run_kimi_wa
+ok $((RC != 1)) "Kimi sem argumentos com uma bead ga- e uma wa-: recusa a ambiguidade"
+has "$T/err" "2 beads in_progress atribuídas a $KALIAS" && has "$T/err" "ga-t1" && has "$T/err" "wa-t1"; ok $? "Kimi ambíguo: o diagnóstico conta as beads das DUAS lojas (não só a ausência no HQ)"
+wa_nothing && [ "$(dbq '.beads["ga-mk1"] // "ausente"')" = ausente ]; ok $? "Kimi ambíguo: nenhuma loja nem origin é escrito"
+kimi_two_stores; run_kimi_wa FAKE_BD_FAIL=list-wa
+ok $((RC != 1)) "Kimi sem argumentos com a loja WA ilegível: recusa 1 mesmo havendo UMA bead GA (a loja ilegível não vira vazia)"
+has "$T/err" "não consegui ler" && wa_nothing && [ "$(dbq '.beads["ga-mk1"] // "ausente"')" = ausente ]; ok $? "Kimi com WA ilegível: explica a leitura e não escreve em nenhuma loja nem origin"
+kimi_ps_db; run_kimi_wa GATE_DONE_REMOTE_DRY_RUN=1 -- ps-t1 "worker/$KWSESS" "$PSSHA"
+ok $((RC != 1)) "Kimi explícito com bead ps-: recusa 1 (GA+WA não vira qualquer prefixo)"
+has "$T/err" "é de outro prefixo (ps)" && ps_nothing; ok $? "Kimi × ps: explica o prefixo e não escreve"
 # ── 11b. ga-2hd02v.3.11: no lugar do pre-push o atalho roda G12/G6/G7/G7b pelos OBJETOS do sha (wa-remote-guards.py, código de origin/main do rig) ANTES de qualquer escrita.
 #    Reprovou → rc 1; não deu para saber → rc 2; nos dois, nenhum marcador, nada empurrado, a bead continua do alias. Só rc 0 COM o certificado `RESULT=PASS sha=<este sha>` vale. Aqui o ponta a ponta usa o wa-remote-guards.py DE VERDADE
 #    com os guards de confiança do fixture; os casos de contrato (rc, certificado, timeout) usam um irmão falso que obedece FAKE_GUARDS_MODE.
@@ -1031,8 +1082,17 @@ case_kimi_happy() { kimi_db; run_kimi GATE_DONE_REMOTE_DRY_RUN=1; [ "$RC" = 0 ] 
 mutant kimi-mesmo-rig-basta 'if rig_of_session(alias) != role_prefix or (ra and rs and ra != rs):' 'if rig_of_session(alias) != role_prefix:' case_kimi_dog_mixed
 mutant kimi-fora-do-role-re 'dog-remote|kimi-worker-remote|ps-worker-remote' 'dog-remote|ps-worker-remote' case_kimi_dog_mixed
 mutant kimi-rig-errado 'also=("kimi-worker-remote",)' 'also=()' case_kimi_happy 'return next((p for p, r in RIGS.items() if m and m.group(1) in (r.role,) + r.also), "ga")' 'return next((p for p, r in RIGS.items() if m and m.group(1) in (r.role,) + r.also), "ps")'
+case_kimi_prefix_guard() { kimi_ps_db; run_kimi_wa GATE_DONE_REMOTE_DRY_RUN=1 -- ps-t1 "worker/$KWSESS" "$PSSHA"; [ "$RC" = 1 ] && has "$T/err" "é de outro prefixo (ps)" && ps_nothing; }
+case_kimi_wa_happy() { reset_kimi_wa; run_kimi_wa GATE_DONE_REMOTE_DRY_RUN=1; [ "$RC" = 0 ] && has "$T/out" "bead=wa-t1 worker/$KWSESS@"; }
+case_kimi_wa_read_fail() { kimi_two_stores; run_kimi_wa FAKE_BD_FAIL=list-wa; [ "$RC" = 1 ] && has "$T/err" "não consegui ler" && wa_nothing && [ "$(dbq '.beads["ga-mk1"] // "ausente"')" = ausente ]; }
 mutant ps-loja-da-cidade        'bead = one_bead(ctx.store, alias)' 'bead = one_bead(city, alias)' case_ps_happy
-mutant ps-guarda-de-prefixo     'if bpfx != role_prefix:' 'if False:' case_ps_prefix_guard
+mutant ps-guarda-de-prefixo     'if bpfx not in allowed_prefixes:' 'if False:' case_ps_prefix_guard
+mutant kimi-prefixo-fora-ga-wa   'if bpfx not in allowed_prefixes:' 'if False:' case_kimi_prefix_guard
+mutant kimi-sem-argumentos-so-le-hq 'for prefix in allowed_prefixes:' 'for prefix in allowed_prefixes[:1]:' case_kimi_wa_happy
+mutant kimi-loja-ilegivel-vira-vazia 'if r.returncode != 0:
+        raise Stop(f"não consegui ler {what}' 'if r.returncode != 0:
+        return []  # falha tratada como loja vazia
+        raise Stop(f"não consegui ler {what}' case_kimi_wa_read_fail
 mutant ps-rotas-do-hq           'bead = named_bead(city, alias, args[0], ctx.store, routes_of(ctx.rig, alias))' 'bead = named_bead(city, alias, args[0], ctx.store)' case_ps_back_hq_route
 mutant ps-rotas-do-ps           'bead = named_bead(city, alias, args[0], ctx.store, routes_of(ctx.rig, alias))' 'bead = named_bead(city, alias, args[0], ctx.store, ROUTES)' case_ps_back
 mutant ps-worktree-fora-do-rig  'str(Path(path) / ".gc-worktrees" / "gate-done-remote"))' 'str(Path(city) / ".gc" / "gate-done-remote"))' case_ps_rig_line

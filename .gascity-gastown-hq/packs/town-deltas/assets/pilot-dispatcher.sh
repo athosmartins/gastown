@@ -12769,37 +12769,45 @@ _pilot_kimi_screen() {
   return 0
 }
 
-# _pilot_kimi_demote <bead_json> <motivo> — tira UMA bead do HQ da faixa Kimi por veto de rótulo, como se o lane:kimi nunca tivesse sido posto: remove o rótulo e, se a rota é a de espera
-# (kimi-lane), devolve gc.routed_to a gastown.dog (a rota de toda bead do HQ). Sem isto a bead que o kimi-worker devolve ao mini (node:never) voltaria ao Kimi a cada varredura — uma sessão paga por volta.
+# _pilot_kimi_demote <bead_json> <motivo> — tira UMA bead ga-/wa- da faixa Kimi por veto de rótulo: remove o rótulo NA LOJA DA BEAD e, se a rota é kimi-lane,
+# restaura o pool original (gastown.dog no HQ; wa-worker no WA). Uma loja WA ausente/ilegível impede o rebaixamento; nunca se escreve no HQ no lugar dela.
 # DUAS escritas: a atualização (rótulo + rota numa chamada só: pega inteira ou não pega) e o comentário (só diz o porquê; se falhar, o log da passada tem o motivo). Devolve 0 se a atualização pegou, 1 se
-# não pegou (a bead segue na faixa, inerte: a passada a trata como em espera). Só se chama com bead do HQ (ga-) e fora do DRY_RUN.
+# não pegou (a bead segue na faixa, inerte: a passada a trata como em espera). Só se chama com ga-/wa- e fora do DRY_RUN.
 _pilot_kimi_demote() {
-  local _dm_bead="$1" _dm_why="$2" _dm_id="" _dm_route="" _dm_note="" _dm_args=()
+  local _dm_bead="$1" _dm_why="$2" _dm_id="" _dm_route="" _dm_note="" _dm_city="" _dm_pool="" _dm_args=()
   # vazio/falhou → sem id: nada a rebaixar (devolve 1)
   _dm_id=$(printf '%s' "$_dm_bead" | jq -r '.id // ""' 2>/dev/null) || _dm_id=""
-  [ -n "$_dm_id" ] || return 1
-  # vazio → bead sem rota gravada (só o rótulo sai); falhou/ilegível (metadata que não é objeto) → trato como carimbada: a rota volta a gastown.dog, que é a do HQ de qualquer jeito
+  case "$_dm_id" in
+    ga-*) _dm_city="$GC_CITY"; _dm_pool=gastown.dog ;;
+    wa-*) _dm_city=$(rig_root_path whatsapp_automation); _dm_pool=wa-worker ;;
+    *) return 1 ;;
+  esac
+  if [ -z "$_dm_city" ]; then
+    warn "ga-do1ixn.6.1: faixa Kimi: não consegui rebaixar $_dm_id ($_dm_why): a loja whatsapp_automation não foi lida; nada foi escrito no HQ"
+    return 1
+  fi
+  # vazio → bead sem rota gravada (só o rótulo sai); falhou/ilegível (metadata que não é objeto) → trato como carimbada: a rota volta ao pool original do rig
   _dm_route=$(printf '%s' "$_dm_bead" | jq -r '.metadata["gc.routed_to"] // ""' 2>/dev/null) || _dm_route="$PILOT_KIMI_ROUTE"
   _dm_args=(--remove-label lane:kimi)
-  if [ "$_dm_route" = "$PILOT_KIMI_ROUTE" ]; then _dm_args+=(--set-metadata "gc.routed_to=gastown.dog"); _dm_note=" e gc.routed_to de volta a gastown.dog"; fi
-  if ! timeout 15 bd -C "$GC_CITY" update "$_dm_id" "${_dm_args[@]}" -q >/dev/null 2>&1; then
+  if [ "$_dm_route" = "$PILOT_KIMI_ROUTE" ]; then _dm_args+=(--set-metadata "gc.routed_to=$_dm_pool"); _dm_note=" e gc.routed_to de volta a $_dm_pool"; fi
+  if ! timeout 15 bd -C "$_dm_city" update "$_dm_id" "${_dm_args[@]}" -q >/dev/null 2>&1; then
     warn "ga-do1ixn.3: faixa Kimi: não consegui rebaixar $_dm_id ($_dm_why) — ela segue na faixa, sem despachar, e a próxima varredura tenta de novo"
     return 1
   fi
-  timeout 15 bd -C "$GC_CITY" comment "$_dm_id" "ga-do1ixn.3: o Pilot tirou esta bead da faixa Kimi — rótulo lane:kimi removido${_dm_note}. Motivo: $_dm_why. Ela segue como bead normal para os dogs Claude. Depois que o rótulo de veto sair, pôr lane:kimi de novo a devolve à faixa." >/dev/null 2>&1 \
+  timeout 15 bd -C "$_dm_city" comment "$_dm_id" "ga-do1ixn.3: o Pilot tirou esta bead da faixa Kimi — rótulo lane:kimi removido${_dm_note}. Motivo: $_dm_why. Ela segue como bead normal para o pool original do rig. Depois que o rótulo de veto sair, pôr lane:kimi de novo a devolve à faixa." >/dev/null 2>&1 \
     || warn "ga-do1ixn.3: faixa Kimi: $_dm_id rebaixada, mas o comentário com o motivo não gravou — o motivo está só neste log: $_dm_why"
   return 0
 }
 
 # _pilot_kimi_lane_pass — uma vez por varredura, ANTES da passada de WA e das pistas. Sempre devolve 0. (1) Tira das duas pistas TODA bead com o rótulo lane:kimi: o laço normal nunca a vê, então
 # o Pilot não a despacha a um pool Claude, com a faixa aberta ou fechada (fora do Pilot, a sondagem dos dogs lê gc.routed_to: a bead que ainda tem rota gastown.dog fica visível a ela do momento em que ganha lane:kimi até o carimbo desta passada, e uma falha do carimbo a deixa visível — por isso o resumo conta carimbos e falhas, e o certo é o Mayor pôr gc.routed_to=kimi-lane junto com o rótulo); pista que o jq não lê fica VAZIA nesta varredura (não dá para separar as do Kimi, e o estado inerte é não despachar). (1b) Valida cada bead
-# do HQ da faixa (_pilot_kimi_screen no JSON da bead, sem ler comentários): veto por rótulo → REBAIXA (_pilot_kimi_demote: sai da faixa e volta ao dog); sem texto ou ilegível → espera na faixa. O rebaixamento vale com a faixa aberta ou
-# fechada (a bead devolvida pelo kimi-worker não pode ficar presa em kimi-lane só porque a bandeira foi desligada) e não escreve nada no DRY_RUN. (2) Carimba gc.routed_to=kimi-lane nas do HQ que ainda
-# não o têm (uma rota de pool posta por outro caminho — a volta do gate, o pilot-missing-route-watchdog — chamaria o pool do mini). (3) Com a faixa aberta, leva UMA bead do HQ (ga-) validada
-# ao kimi-worker-remote por dispatch_one com _PILOT_KIMI_PASS=1; a de outro rig espera (semana 1: só HQ, o traco-bim não tem espelho no nó).
+# ga-/wa- da faixa (_pilot_kimi_screen no JSON da bead, sem ler comentários): veto por rótulo → REBAIXA na loja da bead e restaura gastown.dog ou wa-worker; sem texto ou ilegível → espera na faixa. O rebaixamento vale com a faixa aberta ou
+# fechada (a bead devolvida pelo kimi-worker não pode ficar presa em kimi-lane só porque a bandeira foi desligada) e não escreve nada no DRY_RUN. (2) Carimba gc.routed_to=kimi-lane, na loja da própria bead, nas ga-/wa- que ainda
+# não o têm (uma rota de pool posta por outro caminho — a volta do gate, o pilot-missing-route-watchdog — chamaria o pool do mini). (3) Com a faixa aberta, leva UMA ga-/wa- validada ao kimi-worker-remote por dispatch_one com
+# _PILOT_KIMI_PASS=1. WA exige também o veredito afirmativo node do MESMO classificador do wa-worker (check, nunca apply); mini, desconhecido, erro, timeout e prefixo fora de ga/wa esperam sem despachar.
 _pilot_kimi_lane_pass() {
   local _kl_lane _kl_pool _kl_k _kl_rest _kl_ids _kl_id _kl_pick _kl_rc _kl_tier _kl_closed="" _kl_n=0 _kl_sent=0 _kl_stamped=0 _kl_stampfail=0 _kl_idsfail=0 _kl_tries=0 _kl_rel=0 _kl_rel_max=10 _kl_other=0 _kl_stop="" _kl_unread=0 _kl_dfault=0
-  local _kl_small="[]" _kl_big="[]" _kl_held="[]" _kl_keep _kl_bead _kl_verdict _kl_why _kl_next _kl_demoted=0 _kl_demfail=0 _kl_held_n=0 _kl_stamp_txt
+  local _kl_small="[]" _kl_big="[]" _kl_held="[]" _kl_keep _kl_bead _kl_verdict _kl_why _kl_next _kl_demoted=0 _kl_demfail=0 _kl_held_n=0 _kl_stamp_txt _kl_city
   for _kl_lane in small big; do
     case "$_kl_lane" in small) _kl_pool="${SMALL_CANDIDATES:-[]}" ;; big) _kl_pool="${BIG_CANDIDATES:-[]}" ;; esac
     # vazio → []; falhou/ilegível → as duas metades vazias (a pista inteira sai desta varredura, com aviso)
@@ -12816,7 +12824,7 @@ _pilot_kimi_lane_pass() {
     _kl_n=$((_kl_n + $(printf '%s' "$_kl_k" | jq 'length' 2>/dev/null || echo 0)))
   done
   [ "$_kl_n" -gt 0 ] || return 0
-  # (1b) a validação das beads do HQ da faixa — só o JSON da candidata; nenhum comentário é lido. ok e as de outro rig seguem para a lista de despacho; veto por rótulo rebaixa (e sai das listas);
+  # (1b) validação das ga-/wa- da faixa — só o JSON da candidata; nenhum comentário é lido. ok e prefixos fora de ga/wa seguem para a lista de despacho (onde os últimos esperam); veto por rótulo rebaixa (e sai das listas);
   # sem texto/ilegível, ou rebaixamento que não gravou, fica em _kl_held (espera: recebe o carimbo, não é despachada). Nada aqui escreve no DRY_RUN.
   for _kl_lane in small big; do
     case "$_kl_lane" in small) _kl_pool="$_kl_small" ;; big) _kl_pool="$_kl_big" ;; esac
@@ -12824,14 +12832,14 @@ _pilot_kimi_lane_pass() {
     # vazio → a pista não tinha beads lane:kimi (nada a triar); falhou/ilegível → nenhuma bead da pista fica na lista de despacho (o estado inerte é não despachar)
     while IFS= read -r _kl_bead; do
       [ -n "$_kl_bead" ] || continue
-      # vazio/falhou → sem id: segue como "fora do HQ" e o laço de despacho (que também exige id) a deixa esperando
+      # vazio/falhou → sem id: segue como "fora de ga/wa" e o laço de despacho (que também exige id) a deixa esperando
       _kl_id=$(printf '%s' "$_kl_bead" | jq -r '.id // ""' 2>/dev/null) || _kl_id=""
       # TODA bead lane:kimi com id entra no pilot_sweep já aqui, como ESPERA (kimi_lane_wait), antes de qualquer tentativa: o evento guarda a ÚLTIMA nota de cada bead, então o despacho, o rebaixamento e as falhas abaixo
-      # a sobrescrevem e o que fica como espera é o que esperou de fato (faixa fechada, triagem sem-texto, outro rig, tentativas gastas, dry-run, vaga ocupada). Sem esta nota o evento mostrava 0 candidatas com N esperando.
-      # vazio (bead sem id) → sem nota: sem id não há o que contar; falhou/ilegível (id que o jq não leu) → o mesmo, sem nota, e a bead segue como "fora do HQ" (o laço de despacho, que também exige id, a deixa esperando como antes)
+      # a sobrescrevem e o que fica como espera é o que esperou de fato (faixa fechada, triagem sem-texto, WA inelegível, prefixo não suportado, tentativas gastas, dry-run, vaga ocupada). Sem esta nota o evento mostrava 0 candidatas com N esperando.
+      # vazio (bead sem id) → sem nota: sem id não há o que contar; falhou/ilegível (id que o jq não leu) → o mesmo, sem nota, e a bead segue como "fora de ga/wa" (o laço de despacho, que também exige id, a deixa esperando como antes)
       [ -z "$_kl_id" ] || _pilot_sweep_note "$_kl_id" 1 kimi_lane_wait
       case "$_kl_id" in
-        ga-*) _kl_verdict=$(_pilot_kimi_screen "$_kl_bead") ;;
+        ga-*|wa-*) _kl_verdict=$(_pilot_kimi_screen "$_kl_bead") ;;
         *) _kl_verdict="fora-do-hq" ;;
       esac
       case "$_kl_verdict" in
@@ -12843,7 +12851,7 @@ _pilot_kimi_lane_pass() {
           if [ "${DRY_RUN:-0}" = "1" ]; then
             log "  faixa Kimi: $_kl_id seria rebaixada (dry-run, nada escrito) — $_kl_why"
           elif _pilot_kimi_demote "$_kl_bead" "$_kl_why"; then
-            # saiu da faixa e voltou ao dog: não espera mais no Kimi, então não fica como kimi_lane_wait (refused_by_guard, nome próprio)
+            # saiu da faixa e voltou ao pool original do rig: não espera mais no Kimi, então não fica como kimi_lane_wait (refused_by_guard, nome próprio)
             _kl_demoted=$((_kl_demoted + 1)); log "  faixa Kimi: $_kl_id rebaixada — $_kl_why"; _pilot_sweep_note "$_kl_id" 1 kimi_lane_demoted
           else
             # rebaixamento que não gravou é FALHA (soma em NONQUEUE_FAILS): a nota diz failed_other, nunca espera
@@ -12863,13 +12871,22 @@ _pilot_kimi_lane_pass() {
   done
   # (2) a rota de espera: só nas que ainda não a têm; o DRY_RUN não escreve
   if [ "${DRY_RUN:-0}" != "1" ]; then
-    # só as do HQ (ga-, loja da cidade): a de outro rig espera sem carimbo (semana 1 é só HQ) — vazio → nada a carimbar (todas já têm a rota); falhou/ilegível → nada carimbado, e o aviso e o resumo dizem "não li" (nunca "carimbada=0")
-    _kl_ids=$(printf '%s\n%s\n%s' "$_kl_small" "$_kl_big" "$_kl_held" | jq -r --arg r "$PILOT_KIMI_ROUTE" '.[] | select(((.id // "") | startswith("ga-")) and ((.metadata["gc.routed_to"] // "") != $r)) | .id' 2>/dev/null) || {
+    # ga- usa a loja da cidade e wa- a do whatsapp_automation; outro prefixo não é carimbado. Se a loja WA não for resolvida, aquela bead não é escrita nem despachada.
+    # vazio → nada a carimbar (todas já têm a rota); falhou/ilegível → nada carimbado, e o aviso e o resumo dizem "não li" (nunca "carimbada=0")
+    _kl_ids=$(printf '%s\n%s\n%s' "$_kl_small" "$_kl_big" "$_kl_held" | jq -r --arg r "$PILOT_KIMI_ROUTE" '.[] | select((((.id // "") | startswith("ga-")) or ((.id // "") | startswith("wa-"))) and ((.metadata["gc.routed_to"] // "") != $r)) | .id' 2>/dev/null) || {
       _kl_ids=""; _kl_idsfail=1
       warn "ga-do1ixn.3: faixa Kimi: não consegui ler quais beads precisam do carimbo gc.routed_to=$PILOT_KIMI_ROUTE — nada foi carimbado nesta varredura; as que ainda têm rota de pool seguem visíveis à sondagem dos dogs até a próxima"
     }
     for _kl_id in $_kl_ids; do
-      if timeout 15 bd -C "$GC_CITY" update "$_kl_id" --set-metadata "gc.routed_to=$PILOT_KIMI_ROUTE" -q >/dev/null 2>&1; then _kl_stamped=$((_kl_stamped + 1))
+      case "$_kl_id" in
+        ga-*) _kl_city="$GC_CITY" ;;
+        wa-*) _kl_city=$(rig_root_path whatsapp_automation) ;;
+        *) _kl_city="" ;;
+      esac
+      if [ -z "$_kl_city" ]; then
+        _kl_stampfail=$((_kl_stampfail + 1)); _pilot_sweep_note "$_kl_id" 1 kimi_lane_failed
+        warn "ga-do1ixn.6.1: não consegui carimbar gc.routed_to=$PILOT_KIMI_ROUTE em $_kl_id: a loja whatsapp_automation não foi lida; nada foi escrito no HQ"
+      elif timeout 15 bd -C "$_kl_city" update "$_kl_id" --set-metadata "gc.routed_to=$PILOT_KIMI_ROUTE" -q >/dev/null 2>&1; then _kl_stamped=$((_kl_stamped + 1))
       else _kl_stampfail=$((_kl_stampfail + 1)); _pilot_sweep_note "$_kl_id" 1 kimi_lane_failed; warn "ga-do1ixn.3: não consegui carimbar gc.routed_to=$PILOT_KIMI_ROUTE em $_kl_id — a pista normal não a pega (saiu da lista), mas uma rota de pool posta por fora seguiria valendo"; fi
     done
   fi
@@ -12884,14 +12901,27 @@ _pilot_kimi_lane_pass() {
       case "$_kl_lane" in small) _kl_pool="$_kl_small" ;; big) _kl_pool="$_kl_big" ;; esac
       while :; do
         [ "$_kl_tries" -lt 3 ] || { _kl_stop="tentativas"; break; }
-        # as soltas (kimi_lane_released: alvo que não é dog) não gastam tentativa, mas têm teto próprio: cada uma custa uma claim e uma solta no HQ
+        # as soltas (kimi_lane_released: alvo fora do par gastown.dog/wa-worker) não gastam tentativa, mas têm teto próprio: cada uma custa uma claim e uma solta na loja da bead
         [ "$_kl_rel" -lt "$_kl_rel_max" ] || { _kl_stop="soltas"; break; }
         _kl_pick=$(_top_candidate "$_kl_pool")
         { [ -n "$_kl_pick" ] && [ "$_kl_pick" != null ]; } || break
         _kl_id=$(printf '%s' "$_kl_pick" | jq -r '.id // ""' 2>/dev/null) || _kl_id=""
         [ -n "$_kl_id" ] || break
         _kl_pool=$(printf '%s' "$_kl_pool" | jq -c --arg id "$_kl_id" '[ .[] | select(.id != $id) ]' 2>/dev/null) || _kl_pool="[]"
-        case "$_kl_id" in ga-*) ;; *) _kl_other=$((_kl_other + 1)); log "  faixa Kimi: $_kl_id espera — lane:kimi só vale para bead do HQ (ga-) na semana 1"; continue ;; esac
+        case "$_kl_id" in
+          ga-*) ;;
+          wa-*)
+            _kl_city=$(rig_root_path whatsapp_automation)
+            if [ -z "$_kl_city" ]; then
+              _kl_other=$((_kl_other + 1)); log "  faixa Kimi: $_kl_id espera — loja whatsapp_automation ausente/ilegível; nada foi despachado"; continue
+            fi
+            # O MESMO classificador do wa-worker decide, sem apply nem escrita: só um veredito node afirmativo pode ir ao nó. Base viva (mini), desconhecido, erro e timeout ficam fora do Kimi.
+            _pilot_wa_node_pass_check "$_kl_id" "$_kl_city"
+            if [ "${_PWP_V:-error}" != node ]; then
+              _kl_other=$((_kl_other + 1)); log "  faixa Kimi: $_kl_id espera — classificador WA=$_PWP_V (só node vai ao kimi-worker-remote; mini/desconhecido/falha não vai ao nó)"; continue
+            fi ;;
+          *) _kl_other=$((_kl_other + 1)); log "  faixa Kimi: $_kl_id espera — lane:kimi vale somente para ga-/wa- neste papel"; continue ;;
+        esac
         _kl_tries=$((_kl_tries + 1))
         _PILOT_KIMI_PASS=1; DISPATCH_RESULT=""; _kl_rc=0
         _kl_tier=$(_bead_tier "$_kl_pick")
@@ -12914,7 +12944,7 @@ _pilot_kimi_lane_pass() {
     done
   fi
   _PILOT_KIMI_PASS=0
-  # Para o predicado de saturação e o Step 5 (rodada 2 do gate): a bead lane:kimi que ficou na faixa sem despachar é ESPERA DE PROPÓSITO (faixa fechada, vaga ocupada, triagem, outro rig, tentativas gastas) e a
+  # Para o predicado de saturação e o Step 5 (rodada 2 do gate): a bead lane:kimi que ficou na faixa sem despachar é ESPERA DE PROPÓSITO (faixa fechada, vaga ocupada, triagem, WA inelegível, prefixo não suportado, tentativas gastas) e a
   # pool não a viu como candidata no resto do sweep — sem esta conta o sweep seria lido como parado e o p4 "Pilot estagnado" tocaria a cada 15 min. FALHA (rebaixamento, carimbo, lista do carimbo, triagem que não li,
   # nó que falhou ou retorno sem nome) soma em NONQUEUE_FAILS, e com NONQUEUE_FAILS>0 o predicado NÃO isenta o sweep: a espera nunca esconde uma falha.
   # vazio → 0 esperas (a conta fecha em 0); falhou/ilegível → as contas vêm de contadores locais desta função, que não leem nada de fora
@@ -12923,7 +12953,7 @@ _pilot_kimi_lane_pass() {
   # vazio → 0 carimbadas; falhou/ilegível → o resumo diz que a lista não foi lida
   _kl_stamp_txt="rota carimbada=$_kl_stamped (falhas $_kl_stampfail)"
   [ "$_kl_idsfail" = 0 ] || _kl_stamp_txt="rota carimbada=NÃO LI a lista (nada carimbado)"
-  log "ga-do1ixn.3: faixa Kimi: lane:kimi=$_kl_n · ${_kl_stop:-aberta} · despachada=$_kl_sent · fora do HQ=$_kl_other · $_kl_stamp_txt · rebaixadas=$_kl_demoted (falhas $_kl_demfail) · soltas=$_kl_rel · esperando a triagem=$_kl_held_n — o Pilot não despacha nenhuma a pool Claude; uma rota de pool posta por fora (gastown.dog) vale até o carimbo desta passada"
+  log "ga-do1ixn.3: faixa Kimi: lane:kimi=$_kl_n · ${_kl_stop:-aberta} · despachada=$_kl_sent · fora de ga/wa ou espera WA=$_kl_other · $_kl_stamp_txt · rebaixadas=$_kl_demoted (falhas $_kl_demfail) · soltas=$_kl_rel · esperando a triagem=$_kl_held_n — o Pilot não despacha nenhuma a pool Claude; uma rota de pool posta por fora vale até o carimbo desta passada"
   return 0
 }
 
@@ -15765,12 +15795,12 @@ LIVESEC
       return 1
     fi
   elif [ "${_PILOT_KIMI_PASS:-0}" = "1" ]; then
-    # ga-do1ixn.3: faixa Kimi — a vaga do kimi-worker-remote (no Hetzner) não é a que a P0/P1 espera, então o yield NÃO se aplica; mas só segue a bead do HQ com alvo de dog (a receita do nó é a de dog).
-    # Qualquer outra solta a claim aqui, SEM carimbo de pool (o 4º argumento não é wa-worker/ps-worker de propósito): ela espera na faixa; o Pilot não a manda a pool Claude.
-    if [ "$_PYS_NATIVE" = "0" ] && [ "$_PYS_TARGET" = "gastown.dog" ]; then
+    # ga-do1ixn.3/.6.1: faixa Kimi — a vaga do kimi-worker-remote (no Hetzner) não é a que a P0/P1 espera, então o yield NÃO se aplica; só segue bead do HQ com alvo de dog
+    # ou bead do store WA com alvo wa-worker. Qualquer outra solta a claim aqui, SEM carimbo de pool: outros rigs e alvos nunca entram por esta exceção.
+    if { [ "$_PYS_NATIVE" = "0" ] && [ "$_PYS_TARGET" = "gastown.dog" ]; } || { [ "$_PYS_NATIVE" = "1" ] && [ "$_PYS_TARGET" = "wa-worker" ]; }; then
       log "  ga-do1ixn.3: $STORY_ID segue na faixa Kimi — o yield não se aplica (a vaga é a do kimi-worker-remote, no nó)."
     else
-      log "  ga-do1ixn.3: $STORY_ID espera — a faixa Kimi só leva bead do HQ com alvo de dog (alvo $_PYS_TARGET, rig-native=$_PYS_NATIVE); claim solta, sem carimbo."
+      log "  ga-do1ixn.3: $STORY_ID espera — a faixa Kimi só leva ga-/gastown.dog ou wa-/wa-worker no store WA (alvo $_PYS_TARGET, rig-native=$_PYS_NATIVE); claim solta, sem carimbo."
       _pilot_priority_yield_release "$STORY_ID" "$STORY_BEAD_CITY" "$BUILDER_TARGET" "kimi-lane"
       DISPATCH_RESULT="kimi_lane_released"
       return 1
@@ -18244,7 +18274,7 @@ fi
 # dispatched nothing because the capacity there is, is spoken for by a higher priority — not because the Pilot stalled. It
 # counts on the same side of the predicate as a queue (and, like a queue, never in NONQUEUE_FAILS); without it a sweep that
 # only ceded would trip the Step 5 "Pilot estagnado" streak and imparavel-check's silent-stall alarm.
-# ga-do1ixn.3 (gate, rodada 2): a bead lane:kimi que a passada da faixa Kimi deixou esperando de propósito (KIMI_LANE_WAITING: faixa fechada, vaga ocupada, triagem, outro rig) é a mesma coisa: o sweep não despachou
+# ga-do1ixn.3 (gate, rodada 2): a bead lane:kimi que a passada da faixa Kimi deixou esperando de propósito (KIMI_LANE_WAITING: faixa fechada, vaga ocupada, triagem, WA inelegível, prefixo fora de ga/wa) é a mesma coisa: o sweep não despachou
 # porque a única demanda estava numa faixa que espera, não porque o Pilot parou. Mesma regra das outras duas parcelas: nunca com NONQUEUE_FAILS>0 (a passada soma ali as próprias falhas), nunca com despacho.
 # SELFTEST-EXTRACT pilot-saturation-predicate: BEGIN
 _pool_saturated_sweep=0
