@@ -15,7 +15,7 @@ REGRA  o launchd do mini roda isto a cada 600 s (com.gascity.hetzner-idle-sessio
                                     Bead de issue_type "message" (mail, "context cycle") NÃO segura (ga-uga2a2j); issue_type ausente ou de outro valor segura.
        "não consegui ler" (qualquer das duas) = ninguém é fechado e o estado nem anda. Bead ABERTA também segura a sessão (a in_progress sozinha não basta).
        kimi-worker-remote (ga-do1ixn.5) entra: a bead dele é do rig gascity, na loja da HQ, como a do dog-remote.
-       wa-worker-remote fica de fora de propósito: a bead dele mora na loja da WA, que o bd da HQ não lê; sem provar "sem bead" não se fecha.
+       wa-worker-remote e kimi-worker-wa-remote ficam de fora de propósito: suas beads moram na loja da WA, que o bd da HQ não lê; sem provar "sem bead" não se fecha.
 ESTADO por sessão (id), em <cidade>/.gc/hetzner-idle-reaper.state.json: `desde` (1ª leitura sem bead, vale também enquanto ela dorme: o laço do engine a faz dormir e acordar)
        e `vivas_seguidas` (rodadas seguidas em que a vi VIVA e sem bead). Uma leitura em que ela segura bead, ou em que sumiu da lista, apaga o relógio.
 FECHA  só se: viva (active/awake) · sem bead · agora - desde > 900 s (HETZNER_REAP_GRACE_S) · vivas_seguidas >= 2 (a sessão que o Pilot acabou de acordar para receber bead

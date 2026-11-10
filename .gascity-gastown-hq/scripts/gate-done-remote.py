@@ -12,11 +12,10 @@ O QUE É
   não-fast-forward): a 2ª bead da sessão, e o conserto depois de uma reprovação, saem do ref que o dog diz, com o sha conferido.
 
 O QUE FAZ, EM ORDEM (passo que não consegue saber algo para sem escrever nada: "não sei" nunca vira "pode")
-  1. Quem pede: alias = BEADS_ACTOR, sessão = GC_SESSION_NAME. Os dois precisam ter o formato esperado E ser do mesmo papel (dog-remote, kimi-worker-remote, ps-worker-remote ou wa-worker-remote; nome sem papel vale como
-     dog-remote): o identity_pattern do atalho é global, então a mistura passaria por ele. Para dog/ps/wa, o PAPEL da sessão escolhe o rig (tabela RIGS) e, com ele, a loja da bead, o repositório do worktree e o espelho.
-     O Kimi é a exceção multi-rig explícita (ga-do1ixn.6.1): pode submeter SÓ ga/wa, e o prefixo validado da bead escolhe entre gascity e whatsapp_automation; isso não libera prefixos arbitrários.
-  2. A bead. Sem argumento: a ÚNICA bead in_progress atribuída ao alias na loja do rig dele (a cidade para o HQ); para o Kimi, a ÚNICA considerando as lojas GA e WA juntas. Nenhuma, mais de uma ou qualquer loja ilegível → recusa (nunca adivinha qual submeter, e falha não vira loja vazia).
-     Com argumentos, a que o worker NOMEOU (o prefixo dela tem de estar no conjunto permitido ao papel; Kimi: ga/wa): (A) in_progress com assignee = alias, ou (B) a VOLTA DO GATE: sem assignee, `gate:needs-fix`, gc.routed_to = a rota do pool do rig
+  1. Quem pede: alias = BEADS_ACTOR, sessão = GC_SESSION_NAME. Os dois precisam ter o formato esperado E ser do mesmo papel (dog-remote, kimi-worker-remote, kimi-worker-wa-remote, ps-worker-remote ou wa-worker-remote; nome sem papel vale como
+     dog-remote): o identity_pattern do atalho é global, então a mistura passaria por ele. O PAPEL da sessão escolhe UM rig (tabela RIGS) e, com ele, a loja da bead, o repositório do worktree e o espelho. Os papéis Kimi GA e WA são distintos e compartilham só a rota kimi-lane (ga-do1ixn.6.1).
+  2. A bead. Sem argumento: a ÚNICA bead in_progress atribuída ao alias na loja do rig dele (a cidade para o HQ). Nenhuma, mais de uma ou loja ilegível → recusa (nunca adivinha qual submeter, e falha não vira loja vazia).
+     Com argumentos, a que o worker NOMEOU (o prefixo dela tem de ser o do rig do papel): (A) in_progress com assignee = alias, ou (B) a VOLTA DO GATE: sem assignee, `gate:needs-fix`, gc.routed_to = a rota do pool do rig
      (gastown.dog no HQ, ps-worker, wa-worker: a que o dispatcher RESTAURA ao reprovar; medida em 3 beads do HQ) ou a do nó (posta à mão) e a última entrega (o marcador MAIS NOVO com source-bead:<bead>, de qualquer status) é deste alias, por gate.submitted_by OU pela linha `author:` do marcador
      (sem assignee o gate-done.md congela o CRIADOR em submitted_by; só o author guarda o alias). Sem marcador, leitura que falha ou ilegível → recusa.
   3. O trabalho, no espelho do rig (<cidade>/.gc/hetzner-mirror/repos/<rig>.git; gascity para o HQ), onde o `git push` do servidor chegou. Sem argumento (pick_ref): entre os
@@ -49,7 +48,7 @@ O QUE NÃO FAZ
   seguem NÃO verificados e o `self_audit:` do marcador diz exatamente isso (só G12, G6, G7 e G7b foram verificados) e conta os AVISO que os guards imprimiram (sem copiar o texto que veio do nó).
   Não roda a checagem "NEW READS NEED A FAILURE TEST" nem a auto-auditoria do diff (são do construtor, antes do push): o marcador registra
   `self_audit: … auto-auditoria do diff NÃO verificada aqui`, visível, não calado.
-  Só os rigs da tabela RIGS (gascity, property_scrapers, whatsapp_automation; ga-2hd02v.4): para dog/ps/wa o PAPEL da sessão decide o rig, e com ele a loja da bead, o repositório do worktree e o espelho. O Kimi pode submeter ga/wa (ga-do1ixn.6.1): a bead nomeada escolhe o rig dentro desse conjunto; sem argumentos é preciso haver exatamente uma candidata nas duas lojas, e uma leitura que falha aborta antes de qualquer escrita.
+  Só os rigs da tabela RIGS (gascity, property_scrapers, whatsapp_automation; ga-2hd02v.4): o PAPEL da sessão decide o único rig, e com ele a loja da bead, o repositório do worktree e o espelho. O Kimi GA lê só a loja do HQ e o Kimi WA só a do WA; uma leitura que falha aborta antes de qualquer escrita.
   Alias e sessão de papéis diferentes, bead fora dos prefixos permitidos ao papel, ou prefixo fora da tabela → recusa; nome de sessão que não é de nenhum papel vale como dog-remote, o comportamento de antes. O marcador do gate mora SEMPRE na loja da cidade; a bead, na do rig. Só reescreve um branch fix/<bead>-… do origin com --force-with-lease e quando
   nada do origin se perde (passo 3b); fora disso o push é o do passo 1 do gate-done.md, que recusa o não-FF.
   Se uma execução morrer no meio (kill do wrapper), sobra o worktree/branch: a próxima recusa e diz o que recolher (nunca apaga o que não criou).
@@ -81,12 +80,13 @@ SESS_RE = re.compile(r"[a-z0-9][a-z0-9._-]{0,60}")  # o formato que o `wt-add` a
 BEAD_RE = re.compile(r"[a-z]{2,8}-[a-z0-9]{2,16}(?:\.[0-9]{1,4}){0,3}")  # o id que o passo 2 do gate-done.md extrai do nome do branch (se divergirem, ELE recusa)
 MARKER_RE = re.compile(r"^Marker created: (\S+)\s*$", re.M)
 SHA_RE = re.compile(r"[0-9a-f]{40}")  # o sha que o dog diz: inteiro, para a conferência com o espelho ser igualdade e não prefixo
-USAGE = "gate-done <bead> <ref> <sha>   (ou `gate-done` sem argumento: a ÚNICA bead in_progress do alias nas lojas permitidas, de worker/<sessão>)"
+USAGE = "gate-done <bead> <ref> <sha>   (ou `gate-done` sem argumento: a ÚNICA bead in_progress do alias na loja do rig, de worker/<sessão>)"
 FIX_LABEL = "gate:needs-fix"  # o que o dispatcher põe na bead-fonte quando o gate reprova: a "volta do gate"
 ROUTES = ("gastown.dog", "dog-remote")  # (rig gascity; os outros: RIGS) gc.routed_to de uma volta do gate: gastown.dog é o que o dispatcher RESTAURA ao reprovar (gate_fail_restore_route → default_pool_route_for_rig; medido em ga-9636op, ga-2hd02v.1.12 e .1.18); dog-remote é a rota posta à mão. Quem prova que a bead é DESTE alias é a última entrega, não a rota
-KIMI_ROLE = "kimi-worker-remote"  # o papel multi-rig do teste Kimi: submete ga/wa (ga-do1ixn.6.1), os demais papéis conservam um só rig
-KIMI_ROUTE = "kimi-lane"  # gc.routed_to da bead lane:kimi, na espera e na volta do gate (ga-do1ixn.3: o gate devolve a bead lane:kimi para cá, não para gastown.dog). NÃO é pool: nenhuma sonda de pool a pega, só o Pilot a leva ao kimi-worker-remote
-BARE_ROLE_RE = re.compile(r"(?:dog|gate-reviewer|wa-worker|ps-worker|kimi-worker)-remote(?:-adhoc)?")  # nome de sessão SEM cauda: pelo IDENTITY_PATTERN (gc-session-ssh.md) `<papel>-remote-<1-3 dígitos | 3-12 alnum>` TAMBÉM é nome válido de sessão, e `<papel>-remote-adhoc-<10 alnum>` idem (ga-2hd02v.3.13)
+KIMI_ROLE = "kimi-worker-remote"  # faixa Kimi no HQ; o papel WA é separado para herdar um único rig da tabela (ga-do1ixn.6.1)
+KIMI_WA_ROLE = "kimi-worker-wa-remote"
+KIMI_ROUTE = "kimi-lane"  # gc.routed_to da bead lane:kimi, na espera e na volta do gate (ga-do1ixn.3: o gate devolve a bead lane:kimi para cá, não para gastown.dog). NÃO é pool: nenhuma sonda de pool a pega, só o Pilot a leva ao papel Kimi do rig
+BARE_ROLE_RE = re.compile(r"(?:dog|gate-reviewer|wa-worker|ps-worker|kimi-worker-wa|kimi-worker)-remote(?:-adhoc)?")  # nome de sessão SEM cauda: pelo IDENTITY_PATTERN (gc-session-ssh.md) `<papel>-remote-<1-3 dígitos | 3-12 alnum>` TAMBÉM é nome válido de sessão, e `<papel>-remote-adhoc-<10 alnum>` idem (ga-2hd02v.3.13)
 SUFFIX_RE = r"-[A-Za-z0-9][A-Za-z0-9._-]{0,40}"  # a cauda de worker/<sessão>-<cauda>: o `-v2`, o `-<bead>`, o `-a2lb9b` que os dogs usam quando worker/<sessão> está preso em outra entrega (ga-2hd02v.3.13)
 MIRROR_MAIN = "refs/remotes/origin/main"  # no espelho de produção o main mora SÓ aqui (o hetzner-mirror.sh o sincroniza); não há refs/heads/main
 MAX_CANDS = 40  # worker/<sessão>-… acima disso não se confere um a um: recusa e manda usar a forma com argumentos
@@ -108,14 +108,14 @@ class Rig(NamedTuple):
 RIGS = {
     "ga": Rig("ga", "gascity", "dog-remote", ROUTES, also=("kimi-worker-remote",)),  # kimi-worker-remote: o worker do teste Kimi (ga-do1ixn), 2º papel do HQ
     "ps": Rig("ps", "property_scrapers", "ps-worker-remote", ("ps-worker", "ps-worker-remote")),
-    "wa": Rig("wa", "whatsapp_automation", "wa-worker-remote", ("wa-worker", "wa-worker-remote"), prepush=False, guards=True),  # medido 22/10: ~12 dos ~15 guards do pre-push do WA rodam arquivos de $REPO_ROOT (a árvore empurrada); HQ e PS seguem com o hook (PS: só um shim do bd)
+    "wa": Rig("wa", "whatsapp_automation", "wa-worker-remote", ("wa-worker", "wa-worker-remote"), prepush=False, also=("kimi-worker-wa-remote",), guards=True),  # medido 22/10: ~12 dos ~15 guards do pre-push do WA rodam arquivos de $REPO_ROOT (a árvore empurrada); HQ e PS seguem com o hook (PS: só um shim do bd)
 }
 GUARDS_BIN = Path(__file__).resolve().with_name("wa-remote-guards.py")
 GUARDS_TIMEOUT = 180  # medido 23/10 com o mini a load 55: 17 s (WA main, 304 plists) a 65 s; o wrapper corta tudo em timeout_s (300 por padrão), então estourar aqui vira recusa limpa antes de qualquer escrita
 GUARDS_PASS_RE = re.compile(r"^wa-remote-guards: RESULT=PASS sha=([0-9a-f]{40}) trusted=([0-9a-f]{40})\s*$", re.M)  # o "certificado": sem esta linha um rc 0 não vale
 GUARDS_BLOCK_RE = re.compile(r"^wa-remote-guards: RESULT=BLOCKED sha=([0-9a-f]{40}) trusted=([0-9a-f]{40})\s*$", re.M)  # idem para o rc 1: um Python que estoura também sai 1, e isso NÃO é "reprovou"
 GUARDS_WARN_RE = re.compile(r"^wa-remote-guards:\s+AVISO:\s*(.*?)\s*$", re.M)  # uma linha AVISO do exe (G12: plist ilegível / agendado sem entrypoint; G6: fragmento MDS inválido); o grupo é o texto depois de "AVISO:"
-ROLE_RE = re.compile(r"(dog-remote|kimi-worker-remote|ps-worker-remote|wa-worker-remote)(?:-|$)")  # o papel de um nome de sessão; gate-reviewer-remote e nomes de teste não casam → vale o rig do HQ, como antes
+ROLE_RE = re.compile(r"(dog-remote|kimi-worker-wa-remote|kimi-worker-remote|ps-worker-remote|wa-worker-remote)(?:-|$)")  # o papel de um nome de sessão; gate-reviewer-remote e nomes de teste não casam → vale o rig do HQ, como antes
 
 
 class Ctx(NamedTuple):
@@ -165,14 +165,12 @@ def slugify(title: str) -> str:
     return t[:40].rstrip("-") or "remote"
 
 
-def one_bead(city: str, alias: str, empty_ok: bool = False) -> dict | None:
-    # (city = a pasta da loja da bead) vazio ([]) → None só no modo multi-rig; fora dele, Stop "nenhuma bead"; falhou/ilegível → Stop do bd_json; duas ou mais → Stop: a submissão nunca escolhe
+def one_bead(city: str, alias: str) -> dict:
+    # (city = a pasta da loja da bead) vazio ([]) → Stop "nenhuma bead"; falhou/ilegível → Stop do bd_json; duas ou mais → Stop: a submissão nunca escolhe
     rows = bd_json(city, ["list", "--status", "in_progress", "--assignee", alias, "--json", "--limit", "0"], f"as beads in_progress de {alias}")
     if not isinstance(rows, list) or not all(isinstance(x, dict) and isinstance(x.get("id"), str) for x in rows):
         raise Stop(f"beads de {alias}: resposta do bd com forma inesperada")
     if not rows:
-        if empty_ok:
-            return None
         raise Stop(f"nenhuma bead in_progress atribuída a {alias}: não sei o que submeter")
     if len(rows) > 1:
         raise Stop(f"{len(rows)} beads in_progress atribuídas a {alias} ({', '.join(x['id'] for x in rows[:5])}): não adivinho qual submeter")
@@ -600,8 +598,8 @@ def rig_of_session(sess: str) -> str:
 
 
 def prefixes_of_session(sess: str) -> tuple:
-    """Os prefixos que o papel pode submeter. Kimi é multi-rig por decisão explícita (ga-do1ixn.6.1); todos os outros papéis conservam exatamente o rig de antes."""
-    return ("ga", "wa") if role_of(sess) == KIMI_ROLE else (rig_of_session(sess),)
+    """Cada papel tem exatamente um rig; os dois papéis Kimi compartilham só a rota kimi-lane, não as lojas."""
+    return (rig_of_session(sess),)
 
 
 def role_of(name: str) -> str:
@@ -613,7 +611,7 @@ def role_of(name: str) -> str:
 def routes_of(rig: Rig, alias: str) -> tuple:
     """As rotas de volta do gate que ESTE alias aceita (ga-do1ixn.3). O worker do Kimi aceita SÓ a faixa dele (kimi-lane: ele só trabalha bead lane:kimi, e a que o Pilot rebaixou volta à pool original — gastown.dog no HQ,
     wa-worker no WA — e o Kimi não a conserta mais); todo outro alias aceita as do rig e NUNCA kimi-lane (um worker fora da faixa não submete bead dela)."""
-    return (KIMI_ROUTE,) if role_of(alias) == KIMI_ROLE else rig.routes
+    return (KIMI_ROUTE,) if role_of(alias) in (KIMI_ROLE, KIMI_WA_ROLE) else rig.routes
 
 
 def rig_ctx(city: str, prefix: str, mirror_override: str = "") -> Ctx:
@@ -669,27 +667,13 @@ def main() -> int:
         want = args[2]
         src = check_ref(args[1], sess, args[0])
         bpfx = args[0].split("-", 1)[0]
-        if bpfx not in allowed_prefixes:  # a bead validada escolhe o rig, mas só dentro do conjunto permitido ao papel (Kimi: ga/wa, nunca qualquer prefixo)
+        if bpfx not in allowed_prefixes:  # a bead tem de pertencer ao único rig do papel
             raise Stop(f"a sessão {sess} só submete os prefixos {'/'.join(allowed_prefixes)} e {args[0]} é de outro prefixo ({bpfx}): não submeto")
         ctx = rig_ctx(city, bpfx, mirror)
         bead = named_bead(city, alias, args[0], ctx.store, routes_of(ctx.rig, alias))
-    elif len(allowed_prefixes) == 1:
+    else:
         ctx = rig_ctx(city, role_prefix, mirror)
         bead = one_bead(ctx.store, alias)
-    else:
-        # Multi-rig: toda loja elegível é lida. Ausência/ilegibilidade de uma loja aborta (nunca vira "não havia bead nela"); só EXATAMENTE UMA candidata no conjunto pode ser submetida.
-        candidates = []
-        for prefix in allowed_prefixes:
-            candidate_ctx = rig_ctx(city, prefix, mirror)
-            candidate = one_bead(candidate_ctx.store, alias, empty_ok=True)
-            if candidate is not None:
-                candidates.append((candidate_ctx, candidate))
-        if not candidates:
-            raise Stop(f"nenhuma bead in_progress atribuída a {alias}: não sei o que submeter")
-        if len(candidates) > 1:
-            ids = [bead["id"] for _, bead in candidates]
-            raise Stop(f"{len(ids)} beads in_progress atribuídas a {alias} ({', '.join(ids[:5])}): não adivinho qual submeter")
-        ctx, bead = candidates[0]
     bid = bead["id"]
     if bid.split("-", 1)[0] != ctx.rig.prefix:  # a lista da loja do rig só devolve bead dele; se não for, algo está errado e eu não submeto
         raise Stop(f"a bead {bid} não é do rig {ctx.rig.name} (prefixo {ctx.rig.prefix}): não submeto")
