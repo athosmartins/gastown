@@ -1038,6 +1038,10 @@ g_floor() {
   # tmux que NÃO EXECUTA (caminho que não existe = OSError, outro ramo que o rc ≠ 0 do tmux de brinquedo): é não-consegui-ler, nunca 0 sessões (0 liberaria RAM)
   fl_up; EXTRA_ENV="$EXTRA_ENV BALLAST_TMUX=$W/nao-existe/tmux"; good 50; good 50; good 50; good 50; good 50; a=$(fl_rec)
   check "piso/sem leitura: tmux que não executa (OSError) é 'sem leitura', sessões null (nunca 0) e, com a janela cheia, nada começa" "14336 fixo-sem-leitura null null 0" "$a"
+  # tmux TRAVADO (não responde dentro de BALLAST_TMUX_TIMEOUT_S): é não-consegui-ler, nunca 0 sessões; `exec sleep` para o timeout matar o próprio processo (um filho do sh seguraria o pipe)
+  printf '#!/bin/sh\nexec sleep 20\n' > "$W/slow-tmux"; chmod +x "$W/slow-tmux"
+  fl_up; EXTRA_ENV="$EXTRA_ENV BALLAST_TMUX=$W/slow-tmux BALLAST_TMUX_TIMEOUT_S=1"; good 50; good 50; good 50; good 50; good 50; a=$(fl_rec)
+  check "piso/sem leitura: tmux que trava (passa do tempo limite) é 'sem leitura', sessões null (nunca 0) e, com a janela cheia, nada começa" "14336 fixo-sem-leitura null null 0" "$a"
   # o pico some do registro no tick em que o tmux não leu (a história guardada tem 2, mas este tick não sabe quantas sessões há): sess_peak null, nunca o pico velho
   fl_up; tmux_n 2; good 50; tmux_bad; good 50; a=$(fl_rec)
   check "piso/sem leitura: com 2 sessões na história, o tick em que o tmux não leu registra sess null e sess_peak null (não 2) e o piso FIXO" "14336 fixo-sem-leitura null null 0" "$a"
@@ -1461,6 +1465,7 @@ def read_cpu_prev(cfg):
 [piso] saída do tmux sem linha conta como 1 sessão@@        return len([ln for ln in out.splitlines() if ln.strip()])@@        return len(out.splitlines()) or 1
 [piso] o tmux que não executa é 0 sessões@@        raise Unreadable("tmux list-sessions: não executou (%s)" % e)@@        return 0
 [piso] a lacuna de leituras não recomeça a história@@    if not s or cfg.now < s["last"] or cfg.now - s["last"] > cfg.sess_gap_s:@@    if not s:
+[piso] o tmux travado é 0 sessões@@        raise Unreadable("tmux list-sessions: passou de %d s" % cfg.tmux_timeout_s)@@        return 0
 [piso] o balde guarda a última contagem e não a maior@@    s["b"][k] = max(s["b"].get(k, 0), n)@@    s["b"][k] = n
 [piso] o histórico nunca esquece (sem a poda dos baldes velhos)@@    s["b"] = {b: v for b, v in s["b"].items() if int(b) >= lo}@@    s["b"] = s["b"]
 [piso] o pico aparece mesmo quando o tmux não leu neste tick@@    peak = max(s["b"].values()) if (n is not None and s and s["b"]) else None@@    peak = max(s["b"].values()) if (s and s["b"]) else None
