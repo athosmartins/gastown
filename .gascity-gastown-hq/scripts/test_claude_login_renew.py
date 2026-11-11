@@ -124,6 +124,11 @@ print(json.dumps({"verdict": v, "step": "at claude.ai/oauth/authorize"}))
 
 EMAIL = {"crypto": "athoscrypto@gmail.com", "b85": "athosb85@gmail.com", "martins": "athosmartins@gmail.com", "terr": "terrenos.incorporacoes@gmail.com",
          "amb": "throw.away.amb@gmail.com"}
+# The account list the World runs on (CLAUDE_CREW_ACCOUNTS): the five accounts these tests were written for, as the crew job listed them until 11/11. b85 is the
+# FIFTH ordinary account of the fixtures (most tests renew it), not a claim about production: athosb85@ was cancelled by Athos (ga-oo94pgo) and the job no longer
+# serves it. The list production runs with has its own test, and the tests of a cancelled account run on it (World.production_accounts).
+TEST_ACCOUNTS = {EMAIL["crypto"]: {"dir": "athoscrypto"}, EMAIL["amb"]: {"dir": "throw.away.amb"}, EMAIL["b85"]: {"dir": "athosb85"},
+                 EMAIL["terr"]: {"dir": "terrenos"}, EMAIL["martins"]: {"item": "Claude Code-credentials-BACKUP-athosmartins-20261004"}}
 T0 = float(int(time.time()))
 DAY = 86400
 _GUARD: dict = {}
@@ -200,10 +205,15 @@ class World:
             monkeypatch.setenv(k, v)
         for k in ("CLAUDE_CREW_ACCOUNTS", "FAKE_SEC_FAIL", "FAKE_CLAUDE_MODE", "FAKE_DRIVER_VERDICT", "FAKE_CLAUDE_BLOB", "FAKE_NOTIFY_RC", "FAKE_NOTIFY_CAP", "GC_LOGIN_RENEW"):
             monkeypatch.delenv(k, raising=False)
+        monkeypatch.setenv("CLAUDE_CREW_ACCOUNTS", json.dumps(TEST_ACCOUNTS))
         monkeypatch.setattr(renew, "DRY", False, raising=False)  # main() sets it for the whole process: no test leaves a dry run behind
         self.mp = monkeypatch
         self.crew_state()                                          # the crew job's state: empty but READABLE (a missing or corrupt one is a case of its own)
         assert str(crew.security_bin()).startswith(str(self.d)) and str(crew.city()).startswith(str(self.d))
+
+    def production_accounts(self):
+        """The list launchd's job runs with (the crew script's own), not the fixtures' five: what a test of a CANCELLED account must run on."""
+        self.mp.delenv("CLAUDE_CREW_ACCOUNTS", raising=False)
 
     def store(self):
         p = self.d / "store.json"
@@ -274,6 +284,52 @@ class World:
 @pytest.fixture
 def w(tmp_path, monkeypatch):
     return World(tmp_path, monkeypatch)
+
+
+# ── ga-oo94pgo: athosb85@ was cancelled by Athos on 11/11 - the renewal no longer serves it (these run on the crew script's own list) ──
+# First in the file on purpose: the gate runs a test file on the pre-fix tree with failfast and a time limit, and the ~190 tests below would use it up.
+def _ran(w):
+    return [l for l in w.log().splitlines() if "scheduled run:" in l][-1]
+
+
+@pytest.mark.parametrize("newer_login", [False, True])
+def test_the_record_of_a_cancelled_account_stays_in_the_state_and_nothing_acts_on_it(w, newer_login):
+    """athosb85@ has a `failed_3_times` mark whose push was never delivered. Breaks if the run still pushes it (the push retry walks every account of the
+    STATE, not of the list), lifts it (its dir item is not deleted: a login with more life than at the mark lifts a mark) or counts the account as one it
+    looked at. The record is not erased: the file stays as it was and the run says what it ignored."""
+    w.production_accounts()
+    rec = {"tries": 3, "infeasible": {"verdict": "failed_3_times", "step": "driver_timeout: x", "at": T0 - 3600, "left": 3 * DAY}}
+    live = {"tries": 1, "next_at": T0 + 3600}                      # a served account with a record too: the run SAVES the state, and with it whatever it did to the other record
+    (w.d / "renew_state.json").write_text(json.dumps({"accounts": {EMAIL["b85"]: rec, EMAIL["terr"]: live}}))
+    if newer_login:                                               # 26 days MORE life than at the mark, in both places its logins live: on a served account that lifts it
+        for svc in (w.svc("b85"), crew.reserve_service(EMAIL["b85"])):
+            w.put(svc, blob("b85-relogin", rexp_days=29.0))
+    seen = record(w)
+    assert renew.main([]) == 0
+    assert seen == [] and w.calls("notify") == [] and w.calls("claude") == []
+    assert json.loads((w.d / "renew_state.json").read_text())["accounts"] == {EMAIL["b85"]: rec, EMAIL["terr"]: live}
+    assert "4 account(s) looked at" in _ran(w) and f"ignored, not an account of the crew job: {EMAIL['b85']}" in _ran(w)
+
+
+def test_a_cancelled_account_whose_login_ends_soon_is_not_in_the_forecast_and_cannot_be_renewed_by_hand(w):
+    """Breaks if athosb85@ is still in the forecast queue: its refresh token ends 15/11, so the run would open the automation Chrome for an account Athos cancelled."""
+    w.production_accounts()
+    w.own("b85", blob("b85-old", rexp_days=3.0))                  # inside the 7-day window
+    seen = record(w)
+    assert renew.main([]) == 0 and seen == []
+    assert "4 account(s) looked at" in _ran(w) and "nothing launched" in _ran(w)
+    assert renew.main(["--account", EMAIL["b85"], "--force"]) == 2 and seen == [] and w.calls("claude") == []
+
+
+def test_a_dry_run_lists_only_the_four_accounts_names_the_ignored_record_and_writes_nothing(w, capsys):
+    """The bead's proof, without the mini: `--dry-run` says which accounts it looked at and what it ignored, and touches neither the state nor the log."""
+    w.production_accounts()
+    (w.d / "renew_state.json").write_text(json.dumps({"accounts": {EMAIL["b85"]: {"tries": 3, "infeasible": {"verdict": "failed_3_times", "step": "x", "at": T0 - 3600, "left": 3 * DAY}}}}))
+    before = (w.d / "renew_state.json").read_text()
+    assert renew.main(["--dry-run"]) == 0
+    err = capsys.readouterr().err
+    assert "4 account(s) looked at" in err and f"ignored, not an account of the crew job: {EMAIL['b85']}" in err
+    assert (w.d / "renew_state.json").read_text() == before and w.log() == "" and w.calls("notify") == []
 
 
 # ── the attempt ─────────────────────────────────────────────────────────────────
@@ -476,17 +532,17 @@ def test_without_both_an_account_and_force_nothing_is_launched(w, capsys, argv):
 
 @pytest.mark.parametrize("py", ["/usr/bin/python3", sys.executable])
 def test_the_real_script_runs_from_an_empty_environment_under_both_interpreters(w, py):
-    w.own("b85", blob("b85-old", rexp_days=3.0))
+    w.own("terr", blob("terr-old", rexp_days=3.0))               # the child has NO account list of the world: it runs on the script's own, where terr is one of the four
     env = {"PATH": "/usr/bin:/bin", "HOME": os.environ["HOME"], "CLAUDE_CREW_NOW": str(T0), "CLAUDE_CREW_USER": "athos", "FAKE_SEC_DIR": str(w.d),
            "CLAUDE_CREW_SECURITY": str(w.d / "security"), "CLAUDE_CREW_STATE": str(w.d / "crew_state.json"), "CLAUDE_CREW_ACCOUNTS_DIR": str(w.d / "accts"),
            "GC_CITY_PATH": str(w.d / "city"), "CLAUDE_RENEW_CLAUDE": str(w.d / "claude"), "CLAUDE_RENEW_DRIVER": os.environ["CLAUDE_RENEW_DRIVER"],
            "FAKE_DRIVER_VERDICT": "puzzle", "CLAUDE_CREW_PROFILE_URL": os.environ["CLAUDE_CREW_PROFILE_URL"],
            # everything the script WRITES or CALLS is pinned into the world: without these the child falls back to the REAL
-           # shared state file (a fake mark on the real athosb85) and to whatever `notify` the PATH finds (ga-xoe5ao.5.3)
+           # shared state file (a fake mark on a real account) and to whatever `notify` the PATH finds (ga-xoe5ao.5.3)
            "CLAUDE_RENEW_STATE": str(w.d / "renew_state.json"), "CLAUDE_CREW_DECISION": str(w.d / "pool_decision.json"), "CLAUDE_CREW_NOTIFY": str(w.d / "notify")}
-    r = subprocess.run([py, str(SCRIPT), "--account", EMAIL["b85"], "--force"], env=env, capture_output=True, text=True, timeout=60)
+    r = subprocess.run([py, str(SCRIPT), "--account", EMAIL["terr"], "--force"], env=env, capture_output=True, text=True, timeout=60)
     assert r.returncode == 2 and "puzzle" in r.stdout, r.stderr
-    mark = json.loads((w.d / "renew_state.json").read_text())["accounts"][EMAIL["b85"]]["infeasible"]    # the mark landed in THIS world's state, not the real one
+    mark = json.loads((w.d / "renew_state.json").read_text())["accounts"][EMAIL["terr"]]["infeasible"]    # the mark landed in THIS world's state, not the real one
     assert mark["verdict"] == "puzzle" and mark["left"] == pytest.approx(3 * 86400, abs=5)
 
 

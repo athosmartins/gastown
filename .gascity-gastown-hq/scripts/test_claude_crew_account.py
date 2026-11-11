@@ -146,6 +146,11 @@ NOTIFY = ("#!/bin/sh\necho \"$@\" >> \"$FAKE_SEC_DIR/notify.log\"\necho \"$NOTIF
           "exit \"${FAKE_NOTIFY_RC:-0}\"\n")      # FAKE_NOTIFY_RC: the strict exit codes of the real notify
 EMAIL = {"crypto": "athoscrypto@gmail.com", "amb": "throw.away.amb@gmail.com", "b85": "athosb85@gmail.com",
          "terr": "terrenos.incorporacoes@gmail.com", "martins": "athosmartins@gmail.com"}
+# The account list the World runs on (CLAUDE_CREW_ACCOUNTS): the five accounts these tests were written for, as production listed them until 11/11. b85 is the
+# FIFTH ordinary account of the fixtures, not a claim about production: athosb85@ was cancelled by Athos (ga-oo94pgo) and the job no longer serves it. The
+# list production runs with is pinned by its own test, and the tests of a cancelled account run on it (World.production_accounts).
+TEST_ACCOUNTS = {EMAIL["crypto"]: {"dir": "athoscrypto"}, EMAIL["amb"]: {"dir": "throw.away.amb"}, EMAIL["b85"]: {"dir": "athosb85"},
+                 EMAIL["terr"]: {"dir": "terrenos"}, EMAIL["martins"]: {"item": "Claude Code-credentials-BACKUP-athosmartins-20261004"}}
 
 
 T0 = time.time()      # one clock for every login in a test: only `rexp_days` tells two logins of the same age apart
@@ -420,12 +425,17 @@ class World:
                   "GC_CREW_UNSTICK", "FAKE_TMUX_DOWN", "CLAUDE_CREW_TMUX_SOCKET", "GC_CREW_RESET", "FAKE_GC_LIST_FAIL", "FAKE_GC_RESET_FAIL",
                   "FAKE_NOTIFY_RC", "FAKE_NOTIFY_CAP", "FAKE_GC_MAIL_FAIL", "NOTIFY_STRICT_EXIT", "NOTIFY_FORCE_PUSH"):
             monkeypatch.delenv(k, raising=False)
+        monkeypatch.setenv("CLAUDE_CREW_ACCOUNTS", json.dumps(TEST_ACCOUNTS))
         self.mp = monkeypatch
         # the world must be sealed: every seam inside this tmp dir, none of them a sentinel
         for fn in (crew.security_bin, crew.state_path, crew.decision_path, crew.sessions_dir, crew.tmux_bin,
                    *([crew.cred_file] if hasattr(crew, "cred_file") else [])):        # (the previous HEAD has no credentials-file seam: its tests must still run)
             assert str(fn()).startswith(str(self.d)), f"{fn.__name__} escapes the test world: {fn()}"
         assert os.environ["CLAUDE_CREW_NOTIFY"].startswith(str(self.d)) and str(crew.city()).startswith(str(self.d))
+
+    def production_accounts(self):
+        """The list launchd's job runs with (the script's own), not the fixtures' five: what a test of a CANCELLED account must run on."""
+        self.mp.delenv("CLAUDE_CREW_ACCOUNTS", raising=False)
 
     # keychain
     def store(self):
@@ -560,6 +570,109 @@ def test_item_names_are_derived_from_the_absolute_path_and_match_the_measured_on
     assert crew.dir_service(base + "throw.away.amb") == "Claude Code-credentials-d0aeaa6c"
     assert crew.dir_service(base + "athosb85") == "Claude Code-credentials-3839ec1f"
     assert crew.dir_service("/Users/athos/.gastown/claude-pool-cred") == "Claude Code-credentials-50adeaf1"
+
+
+# ══ ga-oo94pgo: athosb85@ was cancelled by Athos on 11/11 - no switch, heal or renewal may land on it ═══════════════════════════
+# Production no longer lists it (the World's five accounts are the fixtures', TEST_ACCOUNTS): every test here runs on the script's own list.
+# First in the file on purpose: the gate runs a test file on the pre-fix tree with failfast and a time limit, and the ~270 tests below would use it up.
+def _cancelled(w, b):
+    """athosb85@'s logins where they still are on the mini (its config dir and its items are not deleted): the job must read neither."""
+    for svc in (crew.dir_service(str(w.d / "accts" / "athosb85")), crew.reserve_service(EMAIL["b85"])):
+        w.put(svc, b)
+
+
+def test_the_script_serves_the_four_live_accounts_and_not_the_cancelled_one(w):
+    w.production_accounts()
+    assert set(crew.accounts()) == {EMAIL[k] for k in ("crypto", "amb", "terr", "martins")}, "athosb85@ was cancelled by Athos on 11/11 (ga-oo94pgo)"
+    assert crew.reserve_service(EMAIL["b85"]) not in crew.writable_services()          # nor may the job write the items it left behind
+
+
+def test_a_cancelled_account_is_not_the_fallback_whatever_logins_it_still_has_stored(w):
+    """Breaks if athosb85@ is still on the list (`fallback:athosb85`, 25/10, put the crews on it) or if its items are still read."""
+    w.production_accounts()
+    w.default("crypto", blob("crypto"))
+    w.account("crypto", blob("crypto"))
+    _cancelled(w, blob("b85", acc_hours=-30))
+    w.decide("terr", exhausted=["crypto"])                        # crypto is exhausted and the pool's terrenos has no login: only a fallback can move the crews
+    w.run()
+    assert crew.DEFAULT_SERVICE not in w.writes() and w.state()["current"] == EMAIL["crypto"]
+    assert any("STUCK" in n for n in w.notified())
+
+
+@pytest.mark.parametrize("pick", ["amb", "b85"])
+def test_a_cancelled_account_is_not_a_heal_source_whatever_logins_it_still_has_stored(w, pick):
+    """Breaks if the heal still reaches athosb85@ (`heal-fallback:athosb85`, 08/11; 28 heals of it on 14-15/10), or if its Fix tells Athos to log the
+    cancelled account in when the pool still picks it."""
+    w.production_accounts()
+    w.put(crew.DEFAULT_SERVICE, blob("old", refresh=False))      # the default holds no full login: the heal puts SOME login there
+    _cancelled(w, blob("b85", acc_hours=-30))
+    w.decide(pick)                                                # the pool's pick has no login either (b85: it IS the cancelled account)
+    w.run()
+    said = "\n".join(w.notified())
+    assert crew.DEFAULT_SERVICE not in w.writes()
+    assert "cannot heal" in said and f"log {EMAIL['b85']} in" not in said
+
+
+def test_a_pool_pick_the_job_does_not_serve_is_not_followed_and_nobody_is_told_to_log_it_in(w):
+    """The pool keeps its own list. Breaks if the job follows a pick it does not serve - taking the account off the list is not enough, the reserve item it
+    left behind still holds a login - or if the push tells Athos to log the cancelled account in."""
+    w.production_accounts()
+    w.default("crypto", blob("crypto"))
+    w.account("crypto", blob("crypto"))
+    _cancelled(w, blob("b85", acc_hours=-30))
+    w.decide("b85")
+    w.run()
+    assert crew.DEFAULT_SERVICE not in w.writes() and w.state()["current"] == EMAIL["crypto"]
+    said = [n for n in w.notified() if EMAIL["b85"] in n]
+    assert len(said) == 1 and "not one of the accounts this job serves" in said[0] and "out of the pool's list" in said[0] and "claude auth login" not in said[0]
+
+
+def test_the_outage_notice_does_not_tell_anybody_to_log_a_cancelled_account_in(w):
+    """The pool's pick is the account the notice's Fix names. Breaks if a pick the job does not serve is named there, with its login command."""
+    w.production_accounts()
+    _dead_world(w, keys=("terr", "crypto", "amb"))
+    w.decide("b85")
+    _run_dead(w, 0, 600, 660)
+    said = _ep_pushes(w)
+    assert len(said) == 1 and f"claude auth login --email {EMAIL['b85']}" not in said[0] and f"claude auth login --email {EMAIL['crypto']}" in said[0]
+
+
+def test_the_crews_can_leave_a_cancelled_account_that_holds_the_default_and_its_login_is_parked_not_lost(w):
+    """If the default holds athosb85@'s login when the job is updated, the switch away must not be refused for ever: the sync-back has no item of its own to
+    write to (the write allowlist is the list's), so the login is parked - kept whole in an item nothing reads."""
+    w.production_accounts()
+    w.default("b85", blob("b85", rt="b85-held"))                  # the profile says the default is athosb85@'s
+    w.account("crypto", blob("crypto"))
+    w.decide("crypto")
+    w.run()
+    assert _rt(w.get(crew.DEFAULT_SERVICE)) == "sk-ant-ort01-crypto-ref" and w.state()["current"] == EMAIL["crypto"]
+    parked = w.get(crew.parked_service(crew.fp("sk-ant-ort01-b85-held-ref")))
+    assert parked is not None and _rt(parked) == "sk-ant-ort01-b85-held-ref"
+    assert not any("sync-back" in n for n in w.notified())
+
+
+def test_a_cancelled_holder_whose_login_cannot_be_parked_is_not_overwritten_and_the_crews_stay(w):
+    """The failed side of the park: the login of an account nothing else keeps is never destroyed on a guess - the switch is refused, said, the default stays."""
+    w.production_accounts()
+    w.default("b85", blob("b85", rt="b85-held"))
+    w.account("crypto", blob("crypto"))
+    w.decide("crypto")
+    w.mp.setenv("FAKE_SEC_WFAIL", crew.parked_service(crew.fp("sk-ant-ort01-b85-held-ref")))      # `security` refuses the write of the parked copy
+    w.run()
+    assert crew.DEFAULT_SERVICE not in w.writes() and _rt(w.get(crew.DEFAULT_SERVICE)) == "sk-ant-ort01-b85-held-ref"
+    assert any("could not be parked" in n and "STAY on" in n and EMAIL["b85"] in n for n in w.notified())
+
+
+def test_a_pool_pick_the_job_does_not_serve_still_lets_the_crews_fall_back_when_the_current_account_is_exhausted(w):
+    """Refusing the pick must not strand the crews on an exhausted account: the same fallback as for a pick with no login."""
+    w.production_accounts()
+    w.default("crypto", blob("crypto"))
+    w.account("crypto", blob("crypto"))
+    w.account("amb", blob("amb"))
+    _cancelled(w, blob("b85", acc_hours=-30))
+    w.decide("b85", exhausted=["crypto"])
+    w.run()
+    assert w.state()["current"] == EMAIL["amb"] and w.state()["last_switch"]["reason"] == "fallback"
 
 
 # ── 1. in sync: nothing is written ───────────────────────────────────────────
@@ -1659,11 +1772,11 @@ INTERPRETERS = [sys.executable] + (["/usr/bin/python3"] if os.path.exists("/usr/
 @pytest.mark.parametrize("interpreter", INTERPRETERS)       # the plist runs /usr/bin/python3 (3.9): the suite must too
 def test_the_real_script_run_from_an_empty_environment_stays_inside_the_test_world(w, interpreter):
     w.default("crypto", blob("crypto"))
-    w.account("b85", blob("b85"))
-    w.decide("b85")
+    w.account("terr", blob("terr"))                               # the child has NO account list of the world: it runs on the script's own, where terr is one of the four
+    w.decide("terr")
     r = _env_i(w, interpreter)
     assert r.returncode == 0, r.stderr
-    assert "SWITCH crews" in w.log() and w.state()["current"] == EMAIL["b85"]       # log + state landed in the tmp world
+    assert "SWITCH crews" in w.log() and w.state()["current"] == EMAIL["terr"]       # log + state landed in the tmp world
     w.account("amb", blob("amb", refresh=False))
     w.decide("amb")
     r = _env_i(w, interpreter)                                    # an alert: the push must go to the PINNED notify

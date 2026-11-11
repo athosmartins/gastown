@@ -198,10 +198,12 @@ POOL_CRED_DIR = str(Path.home() / ".gastown" / "claude-pool-cred")
 # ~/.gastown/claude-accounts (item = "Claude Code-credentials-" + sha256(ABSOLUTE PATH)[:8]; DERIVE it, never copy a hash
 # from a note: the 05/10 note had two swapped). "item" = a fixed service name. terrenos has no login of its own any more:
 # its home WAS the default item.
+# athosb85@ is NOT here: Athos cancelled the account on 11/11 (ga-oo94pgo). An account that is not on this list is never a switch target, a heal
+# source or a renewal candidate, whoever names it (the pool's pick, the holder of the default, a record in a state file); its config dir and its
+# Keychain items are left where they are (nobody deletes them from here).
 DEFAULT_ACCOUNTS: Dict[str, dict] = {
     "athoscrypto@gmail.com": {"dir": "athoscrypto"},
     "throw.away.amb@gmail.com": {"dir": "throw.away.amb"},
-    "athosb85@gmail.com": {"dir": "athosb85"},
     "terrenos.incorporacoes@gmail.com": {"dir": "terrenos"},
     "athosmartins@gmail.com": {"item": "Claude Code-credentials-BACKUP-athosmartins-20261004"},
 }
@@ -1009,6 +1011,12 @@ def mail_mayor(subject: str, body: str) -> bool:
     return rc == 0
 
 
+def login_pick(want: str) -> str:
+    """`want` (the pool's pick) as the account a `Fix: log X in` names - only when this job serves it. A pick it does not serve (a cancelled account) is never
+    one to log in: '' lets the caller name another account, or say something else."""
+    return want if want in accounts() else ""
+
+
 def relogin_cmd(email: str) -> str:
     """The one step that always works (ga-yyltfk): a fresh full-scope login in the account's own config dir; the next run finds it."""
     d = (accounts().get(email) or {}).get("dir")
@@ -1020,7 +1028,7 @@ def relogin_cmd(email: str) -> str:
 
 
 def no_login_text(ep: dict, dec, t: float) -> str:
-    want = str((dec or {}).get("current") or "").strip().lower() or next(iter(accounts()), "")
+    want = login_pick(str((dec or {}).get("current") or "").strip().lower()) or next(iter(accounts()), "")
     # vazio (no count, no list: the job did not record a try) → it says NOTHING about tries, "not recorded" is not "none was tried"; falhou/ilegível (not an int / not a text) → the same
     n, who, tried = ep.get("writes"), ep.get("wrote"), ep.get("accounts")
     did = ""
@@ -1965,6 +1973,10 @@ def load_source(email: str, t: float, st: Optional[dict] = None) -> Tuple[Option
     """The first usable full login of `email`: ((service, acct, blob), [], False) or (None, [why-not per place], unreadable).
     'Could not read' ends the search (falling through to a later place would hand out whatever stale copy lives there) and
     sets `unreadable`: that is "cannot tell if it has a login", which no caller may treat as "it has none"."""
+    # vazio (an e-mail that is not on the list: a cancelled account the pool or the state still names) → no source, said - taking it off the list is not enough, its reserve
+    # item is still a place source_services() would look; falhou/ilegível (CLAUDE_CREW_ACCOUNTS unparsable) → accounts() already answered with the built-in list, said
+    if email not in accounts():
+        return None, [f"{email}: not one of the accounts this job serves"], False
     why = []
     for svc in source_services(email):
         s, acct, blob = kc_read(svc)
@@ -1995,6 +2007,10 @@ def sync_back(st: dict, ident: str, cur: dict, t: float, dry: bool) -> Tuple[str
         # or the identity would have been re-asked), so there is nothing rotated to save - and writing it to the CLAIMED
         # owner's item would be the very mistake the unverified state exists to catch.
         return SB_NOTHING, "the owner is unverified and the default item is unchanged since the switch"
+    if ident not in accounts():
+        # vazio (a holder this job does not serve - a cancelled account: no item of its own, and none on the write allowlist) → nothing is copied back here; the switch that
+        # ends its stay parks the login whole instead (_follow), so the crews can leave it; falhou/ilegível (CLAUDE_CREW_ACCOUNTS unparsable) → accounts() fell back to the built-in list
+        return SB_NOTHING, f"{ident} is not an account this job serves: there is no item of its own to copy its login back to"
     o = cur["claudeAiOauth"]
     dest: Optional[Tuple[str, str, Optional[dict]]] = None
     for svc in source_services(ident):                          # its own item(s) first, the reserve last
@@ -2058,7 +2074,8 @@ def choose(st: dict, dec: dict, ident: str, t: float) -> Choice:
         return None, None, "wanted account could not be read", None
     msg = f"the pool is on {want} but there is no usable full login for it ({'; '.join(why)}) - the crews stay on {ident}"
     if not exhausted(dec, ident, t):
-        alert(st, f"no-login:{want}", msg + ". Fix: log {0} in (claude auth login with its CLAUDE_CONFIG_DIR) - a human step".format(want), t)
+        fix = f"log {want} in (claude auth login with its CLAUDE_CONFIG_DIR)" if login_pick(want) else f"take {want} out of the pool's list"
+        alert(st, f"no-login:{want}", f"{msg}. Fix: {fix} - a human step", t)
         return None, None, "wanted account has no full login; current one still has balance", None
     unread_others = []
     for other in accounts():
@@ -2091,7 +2108,7 @@ def heal_choice(st: dict, dec: dict, ident: Optional[str], want: str, t: float) 
         whys.append(f"{cand}: {'; '.join(why)}")
         short.append(f"{cand}: " + ", ".join(sorted({r.split(": ", 1)[-1].split(" - ")[0].split(" (")[0] for r in why})))   # 'held', 'dead', 'missing', 'no access token' ...
     alert(st, "heal-no-source", f"cannot heal the default item: no account has a usable full login ({' | '.join(whys)}). "
-                                f"Fix: log {want or 'one of the accounts'} in (claude auth login with its CLAUDE_CONFIG_DIR) - a human "
+                                f"Fix: log {login_pick(want) or 'one of the accounts'} in (claude auth login with its CLAUDE_CONFIG_DIR) - a human "
                                 "step", t)
     ep = st.get("no_login")
     if isinstance(ep, dict):                                   # ga-xoe5ao.4: the episode notice (what reaches the Mayor) says which account failed and why
@@ -2242,6 +2259,10 @@ def _follow(st: dict, dec: dict, user: str, t: float, dry: bool) -> int:
     if dry:
         log("INFO", f"DRY-RUN would switch the crews {ident} -> {target} ({reason}) from {svc}"
                     + ("" if claimed else " [owner unverified: the profile cannot answer for that token]"))
+        return 0
+    if ok and ident not in accounts() and not park(cur, "item or file"):     # a holder this job does not serve: sync_back kept nothing, so its login is parked whole before the crews leave it
+        alert(st, f"sync-back:{ident}", f"the login of {ident}, an account this job does not serve, could not be parked (see the log): the switch to {target} "
+              f"is refused and the crews STAY on {ident} until it can be saved", t)
         return 0
     before = bridges()
     done, why_not = put_default(st, acct or user, item, cur, ident if ok else None, fs, fblob, fraw, blob, target, t)

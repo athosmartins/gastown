@@ -382,10 +382,19 @@ def survey(email: str, crew: dict, t: float, file: Optional[dict] = None) -> dic
     return {"best_left": best, "full": full, "default_full": default_full, "unread": unread, "no_object": no_object, "refused": refused, "unread_file": only_file}
 
 
+def retired(st: dict) -> List[str]:
+    """The accounts the state still has a record of that the crew job does not serve (a cancelled one: ga-oo94pgo). Their records stay in the file as they
+    are - nobody erases a state by hand - and nothing acts on them: no Keychain read, no mark lifted, no push, no candidate."""
+    return sorted(e for e in (st.get("accounts") or {}) if e not in C.accounts())
+
+
 def release_marks(st: dict, crew: dict, t: float) -> None:
     """A mark is lifted when somebody logged the account in by hand: its best login now has HAND_LOGIN_GAIN_S more life than when it was marked,
     or it now has a login with a recorded end where the mark found none."""
+    gone = retired(st)
     for email, a in list((st.get("accounts") or {}).items()):
+        if email in gone:                                      # not an account any more: its items are not looked at and its mark is not lifted (housekeeping() does not push it either)
+            continue
         mark = a.get("infeasible")
         if not isinstance(mark, dict):
             continue
@@ -661,11 +670,13 @@ def housekeeping() -> int:
                 launched = f"launched {email} ({reason}): {verdict}"
                 break
             facts.setdefault("passed", []).append(f"{email} (nothing could be launched for it)")
+    gone = retired(st)
     if crew_status == "ok":                                    # ga-i4t0lzx: EVERY scheduled run leaves a line - 04/11 13:48Z-15:00Z the log stood still and silence looked the same as a job that was not running
         passed = facts.get("passed") or []
         rlog("INFO", f"scheduled run: {facts.get('accounts', 0)} account(s) looked at; {facts.get('outage', 'no outage')}; " + (launched or "nothing launched")
-             + (f"; passed over: {', '.join(passed)}" if passed else ""))
-    err = None if DRY or not st.get("accounts") else settle(st, list(st["accounts"]), t)
+             + (f"; passed over: {', '.join(passed)}" if passed else "") + (f"; ignored, not an account of the crew job: {', '.join(gone)}" if gone else ""))
+    live = [e for e in (st.get("accounts") or {}) if e not in gone]       # only these get their push retried (and a run with none of them saves nothing); a cancelled one's record is kept, never pushed
+    err = None if DRY or not live else settle(st, live, t)
     if err:
         rlog("ERROR", f"the state could not be written ({type(err).__name__}): this run's marks, tries and pushes are NOT recorded")
     return 0 if crew_status == "ok" and not err else 1

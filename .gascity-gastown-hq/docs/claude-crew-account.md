@@ -240,6 +240,13 @@ de login **Background** do launchd, onde a leitura do Keychain falha (rc 36), en
 - Uma troca não verificada não se repete com a mesma cópia: o 2º `unverified switch` do mesmo login (mesmo refresh token) não acontece por
   6 h; o 1º continua sendo o caminho normal de produção (fail-open do item 4).
 - Um login que o perfil já deu a OUTRA conta nunca é escrito como se fosse da conta pedida, esteja em que item estiver.
+- **Conta cancelada não é candidata (ga-oo94pgo, 11/11).** A athosb85@ foi cancelada pelo Athos e saiu de `DEFAULT_ACCOUNTS` (já tinha sido o alvo de `fallback:athosb85`, 25/10, e de `heal-fallback:athosb85`, 08/11).
+  Conta fora da lista nunca é fonte de login, quem quer que a nomeie — a escolha do pool, o dono do default, um registro no estado: `load_source` diz «not one of the accounts this job serves» (tirar da lista não bastaria, o item
+  reserva que ela deixou ainda é um lugar onde `source_services` olharia), e a allowlist de escrita é a da lista. Se o pool ainda a escolhe, as crews **ficam onde estão** (o fallback segue valendo quando a atual está esgotada) e
+  o alerta diz «take <conta> out of the pool's list» em vez de mandar fazer login; o `Fix: log … in` das outras notícias (episódio sem login, heal sem fonte) nunca nomeia uma conta que o job não atende. Se for o próprio default que
+  guarda o login dela, o `sync-back` não tem item próprio para onde copiá-lo: a troca **estaciona** o login inteiro (`Claude Code-credentials-CREW-RESERVE-PARKED-<impressão>`, que ninguém lê) antes de as crews saírem; se o `park`
+  falhar a troca é recusada e as crews ficam (alerta `sync-back:<conta>`). Não foram tocados: o dir `~/.gastown/claude-accounts/athosb85` e os itens dela no chaveiro (decisão à parte), a lista de contas do pool
+  (`lib/claude_account_pool.py`, repo do WA) e a lista de contas conhecidas do `claude-credential-preflight.sh`.
 
 ## Liga/desliga
 - Kill switch: `touch /Users/athos/gt/.gascity-gastown-hq/.gc/no-crew-account` (ou `GC_CREW_ACCOUNT=0`).
