@@ -6272,7 +6272,7 @@ rebase_deploy_deps_inherited_drift() {
 rebase_deploy_deps_verdict() {
   local wt="$1" gd="$2" main_ref="$3" new_tip="$4" mt_out="$5" mode="${6:-conflict}"
   local paths expected actual diffout diff_rc tip_sha wt_head wt_dirty wt_rc
-  local main_gen tip_gen chk_err chk_rc chk_timeout why inh
+  local main_gen tip_gen main_gen_rc tip_gen_rc chk_err chk_rc chk_timeout why inh
   case "$mode" in
     conflict|clean) : ;;
     *) echo "unknown:deploy-deps-bad-mode"; return 0 ;;
@@ -6306,10 +6306,13 @@ rebase_deploy_deps_verdict() {
     echo "unknown:deploy-deps-tree-mismatch"; return 0
   fi
   # 3. the generator is main's own. Both sides must resolve to a real blob:
-  # `rev-parse <ref:path>` on a missing path exits non-zero, and an empty
-  # answer on both sides must not compare equal.
-  main_gen=$(git --git-dir="$gd" rev-parse --verify --quiet "${main_ref}:scripts/gen_daemon_deps.py" 2>/dev/null || echo "")
-  tip_gen=$(git --git-dir="$gd" rev-parse --verify --quiet "${new_tip}:scripts/gen_daemon_deps.py" 2>/dev/null || echo "")
+  # `rev-parse <ref:path>` on a missing path exits 1 (a read that FAILED exits
+  # >= 2, kept apart below), and an empty answer on both sides must not compare equal.
+  # vazio (exit 1: o caminho nao esta nessa arvore) → generator-unverified, a recusa; falhou/ilegivel (exit >= 2: o git nao conseguiu ler)
+  # → unknown:deploy-deps-generator-read-failed, nunca a recusa (ga-uw1oc1u: ela vale "no" nos dois modos, e erro de leitura nao e "ausente")
+  main_gen=$(git --git-dir="$gd" rev-parse --verify --quiet "${main_ref}:scripts/gen_daemon_deps.py" 2>/dev/null); main_gen_rc=$?
+  tip_gen=$(git --git-dir="$gd" rev-parse --verify --quiet "${new_tip}:scripts/gen_daemon_deps.py" 2>/dev/null); tip_gen_rc=$?
+  if [ "$main_gen_rc" -gt 1 ] || [ "$tip_gen_rc" -gt 1 ]; then echo "unknown:deploy-deps-generator-read-failed"; return 0; fi
   case "$main_gen$tip_gen" in
     *[!0-9a-f]*|"") echo "unknown:deploy-deps-generator-unverified"; return 0 ;;
   esac
@@ -6641,6 +6644,10 @@ rebase_deploy_deps_map() {
 #                     :deploy-deps-generator-unverified — scripts/gen_daemon_deps.py
 #                                                         ausente, ou diferente do
 #                                                         de main_ref
+#                     :deploy-deps-generator-read-failed — o git nao conseguiu LER
+#                                                         esse arquivo (exit >= 2;
+#                                                         ausente e exit 1 e e o
+#                                                         unverified acima — ga-uw1oc1u)
 #                     :deploy-deps-wt-not-at-tip       — <worktree> nao esta em
 #                                                         new_tip, ou tem
 #                                                         modificacao rastreada
@@ -6676,8 +6683,8 @@ rebase_deploy_deps_map() {
 #                     :deploy-deps-wt-not-at-tip / :deploy-deps-check-timeout /
 #                     :deploy-deps-check-unavailable / :deploy-deps-check-failed /
 #                     :deploy-deps-inherited-timeout / :deploy-deps-inherited-unverified /
-#                     :deploy-deps-diff-error / :deploy-deps-bad-mode /
-#                     :deploy-deps-no-verdict
+#                     :deploy-deps-diff-error / :deploy-deps-generator-read-failed /
+#                     :deploy-deps-bad-mode / :deploy-deps-no-verdict
 #                   Ate o ga-uw1oc1u o modo conflito (ga-r5dsgp) devolvia a linha
 #                   do arbitro como estava, inclusive check-drift, e esse
 #                   "unknown" caia no retry transitorio (exile -> recovery ->

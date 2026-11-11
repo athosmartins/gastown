@@ -1031,6 +1031,20 @@ parity "check-drift (exit 4)" "$RD"  "$V8B" "$RC4" "$V9D"
 parity "tree-mismatch"        "$RD4" "$V8F" "$RC2" "$V9B"
 parity "generator-unverified" "$RD6" "$V8H" "$RC5" "$V9E"
 
+# Leitura que FALHA != caminho que nao existe. generator-unverified agora vale "no" nos dois modos, entao
+# um git que nao conseguiu ler o blob do gerador (exit 128) nao pode sair com a cara de "main nao tem
+# gerador" (exit 1, ausente — 8c): e "nao consegui saber" e fica unknown. O shim falha SO essa leitura.
+RD_MAIN=$(git -C "$RD" rev-parse ddjmain); RD_BRANCH=$(git -C "$RD" rev-parse ddjbranch)
+GITSHIM="$TMP/gitshim"; mkdir -p "$GITSHIM"; REAL_GIT="$(command -v git)"
+printf '#!/bin/sh\nfor a in "$@"; do case "$a" in *:scripts/gen_daemon_deps.py) exit 128 ;; esac; done\nexec "%s" "$@"\n' "$REAL_GIT" > "$GITSHIM/git"
+chmod +x "$GITSHIM/git"
+V11N=$( PATH="$GITSHIM:$PATH"; run_verdict_at "$RD" "$RD_MAIN" "$RD_BRANCH" "$DDJ_BAD_TIP" )
+[ "$V11N" = "unknown:deploy-deps-generator-read-failed" ] \
+  && ok "11n: a leitura do gerador FALHA (git exit 128) => unknown:deploy-deps-generator-read-failed (nao consegui saber), nao a recusa" \
+  || bad "11n: esperava unknown:deploy-deps-generator-read-failed com a leitura do gerador falhando, deu '$V11N' (uma leitura que falhou virou o mesmo veredito de 'gerador ausente')"
+[ "$V8C" = "no" ] && ok "11n-controle: o gerador AUSENTE em main (8c, exit 1) segue sendo a recusa: no" \
+                  || bad "11n-controle: o gerador ausente deveria seguir no, deu '$V8C'"
+
 # A composicao: o veredito REAL de cada fixture entra no bloco REAL do Step 4c (mesmo sentinela do
 # selftest do ga-10uqmi). merge = needs-rebase direto, sem contador nem exile; transient = exile + retry.
 CLS_BLOCK=$(sed -n '/# SELFTEST-EXTRACT gate-10uqmi-rebase-fail-classify: BEGIN/,/# SELFTEST-EXTRACT gate-10uqmi-rebase-fail-classify: END/p' "$DISPATCHER")
@@ -1059,6 +1073,7 @@ else
   expect_kind "modo conflito, worktree fora do tip"                  "$V8G1" transient
   expect_kind "modo conflito, --check estourou o timeout"            "$V8I"  transient
   expect_kind "modo conflito, lint estourou o timeout"               "$V10E" transient
+  expect_kind "modo conflito, a leitura do gerador FALHOU"           "$V11N" transient
   expect_kind "modo texto-limpo, --check estourou o timeout"         "$V9F"  transient
 fi
 
@@ -1073,7 +1088,7 @@ if ( . "$TMP/block.sh"; declare -F rebase_deploy_deps_map >/dev/null 2>&1 ); the
       && ok "11 mapa: unknown:deploy-deps-$s => no nos dois modos (o arbitro rodou ate o fim e recusou; se reproduz)" \
       || bad "11 mapa: unknown:deploy-deps-$s deveria virar no nos dois modos, deu '$(mapv "unknown:deploy-deps-$s" conflict)' / '$(mapv "unknown:deploy-deps-$s" clean)'"
   done
-  for s in wt-not-at-tip check-timeout check-unavailable check-failed inherited-timeout inherited-unverified diff-error bad-mode no-verdict um-sufixo-novo; do
+  for s in wt-not-at-tip check-timeout check-unavailable check-failed inherited-timeout inherited-unverified diff-error generator-read-failed bad-mode no-verdict um-sufixo-novo; do
     [ "$(mapv "unknown:deploy-deps-$s" conflict)" = "unknown:deploy-deps-$s" ] && [ "$(mapv "unknown:deploy-deps-$s" clean)" = "unknown:deploy-deps-$s" ] \
       && ok "11 mapa: unknown:deploy-deps-$s segue unknown (nao consegui saber != reprovado; default de sufixo novo)" \
       || bad "11 mapa: unknown:deploy-deps-$s deveria seguir unknown nos dois modos, deu '$(mapv "unknown:deploy-deps-$s" conflict)' / '$(mapv "unknown:deploy-deps-$s" clean)'"
@@ -1097,7 +1112,6 @@ fi
 # Terceiro estado do segundo parecer (leitura que NAO respondeu != leitura que respondeu "drift"): o ramo
 # default do case "$inh" devolvia check-drift para saida vazia ou fora do contrato — e agora que check-drift e
 # "no" nos dois modos, um "nao consegui saber" viraria needs-rebase de um branch que pode estar certo.
-RD_MAIN=$(git -C "$RD" rev-parse ddjmain); RD_BRANCH=$(git -C "$RD" rev-parse ddjbranch)
 V11D1=$( . "$TMP/block.sh"; rebase_deploy_deps_inherited_drift() { printf ''; }; rebase_content_verdict "$RD" "$RD_MAIN" "$RD_BRANCH" "$DDJ_BAD_TIP" )
 V11D2=$( . "$TMP/block.sh"; rebase_deploy_deps_inherited_drift() { printf 'texto fora do contrato'; }; rebase_content_verdict "$RD" "$RD_MAIN" "$RD_BRANCH" "$DDJ_BAD_TIP" )
 V11D3=$( . "$TMP/block.sh"; rebase_deploy_deps_inherited_drift() { printf 'drift'; }; rebase_content_verdict "$RD" "$RD_MAIN" "$RD_BRANCH" "$DDJ_BAD_TIP" )
@@ -1156,6 +1170,15 @@ else
   [ "$LPM" != "<could not compute: merge-tree-conflict>" ] \
     && ok "11m-mut: sem a checagem do conflito unico o conflito duplo deixa de dar o sentinel => e ela que o segura" \
     || bad "11m-mut: o codigo mutado deveria deixar de dar o sentinel para o conflito duplo, deu '$LPM'"
+fi
+# 11n-mut: sem a separacao "falhou != ausente" a leitura que falhou volta a ser a recusa — e agora ela vale no.
+sed 's/if \[ "\$main_gen_rc" -gt 1 \] || \[ "\$tip_gen_rc" -gt 1 \]; then/if false; then/' "$TMP/block.sh" > "$TMP/block_mut11n.sh"
+if cmp -s "$TMP/block.sh" "$TMP/block_mut11n.sh"; then
+  bad "11n-mut: mutacao nao aplicou — a separacao da leitura do gerador nao esta onde o teste espera"
+else
+  V11NM=$( PATH="$GITSHIM:$PATH"; . "$TMP/block_mut11n.sh"; rebase_content_verdict "$RD" "$RD_MAIN" "$RD_BRANCH" "$DDJ_BAD_TIP" )
+  [ "$V11NM" = "no" ] && ok "11n-mut: sem a separacao a leitura que falhou vira a recusa e o veredito no => e ela que o segura" \
+                      || bad "11n-mut: o codigo mutado deveria dar no para a leitura que falhou, deu '$V11NM'"
 fi
 # 11h-mut1: o ponto de chamada do modo CONFLITO volta a devolver a linha do arbitro como estava.
 sed 's/rebase_deploy_deps_map "\$ddv" conflict/echo "$ddv"/' "$TMP/block.sh" > "$TMP/block_mut11h1.sh"
