@@ -100,7 +100,7 @@ esac
 exit 0
 EOF
 chmod +x "$SB/bin/gc" "$SB/bin/bd"
-sandbox_path_init "$SB" jq date mktemp timeout awk sed tr cat head mv rm mkdir basename wc || { echo "FATAL: sandbox PATH" >&2; exit 2; }
+sandbox_path_init "$SB" jq date mktemp timeout awk sed tr cat head mv rm mkdir basename wc find || { echo "FATAL: sandbox PATH" >&2; exit 2; }
 selftest_fail_closed_arm cleanup
 
 # ── the code under test ──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
@@ -329,6 +329,16 @@ g_sw_match() {
   new_case; mkrec; put_list open; put_list closed "$(nbead failed closed "x" $((T0 + 1)) "A different text entirely")"; sweep $((T0 + 600))
   chk "sweep16c a different text is not this record's nudge (waits)" streq "$(mail_n):$(pending_n)" "0:1"
 }
+g_sw_budget() {
+  echo "── sweep: time budget and housekeeping ──"
+  case_closed failed x; GATE_NR_BUDGET_S=0 sweep $((T0 + 600))
+  chk "sweep19 a spent budget (0 s): no record is started, nothing is read or mailed, the record waits, and the log says so" streq "$(lists_n):$(mail_n):$(pending_n):$(grep -c 'budget' "$LOG_LOG")" "0:0:1:1"
+  sweep $((T0 + 601)); chk "sweep19b ... and the next sweep (default budget) handles it" streq "$(mail_n):$(pending_n)" "1:0"
+  case_closed failed x; : > "$GATE_NR_DIR/settled/old.rec"; touch -t 202001010000 "$GATE_NR_DIR/settled/old.rec"; : > "$GATE_NR_DIR/settled/new.rec"; sweep $((T0 + 600))
+  chk "sweep20 settled records older than 30 days are trimmed by a sweep that did work; recent ones stay" streq "$(test -e "$GATE_NR_DIR/settled/old.rec" && echo old)$(test -e "$GATE_NR_DIR/settled/new.rec" && echo new)" "new"
+  case_closed failed x; : > "$GATE_NR_DIR/settled/old.rec"; touch -t 202001010000 "$GATE_NR_DIR/settled/old.rec"; sweep $((T0 + 60))
+  chk "sweep20b a sweep that did no work trims nothing" test -e "$GATE_NR_DIR/settled/old.rec"
+}
 g_sw_switch() {
   echo "── sweep: switches and errexit ──"
   case_closed failed x; DRY_RUN=1 sweep $((T0 + 600))
@@ -359,7 +369,7 @@ g_static() {
   fi
 }
 
-GROUPS_ALL="send sw_inject sw_gone sw_wait sw_age sw_unread sw_moot sw_escal sw_cap sw_damage sw_match sw_switch static"
+GROUPS_ALL="send sw_inject sw_gone sw_wait sw_age sw_unread sw_moot sw_escal sw_cap sw_damage sw_match sw_budget sw_switch static"
 for g in ${GNR_GROUPS:-$GROUPS_ALL}; do "g_$g"; done
 
 # ═════════════════════════════════════════════════ mutants ═══════════════════════════════════════════════════════════════════════════════════════════
@@ -397,6 +407,9 @@ M = [
  ("l19", "lib", 'if [ "$rc" = "0" ]; then\n    verdict="mailed"', 'if [ "$rc" = "1" ]; then\n    verdict="mailed"', "sw_gone sw_escal", "mailed and escalated swapped"),
  ("l20", "lib", '$(_gate_nr_classify "$closed_json" "$probe" "$sent") || cls="UNREADABLE"', '$(_gate_nr_classify "$closed_json" "$probe" "$sent") || cls="NONE"', "sw_unread", "a jq failure on the closed list is read as 'not found'"),
  ("l21", "lib", '|| [ ! -s "$d/pending/$key.msg" ]; then', '; then', "sw_damage", "a record without its text is not damaged"),
+ ("l22", "lib", 'if [ $(( $(date +%s) - t0 )) -ge "$budget" ]; then', 'if false; then', "sw_budget", "no time budget"),
+ ("l23", "lib", '-mtime +30 -exec rm -f {} +', '-mtime +3650 -exec rm -f {} +', "sw_budget", "settled records are kept far too long"),
+ ("l24", "lib", 'if [ "$n" -gt 0 ]; then find', 'if true; then find', "sw_budget", "an idle sweep trims too"),
  ("d01", "disp", 'if [ "$_noc" != "delivered" ] && [ "$_defer" != "1" ] && declare -F', 'if [ "$_defer" != "1" ] && declare -F', "send", "a delivered nudge is recorded too"),
  ("d02", "disp", 'if [ "$_noc" != "delivered" ] && [ "$_defer" != "1" ] && declare -F', 'if [ "$_noc" != "delivered" ] && declare -F', "send", "an ephemeral author is recorded"),
  ("d03", "disp", '--delivery wait-idle --json >"${_nf:-/dev/null}"', '--delivery wait-idle >"${_nf:-/dev/null}"', "send", "no --json"),

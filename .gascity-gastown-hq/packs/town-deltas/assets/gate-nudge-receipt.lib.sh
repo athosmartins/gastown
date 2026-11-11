@@ -35,7 +35,8 @@
 # Source-only: defines functions and runs NOTHING at source time. The dispatcher is `set -euo pipefail` on bash 3.2: no arrays, no ${v,,}, every command
 # that may fail is guarded, every function returns 0 unless its header says otherwise.
 # Knobs (env): GATE_NR_DIR, GATE_NR_MIN_AGE_S (90: do not look before the queue had a chance), GATE_NR_RECHECK_S (300), GATE_NR_PENDING_MAX_S (1800),
-# GATE_NR_MAX_PER_SWEEP (5 records looked at per sweep), GATE_NR_NOW (test seam: the clock).
+# GATE_NR_MAX_PER_SWEEP (5 records looked at per sweep), GATE_NR_BUDGET_S (90: no new record is started once a sweep has spent this many seconds),
+# GATE_NR_NOW (test seam: the clock).
 
 gate_nr_dir() { printf '%s' "${GATE_NR_DIR:-${GC_CITY:-/nonexistent}/.gc/runtime/gate-author-nudge}"; }
 
@@ -257,12 +258,15 @@ $msg"
 # than GATE_NR_RECHECK_S; reads the queue's nudge beads at most twice per sweep (open first, closed only when a record is not among the open ones).
 gate_nr_sweep() {
   local d now f key sent to bead probe age last day cls decide n=0 pending=0 oldest=0 max verdict open_ok=0 closed_ok=0 closed_loaded=0 open_json="" closed_json=""
+  local t0 budget
   gate_nr_enabled || return 0
   [ "${DRY_RUN:-0}" = "1" ] && return 0
   d="$(gate_nr_dir)"
   [ -d "$d/pending" ] || return 0
   now=$(_gate_nr_now)
+  t0=$(date +%s)   # the real clock on purpose (now may be a test seam): the budget bounds wall time under the gate lock
   max="${GATE_NR_MAX_PER_SWEEP:-5}"; case "$max" in ''|*[!0-9]*) max=5 ;; esac
+  budget="${GATE_NR_BUDGET_S:-90}"; case "$budget" in ''|*[!0-9]*) budget=90 ;; esac
   for f in "$d"/pending/*.rec; do
     [ -e "$f" ] || continue
     key=$(basename "$f" .rec)
@@ -283,6 +287,11 @@ gate_nr_sweep() {
     case "$last" in ''|*[!0-9]*) last="" ;; esac
     if [ -n "$last" ] && [ $((now - last)) -lt "${GATE_NR_RECHECK_S:-300}" ]; then continue; fi
     [ "$n" -ge "$max" ] && break
+    # this runs under the gate lock, ahead of Phase C: once the budget is spent the rest wait for the next sweep (a hung Dolt must not hold the gate)
+    if [ $(( $(date +%s) - t0 )) -ge "$budget" ]; then
+      _gate_nr_say "ga-5aovajz: receipt budget (${budget}s) spent — the remaining records wait for the next sweep"
+      break
+    fi
     n=$((n + 1))
     printf '%s' "$now" > "$d/pending/$key.chk" 2>/dev/null || true
     if [ "$open_ok" = "0" ]; then
@@ -318,6 +327,8 @@ gate_nr_sweep() {
     # a record that is still there (the mail could not be attempted, or it could not be moved) is still awaiting its receipt
     [ -e "$f" ] || pending=$((pending - 1))
   done
+  # settled records are kept 30 days for whoever asks what happened to a nudge; only a sweep that did work trims them
+  if [ "$n" -gt 0 ]; then find "$d/settled" -type f -mtime +30 -exec rm -f {} + 2>/dev/null || true; fi
   if [ "$pending" -gt 0 ]; then _gate_nr_say "ga-5aovajz: author nudges awaiting a receipt: ${pending} (oldest ${oldest}s)"; fi
   return 0
 }
