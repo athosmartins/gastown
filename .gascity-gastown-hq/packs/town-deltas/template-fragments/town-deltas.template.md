@@ -1169,8 +1169,8 @@ fi
 ```
 
 **Step 3 substituto** (bootstrap — só roda se Step 1 e Step 2 não acharam
-nada): pina o banco certo com `-C` e passa `rig_root` pra formula poder
-repetir o mesmo pin nos ciclos seguintes:
+nada): pina o banco certo com `-C` e passa `rig_root` (só o override da HQ usa
+essa variável para repetir o pin nos ciclos seguintes; veja o fim desta seção):
 ```bash
 NEW_WISP=$(gc bd -C '{{ .RigRoot }}' mol wisp mol-witness-patrol --root-only --var binding_prefix='{{ .BindingPrefix }}' --var rig_root='{{ .RigRoot }}' --json | jq -r '.new_epic_id // empty')
 if [ -z "$NEW_WISP" ] || ! gc bd -C '{{ .RigRoot }}' show "$NEW_WISP" --json >/dev/null 2>&1; then
@@ -1219,14 +1219,37 @@ fi
 gc hook
 ```
 
-A metade da formula (step `next-iteration`, mesma técnica — `-C
-'{{ .RigRoot }}'` + verificação pós-pour antes de assign/burn) já está
-corrigida em paralelo no override
-`packs/town-deltas/formulas/mol-witness-patrol.toml`. Qualquer pour manual
-fora da formula (ex.: o Step 3 acima) precisa sempre passar `--var
-rig_root='{{ .RigRoot }}'` junto com `--var binding_prefix=...` — sem isso o
-próprio step `next-iteration` trata `rig_root` vazio como erro (mail pro
-mayor + aborta), não como fallback silencioso, exatamente para não repetir
-o vazamento em silêncio.
+**Onde a guarda da formula vale — e onde NÃO vale (ga-zo1bzza).** O override
+`packs/town-deltas/formulas/mol-witness-patrol.toml` (step `next-iteration` com
+`-C '{{ .RigRoot }}'` e verificação pós-pour antes de assign/burn; leitura do
+overlay de sessões com `-C "$GC_CITY_PATH"`) só é resolvido pelo store da HQ.
+Cada rig importa apenas o pack `gastown` (`[rigs.imports.gastown]` no
+`city.toml`) e, medido em 11/11 nos 5 rigs (ga-zo1bzza), o store de RIG resolve
+a formula NATIVA: sem `rig_root`, sem `-C`, sem verificação. Numa wisp de rig o
+texto dos steps é o nativo, então as guardas são as deste prompt — e quem as
+aplica é você:
+
+**Pour/burn (step `next-iteration`).** Se o step da sua wisp traz `gc bd mol
+wisp`, `show`, `update` ou `mol burn` sem `-C`, não os rode como estão: use o
+bloco "CRITICAL: No Idle State" acima (pina `-C` e confere o pour antes de
+atribuir/queimar).
+
+**Overlay de sessões (step `recover-orphaned-beads`).** Os beads de sessão moram
+no store da CIDADE. Sem `-C` o `gc bd` lê o store do cwd: no agent-home do
+property_scrapers isso é o store do rig e a leitura falha com `invalid issue
+type "session"`; onde o agent-home cai na HQ (item 3 acima) ela só acerta por
+acaso do cwd. Leia assim:
+```bash
+gc bd -C "$GC_CITY_PATH" list --type=session --label=gc:session --include-infra --include-gates --all --json --limit=0
+```
+Se `$GC_CITY_PATH` vier vazio, ou a leitura falhar ou vier ilegível, o overlay é
+DESCONHECIDO: resolva só pela lista viva de sessões e diga isso — nunca trate
+como "vazio".
+
+Qualquer pour manual (ex.: o Step 3 acima) precisa sempre passar `--var
+rig_root='{{ .RigRoot }}'` junto com `--var binding_prefix=...`: o override da
+HQ trata `rig_root` vazio como erro (mail pro mayor + aborta) em vez de cair em
+fallback silencioso; a formula nativa, nos rigs, aceita a variável e a ignora
+sem avisar.
 {{ end -}}
 {{ end }}

@@ -33,10 +33,32 @@
 # template itself is embedded/materialized and can't be durably hand-edited,
 # per the gascity-native-template-fragment-source-location doctrine).
 #
+# ga-zo1bzza (same class, second pin): the session-bead overlay read in
+# `recover-orphaned-beads` is pinned to the CITY store with
+# `-C "$GC_CITY_PATH"`. Session beads (type=session) live in the city store; a
+# `gc bd` with no -C reads whichever store its caller resolves to, which for a
+# witness whose agent-home resolves into its rig (property_scrapers, measured
+# 2026-11-11) is the RIG store, where the type does not exist (`invalid issue
+# type "session"`) -- so the configured_named_identity overlay never contributed
+# and nothing said why. An empty GC_CITY_PATH is handled like a failed read
+# (OVERLAY UNKNOWN, read not attempted), never as an unpinned read, and
+# OVERLAY UNKNOWN now carries the read's own error line.
+#
+# WHERE THIS FILE IS RESOLVED -- read this before trusting any pin above:
+# only by the HQ store. city.toml imports town-deltas at city scope only and
+# each [[rigs]] imports just `gastown` ([rigs.imports.gastown]); measured on
+# 2026-11-11 (ga-zo1bzza report), in all 5 rigs `<rig>/.beads/formulas/mol-
+# witness-patrol*.toml` points at the NATIVE `.gc/system/packs/gastown/
+# formulas/` file, which has no rig_root and none of these pins. So in a rig
+# wisp the guards of this file are not in force, and the WITNESS section of
+# town-deltas.template.md is what tells the witness to apply the same -C pins
+# itself. Making rigs resolve this file is a city.toml layering change that
+# has not been made or verified.
+#
 # Everything else in this file is an unmodified copy of the embedded
-# default (see .gc/system/packs/gastown/formulas/mol-witness-patrol.toml) --
-# town-deltas, imported after the builtin `gastown` pack, wins for
-# same-named formulas.
+# default (see .gc/system/packs/gastown/formulas/mol-witness-patrol.toml).
+# At CITY scope, town-deltas (imported after the builtin `gastown` pack) wins
+# for same-named formulas.
 description = """
 Witness patrol loop. Poured as a root-only wisp on startup:
 
@@ -199,10 +221,12 @@ open/unassigned before witness observes it; that requires a separate
 worktree-salvage scan keyed by `metadata.work_dir`. Bound Gastown polecat
 assignees use the shape `<rig>/{{binding_prefix}}<polecat-suffix>`.
 
-Get the full session roster for liveness checks:
+Get the full session roster for liveness checks (the session beads live in the
+CITY store, so that read carries `-C "$GC_CITY_PATH"`; its failure handling is in
+the recipe below):
 ```bash
 gc session list --state=all --json
-gc bd list --type=session --label=gc:session --include-infra --include-gates --all --json --limit=0
+gc bd -C "$GC_CITY_PATH" list --type=session --label=gc:session --include-infra --include-gates --all --json --limit=0
 ```
 
 For each bead with an assignee, check **session-ID liveness** — NOT
@@ -243,8 +267,18 @@ a NEW session with a different ID — the old one never comes back.
    SESSIONS_FILE=$(mktemp); SESSION_BEADS_FILE=$(mktemp)
    gc session list --state=all --json > "$SESSIONS_FILE" 2>"$SESSIONS_FILE.err"
    SESSIONS_RC=$?
-   gc bd list --type=session --label=gc:session --include-infra --include-gates --all --json --limit=0 > "$SESSION_BEADS_FILE" 2>"$SESSION_BEADS_FILE.err"
-   SESSION_BEADS_RC=$?
+   # Session beads live in the city store: a gc bd with no -C reads whichever store its caller resolves
+   # to (the property_scrapers witness: the rig store, where this type does not exist), so the read is
+   # pinned to the city. No city path, no read: an unpinned read would resolve from the cwd, a different
+   # store per agent-home.
+   if [ -n "${GC_CITY_PATH:-}" ]; then
+     # vazio → o overlay não soma nada e o roster fica só com a lista viva; falhou/ilegível (rc≠0, 0 bytes, JSON inválido) → OVERLAY UNKNOWN abaixo (declarado, não silencioso): o roster usa só a lista viva neste ciclo
+     gc bd -C "$GC_CITY_PATH" list --type=session --label=gc:session --include-infra --include-gates --all --json --limit=0 > "$SESSION_BEADS_FILE" 2>"$SESSION_BEADS_FILE.err"
+     SESSION_BEADS_RC=$?
+   else
+     echo "GC_CITY_PATH is empty: the session-bead read cannot be pinned to the city store, so it was not attempted" > "$SESSION_BEADS_FILE.err"
+     SESSION_BEADS_RC=2
+   fi
 
    # The live session list is load-bearing for the whole step: a failed or
    # unparseable read here is NOT "zero sessions" and must not be treated
@@ -274,7 +308,8 @@ a NEW session with a different ID — the old one never comes back.
    # live list alone instead of silently proceeding as if the overlay had
    # legitimately contributed nothing.
    if [ "$SESSION_BEADS_RC" -ne 0 ] || [ ! -s "$SESSION_BEADS_FILE" ] || ! jq -e . "$SESSION_BEADS_FILE" >/dev/null 2>&1; then
-     echo "OVERLAY UNKNOWN: gc bd list (session beads) read failed (rc=$SESSION_BEADS_RC, $(wc -c <"$SESSION_BEADS_FILE" | tr -d ' ') bytes) — resolving liveness from the live session list only this cycle; the configured_named_identity overlay did not contribute."
+     OVERLAY_ERR=$(head -n 1 "$SESSION_BEADS_FILE.err" | cut -c1-200)
+     echo "OVERLAY UNKNOWN: gc bd list (session beads) read failed (rc=$SESSION_BEADS_RC, $(wc -c <"$SESSION_BEADS_FILE" | tr -d ' ') bytes${OVERLAY_ERR:+; stderr: $OVERLAY_ERR}) — resolving liveness from the live session list only this cycle; the configured_named_identity overlay did not contribute."
      printf '[]' > "$SESSION_BEADS_FILE"
    fi
 

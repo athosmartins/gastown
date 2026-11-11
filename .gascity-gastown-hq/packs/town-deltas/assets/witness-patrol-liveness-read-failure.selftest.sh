@@ -25,6 +25,18 @@
 # isolates the old first fenced block, which never had the rc/size checks,
 # so most assertions correctly fail), 11/11 pass against this fix.
 #
+# ga-zo1bzza (store topology): the same block also READS the session beads, which live in the city
+# store only. That read carried no -C, so a witness whose cwd resolves to its rig store read the wrong
+# one and the overlay never contributed (and nothing said why). The stub now answers `gc bd` by the
+# store a call would reach (no -C, or a -C that is not the city: the real "invalid issue type" error)
+# and logs every call (the spy). Scenarios 1, 2 and 6-8 pin the read to the city path, require that an
+# empty or unset GC_CITY_PATH makes NO call, require the read's own error line in OVERLAY UNKNOWN, and
+# EXECUTE the read commands the formula documents and the witness prompt prescribes (a rig witness runs
+# the NATIVE formula, so the prompt line is the effective guard there) instead of comparing their text.
+# Verified both directions: against the pre-fix formula and prompt this file passes 20 and fails 10 (each
+# failure one of the symptoms above); against the fix it passes 30/30, also under a real bash 3.2.57
+# (harness and extracted block).
+#
 # Exit 0 iff all scenarios hold.
 
 set -uo pipefail
@@ -32,6 +44,7 @@ set -uo pipefail
 SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 TOWN_DELTAS_ROOT="$(cd "$SELF_DIR/.." && pwd)"
 FORMULA="$TOWN_DELTAS_ROOT/formulas/mol-witness-patrol.toml"
+TEMPLATE="$TOWN_DELTAS_ROOT/template-fragments/town-deltas.template.md"
 
 PASS=0
 FAIL=0
@@ -42,8 +55,12 @@ if [ ! -f "$FORMULA" ]; then
   echo "FATAL: formula override not found at $FORMULA" >&2
   exit 2
 fi
+if [ ! -f "$TEMPLATE" ]; then
+  echo "FATAL: template fragment not found at $TEMPLATE" >&2
+  exit 2
+fi
 
-echo "witness-patrol-liveness-read-failure.selftest — ga-17f7ap rc/size read-failure guards"
+echo "witness-patrol-liveness-read-failure.selftest — ga-17f7ap rc/size read-failure guards + ga-zo1bzza city-store pin"
 
 # ── Extract the actual liveness-map bash block ────────────────────────────
 # Anchored on the literal first content line (unique in the file) through
@@ -77,14 +94,28 @@ mkdir -p "$STUBDIR/bin"
 
 cat > "$STUBDIR/bin/gc" <<'STUB'
 #!/usr/bin/env bash
+# gc bd [-C <dir>] list ...: every call is logged to BD_LOG (the spy) and answered by the STORE it would
+# reach. Session beads exist ONLY in the city store (STUB_CITY_PATH). A call with no -C, or pinned to any
+# other directory (the rig root, empty), reads a rig store, where the real bd answers with this exact
+# error (measured on the property_scrapers witness, 2026-11-11, ga-zo1bzza).
+if [ "${1:-}" = "bd" ]; then
+  printf 'GCBD %s\n' "$*" >> "${BD_LOG:-/dev/null}"
+  shift
+  pin=""
+  if [ "${1:-}" = "-C" ]; then pin="${2:-}"; shift 2; fi
+  [ "${1:-}" = "list" ] || { echo "unstubbed gc bd subcommand: $*" >&2; exit 99; }
+  if [ -n "$pin" ] && [ "$pin" = "${STUB_CITY_PATH:-}" ]; then
+    [ -n "${STUB_BEADS_BODY:-}" ] && printf '%s' "$STUB_BEADS_BODY"
+    [ "${STUB_BEADS_RC:-0}" -ne 0 ] && echo "STUB-ERR-city: simulated city-store read failure" >&2
+    exit "${STUB_BEADS_RC:-0}"
+  fi
+  echo 'Error: invalid issue type "session" (valid: bug, feature, task, epic, chore, decision, agent, convoy, event, gate, merge-request, message, molecule, queue, rig, role, slot)' >&2
+  exit 1
+fi
 case "$1 $2" in
   "session list")
     [ -n "${STUB_SESSIONS_BODY:-}" ] && printf '%s' "$STUB_SESSIONS_BODY"
     exit "${STUB_SESSIONS_RC:-0}"
-    ;;
-  "bd list")
-    [ -n "${STUB_BEADS_BODY:-}" ] && printf '%s' "$STUB_BEADS_BODY"
-    exit "${STUB_BEADS_RC:-0}"
     ;;
   "mail send")
     echo "MAIL: $*" >> "${MAIL_LOG:-/dev/null}"
@@ -106,26 +137,66 @@ sandbox_path_init "$STUBDIR" jq || exit 2   # jq: the extracted code's session/b
 TWO_LIVE_SESSIONS='{"sessions":[{"id":"s1","name":"gastown.dog-1","state":"active","closed":false},{"id":"s2","name":"gastown.dog-2","state":"active","closed":false}]}'
 ONE_OVERLAY_ROW='[{"metadata":{"configured_named_identity":"lexbh/gastown.witness","state":"active"},"status":"open"}]'
 
-# run_scenario NAME SESSIONS_RC SESSIONS_BODY BEADS_RC BEADS_BODY
-# Prints the extracted code's combined stdout+stderr, one line per output
-# line, prefixed nothing — callers grep the captured text.
+# The witness's session exports its rig root next to GC_CITY_PATH; a read pinned to it (instead of to the
+# city) reaches the rig store, so every scenario carries it as the wrong store a mispinned read would hit.
+# Neither path has to exist: the stub only compares the strings.
+FAKE_CITY="/fake/city"
+FAKE_RIG="/fake/rig"
+
+# Printed after the extracted block. The map goes out as one JSON line so a scenario can ask what a given
+# assignee resolved to — proving the overlay contributed, not merely that nothing was reported.
+TRAILER='echo "RESULT MAP_COUNT=$MAP_COUNT SESSION_COUNT=$SESSION_COUNT"; echo "RESULT_MAP $(printf "%s" "$LIVENESS_MAP" | jq -c .)"'
+
+# run_scenario SESSIONS_RC SESSIONS_BODY BEADS_RC BEADS_BODY [CITY_MODE]
+#   CITY_MODE: set (default, GC_CITY_PATH=$FAKE_CITY) | empty (exported empty) | unset (not in the env)
+# Sets SCENARIO_OUT (the extracted code's combined stdout+stderr — callers grep it), SCENARIO_RC,
+# SCENARIO_MAILED, SCENARIO_MAP (the liveness map JSON, empty if the block never got that far) and the spy:
+# SCENARIO_BD_CALLS / SCENARIO_BD_LOG (every `gc bd` call the block made).
 run_scenario() {
-  local sessions_rc="$1" sessions_body="$2" beads_rc="$3" beads_body="$4"
-  local mail_log; mail_log="$(mktemp)"
+  local sessions_rc="$1" sessions_body="$2" beads_rc="$3" beads_body="$4" city_mode="${5:-set}"
+  local mail_log bd_log city_env="$FAKE_CITY" prefix=""
+  mail_log="$(mktemp)"; bd_log="$(mktemp)"
+  case "$city_mode" in
+    empty) city_env="" ;;
+    unset) city_env=""; prefix='unset GC_CITY_PATH; ' ;;
+  esac
   local out rc
   out="$(
     STUB_SESSIONS_RC="$sessions_rc" STUB_SESSIONS_BODY="$sessions_body" \
     STUB_BEADS_RC="$beads_rc" STUB_BEADS_BODY="$beads_body" \
-    MAIL_LOG="$mail_log" \
+    STUB_CITY_PATH="$FAKE_CITY" GC_CITY_PATH="$city_env" GC_RIG_ROOT="$FAKE_RIG" \
+    BD_LOG="$bd_log" MAIL_LOG="$mail_log" \
     PATH="$SANDBOX_PATH" \
-    bash -c "$LIVENESS_CODE"$'\n''echo "RESULT MAP_COUNT=$MAP_COUNT SESSION_COUNT=$SESSION_COUNT"' 2>&1
+    bash -c "${prefix}${LIVENESS_CODE}"$'\n'"$TRAILER" 2>&1
   )"
   rc=$?
   SCENARIO_OUT="$out"
   SCENARIO_RC="$rc"
+  SCENARIO_MAP="$(printf '%s\n' "$out" | sed -n 's/^RESULT_MAP //p')"
   SCENARIO_MAILED="no"
   [ -s "$mail_log" ] && SCENARIO_MAILED="yes"
-  rm -f "$mail_log"
+  SCENARIO_BD_CALLS="$(grep -c '^GCBD ' "$bd_log")"
+  SCENARIO_BD_LOG="$(cat "$bd_log")"
+  rm -f "$mail_log" "$bd_log"
+}
+
+# map_state KEY — what the last scenario's liveness map resolved KEY to ("absent" if not a key, "nomap" if
+# the block never built a map).
+map_state() {
+  [ -n "$SCENARIO_MAP" ] || { printf 'nomap'; return; }
+  printf '%s' "$SCENARIO_MAP" | jq -r --arg k "$1" '.[$k] // "absent"'
+}
+
+# run_snippet CODE — runs one command line (a documented or prompted read) under the same stub topology
+# with GC_CITY_PATH set. Sets SNIPPET_OUT (stdout+stderr) and SNIPPET_RC.
+run_snippet() {
+  SNIPPET_OUT="$(
+    STUB_BEADS_RC=0 STUB_BEADS_BODY="$ONE_OVERLAY_ROW" \
+    STUB_CITY_PATH="$FAKE_CITY" GC_CITY_PATH="$FAKE_CITY" GC_RIG_ROOT="$FAKE_RIG" \
+    PATH="$SANDBOX_PATH" \
+    bash -c "$1" 2>&1
+  )"
+  SNIPPET_RC=$?
 }
 
 # ── Scenario 1: baseline healthy — both reads succeed ─────────────────────
@@ -142,6 +213,11 @@ if printf '%s' "$SCENARIO_OUT" | grep "RESULT MAP_COUNT=[1-9]" >/dev/null; then
   ok "map is non-empty on the healthy path"
 else
   bad "map came back empty on the healthy path: $SCENARIO_OUT"
+fi
+if [ "$(map_state lexbh/gastown.witness)" = "active" ]; then
+  ok "the session-bead overlay contributed (lexbh/gastown.witness resolved to its overlay state)"
+else
+  bad "the overlay did not contribute on the healthy path (lexbh/gastown.witness -> $(map_state lexbh/gastown.witness)): $SCENARIO_OUT"
 fi
 
 # ── Scenario 2: THE BUG — session-beads read fails, rc=1, 0 bytes ─────────
@@ -166,6 +242,18 @@ if printf '%s' "$SCENARIO_OUT" | grep "RESULT MAP_COUNT=[1-9] SESSION_COUNT=2" >
   ok "still resolves assignees from the live session list (map non-empty, 2 sessions counted)"
 else
   bad "live-session-derived map was lost: $SCENARIO_OUT"
+fi
+# The read's own error line must reach the declaration: `rc=1, 0 bytes` alone cannot tell a wrong store from
+# a flaky one, which is how a dead overlay stayed unnoticed (ga-zo1bzza).
+if printf '%s' "$SCENARIO_OUT" | grep -F 'STUB-ERR-city: simulated city-store read failure' >/dev/null; then
+  ok "OVERLAY UNKNOWN carries the read's own error line, so the cause is visible"
+else
+  bad "OVERLAY UNKNOWN hides WHY the read failed (its stderr never reaches the output): $SCENARIO_OUT"
+fi
+if [ "$(map_state lexbh/gastown.witness)" = "absent" ]; then
+  ok "a failed overlay read adds nothing to the map (inert, not invented)"
+else
+  bad "a failed overlay read still put lexbh/gastown.witness in the map as '$(map_state lexbh/gastown.witness)': $SCENARIO_OUT"
 fi
 
 # ── Scenario 3: live session list itself fails, rc=1, 0 bytes ─────────────
@@ -247,6 +335,80 @@ if [ "$SCENARIO_MAILED" = "yes" ]; then
 else
   bad "schema-drift fail-safe no longer escalates to mayor"
 fi
+
+# ── Scenario 6 (ga-zo1bzza): the overlay read targets the CITY store ───────
+# Session beads live only in the city store. `gc bd` with no -C reads the store the caller resolves to —
+# for a rig witness the RIG store, where the type does not exist — so the overlay silently never
+# contributed. The stub answers each call by the store it reaches (see its header), so an unpinned or
+# mispinned read fails here the way the real one did.
+echo ""
+echo "Scenario 6 (THE BUG, ga-zo1bzza): the session-bead read is pinned to the city store"
+ctl_out="$("$STUBDIR/bin/gc" bd list --type=session 2>&1)"; ctl_rc=$?
+if [ "$ctl_rc" -eq 1 ] && printf '%s' "$ctl_out" | grep -F 'invalid issue type "session"' >/dev/null; then
+  ok "control: an unpinned read answers like a rig store (the stub models the real topology)"
+else
+  bad "control broken: the stub no longer fails an unpinned session read (rc=$ctl_rc): $ctl_out"
+fi
+run_scenario 0 "$TWO_LIVE_SESSIONS" 0 "$ONE_OVERLAY_ROW"
+if [ "$SCENARIO_BD_CALLS" -eq 1 ] && printf '%s\n' "$SCENARIO_BD_LOG" | grep -F "GCBD bd -C $FAKE_CITY list --type=session" >/dev/null; then
+  ok "one gc bd call, pinned to the city store"
+else
+  bad "REGRESSION (this is the bug): the session-bead read is not pinned to the city store. gc bd calls ($SCENARIO_BD_CALLS): $SCENARIO_BD_LOG"
+fi
+
+# ── Scenario 7 (ga-zo1bzza): no city path, no read ─────────────────────────
+# An empty GC_CITY_PATH must not become `gc bd -C "" ...` (or a bare gc bd): that read resolves from the
+# caller's cwd — a different store depending on where the agent-home sits, and it can even succeed by
+# accident. The read is not attempted and the overlay is declared unknown: the same inert state as a failed read.
+for mode in empty unset; do
+  echo ""
+  echo "Scenario 7 ($mode): GC_CITY_PATH $mode — the read is not attempted"
+  run_scenario 0 "$TWO_LIVE_SESSIONS" 0 "$ONE_OVERLAY_ROW" "$mode"
+  if [ "$SCENARIO_BD_CALLS" -eq 0 ]; then
+    ok "no gc bd call goes out without a city path to pin it to"
+  else
+    bad "a gc bd read went out with GC_CITY_PATH $mode (cwd-dependent store): $SCENARIO_BD_LOG"
+  fi
+  if printf '%s' "$SCENARIO_OUT" | grep "OVERLAY UNKNOWN" >/dev/null && printf '%s' "$SCENARIO_OUT" | grep -F "GC_CITY_PATH" >/dev/null; then
+    ok "declares OVERLAY UNKNOWN and says why (GC_CITY_PATH)"
+  else
+    bad "no OVERLAY UNKNOWN naming GC_CITY_PATH: $SCENARIO_OUT"
+  fi
+  if [ "$SCENARIO_RC" -eq 0 ] && printf '%s' "$SCENARIO_OUT" | grep "RESULT MAP_COUNT=4 SESSION_COUNT=2" >/dev/null \
+     && ! printf '%s' "$SCENARIO_OUT" | grep "FAIL-SAFE" >/dev/null; then
+    ok "still resolves from the live session list alone (4 keys, 2 sessions), no fail-safe, exit 0"
+  else
+    bad "live-list-only roster lost or fail-safe tripped (rc=$SCENARIO_RC): $SCENARIO_OUT"
+  fi
+done
+
+# ── Scenario 8 (ga-zo1bzza): the reads written down for a witness run clean ─
+# The formula documents the roster read once above the recipe, and the prompt tells a RIG witness (whose
+# wisp text is the native formula, not this file) what to run for the overlay. A witness copies those
+# lines, so they are EXECUTED here under the same stub topology instead of being compared as text.
+run_documented_reads() { # $1 = label, $2 = newline-separated command lines
+  local label="$1" lines="$2" n=0 failed=0 line
+  while IFS= read -r line; do
+    [ -n "$line" ] || continue
+    n=$((n+1))
+    run_snippet "$line"
+    if [ "$SNIPPET_RC" -ne 0 ] || [ "$SNIPPET_OUT" != "$ONE_OVERLAY_ROW" ]; then
+      failed=$((failed+1))
+      echo "    ($label) rc=$SNIPPET_RC for: $line :: $SNIPPET_OUT"
+    fi
+  done <<< "$lines"
+  if [ "$n" -eq 0 ]; then
+    bad "$label: no session-bead read command found to run"
+  elif [ "$failed" -eq 0 ]; then
+    ok "$label: all $n session-bead read command(s) read the city store"
+  else
+    bad "$label: $failed of $n session-bead read command(s) did not reach the city store"
+  fi
+}
+echo ""
+echo "Scenario 8 (ga-zo1bzza): the documented and the prompted session-bead reads reach the city store"
+run_documented_reads "formula roster listing" "$(grep -E '^gc bd .*--type=session' "$FORMULA")"
+run_documented_reads "witness prompt" "$(sed -n '/WITNESS: o Startup Protocol/,$p' "$TEMPLATE" | grep -E '^gc bd .*--type=session')"
 
 # ── Verdict ─────────────────────────────────────────────────────────────
 echo ""

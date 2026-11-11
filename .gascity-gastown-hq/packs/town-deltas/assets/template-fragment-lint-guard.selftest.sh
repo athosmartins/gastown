@@ -107,8 +107,10 @@ check_exit "current fragment lints clean -> exit 0" "0" "$EXIT2"
 
 # ── Case 3: reintroduce the exact historical bug (ga-3v2n4's fix commit
 # shipped it; fixed by a25cc3724). Anchor on the surrounding sentence so
-# this fails LOUDLY, not silently, if that text is ever edited away. ────
-ANCHOR="mesma técnica"
+# this fails LOUDLY, not silently, if that text is ever edited away.
+# (Re-anchored by ga-zo1bzza, which rewrote the sentence that said the
+# override's guard already covered rig wisps: it did not, in rig stores.) ────
+ANCHOR="e verificação pós-pour antes de assign/burn; leitura do"
 if ! grep -qF "$ANCHOR" "$FRAG"; then
   echo "FAIL: anchor text for the historical bug not found in $FRAG -- source text has changed, update this selftest's anchor."
   exit 1
@@ -119,8 +121,8 @@ import sys
 path = sys.argv[1]
 with open(path, encoding="utf-8") as f:
     text = f.read()
-old = "'{{ .RigRoot }}'` + verificação pós-pour antes de assign/burn) já está"
-new = "'{{rig_root}}'` + verificação pós-pour antes de assign/burn) já está"
+old = "'{{ .RigRoot }}'` e verificação pós-pour antes de assign/burn; leitura do"
+new = "'{{rig_root}}'` e verificação pós-pour antes de assign/burn; leitura do"
 if old not in text:
     sys.exit(1)
 text = text.replace(old, new, 1)
