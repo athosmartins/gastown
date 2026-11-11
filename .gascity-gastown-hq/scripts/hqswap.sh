@@ -16,7 +16,8 @@
 #   HQSWAP_FLATTEN=1 (vale nos dois modos): antes do GC, ACHATA o histórico na cópia do nó
 #              (ga-1p1i5jr.12) — mesmo dado, hash de cada tabela conferido antes/depois, 1 commit.
 #              Perde a "viagem no tempo" do Dolt (decisão do Athos, ga-2895yv); o histórico
-#              completo fica na cópia do MacBook (passo 7b, estado de antes do flatten) e no S3.
+#              completo fica na cópia do MacBook (passo 7b, estado de antes do flatten); o S3 só até o
+#              próximo backup noturno (sync com --delete).
 #
 # Saídas: 0 trocado, conferido e cidade retomada; 10 abortado ANTES do irreversível (mini
 # intacto, Dolt religado, cidade retomada); 20 falhou DEPOIS do irreversível (Dolt fica PARADO e travado: voltar atrás B do
@@ -43,6 +44,7 @@ LIFECYCLE="${HQSWAP_LIFECYCLE:-$C/.gc/system/packs/bd/assets/scripts/gc-beads-bd
 PORT="${HQSWAP_PORT:-52756}"
 DB=hq
 FLATTEN="${HQSWAP_FLATTEN:-0}"
+case "$FLATTEN" in 0|1) ;; *) echo "HQSWAP_FLATTEN tem de ser 0 ou 1 (veio [$FLATTEN])" >&2; exit 2 ;; esac
 RELEASE="$X/release"
 HOLDER_PID="$X/holder.pid"
 VERSIONED="${HQSWAP_VERSIONED:-issues comments labels dependencies}"
@@ -122,24 +124,30 @@ flatten_script() {  # imprime o script que roda NO NÓ, dentro de $NODE_DIR, com
 flatten_main() {
 set -euo pipefail
 B="$1"; tmp=$(mktemp -d); trap 'rm -rf "$tmp"' EXIT
-q() { "$B" sql -r csv -q "$1" | tail -n +2; }
-hashes() { local t h; q "select table_name from information_schema.tables where table_schema = database() and table_type = 'BASE TABLE' order by table_name" > "$tmp/tables"; [ -s "$tmp/tables" ] || return 1
+q() { "$B" sql -r csv -q "$1" </dev/null | tail -n +2; }
+hashes() { local t h; q "select table_name from information_schema.tables where table_schema = database() and table_type = 'BASE TABLE' order by table_name" > "$tmp/tables" || return 1; [ -s "$tmp/tables" ] || return 1
+  for t in dolt_schemas dolt_procedures; do q "select dolt_hashof_table('$t')" >/dev/null 2>&1 && echo "$t" >> "$tmp/tables"; done
   while IFS= read -r t; do h=$(q "select dolt_hashof_table('$t')") && [ -n "$h" ] || return 1; printf '%s %s\n' "$t" "$h"; done < "$tmp/tables"; }
 hashes > "$tmp/before" || { echo "flatten: tabelas ou hash ilegível — nada mexido"; exit 3; }
 [ "$("$B" branch --show-current)" = main ] || { echo "flatten: branch atual não é main — nada mexido"; exit 3; }
-root=$(q "select commit_hash from dolt_log order by date asc limit 1")
+root=$(q "select commit_hash from dolt_log order by commit_order asc limit 1")
 [ -n "$root" ] || { echo "flatten: raiz ilegível — nada mexido"; exit 3; }
 tags=$("$B" tag) || { echo "flatten: lista de tags ilegível — nada mexido"; exit 3; }
+stash=$("$B" stash list) || { echo "flatten: lista de stash ilegível — nada mexido"; exit 3; }
+[ -z "$stash" ] || { echo "flatten: há stash (segura o histórico) — nada mexido"; exit 3; }
+remotes=$("$B" branch -r) || { echo "flatten: refs remotas ilegíveis — nada mexido"; exit 3; }
+[ -z "$remotes" ] || { echo "flatten: há refs remotas (seguram o histórico) — nada mexido: $remotes"; exit 3; }
+echo "branches antes (apagadas exceto main; ficam na cópia do MacBook):"; "$B" branch -v || exit 3
 for b in $("$B" branch | sed 's/^[* ]*//'); do [ "$b" = main ] || "$B" branch -D -f "$b" >/dev/null || exit 4; done
 for t in $tags; do "$B" tag -d "$t" >/dev/null || exit 4; done
 "$B" reset --soft "$root" >/dev/null || exit 4
 "$B" add -A || exit 4
-"$B" commit --allow-empty -m "hqswap: flatten do histórico (ga-1p1i5jr.12)" >/dev/null || exit 4
+"$B" commit --allow-empty --author "hqswap <hqswap@gastown.invalid>" -m "hqswap: flatten do histórico (ga-1p1i5jr.12)" >/dev/null || exit 4
 hashes > "$tmp/after" || { echo "flatten: hash ilegível depois"; exit 4; }
 diff "$tmp/before" "$tmp/after" || { echo "flatten: hash de tabela mudou"; exit 4; }
 n=$(q "select count(*) from dolt_log")
 [ "$n" -le 2 ] || { echo "flatten: sobraram $n commits"; exit 4; }
-left=$("$B" tag) && [ -z "$left" ] && [ "$("$B" branch | wc -l | tr -d ' ')" = 1 ] || { echo "flatten: sobrou branch ou tag"; exit 4; }
+left=$("$B" tag; "$B" stash list) && [ -z "$left" ] && [ "$("$B" branch -a | wc -l | tr -d ' ')" = 1 ] || { echo "flatten: sobrou branch ou tag"; exit 4; }
 echo "flatten ok: commits=$n tabelas=$(wc -l < "$tmp/before" | tr -d ' ') raiz=$root"
  }
 flatten_main "$@" </dev/null
@@ -295,7 +303,7 @@ log "8 base: $(tr '\n' ' ' < "$X/base.txt")"
 # 9. (flatten) + GC + contagens + fsck no nó
 if [ "$FLATTEN" = 1 ]; then
   flatten_script | node "cd $NODE_DIR && bash -s -- ~/$NODE_DOLT" > "$X/flatten.log" 2>&1 \
-    || die "flatten no nó falhou ($X/flatten.log: $(tail -1 "$X/flatten.log"))"
+    || die "flatten no nó falhou ($X/flatten.log: $(tail -5 "$X/flatten.log" | tr '\n' ' '))"
   log "9a $(tail -1 "$X/flatten.log")"
 fi
 node "cd $NODE_DIR && ~/$NODE_DOLT gc --full --archive-level=0 --incremental-file-size=1073741824" > "$X/gc.log" 2>&1 \
@@ -310,7 +318,7 @@ if [ "$FLATTEN" = 1 ]; then  # HEAD novo de propósito; o resto tem de ser idên
   { echo "HEAD $CHECK_HEAD"; cat "$X/base-rows.txt"; } > "$X/base-check.txt"  # third-state-waiver: arquivo escrito 2 linhas acima neste mesmo passo; falha de escrita = diff abaixo vazio → die no 12
 else
   diff -u "$X/base.txt" "$X/after-gc.txt" || die "contagens/HEAD mudaram com o GC"
-  CHECK_HEAD=$BASE_HEAD; cp "$X/base.txt" "$X/base-check.txt"
+  CHECK_HEAD=$BASE_HEAD; cp "$X/base.txt" "$X/base-check.txt" || die "cópia de base.txt falhou"
 fi
 node "cd $NODE_DIR && ~/$NODE_DOLT fsck" > "$X/fsck.log" 2>&1 || die "fsck sujo ($X/fsck.log)"
 log "9 GC ok, contagens iguais, fsck limpo; nó: $(node "du -sh $NODE_DIR" | cut -f1)"
@@ -347,7 +355,7 @@ live_ignored > "$X/live-ignored.txt"
 grep -vE "^(HEAD|$(echo $VERSIONED | tr ' ' '|')) " "$X/base-check.txt" | diff -u - "$X/live-ignored.txt" \
   && log "12 tabelas ignoradas iguais à base" || log "AVISO: tabelas ignoradas diferem da base (pode ser gravação nova depois do start) — conferir $X/live-ignored.txt"
 log "12 servidor novo conferido; hq agora $(du -sh "$D/$DB" | cut -f1)"
-[ "$FLATTEN" = 1 ] && log "histórico completo (antes do flatten) só na cópia do MacBook $MBP:$MBP_DIR e no S3 — NÃO apagar em 24 h"
+[ "$FLATTEN" = 1 ] && log "histórico completo (antes do flatten) só na cópia do MacBook $MBP:$MBP_DIR (o S3 o perde no próximo backup noturno) — NÃO apagar sem decisão"
 [ -d "$X/hq.old" ] && log "hq.old ainda em $X/hq.old (apagar depois de 24 h ou quando o disco pedir)"
 touch "$X/stop-watch"
 finish
