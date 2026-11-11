@@ -196,9 +196,23 @@ enabled = false
 name = "order-tracking-sweep"
 enabled = true
 
+# ga-p8ip28d: rigs resolve the town-deltas formula overrides. Each rig imports only the gastown pack
+# ([rigs.imports.gastown] below) and town-deltas is imported only at the city level, so without
+# this a rig's witness poured the NATIVE mol-witness-patrol (the -C/overlay guards of the override
+# worked on the HQ only; measured by dog-remote-1 in ga-zo1bzza). `formulas_dir` adds a formula
+# layer for the rig: rig-overrides/formulas/ holds one RELATIVE symlink per override, pointing at the
+# single source in packs/town-deltas/formulas/ (never a copy: a copy drifts).
+# TRAP, measured 2026-11-11 on a throwaway city (ga-p8ip28d): gc also reads <formulas_dir>/../orders
+# as that rig's ORDER layer. formulas_dir = packs/town-deltas/rig-formulas gave 174 orders instead of
+# 84 (+45 per rig, the skip-ed ones such as wisp-compact included, and the maintenance orders took the
+# town-deltas interval). So rig-overrides/ must NEVER get an orders/ sibling, and the dir must not sit
+# inside a pack or beside the city's own orders/. scripts/rig-formula-overrides.selftest.sh holds
+# both, and fails when a rig below loses the line. New rig? Add the same line.
+# Rollback = delete the five formulas_dir lines (rigs go back to the native formula).
 [[rigs]]
 name = "property_scrapers"
 prefix = "ps"
+formulas_dir = "rig-overrides/formulas"
 # ga-68cijh: without this, `gc sling <bead-id>` (1-arg form, no explicit pool
 # target) errors "rig has no default_sling_target" instead of routing to this
 # rig's own dedicated pool — the gap the bug's own reporter suspected.
@@ -221,6 +235,7 @@ source = ".gc/system/packs/gastown"
 [[rigs]]
 name = "marketing"
 prefix = "ma"
+formulas_dir = "rig-overrides/formulas"
 default_branch = "main"
 suspended = true
 [rigs.imports]
@@ -234,6 +249,7 @@ source = ".gc/system/packs/gastown"
 [[rigs]]
 name = "lexbh"
 prefix = "lx"
+formulas_dir = "rig-overrides/formulas"
 # Mayor 16/09: rig dormente ate a sancao do PL 574/2025 (lx-8jd).
 # Re-armar: gc agent resume + remover pilot:no-auto-dispatch da lx-8jd.
 suspended = true
@@ -246,6 +262,7 @@ source = ".gc/system/packs/gastown"
 [[rigs]]
 name = "gastown"
 prefix = "gt"
+formulas_dir = "rig-overrides/formulas"
 [rigs.imports]
 
 # gt-kfr7m: same fix as property_scrapers above (see that block's comment for
@@ -257,6 +274,7 @@ source = ".gc/system/packs/gastown"
 [[rigs]]
 name = "whatsapp_automation"
 prefix = "wa"
+formulas_dir = "rig-overrides/formulas"
 default_branch = "main"
 # ga-68cijh: without this, `gc sling <bead-id>` (1-arg form, no explicit pool
 # target) errors "rig has no default_sling_target" instead of routing to this
