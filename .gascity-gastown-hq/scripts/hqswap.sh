@@ -13,6 +13,10 @@
 #   run        produção (exige HQSWAP_CONFIRM=sim-producao)
 #   rehearsal  Dolt descartável: tudo vem de variáveis HQSWAP_* (C, D, R, NODE_DIR, MBP_DIR,
 #              LIFECYCLE); pula launchctl e gc suspend/resume.
+#   HQSWAP_FLATTEN=1 (vale nos dois modos): antes do GC, ACHATA o histórico na cópia do nó
+#              (ga-1p1i5jr.12) — mesmo dado, hash de cada tabela conferido antes/depois, 1 commit.
+#              Perde a "viagem no tempo" do Dolt (decisão do Athos, ga-2895yv); o histórico
+#              completo fica na cópia do MacBook (passo 7b, estado de antes do flatten) e no S3.
 #
 # Saídas: 0 trocado, conferido e cidade retomada; 10 abortado ANTES do irreversível (mini
 # intacto, Dolt religado, cidade retomada); 20 falhou DEPOIS do irreversível (Dolt fica PARADO e travado: voltar atrás B do
@@ -38,6 +42,7 @@ MBP_DIR="${HQSWAP_MBP_DIR:-hqswap/hq.old}"
 LIFECYCLE="${HQSWAP_LIFECYCLE:-$C/.gc/system/packs/bd/assets/scripts/gc-beads-bd.sh}"
 PORT="${HQSWAP_PORT:-52756}"
 DB=hq
+FLATTEN="${HQSWAP_FLATTEN:-0}"
 RELEASE="$X/release"
 HOLDER_PID="$X/holder.pid"
 VERSIONED="${HQSWAP_VERSIONED:-issues comments labels dependencies}"
@@ -106,6 +111,39 @@ node_counts() {  # HEAD + contagens da cópia no nó, uma tabela por chamada
   for t in $VERSIONED $IGNORED; do
     printf '%s %s\n' "$t" "$(node "cd $NODE_DIR && ~/$NODE_DOLT sql -r csv -q 'select count(*) from \`$t\`' 2>&1 | tail -1")"
   done
+}
+flatten_script() {  # imprime o script que roda NO NÓ, dentro de $NODE_DIR, com $1 = binário dolt (ga-1p1i5jr.12)
+  # mesmo dado antes/depois (hash de cada tabela), histórico vira raiz + 1 commit, sem branch nem tag que segure o
+  # histórico velho (senão o GC não libera nada). Saídas: 0 ok; 3 recusou antes de mexer; 4 mexeu e não confere
+  # (a cópia do nó é descartável: o hqswap aborta antes do irreversível, mini intacto)
+  # o script chega por stdin (bash -s): o corpo é UMA função, lida inteira antes de rodar, e roda com stdin=/dev/null —
+  # senão um dolt que lê stdin comeria o resto do script
+  cat <<'FLAT'
+flatten_main() {
+set -euo pipefail
+B="$1"; tmp=$(mktemp -d); trap 'rm -rf "$tmp"' EXIT
+q() { "$B" sql -r csv -q "$1" | tail -n +2; }
+hashes() { local t h; q "select table_name from information_schema.tables where table_schema = database() and table_type = 'BASE TABLE' order by table_name" > "$tmp/tables"; [ -s "$tmp/tables" ] || return 1
+  while IFS= read -r t; do h=$(q "select dolt_hashof_table('$t')") && [ -n "$h" ] || return 1; printf '%s %s\n' "$t" "$h"; done < "$tmp/tables"; }
+hashes > "$tmp/before" || { echo "flatten: tabelas ou hash ilegível — nada mexido"; exit 3; }
+[ "$("$B" branch --show-current)" = main ] || { echo "flatten: branch atual não é main — nada mexido"; exit 3; }
+root=$(q "select commit_hash from dolt_log order by date asc limit 1")
+[ -n "$root" ] || { echo "flatten: raiz ilegível — nada mexido"; exit 3; }
+tags=$("$B" tag) || { echo "flatten: lista de tags ilegível — nada mexido"; exit 3; }
+for b in $("$B" branch | sed 's/^[* ]*//'); do [ "$b" = main ] || "$B" branch -D -f "$b" >/dev/null || exit 4; done
+for t in $tags; do "$B" tag -d "$t" >/dev/null || exit 4; done
+"$B" reset --soft "$root" >/dev/null || exit 4
+"$B" add -A || exit 4
+"$B" commit --allow-empty -m "hqswap: flatten do histórico (ga-1p1i5jr.12)" >/dev/null || exit 4
+hashes > "$tmp/after" || { echo "flatten: hash ilegível depois"; exit 4; }
+diff "$tmp/before" "$tmp/after" || { echo "flatten: hash de tabela mudou"; exit 4; }
+n=$(q "select count(*) from dolt_log")
+[ "$n" -le 2 ] || { echo "flatten: sobraram $n commits"; exit 4; }
+left=$("$B" tag) && [ -z "$left" ] && [ "$("$B" branch | wc -l | tr -d ' ')" = 1 ] || { echo "flatten: sobrou branch ou tag"; exit 4; }
+echo "flatten ok: commits=$n tabelas=$(wc -l < "$tmp/before" | tr -d ' ') raiz=$root"
+ }
+flatten_main "$@" </dev/null
+FLAT
 }
 live_counts() {  # o servidor novo: HEAD da base no histórico + versionadas AS OF a base (estrito); ignoradas (só aviso)
   local head="$1" q
@@ -205,7 +243,7 @@ finish() {  # passos 13-14: gc resume + vigias de volta (o HALT fica, de propós
   done < "$X/watchdogs-booted-out.txt"
 }
 
-log "=== hqswap $MODE: D=$D X=$X nó=$NODE:$NODE_DIR mbp=$MBP:$MBP_DIR"
+log "=== hqswap $MODE: D=$D X=$X nó=$NODE:$NODE_DIR mbp=$MBP:$MBP_DIR flatten=$FLATTEN"
 [ -d "$D/$DB/.dolt" ] || { log "não achei $D/$DB/.dolt"; exit 2; }
 [ ! -e "$X/hq.new" ] && [ ! -e "$X/hq.old" ] || { log "$X/hq.new ou hq.old já existe — limpe antes"; exit 2; }
 
@@ -254,11 +292,26 @@ BASE_HEAD=$(awk '$1=="HEAD"{print $2}' "$X/base.txt")
 grep -qiE 'error|not found' "$X/base.txt" && die "erro nas contagens de base: $(cat "$X/base.txt")"
 log "8 base: $(tr '\n' ' ' < "$X/base.txt")"
 
-# 9. GC + contagens + fsck no nó
+# 9. (flatten) + GC + contagens + fsck no nó
+if [ "$FLATTEN" = 1 ]; then
+  flatten_script | node "cd $NODE_DIR && bash -s -- ~/$NODE_DOLT" > "$X/flatten.log" 2>&1 \
+    || die "flatten no nó falhou ($X/flatten.log: $(tail -1 "$X/flatten.log"))"
+  log "9a $(tail -1 "$X/flatten.log")"
+fi
 node "cd $NODE_DIR && ~/$NODE_DOLT gc --full --archive-level=0 --incremental-file-size=1073741824" > "$X/gc.log" 2>&1 \
   || die "dolt gc no nó falhou ($X/gc.log)"
 node_counts > "$X/after-gc.txt"
-diff -u "$X/base.txt" "$X/after-gc.txt" || die "contagens/HEAD mudaram com o GC"
+grep -qiE 'error|not found' "$X/after-gc.txt" && die "erro nas contagens depois do GC: $(cat "$X/after-gc.txt")"
+if [ "$FLATTEN" = 1 ]; then  # HEAD novo de propósito; o resto tem de ser idêntico à base
+  CHECK_HEAD=$(awk '$1=="HEAD"{print $2}' "$X/after-gc.txt")
+  [ -n "$CHECK_HEAD" ] && [ "$CHECK_HEAD" != "$BASE_HEAD" ] || die "HEAD depois do flatten inválido: [$CHECK_HEAD]"
+  grep -v '^HEAD ' "$X/base.txt" > "$X/base-rows.txt"; grep -v '^HEAD ' "$X/after-gc.txt" > "$X/after-rows.txt"
+  diff -u "$X/base-rows.txt" "$X/after-rows.txt" || die "contagens mudaram com o flatten/GC"
+  { echo "HEAD $CHECK_HEAD"; cat "$X/base-rows.txt"; } > "$X/base-check.txt"
+else
+  diff -u "$X/base.txt" "$X/after-gc.txt" || die "contagens/HEAD mudaram com o GC"
+  CHECK_HEAD=$BASE_HEAD; cp "$X/base.txt" "$X/base-check.txt"
+fi
 node "cd $NODE_DIR && ~/$NODE_DOLT fsck" > "$X/fsck.log" 2>&1 || die "fsck sujo ($X/fsck.log)"
 log "9 GC ok, contagens iguais, fsck limpo; nó: $(node "du -sh $NODE_DIR" | cut -f1)"
 
@@ -287,13 +340,14 @@ unfreeze_launchd
 release_holder
 lifecycle start || die "start falhou"
 for _ in $(seq 1 30); do dolt --host 127.0.0.1 --port "$PORT" --no-tls -u root -p '' sql -q 'select 1' >/dev/null 2>&1 && break; sleep 2; done
-live_counts "$BASE_HEAD" > "$X/live.txt"
-grep -E "^(HEAD|$(echo $VERSIONED | tr ' ' '|')) " "$X/base.txt" | diff -u - "$X/live.txt" \
+live_counts "$CHECK_HEAD" > "$X/live.txt"
+grep -E "^(HEAD|$(echo $VERSIONED | tr ' ' '|')) " "$X/base-check.txt" | diff -u - "$X/live.txt" \
   || die "servidor novo difere da base nas tabelas versionadas (Dolt está NO AR com o hq novo; hq antigo no MacBook)"
 live_ignored > "$X/live-ignored.txt"
-grep -vE "^(HEAD|$(echo $VERSIONED | tr ' ' '|')) " "$X/base.txt" | diff -u - "$X/live-ignored.txt" \
+grep -vE "^(HEAD|$(echo $VERSIONED | tr ' ' '|')) " "$X/base-check.txt" | diff -u - "$X/live-ignored.txt" \
   && log "12 tabelas ignoradas iguais à base" || log "AVISO: tabelas ignoradas diferem da base (pode ser gravação nova depois do start) — conferir $X/live-ignored.txt"
 log "12 servidor novo conferido; hq agora $(du -sh "$D/$DB" | cut -f1)"
+[ "$FLATTEN" = 1 ] && log "histórico completo (antes do flatten) só na cópia do MacBook $MBP:$MBP_DIR e no S3 — NÃO apagar em 24 h"
 [ -d "$X/hq.old" ] && log "hq.old ainda em $X/hq.old (apagar depois de 24 h ou quando o disco pedir)"
 touch "$X/stop-watch"
 finish

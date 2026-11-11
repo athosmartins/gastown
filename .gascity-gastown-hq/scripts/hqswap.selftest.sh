@@ -3,7 +3,7 @@
 # segundos) e QUEM abriu o banco com o Dolt parado: dotdolt_mtimes e watch_dolt_procs.
 #
 # ## Contents
-# - O que cobre · Como roda
+# - O que cobre · Como roda · flatten (ga-1p1i5jr.12)
 #
 # O que cobre: dotdolt_mtimes (números de verdade, "?" quando não lê, nunca vazio nem parcial);
 # watch_dolt_procs com `ps`/`lsof` falsos num PATH de scratch (a cadeia de pais de um `dolt backup`
@@ -145,6 +145,57 @@ for _ in 1 2 3 4 5 6 7 8 9 10 11 12; do
 done
 check "o amostrador não fica órfão: com o script principal morto por SIGKILL, ele sai em até 3 s" test "$GONE" = 1
 touch "$XO/stop-watch"; [ "$GONE" = 1 ] || kill "$SAMPLER_PID" 2>/dev/null
+echo "── flatten_script (Dolt descartável, ga-1p1i5jr.12) ──"
+fn_of flatten_script > "$WORK/f-flat.sh"
+if [ -s "$WORK/f-flat.sh" ]; then ok "flatten_script existe em hqswap.sh"; else nope "flatten_script não existe em hqswap.sh"; fi
+bash -c ". '$WORK/f-flat.sh'; flatten_script" > "$WORK/flat.sh"
+check "o script do nó é bash válido" bash -n "$WORK/flat.sh"
+REAL_DOLT=$(command -v dolt || true)
+if [ -z "$REAL_DOLT" ]; then
+  nope "dolt não está no PATH — os casos de flatten não rodaram (não é verde)"
+else
+  export DOLT_ROOT_PATH="$WORK/doltroot"; mkdir -p "$DOLT_ROOT_PATH"
+  dolt config --global --add user.name selftest >/dev/null; dolt config --global --add user.email selftest@example.invalid >/dev/null
+  # mkrepo <dir>: 6 commits, branch e tag velhas, tabela ignorada (como as wisps do hq) e mudança não commitada
+  mkrepo() {
+    mkdir -p "$1" && ( cd "$1" && dolt init >/dev/null &&
+      dolt sql -q "create table issues (id int primary key, t varchar(20)); insert into dolt_ignore values ('wisp%', true); create table wisps (id int primary key); create view v_issues as select * from issues" >/dev/null &&
+      dolt add -A >/dev/null && dolt commit -m c1 >/dev/null &&
+      for i in 1 2 3 4 5; do dolt sql -q "insert into issues values ($i,'v$i'); update issues set t='x$i' where id=1" >/dev/null && dolt commit -am "c$i" >/dev/null || exit 1; done &&
+      dolt branch velha HEAD~2 && dolt tag t-velha HEAD~3 &&
+      dolt sql -q "insert into wisps values (1),(2); insert into issues values (99,'nao-commitada')" >/dev/null ) </dev/null
+  }
+  counts() { ( cd "$1" && for t in issues wisps; do printf '%s %s\n' "$t" "$(dolt sql -r csv -q "select count(*) from $t" | tail -1)"; done ) </dev/null; }
+  R1="$WORK/flat1"; mkrepo "$R1"; counts "$R1" > "$WORK/c1-before"
+  ( cd "$R1" && bash -s -- "$REAL_DOLT" < "$WORK/flat.sh" ) > "$WORK/flat1.out" 2>&1; RC1=$?
+  check "repo normal: flatten sai 0 ($(tail -1 "$WORK/flat1.out"))" test "$RC1" = 0
+  check "a última linha diz 'flatten ok' (o script foi lido até o fim, nada comido do stdin)" grep -q '^flatten ok: ' "$WORK/flat1.out"
+  N1=$( cd "$R1" && dolt sql -r csv -q "select count(*) from dolt_log" </dev/null | tail -1 )
+  check "o histórico vira no máximo 2 commits (tinha 7; ficou $N1)" test "${N1:-99}" -le 2
+  check "branch e tag velhas somem (senão seguram o histórico e o GC não libera)" sh -c "cd '$R1' && [ \"\$(dolt branch | wc -l | tr -d ' ')\" = 1 ] && [ -z \"\$(dolt tag)\" ]"
+  counts "$R1" > "$WORK/c1-after"
+  check "contagens iguais antes/depois, inclusive a não commitada e a tabela ignorada" diff "$WORK/c1-before" "$WORK/c1-after"
+  check "o valor da linha alterada 5x continua o último (x5)" sh -c "cd '$R1' && dolt sql -r csv -q \"select t from issues where id=1\" </dev/null | tail -1 | grep -qx x5"
+  # mutante: um dolt que, no commit, também apaga uma linha → o hash muda → tem de sair 4
+  R2="$WORK/flat2"; mkrepo "$R2"
+  cat > "$BIN/dolt-mut" <<STUB
+#!/bin/sh
+"$REAL_DOLT" "\$@"; rc=\$?
+[ "\$1" = commit ] && "$REAL_DOLT" sql -q "delete from issues where id=2" >/dev/null
+exit \$rc
+STUB
+  chmod +x "$BIN/dolt-mut"
+  ( cd "$R2" && bash -s -- "$BIN/dolt-mut" < "$WORK/flat.sh" ) > "$WORK/flat2.out" 2>&1; RC2=$?
+  check "mutante (dado muda no commit): sai 4 com 'hash de tabela mudou' (rc=$RC2)" sh -c "[ $RC2 = 4 ] && grep -q 'hash de tabela mudou' '$WORK/flat2.out'"
+  # fora da main: recusa ANTES de mexer (rc 3, histórico intacto)
+  R3="$WORK/flat3"; mkrepo "$R3"; ( cd "$R3" && dolt reset --hard >/dev/null && dolt checkout velha >/dev/null ) </dev/null || nope "setup: checkout da branch velha falhou"
+  B3=$( cd "$R3" && dolt sql -r csv -q "select count(*) from dolt_log" </dev/null | tail -1 )
+  ( cd "$R3" && bash -s -- "$REAL_DOLT" < "$WORK/flat.sh" ) > "$WORK/flat3.out" 2>&1; RC3=$?
+  A3=$( cd "$R3" && dolt sql -r csv -q "select count(*) from dolt_log" </dev/null | tail -1 )
+  check "branch atual não é main: sai 3 e não mexe no histórico ($B3 → $A3 commits)" sh -c "[ $RC3 = 3 ] && [ '$B3' = '$A3' ] && [ '$B3' -gt 2 ]"
+fi
+check "o passo 9 só achata com HQSWAP_FLATTEN=1"                    grep -q 'if \[ "\$FLATTEN" = 1 \]; then' "$SCRIPT"
+check "o passo 12 confere contra base-check.txt (HEAD novo no flatten)" grep -q 'live_counts "\$CHECK_HEAD"' "$SCRIPT"
 check "o log do operador diz onde olhar (dotdolt-procs.log)"         grep -q '5b vigias ligados' "$SCRIPT"
 check "bash -n limpo"                                                bash -n "$SCRIPT"
 
