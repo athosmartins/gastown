@@ -307,7 +307,7 @@ if [ "$FLATTEN" = 1 ]; then  # HEAD novo de propósito; o resto tem de ser idên
   [ -n "$CHECK_HEAD" ] && [ "$CHECK_HEAD" != "$BASE_HEAD" ] || die "HEAD depois do flatten inválido: [$CHECK_HEAD]"
   grep -v '^HEAD ' "$X/base.txt" > "$X/base-rows.txt"; grep -v '^HEAD ' "$X/after-gc.txt" > "$X/after-rows.txt"
   diff -u "$X/base-rows.txt" "$X/after-rows.txt" || die "contagens mudaram com o flatten/GC"
-  { echo "HEAD $CHECK_HEAD"; cat "$X/base-rows.txt"; } > "$X/base-check.txt"
+  { echo "HEAD $CHECK_HEAD"; cat "$X/base-rows.txt"; } > "$X/base-check.txt"  # third-state-waiver: arquivo escrito 2 linhas acima neste mesmo passo; falha de escrita = diff abaixo vazio → die no 12
 else
   diff -u "$X/base.txt" "$X/after-gc.txt" || die "contagens/HEAD mudaram com o GC"
   CHECK_HEAD=$BASE_HEAD; cp "$X/base.txt" "$X/base-check.txt"

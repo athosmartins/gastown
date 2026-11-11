@@ -187,6 +187,18 @@ STUB
   chmod +x "$BIN/dolt-mut"
   ( cd "$R2" && bash -s -- "$BIN/dolt-mut" < "$WORK/flat.sh" ) > "$WORK/flat2.out" 2>&1; RC2=$?
   check "mutante (dado muda no commit): sai 4 com 'hash de tabela mudou' (rc=$RC2)" sh -c "[ $RC2 = 4 ] && grep -q 'hash de tabela mudou' '$WORK/flat2.out'"
+  # hash ilegível (dolt falha no dolt_hashof_table): recusa ANTES de mexer (rc 3, histórico intacto)
+  R4="$WORK/flat4"; mkrepo "$R4"
+  cat > "$BIN/dolt-nohash" <<STUB
+#!/bin/sh
+case "\$*" in *dolt_hashof_table*) echo "error: simulado" >&2; exit 1 ;; esac
+exec "$REAL_DOLT" "\$@"
+STUB
+  chmod +x "$BIN/dolt-nohash"
+  B4=$( cd "$R4" && dolt sql -r csv -q "select count(*) from dolt_log" </dev/null | tail -1 )
+  ( cd "$R4" && bash -s -- "$BIN/dolt-nohash" < "$WORK/flat.sh" ) > "$WORK/flat4.out" 2>&1; RC4=$?
+  A4=$( cd "$R4" && dolt sql -r csv -q "select count(*) from dolt_log" </dev/null | tail -1 )
+  check "hash ilegível: sai 3 e não mexe no histórico ($B4 → $A4 commits)" sh -c "[ $RC4 = 3 ] && [ '$B4' = '$A4' ] && [ '$B4' -gt 2 ]"
   # fora da main: recusa ANTES de mexer (rc 3, histórico intacto)
   R3="$WORK/flat3"; mkrepo "$R3"; ( cd "$R3" && dolt reset --hard >/dev/null && dolt checkout velha >/dev/null ) </dev/null || nope "setup: checkout da branch velha falhou"
   B3=$( cd "$R3" && dolt sql -r csv -q "select count(*) from dolt_log" </dev/null | tail -1 )
