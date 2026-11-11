@@ -6182,8 +6182,9 @@ rebase_deploy_deps_inherited_drift() {
   # With check-drift answering "no" in both modes (ga-uw1oc1u) it is what the builder has to fix (the findings this tree adds on
   # top of main) or what a repair agent needs (the crash) — until now it was thrown away on every path but "inherited".
   # vazio (stderr sem texto) → o log sai com a lista vazia; o veredito continua vindo so do case abaixo
+  # (awk NR<=8 drena a entrada toda — `| head -8` fecharia cedo e daria SIGPIPE no escritor, o C11 do pipe-early-exit.selftest.sh)
   if [ "$lint_rc" -eq 1 ] && [ "$(type -t log 2>/dev/null)" = "function" ]; then
-    log "rebase_content_verdict: lint_daemon_deps.py --against-ref ${main_sha} exited 1 — its stderr (findings this tree adds on top of main, or a crash/fallback; ga-uw1oc1u): $(printf '%s' "$lint_err" | head -8 | tr '\n' '|')" >&2
+    log "rebase_content_verdict: lint_daemon_deps.py --against-ref ${main_sha} exited 1 — its stderr (findings this tree adds on top of main, or a crash/fallback; ga-uw1oc1u): $(printf '%s' "$lint_err" | awk 'NR <= 8 { printf "%s|", $0 }')" >&2
   fi
   case "$lint_rc" in
     0)
@@ -6361,10 +6362,10 @@ rebase_deploy_deps_verdict() {
     124) echo "unknown:deploy-deps-check-timeout"; return 0 ;;
     127) echo "unknown:deploy-deps-check-unavailable"; return 0 ;;
     4)
-      # vazio (o segundo parecer nao imprimiu linha — inclusive quando a conta do timeout abaixo falhou e a funcao nem rodou) →
-      # unknown:deploy-deps-inherited-unverified; falhou/ilegivel (texto fora do contrato) → o mesmo, nunca drift (ga-uw1oc1u:
-      # check-drift virou "no" nos dois modos, entao um "nao consegui saber" nao pode sair com a cara dele). 10#: o valor ja
-      # passou a validacao so-digitos acima, e um zero a esquerda ("08") seria lido como octal e deixaria a expansao vazia.
+      # vazio (o segundo parecer nao imprimiu linha — por exemplo, a funcao nem chegou a rodar) → unknown:deploy-deps-inherited-unverified;
+      # falhou/ilegivel (texto fora do contrato) → o mesmo, nunca drift (ga-uw1oc1u: check-drift virou "no" nos dois modos, entao um
+      # "nao consegui saber" nao pode sair com a cara dele). 10#: o valor ja passou a validacao so-digitos acima, e um zero a esquerda
+      # ("08") seria lido como octal, a conta falharia e a expansao ficaria vazia (era o gatilho real desse terceiro estado).
       inh=$(rebase_deploy_deps_inherited_drift "$wt" "$gd" "$main_ref" "$new_tip" "${GATE_DEPLOY_DEPS_INHERITED_TIMEOUT:-$((10#$chk_timeout * 2))}")
       case "$inh" in
         inherited) : ;;
@@ -6870,8 +6871,9 @@ rebase_content_lost_paths() {
       # where the rebased tip differs from the conflicted merge's own tree, as the clean-text mode already does;
       # any other conflict keeps the sentinel.
       # vazio (nenhuma linha de path depois do oid) → sentinel, como antes; falhou/ilegivel (stdout fora da forma oid + linhas "<modo> <oid> <estagio>\t<path>") → o mesmo sentinel
+      # (as linhas 2.. ate a primeira em branco, como rebase_deploy_deps_verdict() le; o awk drena a entrada toda, `sed q` daria SIGPIPE no escritor — C11)
       local _rclp_cpaths
-      _rclp_cpaths=$(printf '%s\n' "$out" | tail -n +2 | sed '/^$/q' | sed '/^$/d' | cut -f2- | sort -u)
+      _rclp_cpaths=$(printf '%s\n' "$out" | awk 'NR == 1 { next } /^$/ { done = 1 } !done { print }' | cut -f2- | sort -u)
       if [ "$_rclp_cpaths" != "daemons/deploy_deps.json" ]; then
         echo "<could not compute: merge-tree-conflict>"
         return 0

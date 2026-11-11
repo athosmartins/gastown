@@ -526,7 +526,7 @@ V8A=$(run_verdict_at "$RD" "$DDJ_MAIN" "$DDJ_BRANCH" "$DDJ_GOOD_TIP")
 # "no", not "unknown" (ga-uw1oc1u): exit 4 is the one code of the generator that
 # is a VERDICT (it ran to the end and refused), re-running reproduces it, and the
 # gate sends only a literal "no" to needs-rebase — an "unknown" went into the
-# exile/retry loop that gate_exile_recovery_sweep then undid every sweep. The
+# exile/retry loop that gate_exile_recovery_sweep then cleared. The
 # clean-text mode already answered "no" for the same exit (Teste 9d); Teste 11
 # pins that both modes agree.
 printf '{"n": 999}\n' > "$RD/daemons/deploy_deps.json"
@@ -1033,7 +1033,8 @@ parity "generator-unverified" "$RD6" "$V8H" "$RC5" "$V9E"
 
 # Leitura que FALHA != caminho que nao existe. generator-unverified agora vale "no" nos dois modos, entao
 # um git que nao conseguiu ler o blob do gerador (exit 128) nao pode sair com a cara de "main nao tem
-# gerador" (exit 1, ausente — 8c): e "nao consegui saber" e fica unknown. O shim falha SO essa leitura.
+# gerador" (exit 1, ausente — 8c): e "nao consegui saber" e fica unknown. As duas leituras sao as do
+# requisito 3 de rebase_deploy_deps_verdict() em quality-gate-dispatcher.sh; o shim falha SO elas.
 RD_MAIN=$(git -C "$RD" rev-parse ddjmain); RD_BRANCH=$(git -C "$RD" rev-parse ddjbranch)
 GITSHIM="$TMP/gitshim"; mkdir -p "$GITSHIM"; REAL_GIT="$(command -v git)"
 printf '#!/bin/sh\nfor a in "$@"; do case "$a" in *:scripts/gen_daemon_deps.py) exit 128 ;; esac; done\nexec "%s" "$@"\n' "$REAL_GIT" > "$GITSHIM/git"
@@ -1129,7 +1130,7 @@ V11E=$( export GATE_DEPLOY_DEPS_CHECK_TIMEOUT=08; run_verdict_at "$RI1" "$I1_MAI
                     || bad "11e: esperava yes com GATE_DEPLOY_DEPS_CHECK_TIMEOUT=08, deu '$V11E' (o 08 foi lido como octal e o segundo parecer nao rodou)"
 
 # Diagnostico: o "no" (e o achado do lint que o causou) tem de aparecer no log do dispatcher — sem isso o
-# motivo some no literal "no" (era a unica pista que o reparo autonomo do ga-rf9pnrz nao tinha).
+# motivo some no literal "no" (no ga-rf9pnrz a causa so apareceu depois do re-anchor do Mayor).
 V11F=$( . "$TMP/block.sh"; log() { echo "[t] $*"; }; rebase_content_verdict "$RI3" "$I3_MAIN" "$I3_BRANCH" "$I3_TIP" 2>"$TMP/11f.err" )
 { [ "$V11F" = "no" ] && grep -q "against-ref $I3_MAIN exited 1" "$TMP/11f.err" && grep -q 'findings this tree adds on top of main' "$TMP/11f.err" \
     && grep -q 'DESATUALIZADO' "$TMP/11f.err"; } \
