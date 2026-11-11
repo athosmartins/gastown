@@ -5270,6 +5270,20 @@ gate_exile_recovery_sweep() {
     # "fix" this into a rebase_content_verdict() check assuming ga-10uqmi
     # was never applied — that would spend a real git worktree+rebase per
     # exiled marker per sweep to re-guard against an already-closed path.
+    #
+    # ga-uw1oc1u: "by construction" holds only while EVERY failure that
+    # reproduces reaches the Step 4c classifier as a literal "no". The
+    # conflicted-merge-tree mode of the deploy_deps arbiter broke that for
+    # three of its answers (check-drift, tree-mismatch, generator-unverified
+    # came out "unknown:*" and took the transient path; for check-drift this
+    # textual check then cleared the exile — log: "merges into origin/main with
+    # zero conflicts" — and the marker came back to the head of the queue, ~8 min
+    # of arbiter work per cycle with no reviewer running). rebase_deploy_deps_map()
+    # now gives both modes one mapping, and Teste 11 of
+    # gate-rebase-content-verdict.selftest.sh pins the whole chain (real verdict
+    # -> real Step 4c classifier). A NEW way for a reproducible failure to answer
+    # "unknown" would reopen this loop HERE, not upstream of it: put its suffix
+    # in that mapping instead of teaching this sweep to second-guess the rebase.
     verdict=$(rig_merge_has_conflict "origin/$DEFAULT_BRANCH" "origin/$m_branch")
     [ "$verdict" = "0" ] || continue
     attempt=$(read_rebase_attempt "$marker_id")
@@ -6164,6 +6178,13 @@ rebase_deploy_deps_inherited_drift() {
   fi
   # vazio (exit 0, nada no stderr) → inherited; falhou (timeout/crash/sem python) → unknown:*, nunca inherited
   lint_err=$( cd "$wt" && timeout "$lint_timeout" python3 scripts/lint_daemon_deps.py --against-ref "$main_sha" 2>&1 >/dev/null ); lint_rc=$?
+  # Exit 1 is the lint's "new drift" AND its "uncaught exception" (see above): either way its stderr is the only trace of WHY.
+  # With check-drift answering "no" in both modes (ga-uw1oc1u) it is what the builder has to fix (the findings this tree adds on
+  # top of main) or what a repair agent needs (the crash) — until now it was thrown away on every path but "inherited".
+  # vazio (stderr sem texto) → o log sai com a lista vazia; o veredito continua vindo so do case abaixo
+  if [ "$lint_rc" -eq 1 ] && [ "$(type -t log 2>/dev/null)" = "function" ]; then
+    log "rebase_content_verdict: lint_daemon_deps.py --against-ref ${main_sha} exited 1 — its stderr (findings this tree adds on top of main, or a crash/fallback; ga-uw1oc1u): $(printf '%s' "$lint_err" | head -8 | tr '\n' '|')" >&2
+  fi
   case "$lint_rc" in
     0)
       if [ "$(type -t log 2>/dev/null)" = "function" ]; then
@@ -6190,7 +6211,7 @@ rebase_deploy_deps_inherited_drift() {
 # call used (ga-stisew). Prints one line: "yes" or "unknown:<reason>" — never
 # "no": nothing here can PROVE a rebase lost content, it can only fail to
 # verify it. (The caller decides which of those reasons still mean "no" — see
-# the mapping in rebase_content_verdict().)
+# rebase_deploy_deps_map(), which both of rebase_content_verdict()'s calls use.)
 #
 # <mode> says HOW the ground truth disagrees:
 #   conflict (default, ga-r5dsgp) — the merge-tree CONFLICTED and printed a
@@ -6337,11 +6358,16 @@ rebase_deploy_deps_verdict() {
     124) echo "unknown:deploy-deps-check-timeout"; return 0 ;;
     127) echo "unknown:deploy-deps-check-unavailable"; return 0 ;;
     4)
-      inh=$(rebase_deploy_deps_inherited_drift "$wt" "$gd" "$main_ref" "$new_tip" "${GATE_DEPLOY_DEPS_INHERITED_TIMEOUT:-$((chk_timeout * 2))}")
+      # vazio (o segundo parecer nao imprimiu linha — inclusive quando a conta do timeout abaixo falhou e a funcao nem rodou) →
+      # unknown:deploy-deps-inherited-unverified; falhou/ilegivel (texto fora do contrato) → o mesmo, nunca drift (ga-uw1oc1u:
+      # check-drift virou "no" nos dois modos, entao um "nao consegui saber" nao pode sair com a cara dele). 10#: o valor ja
+      # passou a validacao so-digitos acima, e um zero a esquerda ("08") seria lido como octal e deixaria a expansao vazia.
+      inh=$(rebase_deploy_deps_inherited_drift "$wt" "$gd" "$main_ref" "$new_tip" "${GATE_DEPLOY_DEPS_INHERITED_TIMEOUT:-$((10#$chk_timeout * 2))}")
       case "$inh" in
         inherited) : ;;
+        drift) echo "unknown:deploy-deps-check-drift"; return 0 ;;
         unknown:deploy-deps-inherited-timeout|unknown:deploy-deps-inherited-unverified) echo "$inh"; return 0 ;;
-        *) echo "unknown:deploy-deps-check-drift"; return 0 ;;
+        *) echo "unknown:deploy-deps-inherited-unverified"; return 0 ;;
       esac ;;
     *) echo "unknown:deploy-deps-check-failed"; return 0 ;;
   esac
@@ -6498,6 +6524,51 @@ rebase_union_paths_verdict() {
   return 0
 }
 
+# rebase_deploy_deps_map <arbiter line> <mode>   (ga-uw1oc1u)
+#
+# The ONE place that says what an answer of rebase_deploy_deps_verdict() means to the gate. Both of
+# rebase_content_verdict()'s calls to the arbiter go through it — <mode> is conflict for the merge-tree
+# that CONFLICTED on daemons/deploy_deps.json alone, clean for the clean-but-different one — so the same
+# suffix can no longer mean "no" in one and "could not tell" in the other. That is what it meant until
+# ga-uw1oc1u: conflict mode echoed the line as it came, check-drift reached the gate as "unknown:*", the
+# Step 4c classifier (it routes only a literal "no" to needs-rebase) called that transient, and
+# gate_exile_recovery_sweep — whose check is only whether origin/main and the branch merge without a
+# textual conflict, and they did — cleared the exile. The marker came back to the head of the queue,
+# ~8 min of arbiter work per cycle (gen --check ~2 min + lint --against-ref ~4.5 min) with no reviewer
+# running: the resonance loop of ga-10uqmi, through the door ga-ub5hkz left open when it taught the
+# clean-text mode this mapping.
+#
+#   yes                                          -> yes
+#   unknown:deploy-deps-tree-mismatch            -> no   the arbiter reached a verdict and it was a refusal:
+#   unknown:deploy-deps-generator-unverified     -> no   the tip differs from the reference merge at more than
+#   unknown:deploy-deps-check-drift              -> no   deploy_deps.json, or nothing can vouch for it, or --check
+#                                                        (exit 4, the one code of the generator that is a verdict)
+#                                                        said the file is stale. Re-running the same rebase
+#                                                        reproduces each, so a retry can only burn sweeps.
+#   any other unknown:*                          -> itself   no verdict was reached (timeout, killed, crashed,
+#                                                        unreadable, worktree not at the tip, ...): "could not tell"
+#                                                        stays unknown, never no. Also the default for a suffix
+#                                                        nobody decided about — when the arbiter gains one, decide
+#                                                        HERE which side of that line it is on.
+#   anything else (empty, "no", "drift", prose)  -> unknown:deploy-deps-no-verdict   the arbiter's contract is ONE
+#                                                        line, "yes" or "unknown:<reason>"; a line outside it is not
+#                                                        a verdict, and an empty read is not a refusal.
+# The log line (stderr: stdout is the caller's verdict channel) is written only when the answer becomes "no",
+# so the reason survives the collapse into the bare literal that the callers compare against.
+rebase_deploy_deps_map() {
+  local line="${1:-}" mode="${2:-?}"
+  case "$line" in
+    yes) echo "yes" ;;
+    unknown:deploy-deps-tree-mismatch|unknown:deploy-deps-generator-unverified|unknown:deploy-deps-check-drift)
+      if [ "$(type -t log 2>/dev/null)" = "function" ]; then
+        log "rebase_content_verdict: deploy_deps arbiter (${mode} mode) answered ${line} — a verdict (a refusal), and re-running reproduces it, so the answer is no, not unknown (ga-uw1oc1u)" >&2
+      fi
+      echo "no" ;;
+    unknown:*) echo "$line" ;;
+    *) echo "unknown:deploy-deps-no-verdict" ;;
+  esac
+}
+
 # rebase_content_verdict <worktree> <main_ref> <orig_tip> <new_tip>
 #   yes           — a arvore do rebase bate com a do merge 3-way: nada se perdeu
 #                   (ga-r5dsgp: OU o merge-tree conflitou SO em
@@ -6508,16 +6579,18 @@ rebase_union_paths_verdict() {
 #                   resto — o texto limpo pode estar velho, o driver do rebase
 #                   e quem soma os itens)
 #   no            — DIFEREM: o rebase perdeu ou alterou conteudo; NAO empurrar
-#                   (ga-ub5hkz: segue "no" quando o arbitro de deploy_deps.json
-#                   nao abona — diverge TAMBEM outro path (tree-mismatch),
-#                   ninguem pode abonar o tip (gerador ausente ou diferente do
-#                   de main) ou o --check rodou ATE O FIM e disse que o arquivo
-#                   esta desatualizado (exit 4, check-drift — o unico codigo do
-#                   gerador que e veredito; crash, kill e uso NAO sao "no", ver
-#                   check-failed abaixo). Fica "no" porque e deterministico: o
-#                   classificador do gate manda "no" pra needs-rebase e
-#                   "unknown" pro retry transitorio, ga-10uqmi, e re-rodar nao
-#                   muda o resultado)
+#                   (ga-ub5hkz, ga-uw1oc1u: segue "no" quando o arbitro de
+#                   deploy_deps.json nao abona — diverge TAMBEM outro path
+#                   (tree-mismatch), ninguem pode abonar o tip (gerador ausente
+#                   ou diferente do de main) ou o --check rodou ATE O FIM e
+#                   disse que o arquivo esta desatualizado (exit 4, check-drift
+#                   — o unico codigo do gerador que e veredito; crash, kill e
+#                   uso NAO sao "no", ver check-failed abaixo), tanto no
+#                   merge-tree LIMPO quanto no que CONFLITOU so em deploy_deps.json:
+#                   rebase_deploy_deps_map() e o mapa dos dois. Fica "no" porque
+#                   e deterministico: o classificador do gate manda "no" pra
+#                   needs-rebase e "unknown" pro retry transitorio, ga-10uqmi, e
+#                   re-rodar nao muda o resultado)
 #   unknown:*     — nao deu pra comparar. Terceiro estado explicito: quem chama
 #                   trata como "nao verificado", nunca como "verificado ok"
 #                   (todo comparador no dispatcher testa "= yes"/"!= yes",
@@ -6590,8 +6663,10 @@ rebase_union_paths_verdict() {
 #                                                         selftest ou uso (2), --assert
 #                                                         (3, o gate nao passa), morto por
 #                                                         sinal (>=128)
-#                   (ga-ub5hkz) num merge-tree LIMPO que so difere em
-#                   deploy_deps.json o resultado e um destes dois grupos:
+#                   (ga-ub5hkz, ga-uw1oc1u) a resposta do arbitro — num merge-tree
+#                   LIMPO que so difere em deploy_deps.json OU num que CONFLITOU
+#                   so nele — e um destes dois grupos, decididos num lugar so
+#                   (rebase_deploy_deps_map(), igual nos dois modos):
 #                   - SO estes viram "no" (deterministico, re-rodar reproduz):
 #                     :deploy-deps-tree-mismatch / :deploy-deps-generator-unverified
 #                     / :deploy-deps-check-drift
@@ -6603,8 +6678,11 @@ rebase_union_paths_verdict() {
 #                     :deploy-deps-inherited-timeout / :deploy-deps-inherited-unverified /
 #                     :deploy-deps-diff-error / :deploy-deps-bad-mode /
 #                     :deploy-deps-no-verdict
-#                   No modo conflito (ga-r5dsgp) NENHUM sufixo vira "no": a linha
-#                   do arbitro sai como esta, inclusive check-drift.
+#                   Ate o ga-uw1oc1u o modo conflito (ga-r5dsgp) devolvia a linha
+#                   do arbitro como estava, inclusive check-drift, e esse
+#                   "unknown" caia no retry transitorio (exile -> recovery ->
+#                   cabeca da fila). :merge-tree-conflict (OUTRO path tambem
+#                   conflita) nao e do arbitro e segue unknown nos dois casos.
 rebase_content_verdict() {
   local wt="$1" main_ref="$2" orig_tip="$3" new_tip="$4"
   # ga-pgxs78: every "unknown" now carries WHICH of the could-not-verify
@@ -6627,7 +6705,7 @@ rebase_content_verdict() {
   # is not trustworthy here.
   local gd; gd=$(rebase_wt_git_dir "$wt")
   if [ -z "$gd" ]; then echo "unknown:no-gitdir"; return 0; fi
-  local out rc expected actual attrs_file
+  local out rc expected actual attrs_file ddv
   # ga-stisew: apply new_tip's own .gitattributes (if any) so a merge driver
   # like merge=union is honored even though this call has no working tree —
   # see rebase_git_attributes_file() above.
@@ -6655,7 +6733,14 @@ rebase_content_verdict() {
       # is not evidence content was lost — see rebase_deploy_deps_verdict()
       # above for what it takes to earn a "yes" here (it prints exactly one
       # verdict line, "yes" or a distinct "unknown:<reason>").
-      rebase_deploy_deps_verdict "$wt" "$gd" "$main_ref" "$new_tip" "$out"
+      # ga-uw1oc1u: the refusals that reproduce (check-drift, tree-mismatch,
+      # generator-unverified) answer "no" HERE exactly as they do in the
+      # clean-text mode below — rebase_deploy_deps_map() is the one mapping.
+      # Until then this line was echoed as it came and check-drift went into
+      # the exile/retry loop that gate_exile_recovery_sweep then cleared.
+      # vazio (o arbitro nao imprimiu linha) → unknown:deploy-deps-no-verdict; falhou/ilegivel (texto fora do contrato) → o mesmo unknown, nunca no
+      ddv=$(rebase_deploy_deps_verdict "$wt" "$gd" "$main_ref" "$new_tip" "$out")
+      rebase_deploy_deps_map "$ddv" conflict
     else
       echo "unknown:merge-tree-error"
     fi
@@ -6705,26 +6790,15 @@ rebase_content_verdict() {
   # verdict() (clean mode) is also what pins the difference to that one path,
   # so a tree that differs anywhere else comes back as tree-mismatch => "no".
   #
-  # The mapping is the point of this block: only "yes" upgrades. Three outcomes
-  # stay "no", because re-running reproduces each and "unknown" would send a
-  # deterministic failure into the transient retry path (ga-10uqmi): another
-  # path differs too (tree-mismatch), nothing can vouch for the tip (generator
-  # absent or not main's), or the generator's --check ran to the end and said
-  # the file is stale (check-drift: its exit 4, the one code that is a verdict).
-  # Everything else — the arbiter could not run, was killed, crashed before
-  # reaching a verdict (check-failed: exit 1/2/>=128), or said something this
-  # block does not know — is "unknown:*": three states, and "could not tell"
-  # never becomes "no". When adding a suffix to rebase_deploy_deps_verdict(),
-  # decide HERE which side of that line it is on; the default is unknown.
-  local ddv
+  # The mapping is the point of this block: only "yes" upgrades, three outcomes
+  # that reproduce stay "no" (ga-10uqmi: "unknown" would send a deterministic
+  # failure into the transient retry path) and everything else stays "unknown:*".
+  # It lives in rebase_deploy_deps_map(), shared with the conflicted-merge-tree
+  # call above (ga-uw1oc1u) — when adding a suffix to rebase_deploy_deps_verdict(),
+  # decide THERE which side of that line it is on; the default is unknown.
+  # vazio (o arbitro nao imprimiu linha) → unknown:deploy-deps-no-verdict; falhou/ilegivel (texto fora do contrato) → o mesmo unknown, nunca no
   ddv=$(rebase_deploy_deps_verdict "$wt" "$gd" "$main_ref" "$new_tip" "$out" clean)
-  case "$ddv" in
-    yes) echo "yes" ;;
-    unknown:deploy-deps-tree-mismatch|unknown:deploy-deps-generator-unverified|unknown:deploy-deps-check-drift)
-      echo "no" ;;
-    unknown:*) echo "$ddv" ;;
-    *) echo "unknown:deploy-deps-no-verdict" ;;
-  esac
+  rebase_deploy_deps_map "$ddv" clean
 }
 
 # rebase_content_lost_paths <worktree> <main_ref> <orig_tip> <new_tip> — lista
@@ -6755,6 +6829,11 @@ rebase_content_verdict() {
 # conflict never writes to stderr); a merge-tree call that never produced a
 # tree gets its stderr attached instead, since that shape is exactly what was
 # being mislabeled as a "conflict" with no way to tell the two apart.
+#
+# ga-uw1oc1u: the one conflict that is NOT a could-not-compute any more is a
+# conflict on daemons/deploy_deps.json ALONE — the case the deploy_deps arbiter
+# judges and can answer "no" for. It lists the diverging paths like the clean
+# case does (see the comment in the conflict branch below).
 rebase_content_lost_paths() {
   local wt="$1" main_ref="$2" orig_tip="$3" new_tip="$4"
   local gd; gd=$(rebase_wt_git_dir "$wt")
@@ -6778,13 +6857,24 @@ rebase_content_lost_paths() {
   if [ "$rc" -ne 0 ]; then
     if [ -n "$out" ]; then
       rm -f "$_rclp_err_file" 2>/dev/null || true
-      echo "<could not compute: merge-tree-conflict>"
+      # ga-uw1oc1u: a conflict on daemons/deploy_deps.json ALONE is the one the deploy_deps arbiter judges
+      # (rebase_content_verdict()), and since it can answer "no" there the author reads THIS text (CONFLICT_FILES
+      # -> pool handoff / nudge): the opaque sentinel hid WHICH file was judged. That case falls through and lists
+      # where the rebased tip differs from the conflicted merge's own tree, as the clean-text mode already does;
+      # any other conflict keeps the sentinel.
+      # vazio (nenhuma linha de path depois do oid) → sentinel, como antes; falhou/ilegivel (stdout fora da forma oid + linhas "<modo> <oid> <estagio>\t<path>") → o mesmo sentinel
+      local _rclp_cpaths
+      _rclp_cpaths=$(printf '%s\n' "$out" | tail -n +2 | sed '/^$/q' | sed '/^$/d' | cut -f2- | sort -u)
+      if [ "$_rclp_cpaths" != "daemons/deploy_deps.json" ]; then
+        echo "<could not compute: merge-tree-conflict>"
+        return 0
+      fi
     else
       local _rclp_stderr; _rclp_stderr=$(tr '\n' ' ' < "$_rclp_err_file" 2>/dev/null | cut -c1-500)
       rm -f "$_rclp_err_file" 2>/dev/null || true
       echo "<could not compute: merge-tree-error — not a real conflict (rc=$rc, no tree produced); git said: ${_rclp_stderr:-<stderr empty too>}>"
+      return 0
     fi
-    return 0
   fi
   rm -f "$_rclp_err_file" 2>/dev/null || true
   expected=$(printf '%s\n' "$out" | head -1)

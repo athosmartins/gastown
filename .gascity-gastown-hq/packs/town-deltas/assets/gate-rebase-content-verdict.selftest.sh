@@ -522,26 +522,33 @@ V8A=$(run_verdict_at "$RD" "$DDJ_MAIN" "$DDJ_BRANCH" "$DDJ_GOOD_TIP")
                    || bad "expected yes (driver-resolved, rest of tree intact, --check green), got '$V8A'"
 
 # Teste 8b — SAFETY: --check FAILS (drift — the committed content does NOT
-# match what regeneration would produce) => stays unknown, never upgraded.
+# match what regeneration would produce) => never upgraded to yes. And it is
+# "no", not "unknown" (ga-uw1oc1u): exit 4 is the one code of the generator that
+# is a VERDICT (it ran to the end and refused), re-running reproduces it, and the
+# gate sends only a literal "no" to needs-rebase — an "unknown" went into the
+# exile/retry loop that gate_exile_recovery_sweep then undid every sweep. The
+# clean-text mode already answered "no" for the same exit (Teste 9d); Teste 11
+# pins that both modes agree.
 printf '{"n": 999}\n' > "$RD/daemons/deploy_deps.json"
 git -C "$RD" commit -qam "corrupted: does not match the generator"
 DDJ_BAD_TIP=$(git -C "$RD" rev-parse HEAD)
 V8B=$(run_verdict_at "$RD" "$DDJ_MAIN" "$DDJ_BRANCH" "$DDJ_BAD_TIP")
-[ "$V8B" = "unknown:deploy-deps-check-drift" ] && ok "--check reports DRIFT (rc 4) on drifted content => unknown:deploy-deps-check-drift (never silently upgraded to yes)" \
-                   || bad "expected unknown:deploy-deps-check-drift for drifted content, got '$V8B' (would silently push bad content)"
+[ "$V8B" = "no" ] && ok "--check reports DRIFT (rc 4) on drifted content => no (deterministic: never silently upgraded to yes, never a retry-loop unknown)" \
+                   || bad "expected no for drifted content, got '$V8B' (yes would push bad content; unknown would loop exile -> recovery -> head of the queue, ga-uw1oc1u)"
 
 # Teste 8c — SAFETY: a rig whose main has NO generator at all => nothing to
-# vouch for the file, so it cannot be verified; falls through with its own
-# reason, no crash, never mistaken for a resolvable case. (A tip that DELETES a
-# generator main has is a different shape — the tree comparison catches it as
+# vouch for the file, so it cannot be verified: no crash, never mistaken for a
+# resolvable case, and "no" rather than "unknown" (ga-uw1oc1u) — nothing changes
+# between two retries, so only a human re-anchor can move it. (A tip that DELETES
+# a generator main has is a different shape — the tree comparison catches it as
 # deploy-deps-tree-mismatch before this check is ever reached.)
 RD2="$TMP/repo-deploydeps-nogen"; ddj_setup "$RD2" 0 0 none; D2_MAIN="$DDJ_MAIN"; D2_BRANCH="$DDJ_BRANCH"
 printf '{"n": 2}\n' > "$RD2/daemons/deploy_deps.json"
 git -C "$RD2" commit -qam "no generator in this rig"
 DDJ2_TIP=$(git -C "$RD2" rev-parse HEAD)
 V8C=$(run_verdict_at "$RD2" "$D2_MAIN" "$D2_BRANCH" "$DDJ2_TIP")
-[ "$V8C" = "unknown:deploy-deps-generator-unverified" ] && ok "rig with no scripts/gen_daemon_deps.py on main => unknown:deploy-deps-generator-unverified, no crash" \
-                   || bad "expected unknown:deploy-deps-generator-unverified when no generator exists, got '$V8C'"
+[ "$V8C" = "no" ] && ok "rig with no scripts/gen_daemon_deps.py on main => no (nobody can vouch for the tip; deterministic), no crash" \
+                   || bad "expected no when no generator exists on main, got '$V8C'"
 
 # Teste 8d — SAFETY: a SECOND, unrelated conflicting path alongside
 # deploy_deps.json => not a SOLE conflict anymore, falls through unchanged
@@ -567,8 +574,8 @@ printf '{"n": 2}\n' > "$RD4/daemons/deploy_deps.json"
 git -C "$RD4" commit -qam "rebase tip: canonical deploy_deps.json but feature.txt silently dropped"
 DDJ4_TIP=$(git -C "$RD4" rev-parse HEAD)
 V8F=$(run_verdict_at "$RD4" "$D4_MAIN" "$D4_BRANCH" "$DDJ4_TIP")
-[ "$V8F" = "unknown:deploy-deps-tree-mismatch" ] && ok "sole conflict = deploy_deps.json + a NON-conflicting file dropped by the tip => unknown:deploy-deps-tree-mismatch, NOT yes (the attempt-1 blocking issue)" \
-                   || bad "expected unknown:deploy-deps-tree-mismatch for a tip that dropped feature.txt, got '$V8F' (a content-losing tip would be force-pushed)"
+[ "$V8F" = "no" ] && ok "sole conflict = deploy_deps.json + a NON-conflicting file dropped by the tip => no (a lost file reproduces on every rebase), NOT yes (the attempt-1 blocking issue)" \
+                   || bad "expected no for a tip that dropped feature.txt, got '$V8F' (yes would force-push a content-losing tip; unknown would retry a loss that reproduces, ga-uw1oc1u)"
 
 # Teste 8f-mut — MUTATION: neutralize the tree-difference requirement and the
 # SAME fixture must flip to yes. Without this, 8f could pass for an unrelated
@@ -611,8 +618,8 @@ printf '{"n": 999}\n' > "$RD6/daemons/deploy_deps.json"
 git -C "$RD6" commit -qam "rebase tip: the branch's own always-approving generator vouches for a WRONG deploy_deps.json"
 DDJ6_TIP=$(git -C "$RD6" rev-parse HEAD)
 V8H=$(run_verdict_at "$RD6" "$D6_MAIN" "$D6_BRANCH" "$DDJ6_TIP")
-[ "$V8H" = "unknown:deploy-deps-generator-unverified" ] && ok "generator at the tip differs from main's => unknown:deploy-deps-generator-unverified (a branch cannot attest its own output)" \
-                   || bad "expected unknown:deploy-deps-generator-unverified when the branch rewrote the generator, got '$V8H'"
+[ "$V8H" = "no" ] && ok "generator at the tip differs from main's => no (a branch cannot attest its own output; the same tip answers the same every sweep)" \
+                   || bad "expected no when the branch rewrote the generator, got '$V8H'"
 sed 's/ || \[ "\$main_gen" != "\$tip_gen" \]//' "$TMP/block.sh" > "$TMP/block_mut8h.sh"
 if cmp -s "$TMP/block.sh" "$TMP/block_mut8h.sh"; then
   bad "8h-mut: mutacao nao aplicou — 8h nao esta provando nada"
@@ -867,12 +874,14 @@ V10B=$(run_verdict_at "$RI2" "$I2_MAIN" "$I2_BRANCH" "$I2_TIP")
                     || bad "10b: esperava yes para um subconjunto dos achados de main, deu '$V10B'"
 
 # Teste 10c — CONTROLE (o que o fix NAO pode afrouxar): UM achado a mais do que main ({3,4,5,6})
-# e o veredito continua o de antes. No modo conflito nenhum sufixo vira "no" — sai como estava.
+# nunca vira yes: a branch responde pelo que ela introduz. O veredito e "no" (ga-uw1oc1u: ate la o
+# modo conflito deixava este sufixo sair como unknown, e o modo texto-limpo — 10d — ja dizia "no"
+# para o mesmo achado; um drift novo se reproduz em toda tentativa, retry nao muda nada).
 RI3="$TMP/repo-inh-newdrift"; ddj_setup "$RI3" 0 1 canon 5 inherit
 I3_MAIN="$DDJ_MAIN"; I3_BRANCH="$DDJ_BRANCH"; I3_TIP=$(ddj_tip "$RI3" 6)
 V10C=$(run_verdict_at "$RI3" "$I3_MAIN" "$I3_BRANCH" "$I3_TIP")
-[ "$V10C" = "unknown:deploy-deps-check-drift" ] && ok "10c: um achado que main NAO tem => segue unknown:deploy-deps-check-drift (a branch responde pelo que ela introduz)" \
-                                              || bad "10c: esperava unknown:deploy-deps-check-drift para drift novo, deu '$V10C' (drift da branch foi perdoado)"
+[ "$V10C" = "no" ] && ok "10c: um achado que main NAO tem => no (a branch responde pelo que ela introduz; deterministico, nao vira retry)" \
+                   || bad "10c: esperava no para drift novo, deu '$V10C' (yes = drift da branch perdoado; unknown = retry de algo que se reproduz)"
 
 # Teste 10d — idem no modo texto-limpo (ga-ub5hkz): drift novo continua "no", deterministico —
 # nao vira unknown (retry transitorio ressoaria, ga-10uqmi) nem yes.
@@ -916,8 +925,8 @@ done
 RI8="$TMP/repo-inh-selfattest"; ddj_setup "$RI8" 0 1 canon 5 selfattest
 I8_MAIN="$DDJ_MAIN"; I8_BRANCH="$DDJ_BRANCH"; I8_TIP=$(ddj_tip "$RI8" 999)
 V10H=$(run_verdict_at "$RI8" "$I8_MAIN" "$I8_BRANCH" "$I8_TIP")
-[ "$V10H" = "unknown:deploy-deps-check-drift" ] && ok "10h: o lint do tip difere do de main => segue unknown:deploy-deps-check-drift (a branch nao atesta a propria saida)" \
-                                              || bad "10h: esperava unknown:deploy-deps-check-drift quando a branch reescreveu o lint, deu '$V10H'"
+[ "$V10H" = "no" ] && ok "10h: o lint do tip difere do de main => segue drift, e drift e no (a branch nao atesta a propria saida)" \
+                   || bad "10h: esperava no quando a branch reescreveu o lint, deu '$V10H'"
 sed 's/ || \[ "\$main_lint" != "\$tip_lint" \]//' "$TMP/block.sh" > "$TMP/block_mut10h.sh"
 if cmp -s "$TMP/block.sh" "$TMP/block_mut10h.sh"; then
   bad "10h-mut: mutacao nao aplicou — 10h nao esta provando nada"
@@ -932,8 +941,8 @@ fi
 RI9="$TMP/repo-inh-nolint"; ddj_setup "$RI9" 0 1 canon 5 none
 I9_MAIN="$DDJ_MAIN"; I9_BRANCH="$DDJ_BRANCH"; I9_TIP=$(ddj_tip "$RI9" 5)
 V10I=$(run_verdict_at "$RI9" "$I9_MAIN" "$I9_BRANCH" "$I9_TIP")
-[ "$V10I" = "unknown:deploy-deps-check-drift" ] && ok "10i: main sem scripts/lint_daemon_deps.py => segue unknown:deploy-deps-check-drift (sem segunda opiniao nao ha upgrade)" \
-                                              || bad "10i: esperava unknown:deploy-deps-check-drift sem lint em main, deu '$V10I'"
+[ "$V10I" = "no" ] && ok "10i: main sem scripts/lint_daemon_deps.py => segue drift, e drift e no (sem segunda opiniao nao ha upgrade)" \
+                   || bad "10i: esperava no sem lint em main, deu '$V10I'"
 
 # Teste 10j — main_ref SIMBOLICO (um nome de branch): o dispatcher entrega ao lint o SHA resolvido
 # (o stub recusa qualquer coisa que nao seja 40 hex) — o baseline e o main deste veredito, nao o
@@ -985,6 +994,203 @@ grep -q 'rebase_deploy_deps_inherited_drift "\$wt" "\$gd" "\$main_ref" "\$new_ti
 grep -q 'lint_daemon_deps.py --against-ref' "$DISPATCHER" \
   && ok "dispatcher still invokes the rig's lint with --against-ref as the second opinion" \
   || bad "the lint --against-ref invocation is gone from the dispatcher"
+
+# Teste 11 (ga-uw1oc1u) — o MESMO sufixo do arbitro tem o MESMO destino nos dois modos, e o
+# classificador do gate (Step 4c) so manda para needs-rebase o "no" LITERAL.
+#
+# INCIDENTE (markers ga-6e2t3e3 e ga-0wbprdw, 11/11): depois do rebase, 6 daemons passaram a
+# importar lib/dono_esquecido.py e o deploy_deps.json do branch nao tinha as entradas — drift REAL do
+# branch, e a recusa do push estava certa. O erro era o destino: o arbitro disse exit 4 (check-drift),
+# o modo CONFLITO devolveu o sufixo como "unknown:*" (o modo texto-limpo ja o mapeava para "no" desde o
+# ga-ub5hkz), o Step 4c so roteia o literal "no" para needs-rebase, e o marker caiu no retry transitorio
+# (exile). O gate_exile_recovery_sweep — criterio mais fraco, so conflito de TEXTO — limpou o exile
+# ("merges into origin/main with zero conflicts") e o marker voltou a cabeca da fila, ~8 min por ciclo
+# (gen --check ~2 min + lint --against-ref ~4,5 min) sem revisor rodando. A invariante (c) do ga-10uqmi ("falha deterministica de
+# conteudo nunca entra no exile") so vale se todo veredito deterministico chegar como "no"; o modo
+# conflito a quebrava. Cada metade tinha o seu teste (veredito -> "no" aqui, "no" -> merge no selftest do
+# ga-10uqmi); faltava a COMPOSICAO, e e ela que este teste prova, com o veredito e o classificador reais.
+echo "── Teste 11 (ga-uw1oc1u): mesmo sufixo, mesmo destino nos dois modos; so o 'no' literal vai para needs-rebase ──"
+
+mt_mode() {  # <repo> -> clean | conflict | error  (modo em que o arbitro e chamado para o par ddjmain/ddjbranch)
+  local rc
+  git -C "$1" merge-tree --write-tree ddjmain ddjbranch >/dev/null 2>&1; rc=$?
+  case "$rc" in (0) echo clean ;; (1) echo conflict ;; (*) echo error ;; esac
+}
+parity() {  # <motivo> <repo conflito> <veredito conflito> <repo texto-limpo> <veredito texto-limpo>
+  local m_c m_l
+  m_c=$(mt_mode "$2"); m_l=$(mt_mode "$4")
+  if [ "$m_c" != "conflict" ] || [ "$m_l" != "clean" ]; then
+    bad "11 premissa ($1): esperava um fixture em modo conflito e outro em texto-limpo, deu '$m_c' / '$m_l' — a paridade compararia o mesmo modo"
+    return 0
+  fi
+  { [ "$3" = "no" ] && [ "$5" = "no" ]; } \
+    && ok "11 paridade ($1): modo conflito e modo texto-limpo respondem o MESMO — no" \
+    || bad "11 paridade ($1): modo conflito deu '$3', modo texto-limpo deu '$5' — o mesmo sufixo do arbitro nao pode ter dois destinos"
+}
+parity "check-drift (exit 4)" "$RD"  "$V8B" "$RC4" "$V9D"
+parity "tree-mismatch"        "$RD4" "$V8F" "$RC2" "$V9B"
+parity "generator-unverified" "$RD6" "$V8H" "$RC5" "$V9E"
+
+# A composicao: o veredito REAL de cada fixture entra no bloco REAL do Step 4c (mesmo sentinela do
+# selftest do ga-10uqmi). merge = needs-rebase direto, sem contador nem exile; transient = exile + retry.
+CLS_BLOCK=$(sed -n '/# SELFTEST-EXTRACT gate-10uqmi-rebase-fail-classify: BEGIN/,/# SELFTEST-EXTRACT gate-10uqmi-rebase-fail-classify: END/p' "$DISPATCHER")
+if [ -z "$CLS_BLOCK" ]; then
+  bad "11: o bloco do classificador do Step 4c (gate-10uqmi-rebase-fail-classify) nao foi extraido — a composicao nao esta provando nada"
+else
+  classify_kind() {  # <veredito> -> o CONFLICT_KIND que o Step 4c REAL atribui a ele
+    AUTO_REBASE_OK=0 BRANCH_IS_CURRENT=0 PR_CONTENT_VERDICT="$1" AUTO_REBASE_PUSH_ERR="" AUTO_REBASE_PUSH_RC="" \
+    AUTO_MERGE_FALLBACK_ERR="" AUTO_REBASE_SETUP_ERR="" _LOST_PATHS="" \
+      bash -c "set -euo pipefail; $CLS_BLOCK"$'\nprintf "%s" "$CONFLICT_KIND"' 2>/dev/null
+  }
+  expect_kind() {  # <rotulo> <veredito real> <CONFLICT_KIND esperado>
+    local k; k=$(classify_kind "$2")
+    [ "$k" = "$3" ] \
+      && ok "11 composicao: $1 => veredito '$2' => Step 4c: CONFLICT_KIND=$k" \
+      || bad "11 composicao: $1 => veredito '$2' => Step 4c deu CONFLICT_KIND='$k', esperava '$3' (merge = needs-rebase direto; transient = exile + recovery + cabeca da fila)"
+  }
+  # o que reproduz em toda tentativa vai para needs-rebase — nos DOIS modos
+  expect_kind "modo conflito, drift do gerador (o incidente)"        "$V8B"  merge
+  expect_kind "modo conflito, achado novo alem de main (lint)"       "$V10C" merge
+  expect_kind "modo conflito, arquivo perdido (tree-mismatch)"       "$V8F"  merge
+  expect_kind "modo conflito, gerador do tip != o de main"           "$V8H"  merge
+  expect_kind "modo texto-limpo, drift do gerador (controle)"        "$V9D"  merge
+  # o que pode nao se repetir (ou que nao da pra verificar) continua no retry transitorio
+  expect_kind "modo conflito, OUTRO path tambem conflita"            "$V8D"  transient
+  expect_kind "modo conflito, worktree fora do tip"                  "$V8G1" transient
+  expect_kind "modo conflito, --check estourou o timeout"            "$V8I"  transient
+  expect_kind "modo conflito, lint estourou o timeout"               "$V10E" transient
+  expect_kind "modo texto-limpo, --check estourou o timeout"         "$V9F"  transient
+fi
+
+# O mapa em si (puro): so 3 sufixos viram "no", cada um com a sua razao; qualquer outro sufixo, inclusive um
+# novo que ninguem decidiu, continua unknown — a regra "nao consegui saber nunca vira no" do ga-ub5hkz.
+if ( . "$TMP/block.sh"; declare -F rebase_deploy_deps_map >/dev/null 2>&1 ); then
+  mapv() { ( . "$TMP/block.sh"; rebase_deploy_deps_map "$@" 2>/dev/null ); }
+  [ "$(mapv yes conflict)" = "yes" ] && [ "$(mapv yes clean)" = "yes" ] \
+    && ok "11 mapa: yes => yes nos dois modos" || bad "11 mapa: yes deveria continuar yes nos dois modos"
+  for s in check-drift tree-mismatch generator-unverified; do
+    [ "$(mapv "unknown:deploy-deps-$s" conflict)" = "no" ] && [ "$(mapv "unknown:deploy-deps-$s" clean)" = "no" ] \
+      && ok "11 mapa: unknown:deploy-deps-$s => no nos dois modos (o arbitro rodou ate o fim e recusou; se reproduz)" \
+      || bad "11 mapa: unknown:deploy-deps-$s deveria virar no nos dois modos, deu '$(mapv "unknown:deploy-deps-$s" conflict)' / '$(mapv "unknown:deploy-deps-$s" clean)'"
+  done
+  for s in wt-not-at-tip check-timeout check-unavailable check-failed inherited-timeout inherited-unverified diff-error bad-mode no-verdict um-sufixo-novo; do
+    [ "$(mapv "unknown:deploy-deps-$s" conflict)" = "unknown:deploy-deps-$s" ] && [ "$(mapv "unknown:deploy-deps-$s" clean)" = "unknown:deploy-deps-$s" ] \
+      && ok "11 mapa: unknown:deploy-deps-$s segue unknown (nao consegui saber != reprovado; default de sufixo novo)" \
+      || bad "11 mapa: unknown:deploy-deps-$s deveria seguir unknown nos dois modos, deu '$(mapv "unknown:deploy-deps-$s" conflict)' / '$(mapv "unknown:deploy-deps-$s" clean)'"
+  done
+  for s in merge-tree-conflict bad-expected-sha bad-actual-sha; do
+    [ "$(mapv "unknown:$s" conflict)" = "unknown:$s" ] \
+      && ok "11 mapa: unknown:$s segue unknown (nao e um veredito do arbitro de deploy_deps)" \
+      || bad "11 mapa: unknown:$s deveria seguir unknown, deu '$(mapv "unknown:$s" conflict)'"
+  done
+  # vazio / fora do contrato: o arbitro nunca imprime "no" (so o mapa o produz) nem "drift" (so o segundo
+  # parecer interno) — uma linha assim e "sem veredito", nunca um veredito
+  for raw in "" "no" "drift" "texto fora do contrato"; do
+    [ "$(mapv "$raw" conflict)" = "unknown:deploy-deps-no-verdict" ] && [ "$(mapv "$raw" clean)" = "unknown:deploy-deps-no-verdict" ] \
+      && ok "11 mapa: linha do arbitro fora do contrato ('$raw') => unknown:deploy-deps-no-verdict (vazio != veredito)" \
+      || bad "11 mapa: linha fora do contrato ('$raw') deveria dar unknown:deploy-deps-no-verdict, deu '$(mapv "$raw" conflict)'"
+  done
+else
+  bad "11 mapa: rebase_deploy_deps_map nao existe no bloco extraido — os dois modos ainda decidem o destino do sufixo por conta propria"
+fi
+
+# Terceiro estado do segundo parecer (leitura que NAO respondeu != leitura que respondeu "drift"): o ramo
+# default do case "$inh" devolvia check-drift para saida vazia ou fora do contrato — e agora que check-drift e
+# "no" nos dois modos, um "nao consegui saber" viraria needs-rebase de um branch que pode estar certo.
+RD_MAIN=$(git -C "$RD" rev-parse ddjmain); RD_BRANCH=$(git -C "$RD" rev-parse ddjbranch)
+V11D1=$( . "$TMP/block.sh"; rebase_deploy_deps_inherited_drift() { printf ''; }; rebase_content_verdict "$RD" "$RD_MAIN" "$RD_BRANCH" "$DDJ_BAD_TIP" )
+V11D2=$( . "$TMP/block.sh"; rebase_deploy_deps_inherited_drift() { printf 'texto fora do contrato'; }; rebase_content_verdict "$RD" "$RD_MAIN" "$RD_BRANCH" "$DDJ_BAD_TIP" )
+V11D3=$( . "$TMP/block.sh"; rebase_deploy_deps_inherited_drift() { printf 'drift'; }; rebase_content_verdict "$RD" "$RD_MAIN" "$RD_BRANCH" "$DDJ_BAD_TIP" )
+{ [ "$V11D1" = "unknown:deploy-deps-inherited-unverified" ] && [ "$V11D2" = "unknown:deploy-deps-inherited-unverified" ]; } \
+  && ok "11d: segundo parecer vazio ou fora do contrato => unknown:deploy-deps-inherited-unverified (nunca drift, nunca no)" \
+  || bad "11d: esperava unknown:deploy-deps-inherited-unverified para saida vazia ('$V11D1') e fora do contrato ('$V11D2')"
+[ "$V11D3" = "no" ] && ok "11d-controle: o parecer que diz drift de verdade continua virando no (o stub e efetivo)" \
+                    || bad "11d-controle: parecer 'drift' deveria dar no, deu '$V11D3'"
+
+# O gatilho real desse terceiro estado: GATE_DEPLOY_DEPS_CHECK_TIMEOUT=08 passa a validacao numerica, mas
+# $((chk_timeout * 2)) le "08" como octal ("value too great for base"), a expansao fica vazia e o segundo
+# parecer nem chega a rodar. Com base 10 explicita o lint roda e o tip que so carrega o drift de main e yes.
+V11E=$( export GATE_DEPLOY_DEPS_CHECK_TIMEOUT=08; run_verdict_at "$RI1" "$I1_MAIN" "$I1_BRANCH" "$I1_TIP" )
+[ "$V11E" = "yes" ] && ok "11e: GATE_DEPLOY_DEPS_CHECK_TIMEOUT=08 (zero a esquerda) => o lint roda em base 10 e o drift herdado de main e yes" \
+                    || bad "11e: esperava yes com GATE_DEPLOY_DEPS_CHECK_TIMEOUT=08, deu '$V11E' (o 08 foi lido como octal e o segundo parecer nao rodou)"
+
+# Diagnostico: o "no" (e o achado do lint que o causou) tem de aparecer no log do dispatcher — sem isso o
+# motivo some no literal "no" (era a unica pista que o reparo autonomo do ga-rf9pnrz nao tinha).
+V11F=$( . "$TMP/block.sh"; log() { echo "[t] $*"; }; rebase_content_verdict "$RI3" "$I3_MAIN" "$I3_BRANCH" "$I3_TIP" 2>"$TMP/11f.err" )
+{ [ "$V11F" = "no" ] && grep -q "against-ref $I3_MAIN exited 1" "$TMP/11f.err" && grep -q 'findings this tree adds on top of main' "$TMP/11f.err" \
+    && grep -q 'DESATUALIZADO' "$TMP/11f.err"; } \
+  && ok "11f: o log traz o stderr do lint (os achados que a branch introduziu) quando o drift e novo" \
+  || bad "11f: esperava no + o achado do lint no stderr, deu '$V11F' / stderr: $(tr '\n' '|' < "$TMP/11f.err" 2>/dev/null)"
+{ grep -q 'arbiter (conflict mode) answered unknown:deploy-deps-check-drift' "$TMP/11f.err" && grep -q 'ga-uw1oc1u' "$TMP/11f.err"; } \
+  && ok "11g: o log diz qual sufixo do arbitro virou no, e em qual modo" \
+  || bad "11g: esperava 'arbiter (conflict mode) answered unknown:deploy-deps-check-drift' no stderr, veio: $(tr '\n' '|' < "$TMP/11f.err" 2>/dev/null)"
+
+# O que o AUTOR le. Com o arbitro podendo dizer "no" no modo conflito, o marker vai para needs-rebase e o
+# handoff ao pool / o nudge ao autor carregam CONFLICT_FILES, que traz o "Diverging paths:" de
+# rebase_content_lost_paths(). Ali o modo conflito dava o sentinel opaco "<could not compute:
+# merge-tree-conflict>" — nao dizia QUAL arquivo o arbitro julgou — enquanto o modo texto-limpo ja lista o
+# path. Conflito SO em deploy_deps.json (o unico caso em que o arbitro e consultado) agora lista os paths
+# onde o tip difere da arvore conflitada, como o texto-limpo; qualquer outro conflito mantem o sentinel (3g).
+RD3_MAIN="$D3_MAIN"; RD3_BRANCH="$D3_BRANCH"; RD4_MAIN="$D4_MAIN"; RD4_BRANCH="$D4_BRANCH"
+LP1=$( . "$TMP/block.sh"; rebase_content_lost_paths "$RD" "$RD_MAIN" "$RD_BRANCH" "$DDJ_BAD_TIP" )
+[ "$LP1" = "daemons/deploy_deps.json" ] \
+  && ok "11j: conflito so em deploy_deps.json + tip com drift => 'Diverging paths' nomeia daemons/deploy_deps.json (nao o sentinel opaco)" \
+  || bad "11j: esperava exatamente 'daemons/deploy_deps.json', deu '$LP1'"
+LP2=$( . "$TMP/block.sh"; rebase_content_lost_paths "$RD4" "$RD4_MAIN" "$RD4_BRANCH" "$DDJ4_TIP" | tr '\n' ' ' )
+case "$LP2" in
+  *"daemons/deploy_deps.json"*"feature.txt"*) ok "11k: conflito so em deploy_deps.json + tip que perdeu feature.txt => lista os DOIS paths ($LP2)" ;;
+  *) bad "11k: esperava daemons/deploy_deps.json e feature.txt na lista, deu '$LP2'" ;;
+esac
+LP3=$( . "$TMP/block.sh"; rebase_content_lost_paths "$RD3" "$RD3_MAIN" "$RD3_BRANCH" "$DDJ3_TIP" )
+[ "$LP3" = "<could not compute: merge-tree-conflict>" ] \
+  && ok "11l: deploy_deps.json E outro path conflitam => mantem o sentinel (nao e o caso que o arbitro julga)" \
+  || bad "11l: esperava o sentinel '<could not compute: merge-tree-conflict>' com DOIS paths em conflito, deu '$LP3'"
+
+# Mutantes — cada teste acima so vale se o codigo que ele diz proteger o faz mudar de resposta.
+# 11m-mut: sem a checagem "conflito SO em deploy_deps.json" todo conflito cairia no calculo de paths — o 11l tem de mudar.
+sed 's/if \[ "\$_rclp_cpaths" != "daemons\/deploy_deps.json" \]; then/if false; then/' "$TMP/block.sh" > "$TMP/block_mut11m.sh"
+if cmp -s "$TMP/block.sh" "$TMP/block_mut11m.sh"; then
+  bad "11m-mut: mutacao nao aplicou — a checagem do conflito unico nao esta onde o teste espera"
+else
+  LPM=$( . "$TMP/block_mut11m.sh"; rebase_content_lost_paths "$RD3" "$RD3_MAIN" "$RD3_BRANCH" "$DDJ3_TIP" )
+  [ "$LPM" != "<could not compute: merge-tree-conflict>" ] \
+    && ok "11m-mut: sem a checagem do conflito unico o conflito duplo deixa de dar o sentinel => e ela que o segura" \
+    || bad "11m-mut: o codigo mutado deveria deixar de dar o sentinel para o conflito duplo, deu '$LPM'"
+fi
+# 11h-mut1: o ponto de chamada do modo CONFLITO volta a devolver a linha do arbitro como estava.
+sed 's/rebase_deploy_deps_map "\$ddv" conflict/echo "$ddv"/' "$TMP/block.sh" > "$TMP/block_mut11h1.sh"
+if cmp -s "$TMP/block.sh" "$TMP/block_mut11h1.sh"; then
+  bad "11h-mut1: mutacao nao aplicou — o ponto de chamada do modo conflito nao esta onde o teste espera"
+else
+  V11H1=$( . "$TMP/block_mut11h1.sh"; rebase_content_verdict "$RD" "$RD_MAIN" "$RD_BRANCH" "$DDJ_BAD_TIP" )
+  [ "$V11H1" = "unknown:deploy-deps-check-drift" ] \
+    && ok "11h-mut1: sem o mapa no ponto de chamada do modo conflito o drift volta a sair unknown (o loop do ga-uw1oc1u) => e ele que o segura" \
+    || bad "11h-mut1: o codigo mutado deveria devolver unknown:deploy-deps-check-drift, deu '$V11H1'"
+fi
+# 11h-mut2: o ramo default do segundo parecer volta a devolver check-drift.
+sed 's/^        \*) echo "unknown:deploy-deps-inherited-unverified"; return 0 ;;/        *) echo "unknown:deploy-deps-check-drift"; return 0 ;;/' "$TMP/block.sh" > "$TMP/block_mut11h2.sh"
+if cmp -s "$TMP/block.sh" "$TMP/block_mut11h2.sh"; then
+  bad "11h-mut2: mutacao nao aplicou — o ramo default do case do segundo parecer nao esta onde o teste espera"
+else
+  V11H2=$( . "$TMP/block_mut11h2.sh"; rebase_deploy_deps_inherited_drift() { printf ''; }; rebase_content_verdict "$RD" "$RD_MAIN" "$RD_BRANCH" "$DDJ_BAD_TIP" )
+  [ "$V11H2" = "no" ] && ok "11h-mut2: com o ramo default antigo um segundo parecer vazio vira no => e o default novo que o segura" \
+                      || bad "11h-mut2: o codigo mutado deveria dar no para parecer vazio, deu '$V11H2'"
+fi
+# 11h-mut3: a conta do timeout do lint volta a ler o zero a esquerda como octal.
+sed 's/\$((10#\$chk_timeout \* 2))/$((chk_timeout * 2))/' "$TMP/block.sh" > "$TMP/block_mut11h3.sh"
+if cmp -s "$TMP/block.sh" "$TMP/block_mut11h3.sh"; then
+  bad "11h-mut3: mutacao nao aplicou — a conta do timeout do lint nao esta onde o teste espera"
+else
+  V11H3=$( export GATE_DEPLOY_DEPS_CHECK_TIMEOUT=08; . "$TMP/block_mut11h3.sh"; rebase_content_verdict "$RI1" "$I1_MAIN" "$I1_BRANCH" "$I1_TIP" 2>/dev/null )
+  [ "$V11H3" = "unknown:deploy-deps-inherited-unverified" ] \
+    && ok "11h-mut3: com o octal de volta o 08 derruba o segundo parecer — e o default seguro o deixa unverified, nao no" \
+    || bad "11h-mut3: o codigo mutado deveria dar unknown:deploy-deps-inherited-unverified, deu '$V11H3'"
+fi
+
+echo "── Teste 11i — drift-guard: os dois modos decidem o destino pelo MESMO mapa ──"
+grep -q 'rebase_deploy_deps_map "\$ddv" conflict' "$DISPATCHER" && grep -q 'rebase_deploy_deps_map "\$ddv" clean' "$DISPATCHER" \
+  && ok "rebase_content_verdict passa a linha do arbitro pelo rebase_deploy_deps_map nos dois modos" \
+  || bad "um dos dois modos de rebase_content_verdict deixou de usar o rebase_deploy_deps_map — o destino do sufixo voltou a depender do modo"
 
 echo
 echo "PASS=$PASS FAIL=$FAIL"
