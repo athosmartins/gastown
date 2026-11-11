@@ -793,6 +793,28 @@
 #      nothing from the repo (com.phoneproxy.adbforward*, com.phoneproxy.relay*,
 #      com.urblink.dialer-ari-tunnel) — "could not check" is the right answer there.
 #
+#  27. (ga-maor6ab) already_fresh()'s floor was the COMMIT time of the change, but a
+#      commit is dated when its author made it, not when the code reached the
+#      checkout the daemons run from. MEDIDO 11/11 (wa-j0af6b): the fix to
+#      daemons/inbound_sweep.py was committed 08:57:33, arrived in the runtime
+#      checkout at 09:17:55 (HEAD reflog), and com.urblink.inbound-sweep had started
+#      09:05 — after the commit, before the code. already_fresh() read that as "plausibly
+#      already running the new code", the label went to ALREADY_FRESH, and the one
+#      daemon whose OWN file was in the diff was missing from the NEEDS_GUARDED_RESTART
+#      list (the verdict named central-sender and procob-api instead — not false
+#      positives: both reach the file through their import closure, central-sender via
+#      lib/device_human_sender.py's deferred `from daemons import inbound_sweep`). Same class on
+#      17/10 (demand-dashboard). The floor is now the LATER of the commit time and the
+#      time the floor commit became reachable from $RUNTIME_DIR's HEAD
+#      (runtime_arrival_epoch(), the helper story-delivery.sh already uses for its
+#      own re-probe floor). Only ever stricter than before: it can turn a false
+#      "already fresh" into "not fresh", never the reverse. Three states: arrival
+#      known (floor = max) / arrival cannot be read (reflog missing, the commit not in
+#      HEAD, a timestamp that does not parse) -> the daemon is NOT claimed fresh, a
+#      log line says why, and the usual guarded/safe restart path runs / the bounded
+#      walk hits its cap -> the oldest entry seen, which is later than the true
+#      arrival, so still the strict side.
+#
 # VERDICT (last-resort gate): the caller must NOT mark a story:done unless the
 # verdict is OK/SKIPPED. A dormant or unverifiable daemon halts delivery.
 #
@@ -3954,18 +3976,27 @@ ga0fawwr_freshness_base_sha() {  # ga0fawwr_freshness_base_sha <label> -> prints
 # can only ever ADD true-fresh detections relative to the old COMMIT_EPOCH-
 # only comparison — the identical safety argument the COMMIT_EPOCH-vs-
 # DEPLOY_EPOCH comment above already established.
-ga0fawwr_daemon_closure_epoch() {  # ga0fawwr_daemon_closure_epoch <label> <base_sha> -> prints epoch, or nothing (return 1)
+# ga-maor6ab: the SHA of that commit (the epoch below is its commit time); the
+# floor needs the sha too, to ask when it ARRIVED in the checkout.
+ga0fawwr_daemon_closure_sha() {  # ga0fawwr_daemon_closure_sha <label> <base_sha> -> prints sha, or nothing (return 1)
   local label="$1" base_sha="$2" sha single_changed
   [ "$base_sha" != "$POST_DEPLOY_SHA" ] || return 1
   while IFS= read -r sha; do
     [ -n "$sha" ] || continue
     single_changed="$(git -C "$RUNTIME_DIR" diff --name-only "${sha}^" "$sha" 2>/dev/null || true)"
     if ga0fawwr_label_hits "$label" "$single_changed"; then
-      git -C "$RUNTIME_DIR" show -s --format=%ct "$sha" 2>/dev/null
+      printf '%s' "$sha"
       return 0
     fi
   done < <(git -C "$RUNTIME_DIR" rev-list "${base_sha}..${POST_DEPLOY_SHA}" 2>/dev/null)
   return 1
+}
+
+ga0fawwr_daemon_closure_epoch() {  # ga0fawwr_daemon_closure_epoch <label> <base_sha> -> prints epoch, or nothing (return 1)
+  local label="$1" base_sha="$2" sha
+  sha="$(ga0fawwr_daemon_closure_sha "$label" "$base_sha")" || return 1
+  [ -n "$sha" ] || return 1
+  git -C "$RUNTIME_DIR" show -s --format=%ct "$sha" 2>/dev/null
 }
 
 # ga-n2jnsa: already_fresh()'s per-daemon floor, or nothing when it cannot
@@ -3974,6 +4005,58 @@ ga0fawwr_daemon_floor_epoch() {  # ga0fawwr_daemon_floor_epoch <label> -> prints
   local label="$1" base_sha
   base_sha="$(ga0fawwr_freshness_base_sha "$label")"
   ga0fawwr_daemon_closure_epoch "$label" "$base_sha"
+}
+
+# ga-maor6ab: the same lookup, answering with the commit's SHA (ga0fawwr_daemon_floor_epoch's
+# twin) so already_fresh() can ask when that commit reached the runtime checkout.
+ga0fawwr_daemon_floor_sha() {  # ga0fawwr_daemon_floor_sha <label> -> prints sha, or nothing (return 1)
+  local label="$1" base_sha
+  base_sha="$(ga0fawwr_freshness_base_sha "$label")"
+  ga0fawwr_daemon_closure_sha "$label" "$base_sha"
+}
+
+# ga-maor6ab (header point 27): unix epoch at which <sha> became reachable from
+# $RUNTIME_DIR's HEAD — when the code actually landed in the checkout the daemons
+# run from, as opposed to when its author committed it. Same contract as
+# story-delivery.sh's runtime_arrival_epoch() (ga-c3oyk6, which floors ITS re-probe
+# with it); this one lives here because daemon-refresh.sh runs as a separate process.
+# Read from HEAD's reflog, newest first: the entries whose commit contains <sha> form
+# the current "arrival run" and the answer is the OLDEST entry of that run.
+#   found   -> ARRIVAL_EPOCH_OUT = the epoch, return 0
+#   cannot  -> ARRIVAL_EPOCH_OUT empty, return 1 (not a git checkout, <sha> unknown to it, the
+#              newest reflog entry does not contain <sha>, a timestamp that does not
+#              parse, no reflog at all). NEVER read as "arrived long ago".
+# Reaching the cap, or the end of the reflog, answers with the oldest run entry seen:
+# later than the true arrival, so only ever the strict side for a freshness floor.
+# Cached per sha (one reflog walk per sha per run, not per daemon), so the answer comes
+# back in ARRIVAL_EPOCH_OUT, not on stdout: a $(...) call would lose the cache write.
+ARRIVAL_CACHE=""
+ARRIVAL_EPOCH_OUT=""
+runtime_arrival_epoch() {  # runtime_arrival_epoch <sha> [<cap>] -> sets ARRIVAL_EPOCH_OUT, rc 0 | rc 1 (cannot tell)
+  local sha="$1" cap="${2:-500}" n=0 arrival="" ent when hit
+  ARRIVAL_EPOCH_OUT=""
+  [ -n "$sha" ] && [ -n "$RUNTIME_DIR" ] || return 1
+  hit="$(printf '%s\n' "$ARRIVAL_CACHE" | awk -v s="$sha" '$1==s{print $2; exit}')"
+  if [ -n "$hit" ]; then
+    [ "$hit" = "-" ] && return 1
+    ARRIVAL_EPOCH_OUT="$hit"
+    return 0
+  fi
+  if git -C "$RUNTIME_DIR" rev-parse --verify -q "${sha}^{commit}" >/dev/null 2>&1; then
+    while IFS=' ' read -r ent when; do
+      [ -n "$ent" ] || continue
+      n=$((n + 1))
+      [ "$n" -le "$cap" ] || break
+      git -C "$RUNTIME_DIR" merge-base --is-ancestor "$sha" "$ent" 2>/dev/null || break
+      when="${when//[^0-9]/}"   # HEAD@{1789875106} -> 1789875106 (no braces: bash 3.2)
+      [ -n "$when" ] || { arrival=""; break; }
+      arrival="$when"
+    done < <(git -C "$RUNTIME_DIR" reflog show --date=unix --format='%H %gd' HEAD 2>/dev/null)
+  fi
+  ARRIVAL_CACHE="${ARRIVAL_CACHE}
+$sha ${arrival:--}"
+  [ -n "$arrival" ] || return 1
+  ARRIVAL_EPOCH_OUT="$arrival"
 }
 
 if [ -n "${DAEMON_BASELINE_OVERRIDES// /}" ] && [ -n "${AFFECTED// /}" ]; then
@@ -4229,7 +4312,7 @@ verify_stable_all() {
 # assume verified outright. See header point 7 for why a file-mtime
 # comparison would be a different (and misleading) alternative.
 already_fresh() {  # already_fresh <label> -> 0/1; sets AFR_TIER on a 0 return
-  local label="$1" pid se floor_epoch
+  local label="$1" pid se floor_epoch floor_sha arrival_epoch
   pid="$(daemon_pid "$label")"
   [ -n "$pid" ] || return 1
   se="$(pid_start_epoch "$pid" || echo 0)"
@@ -4239,9 +4322,29 @@ already_fresh() {  # already_fresh <label> -> 0/1; sets AFR_TIER on a 0 return
   # ADD true-fresh detections, never mask a real one. Falls back to
   # COMMIT_EPOCH, unchanged from before this fix, whenever the per-daemon
   # epoch cannot be determined (no AFFECTED context, no resolvable range).
-  floor_epoch="$(ga0fawwr_daemon_floor_epoch "$label" 2>/dev/null)"
+  # ga-maor6ab: ONE walk answers both the floor epoch and the floor sha (this used to call
+  # ga0fawwr_daemon_floor_epoch, which does the same walk and keeps only the epoch).
+  floor_sha="$(ga0fawwr_daemon_floor_sha "$label" 2>/dev/null)"
+  floor_epoch=""
+  [ -n "$floor_sha" ] && floor_epoch="$(git -C "$RUNTIME_DIR" show -s --format=%ct "$floor_sha" 2>/dev/null)"
   case "$floor_epoch" in ''|*[!0-9]*) floor_epoch="$COMMIT_EPOCH" ;; esac
   [ -n "$se" ] && [ "$se" -gt "$floor_epoch" ] 2>/dev/null || return 1
+  # ga-maor6ab (header point 27): the commit time is when the code was WRITTEN; a process
+  # that started between that and the moment the code reached the checkout ran the OLD
+  # code. Raise the floor to the arrival of the same commit in $RUNTIME_DIR's HEAD reflog.
+  # vazio -> n/a (a floor sha always resolves: it falls back to POST_DEPLOY_SHA);
+  # falhou/ilegivel -> NOT claimed fresh (return 1), the guarded/safe path decides.
+  [ -n "$floor_sha" ] || floor_sha="$POST_DEPLOY_SHA"
+  if runtime_arrival_epoch "$floor_sha" && [ -n "$ARRIVAL_EPOCH_OUT" ]; then
+    arrival_epoch="$ARRIVAL_EPOCH_OUT"
+    if [ "$se" -le "$arrival_epoch" ] 2>/dev/null; then
+      log "$label: current process started ($se) after the commit ($floor_epoch) but NOT after the code reached the runtime checkout ($arrival_epoch, HEAD reflog) — it can only be running the previous code; NOT already fresh (ga-maor6ab)."
+      return 1
+    fi
+  else
+    log "$label: cannot tell when commit $floor_sha reached the runtime checkout (HEAD reflog unreadable or does not contain it) — NOT claiming already fresh from the commit time alone (ga-maor6ab)."
+    return 1
+  fi
   if [ "$se" -gt "$DEPLOY_EPOCH" ] 2>/dev/null; then
     AFR_TIER="verified"
   else
