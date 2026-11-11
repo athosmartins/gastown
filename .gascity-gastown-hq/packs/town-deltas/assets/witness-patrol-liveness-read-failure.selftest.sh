@@ -96,8 +96,9 @@ cat > "$STUBDIR/bin/gc" <<'STUB'
 #!/usr/bin/env bash
 # gc bd [-C <dir>] list ...: every call is logged to BD_LOG (the spy) and answered by the STORE it would
 # reach. Session beads exist ONLY in the city store (STUB_CITY_PATH). A call with no -C, or pinned to any
-# other directory (the rig root, empty), reads a rig store, where the real bd answers with this exact
-# error (measured on the property_scrapers witness, 2026-11-11, ga-zo1bzza).
+# other directory (the rig root, empty), is answered the way the property_scrapers witness's cwd store
+# answered it: this exact error, measured on 2026-11-11 (ga-zo1bzza). Witnesses whose cwd resolves to the
+# HQ store would read the city by accident; the stub deliberately models only the case that failed.
 if [ "${1:-}" = "bd" ]; then
   printf 'GCBD %s\n' "$*" >> "${BD_LOG:-/dev/null}"
   shift
