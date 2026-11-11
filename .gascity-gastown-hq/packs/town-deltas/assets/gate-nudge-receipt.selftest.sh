@@ -6,9 +6,9 @@
 #   send    nudge_author_with_fallback reads the outcome (--json): only `delivered` is "told". Queued / no output / garbage / ok:false leave ONE record whose
 #           text round-trips byte for byte; the next candidate is tried when one fails; total failure keeps its Mayor mail + comment and records nothing;
 #           an ephemeral author, the kill switches, DRY_RUN and a lib that is not there record nothing; an unwritable spool is a WARN, never a failure.
-#   sweep   gate_nr_sweep: injected -> settled quietly; failed / expired / closed-not-injected -> the author is mailed ONCE (text verbatim, reason, a
+#   sweep   gate_rcpt_sweep: injected -> settled quietly; failed / expired / closed-not-injected -> the author is mailed ONCE (text verbatim, reason, a
 #           GATE-NUDGE-RECEIPT comment in the bead's own store, an event, record settled); still queued / unreadable / not found -> waits, then mails at
-#           exactly GATE_NR_PENDING_MAX_S, and "could not read" is never worded as "not found"; a closed / gate:passed source bead is left alone; mail that
+#           exactly GATE_RCPT_PENDING_MAX_S, and "could not read" is never worded as "not found"; a closed / gate:passed source bead is left alone; mail that
 #           fails reaches the Mayor; the per-sweep cap, the min-age and the re-check throttles hold; damaged records are settled; the right nudge bead is
 #           picked among look-alikes; every path survives `set -euo pipefail`.
 #   static  the live dispatcher loads the lib optionally, calls the sweep (not in a Phase-C-only pass), passes --json and keeps the nudge call in the
@@ -21,7 +21,7 @@ set -uo pipefail
 SELF="${BASH_SOURCE[0]}"
 SELF_DIR="$(cd "$(dirname "$SELF")" && pwd)"
 DISPATCHER="${GATE_DISPATCHER_UNDER_TEST:-$SELF_DIR/quality-gate-dispatcher.sh}"
-LIB="${GATE_NR_LIB_UNDER_TEST:-$SELF_DIR/gate-nudge-receipt.lib.sh}"
+LIB="${GATE_RCPT_LIB_UNDER_TEST:-$SELF_DIR/gate-nudge-receipt.lib.sh}"
 
 PASS=0; FAIL=0
 ok()  { PASS=$((PASS+1)); echo "  ok $*"; }
@@ -99,8 +99,15 @@ case "$1" in
 esac
 exit 0
 EOF
-chmod +x "$SB/bin/gc" "$SB/bin/bd"
+cat > "$SB/bin/date" <<'EOF'
+#!/bin/bash
+# fake date: FAKE_DATE_FAIL=1 makes the epoch -> day conversions (-r, -d) fail, as on a box whose date knows neither form; everything else is the real date
+if [ -n "${FAKE_DATE_FAIL:-}" ]; then for a in "$@"; do case "$a" in -r|-d) exit 1 ;; esac; done; fi
+exec "$REAL_DATE" "$@"
+EOF
+chmod +x "$SB/bin/gc" "$SB/bin/bd" "$SB/bin/date"
 sandbox_path_init "$SB" jq date mktemp timeout awk sed tr cat head mv rm mkdir basename wc find || { echo "FATAL: sandbox PATH" >&2; exit 2; }
+export REAL_DATE="$SB/tools/date"
 selftest_fail_closed_arm cleanup
 
 # ── the code under test ──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
@@ -112,7 +119,7 @@ eval "$NOTIFY_BLOCK"
 eval "$NUDGE_BLOCK"
 # shellcheck disable=SC1090
 . "$LIB" || { echo "FATAL: cannot source $LIB" >&2; exit 2; }
-for fn in nudge_author_with_fallback notify_author_with_fallback gate_nr_record gate_nr_sweep; do
+for fn in nudge_author_with_fallback notify_author_with_fallback gate_rcpt_record gate_rcpt_sweep; do
   declare -F "$fn" >/dev/null 2>&1 || { echo "FATAL: $fn not defined after loading" >&2; exit 2; }
 done
 warn() { printf '%s\n' "$*" >> "${WARN_LOG:-/dev/null}"; }
@@ -126,21 +133,21 @@ PROBE1='QUALITY GATE FAILED for branch crew/peter/wa-2h615v.7. Blocking reasons:
 new_case() {
   CASE="$(mktemp -d "$SB/case.XXXXXX")" || exit 2
   FD="$CASE/fake"; mkdir -p "$FD" "$CASE/city/.gc"
-  export FAKE_DIR="$FD" GC_CITY="$CASE/city" GATE_NR_DIR="$CASE/city/.gc/runtime/gate-author-nudge" QG_LOG="$CASE/city/.gc/quality-gate.jsonl"
+  export FAKE_DIR="$FD" GC_CITY="$CASE/city" GATE_RCPT_DIR="$CASE/city/.gc/runtime/gate-author-nudge" QG_LOG="$CASE/city/.gc/quality-gate.jsonl"
   : > "$FD/mail.log"; : > "$FD/nudge.log"; : > "$FD/nudge.argv"; : > "$FD/bd.lists"; : > "$FD/bd.comments"; : > "$QG_LOG"
   WARN_LOG="$CASE/warn.log"; LOG_LOG="$CASE/log.log"; : > "$WARN_LOG"; : > "$LOG_LOG"
-  unset BEAD_CITY GATE_FAIL_DEFER_MAYOR DRY_RUN GATE_NR_ENABLED GATE_NR_NOW GATE_NR_PENDING_MAX_S GATE_NR_MIN_AGE_S GATE_NR_RECHECK_S GATE_NR_MAX_PER_SWEEP GATE_NR_OFF_FILE
+  unset BEAD_CITY GATE_FAIL_DEFER_MAYOR DRY_RUN GATE_RCPT_ENABLED GATE_RCPT_NOW GATE_RCPT_PENDING_MAX_S GATE_RCPT_MIN_AGE_S GATE_RCPT_RECHECK_S GATE_RCPT_MAX_PER_SWEEP GATE_RCPT_OFF_FILE
   put_bead "$BEAD" in_progress gate:needs-fix
 }
 put_bead() { jq -n --arg id "$1" --arg s "$2" --arg l "${*:3}" '[{id:$id, status:$s, labels:($l | split(" ") | map(select(. != "")))}]' > "$FD/bead.$1.json"; }
 nbead() { jq -n --arg st "$1" --arg sts "$2" --arg rsn "$3" --argjson c "$4" --arg msg "$5" '{id:("ga-wisp-n" + ($c|tostring)), status:$sts, created_at:($c|todate), close_reason:$rsn, metadata:{agent:"peter-wa", state:$st, message:$msg, terminal_reason:$rsn}, labels:["gc:nudge","agent:peter-wa"]}'; }
 put_list() { local st="$1"; shift; if [ "$#" -eq 0 ]; then echo '[]' > "$FD/nudges.$st.json"; else printf '%s\n' "$@" | jq -s . > "$FD/nudges.$st.json"; fi; }
-recf() { printf '%s/pending/%s.rec' "$GATE_NR_DIR" "$(printf '%s__%s' "$1" "$2" | tr -c 'A-Za-z0-9._-' '_')"; }
+recf() { printf '%s/pending/%s.rec' "$GATE_RCPT_DIR" "$(printf '%s__%s' "$1" "$2" | tr -c 'A-Za-z0-9._-' '_')"; }
 rget() { sed -n "s/^$2=//p" "$1" 2>/dev/null | head -n1; }
 nlines() { wc -l < "$1" | tr -d ' '; }
 has() { grep -qF -- "$2" "$1" 2>/dev/null; }
-settled_verdicts() { cat "$GATE_NR_DIR"/settled/*.rec 2>/dev/null | sed -n 's/^verdict=//p' | tr '\n' ' '; }
-pending_n() { ls "$GATE_NR_DIR"/pending/*.rec 2>/dev/null | wc -l | tr -d ' '; }
+settled_verdicts() { cat "$GATE_RCPT_DIR"/settled/*.rec 2>/dev/null | sed -n 's/^verdict=//p' | tr '\n' ' '; }
+pending_n() { ls "$GATE_RCPT_DIR"/pending/*.rec 2>/dev/null | wc -l | tr -d ' '; }
 event_verdicts() { jq -r 'select(.event=="author_nudge_receipt") | .verdict' "$QG_LOG" 2>/dev/null | tr '\n' ' '; }
 mail_n() { nlines "$FD/mail.log"; }
 mail_to() { sed -n "${1}p" "$FD/mail.log" | cut -f1; }
@@ -148,13 +155,13 @@ lists_n() { nlines "$FD/bd.lists"; }
 streq() { [ "$1" = "$2" ]; }
 
 # send <bead> <notify_author> <author> <message> [clock]   (the real nudge_author_with_fallback on the sandbox PATH)
-send() { GATE_NR_NOW="${5:-$T0}" PATH="$SANDBOX_PATH" nudge_author_with_fallback "$1" "$2" "$3" "$4" "ctx $1"; SEND_RC=$?; }
+send() { GATE_RCPT_NOW="${5:-$T0}" PATH="$SANDBOX_PATH" nudge_author_with_fallback "$1" "$2" "$3" "$4" "ctx $1"; SEND_RC=$?; }
 mkrec() { # [sent] [bead] [message] [to]  — a nudge the queue ACCEPTED, recorded by the real code
   local sent="${1:-$T0}" bead="${2:-$BEAD}" msg="${3:-$MSG1}" to="${4:-$TO}"
   echo queued > "$FD/nudge.$to"; BEAD_CITY="$RIGCITY" send "$bead" "$to" author-x "$msg" "$sent"
 }
-sweep() { GATE_NR_NOW="$1" PATH="$SANDBOX_PATH" gate_nr_sweep; SWEEP_RC=$?; }
-bare_sweep_reaches_end() { ( set -euo pipefail; PATH="$SANDBOX_PATH"; GATE_NR_NOW="$1"; gate_nr_sweep; echo REACHED ) 2>/dev/null; }
+sweep() { GATE_RCPT_NOW="$1" PATH="$SANDBOX_PATH" gate_rcpt_sweep; SWEEP_RC=$?; }
+bare_sweep_reaches_end() { ( set -euo pipefail; PATH="$SANDBOX_PATH"; GATE_RCPT_NOW="$1"; gate_rcpt_sweep; echo REACHED ) 2>/dev/null; }
 case_closed() { # <state> <reason> [created offset]  → a record at T0 and one CLOSED nudge bead of that state
   new_case; mkrec "$T0"; put_list open; put_list closed "$(nbead "$1" closed "$2" "$((T0 + ${3:-1}))" "$MSG1")"
 }
@@ -195,25 +202,25 @@ g_send() {
 
   new_case; echo queued > "$FD/nudge.$TO"; GATE_FAIL_DEFER_MAYOR=1 send "$BEAD" "$TO" author-x "$MSG1"
   chk "send6 an ephemeral pool author (deferred Mayor page) is not recorded" streq "$SEND_RC:$(pending_n)" "0:0"
-  new_case; echo queued > "$FD/nudge.$TO"; GATE_NR_ENABLED=0 send "$BEAD" "$TO" author-x "$MSG1"
-  chk "send7a kill switch GATE_NR_ENABLED=0 records nothing" streq "$SEND_RC:$(pending_n)" "0:0"
+  new_case; echo queued > "$FD/nudge.$TO"; GATE_RCPT_ENABLED=0 send "$BEAD" "$TO" author-x "$MSG1"
+  chk "send7a kill switch GATE_RCPT_ENABLED=0 records nothing" streq "$SEND_RC:$(pending_n)" "0:0"
   new_case; echo queued > "$FD/nudge.$TO"; : > "$GC_CITY/.gc/gate-nudge-receipt.off"; send "$BEAD" "$TO" author-x "$MSG1"
   chk "send7b kill switch off-file records nothing" streq "$SEND_RC:$(pending_n)" "0:0"
   new_case; echo queued > "$FD/nudge.$TO"; DRY_RUN=1 send "$BEAD" "$TO" author-x "$MSG1"
   chk "send7c DRY_RUN=1 records nothing" streq "$SEND_RC:$(pending_n)" "0:0"
-  new_case; echo queued > "$FD/nudge.$TO"; ( unset -f gate_nr_record; send "$BEAD" "$TO" author-x "$MSG1"; exit "$SEND_RC" ); SEND_RC=$?
+  new_case; echo queued > "$FD/nudge.$TO"; ( unset -f gate_rcpt_record; send "$BEAD" "$TO" author-x "$MSG1"; exit "$SEND_RC" ); SEND_RC=$?
   chk "send8 a lib that is not loaded: the nudge still goes out and the call returns 0" streq "$SEND_RC:$(nlines "$FD/nudge.log"):$(pending_n)" "0:1:0"
 
   new_case; echo queued > "$FD/nudge.$TO"; send "$BEAD" "$TO" author-x "$MSG1" 1000; send "$BEAD" "$TO" author-x $'Gate FAILED for wa-2h615v.7 (attempt 1/3) — see GATE-FEEDBACK.' 2000
   chk "send9 a later notice for the same bead+recipient REPLACES the record (one file, the new probe and time)" streq "$(pending_n):$(rget "$(recf "$BEAD" "$TO")" sent_at):$(rget "$(recf "$BEAD" "$TO")" probe)" "1:2000:Gate FAILED for wa-2h615v.7 (attempt 1/3) — see GATE-FEEDBACK."
 
-  new_case; echo queued > "$FD/nudge.$TO"; : > "$CASE/blocker"; GATE_NR_DIR="$CASE/blocker/sub" send "$BEAD" "$TO" author-x "$MSG1"
+  new_case; echo queued > "$FD/nudge.$TO"; : > "$CASE/blocker"; GATE_RCPT_DIR="$CASE/blocker/sub" send "$BEAD" "$TO" author-x "$MSG1"
   chk "send10 an unwritable spool: rc 0 and a WARN that says the nudge will NOT be verified" streq "$SEND_RC:$(grep -c 'NOT be verified' "$WARN_LOG")" "0:1"
-  new_case; PATH="$SANDBOX_PATH" gate_nr_record "" "$RIGCITY" "$TO" a b queued "$MSG1" ctx
+  new_case; PATH="$SANDBOX_PATH" gate_rcpt_record "" "$RIGCITY" "$TO" a b queued "$MSG1" ctx
   chk "send10b no bead id: nothing recorded, a WARN, rc 0" streq "$?:$(pending_n):$(grep -c 'NOT recorded' "$WARN_LOG")" "0:0:1"
 
   new_case; echo queued > "$FD/nudge.$TO"
-  chk "send11 under set -euo pipefail a queued send is a plain success (no unbound variable, no errexit)" streq "$( ( set -euo pipefail; PATH="$SANDBOX_PATH"; GATE_NR_NOW=5; nudge_author_with_fallback "$BEAD" "$TO" author-x m ctx; echo REACHED ) 2>/dev/null )" REACHED
+  chk "send11 under set -euo pipefail a queued send is a plain success (no unbound variable, no errexit)" streq "$( ( set -euo pipefail; PATH="$SANDBOX_PATH"; GATE_RCPT_NOW=5; nudge_author_with_fallback "$BEAD" "$TO" author-x m ctx; echo REACHED ) 2>/dev/null )" REACHED
 }
 
 # ═════════════════════════════════════════════════ sweep groups ══════════════════════════════════════════════════════════════════════════════════════
@@ -247,14 +254,14 @@ g_sw_wait() {
   case_open queued; sweep $((T0 + 1799))
   chk "sweep5a 1799 s: one second short of the limit still waits" streq "$(mail_n)" 0
   case_open accepted_for_injection; sweep $((T0 + 1800))
-  chk "sweep5b exactly GATE_NR_PENDING_MAX_S: mailed, worded as 'still not delivered' (not as a failure)" streq "$(mail_n):$(has "$FD/mail.body.1" "it was still not delivered after 1800s (state 'accepted_for_injection')" && echo y)" "1:y"
-  new_case; mkrec; GATE_NR_PENDING_MAX_S=100 sweep $((T0 + 100))
-  chk "sweep5c GATE_NR_PENDING_MAX_S is honoured (100 s)" streq "$(mail_n)" 1
+  chk "sweep5b exactly GATE_RCPT_PENDING_MAX_S: mailed, worded as 'still not delivered' (not as a failure)" streq "$(mail_n):$(has "$FD/mail.body.1" "it was still not delivered after 1800s (state 'accepted_for_injection')" && echo y)" "1:y"
+  new_case; mkrec; GATE_RCPT_PENDING_MAX_S=100 sweep $((T0 + 100))
+  chk "sweep5c GATE_RCPT_PENDING_MAX_S is honoured (100 s)" streq "$(mail_n)" 1
 }
 g_sw_age() {
   echo "── sweep: when it looks ──"
   new_case; mkrec; sweep $((T0 + 60))
-  chk "sweep6 younger than GATE_NR_MIN_AGE_S: zero bd reads, the record stays" streq "$(lists_n):$(pending_n):$(mail_n)" "0:1:0"
+  chk "sweep6 younger than GATE_RCPT_MIN_AGE_S: zero bd reads, the record stays" streq "$(lists_n):$(pending_n):$(mail_n)" "0:1:0"
   new_case; sweep $((T0 + 600))
   chk "sweep6b nothing recorded: no bd read at all, rc 0" streq "$(lists_n):$SWEEP_RC" "0:0"
   case_open queued; sweep $((T0 + 120)); sweep $((T0 + 180))
@@ -277,6 +284,10 @@ g_sw_unread() {
   chk "sweep9 both lists readable and no such nudge: waits" streq "$(mail_n):$(pending_n)" "0:1"
   sweep $((T0 + 2000))
   chk "sweep9b ... at the limit mailed, worded 'no nudge bead was found'" streq "$(mail_n):$(has "$FD/mail.body.1" "no nudge bead was found after 2000s" && echo y)" "1:y"
+  new_case; mkrec; put_list open; FAKE_DATE_FAIL=1 sweep $((T0 + 600))
+  chk "sweep9d the day for --closed-after cannot be computed: the closed list is NOT read (no wrong query), the record waits" streq "$(grep -c 'status=closed' "$FD/bd.lists"):$(mail_n):$(pending_n)" "0:0:1"
+  FAKE_DATE_FAIL=1 sweep $((T0 + 2000))
+  chk "sweep9e ... and at the limit it is worded 'could not be read', never 'no nudge bead was found'" streq "$(has "$FD/mail.body.1" "could not be read" && echo y):$(has "$FD/mail.body.1" "no nudge bead was found" || echo n)" "y:n"
   new_case; mkrec; put_list open; echo '[{"metadata":{"message":5},"created_at":"2026-11-10T01:27:47Z"}]' > "$FD/nudges.closed.json"; sweep $((T0 + 2000))
   chk "sweep9c a nudge bead whose text is not a string makes jq fail: 'could not be read', never 'not found'" streq "$(has "$FD/mail.body.1" "could not be read" && echo y):$(has "$FD/mail.body.1" "no nudge bead was found" || echo n)" "y:n"
 }
@@ -302,16 +313,16 @@ g_sw_cap() {
   new_case; mkrec "$T0" wa-aaa1 $'Gate FAILED for wa-aaa1 — one'; mkrec "$T0" wa-bbb2 $'Gate FAILED for wa-bbb2 — two'
   put_bead wa-aaa1 in_progress; put_bead wa-bbb2 in_progress
   put_list open; put_list closed "$(nbead failed closed x $((T0 + 1)) $'Gate FAILED for wa-aaa1 — one')" "$(nbead failed closed x $((T0 + 1)) $'Gate FAILED for wa-bbb2 — two')"
-  GATE_NR_MAX_PER_SWEEP=1 sweep $((T0 + 600))
+  GATE_RCPT_MAX_PER_SWEEP=1 sweep $((T0 + 600))
   chk "sweep13 the per-sweep cap: one record handled, the other left for the next sweep" streq "$(mail_n):$(pending_n)" "1:1"
-  GATE_NR_MAX_PER_SWEEP=1 sweep $((T0 + 601))
+  GATE_RCPT_MAX_PER_SWEEP=1 sweep $((T0 + 601))
   chk "sweep13b ... and the next sweep handles it (each mail names its own bead)" streq "$(mail_n):$(has "$FD/mail.log" wa-aaa1 && has "$FD/mail.log" wa-bbb2 && echo y)" "2:y"
 }
 g_sw_damage() {
   echo "── sweep: damaged records ──"
   new_case; mkrec; sed -i.bak '/^sent_at=/d' "$(recf "$BEAD" "$TO")"; sweep $((T0 + 600))
   chk "sweep15 a record with no sent_at is DAMAGED: settled with a WARN, nobody mailed, no bd read" streq "$(mail_n):$(settled_verdicts):$(grep -c 'damaged' "$WARN_LOG"):$(lists_n)" "0:damaged :1:0"
-  new_case; mkrec; rm -f "${GATE_NR_DIR}/pending/"*.msg; sweep $((T0 + 600))
+  new_case; mkrec; rm -f "${GATE_RCPT_DIR}/pending/"*.msg; sweep $((T0 + 600))
   chk "sweep15b a record whose text is gone is damaged too (a mail with no text would be made up)" streq "$(mail_n):$(settled_verdicts)" "0:damaged "
   if [ "$(id -u)" != 0 ]; then
     new_case; mkrec; chmod 000 "$(recf "$BEAD" "$TO")"; sweep $((T0 + 600))
@@ -331,19 +342,19 @@ g_sw_match() {
 }
 g_sw_budget() {
   echo "── sweep: time budget and housekeeping ──"
-  case_closed failed x; GATE_NR_BUDGET_S=0 sweep $((T0 + 600))
+  case_closed failed x; GATE_RCPT_BUDGET_S=0 sweep $((T0 + 600))
   chk "sweep19 a spent budget (0 s): no record is started, nothing is read or mailed, the record waits, and the log says so" streq "$(lists_n):$(mail_n):$(pending_n):$(grep -c 'budget' "$LOG_LOG")" "0:0:1:1"
   sweep $((T0 + 601)); chk "sweep19b ... and the next sweep (default budget) handles it" streq "$(mail_n):$(pending_n)" "1:0"
-  case_closed failed x; : > "$GATE_NR_DIR/settled/old.rec"; touch -t 202001010000 "$GATE_NR_DIR/settled/old.rec"; : > "$GATE_NR_DIR/settled/new.rec"; sweep $((T0 + 600))
-  chk "sweep20 settled records older than 30 days are trimmed by a sweep that did work; recent ones stay" streq "$(test -e "$GATE_NR_DIR/settled/old.rec" && echo old)$(test -e "$GATE_NR_DIR/settled/new.rec" && echo new)" "new"
-  case_closed failed x; : > "$GATE_NR_DIR/settled/old.rec"; touch -t 202001010000 "$GATE_NR_DIR/settled/old.rec"; sweep $((T0 + 60))
-  chk "sweep20b a sweep that did no work trims nothing" test -e "$GATE_NR_DIR/settled/old.rec"
+  case_closed failed x; : > "$GATE_RCPT_DIR/settled/old.rec"; touch -t 202001010000 "$GATE_RCPT_DIR/settled/old.rec"; : > "$GATE_RCPT_DIR/settled/new.rec"; sweep $((T0 + 600))
+  chk "sweep20 settled records older than 30 days are trimmed by a sweep that did work; recent ones stay" streq "$(test -e "$GATE_RCPT_DIR/settled/old.rec" && echo old)$(test -e "$GATE_RCPT_DIR/settled/new.rec" && echo new)" "new"
+  case_closed failed x; : > "$GATE_RCPT_DIR/settled/old.rec"; touch -t 202001010000 "$GATE_RCPT_DIR/settled/old.rec"; sweep $((T0 + 60))
+  chk "sweep20b a sweep that did no work trims nothing" test -e "$GATE_RCPT_DIR/settled/old.rec"
 }
 g_sw_switch() {
   echo "── sweep: switches and errexit ──"
   case_closed failed x; DRY_RUN=1 sweep $((T0 + 600))
   chk "sweep17 DRY_RUN=1: the sweep does nothing" streq "$(lists_n):$(mail_n):$(pending_n)" "0:0:1"
-  case_closed failed x; GATE_NR_ENABLED=0 sweep $((T0 + 600))
+  case_closed failed x; GATE_RCPT_ENABLED=0 sweep $((T0 + 600))
   chk "sweep17b kill switch: the sweep does nothing and the record stays" streq "$(lists_n):$(mail_n):$(pending_n)" "0:0:1"
   case_closed failed x; : > "$FD/show.fail"; echo x > "$FD/mailfail.$TO"; echo x > "$FD/mailfail.author-x"
   chk "sweep18 under set -euo pipefail, bd show failing and every mail failing, a bare sweep still runs to its end" streq "$(bare_sweep_reaches_end $((T0 + 600)))" REACHED
@@ -355,14 +366,14 @@ g_sw_switch() {
 g_static() {
   echo "── static ──"
   local l_pm l_nr
-  chk "static1 the dispatcher loads the lib only when readable and sets GATE_NR_LIB_OK from the function it must define" bash -c 'grep -qF "[ -r \"\$_GATE_NR_LIB\" ]" "$1" && grep -qF "type gate_nr_sweep >/dev/null 2>&1; then GATE_NR_LIB_OK=1" "$1"' _ "$DISPATCHER"
+  chk "static1 the dispatcher loads the lib only when readable and sets GATE_RCPT_LIB_OK from the function it must define" bash -c 'grep -qF "[ -r \"\$_GATE_RCPT_LIB\" ]" "$1" && grep -qF "type gate_rcpt_sweep >/dev/null 2>&1; then GATE_RCPT_LIB_OK=1" "$1"' _ "$DISPATCHER"
   l_pm="$(grep -n 'gate_pm_sweep || true' "$DISPATCHER" | head -n1 | cut -d: -f1)"
-  l_nr="$(grep -n 'gate_nr_sweep || true' "$DISPATCHER" | head -n1 | cut -d: -f1)"
-  chk "static2 the sweep is called once, after the post-merge sweep, with its failure neutralised" streq "$(grep -c 'gate_nr_sweep || true' "$DISPATCHER"):$([ -n "$l_nr" ] && [ -n "$l_pm" ] && [ "$l_nr" -gt "$l_pm" ] && echo after)" "1:after"
+  l_nr="$(grep -n 'gate_rcpt_sweep || true' "$DISPATCHER" | head -n1 | cut -d: -f1)"
+  chk "static2 the sweep is called once, after the post-merge sweep, with its failure neutralised" streq "$(grep -c 'gate_rcpt_sweep || true' "$DISPATCHER"):$([ -n "$l_nr" ] && [ -n "$l_pm" ] && [ "$l_nr" -gt "$l_pm" ] && echo after)" "1:after"
   chk "static3 not in a Phase-C-only child pass (the guard sits just above the call)" bash -c 'sed -n "$(( $2 - 4 )),$2p" "$1" | grep -qF "GATE_PHASE_C_ONLY:-0}\" != \"1\""' _ "$DISPATCHER" "${l_nr:-0}"
   chk "static4 a lib that did not load is said out loud by the sweep call site" bash -c 'sed -n "$2,$(( $2 + 2 ))p" "$1" | grep -qF "NOT being verified"' _ "$DISPATCHER" "${l_nr:-0}"
   chk "static5 the nudge asks for --json and the call stays in THIS shell (output to a file, no command substitution)" streq "$(grep -c 'if gc --city "$GC_CITY" session nudge "$_candidate" "$_message" --delivery wait-idle --json >' "$DISPATCHER"):$(grep -c '\$(gc --city "\$GC_CITY" session nudge' "$DISPATCHER")" "1:0"
-  chk "static6 the record call is guarded by declare -F (sibling selftests eval the function without the lib) and by the neutralising || true" streq "$(grep -c 'declare -F gate_nr_record' "$DISPATCHER"):$(grep -c 'gate_nr_record "\$_bead_id".* || true' "$DISPATCHER")" "1:1"
+  chk "static6 the record call is guarded by declare -F (sibling selftests eval the function without the lib) and by the neutralising || true" streq "$(grep -c 'declare -F gate_rcpt_record' "$DISPATCHER"):$(grep -c 'gate_rcpt_record "\$_bead_id".* || true' "$DISPATCHER")" "1:1"
   chk "static7 both files pass bash -n" bash -c 'bash -n "$1" && bash -n "$2"' _ "$DISPATCHER" "$LIB"
   if [ -n "${B32_BASH:-}" ] && [ -x "${B32_BASH:-}" ]; then
     chk "static8 and a real bash 3.2 (B32_BASH) accepts both, printing nothing" streq "$("$B32_BASH" -n "$DISPATCHER" 2>&1)$("$B32_BASH" -n "$LIB" 2>&1)" ""
@@ -390,14 +401,14 @@ M = [
  ("l02", "lib", "    failed|expired|superseded) echo \"fallback:it ended as '$st'${rsn:+ ($rsn)} without reaching the session\"; return 0 ;;", "    failed|expired|superseded) ;;", "sw_gone", "failed/expired wait for the age rule instead of mailing now"),
  ("l03", "lib", 'if [ "$age" -ge "$max" ]; then', 'if [ "$age" -gt "$max" ]; then', "sw_wait", "off by one at the pending limit"),
  ("l04", "lib", 'else cls="UNREADABLE"; fi', 'else cls="NONE"; fi', "sw_unread", "an unreadable closed list is read as 'not found'"),
- ("l05", "lib", '    if [ "$st" = "closed" ]; then\n      _gate_nr_say', '    if [ "$st" = "never" ]; then\n      _gate_nr_say', "sw_moot", "a closed source bead still gets the mail"),
+ ("l05", "lib", '    if [ "$st" = "closed" ]; then\n      _gate_rcpt_say', '    if [ "$st" = "never" ]; then\n      _gate_rcpt_say', "sw_moot", "a closed source bead still gets the mail"),
  ("l06", "lib", '    case " $labels " in *" gate:passed "*) st=closed ;; esac\n', '', "sw_moot", "gate:passed is no longer moot"),
  ("l07", "lib", '  if [ -z "$st" ]; then\n    note=', '  if [ -n "$st" ]; then\n    note=', "sw_moot", "an unreadable source bead is not noted / a readable one is"),
- ("l08", "lib", '    [ "$age" -lt "${GATE_NR_MIN_AGE_S:-90}" ] && continue\n', '', "sw_age", "no minimum age"),
- ("l09", "lib", 'if [ -n "$last" ] && [ $((now - last)) -lt "${GATE_NR_RECHECK_S:-300}" ]; then continue; fi', 'if false; then continue; fi', "sw_age", "no re-check throttle"),
+ ("l08", "lib", '    [ "$age" -lt "${GATE_RCPT_MIN_AGE_S:-90}" ] && continue\n', '', "sw_age", "no minimum age"),
+ ("l09", "lib", 'if [ -n "$last" ] && [ $((now - last)) -lt "${GATE_RCPT_RECHECK_S:-300}" ]; then continue; fi', 'if false; then continue; fi', "sw_age", "no re-check throttle"),
  ("l10", "lib", '($t != null) and ($t >= ($sent - 300))', '($t != null)', "sw_match", "no time window on the nudge bead"),
  ("l11", "lib", '| sort_by(.created_at) | .[0]', '| sort_by(.created_at) | .[-1]', "sw_match", "the newest look-alike instead of the oldest"),
- ("l12", "lib", '  [ "${DRY_RUN:-0}" = "1" ] && return 0\n  d="$(gate_nr_dir)"\n  [ -d "$d/pending" ] || return 0', '  d="$(gate_nr_dir)"\n  [ -d "$d/pending" ] || return 0', "sw_switch", "the sweep ignores DRY_RUN"),
+ ("l12", "lib", '  [ "${DRY_RUN:-0}" = "1" ] && return 0\n  d="$(gate_rcpt_dir)"\n  [ -d "$d/pending" ] || return 0', '  d="$(gate_rcpt_dir)"\n  [ -d "$d/pending" ] || return 0', "sw_switch", "the sweep ignores DRY_RUN"),
  ("l13", "lib", '  [ "${DRY_RUN:-0}" = "1" ] && return 0\n  if [ -z "$bead" ]', '  if [ -z "$bead" ]', "send", "the record ignores DRY_RUN"),
  ("l14", "lib", 'BEAD_CITY="${bcity:-${GC_CITY:-}}" notify_author_with_fallback', 'notify_author_with_fallback', "sw_escal", "the helper comments in the HQ store"),
  ("l15", "lib", 'if mv "$d/pending/$key.rec" "$d/settled/$key.$now.rec" 2>/dev/null; then', 'if false; then', "sw_gone", "a settled record is deleted instead of kept"),
@@ -405,8 +416,9 @@ M = [
  ("l17", "lib", '    [ "$n" -ge "$max" ] && break\n', '', "sw_cap", "no per-sweep cap"),
  ("l18", "lib", "      *)          echo \"fallback:it was still not delivered after ${age}s (state '${st:-none}')\" ;;", '      *)          echo "wait:$cls" ;;', "sw_wait", "a queued nudge never ages into a mail"),
  ("l19", "lib", 'if [ "$rc" = "0" ]; then\n    verdict="mailed"', 'if [ "$rc" = "1" ]; then\n    verdict="mailed"', "sw_gone sw_escal", "mailed and escalated swapped"),
- ("l20", "lib", '$(_gate_nr_classify "$closed_json" "$probe" "$sent") || cls="UNREADABLE"', '$(_gate_nr_classify "$closed_json" "$probe" "$sent") || cls="NONE"', "sw_unread", "a jq failure on the closed list is read as 'not found'"),
+ ("l20", "lib", '$(_gate_rcpt_classify "$closed_json" "$probe" "$sent") || cls="UNREADABLE"', '$(_gate_rcpt_classify "$closed_json" "$probe" "$sent") || cls="NONE"', "sw_unread", "a jq failure on the closed list is read as 'not found'"),
  ("l21", "lib", '|| [ ! -s "$d/pending/$key.msg" ]; then', '; then', "sw_damage", "a record without its text is not damaged"),
+ ("l25", "lib", 'if [ -n "$day" ] && closed_json=$(_gate_rcpt_list closed "$day"); then closed_ok=1; fi', 'if closed_json=$(_gate_rcpt_list closed "$day"); then closed_ok=1; fi', "sw_unread", "an uncomputable day still queries the closed list"),
  ("l22", "lib", 'if [ $(( $(date +%s) - t0 )) -ge "$budget" ]; then', 'if false; then', "sw_budget", "no time budget"),
  ("l23", "lib", '-mtime +30 -exec rm -f {} +', '-mtime +3650 -exec rm -f {} +', "sw_budget", "settled records are kept far too long"),
  ("l24", "lib", 'if [ "$n" -gt 0 ]; then find', 'if true; then find', "sw_budget", "an idle sweep trims too"),
@@ -415,9 +427,9 @@ M = [
  ("d03", "disp", '--delivery wait-idle --json >"${_nf:-/dev/null}"', '--delivery wait-idle >"${_nf:-/dev/null}"', "send", "no --json"),
  ("d04", "disp", "jq -er 'select(.ok == true) | .outcome' \"$_nf\"", "jq -er '.outcome' \"$_nf\"", "send", "ok:false is believed"),
  ("d05", "disp", 'if gc --city "$GC_CITY" session nudge "$_candidate" "$_message" --delivery wait-idle --json >"${_nf:-/dev/null}" 2>/dev/null; then', 'if _x=$(gc --city "$GC_CITY" session nudge "$_candidate" "$_message" --delivery wait-idle --json 2>/dev/null); then', "static", "the nudge runs in a subshell"),
- ("d06", "disp", 'if [ "${GATE_NR_LIB_OK:-0}" = "1" ]; then gate_nr_sweep || true', 'if [ "${GATE_NR_LIB_OK:-0}" = "1" ]; then :', "static", "the sweep is never called"),
- ("d07", "disp", 'if [ "${GATE_PHASE_C_ONLY:-0}" != "1" ]; then\n  if [ "${GATE_NR_LIB_OK:-0}" = "1" ]', 'if true; then\n  if [ "${GATE_NR_LIB_OK:-0}" = "1" ]', "static", "the sweep runs in a Phase-C-only pass"),
- ("d08", "disp", 'gate_nr_record "$_bead_id" "${BEAD_CITY:-$GC_CITY}" "$_notified" "$_notify_author" "$_author" "${_noc:-unreadable}" "$_message" "$_fail_context" || true', 'gate_nr_record "$_bead_id" "${BEAD_CITY:-$GC_CITY}" "$_notified" "$_notify_author" "$_author" "${_noc:-unreadable}" "$_message" "$_fail_context"', "static", "the record call is no longer neutralised"),
+ ("d06", "disp", 'if [ "${GATE_RCPT_LIB_OK:-0}" = "1" ]; then gate_rcpt_sweep || true', 'if [ "${GATE_RCPT_LIB_OK:-0}" = "1" ]; then :', "static", "the sweep is never called"),
+ ("d07", "disp", 'if [ "${GATE_PHASE_C_ONLY:-0}" != "1" ]; then\n  if [ "${GATE_RCPT_LIB_OK:-0}" = "1" ]', 'if true; then\n  if [ "${GATE_RCPT_LIB_OK:-0}" = "1" ]', "static", "the sweep runs in a Phase-C-only pass"),
+ ("d08", "disp", 'gate_rcpt_record "$_bead_id" "${BEAD_CITY:-$GC_CITY}" "$_notified" "$_notify_author" "$_author" "${_noc:-unreadable}" "$_message" "$_fail_context" || true', 'gate_rcpt_record "$_bead_id" "${BEAD_CITY:-$GC_CITY}" "$_notified" "$_notify_author" "$_author" "${_noc:-unreadable}" "$_message" "$_fail_context"', "static", "the record call is no longer neutralised"),
 ]
 bad = 0
 with open(os.path.join(out, "manifest.tsv"), "w") as man:
@@ -433,7 +445,7 @@ PYEOF
   while IFS="$(printf '\t')" read -r id kind groups desc; do
     (
       if [ "$kind" = "lib" ]; then
-        GNR_NO_MUTANTS=1 GNR_GROUPS="$groups" GATE_NR_LIB_UNDER_TEST="$MUT/$id.lib" bash "$SELF" > "$MUT/$id.out" 2>&1 < /dev/null
+        GNR_NO_MUTANTS=1 GNR_GROUPS="$groups" GATE_RCPT_LIB_UNDER_TEST="$MUT/$id.lib" bash "$SELF" > "$MUT/$id.out" 2>&1 < /dev/null
       else
         GNR_NO_MUTANTS=1 GNR_GROUPS="$groups" GATE_DISPATCHER_UNDER_TEST="$MUT/$id.disp" bash "$SELF" > "$MUT/$id.out" 2>&1 < /dev/null
       fi

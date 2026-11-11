@@ -17,13 +17,13 @@ crew is the worst case: the dispatcher keeps the crew as owner on the strength o
 
 `nudge_author_with_fallback` (quality-gate-dispatcher.sh) now asks for `--json`. `outcome: delivered` = typed into the session: done.
 Anything else (queued, or rc 0 with no readable outcome) is written to a spool by `gate-nudge-receipt.lib.sh`. Each gate sweep
-(`gate_nr_sweep`, right after the post-merge sweep) looks the nudge up as a `gc:nudge` bead and decides:
+(`gate_rcpt_sweep`, right after the post-merge sweep) looks the nudge up as a `gc:nudge` bead and decides:
 
 | what the sweep finds | what happens |
 |---|---|
 | `state=injected` | settled, nothing sent |
 | `failed`, `expired`, `superseded`, or closed in any other state | the author is mailed now |
-| still queued / not found / the beads unreadable, once the record is 30 min old (`GATE_NR_PENDING_MAX_S`) | the author is mailed, worded as "could not be confirmed", never as "failed" |
+| still queued / not found / the beads unreadable, once the record is 30 min old (`GATE_RCPT_PENDING_MAX_S`) | the author is mailed, worded as "could not be confirmed", never as "failed" |
 | the source bead is closed or `gate:passed` | moot: settled, nobody mailed |
 
 The mail goes through `notify_author_with_fallback` (the recipient that accepted the nudge first, the Mayor only when nobody can be
@@ -46,9 +46,9 @@ engine queue: mail is the durable channel, and it survives the restart that kill
 - One bead: its `GATE-NUDGE-RECEIPT` comment, and `bd show` of the mail the author got.
 
 ## Knobs and kill switch
-Environment of the dispatcher (defaults in the lib header): `GATE_NR_PENDING_MAX_S` 1800, `GATE_NR_MIN_AGE_S` 90 (no look before the
-queue had a chance), `GATE_NR_RECHECK_S` 300 (per record), `GATE_NR_MAX_PER_SWEEP` 5, `GATE_NR_BUDGET_S` 90 (no new record is started
-once a sweep spent this long: the sweep runs under the gate lock), `GATE_NR_DIR`. Off: `GATE_NR_ENABLED=0` or the file
+Environment of the dispatcher (defaults in the lib header): `GATE_RCPT_PENDING_MAX_S` 1800, `GATE_RCPT_MIN_AGE_S` 90 (no look before the
+queue had a chance), `GATE_RCPT_RECHECK_S` 300 (per record), `GATE_RCPT_MAX_PER_SWEEP` 5, `GATE_RCPT_BUDGET_S` 90 (no new record is started
+once a sweep spent this long: the sweep runs under the gate lock), `GATE_RCPT_DIR`. Off: `GATE_RCPT_ENABLED=0` or the file
 `$GC_CITY/.gc/gate-nudge-receipt.off`; nothing is recorded and no sweep acts, records already written stay. `DRY_RUN=1` does neither.
 
 ## Not covered
@@ -64,4 +64,6 @@ Built on the Hetzner node, which has no city and no Dolt. Taken from other code 
 no nudge id, so the sweep matches the first line of the text and the time), the nudge bead states (`queued`, `accepted_for_injection`,
 `injected`, `failed`, `expired`, `superseded`, from `wisp-reaper.sh`, `nudge-queue-hygiene.py` and one closed bead, `ga-wisp-dkkuz`), and the `bd list` flags
 (`--include-infra --status --limit 0 -l gc:nudge --closed-after <date>`, all used elsewhere in the dispatcher or in the witness query of
-the bead). First thing to check after the merge: one queued FAIL nudge appears in `pending/`, and its receipt settles.
+the bead). A nudge bead's `created_at` is read as UTC ending in `Z` (the one sample bead has it, fractions are tolerated); any other
+offset is read as "not found", which waits for the 30 min rule and then mails. First thing to check after the merge: one queued FAIL
+nudge appears in `pending/`, and its receipt settles.
