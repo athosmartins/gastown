@@ -183,7 +183,7 @@ g_send() {
   chk "send2 queued: rc 0 (the gate path is not failed by it)" streq "$SEND_RC" 0
   chk "send2 queued: a record exists" test -f "$R"
   chk "send2 record: to / bead / bead_city / sent_at / outcome" streq "$(rget "$R" to)|$(rget "$R" bead)|$(rget "$R" bead_city)|$(rget "$R" sent_at)|$(rget "$R" outcome)" "$TO|$BEAD|$RIGCITY|1000000|queued"
-  chk "send2 record: author and notify_author kept for the mail cascade" streq "$(rget "$R" author)|$(rget "$R" notify_author)" "author-x|$TO"
+  chk "send2 record: the author is kept (the mail cascade ends with it)" streq "$(rget "$R" author)" "author-x"
   chk "send2 record: the probe is the first line of the text" streq "$(rget "$R" probe)" "$PROBE1"
   printf '%s' "$MSG1" > "$CASE/expect.msg"
   chk "send2 the text round-trips byte for byte (newlines, quotes, \$, backtick, backslash)" cmp -s "$CASE/expect.msg" "${R%.rec}.msg"
@@ -216,7 +216,7 @@ g_send() {
 
   new_case; echo queued > "$FD/nudge.$TO"; : > "$CASE/blocker"; GATE_RCPT_DIR="$CASE/blocker/sub" send "$BEAD" "$TO" author-x "$MSG1"
   chk "send10 an unwritable spool: rc 0 and a WARN that says the nudge will NOT be verified" streq "$SEND_RC:$(grep -c 'NOT be verified' "$WARN_LOG")" "0:1"
-  new_case; PATH="$SANDBOX_PATH" gate_rcpt_record "" "$RIGCITY" "$TO" a b queued "$MSG1" ctx
+  new_case; PATH="$SANDBOX_PATH" gate_rcpt_record "" "$RIGCITY" "$TO" a queued "$MSG1" ctx
   chk "send10b no bead id: nothing recorded, a WARN, rc 0" streq "$?:$(pending_n):$(grep -c 'NOT recorded' "$WARN_LOG")" "0:0:1"
 
   new_case; echo queued > "$FD/nudge.$TO"
@@ -429,7 +429,7 @@ M = [
  ("d05", "disp", 'if gc --city "$GC_CITY" session nudge "$_candidate" "$_message" --delivery wait-idle --json >"${_nf:-/dev/null}" 2>/dev/null; then', 'if _x=$(gc --city "$GC_CITY" session nudge "$_candidate" "$_message" --delivery wait-idle --json 2>/dev/null); then', "static", "the nudge runs in a subshell"),
  ("d06", "disp", 'if [ "${GATE_RCPT_LIB_OK:-0}" = "1" ]; then gate_rcpt_sweep || true', 'if [ "${GATE_RCPT_LIB_OK:-0}" = "1" ]; then :', "static", "the sweep is never called"),
  ("d07", "disp", 'if [ "${GATE_PHASE_C_ONLY:-0}" != "1" ]; then\n  if [ "${GATE_RCPT_LIB_OK:-0}" = "1" ]', 'if true; then\n  if [ "${GATE_RCPT_LIB_OK:-0}" = "1" ]', "static", "the sweep runs in a Phase-C-only pass"),
- ("d08", "disp", 'gate_rcpt_record "$_bead_id" "${BEAD_CITY:-$GC_CITY}" "$_notified" "$_notify_author" "$_author" "${_noc:-unreadable}" "$_message" "$_fail_context" || true', 'gate_rcpt_record "$_bead_id" "${BEAD_CITY:-$GC_CITY}" "$_notified" "$_notify_author" "$_author" "${_noc:-unreadable}" "$_message" "$_fail_context"', "static", "the record call is no longer neutralised"),
+ ("d08", "disp", 'gate_rcpt_record "$_bead_id" "${BEAD_CITY:-$GC_CITY}" "$_notified" "$_author" "${_noc:-unreadable}" "$_message" "$_fail_context" || true', 'gate_rcpt_record "$_bead_id" "${BEAD_CITY:-$GC_CITY}" "$_notified" "$_author" "${_noc:-unreadable}" "$_message" "$_fail_context"', "static", "the record call is no longer neutralised"),
 ]
 bad = 0
 with open(os.path.join(out, "manifest.tsv"), "w") as man:

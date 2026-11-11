@@ -80,11 +80,11 @@ _gate_rcpt_get() { sed -n "s/^$2=//p" "$1" 2>/dev/null | head -n1 || true; }
 # _gate_rcpt_oneline <text> — newlines and CRs to spaces: the record is key=value lines.
 _gate_rcpt_oneline() { printf '%s' "$1" | tr '\n\r' '  '; }
 
-# gate_rcpt_record <bead_id> <bead_city> <to> <notify_author> <author> <outcome> <message> <fail_context>
+# gate_rcpt_record <bead_id> <bead_city> <to> <author> <outcome> <message> <fail_context>
 # Called by nudge_author_with_fallback after a nudge that was ACCEPTED but not typed. Always rc 0: a record that cannot be written is a WARN that says the
 # nudge will not be verified, never a failure of the gate path that called it.
 gate_rcpt_record() {
-  local bead="${1:-}" bcity="${2:-}" to="${3:-}" nauth="${4:-}" author="${5:-}" outcome="${6:-unreadable}" msg="${7:-}" fctx="${8:-}"
+  local bead="${1:-}" bcity="${2:-}" to="${3:-}" author="${4:-}" outcome="${5:-unreadable}" msg="${6:-}" fctx="${7:-}"
   local d key probe tmp now
   gate_rcpt_enabled || return 0
   [ "${DRY_RUN:-0}" = "1" ] && return 0
@@ -104,9 +104,9 @@ gate_rcpt_record() {
   tmp="$d/pending/.$key.$$"
   # .msg first: the .rec is what the sweep discovers, so it must never exist without its text
   if printf '%s' "$msg" > "$tmp.msg" 2>/dev/null && mv "$tmp.msg" "$d/pending/$key.msg" 2>/dev/null \
-     && printf 'bead=%s\nbead_city=%s\nto=%s\nnotify_author=%s\nauthor=%s\nsent_at=%s\noutcome=%s\nprobe=%s\nfail_context=%s\n' \
-          "$(_gate_rcpt_oneline "$bead")" "$(_gate_rcpt_oneline "$bcity")" "$(_gate_rcpt_oneline "$to")" "$(_gate_rcpt_oneline "$nauth")" \
-          "$(_gate_rcpt_oneline "$author")" "$now" "$(_gate_rcpt_oneline "$outcome")" "$probe" "$(_gate_rcpt_oneline "$fctx")" > "$tmp.rec" 2>/dev/null \
+     && printf 'bead=%s\nbead_city=%s\nto=%s\nauthor=%s\nsent_at=%s\noutcome=%s\nprobe=%s\nfail_context=%s\n' \
+          "$(_gate_rcpt_oneline "$bead")" "$(_gate_rcpt_oneline "$bcity")" "$(_gate_rcpt_oneline "$to")" "$(_gate_rcpt_oneline "$author")" \
+          "$now" "$(_gate_rcpt_oneline "$outcome")" "$probe" "$(_gate_rcpt_oneline "$fctx")" > "$tmp.rec" 2>/dev/null \
      && mv "$tmp.rec" "$d/pending/$key.rec" 2>/dev/null; then
     rm -f "$d/pending/$key.chk" 2>/dev/null || true   # a replaced record starts its schedule again
     _gate_rcpt_say "ga-5aovajz: nudge to $to for $bead was QUEUED, not delivered (outcome=$outcome) — a receipt is checked on the next sweeps; if it does not land the author is mailed"

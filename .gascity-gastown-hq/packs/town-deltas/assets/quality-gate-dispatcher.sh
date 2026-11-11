@@ -714,7 +714,7 @@ nudge_author_with_fallback() {
     # Anything but "delivered" is NOT "the author was told": record it so a later sweep can check the nudge and mail the author if it died. Not for an
     # ephemeral pool author (_defer=1: its session is gone by design and the bead returns to the pool). The record is optional (lib missing -> skipped).
     if [ "$_noc" != "delivered" ] && [ "$_defer" != "1" ] && declare -F gate_rcpt_record >/dev/null 2>&1; then
-      gate_rcpt_record "$_bead_id" "${BEAD_CITY:-$GC_CITY}" "$_notified" "$_notify_author" "$_author" "${_noc:-unreadable}" "$_message" "$_fail_context" || true
+      gate_rcpt_record "$_bead_id" "${BEAD_CITY:-$GC_CITY}" "$_notified" "$_author" "${_noc:-unreadable}" "$_message" "$_fail_context" || true
     fi
     return 0
   fi
