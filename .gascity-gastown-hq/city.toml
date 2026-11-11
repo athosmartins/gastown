@@ -657,9 +657,17 @@ option_defaults = { effort = "high" }
 # key is not part of the session fingerprint, so changing it should restart no session; it
 # only applies once the running supervisor re-reads city.toml, and whether it hot-reloads
 # this key was NOT tested here.
+# Sessões remotas (Hetzner/MBP) pelo provider híbrido — runbook docs/runbooks/gc-session-ssh.md.
+# Já estava LIGADO no city.toml vivo do mini sem nunca ter sido commitado (achado do Mayor 11/11: a
+# raiz divergia do origin/main e o town-root-reconciler travou a atualização). Este commit só
+# VERSIONA o que roda; NÃO tire: trocar o provider de volta para o tmux padrão derruba TODAS as
+# sessões em execução (ga-2hd02v.1.6).
 [session]
+provider = "hybrid"
 startup_timeout = "180s"
 setup_timeout = "60s"
+remote_match = "-remote-"
+remote_exec = "/Users/athos/gt/.gascity-gastown-hq/scripts/gc-session-ssh"
 
 [daemon]
 # nudge_dispatcher: EXPLICITAMENTE "legacy" — nao remova sem MEDIR (ga-yxuab).
