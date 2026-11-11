@@ -696,12 +696,28 @@ nudge_author_with_fallback() {
     done
     _candidates="${_kept# }"
   fi
-  local _notified="" _candidate
+  local _notified="" _candidate _nf="" _noc=""
+  # ga-5aovajz: rc 0 of `session nudge --delivery wait-idle` means "accepted", not "typed": with a busy target it only QUEUES the text, and a queued item
+  # dies silently when the session restarts (state=failed, "queued nudge session fence mismatch") or expires unseen. --json says which (outcome delivered |
+  # queued). The JSON goes to a FILE, not $(...): the call must stay in THIS shell (the selftests' gc stubs record it in variables).
+  _nf=$(mktemp "${TMPDIR:-/tmp}/gate-nudge-out.XXXXXX" 2>/dev/null) || _nf=""
   for _candidate in $_candidates; do
-    gc --city "$GC_CITY" session nudge "$_candidate" "$_message" --delivery wait-idle 2>/dev/null \
-      && { _notified="$_candidate"; break; }
+    # vazio (rc 0 sem JSON legível) → outcome desconhecido, tratado abaixo como enfileirado; falhou (rc≠0) → próximo candidato
+    if gc --city "$GC_CITY" session nudge "$_candidate" "$_message" --delivery wait-idle --json >"${_nf:-/dev/null}" 2>/dev/null; then
+      _notified="$_candidate"
+      if [ -n "$_nf" ]; then _noc=$(jq -er 'select(.ok == true) | .outcome' "$_nf" 2>/dev/null) || _noc=""; fi
+      break
+    fi
   done
-  [ -n "$_notified" ] && return 0
+  [ -z "$_nf" ] || rm -f "$_nf" 2>/dev/null || true
+  if [ -n "$_notified" ]; then
+    # Anything but "delivered" is NOT "the author was told": record it so a later sweep can check the nudge and mail the author if it died. Not for an
+    # ephemeral pool author (_defer=1: its session is gone by design and the bead returns to the pool). The record is optional (lib missing -> skipped).
+    if [ "$_noc" != "delivered" ] && [ "$_defer" != "1" ] && declare -F gate_nr_record >/dev/null 2>&1; then
+      gate_nr_record "$_bead_id" "${BEAD_CITY:-$GC_CITY}" "$_notified" "$_notify_author" "$_author" "${_noc:-unreadable}" "$_message" "$_fail_context" || true
+    fi
+    return 0
+  fi
   if [ "$_defer" = "1" ]; then
     warn "Could not nudge any author candidate (${_candidates:-none}) for $_fail_context — Mayor page DEFERRED until the re-dispatch is verified (ga-aijm2v.5)"
     # When the Mayor-sentinel filter emptied the list NOTHING was attempted: "FAILED for every candidate ()"
@@ -869,6 +885,15 @@ _GATE_PM_LIB="${GATE_PM_LIB:-$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null &
 if [ -r "$_GATE_PM_LIB" ]; then
   # shellcheck disable=SC1090
   if . "$_GATE_PM_LIB" && type gate_pm_begin >/dev/null 2>&1; then GATE_PM_LIB_OK=1; fi
+fi
+# ga-5aovajz: a QUEUED author nudge is not a delivered one — gate-nudge-receipt.lib.sh records it and the sweep (see the call after the sweep banner) mails
+# the author when it dies in the queue. OPTIONAL like the lib above: missing/unloadable -> GATE_NR_LIB_OK=0, the nudge is sent exactly as before and the
+# sweep says once per sweep that nothing is being verified. GATE_NR_LIB is a test seam. stderr is NOT suppressed: a corrupt sibling must be loud.
+GATE_NR_LIB_OK=0
+_GATE_NR_LIB="${GATE_NR_LIB:-$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd || true)/gate-nudge-receipt.lib.sh}"
+if [ -r "$_GATE_NR_LIB" ]; then
+  # shellcheck disable=SC1090
+  if . "$_GATE_NR_LIB" && type gate_nr_sweep >/dev/null 2>&1; then GATE_NR_LIB_OK=1; fi
 fi
 case "$GATE_CODE_REVIEWERS"      in ''|*[!0-9]*) GATE_CODE_REVIEWERS=2 ;; esac
 case "$GATE_SWAP_FREE_FLOOR_MB"  in ''|*[!0-9]*) GATE_SWAP_FREE_FLOOR_MB=512 ;; esac
@@ -13759,6 +13784,15 @@ fi
 # ga-qmymjm: post-merge tails forked by an EARLIER sweep that never reported back (killed hard, machine restarted): said out loud, once each
 # (label + comment on the source bead, event, nudge). Detection only — see gate-postmerge.lib.sh. One local directory listing when all is well.
 if [ "${GATE_PM_LIB_OK:-0}" = "1" ]; then gate_pm_sweep || true; fi
+
+# ga-5aovajz: author nudges that were only QUEUED and have not landed (gate-nudge-receipt.lib.sh): look each one up and mail the author when it died in the
+# queue or is still undelivered after GATE_NR_PENDING_MAX_S. One directory test when nothing is recorded. Not in a Phase-C-only child pass (it borrows the
+# parent's lock and touches only the runs it was handed). A lib that did not load is said out loud, once per sweep: a safety net that is absent must not
+# look like one that found nothing.
+if [ "${GATE_PHASE_C_ONLY:-0}" != "1" ]; then
+  if [ "${GATE_NR_LIB_OK:-0}" = "1" ]; then gate_nr_sweep || true
+  else warn "ga-5aovajz: gate-nudge-receipt.lib.sh did not load ($_GATE_NR_LIB) — queued author nudges are NOT being verified this sweep"; fi
+fi
 
 # ── ga-bgvc0: ambient Dolt-CPU snapshot (BEFORE the janitors) ─────────────────
 # The Step 0b-1 headroom gate must judge the data plane by its AMBIENT load, not
