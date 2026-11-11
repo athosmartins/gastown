@@ -65,7 +65,7 @@ reviewed	packs/town-deltas/assets/pilot-dispatcher.sh	sort_by\(\.created_at\) \|
 reviewed	packs/town-deltas/assets/pilot-dispatcher.sh	list --limit 1 >/dev/null	-	store liveness probe, the output is thrown away
 reviewed	packs/town-deltas/assets/gate-needs-human-divergence-sweep.sh	sort_by\(\.created_at // ""\) \| last	-	the NEWEST gate marker of ONE source bead, to read its branch label
 reviewed	packs/town-deltas/assets/refino-gate-dispatcher.sh	sort_by\(\.created_at // ""\) \| \.\[0\]\.id	-	one story's own pending verdict wisp (oldest, to be deterministic); not a queue of stories
-reviewed	packs/town-deltas/assets/gate-nudge-receipt.lib.sh	sort_by\(\.created_at\) \| \.\[0\]	-	ga-5aovajz: the nudge bead sent for ONE gate notice (the oldest of the look-alikes that carry its text, to be deterministic); not a queue of work
+reviewed	packs/town-deltas/assets/gate-nudge-receipt.lib.sh	\| sort_by\(\[ \(if \$to != ""	-	ga-5aovajz: the nudge bead sent for ONE gate notice (among the look-alikes that carry its text, the one addressed to the recipient first, then the oldest, to be deterministic); not a queue of work
 reviewed	packs/town-deltas/assets/quality-gate-guard.sh	\.comments // \[\] \| sort_by\(\.created_at\) \| reverse	-	the comments of ONE bead, newest first
 reviewed	scripts/inflight-reclaim-guard.py	--sort=-committerdate	-	git for-each-ref of remote branches, not beads
 reviewed	scripts/home-scan-guard.py	rg --sort path	-	docstring example of a forbidden $HOME scan

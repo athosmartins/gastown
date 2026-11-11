@@ -12,9 +12,11 @@
 # or rc 0 with no readable outcome) is written down by gate_rcpt_record, one small file per bead + recipient (a later FAIL notice replaces the earlier
 # one: it is the one that matters). Each sweep, gate_rcpt_sweep looks the nudge up as a bead (label gc:nudge; matched by the first line of its text and
 # the time it was sent: the --json output measured in pool-idle-nobead-guard.sh carries no nudge id) and decides:
-#   state injected                                  the session took it: settled, nothing sent.
-#   state failed / expired / superseded, or closed  the nudge is gone: the author is MAILED now. Mail is durable, so it survives the restart that killed
-#   in any other state                              the nudge.
+#   state injected, or accepted_for_injection       the session took it (injected), or the hook transport accepted it for the session's next prompt
+#   and the bead closed                             (accepted_for_injection + closed: 53% of all closed nudges, the usual success): settled, nothing sent.
+#                                                   accepted_for_injection still OPEN waits like a queued one.
+#   state failed / expired / superseded, or closed  the nudge is gone (or cannot be read: a state this check does not know): the author is MAILED now.
+#   in a state this check does not recognise        Mail is durable, so it survives the restart that killed the nudge.
 #   still queued, not found, or the beads unreadable, once the record is GATE_RCPT_PENDING_MAX_S old (default 1800)   the same mail: "queued" is not
 #                                                   "told", and waiting for the 24 h expiry would leave a P0 parked for a day. "I could not confirm it"
 #                                                   is worded as that, never as "it failed".
@@ -136,22 +138,28 @@ _gate_rcpt_list() {
   printf '%s' "$out"
 }
 
-# _gate_rcpt_classify <json-array> <probe> <sent_at> — the nudge bead sent for this record: the OLDEST one created no earlier than 300 s before sent_at
-# (wait-idle can hold the call up to 30 s before it enqueues) whose text contains the probe line. Prints NONE, or <state>|<status>|<reason> (reason on one
-# line, no '|'). rc 1 (nothing printed) when jq cannot read the list.
+# _gate_rcpt_classify <json-array> <probe> <sent_at> [recipient] — the nudge bead sent for this record: created no earlier than 300 s before sent_at
+# (wait-idle can hold the call up to 30 s before it enqueues) and whose text contains the probe line. Among those, a bead addressed to <recipient>
+# (metadata.agent, metadata.session_id or label agent:<recipient>) comes first, then the OLDEST. The identity only RANKS, it never excludes: the engine may
+# spell the target differently from the name the dispatcher used (alias, session name, id), and a bead wrongly excluded would read as "not found".
+# Prints NONE, or <state>|<status>|<reason> (reason on one line, no '|'; the first NON-EMPTY of terminal_reason, last_error, close_reason — a delivered
+# nudge carries "" there, and jq's // does not skip ""). rc 1 (nothing printed) when jq cannot read the list.
 _gate_rcpt_classify() {
   # vazio ([] ou sem bead que case) → NONE; falhou (jq erra) → rc 1
-  printf '%s' "$1" | jq -r --arg probe "$2" --argjson sent "$3" '
+  printf '%s' "$1" | jq -r --arg probe "$2" --argjson sent "$3" --arg to "${4:-}" '
     [ .[] | select(type == "object")
           | select((.metadata.message // "") | contains($probe))
           | select(((.created_at // "") | sub("\\.[0-9]+Z$"; "Z") | try fromdateiso8601 catch null) as $t | ($t != null) and ($t >= ($sent - 300))) ]
-    | sort_by(.created_at) | .[0]
+    | sort_by([ (if $to != "" and (((.metadata.agent // "") == $to) or ((.metadata.session_id // "") == $to) or (((.labels // []) | index("agent:" + $to)) != null)) then 0 else 1 end), (.created_at // "") ])
+    | .[0]
     | if . == null then "NONE"
       else ((.metadata.state // "") + "|" + (.status // "") + "|"
-            + ((.metadata.terminal_reason // .metadata.last_error // .close_reason // "") | gsub("[|\n\r]"; " "))) end' 2>/dev/null
+            + (([.metadata.terminal_reason, .metadata.last_error, .close_reason, .metadata.close_reason] | map(select(type == "string" and . != "")) | .[0] // "") | gsub("[|\n\r]"; " "))) end' 2>/dev/null
 }
 
-# _gate_rcpt_decide <class> <age_s> — PURE. <class> is NONE, UNREADABLE or <state>|<status>|<reason>. Prints settle:delivered | fallback:<why> | wait:<class>.
+# _gate_rcpt_decide <class> <age_s> — PURE. <class> is NONE, UNREADABLE or <state>|<status>|<reason>. Prints settle:<how it was delivered> | fallback:<why> |
+# wait:<class>. States as measured live on 2026-11-11 over 799 closed gc:nudge beads: accepted_for_injection 425 (53%: the hook transport took the text for
+# the session's next prompt — the usual SUCCESS), injected 121, failed 136 (queued nudge session fence mismatch), expired 113, superseded 4.
 _gate_rcpt_decide() {
   local cls="${1:-UNREADABLE}" age="${2:-0}" max="${GATE_RCPT_PENDING_MAX_S:-1800}" st sts rest rsn
   case "$max" in ''|*[!0-9]*) max=1800 ;; esac
@@ -161,15 +169,18 @@ _gate_rcpt_decide() {
     *) st="${cls%%|*}"; rest="${cls#*|}"; sts="${rest%%|*}"; rsn="${rest#*|}" ;;
   esac
   case "$st" in
-    injected) echo "settle:delivered"; return 0 ;;
+    injected) echo "settle:injected into the session"; return 0 ;;
+    # closed = the hook accepted it (delivered, as far as the engine can say); still open = the hook has not drained it yet, so it waits like a queued one
+    accepted_for_injection) if [ "$sts" = "closed" ]; then echo "settle:accepted for hook-transport injection"; return 0; fi ;;
     failed|expired|superseded) echo "fallback:it ended as '$st'${rsn:+ ($rsn)} without reaching the session"; return 0 ;;
     NONE|UNREADABLE) ;;
-    # queued, accepted_for_injection, a state nobody named, or none: still pending while the bead is open; a CLOSED bead that was not injected is gone
-    *) if [ "$sts" = "closed" ]; then echo "fallback:its bead is closed (state '${st:-none}'${rsn:+, $rsn}) without having been injected"; return 0; fi ;;
+    # queued, or a state nobody named, or none: still pending while the bead is open. A bead CLOSED in a state this check does not know cannot be read
+    # either way (it may be a new success state), and a closed bead does not change, so the author is told now, in those words
+    *) if [ "$sts" = "closed" ]; then echo "fallback:its bead is closed in state '${st:-none}', which this check does not recognise, so delivery cannot be confirmed${rsn:+ ($rsn)}"; return 0; fi ;;
   esac
   if [ "$age" -ge "$max" ]; then
     case "$st" in
-      NONE)       echo "fallback:no nudge bead was found after ${age}s" ;;
+      NONE)       echo "fallback:no open or closed nudge bead was found after ${age}s" ;;
       UNREADABLE) echo "fallback:the nudge beads could not be read for ${age}s" ;;
       *)          echo "fallback:it was still not delivered after ${age}s (state '${st:-none}')" ;;
     esac
@@ -243,7 +254,7 @@ $msg"
   if [ "$rc" = "0" ]; then
     verdict="mailed"; how="The author was mailed instead (mail survives a restart)."; who="MAILED"
   else
-    verdict="escalated"; how="Mailing the author failed too: the Mayor was mailed to relay it."; who="UNREACHABLE (Mayor mailed)"
+    verdict="escalated"; how="Mailing the author failed too: a mail to the Mayor was attempted to relay it (whether it went out is not confirmed)."; who="UNREACHABLE (Mayor mail attempted)"
   fi
   bd -C "${bcity:-${GC_CITY:-}}" comment "$bead" "GATE-NUDGE-RECEIPT (ga-5aovajz): the gate's FAIL nudge to $to could not be confirmed delivered — $why. ${how}${note} A queued nudge is not a delivered one; this note keeps 'not told' from reading as 'told' (ga-fe5at)." \
     2>/dev/null || _gate_rcpt_warn "ga-5aovajz: could not leave the GATE-NUDGE-RECEIPT comment on $bead (the mail above and the log line are the record)"
@@ -300,7 +311,7 @@ gate_rcpt_sweep() {
     fi
     cls="UNREADABLE"
     if [ "$open_ok" = "1" ]; then
-      if cls=$(_gate_rcpt_classify "$open_json" "$probe" "$sent"); then
+      if cls=$(_gate_rcpt_classify "$open_json" "$probe" "$sent" "$to"); then
         if [ "$cls" = "NONE" ]; then
           if [ "$closed_loaded" = "0" ]; then
             closed_loaded=1
@@ -308,7 +319,7 @@ gate_rcpt_sweep() {
             day=$(_gate_rcpt_utc_date $((sent - 86400)))
             if [ -n "$day" ] && closed_json=$(_gate_rcpt_list closed "$day"); then closed_ok=1; fi
           fi
-          if [ "$closed_ok" = "1" ]; then cls=$(_gate_rcpt_classify "$closed_json" "$probe" "$sent") || cls="UNREADABLE"; else cls="UNREADABLE"; fi
+          if [ "$closed_ok" = "1" ]; then cls=$(_gate_rcpt_classify "$closed_json" "$probe" "$sent" "$to") || cls="UNREADABLE"; else cls="UNREADABLE"; fi
         fi
       else
         cls="UNREADABLE"
@@ -318,9 +329,9 @@ gate_rcpt_sweep() {
     verdict="${decide%%:*}"
     case "$verdict" in
       settle)
-        _gate_rcpt_say "ga-5aovajz: nudge to $to for $bead was INJECTED into the session (after ${age}s) — receipt settled"
-        gate_rcpt_event author_nudge_receipt bead "$bead" to "$to" verdict delivered age_s "$age" || true
-        _gate_rcpt_settle "$d" "$key" delivered "injected" ;;
+        _gate_rcpt_say "ga-5aovajz: nudge to $to for $bead: ${decide#*:} (after ${age}s) — receipt settled"
+        gate_rcpt_event author_nudge_receipt bead "$bead" to "$to" verdict delivered age_s "$age" via "${decide#*:}" || true
+        _gate_rcpt_settle "$d" "$key" delivered "${decide#*:}" ;;
       fallback)
         _gate_rcpt_fallback "$d" "$key" "${decide#*:}" "$age" ;;
       *) ;;

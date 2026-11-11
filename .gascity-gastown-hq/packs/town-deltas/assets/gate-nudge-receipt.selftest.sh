@@ -140,7 +140,19 @@ new_case() {
   put_bead "$BEAD" in_progress gate:needs-fix
 }
 put_bead() { jq -n --arg id "$1" --arg s "$2" --arg l "${*:3}" '[{id:$id, status:$s, labels:($l | split(" ") | map(select(. != "")))}]' > "$FD/bead.$1.json"; }
-nbead() { jq -n --arg st "$1" --arg sts "$2" --arg rsn "$3" --argjson c "$4" --arg msg "$5" '{id:("ga-wisp-n" + ($c|tostring)), status:$sts, created_at:($c|todate), close_reason:$rsn, metadata:{agent:"peter-wa", state:$st, message:$msg, terminal_reason:$rsn}, labels:["gc:nudge","agent:peter-wa"]}'; }
+# nbead <state> <status> <reason> <created-epoch> <message> [agent]. Shape measured live on 2026-11-11 (799 closed gc:nudge beads since 04/11, `bd list --include-infra
+# --status closed -l gc:nudge`): the engine's own words are in close_reason; terminal_reason / last_error are "" (EMPTY STRINGS, not null) for a nudge that was
+# accepted or injected, and carry the failure for failed / expired / superseded (close_reason there is the engine's generic "nudge <state>: ..." line).
+# So <reason> is the close_reason for the delivered states ("nudge accepted for hook-transport injection", "nudge delivered via provider injection") and the
+# terminal_reason / last_error text for the others.
+nbead() {
+  jq -n --arg st "$1" --arg sts "$2" --arg rsn "$3" --argjson c "$4" --arg msg "$5" --arg ag "${6:-peter-wa}" '
+    ($st == "failed" or $st == "expired" or $st == "superseded" or ($sts == "closed" and $st != "injected" and $st != "accepted_for_injection")) as $bad
+    | (if $sts != "closed" then "" elif $bad then ("nudge " + $st + ": engine close") else $rsn end) as $cr
+    | {id:("ga-wisp-n" + ($c|tostring)), status:$sts, created_at:($c|todate), close_reason:$cr,
+       metadata:{agent:$ag, session_id:$ag, state:$st, message:$msg, close_reason:$cr,
+                 terminal_reason:(if $bad then $rsn else "" end), last_error:(if $bad then $rsn else "" end)}, labels:["gc:nudge",("agent:" + $ag)]}'
+}
 put_list() { local st="$1"; shift; if [ "$#" -eq 0 ]; then echo '[]' > "$FD/nudges.$st.json"; else printf '%s\n' "$@" | jq -s . > "$FD/nudges.$st.json"; fi; }
 recf() { printf '%s/pending/%s.rec' "$GATE_RCPT_DIR" "$(printf '%s__%s' "$1" "$2" | tr -c 'A-Za-z0-9._-' '_')"; }
 rget() { sed -n "s/^$2=//p" "$1" 2>/dev/null | head -n1; }
@@ -226,9 +238,22 @@ g_send() {
 # ═════════════════════════════════════════════════ sweep groups ══════════════════════════════════════════════════════════════════════════════════════
 g_sw_inject() {
   echo "── sweep: injected ──"
-  case_closed injected "accepted by injection at the hook" 2; sweep $((T0 + 600))
+  case_closed injected "nudge delivered via provider injection" 2; sweep $((T0 + 600))
   chk "sweep1 injected: nobody mailed, no comment, record settled as delivered" streq "$(mail_n):$(nlines "$FD/bd.comments"):$(pending_n):$(settled_verdicts)" "0:0:0:delivered "
   chk "sweep1 open was read first, closed only because open had no match, with the day before the send" streq "$(sed -n 1p "$FD/bd.lists" | cut -d' ' -f1):$(sed -n 2p "$FD/bd.lists" | cut -d' ' -f1,2)" "status=open:status=closed after=$(date -u -r $((T0 - 86400)) +%Y-%m-%d 2>/dev/null || date -u -d "@$((T0 - 86400))" +%Y-%m-%d)"
+}
+# ga-5aovajz gate attempt 1: a CLOSED nudge bead in state accepted_for_injection is the hook-transport SUCCESS state, not a lost nudge. Measured live on
+# 2026-11-11 over 799 closed gc:nudge beads since 04/11: 425-428 accepted_for_injection ("nudge accepted for hook-transport injection", 53%, the most common
+# outcome), 121 injected, 136 failed (fence mismatch), 113 expired, 4 superseded. The review's own POINTER nudge to the reviewer was in that state and reached it.
+g_sw_hook() {
+  echo "── sweep: accepted for hook-transport injection ──"
+  case_closed accepted_for_injection "nudge accepted for hook-transport injection" 2; sweep $((T0 + 600))
+  chk "sweep1b CLOSED accepted_for_injection (the live hook-transport success): settled as delivered, nobody mailed, no comment" streq "$(mail_n):$(nlines "$FD/bd.comments"):$(pending_n):$(settled_verdicts):$(event_verdicts)" "0:0:0:delivered :delivered "
+  chk "sweep1c ... and the log says the hook accepted it, not that it was 'injected into the session'" streq "$(has "$LOG_LOG" "accepted for hook-transport injection" && echo y):$(has "$LOG_LOG" "was INJECTED into the session" || echo n)" "y:n"
+  case_open accepted_for_injection; sweep $((T0 + 600))
+  chk "sweep1d OPEN accepted_for_injection and young: waits (it is not closed yet; nothing mailed, record kept)" streq "$(mail_n):$(pending_n)" "0:1"
+  case_closed accepted_for_injection "nudge accepted for hook-transport injection" 2; sweep $((T0 + 5000)); sweep $((T0 + 9000))
+  chk "sweep1e a settled receipt is not mailed on a later sweep" streq "$(mail_n):$(pending_n)" "0:0"
 }
 g_sw_gone() {
   echo "── sweep: the nudge is gone ──"
@@ -243,9 +268,9 @@ g_sw_gone() {
   case_closed expired "expired by delivery deadline" 5; sweep $((T0 + 600))
   chk "sweep3 expired: mailed, reason names the state" streq "$(mail_n):$(has "$FD/mail.body.1" "ended as 'expired'" && echo y)" "1:y"
   case_closed superseded "" 5; sweep $((T0 + 600))
-  chk "sweep3b superseded (replaced by a newer enqueue) is not a delivery either: mailed" streq "$(mail_n)" "1"
+  chk "sweep3b superseded (replaced by a newer enqueue) is not a delivery either: mailed, and with an EMPTY terminal_reason the engine's close_reason is the reason" streq "$(mail_n):$(has "$FD/mail.body.1" "ended as 'superseded' (nudge superseded: engine close)" && echo y)" "1:y"
   case_closed weird x 5; sweep $((T0 + 600))
-  chk "sweep3c a CLOSED nudge in a state nobody named, not injected: mailed (it is gone)" streq "$(mail_n):$(has "$FD/mail.body.1" "its bead is closed (state 'weird'" && echo y)" "1:y"
+  chk "sweep3c a CLOSED nudge in a state nobody named: mailed at once (a closed bead does not change), worded as 'not recognised', never as 'not injected'" streq "$(mail_n):$(has "$FD/mail.body.1" "its bead is closed in state 'weird', which this check does not recognise" && echo y):$(has "$FD/mail.body.1" "without having been injected" || echo n)" "1:y:n"
 }
 g_sw_wait() {
   echo "── sweep: still queued ──"
@@ -279,17 +304,17 @@ g_sw_unread() {
   new_case; mkrec; : > "$FD/list.closed.fail"; put_list open; sweep $((T0 + 600))
   chk "sweep8 open read fine but empty, closed unreadable: still 'cannot tell' (waits)" streq "$(mail_n):$(pending_n)" "0:1"
   sweep $((T0 + 2000))
-  chk "sweep8b ... and at the limit it is worded 'could not be read', never 'no nudge bead was found'" streq "$(has "$FD/mail.body.1" "could not be read" && echo y):$(has "$FD/mail.body.1" "no nudge bead was found" || echo n)" "y:n"
+  chk "sweep8b ... and at the limit it is worded 'could not be read', never 'no open or closed nudge bead was found'" streq "$(has "$FD/mail.body.1" "could not be read" && echo y):$(has "$FD/mail.body.1" "no open or closed nudge bead was found" || echo n)" "y:n"
   new_case; mkrec; put_list open; put_list closed; sweep $((T0 + 600))
   chk "sweep9 both lists readable and no such nudge: waits" streq "$(mail_n):$(pending_n)" "0:1"
   sweep $((T0 + 2000))
-  chk "sweep9b ... at the limit mailed, worded 'no nudge bead was found'" streq "$(mail_n):$(has "$FD/mail.body.1" "no nudge bead was found after 2000s" && echo y)" "1:y"
+  chk "sweep9b ... at the limit mailed, worded 'no open or closed nudge bead was found'" streq "$(mail_n):$(has "$FD/mail.body.1" "no open or closed nudge bead was found after 2000s" && echo y)" "1:y"
   new_case; mkrec; put_list open; FAKE_DATE_FAIL=1 sweep $((T0 + 600))
   chk "sweep9d the day for --closed-after cannot be computed: the closed list is NOT read (no wrong query), the record waits" streq "$(grep -c 'status=closed' "$FD/bd.lists"):$(mail_n):$(pending_n)" "0:0:1"
   FAKE_DATE_FAIL=1 sweep $((T0 + 2000))
-  chk "sweep9e ... and at the limit it is worded 'could not be read', never 'no nudge bead was found'" streq "$(has "$FD/mail.body.1" "could not be read" && echo y):$(has "$FD/mail.body.1" "no nudge bead was found" || echo n)" "y:n"
+  chk "sweep9e ... and at the limit it is worded 'could not be read', never 'no open or closed nudge bead was found'" streq "$(has "$FD/mail.body.1" "could not be read" && echo y):$(has "$FD/mail.body.1" "no open or closed nudge bead was found" || echo n)" "y:n"
   new_case; mkrec; put_list open; echo '[{"metadata":{"message":5},"created_at":"2026-11-10T01:27:47Z"}]' > "$FD/nudges.closed.json"; sweep $((T0 + 2000))
-  chk "sweep9c a nudge bead whose text is not a string makes jq fail: 'could not be read', never 'not found'" streq "$(has "$FD/mail.body.1" "could not be read" && echo y):$(has "$FD/mail.body.1" "no nudge bead was found" || echo n)" "y:n"
+  chk "sweep9c a nudge bead whose text is not a string makes jq fail: 'could not be read', never 'not found'" streq "$(has "$FD/mail.body.1" "could not be read" && echo y):$(has "$FD/mail.body.1" "no open or closed nudge bead was found" || echo n)" "y:n"
 }
 g_sw_moot() {
   echo "── sweep: the source bead ──"
@@ -304,7 +329,7 @@ g_sw_escal() {
   echo "── sweep: the author cannot be mailed ──"
   case_closed failed x; echo x > "$FD/mailfail.$TO"; echo x > "$FD/mailfail.author-x"; BEAD_CITY="/stale/other"; sweep $((T0 + 600))
   chk "sweep12 the author cannot be mailed: the Mayor is mailed (author first, then author-x, then mayor), verdict escalated" streq "$(mail_n):$(mail_to 3):$(settled_verdicts)" "3:mayor:escalated "
-  chk "sweep12b both comments (the helper's and the receipt) go to the bead's own store, never the HQ or a stale BEAD_CITY, and the receipt says the Mayor was mailed" streq "$(cut -f1 "$FD/bd.comments" | sort -u):$(nlines "$FD/bd.comments"):$(has "$FD/comment.2" "Mayor was mailed" && echo y)" "$RIGCITY:2:y"
+  chk "sweep12b both comments (the helper's and the receipt) go to the bead's own store, never the HQ or a stale BEAD_CITY, and the receipt says the Mayor mail was attempted" streq "$(cut -f1 "$FD/bd.comments" | sort -u):$(nlines "$FD/bd.comments"):$(has "$FD/comment.2" "mail to the Mayor was attempted" && echo y)" "$RIGCITY:2:y"
   chk "sweep12c the dispatcher's own BEAD_CITY is left exactly as it was" streq "$BEAD_CITY" "/stale/other"
   unset BEAD_CITY
 }
@@ -339,6 +364,15 @@ g_sw_match() {
   chk "sweep16b a nudge with the same text created 1000 s BEFORE the send is another notice: not this one (waits)" streq "$(mail_n):$(pending_n)" "0:1"
   new_case; mkrec; put_list open; put_list closed "$(nbead failed closed "x" $((T0 + 1)) "A different text entirely")"; sweep $((T0 + 600))
   chk "sweep16c a different text is not this record's nudge (waits)" streq "$(mail_n):$(pending_n)" "0:1"
+  # the nudge bead carries the session it was sent to (metadata.agent / session_id, label agent:<s>): among same-text beads in the window, the one for THIS
+  # recipient wins over an older one for another session; with no bead for this recipient the text+time match still applies (the identity can be spelled
+  # differently: alias, session name, id — so it ranks, it does not exclude)
+  new_case; mkrec; put_list open
+  put_list closed "$(nbead failed closed "queued nudge session fence mismatch" $((T0 + 1)) "$MSG1" other-wa)" "$(nbead injected closed "nudge delivered via provider injection" $((T0 + 5)) "$MSG1" "$TO")"
+  sweep $((T0 + 600))
+  chk "sweep16d same text, an OLDER bead for another session (failed) and a newer one for this recipient (injected): this recipient's wins, nobody mailed" streq "$(mail_n):$(settled_verdicts)" "0:delivered "
+  new_case; mkrec; put_list open; put_list closed "$(nbead failed closed "queued nudge session fence mismatch" $((T0 + 1)) "$MSG1" other-wa)"; sweep $((T0 + 600))
+  chk "sweep16e the only same-text bead names another session: still used (identity ranks, it does not exclude; the spelling may differ)" streq "$(mail_n):$(has "$FD/mail.body.1" "ended as 'failed'" && echo y)" "1:y"
 }
 g_sw_budget() {
   echo "── sweep: time budget and housekeeping ──"
@@ -380,7 +414,7 @@ g_static() {
   fi
 }
 
-GROUPS_ALL="send sw_inject sw_gone sw_wait sw_age sw_unread sw_moot sw_escal sw_cap sw_damage sw_match sw_budget sw_switch static"
+GROUPS_ALL="send sw_inject sw_hook sw_gone sw_wait sw_age sw_unread sw_moot sw_escal sw_cap sw_damage sw_match sw_budget sw_switch static"
 for g in ${GNR_GROUPS:-$GROUPS_ALL}; do "g_$g"; done
 
 # ═════════════════════════════════════════════════ mutants ═══════════════════════════════════════════════════════════════════════════════════════════
@@ -397,7 +431,7 @@ disp = open(os.environ["GNR_DISP"]).read()
 out = os.environ["GNR_OUT"]
 M = [
  # (id, file, old, new, groups, description)
- ("l01", "lib", '    injected) echo "settle:delivered"; return 0 ;;', '    injected) echo "fallback:x"; return 0 ;;', "sw_inject", "an injected nudge is treated as lost"),
+ ("l01", "lib", '    injected) echo "settle:injected into the session"; return 0 ;;', '    injected) echo "fallback:x"; return 0 ;;', "sw_inject", "an injected nudge is treated as lost"),
  ("l02", "lib", "    failed|expired|superseded) echo \"fallback:it ended as '$st'${rsn:+ ($rsn)} without reaching the session\"; return 0 ;;", "    failed|expired|superseded) ;;", "sw_gone", "failed/expired wait for the age rule instead of mailing now"),
  ("l03", "lib", 'if [ "$age" -ge "$max" ]; then', 'if [ "$age" -gt "$max" ]; then', "sw_wait", "off by one at the pending limit"),
  ("l04", "lib", 'else cls="UNREADABLE"; fi', 'else cls="NONE"; fi', "sw_unread", "an unreadable closed list is read as 'not found'"),
@@ -407,7 +441,7 @@ M = [
  ("l08", "lib", '    [ "$age" -lt "${GATE_RCPT_MIN_AGE_S:-90}" ] && continue\n', '', "sw_age", "no minimum age"),
  ("l09", "lib", 'if [ -n "$last" ] && [ $((now - last)) -lt "${GATE_RCPT_RECHECK_S:-300}" ]; then continue; fi', 'if false; then continue; fi', "sw_age", "no re-check throttle"),
  ("l10", "lib", '($t != null) and ($t >= ($sent - 300))', '($t != null)', "sw_match", "no time window on the nudge bead"),
- ("l11", "lib", '| sort_by(.created_at) | .[0]', '| sort_by(.created_at) | .[-1]', "sw_match", "the newest look-alike instead of the oldest"),
+ ("l11", "lib", '    | .[0]\n    | if . == null then "NONE"', '    | .[-1]\n    | if . == null then "NONE"', "sw_match", "the newest look-alike instead of the oldest"),
  ("l12", "lib", '  [ "${DRY_RUN:-0}" = "1" ] && return 0\n  d="$(gate_rcpt_dir)"\n  [ -d "$d/pending" ] || return 0', '  d="$(gate_rcpt_dir)"\n  [ -d "$d/pending" ] || return 0', "sw_switch", "the sweep ignores DRY_RUN"),
  ("l13", "lib", '  [ "${DRY_RUN:-0}" = "1" ] && return 0\n  if [ -z "$bead" ]', '  if [ -z "$bead" ]', "send", "the record ignores DRY_RUN"),
  ("l14", "lib", 'BEAD_CITY="${bcity:-${GC_CITY:-}}" notify_author_with_fallback', 'notify_author_with_fallback', "sw_escal", "the helper comments in the HQ store"),
@@ -416,11 +450,15 @@ M = [
  ("l17", "lib", '    [ "$n" -ge "$max" ] && break\n', '', "sw_cap", "no per-sweep cap"),
  ("l18", "lib", "      *)          echo \"fallback:it was still not delivered after ${age}s (state '${st:-none}')\" ;;", '      *)          echo "wait:$cls" ;;', "sw_wait", "a queued nudge never ages into a mail"),
  ("l19", "lib", 'if [ "$rc" = "0" ]; then\n    verdict="mailed"', 'if [ "$rc" = "1" ]; then\n    verdict="mailed"', "sw_gone sw_escal", "mailed and escalated swapped"),
- ("l20", "lib", '$(_gate_rcpt_classify "$closed_json" "$probe" "$sent") || cls="UNREADABLE"', '$(_gate_rcpt_classify "$closed_json" "$probe" "$sent") || cls="NONE"', "sw_unread", "a jq failure on the closed list is read as 'not found'"),
+ ("l20", "lib", '$(_gate_rcpt_classify "$closed_json" "$probe" "$sent" "$to") || cls="UNREADABLE"', '$(_gate_rcpt_classify "$closed_json" "$probe" "$sent" "$to") || cls="NONE"', "sw_unread", "a jq failure on the closed list is read as 'not found'"),
  ("l21", "lib", '|| [ ! -s "$d/pending/$key.msg" ]; then', '; then', "sw_damage", "a record without its text is not damaged"),
  ("l25", "lib", 'if [ -n "$day" ] && closed_json=$(_gate_rcpt_list closed "$day"); then closed_ok=1; fi', 'if closed_json=$(_gate_rcpt_list closed "$day"); then closed_ok=1; fi', "sw_unread", "an uncomputable day still queries the closed list"),
  ("l22", "lib", 'if [ $(( $(date +%s) - t0 )) -ge "$budget" ]; then', 'if false; then', "sw_budget", "no time budget"),
  ("l23", "lib", '-mtime +30 -exec rm -f {} +', '-mtime +3650 -exec rm -f {} +', "sw_budget", "settled records are kept far too long"),
+ ("l26", "lib", '    accepted_for_injection) if [ "$sts" = "closed" ]; then echo "settle:accepted for hook-transport injection"; return 0; fi ;;\n', '', "sw_hook", "a closed accepted_for_injection (the hook-transport success) is read as a lost nudge: the reviewer's finding"),
+ ("l27", "lib", 'accepted_for_injection) if [ "$sts" = "closed" ]; then echo', 'accepted_for_injection) if true; then echo', "sw_hook", "an OPEN accepted_for_injection is settled as delivered before the hook drained it"),
+ ("l28", "lib", 'index("agent:" + $to)) != null)) then 0 else 1 end)', 'index("agent:" + $to)) != null)) then 1 else 1 end)', "sw_match", "the recipient's own nudge bead is not preferred over an older look-alike for another session"),
+ ("l29", "lib", '| map(select(type == "string" and . != ""))', '| map(select(type == "string"))', "sw_gone", "an empty terminal_reason hides the engine's close_reason (jq // keeps the empty string)"),
  ("l24", "lib", 'if [ "$n" -gt 0 ]; then find', 'if true; then find', "sw_budget", "an idle sweep trims too"),
  ("d01", "disp", 'if [ "$_noc" != "delivered" ] && [ "$_defer" != "1" ] && declare -F', 'if [ "$_defer" != "1" ] && declare -F', "send", "a delivered nudge is recorded too"),
  ("d02", "disp", 'if [ "$_noc" != "delivered" ] && [ "$_defer" != "1" ] && declare -F', 'if [ "$_noc" != "delivered" ] && declare -F', "send", "an ephemeral author is recorded"),
