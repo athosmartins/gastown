@@ -1,0 +1,38 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.gascity.config-drift-wake</string>
+  <!-- Config Drift Wake (2026-11-12, ga-wo99v8w): a pool session (dog, dog-remote, wa-worker, wa-worker-remote, ps-worker, ps-worker-remote) that the config-drift drain left asleep
+       with the reason config-drift WHILE an in_progress bead of its own names it gets ONE `gc session wake <id>` (at most once per session per 15 min), a comment line on the bead and a log line.
+       STOPGAP until the engine patch of ga-gn35963 is live (docs/pending-engine-window): when `strings $(readlink -f $(which gc)) | grep -c sessionHasLiveAssignedWorkForConfigDrift` finds the
+       symbol AND the supervisor restarted after the swap, unload this job and delete the files (docs/runbooks/config-drift-wake.md).
+       DRY_RUN 0 acts. Only an exact "0" acts; anything else is a dry run (WOULD-WAKE in the log, no wake, no comment, the clock not written). KILL-SWITCH CONFIG_DRIFT_WAKE_ENABLED=0 or the file
+       .gc/config-drift-wake.off. NOT VERIFIED LIVE: the roster key that carries the sleep reason (the code reads sleep_reason, then reason; CONFIG_DRIFT_WAKE_REASON_KEYS changes the list): the
+       first round writes a census line (asleep, with a readable reason, the reasons seen) and ROSTER-SEM-MOTIVO when no asleep row carries one: read it after loading.
+       StartInterval 307, off the 300 s step the other daemons share. A round with no candidate is ONE `gc session list`; with a candidate it is that plus rig list, one bd list per store and the
+       re-reads. The end of every round logs elapsed=: it has to stay under 307 (a longer round is not overlapped, the lock refuses a second copy). CALL_TIMEOUT 150 is the ceiling of each gc call:
+       the code default is 40, and with the mini at load 26 the roster read took 58 s to over 90 s (ga-pdyayy2); a value that is not an integer, or is below 5, falls back to 40 without a word, so
+       the start line of every round logs call_timeout=N: after a reload, that line says what the job runs with.
+       NOT LOADED BY MERGING THIS FILE: ~/Library/LaunchAgents/ holds the live copy, and this file lives in scripts/ on purpose (the installer only sweeps packs/town-deltas/assets). Not registered
+       in daemon-presence-watchdog.sh yet: register it in the SAME change that loads it (DPW_CRITICAL plus a heartbeat entry on the .out, 900 s), or the watchdog calls the missing job ABSENT. -->
+  <key>ProgramArguments</key>
+  <array>
+    <string>/usr/bin/python3</string>
+    <string>/Users/athos/gt/.gascity-gastown-hq/scripts/config-drift-wake.py</string>
+  </array>
+  <key>WorkingDirectory</key><string>/Users/athos/gt/.gascity-gastown-hq</string>
+  <key>StartInterval</key><integer>307</integer>
+  <key>StandardOutPath</key><string>/Users/athos/gt/.gascity-gastown-hq/.gc/logs/config-drift-wake.out</string>
+  <key>StandardErrorPath</key><string>/Users/athos/gt/.gascity-gastown-hq/.gc/logs/config-drift-wake.err</string>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key><string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:/Users/athos/go/bin:/Users/athos/.local/bin</string>
+    <key>HOME</key><string>/Users/athos</string>
+    <key>GC_CITY_PATH</key><string>/Users/athos/gt/.gascity-gastown-hq</string>
+    <key>CONFIG_DRIFT_WAKE_ENABLED</key><string>1</string>
+    <key>CONFIG_DRIFT_WAKE_DRY_RUN</key><string>0</string>
+    <key>CONFIG_DRIFT_WAKE_CALL_TIMEOUT</key><string>150</string>
+  </dict>
+</dict>
+</plist>
