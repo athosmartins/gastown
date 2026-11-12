@@ -1,0 +1,13 @@
+# ga-esorlre.4: antes do reboot das 23:40, toda crew nomeada e o Mayor com conversa grande E ociosa recebe `/compact` (nunca /clear) para a retomada
+# depois do boot ser barata (Athos, 12/11: compactar sempre, terminou ou não). ARMADILHA DO CRON (ver engine-window-reboot-noon.toml): cron de order é
+# UTC; 23:00 local (-03) = 02:00 UTC. O script só roda em 22:30-23:25 locais (--force à mão) e a última compactação ainda tem 10 min: acaba antes das 23:40.
+# Só LÊ roster, registros ~/.claude/sessions e transcripts e digita `/compact` em sessão provada ociosa; tokens antes/depois por alvo em
+# .gc/logs/nightly-session-compact.jsonl. Desligar: touch $GC_CITY_PATH/.gc/nightly-session-compact.off. Teste a seco no mini, sem enviar nada, antes da 1ª noite:
+#   python3 -I $GC_CITY_PATH/packs/town-deltas/assets/scripts/nightly-session-compact.py --force --dry-run
+# Mergeado não é vivo: `gc order show nightly-session-compact` e leia o log na manhã seguinte.
+[order]
+description = "23:00 local: compactar (nunca limpar) a conversa grande e ociosa de cada crew nomeada e do Mayor antes do reboot das 23:40 (ga-esorlre.4)"
+trigger = "cron"
+schedule = "0 2 * * *"
+timeout = "2400s"
+exec = "python3 -I $PACK_DIR/assets/scripts/nightly-session-compact.py"
