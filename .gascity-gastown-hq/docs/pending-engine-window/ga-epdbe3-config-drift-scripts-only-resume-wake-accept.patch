@@ -1,8 +1,8 @@
 diff --git a/cmd/gc/session_reconciler.go b/cmd/gc/session_reconciler.go
-index 328dd959b..339675144 100644
+index 66cdbdecbb..1e267e2d0c 100644
 --- a/cmd/gc/session_reconciler.go
 +++ b/cmd/gc/session_reconciler.go
-@@ -1855,6 +1855,38 @@ func reconcileSessionBeadsTracedWithNamedDemand(
+@@ -1862,6 +1862,38 @@ func reconcileSessionBeadsTracedWithNamedDemand(
  							}
  							continue
  						}
@@ -41,7 +41,7 @@ index 328dd959b..339675144 100644
  						if isNamedSessionBead(*session) {
  							// Defer config-drift restart for named sessions
  							// that are actively in use (pending interaction,
-@@ -4096,6 +4128,57 @@ func silentRebaselineSessionHashes(session *beads.Bead, store beads.Store, agent
+@@ -4108,6 +4140,57 @@ func silentRebaselineSessionHashes(session *beads.Bead, store beads.Store, agent
  	return nil
  }
  
@@ -100,11 +100,11 @@ index 328dd959b..339675144 100644
  // On a fresh provider start (first boot or wake_mode=fresh), it uses
  // SessionIDFlag to create a new provider conversation with the given key as
 diff --git a/cmd/gc/session_reconciler_scripts_drift_test.go b/cmd/gc/session_reconciler_scripts_drift_test.go
-index b7f278e31..f49175eda 100644
+index 5bfb73522c..7bebeff1b7 100644
 --- a/cmd/gc/session_reconciler_scripts_drift_test.go
 +++ b/cmd/gc/session_reconciler_scripts_drift_test.go
-@@ -263,3 +263,265 @@ func TestReconcileSessionBeads_ScriptsOnlyDriftStillDrainsResumeWakeCreating(t *
- 		t.Errorf("drain reason = %q, want config-drift", ds.reason)
+@@ -381,3 +381,265 @@ func TestReconcileSessionBeads_ScriptsDriftDoesNotDrainAwakeWorkerWithAssignedWo
+ 			ds, env.stdout.String(), env.stderr.String())
  	}
  }
 +

@@ -42,13 +42,12 @@ on an error). A session whose rig IS resolved keeps the single-rig answer.
   and applies in either order: checked with `git apply --check` alone on
   `8f1be0e2b3` and after v1's `session_reconciler.go` hunks. Its tests are in a
   NEW file (`session_reconciler_drift_cityscope_work_test.go`) on purpose.
-- WARNING about v1, not about this patch: v1's hunk on
-  `cmd/gc/session_reconciler_scripts_drift_test.go` appends at EOF against the
-  pre-gt-69j2v version of that file (`index b7f278e31`). On `8f1be0e2b3` that
-  hunk is rejected ("patch failed: ...scripts_drift_test.go:263") because the
-  gt-69j2v test is now the last function. v1's `session_reconciler.go` hunks
-  apply (offset +7 / +12). The window needs v1's test hunk re-appended after the
-  gt-69j2v test (that is how the baseline for this work was built).
+- v1 (`ga-epdbe3-...-resume-wake-accept.patch`) was re-anchored on `8f1be0e2b3`
+  by ga-meokeks (12/11): its test hunk used to be rejected at
+  `session_reconciler_scripts_drift_test.go:263` (the gt-69j2v test became the
+  last function). The file now applies clean on `8f1be0e2b3` alone, and in
+  either order with this patch (`git apply --check`, checked both orders).
+  Only hunk headers and `index` lines changed; the added code is the same.
 
 ## Tests (A/B on the MBP)
 
