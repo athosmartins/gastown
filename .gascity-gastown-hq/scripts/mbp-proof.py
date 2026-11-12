@@ -160,7 +160,7 @@ def pre_zcomp(pre: dict):
     return sorted(k for k in b["files"] if re.fullmatch("zdot/" + ZCOMP_RX, k))
 AGENT_PFX = "com.gascity.remote-session."  # o prefixo FIXO dos labels do agente do domínio gráfico (scripts/gc-session-ssh, AGENT_PFX); label = prefixo + nome da sessão
 MULTI = ("remote-test-remote-mbp-91", "remote-test-remote-mbp-92")  # as duas sessões LEVES de (g), fora do nome da sessão da prova (a 1ª, a que roda o claude) e dentro do SESSION_RE e do teto (cap 2)
-BEAD_RE = re.compile(r"[a-z]{2,8}-[a-z0-9]{2,16}(\.[0-9]{1,4}){0,3}")
+BEAD_RE = re.compile(r"[a-z]{2,8}-[a-z0-9]{2,16}(\.[0-9]{1,4}){0,8}")
 MARK, NMARK = "E2E-42-OK", "NUDGE-25-OK"  # o prompt só traz `$((6*7))`/`$((5*5))`: ver o número na tela quer dizer que o comando RODOU, não que o texto foi ecoado
 DIALOGS = ("trust this folder", "Yes, I trust", "Bypass Permissions", "Enter to confirm", "Choose the text style", "Security notes", "Do you want to proceed",
            "Please run /login", "Not logged in", "Invalid API key")

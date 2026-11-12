@@ -305,6 +305,15 @@ has "$T/out" "submetido: $BR2 @ $SHAB"; ok $? "2ª bead: a saída imprime o sha 
 clean_after2 ga-t2 "$BR2"; ok $? "2ª bead: worktree, branch local e ref temporária foram recolhidos"
 reset_db2; run_exe_a -- ga-t2 "refs/heads/worker/$SESS-2" "$SHAB"
 ok $((RC != 0)) "ref escrito com refs/heads/: aceito, mesmo caminho"
+# ga-ldg7vyv: o id da bead tem o MESMO teto de níveis `.N` do passo 2 do gate-done.md e do validate_bead_id do guard (8): 4 e 8 níveis passam da guarda de forma
+# (qualquer recusa que venha depois é outra, nunca "forma:"); 9 níveis é recusa de forma (sai 2, nada lido nem escrito).
+for deep in wa-p7ag21.14.2.2.1 wa-d3ys32.1.2.3.4.5.6.7.8; do
+  reset_db2; run_exe_a -- "$deep" "worker/$SESS-2" "$SHAB"
+  ! has "$T/err" "forma:"; ok $? "bead de fatia profunda $deep: passa da guarda de forma"
+done
+reset_db2; run_exe_a -- wa-d3ys32.1.2.3.4.5.6.7.8.9 "worker/$SESS-2" "$SHAB"
+ok $((RC != 2)) "bead com 9 níveis: recusa 2"; has "$T/err" "forma:"; ok $? "bead com 9 níveis: recusa de forma"
+[ "$(mut_count)" = 0 ]; ok $? "bead com 9 níveis: nada escrito"
 # sha que não é o do espelho: recusa ANTES do marcador, dizendo os dois
 reset_db2; run_exe_a -- ga-t2 "worker/$SESS-2" "$SHA"
 ok $((RC != 1)) "sha que não é o do espelho: recusa 1"; has "$T/err" "o espelho tem ${SHAB:0:12}"; ok $? "sha errado: diz o que o espelho tem"

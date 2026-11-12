@@ -5917,15 +5917,18 @@ validate_branch() {
 
 # Validate bead ID: e.g. "gt-abc123", "wa-xyz", "ga-qw3p.1" (sub-beads),
 # "wa-d3ys32.2.1" (a sub-bead of a sub-bead — E11 slicing makes these).
-# ga-ovz0up: up to 3 dotted levels of 1-4 digits. This is a SECURITY check (the id
-# reaches bd/labels/branch names), so the ceiling stays bounded: no unbounded
-# repeat, no empty level, no non-digit level, same 16-char suffix cap. The id shape
-# in commands/gate-done.md Step 2 must stay identical — a one-sided change makes
-# /gate-done build a marker this function rejects (gate-status:error), or the
-# reverse; gate-done-dotted-bead-id.selftest.sh checks both sides together.
+# ga-ovz0up: dotted levels of 1-4 digits; ga-ldg7vyv raised the ceiling from 3 to 8
+# (wa-p7ag21.14.2.2.1 is a real 4-level slice; `bd create --parent` nests without
+# a cap). This is a SECURITY check (the id reaches bd/labels/branch names), so the
+# ceiling stays bounded: no unbounded repeat, no empty level, no non-digit level,
+# same 16-char suffix cap. The id shape in commands/gate-done.md Step 2 (and its
+# internal/templates copy), scripts/gate-done-remote.py BEAD_RE and the selftests
+# must stay identical — a one-sided change makes /gate-done build a marker this
+# function rejects (gate-status:error), or the reverse;
+# gate-done-dotted-bead-id.selftest.sh checks both sides together.
 validate_bead_id() {
   local val="$1"
-  if [[ "$val" =~ ^[a-z]{1,8}-[a-z0-9]{2,16}(\.[0-9]{1,4}){0,3}$ ]]; then
+  if [[ "$val" =~ ^[a-z]{1,8}-[a-z0-9]{2,16}(\.[0-9]{1,4}){0,8}$ ]]; then
     return 0
   fi
   return 1

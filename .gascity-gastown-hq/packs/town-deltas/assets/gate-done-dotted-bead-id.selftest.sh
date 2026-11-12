@@ -28,12 +28,16 @@
 #   (A) 2- and 3-level dotted ids resolve from crew/* and generic branches
 #   (B) suffix up to 16 chars resolves (aligned with the guard's cap)
 #   (C) controls: ids that already worked keep resolving the same way
-#   (D) beyond the shared ceiling (4 levels, 5-digit sub-id) -> Step 2 gives
+#   (A2) ga-ldg7vyv: 4-, 5- and 8-level slices (wa-p7ag21.14.2.2.1) resolve —
+#       the ceiling was 3 levels, so a slice of a slice of a slice was refused
+#       by Step 2 (BEAD_ID empty) and by the guard
+#   (D) beyond the shared ceiling (9 levels, 5-digit sub-id) -> Step 2 gives
 #       EMPTY (fail closed), never the truncated parent
 #   (E) CONTRACT: every id Step 2 resolves is accepted by validate_bead_id
 #   (F) the guard validator still rejects everything unsafe (security ceiling)
-#   (G) mutation guard: the pre-fix guard regex rejects wa-d3ys32.2.1, so (E)
-#       would have caught the live incident
+#   (G) mutation guard: the pre-fix guard regex rejects wa-d3ys32.2.1 (and the
+#       ga-ldg7vyv-era {0,3} regex rejects wa-p7ag21.14.2.2.1), so (E) would
+#       have caught both live incidents
 #
 # Exit 0 iff every assertion holds.
 set -uo pipefail
@@ -86,6 +90,15 @@ CASES_RESOLVE=(
   "fix/wa-d3ys32.2.1|wa-d3ys32.2.1"
   "crew/wa-worker/wa-d3ys32.2.1.3|wa-d3ys32.2.1.3"
   "fix/wa-d3ys32.2.1.3-desc|wa-d3ys32.2.1.3"
+  # (A2) ga-ldg7vyv: 4/5/8 levels (the real slice wa-p7ag21.14.2.2.1 has 4)
+  "crew/mila/wa-p7ag21.14.2.2.1-fix-x|wa-p7ag21.14.2.2.1"
+  "crew/mila/wa-p7ag21.14.2.2.1|wa-p7ag21.14.2.2.1"
+  "fix/wa-p7ag21.14.2.2.1-desc|wa-p7ag21.14.2.2.1"
+  "fix/wa-p7ag21.14.2.2.1|wa-p7ag21.14.2.2.1"
+  "crew/mila/wa-p7ag21.14.2.2.1.3-x|wa-p7ag21.14.2.2.1.3"
+  "fix/wa-p7ag21.14.2.2.1.3|wa-p7ag21.14.2.2.1.3"
+  "crew/mila/wa-d3ys32.1.2.3.4.5.6.7.8-x|wa-d3ys32.1.2.3.4.5.6.7.8"
+  "fix/wa-d3ys32.1.2.3.4.5.6.7.8-x|wa-d3ys32.1.2.3.4.5.6.7.8"
   # (B) suffix longer than 8 chars (guard accepts up to 16)
   "crew/wa-worker/wa-prodmotor|wa-prodmotor"
   "fix/wa-prodmotor-desc|wa-prodmotor"
@@ -101,8 +114,10 @@ CASES_RESOLVE=(
   # full id is recovered later by the ga-3xuanq store-identity upgrade
   "crew/mila/wa-campanha-diaria|wa-campanha"
   # (D) past the shared ceiling -> fail closed, never the truncated parent
-  "crew/wa-worker/wa-d3ys32.1.2.3.4|"
-  "fix/wa-d3ys32.1.2.3.4-desc|"
+  "crew/wa-worker/wa-d3ys32.1.2.3.4.5.6.7.8.9|"
+  "fix/wa-d3ys32.1.2.3.4.5.6.7.8.9-desc|"
+  "crew/wa-worker/wa-p7ag21.14.2.2.12345|"
+  "fix/wa-p7ag21.14.2.2.12345-desc|"
   "crew/wa-worker/wa-x1y2.12345|"
   "fix/wa-x1y2.12345-desc|"
   "crew/wa-worker/wa-abcdefghijklmnopq|"
@@ -156,7 +171,9 @@ done
 # widening above must not loosen it beyond dotted levels + the 16-char suffix.
 echo "── (F) validate_bead_id: still rejects everything unsafe ──"
 for V in "" "WA-D3YS32" "wa-d3ys32." "wa-d3ys32.2." "wa-d3ys32..2" "wa-d3ys32.a" \
-         "wa-d3ys32.1.2.3.4" "wa-d3ys32.12345" "wa-d3ys32.2.1.12345" "wa-abcdefghijklmnopq" \
+         "wa-d3ys32.1.2.3.4.5.6.7.8.9" "wa-d3ys32.12345" "wa-d3ys32.2.1.12345" "wa-abcdefghijklmnopq" \
+         "wa-p7ag21.14.2.2.x" "wa-p7ag21.14.2.2." "wa-p7ag21.14..2.2.1" "wa-p7ag21.14.2.2.12345" \
+         'wa-p7ag21.14.2.2.1;id' 'wa-p7ag21.14.2.2.1$(id)' $'wa-p7ag21.14.2.2\n.1' \
          "wa-a" "-d3ys32" "wa-d3ys32;id" 'wa-d3ys32$(id)' 'wa-d3ys32`id`' "wa-d3ys32 x" \
          "wa-d3ys32/../x" "wa_d3ys32" $'wa-d3ys32\nrm' $'wa-d3ys32.2\n.1'; do
   if validate_bead_id "$V"; then
@@ -166,7 +183,8 @@ for V in "" "WA-D3YS32" "wa-d3ys32." "wa-d3ys32.2." "wa-d3ys32..2" "wa-d3ys32.a"
   fi
 done
 echo "── (F2) validate_bead_id: accepts the legitimate shapes ──"
-for V in "ga-xj6rp0" "ga-qw3p.1" "wa-d3ys32.2.1" "wa-d3ys32.2.1.3" "wa-prodmotor" "wa-abcdefghijklmnop" "ps-8iuu.12" "gt-abc123"; do
+for V in "ga-xj6rp0" "ga-qw3p.1" "wa-d3ys32.2.1" "wa-d3ys32.2.1.3" "wa-prodmotor" "wa-abcdefghijklmnop" "ps-8iuu.12" "gt-abc123" \
+         "wa-p7ag21.14.2.2.1" "wa-p7ag21.14.2.2.1.3" "wa-d3ys32.1.2.3.4.5.6.7.8"; do
   if validate_bead_id "$V"; then ok "validate_bead_id accepts '$V'"; else bad "validate_bead_id REJECTED legitimate id '$V'"; fi
 done
 
@@ -177,6 +195,14 @@ if [[ "wa-d3ys32.2.1" =~ ^[a-z]{1,8}-[a-z0-9]{2,16}(\.[0-9]{1,4})?$ ]]; then
   bad "pre-fix guard regex unexpectedly accepts wa-d3ys32.2.1 — (E)/(F2) would not catch a reversion"
 else
   ok "pre-fix guard regex rejects wa-d3ys32.2.1 (the incident) — (E)/(F2) discriminate"
+fi
+
+# (G2) ga-ldg7vyv mutation guard: the {0,3} guard regex that was live until the
+# ceiling moved rejects the real 4-level slice.
+if [[ "wa-p7ag21.14.2.2.1" =~ ^[a-z]{1,8}-[a-z0-9]{2,16}(\.[0-9]{1,4}){0,3}$ ]]; then
+  bad "{0,3} guard regex unexpectedly accepts wa-p7ag21.14.2.2.1 — (A2)/(F2) would not catch a reversion"
+else
+  ok "{0,3} guard regex rejects wa-p7ag21.14.2.2.1 (ga-ldg7vyv) — (A2)/(F2) discriminate"
 fi
 
 echo

@@ -307,7 +307,7 @@ case "$BRANCH" in
     # char class alone has no '.', so a dotted sub-bead id used to truncate at
     # the dot (ps-8iuu.4 -> ps-8iuu, the PARENT epic).
     # ga-ovz0up: the id shape here MUST equal the guard's validate_bead_id
-    # (quality-gate-guard.sh) — suffix up to 16 chars, up to 3 dotted levels of
+    # (quality-gate-guard.sh) — suffix up to 16 chars, up to 8 dotted levels of
     # 1-4 digits (wa-d3ys32.2.1 is a child of a child; E11 slicing makes them).
     # With one level only, a two-level id matched its PARENT and the identity
     # pre-filter below discarded it; a looser digit count here would hand the
@@ -317,7 +317,7 @@ case "$BRANCH" in
     # finds nothing either; falhou → a grep error is the same empty, so no marker
     # is ever built from a failed read.
     BEAD_ID=$(printf '%s\n' "$_CREW_SEG" \
-      | grep -oE '^[a-z]{2,8}-[a-z0-9]{2,16}(\.[0-9]{1,4}){0,3}' | head -1 2>/dev/null || echo "")
+      | grep -oE '^[a-z]{2,8}-[a-z0-9]{2,16}(\.[0-9]{1,4}){0,8}' | head -1 2>/dev/null || echo "")
     # ga-pkvfc: existence-check below is not identity-check — a truncated
     # match can coincidentally BE a real bead (a dotted sub-bead's truncated
     # prefix is its parent epic, which really exists), so existence alone
@@ -355,14 +355,14 @@ case "$BRANCH" in
     # here (unlike the crew arm, which truncated at the dot instead), and
     # BEAD_ID came back empty.
     # ga-ovz0up: same id shape as the crew/*/* arm above and the guard's
-    # validate_bead_id (suffix up to 16, up to 3 dotted levels of 1-4 digits) —
-    # see the note there. A shape past that ceiling (4 levels, 5-digit sub-id)
+    # validate_bead_id (suffix up to 16, up to 8 dotted levels of 1-4 digits) —
+    # see the note there. A shape past that ceiling (9 levels, 5-digit sub-id)
     # matches nothing here, so BEAD_ID stays empty and goes to the SECONDARY
     # lookup / FAIL CLOSED block instead of shipping a truncated parent id.
     # vazio → BEAD_ID empty (same SECONDARY-then-FAIL-CLOSED path as above);
     # falhou → same.
-    BEAD_ID=$(echo "$BRANCH" | grep -oE '^[^/]+/[a-z]{2,8}-[a-z0-9]{2,16}(\.[0-9]{1,4}){0,3}(-|$)' \
-      | grep -oE '[a-z]{2,8}-[a-z0-9]{2,16}(\.[0-9]{1,4}){0,3}' 2>/dev/null || echo "")
+    BEAD_ID=$(echo "$BRANCH" | grep -oE '^[^/]+/[a-z]{2,8}-[a-z0-9]{2,16}(\.[0-9]{1,4}){0,8}(-|$)' \
+      | grep -oE '[a-z]{2,8}-[a-z0-9]{2,16}(\.[0-9]{1,4}){0,8}' 2>/dev/null || echo "")
     ;;
   *)
     BEAD_ID=""

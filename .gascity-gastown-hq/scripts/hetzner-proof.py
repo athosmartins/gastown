@@ -665,7 +665,7 @@ def main(argv: list) -> int:
     la.add_argument("--timeout", type=int, default=120)
     la.add_argument("--control", type=int, default=10, help="prompts do controle direto no mini (0 desliga)")
     e = sub.add_parser("e2e")
-    e.add_argument("--bead", default="ga-2hd02v.1.5.3", type=_arg(r"[a-z]{2,8}-[a-z0-9]{2,16}(\.[0-9]{1,4}){0,3}", "id de bead"))
+    e.add_argument("--bead", default="ga-2hd02v.1.5.3", type=_arg(r"[a-z]{2,8}-[a-z0-9]{2,16}(\.[0-9]{1,4}){0,8}", "id de bead"))
     e.add_argument("--model", default="haiku", type=_arg(r"[A-Za-z0-9._-]{1,40}", "modelo"))
     e.add_argument("--timeout", type=int, default=900)
     e.add_argument("--prompts", type=int, default=0, help="N prompts curtos à mesma sessão depois dos passos (0 = só os 7 passos)")
