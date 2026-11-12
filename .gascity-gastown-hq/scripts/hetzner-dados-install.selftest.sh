@@ -23,7 +23,7 @@ mk passwd 'echo "dados ${PW_STATE:-L} 2026-11-11 0 99999 7 -1"'
 mk ssh-keygen 'echo "ssh-keygen $*" >> "$LOG"; ! grep -q BADKEY "$3"'
 mk sshd 'echo "sshd $*" >> "$LOG"
 case "$1" in -t) [ -z "${SSHD_T_FAIL:-}" ] ;; -T) case "$3" in user=dados,*) [ -n "${SSHD_DADOS_WRONG:-}" ] && echo "authorizedkeysfile .ssh/authorized_keys" || { [ -f "$R/etc/ssh/sshd_config.d/50-gt-dados.conf" ] && sed -n "s#^ *AuthorizedKeysFile \(.*\)#authorizedkeysfile \1#p" "$R/etc/ssh/sshd_config.d/50-gt-dados.conf"; } ;; *) echo "authorizedkeysfile ${SSHD_RUNNER_LEAK:-.ssh/authorized_keys}" ;; esac ;; esac'
-mk systemctl 'echo "systemctl $*" >> "$LOG"'
+mk systemctl 'echo "systemctl $*" >> "$LOG"; [ "${SWEEP_FAIL:-}" = 1 ] && [ "$1 $2" = "start gt-dados-sweep.service" ] && exit 1; exit 0'
 mk visudo 'echo "visudo $*" >> "$LOG"; [ -z "${VISUDO_MISSING:-}" ] || exit 127; [ -z "${VISUDO_FAIL:-}" ]'
 mk mountpoint '[ -f "$T/mounted" ]'
 mk mount 'echo "mount $*" >> "$LOG"; touch "$T/mounted"; echo "dados dados 700" > "$T/own/$(echo "$R/srv/gtdados" | tr / _)"'
@@ -75,6 +75,7 @@ case_happy() { local s=$1; world; ap "$s" --entrypoint build-x --runner runner -
   ck "timer: enable --now e a varredura roda uma vez" bash -c "grep -q '^systemctl enable --now gt-dados-sweep.timer' '$LOG' && grep -q '^systemctl start gt-dados-sweep.service' '$LOG'"
   ap "$s" --entrypoint build-x --runner runner --stage-size 6g; ck "2ª instalação (idempotente): rc 0, 1 linha # gt-dados no fstab, 1 sudoers por entrypoint" bash -c "[ $RC = 0 ] && [ \"\$(grep -c '# gt-dados\$' '$R/etc/fstab')\" = 1 ] && [ \"\$(grep -c '^runner ' '$R/etc/sudoers.d/gt-dados-run')\" = 2 ] && [ \"\$(grep -c '^useradd' '$LOG')\" = 1 ]"; }
 case_rollback() { local s=$1
+  world; SWEEP_FAIL=1 ap "$s"; ck "1ª varredura falha ou passa do prazo → 98 sweep-primeira (nunca instalação 'ok' sem varredura)" bash -c "[ $RC = 98 ] && grep -q 'falhou:sweep-primeira' '$ERR'"
   world; echo "# ANTERIOR" > "$R/etc/ssh/sshd_config.d/50-gt-dados.conf"; SSHD_T_FAIL=1 ap "$s"; ck "sshd -t reprova → 98, drop-in ANTERIOR restaurado, sem reload" bash -c "[ $RC = 98 ] && grep -q ANTERIOR '$R/etc/ssh/sshd_config.d/50-gt-dados.conf' && ! grep -q '^systemctl reload' '$LOG'"
   world; SSHD_T_FAIL=1 ap "$s"; ck "sshd -t reprova sem drop-in anterior → drop-in removido" test ! -e "$R/etc/ssh/sshd_config.d/50-gt-dados.conf"
   world; SSHD_DADOS_WRONG=1 ap "$s"; ck "dados fora do arquivo de root → 98, drop-in desfeito, sem reload" bash -c "[ $RC = 98 ] && [ ! -e '$R/etc/ssh/sshd_config.d/50-gt-dados.conf' ] && ! grep -q '^systemctl reload' '$LOG'"
@@ -104,6 +105,7 @@ mut I7-fstab-ilegivel-vira-vazio 's#\[ \$? -le 1 \] || die fstab-leitura#true#' 
 mut I8-sem-guarda-de-link 's#die "link-fora-da-arvore:\$l"#true#' case_refuse
 mut I9-chave-sem-restrict 's#restrict,command=#command=#' case_happy
 mut I10-sudoers-com-curinga 's#gt-dados-run \$e"#gt-dados-run *"#' case_happy
+mut I16-1a-varredura-falha-vira-ok 's#|| die sweep-primeira#|| true#' case_rollback
 mut I11-fstab-sem-noexec 's#,noexec,nosuid,nodev,nofail 0 0#,nosuid,nodev,nofail 0 0#' case_happy
 mut I15-fstab-sem-nofail 's#,nodev,nofail 0 0#,nodev 0 0#' case_happy
 mut I12-undo-nao-desfaz 's#^undo() { if.*#undo() { die "$1"; }#' case_rollback

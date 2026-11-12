@@ -2,7 +2,7 @@
 # prod-tests/gascity/story-ga-qg1dw5z.1.sh — prod test para ga-qg1dw5z.1: Hetzner trava 1 (dado pessoal só no usuário `dados`, só enquanto o build roda).
 # O que esta fatia ENTREGA é código versionado (instalador de root, wrapper, canal do mini, varredura, prova) e o runbook; a INSTALAÇÃO no nó é um passo de root separado (docs/runbooks/hetzner-dados.md).
 # Por isso o teste confere a árvore viva: arquivos presentes e executáveis, sintaxe, e as garantias do contrato no TEXTO do que será instalado (sem curinga no sudoers, chave de root com restrict, tmpfs
-# noexec/nosuid/nodev, recusa de swap e de staging fora do tmpfs, `dados` com shell real). Hermético: não fala com o nó, não chama gc/bd, não toca em .gc/. As baterias (119 + 73 casos e os mutantes) são a
+# noexec/nosuid/nodev, recusa de swap e de staging fora do tmpfs, `dados` com shell real). Hermético: não fala com o nó, não chama gc/bd, não toca em .gc/. As baterias (127 + 75 casos e os mutantes) são a
 # evidência do gate e rodam no nó Linux; aqui só se confere que existem.
 set -uo pipefail
 
@@ -60,6 +60,10 @@ has "$ING" 'no link-simbolico-ou-ilegivel 65'                      || fail "inge
 has "$ING" 'no stage-nao-e-tmpfs 98'                               || fail "ingest: grava dado fora do tmpfs"
 has "$SWP" 'NAO-CONSEGUI'                                          || fail "varredura: não distingue 'não consegui' de 'limpo'"
 has "$SWP" 'cant "stage-nao-e-tmpfs'                               || fail "varredura: não acusa staging fora do tmpfs"
+has "$SWP" 'flock -w "\$LOCKWAIT" -E 75 8'                         || fail "varredura: não toma o lock do wrapper (um build no meio perderia o staging)"
+has "$SWP" 'timeout -k 5 "\$SCANSECS" find'                        || fail "varredura: find sem prazo (no nó real a árvore do /tmp travou 40+ min sem escrever o log)"
+has "$SWP" '-maxdepth 1'                                           || fail "varredura: /tmp inteiro em vez do 1º nível"
+has "$INST" 'timeout 900 systemctl start gt-dados-sweep.service \|\| die sweep-primeira' || fail "instalador: 1ª varredura sem prazo ou sem falhar alto"
 log "ingest e varredura ✓"
 
 # ── runbook: contrato, instalação, prova, ordem com a trava 2

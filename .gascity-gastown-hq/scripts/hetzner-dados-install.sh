@@ -93,6 +93,8 @@ echo "tmpfs $STAGE tmpfs size=$SIZE,mode=0700,uid=$(id -u "$DU"),gid=$(id -g "$D
 mkdir -p "$STAGE" && systemctl daemon-reload && { if mountpoint -q "$STAGE"; then mount -o remount "$STAGE"; else mount "$STAGE"; fi; } || die mount
 printf '[Unit]\nDescription=gt-dados: varredura do dado que o trap nao apagou\n[Service]\nType=oneshot\nNice=10\nExecStart=%s/gt-dados-sweep\n' "$SBIN" > "$UNITS/gt-dados-sweep.service" || die unit
 printf '[Unit]\nDescription=gt-dados: varredura diaria\n[Timer]\nOnCalendar=*-*-* 04:17:00 UTC\nPersistent=true\n[Install]\nWantedBy=timers.target\n' > "$UNITS/gt-dados-sweep.timer" || die unit
-systemctl daemon-reload && systemctl enable --now gt-dados-sweep.timer && systemctl start gt-dados-sweep.service || die timer
+systemctl daemon-reload && systemctl enable --now gt-dados-sweep.timer || die timer
+# a 1ª varredura roda AQUI e tem prazo: no nó real (/tmp com ~1,7 mi de entradas) a versão sem prazo ficou 40+ min presa sem escrever o log. Passou do prazo ou saiu ≠ 0 (NAO-CONSEGUI) → a instalação falha ALTO
+timeout 900 systemctl start gt-dados-sweep.service || die sweep-primeira
 echo "GTD-INSTALL: aplicado; conferindo (--check) e a varredura rodou uma vez (veja $LOGF)"
 check
