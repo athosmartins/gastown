@@ -8,10 +8,11 @@
        STOPGAP until the engine patch of ga-gn35963 is live (docs/pending-engine-window): when `strings $(readlink -f $(which gc)) | grep -c sessionHasLiveAssignedWorkForConfigDrift` finds the
        symbol AND the supervisor restarted after the swap, unload this job and delete the files (docs/runbooks/config-drift-wake.md).
        DRY_RUN 0 acts. Only an exact "0" acts; anything else is a dry run (WOULD-WAKE in the log, no wake, no comment, the clock not written). KILL-SWITCH CONFIG_DRIFT_WAKE_ENABLED=0 or the file
-       .gc/config-drift-wake.off. NOT VERIFIED LIVE: the roster key that carries the sleep reason (the code reads sleep_reason, then reason; CONFIG_DRIFT_WAKE_REASON_KEYS changes the list): the
-       first round writes a census line (asleep, with a readable reason, the reasons seen) and ROSTER-SEM-MOTIVO when no asleep row carries one: read it after loading.
-       StartInterval 307, off the 300 s step the other daemons share. A round with no candidate is ONE `gc session list`; with a candidate it is that plus rig list, one bd list per store and the
-       re-reads. The end of every round logs elapsed=: it has to stay under 307 (a longer round is not overlapped, the lock refuses a second copy). CALL_TIMEOUT 150 is the ceiling of each gc call:
+       .gc/config-drift-wake.off. WHERE THE REASON LIVES: not in the `gc session list` row (it carries no reason key, read live on 12/11) but in the SESSION BEAD, metadata.sleep_reason (`bd show <id>`;
+       the REASON column of `gc session list` prints that same field). NOT VERIFIED LIVE: a session bead carrying sleep_reason=config-drift (none existed when this was written): the first round writes a
+       census line with motivos= (the reasons the asleep pool sessions carry) and, when none of them has a readable reason, WARN BEAD-SEM-MOTIVO and exit code 1: read it after loading.
+       StartInterval 307, off the 300 s step the other daemons share. A round with no asleep pool session is ONE `gc session list`; with them it is that plus ONE `bd show` per such session (at most 30), and
+       with a candidate also rig list, one bd list per store and the re-reads. The end of every round logs elapsed=: it has to stay under 307 (a longer round is not overlapped, the lock refuses a second copy). CALL_TIMEOUT 150 is the ceiling of each gc call:
        the code default is 40, and with the mini at load 26 the roster read took 58 s to over 90 s (ga-pdyayy2); a value that is not an integer, or is below 5, falls back to 40 without a word, so
        the start line of every round logs call_timeout=N: after a reload, that line says what the job runs with.
        NOT LOADED BY MERGING THIS FILE: ~/Library/LaunchAgents/ holds the live copy, and this file lives in scripts/ on purpose (the installer only sweeps packs/town-deltas/assets). Not registered

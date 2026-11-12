@@ -9,15 +9,21 @@ verdade é o patch do motor (docs/pending-engine-window/ga-gn35963-*.patch).
 SAI QUANDO o patch da ga-gn35963 estiver NO AR: o binário `gc` com o símbolo `sessionHasLiveAssignedWorkForConfigDrift` (`strings $(readlink -f $(which gc)) | grep -c sessionHasLiveAssignedWorkForConfigDrift`) E o
 supervisor reiniciado depois da troca. Aí se descarrega o job e se apagam estes arquivos (docs/runbooks/config-drift-wake.md); mergeado ≠ vivo, então a conferência é no binário, não na bead.
 
-REGRA  Por rodada lê o roster (`gc session list --json`). CANDIDATA = sessão de template de pool (CONFIG_DRIFT_WAKE_TEMPLATES: dog, dog-remote, wa-worker, wa-worker-remote, ps-worker, ps-worker-remote; pelo campo
-`template` OU pelo nome; o MBP, `-remote-mbp-`, fica fora) com state `asleep`, não fechada e motivo do sono == `config-drift` (chave `sleep_reason` ou `reason` da linha, CONFIG_DRIFT_WAKE_REASON_KEYS: NÃO VERIFICADO
-ao vivo, o nó recusa `gc session list`; a linha `census` de cada rodada diz quantas asleep trazem motivo legível e quais motivos aparecem, e `ROSTER-SEM-MOTIVO` avisa quando nenhuma traz). Sem candidata a rodada
-acaba ali (uma leitura só). Com candidata lê as in_progress de todas as lojas (`gc rig list` + `bd -C <loja> list`) e a acorda se há bead feature/bug/task/chore cujo assignee é um dos nomes dela (id, session_name,
-name, alias, agent_name), o `bead_state.derive` com o dono dado como morto diz `stranded` (park, gate e entrega ficam de fora), a bead não tem `pilot:dispatching`, nenhuma outra sessão não-morta responde pelo mesmo
-nome (gêmea viva = trabalho em dobro) e nenhuma outra candidata aponta para a mesma bead. UMA vez por sessão a cada CONFIG_DRIFT_WAKE_COOLDOWN_SEC (900), relógio em .gc/state/config-drift-wake.json gravado ANTES do
-`gc session wake <id>`; no máximo CONFIG_DRIFT_WAKE_MAX_PER_RUN (6) por rodada. Antes de agir relê roster e bead e decide de novo. Depois do wake, uma linha de comentário na bead e uma no log: o comando é um PEDIDO
-de acordar, não prova de que a sessão subiu (se seguir dormindo, a rodada seguinte mostra e a trava decide a nova tentativa).
-TRÊS ESTADOS  roster ilegível/vazio = nada é decidido (rc 1); loja ilegível = a candidata cuja bead pode estar lá é "não sei" e não acorda; relógio ilegível = nada acorda na rodada; releitura que falha = SKIP.
+REGRA  Por rodada lê o roster (`gc session list --json`). A linha do roster NÃO traz o motivo do sono (o revisor do gate leu as 20 chaves ao vivo, 12/11: nenhuma de motivo): ele mora na BEAD DE SESSÃO, em
+`metadata.sleep_reason` (`bd -C <cidade> show <id> --json`; o id da linha é o id da bead, como o revisor leu). A coluna REASON do `gc session list` imprime esse mesmo campo (fonte aberto do motor,
+`lifecycleDisplayReasonFromViewInfo`) e `config-drift` é o literal que esse fonte define (`SleepReasonConfigDrift`); o Mayor viu `asleep · config-drift` nela em 12/11. CANDIDATA = sessão de template de pool (CONFIG_DRIFT_WAKE_TEMPLATES: dog, dog-remote, wa-worker, wa-worker-remote, ps-worker, ps-worker-remote; pelo campo `template` OU pelo
+nome; o MBP, `-remote-mbp-`, fica fora) com state `asleep` na linha, não fechada, e a bead de sessão dela com `sleep_reason` == `config-drift`. Sem sessão de pool asleep a rodada acaba ali (uma leitura só); com
+elas é UMA leitura de bead de sessão por sessão (no máximo CONFIG_DRIFT_WAKE_MAX_PROBES, 30). Com candidata lê as in_progress de todas as lojas (`gc rig list` + `bd -C <loja> list`) e a acorda se há bead
+feature/bug/task/chore cujo assignee é um dos nomes dela (id, session_name, name, alias, agent_name), o `bead_state.derive` com o dono dado como morto diz `stranded` (park, gate e entrega ficam de fora), a bead
+não tem `pilot:dispatching`, nenhuma outra sessão não-morta responde pelo mesmo nome (gêmea viva = trabalho em dobro) e nenhuma outra candidata aponta para a mesma bead. UMA vez por sessão a cada
+CONFIG_DRIFT_WAKE_COOLDOWN_SEC (900), relógio em .gc/state/config-drift-wake.json gravado ANTES do `gc session wake <id>`; no máximo CONFIG_DRIFT_WAKE_MAX_PER_RUN (6) por rodada. Antes de agir relê roster, bead e
+bead de sessão e decide de novo. Depois do wake, uma linha de comentário na bead e uma no log: o comando é um PEDIDO de acordar, não prova de que a sessão subiu (se seguir dormindo, a rodada seguinte mostra e a
+trava decide a nova tentativa).
+NÃO VERIFICADO AO VIVO  uma bead de sessão com `sleep_reason=config-drift` de uma sessão que o drift de fato adormeceu: nenhuma existia quando isto foi escrito (as duas de 12/11 fecharam por idle-timeout e o
+motivo foi sobrescrito). A linha `census` de cada rodada traz `motivos=` com os motivos que as sessões de pool asleep carregam (`drained`, `idle-timeout`, `config-drift`...): a 1ª rodada com uma sessão presa
+confere o literal. Se NENHUMA sessão de pool asleep trouxer motivo legível, o `.out` diz `WARN BEAD-SEM-MOTIVO` e a rodada sai com rc 1 (o job não pode ficar cego com o batimento fresco).
+TRÊS ESTADOS  roster ilegível/vazio = nada é decidido (rc 1); bead de sessão ilegível = "não sei" e não acorda; nenhuma sessão de pool asleep com motivo legível = cego, rc 1; loja ilegível = a candidata cuja bead pode estar lá
+é "não sei" e não acorda; relógio ilegível = nada acorda na rodada; releitura que falha = SKIP.
 NÃO FAZ  não fecha nem reabre bead, não mexe em worktree, não acorda sessão fora do pool, a do MBP nem a sem bead. CONFIG_DRIFT_WAKE_ENABLED≠1 → no-op. CONFIG_DRIFT_WAKE_DRY_RUN: só "0" exato age (ausente/vazio/
 lixo = ENSAIO: loga WOULD-WAKE, sem wake, sem comentário e sem gravar o relógio). .gc/config-drift-wake.off → no-op.
 """
@@ -59,6 +65,11 @@ def _list_env(name, default):
     return v or default
 
 
+def _norm(v):
+    # texto → minúsculo, sem espaço nas pontas, com espaço e `_` trocados por `-` (Config_Drift == config-drift); o que não é texto → ""
+    return re.sub(r"[\s_]+", "-", v.strip().lower()) if isinstance(v, str) else ""
+
+
 ENABLED = os.environ.get("CONFIG_DRIFT_WAKE_ENABLED", "1") == "1"
 DRY_RUN = os.environ.get("CONFIG_DRIFT_WAKE_DRY_RUN", "1") != "0"   # só "0" exato age; qualquer outra coisa é ensaio
 COOLDOWN_SEC = _int_env("CONFIG_DRIFT_WAKE_COOLDOWN_SEC", 900, 60)
@@ -66,14 +77,14 @@ MAX_PER_RUN = _int_env("CONFIG_DRIFT_WAKE_MAX_PER_RUN", 6, 1)
 BD_TIMEOUT = _int_env("CONFIG_DRIFT_WAKE_BD_TIMEOUT", 60, 5)
 CALL_TIMEOUT = _int_env("CONFIG_DRIFT_WAKE_CALL_TIMEOUT", 40, 5)    # teto de cada `gc`; o plist põe 150 (sob load 26 o session list levou 58-90 s: ga-pdyayy2)
 TEMPLATES = _list_env("CONFIG_DRIFT_WAKE_TEMPLATES", ["dog", "dog-remote", "wa-worker", "wa-worker-remote", "ps-worker", "ps-worker-remote"])
-REASON_KEYS = _list_env("CONFIG_DRIFT_WAKE_REASON_KEYS", ["sleep_reason", "reason"])
-REASON = re.sub(r"[\s_]+", "-", os.environ.get("CONFIG_DRIFT_WAKE_REASON", "").strip().lower()) or "config-drift"
+PROBE_MAX = _int_env("CONFIG_DRIFT_WAKE_MAX_PROBES", 30, 1)         # teto de leituras de bead de sessão por rodada (uma por sessão de pool asleep)
+REASON = _norm(os.environ.get("CONFIG_DRIFT_WAKE_REASON", "")) or "config-drift"
 
 WORK_TYPES = frozenset({"feature", "bug", "task", "chore"})
 NAME_KEYS = ("session_name", "name", "alias", "agent_name")        # os nomes pelos quais uma sessão se chama (a porta "nome" do template)
 IDENT_KEYS = ("id",) + NAME_KEYS                                   # e pelos quais o assignee de uma bead aponta para ela
 MBP_RE = re.compile(r"-remote-mbp(?:-|$)")
-SAFE_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:@-]{0,99}$")       # nunca um `-x` (viraria opção do gc) nem texto com espaço
+SAFE_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:@-]{0,99}\Z")      # nunca um `-x` (viraria opção do gc/bd) nem texto com espaço ou quebra de linha (`\Z`, não `$`: o `$` do Python aceita um `\n` no fim)
 _STATIC_RIGS = [("whatsapp_automation", "/Users/athos/gt/whatsapp_automation"), ("property_scrapers", "/Users/athos/gt/property_scrapers")]
 
 
@@ -170,22 +181,18 @@ def pool_template(row):
     return None
 
 
-def sleep_reason(row):
-    """Motivo do sono, normalizado, ou None = sem motivo legível (chave ausente, vazia ou de outro tipo, na linha ou em row["metadata"]). Pura."""
-    md = row.get("metadata")
-    for src in (row, md if isinstance(md, dict) else {}):
-        for k in REASON_KEYS:
-            if _str(src.get(k)):
-                return re.sub(r"[\s_]+", "-", _str(src.get(k)).lower())
-    return None
+def session_reason(sess):
+    """Motivo do sono lido da BEAD DE SESSÃO (`metadata.sleep_reason`), normalizado. "" = a bead respondeu sem motivo (chave ausente, vazia ou de outro tipo); None = não sei (a bead não é objeto ou não tem `metadata` objeto). Pura."""
+    md = sess.get("metadata") if isinstance(sess, dict) else None
+    return _norm(md.get("sleep_reason")) if isinstance(md, dict) else None
 
 
 def row_state(row):
     return _str(row.get("state")).lower()
 
 
-def candidate_row(row):
-    """(template, "") se a linha é candidata (pool, asleep, não fechada, motivo == REASON); senão (None, porquê). Pura."""
+def candidate_row(row, sess):
+    """(template, "") se a sessão é candidata: linha de pool, asleep, não fechada E a bead de sessão `sess` (None = não li) diz motivo == REASON; senão (None, porquê). Pura."""
     if row.get("closed") is True:
         return None, "fechada"
     if row_state(row) != "asleep":
@@ -193,27 +200,49 @@ def candidate_row(row):
     tpl = pool_template(row)
     if tpl is None:
         return None, "fora-do-pool"
-    why = sleep_reason(row)
-    if why is None:
-        return None, "sem-motivo-legivel"
+    why = session_reason(sess)
+    if not why:  # None (não li / ilegível) e "" (a bead respondeu sem motivo) não são candidatas; o `scan` conta os dois à parte
+        return None, "sem-motivo"
     return (tpl, "") if why == REASON else (None, "motivo:" + _safe(why))
 
 
-def scan(roster):
-    """-> (candidatas, contagem). Linha com id que o gc não aceitaria como argumento não é candidata (e é dita). Pura."""
-    cen, cands, why_n = {"sessoes": len(roster), "asleep": 0, "com_motivo": 0, "pool_asleep": 0, "candidatas": 0}, [], {}
-    for row in sorted((r for r in roster if r.get("closed") is not True and row_state(r) == "asleep"), key=lambda r: str(r.get("id"))):
-        rs = sleep_reason(row)
-        cen["asleep"] += 1
-        cen["com_motivo"] += rs is not None
-        tpl = candidate_row(row)[0]
-        if pool_template(row):
-            cen["pool_asleep"] += 1
-            why_n[rs or "?"] = why_n.get(rs or "?", 0) + 1
+def asleep_rows(roster):
+    """As linhas asleep e não fechadas, em ordem de id (o teto de leituras corta sempre as mesmas). Pura."""
+    return sorted((r for r in roster if r.get("closed") is not True and row_state(r) == "asleep"), key=lambda r: str(r.get("id")))
+
+
+def probe(roster):
+    """{id: bead de sessão | None} para as sessões de pool asleep do roster: UMA chamada de bd por sessão. Id que o bd leria como opção e o que passa de PROBE_MAX não são lidos (sem entrada = não sei). Não levanta."""
+    out, over = {}, 0
+    for row in (r for r in asleep_rows(roster) if pool_template(r)):
         sid = row.get("id")
-        if tpl and not (isinstance(sid, str) and SAFE_ID.match(sid)):
-            _log("WARN: linha candidata com id inaceitável (%s) — não acordo" % _safe(sid))
-        elif tpl:
+        if not (isinstance(sid, str) and SAFE_ID.match(sid)):
+            _log("WARN: sessão de pool asleep com id inaceitável (%s) — não leio o motivo, não acordo" % _safe(sid))
+        elif len(out) >= PROBE_MAX:
+            over += 1
+        else:
+            # vazio/falhou/ilegível/OUTRA bead → None (não sei): a leitura que não responde nunca vira "sem motivo"
+            out[sid] = _show(CITY, sid)
+    if over:
+        _log("WARN: %d sessões de pool asleep além do teto de %d leituras — não lidas (não sei)" % (over, PROBE_MAX))
+    return out
+
+
+def scan(roster, sessions):
+    """`sessions` = o que `probe` leu. -> (candidatas, contagem). O motivo de cada sessão de pool asleep vem da bead de sessão dela, nunca da linha do roster. Pura."""
+    cen, cands, why_n = {"sessoes": len(roster), "asleep": 0, "pool_asleep": 0, "com_motivo": 0, "candidatas": 0}, [], {}
+    for row in asleep_rows(roster):
+        cen["asleep"] += 1
+        if not pool_template(row):
+            continue
+        sid = row.get("id")
+        sess = sessions.get(sid) if isinstance(sid, str) else None
+        rs, tpl = session_reason(sess), candidate_row(row, sess)[0]
+        cen["pool_asleep"] += 1
+        cen["com_motivo"] += bool(rs)
+        why = rs or ("sem-motivo" if rs == "" else "nao-sei")
+        why_n[why] = why_n.get(why, 0) + 1
+        if tpl:
             cands.append({"sid": sid, "tpl": tpl, "row": row, "alias": _safe(next((row[k] for k in ("alias",) + NAME_KEYS if _str(row.get(k))), sid))})  # o alias primeiro: é o nome que o assignee da bead usa
             cen["candidatas"] += 1
     cen["motivos"] = ",".join("%s:%d" % (_safe(k), n) for k, n in sorted(why_n.items(), key=lambda kv: (-kv[1], kv[0]))[:6]) or "-"
@@ -221,9 +250,9 @@ def scan(roster):
 
 
 def holds(b, ids):
-    who = b.get("assignee")
+    who, bid = b.get("assignee"), b.get("id")
     return (isinstance(who, str) and who in ids and b.get("status") == "in_progress" and b.get("issue_type") in WORK_TYPES
-            and isinstance(b.get("id"), str) and bool(b.get("id")))
+            and isinstance(bid, str) and bool(SAFE_ID.match(bid)))   # o id vai a `bd show` e `bd comment`: nunca um `-x` (opção) nem texto com espaço ou quebra de linha
 
 
 def needs_owner(b, now):
@@ -260,12 +289,12 @@ def pick(c, beads, complete, roster, now):
     return "skip", why
 
 
-def verify(c, roster, cur, now):
-    """"" se a decisão ainda vale com o dado fresco, senão o porquê. Pura."""
+def verify(c, roster, sess, cur, now):
+    """"" se a decisão ainda vale com o dado fresco (roster, bead de sessão `sess` e bead `cur` relidos), senão o porquê. Pura."""
     rows = [s for s in roster if s.get("id") == c["sid"]]
     if len(rows) != 1:
         return "a sessão saiu do roster (ou o id se repete)"
-    tpl, why = candidate_row(rows[0])
+    tpl, why = candidate_row(rows[0], sess)
     if tpl is None:
         return "a sessão mudou: " + why
     if not holds(cur, idents(rows[0])):
@@ -307,14 +336,18 @@ def _save_state(st):
 
 
 def wake_one(c, store, path, bead, state, now):
-    """(resultado, porquê). Relê roster e bead, decide de novo e só então grava o relógio e pede o wake. woke | would (ensaio) | skip (a releitura desmentiu ou não respondeu) | fail (o gc recusou) | state-error."""
+    """(resultado, porquê). Relê roster, bead e bead de sessão, decide de novo e só então grava o relógio e pede o wake. woke | would (ensaio) | skip (a releitura desmentiu ou não respondeu) | fail (o gc recusou) | state-error."""
     roster = _roster()
     if roster is None:
         return "skip", "roster ilegível na releitura"
     cur = _show(path, bead["id"])
     if cur is None:
         return "skip", "bead ilegível na releitura"
-    why = verify(c, roster, cur, now)
+    # vazio/falhou/ilegível/OUTRA bead → None → SKIP: a releitura que não responde não vira "o mesmo motivo de antes"
+    sess = _show(CITY, c["sid"])
+    if sess is None:
+        return "skip", "bead de sessão ilegível na releitura"
+    why = verify(c, roster, sess, cur, now)
     if why:
         return "skip", why
     if DRY_RUN:
@@ -333,7 +366,7 @@ def wake_one(c, store, path, bead, state, now):
 
 
 def run_cycle(now=None):
-    """Uma rodada. Devolve o código de saída: 1 se nada pôde ser examinado (roster ilegível, vocabulário canônico ausente, relógio não gravável), senão 0."""
+    """Uma rodada. Devolve o código de saída: 1 se nada pôde ser examinado (roster ilegível, vocabulário canônico ausente, relógio não gravável, nenhuma sessão de pool asleep com motivo legível), senão 0."""
     if BS is None:
         _log("FATAL: bead_state não importou (%r) — nada é classificado" % (_IMPORT_ERR,))
         return 1
@@ -342,12 +375,14 @@ def run_cycle(now=None):
     if roster is None:
         _log("DEGRADED: gc session list falhou/ilegível/vazio — nada é decidido nesta rodada")
         return 1
-    cands, cen = scan(roster)
-    _log("census sessoes=%(sessoes)d asleep=%(asleep)d com_motivo=%(com_motivo)d pool_asleep=%(pool_asleep)d candidatas=%(candidatas)d motivos=%(motivos)s" % cen)
-    if cen["asleep"] and not cen["com_motivo"]:
-        _log("WARN ROSTER-SEM-MOTIVO: nenhuma das %d sessões asleep traz motivo legível em %s — o vigia está cego até a chave certa entrar em CONFIG_DRIFT_WAKE_REASON_KEYS" % (cen["asleep"], ",".join(REASON_KEYS)))
+    # vazio (nenhuma sessão de pool asleep) → nenhuma leitura de bead; falhou/ilegível → None por sessão (não sei): o motivo é lido da bead de sessão, nunca da linha do roster
+    cands, cen = scan(roster, probe(roster))
+    _log("census sessoes=%(sessoes)d asleep=%(asleep)d pool_asleep=%(pool_asleep)d com_motivo=%(com_motivo)d candidatas=%(candidatas)d motivos=%(motivos)s" % cen)
+    blind = bool(cen["pool_asleep"]) and not cen["com_motivo"]
+    if blind:
+        _log("WARN BEAD-SEM-MOTIVO: nenhuma das %d sessões de pool asleep trouxe motivo legível na bead de sessão (metadata.sleep_reason) — o vigia não enxerga o motivo de nenhuma nesta rodada" % cen["pool_asleep"])
     if not cands:
-        return 0
+        return 1 if blind else 0
     stores = _stores()
     complete = stores is not None
     if stores is None:
@@ -414,7 +449,7 @@ def run_cycle(now=None):
 
 def main():
     # loga SEMPRE primeiro: o .out é o batimento (o daemon-presence-watchdog o lê quando o job for registrado nele)
-    _log("start enabled=%s dry_run=%s cooldown=%ds max=%d reason=%s keys=%s call_timeout=%ds" % (ENABLED, DRY_RUN, COOLDOWN_SEC, MAX_PER_RUN, REASON, ",".join(REASON_KEYS), CALL_TIMEOUT))  # o que VALE: env ilegível volta ao padrão em silêncio
+    _log("start enabled=%s dry_run=%s cooldown=%ds max=%d reason=%s probes=%d call_timeout=%ds" % (ENABLED, DRY_RUN, COOLDOWN_SEC, MAX_PER_RUN, REASON, PROBE_MAX, CALL_TIMEOUT))  # o que VALE: env ilegível volta ao padrão em silêncio
     if not ENABLED or os.path.exists(OFF_PATH):
         _log("kill-switch (CONFIG_DRIFT_WAKE_ENABLED!=1 ou arquivo %s) — no-op" % OFF_PATH)
         return 0
