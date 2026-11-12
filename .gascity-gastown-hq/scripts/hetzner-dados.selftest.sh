@@ -6,7 +6,7 @@
 #
 # CASOS: gt-dados-run (quem chama, nome fora da lista/ilegível/substring, entrypoint que não é de root, staging que não é tmpfs, swap ligada/ilegível, lock ocupado, montagem do netns, setpriv/env -i, o dado some e o
 #   resultado fica, falha do entrypoint, apagar que falha → 99, TERM) · gt-dados-ingest (verbos, nome, tmpfs, put/replace/link simbólico/tar quebrado, get presente/ausente, clean, status) · gt-dados-sweep (LIMPO, PULADO,
-#   processo velho morto, ps que falha, stage fora do tmpfs, sobra, lock do wrapper tomado, prazo do find estourado, entrada que sumiu, erro de leitura) · synth (quem roda, saída de rede aberta) · prove (ok, vazamento, não instalado, grupo, sudo, fora-da-lista, build sem prova).
+#   processo velho morto, ps que falha, stage fora do tmpfs, sobra, lock do wrapper tomado (com e sem processo de dados), lock 0600, prazo do find estourado, entrada que sumiu, erro de leitura) · synth (quem roda, saída de rede aberta) · prove (ok, vazamento, não instalado, grupo, sudo, fora-da-lista, build sem prova).
 # MUTANTES: cada guarda é removida numa cópia e algum caso TEM de reprovar (caso que passa no mutante não pega o bug).
 # O QUE NÃO PROVA: que o kernel isola, que o sshd aceita a chave, que o sudo recusa. Isso é o `hetzner-dados-prove.sh` no nó, depois da instalação por root (runbook hetzner-dados.md).
 set -u
@@ -55,7 +55,7 @@ EOF
 printf '#!/usr/bin/env bash\ncase "$*" in *OPTIONS*) echo "${FS:-tmpfs} rw,nosuid,nodev,noexec,relatime" ;; *) echo "${FS:-tmpfs}" ;; esac\n' > "$T/stubs/findmnt"
 printf '#!/usr/bin/env bash\n[ "${NOMNT:-}" = 1 ] && exit 1; exit 0\n' > "$T/stubs/mountpoint"
 printf '#!/usr/bin/env bash\ncase "$*" in "-u dados") echo "${DUID:-1234}" ;; "-g dados") echo "${DGID:-1234}" ;; "-un") echo "${ID_UN:-dados}" ;; "-nG") echo "${ID_G:-runner}" ;; *) exec /usr/bin/id "$@" ;; esac\n' > "$T/stubs/id"
-printf '#!/usr/bin/env bash\n[ "${PS_FAIL:-}" = 1 ] && exit 1; cat "$T/ps"\n' > "$T/stubs/ps"
+printf '#!/usr/bin/env bash\n[ "${PS_FAIL:-}" = 1 ] && exit 1; if [ -n "${PS_SECOND:-}" ] && [ -e "$T/ps.n" ]; then printf "%%s\\n" "$PS_SECOND"; else : > "$T/ps.n"; cat "$T/ps"; fi\n' > "$T/stubs/ps"
 cat > "$T/stubs/sudo" <<'EOF'
 #!/usr/bin/env bash
 echo "sudo $*" >> "$LOG"
@@ -109,6 +109,8 @@ case_run() { local s=$1
   if [ "$(id -u)" != 0 ]; then fresh; seed; mkdir -p "$S/in/proj/trava"; echo x > "$S/in/proj/trava/f"; chmod 555 "$S/in/proj/trava"; SUDO_UID=1000 "$s" synth > "$OUT" 2> "$ERR"; RC=$?
     ck "run: apagar in/ falha → 99 mesmo com entrypoint ok" rcis 99; ck "run: ...GTD-WIPE falhou" has "$ERR" '^GTD-WIPE: falhou'; chmod -R u+rwx "$S"; fi
   fresh; find "$S/in" -delete 2>/dev/null; SUDO_UID=1000 "$s" synth > "$OUT" 2> "$ERR"; RC=$?; ck "run: in/ recriado quando faltava (install -d)" test -d "$S/in"; }
+case_lock() { local s=$1; fresh; seed; chmod 644 "$T/lock" 2> /dev/null; SUDO_UID=1000 "$s" synth > "$OUT" 2> "$ERR"; RC=$?; ck "run: lock vira 0600 (era 0644) e o build roda" bash -c "[ $RC = 0 ] && [ -n \"\$(find '$T/lock' -perm 600)\" ]"
+  fresh; seed; rm -f "$T/lock"; SUDO_UID=1000 "$s" synth > "$OUT" 2> "$ERR"; RC=$?; ck "run: lock criado do zero nasce 0600" bash -c "[ $RC = 0 ] && [ -n \"\$(find '$T/lock' -perm 600)\" ]"; }
 case_signal() { local s=$1; fresh; seed; : > "$LOG"; env SLOW=1 SUDO_UID=1000 "$s" synth > "$OUT" 2> "$ERR" & local hp=$! i=0
   while ! grep -q '^started$' "$LOG" 2>/dev/null && [ $i -lt 50 ]; do sleep 0.1; i=$((i+1)); done; kill -TERM "$hp" 2>/dev/null; wait "$hp"; RC=$?
   [ -z "${GTD_DEBUG:-}" ] || { cat "$ERR" "$LOG"; }
@@ -126,7 +128,7 @@ case_ingest() { local s=$1 src="$T/src"; find "$src" -mindepth 0 -delete 2>/dev/
   ing "clean proj"; ck "ingest clean <nome>: apaga in e out desse nome" test ! -e "$S/in/proj" -a ! -e "$S/out/proj"; mkdir -p "$S/in/outro"; seed; ing "clean"; ck "ingest clean (tudo): in/ e out/ somem" test ! -e "$S/in/proj" -a ! -e "$S/out/proj"
   ing "status"; ck "ingest status: conta in/out" has "$OUT" 'tmpfs=sim in=1 out=1'
   if [ "$(id -u)" != 0 ]; then fresh; seed; chmod 555 "$S/in/proj"; SSH_ORIGINAL_COMMAND="clean proj" "$s" > "$OUT" 2> "$ERR"; RC=$?; ck "ingest clean: não consegui apagar → 99 (nunca 'ok')" rcis 99; chmod -R u+rwx "$S"; fi; }
-sw() { fresh; seed; mkdir -p "$S/in/x"; echo d > "$T/dhome/cache"; echo t > "$T/tmp1/$ME-file"; mkdir -p "$T/tmp1/$ME-dir/sub"; echo n > "$T/tmp1/$ME-dir/sub/f"; echo v > "$T/tmp2/$ME-file"; printf '%s\n' "${PS_ROWS:-}" > "$T/ps"; "$1" > "$OUT" 2> "$ERR"; RC=$?; }
+sw() { fresh; rm -f "$T/ps.n"; seed; mkdir -p "$S/in/x"; echo d > "$T/dhome/cache"; echo t > "$T/tmp1/$ME-file"; mkdir -p "$T/tmp1/$ME-dir/sub"; echo n > "$T/tmp1/$ME-dir/sub/f"; echo v > "$T/tmp2/$ME-file"; printf '%s\n' "${PS_ROWS:-}" > "$T/ps"; "$1" > "$OUT" 2> "$ERR"; RC=$?; }
 case_sweep() { local s=$1 row_new="$ME 60 99999"
   PS_ROWS="root 100 1" sw "$s"; ck "sweep: sem build vivo → LIMPO rc 0" rcis 0; ck "sweep: linha LIMPO no stdout e no log" bash -c "grep -q 'gt-dados-sweep: LIMPO removed=' '$OUT' && grep -q 'gt-dados-sweep: LIMPO' '$T/sweep.log'"
   ck "sweep: staging, home e tmp do dados sumiram" bash -c "[ -z \"\$(find '$S' '$T/dhome' '$T/tmp1' '$T/tmp2' -mindepth 1)\" ]"
@@ -135,9 +137,13 @@ case_sweep() { local s=$1 row_new="$ME 60 99999"
   PS_FAIL=1 PS_ROWS="root 1 1" sw "$s"; ck "sweep: ps falhou → NAO-CONSEGUI rc 2, nada apagado" bash -c "[ $RC = 2 ] && grep -q 'NAO-CONSEGUI ps-falhou' '$OUT' && [ -f '$S/in/proj/dado.txt' ]"
   FS=ext4 PS_ROWS="root 1 1" sw "$s"; ck "sweep: staging fora do tmpfs → NAO-CONSEGUI rc 2 (e conta o que há)" bash -c "[ $RC = 2 ] && grep -q 'NAO-CONSEGUI stage-nao-e-tmpfs itens=[1-9]' '$OUT' && [ -f '$S/in/proj/dado.txt' ]"
   if [ "$(id -u)" != 0 ]; then fresh; seed; chmod 555 "$S/in/proj"; echo "root 1 1" > "$T/ps"; "$s" > "$OUT" 2> "$ERR"; RC=$?; ck "sweep: o que não consegue apagar → NAO-CONSEGUI sobrou, rc 2 (nunca LIMPO)" bash -c "[ $RC = 2 ] && grep -q 'NAO-CONSEGUI sobrou' '$OUT' && ! grep -q LIMPO '$OUT'"; chmod -R u+rwx "$S"; fi
-  # lock do wrapper tomado (build vivo, mesmo sem processo de dados à vista) → PULADO, nada apagado; um lock que o selftest segura por 3 s, a varredura espera LOCKWAIT=1
-  fresh; seed; echo t > "$T/tmp1/$ME-file"; echo "root 1 1" > "$T/ps"; flock "$T/lock" sleep 3 & local HOLD=$!; sleep 0.3; "$s" > "$OUT" 2> "$ERR"; RC=$?; wait "$HOLD" 2> /dev/null
-  ck "sweep: lock do wrapper tomado → PULADO build-vivo, rc 0, NADA apagado" bash -c "[ $RC = 0 ] && grep -q 'PULADO build-vivo' '$OUT' && [ -f '$S/in/proj/dado.txt' ] && [ -f '$T/tmp1/$ME-file' ]"
+  # lock do wrapper tomado (o selftest o segura por 3 s; a varredura espera LOCKWAIT=1). Com processo de dados na 2ª leitura do ps → PULADO, nada apagado; SEM ele → NAO-CONSEGUI (lock preso por outra coisa), nada apagado
+  fresh; rm -f "$T/ps.n"; seed; echo t > "$T/tmp1/$ME-file"; echo "root 1 1" > "$T/ps"; flock "$T/lock" sleep 3 & local HOLD=$!; sleep 0.3; PS_SECOND="$ME 5 4242" "$s" > "$OUT" 2> "$ERR"; RC=$?; wait "$HOLD" 2> /dev/null
+  ck "sweep: lock do wrapper tomado + processo de dados na 2ª leitura → PULADO build-vivo, rc 0, NADA apagado" bash -c "[ $RC = 0 ] && grep -q 'PULADO build-vivo lock=ocupado dados=1' '$OUT' && [ -f '$S/in/proj/dado.txt' ] && [ -f '$T/tmp1/$ME-file' ]"
+  fresh; rm -f "$T/ps.n"; seed; echo "root 1 1" > "$T/ps"; flock "$T/lock" sleep 3 & HOLD=$!; sleep 0.3; "$s" > "$OUT" 2> "$ERR"; RC=$?; wait "$HOLD" 2> /dev/null
+  ck "sweep: lock tomado SEM processo de dados → NAO-CONSEGUI lock-tomado-sem-build, rc 2, nunca PULADO/LIMPO, nada apagado" bash -c "[ $RC = 2 ] && grep -q 'NAO-CONSEGUI lock-tomado-sem-build' '$OUT' && ! grep -q -e PULADO -e LIMPO '$OUT' && [ -f '$S/in/proj/dado.txt' ]"
+  # lock só de root: o modo 0600 é imposto mesmo num arquivo que já existia 0644 (um usuário local o travaria)
+  chmod 644 "$T/lock"; PS_ROWS="root 1 1" sw "$s"; ck "sweep: lock nasce/vira 0600 (era 0644)" bash -c "[ -n \"\$(find '$T/lock' -perm 600)\" ]"
   TIMEOUT_RC=124 PS_ROWS="root 1 1" sw "$s"; ck "sweep: prazo do find estourado → NAO-CONSEGUI leitura-falhou, rc 2, nunca LIMPO, nada apagado" bash -c "[ $RC = 2 ] && grep -q 'NAO-CONSEGUI leitura-falhou' '$OUT' && ! grep -q LIMPO '$OUT' && [ -f '$S/in/proj/dado.txt' ]"
   FIND_NOISE=enoent PS_ROWS="root 1 1" sw "$s"; ck "sweep: find com 'No such file or directory' (entrada sumiu no meio) → ainda LIMPO rc 0" bash -c "[ $RC = 0 ] && grep -q 'gt-dados-sweep: LIMPO' '$OUT'"
   FIND_NOISE=eacces PS_ROWS="root 1 1" sw "$s"; ck "sweep: find com 'Permission denied' → NAO-CONSEGUI leitura-falhou, rc 2, nunca LIMPO" bash -c "[ $RC = 2 ] && grep -q 'NAO-CONSEGUI leitura-falhou' '$OUT' && ! grep -q LIMPO '$OUT'"; }
@@ -159,7 +165,7 @@ case_prove() { local s=$1
   SUDO_LIST_LEAK=1 pv "$s"; ck "prove: entrypoint fora da lista rodou → FALHOU" has "$OUT" 'fora-da-lista-recusado FALHOU'; SYNTH_OUT="synth: ok" pv "$s"; ck "prove: build sem GTD-WIPE ok → FALHOU" has "$OUT" 'build-sintetico FALHOU'
   SYNTH_RC=3 pv "$s"; ck "prove: build com rc≠0 → FALHOU" has "$OUT" 'build-sintetico FALHOU'; }
 # GTD_CASES="run signal ..." roda só esses casos (depuração) e pula os mutantes
-for c in ${GTD_CASES:-run ingest sweep synth prove signal}; do case_$c "$T/${c/signal/run}.sh"; done
+for c in ${GTD_CASES:-run ingest sweep synth prove signal lock}; do x=${c/signal/run}; case_$c "$T/${x/lock/run}.sh"; done
 [ -z "${GTD_CASES:-}" ] || { echo "---"; echo "casos: $n, reprovados: $fails (só GTD_CASES=$GTD_CASES)"; [ "$fails" -eq 0 ]; exit; }
 # MUTANTES: cada um tira UMA guarda de uma cópia; o caso da guarda tem de reprovar
 mut() { local name=$1 script=$2 expr=$3 fn=$4 mc="$T/mut-$1.sh"; mkcopy "$HERE/hetzner-dados-$script.sh" "$mc" "$expr"; cmp -s "$mc" "$T/$script.sh" && { echo "FAIL mutante $name não alterou nada"; fails=$((fails+1)); return; }
@@ -185,6 +191,9 @@ mut M21-sweep-sem-lock sweep 's#flock -w "\$LOCKWAIT" -E 75 8; r=\$?#r=0#' case_
 mut M22-sweep-prazo-vira-limpo sweep 's#\[ "\$rc" -ge 124 \] || ! \[ -s "\$ef" \] || ##' case_sweep
 mut M23-sweep-entrada-que-sumiu-reprova sweep 's#grep -v -F -e "\$GONE" "\$ef" | grep -q \.#grep -q . "\$ef"#' case_sweep
 mut M24-sweep-erro-de-leitura-ignorado sweep 's#grep -v -F -e "\$GONE" "\$ef" | grep -q \.#false#' case_sweep
+mut M25-sweep-lock-sem-build-vira-pulado sweep 's#\[ "\$L2" -gt 0 \] || cant "lock-tomado-sem-build"#true#' case_sweep
+mut M26-run-lock-sem-chmod run 's#&& chmod 0600 "\$LOCK" 2> /dev/null || fail lock-modo#|| fail lock-modo#' case_lock
+mut M27-sweep-lock-sem-chmod sweep 's#&& chmod 0600 "\$LOCK" 2> /dev/null || cant lock-modo#|| cant lock-modo#' case_sweep
 mut M18-synth-rede-aberta synth 's#exit 3; fi#true; fi#' case_synth
 mut M19-prove-ls-vazio prove 's#\*"No such file"\*) item "\$1" nao-consegui#*"No such file"*) item "$1" ok#' case_prove
 mut M20-prove-sudo-dados prove 's#|| item sudo-como-dados-recusado FALHOU "o runner virou dados"#|| true#' case_prove

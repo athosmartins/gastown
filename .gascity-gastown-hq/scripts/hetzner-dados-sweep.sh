@@ -7,11 +7,11 @@
 # O QUE FAZ: sem build vivo (processo de `dados` com menos de 3 h, ou o lock do wrapper tomado), apaga o staging /srv/gtdados, o home do `dados` e o que `dados` deixou em /tmp, /var/tmp e /dev/shm. Processo de `dados`
 #   com 3 h ou mais não é build (o prazo do wrapper é 2 h): é morto, e a varredura segue. Conferiu que sumiu, ou diz que não conseguiu: leitura que falhou NUNCA vira "limpo".
 # LOCK: a varredura toma o MESMO lock do wrapper (/run/gt-dados-run.lock) e o segura até o fim: um build que comece no meio recusa `ocupado` em vez de ter o staging apagado (o filho do build herda o fd do lock, então
-#   até um wrapper morto por kill -9 o mantém enquanto o build existir). Lock tomado por build vivo → PULADO. Um `put` do canal do mini que comece DEPOIS da checagem de processos não é protegido (o ingest não toma o lock).
+#   até um wrapper morto por kill -9 o mantém enquanto o build existir). O lock é de root, modo 0600 (0644 deixaria qualquer usuário local travar os builds e calar a varredura). Lock tomado por build vivo (há processo de `dados` depois da espera) → PULADO; tomado SEM processo de `dados` → NAO-CONSEGUI lock-tomado-sem-build. Um `put` do canal do mini que comece DEPOIS da checagem de processos não é protegido (o ingest não toma o lock).
 # ALCANCE EM /tmp: só o 1º nível (o que `dados` cria direto lá, com o que houver dentro). O /tmp do nó tem ~1,7 milhão de entradas e a árvore inteira levou 40+ min sem terminar e sem escrever o log (medido 12/11);
 #   arquivo de `dados` dentro de pasta de OUTRO dono em /tmp não é visto. /var/tmp e /dev/shm são varridos inteiros (pequenos). Cada apagamento e cada leitura de verificação tem prazo (SCANSECS): a verificação que estourou = NAO-CONSEGUI.
 # LINHA DE LOG (/var/log/gt-dados-sweep.log, e no journal; a trava 3 lê a última e a idade dela):
-#   <UTC> gt-dados-sweep: LIMPO removed=N killed=K · PULADO dados-vivo=N · PULADO build-vivo lock=ocupado · NAO-CONSEGUI <motivo>
+#   <UTC> gt-dados-sweep: LIMPO removed=N killed=K · PULADO dados-vivo=N · PULADO build-vivo lock=ocupado dados=N · NAO-CONSEGUI <motivo>
 # CÓDIGOS: 0 LIMPO ou PULADO · 2 NAO-CONSEGUI
 set -u
 PATH=/usr/sbin:/usr/bin:/sbin:/bin
@@ -39,9 +39,18 @@ if [ "$LIVE" -gt 0 ]; then log "PULADO dados-vivo=$LIVE"; exit 0; fi
 KILLED=0
 for pid in $OLD; do kill -9 "$pid" 2> /dev/null && KILLED=$((KILLED + 1)); done
 # lock livre → segue segurando-o até o fim; ocupado por build vivo (rc 75, depois de LOCKWAIT s: dá tempo de o kill -9 acima soltar o de um órfão) → PULADO; não consegui abrir/usar o lock → NAO-CONSEGUI (nunca varre às cegas)
+# o lock é só de ROOT (0600): com 0644 qualquer usuário local (o runner!) faria `flock -x` nele, travaria os builds e deixaria esta varredura em PULADO para sempre (revisão de segurança, 12/11)
+( umask 077; : >> "$LOCK" ) 2> /dev/null && chmod 0600 "$LOCK" 2> /dev/null || cant lock-modo
 { exec 8> "$LOCK"; } 2> /dev/null || cant lock-ilegivel
 flock -w "$LOCKWAIT" -E 75 8; r=$?
-[ "$r" -ne 75 ] || { log "PULADO build-vivo lock=ocupado"; exit 0; }
+if [ "$r" -eq 75 ]; then
+  # tomado até depois da espera: só é build se há processo de `dados` AGORA (o wrapper leva segundos entre o lock e o entrypoint). Ninguém de dados = o lock está preso por outra coisa → NAO-CONSEGUI, nunca "build vivo"
+  # vazio (ninguém) → NAO-CONSEGUI; ps falhou → NAO-CONSEGUI
+  P2=$(ps -eo user:20=,etimes=,pid= 2> /dev/null) || cant ps-falhou
+  L2=$(printf '%s\n' "$P2" | awk -v u="$DU" '$1 == u { n++ } END { print n + 0 }')
+  [ "$L2" -gt 0 ] || cant "lock-tomado-sem-build"
+  log "PULADO build-vivo lock=ocupado dados=$L2"; exit 0
+fi
 [ "$r" -eq 0 ] || cant "lock-falhou:$r"
 N=0
 for d in "$STAGE" "$DHOME"; do

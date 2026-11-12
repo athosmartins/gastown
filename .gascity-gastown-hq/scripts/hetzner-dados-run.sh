@@ -42,6 +42,8 @@ case "$DUID$DGID" in ''|*[!0-9]*) fail usuario-dados ;; esac
 # swap ligada deixaria a RAM do tmpfs ir a disco; /proc/swaps ilegível também recusa (só o cabeçalho sozinho, 1 linha, libera)
 SW=$({ wc -l < "$SWAPS"; } 2> /dev/null | tr -d ' ')
 [ "$SW" = 1 ] || fail swap-ligada-ou-ilegivel
+# o lock é só de ROOT (0600): com 0644 qualquer usuário local (o runner!) faria `flock -x` nele e todo build recusaria `ocupado` (revisão de segurança, 12/11). Falhou em criar/ajustar o modo → recusa
+( umask 077; : >> "$LOCK" ) 2> /dev/null && chmod 0600 "$LOCK" 2> /dev/null || fail lock-modo
 exec 9> "$LOCK" && flock -n 9 || fail ocupado
 install -d -o "$DU" -g "$DU" -m 0700 "$STAGE/in" "$STAGE/out" || fail stage-dirs
 ip netns add "$NS" || fail netns-add
