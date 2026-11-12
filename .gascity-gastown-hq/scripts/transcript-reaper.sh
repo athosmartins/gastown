@@ -18,7 +18,10 @@
 #      default `gc session list` output (active + suspended/asleep + anything
 #      not closed). Absence = dead. Identical mechanism to
 #      scratchpad-reaper.sh's _fetch_live_keys — same call, same jq, same
-#      abort-on-failure discipline.
+#      abort-on-failure discipline. A session_key is not the only proof of
+#      life (ga-esorlre.1): the id must ALSO be neither the `sessionId` of a
+#      running Claude process nor a value recorded in a session bead's
+#      metadata — see "LIVE CONVERSATIONS" below.
 #   2. STALE — the `.jsonl` file's mtime is older than MIN_AGE_HOURS (default
 #      24h; lowered from the original 72h per ga-5ppqo — measured 2026-08-07:
 #      at 72h only 281MB of 1.6GB total was ever eligible, since 82% of
@@ -53,6 +56,21 @@
 #     transcript filename (if any) can't be named directly. See
 #     _fetch_live_keys/_shield_unresolved_session (gate:fix-attempt:1 finding).
 #
+# LIVE CONVERSATIONS ARE NOT session_keys (ga-esorlre.1; the epic's 12/11 adversarial review, read on the mini): the Athos
+# switches conversations inside a crew (/resume), so the transcript he is using is the `sessionId`
+# of that crew's ~/.claude/sessions/<pid>.json, NOT the session_key of its session bead (thies: live
+# 53bf2758, bead d27b72b2; digo: live d150ee9b, bead 5eb94e99). Protecting session_keys alone
+# deleted a live conversation once it had gone 24h without a write. Two more sources now feed the
+# SAME live-keys file, so _should_reap stays the single gate:
+#   - _fetch_live_conversations: the sessionId of every `*.json` in $SESSIONS_DIR whose pid is
+#     alive (a pid that `ps` cannot answer for counts as alive);
+#   - _fetch_captured_ids: every one-word metadata value of every non-closed session bead — the id
+#     the capture slice (ga-esorlre.2) records there, which keeps a conversation protected in the
+#     window after a reboot, when no process is alive.
+# Like the session list, each source that cannot be read (sessions dir, a session file of a
+# pid whose process is not provably gone, `bd query`, a failed write to the live-keys file) aborts the
+# WHOLE cycle with zero deletions.
+#
 # OUT OF SCOPE: directories under ~/.claude/projects with NO matching `.jsonl`
 # (observed to exist on this machine — a distinct leak, not what ga-t1ub9's fix
 # text describes; flagged separately rather than folded in here). Does not gate
@@ -84,6 +102,11 @@ TRANSCRIPT_REAL_DEFAULT_ROOT="/Users/athos/.claude/projects"
 TRANSCRIPT_ROOT="${TRANSCRIPT_REAPER_ROOT:-$TRANSCRIPT_REAL_DEFAULT_ROOT}"
 LOG="${TRANSCRIPT_REAPER_LOG:-$CITY/.gc/logs/transcript-reaper.log}"
 GC="${GC_BIN:-gc}"
+# ga-esorlre.1: where Claude Code keeps one <pid>.json per running process (the conversation it is
+# using NOW), the bd that reads the session beads, and the ps that says whether a pid is alive.
+SESSIONS_DIR="${TRANSCRIPT_REAPER_SESSIONS_DIR:-/Users/athos/.claude/sessions}"
+BD="${BD_BIN:-bd}"
+PS="${PS_BIN:-ps}"
 ENABLED="${TRANSCRIPT_REAPER_ENABLED:-1}"
 DRY_RUN="${TRANSCRIPT_REAPER_DRY_RUN:-0}"
 MIN_AGE_HOURS="${TRANSCRIPT_REAPER_MIN_AGE_HOURS:-24}"
@@ -246,6 +269,137 @@ _fetch_live_keys() {
   return 0
 }
 
+# _pid_liveness <pid> → 0 = a process with that pid exists, 1 = none does, 2 = cannot tell (not a
+# pid at all, or ps failed or complained). `ps -p`, not `kill -0`: kill -0 answers EPERM for a
+# process the caller does not own, and that would read as "gone". The caller treats 0 AND 2 as
+# alive — over-protecting one transcript is the safe direction for an irreversible delete; only 1
+# lets a session file stop protecting its conversation. A pid the OS has since handed to a
+# stranger reads as alive too: the same direction, and it lapses when that process ends.
+_pid_liveness() {
+  local pid="$1" out rc
+  case "$pid" in ''|*[!0-9]*|0*) return 2 ;; esac     # empty, not digits, or 0/leading zero: no real pid looks like that
+  # vazio (rc 1 and not a word on stdout/stderr) → 1, no such process; falhou/ilegível (an rc other than 0 and 1, or rc 1 WITH text) → 2, the caller protects; rc 0 is a live process
+  out="$("$PS" -p "$pid" -o pid= 2>&1)"
+  rc=$?
+  if [ "$rc" -eq 0 ]; then return 0; fi
+  if [ "$rc" -eq 1 ] && [ -z "$out" ]; then return 1; fi
+  return 2
+}
+
+# _fetch_live_conversations <out_file> → APPENDS to out_file (the live-keys file _fetch_live_keys
+# just wrote) the id of every conversation a RUNNING Claude process is using, read from
+# $SESSIONS_DIR/<pid>.json ("sessionId"). Returns nonzero when that cannot be established, and
+# the caller aborts the whole cycle (ga-p5q3 class: unreadable must never read as "nobody").
+#
+# WHY (ga-esorlre.1; the epic's 12/11 adversarial review, read on the mini): the conversation the Athos is using in a crew is
+# NOT the session_key of its session bead — he switches conversations inside the crew (/resume) and
+# the live id follows only in this file (thies: live 53bf2758, bead d27b72b2; digo: live d150ee9b,
+# bead 5eb94e99). _fetch_live_keys knows session_keys only, so that transcript read as DEAD and
+# was deleted once 24h stale.
+#
+# Per file, three states:
+#   - names a usable pid + sessionId, pid alive or unknown → the sessionId is protected;
+#   - same, pid gone → protects nothing (a leftover file must not pin a transcript forever; the id
+#     recorded in the session bead, _fetch_captured_ids, covers the window after a reboot);
+#   - does NOT name a usable pid + sessionId (not JSON, a field missing, a pid that is not a whole
+#     number, a sessionId that is not a plain id) → what it protects cannot be named. Only when the
+#     process in its FILE NAME is provably gone is it skipped; anything else (alive, unknown, a name
+#     that is no pid) aborts.
+# Only `*.json` counts: on the node (Claude Code 2.1.302) a `<pid>.<hash>.key` sits beside each one and
+# is not a session file.
+# A directory that cannot be listed (missing, not a directory, no r/x) aborts: it must not read as
+# "no live sessions".
+_fetch_live_conversations() {
+  local out="$1" f base fpid parsed pid sid st files=0 live=0 gone=0 skipped=0
+  local sid_re='^[A-Za-z0-9][A-Za-z0-9-]{0,79}$'     # 1-80 chars, never a leading '-': grep -qxF would read it as an option
+  # vazio (no *.json in the dir) → nothing extra is protected, rc 0; falhou/ilegível (dir missing, not a dir, no r/x) → ABORT, rc 1
+  if [ ! -d "$SESSIONS_DIR" ] || [ ! -r "$SESSIONS_DIR" ] || [ ! -x "$SESSIONS_DIR" ]; then
+    log "ABORT: live-conversation scan: sessions dir $SESSIONS_DIR is missing or unreadable — cannot tell which conversations running processes are using"
+    return 1
+  fi
+  for f in "$SESSIONS_DIR"/*.json; do
+    [ -f "$f" ] || continue          # no match leaves the literal pattern behind when nullglob is off
+    files=$((files + 1))
+    base="${f##*/}"
+    fpid="${base%.json}"
+    # vazio (valid JSON without a usable pid/sessionId) → parsed is empty; falhou/ilegível (not JSON, unreadable) → parsed is empty too: both take the unusable-file branch below
+    parsed="$(jq -r 'select((.pid | type) == "number" and (.sessionId | type) == "string") | [(.pid | tostring), .sessionId] | @tsv' "$f" 2>/dev/null)"
+    pid=""; sid=""
+    [ -n "$parsed" ] && IFS=$'\t' read -r pid sid <<< "$parsed"
+    if [[ "$pid" =~ ^[0-9]+$ ]] && [[ "$sid" =~ $sid_re ]]; then
+      _pid_liveness "$pid"; st=$?
+      if [ "$st" -eq 1 ]; then
+        gone=$((gone + 1))
+        continue
+      fi
+      live=$((live + 1))
+      if ! _session_is_live "$sid" "$out"; then
+        log "protecting conversation $sid: pid $pid ($base) $([ "$st" -eq 0 ] && echo 'is alive' || echo 'could not be checked') and the id is not the session_key of any listed session"
+      fi
+      # a write that fails (the reaper runs under disk pressure) must not leave this conversation unprotected without a word
+      printf '%s\n' "$sid" >> "$out" || { log "ABORT: live-conversation scan: could not record the protected id $sid in $out"; return 1; }
+      continue
+    fi
+    case "$fpid" in
+      (''|*[!0-9]*) st=2 ;;
+      (*) _pid_liveness "$fpid"; st=$? ;;
+    esac
+    if [ "$st" -eq 1 ]; then
+      skipped=$((skipped + 1))
+      log "live-conversation scan: $base names no usable pid+sessionId but its process ($fpid) is gone — ignored"
+      continue
+    fi
+    log "ABORT: live-conversation scan: $f names no usable pid+sessionId and its process ($fpid) is not provably gone — cannot tell which conversation it protects"
+    return 1
+  done
+  log "live-conversation scan: $SESSIONS_DIR files=$files protected=$live gone=$gone ignored_unreadable_dead=$skipped"
+  return 0
+}
+
+# _fetch_captured_ids <out_file> → APPENDS to out_file every metadata value, of every non-closed
+# session bead, that could be a conversation id (one word, at most 80 chars). This is the id the
+# capture slice (ga-esorlre.2) records in the session bead, e.g. session.live_conversation_id: it
+# keeps the conversation protected in the window after a reboot, when no process is alive and
+# $SESSIONS_DIR holds nothing live. No key name is hard-coded, so the two slices cannot drift
+# apart: a value that is not the name of a transcript matches nothing and costs nothing, one that is
+# keeps that transcript. `gc session list --json` is not a known source of free-form bead metadata
+# (the fields known here are session_key, id, name, state, work_dir, alias, template), hence `bd query`
+# — the form nightly-reboot.sh and quality-gate-dispatcher.sh already use (nightly-reboot.sh measured
+# `bd list` blind to ephemeral session beads). Returns nonzero when the beads cannot be read.
+_fetch_captured_ids() {
+  local out="$1" raw rc n ids
+  # vazio ([] — no non-closed session bead) → nothing captured, rc 0, but only while no live session is known either (below); falhou/ilegível (bd rc != 0, empty or non-JSON answer, not a list of objects, metadata that is not an object) → ABORT, rc 1
+  raw="$("$BD" -C "$CITY" query --json 'type=session AND status!=closed' --limit=0 2>/dev/null)"
+  rc=$?
+  if [ $rc -ne 0 ] || [ -z "$raw" ]; then
+    log "ABORT: captured-id scan: 'bd query' for the session beads failed (rc=$rc) or returned nothing — cannot read the conversation ids recorded in them"
+    return 1
+  fi
+  if ! printf '%s' "$raw" | jq -e 'type == "array" and all(.[]; type == "object" and (.metadata == null or (.metadata | type) == "object"))' >/dev/null 2>&1; then
+    log "ABORT: captured-id scan: 'bd query' did not answer a list of beads with object metadata — cannot read the conversation ids recorded in them"
+    return 1
+  fi
+  n="$(printf '%s' "$raw" | jq 'length' 2>/dev/null)"
+  # an empty list while sessions are known live is not believed: gc and bd read the same store, so the query is broken, not "nothing captured"
+  if [ "$n" = "0" ] && [ -s "$out" ]; then
+    log "ABORT: captured-id scan: 'bd query' returned no session bead although live sessions are listed — the answer is not believed"
+    return 1
+  fi
+  ids="$(printf '%s' "$raw" | jq -r '.[] | (.metadata // {}) | to_entries[] | .value | select(type == "string" and length >= 1 and length <= 80 and (test("\\s") | not))' 2>/dev/null)"
+  rc=$?
+  if [ $rc -ne 0 ]; then
+    log "ABORT: captured-id scan: could not extract the metadata values from the 'bd query' answer (jq rc=$rc)"
+    return 1
+  fi
+  # same reason as in the live-conversation scan: a failed write is a failure, not "nothing captured"
+  if [ -n "$ids" ] && ! printf '%s\n' "$ids" >> "$out"; then
+    log "ABORT: captured-id scan: could not record the metadata values in $out"
+    return 1
+  fi
+  log "captured-id scan: session beads=$n values kept=$(printf '%s' "$ids" | grep -c .)"
+  return 0
+}
+
 main() {
   if [ ! -d "$TRANSCRIPT_ROOT" ]; then
     log "TRANSCRIPT_ROOT $TRANSCRIPT_ROOT does not exist — nothing to do"
@@ -263,6 +417,16 @@ main() {
 
   if ! _fetch_live_keys "$keyfile"; then
     log "ABORT: skipping reap cycle entirely — could not establish a trustworthy live-session set"
+    return 1
+  fi
+  # ga-esorlre.1: session_key is not the conversation the Athos is using. Both scans APPEND to the
+  # file _fetch_live_keys just truncated and wrote, so _should_reap stays the single gate.
+  if ! _fetch_live_conversations "$keyfile"; then
+    log "ABORT: skipping reap cycle entirely — could not establish which conversations running processes are using"
+    return 1
+  fi
+  if ! _fetch_captured_ids "$keyfile"; then
+    log "ABORT: skipping reap cycle entirely — could not read the conversation ids recorded in the session beads"
     return 1
   fi
 
