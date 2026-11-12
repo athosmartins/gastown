@@ -133,13 +133,16 @@ mk_case() {  # $1=nome → C=$T/<nome> com stubs "tudo ok" e o vetor ENVV
 exit \$(cat $C/reboot.rc)"
   printf 'import sys\nsys.stdout.write(open("%s/sender.out").read())\nsys.exit(int(open("%s/sender.rc").read()))\n' "$C" "$C" > "$C/sender_stub.py"
   printf 'import sys\nsys.stdout.write(open("%s/calls.out").read())\nsys.exit(int(open("%s/calls.rc").read()))\n' "$C" "$C" > "$C/calls_stub.py"
+  # captura da conversa viva (ga-esorlre.2): anota "<args>|marca=<1 se a marca do reinício JÁ estava no estado>"; capture.hang = pendura; capture.rc = o rc
+  echo 0 > "$C/capture.rc"; : > "$C/capture.calls"
+  printf 'import os, sys, time\nC = "%s"\nm = os.path.exists(C + "/state") and "reboots=%s" in open(C + "/state").read()\nopen(C + "/capture.calls", "a").write(" ".join(sys.argv[1:]) + "|marca=" + str(int(m)) + "\\n")\nif os.path.exists(C + "/capture.hang"):\n  time.sleep(60)\nsys.exit(int(open(C + "/capture.rc").read()))\n' "$C" "$NOW" > "$C/capture_stub.py"
   ENVV=(
     "DR_CITY=$C/city" "DR4_STATE=$C/state" "DR4_LOG=$C/log" "DR_OFF_FILE=$C/off"
     "DR_NOTIFY_BIN=$C/bin/notify" "DR_GC_BIN=$C/bin/gc"
     "DR4_NOW=$NOW" "DR4_BOOT_EPOCH=$BOOT" "DR4_FREE_MB_OVERRIDE=2000" "DR4_CONSOLE_USER=athos"
     "DR4_FDESETUP_BIN=$C/bin/fdesetup" "DR4_DEFAULTS_BIN=$C/bin/defaults" "DR4_LAUNCHCTL_BIN=$C/bin/launchctl"
     "DR4_PGREP_BIN=$C/bin/pgrep" "DR4_SYSCTL_BIN=$C/bin/sysctl" "DR4_DF_BIN=$C/bin/df" "DR4_OSASCRIPT_BIN=$C/bin/osascript"
-    "DR4_SENDER_SAFE_PY=$C/sender_stub.py" "DR4_CALLS_PY=$C/calls_stub.py" "DR4_NIGHTLY=$NIGHTLY_REAL"
+    "DR4_SENDER_SAFE_PY=$C/sender_stub.py" "DR4_CALLS_PY=$C/calls_stub.py" "DR4_NIGHTLY=$NIGHTLY_REAL" "DR4_CAPTURE_PY=$C/capture_stub.py" "DR4_CAPTURE_TIMEOUT_S=15"
     "SCRAPER_RODADA_DIR=$C/rodadas" "SCRAPER_BOOT_EPOCH=$REALBOOT"
     "DR4_REBOOT_CMD=$C/bin/reboot-stub" "DR4_NO_REAL_REBOOT=1"
     "DR4_GRACE_S=0" "DR4_WAIT_S=1" "DR4_REBOOT_TIMEOUT_S=15" "DR4_GUARD_TIMEOUT_S=30" "DR4_NOTIFY_TIMEOUT_S=10" "DR4_MAIL_TIMEOUT_S=10"
@@ -562,6 +565,7 @@ mk_case re_snd; echo "echo 1 > '$C/sender.rc'; echo 'central_sender_restart_safe
 run_sut --run
 chk "envio começou durante o aviso: rc 10, NÃO pediu reinício, nenhuma marca, grava a espera (veio $RC: $OUT)" '[ "$RC" = 10 ] && no_reboot && ! state_has "reboots=$NOW" && state_has "defer_until=$((NOW + 600))"'
 check "envio começou durante o aviso: diz 'cancelado' no aviso" grep -q "cancelado" "$C/notify.log"
+check "envio começou durante o aviso: a captura NÃO rodou (o reinício foi cancelado)" [ ! -s "$C/capture.calls" ]
 mk_case re_off; echo "touch '$C/off'" > "$C/notify.hook"; setenv "DR4_GRACE_S=3"
 run_sut --run
 chk "interruptor ligado durante a carência: rc 10, não reiniciou, e NÃO grava espera (é um humano mandando calar; o passo 1 o respeita sozinho; veio $RC: $OUT)" '[ "$RC" = 10 ] && no_reboot && ! state_has "defer_until=[1-9]"'
@@ -574,6 +578,16 @@ chk "guarda ficou ilegível durante a carência: rc 30, não reiniciou (veio $RC
 mk_case re_pos; touch "$C/reboot.dies"
 run_sut --run
 check "controle positivo: sem mudança durante a carência, reinicia (kill 143)" [ "$RC" = 143 ]
+
+section "captura da conversa viva (ga-esorlre.2): o último ato antes da marca; falha ou prazo estourado NUNCA barram o reinício"
+mk_case cap_ok; touch "$C/reboot.dies"; run_sut --run
+chk "chamada UMA vez, com --final, ANTES da marca; o reinício veio depois (143; veio $RC)" '[ "$RC" = 143 ] && [ "$(cat "$C/capture.calls")" = "--final|marca=0" ] && [ "$(n_reboot)" = 1 ]'
+mk_case cap_fail; touch "$C/reboot.dies"; echo 1 > "$C/capture.rc"; run_sut --run
+chk "captura com rc 1: o reinício segue (143) e o log avisa" '[ "$RC" = 143 ] && grep -q "WARN: captura.*rc=1" "$C/log"'
+mk_case cap_hang; touch "$C/reboot.dies" "$C/capture.hang"; setenv "DR4_CAPTURE_TIMEOUT_S=1"; run_sut --run
+chk "captura que pendura: o prazo a mata e o reinício segue (143; log com rc=124)" '[ "$RC" = 143 ] && grep -q "WARN: captura.*rc=124" "$C/log"'
+mk_case cap_dry; run_sut --dry-run
+check "dry-run não captura" [ ! -s "$C/capture.calls" ]
 
 section "instância única"
 mk_case lock_live; setenv "DR4_BOOT_EPOCH=$(( $(date +%s) - 100000 ))"; mkdir "$C/state.lock.d"; sleep 30 & LP=$!; echo "$LP" > "$C/state.lock.d/pid"

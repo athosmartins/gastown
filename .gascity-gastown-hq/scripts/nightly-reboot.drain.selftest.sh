@@ -981,6 +981,24 @@ else
 fi
 wait "$NRPID" 2>/dev/null
 
+# ═══ E21: a captura da conversa viva de cada crew e do Mayor, o ultimo ato antes do shutdown (ga-esorlre.2) ═══
+echo "E21: captura --final via sudo -u <usuario>, DEPOIS do re-check e ANTES do shutdown; falha e prazo nunca seguram o reboot"
+mk_cap() {  # mundo + stub que anota "<args>|shutdown=<1 se o shutdown ja foi pedido>"; capture.rc = rc; capture.hang = pendura (e anota o pid)
+  new_world "$1"
+  printf 'import os, sys, time\nW = "%s"\nopen(W + "/capture.calls", "a").write(" ".join(sys.argv[1:]) + "|shutdown=" + str(int(os.path.exists("%s") and os.path.getsize("%s") > 0)) + "\\n")\nif os.path.exists(W + "/capture.hang"):\n  open(W + "/capture.pid", "w").write(str(os.getpid()))\n  time.sleep(120)\nsys.exit(int(open(W + "/capture.rc").read()) if os.path.exists(W + "/capture.rc") else 0)\n' "$W" "$SHUT" "$SHUT" > "$W/capture_stub.py"
+}
+mk_cap e21a; run_nr FAKE_HOUR=23 NIGHTLY_REBOOT_CAPTURE_PY="$W/capture_stub.py"
+rebooted && ok "E21 o reboot sai" || bad "E21 NAO reiniciou. log: $(tail -2 "$LOGF" 2>/dev/null | tr '\n' '|')"
+[ "$(cat "$W/capture.calls" 2>/dev/null)" = "--final|shutdown=0" ] && ok "E21 captura chamada UMA vez, com --final, antes do shutdown" || bad "E21 chamadas da captura: '$(tr '\n' '|' < "$W/capture.calls" 2>/dev/null)'"
+grep -qF -- "-u ${USER} /usr/bin/env" "$SUDO_CALLS" && grep -qF -- "capture_stub.py --final" "$SUDO_CALLS" && ok "E21 a captura passou por 'sudo -u ${USER}' (nao como root)" || bad "E21 a captura NAO passou por sudo -u. sudo: $(tr '\n' '|' < "$SUDO_CALLS")"
+mk_cap e21b; echo 1 > "$W/capture.rc"; run_nr FAKE_HOUR=23 NIGHTLY_REBOOT_CAPTURE_PY="$W/capture_stub.py"
+rebooted && log_has "capture.*rc=1" && ok "E21 captura com rc 1: o reboot sai e o log diz" || bad "E21 captura que falhou segurou o reboot ou sumiu do log: $(tail -3 "$LOGF" 2>/dev/null | tr '\n' '|')"
+mk_cap e21c; touch "$W/capture.hang"; run_nr FAKE_HOUR=23 NIGHTLY_REBOOT_CAPTURE_PY="$W/capture_stub.py" NIGHTLY_REBOOT_CAPTURE_TIMEOUT_SECS=2
+rebooted && log_has "capture.*TIMED OUT" && ok "E21 captura pendurada: o prazo a corta, o reboot sai e o log diz" || bad "E21 captura pendurada segurou o reboot ou nao foi dita: $(tail -3 "$LOGF" 2>/dev/null | tr '\n' '|')"
+[ -s "$W/capture.pid" ] && ! kill -0 "$(cat "$W/capture.pid")" 2>/dev/null && ok "E21 o processo da captura que estourou o prazo foi morto" || { bad "E21 o processo da captura continua vivo"; kill -KILL "$(cat "$W/capture.pid" 2>/dev/null)" 2>/dev/null; }
+W_SENDER_SEQ="0 1" mk_cap e21d; run_nr FAKE_HOUR=23 NIGHTLY_REBOOT_CAPTURE_PY="$W/capture_stub.py"
+! rebooted && [ ! -s "$W/capture.calls" ] && ok "E21 noite pulada no re-check final: NAO capturou (a captura so roda depois do re-check)" || bad "E21 capturou (ou reiniciou) numa noite pulada no re-check: '$(cat "$W/capture.calls" 2>/dev/null)'"
+
 echo ""
 echo "nightly-reboot drain selftest: PASS=$PASS FAIL=$FAIL SKIPPED=$SKIPPED"
 [ "$FAIL" -eq 0 ]
