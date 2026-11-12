@@ -23,9 +23,11 @@ ready_delay_ms = 0
 # builtin "opus" choice maps to `--model claude-opus-4-8` (checked in gc-1.1.1-engwin0919), which
 # would silently DOWNGRADE every crew. Since 2026-10-05 claude-rc is the MAYOR's only (Opus); the 10 named
 # crews moved to claude-rc-crew (Sonnet) below.
+# ga-ift2yeq (Athos 11/11): the Remote Control session is NAMED, so the Claude app shows a fixed name
+# ("mayor") instead of one generated per launch ("Gascity mayor worker"). `claude --help`: --remote-control [name].
 [providers.claude-rc]
 base = "builtin:claude"
-args_append = ["--remote-control", "--model", "opus"]
+args_append = ["--remote-control", "mayor", "--model", "opus"]
 ready_delay_ms = 0
 # Athos, 2026-10-11 06:5x (Mayor session, AskUserQuestion: "Manter Opus"): crews run on Opus with effort
 # high. Supersedes the 2026-10-05 instruction (crews on Sonnet + high). claude-rc above stays the Mayor's;
@@ -34,6 +36,54 @@ ready_delay_ms = 0
 [providers.claude-rc-crew]
 base = "builtin:claude"
 args_append = ["--remote-control", "--model", "opus"]
+ready_delay_ms = 0
+# ga-ift2yeq (Athos 11/11): one provider per named crew, identical to claude-rc-crew except the Remote Control
+# NAME, so each crew keeps a fixed name in the Claude app (digo, batista, oracle...) instead of a generated
+# "thies-wa-polite-tiger". Suspended crews get their own names so two sessions never share one.
+# claude-rc-crew above stays as the unnamed fallback for any crew not listed here.
+[providers.claude-rc-batista]
+base = "builtin:claude"
+args_append = ["--remote-control", "batista", "--model", "opus"]
+ready_delay_ms = 0
+[providers.claude-rc-digo]
+base = "builtin:claude"
+args_append = ["--remote-control", "digo", "--model", "opus"]
+ready_delay_ms = 0
+[providers.claude-rc-oracle]
+base = "builtin:claude"
+args_append = ["--remote-control", "oracle", "--model", "opus"]
+ready_delay_ms = 0
+[providers.claude-rc-peter]
+base = "builtin:claude"
+args_append = ["--remote-control", "peter", "--model", "opus"]
+ready_delay_ms = 0
+[providers.claude-rc-thies]
+base = "builtin:claude"
+args_append = ["--remote-control", "thies", "--model", "opus"]
+ready_delay_ms = 0
+[providers.claude-rc-mila]
+base = "builtin:claude"
+args_append = ["--remote-control", "mila", "--model", "opus"]
+ready_delay_ms = 0
+[providers.claude-rc-batista-ps]
+base = "builtin:claude"
+args_append = ["--remote-control", "batista-ps", "--model", "opus"]
+ready_delay_ms = 0
+[providers.claude-rc-batista-lx]
+base = "builtin:claude"
+args_append = ["--remote-control", "batista-lx", "--model", "opus"]
+ready_delay_ms = 0
+[providers.claude-rc-thies-ps]
+base = "builtin:claude"
+args_append = ["--remote-control", "thies-ps", "--model", "opus"]
+ready_delay_ms = 0
+[providers.claude-rc-mila-ma]
+base = "builtin:claude"
+args_append = ["--remote-control", "mila-ma", "--model", "opus"]
+ready_delay_ms = 0
+[providers.claude-rc-henrique]
+base = "builtin:claude"
+args_append = ["--remote-control", "henrique", "--model", "opus"]
 ready_delay_ms = 0
 [providers.claude-headless]
 base = "builtin:claude"
