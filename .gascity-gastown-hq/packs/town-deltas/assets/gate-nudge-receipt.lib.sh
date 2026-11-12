@@ -24,7 +24,16 @@
 # comment on total failure), and the source bead gets one GATE-NUDGE-RECEIPT comment saying what happened ("not told" must never read as "told",
 # ga-fe5at). A source bead that is already closed or gate:passed is left alone (the FAIL it was about no longer matters).
 #
-# Detection plus a notice. It never re-sends the nudge, never writes the engine queue, and the nudge sites that do not go through
+# THE WAKE-UP (ga-9kxy44u). Mail is read at the NEXT turn, and an idle crew has none: on 12/11 three crews sat idle at their prompt in gate:needs-fix for 65 min to
+# 4 h with the FAIL nudge queued and the mail unread (the queue's poller can die, ga-55jx16q), and one short `--delivery immediate` nudge woke each in about a minute.
+# So, right after the mail, the sweep also types ONE short line into the recipient's session (_gate_rcpt_wake; at most once per record: the attempt is written
+# down before it is typed), only when ALL of this holds: the switch is on; the source bead is readable, still assigned to the author (or the recipient), not back
+# in the gate (gate:queued / gate:reviewing) and not parked for a human (gate:needs-human*); and the session's pane reads as an idle Claude Code prompt
+# (_gate_rcpt_pane_state: no turn running, no dialog waiting for a key, not a shell, readable). Anything else is a skip WITH its reason: an interruption is
+# never sent on a guess. The outcome (delivered / queued / unconfirmed / failed / skipped) goes in the bead comment, the event (wake=) and the settled record,
+# and "typed" is claimed only for outcome=delivered.
+#
+# Detection, a notice and that one wake-up. It never re-sends the queued nudge, never writes the engine queue, and the nudge sites that do not go through
 # nudge_author_with_fallback (the rebase nudges, the Mayor pings) are NOT covered. An ephemeral pool author is not recorded (the dispatcher defers its
 # Mayor page on purpose: its session is gone and the bead returns to the pool by itself).
 #
@@ -38,7 +47,8 @@
 # that may fail is guarded, every function returns 0 unless its header says otherwise.
 # Knobs (env): GATE_RCPT_DIR, GATE_RCPT_MIN_AGE_S (90: do not look before the queue had a chance), GATE_RCPT_RECHECK_S (300), GATE_RCPT_PENDING_MAX_S (1800),
 # GATE_RCPT_MAX_PER_SWEEP (5 records looked at per sweep), GATE_RCPT_BUDGET_S (90: no new record is started once a sweep has spent this many seconds),
-# GATE_RCPT_NOW (test seam: the clock).
+# GATE_RCPT_NOW (test seam: the clock). The wake-up: GATE_RCPT_WAKE=0 or the file $GC_CITY/.gc/gate-nudge-wake.off turn it off (the mail stays),
+# GATE_RCPT_WAKE_TIMEOUT_S (20) bounds the pane read and the nudge, each.
 
 gate_rcpt_dir() { printf '%s' "${GATE_RCPT_DIR:-${GC_CITY:-/nonexistent}/.gc/runtime/gate-author-nudge}"; }
 
@@ -208,9 +218,97 @@ _gate_rcpt_settle() {
   return 0
 }
 
+# _gate_rcpt_wake_enabled — rc 0 unless GATE_RCPT_WAKE is a literal 0 or the off-file exists (same reading as gate_rcpt_enabled; the mail does not depend on it).
+_gate_rcpt_wake_enabled() {
+  case "${GATE_RCPT_WAKE:-1}" in 0) return 1 ;; esac
+  [ -e "${GATE_RCPT_WAKE_OFF_FILE:-${GC_CITY:-/nonexistent}/.gc/gate-nudge-wake.off}" ] && return 1
+  return 0
+}
+
+# _gate_rcpt_gc <out-file> <gc args...> — `gc --city $GC_CITY <args>` with stdout in <out-file> (a file, not $(...): a child that outlives the timeout would hold a
+# pipe open and the sweep, which runs under the gate lock, would wait for it). Bounded by GATE_RCPT_WAKE_TIMEOUT_S (20; 0 or text = 20: `timeout 0` means none).
+# rc = gc's own (124 = timed out); the caller guards it.
+_gate_rcpt_gc() {
+  local out="$1" tmo="${GATE_RCPT_WAKE_TIMEOUT_S:-20}" rc=0
+  shift
+  case "$tmo" in ''|*[!0-9]*|0) tmo=20 ;; esac
+  timeout -k 5 "$tmo" gc --city "${GC_CITY:-}" "$@" >"$out" 2>/dev/null || rc=$?
+  return "$rc"
+}
+
+# _gate_rcpt_pane_state <session> — prints what the session's pane shows: idle | busy | dialog | unknown | unread. The busy / idle tests are the ones of
+# scripts/pool-idle-nobead-guard.sh (pane_state, measured on live panes 03/10); the dialog test extends the one of agent-stuck-escalation.sh
+# (pane_shows_permission_prompt) with the selection-menu hints:
+#   unread   peek failed, timed out or printed nothing
+#   dialog   a marker of a dialog that waits for a key in the last 12 lines: a permission prompt, a selection menu (its option cursor is a "❯" too)
+#   busy     a turn is running: "<Verb>… (<elapsed>" (the elapsed time can have an HOURS unit) or, on older builds, "esc to interrupt"
+#   unknown  a spinner-shaped line whose timer cannot be read, or nothing that looks like a Claude Code pane (no prompt box, no turn summary: a shell)
+#   idle     a Claude Code pane with no activity marker in view: "nothing found", not "idle proven" — the bead checks are the other half
+# Always rc 0.
+_gate_rcpt_pane_state() {
+  local f pane tail_out rc=0 dur='([0-9]+h[[:space:]]+)?([0-9]+m[[:space:]]+)?[0-9]+s' glyph='(✻|✽|✳|✶|✢|✺|✹|·|\*)'
+  # vazio (pane sem texto) ou falhou (mktemp, peek rc≠0, estouro, arquivo ilegível) → unread: não se sabe o que a sessão mostra, e então nada é digitado nela
+  f=$(mktemp "${TMPDIR:-/tmp}/gate-wake-pane.XXXXXX" 2>/dev/null) || { echo unread; return 0; }
+  _gate_rcpt_gc "$f" session peek "$1" --lines 40 || rc=$?
+  pane=$(cat "$f" 2>/dev/null) || pane=""
+  rm -f "$f" 2>/dev/null || true
+  if [ "$rc" != "0" ] || [ -z "$pane" ]; then echo unread; return 0; fi
+  tail_out=$(printf '%s\n' "$pane" | tail -n 12)
+  if printf '%s' "$tail_out" | grep -E 'Do you want to proceed\?|requires confirmation|Enter to select|Esc to cancel' >/dev/null 2>&1; then echo dialog; return 0; fi
+  if printf '%s' "$pane" | grep -E "(…|\.\.\.)[^(]*\\(${dur}" >/dev/null 2>&1 || printf '%s' "$pane" | grep 'esc to interrupt' >/dev/null 2>&1; then echo busy; return 0; fi
+  if printf '%s' "$pane" | grep -E "^[[:space:]]*${glyph}[[:space:]]+[^[:space:]]+(…|\.\.\.)" >/dev/null 2>&1; then echo unknown; return 0; fi
+  if printf '%s' "$pane" | grep '❯' >/dev/null 2>&1 || printf '%s' "$pane" | grep -E "^[[:space:]]*${glyph}[[:space:]]+[^[:space:]]+ for ${dur}" >/dev/null 2>&1; then echo idle; else echo unknown; fi
+  return 0
+}
+
+# _gate_rcpt_wake <bead> <to> <author> <status> <labels> <assignee> — the wake-up: ONE short `--delivery immediate` nudge, typed into <to>'s pane. Prints
+# <result>|<detail>, result = delivered | queued | unreadable | failed | skipped. Only `outcome: delivered` is "typed" (the pilot reads it the same way). The
+# checks are cheap-first and every doubt is a skip: a status or labels that could not be read, a bead that is no longer the author's, that is back in the gate
+# or parked for a human, or a pane that is not an idle prompt. Always rc 0.
+_gate_rcpt_wake() {
+  local bead="$1" to="$2" author="$3" st="$4" labels="$5" asg="$6" ps f rc=0 out oc txt
+  if ! _gate_rcpt_wake_enabled; then echo "skipped|the wake-up is switched off (GATE_RCPT_WAKE=0 or the gate-nudge-wake.off file)"; return 0; fi
+  # vazio (bd show não leu) → estado desconhecido: sem interrupção por palpite
+  if [ -z "$st" ]; then echo "skipped|the bead's state could not be read, so it is not known that this FAIL still waits for the crew"; return 0; fi
+  if [ "$labels" = "?" ]; then echo "skipped|the bead's labels could not be read, so it is not known whether it is back in the gate or parked for a human"; return 0; fi
+  if [ -z "$asg" ] || { [ "$asg" != "$author" ] && [ "$asg" != "$to" ]; }; then
+    echo "skipped|the bead is no longer assigned to ${author:-the author} (now: ${asg:-nobody})"; return 0
+  fi
+  case " $labels " in
+    *" gate:queued "*|*" gate:reviewing "*) echo "skipped|the bead is already back in the gate (gate:queued or gate:reviewing)"; return 0 ;;
+    *" gate:needs-human"*) echo "skipped|the bead is parked for a human (gate:needs-human), not waiting for the crew's fix"; return 0 ;;
+  esac
+  ps=$(_gate_rcpt_pane_state "$to")
+  case "$ps" in
+    idle) ;;
+    busy)    echo "skipped|its pane shows a turn running (busy): nothing is typed into it, the queued notice and the mail wait for its next prompt"; return 0 ;;
+    dialog)  echo "skipped|its pane shows a dialog waiting for a key (a permission prompt or a selection menu), and a typed line could answer it"; return 0 ;;
+    unknown) echo "skipped|its pane is not a Claude Code prompt that reads as idle (a shell, or a spinner whose timer this check cannot read)"; return 0 ;;
+    *)       echo "skipped|its pane could not be read"; return 0 ;;
+  esac
+  # one line, no slash-command token (typed into a prompt, "/gate-done" would be attached as the skill and re-submit the unfixed work), short (a long nudge arrives truncated)
+  txt="Gate FAIL on $bead (the earlier notice may not have reached you): read the GATE-FEEDBACK and the gate comments on the bead (bd show $bead), fix what they ask and run gate-done again."
+  # vazio (rc 0 sem JSON legível, ou mktemp que falha: a saída vai a /dev/null) → não confirmado ("unreadable"); falhou (rc≠0, estouro) → "failed": nunca "delivered"
+  f=$(mktemp "${TMPDIR:-/tmp}/gate-wake-out.XXXXXX" 2>/dev/null) || f=""
+  _gate_rcpt_gc "${f:-/dev/null}" session nudge "$to" "$txt" --delivery immediate --json || rc=$?
+  if [ "$rc" != "0" ]; then
+    [ -z "$f" ] || rm -f "$f" 2>/dev/null || true
+    echo "failed|rc $rc"; return 0
+  fi
+  out=""; oc=""
+  if [ -n "$f" ]; then out=$(cat "$f" 2>/dev/null) || out=""; rm -f "$f" 2>/dev/null || true; fi
+  oc=$(printf '%s' "$out" | jq -er 'select(.ok == true) | .outcome' 2>/dev/null) || oc=""
+  case "$oc" in
+    delivered) echo "delivered|typed into the session" ;;
+    queued)    echo "queued|the engine queued it instead of typing it" ;;
+    *)         echo "unreadable|rc 0 but no readable outcome" ;;
+  esac
+  return 0
+}
+
 # _gate_rcpt_fallback <dir> <key> <why> <age_s> — the author could not be told by nudge: mail them, say so on the bead, settle. Always rc 0.
 _gate_rcpt_fallback() {
-  local d="$1" key="$2" why="$3" age="$4" f="$1/pending/$2.rec" bead bcity to author msg fctx src st labels rc=0 subj body note verdict how who
+  local d="$1" key="$2" why="$3" age="$4" f="$1/pending/$2.rec" bead bcity to author msg fctx src st labels asg rc=0 subj body note verdict how who wake wres wwhy wnote
   bead=$(_gate_rcpt_get "$f" bead); bcity=$(_gate_rcpt_get "$f" bead_city); to=$(_gate_rcpt_get "$f" to)
   author=$(_gate_rcpt_get "$f" author); fctx=$(_gate_rcpt_get "$f" fail_context)
   # vazio/falhou (.msg sem texto ou ilegível) → o registro é liquidado como danificado, sem mail inventado
@@ -223,7 +321,10 @@ _gate_rcpt_fallback() {
   # vazio/falhou (bd show ≠ 0 ou JSON ilegível) → estado da bead DESCONHECIDO: o aviso segue (o inerte aqui é informar), dito no texto
   src=$(timeout -k 5 30 bd -C "${bcity:-${GC_CITY:-}}" show "$bead" --json 2>/dev/null) || src=""
   st=$(printf '%s' "$src" | jq -r 'if type == "array" then .[0] else . end | .status // empty' 2>/dev/null) || st=""
-  labels=$(printf '%s' "$src" | jq -r 'if type == "array" then .[0] else . end | (.labels // []) | join(" ")' 2>/dev/null) || labels=""
+  # vazio (sem .labels) → nenhum rótulo; falhou (jq erra: .labels que não é lista) → "?" = rótulos DESCONHECIDOS (o despertar é pulado; o resto lê "?" como rótulo nenhum)
+  labels=$(printf '%s' "$src" | jq -r 'if type == "array" then .[0] else . end | (.labels // []) | join(" ")' 2>/dev/null) || labels="?"
+  # vazio (sem .assignee) ou falhou (jq erra) → asg vazio: o despertar é pulado ("no longer assigned"), nunca se acorda quem não se sabe que é o dono
+  asg=$(printf '%s' "$src" | jq -r 'if type == "array" then .[0] else . end | .assignee // empty' 2>/dev/null) || asg=""
   note=""
   if [ -z "$st" ]; then
     note=" (the bead's current state could not be read, so it is not known whether this FAIL is still current)"
@@ -251,16 +352,36 @@ $msg"
     _gate_rcpt_warn "ga-5aovajz: notify_author_with_fallback is not defined — cannot mail $to about $bead; the record stays for the next sweep"
     return 0
   fi
+  # the wake-up comes AFTER the mail helper proved to exist: a record that stays for the next sweep (above) must not have woken anybody yet, or it would wake twice.
+  # AT MOST ONE per record: the attempt is written into the record BEFORE anything is typed, so a sweep that dies after the wake, or a settle that fails (the record
+  # is then handled again), cannot type a second line (an unrecorded nudge repeats on every pass, one agent turn each: the rule of pool-idle-nobead-guard.sh).
+  # vazio (sem a linha wake_attempt) → nunca tentou, segue; ilegível → também vazio, mas o sweep acabou de ler o registro inteiro e a escrita abaixo falharia igual (pula)
+  if [ -n "$(_gate_rcpt_get "$f" wake_attempt)" ]; then
+    wake="skipped|an earlier sweep already tried to wake it (wake_attempt is in the record)"
+  elif ! printf 'wake_attempt=%s\n' "$(_gate_rcpt_now)" >> "$f" 2>/dev/null; then
+    wake="skipped|the attempt could not be written down, and a wake-up that is not recorded could repeat on every sweep"
+  else
+    wake=$(_gate_rcpt_wake "$bead" "$to" "$author" "$st" "$labels" "$asg") || wake="skipped|the wake-up check itself failed"
+  fi
+  wres="${wake%%|*}"; wwhy="${wake#*|}"
+  case "$wres" in
+    delivered)  wnote=" A short immediate nudge (ga-9kxy44u) to $to was DELIVERED: it was typed into the session." ;;
+    queued)     wnote=" A short immediate nudge (ga-9kxy44u) to $to was only QUEUED, not typed ($wwhy): it may not have been seen." ;;
+    unreadable) wnote=" A short immediate nudge (ga-9kxy44u) to $to is UNCONFIRMED ($wwhy)." ;;
+    failed)     wnote=" A short immediate nudge (ga-9kxy44u) to $to FAILED ($wwhy; rc 124 means it timed out and may still have gone out)." ;;
+    *)          wnote=" No immediate nudge was sent (ga-9kxy44u): ${wwhy}." ;;
+  esac
   if [ "$rc" = "0" ]; then
     verdict="mailed"; how="The author was mailed instead (mail survives a restart)."; who="MAILED"
   else
     verdict="escalated"; how="Mailing the author failed too: a mail to the Mayor was attempted to relay it (whether it went out is not confirmed)."; who="UNREACHABLE (Mayor mail attempted)"
   fi
-  bd -C "${bcity:-${GC_CITY:-}}" comment "$bead" "GATE-NUDGE-RECEIPT (ga-5aovajz): the gate's FAIL nudge to $to could not be confirmed delivered — $why. ${how}${note} A queued nudge is not a delivered one; this note keeps 'not told' from reading as 'told' (ga-fe5at)." \
+  bd -C "${bcity:-${GC_CITY:-}}" comment "$bead" "GATE-NUDGE-RECEIPT (ga-5aovajz): the gate's FAIL nudge to $to could not be confirmed delivered — $why. ${how}${note}${wnote} A queued nudge is not a delivered one; this note keeps 'not told' from reading as 'told' (ga-fe5at)." \
     2>/dev/null || _gate_rcpt_warn "ga-5aovajz: could not leave the GATE-NUDGE-RECEIPT comment on $bead (the mail above and the log line are the record)"
-  _gate_rcpt_say "ga-5aovajz: $bead → $to: $why — author $who"
-  gate_rcpt_event author_nudge_receipt bead "$bead" to "$to" verdict "$verdict" age_s "$age" reason "$why" \
+  _gate_rcpt_say "ga-5aovajz: $bead → $to: $why — author $who; wake-up: $wres ($wwhy)"
+  gate_rcpt_event author_nudge_receipt bead "$bead" to "$to" verdict "$verdict" age_s "$age" reason "$why" wake "$wres" wake_why "$wwhy" \
     || _gate_rcpt_warn "ga-5aovajz: could not write the author_nudge_receipt event for $bead (the bead comment and settled/ are the record)"
+  printf 'wake=%s\nwake_why=%s\n' "$wres" "$(_gate_rcpt_oneline "$wwhy")" >> "$f" 2>/dev/null || true
   _gate_rcpt_settle "$d" "$key" "$verdict" "$why"
   return 0
 }
