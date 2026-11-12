@@ -22,7 +22,8 @@ ready_delay_ms = 0
 # relying on ~/.claude/settings.json's global model. NOT via option_defaults.model: the engine's
 # builtin "opus" choice maps to `--model claude-opus-4-8` (checked in gc-1.1.1-engwin0919), which
 # would silently DOWNGRADE every crew. Since 2026-10-05 claude-rc is the MAYOR's only (Opus); the 10 named
-# crews moved to claude-rc-crew (Sonnet) below.
+# crews moved to claude-rc-crew (Sonnet) below; since 2026-10-11 they run Opus, and since ga-ift2yeq each has its own
+# named claude-rc-<name> provider.
 # ga-ift2yeq (Athos 11/11): the Remote Control session is NAMED, so the Claude app shows a fixed name
 # ("mayor") instead of one generated per launch ("Gascity mayor worker"). `claude --help`: --remote-control [name].
 [providers.claude-rc]
@@ -40,7 +41,9 @@ ready_delay_ms = 0
 # ga-ift2yeq (Athos 11/11): one provider per named crew, identical to claude-rc-crew except the Remote Control
 # NAME, so each crew keeps a fixed name in the Claude app (digo, batista, oracle...) instead of a generated
 # "thies-wa-polite-tiger". Suspended crews get their own names so two sessions never share one.
-# claude-rc-crew above stays as the unnamed fallback for any crew not listed here.
+# claude-rc-crew above stays defined (unnamed): agents/henrique-traco/agent.toml is not tracked yet and the live one
+# still points at it; it moves to claude-rc-henrique in the live root right after this merges (then claude-rc-crew
+# is only a fallback with no users). claude-rc-henrique is defined here so that switch needs no second merge.
 [providers.claude-rc-batista]
 base = "builtin:claude"
 args_append = ["--remote-control", "batista", "--model", "opus"]

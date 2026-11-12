@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """claude-crew-account — ga-qdtmq2 (Fase 2 da ga-xoe5ao): the Claude account of the Mayor and the named crews, LIVE.
 
-Who this is for: the sessions launched with --remote-control (providers claude-rc / claude-rc-crew). They are NOT wrapped
+Who this is for: the sessions launched with --remote-control (providers claude-rc / claude-rc-<crew>, ga-ift2yeq). They are NOT wrapped
 (city.toml), so they read the DEFAULT login: the Keychain item "Claude Code-credentials" AND ~/.claude/.credentials.json - the file claude
 falls back to when it cannot read the Keychain, which is the case of every session of the tmux server `-L gascity`: it lives in launchd's
 Background session, where `security` answers rc 36 (ga-i4t0lzx, 04/11: the job wrote only the item and its switch moved nothing for the Mayor and

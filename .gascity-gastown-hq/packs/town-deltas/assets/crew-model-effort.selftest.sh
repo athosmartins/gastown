@@ -5,10 +5,12 @@
 #
 # Static check against the committed text (same convention as peter-rc-provider.selftest.sh —
 # `gc config show` needs untracked local state a clean checkout does not have):
-#   1. every named crew is on provider claude-rc-crew and sets effort = "high";
+#   1. every named crew is on its OWN provider claude-rc-<name> (ga-ift2yeq, Athos 11/11: a fixed Remote
+#      Control name per crew) and sets effort = "high";
 #   2. the set of crews is non-empty (an empty set would pass 1 vacuously);
 #   3. no agent.toml is left on the Opus provider claude-rc (that one is the Mayor's, set by the pack);
-#   4. claude-rc-crew pins --model opus with --remote-control; claude-rc keeps --model opus;
+#   4. each claude-rc-<name> is exactly --remote-control <name> --model opus; claude-rc-crew (the unnamed
+#      fallback) pins --model opus with --remote-control; claude-rc keeps --model opus;
 #   5. the Mayor's effort patch in city.toml is "high".
 # The model comes from the provider's own --model alias (latest Sonnet / latest Opus), NOT from
 # option_defaults.model — the engine's builtin "opus" choice maps to claude-opus-4-8 (a downgrade).
@@ -27,12 +29,24 @@ bad() { echo "  ✗ $*"; FAIL=$((FAIL+1)); }
 [ -d "$AGENTS_DIR" ] || { echo "FATAL: agents dir not found at $AGENTS_DIR"; exit 1; }
 
 EXPECTED_EFFORT="high"
-echo "── 1+2. every claude-rc-crew crew runs effort = $EXPECTED_EFFORT ──"
+# ga-ift2yeq: crew agent dir -> its fixed Remote Control name (= its provider claude-rc-<name>).
+CREW_RC_NAMES="batista-lx:batista-lx batista-ps:batista-ps batista-wa:batista digo-wa:digo mila-ma:mila-ma mila-wa:mila oracle-wa:oracle peter-wa:peter thies-ps:thies-ps thies-wa:thies"
+block() { awk -v h="[providers.$1]" '$0==h{f=1; print; next} /^\[/{f=0} f' "$CITY_TOML"; }
+args_of() { block "$1" | grep '^args_append' || true; }
+
+echo "── 1+2. every named crew is on its own claude-rc-<name> and runs effort = $EXPECTED_EFFORT ──"
 n=0
-for f in "$AGENTS_DIR"/*/agent.toml; do
-  grep -q '^provider = "claude-rc-crew"$' "$f" || continue
+for pair in $CREW_RC_NAMES; do
+  crew="${pair%%:*}"; rcname="${pair#*:}"
+  f="$AGENTS_DIR/$crew/agent.toml"
+  if [ ! -f "$f" ]; then bad "$crew: agent.toml not found"; continue; fi
   n=$((n+1))
-  crew="$(basename "$(dirname "$f")")"
+  grep -q "^provider = \"claude-rc-$rcname\"\$" "$f" \
+    && ok "$crew: provider = claude-rc-$rcname" || bad "$crew: not on claude-rc-$rcname ($(grep '^provider' "$f" || echo 'no provider line'))"
+  want="args_append = [\"--remote-control\", \"$rcname\", \"--model\", \"opus\"]"
+  [ "$(args_of "claude-rc-$rcname")" = "$want" ] \
+    && ok "claude-rc-$rcname is exactly RC '$rcname' + --model opus" \
+    || bad "claude-rc-$rcname args are not [--remote-control, $rcname, --model, opus]: $(args_of "claude-rc-$rcname" | sed 's/^$/<no block>/')"
   if grep -q "^option_defaults = { effort = \"$EXPECTED_EFFORT\" }" "$f"; then
     ok "$crew: effort = $EXPECTED_EFFORT"
   else
@@ -42,7 +56,7 @@ for f in "$AGENTS_DIR"/*/agent.toml; do
     bad "$crew: sets option_defaults.model — the model must come from the provider's --model alias"
   fi
 done
-[ "$n" -gt 0 ] && ok "$n crews on claude-rc-crew checked" || bad "no agent uses provider claude-rc-crew — nothing was checked"
+[ "$n" -gt 0 ] && ok "$n named crews checked" || bad "no named crew found — nothing was checked"
 
 echo "── 3. no crew left on the Opus provider ──"
 left="$(grep -l '^provider = "claude-rc"$' "$AGENTS_DIR"/*/agent.toml 2>/dev/null || true)"
