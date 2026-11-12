@@ -2,7 +2,7 @@
 # prod-tests/gascity/story-ga-qg1dw5z.1.sh — prod test para ga-qg1dw5z.1: Hetzner trava 1 (dado pessoal só no usuário `dados`, só enquanto o build roda).
 # O que esta fatia ENTREGA é código versionado (instalador de root, wrapper, canal do mini, varredura, prova) e o runbook; a INSTALAÇÃO no nó é um passo de root separado (docs/runbooks/hetzner-dados.md).
 # Por isso o teste confere a árvore viva: arquivos presentes e executáveis, sintaxe, e as garantias do contrato no TEXTO do que será instalado (sem curinga no sudoers, chave de root com restrict, tmpfs
-# noexec/nosuid/nodev, recusa de swap e de staging fora do tmpfs, `dados` com shell real). Hermético: não fala com o nó, não chama gc/bd, não toca em .gc/. As baterias (134 + 75 casos e os mutantes) são a
+# noexec/nosuid/nodev, recusa de swap e de staging fora do tmpfs, `dados` com shell real). Hermético: não fala com o nó, não chama gc/bd, não toca em .gc/. As baterias (137 + 74 casos e os mutantes) são a
 # evidência do gate e rodam no nó Linux; aqui só se confere que existem.
 set -uo pipefail
 
@@ -39,6 +39,9 @@ has "$INST" 'visudo -cf "\$SUDOERS.new"'                           || fail "inst
 has "$INST" 'NOPASSWD: \$SBIN/gt-dados-run \$e"'                   || fail "instalador: sudoers não é uma linha por entrypoint"
 has "$INST" 'noexec,nosuid,nodev,nofail 0 0 # gt-dados'            || fail "instalador: tmpfs sem noexec,nosuid,nodev,nofail"
 has "$INST" 'sshd -t \|\| undo sshd-t'                             || fail "instalador: sshd recarrega sem 'sshd -t' (ou sem desfazer)"
+has "$INST" 'opção sem valor'                                      || fail "instalador: opção sem valor gira para sempre"
+has "$INST" 'die runner-ilegivel'                                  || fail "instalador: id do runner que falha vira 'fora do grupo'"
+has "$INST" 'undo sshd-runner-ilegivel'                            || fail "instalador: sshd -T do runner que falha vira 'runner intacto'"
 # vazio (instalador sem linha fora de comentário) ou falhou (ilegível) → recusa; só "li e não há regra larga" libera (contagem, não `grep -q` em pipe: SIGPIPE sob pipefail esconderia o achado)
 body=$(grep -v '^#' "$INST") || fail "instalador ilegível ou vazio: $INST"
 n=$(printf '%s\n' "$body" | grep -c -E 'ALL=\(dados\)|NOPASSWD: ALL')
@@ -53,11 +56,18 @@ has "$RUN" 'setpriv .*--no-new-privs'                              || fail "wrap
 has "$RUN" 'env -i'                                                || fail "wrapper: não limpa o ambiente"
 has "$RUN" 'GTD-WIPE: falhou'                                      || fail "wrapper: apagar que falha não é reportado"
 has "$RUN" 'reject'                                                || fail "wrapper: netns sem a regra reject"
+has "$RUN" 'chown -h'                                              || fail "wrapper: root cria in/ e out/ sem chown -h (seguiria link do build)"
+has "$RUN" 'fail stage-dirs'                                       || fail "wrapper: in/ ou out/ que virou link não é recusado"
+has "$RUN" '\[ ! -L "\$STAGE/in" \]'                              || fail "wrapper: apagar in/ trocado por link viraria 'ok'"
+# `install -d` como root SEGUE link simbólico do build e dá chown/chmod no alvo (dados → root); só comentário pode citá-lo (contagem, não `grep -q` em pipe)
+nid=$(grep -v '^#' "$RUN" | grep -c -E '(^|[^-])install -d') || true
+[[ "${nid:-1}" == 0 ]] || fail "wrapper: install -d como root em caminho do build ($nid linhas)"
 log "wrapper: tmpfs, sem swap, lista exata, no-new-privs, env -i, apagar confirmado, netns sem saída ✓"
 
 # ── canal do mini e varredura
 has "$ING" 'no link-simbolico-ou-ilegivel 65'                      || fail "ingest: link simbólico no tar não é recusado"
 has "$ING" 'no stage-nao-e-tmpfs 98'                               || fail "ingest: grava dado fora do tmpfs"
+has "$ING" 'no put-sem-arquivos 67'                                || fail "ingest: put sem arquivo nenhum vira 'ok files=0'"
 has "$SWP" 'NAO-CONSEGUI'                                          || fail "varredura: não distingue 'não consegui' de 'limpo'"
 has "$SWP" 'cant "stage-nao-e-tmpfs'                               || fail "varredura: não acusa staging fora do tmpfs"
 has "$SWP" 'flock -w "\$LOCKWAIT" -E 75 8'                         || fail "varredura: não toma o lock do wrapper (um build no meio perderia o staging)"

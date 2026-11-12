@@ -6,8 +6,11 @@ S=${GT_DADOS_STAGE:-}
 [ -n "$S" ] && [ "$(id -un)" = dados ] || { echo "synth: FALHOU não roda como dados no staging" >&2; exit 2; }
 mkdir -p "$S/in/synth" "$S/out/synth" || { echo "synth: FALHOU staging não gravável" >&2; exit 2; }
 for i in 1 2 3 4 5; do echo "SINTETICO-$i-$RANDOM-$$" > "$S/in/synth/r$i.txt"; done
+# o "ok files=" é o que EXISTE em in/synth, não uma constante: escrita que falhou, vazio ou find com erro (conta 0) → FALHOU
+n=$(find "$S/in/synth" -maxdepth 1 -type f -name 'r*.txt' -size +0c 2> /dev/null | wc -l | tr -d ' ')
+[ "$n" = 5 ] || { echo "synth: FALHOU só $n de 5 arquivos gravados em in/synth" >&2; exit 2; }
 # a saída tem de FALHAR (o netns rejeita tudo); se conectar, o isolamento não existe
 # (GTD_SYNTH_PROBE só existe para o selftest abrir um alvo local; o wrapper limpa o ambiente com env -i)
 if (exec 3<> "/dev/tcp/${GTD_SYNTH_PROBE:-1.1.1.1/53}") 2> /dev/null; then echo "synth: FALHOU saída de rede aberta" >&2; exit 3; fi
 cat "$S"/in/synth/r*.txt | sha256sum > "$S/out/synth/result.sha256" || exit 4
-echo "synth: ok files=5"
+echo "synth: ok files=$n"

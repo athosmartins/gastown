@@ -6,7 +6,7 @@
 #
 # CASOS: recusas antes de tocar em qualquer coisa (não é root, chave com opções/2 linhas/ilegível, entrypoint e tamanho inválidos, código sem sha limpo, runner no grupo, grupos extras) · instalação feliz (usuário, sudoers sem curinga,
 #   chave de root com restrict, drop-in, fstab sem perder as outras linhas, árvore, timer) e `--check` com os 20 itens ok · idempotência · sshd reprovado desfaz o drop-in (-t, dados fora do arquivo de root, runner afetado) e restaura o anterior ·
-#   visudo reprovado não troca o sudoers · fstab ilegível não é reescrito · link para fora da árvore · `--check` que FALHA / não consegue (cada item adulterado).
+#   visudo reprovado não troca o sudoers · fstab ilegível não é reescrito · link para fora da árvore · `--check` que FALHA / não consegue (cada item adulterado, e cada leitura que falha: id do runner, swapon, árvore, sudoers, sshd -T) · opção sem valor (com prazo: nunca gira) · chave com linha em branco · sshd -T do runner que falha desfaz o drop-in.
 # O QUE NÃO PROVA: que useradd/sshd/sudo/mount se comportam assim no Ubuntu 24.04 do nó. Isso é o `--check` + `hetzner-dados-prove.sh` rodados no nó depois da instalação.
 set -u
 HERE="$(cd "$(dirname "$0")" && pwd)"
@@ -15,20 +15,20 @@ trap 'chmod -R u+rwx "$T" 2>/dev/null; find "$T" -mindepth 1 -delete 2>/dev/null
 mkdir -p "$T/stubs" "$T/own"
 mk() { printf '%s\n' "$2" > "$T/stubs/$1"; chmod +x "$T/stubs/$1"; }
 mk id '#!/usr/bin/env bash
-case "$*" in "-u") echo "${ID_U:-0}" ;; "-u dados"|"-g dados") echo 1234 ;; "-nG dados") echo "${ID_G_DADOS:-dados}" ;; "-nG runner") echo "${ID_G_RUNNER:-runner}" ;; *) exec /usr/bin/id "$@" ;; esac'
+case "$*" in "-u") echo "${ID_U:-0}" ;; "-u dados"|"-g dados") echo 1234 ;; "-nG dados") echo "${ID_G_DADOS:-dados}" ;; "-nG runner") [ -z "${ID_RUNNER_FAIL:-}" ] || exit 1; echo "${ID_G_RUNNER:-runner}" ;; *) exec /usr/bin/id "$@" ;; esac'
 mk getent '[ -f "$T/user" ] && echo "dados:x:1234:1234::/home/dados:${SHELL_DADOS:-/bin/bash}"; [ -f "$T/user" ]'
 mk useradd 'echo "useradd $*" >> "$LOG"; touch "$T/user"'
 mk usermod 'echo "usermod $*" >> "$LOG"'
 mk passwd 'echo "dados ${PW_STATE:-L} 2026-11-11 0 99999 7 -1"'
 mk ssh-keygen 'echo "ssh-keygen $*" >> "$LOG"; ! grep -q BADKEY "$3"'
 mk sshd 'echo "sshd $*" >> "$LOG"
-case "$1" in -t) [ -z "${SSHD_T_FAIL:-}" ] ;; -T) case "$3" in user=dados,*) [ -n "${SSHD_DADOS_WRONG:-}" ] && echo "authorizedkeysfile .ssh/authorized_keys" || { [ -f "$R/etc/ssh/sshd_config.d/50-gt-dados.conf" ] && sed -n "s#^ *AuthorizedKeysFile \(.*\)#authorizedkeysfile \1#p" "$R/etc/ssh/sshd_config.d/50-gt-dados.conf"; } ;; *) echo "authorizedkeysfile ${SSHD_RUNNER_LEAK:-.ssh/authorized_keys}" ;; esac ;; esac'
+case "$1" in -t) [ -z "${SSHD_T_FAIL:-}" ] ;; -T) case "$3" in user=dados,*) [ -n "${SSHD_DADOS_WRONG:-}" ] && echo "authorizedkeysfile .ssh/authorized_keys" || { [ -f "$R/etc/ssh/sshd_config.d/50-gt-dados.conf" ] && sed -n "s#^ *AuthorizedKeysFile \(.*\)#authorizedkeysfile \1#p" "$R/etc/ssh/sshd_config.d/50-gt-dados.conf"; } ;; *) [ -z "${SSHD_RUNNER_FAIL:-}" ] || exit 1; echo "authorizedkeysfile ${SSHD_RUNNER_LEAK:-.ssh/authorized_keys}" ;; esac ;; esac'
 mk systemctl 'echo "systemctl $*" >> "$LOG"; [ "${SWEEP_FAIL:-}" = 1 ] && [ "$1 $2" = "start gt-dados-sweep.service" ] && exit 1; exit 0'
 mk visudo 'echo "visudo $*" >> "$LOG"; [ -z "${VISUDO_MISSING:-}" ] || exit 127; [ -z "${VISUDO_FAIL:-}" ]'
 mk mountpoint '[ -f "$T/mounted" ]'
 mk mount 'echo "mount $*" >> "$LOG"; touch "$T/mounted"; echo "dados dados 700" > "$T/own/$(echo "$R/srv/gtdados" | tr / _)"'
 mk findmnt 'echo "${FS:-tmpfs} rw,nosuid,nodev,noexec,relatime"'
-mk swapon '[ -z "${SWAP:-}" ] || echo "/dev/sda2 partition 1G"'
+mk swapon '[ -z "${SWAPON_FAIL:-}" ] || exit 1; [ -z "${SWAP:-}" ] || echo "/dev/sda2 partition 1G"'
 mk rsync 'echo "rsync $*" >> "$LOG"; for a; do d=$a; done; mkdir -p "$d"; cp -R "${@: -2:1}". "$d"'
 mk git 'case "$3" in rev-parse) echo "${GIT_HEAD:-abc123}" ;; status) echo "${GIT_DIRTY:-}" ;; esac'
 mk install 'a=(); u=""; g=""; m=""; d=0; while [ $# -gt 0 ]; do case "$1" in -o) u=$2; shift 2 ;; -g) g=$2; shift 2 ;; -m) m=$2; shift 2 ;; -d) d=1; shift ;; *) a+=("$1"); shift ;; esac; done
@@ -53,6 +53,9 @@ world() { chmod -R u+rwx "$T/r" 2>/dev/null; find "$T/r" "$T/own" -mindepth 1 -d
   printf '#!/bin/sh\n' > "$R/opt/gt-dados/app/bin/build-x"; chmod 755 "$R/opt/gt-dados/app/bin/build-x"; }
 inst() { local s=$1; shift; "$s" "$@" > "$OUT" 2> "$ERR"; RC=$?; }
 ap() { inst "$1" apply --pubkey-file "$T/mini.pub" "${@:2}"; }
+# como inst, mas com prazo de 3 s: um instalador que GIRA (laço sem saída) vira RC=124, nunca trava a bateria
+inst_t() { local s=$1 p i=0; shift; "$s" "$@" > "$OUT" 2> "$ERR" & p=$!; while kill -0 "$p" 2> /dev/null && [ $i -lt 30 ]; do sleep 0.1; i=$((i+1)); done
+  if kill -0 "$p" 2> /dev/null; then kill -9 "$p" 2> /dev/null; wait "$p" 2> /dev/null; RC=124; else wait "$p"; RC=$?; fi; }
 okc() { grep -c '^GTD-CHECK: .* ok$' "$OUT"; }
 case_refuse() { local s=$1
   world; ID_U=1000 inst "$s" apply --pubkey-file "$T/mini.pub"; ck "não é root → 64" rcis 64; world; inst "$s"; ck "sem argumentos → 64" rcis 64; inst "$s" apply --nao-existe; ck "argumento desconhecido → 64" rcis 64
@@ -62,6 +65,9 @@ case_refuse() { local s=$1
 ssh-ed25519 AAAAB3Nzb k2' 'lixo sem chave' 'ssh-ed25519 BADKEY'; do printf '%s\n' "$kc" > "$T/k.pub"; inst "$s" apply --pubkey-file "$T/k.pub"; ck "chave inválida ('$(printf %s "$kc" | head -c 20)') → 98 pubkey" rcis 98; done
   inst "$s" apply --pubkey-file "$T/nao-existe.pub"; ck "chave inexistente → 98" rcis 98; ck "recusas: nada foi criado/instalado" hasnt "$LOG" '^(useradd|usermod|mount|systemctl)'
   world; ID_G_RUNNER="runner dados" ap "$s"; ck "runner no grupo dados → 98" bash -c "[ $RC = 98 ] && grep -q 'runner-no-grupo-dados' '$ERR'"; world; ID_G_DADOS="dados sudo" ap "$s"; ck "dados com grupo extra → 98" has "$ERR" 'grupos-extras-do-dados'
+  world; for o in --pubkey-file --entrypoint --code-dir --code-sha --runner --stage-size; do inst_t "$s" apply $o; ck "opção sem valor ($o, última palavra) → 64, não gira para sempre" rcis 64; done
+  inst_t "$s" apply --pubkey-file "$T/mini.pub" --runner; ck "opção sem valor depois de uma opção boa → 64" rcis 64
+  world; ID_RUNNER_FAIL=1 ap "$s"; ck "id do runner falha (nome errado/NSS) → 98 runner-ilegivel, nunca 'fora do grupo'" bash -c "[ $RC = 98 ] && grep -q 'runner-ilegivel' '$ERR'"
   world; ap "$s" --entrypoint fantasma; ck "entrypoint que não está na árvore → 98" has "$ERR" 'entrypoint-ausente:fantasma'; world; mkdir -p "$R/opt/gt-dados/app/bin"; ln -s /etc/passwd "$R/opt/gt-dados/app/bin/evil"; ap "$s"; ck "link para fora da árvore → 98" has "$ERR" 'link-fora-da-arvore'; }
 case_happy() { local s=$1; world; ap "$s" --entrypoint build-x --runner runner --stage-size 6g; [ "$RC" = 0 ] || { echo "--- a instalação feliz saiu rc=$RC; stderr e itens do --check que não deram ok:"; cat "$ERR"; grep '^GTD-CHECK:' "$OUT" | grep -v ' ok$'; echo "--- fim"; }; ck "instalação feliz: rc 0" rcis 0; ck "feliz: os 20 itens do --check ok" test "$(okc)" = 20; ck "feliz: nenhum FALHOU/nao-consegui" hasnt "$OUT" 'FALHOU|nao-consegui'
   ck "feliz: useradd sem skel (-M), shell real, grupo próprio" has "$LOG" '^useradd -M -d .*/home/dados -s /bin/bash -U '; ck "feliz: senha travada (usermod -L)" has "$LOG" '^usermod -L dados$'
@@ -73,13 +79,15 @@ case_happy() { local s=$1; world; ap "$s" --entrypoint build-x --runner runner -
   ck "sshd: -t e os dois -T ANTES do reload" bash -c "grep -n -E '^sshd -t|^sshd -T -C user=dados|^sshd -T -C user=runner|^systemctl reload' '$LOG' | cut -d: -f2 | tr '\n' '|' | grep -q '^sshd -t|sshd -T -C user=dados.*|sshd -T -C user=runner.*|systemctl reload ssh|'"
   ck "visudo -cf valida o arquivo .new (a 1ª chamada do visudo), e o sudoers final existe" bash -c "[ \"\$(grep '^visudo' '$LOG' | head -n 1)\" = 'visudo -cf $R/etc/sudoers.d/gt-dados-run.new' ] && [ -s '$R/etc/sudoers.d/gt-dados-run' ] && [ ! -e '$R/etc/sudoers.d/gt-dados-run.new' ]"
   ck "timer: enable --now e a varredura roda uma vez" bash -c "grep -q '^systemctl enable --now gt-dados-sweep.timer' '$LOG' && grep -q '^systemctl start gt-dados-sweep.service' '$LOG'"
-  ap "$s" --entrypoint build-x --runner runner --stage-size 6g; ck "2ª instalação (idempotente): rc 0, 1 linha # gt-dados no fstab, 1 sudoers por entrypoint" bash -c "[ $RC = 0 ] && [ \"\$(grep -c '# gt-dados\$' '$R/etc/fstab')\" = 1 ] && [ \"\$(grep -c '^runner ' '$R/etc/sudoers.d/gt-dados-run')\" = 2 ] && [ \"\$(grep -c '^useradd' '$LOG')\" = 1 ]"; }
+  ap "$s" --entrypoint build-x --runner runner --stage-size 6g; ck "2ª instalação (idempotente): rc 0, 1 linha # gt-dados no fstab, 1 sudoers por entrypoint" bash -c "[ $RC = 0 ] && [ \"\$(grep -c '# gt-dados\$' '$R/etc/fstab')\" = 1 ] && [ \"\$(grep -c '^runner ' '$R/etc/sudoers.d/gt-dados-run')\" = 2 ] && [ \"\$(grep -c '^useradd' '$LOG')\" = 1 ]"
+  world; printf '\n%s\n' "$(cat "$T/mini.pub")" > "$T/blank.pub"; inst "$s" apply --pubkey-file "$T/blank.pub"; ck "chave em arquivo com linha em branco antes: rc 0 e o authorized_keys tem UMA linha, a da chave, com restrict" bash -c "[ $RC = 0 ] && [ \"\$(wc -l < '$R/etc/ssh/authorized_keys.d/dados' | tr -d ' ')\" = 1 ] && grep -q '^restrict,command=\".*\" ssh-ed25519 ' '$R/etc/ssh/authorized_keys.d/dados'"; }
 case_rollback() { local s=$1
   world; SWEEP_FAIL=1 ap "$s"; ck "1ª varredura falha ou passa do prazo → 98 sweep-primeira (nunca instalação 'ok' sem varredura)" bash -c "[ $RC = 98 ] && grep -q 'falhou:sweep-primeira' '$ERR'"
   world; echo "# ANTERIOR" > "$R/etc/ssh/sshd_config.d/50-gt-dados.conf"; SSHD_T_FAIL=1 ap "$s"; ck "sshd -t reprova → 98, drop-in ANTERIOR restaurado, sem reload" bash -c "[ $RC = 98 ] && grep -q ANTERIOR '$R/etc/ssh/sshd_config.d/50-gt-dados.conf' && ! grep -q '^systemctl reload' '$LOG'"
   world; SSHD_T_FAIL=1 ap "$s"; ck "sshd -t reprova sem drop-in anterior → drop-in removido" test ! -e "$R/etc/ssh/sshd_config.d/50-gt-dados.conf"
   world; SSHD_DADOS_WRONG=1 ap "$s"; ck "dados fora do arquivo de root → 98, drop-in desfeito, sem reload" bash -c "[ $RC = 98 ] && [ ! -e '$R/etc/ssh/sshd_config.d/50-gt-dados.conf' ] && ! grep -q '^systemctl reload' '$LOG'"
   world; SSHD_RUNNER_LEAK=/etc/ssh/authorized_keys.d/x ap "$s"; ck "runner afetado pelo drop-in → 98, desfeito, sem reload" bash -c "[ $RC = 98 ] && [ ! -e '$R/etc/ssh/sshd_config.d/50-gt-dados.conf' ] && ! grep -q '^systemctl reload' '$LOG'"
+  world; SSHD_RUNNER_FAIL=1 ap "$s"; ck "sshd -T do runner falha → 98 sshd-runner-ilegivel, drop-in desfeito, sem reload (silêncio não prova 'runner intacto')" bash -c "[ $RC = 98 ] && grep -q 'sshd-runner-ilegivel' '$ERR' && [ ! -e '$R/etc/ssh/sshd_config.d/50-gt-dados.conf' ] && ! grep -q '^systemctl reload' '$LOG'"
   world; echo "# SUDOERS ANTIGO" > "$R/etc/sudoers.d/gt-dados-run"; VISUDO_FAIL=1 ap "$s"; ck "visudo reprova → 98, sudoers ANTIGO intacto, sem .new" bash -c "[ $RC = 98 ] && grep -q 'SUDOERS ANTIGO' '$R/etc/sudoers.d/gt-dados-run' && [ ! -e '$R/etc/sudoers.d/gt-dados-run.new' ]"
   world; rm -f "$R/etc/fstab"; ap "$s"; ck "fstab ilegível → 98 fstab-leitura e NÃO cria fstab só com a nossa linha" bash -c "[ $RC = 98 ] && grep -q 'fstab-leitura' '$ERR' && [ ! -s '$R/etc/fstab' ]"; }
 adult() { # <rótulo> <item esperado FALHOU/nao-consegui> <comando de adulteração>
@@ -91,7 +99,11 @@ case_check() { s_=$1; world; ap "$s_" > /dev/null 2>&1; inst "$s_" --check; ck "
   adult "staging em ext4" "stage-tmpfs-proprio FALHOU" "export FS=ext4"; unset FS; adult "swap ligada" "sem-swap FALHOU" "export SWAP=1"; unset SWAP; adult "senha destravada" "senha-travada FALHOU" "export PW_STATE=P"; unset PW_STATE
   adult "shell nologin" "shell-real FALHOU" "export SHELL_DADOS=/usr/sbin/nologin"; unset SHELL_DADOS; adult "runner no grupo" "runner-fora-do-grupo FALHOU" "export ID_G_RUNNER='runner dados'"; unset ID_G_RUNNER
   adult "sshd: runner afetado" "sshd-runner-intacto FALHOU" "export SSHD_RUNNER_LEAK=/etc/ssh/authorized_keys.d/x"; unset SSHD_RUNNER_LEAK; adult "arquivo de root gravável" "arvore-de-root FALHOU" "chmod 777 '$R/opt/gt-dados/app/bin/synth'"
-  adult "visudo ausente (127)" "sudoers-valido nao-consegui" "export VISUDO_MISSING=1"; unset VISUDO_MISSING; }
+  adult "visudo ausente (127)" "sudoers-valido nao-consegui" "export VISUDO_MISSING=1"; unset VISUDO_MISSING
+  # 3º estado: leitura que FALHA nunca vira ok (o teste negado `! ...` e o `[ -z "$(...)" ]` liam o erro como "não tem nada")
+  adult "id do runner falha" "runner-fora-do-grupo nao-consegui" "export ID_RUNNER_FAIL=1"; unset ID_RUNNER_FAIL; adult "swapon falha" "sem-swap nao-consegui" "export SWAPON_FAIL=1"; unset SWAPON_FAIL
+  adult "árvore de root sumiu (find falha)" "arvore-de-root nao-consegui" "mv '$R/opt/gt-dados' '$R/opt/gt-dados.x'"; adult "sudoers ilegível" "sudoers-sem-curinga nao-consegui" "rm -f '$R/etc/sudoers.d/gt-dados-run'"
+  adult "sshd -T do runner falha" "sshd-runner-intacto nao-consegui" "export SSHD_RUNNER_FAIL=1"; unset SSHD_RUNNER_FAIL; }
 case_refuse "$T/inst.sh"; case_happy "$T/inst.sh"; case_rollback "$T/inst.sh"; case_check "$T/inst.sh"
 mut() { local name=$1 expr=$2 fn=$3 mc="$T/mut-$1.sh"; mkcopy "$HERE/hetzner-dados-install.sh" "$expr" "$mc"; cmp -s "$mc" "$T/inst.sh" && { echo "FAIL mutante $name não alterou nada"; fails=$((fails+1)); return; }
   QUIET=1; BAD=0; "$fn" "$mc" > /dev/null 2>&1; QUIET=0; n=$((n+1)); if [ "$BAD" = 1 ]; then echo "ok   mutante $name reprovado"; else echo "FAIL mutante $name SOBREVIVEU"; fails=$((fails+1)); fi; }
@@ -111,4 +123,13 @@ mut I15-fstab-sem-nofail 's#,nodev,nofail 0 0#,nodev 0 0#' case_happy
 mut I12-undo-nao-desfaz 's#^undo() { if.*#undo() { die "$1"; }#' case_rollback
 mut I13-check-sudo-curinga-cego 's#^t_sudo_strict() {.*#t_sudo_strict() { true; }#' case_check
 mut I14-check-127-vira-ok 's#127) echo "GTD-CHECK: \$n nao-consegui"#127) echo "GTD-CHECK: $n ok"#' case_check
+mut I17-opcao-sem-valor-gira 's,\[ \$# -ge 2 \] || { echo "opção sem valor: \$1" >&2; exit 64; },true,' case_refuse
+mut I18-runner-ilegivel-vira-fora-do-grupo 's#RG=\$(id -nG "\$RUNNER" 2> /dev/null) || die runner-ilegivel#RG=$(id -nG "$RUNNER" 2> /dev/null)#' case_refuse
+mut I19-check-runner-127-vira-ok 's#g=\$(id -nG "\$RUNNER" 2> /dev/null) || return 127; ##' case_check
+mut I20-check-swapon-127-vira-ok 's#s=\$(swapon --noheadings --show 2> /dev/null) || return 127; #s=$(swapon --noheadings --show 2> /dev/null); #' case_check
+mut I21-check-arvore-127-vira-ok 's#-print -quit 2> /dev/null) || return 127;#-print -quit 2> /dev/null);#' case_check
+mut I22-check-sudoers-ilegivel-vira-ok 's#t_sudo_strict() { \[ -r "\$SUDOERS" \] || return 127; #t_sudo_strict() { #' case_check
+mut I23-sshd-runner-ilegivel-vira-intacto 's#RO=\$(sshd_for "\$RUNNER") || undo sshd-runner-ilegivel#RO=$(sshd_for "$RUNNER")#' case_rollback
+mut I24-check-sshd-runner-127-vira-ok 's#o=\$(sshd_for "\$RUNNER") || return 127; #o=$(sshd_for "$RUNNER"); #' case_check
+mut I25-chave-com-linha-em-branco 's#KEYLINE=\$(grep -m1 \. "\$PUB")#KEYLINE=$(cat "$PUB")#' case_happy
 echo "---"; echo "casos: $n, reprovados: $fails"; [ "$fails" -eq 0 ]

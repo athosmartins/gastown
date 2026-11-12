@@ -5,7 +5,7 @@
 #   Itens · Códigos de saída
 #
 # ITENS (uma linha `GTD-PROVE: <item> ok|FALHOU|nao-consegui`): home-negado (ls /home/dados → Permission denied) · stage-negado · sem-grupo-dados (id) · sudo-como-dados-recusado (sudo -n -u dados true) ·
-#   fora-da-lista-recusado (sudo -n gt-dados-run <nome que não existe>) · build-sintetico (sudo -n gt-dados-run synth: rc 0, `synth: ok`, `GTD-WIPE: ok`, `GTD-EGRESS: attempts=` numérico).
+#   fora-da-lista-recusado (sudo -n gt-dados-run <nome que não existe>) · build-sintetico (sudo -n gt-dados-run synth: rc 0, `synth: ok`, `GTD-WIPE: ok`, `GTD-EGRESS: attempts=` ≥ 1: 0 = a sonda não chegou ao netns).
 #   "Permission denied" é o ÚNICO jeito de ok: diretório que não existe (`No such file`) = trava não instalada = nao-consegui, nunca ok. A conferência do staging VAZIO por root é a linha `GTD-WIPE: ok` do wrapper (ele lê como root) e `hetzner-dados-install.sh --check`.
 # CÓDIGOS: 0 todos ok · 1 algum FALHOU · 2 algum nao-consegui (e nenhum FALHOU)
 set -u
@@ -24,7 +24,9 @@ out=$(sudo -n -u dados true 2>&1); rc=$?
 out=$(sudo -n "$RUN" __fora-da-lista__ 2>&1); rc=$?
 case $out in *"GTD-RUN: ok"*) item fora-da-lista-recusado FALHOU "rodou" ;; *) [ $rc -ne 0 ] && item fora-da-lista-recusado ok || item fora-da-lista-recusado FALHOU "rc=0" ;; esac
 out=$(sudo -n "$RUN" synth 2>&1); rc=$?
-if [ $rc -eq 0 ] && [[ $out == *"synth: ok"* && $out == *"GTD-WIPE: ok"* && $out =~ GTD-EGRESS:\ attempts=[0-9]+ ]]; then item build-sintetico ok
+# a sonda de rede do synth SEMPRE tenta ao menos uma conexão: attempts=0 quer dizer que ela nunca chegou à regra de rejeição do netns (ex.: bash sem /dev/tcp acha que está "isolado") → não prova isolamento
+if [ $rc -eq 0 ] && [[ $out == *"synth: ok"* && $out == *"GTD-WIPE: ok"* && $out =~ GTD-EGRESS:\ attempts=[1-9][0-9]* ]]; then item build-sintetico ok
+elif [ $rc -eq 0 ] && [[ $out =~ GTD-EGRESS:\ attempts=0($|[^0-9]) ]]; then item build-sintetico FALHOU "attempts=0: a sonda de rede não chegou ao netns, isolamento não provado"
 else item build-sintetico FALHOU "rc=$rc: $(printf '%s' "$out" | tail -n 1 | cut -c1-160)"; fi
 [ $BAD -eq 0 ] && [ $CANT -eq 0 ] && { echo "GTD-PROVE: resultado ok"; exit 0; }
 [ $BAD -eq 1 ] && { echo "GTD-PROVE: resultado FALHOU"; exit 1; }

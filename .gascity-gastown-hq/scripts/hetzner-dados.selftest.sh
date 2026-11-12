@@ -38,6 +38,7 @@ EOF
 cat > "$T/stubs/setpriv" <<'EOF'
 #!/usr/bin/env bash
 echo "setpriv $*" >> "$LOG"; echo "IN=$(find "$STAGE_T/in" -type f | wc -l | tr -d ' ')" >> "$LOG"
+if [ "${LINK_IN:-}" = 1 ]; then find "$STAGE_T/in" -mindepth 1 -delete; rmdir "$STAGE_T/in"; ln -s "$T/victim" "$STAGE_T/in"; fi
 if [ "${SLOW:-}" = 1 ]; then sleep 20 & sp=$!; trap 'echo got-term >> "$LOG"; kill $sp 2>/dev/null; exit 143' TERM; echo started >> "$LOG"; wait $sp; fi
 exit "${CMD_RC:-0}"
 EOF
@@ -49,6 +50,8 @@ cat > "$T/stubs/find" <<'EOF'
 case "${FIND_NOISE:-}" in
   enoent) echo "find: '/tmp/x': No such file or directory" >&2; exit 1 ;;
   eacces) echo "find: '/tmp/y': Permission denied" >&2; exit 1 ;;
+  masked) echo "find: '/tmp/No such file or directory/z': Permission denied" >&2; exit 1 ;;
+  countfail) case " $* " in *" -delete "* | *" -print "* | *" -exec "*) ;; *) echo "find: '$1/x': Permission denied" >&2; exit 1 ;; esac ;;
 esac
 exit $rc
 EOF
@@ -62,11 +65,11 @@ echo "sudo $*" >> "$LOG"
 case "$*" in
   "-n -u dados true") [ "${SUDO_AS_DADOS:-}" = 1 ] && exit 0; echo "sudo: a password is required" >&2; exit 1 ;;
   "-n /usr/local/sbin/gt-dados-run __fora-da-lista__") [ "${SUDO_LIST_LEAK:-}" = 1 ] && { echo "GTD-RUN: ok ns=x"; exit 0; }; echo "sudo: a password is required" >&2; exit 1 ;;
-  "-n /usr/local/sbin/gt-dados-run synth") printf '%s\n' ${SYNTH_OUT:-"synth: ok files=5" "GTD-EGRESS: attempts=3" "GTD-WIPE: ok"}; exit "${SYNTH_RC:-0}" ;;
+  "-n /usr/local/sbin/gt-dados-run synth") printf '%b\n' "${SYNTH_OUT:-synth: ok files=5\nGTD-EGRESS: attempts=3\nGTD-WIPE: ok}"; exit "${SYNTH_RC:-0}" ;;
 esac
 EOF
 printf '#!/usr/bin/env bash\ncase "$2" in /home/dados|/srv/gtdados/in) case "${LS_MODE:-denied}" in denied) echo "ls: cannot open directory $2: Permission denied" >&2; exit 2 ;; missing) echo "ls: cannot access $2: No such file or directory" >&2; exit 2 ;; leak) echo secret; exit 0 ;; esac ;; esac\nexit 0\n' > "$T/stubs/ls"
-printf '#!/usr/bin/env bash\na=(); while [ $# -gt 0 ]; do case "$1" in -o|-g) shift 2 ;; *) a+=("$1"); shift ;; esac; done; exec /usr/bin/install "${a[@]}"\n' > "$T/stubs/install"
+printf '#!/usr/bin/env bash\necho "chown $*" >> "$LOG"; [ "${FAIL_STEP:-}" = chown ] && exit 1; exit 0\n' > "$T/stubs/chown"
 chmod +x "$T/stubs/"*
 export LOG T STAGE_T="$S" GTD_TEST_ETC="$T/etc-netns" GTD_TEST_OWNER="$ME"
 mkcopy() { # <origem> <destino> [sed extra]
@@ -108,7 +111,20 @@ case_run() { local s=$1
   for st in netns-add lo gtn0 nft nft-regra; do FAIL_STEP=$st go "$s" synth; ck "run: falha em $st → 98, entrypoint NÃO roda, dado intacto" bash -c "[ $RC = 98 ] && ! grep -q '$SP' '$LOG' && [ -f '$S/in/proj/dado.txt' ]"; done
   if [ "$(id -u)" != 0 ]; then fresh; seed; mkdir -p "$S/in/proj/trava"; echo x > "$S/in/proj/trava/f"; chmod 555 "$S/in/proj/trava"; SUDO_UID=1000 "$s" synth > "$OUT" 2> "$ERR"; RC=$?
     ck "run: apagar in/ falha → 99 mesmo com entrypoint ok" rcis 99; ck "run: ...GTD-WIPE falhou" has "$ERR" '^GTD-WIPE: falhou'; chmod -R u+rwx "$S"; fi
-  fresh; find "$S/in" -delete 2>/dev/null; SUDO_UID=1000 "$s" synth > "$OUT" 2> "$ERR"; RC=$?; ck "run: in/ recriado quando faltava (install -d)" test -d "$S/in"; }
+  fresh; find "$S/in" -delete 2>/dev/null; SUDO_UID=1000 "$s" synth > "$OUT" 2> "$ERR"; RC=$?; ck "run: in/ recriado quando faltava (mkdir + chown -h, nunca install -d)" test -d "$S/in"; ck "run: ...com chown -h (não segue link) para dados:dados" has "$LOG" '^chown -h dados:dados .*/in$'
+  fresh; find "$S/in" "$S/out" -delete 2>/dev/null; FAIL_STEP=chown SUDO_UID=1000 "$s" synth > "$OUT" 2> "$ERR"; RC=$?; ck "run: chown falhou → 98 stage-dirs e o entrypoint NÃO roda" bash -c "[ $RC = 98 ] && grep -q 'recusado:stage-dirs' '$ERR' && ! grep -q '$SP' '$LOG'"; }
+# revisão do gate 12/11: o build (dados) troca in/ ou out/ por link para um diretório de FORA; root não pode dar chown/chmod nele (dados → root por /usr/local/sbin)
+vmode() { stat -c %a "$T/victim" 2> /dev/null || stat -f %Lp "$T/victim"; }
+lnk() { local nm=$1 kind=$2; fresh; seed; find "$T/victim" -mindepth 0 -delete 2>/dev/null; mkdir -p "$T/victim"; chmod 755 "$T/victim"; echo keep > "$T/victim/sentinela"; find "$S/$nm" -delete 2>/dev/null
+  case $kind in link) ln -s "$T/victim" "$S/$nm" ;; solto) ln -s "$T/nao-existe" "$S/$nm" ;; arquivo) echo x > "$S/$nm" ;; esac; }
+case_link() { local s=$1 nm kind
+  for nm in in out; do for kind in link solto arquivo; do lnk "$nm" "$kind"; SUDO_UID=1000 "$s" synth > "$OUT" 2> "$ERR"; RC=$?
+    ck "run: $nm/ é $kind → 98 stage-dirs, o entrypoint NÃO roda" bash -c "[ $RC = 98 ] && grep -q 'recusado:stage-dirs' '$ERR' && ! grep -q '$SP' '$LOG'"
+    ck "run: $nm/ é $kind → nenhum chown/chmod/mkdir de root" hasnt "$LOG" '^chown '
+    [ "$kind" != link ] || ck "run: $nm/ link → o diretório de fora ficou intacto (modo 755, sentinela, dono)" bash -c "[ \"$(vmode)\" = 755 ] && [ -f '$T/victim/sentinela' ]"; done; done
+  # o build troca in/ por link DURANTE a rodada: apagar não pode virar "ok" (find não entra em link dado como ponto de partida)
+  fresh; seed; find "$T/victim" -mindepth 0 -delete 2>/dev/null; mkdir -p "$T/victim"; chmod 755 "$T/victim"; echo keep > "$T/victim/sentinela"; LINK_IN=1 SUDO_UID=1000 "$s" synth > "$OUT" 2> "$ERR"; RC=$?
+  ck "run: in/ virou link durante o build → 99 GTD-WIPE falhou (nunca ok)" bash -c "[ $RC = 99 ] && grep -q '^GTD-WIPE: falhou' '$ERR' && ! grep -q '^GTD-WIPE: ok' '$ERR'"; ck "run: ...e o alvo do link não foi tocado" bash -c "[ -f '$T/victim/sentinela' ] && [ \"$(vmode)\" = 755 ]"; }
 case_lock() { local s=$1; fresh; seed; chmod 644 "$T/lock" 2> /dev/null; SUDO_UID=1000 "$s" synth > "$OUT" 2> "$ERR"; RC=$?; ck "run: lock vira 0600 (era 0644) e o build roda" bash -c "[ $RC = 0 ] && [ -n \"\$(find '$T/lock' -perm 600)\" ]"
   fresh; seed; rm -f "$T/lock"; SUDO_UID=1000 "$s" synth > "$OUT" 2> "$ERR"; RC=$?; ck "run: lock criado do zero nasce 0600" bash -c "[ $RC = 0 ] && [ -n \"\$(find '$T/lock' -perm 600)\" ]"; }
 case_signal() { local s=$1; fresh; seed; : > "$LOG"; env SLOW=1 SUDO_UID=1000 "$s" synth > "$OUT" 2> "$ERR" & local hp=$! i=0
@@ -127,7 +143,11 @@ case_ingest() { local s=$1 src="$T/src"; find "$src" -mindepth 0 -delete 2>/dev/
   ing "get proj"; ck "ingest get: devolve o tar do resultado" bash -c "tar -t < '$OUT' | grep -q r.txt"; SEED= ing "get nada"; ck "ingest get: ausente → 66 e stdout vazio (não um tar vazio)" bash -c "[ $RC = 66 ] && [ ! -s '$OUT' ]"
   ing "clean proj"; ck "ingest clean <nome>: apaga in e out desse nome" test ! -e "$S/in/proj" -a ! -e "$S/out/proj"; mkdir -p "$S/in/outro"; seed; ing "clean"; ck "ingest clean (tudo): in/ e out/ somem" test ! -e "$S/in/proj" -a ! -e "$S/out/proj"
   ing "status"; ck "ingest status: conta in/out" has "$OUT" 'tmpfs=sim in=1 out=1'
-  if [ "$(id -u)" != 0 ]; then fresh; seed; chmod 555 "$S/in/proj"; SSH_ORIGINAL_COMMAND="clean proj" "$s" > "$OUT" 2> "$ERR"; RC=$?; ck "ingest clean: não consegui apagar → 99 (nunca 'ok')" rcis 99; chmod -R u+rwx "$S"; fi; }
+  FIND_NOISE=eacces ing "status"; ck "ingest status: find que falha → '?' e rc 74 (nunca 0 itens)" bash -c "[ $RC = 74 ] && grep -q 'in=? out=?' '$OUT'"; SEED= ing "status"; ck "ingest status: nada em in/ e out/ → 0 e 0 (diferente de '?')" has "$OUT" 'in=0 out=0'
+  # o tar do remetente que morre antes de listar nada deixa um arquivo VÁLIDO e vazio (só blocos de zeros): `tar -x` sai 0 sem extrair nada (um stream de 0 byte já sai 2 sozinho, caso do "tar quebrado")
+  head -c 10240 /dev/zero > "$T/empty.tar"; IN="$T/empty.tar" SEED= ing "put proj"; ck "ingest put: arquivo tar válido e vazio (o tar do remetente morreu) → 67, nada ficou, nunca 'ok files=0'" bash -c "[ $RC = 67 ] && [ ! -e '$S/in/proj' ] && ! grep -q 'ok files' '$OUT'"
+  if [ "$(id -u)" != 0 ]; then fresh; seed; chmod 555 "$S/in/proj"; SSH_ORIGINAL_COMMAND="clean proj" "$s" > "$OUT" 2> "$ERR"; RC=$?; ck "ingest clean: não consegui apagar → 99 (nunca 'ok')" rcis 99; chmod -R u+rwx "$S"
+    fresh; seed; chmod 555 "$S/in/proj"; SSH_ORIGINAL_COMMAND="clean" "$s" > "$OUT" 2> "$ERR"; RC=$?; ck "ingest clean (tudo): in/ resistiu → 99, mas out/ foi apagado mesmo assim (não para no 1º que sobrou)" bash -c "[ $RC = 99 ] && [ ! -e '$S/out' ]"; chmod -R u+rwx "$S"; fi; }
 sw() { fresh; rm -f "$T/ps.n"; seed; mkdir -p "$S/in/x"; echo d > "$T/dhome/cache"; echo t > "$T/tmp1/$ME-file"; mkdir -p "$T/tmp1/$ME-dir/sub"; echo n > "$T/tmp1/$ME-dir/sub/f"; echo v > "$T/tmp2/$ME-file"; printf '%s\n' "${PS_ROWS:-}" > "$T/ps"; "$1" > "$OUT" 2> "$ERR"; RC=$?; }
 case_sweep() { local s=$1 row_new="$ME 60 99999"
   PS_ROWS="root 100 1" sw "$s"; ck "sweep: sem build vivo → LIMPO rc 0" rcis 0; ck "sweep: linha LIMPO no stdout e no log" bash -c "grep -q 'gt-dados-sweep: LIMPO removed=' '$OUT' && grep -q 'gt-dados-sweep: LIMPO' '$T/sweep.log'"
@@ -146,7 +166,9 @@ case_sweep() { local s=$1 row_new="$ME 60 99999"
   chmod 644 "$T/lock"; PS_ROWS="root 1 1" sw "$s"; ck "sweep: lock nasce/vira 0600 (era 0644)" bash -c "[ -n \"\$(find '$T/lock' -perm 600)\" ]"
   TIMEOUT_RC=124 PS_ROWS="root 1 1" sw "$s"; ck "sweep: prazo do find estourado → NAO-CONSEGUI leitura-falhou, rc 2, nunca LIMPO, nada apagado" bash -c "[ $RC = 2 ] && grep -q 'NAO-CONSEGUI leitura-falhou' '$OUT' && ! grep -q LIMPO '$OUT' && [ -f '$S/in/proj/dado.txt' ]"
   FIND_NOISE=enoent PS_ROWS="root 1 1" sw "$s"; ck "sweep: find com 'No such file or directory' (entrada sumiu no meio) → ainda LIMPO rc 0" bash -c "[ $RC = 0 ] && grep -q 'gt-dados-sweep: LIMPO' '$OUT'"
-  FIND_NOISE=eacces PS_ROWS="root 1 1" sw "$s"; ck "sweep: find com 'Permission denied' → NAO-CONSEGUI leitura-falhou, rc 2, nunca LIMPO" bash -c "[ $RC = 2 ] && grep -q 'NAO-CONSEGUI leitura-falhou' '$OUT' && ! grep -q LIMPO '$OUT'"; }
+  FIND_NOISE=eacces PS_ROWS="root 1 1" sw "$s"; ck "sweep: find com 'Permission denied' → NAO-CONSEGUI leitura-falhou, rc 2, nunca LIMPO" bash -c "[ $RC = 2 ] && grep -q 'NAO-CONSEGUI leitura-falhou' '$OUT' && ! grep -q LIMPO '$OUT'"
+  FIND_NOISE=masked PS_ROWS="root 1 1" sw "$s"; ck "sweep: erro de OUTRO tipo num caminho que contém 'No such file or directory' não é entrada que sumiu → NAO-CONSEGUI rc 2, nunca LIMPO" bash -c "[ $RC = 2 ] && grep -q 'NAO-CONSEGUI leitura-falhou' '$OUT' && ! grep -q LIMPO '$OUT'"
+  FIND_NOISE=countfail PS_ROWS="root 1 1" sw "$s"; ck "sweep: contagem ilegível mas o resto confere → LIMPO rc 0 com 'contagem=incompleta' no fim (nunca um removed=0 que pareça 'nada havia')" bash -c "[ $RC = 0 ] && grep -q 'LIMPO removed=.* killed=0 contagem=incompleta\$' '$OUT'"; PS_ROWS="root 1 1" sw "$s"; ck "sweep: contagem legível → a linha NÃO leva 'contagem=incompleta'" hasnt "$OUT" 'contagem=incompleta'; }
 case_synth() { local s=$1 PATH="$T/stubs:$PATH"; fresh; mkdir -p "$S/in" "$S/out"
   ID_UN=runner GT_DADOS_STAGE="$S" "$s" > "$OUT" 2> "$ERR"; RC=$?; ck "synth: fora do usuário dados → 2" rcis 2; GT_DADOS_STAGE= "$s" > "$OUT" 2> "$ERR"; RC=$?; ck "synth: sem GT_DADOS_STAGE → 2" rcis 2
   python3 - "$T/port" <<'PY' &
@@ -155,7 +177,8 @@ s = socket.socket(); s.bind(("127.0.0.1", 0)); s.listen(5); open(sys.argv[1], "w
 PY
   local lp=$! i=0; while [ ! -s "$T/port" ] && [ $i -lt 30 ]; do sleep 0.1; i=$((i+1)); done
   GTD_SYNTH_PROBE="127.0.0.1/$(cat "$T/port")" GT_DADOS_STAGE="$S" "$s" > "$OUT" 2> "$ERR"; RC=$?; ck "synth: saída de rede aberta → 3 (isolamento inexistente)" rcis 3; kill "$lp" 2>/dev/null; wait "$lp" 2>/dev/null
-  GTD_SYNTH_PROBE="127.0.0.1/1" GT_DADOS_STAGE="$S" "$s" > "$OUT" 2> "$ERR"; RC=$?; ck "synth: saída fechada → ok rc 0" rcis 0; ck "synth: resultado em out/" test -s "$S/out/synth/result.sha256"; ck "synth: dado sintético em in/ (5 arquivos)" test "$(find "$S/in/synth" -type f | wc -l | tr -d ' ')" = 5; }
+  GTD_SYNTH_PROBE="127.0.0.1/1" GT_DADOS_STAGE="$S" "$s" > "$OUT" 2> "$ERR"; RC=$?; ck "synth: saída fechada → ok rc 0" rcis 0; ck "synth: resultado em out/" test -s "$S/out/synth/result.sha256"; ck "synth: dado sintético em in/ (5 arquivos)" test "$(find "$S/in/synth" -type f | wc -l | tr -d ' ')" = 5; ck "synth: 'ok files=' é a contagem do que existe" has "$OUT" '^synth: ok files=5$'
+  if [ "$(id -u)" != 0 ]; then fresh; mkdir -p "$S/in/synth"; chmod 555 "$S/in/synth"; GTD_SYNTH_PROBE="127.0.0.1/1" GT_DADOS_STAGE="$S" "$s" > "$OUT" 2> "$ERR"; RC=$?; ck "synth: in/synth não gravável → 2 FALHOU (nunca 'ok files=5' constante)" bash -c "[ $RC = 2 ] && ! grep -q 'synth: ok' '$OUT'"; chmod -R u+rwx "$S"; fi; }
 pv() { : > "$LOG"; "$1" > "$OUT" 2> "$ERR"; RC=$?; }
 case_prove() { local s=$1
   pv "$s"; ck "prove: tudo ok → rc 0" rcis 0; ck "prove: 6 itens + o resultado, todos ok" test "$(grep -c '^GTD-PROVE: .* ok$' "$OUT")" = 7
@@ -163,9 +186,12 @@ case_prove() { local s=$1
   LS_MODE=missing pv "$s"; ck "prove: diretório não existe → nao-consegui rc 2 (nunca ok)" bash -c "[ $RC = 2 ] && grep -q 'home-negado nao-consegui' '$OUT'"
   ID_G="runner dados" pv "$s"; ck "prove: runner no grupo dados → FALHOU" has "$OUT" 'sem-grupo-dados FALHOU'; SUDO_AS_DADOS=1 pv "$s"; ck "prove: sudo -u dados funcionou → FALHOU" has "$OUT" 'sudo-como-dados-recusado FALHOU'
   SUDO_LIST_LEAK=1 pv "$s"; ck "prove: entrypoint fora da lista rodou → FALHOU" has "$OUT" 'fora-da-lista-recusado FALHOU'; SYNTH_OUT="synth: ok" pv "$s"; ck "prove: build sem GTD-WIPE ok → FALHOU" has "$OUT" 'build-sintetico FALHOU'
-  SYNTH_RC=3 pv "$s"; ck "prove: build com rc≠0 → FALHOU" has "$OUT" 'build-sintetico FALHOU'; }
+  SYNTH_RC=3 pv "$s"; ck "prove: build com rc≠0 → FALHOU" has "$OUT" 'build-sintetico FALHOU'
+  SYNTH_OUT='synth: ok files=5\nGTD-EGRESS: attempts=0\nGTD-WIPE: ok' pv "$s"; ck "prove: attempts=0 (a sonda não chegou ao netns) → FALHOU rc 1, nunca ok" bash -c "[ $RC = 1 ] && grep -q 'build-sintetico FALHOU (attempts=0' '$OUT'"
+  SYNTH_OUT='synth: ok files=5\nGTD-EGRESS: attempts=1\nGTD-WIPE: ok' pv "$s"; ck "prove: attempts=1 → ok" has "$OUT" 'build-sintetico ok'
+  SYNTH_OUT='synth: ok files=5\nGTD-EGRESS: attempts=?\nGTD-WIPE: ok' pv "$s"; ck "prove: attempts=? (contador ilegível) → FALHOU" has "$OUT" 'build-sintetico FALHOU'; }
 # GTD_CASES="run signal ..." roda só esses casos (depuração) e pula os mutantes
-for c in ${GTD_CASES:-run ingest sweep synth prove signal lock}; do x=${c/signal/run}; case_$c "$T/${x/lock/run}.sh"; done
+for c in ${GTD_CASES:-run link ingest sweep synth prove signal lock}; do x=${c/signal/run}; x=${x/link/run}; case_$c "$T/${x/lock/run}.sh"; done
 [ -z "${GTD_CASES:-}" ] || { echo "---"; echo "casos: $n, reprovados: $fails (só GTD_CASES=$GTD_CASES)"; [ "$fails" -eq 0 ]; exit; }
 # MUTANTES: cada um tira UMA guarda de uma cópia; o caso da guarda tem de reprovar
 mut() { local name=$1 script=$2 expr=$3 fn=$4 mc="$T/mut-$1.sh"; mkcopy "$HERE/hetzner-dados-$script.sh" "$mc" "$expr"; cmp -s "$mc" "$T/$script.sh" && { echo "FAIL mutante $name não alterou nada"; fails=$((fails+1)); return; }
@@ -180,7 +206,10 @@ mut M7-run-sem-env-i run 's#/usr/bin/env -i #/usr/bin/env #' case_run
 mut M8-run-sem-dono-root run 's#-type f -user \${GTD_TEST_OWNER} ! -perm -020 ! -perm -002 -perm -100#-type f#' case_run
 mut M9-run-sem-matar-o-netns run 's#xargs -r kill -9#cat > /dev/null#' case_run
 mut M10-ingest-sem-link ingest 's#\[ -z "\$l" \] ||#true ||#' case_ingest
-mut M11-ingest-gone-mente ingest 's#return 1; done; return 0#true; done; return 0#' case_ingest
+mut M11-ingest-gone-mente ingest 's#then rc=1; fi#then rc=0; fi#' case_ingest
+mut M31-ingest-gone-para-no-1o ingest 's#then rc=1; fi#then return 1; fi#' case_ingest
+mut M32-ingest-put-vazio-vira-ok ingest 's#\[ "\${nf:-0}" -gt 0 \] ||#true ||#' case_ingest
+mut M33-ingest-status-falha-vira-0 ingest "s#|| { echo '?'; return 0; }#|| { echo 0; return 0; }#" case_ingest
 mut M12-ingest-sem-tmpfs ingest 's#|| no stage-nao-e-tmpfs 98##' case_ingest
 mut M13-ingest-get-vazio ingest 's#|| no resultado-ausente 66##' case_ingest
 mut M14-sweep-ignora-vivo sweep 's#if \[ "\$LIVE" -gt 0 \]#if false#' case_sweep
@@ -189,11 +218,18 @@ mut M16-sweep-sobra-vira-limpo sweep 's#\[ -z "\$left" \] || cant "sobrou:\$left
 mut M17-sweep-sem-tmpfs sweep 's#cant "stage-nao-e-tmpfs#log "ignorado stage-nao-e-tmpfs#' case_sweep
 mut M21-sweep-sem-lock sweep 's#flock -w "\$LOCKWAIT" -E 75 8; r=\$?#r=0#' case_sweep
 mut M22-sweep-prazo-vira-limpo sweep 's#\[ "\$rc" -ge 124 \] || ! \[ -s "\$ef" \] || ##' case_sweep
-mut M23-sweep-entrada-que-sumiu-reprova sweep 's#grep -v -F -e "\$GONE" "\$ef" | grep -q \.#grep -q . "\$ef"#' case_sweep
-mut M24-sweep-erro-de-leitura-ignorado sweep 's#grep -v -F -e "\$GONE" "\$ef" | grep -q \.#false#' case_sweep
+mut M23-sweep-entrada-que-sumiu-reprova sweep 's#grep -v -e "\$GONE_RE" "\$ef" | grep -q \.#grep -q . "\$ef"#' case_sweep
+mut M24-sweep-erro-de-leitura-ignorado sweep 's#grep -v -e "\$GONE_RE" "\$ef" | grep -q \.#false#' case_sweep
+mut M34-sweep-gone-por-substring sweep 's#grep -v -e "\$GONE_RE" "\$ef"#grep -v -F -e "No such file or directory" "\$ef"#' case_sweep
+mut M35-sweep-contagem-ilegivel-vira-zero sweep 's#else NQ=1; fi#else NQ=0; fi#' case_sweep
 mut M25-sweep-lock-sem-build-vira-pulado sweep 's#\[ "\$L2" -gt 0 \] || cant "lock-tomado-sem-build"#true#' case_sweep
 mut M26-run-lock-sem-chmod run 's#&& chmod 0600 "\$LOCK" 2> /dev/null || fail lock-modo#|| fail lock-modo#' case_lock
 mut M27-sweep-lock-sem-chmod sweep 's#&& chmod 0600 "\$LOCK" 2> /dev/null || cant lock-modo#|| cant lock-modo#' case_sweep
+mut M36-run-sem-guarda-de-link run 's#\[ -n "\$(find "\$STAGE/\$d" -maxdepth 0 -type d 2> /dev/null)" \] || fail stage-dirs#true#' case_link
+mut M37-run-chown-segue-link run 's#chown -h #chown #' case_run
+mut M38-run-wipe-segue-link run 's#{ \[ -d "\$STAGE/in" \] && \[ ! -L "\$STAGE/in" \]; } || return 1; ##' case_link
+mut M40-synth-conta-constante synth 's#\[ "\$n" = 5 \] ||#true ||#' case_synth
+mut M41-prove-attempts-zero-ok prove 's#attempts=\[1-9\]\[0-9\]\*#attempts=[0-9]+#' case_prove
 mut M18-synth-rede-aberta synth 's#exit 3; fi#true; fi#' case_synth
 mut M19-prove-ls-vazio prove 's#\*"No such file"\*) item "\$1" nao-consegui#*"No such file"*) item "$1" ok#' case_prove
 mut M20-prove-sudo-dados prove 's#|| item sudo-como-dados-recusado FALHOU "o runner virou dados"#|| true#' case_prove

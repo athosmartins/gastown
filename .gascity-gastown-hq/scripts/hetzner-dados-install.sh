@@ -25,15 +25,16 @@ sshd_for() { sshd -T -C "user=$1,host=localhost,addr=127.0.0.1" 2> /dev/null; }
 t_locked() { [ "$(passwd -S "$DU" | cut -d' ' -f2)" = L ]; }
 t_shell() { case "$(getent passwd "$DU" | cut -d: -f7)" in ''|*nologin|*/false) return 1 ;; esac; }
 t_grupos() { [ "$(id -nG "$DU")" = "$DU" ]; }
-t_runner() { ! id -nG "$RUNNER" | tr ' ' '\n' | grep -qx "$DU"; }
+# vazio/falhou: `id` do runner que falha (nome errado, NSS) é "não consegui" (127), nunca "fora do grupo"
+t_runner() { local g; g=$(id -nG "$RUNNER" 2> /dev/null) || return 127; ! printf '%s\n' $g | grep -qx "$DU"; }
 t_keys() { [ "$(stat -c '%U %a' "$AKDIR/$DU")" = "root 640" ] && grep -Eq "^restrict,command=\"$SBIN/gt-dados-ingest\" ssh-|^restrict,command=\"$SBIN/gt-dados-ingest\" ecdsa-" "$AKDIR/$DU"; }
 t_sshd_d() { sshd_for "$DU" | grep -qx "authorizedkeysfile $AKDIR/$DU"; }
-t_sshd_r() { ! sshd_for "$RUNNER" | grep -q '^authorizedkeysfile .*authorized_keys.d'; }
-t_tree() { [ -z "$(find "$OPT" \( -not -user root -o -perm -020 -o -perm -002 \) -print -quit)" ]; }
-t_sudo_strict() { ! grep -E '^[^#]' "$SUDOERS" | grep -Ev "^$RUNNER ALL=\(root\) NOPASSWD: $SBIN/gt-dados-run [a-z0-9_.-]+\$" | grep -q .; }
-t_sudo_list() { [ "$(grep -E '^[^#]' "$SUDOERS" | sed 's/.* //' | sort)" = "$(sort "$ETC/entrypoints")" ]; }
+t_sshd_r() { local o; o=$(sshd_for "$RUNNER") || return 127; ! printf '%s\n' "$o" | grep -q '^authorizedkeysfile .*authorized_keys.d'; }
+t_tree() { local x; x=$(find "$OPT" \( -not -user root -o -perm -020 -o -perm -002 \) -print -quit 2> /dev/null) || return 127; [ -z "$x" ]; }
+t_sudo_strict() { [ -r "$SUDOERS" ] || return 127; ! grep -E '^[^#]' "$SUDOERS" | grep -Ev "^$RUNNER ALL=\(root\) NOPASSWD: $SBIN/gt-dados-run [a-z0-9_.-]+\$" | grep -q .; }
+t_sudo_list() { { [ -r "$SUDOERS" ] && [ -r "$ETC/entrypoints" ]; } || return 127; [ "$(grep -E '^[^#]' "$SUDOERS" | sed 's/.* //' | sort)" = "$(sort "$ETC/entrypoints")" ]; }
 t_stage() { local o; mountpoint -q "$STAGE" && o=$(findmnt -no FSTYPE,OPTIONS "$STAGE") && [ "${o%% *}" = tmpfs ] && case ",${o#* }," in *,noexec,*) case ",${o#* }," in *,nosuid,*) case ",${o#* }," in *,nodev,*) return 0 ;; esac ;; esac ;; esac; return 1; }
-t_swap() { [ -z "$(swapon --noheadings --show)" ]; }
+t_swap() { local s; s=$(swapon --noheadings --show 2> /dev/null) || return 127; [ -z "$s" ]; }
 t_timer() { systemctl is-enabled gt-dados-sweep.timer && systemctl is-active gt-dados-sweep.timer; }
 check() {
   CH=0; local l
@@ -47,11 +48,17 @@ check() {
 [ "${1:-}" = --check ] && { check; exit $?; }
 [ "${1:-}" = apply ] && [ "$(id -u)" = 0 ] || { echo "uso (como root): $0 apply --pubkey-file <f.pub> [...] | --check" >&2; exit 64; }
 shift; PUB=""; ENTS="synth"; CODE=""; SHA=""; SIZE=8g
-while [ $# -gt 0 ]; do case $1 in
-  --pubkey-file) PUB=${2:-}; shift 2 ;; --entrypoint) ENTS="$ENTS ${2:-}"; shift 2 ;; --code-dir) CODE=${2:-}; shift 2 ;; --code-sha) SHA=${2:-}; shift 2 ;;
-  --runner) RUNNER=${2:-}; shift 2 ;; --stage-size) SIZE=${2:-}; shift 2 ;; *) echo "argumento desconhecido: $1" >&2; exit 64 ;; esac; done
+while [ $# -gt 0 ]; do
+  # opção sem valor (última palavra): `shift 2` falha sem deslocar nada e o laço giraria para sempre a 100% de CPU, sem saída (revisão do gate, 12/11) → recusa
+  case $1 in --pubkey-file | --entrypoint | --code-dir | --code-sha | --runner | --stage-size) [ $# -ge 2 ] || { echo "opção sem valor: $1" >&2; exit 64; } ;; esac
+  case $1 in
+    --pubkey-file) PUB=${2:-}; shift 2 ;; --entrypoint) ENTS="$ENTS ${2:-}"; shift 2 ;; --code-dir) CODE=${2:-}; shift 2 ;; --code-sha) SHA=${2:-}; shift 2 ;;
+    --runner) RUNNER=${2:-}; shift 2 ;; --stage-size) SIZE=${2:-}; shift 2 ;; *) echo "argumento desconhecido: $1" >&2; exit 64 ;; esac
+done
 # vazio → recusa (nunca "sem chave = qualquer chave"); chave com opções (command=, no-restrict) também: as opções são só as nossas
 [ -n "$PUB" ] && [ "$(grep -c . "$PUB" 2> /dev/null)" = 1 ] && grep -Eq '^(ssh-ed25519|ecdsa-sha2-nistp256|ssh-rsa) [A-Za-z0-9+/=]+( .*)?$' "$PUB" && ssh-keygen -l -f "$PUB" > /dev/null 2>&1 || die pubkey
+# a linha validada (a única não-vazia) é a que é copiada: `$(cat)` levaria uma linha em branco antes da chave e a chave ficaria numa 2ª linha, SEM o restrict
+KEYLINE=$(grep -m1 . "$PUB") || die pubkey
 for e in $ENTS; do [[ $e =~ ^[a-z0-9][a-z0-9_.-]{0,63}$ ]] || die "entrypoint-invalido:$e"; done
 [[ $SIZE =~ ^[1-9][0-9]*[mg]$ ]] || die stage-size
 [ -z "$CODE" ] || { [ -n "$SHA" ] && [ "$(git -C "$CODE" rev-parse HEAD 2> /dev/null)" = "$SHA" ] && [ -z "$(git -C "$CODE" status --porcelain 2> /dev/null || echo ?)" ]; } || die code-dir-nao-e-o-sha-limpo
@@ -60,7 +67,9 @@ getent passwd "$DU" > /dev/null || useradd -M -d "$DHOME" -s /bin/bash -U -c "gt
 usermod -L "$DU" || die passwd-lock
 install -d -o "$DU" -g "$DU" -m 0700 "$DHOME" || die home
 [ "$(id -nG "$DU")" = "$DU" ] || die grupos-extras-do-dados
-id -nG "$RUNNER" | tr ' ' '\n' | grep -qx "$DU" && die runner-no-grupo-dados
+# vazio/falhou: `id` do runner que falha (nome errado, NSS) → recusa; só a lista lida e sem `dados` libera
+RG=$(id -nG "$RUNNER" 2> /dev/null) || die runner-ilegivel
+printf '%s\n' $RG | grep -qx "$DU" && die runner-no-grupo-dados
 # 2. árvore de root: nada que o runner edite roda como dados
 install -d -o root -g root -m 0755 "$OPT" "$OPT/app" "$OPT/app/bin" "$ETC" || die dirs
 [ -z "$CODE" ] || rsync -a --delete --chown=root:root --chmod=Dgo-w,Fgo-w --exclude=.git "$CODE"/ "$OPT/app/" || die rsync-code
@@ -73,13 +82,15 @@ printf '%s\n' $ENTS | sort -u > "$ETC/entrypoints.new" && chmod 0644 "$ETC/entry
 for p in run ingest sweep; do install -o root -g root -m 0755 "$SRC/hetzner-dados-$p.sh" "$SBIN/gt-dados-$p" || die "install-$p"; done
 # 3. canal do mini: chave de ROOT (o dados não regrava a própria chave) + drop-in; só recarrega o sshd com a prova do `sshd -T`; reprovou → desfaz o drop-in
 install -d -o root -g root -m 0755 "$AKDIR" || die akdir
-printf 'restrict,command="%s/gt-dados-ingest" %s\n' "$SBIN" "$(cat "$PUB")" > "$AKDIR/$DU.new" && chown "root:$DU" "$AKDIR/$DU.new" && chmod 0640 "$AKDIR/$DU.new" && mv "$AKDIR/$DU.new" "$AKDIR/$DU" || die authorized-keys
+printf 'restrict,command="%s/gt-dados-ingest" %s\n' "$SBIN" "$KEYLINE" > "$AKDIR/$DU.new" && chown "root:$DU" "$AKDIR/$DU.new" && chmod 0640 "$AKDIR/$DU.new" && mv "$AKDIR/$DU.new" "$AKDIR/$DU" || die authorized-keys
 DROP="$SSHD_D/50-gt-dados.conf"; [ -f "$DROP" ] && cp -p "$DROP" "$DROP.prev"
 printf 'Match User %s\n    AuthorizedKeysFile %s/%s\n    PasswordAuthentication no\n    KbdInteractiveAuthentication no\n    AllowTcpForwarding no\n    AllowAgentForwarding no\n    X11Forwarding no\n    PermitTTY no\n    PermitUserRC no\n' "$DU" "$AKDIR" "$DU" > "$DROP" || die dropin
 undo() { if [ -f "$DROP.prev" ]; then mv "$DROP.prev" "$DROP"; else rm -f "$DROP"; fi; die "$1 (drop-in do sshd desfeito)"; }
 sshd -t || undo sshd-t
 sshd_for "$DU" | grep -qx "authorizedkeysfile $AKDIR/$DU" || undo sshd-dados-nao-usa-o-arquivo-de-root
-sshd_for "$RUNNER" | grep -q '^authorizedkeysfile .*authorized_keys.d' && undo sshd-runner-afetado
+# vazio/falhou: sshd -T do runner que falha não prova "runner intacto" → desfaz o drop-in, nunca recarrega sem a prova
+RO=$(sshd_for "$RUNNER") || undo sshd-runner-ilegivel
+printf '%s\n' "$RO" | grep -q '^authorizedkeysfile .*authorized_keys.d' && undo sshd-runner-afetado
 rm -f "$DROP.prev"; { systemctl reload ssh || systemctl reload sshd; } || die sshd-reload
 # 4. sudoers: UMA linha por entrypoint, sem curinga; nada entra sem `visudo -cf`
 { echo "# gt-dados (ga-qg1dw5z.1): o runner dispara SÓ estes entrypoints; sem curinga, sem (dados) ALL"; for e in $(sort -u "$ETC/entrypoints"); do echo "$RUNNER ALL=(root) NOPASSWD: $SBIN/gt-dados-run $e"; done; } > "$SUDOERS.new" || die sudoers

@@ -10,7 +10,8 @@
 # O QUE O BUILD ENXERGA: netns novo sem saída (mesmo padrão do gt-netns-run: `lo` aceito, o resto rejeitado COM contador), uid/gid `dados` sem grupos extras nem capacidades (setpriv --no-new-privs),
 #   ambiente LIMPO (env -i), GT_DADOS_STAGE=/srv/gtdados (tmpfs dedicado: entrada em in/, resultado em out/), prazo de 2 h. Ao fim apaga in/ (o dado), mata o que sobrou no netns e confere que in/ ficou vazio.
 #   O resultado em out/ sai SÓ pelo canal do mini (gt-dados-ingest `get`), nunca por diretório legível ao runner.
-# CÓDIGOS: o do entrypoint · 64 uso/fora da lista · 98 recusei antes de rodar (`GTD-RUN: recusado:<motivo>`: nada rodou) · 99 o entrypoint terminou mas in/ NÃO ficou vazio (`GTD-WIPE: falhou`; a varredura diária tenta de novo)
+#   in/ e out/ são nomes do build: link simbólico ou arquivo no lugar deles → `recusado:stage-dirs` (98) antes de rodar, e, se o build os trocar durante a rodada, `GTD-WIPE: falhou` (99). Root nunca dá chown/chmod num caminho que o build escolhe.
+# CÓDIGOS: o do entrypoint · 64 uso/fora da lista · 98 recusei antes de rodar (`GTD-RUN: recusado:<motivo>`: nada rodou) · 99 o entrypoint terminou mas in/ NÃO ficou vazio ou não é mais um diretório (`GTD-WIPE: falhou`; a varredura diária tenta de novo e apaga o link)
 set -u
 PATH=/usr/sbin:/usr/bin:/sbin:/bin
 DU=dados; STAGE=/srv/gtdados; LIST=/etc/gt-dados/entrypoints; APP=/opt/gt-dados/app/bin; LOCK=/run/gt-dados-run.lock; SWAPS=/proc/swaps; MAXSECS=7200
@@ -21,8 +22,8 @@ case $NAME in ''|-*|.*|*[!a-z0-9_.-]*) usage nome-invalido ;; esac
 # vazio/falhou (lista ausente ou ilegível) → recusa: só a linha EXATA do nome libera, nunca "sem lista = livre"
 grep -Fx -- "$NAME" "$LIST" > /dev/null 2>&1 || usage fora-da-lista
 NS="gtd$$"; CHILD=""; CANCEL=""
-# vazio → in/ sem nada; falhou (in/ sumiu, find com erro) → rc 1: nunca vira "limpo"
-wipe_in() { local left; find "$STAGE/in" -mindepth 1 -delete 2> /dev/null; left=$(find "$STAGE/in" -mindepth 1 -print -quit 2> /dev/null) || return 1; [ -z "$left" ]; }
+# vazio → in/ sem nada; falhou (in/ sumiu, virou link simbólico ou arquivo — o build manda nesse nome —, find com erro) → rc 1: nunca vira "limpo". `find` não entra num link dado como ponto de partida, então sem esta guarda um in/ trocado por link daria "vazio" sem apagar nada
+wipe_in() { local left; { [ -d "$STAGE/in" ] && [ ! -L "$STAGE/in" ]; } || return 1; find "$STAGE/in" -mindepth 1 -delete 2> /dev/null; left=$(find "$STAGE/in" -mindepth 1 -print -quit 2> /dev/null) || return 1; [ -z "$left" ]; }
 cleanup() {
   # o netns só some quando o último processo dentro dele sai: mata o que sobrou (todo processo do build nasce dentro dele, setsid não escapa) ANTES de apagar in/, para ninguém recriar arquivo
   # vazio → ninguém sobrou; falhou/ilegível → segue: o `del` e a verificação de in/ abaixo dizem o resto
@@ -45,7 +46,12 @@ SW=$({ wc -l < "$SWAPS"; } 2> /dev/null | tr -d ' ')
 # o lock é só de ROOT (0600): com 0644 qualquer usuário local (o runner!) faria `flock -x` nele e todo build recusaria `ocupado` (revisão de segurança, 12/11). Falhou em criar/ajustar o modo → recusa
 ( umask 077; : >> "$LOCK" ) 2> /dev/null && chmod 0600 "$LOCK" 2> /dev/null || fail lock-modo
 exec 9> "$LOCK" && flock -n 9 || fail ocupado
-install -d -o "$DU" -g "$DU" -m 0700 "$STAGE/in" "$STAGE/out" || fail stage-dirs
+# in/ e out/ são nomes que o BUILD (dados) controla: ele pode trocá-los por link simbólico, e `install -d -o -g -m` como ROOT SEGUE o link e dá chown/chmod no ALVO (revisão do gate, 12/11: dados chegava a root por /usr/local/sbin). Aqui root NUNCA segue nome do dados:
+# existe (inclusive link solto) e não é diretório de verdade, ou o find falhou → recusa stage-dirs, nada é tocado; não existe → mkdir (não segue nada) + chown -h (não segue link). Só não existir cria.
+for d in in out; do
+  if [ -e "$STAGE/$d" ] || [ -L "$STAGE/$d" ]; then [ -n "$(find "$STAGE/$d" -maxdepth 0 -type d 2> /dev/null)" ] || fail stage-dirs
+  else mkdir -m 0700 "$STAGE/$d" && chown -h "$DU:$DU" "$STAGE/$d" || fail stage-dirs; fi
+done
 ip netns add "$NS" || fail netns-add
 ip -n "$NS" link set lo up || fail lo
 ip -n "$NS" link add gtn0 type dummy && ip -n "$NS" addr add 192.0.2.2/24 dev gtn0 && ip -n "$NS" link set gtn0 up \

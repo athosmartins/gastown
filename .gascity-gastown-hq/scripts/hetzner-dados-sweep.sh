@@ -11,7 +11,7 @@
 # ALCANCE EM /tmp: só o 1º nível (o que `dados` cria direto lá, com o que houver dentro). O /tmp do nó tem ~1,7 milhão de entradas e a árvore inteira levou 40+ min sem terminar e sem escrever o log (medido 12/11);
 #   arquivo de `dados` dentro de pasta de OUTRO dono em /tmp não é visto. /var/tmp e /dev/shm são varridos inteiros (pequenos). Cada apagamento e cada leitura de verificação tem prazo (SCANSECS): a verificação que estourou = NAO-CONSEGUI.
 # LINHA DE LOG (/var/log/gt-dados-sweep.log, e no journal; a trava 3 lê a última e a idade dela):
-#   <UTC> gt-dados-sweep: LIMPO removed=N killed=K · PULADO dados-vivo=N · PULADO build-vivo lock=ocupado dados=N · NAO-CONSEGUI <motivo>
+#   <UTC> gt-dados-sweep: LIMPO removed=N killed=K[ contagem=incompleta] · PULADO dados-vivo=N · PULADO build-vivo lock=ocupado dados=N · NAO-CONSEGUI <motivo>
 # CÓDIGOS: 0 LIMPO ou PULADO · 2 NAO-CONSEGUI
 set -u
 PATH=/usr/sbin:/usr/bin:/sbin:/bin
@@ -19,13 +19,13 @@ export LC_ALL=C
 DU=dados; STAGE=/srv/gtdados; DHOME=/home/dados; LOG=/var/log/gt-dados-sweep.log; MAXSECS=10800; LOCK=/run/gt-dados-run.lock; LOCKWAIT=10; SCANSECS=900; TOPONLY=/tmp
 log() { local l; l="$(date -u +%Y-%m-%dT%H:%M:%SZ) gt-dados-sweep: $*"; echo "$l"; echo "$l" >> "$LOG" 2> /dev/null || echo "gt-dados-sweep: NAO-CONSEGUI escrever $LOG" >&2; }
 cant() { log "NAO-CONSEGUI $*"; exit 2; }
-# find com prazo. Entrada que SUMIU durante a leitura ("No such file or directory": o runner apaga e cria em /tmp o tempo todo) não é sobra e não reprova a leitura; QUALQUER outro erro, o prazo estourado (rc ≥ 124)
+# find com prazo. Entrada que SUMIU durante a leitura (a linha de erro TERMINA em ": No such file or directory": o runner apaga e cria em /tmp o tempo todo) não é sobra e não reprova a leitura; QUALQUER outro erro (inclusive uma linha cujo CAMINHO contém esse texto mas termina em outro erro), o prazo estourado (rc ≥ 124)
 # ou rc ≠ 0 sem erro legível → return 2 (não consegui). Imprime o que o find imprimiu.
-GONE="No such file or directory"
+GONE_RE=': No such file or directory$'
 ff() { local ef out rc; ef=$(mktemp) || return 2
   out=$(timeout -k 5 "$SCANSECS" find "$@" 2> "$ef"); rc=$?
   if [ "$rc" -ne 0 ]; then
-    if [ "$rc" -ge 124 ] || ! [ -s "$ef" ] || grep -v -F -e "$GONE" "$ef" | grep -q .; then rm -f "$ef"; return 2; fi
+    if [ "$rc" -ge 124 ] || ! [ -s "$ef" ] || grep -v -e "$GONE_RE" "$ef" | grep -q .; then rm -f "$ef"; return 2; fi
   fi
   rm -f "$ef"; [ -z "$out" ] || printf '%s\n' "$out"; return 0; }
 id -u "$DU" > /dev/null 2>&1 || cant usuario-dados-ausente
@@ -52,10 +52,11 @@ if [ "$r" -eq 75 ]; then
   log "PULADO build-vivo lock=ocupado dados=$L2"; exit 0
 fi
 [ "$r" -eq 0 ] || cant "lock-falhou:$r"
-N=0
+N=0; NQ=0
 for d in "$STAGE" "$DHOME"; do
   # vazio → 0 itens; falhou (find com erro ou prazo estourado) → não consegui
-  c=$(find "$d" -xdev -mindepth 1 2> /dev/null | wc -l | tr -d ' '); N=$((N + c))
+  # a contagem é só para o log (quem prova que sumiu é a leitura abaixo): ilegível → "contagem=incompleta" no fim da linha, nunca um 0 que pareça "nada havia"
+  if cl=$(ff "$d" -xdev -mindepth 1); then N=$((N + $(printf '%s' "$cl" | grep -c .))); else NQ=1; fi
   timeout -k 5 "$SCANSECS" find "$d" -xdev -mindepth 1 -delete 2> /dev/null
   left=$(ff "$d" -xdev -mindepth 1 -print -quit) || cant "leitura-falhou:$d"
   [ -z "$left" ] || cant "sobrou:$left"
@@ -69,4 +70,4 @@ for d in /tmp /var/tmp /dev/shm; do
   left=$(ff "$d" "${A[@]}" -user "$DU" -print -quit) || cant "leitura-falhou:$d"
   [ -z "$left" ] || cant "sobrou:$left"
 done
-log "LIMPO removed=$N killed=$KILLED"
+if [ "$NQ" = 1 ]; then log "LIMPO removed=$N killed=$KILLED contagem=incompleta"; else log "LIMPO removed=$N killed=$KILLED"; fi
