@@ -130,23 +130,39 @@ fi
 
 # ── Build list of watched paths ───────────────────────────────────────────────
 # Returns hash of all relevant files. Using find+stat over the watched dirs.
+#
+# The processes ONE call creates do not grow with the number of files (ga-qg1dw5z.6). This runs every
+# POLL_INTERVAL (3 s) for the life of the daemon and it used to start one `stat` per file (a `while read`
+# loop) plus one `find` per skills dir: ~1 process per watched file per tick (measured: 1086 processes per
+# call for 1061 watched files, ~360 per second from this one daemon).
+# Now: one `find` over every directory root, one for scripts/, and one `stat` fed the whole sorted list by
+# xargs. The OUTPUT is byte for byte what the per-file loop printed (same paths, same sort, same
+# "<name> <mtime> <size>" line per file): that value is persisted (covered_hash) and compared again after a
+# restart, so it is a contract. config-drift-watcher-fork-cost.selftest.sh keeps the old loop as its oracle.
 compute_hash() {
+    local _roots _skills
+    # HQ skill sinks
+    _roots=("$CITY/skills" "$CITY/.claude/skills")
+    # Crew skill copies (follow symlinks to detect changes in targets too)
+    # Only each crew's own .claude/skills — never a walk of the whole crew tree.
+    # $WA/crew holds ~40 full repo worktrees (one per pool bead); the old
+    # `find "$WA/crew" -path "*/.claude/skills/*"` walked every file of every
+    # one of them each POLL_INTERVAL (3 s), each walk taking 12 s+ under load:
+    # a never-ending full-disk scan that held load at 90+ on 09/10 (Mayor).
+    # Same matches as before for crew/<name>/.claude/skills; -P (find's
+    # default) keeps the old symlink behaviour.
+    for _skills in "$WA"/crew/*/.claude/skills; do
+        [[ -d "$_skills" ]] && _roots+=("$_skills")
+    done
+    _roots+=("$WA/city-local/skills")
+    # Agent templates — adding/editing a template changes the effective config hash
+    # for all sessions; catching this here requests gc reload --soft before the
+    # controller's own watcher can queue drains (immediate vs heartbeat fallback).
+    _roots+=("$CITY/agents")
     {
-        # HQ skill sinks
-        find "$CITY/skills" -type f 2>/dev/null
-        find "$CITY/.claude/skills" -type f 2>/dev/null
-        # Crew skill copies (follow symlinks to detect changes in targets too)
-        # Only each crew's own .claude/skills — never a walk of the whole crew tree.
-        # $WA/crew holds ~40 full repo worktrees (one per pool bead); the old
-        # `find "$WA/crew" -path "*/.claude/skills/*"` walked every file of every
-        # one of them each POLL_INTERVAL (3 s), each walk taking 12 s+ under load:
-        # a never-ending full-disk scan that held load at 90+ on 09/10 (Mayor).
-        # Same matches as before for crew/<name>/.claude/skills; -P (find's
-        # default) keeps the old symlink behaviour.
-        for _skills in "$WA"/crew/*/.claude/skills; do
-            [[ -d "$_skills" ]] && find "$_skills" -type f 2>/dev/null
-        done
-        find "$WA/city-local/skills" -type f 2>/dev/null
+        # vazio → no line (the hash of an empty list, as before); falhou/ilegível (a root is missing or
+        # unreadable) → find's status is dropped here and the hash covers what was listed, as before
+        find "${_roots[@]}" -type f 2>/dev/null
         # City config files
         [[ -f "$CITY/city.toml" ]] && echo "$CITY/city.toml"
         [[ -f "$CITY/pack.toml" ]] && echo "$CITY/pack.toml"
@@ -155,17 +171,19 @@ compute_hash() {
         # controller's own fsnotify watches (measured ga-m9x0lb.1: otherwise a new ceiling waits for the
         # 30-60 min heartbeat reload). Only this ONE file: the rest of .gc/ (logs, state) must not reload.
         [[ -f "$CITY/.gc/pool-ceiling-engine.toml" ]] && echo "$CITY/.gc/pool-ceiling-engine.toml"
-        # Agent templates — adding/editing a template changes the effective config hash
-        # for all sessions; catching this here requests gc reload --soft before the
-        # controller's own watcher can queue drains (immediate vs heartbeat fallback).
-        find "$CITY/agents" -type f 2>/dev/null
         # Daemon scripts (source only — .sh and .py; excludes __pycache__/.pyc which
         # are regenerated on every python invocation and would cause reload storms).
+        # LAST on purpose: its exit status is the group's, so under pipefail a scripts/ that cannot be
+        # listed ends the output in "hash-error" (a hash nobody may trust), exactly as before.
         find "$CITY/scripts" -type f \( -name "*.sh" -o -name "*.py" \) 2>/dev/null
-    } | sort | while IFS= read -r f; do
-        # Include file path + mtime + size (fast, no md5 overhead per file)
-        stat -f '%N %m %z' "$f" 2>/dev/null || true
-    done | md5 -q 2>/dev/null || echo "hash-error"
+    } | sort | LC_ALL=C tr '\n' '\0' | {
+        # Include file path + mtime + size (fast, no md5 overhead per file). One `stat` for the whole list;
+        # NUL-separated (and `tr` in the C locale) so a name with a space, a quote or a stray byte stays one operand.
+        # vazio → no line (md5 of nothing, as the old loop gave); falhou/ilegível (a file that vanished between
+        # find and stat) → that file's line is dropped and this stage still ends 0, as the old `|| true` did:
+        # a vanished file is not "hash-error"
+        xargs -0 stat -f '%N %m %z' 2>/dev/null || true
+    } | md5 -q 2>/dev/null || echo "hash-error"
 }
 
 # ── Hooks lock-guard (ga-tctky) ───────────────────────────────────────────────
