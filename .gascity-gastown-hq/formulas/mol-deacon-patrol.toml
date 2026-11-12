@@ -408,6 +408,15 @@ gc mail send mayor/ -s "DOCTOR: <finding>" -m "<details>"
 
 Close this step after check."""
 
+# ga-x9jivyf (same class as ga-jhsxo4p, mol-witness-patrol): step 3 of `next-iteration` used to pour with no read first and
+# never read the assign's exit code, so a pour that worked followed by an assign that failed left a next wisp with no owner
+# (no --assignee read finds it; the wisp reaper only closes a wisp whose parent is closed, and a root-only patrol wisp has
+# none) and a re-run poured another. It now reads my live wisps first (three states), assigns, reads the assign's exit
+# code and burns the wisp it just poured when it cannot assign it, and exits 0 only with a next wisp assigned; the prose
+# says what exit 1 means (do not go on to step 4, do not burn this wisp).
+# No -C pin and no rig_root here, unlike mol-witness-patrol: this step, like the other `gc bd` calls of this file except the
+# cross-rig close described in the header, uses the store its session's cwd resolves to.
+# Proof: packs/town-deltas/assets/deacon-next-iteration-idempotent.selftest.sh executes the block under a stateful fake gc.
 [[steps]]
 id = "next-iteration"
 title = "Pour next iteration and loop"
@@ -433,9 +442,49 @@ gc mail inbox
 Handle any urgent messages that arrived during patrol. Archive the rest.
 
 **3. Pour next iteration BEFORE burning:**
+
+Run the block below as written (ga-x9jivyf). It is safe to re-run: it READS before it pours, so a
+second run never pours a second next wisp behind one that is already poured and assigned to you,
+and a wisp it poured but could not assign is burned, not left behind. Only a clean answer may pour:
+- two or more live wisps are assigned to you (this one plus a next one) -> a next wisp already
+  exists: it does not pour and says so;
+- one or none -> it pours, then assigns the new wisp to you;
+- the read could not tell (it failed or came back unreadable) -> it says NOT pouring and exits 1.
+The two failures it cannot undo (the burn fails too, or the pour answers with no wisp id) are
+mailed to the mayor.
+
+Exit 0 = a next wisp exists and is assigned to you: go on to step 4. Exit 1 = the block could not
+confirm that (it says why): do NOT go on to step 4 and do NOT burn this wisp. Wait a minute, then
+run the block again. Three exit 1 in a row: nudge the mayor (`gc session nudge mayor/ "deacon: next-iteration failing 3x"`,
+adding the last line the block printed) and end the turn without burning.
 ```bash
-NEXT=$(gc bd mol wisp mol-deacon-patrol --root-only --var binding_prefix='{{binding_prefix}}' --json | jq -r '.new_epic_id')
-gc bd update "$NEXT" --assignee=$GC_AGENT
+[ -n "$GC_AGENT" ] || { echo "next-iteration: GC_AGENT is empty -- cannot tell which wisps are mine; NOT pouring." >&2; exit 1; }
+# vazio → [] or one wisp (this one): pour; tem → 2+ (this one plus a next one): a next wisp already exists, no pour; falhou/ilegível → do not know: NOT pouring, exit 1 (--limit=2 on purpose: two is all the decision needs to see)
+LIVE=$(gc bd list --assignee="$GC_AGENT" --type=molecule --include-infra --limit=2 --json) &&
+  LIVE=$(printf '%s' "$LIVE" | jq -er 'if type != "array" then error("not an array") else length end') ||
+  { echo "next-iteration: cannot tell whether a next wisp already exists (the read of my live wisps failed or came back unreadable) -- NOT pouring, this wisp NOT burned; wait a minute and re-run this block." >&2; exit 1; }
+if [ "$LIVE" -ge 2 ]; then
+  echo "next-iteration: a next wisp already exists ($LIVE live wisps are assigned to $GC_AGENT, this one included) -- NOT pouring another; go on to step 4."
+  exit 0
+fi
+# vazio → no wisp id: a wisp MAY exist (the answer can be lost after the commit), so nothing is assigned or burned by guess and the mayor is told; falhou/ilegível → the same
+NEXT=$(gc bd mol wisp mol-deacon-patrol --root-only --var binding_prefix='{{binding_prefix}}' --json | jq -r '.new_epic_id // empty')
+if [ -z "$NEXT" ]; then
+  echo "next-iteration: the pour returned no wisp id -- a wisp MAY have been created and left unassigned; nothing assigned, nothing burned, this wisp NOT burned." >&2
+  gc mail send mayor/ -s "DEACON: mol-deacon-patrol pour returned no wisp id" -m "next-iteration poured for $GC_AGENT and got no wisp id back (the pour failed, or its answer was lost after the wisp was created). A stray unassigned wisp may exist; look with: gc bd list --no-assignee --type=molecule --include-infra --status=open --limit=0 --json -- and burn a mol-deacon-patrol wisp you find there with: gc bd mol burn <id> --force. This wisp was NOT burned."
+  exit 1
+fi
+# a write, not a read: when the assign fails, burn the wisp just poured (never this one) so a re-run starts clean; when the burn fails too, say so and mail the id
+if ! gc bd update "$NEXT" --assignee="$GC_AGENT"; then
+  if gc bd mol burn "$NEXT" --force; then
+    echo "next-iteration: could not assign $NEXT to $GC_AGENT -- burned it, nothing left behind; this wisp NOT burned; wait a minute and re-run this block." >&2
+  else
+    echo "next-iteration: could not assign $NEXT to $GC_AGENT and could not burn it either -- $NEXT is LEFT BEHIND (probably unassigned); this wisp NOT burned; the mayor is mailed with its id." >&2
+    gc mail send mayor/ -s "DEACON: mol-deacon-patrol left a stray wisp $NEXT" -m "next-iteration poured $NEXT for $GC_AGENT but could neither assign nor burn it. If it is unassigned, no assignee read finds it, and the wisp reaper only closes a wisp whose parent is closed (a root-only patrol wisp has no parent). Clean up with: gc bd mol burn $NEXT --force. This wisp was NOT burned."
+  fi
+  exit 1
+fi
+echo "next-iteration: next wisp $NEXT is poured and assigned to $GC_AGENT; go on to step 4."
 ```
 
 **4. Wait before next cycle:**
@@ -449,6 +498,8 @@ Previous implementation watched `gc events --type=bead.updated` for fast wake-up
 ```bash
 gc bd mol burn <this-wisp-id> --force
 ```
+
+Burn only the wisp you are executing now, never the next wisp from step 3.
 
 The new wisp is ready. Re-read formula steps to start
 the next patrol cycle.
