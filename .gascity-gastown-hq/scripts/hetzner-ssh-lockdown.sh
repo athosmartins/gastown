@@ -12,16 +12,16 @@
 #   origins                                   só lê: de que IP o runner/root entram (auth.log, só contagem). Responde "o IP do mini é fixo?" antes de qualquer allowlist.
 #   admin --user NOME --pubkey-file ARQ       cria o usuário admin (sudo, senha travada) e instala SÓ a chave PÚBLICA (ed25519/ecdsa, sem opções). A privada nunca passa por aqui.
 #   fail2ban --ignoreip IP[,IP...]            instala/ativa fail2ban com jail sshd; o ignoreip (o IP do mini) é OBRIGATÓRIO, senão um ban cortaria o túnel e o espelho.
-#   ufw --ssh-from any|IP[,IP...]             default deny incoming + regra da 22 ANTES do enable; arma a rede de segurança (ufw desliga sozinho em 10 min) e só então liga.
+#   ufw --ssh-from any|IP[,IP...]             default deny incoming + regra da 22 ANTES do enable; arma a rede de segurança (ufw desliga sozinho em 10 min) e só então liga. Com o ufw JÁ ativo não há enable nem rede: a política muda na hora.
 #   rootcut [--sem-trava1 "motivo"]           PermitRootLogin no, SÓ com as 5 provas abaixo; arma a rede de segurança (reabre o root em 10 min) e recarrega o sshd.
 #   confirm ufw|rootcut                       cancela a rede de segurança do passo (rode DEPOIS de provar por uma conexão NOVA).
 #   undo ufw|rootcut                          desfaz o passo à mão (console da Hetzner ou a sessão de root ainda aberta).
 # ORDEM (a trava 1, ga-qg1dw5z.1, precisa do root atual: aplique-a ANTES do rootcut): admin → prova do admin por 2ª sessão NOVA → fail2ban → ufw (+confirm) → rootcut (+confirm).
-#   O rootcut recusa sem: (1) admin gravado; (2) usuário `dados` da trava 1 (ou --sem-trava1 com motivo, que fica no log); (3) ufw ativo; (4) jail sshd do fail2ban de pé;
+#   O rootcut recusa sem: (1) admin gravado E a chave que está no authorized_keys dele é a gravada (uma só); (2) usuário `dados` da trava 1 (ou --sem-trava1 com motivo, que fica no log); (3) ufw ativo; (4) jail sshd do fail2ban de pé;
 #   (5) LOGIN REAL do admin com a chave gravada, lido do journal do sshd depois da instalação (o agente não tem a chave privada: quem entra é o Athos, e o journal é a prova) + sudo do admin válido.
-# REDES DE SEGURANÇA: ufw e rootcut armam um timer systemd (gt-ufw-revert / gt-rootcut-revert, 10 min) ANTES de agir; sem timer armado, o passo NÃO roda. `confirm` o cancela.
+# REDES DE SEGURANÇA: ufw e rootcut armam um timer systemd (gt-ufw-revert / gt-rootcut-revert, 10 min); sem timer armado, o passo NÃO roda. O ufw arma antes do enable; o rootcut escreve o drop-in, confere o efetivo, arma e só então recarrega (o sshd só lê o drop-in no reload: o corte nunca vale sem o timer). `confirm` o cancela.
 # CÓDIGOS: 0 ok · 2 recusado (pré-condição/uso; NADA foi mudado) · 3 não consegui ler (NADA foi mudado; nunca vira "vazio") · 98 um passo falhou (o que ficou no nó está na mensagem; o estado perigoso é desfeito).
-# NÃO FAZ: firewall da Hetzner Cloud (sem token no Bitwarden hoje), a chave privada do admin (fica no Bitwarden do Athos), a trava 1 (usuário `dados`) e a auditoria (trava 3).
+# NÃO FAZ: firewall da Hetzner Cloud (sem token no Bitwarden hoje), a chave privada do admin (fica no Bitwarden do Athos), a trava 1 (usuário `dados`) e a auditoria (trava 3). `sshd -T` (sem -C) não enxerga blocos Match: o nó não tem nenhum (medido 11/11) e a prova final é o `ssh root@` recusando.
 set -u
 PATH=/usr/sbin:/usr/bin:/sbin:/bin
 ETC=/etc
@@ -41,6 +41,9 @@ valid_srcs() {
   [ -n "$1" ] || return 1
   IFS=, read -r -a a <<< "$1"
   for s in "${a[@]}"; do
+    # endereço só de zeros (0.0.0.0, ::, 0:0:0:0:0:0:0:0) ou máscara /0 (também /00, /000) é a internet inteira: no ignoreip o fail2ban deixaria de banir TODO MUNDO, na regra da 22 seria `any` sem dizer; quem quer "qualquer origem" no ufw escreve `any`
+    case "$s" in */*) [[ "${s#*/}" =~ ^0+$ ]] && return 1 ;; esac
+    [[ "${s%%/*}" =~ ^[0.:]+$ ]] && return 1
     [[ "$s" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}(/[0-9]{1,2})?$ || "$s" =~ ^[0-9a-fA-F]*:[0-9a-fA-F:]*(/[0-9]{1,3})?$ ]] || return 1
   done
 }
@@ -66,7 +69,7 @@ cmd_status() {
   # vazio → ufw ausente ou ilegível: "?" (nunca "inativo")
   ufw_active; case $? in 0) u=ativo ;; 1) u=inativo ;; *) u="?" ;; esac
   say "ufw=$u"
-  # vazio → comando ausente ("ausente"); falhou → jail sshd não responde ("sem-jail"); só rc 0 é "ativo"
+  # vazio → comando ausente ("ausente"); falhou → a jail sshd não respondeu ("sem-jail" = jail inexistente OU servidor fora do ar: o rc do fail2ban-client não distingue, então NÃO é prova de que falta a jail); só rc 0 é "ativo"
   if command -v fail2ban-client >/dev/null 2>&1; then
     if fail2ban-client status sshd >/dev/null 2>&1; then f=ativo; else f=sem-jail; fi
   else f=ausente; fi
@@ -94,7 +97,7 @@ cmd_origins() {
 
 cmd_admin() {
   PHASE=admin
-  local user="" keyf="" replace=0 keys want have fp T H AK SF rc existing=0 epoch old_fp
+  local user="" keyf="" replace=0 keys want have fp T H AK SF rc existing=0 epoch old_fp old_user old_epoch
   while [ $# -gt 0 ]; do
     case "$1" in
       --user) need_val $# "$1"; user=$2; shift 2 ;;
@@ -126,13 +129,23 @@ cmd_admin() {
   if [ $existing = 1 ]; then
     H=$(getent passwd "$user" | awk -F: '{print $6}')
     AK="$H/.ssh/authorized_keys"
-    # vazio → sem authorized_keys: instala; já tem OUTRA chave → recusa sem --replace (trocar a chave do admin é decisão explícita); ilegível → nao-consegui
+    # sem arquivo → instala; arquivo vazio/só comentários ou com OUTRA chave → recusa sem --replace (fail-closed: trocar a chave do admin é decisão explícita); ilegível → nao-consegui
     if [ -e "$AK" ]; then
       have=$(awk '!/^[[:space:]]*(#|$)/{print $1" "$2}' "$AK") || { cleanup_t; cant "leitura de $AK"; }
       [ "$have" = "$want" ] || [ "$replace" = 1 ] || { cleanup_t; nope "$AK ja tem outra chave (--replace para trocar)"; }
     fi
   fi
   # ── daqui em diante muda o nó
+  # state anterior, lido ANTES de mexer na chave. vazio → sem admin gravado: marco novo; falhou/ilegível → campos vazios: marco novo e state invalidado (o mais exigente: a prova tem de ser posterior)
+  old_user=""; old_fp=""; old_epoch=""
+  if [ -e "$STATE/admin" ]; then
+    old_user=$(awk -F= '$1=="user"{print $2}' "$STATE/admin" 2>/dev/null)
+    old_fp=$(awk -F= '$1=="fp"{print $2}' "$STATE/admin" 2>/dev/null)
+    old_epoch=$(awk -F= '$1=="epoch"{print $2}' "$STATE/admin" 2>/dev/null)
+  fi
+  # o state diz o que o admin DECIDIU; o authorized_keys é o que o sshd ACEITA. Se a chave vai mudar, o state antigo deixa de valer ANTES do authorized_keys mudar: uma falha daqui até o state novo (visudo, sudoers, escrita)
+  # não pode deixar "fp=K1, login provado" apontando para um nó que já aceita a K2. Sem state, o rootcut recusa; remover falhou → 98 antes de tocar na chave
+  if [ -e "$STATE/admin" ] && { [ "$old_user" != "$user" ] || [ "$old_fp" != "$fp" ]; }; then rm -f "$STATE/admin" || { cleanup_t; die state-invalida; }; fi
   if [ $existing = 0 ]; then useradd -m -s /bin/bash "$user" || { cleanup_t; die useradd; }; fi
   usermod -aG sudo "$user" || { cleanup_t; die grupo-sudo; }
   passwd -l "$user" >/dev/null 2>&1 || { cleanup_t; die passwd-l; }
@@ -148,11 +161,9 @@ cmd_admin() {
   printf '%s ALL=(ALL) NOPASSWD:ALL\n' "$user" > "$SF.tmp" && chmod 0440 "$SF.tmp" || { cleanup_t; die sudoers-tmp; }
   visudo -cf "$SF.tmp" >/dev/null 2>&1 || { rm -f "$SF.tmp"; cleanup_t; die visudo; }
   mv -f "$SF.tmp" "$SF" || { cleanup_t; die sudoers-mv; }
-  # a hora da instalação é o marco da prova do rootcut; chave igual à já gravada mantém a hora (a prova antiga continua valendo)
+  # a hora da instalação é o marco da prova do rootcut; MESMO usuário com a MESMA chave já gravada mantém a hora (a prova antiga continua valendo); qualquer outra combinação, ou marco ilegível → hora nova
   epoch=$(date +%s)
-  # vazio → state sem admin anterior: marco novo; ilegível → marco novo (o mais exigente: a prova tem de ser posterior)
-  old_fp=""; [ -e "$STATE/admin" ] && old_fp=$(awk -F= '$1=="fp"{print $2}' "$STATE/admin" 2>/dev/null)
-  if [ "$old_fp" = "$fp" ]; then epoch=$(awk -F= '$1=="epoch"{print $2}' "$STATE/admin" 2>/dev/null); [[ "$epoch" =~ ^[0-9]+$ ]] || epoch=$(date +%s); fi
+  if [ "$old_user" = "$user" ] && [ "$old_fp" = "$fp" ] && [[ "$old_epoch" =~ ^[0-9]+$ ]]; then epoch=$old_epoch; fi
   printf 'user=%s\nfp=%s\nepoch=%s\n' "$user" "$fp" "$epoch" > "$STATE/admin.new" && mv -f "$STATE/admin.new" "$STATE/admin" || { cleanup_t; die state; }
   cleanup_t
   note "admin $user fp=$fp"
@@ -177,7 +188,8 @@ cmd_fail2ban() {
   fi
   J="$ETC/fail2ban/jail.d/gt-sshd.local"
   mkdir -p "$ETC/fail2ban/jail.d" || die jail-dir
-  [ -e "$J" ] && cp -p "$J" "$J.prev"
+  # vazio → sem config anterior: nada a guardar; falhou → 98 ANTES de sobrescrever (sem o backup o undo apagaria a config antiga em vez de restaurá-la)
+  if [ -e "$J" ]; then cp -p "$J" "$J.prev" || die jail-backup; fi
   printf '[DEFAULT]\nignoreip = 127.0.0.1/8 ::1 %s\n\n[sshd]\nenabled = true\nmaxretry = 5\nfindtime = 10m\nbantime = 1h\n' "${ign//,/ }" > "$J.new" && mv -f "$J.new" "$J" || die jail-escrita
   undo_f2b() { if [ -e "$J.prev" ]; then mv -f "$J.prev" "$J"; else rm -f "$J"; fi; systemctl stop fail2ban >/dev/null 2>&1; }
   fail2ban-client -t >/dev/null 2>&1 || { undo_f2b; die "config-test (fail2ban parado, drop-in removido)"; }
@@ -188,9 +200,10 @@ cmd_fail2ban() {
   # vazio/falhou → sem lista de ignoreip: o jail NÃO está protegendo o mini → para o fail2ban (estado inerte) e diz
   got=$(fail2ban-client get sshd ignoreip 2>/dev/null) || { undo_f2b; die "ignoreip-ilegivel (fail2ban parado)"; }
   IFS=, read -r -a arr <<< "$ign"
+  # o IP tem de ser um TOKEN da lista (substring enganaria: 198.51.100.7 "está" em 198.51.100.77). vazio/falhou → sem match → desfaz
   for a in "${arr[@]}"; do
     ip=${a%%/*}
-    case "$got" in *"$ip"*) ;; *) undo_f2b; die "ignoreip-ausente:$ip (fail2ban parado)" ;; esac
+    printf '%s\n' "$got" | awk -v ip="$ip" 'BEGIN{ip=tolower(ip)} { for (i=1;i<=NF;i++) { t=tolower($i); sub(/\/.*/,"",t); if (t==ip) f=1 } } END{exit f?0:1}' || { undo_f2b; die "ignoreip-ausente:$ip (fail2ban parado)"; }
   done
   rm -f "$J.prev"
   note "fail2ban ativo ignoreip=$ign"
@@ -228,7 +241,8 @@ cmd_ufw() {
   fi
   ufw default deny incoming >/dev/null 2>&1 || die default-deny
   ufw default allow outgoing >/dev/null 2>&1 || die default-allow
-  if [ $rc = 0 ]; then say "ok ufw ja estava ativo; regras da 22 garantidas (sem enable, sem rede de seguranca)"; exit 0; fi
+  # ufw já ativo: não há enable nem rede, a política deny/allow acabou de valer NA HORA — sem timer de reversão. Diz isso claro e manda conferir
+  if [ $rc = 0 ]; then say "ok ufw ja estava ativo: regras da 22 garantidas e politica deny incoming APLICADA na hora (sem enable, SEM rede de seguranca). Confira 'ufw status verbose' e prove uma conexao ssh NOVA"; exit 0; fi
   # sem rede de segurança armada, NÃO liga: se a regra estiver errada, o timer desliga o ufw sozinho em 10 min
   systemctl stop gt-ufw-revert.timer >/dev/null 2>&1
   systemd-run --quiet --unit=gt-ufw-revert --on-active=10min /usr/sbin/ufw disable >/dev/null 2>&1 || die rede-de-seguranca
@@ -243,7 +257,7 @@ cmd_ufw() {
 
 cmd_rootcut() {
   PHASE=rootcut
-  local nota1="" user fp epoch j n s D eff
+  local nota1="" user fp epoch j n s D eff H AK have inst instfp
   while [ $# -gt 0 ]; do
     case "$1" in --sem-trava1) need_val $# "$1"; nota1=$2; shift 2 ;; *) nope "argumento desconhecido: $1" ;; esac
   done
@@ -254,6 +268,21 @@ cmd_rootcut() {
   fp=$(awk -F= '$1=="fp"{print $2}' "$STATE/admin" 2>/dev/null) || cant "leitura do state"
   epoch=$(awk -F= '$1=="epoch"{print $2}' "$STATE/admin" 2>/dev/null) || cant "leitura do state"
   [[ "$user" =~ ^[a-z][a-z0-9_-]{2,31}$ && "$fp" =~ ^SHA256:[A-Za-z0-9+/]{43}$ && "$epoch" =~ ^[0-9]+$ ]] || cant "state do admin incompleto"
+  # (1b) a chave que o sshd ACEITA é a gravada. O state diz o que o admin decidiu; o authorized_keys é o que vale no login. Lê o arquivo de verdade e compara o fingerprint com o do state
+  # getent: rc 0 existe · rc 2 não existe (recusa) · outro rc = falhou/ilegível → nao-consegui. Home que não é caminho absoluto de usuário comum → nao-consegui (não leio em lugar nenhum)
+  getent passwd "$user" >/dev/null 2>&1; n=$?
+  case $n in 0) ;; 2) nope "usuario admin $user nao existe: rode 'admin' de novo" ;; *) cant "getent passwd $user rc=$n" ;; esac
+  H=$(getent passwd "$user" | awk -F: '{print $6}')
+  case "$H" in /|/root|"") cant "home do admin invalido: ${H:-vazio}" ;; /*) ;; *) cant "home do admin invalido: $H" ;; esac
+  AK="$H/.ssh/authorized_keys"
+  # vazio → sem arquivo, ou só comentários: recusa (o admin não tem chave instalada); falhou/ilegível → nao-consegui
+  [ -e "$AK" ] || nope "$AK nao existe: o admin nao tem chave instalada. Rode 'admin --replace' e prove o login de novo"
+  have=$(awk '!/^[[:space:]]*(#|$)/' "$AK") || cant "leitura de $AK"
+  [ -n "$have" ] || nope "$AK sem chave: o admin nao tem chave instalada. Rode 'admin --replace' e prove o login de novo"
+  [ "$(printf '%s\n' "$have" | awk 'END{print NR}')" = 1 ] || nope "$AK tem mais de uma chave: so a gravada pode entrar. Rode 'admin --replace' e prove o login de novo"
+  inst=$(ssh-keygen -l -f "$AK" 2>/dev/null) || cant "ssh-keygen -l -f $AK"
+  instfp=$(printf '%s\n' "$inst" | awk '{print $2}')
+  [ "$instfp" = "$fp" ] || nope "chave instalada (${instfp:-?}) difere da gravada ($fp): rode 'admin --replace' e prove o login de novo"
   # (2) a trava 1 usa o root atual: o usuário `dados` existir é a prova de que ela foi aplicada; o override exige motivo e fica no log
   # getent: rc 0 existe · rc 2 não existe (vazio → sem `dados`: recusa, ou override com motivo) · qualquer outro rc = falhou/ilegível → nao-consegui (nunca vira "não existe")
   getent passwd dados >/dev/null 2>&1; n=$?
@@ -303,8 +332,9 @@ cmd_confirm() {
       systemctl is-active gt-ufw-revert.timer >/dev/null 2>&1 && die "timer-ainda-armado"
       note "confirm ufw"; say "ok ufw confirmado; rede de seguranca cancelada" ;;
     rootcut)
-      # vazio/falhou → efetivo diferente de "no" (o timer já reabriu o root, ou o drop-in sumiu): nada a confirmar
+      # vazio/falhou → sshd -T sem resposta: nao-consegui (a rede continua armada, nada é cancelado); resposta diferente de "no" (o timer já reabriu o root, ou o drop-in sumiu): nada a confirmar
       eff=$(sshd_root_eff)
+      [ -n "$eff" ] || cant "sshd -T ilegivel: nao confirmo as cegas (a rede de seguranca continua armada)"
       [ "$eff" = no ] || nope "permitrootlogin efetivo=${eff:-?}: o root ja voltou (rede disparou) ou o rootcut nao esta aplicado"
       systemctl stop gt-rootcut-revert.timer >/dev/null 2>&1
       systemctl is-active gt-rootcut-revert.timer >/dev/null 2>&1 && die "timer-ainda-armado"

@@ -6,9 +6,9 @@
 #   Casos · Controles negativos · Uso · O que este teste NÃO prova
 #
 # CASOS: uso · status/origins (só leem; falha de leitura é `?`/3, nunca "inativo"/"vazio") · admin (cria com sudo, senha travada, SÓ a chave pública ed25519/ecdsa; recusa nome reservado, chave privada, RSA, opções, 2 chaves,
-#   não-root; chave diferente exige --replace; falha em cada passo → 98 sem state) · fail2ban (ignoreip do mini obrigatório e conferido de volta; falha → desfaz e para) · ufw (regra da 22 ANTES de tudo, rede de segurança
-#   armada ANTES do enable, sem rede não liga) · rootcut (as 5 provas, o login real do admin lido do journal desde a instalação, rede de segurança de 10 min, efetivo conferido; falha → drop-in removido) · confirm · undo · não-root.
-# CONTROLES NEGATIVOS: os mutantes H1-H29 têm de ser REPROVADOS pelo caso correspondente (o caso falha no mutante).
+#   não-root; chave diferente exige --replace; falha em cada passo → 98 sem state; --replace que falha invalida o state) · fail2ban (ignoreip do mini obrigatório e conferido de volta; falha → desfaz e para) · ufw (regra da 22 ANTES de tudo, rede de segurança
+#   armada ANTES do enable, sem rede não liga) · rootcut (as 5 provas, a chave do authorized_keys = a gravada, o login real do admin lido do journal desde a instalação, rede de segurança de 10 min, efetivo conferido; falha → drop-in removido) · confirm · undo · não-root.
+# CONTROLES NEGATIVOS: os mutantes H1-H41 têm de ser REPROVADOS pelo caso correspondente (o caso falha no mutante).
 # USO: hetzner-ssh-lockdown.selftest.sh [--sem-mutantes]   (a prod-test usa --sem-mutantes; a bateria completa roda no gate)
 # O QUE NÃO PROVA: que o sshd/ufw/fail2ban de verdade se comportam como os stubs. Isso só a execução no nó prova — por isso cada passo vivo tem rede de segurança de 10 min e prova por conexão NOVA (docs/runbooks/hetzner-ssh-lockdown.md).
 set -u
@@ -123,7 +123,7 @@ echo "fail2ban-client $*" >> "$LOG"
 case "$*" in
   "-t") [ "${FAIL_STEP:-}" = f2b-test ] && exit 1 ;;
   "status sshd") [ -e "$W/f2b.up" ] || exit 1 ;;
-  "get sshd ignoreip") case "${F2B_IGNORE:-}" in fail) exit 1 ;; empty) ;; other) echo "|- IP list: 127.0.0.1/8 ::1" ;; *) awk -F= '$1 ~ /^ignoreip/ {print "|- IP list:" $2}' "$GT_ETC/fail2ban/jail.d/gt-sshd.local" ;; esac ;;
+  "get sshd ignoreip") case "${F2B_IGNORE:-}" in fail) exit 1 ;; empty) ;; other) echo "|- IP list: 127.0.0.1/8 ::1" ;; substr) echo "|- IP list: 127.0.0.1/8 ::1 198.51.100.77" ;; *) awk -F= '$1 ~ /^ignoreip/ {print "|- IP list:" $2}' "$GT_ETC/fail2ban/jail.d/gt-sshd.local" ;; esac ;;
 esac
 exit 0
 EOF
@@ -245,7 +245,15 @@ case_admin_fail() { local st
     ck "falha em $st: rc 98" rcis 98; ck "falha em $st: diz falhou:" has "$ERR" '^LOCKDOWN-admin: falhou:'; ck "falha em $st: chave NÃO instalada" test ! -e "$HOME_ADM/.ssh/authorized_keys"; ck "falha em $st: sem state" test ! -e "$W/state/admin"; ck "falha em $st: sem sudoers" test ! -e "$SUDOERS"; done
   world; FAIL_STEP=visudo go "$1" admin --user opadm --pubkey-file "$T/K1.pub"; ck "visudo reprova: rc 98" rcis 98; ck "visudo reprova: sudoers NÃO vale" test ! -e "$SUDOERS"; ck "visudo reprova: sem temporário" test ! -e "$SUDOERS.tmp"; ck "visudo reprova: sem state" test ! -e "$W/state/admin"
   world; FAKE_HOME=/ go "$1" admin --user opadm --pubkey-file "$T/K1.pub"; ck "home '/': rc 98" rcis 98; ck "home '/': diz home-invalido" has "$ERR" 'falhou:home-invalido'; ck "home '/': sem state" test ! -e "$W/state/admin"
-  world; FAKE_HOME=rel/home go "$1" admin --user opadm --pubkey-file "$T/K1.pub"; ck "home relativo: rc 98" rcis 98; ck "home relativo: sem state" test ! -e "$W/state/admin"; }
+  world; FAKE_HOME=rel/home go "$1" admin --user opadm --pubkey-file "$T/K1.pub"; ck "home relativo: rc 98" rcis 98; ck "home relativo: sem state" test ! -e "$W/state/admin"
+  # --replace que FALHA depois de trocar o authorized_keys: o state antigo (K1, com login provado) não pode sobreviver apontando para um nó que já aceita a K2.
+  # O state é invalidado ANTES da troca; o rootcut seguinte recusa (sem admin gravado) e não escreve drop-in.
+  for st in usermod passwd chown visudo; do prep "$1"; FAIL_STEP=$st go "$1" admin --user opadm --pubkey-file "$T/K2.pub" --replace
+    ck "--replace falha em $st: rc 98" rcis 98; ck "--replace falha em $st: o state de K1 NÃO sobrevive" test ! -e "$W/state/admin"
+    go "$1" rootcut; ck "--replace falha em $st: rootcut recusa (rc 2)" rcis 2; ck "--replace falha em $st: rootcut diz sem admin gravado" has "$ERR" 'recusado:sem admin gravado'; ck "--replace falha em $st: rootcut não recarrega o ssh" hasnt "$LOG" '^systemctl reload ssh$'; ck "--replace falha em $st: rootcut não escreve drop-in" test ! -e "$D_ROOT"; done
+  # --replace que FUNCIONA: o login que estava no journal é da K1 e não vale para a K2; só um login novo com a K2 libera o rootcut
+  prep "$1"; go "$1" admin --user opadm --pubkey-file "$T/K2.pub" --replace; ck "--replace ok: rc 0" rcis 0; go "$1" rootcut; ck "--replace ok: rootcut sem login da K2 recusa" rcis 2; ck "--replace ok: diz sem prova" has "$ERR" 'recusado:sem prova'
+  login_line opadm "$FP2"; go "$1" rootcut; ck "--replace ok + login da K2 depois: rootcut passa" rcis 0; }
 case_f2b_ok() { world; go "$1" fail2ban --ignoreip 198.51.100.7
   ck "fail2ban: rc 0" rcis 0; ck "diz a jail ativa e o ignoreip" has "$OUT" '^LOCKDOWN-fail2ban: ok jail sshd ativa; ignoreip=198\.51\.100\.7$'
   ck "drop-in: ignoreip = loopback + o mini" has "$J_F2B" '^ignoreip = 127\.0\.0\.1/8 ::1 198\.51\.100\.7$'; ck "drop-in: jail sshd habilitada" has "$J_F2B" '^enabled = true$'; ck "drop-in: seção [sshd]" has "$J_F2B" '^\[sshd\]$'
@@ -256,23 +264,36 @@ case_f2b_ok() { world; go "$1" fail2ban --ignoreip 198.51.100.7
 case_f2b_refuse() { world
   refused "sem --ignoreip" "$1" "$MUT_F2B" fail2ban; refused "--ignoreip vazio" "$1" "$MUT_F2B" fail2ban --ignoreip ''; refused "--ignoreip lixo" "$1" "$MUT_F2B" fail2ban --ignoreip abc
   refused "--ignoreip com injeção" "$1" "$MUT_F2B" fail2ban --ignoreip '1.2.3.4;reboot'; refused "--ignoreip com espaço" "$1" "$MUT_F2B" fail2ban --ignoreip '1.2.3.4 5.6.7.8'; refused "argumento desconhecido" "$1" "$MUT_F2B" fail2ban --ignoreip 1.2.3.4 --foo
+  # "a internet inteira" no ignoreip faria o fail2ban deixar de banir TODO MUNDO (e a leitura de volta passaria): endereço só de zeros ou máscara /0 são recusados, sozinhos ou dentro de uma lista
+  refused "ignoreip 0.0.0.0/0" "$1" "$MUT_F2B" fail2ban --ignoreip 0.0.0.0/0; refused "ignoreip ::/0" "$1" "$MUT_F2B" fail2ban --ignoreip ::/0; refused "ignoreip 0.0.0.0" "$1" "$MUT_F2B" fail2ban --ignoreip 0.0.0.0
+  refused "ignoreip ::" "$1" "$MUT_F2B" fail2ban --ignoreip ::; refused "ignoreip 1.2.3.4/0" "$1" "$MUT_F2B" fail2ban --ignoreip 1.2.3.4/0; refused "ignoreip 1.2.3.4/00" "$1" "$MUT_F2B" fail2ban --ignoreip 1.2.3.4/00
+  refused "ignoreip lista com um 0.0.0.0/0" "$1" "$MUT_F2B" fail2ban --ignoreip 198.51.100.7,0.0.0.0/0
   ck "recusa não escreve drop-in" test ! -e "$J_F2B"; }
 case_f2b_fail() { local st
   world; FAIL_STEP=apt ABSENT=" fail2ban-client " go "$1" fail2ban --ignoreip 198.51.100.7; ck "apt falha: rc 98" rcis 98; ck "apt falha: nenhum drop-in escrito" test ! -e "$J_F2B"; ck "apt falha: não chegou a subir nada" hasnt "$LOG" '^systemctl (enable|restart)'
   world; APT_NOBIN=1 ABSENT=" fail2ban-client " go "$1" fail2ban --ignoreip 198.51.100.7; ck "apt 'ok' sem binário: rc 98" rcis 98; ck "apt sem binário: nenhum drop-in escrito" test ! -e "$J_F2B"
   for st in f2b-test f2b-enable f2b-restart; do world; FAIL_STEP=$st go "$1" fail2ban --ignoreip 198.51.100.7; ck "falha em $st: rc 98" rcis 98; ck "falha em $st: drop-in removido" test ! -e "$J_F2B"; ck "falha em $st: fail2ban parado" has "$LOG" '^systemctl stop fail2ban$'; ck "falha em $st: diz o que ficou" has "$ERR" 'falhou:.*drop-in removido'; done
   world; F2B_NOJAIL=1 go "$1" fail2ban --ignoreip 198.51.100.7; ck "jail nunca responde: rc 98" rcis 98; ck "jail nunca responde: drop-in removido e fail2ban parado" has "$LOG" '^systemctl stop fail2ban$'; ck "jail nunca responde: sem drop-in" test ! -e "$J_F2B"
-  for st in empty fail other; do world; F2B_IGNORE=$st go "$1" fail2ban --ignoreip 198.51.100.7; ck "ignoreip '$st' lido de volta: rc 98" rcis 98; ck "ignoreip '$st': fail2ban parado" has "$LOG" '^systemctl stop fail2ban$'; ck "ignoreip '$st': drop-in removido" test ! -e "$J_F2B"; done
-  world; mkdir -p "$W/etc/fail2ban/jail.d"; echo PREV > "$J_F2B"; FAIL_STEP=f2b-test go "$1" fail2ban --ignoreip 198.51.100.7; ck "drop-in anterior é restaurado na falha" test "$(cat "$J_F2B")" = PREV; }
+  # substr: a lista lida de volta traz 198.51.100.77, e o IP pedido é 198.51.100.7 (substring, não token): tem de falhar como "ausente"
+  for st in empty fail other substr; do world; F2B_IGNORE=$st go "$1" fail2ban --ignoreip 198.51.100.7; ck "ignoreip '$st' lido de volta: rc 98" rcis 98; ck "ignoreip '$st': fail2ban parado" has "$LOG" '^systemctl stop fail2ban$'; ck "ignoreip '$st': drop-in removido" test ! -e "$J_F2B"; done
+  world; mkdir -p "$W/etc/fail2ban/jail.d"; echo PREV > "$J_F2B"; FAIL_STEP=f2b-test go "$1" fail2ban --ignoreip 198.51.100.7; ck "drop-in anterior é restaurado na falha" test "$(cat "$J_F2B")" = PREV
+  # o backup do drop-in anterior não pode ser gravado (symlink para diretório que não existe): 98 ANTES de sobrescrever, e o drop-in anterior continua o que era
+  world; mkdir -p "$W/etc/fail2ban/jail.d"; echo PREV > "$J_F2B"; ln -s "$W/nao-existe/x" "$J_F2B.prev"; go "$1" fail2ban --ignoreip 198.51.100.7
+  ck "backup do drop-in falha: rc 98" rcis 98; ck "backup falha: diz jail-backup" has "$ERR" 'falhou:jail-backup'; ck "backup falha: o drop-in anterior NÃO foi sobrescrito" test "$(cat "$J_F2B")" = PREV; ck "backup falha: não subiu nada" hasnt "$LOG" '^(apt-get|systemctl|fail2ban-client)'; }
 case_ufw_ok() { world; go "$1" ufw --ssh-from any
   ck "ufw any: rc 0" rcis 0; ck "ordem: 22 liberada, lida de volta, política deny, rede armada, rede conferida, enable" order '^ufw allow 22/tcp$' '^ufw show added$' '^ufw default deny incoming$' '^ufw default allow outgoing$' '^systemd-run ' '^systemctl is-active gt-ufw-revert.timer$' '^ufw --force enable$'
   ck "rede de segurança: 10 min, ufw disable" has "$LOG" '^systemd-run --quiet --unit=gt-ufw-revert --on-active=10min /usr/sbin/ufw disable$'; ck "avisa da rede de segurança" has "$OUT" 'REDE DE SEGURANCA'; ck "manda provar por conexão NOVA" has "$OUT" 'conexao ssh NOVA'
   ck "ufw ficou ativo" exists "$W/ufw.on"; ck "rede segue armada até o confirm" exists "$W/timer.gt-ufw-revert"
+  world; go "$1" ufw --ssh-from 198.51.100.0/24,2001:db8::/32; ck "faixas CIDR legítimas: rc 0" rcis 0; ck "faixa IPv4 /24 vira regra" has "$LOG" '^ufw allow from 198\.51\.100\.0/24 to any port 22 proto tcp$'
   world; go "$1" ufw --ssh-from 198.51.100.7,2001:db8::1; ck "lista: rc 0" rcis 0; ck "lista: regra do 1o IP" has "$LOG" '^ufw allow from 198\.51\.100\.7 to any port 22 proto tcp$'; ck "lista: regra do 2o IP" has "$LOG" '^ufw allow from 2001:db8::1 to any port 22 proto tcp$'; ck "lista: NÃO abre a 22 para todos" hasnt "$LOG" '^ufw allow 22/tcp$'
-  world; ufw_on; go "$1" ufw --ssh-from any; ck "já ativo: rc 0" rcis 0; ck "já ativo: diz que já estava" has "$OUT" 'ja estava ativo'; ck "já ativo: NÃO religa nem arma rede" hasnt "$LOG" '^(ufw --force enable|systemd-run)'; ck "já ativo: garante a regra da 22" has "$LOG" '^ufw allow 22/tcp$'; ck "já ativo: a 22 entra ANTES da política" order '^ufw allow 22/tcp$' '^ufw default deny incoming$'; }
+  world; ufw_on; go "$1" ufw --ssh-from any; ck "já ativo: rc 0" rcis 0; ck "já ativo: diz que já estava" has "$OUT" 'ja estava ativo'; ck "já ativo: diz que a política valeu NA HORA, sem rede de segurança" has "$OUT" 'deny incoming APLICADA na hora.*SEM rede de seguranca'; ck "já ativo: NÃO religa nem arma rede" hasnt "$LOG" '^(ufw --force enable|systemd-run)'; ck "já ativo: garante a regra da 22" has "$LOG" '^ufw allow 22/tcp$'; ck "já ativo: a 22 entra ANTES da política" order '^ufw allow 22/tcp$' '^ufw default deny incoming$'; }
 case_ufw_refuse() { world
   refused "sem --ssh-from" "$1" "$MUT_UFW" ufw; refused "--ssh-from vazio" "$1" "$MUT_UFW" ufw --ssh-from ''; refused "--ssh-from lixo" "$1" "$MUT_UFW" ufw --ssh-from 'x;y'; refused "--ssh-from com injeção" "$1" "$MUT_UFW" ufw --ssh-from '1.2.3.4;reboot'; refused "argumento desconhecido" "$1" "$MUT_UFW" ufw --ssh-from any --foo
-  ABSENT=" ufw " cant "ufw ausente" "$1" "$MUT_UFW" ufw --ssh-from any; ABSENT=" systemd-run " cant "systemd-run ausente (sem rede de segurança, não liga)" "$1" "$MUT_UFW" ufw --ssh-from any
+  refused "--ssh-from 0.0.0.0/0 (quem quer qualquer origem escreve any)" "$1" "$MUT_UFW" ufw --ssh-from 0.0.0.0/0; refused "--ssh-from ::/0" "$1" "$MUT_UFW" ufw --ssh-from ::/0; refused "--ssh-from lista com 0.0.0.0/0" "$1" "$MUT_UFW" ufw --ssh-from 198.51.100.7,0.0.0.0/0
+  ABSENT=" ufw " cant "ufw ausente" "$1" "$MUT_UFW" ufw --ssh-from any
+  # esconder o systemd-run só funciona onde o /usr/bin e o /bin do host não o têm (o mini). Num host Linux o PATH hermético (stubs:/usr/bin:/bin) ainda o acha: o caso não prova nada ali e é PULADO, em voz alta (medido no nó em 11/11)
+  if PATH=/usr/bin:/bin command -v systemd-run >/dev/null 2>&1; then [ "$QUIET" = 1 ] || echo "skip systemd-run ausente: este host tem o systemd-run de verdade em /usr/bin ou /bin (AMBIENTE: o caso roda onde ele não existe, o mini)"
+  else ABSENT=" systemd-run " cant "systemd-run ausente (sem rede de segurança, não liga)" "$1" "$MUT_UFW" ufw --ssh-from any; fi
   UFW_STATUS=garbage cant "ufw status ilegível" "$1" "$MUT_UFW" ufw --ssh-from any; UFW_STATUS=fail cant "ufw status que falha" "$1" "$MUT_UFW" ufw --ssh-from any; }
 case_ufw_fail() { local st
   for st in allow default; do world; FAIL_STEP=$st go "$1" ufw --ssh-from any; ck "falha em $st: rc 98" rcis 98; ck "falha em $st: NÃO liga" hasnt "$LOG" '^ufw --force enable'; ck "falha em $st: ufw continua desligado" test ! -e "$W/ufw.on"; done
@@ -307,6 +328,16 @@ case_rootcut_refuse() { local m="$MUT_ROOT"
   prep "$1"; FAIL_STEP=journal cant "journalctl que falha (não vira 'sem prova')" "$1" "$m" rootcut
   prep "$1"; SUDO_MODE=fail cant "sudo -l que falha" "$1" "$m" rootcut
   prep "$1"; awk -F= -v OFS== '$1=="fp"{$2="lixo"}1' "$W/state/admin" > "$W/state/admin.x"; mv "$W/state/admin.x" "$W/state/admin"; cant "state com fp quebrado" "$1" "$m" rootcut
+  # (1b) o que o sshd ACEITA (authorized_keys) tem de ser a chave gravada no state; o state sozinho não prova nada sobre o arquivo
+  AKF="$HOME_ADM/.ssh/authorized_keys"
+  prep "$1"; cp "$T/K2.pub" "$AKF"; refused "authorized_keys com OUTRA chave que a gravada" "$1" "$m" rootcut; ck "…diz que a instalada difere" has "$ERR" 'chave instalada .* difere da gravada'; ck "…sem drop-in" test ! -e "$D_ROOT"
+  prep "$1"; cat "$T/K1.pub" "$T/K2.pub" > "$AKF"; refused "authorized_keys com duas chaves (a gravada e outra)" "$1" "$m" rootcut; ck "…diz que tem mais de uma chave" has "$ERR" 'mais de uma chave'; ck "…sem drop-in" test ! -e "$D_ROOT"
+  prep "$1"; echo '# só comentário' > "$AKF"; refused "authorized_keys só com comentário" "$1" "$m" rootcut; ck "…diz sem chave" has "$ERR" 'sem chave'; ck "…sem drop-in" test ! -e "$D_ROOT"
+  prep "$1"; rm -f "$AKF"; refused "authorized_keys inexistente" "$1" "$m" rootcut; ck "…diz que não existe" has "$ERR" 'nao existe'; ck "…sem drop-in" test ! -e "$D_ROOT"
+  prep "$1"; echo 'isto nao e uma chave' > "$AKF"; cant "authorized_keys ilegível para o ssh-keygen (não vira 'chave diferente' nem 'ok')" "$1" "$m" rootcut; ck "…sem drop-in" test ! -e "$D_ROOT"
+  prep "$1"; GETENT_FAIL=opadm cant "getent do admin que falha" "$1" "$m" rootcut; ck "…diz o rc do getent" has "$ERR" 'getent passwd opadm rc=3'
+  prep "$1"; grep -v '^opadm:' "$W/passwd.db" > "$W/passwd.new"; mv "$W/passwd.new" "$W/passwd.db"; refused "usuário admin sumiu do passwd" "$1" "$m" rootcut; ck "…diz que não existe" has "$ERR" 'nao existe'
+  prep "$1"; awk -F: -v OFS=: '$1=="opadm"{$6="/"}1' "$W/passwd.db" > "$W/passwd.new"; mv "$W/passwd.new" "$W/passwd.db"; cant "home do admin '/' (não leio em lugar nenhum)" "$1" "$m" rootcut
   prep "$1"; ck "(controle) o mesmo mundo sem defeito passa" test "$(go "$1" rootcut; echo $RC)" = 0; }
 case_rootcut_fail() { prep "$1"; local st
   FAIL_STEP=sshd-t go "$1" rootcut; ck "sshd -t reprova: rc 98" rcis 98; ck "sshd -t: drop-in removido" test ! -e "$D_ROOT"; ck "sshd -t: NÃO recarregou" hasnt "$LOG" '^systemctl reload ssh$'
@@ -321,7 +352,8 @@ case_confirm() { world; ufw_on; : > "$W/timer.gt-ufw-revert"; go "$1" confirm uf
   world; ufw_on; : > "$W/timer.gt-ufw-revert"; FAIL_STEP=timer-stuck go "$1" confirm ufw; ck "timer que não para: rc 98" rcis 98; ck "timer que não para: diz timer-ainda-armado" has "$ERR" 'timer-ainda-armado'
   prep "$1"; go "$1" rootcut; go "$1" confirm rootcut; ck "confirm rootcut: rc 0" rcis 0; ck "confirm rootcut: cancela a rede" has "$LOG" '^systemctl stop gt-rootcut-revert.timer$'; ck "confirm rootcut: rede desarmada" test ! -e "$W/timer.gt-rootcut-revert"
   prep "$1"; go "$1" rootcut; SSHD_IGNORE_DROPIN=1 go "$1" confirm rootcut; ck "efetivo != no (o root voltou): rc 2" rcis 2; ck "…NÃO cancela a rede" hasnt "$LOG" '^systemctl stop gt-rootcut-revert.timer$'; ck "…a rede continua armada" exists "$W/timer.gt-rootcut-revert"
-  SSHD_T=empty go "$1" confirm rootcut; ck "efetivo ilegível: rc 2 (não confirma às cegas)" rcis 2; ck "…a rede continua armada" exists "$W/timer.gt-rootcut-revert"
+  # sshd -T sem resposta é "não consegui ler" (rc 3), não "o root voltou" (rc 2): nada é confirmado e a rede continua armada
+  SSHD_T=empty go "$1" confirm rootcut; ck "efetivo ilegível: rc 3 (não confirma às cegas)" rcis 3; ck "…diz nao-consegui" has "$ERR" '^LOCKDOWN-confirm: nao-consegui:'; ck "…NÃO cancela a rede" hasnt "$LOG" '^systemctl stop gt-rootcut-revert.timer$'; ck "…a rede continua armada" exists "$W/timer.gt-rootcut-revert"
   go "$1" confirm; ck "confirm sem alvo: rc 2" rcis 2; go "$1" confirm xpto; ck "confirm alvo desconhecido: rc 2" rcis 2; }
 case_undo() { world; ufw_on; : > "$W/timer.gt-ufw-revert"; go "$1" undo ufw; ck "undo ufw: rc 0" rcis 0; ck "undo ufw: ufw disable" has "$LOG" '^ufw disable$'; ck "undo ufw: ufw desligado" test ! -e "$W/ufw.on"; ck "undo ufw: rede desarmada" test ! -e "$W/timer.gt-ufw-revert"
   prep "$1"; go "$1" rootcut; go "$1" undo rootcut; ck "undo rootcut: rc 0" rcis 0; ck "undo rootcut: drop-in removido" test ! -e "$D_ROOT"; ck "undo rootcut: recarregou" has "$LOG" '^systemctl reload ssh$'; ck "undo rootcut: rede desarmada" test ! -e "$W/timer.gt-rootcut-revert"
@@ -330,7 +362,8 @@ case_nonroot() { world; local c
   for c in "admin --user opadm --pubkey-file $T/K1.pub" "fail2ban --ignoreip 198.51.100.7" "ufw --ssh-from any" "rootcut" "confirm ufw" "undo ufw"; do
     # shellcheck disable=SC2086
     FAKE_UID=1000 refused "não-root ($c)" "$1" '^(useradd|usermod|passwd|visudo|apt-get|ufw (allow|default|--force|disable)|systemd-run|systemctl (stop|reload|restart|enable))' $c; done
-  ck "não-root: nenhum state, drop-in ou sudoers" test ! -e "$W/state/admin" && test ! -e "$D_ROOT" && test ! -e "$SUDOERS"; }
+  # um ck por afirmação: um `&&` fora do ck descartaria tudo menos o primeiro teste (o ck sempre devolve 0)
+  ck "não-root: nenhum state" test ! -e "$W/state/admin"; ck "não-root: nenhum drop-in do rootcut" test ! -e "$D_ROOT"; ck "não-root: nenhum sudoers" test ! -e "$SUDOERS"; }
 
 for c in ${SELFTEST_CASES:-usage status origins admin_ok admin_refuse admin_fail f2b_ok f2b_refuse f2b_fail ufw_ok ufw_refuse ufw_fail rootcut_ok rootcut_refuse rootcut_fail confirm undo nonroot}; do "case_$c" "$T/H.sh"; done
 
@@ -348,7 +381,7 @@ mutant H3-nome-reservado-passa 's/root|runner|dados|nobody/NEVERx|nobody/' admin
 mutant H4-senha-nao-travada-erro-ignorado 's/die passwd-l; }/true; }/' admin_fail
 mutant H5-fail2ban-sem-ignoreip 's/valid_srcs "\$ign" || nope/true || nope/' f2b_refuse
 mutant H6-fail2ban-falha-deixa-rodando 's/; systemctl stop fail2ban >\/dev\/null 2>&1; }/; }/' f2b_fail
-mutant H7-ignoreip-nao-conferido 's/\*) undo_f2b; die "ignoreip-ausente:\$ip (fail2ban parado)" ;;/*) ;;/' f2b_fail
+mutant H7-ignoreip-nao-conferido 's/ || { undo_f2b; die "ignoreip-ausente:\$ip (fail2ban parado)"; }/ || true/' f2b_fail
 mutant H8-liga-ufw-sem-a-regra-da-22 's/die regra-22-ausente ;;/true ;;/' ufw_fail
 mutant H9-liga-ufw-sem-rede-armada 's/ || die rede-nao-armada$/ || true/' ufw_fail
 mutant H10-porta-errada 's/ufw allow 22\/tcp >/ufw allow 2222\/tcp >/' ufw_ok
@@ -371,5 +404,17 @@ mutant H26-confirm-rootcut-as-cegas 's/\[ "\$eff" = no \] || nope "permitrootlog
 mutant H27-confirm-ufw-desligado 's/1) nope "o ufw esta desligado/1) true "o ufw esta desligado/' confirm
 mutant H28-zgrep-que-falha-vira-vazio 's/\*) cant "zgrep rc=\$rc" ;;/*) say "vazio" ;;/' origins
 mutant H29-nao-checa-root 's/^need_root() { .*$/need_root() { true; }/' nonroot
+mutant H30-replace-que-falha-deixa-o-state-antigo 's/then rm -f "\$STATE\/admin" || { cleanup_t; die state-invalida; }; fi/then true; fi/' admin_fail
+mutant H31-rootcut-confia-no-state-sem-ler-o-authorized_keys 's/\[ "\$instfp" = "\$fp" \] || nope .*$/true/' rootcut_refuse
+mutant H32-rootcut-aceita-duas-chaves 's/ = 1 \] || nope "\$AK tem mais de uma chave/ -ge 1 ] || nope "$AK tem mais de uma chave/' rootcut_refuse
+mutant H33-rootcut-aceita-home-barra 's/ in \/|\/root|"") cant "home do admin invalido/ in \/root|"") cant "home do admin invalido/' rootcut_refuse
+mutant H34-getent-do-admin-que-falha-passa 's/\*) cant "getent passwd \$user rc=\$n" ;;/*) ;;/' rootcut_refuse
+mutant H35-admin-sumido-vira-nao-consegui 's/2) nope "usuario admin \$user nao existe[^"]*" ;;/2) ;;/' rootcut_refuse
+mutant H36-ignoreip-so-de-zeros-aceito '/\^\[0\.:\]+\$/d' f2b_refuse
+mutant H37-mascara-zero-aceita '/\^0+\$/d' f2b_refuse
+mutant H38-ignoreip-substring-vale 's/if (t==ip) f=1/if (index(t,ip)) f=1/' f2b_fail
+mutant H39-backup-do-drop-in-ignorado 's/ || die jail-backup//' f2b_fail
+mutant H40-ufw-ja-ativo-sem-avisar 's/SEM rede de seguranca/com rede de seguranca/' ufw_ok
+mutant H41-confirm-rootcut-com-efetivo-ilegivel 's/\[ -n "\$eff" \] || cant "sshd -T ilegivel.*$/true/' confirm
 echo "---"; echo "$((n-fails))/$n ok ($M mutantes)"
 [ $fails -eq 0 ] && echo "SELFTEST OK" || { echo "SELFTEST FALHOU ($fails)"; exit 1; }
