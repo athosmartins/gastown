@@ -8,6 +8,8 @@
 • Redes de segurança e como desfazer · Firewall da Hetzner Cloud (fica para quando houver token)
 • O que este script NÃO prova
 
+Bead ga-qg1dw5z.2 (trava 2 de 3; a 1 é o usuário `dados` sem sudo, a 3 é a auditoria). O alvo é o nó `hetzner-teste` (2.31.41.222). Tudo é um script só, `scripts/hetzner-ssh-lockdown.sh`, que roda **como root no nó** e tem selftest hermético (`scripts/hetzner-ssh-lockdown.selftest.sh`, 29 mutantes). Nenhum passo é comando improvisado ao vivo: cada um só avança com a PROVA do anterior e os dois que podem trancar o servidor para fora (`ufw`, `rootcut`) armam, antes de agir, um timer que desfaz sozinho em 10 min.
+
 ## Estado medido em 11/11
 
 * A chave do `runner` (`hetzner_teste_urblink`, só existe no mini) entra como **root**; o `runner` não tem sudo. Por isso quem aplica isto é o dog do mini (ou o Athos), nunca um `dog-remote-N`.
