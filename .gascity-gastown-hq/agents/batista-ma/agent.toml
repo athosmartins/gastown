@@ -1,0 +1,8 @@
+max_active_sessions = 1
+min_active_sessions = 0
+work_dir = "/Users/athos/gt/marketing/crew/batista"
+provider = "claude-rc-batista"
+# Athos 12/11/2026 (sessão thies-wa): Batista no rig marketing, pra ma-dg0 (seção Parceiros do site). Espelha mila-ma.
+pre_start = ["/Users/athos/gt/.gascity-gastown-hq/scripts/claude-credential-preflight.sh"]
+
+option_defaults = { effort = "high" }
