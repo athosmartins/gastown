@@ -61,9 +61,12 @@ DADOS_ACEITOS=(
   "gt-remote/ballast|wa-mutants.state.json|GRANDE|estado do motor de lastro (JSON de mutantes, 7 MB)"
 )
 n_bad=0; n_cant=0; n_ok=0
+# O relatório vira arquivo e, pelo wrapper diário, um push EXTERNO (ntfy). O scan do espelho imprime os remotos do git CRUS (`remotos_fora_do_espelho=[https://usuario:token@...]`) e o pgrep imprime a linha de comando:
+# usuário:senha@ de URL e token conhecido saem mascarados aqui, em toda linha de veredito (a cópia do wrapper, hetzner-audit-daily.sh, mascara o corpo do push de novo).
+redact() { sed -E -e 's#(://)[^/[:space:]]*@#\1***@#g' -e 's#(sk-ant-|gh[pousr]_|github_pat_|xox[abprs]-)[A-Za-z0-9_-]{8,}#\1***#g' -e 's#AKIA[0-9A-Z]{16}#AKIA***#g' -e 's#-----BEGIN [A-Z ]*PRIVATE KEY-----#***#g' -e 's#eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}[A-Za-z0-9_.-]*#***#g'; }
 emit() { # estado verificação detalhe
   case "$1" in ACHADO) n_bad=$((n_bad+1)) ;; NAO-CONSEGUI) n_cant=$((n_cant+1)) ;; *) n_ok=$((n_ok+1)) ;; esac
-  printf 'AUDITORIA %s %s: %s\n' "$1" "$2" "$3"
+  printf 'AUDITORIA %s %s: %s\n' "$1" "$2" "$3" | redact
 }
 
 # ---------------------------------------------------------------------------------------------------------------------------------------------------------------

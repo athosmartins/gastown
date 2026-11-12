@@ -6,7 +6,8 @@
 #
 # O QUE FAZ: roda hetzner-audit.sh (que sempre termina com um RESULTADO, no máximo no orçamento dele), guarda o relatório em <cidade>/.gc/hetzner-audit/last.txt e numa cópia datada
 #   (AAAA-MM-DD.txt, 30 dias), escreve UMA linha `AUDITORIA-DIARIA <hora> rc=N <RESULTADO>` no stdout (é o que o log .gc/logs/hetzner-audit.out mostra) e, se o veredito não é LIMPO, manda UM
-#   push (`notify -p 4`) com o veredito no TÍTULO, o RESULTADO e as linhas ACHADO/NAO-CONSEGUI (até 8) no corpo. Auditoria que sai com rc estranho, ou com rc 0/1/3 mas sem a linha RESULTADO (cortada
+#   push (`notify -p 4`, com NOTIFY_STRICT_EXIT=1 e NOTIFY_FORCE_PUSH=1) com o veredito no TÍTULO, o RESULTADO e as linhas ACHADO/NAO-CONSEGUI (até 8) no corpo, com URL usuário:senha@ e token MASCARADOS
+#   (o push vai a um serviço externo; o scan do espelho imprime os remotos do git crus). Auditoria que sai com rc estranho, ou com rc 0/1/3 mas sem a linha RESULTADO (cortada
 #   no meio), é QUEBRADA e alarma também: silêncio nunca vale como "limpo". Enquanto as travas 1 e 2 (usuário `dados`, SSH fechado) não estiverem aplicadas no nó o veredito é ACHADO: o alarme diário é isso.
 # CÓDIGOS: 0 rodou (limpo, ou o alarme foi entregue: o notify saiu 0, 10 = guardado para as 7h, ou 11 = mesmo título há pouco) · 2 não consegui preparar a pasta/trava · 4 o alarme NÃO foi entregue
 #   (notify ausente, falhou ou saiu 12 = teto de pushes): o relatório está em last.txt e a rodada de amanhã tenta de novo.
@@ -43,9 +44,13 @@ case $rc in 0) verdict=LIMPO ;; 1) verdict=ACHADO ;; 3) verdict=NAO-CONSEGUI ;; 
 [ "$verdict" = LIMPO ] && exit 0
 
 title="Auditoria Hetzner: $verdict"; [ "$verdict" = QUEBRADA ] && title="Auditoria Hetzner: QUEBRADA (rc=$rc)"
-bad=$(grep -E '^AUDITORIA (ACHADO|NAO-CONSEGUI) ' "$OUT/last.txt"); nbad=$(printf '%s\n' "$bad" | grep -c .)
+# O push sai para um serviço EXTERNO (ntfy). A auditoria já mascara o que imprime (hetzner-audit.sh, redact), mas este é o limite de saída e não confia no que um relatório futuro traga: mascara de novo, ANTES do corte
+# em 200 colunas (cortar primeiro deixaria o começo de um token partido ao meio passar pelo padrão).
+redact() { sed -E -e 's#(://)[^/[:space:]]*@#\1***@#g' -e 's#(sk-ant-|gh[pousr]_|github_pat_|xox[abprs]-)[A-Za-z0-9_-]{8,}#\1***#g' -e 's#AKIA[0-9A-Z]{16}#AKIA***#g' -e 's#-----BEGIN [A-Z ]*PRIVATE KEY-----#***#g' -e 's#eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}[A-Za-z0-9_.-]*#***#g'; }
+bad=$(grep -E '^AUDITORIA (ACHADO|NAO-CONSEGUI) ' "$OUT/last.txt" | redact); nbad=$(printf '%s\n' "$bad" | grep -c .)
 body=$( { printf '%s\n' "${res:-sem linha RESULTADO (rc=$rc)}"; printf '%s\n' "$bad" | head -n 8 | cut -c1-200
           [ "$nbad" -gt 8 ] && printf '... e mais %s\n' "$((nbad - 8))"; printf 'Relatório: %s\n' "$OUT/last.txt"; } )
-NOTIFY_STRICT_EXIT=1 "$NOTIFY" -t "$title" -p 4 "$body" > /dev/null 2>&1; nrc=$?
+# FORCE_PUSH: sem ele o notify escolhe push-vs-resumo pela redação do texto e um -p 4 pode cair no resumo horário mudo (ga-ff6t9); STRICT_EXIT faz o rc dizer o que saiu
+NOTIFY_STRICT_EXIT=1 NOTIFY_FORCE_PUSH=1 "$NOTIFY" -t "$title" -p 4 "$body" > /dev/null 2>&1; nrc=$?
 case $nrc in 0|10|11) ;; *) say "ERRO: o notify saiu $nrc: o alarme NÃO foi entregue (o relatório está em $OUT/last.txt)"; exit 4 ;; esac
 exit 0

@@ -27,7 +27,7 @@ exit "${FAKE_AUDIT_RC:-0}"
 EOF
 cat > "$FAKE/notify" <<'EOF'
 #!/bin/bash
-{ echo "CALL strict=${NOTIFY_STRICT_EXIT:-}"; for a in "$@"; do printf 'ARG %s\n' "${a%%$'\n'*}"; done; } >> "$T/notify.log"
+{ echo "CALL strict=${NOTIFY_STRICT_EXIT:-} force=${NOTIFY_FORCE_PUSH:-}"; for a in "$@"; do printf 'ARG %s\n' "${a%%$'\n'*}"; done; } >> "$T/notify.log"
 printf '%s' "$2" > "$T/notify.title"; printf '%s' "${!#}" > "$T/notify.last"      # o título (-t <título>) e o corpo inteiro (o último argumento, com as quebras de linha)
 exit "${FAKE_NOTIFY_RC:-0}"
 EOF
@@ -65,11 +65,18 @@ printf '%s\n' "$out" | grep -qE '^AUDITORIA-DIARIA [0-9TZ:-]+ rc=0 AUDITORIA RES
 # --- achado: UM alarme, veredito no título, só o que não é limpo no corpo ---
 mk; rep "$ACHADO"; FAKE_AUDIT_RC=1 run; [ "$rc" = 0 ] && [ "$(calls)" = 1 ]; ok $? "ACHADO (rc 1): UM alarme e o wrapper sai 0 (o alarme foi entregue)"
 [ "$(title)" = 'Auditoria Hetzner: ACHADO' ]; ok $? "  o veredito vai no TÍTULO (o notify descarta o mesmo título em 30 min)"
-grep -q '^CALL strict=1$' "$T/notify.log"; ok $? "  pede ao notify os códigos de saída estritos (NOTIFY_STRICT_EXIT=1)"
+grep -q '^CALL strict=1 force=1$' "$T/notify.log"; ok $? "  pede ao notify o rc estrito e o push forçado (NOTIFY_STRICT_EXIT=1, NOTIFY_FORCE_PUSH=1: sem o 2º um -p 4 cai no resumo mudo)"
 grep -q '^ARG -p$' "$T/notify.log" && grep -q '^ARG 4$' "$T/notify.log"; ok $? "  prioridade 4"
 b=$(body); case "$b" in *"RESULTADO ACHADO (achados=2"*"ACHADO usuario-dados"*"ACHADO fail2ban"*"NAO-CONSEGUI ufw"*"$OUT/last.txt"*) true ;; *) false ;; esac; ok $? "  o corpo tem o RESULTADO, os ACHADO/NAO-CONSEGUI e o caminho do relatório"
 case "$b" in *"LIMPO processo"*|*"DETALHE"*) false ;; *) true ;; esac; ok $? "  e NÃO os LIMPO nem o DETALHE (cabe num push)"
 mk; rep "$NAO"; FAKE_AUDIT_RC=3 run; [ "$rc" = 0 ] && [ "$(calls)" = 1 ]; ok $? "NAO-CONSEGUI (rc 3): alarma também (não consegui NUNCA é silêncio)"; [ "$(title)" = 'Auditoria Hetzner: NAO-CONSEGUI' ]; ok $? "  título NAO-CONSEGUI"
+
+# --- segredo no relatório: o push sai para um serviço EXTERNO, então URL com usuário:senha@ e token não podem ir no corpo ---
+SEC=$(printf '%s%s' 'S3cr3t' 'Passw0rd'); TKG=$(printf '%s%s' 'ghp_' 'abcdefghijklmnopqrstuvwxyz0123456789')
+LEAK="AUDITORIA ACHADO github-e-espelho: VIOLAÇÃO remotos=[https://x-access-token:$SEC@github.com/x/y $TKG]
+AUDITORIA RESULTADO ACHADO (achados=1 nao-consegui=0 limpos=8) em urblink-teste-1 2026-11-12T05:41:00Z duracao=90s orcamento=540s"
+mk; rep "$LEAK"; FAKE_AUDIT_RC=1 run; b=$(body); case "$b" in *"$SEC"*|*"${TKG#ghp_}"*) false ;; *) true ;; esac; ok $? "URL com usuário:senha@ e token ghp_ no relatório: NENHUM dos dois chega ao corpo do push"
+case "$b" in *'://***@github.com/x/y'*'ghp_***'*) true ;; *) false ;; esac; ok $? "  o corpo mostra o mascaramento (***), não some a linha"
 
 # --- quebrada: nunca silêncio ---
 mk; rep "algo que não é um relatório"; FAKE_AUDIT_RC=7 run; [ "$(calls)" = 1 ]; ok $? "auditoria que sai com rc estranho (7): alarme"; [ "$(title)" = 'Auditoria Hetzner: QUEBRADA (rc=7)' ]; ok $? "  título QUEBRADA (rc=7)"
@@ -133,6 +140,8 @@ mutant "notify falho ignorado" 's/\*) say "ERRO: o notify saiu/*) :; say "ERRO: 
 mk; rep "$ACHADO"; FAKE_AUDIT_RC=1 FAKE_NOTIFY_RC=7 run; WRAP=$WRAP_REAL; [ "$rc" = 0 ]; ok $? "controle negativo: sem o rc do notify, um alarme perdido viraria sucesso"
 mutant "sem RESULTADO conta como limpo" 's/\[ -n "\$res" \] || verdict=QUEBRADA/true/'; WRAP=$T/mut.sh
 mk; rep "AUDITORIA LIMPO processo: x"; FAKE_AUDIT_RC=0 run; WRAP=$WRAP_REAL; [ "$(calls)" = 0 ]; ok $? "controle negativo: sem a conferência do RESULTADO, um relatório cortado passaria como LIMPO"
+mutant "push sem mascarar" 's/ | redact); nbad=/); nbad=/'; WRAP=$T/mut.sh
+mk; rep "$LEAK"; FAKE_AUDIT_RC=1 run; WRAP=$WRAP_REAL; b=$(body); case "$b" in *"$SEC"*) true ;; *) false ;; esac; ok $? "controle negativo: sem o mascaramento, a senha do URL iria no push (o caso do vazamento vê a diferença)"
 
 echo "---"; echo "$((n-fails))/$n ok"
 [ $fails -eq 0 ] && echo "SELFTEST OK" || { echo "SELFTEST FALHOU ($fails)"; exit 1; }

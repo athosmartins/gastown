@@ -103,7 +103,7 @@ for d in "${dirs[@]}"; do st=LIMPO
       duck) printf 'mbp-run: ALARME: dado ou segredo no destino (nó Linux:%s) — x\n  NOME .duckdb\n' "$d" >&2 ;;
       tool) printf 'mbp-run: ALARME: dado ou segredo no destino (nó Linux:%s) — x\n  NOME go/telemetry/local/upload.token\n' "$d" >&2 ;;
       toolconteudo) printf 'mbp-run: ALARME: dado ou segredo no destino (nó Linux:%s) — x\n  NOME go/telemetry/local/upload.token\n  CONTEUDO 25\t0\tgo/telemetry/local/upload.token\n' "$d" >&2 ;;
-      toolcut) printf 'mbp-run: ALARME: dado ou segredo no destino (nó Linux:%s) — x\n' "$d" >&2; printf '  NOME go/telemetry/local/upload.token\n' >&2; for i in $(seq 1 19); do printf '  NOME logs/x%s.log\n' "$i" >&2; done ;;
+      toolcut) printf 'mbp-run: ALARME: dado ou segredo no destino (nó Linux:%s) — x\n' "$d" >&2; for i in $(seq 1 20); do printf '  NOME logs/x%s.log\n' "$i" >&2; done ;;   # 20 linhas que DADOS_ACEITOS aceitaria uma a uma (.whatsapp-automation|logs/*.log): só o corte em 20 as segura
     esac
   fi
   printf 'AUDIT-NODE %s %s\n' "$st" "$d"
@@ -182,6 +182,10 @@ is root-sem-login NAO-CONSEGUI "  root-sem-login"; is ufw NAO-CONSEGUI "  ufw"; 
 mk; FAKE_SCAN_RC=1 FAKE_SCAN_MSG="VIOLAÇÃO remotos=[https://github.com/x]" run; is github-e-espelho ACHADO "scan com violação (rc 1)"; dets github-e-espelho "VIOLA"; rcis 1
 mk; FAKE_SCAN_RC=2 run; is github-e-espelho NAO-CONSEGUI "scan que não conseguiu varrer (rc 2)"; rcis 3
 mk; rm "$SRV/gt-remote/bin/hetzner-remote-git.sh"; run; is github-e-espelho NAO-CONSEGUI "scan ausente no servidor: não consegui"
+# o scan imprime os remotos do git CRUS e o relatório vai a um push externo (revisão de segurança de 12/11): usuário:senha@ de URL e token saem mascarados
+SEC=$(printf '%s%s' 'S3cr3t' 'Passw0rd')
+mk; FAKE_SCAN_RC=1 FAKE_SCAN_MSG="VIOLAÇÃO remotos_fora_do_espelho=[https://x-access-token:$SEC@github.com/x/y $TOK_GH]" run; is github-e-espelho ACHADO "scan com URL usuário:senha@ e token no texto: segue ACHADO"
+! det github-e-espelho | grep -qF -e "$SEC" -e "${TOK_GH#ghp_}"; ok $? "  nem a senha do URL nem o token aparecem no relatório"; dets github-e-espelho "://***@github.com/x/y"; dets github-e-espelho "ghp_***"
 
 # --- dados (node_audit): onde olhar, e os três estados vindos dele ---
 mk; FAKE_NODE=found run; is dados ACHADO "node_audit achou"; dets dados "2 achados em: ."; printf '%s\n' "$out" | grep -qF 'AUDITORIA DETALHE dados: .: NOME shared'; ok $? "  um DETALHE por achado"; rcis 1
@@ -266,7 +270,7 @@ mk; FAKE_F2B_PKG=err run; is fail2ban NAO-CONSEGUI "dpkg-query que falha: não c
 # --- lista de aceitos: só NOME e GRANDE, nunca CONTEUDO, nunca lista cortada em 20 ---
 mk; mkdir -p "$SRV/.config"; FAKE_NODE=tool FAKE_NODE_DIR=.config run; is dados LIMPO "achado de NOME numa ferramenta conhecida (token de telemetria do Go): aceito"; dets dados "aceitos: 1"
 mk; mkdir -p "$SRV/.config"; FAKE_NODE=toolconteudo FAKE_NODE_DIR=.config run; is dados ACHADO "o mesmo caminho com um CONTEUDO (lista de telefones) NÃO é aceito"; dets dados "CONTEUDO"
-mk; mkdir -p "$SRV/.config"; FAKE_NODE=toolcut FAKE_NODE_DIR=.config run; is dados ACHADO "lista cortada em 20 por tipo: nada da pasta é aceito (pode haver mais atrás)"; dets dados "cortada"
+mk; mkdir -p "$SRV/.whatsapp-automation"; FAKE_NODE=toolcut FAKE_NODE_DIR=.whatsapp-automation run; is dados ACHADO "lista cortada em 20 por tipo (20 logs que a lista aceitaria um a um): nada da pasta é aceito, pode haver mais atrás"; dets dados "cortada"
 mk; FAKE_NODE=found run; is dados ACHADO "shared e .voicebot-cost.db NÃO são aceitos: a volta deles é o achado"
 
 # --- achado e não-consegui juntos: achar vale mais ---
@@ -297,7 +301,9 @@ mk; printf 'ENABLED=no\n' > "$SRV/etc/ufw/ufw.conf"; run; AUD=$AUD_REAL; is ufw 
 mutant "fail2ban sem olhar a jail" 's/elif \[ "\$fj" != true \]; then emit ACHADO fail2ban/elif false; then emit ACHADO fail2ban/'; AUD=$T/mut.sh
 mk; rm "$SRV/etc/fail2ban/jail.d/defaults-debian.conf"; run; AUD=$AUD_REAL; is fail2ban LIMPO "controle negativo: sem a jail, fail2ban instalado e ativo mas sem vigiar o sshd passaria"
 mutant "lista cortada em 20 aceita" 's/if printf .%s\\n. "\$cut_keys" | grep -qxF "\$dir|\$typ"; then/if false; then/'; AUD=$T/mut.sh
-mk; mkdir -p "$SRV/.config"; FAKE_NODE=toolcut FAKE_NODE_DIR=.config run; AUD=$AUD_REAL; is dados LIMPO "controle negativo: sem a trava de lista cortada, o achado escondido atrás dos 20 passaria"
+mk; mkdir -p "$SRV/.whatsapp-automation"; FAKE_NODE=toolcut FAKE_NODE_DIR=.whatsapp-automation run; AUD=$AUD_REAL; is dados LIMPO "controle negativo: sem a trava de lista cortada, o achado escondido atrás dos 20 passaria"
+mutant "relatório sem mascarar" 's/ | redact$//'; AUD=$T/mut.sh
+mk; FAKE_SCAN_RC=1 FAKE_SCAN_MSG="VIOLAÇÃO remotos_fora_do_espelho=[https://x-access-token:$SEC@github.com/x/y]" run; AUD=$AUD_REAL; det github-e-espelho | grep -qF "$SEC"; ok $? "controle negativo: sem o mascaramento, a senha do URL apareceria no relatório (o caso do scan vê a diferença)"
 
 echo "---"; echo "$((n-fails))/$n ok"
 [ $fails -eq 0 ] && echo "SELFTEST OK" || { echo "SELFTEST FALHOU ($fails)"; exit 1; }
