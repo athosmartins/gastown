@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <!-- ga-qg1dw5z.3. 1x por dia (05:41, nice 19): a auditoria do nó Hetzner (scripts/hetzner-audit.sh: credenciais, dados, espelho, e as travas 1 e 2 - usuário dados, root sem login, ufw, fail2ban)
+       com orçamento de 540 s, e UM push (notify -p 4) se o veredito não for LIMPO. SÓ LÊ o servidor por ssh. Sem RunAtLoad de propósito (a 1ª rodada é a das 05:41; para rodar agora:
+       bash scripts/hetzner-audit-daily.sh). O relatório fica em .gc/hetzner-audit/last.txt; uma linha por rodada em .gc/logs/hetzner-audit.out (rc=N e o RESULTADO).
+       Desligar: touch .gc/no-hetzner-audit (apague para religar) ou GC_HETZNER_AUDIT=0, ou launchctl bootout + disable. Runbook: docs/runbooks/hetzner-hardening.md (seção Fatia trava 3).
+       O deploy instala plist novo de packs/town-deltas/assets/ sozinho: este só lê e avisa. -->
+  <key>Label</key><string>com.gascity.hetzner-audit</string>
+  <key>ProgramArguments</key><array>
+    <string>/bin/bash</string>
+    <string>/Users/athos/gt/.gascity-gastown-hq/scripts/hetzner-audit-daily.sh</string>
+  </array>
+  <key>WorkingDirectory</key><string>/Users/athos/gt/.gascity-gastown-hq</string>
+  <key>StartCalendarInterval</key><dict><key>Hour</key><integer>5</integer><key>Minute</key><integer>41</integer></dict>
+  <key>Nice</key><integer>19</integer>
+  <key>LowPriorityIO</key><true/>
+  <key>StandardOutPath</key><string>/Users/athos/gt/.gascity-gastown-hq/.gc/logs/hetzner-audit.out</string>
+  <key>StandardErrorPath</key><string>/Users/athos/gt/.gascity-gastown-hq/.gc/logs/hetzner-audit.err</string>
+  <key>EnvironmentVariables</key><dict>
+    <key>PATH</key><string>/opt/homebrew/bin:/Users/athos/.local/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    <key>HOME</key><string>/Users/athos</string>
+    <key>GC_CITY_PATH</key><string>/Users/athos/gt/.gascity-gastown-hq</string>
+  </dict>
+</dict></plist>
