@@ -63,8 +63,8 @@ cat > "$T/stubs/sudo" <<'EOF'
 #!/usr/bin/env bash
 echo "sudo $*" >> "$LOG"
 case "$*" in
-  "-n -u dados true") [ "${SUDO_AS_DADOS:-}" = 1 ] && exit 0; echo "sudo: a password is required" >&2; exit 1 ;;
-  "-n /usr/local/sbin/gt-dados-run __fora-da-lista__") [ "${SUDO_LIST_LEAK:-}" = 1 ] && { echo "GTD-RUN: ok ns=x"; exit 0; }; echo "sudo: a password is required" >&2; exit 1 ;;
+  "-n -u dados true") [ "${SUDO_AS_DADOS:-}" = 1 ] && exit 0; [ "${SUDO_BROKEN:-}" = 1 ] && { echo "sudo: unknown user dados" >&2; exit 1; }; echo "sudo: a password is required" >&2; exit 1 ;;
+  "-n /usr/local/sbin/gt-dados-run __fora-da-lista__") [ "${SUDO_LIST_LEAK:-}" = 1 ] && { echo "GTD-RUN: ok ns=x"; exit 0; }; [ "${SUDO_BROKEN:-}" = 1 ] && { echo "sudo: unable to resolve host x" >&2; exit 1; }; echo "sudo: a password is required" >&2; exit 1 ;;
   "-n /usr/local/sbin/gt-dados-run synth") printf '%b\n' "${SYNTH_OUT:-synth: ok files=5\nGTD-EGRESS: attempts=3\nGTD-WIPE: ok}"; exit "${SYNTH_RC:-0}" ;;
 esac
 EOF
@@ -142,7 +142,10 @@ case_ingest() { local s=$1 src="$T/src"; find "$src" -mindepth 0 -delete 2>/dev/
   echo "isto não é um tar" > "$T/bad.tar"; IN="$T/bad.tar" SEED= ing "put proj"; ck "ingest put: tar quebrado → rc≠0 e NADA ficou" bash -c "[ $RC != 0 ] && [ ! -e '$S/in/proj' ]"
   ing "get proj"; ck "ingest get: devolve o tar do resultado" bash -c "tar -t < '$OUT' | grep -q r.txt"; SEED= ing "get nada"; ck "ingest get: ausente → 66 e stdout vazio (não um tar vazio)" bash -c "[ $RC = 66 ] && [ ! -s '$OUT' ]"
   ing "clean proj"; ck "ingest clean <nome>: apaga in e out desse nome" test ! -e "$S/in/proj" -a ! -e "$S/out/proj"; mkdir -p "$S/in/outro"; seed; ing "clean"; ck "ingest clean (tudo): in/ e out/ somem" test ! -e "$S/in/proj" -a ! -e "$S/out/proj"
-  ing "status"; ck "ingest status: conta in/out" has "$OUT" 'tmpfs=sim in=1 out=1'
+  ing "status"; ck "ingest status: 1 item em in/ e 1 em out/ → in=1 out=1" has "$OUT" 'tmpfs=sim in=1 out=1'
+  # a contagem de verdade: 5 itens em in/ e 3 em out/ (números diferentes e > 1: um "1" constante, ou um ponto por lote do find, não passa)
+  fresh; seed; for k in 2 3 4 5; do echo x > "$S/in/f$k"; done; for k in 2 3; do echo x > "$S/out/g$k"; done; SSH_ORIGINAL_COMMAND="status" "$s" > "$OUT" 2> "$ERR"; RC=$?
+  ck "ingest status: 5 itens em in/ e 3 em out/ → in=5 out=3" has "$OUT" 'tmpfs=sim in=5 out=3$'
   FIND_NOISE=eacces ing "status"; ck "ingest status: find que falha → '?' e rc 74 (nunca 0 itens)" bash -c "[ $RC = 74 ] && grep -q 'in=? out=?' '$OUT'"; SEED= ing "status"; ck "ingest status: nada em in/ e out/ → 0 e 0 (diferente de '?')" has "$OUT" 'in=0 out=0'
   # o tar do remetente que morre antes de listar nada deixa um arquivo VÁLIDO e vazio (só blocos de zeros): `tar -x` sai 0 sem extrair nada (um stream de 0 byte já sai 2 sozinho, caso do "tar quebrado")
   head -c 10240 /dev/zero > "$T/empty.tar"; IN="$T/empty.tar" SEED= ing "put proj"; ck "ingest put: arquivo tar válido e vazio (o tar do remetente morreu) → 67, nada ficou, nunca 'ok files=0'" bash -c "[ $RC = 67 ] && [ ! -e '$S/in/proj' ] && ! grep -q 'ok files' '$OUT'"
@@ -154,6 +157,11 @@ case_sweep() { local s=$1 row_new="$ME 60 99999"
   ck "sweep: staging, home e tmp do dados sumiram" bash -c "[ -z \"\$(find '$S' '$T/dhome' '$T/tmp1' '$T/tmp2' -mindepth 1)\" ]"
   PS_ROWS="$row_new" sw "$s"; ck "sweep: build vivo (60 s) → PULADO, rc 0" bash -c "[ $RC = 0 ] && grep -q 'PULADO dados-vivo=1' '$OUT'"; ck "sweep: ...e NADA foi apagado" test -f "$S/in/proj/dado.txt"
   sleep 100 & local OLD_PID=$!; PS_ROWS="$ME 20000 $OLD_PID" sw "$s"; sleep 0.2; ck "sweep: processo de dados com ≥3 h é morto e a varredura segue" bash -c "! kill -0 $OLD_PID 2>/dev/null && grep -q 'LIMPO removed=.* killed=1' '$OUT'"; kill -9 $OLD_PID 2>/dev/null
+  # processo velho (≥3 h) COM um jovem (<3 h) vivo: a varredura inteira é PULADA e nada é morto (o velho fica para o dia seguinte); o dado segue intacto
+  sleep 100 & OLD_PID=$!; PS_ROWS="$(printf '%s\n%s' "$ME 20000 $OLD_PID" "$row_new")" sw "$s"; sleep 0.2; ck "sweep: velho + jovem vivos → PULADO dados-vivo=1, rc 0, o velho NÃO é morto e nada é apagado" bash -c "[ $RC = 0 ] && grep -q 'PULADO dados-vivo=1' '$OUT' && ! grep -q 'LIMPO' '$OUT' && kill -0 $OLD_PID 2>/dev/null && [ -f '$S/in/proj/dado.txt' ]"; kill -9 $OLD_PID 2>/dev/null
+  # o log não aceita a linha (aqui: o caminho do log é um diretório): LIMPO só no stdout enganaria a trava 3 → NAO-CONSEGUI escrever, rc 2, e nenhuma palavra LIMPO/PULADO no stdout
+  rm -f "$T/sweep.log"; mkdir "$T/sweep.log"; PS_ROWS="root 1 1" sw "$s"; ck "sweep: log não grava a linha → NAO-CONSEGUI escrever, rc 2, nunca LIMPO no stdout" bash -c "[ $RC = 2 ] && grep -q 'NAO-CONSEGUI escrever' '$OUT' && ! grep -q -e LIMPO -e PULADO '$OUT'"
+  PS_ROWS="$row_new" sw "$s"; ck "sweep: log não grava + build vivo (PULADO) → também NAO-CONSEGUI escrever, rc 2" bash -c "[ $RC = 2 ] && grep -q 'NAO-CONSEGUI escrever' '$OUT' && ! grep -q PULADO '$OUT'"; rmdir "$T/sweep.log"
   PS_FAIL=1 PS_ROWS="root 1 1" sw "$s"; ck "sweep: ps falhou → NAO-CONSEGUI rc 2, nada apagado" bash -c "[ $RC = 2 ] && grep -q 'NAO-CONSEGUI ps-falhou' '$OUT' && [ -f '$S/in/proj/dado.txt' ]"
   FS=ext4 PS_ROWS="root 1 1" sw "$s"; ck "sweep: staging fora do tmpfs → NAO-CONSEGUI rc 2 (e conta o que há)" bash -c "[ $RC = 2 ] && grep -q 'NAO-CONSEGUI stage-nao-e-tmpfs itens=[1-9]' '$OUT' && [ -f '$S/in/proj/dado.txt' ]"
   if [ "$(id -u)" != 0 ]; then fresh; seed; chmod 555 "$S/in/proj"; echo "root 1 1" > "$T/ps"; "$s" > "$OUT" 2> "$ERR"; RC=$?; ck "sweep: o que não consegue apagar → NAO-CONSEGUI sobrou, rc 2 (nunca LIMPO)" bash -c "[ $RC = 2 ] && grep -q 'NAO-CONSEGUI sobrou' '$OUT' && ! grep -q LIMPO '$OUT'"; chmod -R u+rwx "$S"; fi
@@ -187,6 +195,9 @@ case_prove() { local s=$1
   ID_G="runner dados" pv "$s"; ck "prove: runner no grupo dados → FALHOU" has "$OUT" 'sem-grupo-dados FALHOU'; SUDO_AS_DADOS=1 pv "$s"; ck "prove: sudo -u dados funcionou → FALHOU" has "$OUT" 'sudo-como-dados-recusado FALHOU'
   SUDO_LIST_LEAK=1 pv "$s"; ck "prove: entrypoint fora da lista rodou → FALHOU" has "$OUT" 'fora-da-lista-recusado FALHOU'; SYNTH_OUT="synth: ok" pv "$s"; ck "prove: build sem GTD-WIPE ok → FALHOU" has "$OUT" 'build-sintetico FALHOU'
   SYNTH_RC=3 pv "$s"; ck "prove: build com rc≠0 → FALHOU" has "$OUT" 'build-sintetico FALHOU'
+  # recusa de VERDADE é a política dizer não; sudo quebrado (usuário inexistente, host não resolve) com rc≠0 não prova nada → nao-consegui, nunca ok
+  SUDO_BROKEN=1 pv "$s"; ck "prove: sudo -u dados quebrado (sem recusa de política) → nao-consegui, nunca ok" has "$OUT" 'sudo-como-dados-recusado nao-consegui'; ck "prove: ...e o fora-da-lista também" has "$OUT" 'fora-da-lista-recusado nao-consegui'
+  ck "prove: ...e o resultado geral não é ok (rc 2)" bash -c "[ $RC = 2 ] && ! grep -q 'sudo-como-dados-recusado ok' '$OUT' && ! grep -q 'fora-da-lista-recusado ok' '$OUT'"
   SYNTH_OUT='synth: ok files=5\nGTD-EGRESS: attempts=0\nGTD-WIPE: ok' pv "$s"; ck "prove: attempts=0 (a sonda não chegou ao netns) → FALHOU rc 1, nunca ok" bash -c "[ $RC = 1 ] && grep -q 'build-sintetico FALHOU (attempts=0' '$OUT'"
   SYNTH_OUT='synth: ok files=5\nGTD-EGRESS: attempts=1\nGTD-WIPE: ok' pv "$s"; ck "prove: attempts=1 → ok" has "$OUT" 'build-sintetico ok'
   SYNTH_OUT='synth: ok files=5\nGTD-EGRESS: attempts=?\nGTD-WIPE: ok' pv "$s"; ck "prove: attempts=? (contador ilegível) → FALHOU" has "$OUT" 'build-sintetico FALHOU'; }
@@ -210,8 +221,11 @@ mut M11-ingest-gone-mente ingest 's#then rc=1; fi#then rc=0; fi#' case_ingest
 mut M31-ingest-gone-para-no-1o ingest 's#then rc=1; fi#then return 1; fi#' case_ingest
 mut M32-ingest-put-vazio-vira-ok ingest 's#\[ "\${nf:-0}" -gt 0 \] ||#true ||#' case_ingest
 mut M33-ingest-status-falha-vira-0 ingest "s#|| { echo '?'; return 0; }#|| { echo 0; return 0; }#" case_ingest
+mut M42-ingest-status-conta-constante ingest 's|echo "\${#o}"|echo 1|' case_ingest
+mut M43-ingest-status-um-ponto-por-lote ingest "s|printf '.%.0s'|printf .|" case_ingest
 mut M12-ingest-sem-tmpfs ingest 's#|| no stage-nao-e-tmpfs 98##' case_ingest
 mut M13-ingest-get-vazio ingest 's#|| no resultado-ausente 66##' case_ingest
+mut M45-sweep-log-que-falha-vira-limpo sweep 's#else echo "\$(date -u +%Y-%m-%dT%H:%M:%SZ) gt-dados-sweep: NAO-CONSEGUI escrever \$LOG"; exit 2; fi; }#else echo "\$l"; fi; }#' case_sweep
 mut M14-sweep-ignora-vivo sweep 's#if \[ "\$LIVE" -gt 0 \]#if false#' case_sweep
 mut M15-sweep-ps-vazio sweep 's#|| cant ps-falhou##' case_sweep
 mut M16-sweep-sobra-vira-limpo sweep 's#\[ -z "\$left" \] || cant "sobrou:\$left"#true#' case_sweep
@@ -232,5 +246,6 @@ mut M40-synth-conta-constante synth 's#\[ "\$n" = 5 \] ||#true ||#' case_synth
 mut M41-prove-attempts-zero-ok prove 's#attempts=\[1-9\]\[0-9\]\*#attempts=[0-9]+#' case_prove
 mut M18-synth-rede-aberta synth 's#exit 3; fi#true; fi#' case_synth
 mut M19-prove-ls-vazio prove 's#\*"No such file"\*) item "\$1" nao-consegui#*"No such file"*) item "$1" ok#' case_prove
-mut M20-prove-sudo-dados prove 's#|| item sudo-como-dados-recusado FALHOU "o runner virou dados"#|| true#' case_prove
+mut M20-prove-sudo-dados prove 's#if \[ \$rc -eq 0 \]; then item sudo-como-dados-recusado FALHOU#if false; then item sudo-como-dados-recusado FALHOU#' case_prove
+mut M44-prove-qualquer-rc-vira-recusa prove 's#^policy_denied() {.*#policy_denied() { return 0; }#' case_prove
 echo "---"; echo "casos: $n, reprovados: $fails"; [ "$fails" -eq 0 ]

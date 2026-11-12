@@ -30,7 +30,7 @@ t_runner() { local g; g=$(id -nG "$RUNNER" 2> /dev/null) || return 127; ! printf
 t_keys() { [ "$(stat -c '%U %a' "$AKDIR/$DU")" = "root 640" ] && grep -Eq "^restrict,command=\"$SBIN/gt-dados-ingest\" ssh-|^restrict,command=\"$SBIN/gt-dados-ingest\" ecdsa-" "$AKDIR/$DU"; }
 t_sshd_d() { sshd_for "$DU" | grep -qx "authorizedkeysfile $AKDIR/$DU"; }
 t_sshd_r() { local o; o=$(sshd_for "$RUNNER") || return 127; ! printf '%s\n' "$o" | grep -q '^authorizedkeysfile .*authorized_keys.d'; }
-t_tree() { local x; x=$(find "$OPT" \( -not -user root -o -perm -020 -o -perm -002 \) -print -quit 2> /dev/null) || return 127; [ -z "$x" ]; }
+t_tree() { local x; x=$(find "$OPT" \( -not -user root -o \( ! -type l \( -perm -020 -o -perm -002 \) \) \) -print -quit 2> /dev/null) || return 127; [ -z "$x" ]; }
 t_sudo_strict() { [ -r "$SUDOERS" ] || return 127; ! grep -E '^[^#]' "$SUDOERS" | grep -Ev "^$RUNNER ALL=\(root\) NOPASSWD: $SBIN/gt-dados-run [a-z0-9_.-]+\$" | grep -q .; }
 t_sudo_list() { { [ -r "$SUDOERS" ] && [ -r "$ETC/entrypoints" ]; } || return 127; [ "$(grep -E '^[^#]' "$SUDOERS" | sed 's/.* //' | sort)" = "$(sort "$ETC/entrypoints")" ]; }
 t_stage() { local o; mountpoint -q "$STAGE" && o=$(findmnt -no FSTYPE,OPTIONS "$STAGE") && [ "${o%% *}" = tmpfs ] && case ",${o#* }," in *,noexec,*) case ",${o#* }," in *,nosuid,*) case ",${o#* }," in *,nodev,*) return 0 ;; esac ;; esac ;; esac; return 1; }

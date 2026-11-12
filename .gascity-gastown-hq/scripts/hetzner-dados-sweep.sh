@@ -5,19 +5,20 @@
 #   O que faz · Linha de log · Códigos de saída
 #
 # O QUE FAZ: sem build vivo (processo de `dados` com menos de 3 h, ou o lock do wrapper tomado), apaga o staging /srv/gtdados, o home do `dados` e o que `dados` deixou em /tmp, /var/tmp e /dev/shm. Processo de `dados`
-#   com 3 h ou mais não é build (o prazo do wrapper é 2 h): é morto, e a varredura segue. Conferiu que sumiu, ou diz que não conseguiu: leitura que falhou NUNCA vira "limpo".
+#   com 3 h ou mais não é build (o prazo do wrapper é 2 h): é morto, e a varredura segue, MAS só quando não há processo jovem de `dados` (com um, a varredura inteira é PULADA e nada é morto: o velho fica para o dia seguinte). Conferiu que sumiu, ou diz que não conseguiu: leitura que falhou NUNCA vira "limpo".
 # LOCK: a varredura toma o MESMO lock do wrapper (/run/gt-dados-run.lock) e o segura até o fim: um build que comece no meio recusa `ocupado` em vez de ter o staging apagado (o filho do build herda o fd do lock, então
 #   até um wrapper morto por kill -9 o mantém enquanto o build existir). O lock é de root, modo 0600 (0644 deixaria qualquer usuário local travar os builds e calar a varredura). Lock tomado por build vivo (há processo de `dados` depois da espera) → PULADO; tomado SEM processo de `dados` → NAO-CONSEGUI lock-tomado-sem-build. Um `put` do canal do mini que comece DEPOIS da checagem de processos não é protegido (o ingest não toma o lock).
 # ALCANCE EM /tmp: só o 1º nível (o que `dados` cria direto lá, com o que houver dentro). O /tmp do nó tem ~1,7 milhão de entradas e a árvore inteira levou 40+ min sem terminar e sem escrever o log (medido 12/11);
 #   arquivo de `dados` dentro de pasta de OUTRO dono em /tmp não é visto. /var/tmp e /dev/shm são varridos inteiros (pequenos). Cada apagamento e cada leitura de verificação tem prazo (SCANSECS): a verificação que estourou = NAO-CONSEGUI.
 # LINHA DE LOG (/var/log/gt-dados-sweep.log, e no journal; a trava 3 lê a última e a idade dela):
-#   <UTC> gt-dados-sweep: LIMPO removed=N killed=K[ contagem=incompleta] · PULADO dados-vivo=N · PULADO build-vivo lock=ocupado dados=N · NAO-CONSEGUI <motivo>
-# CÓDIGOS: 0 LIMPO ou PULADO · 2 NAO-CONSEGUI
+#   <UTC> gt-dados-sweep: LIMPO removed=N killed=K[ contagem=incompleta] · PULADO dados-vivo=N · PULADO build-vivo lock=ocupado dados=N · NAO-CONSEGUI <motivo> (a de "escrever <log>" só sai no stdout: o log não aceitou a linha)
+# CÓDIGOS: 0 LIMPO ou PULADO · 2 NAO-CONSEGUI (inclusive não conseguir gravar a linha no log)
 set -u
 PATH=/usr/sbin:/usr/bin:/sbin:/bin
 export LC_ALL=C
 DU=dados; STAGE=/srv/gtdados; DHOME=/home/dados; LOG=/var/log/gt-dados-sweep.log; MAXSECS=10800; LOCK=/run/gt-dados-run.lock; LOCKWAIT=10; SCANSECS=900; TOPONLY=/tmp
-log() { local l; l="$(date -u +%Y-%m-%dT%H:%M:%SZ) gt-dados-sweep: $*"; echo "$l"; echo "$l" >> "$LOG" 2> /dev/null || echo "gt-dados-sweep: NAO-CONSEGUI escrever $LOG" >&2; }
+# a linha só vale se entrou no log (a trava 3 lê a idade dela): gravar falhou → NAO-CONSEGUI escrever (rc 2), nunca um LIMPO só no stdout
+log() { local l; l="$(date -u +%Y-%m-%dT%H:%M:%SZ) gt-dados-sweep: $*"; if { echo "$l" >> "$LOG"; } 2> /dev/null; then echo "$l"; else echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) gt-dados-sweep: NAO-CONSEGUI escrever $LOG"; exit 2; fi; }
 cant() { log "NAO-CONSEGUI $*"; exit 2; }
 # find com prazo. Entrada que SUMIU durante a leitura (a linha de erro TERMINA em ": No such file or directory": o runner apaga e cria em /tmp o tempo todo) não é sobra e não reprova a leitura; QUALQUER outro erro (inclusive uma linha cujo CAMINHO contém esse texto mas termina em outro erro), o prazo estourado (rc ≥ 124)
 # ou rc ≠ 0 sem erro legível → return 2 (não consegui). Imprime o que o find imprimiu.

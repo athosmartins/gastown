@@ -23,7 +23,8 @@ case $VERB in put | get) [[ $NAME =~ ^[a-z0-9][a-z0-9_.-]{0,63}$ ]] || no nome ;
 # tenta TODOS os caminhos (um que sobrou não pula os seguintes: `clean` sem nome tem de tentar out/ mesmo se in/ resistiu) e devolve 1 se ALGUM sobrou
 gone() { local p rc=0; for p in "$@"; do [ -e "$p" ] || [ -L "$p" ] || continue; find "$p" -delete 2> /dev/null; if [ -e "$p" ] || [ -L "$p" ]; then rc=1; fi; done; return $rc; }
 # itens de um diretório: não existe → 0; find que falha → "?" (nunca 0, que pareceria "nada aqui")
-cnt() { local o; [ -e "$1" ] || [ -L "$1" ] || { echo 0; return 0; }; o=$(find "$1" -mindepth 1 -maxdepth 1 -exec printf . {} + 2> /dev/null) || { echo '?'; return 0; }; echo "${#o}"; }
+# UM ponto por ENTRADA: o formato '.%.0s' consome um argumento por vez (com `printf .` o `{} +` imprimia 1 ponto por LOTE do find, ou seja, 1 para qualquer N ≥ 1: gate 12/11, tentativa 2)
+cnt() { local o; [ -e "$1" ] || [ -L "$1" ] || { echo 0; return 0; }; o=$(find "$1" -mindepth 1 -maxdepth 1 -exec printf '.%.0s' {} + 2> /dev/null) || { echo '?'; return 0; }; echo "${#o}"; }
 case $VERB in
   put)
     [ -d "$STAGE/in" ] || { mkdir "$STAGE/in" && chmod 0700 "$STAGE/in"; } || no destino 73

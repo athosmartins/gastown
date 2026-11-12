@@ -103,10 +103,14 @@ case_check() { s_=$1; world; ap "$s_" > /dev/null 2>&1; inst "$s_" --check; ck "
   # 3º estado: leitura que FALHA nunca vira ok (o teste negado `! ...` e o `[ -z "$(...)" ]` liam o erro como "não tem nada")
   adult "id do runner falha" "runner-fora-do-grupo nao-consegui" "export ID_RUNNER_FAIL=1"; unset ID_RUNNER_FAIL; adult "swapon falha" "sem-swap nao-consegui" "export SWAPON_FAIL=1"; unset SWAPON_FAIL
   adult "árvore de root sumiu (find falha)" "arvore-de-root nao-consegui" "mv '$R/opt/gt-dados' '$R/opt/gt-dados.x'"; adult "sudoers ilegível" "sudoers-sem-curinga nao-consegui" "rm -f '$R/etc/sudoers.d/gt-dados-run'"
-  adult "sshd -T do runner falha" "sshd-runner-intacto nao-consegui" "export SSHD_RUNNER_FAIL=1"; unset SSHD_RUNNER_FAIL; }
+  adult "sshd -T do runner falha" "sshd-runner-intacto nao-consegui" "export SSHD_RUNNER_FAIL=1"; unset SSHD_RUNNER_FAIL
+  # link simbólico DENTRO da árvore de root (o guarda do instalador aceita os que ficam na árvore): o modo 0777 do próprio link (Linux sempre) não é "arquivo gravável por outros" → arvore-de-root segue ok (o mundo adulterado acima prova que o teste ainda reprova de verdade)
+  world; ap "$s_" --entrypoint build-x > /dev/null 2>&1; ln -s bin/synth "$R/opt/gt-dados/app/elo"; chmod -h 777 "$R/opt/gt-dados/app/elo" 2> /dev/null; inst "$s_" --check
+  ck "check: link simbólico dentro da árvore de root (modo 0777 do link) → arvore-de-root ok, rc 0" bash -c "[ $RC = 0 ] && grep -q '^GTD-CHECK: arvore-de-root ok' '$OUT'"; }
 case_refuse "$T/inst.sh"; case_happy "$T/inst.sh"; case_rollback "$T/inst.sh"; case_check "$T/inst.sh"
 mut() { local name=$1 expr=$2 fn=$3 mc="$T/mut-$1.sh"; mkcopy "$HERE/hetzner-dados-install.sh" "$expr" "$mc"; cmp -s "$mc" "$T/inst.sh" && { echo "FAIL mutante $name não alterou nada"; fails=$((fails+1)); return; }
   QUIET=1; BAD=0; "$fn" "$mc" > /dev/null 2>&1; QUIET=0; n=$((n+1)); if [ "$BAD" = 1 ]; then echo "ok   mutante $name reprovado"; else echo "FAIL mutante $name SOBREVIVEU"; fails=$((fails+1)); fi; }
+mut I26-tree-reprova-link 's#! -type l ##' case_check
 mut I1-sem-lock-da-senha 's#^usermod -L "\$DU" || die passwd-lock#true#' case_happy
 mut I2-shell-nologin 's#-s /bin/bash#-s /usr/sbin/nologin#' case_happy
 mut I3-sem-valida-chave 's#&& ssh-keygen -l -f "\$PUB" > /dev/null 2>&1 || die pubkey#|| die pubkey#' case_refuse

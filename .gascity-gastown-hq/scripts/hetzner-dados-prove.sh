@@ -19,10 +19,17 @@ denied home-negado /home/dados
 denied stage-negado /srv/gtdados/in
 G=$(id -nG) || G="?"
 case " $G " in *" dados "*) item sem-grupo-dados FALHOU "runner está no grupo dados" ;; *"?"*) item sem-grupo-dados nao-consegui "id falhou" ;; *) item sem-grupo-dados ok ;; esac
-out=$(sudo -n -u dados true 2>&1); rc=$?
-[ $rc -ne 0 ] && item sudo-como-dados-recusado ok || item sudo-como-dados-recusado FALHOU "o runner virou dados"
-out=$(sudo -n "$RUN" __fora-da-lista__ 2>&1); rc=$?
-case $out in *"GTD-RUN: ok"*) item fora-da-lista-recusado FALHOU "rodou" ;; *) [ $rc -ne 0 ] && item fora-da-lista-recusado ok || item fora-da-lista-recusado FALHOU "rc=0" ;; esac
+# recusa de VERDADE = o sudo (ou o wrapper) disse que a política negou; rc≠0 por outro motivo (sudo ausente, usuário inexistente, sem tty) não prova a política → nao-consegui, nunca ok. LC_ALL=C: a frase do sudo vem no idioma de quem chama
+policy_denied() { case $1 in *"a password is required"* | *"not allowed"* | *"may not run"* | *"GTD-RUN: recusado"*) return 0 ;; esac; return 1; }
+out=$(LC_ALL=C sudo -n -u dados true 2>&1); rc=$?
+if [ $rc -eq 0 ]; then item sudo-como-dados-recusado FALHOU "o runner virou dados"
+elif policy_denied "$out"; then item sudo-como-dados-recusado ok
+else item sudo-como-dados-recusado nao-consegui "rc=$rc sem recusa de política: $(printf '%s' "$out" | head -n 1 | cut -c1-100)"; fi
+out=$(LC_ALL=C sudo -n "$RUN" __fora-da-lista__ 2>&1); rc=$?
+case $out in *"GTD-RUN: ok"*) item fora-da-lista-recusado FALHOU "rodou" ;; *)
+  if [ $rc -eq 0 ]; then item fora-da-lista-recusado FALHOU "rc=0"
+  elif policy_denied "$out"; then item fora-da-lista-recusado ok
+  else item fora-da-lista-recusado nao-consegui "rc=$rc sem recusa de política: $(printf '%s' "$out" | head -n 1 | cut -c1-100)"; fi ;; esac
 out=$(sudo -n "$RUN" synth 2>&1); rc=$?
 # a sonda de rede do synth SEMPRE tenta ao menos uma conexão: attempts=0 quer dizer que ela nunca chegou à regra de rejeição do netns (ex.: bash sem /dev/tcp acha que está "isolado") → não prova isolamento
 if [ $rc -eq 0 ] && [[ $out == *"synth: ok"* && $out == *"GTD-WIPE: ok"* && $out =~ GTD-EGRESS:\ attempts=[1-9][0-9]* ]]; then item build-sintetico ok
