@@ -37,6 +37,10 @@
 # an ignored .claude/ FOLDER is opened to see them, so a tree is no longer kept for a 4 KB .claude/settings.json.
 # ga-ggj1wnv: a repo with NO remote (traco-bim) has no origin/<default>, so none of its trees was ever "merged", and the per-bead trees it keeps in ~/gt/<rig>-wt/<bead> were listed
 # only when their branch happened to be crew/* or their directory worker-*. Every tree directly under <rig>-wt/ is listed now, and for such a repo "merged" is HEAD in its local trunk.
+# ga-ryykl9l: a rig CONTAINER (property_scrapers, lexbh: <rig>/.git is a FILE pointing at a BARE repo, <rig>/.repo.git) was never swept: `rev-parse --show-toplevel` fails in a bare repo (rc 128) and the pool loop
+# read that as "nothing to sweep" (the witness found 21 trees of closed beads in property_scrapers and no event of that rig in the log since 30/06). A bare repo is now swept through its own `git worktree list`
+# (its own entry, marked `bare`, is skipped; <rig>-wt is the container's sibling directory), and a repo git cannot read (what it is, or its worktree list) is skipped WITH an event (skip_repo_unresolvable: path,
+# rc, why) and counted on the sweep line (repo_unresolvable).
 # The one exception to "WITHOUT --force" is a LOCKED worktree (`remove -f -f`); it is reaped only
 # under the LOCK CONTRACT stated at ZOMBIE-LOCK DETECTION below, never because of its age alone.
 # A second, narrower exception (ga-he2c1u, town .gc-worktrees roots only): an UNLOCKED tree dirty with nothing but generated
@@ -177,6 +181,8 @@ _BC_PROOF_IDS=""                  # ga-yw18yk: _bead_closed_proof's answer, hand
 _BC_PROOF_FIRST=""                # ... and the first of them (the label of a rescue/ branch)
 _BC_ROWS=""; _BC_FOUND_IDS=""; _BC_FOUND_PFX=""   # ga-yw18yk: _bead_ask's working set while one proof is being decided
 _KU_PROOF_JSON=""                 # ga-ggj1wnv: _keep_unsafe's answer to its caller: the event fields of a tree it let through on the closed-bead proof ("" = it did not)
+repo_unresolvable=0               # ga-ryykl9l: repos the pool loop could not read (each skipped and logged as skip_repo_unresolvable); the sweep line carries the count
+_RR_ROOT=""                       # ga-ryykl9l: _resolve_repo_root's answer to its caller: the repo's own tree (a work tree's root, or the directory a bare container was found under)
 # ga-pdrij: the rig-worktree backlog is LARGE (704 observed — the legacy loop used
 # `git -C $GT` and could never remove rig-owned worktrees, so they piled up). Bound the
 # per-sweep pool reaping so a single run is never a massive destructive operation; the
@@ -1394,26 +1400,72 @@ _pool_shipped_and_closed() {
   _bead_closed_proof "$repo" "$wt" "$br"
 }
 
+# ── _log_repo_unresolvable <repo> <rc> <why> — ga-ryykl9l: the ONE event for a repo the pool loop could not read (its path, the rc of the first read that failed — --show-toplevel or the worktree list —, and why),
+# and the count the sweep line carries. A repo that cannot be read is not a repo with nothing to sweep: without this line the two looked the same in the log (a rig container went unswept, unlogged). Main shell only: it counts.
+_log_repo_unresolvable() {
+  repo_unresolvable=$((repo_unresolvable+1))
+  printf '{"ts":"%s","event":"skip_repo_unresolvable","repo":"%s","path":"%s","rc":%s,"why":"%s"}\n' \
+    "$(ts)" "$(_json_esc "$(basename "$1")")" "$(_json_esc "$1")" "$2" "$(_json_esc "$3")" >> "$LOG" 2>/dev/null
+}
+
+# ── _resolve_repo_root <repo> — ga-ryykl9l: what the pool loop calls "the repo's own tree". Sets _RR_ROOT and returns 0, or logs skip_repo_unresolvable and returns 1 (the caller skips the repo). Main shell only (it counts).
+# A rig CONTAINER (property_scrapers, lexbh) has a .git FILE pointing at a BARE repo (<rig>/.repo.git): `rev-parse --show-toplevel` fails there (rc 128) although the repo is fine and holds the pool's trees, and the
+# pool loop read that as "nothing to sweep". Three states, and only the first two are swept:
+#   --show-toplevel answers                                → a repo with a work tree: that path, exactly as before
+#   it does not, and --is-bare-repository says exactly "true" → a bare container: the directory it was found under, as a physical path (what git prints for a work tree's root and lists for its trees)
+#   anything else (a read fails or prints nothing, or --is-bare-repository says something other than "true") → NOT KNOWN what this repo is: not swept this time, logged, counted. Never "bare" on a guess, and never a
+#   root on an empty answer (rc 0 with nothing printed is no answer).
+_resolve_repo_root() {
+  local repo="$1" out rc bare brc why
+  # vazio (rc 0 and nothing printed) → no answer, handled like a failure; falhou (rc != 0: a bare repo, a .git pointer to nowhere, "dubious ownership") → asks --is-bare-repository below
+  out="$(git -C "$repo" rev-parse --show-toplevel 2>/dev/null)"; rc=$?
+  if [ "$rc" -eq 0 ] && [ -n "$out" ]; then _RR_ROOT="$out"; return 0; fi
+  # vazio / falhou / anything but exactly "true" → NOT proven bare: the repo is skipped and logged below, never swept
+  bare="$(git -C "$repo" rev-parse --is-bare-repository 2>/dev/null)"; brc=$?
+  # falhou (cd cannot enter the directory it was seen in a moment ago; pwd -P prints nothing only then) → no root, skipped and logged below like any other "not known"
+  if [ "$brc" -eq 0 ] && [ "$bare" = "true" ] && out="$(cd "$repo" 2>/dev/null && pwd -P)"; then
+    _RR_ROOT="$out"; return 0
+  fi
+  # vazio → no git message to quote, the text says so; falhou → the same: a log field only, the repo is skipped either way
+  why="$(git -C "$repo" rev-parse --show-toplevel 2>&1 >/dev/null | head -n 1)"
+  [ -n "$why" ] || why="git rev-parse --show-toplevel printed nothing"
+  why="$why (--is-bare-repository: rc=$brc, '$bare')"
+  _log_repo_unresolvable "$repo" "$rc" "$why"
+  return 1
+}
+
 # ── reap_pool_worktrees <repo> — enumerate a repo's worktrees via `git worktree list`
 # (catches the pool worktrees at $GT/worker-* and <rig>/crew/worker-* that the path-glob
 # loop below MISSES) and reap stale + CLEAN ones, deleting their merged orphan branch.
-# Skips the main worktree (the repo root). no --force → dirty/live WIP is protected.
+# Skips the repo's own entry (its root, or a bare repo's git dir). no --force → dirty/live WIP is protected.
 reap_pool_worktrees() {
   local repo="$1"
   [ -d "$repo/.git" ] || [ -f "$repo/.git" ] || return 0
-  local main_wt; main_wt="$(git -C "$repo" rev-parse --show-toplevel 2>/dev/null)" || return 0
+  # ga-ryykl9l: the repo's own tree (a work tree's root; for a rig container, whose .git FILE points at a bare repo, the directory it was found under); a repo that cannot be read is logged and skipped
+  _resolve_repo_root "$repo" || return 0
+  local main_wt="$_RR_ROOT"
   local rig_wt; rig_wt="$(dirname "$main_wt")/$(basename "$main_wt")-wt"   # ga-ggj1wnv: ~/gt/<rig>-wt, where a rig keeps one tree per bead
-  local wt="" br=""
-  # --porcelain emits blocks: "worktree <path>" / "HEAD <sha>" / "branch refs/heads/<b>"
+  local list lrc
+  # vazio → the repo lists no worktree besides its own and the loop below has nothing to do; falhou (rc != 0) → NOT "nothing to sweep": the repo is skipped and logged (the read is repeated once, for git's message)
+  list="$(git -C "$repo" worktree list --porcelain 2>/dev/null)"; lrc=$?
+  if [ "$lrc" -ne 0 ]; then
+    _log_repo_unresolvable "$repo" "$lrc" "git worktree list --porcelain failed: $(git -C "$repo" worktree list --porcelain 2>&1 >/dev/null | head -n 1)"
+    return 0
+  fi
+  local wt="" br="" bare_entry=0
+  # --porcelain emits blocks: "worktree <path>" / "HEAD <sha>" / "branch refs/heads/<b>" (a bare repo's own entry has a lone "bare" line instead), each ended by a blank line
   while IFS= read -r line; do
     case "$line" in
-      "worktree "*) wt="${line#worktree }"; br=""; lock="" ;;
+      "worktree "*) wt="${line#worktree }"; br=""; lock=""; bare_entry=0 ;;
+      "bare")       bare_entry=1 ;;
       "branch "*)   br="${line#branch refs/heads/}" ;;
       "locked "*)   lock="${line#locked }" ;;
       "locked")     lock="(no reason)" ;;
       "")  # end of a block — process it
         [ -n "$wt" ] || continue
         [ "$wt" = "$main_wt" ] && { wt=""; br=""; lock=""; continue; }   # never the repo root
+        # ga-ryykl9l: nor a bare repo's own entry (its git dir, marked `bare` by the listing): it is not a tree
+        [ "$bare_entry" = "1" ] && { wt=""; br=""; lock=""; continue; }
         # ephemeral FRAMEWORK worktrees ONLY — never durable feature trees (.wt-*, clones):
         #   basename worker-*  OR  crew/* branch  OR  under .claude/worktrees/  OR  under .gc-worktrees/  OR  directly under <rig>-wt/
         # (.claude/worktrees = native agent trees like wa-8y45; .gc-worktrees = gate-review trees; <rig>-wt/<bead> = ga-ggj1wnv: a rig's per-bead
@@ -1530,7 +1582,7 @@ reap_pool_worktrees() {
         wt=""; br=""; lock=""
         ;;
     esac
-  done < <(git -C "$repo" worktree list --porcelain 2>/dev/null)
+  done <<< "$list"$'\n'   # $(...) stripped the listing's final blank line, which is what ends (and so processes) its LAST block: put one back
   [ "$ENABLED" = "1" ] && git -C "$repo" worktree prune 2>/dev/null
 }
 
@@ -1656,6 +1708,6 @@ for _repo in "$GT"/*/; do
   fi
 done
 
-printf '{"ts":"%s","event":"sweep","mode":"%s","free_gb":%s,"gate_hours":%s,"reaped":%s,"pool_reaped":%s,"zombie_reaped":%s,"preserved_dirty":%s,"branches_deleted":%s,"skipped_dirty":%s,"kept":%s,"session_list":"%s","kept_session_list_unavailable":%s,"bead_lookup_failed":%s}\n' \
-  "$(ts)" "$mode" "$free_gb" "$gate_hours" "$reaped" "$pool_reaped" "$zombie_reaped" "$preserved_dirty" "$branches_deleted" "$skipped_dirty" "$kept" "${_WT_REAPER_SESSION_STATE:-unused}" "$kept_session_list_unavailable" "$bead_lookup_failed" >> "$LOG" 2>/dev/null
+printf '{"ts":"%s","event":"sweep","mode":"%s","free_gb":%s,"gate_hours":%s,"reaped":%s,"pool_reaped":%s,"zombie_reaped":%s,"preserved_dirty":%s,"branches_deleted":%s,"skipped_dirty":%s,"kept":%s,"session_list":"%s","kept_session_list_unavailable":%s,"bead_lookup_failed":%s,"repo_unresolvable":%s}\n' \
+  "$(ts)" "$mode" "$free_gb" "$gate_hours" "$reaped" "$pool_reaped" "$zombie_reaped" "$preserved_dirty" "$branches_deleted" "$skipped_dirty" "$kept" "${_WT_REAPER_SESSION_STATE:-unused}" "$kept_session_list_unavailable" "$bead_lookup_failed" "$repo_unresolvable" >> "$LOG" 2>/dev/null
 exit 0

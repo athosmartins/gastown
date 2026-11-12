@@ -25,6 +25,8 @@
 # ga-ggj1wnv: under DISK PRESSURE a clean, unlocked, unused tree whose beads are all closed is reaped with no merge proof (its branch kept; the event carries proof/beads/size_kb/reason), and
 # kept for an open bead, a lookup that cannot answer, dirt, a lock, a process inside, a failing status, a merge under way, ignored data or the kill switch (a detached HEAD gets a rescue/
 # branch first); a repo with NO remote (traco-bim) reads "merged" against its local master/main and has its <rig>-wt/<bead> trees in the list;
+# ga-ryykl9l: a rig CONTAINER (the root's .git is a FILE pointing at a BARE repo: property_scrapers, lexbh) is swept like any rig — its trees are reaped on the same proofs and kept, and logged, for the same reasons, the bare repo's
+# own entry is never a candidate, <rig>-wt comes from the container's physical path — and a repo git cannot read (what it is, or its worktree list) is skipped with a skip_repo_unresolvable event, counted on the sweep line, and left untouched;
 # the SIGTERM guard kills a crew claude proc
 # but never a supervisor/pilot; kill is default-OFF; the feature has a kill-switch + dry-run.
 # Process probes are faked so it's hermetic. Exit 0 iff all hold.
@@ -1277,9 +1279,29 @@ cat > "$PE_BIN/git" <<'PEGIT'
 # And `git rev-list --merges` (the merge-commit check), which PE_REVLIST=fail breaks: rc 128, no output.
 # ga-k0mose6: `git rev-parse HEAD` (PE_REVPARSE=fail) and `git status` (PE_STATUS=fail) break the same way: rc 128, no output.
 # ga-ggj1wnv: so does `git remote` (PE_REMOTE=fail), the read that says whether a repo has a remote at all.
-rp=0
+# ga-ryykl9l: the three reads that decide what a repo IS. `rev-parse --show-toplevel`: PE_TOPLEVEL=fail = rc 128 and a fatal line, empty = rc 0 and no output,
+# partial = a path and THEN rc 128. `rev-parse --is-bare-repository`: PE_BARE=fail = rc 128 and a fatal line, false = a clean "false", garbage = rc 0 and "maybe",
+# partial = "true" and THEN rc 1. `worktree list`: PE_WTLIST=fail = rc 128 and a fatal line.
+rp=0; wk=0
 for a in "$@"; do
   [ "$a" = "rev-parse" ] && rp=1
+  [ "$a" = "worktree" ] && wk=1
+  if [ "$a" = "--show-toplevel" ]; then
+    case "${PE_TOPLEVEL:-}" in
+      fail)    printf '%s\n' 'fatal: injected "rev-parse --show-toplevel" failure \ (a quote and a backslash, on purpose: the log must still be JSON)' >&2; exit 128 ;;
+      empty)   exit 0 ;;
+      partial) echo "/no/such/root"; exit 128 ;;
+    esac
+  fi
+  if [ "$a" = "--is-bare-repository" ]; then
+    case "${PE_BARE:-}" in
+      fail)    echo "fatal: injected rev-parse --is-bare-repository failure" >&2; exit 128 ;;
+      false)   echo false; exit 0 ;;
+      garbage) echo maybe; exit 0 ;;
+      partial) echo true; exit 1 ;;
+    esac
+  fi
+  if [ "$a" = "list" ] && [ "$wk" = "1" ] && [ "${PE_WTLIST:-}" = "fail" ]; then echo "fatal: injected worktree list failure" >&2; exit 128; fi
   if [ "$a" = "HEAD" ] && [ "$rp" = "1" ] && [ "${PE_REVPARSE:-}" = "fail" ]; then exit 128; fi
   if [ "$a" = "status" ] && [ "${PE_STATUS:-}" = "fail" ]; then exit 128; fi
   if [ "$a" = "remote" ] && [ "${PE_REMOTE:-}" = "fail" ]; then exit 128; fi
@@ -2689,6 +2711,209 @@ gg_nr gg_q8 master 'echo wip > wip.txt'; run_kz gg_q8 "$GG_TB_OPEN" "$PRESS"
 { gg_nwt gg_q8 && [ -f "$TMP/gg_q8/rig-wt/tb-gg1xyz/wip.txt" ] && [ "$(events gg_q8 reaped_pool)" = "0" ] && [ "$(events gg_q8 preserve_failed_dirty_kept)" = "1" ]; } \
   && ok "ga-ggj1wnv (q8): dirty tree with HEAD in master → KEPT with its file, preserve_failed_dirty_kept logged" \
   || bad "ga-ggj1wnv (q8): dirty tree — present=$(gg_nwt gg_q8 && echo y || echo n) reaped_pool=$(events gg_q8 reaped_pool) preserve_failed=$(events gg_q8 preserve_failed_dirty_kept)"
+
+# ══ ga-ryykl9l: a rig CONTAINER — <rig>/.git is a FILE pointing at a BARE repo (<rig>/.repo.git), the shape of property_scrapers and lexbh — is swept like any rig ══
+# `git rev-parse --show-toplevel` fails in a bare repo (rc 128, "this operation must be run in a work tree") and the pool loop read that as "nothing to sweep" (`|| return 0`): the witness found 21 trees of closed
+# beads in property_scrapers and no event of that rig in the log since 30/06. A bare repo is now swept through its own `git worktree list` (its own entry, marked `bare`, is skipped), and a repo whose kind git cannot tell, or whose worktrees it cannot list, is skipped
+# WITH an event (skip_repo_unresolvable) and counted on the sweep line (repo_unresolvable), never read as "nothing to sweep". (a) is the measured bug; every later scenario breaks one thing.
+echo "── ga-ryykl9l: a rig container (.git FILE -> bare repo) is swept; a repo git cannot read is logged, never read as 'nothing to sweep' ──"
+CT_AHEAD='echo built > built.txt && git add built.txt && git commit -qm "built, never merged"'
+CT_TB=tb-ct1xyz   # a bead-shaped directory name, for the trees kept under <rig>-wt/
+# ct_mk <name> [<mode>] [<setup run inside the tree>] [<age h, default 14>] [<bare repo dir name, default .repo.git>] — $TMP/<name> is the town and $TMP/<name>/rig a rig CONTAINER: its .git is a FILE
+# "gitdir: <rig>/<bare>", the bare repo is <rig>/<bare>, crew/worker-ct is a linked tree on crew/ct/$KZ_ID cut from main. mode: refs (default) = the bare repo has an origin and its remote-tracking
+# refs (origin/main exists), norefs = an origin that was never fetched (no refs/remotes/origin/*), noremote = no remote at all. The source repos live in $TMP/<name>-src, outside the town.
+ct_mk() {
+  local name="$1" mode="${2:-refs}" extra="${3:-}" bare="${5:-.repo.git}" root="$TMP/$1" src="$TMP/$1-src"
+  mkdir -p "$root/rig/crew" "$src"
+  git init -q --bare "$src/remote.git"; git init -q -b main "$src/donor"
+  ( cd "$src/donor" || exit 1
+    echo base > base.txt; git add base.txt; git commit -qm base
+    git remote add origin "$src/remote.git"; git push -q origin main
+  ) >/dev/null 2>&1
+  if [ "$mode" = "noremote" ]; then
+    git init -q --bare -b main "$root/rig/$bare" && git -C "$src/donor" push -q "$root/rig/$bare" main
+  else
+    git clone -q --bare "$src/remote.git" "$root/rig/$bare"
+    if [ "$mode" = "refs" ]; then
+      git -C "$root/rig/$bare" config remote.origin.fetch '+refs/heads/*:refs/remotes/origin/*' \
+        && git -C "$root/rig/$bare" fetch -q origin && { git -C "$root/rig/$bare" remote set-head origin main 2>/dev/null || true; }
+    fi
+  fi >/dev/null 2>&1
+  printf 'gitdir: %s\n' "$root/rig/$bare" > "$root/rig/.git"
+  git -C "$root/rig" worktree add -q "$root/rig/crew/worker-ct" -b "crew/ct/$KZ_ID" main >/dev/null 2>&1
+  if [ -n "$extra" ]; then ( cd "$root/rig/crew/worker-ct" && eval "$extra" ) >/dev/null 2>&1; fi
+  pe_age "$root/rig/crew/worker-ct" "${4:-14}"
+}
+ct_dir() { [ -d "$TMP/$1/rig/crew/${2:-worker-ct}" ]; }
+ct_wt()  { git -C "$TMP/$1/rig" worktree list --porcelain 2>/dev/null | grep -E "/crew/worker-ct\$" >/dev/null; }
+ct_br()  { git -C "$TMP/$1/rig" rev-parse --verify -q "refs/heads/crew/ct/$KZ_ID" >/dev/null 2>&1; }
+ct_tip() { git -C "$TMP/$1/rig" rev-parse "refs/heads/crew/ct/$KZ_ID" 2>/dev/null; }
+ct_num() { grep '"event":"sweep"' "$TMP/$1.jsonl" 2>/dev/null | tail -n 1 | sed -n "s/.*\"$2\":\([0-9][0-9]*\).*/\1/p"; }   # <name> <field> → that number on the LAST sweep line ("" = no such line or field)
+ct_ev()  { grep "\"event\":\"$2\"" "$TMP/$1.jsonl" 2>/dev/null | grep -F '"repo":"rig"' | wc -l | tr -d ' '; }               # <name> <event> → how many such events name the rig
+ct_kept() { # ct_kept <name> <label> [<event logged once for the rig>] — tree directory and branch intact, nothing reaped
+  if ct_dir "$1" && ct_br "$1" && [ "$(ct_ev "$1" reaped_pool)" = "0" ] && { [ -z "${3:-}" ] || [ "$(ct_ev "$1" "$3")" = "1" ]; }; then ok "ga-ryykl9l: $2 → KEPT (tree + branch intact${3:+, $3 logged once})"
+  else bad "ga-ryykl9l: $2 → NOT kept (dir=$(ct_dir "$1" && echo y || echo n) br=$(ct_br "$1" && echo y || echo n) reaped_pool=$(ct_ev "$1" reaped_pool) ${3:-event}=$([ -n "${3:-}" ] && ct_ev "$1" "$3" || echo -))"; fi
+}
+ct_unres() { # ct_unres <name> <label> [<tree dir under crew/, default worker-ct>] [<text the why must hold>] [<the rc the event must carry>] — the repo was NOT swept: tree intact, nothing reaped, ONE skip_repo_unresolvable naming it (path, rc, a why), counted on the sweep line
+  local ev; ev="$(grep '"event":"skip_repo_unresolvable"' "$TMP/$1.jsonl" 2>/dev/null | head -n 1)"
+  if ct_dir "$1" "${3:-worker-ct}" && [ "$(events "$1" reaped_pool)" = "0" ] && [ "$(ct_ev "$1" skip_repo_unresolvable)" = "1" ] && [ "$(ct_num "$1" repo_unresolvable)" = "1" ] \
+     && printf '%s' "$ev" | grep -E '"path":"[^"]*/rig"' >/dev/null && printf '%s' "$ev" | grep -E '"why":"[^"]+"' >/dev/null \
+     && printf '%s' "$ev" | grep -E "\"rc\":${5:-[0-9]+}," >/dev/null \
+     && { [ -z "${4:-}" ] || printf '%s' "$ev" | grep -F -- "$4" >/dev/null; }; then
+    ok "ga-ryykl9l: $2 → NOT swept, logged once as skip_repo_unresolvable (path, rc${5:+ $5}, why${4:+ naming '$4'}), counted on the sweep line, tree untouched"
+  else bad "ga-ryykl9l: $2 → dir=$(ct_dir "$1" "${3:-worker-ct}" && echo y || echo n) reaped_pool=$(events "$1" reaped_pool) skip_events=$(ct_ev "$1" skip_repo_unresolvable) sweep_count=$(ct_num "$1" repo_unresolvable) event=$(printf '%s' "$ev" | cut -c1-300)"; fi
+}
+
+# (a) the measured bug: a clean tree whose HEAD is in origin/main, idle 14 h, in a container → REAPED (normal mode: "merged" bypasses the age gate) with its merged orphan branch; the bare repo itself is untouched.
+# Breaks if the pool loop goes back to treating a failing --show-toplevel as "nothing to sweep": no event, the tree stays.
+ct_mk ct_a
+{ git -C "$TMP/ct_a/rig" merge-base --is-ancestor "crew/ct/$KZ_ID" refs/remotes/origin/main 2>/dev/null \
+  && [ "$(git -C "$TMP/ct_a/rig" rev-parse --is-bare-repository 2>/dev/null)" = "true" ] && ! git -C "$TMP/ct_a/rig" rev-parse --show-toplevel >/dev/null 2>&1; } \
+  && ok "ga-ryykl9l (fixture): the rig root is a BARE container (--is-bare-repository true, --show-toplevel fails) and the tree's HEAD is in origin/main" \
+  || bad "ga-ryykl9l (fixture): the container fixture is wrong — scenario (a) would prove nothing"
+run_kz ct_a '[]'
+if ! ct_dir ct_a && ! ct_wt ct_a && [ "$(ct_ev ct_a reaped_pool)" = "1" ] && ! ct_br ct_a && [ "$(ct_ev ct_a branch_deleted)" = "1" ] && [ -f "$TMP/ct_a/rig/.repo.git/HEAD" ]; then
+  ok "ga-ryykl9l (a): clean merged tree of a rig CONTAINER reaped — one reaped_pool naming the rig, its merged orphan branch deleted, the bare repo untouched"
+else bad "ga-ryykl9l (a): container tree — dir=$(ct_dir ct_a && echo y || echo n) registered=$(ct_wt ct_a && echo y || echo n) reaped_pool=$(ct_ev ct_a reaped_pool) branch=$(ct_br ct_a && echo y || echo n) branch_deleted=$(ct_ev ct_a branch_deleted) lines=$(grep -c . "$TMP/ct_a.jsonl" 2>/dev/null)"; fi
+{ [ "$(ct_num ct_a pool_reaped)" = "1" ] && [ "$(ct_num ct_a repo_unresolvable)" = "0" ]; } \
+  && ok "ga-ryykl9l (a): the sweep line counts that one reap and says repo_unresolvable 0 (a readable container is not 'unresolvable')" \
+  || bad "ga-ryykl9l (a): sweep line pool_reaped=$(ct_num ct_a pool_reaped) repo_unresolvable=$(ct_num ct_a repo_unresolvable)"
+# (a2) the real leak: an UNMERGED tree of a CLOSED bead under disk pressure → reaped on the closed-bead proof, its branch and unmerged commit kept (only the tree goes)
+ct_mk ct_a2 refs "$CT_AHEAD"; CT_A2_TIP="$(ct_tip ct_a2)"
+run_kz ct_a2 "$KZ_CLOSED" "$PRESS"
+{ ! ct_dir ct_a2 && ct_br ct_a2 && [ -n "$CT_A2_TIP" ] && [ "$(ct_tip ct_a2)" = "$CT_A2_TIP" ] && [ "$(git -C "$TMP/ct_a2/rig" show "refs/heads/crew/ct/$KZ_ID:built.txt" 2>/dev/null)" = "built" ] \
+  && grep '"event":"reaped_pool"' "$TMP/ct_a2.jsonl" | grep -F "\"repo\":\"rig\"" | grep -F "\"proof\":\"bead_closed\",\"beads\":\"$KZ_ID\"" >/dev/null; } \
+  && ok "ga-ryykl9l (a2): unmerged tree of a CLOSED bead in a container reaped under pressure on the bead proof; the branch keeps its unmerged commit" \
+  || bad "ga-ryykl9l (a2): dir=$(ct_dir ct_a2 && echo y || echo n) br=$(ct_br ct_a2 && echo y || echo n) event=$(grep '"event":"reaped_pool"' "$TMP/ct_a2.jsonl" 2>/dev/null | head -n 1 | cut -c1-260)"
+
+# (b) what a container's sweep must NOT take is kept, and says why (the Mayor's check after the merge: "the first reaped_pool of the rig, or the reason each tree stayed")
+ct_mk ct_b1 refs "$CT_AHEAD"; run_kz ct_b1 "[$(bc_bead "$KZ_ID" open)]" "$PRESS"
+ct_kept ct_b1 "bead OPEN under pressure" kept_pressure_unmerged
+ct_mk ct_b2; ( cd "$TMP/ct_b2/rig/crew/worker-ct" && pwd -P ) > "$TMP/ct_b2.lsof"
+run_kz ct_b2 '[]' WORKTREE_REAPER_FAKE_LSOF="$TMP/ct_b2.lsof"
+ct_kept ct_b2 "a live process has its cwd in the tree" kept_merged_in_use
+ct_mk ct_b3 refs "$CT_AHEAD && echo wip > .gate-done-extracted.sh"; run_kz ct_b3 "$KZ_CLOSED" "$PRESS"
+ct_kept ct_b3 "bead closed but an untracked file in the tree (pressure)" kept_pressure_unmerged
+[ -f "$TMP/ct_b3/rig/crew/worker-ct/.gate-done-extracted.sh" ] && ok "ga-ryykl9l (b3): the untracked file is still on disk" || bad "ga-ryykl9l (b3): uncommitted work was destroyed"
+# (b4) normal mode, a merged tree dirty with an untracked file: plain remove refuses, the WIP is preserved to origin FIRST (ga-xv78c), then the tree goes — the same path a rig with a work tree takes
+ct_mk ct_b4 refs 'echo wip > wip.txt'; run_kz ct_b4 '[]'
+{ ! ct_dir ct_b4 && [ "$(ct_ev ct_b4 reaped_dirty_preserved)" = "1" ] && [ "$(git -C "$TMP/ct_b4-src/remote.git" show "refs/heads/crew/ct/$KZ_ID:wip.txt" 2>/dev/null)" = "wip" ]; } \
+  && ok "ga-ryykl9l (b4): dirty merged tree of a container — its WIP is on origin (refs/heads/crew/ct/$KZ_ID:wip.txt) before the tree goes" \
+  || bad "ga-ryykl9l (b4): dirty container tree — dir=$(ct_dir ct_b4 && echo y || echo n) preserved_events=$(ct_ev ct_b4 reaped_dirty_preserved) on origin: $(git -C "$TMP/ct_b4-src/remote.git" show "refs/heads/crew/ct/$KZ_ID:wip.txt" 2>&1 | head -n 1)"
+
+# (c) the bare repo's OWN entry of `git worktree list` is never a tree to sweep, even when its directory name passes the worker filter (worker-bare.git) and it is as old as the trees: it is not counted as kept, nor as a
+# skipped tree (a swept entry would be "kept" by the age gate if young, "skipped" once git refuses to remove a main working tree if old), not logged, not touched
+ct_mk ct_c refs '' 14 worker-bare.git; pe_age "$TMP/ct_c/rig/worker-bare.git" 14; run_kz ct_c '[]'
+{ ! ct_dir ct_c && [ "$(ct_ev ct_c reaped_pool)" = "1" ] && [ -f "$TMP/ct_c/rig/worker-bare.git/HEAD" ] && [ "$(ct_num ct_c skipped_dirty)" = "0" ] && [ "$(ct_num ct_c kept)" = "0" ] \
+  && [ "$(grep -c 'worker-bare' "$TMP/ct_c.jsonl" 2>/dev/null)" = "0" ]; } \
+  && ok "ga-ryykl9l (c): the bare repo's own entry (named worker-bare.git, 14 h old) is skipped — intact, no event, kept 0, skipped_dirty 0 — while its real tree is reaped" \
+  || bad "ga-ryykl9l (c): bare entry — reaped=$(ct_ev ct_c reaped_pool) bare HEAD=$([ -f "$TMP/ct_c/rig/worker-bare.git/HEAD" ] && echo y || echo n) kept=$(ct_num ct_c kept) skipped_dirty=$(ct_num ct_c skipped_dirty) events about it=$(grep -c 'worker-bare' "$TMP/ct_c.jsonl" 2>/dev/null)"
+ct_mk ct_c2 refs '' 14 worker-bare.git; run_kz ct_c2 '[]'
+{ ! ct_dir ct_c2 && [ "$(ct_num ct_c2 kept)" = "0" ] && [ "$(ct_num ct_c2 skipped_dirty)" = "0" ]; } \
+  && ok "ga-ryykl9l (c2): the same with a young bare directory — still not counted (the age gate never sees the bare entry)" \
+  || bad "ga-ryykl9l (c2): young bare entry — kept=$(ct_num ct_c2 kept) skipped_dirty=$(ct_num ct_c2 skipped_dirty)"
+
+# (d) <rig>-wt is the CONTAINER's sibling directory (not the bare repo's): a per-bead tree under ../<rig>-wt/ is listed and reaped on its closed bead; a tree elsewhere with an ordinary name is not in the list at all
+ct_mk ct_d; mkdir -p "$TMP/ct_d/rig-wt" "$TMP/ct_d/other"
+git -C "$TMP/ct_d/rig" worktree add -q "$TMP/ct_d/rig-wt/$CT_TB" -b "work/$CT_TB" main >/dev/null 2>&1
+git -C "$TMP/ct_d/rig" worktree add -q "$TMP/ct_d/other/tb-ct2xyz" -b work/tb-ct2xyz main >/dev/null 2>&1
+for d in "$TMP/ct_d/rig-wt/$CT_TB" "$TMP/ct_d/other/tb-ct2xyz"; do ( cd "$d" && echo built > built.txt && git add built.txt && git commit -qm built ) >/dev/null 2>&1; pe_age "$d" 14; done
+run_kz ct_d "[$(bc_bead "$CT_TB" closed 10),$(bc_bead tb-ct2xyz closed 10)]" "$PRESS"
+{ [ ! -d "$TMP/ct_d/rig-wt/$CT_TB" ] && git -C "$TMP/ct_d/rig" rev-parse --verify -q "refs/heads/work/$CT_TB" >/dev/null 2>&1 \
+  && grep '"event":"reaped_pool"' "$TMP/ct_d.jsonl" | grep -F "\"wt\":\"$CT_TB\"" | grep -F '"proof":"bead_closed"' >/dev/null; } \
+  && ok "ga-ryykl9l (d): a tree under <container>-wt/ is listed and reaped on its closed bead (branch kept)" \
+  || bad "ga-ryykl9l (d): <rig>-wt tree — dir=$([ -d "$TMP/ct_d/rig-wt/$CT_TB" ] && echo y || echo n) event=$(grep '"event":"reaped_pool"' "$TMP/ct_d.jsonl" 2>/dev/null | grep -F "$CT_TB" | head -n 1 | cut -c1-240)"
+{ [ -d "$TMP/ct_d/other/tb-ct2xyz" ] && [ "$(grep -c 'tb-ct2xyz' "$TMP/ct_d.jsonl" 2>/dev/null)" = "0" ]; } \
+  && ok "ga-ryykl9l (d): the same kind of tree outside <container>-wt/ (ordinary name, not crew/*) stays out of the list: untouched, no event" \
+  || bad "ga-ryykl9l (d): an unlisted tree was touched or logged (dir=$([ -d "$TMP/ct_d/other/tb-ct2xyz" ] && echo y || echo n))"
+# (e) the same, with the container reached through a SYMLINK: <rig>-wt comes from the container's physical path, which is how git registers the trees (on macOS the mktemp root itself is one)
+ct_mk ct_e0; mkdir -p "$TMP/ct_e0/rig-wt" "$TMP/ct_e1"
+git -C "$TMP/ct_e0/rig" worktree add -q "$TMP/ct_e0/rig-wt/$CT_TB" -b "work/$CT_TB" main >/dev/null 2>&1
+( cd "$TMP/ct_e0/rig-wt/$CT_TB" && echo built > built.txt && git add built.txt && git commit -qm built ) >/dev/null 2>&1; pe_age "$TMP/ct_e0/rig-wt/$CT_TB" 14
+ln -s "$TMP/ct_e0/rig" "$TMP/ct_e1/rig"
+run_kz ct_e1 "[$(bc_bead "$CT_TB" closed 10)]" "$PRESS"
+{ [ ! -d "$TMP/ct_e0/rig-wt/$CT_TB" ] && grep '"event":"reaped_pool"' "$TMP/ct_e1.jsonl" | grep -F "\"wt\":\"$CT_TB\"" >/dev/null; } \
+  && ok "ga-ryykl9l (e): a container reached through a symlink still has its <rig>-wt/ trees listed (physical path)" \
+  || bad "ga-ryykl9l (e): symlinked container — <rig>-wt tree dir=$([ -d "$TMP/ct_e0/rig-wt/$CT_TB" ] && echo y || echo n) log=$(cut -c1-160 "$TMP/ct_e1.jsonl" 2>/dev/null | head -n 3 | tr '\n' ' ')"
+
+# (f) the container's proofs read ITS refs honestly: no remote at all → "merged" is HEAD in its local trunk (branch kept); a remote that was never fetched has no origin/main → no merge proof, never a guess
+ct_mk ct_f1 noremote; run_kz ct_f1 '[]'
+{ ! ct_dir ct_f1 && ct_br ct_f1 && grep '"event":"reaped_pool"' "$TMP/ct_f1.jsonl" | grep -F '"proof":"local_trunk"' >/dev/null; } \
+  && ok "ga-ryykl9l (f1): container with NO remote — a tree whose HEAD is in its local main is reaped on proof local_trunk, its branch kept" \
+  || bad "ga-ryykl9l (f1): no-remote container — dir=$(ct_dir ct_f1 && echo y || echo n) br=$(ct_br ct_f1 && echo y || echo n) event=$(grep '"event":"reaped_pool"' "$TMP/ct_f1.jsonl" 2>/dev/null | head -n 1 | cut -c1-200)"
+ct_mk ct_f2 noremote "$CT_AHEAD"; run_kz ct_f2 "[$(bc_bead "$KZ_ID" open)]" "$PRESS"
+ct_kept ct_f2 "no remote, HEAD ahead of the local trunk, bead open (pressure)" kept_pressure_unmerged
+ct_mk ct_f3 norefs; run_kz ct_f3 '[]'
+ct_kept ct_f3 "an origin that was never fetched (no origin/main): no merge proof, the 14 h age gate holds"
+ct_mk ct_f4 norefs "$CT_AHEAD"; run_kz ct_f4 "$KZ_CLOSED" "$PRESS"
+{ ! ct_dir ct_f4 && ct_br ct_f4 && grep '"event":"reaped_pool"' "$TMP/ct_f4.jsonl" | grep -F '"proof":"bead_closed"' >/dev/null; } \
+  && ok "ga-ryykl9l (f4): origin never fetched + bead closed (pressure) → still reaped, on the bead proof alone, branch kept" \
+  || bad "ga-ryykl9l (f4): dir=$(ct_dir ct_f4 && echo y || echo n) br=$(ct_br ct_f4 && echo y || echo n)"
+
+# (g) dry-run: would_reap_pool names the rig, nothing is removed
+ct_mk ct_g; run_kz ct_g '[]' WORKTREE_REAPER_ENABLED=0
+{ ct_dir ct_g && ct_br ct_g && [ "$(ct_ev ct_g would_reap_pool)" = "1" ] && [ "$(ct_ev ct_g reaped_pool)" = "0" ]; } \
+  && ok "ga-ryykl9l (g): dry-run on a container logs would_reap_pool and removes nothing" \
+  || bad "ga-ryykl9l (g): dry-run — dir=$(ct_dir ct_g && echo y || echo n) would=$(ct_ev ct_g would_reap_pool) reaped=$(ct_ev ct_g reaped_pool)"
+# (i) every tree of the listing is visited, the LAST block included (a one-tree container is all last block)
+ct_mk ct_i; for n in 2 3; do git -C "$TMP/ct_i/rig" worktree add -q "$TMP/ct_i/rig/crew/worker-ct$n" -b "crew/ct/n$n" main >/dev/null 2>&1; pe_age "$TMP/ct_i/rig/crew/worker-ct$n" 14; done
+run_kz ct_i '[]'
+{ [ "$(ct_ev ct_i reaped_pool)" = "3" ] && ! ct_dir ct_i && ! ct_dir ct_i worker-ct2 && ! ct_dir ct_i worker-ct3 && [ "$(ct_num ct_i pool_reaped)" = "3" ]; } \
+  && ok "ga-ryykl9l (i): three trees of one container, all reaped (the last block of the listing is processed too)" \
+  || bad "ga-ryykl9l (i): reaped_pool=$(ct_ev ct_i reaped_pool) pool_reaped=$(ct_num ct_i pool_reaped) left: $(ct_dir ct_i && echo ct) $(ct_dir ct_i worker-ct2 && echo ct2) $(ct_dir ct_i worker-ct3 && echo ct3)"
+
+# (h) THE THIRD STATE: a repo git cannot read is NOT "nothing to sweep" — it is skipped, logged once (path, rc, why) and counted on the sweep line; the trees stay, and the next sweep that can read the repo takes them
+# (h1) a .git pointer to nowhere: git itself fails, no stub (what a corrupt or moved rig looks like)
+ct_mk ct_h1; printf 'gitdir: %s\n' "$TMP/ct_h1/no-such-repo.git" > "$TMP/ct_h1/rig/.git"; run_kz ct_h1 '[]'
+ct_unres ct_h1 "(h1) .git points at a repo that does not exist" worker-ct "" 128
+# (h2..h5) the bare read is what decides: it fails, says "false", says nonsense, or says "true" and then exits non-zero — none of them is "bare"; the event says what the bare read answered, and the same
+# sweep without the knob then reaps the tree (so the knob was the only thing that held it)
+for kn in fail false garbage partial; do
+  case "$kn" in fail) frag="rc=128" ;; false) frag="rc=0, 'false'" ;; garbage) frag="rc=0, 'maybe'" ;; *) frag="rc=1, 'true'" ;; esac
+  ct_mk "ct_h_$kn"; run_kz "ct_h_$kn" '[]' PE_BARE="$kn"
+  ct_unres "ct_h_$kn" "(h) --is-bare-repository $kn on a container" worker-ct "$frag" 128
+  run_kz "ct_h_$kn" '[]'
+  { ! ct_dir "ct_h_$kn" && [ "$(ct_ev "ct_h_$kn" reaped_pool)" = "1" ]; } \
+    && ok "ga-ryykl9l (h): the same container, git answering this time (--is-bare-repository $kn was the only obstacle) → reaped" \
+    || bad "ga-ryykl9l (h): after the $kn sweep a normal sweep did not reap it (dir=$(ct_dir "ct_h_$kn" && echo y || echo n) reaped_pool=$(ct_ev "ct_h_$kn" reaped_pool))"
+done
+# (h6..h7) a rig WITH a work tree whose --show-toplevel gives no answer (nothing and rc 0, a path and THEN rc 128, or rc 128) is not a bare repo either: skipped and logged, never swept on a guess or on a path from a
+# failed command. The empty answer is told apart from a failure in the log. gg_mk's tree is crew/worker-kz
+gg_mk ct_j1; run_kz ct_j1 "$KZ_CLOSED" "$PRESS" PE_TOPLEVEL=empty
+ct_unres ct_j1 "(h6) rig with a work tree, --show-toplevel prints nothing (rc 0)" worker-kz "printed nothing" 0
+gg_mk ct_j5; run_kz ct_j5 "$KZ_CLOSED" "$PRESS" PE_TOPLEVEL=partial
+ct_unres ct_j5 "(h6b) rig with a work tree, --show-toplevel prints a path and THEN fails" worker-kz "" 128
+gg_mk ct_j2; run_kz ct_j2 "$KZ_CLOSED" "$PRESS" PE_TOPLEVEL=fail
+ct_unres ct_j2 "(h7) rig with a work tree, --show-toplevel fails" worker-kz "injected" 128
+# the git message goes into the event as text: a quote and a backslash in it must not break the JSON, and must come back as they were written (git's own message is quoted, not paraphrased)
+{ jq -e . "$TMP/ct_j2.jsonl" >/dev/null 2>&1 && [ "$(jq -r 'select(.event=="skip_repo_unresolvable") | .why' "$TMP/ct_j2.jsonl" 2>/dev/null | grep -cF 'injected "rev-parse --show-toplevel" failure \ (a quote')" = "1" ]; } \
+  && ok "ga-ryykl9l (h7): git's message with a quote and a backslash — every log line still parses as JSON and the why round-trips" \
+  || bad "ga-ryykl9l (h7): hostile git message — jq says: $(jq -e . "$TMP/ct_j2.jsonl" 2>&1 >/dev/null | head -n 1) why=$(jq -r 'select(.event=="skip_repo_unresolvable") | .why' "$TMP/ct_j2.jsonl" 2>/dev/null | head -n 1 | cut -c1-160)"
+# (h8) a --show-toplevel that answers rc 0 and prints nothing must not hide a container: --is-bare-repository still says "true" → swept
+ct_mk ct_j3; run_kz ct_j3 '[]' PE_TOPLEVEL=empty
+{ ! ct_dir ct_j3 && [ "$(ct_ev ct_j3 reaped_pool)" = "1" ] && [ "$(ct_num ct_j3 repo_unresolvable)" = "0" ]; } \
+  && ok "ga-ryykl9l (h8): a container whose --show-toplevel prints nothing (rc 0) is still swept, via --is-bare-repository" \
+  || bad "ga-ryykl9l (h8): dir=$(ct_dir ct_j3 && echo y || echo n) reaped=$(ct_ev ct_j3 reaped_pool) unresolvable=$(ct_num ct_j3 repo_unresolvable)"
+# (h9) the listing itself fails: not "the repo has no worktree" — skipped and logged (the log says it was the LISTING), and the repo is not touched at all: not even pruned. A registered tree whose directory is
+# gone (worker-gone) is what a prune would take; the control sweep, with git listing again, takes it
+gg_mk ct_j4; git -C "$TMP/ct_j4/rig" worktree add -q "$TMP/ct_j4/rig/crew/worker-gone" -b crew/gone main >/dev/null 2>&1 && mv "$TMP/ct_j4/rig/crew/worker-gone" "$TMP/ct_j4-moved-away"
+run_kz ct_j4 "$KZ_CLOSED" "$PRESS" PE_WTLIST=fail
+ct_unres ct_j4 "(h9) git worktree list fails" worker-kz "worktree list --porcelain failed: fatal: injected worktree list failure" 128
+[ "$(git -C "$TMP/ct_j4/rig" worktree list --porcelain 2>/dev/null | grep -c '/crew/worker-gone$')" = "1" ] \
+  && ok "ga-ryykl9l (h9): the repo whose listing failed was not pruned (the stale registration is still there)" \
+  || bad "ga-ryykl9l (h9): the unreadable repo was pruned anyway (registrations of worker-gone: $(git -C "$TMP/ct_j4/rig" worktree list --porcelain 2>/dev/null | grep -c '/crew/worker-gone$'))"
+run_kz ct_j4 "$KZ_CLOSED" "$PRESS"
+[ "$(git -C "$TMP/ct_j4/rig" worktree list --porcelain 2>/dev/null | grep -c '/crew/worker-gone$')" = "0" ] \
+  && ok "ga-ryykl9l (h9): control — with git listing again, the same sweep prunes it (so the failed listing was what protected it)" \
+  || bad "ga-ryykl9l (h9): control — the stale registration of worker-gone survived a normal sweep (the prune never ran, the test above proves nothing)"
+# (h10) the path of an unreadable repo goes into the log as text: a directory named with a quote and a backslash must not break the JSON (it would poison the file for every later reader)
+CT_ESC="$TMP/ct_esc/ri\"g\\q"; mkdir -p "$CT_ESC" && printf 'gitdir: %s\n' "$TMP/ct_esc/nowhere.git" > "$CT_ESC/.git"
+run_kz ct_esc '[]'
+{ jq -e . "$TMP/ct_esc.jsonl" >/dev/null 2>&1 && [ "$(jq -r 'select(.event=="skip_repo_unresolvable") | .repo' "$TMP/ct_esc.jsonl" 2>/dev/null)" = 'ri"g\q' ] \
+  && [ "$(jq -r 'select(.event=="skip_repo_unresolvable") | .path' "$TMP/ct_esc.jsonl" 2>/dev/null)" = "$CT_ESC" ] \
+  && [ -n "$(jq -r 'select(.event=="skip_repo_unresolvable") | .why' "$TMP/ct_esc.jsonl" 2>/dev/null)" ]; } \
+  && ok "ga-ryykl9l (h10): a repo directory named with a quote and a backslash — every log line parses as JSON, repo and path round-trip, the why is there" \
+  || bad "ga-ryykl9l (h10): hostile directory name — jq says: $(jq -e . "$TMP/ct_esc.jsonl" 2>&1 >/dev/null | head -n 1) repo=$(jq -r 'select(.event=="skip_repo_unresolvable") | .repo' "$TMP/ct_esc.jsonl" 2>/dev/null)"
 
 echo ""
 echo "── RESULTS: $PASS passed, $FAIL failed ──"
