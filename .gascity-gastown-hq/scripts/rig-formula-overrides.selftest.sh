@@ -33,7 +33,8 @@
 #      REDIRECT target (mayor/rig/.beads, which has no formulas/) and then in the checkout root's
 #      .beads/formulas/ (~/gt/.beads/formulas/ for these rigs), never in <rig>/.beads/formulas/.
 #      Where it is fixed: the symlink ~/gt/.beads/formulas/mol-witness-patrol.formula.toml (local,
-#      untracked, git-excluded state) must point at rig-overrides/formulas/mol-witness-patrol.toml.
+#      untracked, git-excluded state) must point at rig-overrides/formulas/mol-witness-patrol.toml;
+#      scripts/rig-formula-redirect-link.sh reports it and, with --apply, recreates it.
 #      E reads three states: resolves to the override (ok) / resolves elsewhere or gc answers
 #      nothing (FAIL - never "ok") / no gc binary or no rig dir (SKIP, printed and counted, rc stays 0:
 #      the node that runs hq batteries has no rigs, so the live part cannot be verified there).
@@ -179,7 +180,7 @@ check_e() {
     src="$($tmo "$gcb" bd -C "$rd" formula show mol-witness-patrol 2>/dev/null | sed -n 's/^[[:space:]]*Source:[[:space:]]*//p' | head -1)"
     if [ -z "$src" ]; then echo "rig $name: gc gave no Source line (cannot tell which formula it pours)"; rc=1; continue; fi
     real="$(realfile "$src")" || { echo "rig $name: Source $src is not a readable file"; rc=1; continue; }
-    [ "$real" = "$want" ] || { echo "rig $name: pours $src -> $real, not the override ($want)"; rc=1; }
+    [ "$real" = "$want" ] || { echo "rig $name: pours $src -> $real, not the override ($want); fix: scripts/rig-formula-redirect-link.sh --apply"; rc=1; }
   done <<RIGS_END
 $out
 RIGS_END
