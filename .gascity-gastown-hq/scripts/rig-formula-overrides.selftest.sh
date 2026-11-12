@@ -3,7 +3,7 @@
 #
 # ## Contents
 #   - What it guards
-#   - Checks (A-D) and mutants (M1-M5)
+#   - Checks (A-E) and mutants (M1-M8)
 #   - Usage
 #
 # ## What it guards
@@ -26,9 +26,22 @@
 #      falls back to the native formula); mol-witness-patrol.toml is one of them
 #   C. rig-overrides/ has no orders/ sibling (nor any entry besides formulas/)
 #   D. no [[rigs]] points formulas_dir anywhere else (one layer, one place)
+#   E. LIVE (ga-6pil72r): `gc bd -C <rig> formula show mol-witness-patrol` resolves, for EVERY rig
+#      whose dir exists next to the city, to the town-deltas override file. A. to D. read config and
+#      the materialized symlinks only; they all passed while gastown/lexbh/marketing (which carry a
+#      .beads/redirect to mayor/rig/.beads) still poured the NATIVE formula, because bd looks in the
+#      REDIRECT target (mayor/rig/.beads, which has no formulas/) and then in the checkout root's
+#      .beads/formulas/ (~/gt/.beads/formulas/ for these rigs), never in <rig>/.beads/formulas/.
+#      Where it is fixed: the symlink ~/gt/.beads/formulas/mol-witness-patrol.formula.toml (local,
+#      untracked, git-excluded state) must point at rig-overrides/formulas/mol-witness-patrol.toml.
+#      E reads three states: resolves to the override (ok) / resolves elsewhere or gc answers
+#      nothing (FAIL - never "ok") / no gc binary or no rig dir (SKIP, printed and counted, rc stays 0:
+#      the node that runs hq batteries has no rigs, so the live part cannot be verified there).
 #   M1 a rig without the line -> A fails     M2 a copied file instead of a symlink -> B fails
 #   M3 a dangling link -> B fails            M4 an orders/ sibling -> C fails
 #   M5 formulas_dir pointing into the pack -> A/D fail
+#   M6 one redirect rig resolves to the native file -> E fails (a control with every rig right is green)
+#   M7 gc answers nothing -> E fails         M8 no rig dir at all -> E skips (rc 2), not green
 #
 # ## Usage
 #   scripts/rig-formula-overrides.selftest.sh          (against the city dir this script lives in)
@@ -39,11 +52,15 @@ set -u
 HERE="$(cd "$(dirname "$0")" && pwd)"
 CITY_DIR="${CITY_DIR:-$(cd "$HERE/.." && pwd)}"
 WANT='rig-overrides/formulas'
+GC_BIN="${GC_BIN:-gc}"
+RIGS_BASE="${RIGS_BASE:-$(dirname "$CITY_DIR")}"
 PASS=0
 FAIL=0
+SKIP=0
 
 ok() { PASS=$((PASS + 1)); echo "  ok   - $1"; }
 bad() { FAIL=$((FAIL + 1)); echo "  FAIL - $1"; }
+skip() { SKIP=$((SKIP + 1)); echo "  SKIP - $1 (NOT verified)"; }
 
 # rig_lines <city.toml>: prints one line per [[rigs]] ("<name>|<formulas_dir or ->"), nothing
 # else. vazio (no [[rigs]]) -> prints nothing and check_a fails (a city with no rigs is not this
@@ -128,10 +145,58 @@ check_d() {
   return 0
 }
 
+# realfile <path>: the regular file behind a chain of symlinks (relative or absolute), or rc 1.
+realfile() {
+  local p="$1" t i=0
+  while [ -L "$p" ] && [ "$i" -lt 10 ]; do
+    t="$(readlink "$p")"
+    case "$t" in /*) p="$t" ;; *) p="$(dirname "$p")/$t" ;; esac
+    i=$((i + 1))
+  done
+  [ -f "$p" ] || return 1
+  echo "$(cd "$(dirname "$p")" && pwd -P)/$(basename "$p")"
+}
+
+# check_e <city dir> <gc binary> <rigs base dir>: ga-6pil72r. rc 0 = every rig found under the base
+# resolves to the override; rc 1 = one resolves elsewhere or gc said nothing; rc 2 = nothing to ask
+# (no gc, or no rig dir). vazio (gc prints no Source line) -> FAIL, never read as "no problem";
+# falhou (gc errors/times out) -> same FAIL; a rig dir that is absent -> skipped, and if that leaves
+# zero rigs checked the whole check is a SKIP (rc 2), never green.
+check_e() {
+  local city="$1" gcb="$2" base="$3" want line name rd src real out checked=0 rc=0 tmo=""
+  command -v "$gcb" >/dev/null 2>&1 || { echo "$gcb not found"; return 2; }
+  want="$(cd "$city/packs/town-deltas/formulas" 2>/dev/null && pwd -P)" || { echo "packs/town-deltas/formulas missing"; return 1; }
+  want="$want/mol-witness-patrol.toml"
+  command -v timeout >/dev/null 2>&1 && tmo="timeout 60"
+  out="$(rig_lines "$city/city.toml")"
+  [ "$out" = "UNREADABLE" ] && { echo "city.toml unreadable"; return 1; }
+  while IFS= read -r line; do
+    [ -z "$line" ] && continue
+    name="${line%%|*}"
+    rd="$base/$name"
+    [ -d "$rd" ] || continue
+    checked=$((checked + 1))
+    src="$($tmo "$gcb" bd -C "$rd" formula show mol-witness-patrol 2>/dev/null | sed -n 's/^[[:space:]]*Source:[[:space:]]*//p' | head -1)"
+    if [ -z "$src" ]; then echo "rig $name: gc gave no Source line (cannot tell which formula it pours)"; rc=1; continue; fi
+    real="$(realfile "$src")" || { echo "rig $name: Source $src is not a readable file"; rc=1; continue; }
+    [ "$real" = "$want" ] || { echo "rig $name: pours $src -> $real, not the override ($want)"; rc=1; }
+  done <<RIGS_END
+$out
+RIGS_END
+  [ "$checked" -gt 0 ] || { echo "no rig dir under $base"; return 2; }
+  return "$rc"
+}
+
 echo "== real city ($CITY_DIR)"
 for c in a b c d; do
   if out="$(check_$c "$CITY_DIR")"; then ok "check $c"; else bad "check $c: $out"; fi
 done
+out="$(check_e "$CITY_DIR" "$GC_BIN" "$RIGS_BASE")"
+case $? in
+  0) ok "check e (live: every rig under $RIGS_BASE pours the override)" ;;
+  2) skip "check e: $out" ;;
+  *) bad "check e: $out" ;;
+esac
 
 # --- mutants: a tiny copy of the three things the checks read, mutated one way each -------------
 TMP="$(mktemp -d "${TMPDIR:-/tmp}/rfo-selftest.XXXXXX")" || { echo "mktemp failed" >&2; exit 1; }
@@ -183,5 +248,25 @@ if m="$(fresh m5)"; then
   expect_fail "M5 formulas_dir into the pack" d "$m"
 else bad "M5 setup"; fi
 
-echo "== $PASS passed, $FAIL failed"
+# --- check E mutants: a fake `gc` that answers `gc bd -C <dir> formula show <name>` -------------
+if m="$(fresh m6)"; then
+  mkdir -p "$m/rigs"
+  for n in $(rig_lines "$m/city.toml" | cut -d'|' -f1); do mkdir -p "$m/rigs/$n"; done
+  printf 'native\n' > "$TMP/native.toml"
+  cat > "$TMP/gc" <<'STUB_END'
+#!/bin/sh
+[ "$1" = bd ] && [ "$2" = -C ] && [ "$4" = formula ] && [ "$5" = show ] || exit 64
+[ -n "${STUB_EMPTY:-}" ] && exit 0
+if [ "$(basename "$3")" = "${STUB_BAD_RIG:-}" ]; then echo "   Source: $STUB_NATIVE"; else echo "   Source: $STUB_GOOD"; fi
+STUB_END
+  chmod +x "$TMP/gc"
+  export STUB_GOOD="$m/rig-overrides/formulas/mol-witness-patrol.toml" STUB_NATIVE="$TMP/native.toml"
+  if out="$(check_e "$m" "$TMP/gc" "$m/rigs")"; then ok "E control: every rig right -> check e green"; else bad "E control: check e failed on a good setup ($out)"; fi
+  if out="$(STUB_BAD_RIG=gastown check_e "$m" "$TMP/gc" "$m/rigs")"; then bad "M6 redirect rig on the native file: check e stayed GREEN (mutant survived)"; else ok "M6 redirect rig on the native file: check e fails ($(echo "$out" | head -1))"; fi
+  if out="$(STUB_EMPTY=1 check_e "$m" "$TMP/gc" "$m/rigs")"; then bad "M7 gc answers nothing: check e stayed GREEN (mutant survived)"; else ok "M7 gc answers nothing: check e fails ($(echo "$out" | head -1))"; fi
+  out="$(check_e "$m" "$TMP/gc" "$m/no-such-rigs-dir")"; rc=$?
+  if [ "$rc" -eq 2 ]; then ok "M8 no rig dir: check e skips (rc 2), not green"; else bad "M8 no rig dir: check e rc=$rc, wanted 2 ($out)"; fi
+else bad "M6-M8 setup"; fi
+
+echo "== $PASS passed, $FAIL failed, $SKIP skipped (a SKIP is NOT a pass)"
 [ "$FAIL" -eq 0 ]
