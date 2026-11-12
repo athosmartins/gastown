@@ -46,7 +46,10 @@
 #      split out the same way: status=in_progress with a session-VERIFIED-
 #      live assignee (gc session list) — counted separately (see the
 #      "ACTIVE:" log line) and likewise excluded from the pipeline below
-#      while that session remains live.
+#      while that session remains live. A FOURTH bucket (ga-ljcbnms): a
+#      routed, unowned bead the Pilot logged as QUEUED/ceded inside the last
+#      GOLW_QUEUE_EVIDENCE_MIN minutes — counted on the "QUEUED:" log line,
+#      excluded the same way (see POOL-QUEUE SPLIT below).
 #   5. Report only — this daemon NEVER mutates a bead (no label/status/assignee/
 #      close calls of any kind). Per-bead: `bd comment` (durable, lives on the
 #      bead itself). Aggregate: `notify` (low priority — see note below) +
@@ -178,6 +181,40 @@
 # mutation added; detection-only, matching this file's own scope for every
 # prior instance of this class.
 #
+# POOL-QUEUE SPLIT (ga-ljcbnms — the SEVENTH instance of this file's own
+# recurring class): a bead the Pilot is HOLDING for pool capacity is a
+# legitimate wait, not a stranding. Reported 12/11: wa-a2iz7b.1 (P2,
+# gate:needs-fix + gate:fix-attempt:1, open, no assignee, gc.routed_to=wa-worker)
+# drew a comment and a mail from this watchdog every ~6h since 08/11 (20+),
+# while the Pilot kept logging "P2 cedida a P0/P1" for it (ga-5fn5p3, Athos
+# 12/10: capacity goes to priority); the Mayor triaged it "not an orphan" twice.
+# The proof is the one autoheal_escalation_watch.py (WA rig) already reads, not
+# a new one: a "<id> QUEUED — ... session cap" line or a "<id> P<n> cedida a
+# P0/P1" line in the Pilot's own text log (PILOT_TEXT_LOG, local clock, no
+# zone) stamped within GOLW_QUEUE_EVIDENCE_MIN (60) minutes. It applies only to
+# a bead that is routed (gc.routed_to non-blank), unowned (no assignee), not
+# status=in_progress and without a pilot:dispatched* label. Three states, and
+# the two that are not "proof" fall back to the alert exactly as before: proof
+# present -> counted on the "QUEUED:" line, out of the alert/cooldown/comment/
+# mail pipeline; log read but no recent line for the bead (it may be a true
+# orphan: dead route, needs-fix with no route) -> alert; log missing, unreadable
+# or unplaceable in time -> alert, with one WARN per sweep. The failure
+# direction is ga-eiaidn's, not the fail-open probes': a wrong "queued" blinds
+# this watchdog to a real orphan, a wrong "not queued" costs one comment.
+# Park outranks queued (a parked bead can be routed and unowned too); active and
+# queued cannot overlap (a live assignee means status=in_progress, never a waiter).
+# NOT covered: the queue the Pilot publishes in ~/.gc/pilot-dispatchable.json,
+# which the WA reader adds (wa-e7vx0o) for beads deeper than the log ever walks.
+# KNOWN LIMIT (security review of ga-ljcbnms): the log is text, and the Pilot logs
+# every physical line of a bead title as its own entry (_queue_preview in
+# pilot-dispatcher.sh), so a title with a newline can make it write a line that
+# is byte-for-byte a real QUEUED/cedida line for another bead id and hide that
+# bead from this alert. The parser pins the Pilot's exact tags and emitter text
+# (a sloppy forgery proves nothing) but cannot tell a copied line from a real
+# one; the fix is upstream (flatten titles where the Pilot logs them), and the
+# WA reader has the same exposure.
+# Detection-only, as everywhere in this file.
+#
 # NOTIFY PRIORITY: low (-p 2), not the -p 4 used by throughput-stall-watchdog.
 # That watchdog pages Athos only when auto-recovery of a SYSTEMIC stall fails
 # (Athos, 2026-06-30: "só me notifique quando a máquina precisar de mim"). A
@@ -305,6 +342,12 @@ GOLW_STORES="${GOLW_STORES:-$HQ /Users/athos/gt/whatsapp_automation /Users/athos
 GOLW_EXCLUDE_LABEL_PREFIXES="${GOLW_EXCLUDE_LABEL_PREFIXES:-gate:prod-deploy: gate:passed gate:nonblocking-findings}"
 
 LOG="${GOLW_LOG:-$HQ/.gc/logs/gate-orphaned-label-watchdog.log}"
+# ga-ljcbnms: the Pilot's own TEXT log (pilot-dispatcher.sh LOG; its PILOT_LOG is the jsonl, a different file) and how far back a
+# QUEUED/ceded line still proves a bead is waiting for pool capacity: 60 min, the WA reader's AUTOHEAL_QUEUE_EVIDENCE_MIN (the
+# Pilot sweeps every ~20 min). A window that is not a positive integer falls back to 60 where it is read; TAIL = bytes read from the end.
+PILOT_TEXT_LOG="${GOLW_PILOT_TEXT_LOG:-$HQ/.gc/logs/pilot-dispatcher.log}"
+GOLW_QUEUE_EVIDENCE_MIN="${GOLW_QUEUE_EVIDENCE_MIN:-60}"
+GOLW_PILOT_TAIL_BYTES="${GOLW_PILOT_TAIL_BYTES:-4000000}"
 NOTIFY_BIN="${GOLW_NOTIFY_BIN:-/Users/athos/.local/bin/notify}"
 GC_BIN="${GOLW_GC_BIN:-gc}"
 BD_BIN="${GOLW_BD_BIN:-bd}"
@@ -370,6 +413,18 @@ _GOLW_IS_PARK_JQ='(
         | if length > 0 then (max >= $now_ts) else true end
       )
     )
+  )'
+
+# _GOLW_IS_POOL_WAITER_JQ — "could this bead be waiting in a pool's queue at all" (ga-ljcbnms), the precondition for reading the
+# Pilot log. Same contract as _GOLW_IS_PARK_JQ (a jq boolean on `$b` and `$L`); mirrors _routed_unowned/is_dispatched of
+# autoheal_escalation_watch.py (WA rig): gc.routed_to is a non-blank string, no assignee, status is not in_progress, no pilot:dispatched*
+# label. Anything else — metadata that is not an object, a number as the route, an assignee that is not a string — reads as "no":
+# the Pilot-log proof is never applied to a shape this cannot read, so the alert stays (ga-eiaidn's direction).
+_GOLW_IS_POOL_WAITER_JQ='(
+    ( (($b.metadata // null) | if type == "object" then (.["gc.routed_to"] // null) else null end) | (type == "string" and test("\\S")) )
+    and ( (($b.assignee // "") | if type == "string" then test("\\S") else true end) | not )
+    and ( (($b.status // "") | tostring | ascii_downcase) != "in_progress" )
+    and ( ($L | any(tostring | startswith("pilot:dispatched"))) | not )
   )'
 
 # _gate_artifact_probe <bead_id>
@@ -504,6 +559,55 @@ _golw_session_alive() {
   esac
 }
 
+# _golw_local_stamp <epoch> — "YYYY-MM-DD HH:MM:SS" on the LOCAL clock, the shape the Pilot's log() stamps (it carries no zone).
+# BSD `date -r <epoch>` first (macOS, where this runs); GNU `date -r` takes a FILE, so there it fails and the `date -d @<epoch>` form
+# answers. The shape check rejects any other output.
+_golw_local_stamp() {
+  local _e="$1" _s
+  case "$_e" in (''|*[!0-9]*) return 1 ;; esac
+  # vazio/falhou/ilegível -> return 1 with nothing printed: the caller reads "no stamp", never an empty or a made-up one
+  _s="$(date -r "$_e" '+%Y-%m-%d %H:%M:%S' 2>/dev/null || date -d "@$_e" '+%Y-%m-%d %H:%M:%S' 2>/dev/null)" || return 1
+  case "$_s" in
+    ([0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]' '[0-9][0-9]:[0-9][0-9]:[0-9][0-9]) printf '%s' "$_s" ;;
+    (*) return 1 ;;
+  esac
+}
+
+# _golw_pilot_queue_ids <now_epoch> — ga-ljcbnms. Prints, one per line, the ids the Pilot's own log records as waiting for pool
+# capacity inside the evidence window: "<id> QUEUED — ... session cap" (ga-in9ebr) or "<id> P<n|?> cedida a P0/P1" (ga-5fn5p3), the
+# two lines autoheal_escalation_watch.py (WA rig) reads. The stamp must fall in [now - GOLW_QUEUE_EVIDENCE_MIN min, now + 300 s] on the
+# local clock (300 s = skew allowance: a stamp from the future cannot be shown fresh); the id is the SUBJECT of the line (the first
+# token after the line's own "<tag>: "), never a waiter named later in it. Exit 0 = the log was READ (an empty list = no bead has
+# proof); exit 1 = it could not be (a WARN says why) and the caller must read that as "no proof", never as an empty queue. LC_ALL=C
+# on sed/awk: the em dash is matched as bytes and the stamps compare as plain strings. Each line is pinned to the Pilot's own bead
+# tag (ga-in9ebr / ga-5fn5p3) and to the rest of its emitter's text (pilot-dispatcher.sh), not to "anything before a colon": a line
+# that only looks like one proves nothing. That stops a sloppy forgery, not a copy of the real text (see POOL-QUEUE SPLIT).
+_golw_pilot_queue_ids() {
+  local _now="$1" _win="$GOLW_QUEUE_EVIDENCE_MIN" _lo _hi _out _rc
+  # a window that is not a positive integer without a leading zero (empty, text, 0, -5, 007: `[ 010 -gt 0 ]` is true but $(( 010 )) is 8) is 60
+  case "$_win" in (''|*[!0-9]*|0*) _win=60 ;; esac
+  # vazio/falhou -> return 1 (WARN): without both ends of the window no line can be judged fresh
+  _lo="$(_golw_local_stamp $(( _now - _win * 60 )))" && _hi="$(_golw_local_stamp $(( _now + 300 )))" \
+    || { log "WARN: ga-ljcbnms: could not place the evidence window on the local clock — pool-queue proof unavailable this sweep, alert as before"; return 1; }
+  # ausente/ilegível (no file, a directory, no read permission) -> return 1 (WARN); a log that is empty or has no matching line is a READ that found nothing, not a failure
+  if [ ! -f "$PILOT_TEXT_LOG" ] || [ ! -r "$PILOT_TEXT_LOG" ]; then
+    log "WARN: ga-ljcbnms: Pilot log '$PILOT_TEXT_LOG' missing or unreadable — pool-queue proof unavailable this sweep, alert as before"
+    return 1
+  fi
+  # vazio -> no output, exit 0; falhou (tail, sed or awk non-zero; pipefail) -> return 1 (WARN)
+  _out="$(tail -c "$GOLW_PILOT_TAIL_BYTES" "$PILOT_TEXT_LOG" 2>/dev/null \
+    | LC_ALL=C sed -n -E \
+      -e 's#^\[([0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2})\] \[pilot-dispatcher\] ga-in9ebr: ([^ ]+) QUEUED — routed to [^ ,]+, pool at session cap \([0-9]+ active/creating >= [0-9]+ max\).*$#\1 \2#p' \
+      -e 's#^\[([0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2})\] \[pilot-dispatcher\] ga-5fn5p3: ([^ ]+) P[0-9?] cedida a P0/P1 de [^ ]+ \(P[0-9?] [^ ]+ waits behind [^ ]+ [^ /)]+/[^ )]+\) — .*$#\1 \2#p' \
+    | LC_ALL=C awk -v lo="$_lo" -v hi="$_hi" '{ ts = $1 " " $2; if (ts >= lo && ts <= hi) print $3 }')"
+  _rc=$?
+  if [ "$_rc" -ne 0 ]; then
+    log "WARN: ga-ljcbnms: reading the Pilot log '$PILOT_TEXT_LOG' failed (exit $_rc) — pool-queue proof unavailable this sweep, alert as before"
+    return 1
+  fi
+  printf '%s\n' "$_out"
+}
+
 # _bead_recheck_status <bead_id> <store> <exclude_prefixes_json> <now_epoch>
 # <now_epoch> (epoch seconds) feeds _GOLW_IS_PARK_JQ's pilot:held timed-hold
 # check (ga-sgp6j) so the "parked" verdict below can tell an unexpired hold
@@ -538,7 +642,9 @@ _golw_session_alive() {
 #   present — bead exists, open, STILL carries a non-excluded gate:* label
 #             and is NOT parked: it dropped out of this sweep for some OTHER
 #             reason (transient probe failure, a live-assignee reclassify per
-#             ga-eiaidn, etc.) — NOT resolved.
+#             ga-eiaidn, a pool-queue reclassify per ga-ljcbnms, etc.) — NOT
+#             resolved. Like the active-live proof, the queue proof is a
+#             separate, volatile read (the Pilot log): it never prunes.
 _bead_recheck_status() {
   local _id="$1" _store="$2" _excl="$3" _now="$4" _out _rc
   _out=$("$BD_BIN" -C "$_store" list --id "$_id" --all --json 2>/dev/null \
@@ -690,11 +796,15 @@ run_sweep() {
   # store are never blank, age_min is a number or "?", labels holds the gate:* labels of a
   # candidate that the candidate filter below only keeps when it has at least one
   # (`any(startswith("gate:"))`), artifact_status/count come from _gate_artifact_probe
-  # (none|unknown|<status>, and a count), and is_park/is_live are 0|1. If you add a field
-  # that CAN be empty, either join with 0x1f (as the `rows` stage of
+  # (none|unknown|<status>, and a count), and is_park/is_waiter/is_live/is_queued are 0|1. If you
+  # add a field that CAN be empty, either join with 0x1f (as the `rows` stage of
   # pilot-missing-route-watchdog.sh does, ga-no6qa) or guarantee a non-empty placeholder
   # for every column before the last (as the adhoc-session-reaper.sh census does, ga-jn82py).
   local flagged_tsv=""
+  # ga-ljcbnms: the Pilot-log proof is read lazily, AT MOST once per sweep (on the first candidate that is routed, unowned and not
+  # parked). qe_state is
+  # "" (not read yet) | ok (qe_ids = " id id ... ", space-delimited for the membership test) | unreadable (qe_ids stays empty).
+  local qe_state="" qe_ids="" qe_out=""
   local store cand_json aged_json
   for store in $GOLW_STORES; do
     # Re-stamp the lock heartbeat once per store (mirrors quality-gate-
@@ -789,6 +899,8 @@ run_sweep() {
     # see _golw_session_alive. Plain passthrough fields, not a park-style
     # boolean, because "in_progress with a live assignee" is a DIFFERENT
     # bucket from is_park (counted separately — see the ACTIVE split below).
+    # is_waiter (ga-ljcbnms): the 0|1 precondition for the QUEUED bucket (routed, unowned, not dispatched — see
+    # _GOLW_IS_POOL_WAITER_JQ). It sits BEFORE assignee, the last column and the one that is often empty, so it can never slide.
     ids_labels=$(printf '%s' "$aged_json" | jq -r --argjson now_ts "$now" '
         .[] | . as $b
         | ($b.labels // []) as $L
@@ -797,13 +909,14 @@ run_sweep() {
             ($b.updated_at // $b.created_at // ""),
             ( if '"$_GOLW_IS_PARK_JQ"' then "1" else "0" end ),
             ($b.status // ""),
+            ( if '"$_GOLW_IS_POOL_WAITER_JQ"' then "1" else "0" end ),
             ($b.assignee // "")
           ] | @tsv
       ' 2>/dev/null)
     [ -z "${ids_labels:-}" ] && continue
 
-    local bid blabels bts is_park bstatus bassignee age_min probe active lstatus lcount is_live
-    while IFS=$'\t' read -r bid blabels bts is_park bstatus bassignee; do
+    local bid blabels bts is_park bstatus is_waiter bassignee age_min probe active lstatus lcount is_live is_queued
+    while IFS=$'\t' read -r bid blabels bts is_park bstatus is_waiter bassignee; do
       [ -z "${bid:-}" ] && continue
       probe="$(_gate_artifact_probe "$bid")"
       active="$(printf '%s' "$probe" | cut -f1)"
@@ -847,7 +960,24 @@ run_sweep() {
       if [ "$is_park" != "1" ] && [ "$bstatus" = "in_progress" ] && [ -n "${bassignee:-}" ]; then
         is_live="$(_golw_session_alive "$bassignee" "$active_sessions_json")"
       fi
-      flagged_tsv="${flagged_tsv}${bid}\t${store}\t${age_min}\t${blabels}\t${lstatus}\t${lcount}\t${is_park}\t${is_live}\n"
+      # ga-ljcbnms: pool-queue proof. Only a routed, unowned, undispatched bead (is_waiter) that is not parked can be QUEUED (a live
+      # bead is status=in_progress, which is_waiter already rules out); the Pilot log is read on the first such bead and reused for the
+      # rest of the sweep.
+      # vazio (log read, no line for this bead) -> is_queued=0, alert as before; falhou/ilegível (qe_state=unreadable) -> is_queued=0, alert as before
+      is_queued="0"
+      if [ "$is_park" != "1" ] && [ "$is_waiter" = "1" ]; then
+        if [ -z "$qe_state" ]; then
+          if qe_out="$(_golw_pilot_queue_ids "$now")"; then
+            qe_state="ok"; qe_ids=" $(printf '%s' "$qe_out" | tr '\n' ' ') "
+          else
+            qe_state="unreadable"; qe_ids=""
+          fi
+        fi
+        if [ "$qe_state" = "ok" ]; then
+          case "$qe_ids" in (*" $bid "*) is_queued="1" ;; esac
+        fi
+      fi
+      flagged_tsv="${flagged_tsv}${bid}\t${store}\t${age_min}\t${blabels}\t${lstatus}\t${lcount}\t${is_park}\t${is_live}\t${is_queued}\n"
     done <<< "$ids_labels"
   done
 
@@ -857,9 +987,9 @@ run_sweep() {
   # means every downstream stage operates on orphan_tsv exactly as it did
   # before this fix — an un-parked bead's behavior is byte-for-byte identical
   # (AC2 control: a real orphan must keep alerting exactly as today). ────────
-  local orphan_tsv="" park_tsv="" park_count=0 active_tsv="" active_count=0
-  local bid store2 age_min labels lstatus lcount is_park is_live
-  while IFS=$'\t' read -r bid store2 age_min labels lstatus lcount is_park is_live; do
+  local orphan_tsv="" park_tsv="" park_count=0 active_tsv="" active_count=0 queued_tsv="" queued_count=0
+  local bid store2 age_min labels lstatus lcount is_park is_live is_queued
+  while IFS=$'\t' read -r bid store2 age_min labels lstatus lcount is_park is_live is_queued; do
     [ -z "${bid:-}" ] && continue
     if [ "$is_park" = "1" ]; then
       park_tsv="${park_tsv}${bid}\t${store2}\t${age_min}\t${labels}\t${lstatus}\t${lcount}\n"
@@ -871,6 +1001,12 @@ run_sweep() {
       # everything else in this split.
       active_tsv="${active_tsv}${bid}\t${store2}\t${age_min}\t${labels}\t${lstatus}\t${lcount}\n"
       active_count=$((active_count + 1))
+    elif [ "$is_queued" = "1" ]; then
+      # ga-ljcbnms: park and active outrank queued. is_queued is only ever set for a bead that is neither (the guard above leaves
+      # park out and is_waiter rules out a live one), but the order here is the contract: a human's park decision, then a live
+      # builder, then a wait for capacity.
+      queued_tsv="${queued_tsv}${bid}\t${store2}\t${age_min}\t${labels}\t${lstatus}\t${lcount}\n"
+      queued_count=$((queued_count + 1))
     else
       orphan_tsv="${orphan_tsv}${bid}\t${store2}\t${age_min}\t${labels}\t${lstatus}\t${lcount}\n"
     fi
@@ -893,10 +1029,19 @@ run_sweep() {
     done
   fi
 
+  if [ "$queued_count" -gt 0 ]; then
+    log "QUEUED: ${queued_count} bead(s) na fila do pool (roteada, sem dono, com linha recente do Pilot: QUEUED por teto de sessoes ou cedida a P0/P1, ga-ljcbnms) — nao contam para o alerta de orfao"
+    printf '%b' "$queued_tsv" | while IFS=$'\t' read -r bid store2 age_min labels lstatus lcount; do
+      [ -z "${bid:-}" ] && continue
+      log "  - QUEUED $bid ($(_store_name "$store2")) age=${age_min}min labels=[${labels}]"
+    done
+  fi
+
   if [ -z "${flagged_tsv:-}" ]; then
     local park_suffix=""
     [ "$park_count" -gt 0 ] && park_suffix="${park_suffix} (${park_count} parked, excluded)"
     [ "$active_count" -gt 0 ] && park_suffix="${park_suffix} (${active_count} active-live, excluded)"
+    [ "$queued_count" -gt 0 ] && park_suffix="${park_suffix} (${queued_count} queued, excluded)"
     if [ "$state" = "{}" ]; then
       # Nothing currently orphaned AND nothing was ever tracked — genuine
       # no-op, nothing to verify or prune.
@@ -1037,6 +1182,7 @@ run_sweep() {
     local park_suffix2=""
     [ "$park_count" -gt 0 ] && park_suffix2="${park_suffix2} (+${park_count} parked, excluded)"
     [ "$active_count" -gt 0 ] && park_suffix2="${park_suffix2} (+${active_count} active-live, excluded)"
+    [ "$queued_count" -gt 0 ] && park_suffix2="${park_suffix2} (+${queued_count} queued, excluded)"
     log "OK: all ${total_flagged} flagged bead(s) already alerted within cooldown (${GOLW_ALERT_COOLDOWN_S}s) — no new notification${park_suffix2}"
     if [ "${GOLW_DRY_RUN:-0}" != "1" ]; then
       mkdir -p "$GOLW_STATE_DIR" 2>/dev/null || true
@@ -1090,6 +1236,9 @@ run_sweep() {
   if [ "$active_count" -gt 0 ]; then
     summary="${summary} +${active_count} em andamento com sessao viva (status=in_progress, assignee confirmado ativo via gc session list, ga-eiaidn) — nao contam para o alerta acima."
   fi
+  if [ "$queued_count" -gt 0 ]; then
+    summary="${summary} +${queued_count} na fila do pool (roteada, sem dono, com linha recente do Pilot de QUEUED/cedida a P0/P1, ga-ljcbnms) — nao contam para o alerta acima."
+  fi
 
   if [ -n "${GOLW_TEST_NOTIFIED:-}" ]; then
     echo "notify:$summary" >> "$GOLW_TEST_NOTIFIED" 2>/dev/null || true
@@ -1141,7 +1290,9 @@ park signal (gate:needs-human*, blocked-by:*, blocked:*, status=blocked) are exc
 this list entirely (ga-cjk1j) — see the parked-count line above. Beads that are
 status=in_progress with a session-verified-live assignee (gc session list,
 ga-eiaidn) are also excluded while that session remains active — see the
-active-live count line above.
+active-live count line above. Beads waiting in a pool queue (routed, unowned,
+with a recent Pilot QUEUED/ceded line in its log, ga-ljcbnms) are excluded
+too — see the queued count line above.
 
 Per-bead detail for NEW/DUE beads is also posted as a comment on each bead.
 Re-alerts for an already-flagged bead are suppressed for ${GOLW_ALERT_COOLDOWN_S}s
@@ -1187,6 +1338,8 @@ if [ "${1:-}" = "--selftest" ] || [ "${GOLW_SELFTEST:-0}" = "1" ]; then
   STATE_FILE="$TMP/state/golw.state.json"
   HQ="$TMP/hq"
   GOLW_STORES="$TMP/hq $TMP/wa"
+  # ga-ljcbnms: the Pilot-log seam. Without it a selftest on the mini would read the REAL pilot-dispatcher.log.
+  PILOT_TEXT_LOG="$TMP/pilot-dispatcher.log"
 
   mkdir -p "$TMP/fixtures" "$GOLW_STATE_DIR"
 
@@ -2429,6 +2582,259 @@ JEVSTUB
   [ -s "$MAIL46" ] && ok "scenario 46: mail fired normally (Jev did not suppress)" || bad "scenario 46 (regression): mail did NOT fire even though Jev did not suppress -- fix over-widened the new gate"
   [ -s "$NOTIF46" ] && ok "scenario 46: notify fired normally" || bad "scenario 46: notify did NOT fire even though Jev did not suppress"
   rm -f "$STATE_FILE" 2>/dev/null
+
+  # ── ga-ljcbnms: pool-queue split — the 7th instance of this file's class (a LEGITIMATE state the watchdog did not recognise) ──
+  # Reported 12/11 (ga-ljcbnms): wa-a2iz7b.1 (P2, gate:needs-fix + gate:fix-attempt:1, open, no assignee, gc.routed_to=wa-worker) drew a comment
+  # and a mail from this watchdog every ~6 h since 08/11 (20+) while the Pilot kept logging "P2 cedida a P0/P1" for it: a real FAIL
+  # waiting for a wa-worker slot, ceded to P0/P1 by design (ga-5fn5p3). Proof = the line autoheal_escalation_watch.py (WA rig)
+  # already reads: the bead QUEUED at the session cap, or "cedida a P0/P1", in the Pilot's own log inside GOLW_QUEUE_EVIDENCE_MIN.
+  # Three states: proof present -> QUEUED (out of the alert); log read, no line for the bead -> alert as before; log missing or
+  # unreadable -> alert as before (never hidden under doubt). The fixture lines copy the real emitters in pilot-dispatcher.sh.
+  PQ_NOW="$(date +%s)"
+  pilot_stamp() { date -r "$1" '+%Y-%m-%d %H:%M:%S' 2>/dev/null || date -d "@$1" '+%Y-%m-%d %H:%M:%S'; }   # the Pilot's log(): local clock, no zone
+  pq_line() { printf '[%s] [pilot-dispatcher] ga-in9ebr: %s QUEUED — routed to wa-worker, pool at session cap (3 active/creating >= 2 max); not claimed, no writes this sweep (the ga-93yxc pool top-up opens a session once a slot frees).\n' "$(pilot_stamp "$2")" "$1"; }
+  pc_line() { printf '[%s] [pilot-dispatcher] ga-5fn5p3: %s P2 cedida a P0/P1 de whatsapp_automation (P1 %s waits behind wa-worker 3/2) — not claimed, no writes this sweep; stays story:approved and is re-evaluated every sweep.\n' "$(pilot_stamp "$2")" "$1" "${3:-wa-pq-waiter}"; }
+  mk_routed() {  # id labels_csv routed_to [jq patch]: open, unowned, routed (the wa-a2iz7b.1 shape); the patch bends it
+    local lj; lj="$(printf '%s' "$2" | tr ',' '\n' | jq -R . | jq -s -c .)"
+    jq -nc --arg id "$1" --arg ts "$OLD_TS" --arg rt "$3" --argjson l "$lj" '{id:$id,status:"open",updated_at:$ts,metadata:{"gc.routed_to":$rt},labels:$l}' | jq -c "${4:-.}"
+  }
+  pq_setup() { printf '%s\n' "$@" | jq -s -c . > "$TMP/fixtures/candidates-hq.json"; echo '[]' > "$TMP/fixtures/candidates-wa.json"; }   # no gate artifact behind any of them
+  pq_run() {  # n: one sweep over the fixtures with fresh sinks (and a fresh cooldown state unless PQ_KEEP=1); leaves rc, NOTIFPQ, MAILPQ, COMMPQ
+    [ "${PQ_KEEP:-0}" = 1 ] || rm -f "$STATE_FILE" 2>/dev/null
+    NOTIFPQ="$TMP/pq$1.notif"; MAILPQ="$TMP/pq$1.mail"; COMMPQ="$TMP/pq$1.comm"; : > "$NOTIFPQ"; : > "$MAILPQ"; : > "$COMMPQ"; : > "$LOG"
+    GOLW_TEST_NOW="$PQ_NOW" GOLW_TEST_NOTIFIED="$NOTIFPQ" GOLW_TEST_MAILED="$MAILPQ" GOLW_TEST_COMMENTS_LOG="$COMMPQ" run_sweep < /dev/null
+    rc=$?
+  }
+  pq_verdict() {  # scenario; stdin "<id> <Q|F>": Q = listed under QUEUED and not commented, F = commented and not listed
+    local sc="$1" id want inq hascom
+    while read -r id want; do
+      [ -n "$id" ] || continue
+      grep -qF -- "  - QUEUED $id (" "$LOG" && inq=1 || inq=0
+      grep -qF -- ":$id:" "$COMMPQ" && hascom=1 || hascom=0
+      if [ "$want" = Q ] && [ "$inq" = 1 ] && [ "$hascom" = 0 ]; then ok "scenario $sc: $id queued, not alerted"
+      elif [ "$want" = F ] && [ "$inq" = 0 ] && [ "$hascom" = 1 ]; then ok "scenario $sc: $id still alerted"
+      else bad "scenario $sc: $id expected $want, got queued=$inq commented=$hascom"; fi
+    done
+  }
+
+  echo "Scenario 47 (ga-ljcbnms AC a, fixture - the wa-a2iz7b.1 shape): needs-fix bead routed to wa-worker, no assignee, Pilot logged QUEUED 10 min ago -> NOT flagged, counted QUEUED only"
+  pq_setup "$(mk_routed wa-a2iz7b.1 "gate:needs-fix,gate:fix-attempt:1" wa-worker)"
+  pq_line wa-a2iz7b.1 $(( PQ_NOW - 600 )) > "$PILOT_TEXT_LOG"
+  pq_run 47
+  [ "$rc" -eq 0 ] && ok "scenario 47: queued bead does not enter NEW/DUE (return 0)" || bad "scenario 47 (ga-ljcbnms, the exact wa-a2iz7b.1 bug): a bead the Pilot holds for capacity was treated as an orphan-suspect, got $rc"
+  [ ! -s "$COMMPQ" ] && ok "scenario 47: no comment posted on the queued bead" || bad "scenario 47: comment posted on a bead the Pilot is holding for capacity"
+  { [ ! -s "$NOTIFPQ" ] && [ ! -s "$MAILPQ" ]; } && ok "scenario 47: no notify, no mail for a queued-only sweep" || bad "scenario 47: notify or mail fired for a queued-only sweep"
+  grep -q "QUEUED: 1 bead" "$LOG" && ok "scenario 47: log records the queued count" || bad "scenario 47: log missing the QUEUED count line"
+  grep -qF "  - QUEUED wa-a2iz7b.1 (" "$LOG" && ok "scenario 47: log names the queued bead" || bad "scenario 47: log does not name wa-a2iz7b.1 under QUEUED"
+  grep -qE "\[golw\] (PARK|ACTIVE):" "$LOG" && bad "scenario 47: queued bead also counted as PARK/ACTIVE" || ok "scenario 47: queued bead is in its own bucket only"
+  grep -q "(1 queued, excluded)" "$LOG" && ok "scenario 47: the OK line reports the excluded queued bead" || bad "scenario 47: the OK line does not mention the excluded queued bead"
+  rm -f "$STATE_FILE" 2>/dev/null
+
+  echo "Scenario 48 (ga-ljcbnms AC b+c, controls): no usable proof -> still alerts exactly as before, and says why when the log cannot be read"
+  pq_setup "$(mk_routed pq-noline "gate:needs-fix" wa-worker)" "$(mk_routed pq-stale "gate:needs-fix" wa-worker)"
+  { pq_line pq-other $(( PQ_NOW - 300 )); pq_line pq-stale $(( PQ_NOW - 10800 )); } > "$PILOT_TEXT_LOG"
+  pq_run 48
+  [ "$rc" -eq 1 ] && ok "scenario 48: readable log without a recent line for the bead -> flagged (return 1)" || bad "scenario 48 (AC b): no recent Pilot line must keep the alert, got $rc"
+  pq_verdict 48 <<'EOF'
+pq-noline F
+pq-stale F
+EOF
+  { [ -s "$NOTIFPQ" ] && [ -s "$MAILPQ" ]; } && ok "scenario 48: notify and mail still fire" || bad "scenario 48: notify/mail did not fire for beads with no proof"
+  grep -q "QUEUED:" "$LOG" && bad "scenario 48: QUEUED bucket reported with no proof" || ok "scenario 48: no QUEUED bucket without proof"
+  grep -q "WARN: ga-ljcbnms: Pilot log" "$LOG" && bad "scenario 48: WARN about an unreadable log although the log was read" || ok "scenario 48: a readable log raises no unreadable-log WARN"
+  : > "$PILOT_TEXT_LOG"
+  pq_run 48e
+  [ "$rc" -eq 1 ] && ok "scenario 48: empty (readable) log -> flagged (return 1)" || bad "scenario 48: an empty Pilot log must not hide the beads, got $rc"
+  for kind in missing dir noperm; do
+    PILOT_TEXT_LOG="$TMP/pilot-dispatcher.log"
+    if [ "$kind" = missing ]; then PILOT_TEXT_LOG="/nonexistent/pilot-dispatcher.log"
+    elif [ "$kind" = dir ]; then PILOT_TEXT_LOG="$TMP/pilot-as-dir"; mkdir -p "$PILOT_TEXT_LOG"
+    else PILOT_TEXT_LOG="$TMP/pilot-noperm.log"; pq_line pq-noline $(( PQ_NOW - 60 )) > "$PILOT_TEXT_LOG"; chmod 000 "$PILOT_TEXT_LOG"; fi
+    if [ "$kind" = noperm ] && [ "$(id -u)" = 0 ]; then ok "scenario 48: (root reads a chmod 000 file, case skipped)"; continue; fi
+    pq_run "48$kind"
+    [ "$rc" -eq 1 ] && ok "scenario 48: $kind Pilot log -> beads flagged (return 1)" || bad "scenario 48 (AC c): an unreadable Pilot log ($kind) hid the alert, got $rc"
+    pq_verdict "48-$kind" <<'EOF'
+pq-noline F
+pq-stale F
+EOF
+    [ "$(grep -c 'WARN: ga-ljcbnms: Pilot log' "$LOG")" = 1 ] && ok "scenario 48: $kind log -> ONE WARN for the sweep (not one per bead)" || bad "scenario 48: $kind log -> expected exactly one WARN about the Pilot log"
+  done
+  chmod 600 "$TMP/pilot-noperm.log" 2>/dev/null
+  PILOT_TEXT_LOG="$TMP/pilot-dispatcher.log"
+  pq_setup "$(mk_candidate pq-unrouted "$TMP/hq" "gate:needs-fix" "$OLD_TS")" "$(mk_routed pq-lazy-park "gate:needs-fix,blocked:sem-prioridade" wa-worker)"
+  PILOT_TEXT_LOG="/nonexistent/pilot-dispatcher.log" pq_run 48u
+  grep -q "WARN: ga-ljcbnms: Pilot log" "$LOG" && bad "scenario 48: Pilot log read although no candidate could be queued (an unrouted and a parked one only)" || ok "scenario 48: Pilot log is not read unless a candidate is routed, unowned and not parked"
+  rm -f "$STATE_FILE" 2>/dev/null
+
+  echo "Scenario 49 (ga-ljcbnms class control): a fresh Pilot line is proof ONLY for a bead that is routed, unowned and not dispatched; every other shape keeps alerting"
+  pq_setup "$(mk_routed pq-ok "gate:needs-fix" wa-worker)" \
+    "$(mk_routed pq-unrouted "gate:needs-fix" x 'del(.metadata)')" \
+    "$(mk_routed pq-blank "gate:needs-fix" "  ")" \
+    "$(mk_routed pq-owned "gate:needs-fix" wa-worker '.assignee="oracle-wa"')" \
+    "$(mk_routed pq-ownednum "gate:needs-fix" wa-worker '.assignee=5')" \
+    "$(mk_routed pq-dispatched "gate:needs-fix,pilot:dispatched" wa-worker)" \
+    "$(mk_routed pq-dispatched2 "gate:needs-fix,pilot:dispatched:wa-worker" wa-worker)" \
+    "$(mk_routed pq-inprog "gate:needs-fix" wa-worker '.status="in_progress"')" \
+    "$(mk_routed pq-inprog-up "gate:needs-fix" wa-worker '.status="IN_PROGRESS"')" \
+    "$(mk_routed pq-metastr "gate:needs-fix" x '.metadata="oops"')" \
+    "$(mk_routed pq-routenum "gate:needs-fix" x '.metadata["gc.routed_to"]=5')" \
+    "$(mk_routed pq-parked "gate:needs-fix,blocked:sem-prioridade" wa-worker)"
+  for id in pq-ok pq-unrouted pq-blank pq-owned pq-ownednum pq-dispatched pq-dispatched2 pq-inprog pq-inprog-up pq-metastr pq-routenum pq-parked; do pq_line "$id" $(( PQ_NOW - 300 )); done > "$PILOT_TEXT_LOG"
+  pq_run 49
+  [ "$rc" -eq 1 ] && ok "scenario 49: the sweep still alerts (return 1)" || bad "scenario 49: expected return 1, got $rc"
+  pq_verdict 49 <<'EOF'
+pq-ok Q
+pq-unrouted F
+pq-blank F
+pq-owned F
+pq-ownednum F
+pq-dispatched F
+pq-dispatched2 F
+pq-inprog F
+pq-inprog-up F
+pq-metastr F
+pq-routenum F
+EOF
+  { grep -qF "  - PARK pq-parked (" "$LOG" && ! grep -qF "  - QUEUED pq-parked (" "$LOG" && ! grep -qF ":pq-parked:" "$COMMPQ"; } && ok "scenario 49: a parked bead with proof stays PARK (the human's decision outranks), neither queued nor alerted" || bad "scenario 49: parked bead with a Pilot line was not counted as PARK only"
+  rm -f "$STATE_FILE" 2>/dev/null
+
+  echo "Scenario 50 (ga-ljcbnms): what counts as a Pilot line - the exact bead as the SUBJECT, the Pilot's own tag and emitter text, a stamp inside [now-60min, now+5min]"
+  pq_setup "$(mk_routed pt-edge-lo "gate:needs-fix" wa-worker)" "$(mk_routed pt-out-lo "gate:needs-fix" wa-worker)" \
+    "$(mk_routed pt-edge-hi "gate:needs-fix" wa-worker)" "$(mk_routed pt-out-hi "gate:needs-fix" wa-worker)" \
+    "$(mk_routed pt-cedida "gate:needs-fix" wa-worker)" "$(mk_routed pt-qclass "gate:needs-fix" wa-worker)" \
+    "$(mk_routed pt-idpre "gate:needs-fix" wa-worker)" "$(mk_routed pt-idsuf "gate:needs-fix" wa-worker)" \
+    "$(mk_routed pt-waiter "gate:needs-fix" wa-worker)" "$(mk_routed pt-badts "gate:needs-fix" wa-worker)" \
+    "$(mk_routed pt-listed "gate:needs-fix" wa-worker)" "$(mk_routed pt-tag "gate:needs-fix" wa-worker)" \
+    "$(mk_routed pt-far "gate:needs-fix" wa-worker)" "$(mk_routed pt-nocap "gate:needs-fix" wa-worker)" \
+    "$(mk_routed pt-p1x "gate:needs-fix" wa-worker)" "$(mk_routed pt-latin1 "gate:needs-fix" wa-worker)" "$(mk_routed pt-tag2 "gate:needs-fix" wa-worker)" \
+    "$(mk_routed pt-badtag-q "gate:needs-fix" wa-worker)" "$(mk_routed pt-badtag-c "gate:needs-fix" wa-worker)" "$(mk_routed pt-bare-q "gate:needs-fix" wa-worker)" "$(mk_routed pt-bare-c "gate:needs-fix" wa-worker)" \
+    "$(mk_routed pt-badcounts "gate:needs-fix" wa-worker)" "$(mk_routed pt-nodash "gate:needs-fix" wa-worker)"
+  {
+    pq_line pt-edge-lo $(( PQ_NOW - 3600 )); pq_line pt-out-lo $(( PQ_NOW - 3601 ))
+    pq_line pt-edge-hi $(( PQ_NOW + 300 )); pq_line pt-out-hi $(( PQ_NOW + 301 )); pq_line pt-far $(( PQ_NOW + 7200 ))
+    pc_line pt-cedida $(( PQ_NOW - 300 )); pc_line pt-qclass $(( PQ_NOW - 300 )) | sed 's/ P2 cedida/ P? cedida/; s/(P1 /(P? /; s# 3/2)# ?/?)#'
+    pq_line pt-idpre0 $(( PQ_NOW - 60 )); pq_line xpt-idsuf $(( PQ_NOW - 60 )); pc_line pt-other $(( PQ_NOW - 60 )) pt-waiter
+    printf '[%s] [pilot-dispatcher] ga-in9ebr: pt-badts QUEUED — routed to wa-worker, pool at session cap (3 active/creating >= 2 max); not claimed\n' "$(pilot_stamp "$PQ_NOW" | cut -c1-16)"   # a stamp with no seconds
+    printf '[%s] [pilot-dispatcher] Dispatch queue (next up, priority order):\n[%s] [pilot-dispatcher]   [small] pt-listed P2 — some title\n' "$(pilot_stamp "$PQ_NOW")" "$(pilot_stamp "$PQ_NOW")"
+    pq_line pt-tag $(( PQ_NOW - 60 )) | sed 's/\[pilot-dispatcher\]/[other-daemon]/'; pc_line pt-tag2 $(( PQ_NOW - 60 )) | sed 's/\[pilot-dispatcher\]/[other-daemon]/'
+    printf '[%s] [pilot-dispatcher] ga-in9ebr: pt-nocap QUEUED — routed to wa-worker, dolt unhealthy, nothing claimed\n' "$(pilot_stamp "$PQ_NOW")"
+    pc_line pt-p1x $(( PQ_NOW - 60 )) | sed 's#P0/P1 de#P0/P1x de#'
+    printf '[%s] [pilot-dispatcher] ga-in9ebr: pt-latin1 QUEUED — routed to wa-worker, pool at session cap (3 active/creating >= 2 max); not claimed, no writes \351 this sweep\n' "$(pilot_stamp "$PQ_NOW")"
+    printf '[%s] [pilot-dispatcher] foo: pt-badtag-q QUEUED — routed to wa-worker, pool at session cap (3 active/creating >= 2 max); not claimed\n' "$(pilot_stamp "$PQ_NOW")"
+    pc_line pt-badtag-c $(( PQ_NOW - 60 )) | sed 's/ga-5fn5p3:/foo:/'
+    printf '[%s] [pilot-dispatcher] ga-in9ebr: pt-badcounts QUEUED — routed to wa-worker, pool at session cap (x active/creating >= y max); not claimed\n' "$(pilot_stamp "$PQ_NOW")"
+    pc_line pt-nodash $(( PQ_NOW - 60 )) | sed 's/) — not claimed/) - not claimed/'
+    printf '[%s] [pilot-dispatcher] ga-in9ebr: pt-bare-q QUEUED — pool at session cap\n[%s] [pilot-dispatcher] ga-5fn5p3: pt-bare-c P2 cedida a P0/P1 de whatsapp_automation\n' "$(pilot_stamp "$PQ_NOW")" "$(pilot_stamp "$PQ_NOW")"
+  } > "$PILOT_TEXT_LOG"
+  LC_ALL=en_US.UTF-8 pq_run 50
+  pq_verdict 50 <<'EOF'
+pt-edge-lo Q
+pt-out-lo F
+pt-edge-hi Q
+pt-out-hi F
+pt-far F
+pt-cedida Q
+pt-qclass Q
+pt-idpre F
+pt-idsuf F
+pt-waiter F
+pt-badts F
+pt-listed F
+pt-tag F
+pt-tag2 F
+pt-nocap F
+pt-p1x F
+pt-latin1 Q
+pt-badtag-q F
+pt-badtag-c F
+pt-bare-q F
+pt-bare-c F
+pt-badcounts F
+pt-nodash F
+EOF
+  rm -f "$STATE_FILE" 2>/dev/null
+
+  echo "Scenario 51 (ga-ljcbnms): the Pilot's stamp is LOCAL time (a UTC-rendered stamp is 9 h off under TZ=JST-9), and GOLW_QUEUE_EVIDENCE_MIN moves the window"
+  pq_setup "$(mk_routed pz-local "gate:needs-fix" wa-worker)" "$(mk_routed pz-utc "gate:needs-fix" wa-worker)"
+  { TZ=JST-9 pq_line pz-local $(( PQ_NOW - 600 )); TZ=UTC pq_line pz-utc $(( PQ_NOW - 600 )); } > "$PILOT_TEXT_LOG"
+  TZ=JST-9 pq_run 51
+  pq_verdict 51-tz <<'EOF'
+pz-local Q
+pz-utc F
+EOF
+  pq_setup "$(mk_routed pw-10min "gate:needs-fix" wa-worker)" "$(mk_routed pw-3570 "gate:needs-fix" wa-worker)" "$(mk_routed pw-3630 "gate:needs-fix" wa-worker)"
+  { pq_line pw-10min $(( PQ_NOW - 600 )); pq_line pw-3570 $(( PQ_NOW - 3570 )); pq_line pw-3630 $(( PQ_NOW - 3630 )); } > "$PILOT_TEXT_LOG"
+  while read -r win w10 w3570 w3630; do   # beads: 10 min, 59.5 min, 60.5 min old. A window that is not a positive integer without a leading zero is 60; one that cannot be placed on the clock (before 1970 or beyond year 9999) widens nothing
+    [ "$win" = empty ] && win=""
+    GOLW_QUEUE_EVIDENCE_MIN="$win" pq_run 51w
+    pq_verdict "51-win=${win:-empty}" <<EOF
+pw-10min $w10
+pw-3570 $w3570
+pw-3630 $w3630
+EOF
+  done <<'TABLE'
+5 F F F
+15 Q F F
+60 Q Q F
+empty Q Q F
+abc Q Q F
+0 Q Q F
+007 Q Q F
+-5 Q Q F
+50000000 F F F
+99999999999 F F F
+TABLE
+  # the read is bounded to the last GOLW_PILOT_TAIL_BYTES: a line cut by the bound breaks nothing and proves nothing; a bound that cannot be applied is a WARN, not an empty queue
+  pq_setup "$(mk_routed pw-tail-cut "gate:needs-fix" wa-worker)" "$(mk_routed pw-tail-ok "gate:needs-fix" wa-worker)"
+  { pq_line pw-tail-cut $(( PQ_NOW - 300 )); pq_line pw-tail-ok $(( PQ_NOW - 200 )); } > "$PILOT_TEXT_LOG"
+  GOLW_PILOT_TAIL_BYTES=$(( $(pq_line pw-tail-ok $(( PQ_NOW - 200 )) | wc -c) + 5 )) pq_run 51t
+  pq_verdict 51-tail <<'EOF'
+pw-tail-cut F
+pw-tail-ok Q
+EOF
+  GOLW_PILOT_TAIL_BYTES=abc pq_run 51tb
+  pq_verdict 51-tail-abc <<'EOF'
+pw-tail-cut F
+pw-tail-ok F
+EOF
+  [ "$(grep -c 'WARN: ga-ljcbnms: reading the Pilot log' "$LOG")" = 1 ] && ok "scenario 51: a tail bound that cannot be applied -> ONE WARN, beads alerted" || bad "scenario 51: expected exactly one 'reading the Pilot log failed' WARN for an unusable tail bound"
+  rm -f "$STATE_FILE" 2>/dev/null
+
+  echo "Scenario 52 (ga-ljcbnms mixed, mirrors 35): 1 real orphan + 1 parked bead that ALSO has proof + 1 active-live + 1 queued in one sweep -> four independent buckets"
+  pq_setup "$(mk_routed pm-orphan "gate:fix-attempt:1" wa-worker)" "$(mk_routed pm-park "gate:fix-attempt:1,gate:needs-human:technical" wa-worker)" \
+    "$(mk_routed pm-live "gate:fix-attempt:1" wa-worker '.status="in_progress" | .assignee="oracle-wa"')" "$(mk_routed pm-queued "gate:fix-attempt:1" wa-worker)"
+  echo '{"sessions":[{"name":"oracle-wa","agent_name":"oracle-wa","alias":"oracle-wa","template":"oracle-wa","session_name":"oracle-wa-awisppq","state":"active"}]}' > "$TMP/fixtures/sessions-active.json"
+  { pq_line pm-park $(( PQ_NOW - 300 )); pq_line pm-live $(( PQ_NOW - 300 )); pq_line pm-queued $(( PQ_NOW - 300 )); } > "$PILOT_TEXT_LOG"
+  pq_run 52
+  [ "$rc" -eq 1 ] && ok "scenario 52: the real orphan still alerts (return 1)" || bad "scenario 52: expected return 1, got $rc"
+  pq_verdict 52 <<'EOF'
+pm-orphan F
+pm-queued Q
+EOF
+  { grep -q "\[golw\] PARK: 1 bead" "$LOG" && grep -q "\[golw\] ACTIVE: 1 bead" "$LOG" && grep -q "\[golw\] QUEUED: 1 bead" "$LOG"; } && ok "scenario 52: PARK, ACTIVE and QUEUED are counted independently (1 each)" || bad "scenario 52: bucket counts are wrong"
+  { ! grep -qF ":pm-park:" "$COMMPQ" && ! grep -qF ":pm-live:" "$COMMPQ" && ! grep -qF "pm-queued" "$MAILPQ" && ! grep -qF "pm-park" "$MAILPQ" && ! grep -qF "pm-live" "$MAILPQ"; } && ok "scenario 52: neither excluded bead is commented or named in the mail" || bad "scenario 52: an excluded bead leaked into a comment or the mail"
+  grep -q "na fila do pool" "$MAILPQ" && ok "scenario 52: the mail summary carries the queued count" || bad "scenario 52: the mail summary does not mention the queued bead"
+  PQ_KEEP=1 pq_run 52c
+  grep -qF "within cooldown" "$LOG" && grep -qF "(+1 queued, excluded)" "$LOG" && ok "scenario 52: inside the cooldown the OK line still reports the queued exclusion" || bad "scenario 52: the within-cooldown OK line lost the queued count"
+  rm -f "$STATE_FILE" "$TMP/fixtures/sessions-active.json" 2>/dev/null
+
+  echo "Scenario 53 (ga-ljcbnms x ga-tqe4j): a tracked orphan-suspect that becomes QUEUED is never declared RESOLVED, keeps its first_seen and alerts nothing; when the proof goes it is an orphan-suspect again"
+  rm -f "$STATE_FILE" 2>/dev/null
+  pq_setup "$(mk_routed pk-track "gate:needs-fix" wa-worker)"
+  : > "$PILOT_TEXT_LOG"
+  pq_run 53a
+  grep -q '"pk-track"' "$STATE_FILE" 2>/dev/null && ok "scenario 53: tracked after the 1st sweep (no proof, real alert)" || bad "scenario 53: pk-track not tracked after the 1st sweep"
+  FS53="$(jq -r '.["pk-track"].first_seen' "$STATE_FILE" 2>/dev/null)"
+  printf '[%s]' "$(mk_routed pk-track "gate:needs-fix" wa-worker)" > "$TMP/fixtures/recheck-pk-track.json"
+  pq_line pk-track $(( PQ_NOW - 300 )) > "$PILOT_TEXT_LOG"
+  PQ_KEEP=1 pq_run 53b
+  { [ "$rc" -eq 0 ] && [ ! -s "$COMMPQ" ]; } && ok "scenario 53: once queued it alerts nothing (return 0, no comment)" || bad "scenario 53: a tracked bead that became queued still alerted, got $rc"
+  grep -q "RESOLVED: pk-track" "$LOG" && bad "scenario 53: queued bead logged RESOLVED although its label never cleared" || ok "scenario 53: queued bead is never logged RESOLVED"
+  [ "$(jq -r '.["pk-track"].first_seen // "gone"' "$STATE_FILE" 2>/dev/null)" = "$FS53" ] && ok "scenario 53: still tracked with the same first_seen" || bad "scenario 53: the tracked entry was pruned or rewritten while the bead was queued"
+  : > "$PILOT_TEXT_LOG"
+  PQ_KEEP=1 pq_run 53c
+  { grep -q "FLAGGED: 1 bead" "$LOG" && [ ! -s "$COMMPQ" ] && [ "$(jq -r '.["pk-track"].first_seen // "gone"' "$STATE_FILE" 2>/dev/null)" = "$FS53" ]; } && ok "scenario 53: proof gone -> flagged again, inside the 6 h cooldown (no new comment), first_seen intact" || bad "scenario 53: after the proof went away the bead did not return to the orphan set cleanly"
+  rm -f "$TMP/fixtures/recheck-pk-track.json" "$STATE_FILE" 2>/dev/null
 
   echo ""
   echo "gate-orphaned-label-watchdog selftest: PASS=$PASS FAIL=$FAIL"
