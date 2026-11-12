@@ -15,8 +15,9 @@
 # healthy scenarios prove the spy does see a pour/burn when one happens.
 #
 # Sibling guards that read the same section: witness-patrol-wisp-store.selftest.sh (structure: -C pins, anchors on the
-# first `BD_C=()` and the last `gc hook` line of the No-Idle block) and witness-patrol-liveness-read-failure.selftest.sh
-# (the session-bead overlay read). This file owns the behavior of the three blocks.
+# first `BD_C=()` and the last `gc hook` line of the No-Idle block), witness-patrol-liveness-read-failure.selftest.sh
+# (the session-bead overlay read) and witness-prompt-pour-idempotent.selftest.sh (ga-5cl2vvn: running the two pouring blocks
+# AGAIN after a failure ends with one wisp). This file owns the behavior of the three blocks on one run.
 #
 # ga-84wifto (the two low findings the gate carried from ga-6zrshxb, plus the stale paragraph): exit 0 with a bare `[]` is
 # NOT "has" (the contract is exit 0 = work, the same reading as pool-autoscale-watchdog.py _pool_probe_verdict, where exit 0
@@ -94,6 +95,7 @@ cat > "$STUBDIR/bin/gc" <<'STUB'
 # Every call goes to the spy ($SPY, one line); the answer comes from the scenario's STUB_* variables.
 printf 'GC %s\n' "$*" >> "${SPY:-/dev/null}"
 case "${1:-}" in
+  mail) exit 0 ;;   # logged by the spy above; the blocks mail the mayor when what a pour left behind cannot be undone (ga-5cl2vvn)
   hook)
     [ -n "${STUB_HOOK_OUT:-}" ] && printf '%s\n' "$STUB_HOOK_OUT"
     [ -n "${STUB_HOOK_ERR:-}" ] && printf '%s\n' "$STUB_HOOK_ERR" >&2
@@ -228,12 +230,18 @@ step3_nopour() {
 }
 echo ""
 echo "Group B: Step 3 — only a clean empty read may pour"
-# GC_ALIAS differs from GC_AGENT here on purpose: the read must go by GC_AGENT (what the bead and the No-Idle block use), not by the alias Step 3 assigns with
+# GC_ALIAS differs from GC_AGENT here on purpose: the read AND the assign must go by GC_AGENT (what the bead and the No-Idle block use), never by the alias:
+# a wisp assigned to the alias is one the guard read of the next run cannot see (ga-5cl2vvn)
 run_block "$STEP3" STUB_ANY_BODY='[]' GC_ALIAS=some-other-alias
 if [ "$(spy_n "$POUR_RE")" -eq 1 ] && [ "$(spy_n "$ASSIGN_RE")" -eq 1 ] && [ "$RC" -eq 0 ]; then
   ok "clean empty read ([] and exit 0) -> exactly one pour and one assign, exit 0"
 else
   bad "clean empty read did not bootstrap (pours=$(spy_n "$POUR_RE"), assigns=$(spy_n "$ASSIGN_RE"), exit $RC) :: $OUT"
+fi
+if printf '%s\n' "$SPY_LOG" | grep -F -q -- "update ga-wisp-new --assignee=$FAKE_AGENT" && ! printf '%s\n' "$SPY_LOG" | grep -F -q -- 'some-other-alias'; then
+  ok "the assign goes to GC_AGENT, the identity the guard reads with (GC_ALIAS is not used)"
+else
+  bad "the assign does not go to GC_AGENT, or the alias leaked into a gc call: $SPY_LOG"
 fi
 if printf '%s\n' "$SPY_LOG" | grep -F -q "GC bd -C $FAKE_RIG list --assignee=$FAKE_AGENT --type=molecule --include-infra --limit=1 --json"; then
   ok "the guard reads the pinned store, by this witness's identity, molecules incl. infra, limit 1"

@@ -1207,6 +1207,15 @@ seguia para o Step 3, que despeja outro wisp. São TRÊS estados, nunca dois:
 leitura falhou ou veio ilegível). Só "não tem" autoriza um pour; "não sei" não
 faz pour.
 
+⚠️ **Quinto defeito (ga-5cl2vvn, 12/11):** o pour do Step 3 e o do bloco "No Idle"
+liam o wisp novo de volta ANTES de atribuí-lo. Um pour que DEU certo seguido de
+uma leitura que falha (timeout sob load) deixava um wisp SEM DONO: nenhuma leitura
+por assignee o acha e o reaper não o fecha (wisp raiz não tem pai), então a
+repetição do bloco despejava outro. Um assign que falhava deixava o mesmo rastro.
+Agora os dois blocos atribuem ANTES de reler, leem o exit do assign e queimam o
+wisp que acabaram de despejar se não conseguem atribuí-lo (nunca o atual): é o
+desenho do step `next-iteration` da formula (ga-jhsxo4p).
+
 **Como aplicar** — troque o Step 1, o Step 3 e o bloco "CRITICAL: No Idle
 State" do prompt nativo pelos comandos abaixo. Deixe os Steps 2 e 4 do
 Startup Protocol nativo (mail, execução) como estão.
@@ -1256,9 +1265,13 @@ wisp duplicado).
 Step 2 não achou nada): antes de qualquer pour ele LÊ o store pinado e só faz o
 pour se a leitura respondeu vazia (`[]` com exit 0); wisp seu já existente = não
 faz pour (retome-o); leitura que falhou ou veio ilegível = NÃO SEI = não faz
-pour. Pina o banco certo com `-C` e passa `rig_root` (só o override usa essa
-variável, para repetir o pin nos ciclos seguintes; a formula nativa a ignora; veja
-o fim desta seção):
+pour. Depois do pour ele atribui o wisp a `$GC_AGENT` (a mesma identidade que a
+leitura de guarda usa) ANTES de lê-lo de volta e lê o exit do assign (ga-5cl2vvn):
+se a releitura falha, o wisp já é seu e a leitura de guarda o acha pelo assignee,
+então rodar o Step 3 de novo não despeja outro; se o assign falha, queima o wisp
+que acabou de despejar. Pina o banco certo com `-C` e passa `rig_root` (só o
+override usa essa variável, para repetir o pin nos ciclos seguintes; a formula
+nativa a ignora; veja o fim desta seção):
 ```bash
 [ -n "$GC_AGENT" ] || { echo "Step 3: GC_AGENT vazio, não sei de quem é o wisp — NÃO faça pour." >&2; exit 1; }
 # vazio ([] com exit 0) → segue para o pour; tem (id) → NÃO faz pour, retome esse wisp; falhou/ilegível → NÃO SEI, NÃO faz pour
@@ -1269,20 +1282,60 @@ if [ -n "$HAVE_WISP" ]; then
   echo "Step 3: o wisp $HAVE_WISP já está atribuído a $GC_AGENT — NÃO faça pour; retome esse wisp."
   exit 0
 fi
+# vazio → o pour não devolveu id, mas um wisp PODE existir (a resposta se perde depois do commit): nada é atribuído nem queimado por palpite e o mayor é avisado por mail (se o mail falha, o bloco diz); falhou/ilegível → o mesmo
 NEW_WISP=$(gc bd -C '{{ .RigRoot }}' mol wisp mol-witness-patrol --root-only --var binding_prefix='{{ .BindingPrefix }}' --var rig_root='{{ .RigRoot }}' --json | jq -r '.new_epic_id // empty')
-if [ -z "$NEW_WISP" ] || ! gc bd -C '{{ .RigRoot }}' show "$NEW_WISP" --json >/dev/null 2>&1; then
-  echo "Bootstrap pour failed or landed outside {{ .RigRoot }} (NEW_WISP='$NEW_WISP')." >&2
+if [ -z "$NEW_WISP" ]; then
+  echo "Step 3: o pour não devolveu id de wisp — um wisp PODE ter sido criado sem dono; nada foi atribuído nem queimado." >&2
+  gc mail send mayor/ -s "WITNESS: bootstrap do mol-witness-patrol sem id de wisp" -m "O Step 3 de $GC_AGENT despejou um wisp em {{ .RigRoot }} e não recebeu o id de volta (o pour falhou, ou a resposta se perdeu depois de o wisp ser criado). Pode haver um wisp sem dono: procure com gc bd -C '{{ .RigRoot }}' list --no-assignee --type=molecule --include-infra --status=open --json e queime o do mol-witness-patrol que achar com gc bd -C '{{ .RigRoot }}' mol burn <id> --force." \
+    || echo "Step 3: o mail ao mayor FALHOU — avise-o você, por gc session nudge mayor/: um wisp sem dono pode estar no store de {{ .RigRoot }}." >&2
   exit 1
 fi
-gc bd -C '{{ .RigRoot }}' update "$NEW_WISP" --assignee="$GC_ALIAS"
+# escrita, não leitura: se o assign falha, queima o wisp que acabou de despejar para o Step 3 seguinte começar limpo; se o burn também falha, diz alto e manda o id ao mayor por mail (se o mail falha, o bloco diz)
+if ! gc bd -C '{{ .RigRoot }}' update "$NEW_WISP" --assignee="$GC_AGENT"; then
+  if gc bd -C '{{ .RigRoot }}' mol burn "$NEW_WISP" --force; then
+    echo "Step 3: não consegui atribuir $NEW_WISP a $GC_AGENT — queimei-o, nada ficou para trás; espere um minuto e repita o Step 1." >&2
+  else
+    echo "Step 3: não consegui atribuir $NEW_WISP a $GC_AGENT nem queimá-lo — $NEW_WISP FICOU PARA TRÁS (provavelmente sem dono)." >&2
+    gc mail send mayor/ -s "WITNESS: bootstrap do mol-witness-patrol deixou o wisp $NEW_WISP" -m "O Step 3 de $GC_AGENT despejou $NEW_WISP e não conseguiu atribuí-lo nem queimá-lo (pode ter caído fora de {{ .RigRoot }}: o vazamento de store do ga-3v2n4). Sem dono, nenhuma leitura por assignee o acha e nenhum reaper o fecha (wisp raiz não tem pai). Limpe com gc bd -C '{{ .RigRoot }}' mol burn $NEW_WISP --force (ou no store onde ele caiu)." \
+      || echo "Step 3: o mail ao mayor FALHOU — avise-o você, por gc session nudge mayor/, com o id $NEW_WISP." >&2
+  fi
+  exit 1
+fi
+# vazio → n/a (só o exit importa); falhou → $NEW_WISP já está atribuído a mim, então o Step 3 seguinte o acha pelo assignee e não despeja outro
+if ! gc bd -C '{{ .RigRoot }}' show "$NEW_WISP" --json >/dev/null 2>&1; then
+  echo "Step 3: $NEW_WISP está atribuído a $GC_AGENT mas não deu para lê-lo de volta — espere um minuto e repita o Step 1: o Step 3 acha $NEW_WISP pelo assignee e não despeja outro." >&2
+  exit 1
+fi
+echo "Step 3: o wisp $NEW_WISP foi despejado e atribuído a $GC_AGENT."
 ```
+
+**Se o Step 3 saiu 1:** o bloco não conseguiu confirmar que há um wisp seu (exit 0 =
+há: retomado, ou despejado agora e atribuído) e diz por quê. Não é "sem wisp":
+espere um minuto e repita o Step 1. Três exit 1 seguidos: `gc session nudge mayor/
+"witness <seu rig>: Step 3 falhou 3x"` com a última linha que o bloco imprimiu, e
+termine o turno. O que o bloco não consegue desfazer (o pour que responde sem id; o
+assign e o burn que falham juntos) vai ao mayor por mail com o id do wisp ou com a
+leitura que o acha (se o mail falha, o bloco diz e o aviso passa a ser seu, por nudge):
+quem limpa é o mayor.
 
 **Bloco "CRITICAL: No Idle State" substituto** (corrige as 3 causas de uma
 vez: `--type=molecule --include-infra` em vez do `--type=wisp` inválido, e
 `-C` pinando o banco certo — com fallback gracioso pro cwd antigo só no caso
 extremo de um rig sem `RigRoot`, para não travar onde não há repo dedicado).
 As duas leituras (wisp em andamento e próximo wisp) saem em três estados: uma
-que falha ou vem ilegível NÃO vira "vazio" — sem pour e sem burn (ga-6zrshxb):
+que falha ou vem ilegível NÃO vira "vazio" — sem pour e sem burn (ga-6zrshxb).
+O pour é seguro de repetir (ga-5cl2vvn): o wisp novo é atribuído ANTES de ser lido
+de volta, o exit do assign é lido, e se o assign falha o bloco queima o wisp que
+acabou de despejar (nunca o atual). O que o bloco não consegue desfazer (o pour que
+responde sem id; o assign e o burn que falham juntos) vai ao mayor por mail com o
+id do wisp ou com a leitura que o acha (se o mail falha, o bloco diz e o aviso passa
+a ser seu, por nudge). O wisp atual só é queimado depois que o
+próximo existe e está atribuído a você; exit 1 = isso não foi confirmado (o bloco
+diz por quê) e o atual NÃO foi queimado: espere um minuto e rode o bloco de novo.
+Se o próximo já foi atribuído a você (só a releitura falhou), a leitura
+`--status=open` o acha e o bloco não despeja outro. Três exit 1 seguidos:
+`gc session nudge mayor/ "witness <seu rig>: No-Idle falhou 3x"` com a
+última linha que o bloco imprimiu, e termine o turno sem burn:
 ```bash
 BD_C=()
 if [ -n '{{ .RigRoot }}' ]; then
@@ -1305,13 +1358,28 @@ fi
 # vazio → ASSIGNED_WISP="" (o próximo ainda não existe); falhou/ilegível → NÃO SEI: sem pour e sem burn
 ASSIGNED_WISP=$(wisp_id --status=open --type=molecule --include-infra) || { echo "NÃO SEI se o próximo wisp já existe — sem pour e sem burn; repita depois." >&2; exit 1; }
 pour_next() {
+  # vazio → o pour não devolveu id, mas um wisp PODE existir (a resposta se perde depois do commit): nada é atribuído nem queimado por palpite e o mayor é avisado por mail (se o mail falha, o bloco diz); falhou/ilegível → o mesmo
   NEXT=$(gc bd "${BD_C[@]}" mol wisp mol-witness-patrol --root-only --var binding_prefix='{{ .BindingPrefix }}' --var rig_root='{{ .RigRoot }}' --json | jq -r '.new_epic_id // empty')
-  if [ -z "$NEXT" ] || ! gc bd "${BD_C[@]}" show "$NEXT" --json >/dev/null 2>&1; then
-    echo "Could not pour/verify next witness wisp; not burning." >&2
+  if [ -z "$NEXT" ]; then
+    echo "Could not pour next witness wisp: the pour returned no wisp id (a wisp MAY exist, unassigned); nothing assigned, nothing burned, the current wisp NOT burned." >&2
+    gc mail send mayor/ -s "WITNESS: mol-witness-patrol pour returned no wisp id" -m "The No-Idle block of $GC_AGENT poured the next witness wisp in {{ .RigRoot }} and got no wisp id back (the pour failed, or its answer was lost after the wisp was created). A stray unassigned wisp may exist: look with: bd ${BD_C[*]} list --no-assignee --type=molecule --include-infra --status=open --json -- and burn a mol-witness-patrol wisp you find there with: bd ${BD_C[*]} mol burn <id> --force. The current wisp was NOT burned." \
+      || echo "The mail to the mayor FAILED -- tell the mayor yourself, with gc session nudge mayor/: an unassigned wisp may be in the store." >&2
     return 1
   fi
+  # escrita, não leitura: se o assign falha, queima o wisp que acabou de despejar (nunca o atual) para a repetição começar limpa; se o burn também falha, diz alto e manda o id ao mayor por mail (se o mail falha, o bloco diz)
   if ! gc bd "${BD_C[@]}" update "$NEXT" --assignee="$GC_AGENT"; then
-    echo "Could not assign next witness wisp; not burning." >&2
+    if gc bd "${BD_C[@]}" mol burn "$NEXT" --force; then
+      echo "Could not assign next witness wisp $NEXT to $GC_AGENT -- burned it, nothing left behind; the current wisp NOT burned; wait a minute and run this block again." >&2
+    else
+      echo "Could not assign next witness wisp $NEXT to $GC_AGENT and could not burn it either -- $NEXT is LEFT BEHIND (probably unassigned); the current wisp NOT burned." >&2
+      gc mail send mayor/ -s "WITNESS: mol-witness-patrol left a stray wisp $NEXT" -m "The No-Idle block of $GC_AGENT poured $NEXT but could neither assign nor burn it (it may have landed outside {{ .RigRoot }}: the ga-3v2n4 wrong-store leak). If it is unassigned, no assignee read finds it and no reaper closes it (a root-only patrol wisp has no parent). Clean up with: bd ${BD_C[*]} mol burn $NEXT --force (or in the store where it landed). The current wisp was NOT burned." \
+        || echo "The mail to the mayor FAILED -- tell the mayor yourself, with gc session nudge mayor/, with the id $NEXT." >&2
+    fi
+    return 1
+  fi
+  # vazio → n/a (só o exit importa); falhou → $NEXT já está atribuído a mim: repetir o bloco o acha pela leitura de ASSIGNED_WISP e não despeja outro; o atual NÃO é queimado
+  if ! gc bd "${BD_C[@]}" show "$NEXT" --json >/dev/null 2>&1; then
+    echo "Next witness wisp $NEXT is assigned to $GC_AGENT but could not be read back; the current wisp NOT burned; wait a minute and run this block again: it finds $NEXT by its assignee and does not pour again." >&2
     return 1
   fi
   printf '%s' "$NEXT"
@@ -1329,23 +1397,24 @@ gc hook
 
 **Onde a guarda da formula vale — e onde NÃO vale (ga-zo1bzza; reescrito em ga-84wifto).** O override
 `packs/town-deltas/formulas/mol-witness-patrol.toml` (step `next-iteration` com
-`-C '{{ .RigRoot }}'` e verificação pós-pour antes de assign/burn; leitura do
-overlay de sessões com `-C "$GC_CITY_PATH"`) vale na HQ e chega aos rigs por duas
-ligações, porque cada rig importa apenas o pack `gastown`
+`-C '{{ .RigRoot }}'`, lendo os seus wisps antes do pour e atribuindo o novo antes de
+relê-lo; leitura do overlay de sessões com `-C "$GC_CITY_PATH"`) vale na HQ e chega
+aos rigs por duas ligações, porque cada rig importa apenas o pack `gastown`
 (`[rigs.imports.gastown]` no `city.toml`): `formulas_dir = "rig-overrides/formulas"`
 em cada rig (ga-p8ip28d), que só alcança os rigs sem `.beads/redirect`; nos que têm
 (hoje gastown, lexbh e marketing) o `bd` lê `~/gt/.beads/formulas/`, e o link de lá
 é estado local, fora do git, que `scripts/rig-formula-redirect-link.sh --apply`
 recria (ga-6pil72r). Só que o texto da SUA wisp foi gravado quando ela foi
 despejada: uma wisp anterior a essas ligações, ou de um rig que perdeu o link, segue
-com a formula NATIVA (sem `rig_root`, sem `-C`, sem verificação) até ser queimada.
+com a formula NATIVA (sem `rig_root`, sem `-C`, sem leitura antes do pour nem conferência depois) até ser queimada.
 Confira no step `next-iteration` dela: com `-C` é o override; sem `-C` é a nativa, e
 então as guardas são as deste prompt — e quem as aplica é você:
 
 **Pour/burn (step `next-iteration`).** Se o step da sua wisp traz `gc bd mol
 wisp`, `show`, `update` ou `mol burn` sem `-C`, não os rode como estão: use o
-bloco "CRITICAL: No Idle State" acima (pina `-C` e confere o pour antes de
-atribuir/queimar).
+bloco "CRITICAL: No Idle State" acima (pina `-C`, lê os seus wisps antes do pour,
+atribui o wisp novo antes de relê-lo e só queima o atual depois que o próximo
+existe e é seu).
 
 **Overlay de sessões (step `recover-orphaned-beads`).** Os beads de sessão moram
 no store da CIDADE. Sem `-C` o `gc bd` lê o store do cwd: no agent-home do
