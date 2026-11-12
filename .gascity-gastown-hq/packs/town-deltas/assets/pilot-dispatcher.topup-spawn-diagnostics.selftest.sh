@@ -101,9 +101,11 @@ printf 'gc\t%s\n' "\$*" >> "$CALLS"
 $_rs_gc_body
 GCSCRIPT
   chmod +x "$WORK/bin/gc"
+  mkdir -p "$WORK/tmp"
   (
     PATH="$SANDBOX_PATH"
     GC_CITY="test-city"
+    TMPDIR="${RS_TMPDIR-$WORK/tmp}"; export TMPDIR   # ga-qnarixf: the stderr scratch file lives under TMPDIR; RS_TMPDIR=<dir> points it somewhere else
     PILOT_SPAWN_TIMEOUT_SECS="${RS_TIMEOUT:-5}"   # ga-6hr8p7: RS_TIMEOUT=<s> shortens the budget for the real-kill scenario
     PILOT_TOPUP_RETRY_DELAY_SECS=0
     log()  { printf 'log\t%s\n'  "$*" >> "$CALLS"; }
@@ -115,10 +117,18 @@ GCSCRIPT
     _pilot_topup_spawn "$_rs_pool" "$_rs_pending"
     echo "RC=$?" >> "$CALLS"
     echo "SLOW=${_PILOT_SLOW_SPAWN_SEEN:-0}" >> "$CALLS"
+    printf 'OUT=%s\n' "${_TOPUP_SPAWN_OUT:-}" >> "$CALLS"   # ga-qnarixf: what the spawn kept for the bind (single-line JSON in every scenario)
+    # RS_TWICE=1: a SECOND spawn in the same shell, as the top-up loop does — what the first one kept must not survive into it.
+    if [ "${RS_TWICE:-0}" = "1" ]; then
+      _pilot_topup_spawn "$_rs_pool" "$_rs_pending"
+      echo "RC2=$?" >> "$CALLS"
+      printf 'OUT2=%s\n' "${_TOPUP_SPAWN_OUT:-}" >> "$CALLS"
+    fi
   )
 }
 
 has_call() { grep -qF -- "$1" "$CALLS" 2>/dev/null; }
+scratch_clean() { [ -z "$(ls -A "$WORK/tmp" 2>/dev/null)" ]; }   # the stderr scratch file of a spawn is gone when it returns
 gc_calls() { local _gn; _gn=$(cat "$WORK/gc_call_count" 2>/dev/null); echo "${_gn:-0}"; }   # empty file (no gc call was made) reads as 0, not ""
 
 echo "pilot-dispatcher.topup-spawn-diagnostics.selftest — real stderr capture + single retry (ga-kmm6rb)"
@@ -131,7 +141,7 @@ if has_call "RC=0" && [ "$(gc_calls)" -eq 1 ]; then
 else
   bad "expected RC=0 with exactly 1 gc call, got $(gc_calls) calls (dump: $(cat "$CALLS" | tr '\n' '|'))"
 fi
-if grep -q '^warn\t' "$CALLS"; then
+if grep -q $'^warn\t' "$CALLS"; then   # a real TAB: GNU grep 3.11 reads '\t' as the letter t (measured), so the old pattern passed whatever was logged
   bad "REGRESSION: warned on a clean first-attempt success"
 else
   ok "no warn logged on clean success"
@@ -310,13 +320,13 @@ fi
 has_call "late failure" && ok "the slow failure's real stderr is still captured and logged" \
   || bad "the slow failure's stderr text was lost"
 
-echo "Scenario L: drift-guard — no spawn call site keeps the old 60 s literal; all eight use the 150 s budget"
+echo "Scenario L: drift-guard — no spawn call site keeps the old 60 s literal; all ten use the 150 s budget"
 _old60=$(grep -c 'timeout "\${PILOT_SPAWN_TIMEOUT_SECS:-60}"' "$DISPATCHER" 2>/dev/null); _old60="${_old60:-0}"
 _new150=$(grep -c 'timeout "\${PILOT_SPAWN_TIMEOUT_SECS:-150}"' "$DISPATCHER" 2>/dev/null); _new150="${_new150:-0}"
-if [ "$_old60" = "0" ] && [ "$_new150" = "8" ]; then
-  ok "8 spawn calls (2 in _pilot_topup_spawn + wa/ps arms of dispatch_one + new/wake in _pilot_node_first_dispatch, ga-2hd02v.1.14 + new/wake in _pilot_node_remote_open, ga-2hd02v.3) on the 150 s default, none on 60 s"
+if [ "$_old60" = "0" ] && [ "$_new150" = "10" ]; then
+  ok "10 spawn calls (2 in _pilot_topup_spawn + wa/ps arms of dispatch_one + new/wake in _pilot_node_first_dispatch, ga-2hd02v.1.14 + new/wake in _pilot_node_remote_open, ga-2hd02v.3 + new/wake in _pilot_kimi_dispatch, ga-do1ixn.3) on the 150 s default, none on 60 s"
 else
-  bad "spawn budget drift: $_old60 call(s) still on the 60 s default, $_new150 on 150 s (want 0 and 8) — a spawn site that kept 60 s is killed before it finishes under load; with 0 on 60 s the count itself moved (a site added, removed or reshaped): read that site's budget, then update this scenario's count and the list in the ok line"
+  bad "spawn budget drift: $_old60 call(s) still on the 60 s default, $_new150 on 150 s (want 0 and 10) — a spawn site that kept 60 s is killed before it finishes under load; with 0 on 60 s the count itself moved (a site added, removed or reshaped): read that site's budget, then update this scenario's count and the list in the ok line"
 fi
 
 echo "Scenario M: _pilot_slow_spawn_deferred_for — the PRE-claim twin defers ONLY a candidate already committed to a pool that would spawn, and only once the budget is spent"
@@ -372,6 +382,101 @@ n_expect 1 "an exit 124 is slow whatever the clock says"                        
 n_expect 1 "known duration >= threshold is slow (started 100 s ago, threshold 60)"       0 '$((SECONDS - 100))'
 n_expect 0 "known duration < threshold is fast (started 10 s ago, threshold 60)"         0 '$((SECONDS - 10))'
 n_expect 1 "a non-numeric PILOT_SLOW_SPAWN_SECS falls back to 60, not to 'never slow' (started 100 s ago)" 0 '$((SECONDS - 100))' 'oops'
+
+# ── ga-qnarixf: the spawn keeps the identity of the session it opened ───────────────────────────────────────────────────────────────
+# `gc session new --json` prints who it opened on stdout; the old call (`2>&1 >/dev/null`) threw that away, and _topup_bind_after_spawn
+# then found the session again by a title the engine does not keep (23 of 44 measured carry another one): no claim, the bead still
+# unassigned, the loop spawned again — 2 sessions for wa-qawq7l.2 in 54 s. pilot-dispatcher.topup-bind-identity.selftest.sh is the
+# end-to-end proof (a fake engine that rewrites the title); these scenarios pin the SPAWN's half: --json is asked for, stdout reaches the
+# bind untouched, stderr stays a separate channel, a failure never leaves an identity behind, and the failure log is never blind.
+echo "Scenario O: the spawn asks for --json and keeps its stdout (the new session's identity) for the bind"
+run_spawn "wa-worker" "wa-id01" 'echo "{\"session_id\":\"ga-wisp-1\",\"session_name\":\"wa-worker-gawisp001\"}"; exit 0'
+if has_call "RC=0" && grep -q '^gc	.*session new wa-worker --no-attach --title-hint pool top-up: wa-id01 --json$' "$CALLS" \
+   && grep -qxF 'OUT={"session_id":"ga-wisp-1","session_name":"wa-worker-gawisp001"}' "$CALLS"; then
+  ok "O: the call carries --json (and still the 'pool top-up: <bead>' hint), and _TOPUP_SPAWN_OUT is exactly what gc printed"
+else
+  bad "O: no --json / the answer was not kept (dump: $(tr '\n' '|' < "$CALLS"))"
+fi
+if scratch_clean; then
+  ok "O: no stderr scratch file is left behind after a success"
+else
+  bad "O: a scratch file leaked into TMPDIR: $(ls -A "$WORK/tmp" | tr '\n' ' ')"
+fi
+
+echo "Scenario P: stderr is a SEPARATE channel — a warning on stderr never reaches the identity on stdout"
+run_spawn "wa-worker" "wa-id02" 'echo "WARN native_store_unavailable gate=version_compat reason=x" >&2; echo "{\"session_name\":\"s-2\"}"; exit 0'
+if has_call "RC=0" && grep -qxF 'OUT={"session_name":"s-2"}' "$CALLS"; then
+  ok "P: success with noise on stderr → _TOPUP_SPAWN_OUT is the JSON alone (merged into stdout it would not parse)"
+else
+  bad "P: stderr leaked into the kept answer (dump: $(tr '\n' '|' < "$CALLS"))"
+fi
+
+echo "Scenario Q: a failed spawn leaves NO identity — not the one an earlier spawn of the same pass kept"
+RS_TWICE=1 run_spawn "wa-worker" "wa-id03" 'if [ "$n" -eq 1 ]; then echo "{\"session_name\":\"s-old\"}"; exit 0; fi; echo "boom" >&2; exit 1'
+if grep -qxF 'OUT={"session_name":"s-old"}' "$CALLS" && grep -qx 'RC2=1' "$CALLS" && grep -qx 'OUT2=' "$CALLS"; then
+  ok "Q: spawn 1 keeps s-old; spawn 2 (and its retry) fail → RC2=1 and the kept answer is EMPTY (a stale identity would claim the wrong bead)"
+else
+  bad "Q: the second spawn inherited the first one's identity or did not fail (dump: $(tr '\n' '|' < "$CALLS"))"
+fi
+
+echo "Scenario R: attempt 1 fails (with an answer on stdout), the retry succeeds (noise on its stderr) — the kept answer is the RETRY's JSON alone"
+run_spawn "wa-worker" "wa-id04" 'if [ "$n" -eq 1 ]; then echo "{\"session_name\":\"s-first\"}"; echo "transient" >&2; exit 1; fi; echo "WARN benign on the retry" >&2; echo "{\"session_name\":\"s-second\"}"; exit 0'
+if has_call "RC=0" && [ "$(gc_calls)" -eq 2 ] && grep -qxF 'OUT={"session_name":"s-second"}' "$CALLS" && scratch_clean; then
+  ok "R: 2 gc calls, RC=0, the identity kept is the session the RETRY opened, and both attempts' scratch files are gone"
+else
+  bad "R: expected the retry's answer (dump: $(tr '\n' '|' < "$CALLS"))"
+fi
+
+echo "Scenario S: a failure that said why on STDOUT (--json) and wrote nothing on stderr is not logged blind"
+run_spawn "wa-worker" "wa-id05" 'echo "{\"error\":\"store down\"}"; exit 1'
+if has_call "RC=1" && grep '^warn	' "$CALLS" | grep 'attempt 1/2' | grep -qF '(stdout) {"error":"store down"}' \
+   && grep '^warn	' "$CALLS" | grep 'attempt 2/2' | grep -qF '(stdout) {"error":"store down"}' && grep -qx 'OUT=' "$CALLS" && scratch_clean; then
+  ok "S: BOTH attempts' warns carry the start of stdout when stderr is empty, nothing is kept for the bind, and no scratch file is left"
+else
+  bad "S: the failure log lost the stdout text (dump: $(tr '\n' '|' < "$CALLS"))"
+fi
+
+echo "Scenario T: the stderr scratch file cannot be created — RC=1 at once, gc is never run, NO retry, and the log says the spawn was NOT attempted"
+RS_TMPDIR="$WORK/no-such-dir" run_spawn "wa-worker" "wa-id06" 'echo "{\"session_name\":\"s-6\"}"; exit 0' 2>/dev/null
+if has_call "RC=1" && [ "$(gc_calls)" -eq 0 ] && grep '^warn	' "$CALLS" | grep -qF 'NOT attempted — cannot create the stderr scratch file' \
+   && ! grep -q 'attempt 1/2' "$CALLS" && grep -qx 'OUT=' "$CALLS"; then
+  ok "T: nothing is spawned or kept, no retry is tried, and the warn says the spawn was NOT attempted (not 'gc wrote nothing')"
+else
+  bad "T: the unwritable scratch dir was not handled (dump: $(tr '\n' '|' < "$CALLS"))"
+fi
+
+echo "Scenario U: the scratch file is made but cannot be READ after the spawn — each attempt's warn says the capture failed, never '<no stderr captured>'"
+mkdir -p "$WORK/tmpU"
+# The stub deletes its own scratch file before it exits (path taken from TMPDIR, so it works on any OS): the open of $(<file) is what fails.
+# (A directory in its place would NOT do: bash reads one as empty with exit 0.)
+RS_TMPDIR="$WORK/tmpU" run_spawn "wa-worker" "wa-id07" 'for f in "$TMPDIR"/pilot-topup-spawn-err.*; do rm -f "$f"; done; exit 1'
+if has_call "RC=1" && [ "$(gc_calls)" -eq 2 ] \
+   && grep '^warn	' "$CALLS" | grep 'attempt 1/2' | grep -qF '<could not read the stderr scratch file' \
+   && grep '^warn	' "$CALLS" | grep 'attempt 2/2' | grep -qF '<could not read the stderr scratch file' \
+   && ! grep '^warn	' "$CALLS" | grep -qF 'no stderr captured'; then
+  ok "U: BOTH attempts say the stderr capture failed (and name the file), not '<no stderr captured>' (= gc wrote nothing)"
+else
+  bad "U: an unreadable scratch file read as 'gc wrote nothing' (dump: $(tr '\n' '|' < "$CALLS"))"
+fi
+
+echo "Scenario V: attempt 1 fails and the scratch dir is gone before the retry — the retry is NOT attempted, and the log says so"
+mkdir -p "$WORK/tmpV"
+RS_TMPDIR="$WORK/tmpV" run_spawn "wa-worker" "wa-id08" 'mv "$TMPDIR" "$TMPDIR.gone"; echo "boom" >&2; exit 1'
+if has_call "RC=1" && [ "$(gc_calls)" -eq 1 ] && grep '^warn	' "$CALLS" | grep 'retry for wa-worker (wa-id08)' | grep -qF 'NOT attempted — cannot create the stderr scratch file' \
+   && ! grep -q 'attempt 2/2' "$CALLS"; then
+  ok "V: one gc call, RC=1, the retry's own warn says it was NOT attempted (no spawn on a blind capture), and there is no 'attempt 2/2' line: it stopped there"
+else
+  bad "V: the retry ran without a scratch file or said nothing (dump: $(tr '\n' '|' < "$CALLS"))"
+fi
+
+echo "Scenario W: drift-guard — both attempts make their scratch file with mktemp, none names it by pid"
+_mk=$(grep -c 'mktemp "\${TMPDIR:-/tmp}/pilot-topup-spawn-err\.XXXXXX"' "$DISPATCHER" 2>/dev/null); _mk="${_mk:-0}"
+_pid=$(grep -c 'pilot-topup-spawn-err\.\$\$' "$DISPATCHER" 2>/dev/null); _pid="${_pid:-0}"
+if [ "$_mk" = "2" ] && [ "$_pid" = "0" ]; then
+  ok "W: 2 mktemp calls for the top-up spawn's scratch file, 0 pid-named ones (a predictable name lets anyone who can write TMPDIR plant a symlink for the '2>' redirect to follow)"
+else
+  bad "W: scratch file naming drift: $_mk mktemp call(s) (want 2), $_pid pid-named (want 0)"
+fi
 
 # ── Summary ───────────────────────────────────────────────────────────────
 echo ""
