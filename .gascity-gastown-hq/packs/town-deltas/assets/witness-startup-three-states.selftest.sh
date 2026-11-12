@@ -23,7 +23,7 @@
 # with an empty list is "unknown"), the nao-sei line carries stdout as well as stderr (an exit 0 + [] has an empty stderr),
 # the block's comment states the one limit of its error test (a hook error is recognized by its "gc hook:" prefix) and a case
 # keeps that comment and the code one claim, and Group D pins that the section no longer says the override is resolved by
-# the HQ store only (it reaches the rigs since ga-p8ip28d / ga-6pil72r) and that the scripts it points to exist.
+# the HQ store only (it reaches the rigs since ga-p8ip28d / ga-6pil72r) and that the files it points to exist.
 #
 # WITNESS_TEMPLATE_UNDER_TEST overrides the template (mutant runs, see the delivery of ga-6zrshxb).
 # Exit 0 iff every scenario holds.
@@ -351,9 +351,9 @@ else
   ok "no shared /tmp/witness-hook.json (the block makes its own temp file and keeps stderr apart)"
 fi
 # ga-84wifto: the paragraph "Onde a guarda da formula vale" said the override is resolved by the HQ store only and that a rig
-# poured the NATIVE formula, true until ga-p8ip28d (formulas_dir) and ga-6pil72r (the ~/gt/.beads/formulas link of the rigs with a
-# .beads/redirect). A witness that believes the old text applies by hand a guard its wisp already carries and, worse, reads a
-# native wisp as "the override is in force". The old sentences must not come back, and the two wirings the new text names must exist.
+# resolves the NATIVE formula: true until ga-p8ip28d (formulas_dir) and ga-6pil72r (the ~/gt/.beads/formulas link of the rigs with
+# a .beads/redirect), false after. The old sentences must not come back, and the two wirings the new text names must still exist,
+# or the paragraph is a claim about something that is gone.
 STALE=""
 for s in 'só é resolvido pelo store da HQ' 'só o override da HQ usa' 'a formula nativa, nos rigs, aceita' 'o store de RIG resolve'; do
   printf '%s\n' "$SECTION" | grep -F -q -- "$s" && STALE="$STALE [$s]"

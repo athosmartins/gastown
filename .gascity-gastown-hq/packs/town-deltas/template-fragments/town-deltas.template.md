@@ -1217,9 +1217,9 @@ rigs acima quando o `bd list` nativo falhava. Como `gc hook` sai 1 tanto para
 vazio quanto para erro, o bloco separa os dois: é VAZIO só com exit 1, nenhuma
 linha `gc hook:` no stderr e stdout vazio ou `[]` (um `warning:` no stderr não
 é erro); é TEM com exit 0 e um corpo que não seja só `[]` (o `gc hook` só sai 0
-quando há trabalho); todo o resto (linha `gc hook:`, timeout, exit 2/124/127,
-exit 0 sem corpo ou só com `[]`, exit 1 com stdout que não seja vazio nem `[]`)
-é NÃO SEI, e o bloco sai 1:
+quando há trabalho); todo o resto (exit 1 com linha `gc hook:` no stderr, timeout,
+exit 2/124/127, exit 0 sem corpo ou só com `[]`, exit 1 com stdout que não seja
+vazio nem `[]`) é NÃO SEI, e o bloco sai 1:
 ```bash
 # Step 1: gc hook acha seu wisp por identidade, mesmo se o agent-home
 # cair no store errado (o que o bd list abaixo NÃO consegue).
