@@ -2,7 +2,7 @@
 # prod-tests/gascity/story-ga-qg1dw5z.1.sh — prod test para ga-qg1dw5z.1: Hetzner trava 1 (dado pessoal só no usuário `dados`, só enquanto o build roda).
 # O que esta fatia ENTREGA é código versionado (instalador de root, wrapper, canal do mini, varredura, prova) e o runbook; a INSTALAÇÃO no nó é um passo de root separado (docs/runbooks/hetzner-dados.md).
 # Por isso o teste confere a árvore viva: arquivos presentes e executáveis, sintaxe, e as garantias do contrato no TEXTO do que será instalado (sem curinga no sudoers, chave de root com restrict, tmpfs
-# noexec/nosuid/nodev, recusa de swap e de staging fora do tmpfs, `dados` com shell real). Hermético: não fala com o nó, não chama gc/bd, não toca em .gc/. As baterias (137 + 74 casos e os mutantes) são a
+# noexec/nosuid/nodev, recusa de swap e de staging fora do tmpfs, `dados` com shell real). Hermético: não fala com o nó, não chama gc/bd, não toca em .gc/. As baterias (242 + 118 casos e os mutantes) são a
 # evidência do gate e rodam no nó Linux; aqui só se confere que existem.
 set -uo pipefail
 
@@ -46,6 +46,13 @@ has "$INST" 'undo sshd-runner-ilegivel'                            || fail "inst
 body=$(grep -v '^#' "$INST") || fail "instalador ilegível ou vazio: $INST"
 n=$(printf '%s\n' "$body" | grep -c -E 'ALL=\(dados\)|NOPASSWD: ALL')
 [[ "$n" == 0 ]] || fail "instalador: sudoers com (dados) ALL / NOPASSWD: ALL ($n linhas)"
+# o código de --code-dir vem do COMMIT (git archive), nunca da árvore de trabalho (rsync copiava arquivo ignorado e edição assume-unchanged); só comentário pode citar rsync
+has "$INST" 'git -C "\$CODE" archive --format=tar "\$SHA"'         || fail "instalador: código de --code-dir não vem do commit (git archive)"
+has "$INST" 'set -o pipefail'                                      || fail "instalador: git archive que morre no meio passaria pelo tar (sem pipefail)"
+has "$INST" 'die "code-modo-inseguro'                              || fail "instalador: árvore de root extraída sem conferir modo (grupo/outros, setuid)"
+nrs=$(grep -v '^#' "$INST" | grep -c 'rsync') || true
+[[ "${nrs:-1}" == 0 ]] || fail "instalador: rsync da árvore de trabalho para a árvore de root ($nrs linhas)"
+has "$INST" 'owned "\$AKDIR/\$DU" "root:\$DU 640"'                  || fail "instalador: --check não confere o grupo do arquivo de chaves"
 log "instalador: shell real, senha travada, chave restrict, arquivo de root, sudoers por entrypoint e validado, tmpfs noexec/nosuid/nodev ✓"
 
 # ── wrapper: recusa antes de rodar, sem rede, sem privilégio, apaga o dado
@@ -68,6 +75,9 @@ log "wrapper: tmpfs, sem swap, lista exata, no-new-privs, env -i, apagar confirm
 has "$ING" 'no link-simbolico-ou-ilegivel 65'                      || fail "ingest: link simbólico no tar não é recusado"
 has "$ING" 'no stage-nao-e-tmpfs 98'                               || fail "ingest: grava dado fora do tmpfs"
 has "$ING" 'no put-sem-arquivos 67'                                || fail "ingest: put sem arquivo nenhum vira 'ok files=0'"
+has "$ING" 'no stage-dirs 98'                                      || fail "ingest: in/ ou out/ trocado por link não é recusado (o dado iria para fora do tmpfs)"
+has "$ING" 'no resultado-ilegivel 74'                              || fail "ingest: get com find que falha vira 'ausente'"
+has "$SWP" 'cant awk-falhou'                                       || fail "varredura: awk que falha vira '0 processos vivos'"
 has "$SWP" 'NAO-CONSEGUI'                                          || fail "varredura: não distingue 'não consegui' de 'limpo'"
 has "$SWP" 'cant "stage-nao-e-tmpfs'                               || fail "varredura: não acusa staging fora do tmpfs"
 has "$SWP" 'flock -w "\$LOCKWAIT" -E 75 8'                         || fail "varredura: não toma o lock do wrapper (um build no meio perderia o staging)"

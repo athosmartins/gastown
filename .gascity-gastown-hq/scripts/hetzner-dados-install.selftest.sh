@@ -6,7 +6,7 @@
 #
 # CASOS: recusas antes de tocar em qualquer coisa (não é root, chave com opções/2 linhas/ilegível, entrypoint e tamanho inválidos, código sem sha limpo, runner no grupo, grupos extras) · instalação feliz (usuário, sudoers sem curinga,
 #   chave de root com restrict, drop-in, fstab sem perder as outras linhas, árvore, timer) e `--check` com os 20 itens ok · idempotência · sshd reprovado desfaz o drop-in (-t, dados fora do arquivo de root, runner afetado) e restaura o anterior ·
-#   visudo reprovado não troca o sudoers · fstab ilegível não é reescrito · link para fora da árvore · `--check` que FALHA / não consegue (cada item adulterado, e cada leitura que falha: id do runner, swapon, árvore, sudoers, sshd -T) · opção sem valor (com prazo: nunca gira) · chave com linha em branco · sshd -T do runner que falha desfaz o drop-in.
+#   visudo reprovado não troca o sudoers · fstab ilegível não é reescrito · link para fora da árvore · `--check` que FALHA / não consegue (cada item adulterado, e cada leitura que falha: id do runner, swapon, árvore, sudoers, sshd -T) · opção sem valor (com prazo: nunca gira) · chave com linha em branco · sshd -T do runner que falha desfaz o drop-in · `--code-dir` com repo de verdade (git archive do COMMIT: arquivo ignorado e edição assume-unchanged não entram, árvore antiga some, extração com modo inseguro e git archive que morre no meio → 98 com a árvore antiga intacta) · chave de root com grupo errado.
 # O QUE NÃO PROVA: que useradd/sshd/sudo/mount se comportam assim no Ubuntu 24.04 do nó. Isso é o `--check` + `hetzner-dados-prove.sh` rodados no nó depois da instalação.
 set -u
 HERE="$(cd "$(dirname "$0")" && pwd)"
@@ -30,7 +30,14 @@ mk mount 'echo "mount $*" >> "$LOG"; touch "$T/mounted"; echo "dados dados 700" 
 mk findmnt 'echo "${FS:-tmpfs} rw,nosuid,nodev,noexec,relatime"'
 mk swapon '[ -z "${SWAPON_FAIL:-}" ] || exit 1; [ -z "${SWAP:-}" ] || echo "/dev/sda2 partition 1G"'
 mk rsync 'echo "rsync $*" >> "$LOG"; for a; do d=$a; done; mkdir -p "$d"; cp -R "${@: -2:1}". "$d"'
-mk git 'case "$3" in rev-parse) echo "${GIT_HEAD:-abc123}" ;; status) echo "${GIT_DIRTY:-}" ;; esac'
+mk git 'if [ "${GIT_REAL:-}" = 1 ]; then
+  # GIT_ARCHIVE_FAIL: um `git archive` que entrega um tar COMPLETO e válido de uma árvore parcial e só depois sai 1 (o tar da outra ponta do pipe aceita o que chegou: só o pipefail reprova)
+  [ "$3" = archive ] && [ -n "${GIT_ARCHIVE_FAIL:-}" ] && { /usr/bin/tar -c -C "$T/partial" .; exit 1; }
+  exec /usr/bin/git "$@"
+fi
+case "$3" in rev-parse) echo "${GIT_HEAD:-abc123}" ;; status) echo "${GIT_DIRTY:-}" ;; esac'
+# TAR_LOOSE: um tar que, depois de extrair, deixa o que extraiu gravável pelo grupo (o instalador não pode confiar só no umask/--no-same-permissions)
+mk tar 'a=("$@"); /usr/bin/tar "$@"; rc=$?; if [ -n "${TAR_LOOSE:-}" ]; then for ((i = 0; i < ${#a[@]}; i++)); do [ "${a[i]}" = -C ] && d=${a[i+1]}; done; [ -z "${d:-}" ] || /bin/chmod -R g+w "$d"/*; fi; exit $rc'
 mk install 'a=(); u=""; g=""; m=""; d=0; while [ $# -gt 0 ]; do case "$1" in -o) u=$2; shift 2 ;; -g) g=$2; shift 2 ;; -m) m=$2; shift 2 ;; -d) d=1; shift ;; *) a+=("$1"); shift ;; esac; done
 /usr/bin/install $([ $d = 1 ] && echo -d) ${m:+-m $m} "${a[@]}" || exit 1; [ $d = 1 ] && t=("${a[@]}") || t=("${a[${#a[@]}-1]}")
 for p in "${t[@]}"; do echo "${u:-root} ${g:-root} ${m#0}" | sed "s/ $/ 755/" > "$T/own/$(echo "$p" | tr / _)"; done'
@@ -90,10 +97,31 @@ case_rollback() { local s=$1
   world; SSHD_RUNNER_FAIL=1 ap "$s"; ck "sshd -T do runner falha → 98 sshd-runner-ilegivel, drop-in desfeito, sem reload (silêncio não prova 'runner intacto')" bash -c "[ $RC = 98 ] && grep -q 'sshd-runner-ilegivel' '$ERR' && [ ! -e '$R/etc/ssh/sshd_config.d/50-gt-dados.conf' ] && ! grep -q '^systemctl reload' '$LOG'"
   world; echo "# SUDOERS ANTIGO" > "$R/etc/sudoers.d/gt-dados-run"; VISUDO_FAIL=1 ap "$s"; ck "visudo reprova → 98, sudoers ANTIGO intacto, sem .new" bash -c "[ $RC = 98 ] && grep -q 'SUDOERS ANTIGO' '$R/etc/sudoers.d/gt-dados-run' && [ ! -e '$R/etc/sudoers.d/gt-dados-run.new' ]"
   world; rm -f "$R/etc/fstab"; ap "$s"; ck "fstab ilegível → 98 fstab-leitura e NÃO cria fstab só com a nossa linha" bash -c "[ $RC = 98 ] && grep -q 'fstab-leitura' '$ERR' && [ ! -s '$R/etc/fstab' ]"; }
+# o código de --code-dir é o do COMMIT: repo de verdade (GIT_REAL=1) com um arquivo ignorado, uma edição escondida por assume-unchanged (nenhum dos dois aparece em `status --porcelain`) e tar.umask=0 (diretórios 0777 no archive)
+mkrepo() { rm -rf "$T/repo" "$T/partial"; mkdir -p "$T/repo/bin" "$T/repo/lib" "$T/partial/bin"; echo partial > "$T/partial/bin/build-x"
+  ( cd "$T/repo" && /usr/bin/git init -q . && /usr/bin/git config user.email t@t && /usr/bin/git config user.name t && /usr/bin/git config commit.gpgsign false && /usr/bin/git config tar.umask 0 \
+    && printf '#!/bin/sh\n' > bin/build-x && chmod 755 bin/build-x && echo good > lib/x.py && echo junk > .gitignore && /usr/bin/git add -A && /usr/bin/git commit -q -m c \
+    && echo evil > lib/x.py && /usr/bin/git update-index --assume-unchanged lib/x.py && echo secret > junk ) > /dev/null 2>&1; }
+case_code() { local s=$1 sha app="$R/opt/gt-dados/app"
+  mkrepo; sha=$(/usr/bin/git -C "$T/repo" rev-parse HEAD); ck "code-dir (preparo): o repo de teste é 'limpo' para o git (o que o instalador confere) e tem a edição escondida" bash -c "[ -z \"\$(/usr/bin/git -C '$T/repo' status --porcelain)\" ] && [ \"\$(cat '$T/repo/lib/x.py')\" = evil ]"
+  world; echo old > "$app/stale"; GIT_REAL=1 ap "$s" --entrypoint build-x --code-dir "$T/repo" --code-sha "$sha"
+  [ "$RC" = 0 ] || { echo "--- code-dir: rc=$RC"; cat "$ERR"; grep '^GTD-CHECK:' "$OUT" | grep -v ' ok$'; echo "--- fim"; }
+  ck "code-dir: instala (rc 0, 20 itens do --check ok) e o entrypoint do commit está lá, executável" bash -c "[ $RC = 0 ] && [ \"\$(grep -c '^GTD-CHECK: .* ok\$' '$OUT')\" = 20 ] && [ -x '$app/bin/build-x' ]"
+  ck "code-dir: o arquivo IGNORADO pelo .gitignore não é copiado" test ! -e "$app/junk"
+  ck "code-dir: a edição escondida (assume-unchanged) não entra: o instalado é o conteúdo do COMMIT" bash -c "[ \"\$(cat '$app/lib/x.py')\" = good ]"
+  ck "code-dir: o que havia na árvore e não está no commit some (como o --delete do rsync)" test ! -e "$app/stale"
+  ck "code-dir: sem .git na árvore de root e sem app.new/app.old de sobra" bash -c "[ ! -e '$app/.git' ] && [ ! -e '$R/opt/gt-dados/app.new' ] && [ ! -e '$R/opt/gt-dados/app.old' ]"
+  ck "code-dir: nada gravável por grupo/outros nem setuid/setgid (o archive tinha diretórios 0777: tar.umask=0)" bash -c "[ -z \"\$(find '$app' ! -type l -perm /6022)\" ]"
+  world; echo old > "$app/stale"; TAR_LOOSE=1 GIT_REAL=1 ap "$s" --entrypoint build-x --code-dir "$T/repo" --code-sha "$sha"
+  ck "code-dir: extração que deixa gravável pelo grupo → 98 code-modo-inseguro, árvore antiga INTACTA, sem app.new" bash -c "[ $RC = 98 ] && grep -q 'falhou:code-modo-inseguro' '$ERR' && [ -f '$app/stale' ] && [ ! -e '$R/opt/gt-dados/app.new' ]"
+  world; echo old > "$app/stale"; GIT_ARCHIVE_FAIL=1 GIT_REAL=1 ap "$s" --entrypoint build-x --code-dir "$T/repo" --code-sha "$sha"
+  ck "code-dir: git archive que sai 1 depois de entregar um tar válido → 98 code-archive (pipefail), árvore antiga INTACTA, sem app.new" bash -c "[ $RC = 98 ] && grep -q 'falhou:code-archive' '$ERR' && [ -f '$app/stale' ] && [ ! -e '$R/opt/gt-dados/app.new' ]"
+  world; GIT_REAL=1 ap "$s" --entrypoint build-x --code-dir "$T/repo" --code-sha 0000000000000000000000000000000000000000; ck "code-dir: sha que não é o HEAD → 98 e nada trocado" bash -c "[ $RC = 98 ] && grep -q 'code-dir-nao-e-o-sha-limpo' '$ERR' && [ -f '$app/bin/build-x' ] && [ ! -e '$app/lib' ]"; }
 adult() { # <rótulo> <item esperado FALHOU/nao-consegui> <comando de adulteração>
   world; ap "$s_" --entrypoint build-x > /dev/null 2>&1; eval "$3"; inst "$s_" --check; ck "check: $1 → $2 e rc≠0" bash -c "[ $RC != 0 ] && grep -q '^GTD-CHECK: $2' '$OUT'"; }
 case_check() { s_=$1; world; ap "$s_" > /dev/null 2>&1; inst "$s_" --check; ck "check: mundo recém-instalado → rc 0, 20 ok" bash -c "[ $RC = 0 ] && [ \"$(okc)\" = 20 ]"
   adult "home 755" "home-0700 FALHOU" "echo 'dados dados 755' > '$T/own/$(echo "$R/home/dados" | tr / _)'"; adult "chave 644" "chaves-de-root FALHOU" "echo 'root dados 644' > '$T/own/$(echo "$R/etc/ssh/authorized_keys.d/dados" | tr / _)'"
+  adult "chave root:root 640 (grupo errado: o dono e o modo conferem, o grupo não)" "chaves-de-root FALHOU" "echo 'root root 640' > '$T/own/$(echo "$R/etc/ssh/authorized_keys.d/dados" | tr / _)'"
   adult "chave sem restrict" "chaves-de-root FALHOU" "sed -i.b 's/^restrict,//' '$R/etc/ssh/authorized_keys.d/dados'"; adult "sudoers com curinga" "sudoers-sem-curinga FALHOU" "chmod u+w '$R/etc/sudoers.d/gt-dados-run'; echo 'runner ALL=(root) NOPASSWD: $R/usr/local/sbin/gt-dados-run *' >> '$R/etc/sudoers.d/gt-dados-run'"
   adult "sudoers com (dados) ALL" "sudoers-sem-curinga FALHOU" "chmod u+w '$R/etc/sudoers.d/gt-dados-run'; echo 'runner ALL=(dados) NOPASSWD: ALL' >> '$R/etc/sudoers.d/gt-dados-run'"; adult "entrypoint fora do sudoers" "sudoers-igual-a-lista FALHOU" "echo evil >> '$R/etc/gt-dados/entrypoints'"
   adult "staging em ext4" "stage-tmpfs-proprio FALHOU" "export FS=ext4"; unset FS; adult "swap ligada" "sem-swap FALHOU" "export SWAP=1"; unset SWAP; adult "senha destravada" "senha-travada FALHOU" "export PW_STATE=P"; unset PW_STATE
@@ -107,7 +135,7 @@ case_check() { s_=$1; world; ap "$s_" > /dev/null 2>&1; inst "$s_" --check; ck "
   # link simbólico DENTRO da árvore de root (o guarda do instalador aceita os que ficam na árvore): o modo 0777 do próprio link (Linux sempre) não é "arquivo gravável por outros" → arvore-de-root segue ok (o mundo adulterado acima prova que o teste ainda reprova de verdade)
   world; ap "$s_" --entrypoint build-x > /dev/null 2>&1; ln -s bin/synth "$R/opt/gt-dados/app/elo"; chmod -h 777 "$R/opt/gt-dados/app/elo" 2> /dev/null; inst "$s_" --check
   ck "check: link simbólico dentro da árvore de root (modo 0777 do link) → arvore-de-root ok, rc 0" bash -c "[ $RC = 0 ] && grep -q '^GTD-CHECK: arvore-de-root ok' '$OUT'"; }
-case_refuse "$T/inst.sh"; case_happy "$T/inst.sh"; case_rollback "$T/inst.sh"; case_check "$T/inst.sh"
+case_refuse "$T/inst.sh"; case_happy "$T/inst.sh"; case_rollback "$T/inst.sh"; case_check "$T/inst.sh"; case_code "$T/inst.sh"
 mut() { local name=$1 expr=$2 fn=$3 mc="$T/mut-$1.sh"; mkcopy "$HERE/hetzner-dados-install.sh" "$expr" "$mc"; cmp -s "$mc" "$T/inst.sh" && { echo "FAIL mutante $name não alterou nada"; fails=$((fails+1)); return; }
   QUIET=1; BAD=0; "$fn" "$mc" > /dev/null 2>&1; QUIET=0; n=$((n+1)); if [ "$BAD" = 1 ]; then echo "ok   mutante $name reprovado"; else echo "FAIL mutante $name SOBREVIVEU"; fails=$((fails+1)); fi; }
 mut I26-tree-reprova-link 's#! -type l ##' case_check
@@ -136,4 +164,10 @@ mut I22-check-sudoers-ilegivel-vira-ok 's#t_sudo_strict() { \[ -r "\$SUDOERS" \]
 mut I23-sshd-runner-ilegivel-vira-intacto 's#RO=\$(sshd_for "\$RUNNER") || undo sshd-runner-ilegivel#RO=$(sshd_for "$RUNNER")#' case_rollback
 mut I24-check-sshd-runner-127-vira-ok 's#o=\$(sshd_for "\$RUNNER") || return 127; #o=$(sshd_for "$RUNNER"); #' case_check
 mut I25-chave-com-linha-em-branco 's#KEYLINE=\$(grep -m1 \. "\$PUB")#KEYLINE=$(cat "$PUB")#' case_happy
+mut I27-code-da-arvore-de-trabalho 's#git -C "\$CODE" archive --format=tar "\$SHA" | tar -x#tar -c -C "$CODE" --exclude=.git . | tar -x#' case_code
+mut I28-code-sem-guarda-de-modo 's#\[ -z "\$bad" \] || {#true || {#' case_code
+mut I29-code-sem-pipefail 's#set -o pipefail; ##' case_code
+mut I30-chave-sem-grupo 's#owned "\$AKDIR/\$DU" "root:\$DU 640"#[ "$(stat -c "%U %a" "$AKDIR/$DU")" = "root 640" ]#' case_check
+mut I31-code-modo-inseguro-deixa-app-new 's#\[ -z "\$bad" \] || { rm -rf -- "\$NEW"; die#[ -z "$bad" ] || { die#' case_code
+mut I32-code-archive-deixa-app-new 's#|| { rm -rf -- "\$NEW"; die code-archive; }#|| die code-archive#' case_code
 echo "---"; echo "casos: $n, reprovados: $fails"; [ "$fails" -eq 0 ]

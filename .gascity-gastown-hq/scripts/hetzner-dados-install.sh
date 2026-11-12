@@ -8,7 +8,7 @@
 #   hetzner-dados-install.sh apply --pubkey-file <mini.pub> [--entrypoint <nome>]... [--code-dir <dir> --code-sha <sha>] [--runner runner] [--stage-size 8g]
 #   hetzner-dados-install.sh --check      confere o contrato inteiro como root e imprime `GTD-CHECK: <item> ok|FALHOU|nao-consegui` (rc 0 só com tudo ok)
 # O QUE INSTALA: usuário `dados` (senha travada, shell real, home 0700, grupo próprio, runner FORA dele) · /srv/gtdados tmpfs (fstab: size=, 0700 dados, noexec,nosuid,nodev) · /usr/local/sbin/gt-dados-{run,ingest,sweep}
-#   · /opt/gt-dados/app/bin/<entrypoint> (árvore de ROOT, ninguém mais escreve; a de `--code-dir` só entra com o HEAD igual a `--code-sha` e árvore limpa) + /etc/gt-dados/entrypoints
+#   · /opt/gt-dados/app/bin/<entrypoint> (árvore de ROOT, ninguém mais escreve; a de `--code-dir` só entra com o HEAD igual a `--code-sha` e árvore limpa, e é o conteúdo do COMMIT (`git archive`), não o da árvore de trabalho) + /etc/gt-dados/entrypoints
 #   · /etc/ssh/authorized_keys.d/dados (de ROOT: `restrict,command="gt-dados-ingest"`) + drop-in sshd `Match User dados` · /etc/sudoers.d/gt-dados-run (UMA linha por entrypoint, sem curinga) · gt-dados-sweep.timer diário.
 #   sshd só recarrega DEPOIS de `sshd -t` e de `sshd -T -C` provar que `dados` usa o arquivo de ROOT e o runner NÃO; qualquer reprovação desfaz o drop-in. sudoers só entra depois de `visudo -cf`.
 # CÓDIGOS: 0 · 64 uso/não é root · 98 um passo falhou (`GTD-INSTALL: falhou:<passo>`; o que já estava no nó não é apagado, exceto o drop-in do sshd reprovado)
@@ -27,7 +27,7 @@ t_shell() { case "$(getent passwd "$DU" | cut -d: -f7)" in ''|*nologin|*/false) 
 t_grupos() { [ "$(id -nG "$DU")" = "$DU" ]; }
 # vazio/falhou: `id` do runner que falha (nome errado, NSS) é "não consegui" (127), nunca "fora do grupo"
 t_runner() { local g; g=$(id -nG "$RUNNER" 2> /dev/null) || return 127; ! printf '%s\n' $g | grep -qx "$DU"; }
-t_keys() { [ "$(stat -c '%U %a' "$AKDIR/$DU")" = "root 640" ] && grep -Eq "^restrict,command=\"$SBIN/gt-dados-ingest\" ssh-|^restrict,command=\"$SBIN/gt-dados-ingest\" ecdsa-" "$AKDIR/$DU"; }
+t_keys() { owned "$AKDIR/$DU" "root:$DU 640" && grep -Eq "^restrict,command=\"$SBIN/gt-dados-ingest\" ssh-|^restrict,command=\"$SBIN/gt-dados-ingest\" ecdsa-" "$AKDIR/$DU"; }
 t_sshd_d() { sshd_for "$DU" | grep -qx "authorizedkeysfile $AKDIR/$DU"; }
 t_sshd_r() { local o; o=$(sshd_for "$RUNNER") || return 127; ! printf '%s\n' "$o" | grep -q '^authorizedkeysfile .*authorized_keys.d'; }
 t_tree() { local x; x=$(find "$OPT" \( -not -user root -o \( ! -type l \( -perm -020 -o -perm -002 \) \) \) -print -quit 2> /dev/null) || return 127; [ -z "$x" ]; }
@@ -72,7 +72,18 @@ RG=$(id -nG "$RUNNER" 2> /dev/null) || die runner-ilegivel
 printf '%s\n' $RG | grep -qx "$DU" && die runner-no-grupo-dados
 # 2. árvore de root: nada que o runner edite roda como dados
 install -d -o root -g root -m 0755 "$OPT" "$OPT/app" "$OPT/app/bin" "$ETC" || die dirs
-[ -z "$CODE" ] || rsync -a --delete --chown=root:root --chmod=Dgo-w,Fgo-w --exclude=.git "$CODE"/ "$OPT/app/" || die rsync-code
+# o código de --code-dir vem do COMMIT (`git archive $SHA`), nunca da árvore de trabalho: o rsync copiava o que estivesse no disco, e `status --porcelain` não vê arquivo ignorado (.gitignore) nem edição escondida por `update-index --assume-unchanged`/`skip-worktree`:
+# o HEAD==sha e a "árvore limpa" conferidos acima não descreviam o que ia para uma árvore que roda como `dados`. Extrai numa pasta nova (dono root, sem escrita de grupo/outros), confere os modos e só então troca a árvore de uma vez (falhou → a antiga fica)
+# falhou (git archive, tar ou find) → recusa, nunca instala o que sobrou: pipefail faz um git que morre no meio da saída reprovar mesmo com um tar que aceita o que chegou
+if [ -n "$CODE" ]; then
+  NEW="$OPT/app.new"; OLD="$OPT/app.old"
+  rm -rf -- "$NEW" "$OLD" && mkdir -m 0755 "$NEW" || die code-new
+  ( set -o pipefail; umask 022; git -C "$CODE" archive --format=tar "$SHA" | tar -x --no-same-owner --no-same-permissions -C "$NEW" ) || { rm -rf -- "$NEW"; die code-archive; }
+  bad=$(find "$NEW" ! -type l -perm /6022 -print -quit) || { rm -rf -- "$NEW"; die code-find; }
+  [ -z "$bad" ] || { rm -rf -- "$NEW"; die "code-modo-inseguro:$bad"; }
+  mv "$OPT/app" "$OLD" && mv "$NEW" "$OPT/app" || { [ -d "$OPT/app" ] || mv "$OLD" "$OPT/app"; rm -rf -- "$NEW"; die code-troca; }
+  rm -rf -- "$OLD" || die code-old
+fi
 install -d -o root -g root -m 0755 "$OPT/app/bin" && install -o root -g root -m 0755 "$SRC/hetzner-dados-synth.sh" "$OPT/app/bin/synth" || die synth
 for e in $ENTS; do [ -f "$OPT/app/bin/$e" ] && [ ! -L "$OPT/app/bin/$e" ] || die "entrypoint-ausente:$e"; done
 # link que aponta para fora da árvore de root deixaria o runner trocar o que roda como dados; find que falha → recusa, nunca "sem links"

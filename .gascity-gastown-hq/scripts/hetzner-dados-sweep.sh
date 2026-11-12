@@ -33,9 +33,13 @@ id -u "$DU" > /dev/null 2>&1 || cant usuario-dados-ausente
 # tmpfs de verdade e montagem PRÓPRIA; se não for, o dado pode estar em disco e esta varredura não prova nada (conta o que há, para quem ler o log)
 if [ "$(findmnt -no FSTYPE --target "$STAGE" 2> /dev/null)" != tmpfs ] || ! mountpoint -q "$STAGE"; then cant "stage-nao-e-tmpfs itens=$(find "$STAGE" -mindepth 1 2> /dev/null | wc -l | tr -d ' ')"; fi
 # vazio (rc 0, ninguém) → segue; falhou (ps com rc ≠ 0) → não consegui
+# a leitura do ps passa por awk: awk que falha (ou número ilegível) NUNCA vira "0 processos vivos" (a varredura apagaria o dado de um build) → NAO-CONSEGUI
 P=$(ps -eo user:20=,etimes=,pid= 2> /dev/null) || cant ps-falhou
-LIVE=$(printf '%s\n' "$P" | awk -v u="$DU" -v m="$MAXSECS" '$1 == u && $2 < m { n++ } END { print n + 0 }')
-OLD=$(printf '%s\n' "$P" | awk -v u="$DU" -v m="$MAXSECS" '$1 == u && $2 >= m { print $3 }')
+LIVE=$(printf '%s\n' "$P" | awk -v u="$DU" -v m="$MAXSECS" '$1 == u && $2 < m { n++ } END { print n + 0 }') || cant awk-falhou
+case $LIVE in '' | *[!0-9]*) cant live-ilegivel ;; esac
+# vazio → nenhum processo velho; falhou → não consegui; cada pid lido tem de ser número (o laço abaixo dá kill -9 neles)
+OLD=$(printf '%s\n' "$P" | awk -v u="$DU" -v m="$MAXSECS" '$1 == u && $2 >= m { print $3 }') || cant awk-falhou
+case $OLD in *[!0-9$'\n']*) cant old-ilegivel ;; esac
 if [ "$LIVE" -gt 0 ]; then log "PULADO dados-vivo=$LIVE"; exit 0; fi
 KILLED=0
 for pid in $OLD; do kill -9 "$pid" 2> /dev/null && KILLED=$((KILLED + 1)); done
@@ -48,7 +52,8 @@ if [ "$r" -eq 75 ]; then
   # tomado até depois da espera: só é build se há processo de `dados` AGORA (o wrapper leva segundos entre o lock e o entrypoint). Ninguém de dados = o lock está preso por outra coisa → NAO-CONSEGUI, nunca "build vivo"
   # vazio (ninguém) → NAO-CONSEGUI; ps falhou → NAO-CONSEGUI
   P2=$(ps -eo user:20=,etimes=,pid= 2> /dev/null) || cant ps-falhou
-  L2=$(printf '%s\n' "$P2" | awk -v u="$DU" '$1 == u { n++ } END { print n + 0 }')
+  L2=$(printf '%s\n' "$P2" | awk -v u="$DU" '$1 == u { n++ } END { print n + 0 }') || cant awk-falhou
+  case $L2 in '' | *[!0-9]*) cant l2-ilegivel ;; esac
   [ "$L2" -gt 0 ] || cant "lock-tomado-sem-build"
   log "PULADO build-vivo lock=ocupado dados=$L2"; exit 0
 fi
@@ -57,7 +62,11 @@ N=0; NQ=0
 for d in "$STAGE" "$DHOME"; do
   # vazio → 0 itens; falhou (find com erro ou prazo estourado) → não consegui
   # a contagem é só para o log (quem prova que sumiu é a leitura abaixo): ilegível → "contagem=incompleta" no fim da linha, nunca um 0 que pareça "nada havia"
-  if cl=$(ff "$d" -xdev -mindepth 1); then N=$((N + $(printf '%s' "$cl" | grep -c .))); else NQ=1; fi
+  # grep -c sai 1 com contagem 0 (legítimo: nada havia); rc ≥ 2 ou número ilegível → contagem incompleta, nunca um 0 que pareça "nada havia"
+  if cl=$(ff "$d" -xdev -mindepth 1); then
+    c=$(printf '%s' "$cl" | grep -c .); gr=$?
+    if [ "$gr" -le 1 ] && [ -n "$c" ] && [ -z "${c//[0-9]/}" ]; then N=$((N + c)); else NQ=1; fi
+  else NQ=1; fi
   timeout -k 5 "$SCANSECS" find "$d" -xdev -mindepth 1 -delete 2> /dev/null
   left=$(ff "$d" -xdev -mindepth 1 -print -quit) || cant "leitura-falhou:$d"
   [ -z "$left" ] || cant "sobrou:$left"

@@ -5,8 +5,8 @@
 #   Casos · Mutantes · O que este teste NÃO prova
 #
 # CASOS: gt-dados-run (quem chama, nome fora da lista/ilegível/substring, entrypoint que não é de root, staging que não é tmpfs, swap ligada/ilegível, lock ocupado, montagem do netns, setpriv/env -i, o dado some e o
-#   resultado fica, falha do entrypoint, apagar que falha → 99, TERM) · gt-dados-ingest (verbos, nome, tmpfs, put/replace/link simbólico/tar quebrado, get presente/ausente, clean, status) · gt-dados-sweep (LIMPO, PULADO,
-#   processo velho morto, ps que falha, stage fora do tmpfs, sobra, lock do wrapper tomado (com e sem processo de dados), lock 0600, prazo do find estourado, entrada que sumiu, erro de leitura) · synth (quem roda, saída de rede aberta) · prove (ok, vazamento, não instalado, grupo, sudo, fora-da-lista, build sem prova).
+#   resultado fica, falha do entrypoint, apagar que falha → 99, TERM) · gt-dados-ingest (verbos, nome, tmpfs, put/replace/link simbólico/tar quebrado, get presente/ausente/sem arquivo/find que falha, clean, status, in/ e out/ trocados por link ou arquivo) · gt-dados-sweep (LIMPO, PULADO,
+#   processo velho morto, ps que falha, stage fora do tmpfs, sobra, lock do wrapper tomado (com e sem processo de dados), lock 0600, prazo do find estourado, entrada que sumiu, erro de leitura, awk e grep que falham ou imprimem lixo) · synth (quem roda, saída de rede aberta) · prove (ok, vazamento, não instalado, grupo, sudo, fora-da-lista, build sem prova).
 # MUTANTES: cada guarda é removida numa cópia e algum caso TEM de reprovar (caso que passa no mutante não pega o bug).
 # O QUE NÃO PROVA: que o kernel isola, que o sshd aceita a chave, que o sudo recusa. Isso é o `hetzner-dados-prove.sh` no nó, depois da instalação por root (runbook hetzner-dados.md).
 set -u
@@ -70,6 +70,19 @@ esac
 EOF
 printf '#!/usr/bin/env bash\ncase "$2" in /home/dados|/srv/gtdados/in) case "${LS_MODE:-denied}" in denied) echo "ls: cannot open directory $2: Permission denied" >&2; exit 2 ;; missing) echo "ls: cannot access $2: No such file or directory" >&2; exit 2 ;; leak) echo secret; exit 0 ;; esac ;; esac\nexit 0\n' > "$T/stubs/ls"
 printf '#!/usr/bin/env bash\necho "chown $*" >> "$LOG"; [ "${FAIL_STEP:-}" = chown ] && exit 1; exit 0\n' > "$T/stubs/chown"
+cat > "$T/stubs/grep" <<'EOF'
+#!/usr/bin/env bash
+# GREP_C: o `grep -c .` da contagem do log da varredura sai 2 com um 0 na saída (parece uma contagem), imprime lixo ou não imprime nada
+if [ "$1" = -c ]; then case "${GREP_C:-}" in fail) echo 0; exit 2 ;; junk) echo x; exit 0 ;; empty) exit 0 ;; esac; fi
+exec /usr/bin/grep "$@"
+EOF
+cat > "$T/stubs/awk" <<'EOF'
+#!/usr/bin/env bash
+# AWK_FAIL=live|old|l2: o awk dessa leitura do ps sai 2 sem saída; AWK_JUNK=...: sai 0 com lixo. O programa é reconhecido pelo texto
+case "$*" in *'$2 < m'*) w=live ;; *'print $3'*) w=old ;; *'$1 == u { n++ }'*) w=l2 ;; *) w= ;; esac
+[ -z "$w" ] || { [ "${AWK_FAIL:-}" != "$w" ] || exit 2; [ "${AWK_JUNK:-}" != "$w" ] || { echo abc; exit 0; }; }
+exec /usr/bin/awk "$@"
+EOF
 chmod +x "$T/stubs/"*
 export LOG T STAGE_T="$S" GTD_TEST_ETC="$T/etc-netns" GTD_TEST_OWNER="$ME"
 mkcopy() { # <origem> <destino> [sed extra]
@@ -149,6 +162,21 @@ case_ingest() { local s=$1 src="$T/src"; find "$src" -mindepth 0 -delete 2>/dev/
   FIND_NOISE=eacces ing "status"; ck "ingest status: find que falha → '?' e rc 74 (nunca 0 itens)" bash -c "[ $RC = 74 ] && grep -q 'in=? out=?' '$OUT'"; SEED= ing "status"; ck "ingest status: nada em in/ e out/ → 0 e 0 (diferente de '?')" has "$OUT" 'in=0 out=0'
   # o tar do remetente que morre antes de listar nada deixa um arquivo VÁLIDO e vazio (só blocos de zeros): `tar -x` sai 0 sem extrair nada (um stream de 0 byte já sai 2 sozinho, caso do "tar quebrado")
   head -c 10240 /dev/zero > "$T/empty.tar"; IN="$T/empty.tar" SEED= ing "put proj"; ck "ingest put: arquivo tar válido e vazio (o tar do remetente morreu) → 67, nada ficou, nunca 'ok files=0'" bash -c "[ $RC = 67 ] && [ ! -e '$S/in/proj' ] && ! grep -q 'ok files' '$OUT'"
+  # revisão do gate 12/11 (tentativa 3): in/ e out/ são nomes do build (o `dados` os troca por link simbólico ou arquivo). put/get/clean <nome> recusam (98) e NADA é gravado, lido ou apagado fora do staging (o `put` por um link gravaria o dado em disco); status conta '?' (74); clean sem nome apaga o próprio link
+  rawing() { SSH_ORIGINAL_COMMAND="$1" "$s" > "$OUT" 2> "$ERR" < "${IN:-/dev/null}"; RC=$?; }
+  swapd() { lnk "$1" "$2"; mkdir -p "$T/victim/proj"; echo keep > "$T/victim/proj/r.txt"; }
+  for nm in in out; do for kind in link solto arquivo; do
+    swapd "$nm" "$kind"; IN="$T/in.tar" rawing "put proj"; ck "ingest put: $nm/ é $kind → 98 stage-dirs, nada gravado fora do staging" bash -c "[ $RC = 98 ] && grep -q 'recusado:stage-dirs' '$ERR' && [ ! -e '$T/victim/proj/sub' ] && [ -f '$T/victim/proj/r.txt' ]"
+    swapd "$nm" "$kind"; rawing "get proj"; ck "ingest get: $nm/ é $kind → 98 stage-dirs e stdout vazio (nada lido de fora)" bash -c "[ $RC = 98 ] && grep -q 'recusado:stage-dirs' '$ERR' && [ ! -s '$OUT' ]"
+    swapd "$nm" "$kind"; rawing "clean proj"; ck "ingest clean <nome>: $nm/ é $kind → 98 stage-dirs, nada apagado fora do staging, nunca 'clean ok'" bash -c "[ $RC = 98 ] && ! grep -q 'clean ok' '$OUT' && [ -f '$T/victim/proj/r.txt' ]"
+    swapd "$nm" "$kind"; rawing "status"; ck "ingest status: $nm/ é $kind → '$nm=?' e rc 74 (nunca o 0 de um caminho que não é o staging)" bash -c "[ $RC = 74 ] && grep -q '$nm=?' '$OUT'"; done
+    swapd "$nm" link; rawing "clean"; ck "ingest clean (tudo): $nm/ é link → o link some, rc 0, o alvo do link intacto" bash -c "[ $RC = 0 ] && [ ! -e '$S/$nm' ] && [ ! -L '$S/$nm' ] && [ -f '$T/victim/proj/r.txt' ]"; done
+  # get: out/<nome> que é link (para um diretório de fora) não é resultado; diretório sem arquivo regular nenhum não é "resultado vazio"; find que falha não é "ausente"
+  swapd out solto; rm -rf "$S/out"; mkdir "$S/out"; ln -s "$T/victim/proj" "$S/out/proj"; rawing "get proj"; ck "ingest get: out/<nome> é link para um diretório com arquivo → 66 e stdout vazio (nunca o tar do link)" bash -c "[ $RC = 66 ] && [ ! -s '$OUT' ]"
+  fresh; mkdir -p "$S/out/vazio/sub"; rawing "get vazio"; ck "ingest get: out/<nome> só com diretórios vazios → 66 resultado-ausente e stdout vazio (nunca um tar sem arquivo)" bash -c "[ $RC = 66 ] && grep -q 'resultado-ausente' '$ERR' && [ ! -s '$OUT' ]"
+  fresh; mkdir -p "$S/out/solo"; ln -s /etc/passwd "$S/out/solo/elo"; rawing "get solo"; ck "ingest get: out/<nome> só com um link (nenhum arquivo regular) → 66" bash -c "[ $RC = 66 ] && [ ! -s '$OUT' ]"
+  fresh; seed; FIND_NOISE=eacces rawing "get proj"; ck "ingest get: find que falha → 74 resultado-ilegivel (não 'ausente'), stdout vazio" bash -c "[ $RC = 74 ] && grep -q 'resultado-ilegivel' '$ERR' && [ ! -s '$OUT' ]"
+  fresh; seed; rawing "get proj"; ck "ingest get: resultado com arquivo → rc 0 e o tar traz o arquivo" bash -c "[ $RC = 0 ] && tar -t < '$OUT' | grep -q r.txt"
   if [ "$(id -u)" != 0 ]; then fresh; seed; chmod 555 "$S/in/proj"; SSH_ORIGINAL_COMMAND="clean proj" "$s" > "$OUT" 2> "$ERR"; RC=$?; ck "ingest clean: não consegui apagar → 99 (nunca 'ok')" rcis 99; chmod -R u+rwx "$S"
     fresh; seed; chmod 555 "$S/in/proj"; SSH_ORIGINAL_COMMAND="clean" "$s" > "$OUT" 2> "$ERR"; RC=$?; ck "ingest clean (tudo): in/ resistiu → 99, mas out/ foi apagado mesmo assim (não para no 1º que sobrou)" bash -c "[ $RC = 99 ] && [ ! -e '$S/out' ]"; chmod -R u+rwx "$S"; fi; }
 sw() { fresh; rm -f "$T/ps.n"; seed; mkdir -p "$S/in/x"; echo d > "$T/dhome/cache"; echo t > "$T/tmp1/$ME-file"; mkdir -p "$T/tmp1/$ME-dir/sub"; echo n > "$T/tmp1/$ME-dir/sub/f"; echo v > "$T/tmp2/$ME-file"; printf '%s\n' "${PS_ROWS:-}" > "$T/ps"; "$1" > "$OUT" 2> "$ERR"; RC=$?; }
@@ -176,7 +204,18 @@ case_sweep() { local s=$1 row_new="$ME 60 99999"
   FIND_NOISE=enoent PS_ROWS="root 1 1" sw "$s"; ck "sweep: find com 'No such file or directory' (entrada sumiu no meio) → ainda LIMPO rc 0" bash -c "[ $RC = 0 ] && grep -q 'gt-dados-sweep: LIMPO' '$OUT'"
   FIND_NOISE=eacces PS_ROWS="root 1 1" sw "$s"; ck "sweep: find com 'Permission denied' → NAO-CONSEGUI leitura-falhou, rc 2, nunca LIMPO" bash -c "[ $RC = 2 ] && grep -q 'NAO-CONSEGUI leitura-falhou' '$OUT' && ! grep -q LIMPO '$OUT'"
   FIND_NOISE=masked PS_ROWS="root 1 1" sw "$s"; ck "sweep: erro de OUTRO tipo num caminho que contém 'No such file or directory' não é entrada que sumiu → NAO-CONSEGUI rc 2, nunca LIMPO" bash -c "[ $RC = 2 ] && grep -q 'NAO-CONSEGUI leitura-falhou' '$OUT' && ! grep -q LIMPO '$OUT'"
-  FIND_NOISE=countfail PS_ROWS="root 1 1" sw "$s"; ck "sweep: contagem ilegível mas o resto confere → LIMPO rc 0 com 'contagem=incompleta' no fim (nunca um removed=0 que pareça 'nada havia')" bash -c "[ $RC = 0 ] && grep -q 'LIMPO removed=.* killed=0 contagem=incompleta\$' '$OUT'"; PS_ROWS="root 1 1" sw "$s"; ck "sweep: contagem legível → a linha NÃO leva 'contagem=incompleta'" hasnt "$OUT" 'contagem=incompleta'; }
+  FIND_NOISE=countfail PS_ROWS="root 1 1" sw "$s"; ck "sweep: contagem ilegível mas o resto confere → LIMPO rc 0 com 'contagem=incompleta' no fim (nunca um removed=0 que pareça 'nada havia')" bash -c "[ $RC = 0 ] && grep -q 'LIMPO removed=.* killed=0 contagem=incompleta\$' '$OUT'"; PS_ROWS="root 1 1" sw "$s"; ck "sweep: contagem legível → a linha NÃO leva 'contagem=incompleta'" hasnt "$OUT" 'contagem=incompleta'
+  # nada em staging/home/tmp: o `grep -c` sai 1 com contagem 0 (legítimo: nada havia) → removed=0 sem 'contagem=incompleta'
+  PS_ROWS="root 1 1" sw "$s"; "$s" > "$OUT" 2> "$ERR"; RC=$?; ck "sweep: 2ª varredura (nada a apagar; grep -c sai 1 com 0) → LIMPO removed=0, sem 'contagem=incompleta'" bash -c "[ $RC = 0 ] && grep -q 'LIMPO removed=0 killed=0\$' '$OUT'"
+  # a contagem passa pelo grep: rc ≥ 2 (com um 0 na saída), lixo ou nada → 'contagem=incompleta' (só o log; quem prova que sumiu é a leitura), nunca um removed=0 que pareça "nada havia"
+  for m in fail junk empty; do GREP_C=$m PS_ROWS="root 1 1" sw "$s"; ck "sweep: grep -c da contagem '$m' → LIMPO rc 0 com 'contagem=incompleta'" bash -c "[ $RC = 0 ] && grep -q 'LIMPO removed=.* killed=0 contagem=incompleta\$' '$OUT'"; done
+  # a leitura do ps passa por awk: awk que falha (rc 2) ou imprime lixo NUNCA vira "0 processos vivos" (com um build vivo a varredura apagaria o dado dele) nem pid inventado (`kill -9 -1` mataria tudo) → NAO-CONSEGUI, rc 2, nada apagado
+  AWK_FAIL=live PS_ROWS="$row_new" sw "$s"; ck "sweep: awk dos vivos falha com build vivo → NAO-CONSEGUI awk-falhou, rc 2, dado intacto (nunca LIMPO)" bash -c "[ $RC = 2 ] && grep -q 'NAO-CONSEGUI awk-falhou' '$OUT' && ! grep -q LIMPO '$OUT' && [ -f '$S/in/proj/dado.txt' ]"
+  AWK_JUNK=live PS_ROWS="$row_new" sw "$s"; ck "sweep: awk dos vivos imprime lixo → NAO-CONSEGUI live-ilegivel, rc 2, dado intacto" bash -c "[ $RC = 2 ] && grep -q 'NAO-CONSEGUI live-ilegivel' '$OUT' && [ -f '$S/in/proj/dado.txt' ]"
+  AWK_FAIL=old PS_ROWS="root 1 1" sw "$s"; ck "sweep: awk dos velhos falha → NAO-CONSEGUI awk-falhou, rc 2, dado intacto" bash -c "[ $RC = 2 ] && grep -q 'NAO-CONSEGUI awk-falhou' '$OUT' && ! grep -q LIMPO '$OUT' && [ -f '$S/in/proj/dado.txt' ]"
+  AWK_JUNK=old PS_ROWS="root 1 1" sw "$s"; ck "sweep: awk dos velhos imprime um pid que não é número → NAO-CONSEGUI old-ilegivel, rc 2, nada morto nem apagado" bash -c "[ $RC = 2 ] && grep -q 'NAO-CONSEGUI old-ilegivel' '$OUT' && ! grep -q LIMPO '$OUT' && [ -f '$S/in/proj/dado.txt' ]"
+  for w in "FAIL awk-falhou" "JUNK l2-ilegivel"; do set -- $w; fresh; rm -f "$T/ps.n"; seed; echo "root 1 1" > "$T/ps"; flock "$T/lock" sleep 3 & HOLD=$!; sleep 0.3; env AWK_$1=l2 PS_SECOND="$ME 5 4242" "$s" > "$OUT" 2> "$ERR"; RC=$?; wait "$HOLD" 2> /dev/null
+    ck "sweep: lock tomado + awk da 2ª leitura ($1) → NAO-CONSEGUI $2, rc 2, nunca PULADO/LIMPO, dado intacto" bash -c "[ $RC = 2 ] && grep -q 'NAO-CONSEGUI $2' '$OUT' && ! grep -q -e PULADO -e LIMPO '$OUT' && [ -f '$S/in/proj/dado.txt' ]"; done; }
 case_synth() { local s=$1 PATH="$T/stubs:$PATH"; fresh; mkdir -p "$S/in" "$S/out"
   ID_UN=runner GT_DADOS_STAGE="$S" "$s" > "$OUT" 2> "$ERR"; RC=$?; ck "synth: fora do usuário dados → 2" rcis 2; GT_DADOS_STAGE= "$s" > "$OUT" 2> "$ERR"; RC=$?; ck "synth: sem GT_DADOS_STAGE → 2" rcis 2
   python3 - "$T/port" <<'PY' &
@@ -225,6 +264,12 @@ mut M42-ingest-status-conta-constante ingest 's|echo "\${#o}"|echo 1|' case_inge
 mut M43-ingest-status-um-ponto-por-lote ingest "s|printf '.%.0s'|printf .|" case_ingest
 mut M12-ingest-sem-tmpfs ingest 's#|| no stage-nao-e-tmpfs 98##' case_ingest
 mut M13-ingest-get-vazio ingest 's#|| no resultado-ausente 66##' case_ingest
+mut M46-ingest-put-segue-link ingest '/^  put)/,/^  get)/s#sane || no stage-dirs 98#true#' case_ingest
+mut M47-ingest-get-segue-link ingest '/^  get)/,/^  clean)/s#sane || no stage-dirs 98#true#' case_ingest
+mut M48-ingest-clean-nome-segue-link ingest 's#sane || no stage-dirs 98; gone#gone#' case_ingest
+mut M50-ingest-get-sem-arquivo-vira-tar ingest 's#\[ -n "\$f" \] || no resultado-ausente 66#true#' case_ingest
+mut M51-ingest-get-find-falha-vira-ausente ingest 's#|| no resultado-ilegivel 74#|| true#' case_ingest
+mut M52-ingest-status-link-vira-zero ingest "s#isdir \"\$1\" || { echo '?'; return 0; }; ##" case_ingest
 mut M45-sweep-log-que-falha-vira-limpo sweep 's#else echo "\$(date -u +%Y-%m-%dT%H:%M:%SZ) gt-dados-sweep: NAO-CONSEGUI escrever \$LOG"; exit 2; fi; }#else echo "\$l"; fi; }#' case_sweep
 mut M14-sweep-ignora-vivo sweep 's#if \[ "\$LIVE" -gt 0 \]#if false#' case_sweep
 mut M15-sweep-ps-vazio sweep 's#|| cant ps-falhou##' case_sweep
@@ -236,6 +281,16 @@ mut M23-sweep-entrada-que-sumiu-reprova sweep 's#grep -v -e "\$GONE_RE" "\$ef" |
 mut M24-sweep-erro-de-leitura-ignorado sweep 's#grep -v -e "\$GONE_RE" "\$ef" | grep -q \.#false#' case_sweep
 mut M34-sweep-gone-por-substring sweep 's#grep -v -e "\$GONE_RE" "\$ef"#grep -v -F -e "No such file or directory" "\$ef"#' case_sweep
 mut M35-sweep-contagem-ilegivel-vira-zero sweep 's#else NQ=1; fi#else NQ=0; fi#' case_sweep
+mut M53-sweep-awk-vivos-falha-vira-zero sweep '/^LIVE=/s# || cant awk-falhou##' case_sweep
+mut M54-sweep-awk-vivos-lixo sweep 's#^case \$LIVE in .*##' case_sweep
+mut M55-sweep-awk-velhos-falha-vira-nenhum sweep '/^OLD=/s# || cant awk-falhou##' case_sweep
+mut M56-sweep-awk-velhos-lixo-vira-pid sweep 's#^case \$OLD in .*##' case_sweep
+mut M57-sweep-awk-2a-leitura-falha-vira-zero sweep '/^  L2=/s# || cant awk-falhou##' case_sweep
+mut M58-sweep-awk-2a-leitura-lixo sweep 's#^  case \$L2 in .*##' case_sweep
+mut M59-sweep-grep-rc-ignorado sweep 's#\[ "\$gr" -le 1 \] && ##' case_sweep
+mut M60-sweep-grep-lixo-vira-numero sweep 's#&& \[ -z "\${c//\[0-9\]/}" \]##' case_sweep
+mut M61-sweep-grep-vazio-vira-numero sweep 's#&& \[ -n "\$c" \] ##' case_sweep
+mut M62-sweep-grep-rc1-vira-incompleto sweep 's#\[ "\$gr" -le 1 \]#[ "$gr" -le 0 ]#' case_sweep
 mut M25-sweep-lock-sem-build-vira-pulado sweep 's#\[ "\$L2" -gt 0 \] || cant "lock-tomado-sem-build"#true#' case_sweep
 mut M26-run-lock-sem-chmod run 's#&& chmod 0600 "\$LOCK" 2> /dev/null || fail lock-modo#|| fail lock-modo#' case_lock
 mut M27-sweep-lock-sem-chmod sweep 's#&& chmod 0600 "\$LOCK" 2> /dev/null || cant lock-modo#|| cant lock-modo#' case_sweep
