@@ -7,7 +7,7 @@
 # O QUE AUDITA (cada verificação diz LIMPO | ACHADO | NAO-CONSEGUI):
 #   processo          nenhum `claude auth login` esquecido (o de 15/10, pid 370419, ficou com a credencial já gravada).
 #   credenciais       as ÚNICAS credenciais são as 3 de CRED_ALLOW (login do claude, atalho ssh→mini, chave do espelho git — a 3ª nasceu na fatia 4 e a bead só
-#                     citava 2) e as contas do rodízio do claude de CRED_ALLOW_GLOB (~/.claude-accounts/<conta>/.credentials.json, uma por conta), todas com modo 600 e dono do usuário; qualquer outro arquivo com chave privada ou token (por CONTEÚDO, não por nome) ou loja
+#                     citava 2) e as contas do rodízio do claude de CRED_ALLOW_GLOB (~/.claude-accounts/<conta>/.credentials.json, uma por conta, só com o token sk-ant-: chave PEM ou token de outro tipo dentro é achado), todas com modo 600 e dono do usuário; qualquer outro arquivo com chave privada ou token (por CONTEÚDO, não por nome) ou loja
 #                     de credencial conhecida (.netrc, .git-credentials, .aws...) é achado.
 #   github-e-espelho  `hetzner-remote-git.sh scan` NO servidor (o que já existia: credencial do GitHub no host + dado negado no espelho git). Não é refeito aqui; o ACHADO mostra, por rig,
 #                     historico · remotos_fora_do_espelho · arvore (a contagem do scan fica de fora). Os `.pyc` de worktree que a lista de negação do sparse-checkout pega são ruído do scan, não daqui.
@@ -15,12 +15,12 @@
 #                     e em cada diretório de topo e filho de gt-remote/ EXCETO os de SKIP_NOTE (a linha LIMPO diz o que ficou de fora). Os padrões do find vivem SÓ lá; aqui só se escolhe ONDE olhar
 #                     e se separam os achados que são FERRAMENTA (DADOS_ACEITOS: só o (pasta, caminho, tipo) que a lista nomeia; CONTEUDO nunca; nunca numa lista cortada em 20).
 #   backup-de-bead    .dolt só se for repositório (noms/ ou repo_state.json: a pasta do CLI em ~ não conta), .dolt-backup, issues.jsonl, beads*.jsonl, qualquer .jsonl dentro de um jsonl-archive/ (peças por dia, ga-e4cbc5s), e .beads com algo além de lock.
-#   usuario-dados     (trava 1, ga-qg1dw5z.1) o usuário `dados` existe, o home dele é 0700 e dele, ele não está no grupo do runner nem o runner no dele, e o runner NÃO lê o home.
-#   root-sem-login    (trava 2, ga-qg1dw5z.2) o sshd_config (com os Include) diz PermitRootLogin no: a 1ª ocorrência fora de Match vale; um Match que libere o root é achado.
+#   usuario-dados     (trava 1, ga-qg1dw5z.1) o usuário `dados` existe, o home dele é 0700 e dele, ele e o runner não têm grupo em comum, e o runner NÃO lê o home.
+#   root-sem-login    (trava 2, ga-qg1dw5z.2) o sshd_config (com os Include; pasta de Include que não consigo abrir = NAO-CONSEGUI) diz PermitRootLogin no: a 1ª ocorrência fora de Match vale; um Match que libere o root é achado.
 #   ufw / fail2ban    (trava 2) ufw com ENABLED=yes no arquivo E a unidade ativa (o unit do ufw roda e sai: "active" sozinho não prova firewall); fail2ban instalado, ativo e com a jail sshd.
 #                     Lê ARQUIVO e `systemctl is-active`, não o estado vivo: regras vivas do ufw e `fail2ban-client` exigem root, que este usuário não tem.
 #
-# TRÊS ESTADOS: achei / li tudo e não achei / não consegui ler (ssh caiu, comando ausente, pasta ilegível, saída que não reconheço, ORÇAMENTO que estourou). O último NUNCA vira LIMPO.
+# TRÊS ESTADOS: achei / li tudo e não achei / não consegui ler (ssh caiu, comando ausente, pasta ilegível, listagem que acusou ERR, saída que não reconheço, ORÇAMENTO que estourou). O último NUNCA vira LIMPO.
 # ORÇAMENTO E ESCOPO (ga-qg1dw5z.3): em 11/11 esta auditoria estourou 280 s SEM saída no nó carregado (= "não sei"). Medido no nó: o script de credenciais, sozinho, não fechava em 280 s (um
 #   grep de token em 390 mil arquivos dos worktrees do repo, 156 acertos de EXEMPLO), o node_audit de ~/.claude (7 GB de transcritos, 331 arquivos > 4 MB) passava de 250 s e o do espelho
 #   levava 126 s; `nice`/`ionice` não mudam nada ali (o escalonador de IO é `none` e o lastro roda em SCHED_IDLE) e a leitura a frio é o que custa. Agora: (1) as fases rodam EM PARALELO
@@ -50,7 +50,7 @@ SKIP_TOP=" .cache .local .duckdb .ssh .npm .cc-safety-net gt-remote "      # top
 SKIP_GT=" bin bundle bundle-out git keys mirror "     # filhos de gt-remote sem dado: ferramentas, bundle, espelho git e seus worktrees (varredura de conteúdo por commit no mini + `scan`), chaves (credenciais); venv-* é pulado no laço do audit_dados
 GT_PRUNE="prune=venv:env:.git:__pycache__"
 CLAUDE_PRUNE="prune=plugins:downloads:cache:security/agent-sdk-venv:projects:file-history:sessions"      # transcritos (7 GB, 331 arquivos > 4 MB), histórico de sessão e o registro de sessão (sessions/<pid>.<hash>.key: 142 bytes de JSON com ids, um por sessão viva, nome terminado em .key): ver LIMITES
-SKIP_NOTE=".cache .local .duckdb .ssh .npm .cc-safety-net (topo), .claude/{projects,file-history,sessions} e gt-remote/{bin,bundle,bundle-out,git,keys,mirror,venv-*}"   # o que SKIP_TOP/SKIP_GT/CLAUDE_PRUNE deixam de fora: a linha LIMPO do dados o repete, para o "limpo" não parecer maior do que é
+SKIP_NOTE=".cache .local .duckdb .ssh .npm .cc-safety-net (topo), .claude/{projects,file-history,sessions}, o CONTEÚDO de .claude/{history.jsonl,usage-analytics.jsonl} (GRANDE aceito: não lido) e gt-remote/{bin,bundle,bundle-out,git,keys,mirror,venv-*}"   # o que SKIP_TOP/SKIP_GT/CLAUDE_PRUNE deixam de fora: a linha LIMPO do dados o repete, para o "limpo" não parecer maior do que é
 CRED_NOTE="a busca por CONTEÚDO não olha (PR e PT do remote_cred): .cache, .local/share/claude, .duckdb, .claude/{projects,file-history,plugins,downloads,security}, gt-remote/{git,mirror,*/env}, venv*, node_modules, site-packages, .git, repo.git, __pycache__, tests/, fixtures/, *.selftest.*, test_*"
 # achados do node_audit que são FERRAMENTA e não dado: pasta|glob relativo à pasta|tipos|por quê. Só o tipo que a linha lista; CONTEUDO nunca (lista de telefones/CPFs é dado); o JWT só num caminho exato de arquivo
 # que a própria ferramenta assina. Cada linha foi conferida no nó em 12/11 (forma e tamanho, sem ler valor).
@@ -108,8 +108,9 @@ start() { # start <nome> <prazo> comando...   (em 2º plano: $W/<nome>.out .err 
   run_bounded "$lim" "$W/$nome.out" "$W/$nome.err" "$W/$nome.rc" "$@" &
 }
 rc_of() { cat "$W/$1.rc" 2>/dev/null || echo 125; }
-cant_of() { # cant_of <nome> <o que não li>: o texto de NAO-CONSEGUI para uma fase que não terminou
+cant_of() { # cant_of <nome> <o que não li>: o texto de NAO-CONSEGUI para uma fase que não terminou ou que acusou ERR
   if [ "$(rc_of "$1")" = 124 ]; then echo "estourou o orçamento de ${BUDGET}s (carga do nó? leitura a frio?): não li $2"
+  elif grep -q '^ERR' "$W/$1.out" 2>/dev/null; then echo "o script remoto acusou '$(grep -m 1 '^ERR' "$W/$1.out")' (leitura que falhou no servidor): não li $2"
   else echo "ssh a $HOST caiu ou o script remoto não terminou (rc=$(rc_of "$1")): não li $2"; fi
 }
 
@@ -136,12 +137,12 @@ P=$(pgrep -af '[c]laude.* auth login' 2>>"$E"); rc=$?
 case $rc in 0) printf '%s\n' "$P" | cut -c1-100 | sed 's/^/PROC /' ;; 1) ;; *) echo "ERR processo" ;; esac
 PT=(-path '*/tests/*' -o -path '*/fixtures/*' -o -name '*.selftest.*' -o -name 'test_*')   # token falso de teste, por desenho (medido: 10 de 10 achados da 1ª rodada eram isso)
 # vazio → nenhuma linha CRED_HIT; falhou/ilegível → stderr do find/grep em $E e o ERR leitura abaixo (nunca "limpo")
-find . \( "${PR[@]}" -o "${PT[@]}" \) -prune -o -type f -size -2049k -exec grep -lIE -e '-----BEGIN [A-Z ]*PRIVATE KEY-----' -e 'sk-ant-[A-Za-z0-9_-]{20,}' -e 'gh[pousr]_[A-Za-z0-9]{30,}' \
-  -e 'github_pat_[A-Za-z0-9_]{30,}' -e 'xox[abprs]-[A-Za-z0-9-]{10,}' -e 'AKIA[0-9A-Z]{16}' {} + 2>>"$E" | sed 's#^\./##; s/^/CRED_HIT /'
+OT=(-e '-----BEGIN [A-Z ]*PRIVATE KEY-----' -e 'gh[pousr]_[A-Za-z0-9]{30,}' -e 'github_pat_[A-Za-z0-9_]{30,}' -e 'xox[abprs]-[A-Za-z0-9-]{10,}' -e 'AKIA[0-9A-Z]{16}')   # tudo que NÃO é o sk-ant- do claude: o arquivo de conta do rodízio com isso dentro não é só uma credencial do claude
+find . \( "${PR[@]}" -o "${PT[@]}" \) -prune -o -type f -size -2049k -exec grep -lIE -e 'sk-ant-[A-Za-z0-9_-]{20,}' "${OT[@]}" {} + 2>>"$E" | sed 's#^\./##; s/^/CRED_HIT /'
 for f in "$@"; do
   case "$f" in
-    # glob: vazio (padrão sem nenhum arquivo) → "nenhuma conta", sem linha CRED_MISSING nem achado; falhou (stat) → ERR stat, que o avaliador lê como NAO-CONSEGUI; cada arquivo que casa é conferido (modo e dono) como os fixos
-    glob:*) set +f; for g in ${f#glob:}; do [ -e "$g" ] || continue; m=$(stat -c '%a %U' "$g" 2>>"$E") && echo "CRED_STAT $m $g" || echo "ERR stat $g"; done; set -f ;;
+    # glob: vazio (padrão sem nenhum arquivo) → "nenhuma conta", sem linha CRED_MISSING nem achado; falhou (stat) → ERR stat, que o avaliador lê como NAO-CONSEGUI; cada arquivo que casa é conferido (modo e dono) como os fixos, e só vale se NÃO tiver outro segredo que o sk-ant- (CRED_OTHER; o grep que falha cai no ERR leitura)
+    glob:*) set +f; for g in ${f#glob:}; do [ -e "$g" ] || continue; m=$(stat -c '%a %U' "$g" 2>>"$E") && echo "CRED_STAT $m $g" || echo "ERR stat $g"; grep -qIE "${OT[@]}" "$g" 2>>"$E" && echo "CRED_OTHER $g"; done; set -f ;;
     *) if [ -e "$f" ]; then m=$(stat -c '%a %U' "$f" 2>>"$E") && echo "CRED_STAT $m $f" || echo "ERR stat $f"; else echo "CRED_MISSING $f"; fi ;;
   esac
 done
@@ -162,7 +163,7 @@ done
 echo DONE
 EOF
 }
-# travas 1 e 2: só LÊ arquivos do /etc e roda id/getent/stat/systemctl/dpkg-query (nada exige root). HZ_ETC troca o /etc: só o selftest o faz (no servidor a variável não existe).
+# travas 1 e 2: só LÊ arquivos do /etc e roda id/getent/stat/systemctl/dpkg-query (nada exige root). HZ_ETC troca o /etc: só o selftest o faz (no servidor a variável não existe). O stderr ($E) é descartado de propósito: cada leitura que importa tem o estado "error" dela (T_*), e um marcador de stderr que ninguém lê parece tratado sem estar.
 remote_travas() { cat <<'EOF'
 set -u -f
 export LC_ALL=C
@@ -199,10 +200,11 @@ sshd_scan() { # sshd_scan <arquivo> <profundidade> <já dentro de Match: 0|1>
       include) shift
         for pat in "$@"; do
           case "$pat" in /etc/*) pat="$ETC/${pat#/etc/}" ;; /*) ;; *) pat="$ETC/ssh/$pat" ;; esac
-          set +f; for g in $pat; do [ -e "$g" ] && sshd_scan "$g" $((d+1)) "$inm"; done; set -f
+          # vazio (o padrão não casa nada numa pasta que abro) → nada a ler; falhou (a pasta do Include não se abre: não sei o que há nela) → SSHD_ERR, nunca "sem Include"
+          set +f; for g in $pat; do if [ -e "$g" ]; then sshd_scan "$g" $((d+1)) "$inm"; elif [ -d "${g%/*}" ] && { [ ! -r "${g%/*}" ] || [ ! -x "${g%/*}" ]; }; then SSHD_ERR=1; fi; done; set -f
         done ;;
       match) inm=1 ;;
-      permitrootlogin) v=$(printf '%s' "${2:-}" | tr 'A-Z' 'a-z'); if [ "$inm" = 1 ]; then echo "T_SSHD_MATCH $v"; else [ -n "$ROOTV" ] || ROOTV=$v; fi ;;
+      permitrootlogin) v=$(printf '%s' "${2:-}" | tr 'A-Z' 'a-z' | tr -d '"'); if [ "$inm" = 1 ]; then echo "T_SSHD_MATCH $v"; else [ -n "$ROOTV" ] || ROOTV=$v; fi ;;
     esac
   done < "$f"
 }
@@ -234,7 +236,6 @@ for f in "$ETC/fail2ban/jail.conf" "$ETC"/fail2ban/jail.d/*.conf "$ETC/fail2ban/
 done
 set -f
 [ "$JERR" = 1 ] && echo "T_F2B_JAIL error" || echo "T_F2B_JAIL $JE"
-[ -s "$E" ] && echo "T_ERR leitura"
 echo T_DONE
 EOF
 }
@@ -252,6 +253,8 @@ wait "$p_lista"
 # 2) com a listagem, as pastas do node_audit vão a K grupos (rodízio), cada um uma invocação do mbp-run; o ssh que o mbp-run usa ganha o `timeout` do nó
 L=$(cat "$W/lista.out" 2>/dev/null)
 case "$L" in *$'\nDONE'|DONE) l_done=1 ;; *) l_done=0 ;; esac
+# vazio → listagem completa; falhou (linha ERR leitura: o ls de ~ ou de gt-remote falhou e a lista veio CURTA, mesmo com DONE) → l_done=0: dados NAO-CONSEGUI, nunca LIMPO com menos pastas
+case "$L" in ERR*|*$'\nERR'*) l_done=0 ;; esac
 lines_of() { printf '%s\n' "$1" | sed -n "s/^$2 //p"; }
 n_dirs=0; njobs=$JOBS
 if [ "$l_done" = 1 ]; then
@@ -285,7 +288,6 @@ A=$(cat "$W/cred.out" 2>/dev/null)
 case "$A" in *$'\nDONE'|DONE) a_done=1 ;; *) a_done=0 ;; esac    # só o script que chegou ao fim leu tudo; ssh que caiu no meio deixa a saída sem DONE
 user=$(printf '%s\n' "$A" | sed -n 's/^HOST \([^@]*\)@.*/\1/p' | head -n 1); hostname=$(printf '%s\n' "$A" | sed -n 's/^HOST [^@]*@//p' | head -n 1)
 lines() { printf '%s\n' "$A" | sed -n "s/^$1 //p"; }
-cant_a=$(cant_of cred "")
 [ "$a_done" = 1 ] && [ -n "$user" ] || { a_done=0; }
 err_for() { printf '%s\n' "$A" | grep -q "^ERR $1" ; }
 
@@ -298,12 +300,13 @@ else emit LIMPO processo "nenhum \`claude auth login\` em execução"; fi
 # credenciais
 if [ "$a_done" = 0 ]; then emit NAO-CONSEGUI credenciais "$(cant_of cred "as credenciais")"
 else
-  bad=""; allowed=" "; known=""; statted=" $(lines CRED_STAT | awk '{print $3}' | tr '\n' ' ')"
+  bad=""; allowed=" "; known=""; statted=" $(lines CRED_STAT | awk '{print $3}' | tr '\n' ' ')"; other=" $(lines CRED_OTHER | tr '\n' ' ')"
   for pair in "${CRED_ALLOW[@]}"; do allowed="$allowed${pair%%:*} "; done
   for h in $(lines CRED_HIT); do
     ok=0; case "$allowed" in *" $h "*) ok=1 ;; esac
     # glob: só vale o arquivo que o servidor expandiu e conferiu (CRED_STAT): o `*` de um `case` atravessa "/", o do servidor não (…/a1/sub/.credentials.json casaria aqui sem nunca ter o modo e o dono vistos)
     for gp in "${CRED_ALLOW_GLOB[@]}"; do case "$h" in ${gp%%:*}) case "$statted" in *" $h "*) ok=1 ;; esac ;; esac; done
+    case "$other" in *" $h "*) ok=0 ;; esac      # a conta do rodízio com OUTRO tipo de segredo (chave PEM, token do GitHub...) não é só a credencial do claude: o glob não a cobre
     [ "$ok" = 1 ] || bad="$bad hit-fora-da-lista:$h"
   done
   for f in $(lines CRED_NAME); do bad="$bad loja-conhecida:$f"; done
@@ -378,6 +381,7 @@ eval_dados() {
     elif aceito "$dir" "$typ" "$path"; then acc=$((acc+1)); continue; fi
     kept="$kept$ln"$'\n'
   done <<< "$found"
+  [ "$acc" -gt 0 ] || acc=""      # nada aceito: a linha não diz "aceitos: 0"
   found=$(printf '%s\n' "$kept" | sed '/^$/d')
   if [ -n "$found" ]; then
     emit ACHADO dados "$(printf '%s\n' "$found" | grep -c .) achados em: $(printf '%s\n' "$found" | sed 's/: .*//' | sort -u | tr '\n' ' ')${cortadas:+· lista cortada em 20 por tipo (nada aceito em:$cortadas)}${acc:+ · aceitos: $acc}"
@@ -394,7 +398,6 @@ eval_dados
 T=$(cat "$W/travas.out" 2>/dev/null)
 case "$T" in *$'\nT_DONE'|T_DONE) t_done=1 ;; *) t_done=0 ;; esac
 tl() { printf '%s\n' "$T" | sed -n "s/^$1 //p" | head -n 1; }
-cant_t=$(cant_of travas "")
 if [ "$t_done" = 0 ]; then
   for c in usuario-dados root-sem-login ufw fail2ban; do emit NAO-CONSEGUI "$c" "$(cant_of travas "esta trava")"; done
 else
@@ -411,8 +414,7 @@ else
       [ "${2:-}" = dados ] || bad="$bad dono ${2:-?} (esperado dados)"
       [ "$dl" = no ] || bad="$bad home legível pelo runner"
     fi
-    case " $dg " in *" runner "*) bad="$bad dados está no grupo do runner" ;; esac
-    case " $rg " in *" dados "*) bad="$bad o runner está no grupo do dados" ;; esac
+    for gg in $dg; do case " $rg " in *" $gg "*) bad="$bad grupo em comum entre dados e o runner: $gg" ;; esac; done
     if [ -n "$bad" ]; then emit ACHADO usuario-dados "${bad# }"
     else emit LIMPO usuario-dados "usuário dados: home 700 e dele, ilegível ao runner, fora do grupo do runner (e o runner fora do dele)"; fi
   fi

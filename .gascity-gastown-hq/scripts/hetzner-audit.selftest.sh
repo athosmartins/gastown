@@ -12,9 +12,9 @@
 #   achado + não consegui → 1 · (ga-qg1dw5z.3) usuário dados (trava 1): ausente / modo / dono / legível pelo runner / grupos / leitura que falha · root sem login (trava 2): primeira ocorrência
 #   vale, Include, Match, "=", maiúsculas, arquivo ausente · ufw e fail2ban (trava 2) · orçamento: fase que trava NÃO derruba as outras, termina no prazo e mata o remoto · pastas em paralelo, uma
 #   só vez cada · escopo (mirror, .npm, .cc-safety-net, .claude/projects fora) · limite de tempo no nó para o node_audit · lista de aceitos (por caminho exato; CONTEUDO nunca, nunca lista cortada) · contas do rodízio do claude (glob conferido pelo servidor) ·
-#   .dolt só com a config do CLI · arquivos do próprio claude (GRANDE e o JWT da lista) · URL com senha e token mascarados no relatório.
+#   .dolt só com a config do CLI · arquivos do próprio claude (GRANDE e o JWT da lista) · URL com senha e token mascarados no relatório · listagem que falha (ERR leitura) · conta do rodízio com outro segredo · Include que não abro · grupo em comum.
 # CONTROLE NEGATIVO: sem a conferência de modo, sem a lista, sem o "não terminou", sem o "ERR leitura", sem a 1ª-ocorrência, sem o corte do orçamento, sem a trava de lista cortada, sem o glob das contas, sem a
-#   conferência do servidor no glob, sem o noms/ do .dolt, sem o caminho exato, sem o mascaramento: o caso correspondente tem de enxergar a diferença.
+#   conferência do servidor no glob, sem o noms/ do .dolt, sem o caminho exato, sem o mascaramento, sem o ERR da listagem, sem o filtro de outro segredo no glob, sem o SSHD_ERR do Include: o caso correspondente tem de enxergar a diferença.
 # HETZNER_AUDIT_UNDER_TEST=<arquivo> roda o selftest contra uma cópia alterada (mutante).
 set -u
 HERE=$(cd "$(dirname "$0")" && pwd)
@@ -53,6 +53,7 @@ cat > "$FAKE/ls" <<'EOF'
 #!/bin/bash
 # o runner NÃO lê o home do dados no servidor de verdade; aqui o mesmo usuário é dono dele, então a negação vem de FAKE_DADOS_LS (denied | ok)
 for a in "$@"; do if [ "$a" = "$SRV/home/dados" ]; then [ "${FAKE_DADOS_LS:-denied}" = ok ] && exit 0; echo "ls: cannot open directory '$a': Permission denied" >&2; exit 2; fi; done
+[ "${FAKE_LS_FAIL:-0}" = 1 ] && [ "${1:-}" = -A1 ] && { echo "ls: boom" >&2; exit 2; }      # só o ls -A1 da LISTAGEM do script remoto falha: as outras fases seguem lendo
 exec /bin/ls "$@"
 EOF
 cat > "$FAKE/getent" <<'EOF'
@@ -142,7 +143,8 @@ nodeargs() { cat "$T"/node-args.* 2>/dev/null; }          # os argumentos de TOD
 
 mk; run; is processo LIMPO "servidor limpo: processo"; is credenciais LIMPO "  credenciais"; is backup-de-bead LIMPO "  backup-de-bead"; is github-e-espelho LIMPO "  github-e-espelho"; is dados LIMPO "  dados"
 is usuario-dados LIMPO "  usuario-dados (trava 1)"; is root-sem-login LIMPO "  root-sem-login (trava 2)"; is ufw LIMPO "  ufw (trava 2)"; is fail2ban LIMPO "  fail2ban (trava 2)"
-dets dados "NÃO auditados por dados: .cache .local .duckdb .ssh .npm .cc-safety-net (topo), .claude/{projects,file-history,sessions} e gt-remote/{bin,bundle,bundle-out,git,keys,mirror,venv-*}"
+dets dados "NÃO auditados por dados: .cache .local .duckdb .ssh .npm .cc-safety-net (topo), .claude/{projects,file-history,sessions}, o CONTEÚDO de .claude/{history.jsonl,usage-analytics.jsonl} (GRANDE aceito: não lido) e gt-remote/{bin,bundle,bundle-out,git,keys,mirror,venv-*}"
+! det dados | grep -qF 'aceitos: 0'; ok $? "  nada aceito: a linha não diz 'aceitos: 0'"
 rcis 0; printf '%s\n' "$out" | grep -q '^AUDITORIA RESULTADO LIMPO (achados=0 nao-consegui=0 limpos=9)'; ok $? "  RESULTADO LIMPO (0/0/9)"
 printf '%s\n' "$out" | grep -qE '^AUDITORIA RESULTADO .* duracao=[0-9]+s orcamento=540s$'; ok $? "  o RESULTADO diz a duração e o orçamento"
 dets credenciais ".claude/.credentials.json .ssh/mini_shim_ed25519 gt-remote/keys/gt_mirror"
@@ -167,6 +169,7 @@ mk; acc; run; is credenciais LIMPO "contas do rodízio (.claude-accounts/<conta>
 mk; acc; chmod 644 "$SRV/.claude-accounts/a2/.credentials.json"; run; is credenciais ACHADO "conta do rodízio com modo 644: o glob permite, o modo continua sendo conferido"; dets credenciais "permissao:.claude-accounts/a2/.credentials.json(644"
 mk; acc; mkdir -p "$SRV/.claude-accounts/a1/sub"; echo "$TOK_CLAUDE" > "$SRV/.claude-accounts/a1/sub/.credentials.json"; run; is credenciais ACHADO "um nível a mais (a1/sub/.credentials.json): o servidor não o expande nem confere, então não vale"; dets credenciais "hit-fora-da-lista:.claude-accounts/a1/sub/.credentials.json"
 mk; acc; echo "$TOK_CLAUDE" > "$SRV/.claude-accounts/a1/notas.txt"; run; is credenciais ACHADO "token em outro arquivo da pasta das contas: o padrão é só do .credentials.json"; dets credenciais "hit-fora-da-lista:.claude-accounts/a1/notas.txt"
+mk; acc; echo "$TOK_GH" >> "$SRV/.claude-accounts/a1/.credentials.json"; run; is credenciais ACHADO "conta do rodízio com OUTRO tipo de segredo (token do GitHub) além do sk-ant-: o glob só cobre a credencial do claude"; dets credenciais "hit-fora-da-lista:.claude-accounts/a1/.credentials.json"
 mk; mkdir "$SRV/gt-remote/wa-base/fechada"; echo x > "$SRV/gt-remote/wa-base/fechada/a"
 if chmod 000 "$SRV/gt-remote/wa-base/fechada" && [ ! -r "$SRV/gt-remote/wa-base/fechada" ]; then run; is credenciais NAO-CONSEGUI "pasta ilegível: não consegui (nunca LIMPO)"; is backup-de-bead NAO-CONSEGUI "  idem backup-de-bead"; rcis 3; chmod 755 "$SRV/gt-remote/wa-base/fechada"
 else echo "SKIP  pasta ilegível: este usuário lê tudo (root)"; fi
@@ -212,6 +215,7 @@ mk; FAKE_NODE=found run; is dados ACHADO "node_audit achou"; dets dados "2 achad
 mk; FAKE_NODE=cant run; is dados NAO-CONSEGUI "node_audit não conseguiu"; rcis 3
 mk; FAKE_NODE=short run; is dados NAO-CONSEGUI "node_audit leu menos pastas do que o pedido"; dets dados "leu "
 mk; RUN_MBP=/nao/existe run; is dados NAO-CONSEGUI "mbp-run ausente"
+mk; FAKE_LS_FAIL=1 run; is dados NAO-CONSEGUI "o ls da listagem falha (ERR leitura, e o script remoto chega ao DONE): dados NAO-CONSEGUI, nunca LIMPO com menos pastas"; dets dados "ERR leitura"; is credenciais LIMPO "  só a listagem caiu: o resto segue"; rcis 3
 mk; FAKE_NODE=nodetail run; is dados ACHADO "pasta ACHADO sem detalhe legível continua achado"; dets dados "1 achados em: ."
 mk; mkdir -p "$SRV/.duckdb/ext"; : > "$SRV/.duckdb/ext/a.duckdb_extension"; : > "$SRV/.duckdb/ext/a.duckdb_extension.info"; FAKE_NODE=duck run; is dados LIMPO ".duckdb só com extensões: aceito (conferido na rodada)"
 mk; mkdir -p "$SRV/.duckdb/ext"; : > "$SRV/.duckdb/ext/a.duckdb_extension"; : > "$SRV/.duckdb/dados.db"; FAKE_NODE=duck run; is dados ACHADO ".duckdb com um .db dentro: a exceção NÃO vale"
@@ -252,8 +256,9 @@ mk; FAKE_DADOS=absent run; is usuario-dados ACHADO "usuário dados ausente: a tr
 mk; FAKE_DADOS_STAT="755 dados dados" run; is usuario-dados ACHADO "home com modo 755"; dets usuario-dados "modo 755"
 mk; FAKE_DADOS_STAT="700 runner runner" run; is usuario-dados ACHADO "home que pertence ao runner (não ao dados)"; dets usuario-dados "dono runner"
 mk; FAKE_DADOS_LS=ok run; is usuario-dados ACHADO "o runner LÊ o home do dados"; dets usuario-dados "legível pelo runner"
-mk; FAKE_DADOS_GROUPS="dados runner" run; is usuario-dados ACHADO "dados dentro do grupo do runner"; dets usuario-dados "grupo do runner"
-mk; FAKE_RUNNER_GROUPS="runner dados" run; is usuario-dados ACHADO "runner dentro do grupo do dados"
+mk; FAKE_DADOS_GROUPS="dados runner" run; is usuario-dados ACHADO "dados dentro do grupo do runner"; dets usuario-dados "grupo em comum entre dados e o runner: runner"
+mk; FAKE_RUNNER_GROUPS="runner dados" run; is usuario-dados ACHADO "runner dentro do grupo do dados"; dets usuario-dados "grupo em comum entre dados e o runner: dados"
+mk; FAKE_DADOS_GROUPS="dados users" FAKE_RUNNER_GROUPS="runner users" run; is usuario-dados ACHADO "um 3º grupo em comum (users), que não é o de nenhum dos dois: 'sem grupo em comum' é o que a trava promete"; dets usuario-dados ": users"
 mk; FAKE_DADOS=err run; is usuario-dados NAO-CONSEGUI "getent que falha: não consegui (nunca \"ausente\")"; rcis 3
 mk; FAKE_DADOS_STAT=err run; is usuario-dados NAO-CONSEGUI "stat do home que falha: não consegui"
 mk; FAKE_ID_FAIL=1 run; is usuario-dados NAO-CONSEGUI "id que falha: não consegui"
@@ -272,6 +277,8 @@ mk; printf 'PermitRootLogin no\nMatch Address 10.0.0.0/8\n  PermitRootLogin yes\
 mk; printf 'PermitRootLogin no\nMatch User ninguem\n  PermitRootLogin no\n' > "$SRV/etc/ssh/sshd_config"; run; is root-sem-login LIMPO "Match que também diz no: segue limpo"
 mk; printf '# PermitRootLogin yes\nPermitRootLogin no # sem login\n' > "$SRV/etc/ssh/sshd_config"; run; is root-sem-login LIMPO "comentário (linha e fim de linha) não conta"
 mk; rm "$SRV/etc/ssh/sshd_config"; run; is root-sem-login NAO-CONSEGUI "sshd_config ausente: não consegui"; rcis 3
+mk; chmod 000 "$SRV/etc/ssh/sshd_config.d"; if [ ! -r "$SRV/etc/ssh/sshd_config.d" ]; then run; is root-sem-login NAO-CONSEGUI "Include de uma pasta que não abro: não sei o que há nela (nunca LIMPO)"; chmod 755 "$SRV/etc/ssh/sshd_config.d"; else echo "SKIP  pasta de Include ilegível: root"; fi
+mk; printf 'PermitRootLogin "no"\n' > "$SRV/etc/ssh/sshd_config"; run; is root-sem-login LIMPO "valor entre aspas (PermitRootLogin \"no\"): o sshd aceita"
 
 # --- trava 2: ufw (ENABLED=yes no arquivo E a unidade ativa: o unit do ufw roda e sai, "active" sozinho não prova firewall) e fail2ban (pacote, serviço, jail sshd) ---
 mk; printf 'ENABLED=no\n' > "$SRV/etc/ufw/ufw.conf"; run; is ufw ACHADO "ENABLED=no mesmo com a unidade ativa (o caso medido no nó)"; dets ufw "ENABLED=no"
@@ -315,8 +322,8 @@ mk; mkdir "$SRV/gt-remote/wa-base/fechada"; echo x > "$SRV/gt-remote/wa-base/fec
 if chmod 000 "$SRV/gt-remote/wa-base/fechada" && [ ! -r "$SRV/gt-remote/wa-base/fechada" ]; then run; AUD=$AUD_REAL; is credenciais LIMPO "controle negativo: sem o ERR leitura, a pasta ilegível viraria LIMPO"; chmod 755 "$SRV/gt-remote/wa-base/fechada"; else AUD=$AUD_REAL; echo "SKIP  controle da pasta ilegível: root"; fi
 
 # controle negativo das guardas da .3: cada mutante estraga UMA guarda e o caso correspondente tem de ver a diferença
-mutant "dados sem conferir o grupo" 's/\*" runner "\*) bad="\$bad dados está/*" nunca-runner "*) bad="$bad dados está/'; AUD=$T/mut.sh
-mk; FAKE_DADOS_GROUPS="dados runner" run; AUD=$AUD_REAL; is usuario-dados LIMPO "controle negativo: sem a conferência do grupo, dados dentro do grupo do runner passaria"
+mutant "dados sem conferir o grupo" 's/\*" \$gg "\*) bad="\$bad grupo em comum/*" @@nunca@@ "*) bad="$bad grupo em comum/'; AUD=$T/mut.sh
+mk; FAKE_DADOS_GROUPS="dados users" FAKE_RUNNER_GROUPS="runner users" run; AUD=$AUD_REAL; is usuario-dados LIMPO "controle negativo: sem a conferência do grupo, um grupo em comum (users) passaria"
 mutant "ultima ocorrencia do PermitRootLogin vale" 's/\[ -n "\$ROOTV" \] || ROOTV=\$v/ROOTV=$v/'; AUD=$T/mut.sh
 mk; printf 'PermitRootLogin no\nPermitRootLogin yes\n' > "$SRV/etc/ssh/sshd_config"; run; AUD=$AUD_REAL; is root-sem-login ACHADO "controle negativo: com a ÚLTIMA ocorrência valendo, no-depois-yes viraria achado (o caso da 1ª ocorrência vê a diferença)"
 mutant "ufw sem olhar o ENABLED" 's/elif \[ "\$ue" != yes \]; then emit ACHADO ufw/elif false; then emit ACHADO ufw/'; AUD=$T/mut.sh
@@ -337,6 +344,12 @@ mutant "scan com corte cego" 's/ | scan_line | cut -c1-400/ | cut -c1-300/'; AUD
 mk; FAKE_SCAN_RC=1 FAKE_SCAN_MSG="$SCAN2" run; AUD=$AUD_REAL; ! det github-e-espelho | grep -qF "x/y.git"; ok $? "controle negativo: com o corte cego em 300 colunas, os remotos do 2º rig ficavam de fora (o caso do formato real vê a diferença)"
 mutant "aceito sem o caminho exato" 's/case "\$3" in \$g) return 0 ;; esac/case "$3" in *) return 0 ;; esac/'; AUD=$T/mut.sh
 mk; mkdir -p "$SRV/.claude"; FAKE_NODE=claudejwt FAKE_NODE_DIR=.claude run; AUD=$AUD_REAL; is dados LIMPO "controle negativo: sem o caminho exato, o JWT de outro arquivo passaria"
+mutant "listagem com ERR conta como completa" 's/^case "\$L" in ERR.*$/:/'; AUD=$T/mut.sh
+mk; FAKE_LS_FAIL=1 run; AUD=$AUD_REAL; is dados LIMPO "controle negativo: sem tratar o ERR da listagem, a lista curta daria dados LIMPO (o caso do ls que falha vê a diferença)"
+mutant "glob sem o filtro de outro segredo" 's/case "\$other" in \*" \$h "\*) ok=0 ;; esac/:/'; AUD=$T/mut.sh
+mk; acc; echo "$TOK_GH" >> "$SRV/.claude-accounts/a1/.credentials.json"; run; AUD=$AUD_REAL; is credenciais LIMPO "controle negativo: sem o filtro, a conta do rodízio com token do GitHub dentro passaria"
+mutant "Include que não abro vira vazio" 's/then SSHD_ERR=1; fi; done; set -f/then :; fi; done; set -f/'; AUD=$T/mut.sh
+mk; chmod 000 "$SRV/etc/ssh/sshd_config.d"; if [ ! -r "$SRV/etc/ssh/sshd_config.d" ]; then run; AUD=$AUD_REAL; is root-sem-login LIMPO "controle negativo: sem o SSHD_ERR, o Include que não abro seria ignorado e daria LIMPO"; chmod 755 "$SRV/etc/ssh/sshd_config.d"; else AUD=$AUD_REAL; echo "SKIP  controle do Include ilegível: root"; fi
 
 echo "---"; echo "$((n-fails))/$n ok"
 [ $fails -eq 0 ] && echo "SELFTEST OK" || { echo "SELFTEST FALHOU ($fails)"; exit 1; }

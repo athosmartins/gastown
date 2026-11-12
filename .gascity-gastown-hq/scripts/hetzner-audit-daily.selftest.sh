@@ -5,10 +5,10 @@
 #   Casos · Controle negativo
 #
 # CASOS (ga-qg1dw5z.3): auditoria LIMPA → nenhum alarme, relatório guardado, linha de heartbeat · ACHADO (rc 1) e NAO-CONSEGUI (rc 3) → UM alarme com o veredito no título, o RESULTADO e as linhas
-#   que não são LIMPO no corpo · auditoria QUEBRADA (rc estranho, ou rc 0/1/3 sem linha RESULTADO) → alarme "QUEBRADA", nunca silêncio · notify que falha → rc 4 (o relatório fica) e exit 10/11 do notify
-#   (guardado para as 7h / mesmo título há pouco) contam como entregue, 12 (teto de pushes) não · desligado por variável ou por arquivo · trava: dono vivo → nada, dono morto → segue · auditoria ausente ·
+#   que não são LIMPO no corpo · auditoria QUEBRADA (rc estranho, rc 0/1/3 sem linha RESULTADO, ou RESULTADO que não bate com o rc) → alarme "QUEBRADA", nunca silêncio · notify que falha → rc 4 (o relatório fica) e exit 10/11
+#   do notify (guardado para as 7h / mesmo título há pouco) não são erro mas ficam escritos no log, 12 (teto de pushes) é falha · desligado por variável ou por arquivo · trava: dono vivo → nada, dono morto → segue · auditoria ausente ·
 #   relatório comprido é cortado · relatórios com mais de 30 dias saem.
-# CONTROLE NEGATIVO: sem alarmar NAO-CONSEGUI, sem o "sem RESULTADO é quebrada", sem o rc do notify, sem a trava: o caso correspondente tem de enxergar a diferença.
+# CONTROLE NEGATIVO: sem alarmar NAO-CONSEGUI, sem conferir o RESULTADO com o rc, sem o rc do notify, sem a trava: o caso correspondente tem de enxergar a diferença.
 # HETZNER_AUDIT_DAILY_UNDER_TEST=<arquivo> roda o selftest contra uma cópia alterada (mutante).
 set -u
 HERE=$(cd "$(dirname "$0")" && pwd)
@@ -80,12 +80,15 @@ case "$b" in *'://***@github.com/x/y'*'ghp_***'*) true ;; *) false ;; esac; ok $
 
 # --- quebrada: nunca silêncio ---
 mk; rep "algo que não é um relatório"; FAKE_AUDIT_RC=7 run; [ "$(calls)" = 1 ]; ok $? "auditoria que sai com rc estranho (7): alarme"; [ "$(title)" = 'Auditoria Hetzner: QUEBRADA (rc=7)' ]; ok $? "  título QUEBRADA (rc=7)"
+case "$(body)" in *"$OUT/last.err"*) true ;; *) false ;; esac; ok $? "  e o corpo aponta o stderr da auditoria (last.err), onde está o motivo"
 mk; rep "AUDITORIA LIMPO processo: x"; FAKE_AUDIT_RC=0 run; [ "$(calls)" = 1 ]; ok $? "rc 0 sem linha RESULTADO: o relatório foi cortado no meio — alarme, não LIMPO"; title | grep -q 'QUEBRADA'; ok $? "  QUEBRADA"
 mk; rep ""; FAKE_AUDIT_RC=1 run; [ "$(calls)" = 1 ]; ok $? "relatório vazio com rc 1: alarme"
+mk; rep "$ACHADO"; FAKE_AUDIT_RC=0 run; [ "$(calls)" = 1 ]; ok $? "rc 0 mas o RESULTADO diz ACHADO: auditoria incoerente, alarme (nunca silêncio)"; title | grep -q 'QUEBRADA (rc=0)'; ok $? "  QUEBRADA (rc=0)"
+mk; rep "$LIMPO"; FAKE_AUDIT_RC=1 run; [ "$(calls)" = 1 ]; ok $? "rc 1 mas o RESULTADO diz LIMPO: auditoria incoerente, alarme"; title | grep -q 'QUEBRADA (rc=1)'; ok $? "  QUEBRADA (rc=1)"
 
 # --- notify que falha ---
 mk; rep "$ACHADO"; FAKE_AUDIT_RC=1 FAKE_NOTIFY_RC=7 run; [ "$rc" = 4 ]; ok $? "notify que falha (7): o wrapper sai 4"; grep -q 'AUDITORIA RESULTADO ACHADO' "$OUT/last.txt"; ok $? "  e o relatório está guardado mesmo assim"
-for c in 10 11; do mk; rep "$ACHADO"; FAKE_AUDIT_RC=1 FAKE_NOTIFY_RC=$c run; [ "$rc" = 0 ]; ok $? "notify saiu $c (guardado p/ as 7h / mesmo título há pouco): conta como entregue"; done
+for c in 10 11; do mk; rep "$ACHADO"; FAKE_AUDIT_RC=1 FAKE_NOTIFY_RC=$c run; [ "$rc" = 0 ] && printf '%s\n' "$out" | grep -q "o notify saiu $c "; ok $? "notify saiu $c (guardado p/ as 7h / mesmo título há pouco): rc 0 (não é erro) e o log diz que o push pode não ter chegado"; done
 mk; rep "$ACHADO"; FAKE_AUDIT_RC=1 FAKE_NOTIFY_RC=12 run; [ "$rc" = 4 ]; ok $? "notify saiu 12 (teto de pushes): NÃO entregue, rc 4"
 mk; rep "$ACHADO"; FAKE_AUDIT_RC=1 NOTIFY_PATH=/nao/existe run; [ "$rc" = 4 ]; ok $? "notify ausente: rc 4"
 
@@ -138,8 +141,8 @@ mutant "NAO-CONSEGUI não alarma" 's/\*) verdict=QUEBRADA ;;/*) verdict=QUEBRADA
 mk; rep "$NAO"; FAKE_AUDIT_RC=3 run; WRAP=$WRAP_REAL; [ "$(calls)" = 0 ]; ok $? "controle negativo: sem alarmar o rc 3, o NAO-CONSEGUI passaria calado (o caso do rc 3 vê a diferença)"
 mutant "notify falho ignorado" 's/\*) say "ERRO: o notify saiu/*) :; say "ERRO: o notify saiu/;s/exit 4 ;; esac/true ;; esac/'; WRAP=$T/mut.sh
 mk; rep "$ACHADO"; FAKE_AUDIT_RC=1 FAKE_NOTIFY_RC=7 run; WRAP=$WRAP_REAL; [ "$rc" = 0 ]; ok $? "controle negativo: sem o rc do notify, um alarme perdido viraria sucesso"
-mutant "sem RESULTADO conta como limpo" 's/\[ -n "\$res" \] || verdict=QUEBRADA/true/'; WRAP=$T/mut.sh
-mk; rep "AUDITORIA LIMPO processo: x"; FAKE_AUDIT_RC=0 run; WRAP=$WRAP_REAL; [ "$(calls)" = 0 ]; ok $? "controle negativo: sem a conferência do RESULTADO, um relatório cortado passaria como LIMPO"
+mutant "RESULTADO sem conferir com o rc" 's/\[ "\$rs" = "\$verdict" \] || verdict=QUEBRADA/true/'; WRAP=$T/mut.sh
+mk; rep "AUDITORIA LIMPO processo: x"; FAKE_AUDIT_RC=0 run; c1=$(calls); mk; rep "$ACHADO"; FAKE_AUDIT_RC=0 run; c2=$(calls); WRAP=$WRAP_REAL; [ "$c1$c2" = 00 ]; ok $? "controle negativo: sem conferir o RESULTADO com o rc, um relatório cortado (sem RESULTADO) ou incoerente (rc 0 e ACHADO) passaria como LIMPO"
 mutant "push sem mascarar" 's/ | redact); nbad=/); nbad=/'; WRAP=$T/mut.sh
 mk; rep "$LEAK"; FAKE_AUDIT_RC=1 run; WRAP=$WRAP_REAL; b=$(body); case "$b" in *"$SEC"*) true ;; *) false ;; esac; ok $? "controle negativo: sem o mascaramento, a senha do URL iria no push (o caso do vazamento vê a diferença)"
 
