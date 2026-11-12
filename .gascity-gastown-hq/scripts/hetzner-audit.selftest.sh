@@ -11,9 +11,10 @@
 #   leu menos pastas do que pediu, mbp-run ausente, achado sem detalhe · .duckdb só com extensões é aceito, com mais coisa não · diretório de topo novo é auditado, .ssh/.cache/chaves não ·
 #   achado + não consegui → 1 · (ga-qg1dw5z.3) usuário dados (trava 1): ausente / modo / dono / legível pelo runner / grupos / leitura que falha · root sem login (trava 2): primeira ocorrência
 #   vale, Include, Match, "=", maiúsculas, arquivo ausente · ufw e fail2ban (trava 2) · orçamento: fase que trava NÃO derruba as outras, termina no prazo e mata o remoto · pastas em paralelo, uma
-#   só vez cada · escopo (mirror, .npm, .cc-safety-net, .claude/projects fora) · limite de tempo no nó para o node_audit · lista de aceitos (só NOME/GRANDE, nunca CONTEUDO, nunca lista cortada).
-# CONTROLE NEGATIVO: sem a conferência de modo, sem a lista, sem o "não terminou", sem o "ERR leitura", sem a 1ª-ocorrência, sem o corte do orçamento, sem a trava de lista cortada: o caso
-#   correspondente tem de enxergar a diferença.
+#   só vez cada · escopo (mirror, .npm, .cc-safety-net, .claude/projects fora) · limite de tempo no nó para o node_audit · lista de aceitos (por caminho exato; CONTEUDO nunca, nunca lista cortada) · contas do rodízio do claude (glob conferido pelo servidor) ·
+#   .dolt só com a config do CLI · arquivos do próprio claude (GRANDE e o JWT da lista) · URL com senha e token mascarados no relatório.
+# CONTROLE NEGATIVO: sem a conferência de modo, sem a lista, sem o "não terminou", sem o "ERR leitura", sem a 1ª-ocorrência, sem o corte do orçamento, sem a trava de lista cortada, sem o glob das contas, sem a
+#   conferência do servidor no glob, sem o noms/ do .dolt, sem o caminho exato, sem o mascaramento: o caso correspondente tem de enxergar a diferença.
 # HETZNER_AUDIT_UNDER_TEST=<arquivo> roda o selftest contra uma cópia alterada (mutante).
 set -u
 HERE=$(cd "$(dirname "$0")" && pwd)
@@ -95,7 +96,7 @@ if [ -n "${FAKE_NODE_SLOW_DIR:-}" ]; then for d in "${dirs[@]}"; do [ "$d" = "$F
 case "${FAKE_NODE:-clean}" in short) printf 'AUDIT-NODE LIMPO %s\n' "${dirs[0]}"; exit 0 ;; esac
 tgt=${FAKE_NODE_DIR:-.}; rc=0
 for d in "${dirs[@]}"; do st=LIMPO
-  if [ "$d" = "$tgt" ]; then case "${FAKE_NODE:-clean}" in found|duck|nodetail|tool|toolconteudo|toolcut) st=ACHADO ;; cant) st=NAO-CONSEGUI ;; esac; fi
+  if [ "$d" = "$tgt" ]; then case "${FAKE_NODE:-clean}" in found|duck|nodetail|tool|toolconteudo|toolcut|claude|claudejwt|claudeconteudo) st=ACHADO ;; cant) st=NAO-CONSEGUI ;; esac; fi
   [ "$st" != LIMPO ] && rc=98
   if [ "$d" = "$tgt" ]; then
     case "${FAKE_NODE:-clean}" in
@@ -104,6 +105,9 @@ for d in "${dirs[@]}"; do st=LIMPO
       tool) printf 'mbp-run: ALARME: dado ou segredo no destino (nó Linux:%s) — x\n  NOME go/telemetry/local/upload.token\n' "$d" >&2 ;;
       toolconteudo) printf 'mbp-run: ALARME: dado ou segredo no destino (nó Linux:%s) — x\n  NOME go/telemetry/local/upload.token\n  CONTEUDO 25\t0\tgo/telemetry/local/upload.token\n' "$d" >&2 ;;
       toolcut) printf 'mbp-run: ALARME: dado ou segredo no destino (nó Linux:%s) — x\n' "$d" >&2; for i in $(seq 1 20); do printf '  NOME logs/x%s.log\n' "$i" >&2; done ;;   # 20 linhas que DADOS_ACEITOS aceitaria uma a uma (.whatsapp-automation|logs/*.log): só o corte em 20 as segura
+      claude) printf 'mbp-run: ALARME: dado ou segredo no destino (nó Linux:%s) — x\n  GRANDE history.jsonl\n  GRANDE usage-analytics.jsonl\n  JWT policy-limits.json.signature.json\n' "$d" >&2 ;;        # os 3 arquivos do próprio claude que a lista aceita
+      claudejwt) printf 'mbp-run: ALARME: dado ou segredo no destino (nó Linux:%s) — x\n  JWT policy-limits.json.signature.json\n  JWT outro-token.json\n' "$d" >&2 ;;                          # um aceito + um JWT em outro arquivo
+      claudeconteudo) printf 'mbp-run: ALARME: dado ou segredo no destino (nó Linux:%s) — x\n  GRANDE history.jsonl\n  CONTEUDO 30\t0\thistory.jsonl\n' "$d" >&2 ;;
     esac
   fi
   printf 'AUDIT-NODE %s %s\n' "$st" "$d"
@@ -138,7 +142,7 @@ nodeargs() { cat "$T"/node-args.* 2>/dev/null; }          # os argumentos de TOD
 
 mk; run; is processo LIMPO "servidor limpo: processo"; is credenciais LIMPO "  credenciais"; is backup-de-bead LIMPO "  backup-de-bead"; is github-e-espelho LIMPO "  github-e-espelho"; is dados LIMPO "  dados"
 is usuario-dados LIMPO "  usuario-dados (trava 1)"; is root-sem-login LIMPO "  root-sem-login (trava 2)"; is ufw LIMPO "  ufw (trava 2)"; is fail2ban LIMPO "  fail2ban (trava 2)"
-dets dados "NÃO auditados por dados: .cache .local .duckdb .ssh .npm .cc-safety-net (topo), .claude/{projects,file-history} e gt-remote/{bin,bundle,bundle-out,git,keys,mirror,venv-*}"
+dets dados "NÃO auditados por dados: .cache .local .duckdb .ssh .npm .cc-safety-net (topo), .claude/{projects,file-history,sessions} e gt-remote/{bin,bundle,bundle-out,git,keys,mirror,venv-*}"
 rcis 0; printf '%s\n' "$out" | grep -q '^AUDITORIA RESULTADO LIMPO (achados=0 nao-consegui=0 limpos=9)'; ok $? "  RESULTADO LIMPO (0/0/9)"
 printf '%s\n' "$out" | grep -qE '^AUDITORIA RESULTADO .* duracao=[0-9]+s orcamento=540s$'; ok $? "  o RESULTADO diz a duração e o orçamento"
 dets credenciais ".claude/.credentials.json .ssh/mini_shim_ed25519 gt-remote/keys/gt_mirror"
@@ -153,16 +157,28 @@ run; is credenciais LIMPO "a mesma chave/token em tests/, *.selftest.* e test_* 
 mk; mkdir -p "$SRV/gt-remote/git/gascity/wt/s1" "$SRV/gt-remote/mirror/x" "$SRV/.claude/projects/p" "$SRV/.claude/file-history/h"; echo "$TOK_CLAUDE" > "$SRV/gt-remote/git/gascity/wt/s1/doc.md"; echo "$TOK_CLAUDE" > "$SRV/gt-remote/mirror/x/a"
 echo "$TOK_CLAUDE" > "$SRV/.claude/projects/p/t.jsonl"; echo "$TOK_CLAUDE" > "$SRV/.claude/file-history/h/v1"
 run; is credenciais LIMPO "token em worktree/espelho git e em transcrito/histórico de sessão: fora da busca por conteúdo (medido: 156 acertos de exemplo, e a busca não fechava em 280 s)"
-dets credenciais "a busca por CONTEÚDO não olha: gt-remote/{git,mirror,venv-*}, .claude/{projects,file-history,plugins,downloads}, .cache, .local/share/claude"
+dets credenciais "a busca por CONTEÚDO não olha (PR e PT do remote_cred): .cache, .local/share/claude, .duckdb, .claude/{projects,file-history,plugins,downloads,security}, gt-remote/{git,mirror,*/env}, venv*, node_modules, site-packages, .git, repo.git, __pycache__, tests/, fixtures/, *.selftest.*, test_*"
 mk; touch "$SRV/.netrc"; run; is credenciais ACHADO "loja conhecida (.netrc)"; dets credenciais "loja-conhecida:.netrc"
 mk; chmod 644 "$SRV/.claude/.credentials.json"; run; is credenciais ACHADO "credencial com modo 644"; dets credenciais "permissao:.claude/.credentials.json(644"
 mk; rm "$SRV/gt-remote/keys/gt_mirror"; run; is credenciais LIMPO "uma das 3 ausente: não é achado"; dets credenciais "ausentes (não é achado): gt-remote/keys/gt_mirror"
+# contas do rodízio do claude (medido no nó em 12/11): .claude-accounts/<conta>/.credentials.json vale por glob, e cada arquivo é conferido (modo 600, dono)
+acc() { mkdir -p "$SRV/.claude-accounts/a1" "$SRV/.claude-accounts/a2"; echo "$TOK_CLAUDE" > "$SRV/.claude-accounts/a1/.credentials.json"; echo "$TOK_CLAUDE" > "$SRV/.claude-accounts/a2/.credentials.json"; chmod 600 "$SRV"/.claude-accounts/*/.credentials.json; }
+mk; acc; run; is credenciais LIMPO "contas do rodízio (.claude-accounts/<conta>/.credentials.json, 600): permitidas"; dets credenciais ".claude-accounts/a1/.credentials.json"
+mk; acc; chmod 644 "$SRV/.claude-accounts/a2/.credentials.json"; run; is credenciais ACHADO "conta do rodízio com modo 644: o glob permite, o modo continua sendo conferido"; dets credenciais "permissao:.claude-accounts/a2/.credentials.json(644"
+mk; acc; mkdir -p "$SRV/.claude-accounts/a1/sub"; echo "$TOK_CLAUDE" > "$SRV/.claude-accounts/a1/sub/.credentials.json"; run; is credenciais ACHADO "um nível a mais (a1/sub/.credentials.json): o servidor não o expande nem confere, então não vale"; dets credenciais "hit-fora-da-lista:.claude-accounts/a1/sub/.credentials.json"
+mk; acc; echo "$TOK_CLAUDE" > "$SRV/.claude-accounts/a1/notas.txt"; run; is credenciais ACHADO "token em outro arquivo da pasta das contas: o padrão é só do .credentials.json"; dets credenciais "hit-fora-da-lista:.claude-accounts/a1/notas.txt"
 mk; mkdir "$SRV/gt-remote/wa-base/fechada"; echo x > "$SRV/gt-remote/wa-base/fechada/a"
 if chmod 000 "$SRV/gt-remote/wa-base/fechada" && [ ! -r "$SRV/gt-remote/wa-base/fechada" ]; then run; is credenciais NAO-CONSEGUI "pasta ilegível: não consegui (nunca LIMPO)"; is backup-de-bead NAO-CONSEGUI "  idem backup-de-bead"; rcis 3; chmod 755 "$SRV/gt-remote/wa-base/fechada"
 else echo "SKIP  pasta ilegível: este usuário lê tudo (root)"; fi
 
 # --- backup de bead ---
 mk; mkdir "$SRV/.dolt-backup"; run; is backup-de-bead ACHADO ".dolt-backup"; dets backup-de-bead ".dolt-backup"
+# .dolt: a pasta do CLI em ~ (config_global.json, version_check.txt, eventsData/; medido no nó em 12/11) não é banco de bead; repositório = noms/ ou repo_state.json
+mk; mkdir -p "$SRV/.dolt/eventsData"; echo '{}' > "$SRV/.dolt/config_global.json"; run; is backup-de-bead LIMPO ".dolt só com a config do CLI do dolt: não é banco de bead"
+mk; mkdir -p "$SRV/.dolt/noms"; run; is backup-de-bead ACHADO ".dolt com noms/: repositório Dolt"; dets backup-de-bead ".dolt (repositório Dolt"
+mk; mkdir -p "$SRV/x/.dolt"; echo '{}' > "$SRV/x/.dolt/repo_state.json"; run; is backup-de-bead ACHADO ".dolt com repo_state.json, em qualquer pasta"
+mk; mkdir "$SRV/loja.dolt"; run; is backup-de-bead ACHADO "nome terminado em .dolt (loja.dolt) segue sendo achado pelo nome"
+mk; mkdir -p "$SRV/.dolt"; if chmod 000 "$SRV/.dolt" && [ ! -r "$SRV/.dolt" ]; then run; is backup-de-bead NAO-CONSEGUI ".dolt que não abro: não sei se é repositório (nunca LIMPO)"; chmod 755 "$SRV/.dolt"; else echo "SKIP  .dolt ilegível: root"; fi
 mk; mkdir -p "$SRV/.beads/eventsData"; : > "$SRV/.beads/eventsData/eventkit.lock"; run; is backup-de-bead LIMPO ".beads só com lock (como está hoje no servidor)"
 mk; mkdir -p "$SRV/.beads/dolt"; echo x > "$SRV/.beads/dolt/manifest"; run; is backup-de-bead ACHADO ".beads com conteúdo além de lock"; dets backup-de-bead ".beads (com conteúdo além de lock)"
 mk; : > "$SRV/issues.jsonl"; run; is backup-de-bead ACHADO "issues.jsonl"
@@ -186,6 +202,10 @@ mk; rm "$SRV/gt-remote/bin/hetzner-remote-git.sh"; run; is github-e-espelho NAO-
 SEC=$(printf '%s%s' 'S3cr3t' 'Passw0rd')
 mk; FAKE_SCAN_RC=1 FAKE_SCAN_MSG="VIOLAÇÃO remotos_fora_do_espelho=[https://x-access-token:$SEC@github.com/x/y $TOK_GH]" run; is github-e-espelho ACHADO "scan com URL usuário:senha@ e token no texto: segue ACHADO"
 ! det github-e-espelho | grep -qF -e "$SEC" -e "${TOK_GH#ghp_}"; ok $? "  nem a senha do URL nem o token aparecem no relatório"; dets github-e-espelho "://***@github.com/x/y"; dets github-e-espelho "ghp_***"
+# a linha real do scan (2 rigs; contagem na frente, depois historico · arvore · remotos): historico e remotos aparecem inteiros, a árvore comprida vai por último e é a que se corta
+AV=""; for i in 1 2 3 4 5; do AV="$AV wt/sessao-000$i/scripts/__pycache__/modulo_longo_de_teste.cpython-312.pyc"; done
+SCAN2="VIOLAÇÃO (3 pares blob/caminho, 2 blobs presentes (0 deles com os mesmos bytes sob caminho permitido), 9 arquivos) historico=[] arvore=[$AV ] remotos_fora_do_espelho=[]"$'\n'"scan wa: VIOLAÇÃO (50071 pares blob/caminho, 48443 blobs presentes (1 deles com os mesmos bytes sob caminho permitido), 1249417 arquivos) historico=[.DS_Store assets/a.pdf ] arvore=[$AV ] remotos_fora_do_espelho=[git@example.org:x/y.git ]"
+mk; FAKE_SCAN_RC=1 FAKE_SCAN_MSG="$SCAN2" run; is github-e-espelho ACHADO "scan com 2 rigs em violação, no formato real"; dets github-e-espelho "scan wa: historico=[.DS_Store assets/a.pdf ] remotos_fora_do_espelho=[git@example.org:x/y.git ] arvore=[ wt/sessao-0001"
 
 # --- dados (node_audit): onde olhar, e os três estados vindos dele ---
 mk; FAKE_NODE=found run; is dados ACHADO "node_audit achou"; dets dados "2 achados em: ."; printf '%s\n' "$out" | grep -qF 'AUDITORIA DETALHE dados: .: NOME shared'; ok $? "  um DETALHE por achado"; rcis 1
@@ -201,7 +221,7 @@ nodeargs | grep -qxF '.config' && nodeargs | grep -qxF '.::maxdepth=1' && nodear
 mk; mkdir -p "$SRV/.claude" "$SRV/gt-remote/mirror" "$SRV/.npm" "$SRV/.cc-safety-net" "$SRV/gt-remote/tools"; run
 ! nodeargs | grep -q -e 'gt-remote/mirror' -e '^\.npm$' -e '^\.cc-safety-net$'; ok $? "  escopo (ga-qg1dw5z.3): mirror (varredura própria por commit no mini), .npm (cache público) e .cc-safety-net (logs de sessão) NÃO entram"
 nodeargs | grep -qxF 'gt-remote/tools::prune=venv:env:.git:__pycache__'; ok $? "  gt-remote/tools (ferramentas de build) entra"
-nodeargs | grep -qxF '.claude::prune=plugins:downloads:cache:security/agent-sdk-venv:projects:file-history'; ok $? "  .claude entra com a poda de plugins/venv e dos transcritos (projects, file-history: 7 GB, 331 arquivos > 4 MB)"
+nodeargs | grep -qxF '.claude::prune=plugins:downloads:cache:security/agent-sdk-venv:projects:file-history:sessions'; ok $? "  .claude entra com a poda de plugins/venv, dos transcritos (projects, file-history: 7 GB, 331 arquivos > 4 MB) e do registro de sessão (sessions)"
 
 # --- paralelismo: K invocações do mbp-run, cada pasta UMA vez ---
 mk; mkdir -p "$SRV/a1" "$SRV/a2" "$SRV/a3" "$SRV/a4" "$SRV/a5" "$SRV/a6"; HETZNER_AUDIT_JOBS=3 run; is dados LIMPO "pastas em paralelo: dados segue LIMPO"
@@ -272,6 +292,9 @@ mk; mkdir -p "$SRV/.config"; FAKE_NODE=tool FAKE_NODE_DIR=.config run; is dados 
 mk; mkdir -p "$SRV/.config"; FAKE_NODE=toolconteudo FAKE_NODE_DIR=.config run; is dados ACHADO "o mesmo caminho com um CONTEUDO (lista de telefones) NÃO é aceito"; dets dados "CONTEUDO"
 mk; mkdir -p "$SRV/.whatsapp-automation"; FAKE_NODE=toolcut FAKE_NODE_DIR=.whatsapp-automation run; is dados ACHADO "lista cortada em 20 por tipo (20 logs que a lista aceitaria um a um): nada da pasta é aceito, pode haver mais atrás"; dets dados "cortada"
 mk; FAKE_NODE=found run; is dados ACHADO "shared e .voicebot-cost.db NÃO são aceitos: a volta deles é o achado"
+mk; mkdir -p "$SRV/.claude"; FAKE_NODE=claude FAKE_NODE_DIR=.claude run; is dados LIMPO "arquivos do próprio claude (history.jsonl e usage-analytics.jsonl GRANDE, assinatura JWT cc-signed-cache): aceitos por caminho exato"; dets dados "aceitos: 3"
+mk; mkdir -p "$SRV/.claude"; FAKE_NODE=claudejwt FAKE_NODE_DIR=.claude run; is dados ACHADO "o JWT de OUTRO arquivo do .claude NÃO é aceito (só o caminho exato da lista)"; dets dados "outro-token.json"
+mk; mkdir -p "$SRV/.claude"; FAKE_NODE=claudeconteudo FAKE_NODE_DIR=.claude run; is dados ACHADO "CONTEUDO no history.jsonl NÃO é aceito mesmo com o GRANDE dele aceito"; dets dados "CONTEUDO"
 
 # --- achado e não-consegui juntos: achar vale mais ---
 mk; chmod 644 "$SRV/.claude/.credentials.json"; FAKE_PGREP=err run; is credenciais ACHADO "achado numa verificação"; is processo NAO-CONSEGUI "  não consegui noutra"; rcis 1
@@ -283,7 +306,7 @@ mutant() {  # mutant NOME SED-EXPR — grava o mutante em $T/mut.sh (com a guard
 AUD_REAL=$AUD
 mutant "sem conferir modo/dono" 's/\[ "\$mode" = 600 \] && \[ "\$owner" = "\$user" \]/true/'; AUD=$T/mut.sh
 mk; chmod 644 "$SRV/.claude/.credentials.json"; run; AUD=$AUD_REAL; is credenciais LIMPO "controle negativo: sem a conferência de modo, 644 passaria (o caso do modo 644 vê a diferença)"
-mutant "lista aceita tudo" 's/\*) bad="\$bad hit-fora-da-lista:\$h"/*) :/'; AUD=$T/mut.sh
+mutant "lista aceita tudo" 's/\[ "\$ok" = 1 \] || bad="\$bad hit-fora-da-lista:\$h"/:/'; AUD=$T/mut.sh
 mk; pem > "$SRV/gt-remote/wa-base/deploy.txt"; run; AUD=$AUD_REAL; is credenciais LIMPO "controle negativo: sem a lista, a chave fora dela passaria"
 mutant "ssh fora vira limpo" 's/^\[ "\$a_done" = 1 \] && \[ -n "\$user" \] || { a_done=0; }/a_done=1/'; AUD=$T/mut.sh
 mk; FAKE_SSH_DOWN=1 run; AUD=$AUD_REAL; is processo LIMPO "controle negativo: sem o \"não terminou\", ssh fora viraria LIMPO"
@@ -304,6 +327,16 @@ mutant "lista cortada em 20 aceita" 's/if printf .%s\\n. "\$cut_keys" | grep -qx
 mk; mkdir -p "$SRV/.whatsapp-automation"; FAKE_NODE=toolcut FAKE_NODE_DIR=.whatsapp-automation run; AUD=$AUD_REAL; is dados LIMPO "controle negativo: sem a trava de lista cortada, o achado escondido atrás dos 20 passaria"
 mutant "relatório sem mascarar" 's/ | redact$//'; AUD=$T/mut.sh
 mk; FAKE_SCAN_RC=1 FAKE_SCAN_MSG="VIOLAÇÃO remotos_fora_do_espelho=[https://x-access-token:$SEC@github.com/x/y]" run; AUD=$AUD_REAL; det github-e-espelho | grep -qF "$SEC"; ok $? "controle negativo: sem o mascaramento, a senha do URL apareceria no relatório (o caso do scan vê a diferença)"
+mutant "contas do rodízio sem glob" 's/case "\$h" in \${gp%%:\*}) case/case "$h" in @@nunca@@) case/'; AUD=$T/mut.sh
+mk; acc; run; AUD=$AUD_REAL; is credenciais ACHADO "controle negativo: sem o glob, as contas do rodízio viram achado (o caso das contas vê a diferença)"
+mutant "glob sem a conferência do servidor" 's/case "\$statted" in \*" \$h "\*) ok=1 ;; esac ;;/ok=1 ;;/'; AUD=$T/mut.sh
+mk; acc; mkdir -p "$SRV/.claude-accounts/a1/sub"; echo "$TOK_CLAUDE" > "$SRV/.claude-accounts/a1/sub/.credentials.json"; run; AUD=$AUD_REAL; is credenciais LIMPO "controle negativo: sem exigir o CRED_STAT, o a1/sub/.credentials.json (nunca conferido) passaria"
+mutant ".dolt só pelo nome" 's/elif \[ -e "\$d\/noms" \] || \[ -e "\$d\/repo_state.json" \]; then echo "BEAD/else echo "BEAD/'; AUD=$T/mut.sh
+mk; mkdir -p "$SRV/.dolt"; echo '{}' > "$SRV/.dolt/config_global.json"; run; AUD=$AUD_REAL; is backup-de-bead ACHADO "controle negativo: só pelo nome, a config do CLI do dolt viraria achado"
+mutant "scan com corte cego" 's/ | scan_line | cut -c1-400/ | cut -c1-300/'; AUD=$T/mut.sh
+mk; FAKE_SCAN_RC=1 FAKE_SCAN_MSG="$SCAN2" run; AUD=$AUD_REAL; ! det github-e-espelho | grep -qF "x/y.git"; ok $? "controle negativo: com o corte cego em 300 colunas, os remotos do 2º rig ficavam de fora (o caso do formato real vê a diferença)"
+mutant "aceito sem o caminho exato" 's/case "\$3" in \$g) return 0 ;; esac/case "$3" in *) return 0 ;; esac/'; AUD=$T/mut.sh
+mk; mkdir -p "$SRV/.claude"; FAKE_NODE=claudejwt FAKE_NODE_DIR=.claude run; AUD=$AUD_REAL; is dados LIMPO "controle negativo: sem o caminho exato, o JWT de outro arquivo passaria"
 
 echo "---"; echo "$((n-fails))/$n ok"
 [ $fails -eq 0 ] && echo "SELFTEST OK" || { echo "SELFTEST FALHOU ($fails)"; exit 1; }

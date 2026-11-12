@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# hetzner-audit.sh — auditoria REPETÍVEL do que o servidor Hetzner guarda (ga-2hd02v.1.5.2, fatia 6b; travas e orçamento: ga-qg1dw5z.3). Roda no MINI, só LÊ o servidor por ssh e não escreve nada lá.
+# hetzner-audit.sh — auditoria REPETÍVEL do que o servidor Hetzner guarda (ga-2hd02v.1.5.2, fatia 6b; travas e orçamento: ga-qg1dw5z.3). Roda no MINI e só LÊ o servidor por ssh (o único arquivo que cria lá é um `mktemp` que sai no `trap`).
 #
 # Contents
 #   O que audita · Três estados · Orçamento e escopo · Saída e códigos · Como repetir · Limites
@@ -7,13 +7,14 @@
 # O QUE AUDITA (cada verificação diz LIMPO | ACHADO | NAO-CONSEGUI):
 #   processo          nenhum `claude auth login` esquecido (o de 15/10, pid 370419, ficou com a credencial já gravada).
 #   credenciais       as ÚNICAS credenciais são as 3 de CRED_ALLOW (login do claude, atalho ssh→mini, chave do espelho git — a 3ª nasceu na fatia 4 e a bead só
-#                     citava 2), com modo 600 e dono do usuário; qualquer outro arquivo com chave privada ou token (por CONTEÚDO, não por nome) ou loja
+#                     citava 2) e as contas do rodízio do claude de CRED_ALLOW_GLOB (~/.claude-accounts/<conta>/.credentials.json, uma por conta), todas com modo 600 e dono do usuário; qualquer outro arquivo com chave privada ou token (por CONTEÚDO, não por nome) ou loja
 #                     de credencial conhecida (.netrc, .git-credentials, .aws...) é achado.
-#   github-e-espelho  `hetzner-remote-git.sh scan` NO servidor (o que já existia: credencial do GitHub no host + dado negado no espelho git). Não é refeito aqui.
+#   github-e-espelho  `hetzner-remote-git.sh scan` NO servidor (o que já existia: credencial do GitHub no host + dado negado no espelho git). Não é refeito aqui; o ACHADO mostra, por rig,
+#                     historico · remotos_fora_do_espelho · arvore (a contagem do scan fica de fora). Os `.pyc` de worktree que a lista de negação do sparse-checkout pega são ruído do scan, não daqui.
 #   dados             o node_audit da semeadura (mbp-run.sh --host linux --audit-node): NOME · GRANDE · JWT · CONTEÚDO (telefones/CPFs) no topo do home (só os arquivos soltos, maxdepth 1)
 #                     e em cada diretório de topo e filho de gt-remote/ EXCETO os de SKIP_NOTE (a linha LIMPO diz o que ficou de fora). Os padrões do find vivem SÓ lá; aqui só se escolhe ONDE olhar
-#                     e se separam os achados que são FERRAMENTA (DADOS_ACEITOS: só NOME/GRANDE, nunca CONTEUDO/JWT, nunca numa lista cortada em 20).
-#   backup-de-bead    .dolt, .dolt-backup, issues.jsonl, beads*.jsonl, qualquer .jsonl dentro de um jsonl-archive/ (peças por dia, ga-e4cbc5s), e .beads com algo além de lock.
+#                     e se separam os achados que são FERRAMENTA (DADOS_ACEITOS: só o (pasta, caminho, tipo) que a lista nomeia; CONTEUDO nunca; nunca numa lista cortada em 20).
+#   backup-de-bead    .dolt só se for repositório (noms/ ou repo_state.json: a pasta do CLI em ~ não conta), .dolt-backup, issues.jsonl, beads*.jsonl, qualquer .jsonl dentro de um jsonl-archive/ (peças por dia, ga-e4cbc5s), e .beads com algo além de lock.
 #   usuario-dados     (trava 1, ga-qg1dw5z.1) o usuário `dados` existe, o home dele é 0700 e dele, ele não está no grupo do runner nem o runner no dele, e o runner NÃO lê o home.
 #   root-sem-login    (trava 2, ga-qg1dw5z.2) o sshd_config (com os Include) diz PermitRootLogin no: a 1ª ocorrência fora de Match vale; um Match que libere o root é achado.
 #   ufw / fail2ban    (trava 2) ufw com ENABLED=yes no arquivo E a unidade ativa (o unit do ufw roda e sai: "active" sozinho não prova firewall); fail2ban instalado, ativo e com a jail sshd.
@@ -26,13 +27,13 @@
 #   (listagem, credenciais, travas, scan do espelho e K grupos de pastas do node_audit, K = HETZNER_AUDIT_JOBS, padrão 4); (2) cada fase tem prazo — o do orçamento (HETZNER_AUDIT_BUDGET,
 #   padrão 540 s) — imposto no nó por `timeout` e aqui por um corte que mata a árvore de processos: a fase que estoura vira NAO-CONSEGUI ("orçamento") e NÃO derruba as outras; (3) o escopo
 #   deixa de fora o que é controlado por outro mecanismo ou não cabe num dia (SKIP_NOTE e CRED_NOTE dizem o quê, na própria linha LIMPO). A rodada SEMPRE termina com um RESULTADO.
-# SAÍDA (stdout): uma linha `AUDITORIA <estado> <verificação>: <detalhe>` por verificação (+ `AUDITORIA DETALHE dados: ...` por achado), sem valor de segredo nem de dado (só caminho e contagem),
+# SAÍDA (stdout): uma linha `AUDITORIA <estado> <verificação>: <detalhe>` por verificação (+ `AUDITORIA DETALHE dados: ...` por achado), sem valor de segredo nem de dado (só caminho e contagem; URL usuário:senha@ e token conhecido saem mascarados, redact),
 #   `AUDITORIA RESULTADO <estado> (...) em <host> <hora> duracao=Ns orcamento=Ns`. CÓDIGOS: 0 tudo limpo · 1 algum ACHADO (vale mesmo que outra verificação tenha caído) · 3 nenhum achado mas algo não foi lido · 2 uso.
 # COMO REPETIR: bash scripts/hetzner-audit.sh   (HETZNER_NODE_HOST e MBP_SSH como no mbp-run.sh). Selftest: scripts/hetzner-audit.selftest.sh. Todo dia, com alarme: hetzner-audit-daily.sh.
 # LIMITES: o que mora em .git/repo.git, venv*/env/site-packages/node_modules, ~/.cache, ~/.local/share/claude e tests/, fixtures/, *.selftest.*, test_* não é lido por CONTEÚDO
 #   (compactado, de terceiros, ou token falso por desenho; o espelho git tem o `scan` próprio e a varredura de conteúdo por commit no mini). Transcritos e histórico de sessão (~/.claude/projects,
-#   file-history; ~/.cc-safety-net/logs) ficam FORA: se um agente vir dado pessoal ele aparece ali, mas a leitura inteira não cabe num dia e o critério "arquivo > 4 MB = não li" os acusaria
-#   para sempre — o certo é uma janela deslizante com varredura em streaming (não feito). Chave sem cabeçalho PEM/OPENSSH e token de formato novo passam pela busca de conteúdo. Esta auditoria
+#   file-history, sessions; ~/.cc-safety-net/logs; o history.jsonl de prompts e o usage-analytics.jsonl, em ~/.claude, são GRANDE aceito) ficam FORA: se um agente vir dado pessoal ele aparece ali, mas a leitura
+#   inteira não cabe num dia e o critério "arquivo > 4 MB = não li" os acusaria para sempre — o certo é uma janela deslizante com varredura em streaming (não feito). Chave sem cabeçalho PEM/OPENSSH e token de formato novo passam pela busca de conteúdo. Esta auditoria
 #   olha ARQUIVOS do sshd/ufw/fail2ban, não o estado vivo deles.
 set -u
 HERE=$(cd "$(dirname "$0")" && pwd)
@@ -43,13 +44,16 @@ case "$JOBS" in ''|*[!0-9]*) JOBS=4 ;; esac; [ "$JOBS" -ge 1 ] || JOBS=4
 SSH_OPTS=(-o BatchMode=yes -o ConnectTimeout=8 -o ServerAliveInterval=15 -o ServerAliveCountMax=4)
 # caminhos relativos ao home do servidor : o que são. Fora desta lista, credencial é achado.
 CRED_ALLOW=(".claude/.credentials.json:login do claude" ".ssh/mini_shim_ed25519:atalho ssh→mini" "gt-remote/keys/gt_mirror:chave do espelho git (fatia 4)")
+# padrões (glob relativo ao home): o rodízio de contas do claude guarda um login por conta em ~/.claude-accounts/<conta>/.credentials.json (600, dono do usuário; criado em 20/10, medido no nó em 12/11); as contas entram e saem, então não há lista fixa
+CRED_ALLOW_GLOB=(".claude-accounts/*/.credentials.json:login do claude de uma conta do rodízio")
 SKIP_TOP=" .cache .local .duckdb .ssh .npm .cc-safety-net gt-remote "      # topo do home que NÃO é auditado por pasta: caches (o .duckdb tem verificação própria), .ssh (credenciais), .npm (cache de pacotes públicos), .cc-safety-net (logs de sessão) e gt-remote (por filho, abaixo)
 SKIP_GT=" bin bundle bundle-out git keys mirror "     # filhos de gt-remote sem dado: ferramentas, bundle, espelho git e seus worktrees (varredura de conteúdo por commit no mini + `scan`), chaves (credenciais); venv-* é pulado no laço do audit_dados
 GT_PRUNE="prune=venv:env:.git:__pycache__"
-CLAUDE_PRUNE="prune=plugins:downloads:cache:security/agent-sdk-venv:projects:file-history"      # transcritos (7 GB, 331 arquivos > 4 MB) e histórico de sessão: ver LIMITES
-SKIP_NOTE=".cache .local .duckdb .ssh .npm .cc-safety-net (topo), .claude/{projects,file-history} e gt-remote/{bin,bundle,bundle-out,git,keys,mirror,venv-*}"   # o que SKIP_TOP/SKIP_GT/CLAUDE_PRUNE deixam de fora: a linha LIMPO do dados o repete, para o "limpo" não parecer maior do que é
-CRED_NOTE="a busca por CONTEÚDO não olha: gt-remote/{git,mirror,venv-*}, .claude/{projects,file-history,plugins,downloads}, .cache, .local/share/claude"
-# achados do node_audit que são FERRAMENTA e não dado: pasta|glob relativo à pasta|tipos|por quê. Só NOME e GRANDE (o CONTEUDO e o JWT são conteúdo: nunca). Cada linha foi conferida no nó em 12/11.
+CLAUDE_PRUNE="prune=plugins:downloads:cache:security/agent-sdk-venv:projects:file-history:sessions"      # transcritos (7 GB, 331 arquivos > 4 MB), histórico de sessão e o registro de sessão (sessions/<pid>.<hash>.key: 142 bytes de JSON com ids, um por sessão viva, nome terminado em .key): ver LIMITES
+SKIP_NOTE=".cache .local .duckdb .ssh .npm .cc-safety-net (topo), .claude/{projects,file-history,sessions} e gt-remote/{bin,bundle,bundle-out,git,keys,mirror,venv-*}"   # o que SKIP_TOP/SKIP_GT/CLAUDE_PRUNE deixam de fora: a linha LIMPO do dados o repete, para o "limpo" não parecer maior do que é
+CRED_NOTE="a busca por CONTEÚDO não olha (PR e PT do remote_cred): .cache, .local/share/claude, .duckdb, .claude/{projects,file-history,plugins,downloads,security}, gt-remote/{git,mirror,*/env}, venv*, node_modules, site-packages, .git, repo.git, __pycache__, tests/, fixtures/, *.selftest.*, test_*"
+# achados do node_audit que são FERRAMENTA e não dado: pasta|glob relativo à pasta|tipos|por quê. Só o tipo que a linha lista; CONTEUDO nunca (lista de telefones/CPFs é dado); o JWT só num caminho exato de arquivo
+# que a própria ferramenta assina. Cada linha foi conferida no nó em 12/11 (forma e tamanho, sem ler valor).
 DADOS_ACEITOS=(
   ".config|go/telemetry/local/upload.token|NOME|token de amostragem da telemetria do toolchain Go (arquivo de 0 bytes)"
   ".pki|nssdb/cert9.db|NOME|banco de certificados NSS que o Chromium cria sozinho (SQLite de 28 KB)"
@@ -59,6 +63,9 @@ DADOS_ACEITOS=(
   ".gastown|logs/*.log|NOME|logs das ferramentas da cidade no nó: idem"
   "gt-remote/tools|*.gz|NOME|man e tarballs das ferramentas compiladas no nó (byacc, bash 3.2.57)"
   "gt-remote/ballast|wa-mutants.state.json|GRANDE|estado do motor de lastro (JSON de mutantes, 7 MB)"
+  ".claude|history.jsonl|GRANDE|histórico de prompts do claude (187 MB, 2391 registros em 12/11): mesma classe dos transcritos fora do escopo, a leitura por conteúdo não cabe num dia (ver LIMITES)"
+  ".claude|usage-analytics.jsonl|GRANDE|telemetria de uso escrita pelo hook log-token-usage.sh (16 MB de linhas de contagem)"
+  ".claude|policy-limits.json.signature.json|JWT|JWS que o próprio claude assina e guarda (typ cc-signed-cache+jws, certificados públicos em x5c, claims de política): não é credencial de portador"
 )
 n_bad=0; n_cant=0; n_ok=0
 # O relatório vira arquivo e, pelo wrapper diário, um push EXTERNO (ntfy). O scan do espelho imprime os remotos do git CRUS (`remotos_fora_do_espelho=[https://usuario:token@...]`) e o pgrep imprime a linha de comando:
@@ -132,14 +139,23 @@ PT=(-path '*/tests/*' -o -path '*/fixtures/*' -o -name '*.selftest.*' -o -name '
 find . \( "${PR[@]}" -o "${PT[@]}" \) -prune -o -type f -size -2049k -exec grep -lIE -e '-----BEGIN [A-Z ]*PRIVATE KEY-----' -e 'sk-ant-[A-Za-z0-9_-]{20,}' -e 'gh[pousr]_[A-Za-z0-9]{30,}' \
   -e 'github_pat_[A-Za-z0-9_]{30,}' -e 'xox[abprs]-[A-Za-z0-9-]{10,}' -e 'AKIA[0-9A-Z]{16}' {} + 2>>"$E" | sed 's#^\./##; s/^/CRED_HIT /'
 for f in "$@"; do
-  if [ -e "$f" ]; then m=$(stat -c '%a %U' "$f" 2>>"$E") && echo "CRED_STAT $m $f" || echo "ERR stat $f"; else echo "CRED_MISSING $f"; fi
+  case "$f" in
+    # glob: vazio (padrão sem nenhum arquivo) → "nenhuma conta", sem linha CRED_MISSING nem achado; falhou (stat) → ERR stat, que o avaliador lê como NAO-CONSEGUI; cada arquivo que casa é conferido (modo e dono) como os fixos
+    glob:*) set +f; for g in ${f#glob:}; do [ -e "$g" ] || continue; m=$(stat -c '%a %U' "$g" 2>>"$E") && echo "CRED_STAT $m $g" || echo "ERR stat $g"; done; set -f ;;
+    *) if [ -e "$f" ]; then m=$(stat -c '%a %U' "$f" 2>>"$E") && echo "CRED_STAT $m $f" || echo "ERR stat $f"; else echo "CRED_MISSING $f"; fi ;;
+  esac
 done
 for f in .netrc .pgpass .npmrc .git-credentials .config/git/credentials .config/gh .aws .docker/config.json .config/gcloud .kube .gnupg .config/rclone .ssh/id_rsa .ssh/id_ed25519 .ssh/id_ecdsa .ssh/id_dsa; do
   [ -e "$f" ] && echo "CRED_NAME $f"
 done
-find . \( "${PR[@]}" \) -prune -o \( -name .dolt -o -name .dolt-backup -o -name dolt-backup -o -name '*.dolt' -o -name issues.jsonl -o -name 'beads*.jsonl' -o \( -name '*.jsonl' -path '*/jsonl-archive/*' \) \) -print 2>>"$E" | sed 's#^\./##; s/^/BEAD /'
+find . \( "${PR[@]}" \) -prune -o \( -name .dolt-backup -o -name dolt-backup -o -name '?*.dolt' -o -name issues.jsonl -o -name 'beads*.jsonl' -o \( -name '*.jsonl' -path '*/jsonl-archive/*' \) \) -print 2>>"$E" | sed 's#^\./##; s/^/BEAD /'
 find . \( "${PR[@]}" \) -prune -o -type d -name .beads -print 2>>"$E" | while read -r d; do
   [ -n "$(find "$d" -type f ! -name '*.lock' -print 2>>"$E" | head -n 1)" ] && echo "BEAD ${d#./} (com conteúdo além de lock)"
+done
+# .dolt só é banco de bead se tem o repositório (noms/ ou repo_state.json); a pasta que o CLI do dolt cria em ~ (config_global.json, version_check.txt, eventsData/) não é (medido no nó em 12/11: 24 KB)
+# vazio (sem .dolt, ou só config) → nenhuma linha BEAD; falhou (pasta que não abro: não sei se é repositório) → ERR leitura, nunca "só config"
+find . \( "${PR[@]}" \) -prune -o -type d -name .dolt -print 2>>"$E" | while read -r d; do
+  if [ ! -r "$d" ] || [ ! -x "$d" ]; then echo "ERR leitura"; elif [ -e "$d/noms" ] || [ -e "$d/repo_state.json" ]; then echo "BEAD ${d#./} (repositório Dolt: noms/ ou repo_state.json)"; fi
 done
 [ -d .duckdb ] && { [ -z "$(find .duckdb -type f ! -name '*.duckdb_extension' ! -name '*.info' -print 2>>"$E" | head -n 1)" ] && echo "DUCKDB_EXT_ONLY 1"; }
 [ -s "$E" ] && echo "ERR leitura"
@@ -227,7 +243,8 @@ EOF
 # 1) as fases rápidas e as pesadas começam JUNTAS (a listagem é o que o node_audit espera, então fica no caminho crítico: prazo curto)
 remote_lista > "$W/lista.sh"; remote_cred > "$W/cred.sh"; remote_travas > "$W/travas.sh"
 start lista "$(lim_of 60)" ssh_script "$W/lista.sh" "$(lim_of 60)" lista; p_lista=$!
-start cred "$(lim_of "$BUDGET")" ssh_script "$W/cred.sh" "$(lim_of "$BUDGET")" cred "${CRED_ALLOW[@]%%:*}"
+cred_args=("${CRED_ALLOW[@]%%:*}"); for p in "${CRED_ALLOW_GLOB[@]}"; do cred_args+=("glob:${p%%:*}"); done
+start cred "$(lim_of "$BUDGET")" ssh_script "$W/cred.sh" "$(lim_of "$BUDGET")" cred "${cred_args[@]}"
 start travas "$(lim_of 120)" ssh_script "$W/travas.sh" "$(lim_of 120)" travas
 start git "$(lim_of "$BUDGET")" "$SSH_BIN" "${SSH_OPTS[@]}" "$HOST" "timeout $(lim_of "$BUDGET") \"\$HOME/gt-remote/bin/hetzner-remote-git.sh\" scan"
 wait "$p_lista"
@@ -281,9 +298,14 @@ else emit LIMPO processo "nenhum \`claude auth login\` em execução"; fi
 # credenciais
 if [ "$a_done" = 0 ]; then emit NAO-CONSEGUI credenciais "$(cant_of cred "as credenciais")"
 else
-  bad=""; allowed=" "; known=""
+  bad=""; allowed=" "; known=""; statted=" $(lines CRED_STAT | awk '{print $3}' | tr '\n' ' ')"
   for pair in "${CRED_ALLOW[@]}"; do allowed="$allowed${pair%%:*} "; done
-  for h in $(lines CRED_HIT); do case "$allowed" in *" $h "*) ;; *) bad="$bad hit-fora-da-lista:$h" ;; esac; done
+  for h in $(lines CRED_HIT); do
+    ok=0; case "$allowed" in *" $h "*) ok=1 ;; esac
+    # glob: só vale o arquivo que o servidor expandiu e conferiu (CRED_STAT): o `*` de um `case` atravessa "/", o do servidor não (…/a1/sub/.credentials.json casaria aqui sem nunca ter o modo e o dono vistos)
+    for gp in "${CRED_ALLOW_GLOB[@]}"; do case "$h" in ${gp%%:*}) case "$statted" in *" $h "*) ok=1 ;; esac ;; esac; done
+    [ "$ok" = 1 ] || bad="$bad hit-fora-da-lista:$h"
+  done
   for f in $(lines CRED_NAME); do bad="$bad loja-conhecida:$f"; done
   while read -r mode owner path; do
     [ -n "$path" ] || continue
@@ -302,18 +324,22 @@ elif err_for leitura; then emit NAO-CONSEGUI backup-de-bead "find falhou no serv
 else emit LIMPO backup-de-bead "nenhum .dolt/.dolt-backup/issues.jsonl/beads*.jsonl e .beads só com lock"; fi
 
 # github-e-espelho: o scan que o servidor já tem (rc 0 limpo · 1 violação · 2/3 não consegui varrer)
+# A linha de VIOLAÇÃO do scan traz a contagem na frente e as listas (no máximo 5 entradas cada) atrás, na ordem historico · arvore · remotos_fora_do_espelho: um corte cego em 300 colunas deixava os remotos do git (o campo de
+# maior risco) sempre de fora. Aqui sai "<rig>: historico=[…] remotos_fora_do_espelho=[…] arvore=[…]" (a árvore, que é a que mais ruído leva, por último); a linha de outra forma (a das credenciais do host) passa como está.
+scan_line() { awk 'function fld(s, k,   i, r) { i = index(s, k "=["); if (!i) return ""; r = substr(s, i); return substr(r, 1, index(r, "]")) }
+  { h = fld($0, "historico"); if (h == "") { print; next }; print substr($0, 1, index($0, ": ") - 1) ": " h " " fld($0, "remotos_fora_do_espelho") " " fld($0, "arvore") }'; }
 G=$(cat "$W/git.out" 2>/dev/null); g_rc=$(rc_of git)
 case $g_rc in
   0) emit LIMPO github-e-espelho "$(printf '%s\n' "$G" | tail -n 2 | tr '\n' '|')" ;;
-  1) emit ACHADO github-e-espelho "$(printf '%s\n' "$G" | grep 'VIOLA' | cut -c1-300 | tr '\n' '|')" ;;
+  1) emit ACHADO github-e-espelho "$(printf '%s\n' "$G" | grep 'VIOLA' | scan_line | cut -c1-400 | tr '\n' '|')" ;;
   124) emit NAO-CONSEGUI github-e-espelho "estourou o orçamento de ${BUDGET}s: não varri" ;;
   *) emit NAO-CONSEGUI github-e-espelho "scan saiu $g_rc (255 = ssh): $(printf '%s\n' "$G" | tail -n 1 | cut -c1-200)" ;;
 esac
 
-# aceito <pasta> <tipo> <caminho>: 0 se DADOS_ACEITOS cobre o achado (só NOME e GRANDE)
+# aceito <pasta> <tipo> <caminho>: 0 se uma linha de DADOS_ACEITOS cobre o achado (pasta, caminho E tipo); CONTEUDO nunca é aceito
 aceito() {
   local e d g t
-  case "$2" in NOME|GRANDE) ;; *) return 1 ;; esac
+  [ "$2" != CONTEUDO ] || return 1
   for e in "${DADOS_ACEITOS[@]}"; do
     IFS='|' read -r d g t _ <<< "$e"
     [ "$d" = "$1" ] || continue
