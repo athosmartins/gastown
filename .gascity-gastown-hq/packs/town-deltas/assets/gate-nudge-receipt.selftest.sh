@@ -11,6 +11,12 @@
 #           exactly GATE_RCPT_PENDING_MAX_S, and "could not read" is never worded as "not found"; a closed / gate:passed source bead is left alone; mail that
 #           fails reaches the Mayor; the per-sweep cap, the min-age and the re-check throttles hold; damaged records are settled; the right nudge bead is
 #           picked among look-alikes; every path survives `set -euo pipefail`.
+#   wake    (ga-9kxy44u) a receipt that gives up on the author also types ONE short --delivery immediate line into the recipient's pane, after the mail
+#           and at most once per record (the attempt is written down first): only with the switch on, a readable bead that is still the author's, not
+#           back in the gate (gate:queued / gate:reviewing) nor parked for a human (gate:needs-human*), and a pane that reads as an idle Claude Code
+#           prompt (busy, dialog, selection menu, shell, empty and cut-short peeks all skip, with the reason; the idle and busy fixtures are REAL
+#           wa-worker panes); the outcome (delivered / queued / unconfirmed / failed / skipped) is never worded as typed unless delivered; both gc
+#           calls run under timeout; failing mail, a missing mail helper and errexit leave it alone.
 #   static  the live dispatcher loads the lib optionally, calls the sweep (not in a Phase-C-only pass), passes --json and keeps the nudge call in the
 #           current shell; both files pass bash -n.
 #   mutants each behaviour is broken on a copy (one exact-once edit) and this selftest, limited to the groups that cover it, must turn red.
@@ -48,25 +54,34 @@ cat > "$SB/bin/gc" <<'EOF'
 [ "$1" = "--city" ] && shift 2
 case "$1 $2" in
   "session nudge")
-    to="$3"; json=0
-    for a in "$@"; do [ "$a" = "--json" ] && json=1; done
+    to="$3"; json=0; imm=0; dl=wait-idle
+    for a in "$@"; do [ "$a" = "--json" ] && json=1; [ "$a" = "immediate" ] && { imm=1; dl=immediate; }; done
     echo "$to" >> "$FAKE_DIR/nudge.log"
     printf '%s\n' "$*" >> "$FAKE_DIR/nudge.argv"
     mode=queued; [ -f "$FAKE_DIR/nudge.$to" ] && mode=$(cat "$FAKE_DIR/nudge.$to")
+    # --delivery immediate (the gate's wake-up nudge) has its own mode file, wake.<to>; it types the text, so the default is delivered
+    if [ "$imm" = 1 ]; then mode=delivered; [ -f "$FAKE_DIR/wake.$to" ] && mode=$(cat "$FAKE_DIR/wake.$to"); printf '%s' "$4" > "$FAKE_DIR/wake.text"; cat "$GATE_RCPT_DIR"/pending/*.rec > "$FAKE_DIR/rec.at-wake" 2>/dev/null; fi
     case "$mode" in
       fail) echo "gc session nudge: session not found: \"$to\"" >&2; exit 1 ;;
       empty) exit 0 ;;
       garbage) echo "native_store_unavailable: x"; exit 0 ;;
+      slow) exec sleep 8 ;;
     esac
     if [ "$json" = 1 ]; then
       case "$mode" in
-        delivered) echo '{"ok":true,"delivery":"wait-idle","queued":false,"outcome":"delivered"}' ;;
+        delivered) echo '{"ok":true,"delivery":"'$dl'","queued":false,"outcome":"delivered"}' ;;
         notok)     echo '{"ok":false,"outcome":"delivered"}' ;;
-        *)         echo '{"ok":true,"delivery":"wait-idle","queued":true,"outcome":"queued"}' ;;
+        *)         echo '{"ok":true,"delivery":"'$dl'","queued":true,"outcome":"queued"}' ;;
       esac
     else
       echo "Nudged $to"
     fi
+    exit 0 ;;
+  "session peek")
+    echo "$3" >> "$FAKE_DIR/peek.log"
+    [ -f "$FAKE_DIR/peek.fail" ] && { echo "gc session peek: session not found: \"$3\"" >&2; exit 1; }
+    [ -f "$FAKE_DIR/pane.$3" ] && cat "$FAKE_DIR/pane.$3"
+    [ -f "$FAKE_DIR/peek.rc1" ] && exit 1
     exit 0 ;;
   "mail send")
     to="$3"; n=$(wc -l < "$FAKE_DIR/mail.log" | tr -d ' '); n=$((n+1))
@@ -105,9 +120,15 @@ cat > "$SB/bin/date" <<'EOF'
 if [ -n "${FAKE_DATE_FAIL:-}" ]; then for a in "$@"; do case "$a" in -r|-d) exit 1 ;; esac; done; fi
 exec "$REAL_DATE" "$@"
 EOF
-chmod +x "$SB/bin/gc" "$SB/bin/bd" "$SB/bin/date"
-sandbox_path_init "$SB" jq date mktemp timeout awk sed tr cat head mv rm mkdir basename wc find || { echo "FATAL: sandbox PATH" >&2; exit 2; }
-export REAL_DATE="$SB/tools/date"
+cat > "$SB/bin/timeout" <<'EOF'
+#!/bin/bash
+# logs what is run under a bound (the wake-up's two gc calls must be), then runs the real timeout
+printf '%s\n' "$*" >> "$FAKE_DIR/timeout.log"
+exec "$REAL_TIMEOUT" "$@"
+EOF
+chmod +x "$SB/bin/gc" "$SB/bin/bd" "$SB/bin/date" "$SB/bin/timeout"
+sandbox_path_init "$SB" jq date mktemp timeout awk sed tr cat head mv rm mkdir basename wc find grep tail sleep || { echo "FATAL: sandbox PATH" >&2; exit 2; }
+export REAL_DATE="$SB/tools/date" REAL_TIMEOUT="$SB/tools/timeout"
 selftest_fail_closed_arm cleanup
 
 # ── the code under test ──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
@@ -130,16 +151,68 @@ BEAD="wa-2h615v.7"; TO="peter-wa"; RIGCITY="/rig/whatsapp_automation"; T0=179000
 MSG1=$'QUALITY GATE FAILED for branch crew/peter/wa-2h615v.7. Blocking reasons: Reviewer 1 FAIL: VERDICT: FAIL\n\nBlocking issue 1: "quoted" text, $dollar, `tick`, back\\slash & more.\nGate run: ga-05z21u8. Fix the issues and re-run /gate-done when ready.'
 PROBE1='QUALITY GATE FAILED for branch crew/peter/wa-2h615v.7. Blocking reasons: Reviewer 1 FAIL: VERDICT: FAIL'
 
+# Pane fixtures for the wake-up (ga-9kxy44u). idle / busy are REAL panes copied from the live wa-workers (`gc session peek`, 03/10, the same ones
+# scripts/tests/pool-idle-nobead-guard.selftest.sh carries), trimmed. All of them draw the "❯" prompt box: it is on EVERY pane (busy, idle, and the option
+# cursor of a dialog), so it can never be what tells them apart. dialog / ask / shell are synthetic: the permission-dialog wording is the one
+# agent-stuck-escalation.sh matches, the selection hints are Claude Code's. (top-level heredocs, read back: bash 3.2 mis-parses one inside $( ))
+mkdir -p "$SB/panes"
+cat > "$SB/panes/idle.txt" <<'EOF'
+⏺ Monitor(mutation (new code) and neighbour differential finished)
+  ⎿  Monitor started · task bh0a27iaa · timeout 1800s
+
+✻ Cooked for 1h 1m 30s · done 10:22 AM · 3 shells, 1 monitor still running
+
+────────────────────────────────────────────────────────────────────────────────
+❯
+────────────────────────────────────────────────────────────────────────────────
+  👥 0 workers · 🚦 running 2/3 6c179cf040677bf559f74e
+  [Sonnet 5.5] ctx: 38.0% (380k/1000k)
+  ⏵⏵ bypass permissions on · 3 shells, 1 monitor · ← 1 agent
+EOF
+cat > "$SB/panes/busy.txt" <<'EOF'
+⏺ Re-running the real-data E2E with a fresh oracle · 1m 5s
+  ⎿  $ cd /Users/athos/gt/whatsapp_automation/crew/worker-wa-yo0ex9 && python3 -
+     (ctrl+b ctrl+b (twice) to run in background)
+
+✢ Kneading… (1h 31m 47s · ↓ 298.6k tokens)
+  ⎿  Tip: Use /clear to start fresh when switching topics and free up context
+
+────────────────────────────────────────────────────────────────────────────────
+❯
+────────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ bypass permissions on · 2 shells · ← 1 agent
+EOF
+cat > "$SB/panes/dialog.txt" <<'EOF'
+⏺ Bash(rm -rf scratch/__pycache__)
+  Permission rule Bash(rm -rf:*) requires confirmation for this command.
+  Do you want to proceed?
+  ❯ 1. Yes
+    2. Yes, and don't ask again
+    3. No
+EOF
+cat > "$SB/panes/ask.txt" <<'EOF'
+Which way should the fix go?
+
+❯ 1. Mail only
+  2. Mail and a wake-up nudge
+  3. Type something.
+Enter to select · ↑/↓ to navigate · Esc to cancel
+EOF
+printf 'athos@mini gascity %% ' > "$SB/panes/shell.txt"
+CHROME=$'\n────────────────────────────────────────────────────────────────────────────────\n❯ \n────────────────────────────────────────────────────────────────────────────────\n  [Sonnet 5.5] ctx: 38.0% (380k/1000k)'
+
 new_case() {
   CASE="$(mktemp -d "$SB/case.XXXXXX")" || exit 2
   FD="$CASE/fake"; mkdir -p "$FD" "$CASE/city/.gc"
   export FAKE_DIR="$FD" GC_CITY="$CASE/city" GATE_RCPT_DIR="$CASE/city/.gc/runtime/gate-author-nudge" QG_LOG="$CASE/city/.gc/quality-gate.jsonl"
-  : > "$FD/mail.log"; : > "$FD/nudge.log"; : > "$FD/nudge.argv"; : > "$FD/bd.lists"; : > "$FD/bd.comments"; : > "$QG_LOG"
+  : > "$FD/mail.log"; : > "$FD/nudge.log"; : > "$FD/nudge.argv"; : > "$FD/peek.log"; : > "$FD/timeout.log"; : > "$FD/bd.lists"; : > "$FD/bd.comments"; : > "$QG_LOG"
   WARN_LOG="$CASE/warn.log"; LOG_LOG="$CASE/log.log"; : > "$WARN_LOG"; : > "$LOG_LOG"
-  unset BEAD_CITY GATE_FAIL_DEFER_MAYOR DRY_RUN GATE_RCPT_ENABLED GATE_RCPT_NOW GATE_RCPT_PENDING_MAX_S GATE_RCPT_MIN_AGE_S GATE_RCPT_RECHECK_S GATE_RCPT_MAX_PER_SWEEP GATE_RCPT_OFF_FILE
+  unset BEAD_CITY GATE_FAIL_DEFER_MAYOR DRY_RUN GATE_RCPT_ENABLED GATE_RCPT_NOW GATE_RCPT_PENDING_MAX_S GATE_RCPT_MIN_AGE_S GATE_RCPT_RECHECK_S GATE_RCPT_MAX_PER_SWEEP GATE_RCPT_OFF_FILE ASG
+  unset GATE_RCPT_WAKE GATE_RCPT_WAKE_OFF_FILE GATE_RCPT_WAKE_TIMEOUT_S
   put_bead "$BEAD" in_progress gate:needs-fix
 }
-put_bead() { jq -n --arg id "$1" --arg s "$2" --arg l "${*:3}" '[{id:$id, status:$s, labels:($l | split(" ") | map(select(. != "")))}]' > "$FD/bead.$1.json"; }
+# put_bead <id> <status> [label]...   the source bead as `bd show --json` prints it; ASG is its assignee (default: the author the records are written for, "author-x")
+put_bead() { jq -n --arg id "$1" --arg s "$2" --arg a "${ASG-author-x}" --arg l "${*:3}" '[{id:$id, status:$s, assignee:$a, labels:($l | split(" ") | map(select(. != "")))}]' > "$FD/bead.$1.json"; }
 # nbead <state> <status> <reason> <created-epoch> <message> [agent]. Shape measured live on 2026-11-11 (799 closed gc:nudge beads since 04/11, `bd list --include-infra
 # --status closed -l gc:nudge`): the engine's own words are in close_reason; terminal_reason / last_error are "" (EMPTY STRINGS, not null) for a nudge that was
 # accepted or injected, and carry the failure for failed / expired / superseded (close_reason there is the engine's generic "nudge <state>: ..." line).
@@ -396,6 +469,108 @@ g_sw_switch() {
   chk "sweep18b ... and with bd list failing" streq "$(bare_sweep_reaches_end $((T0 + 600)))" REACHED
 }
 
+# ═════════════════════════════════════════════════ the wake-up nudge (ga-9kxy44u) ══════════════════════════════════════════════════════════════════
+# An idle crew never sees a wait-idle nudge that stays queued, and mail is read at the NEXT turn, which an idle crew does not have (12/11: three beads, 65 min
+# to 4 h parked in gate:needs-fix with the crew idle at its prompt; one short --delivery immediate nudge woke each in about a minute). So the author that
+# the receipt gives up on gets, besides the mail, ONE short immediate nudge: only when the bead is still theirs and not back in the gate, and only when
+# their pane reads as an idle Claude Code prompt (a typed line into a dialog, a busy turn or a shell is worse than none).
+wake_n() { grep -c -- '--delivery immediate' "$FD/nudge.argv" 2>/dev/null || true; }
+pane_is() { cp "$SB/panes/$1.txt" "$FD/pane.$TO"; }
+wake_ev() { jq -r 'select(.event=="author_nudge_receipt") | .wake' "$QG_LOG" 2>/dev/null | tr '\n' ' '; }
+case_wake() { # <queued|failed> — a record at T0, the nudge bead in that state, the recipient's pane idle
+  new_case; mkrec "$T0"; pane_is idle
+  if [ "$1" = queued ]; then put_list open "$(nbead queued open "" $((T0 + 3)) "$MSG1")"; else put_list open; put_list closed "$(nbead "$1" closed "queued nudge session fence mismatch" $((T0 + 1)) "$MSG1")"; fi
+}
+wake_veto() { # <name> <reason in the comment> <assignee> <labels...> — a bead the wake must leave alone
+  local name="$1" frag="$2" asg="$3"; shift 3
+  case_wake failed; ASG="$asg" put_bead "$BEAD" in_progress "$@"; sweep $((T0 + 600))
+  chk "wake6 [$name] no wake-up and no pane read; the author is still mailed; the comment and the event say it was skipped, and why" streq "$(wake_n):$(nlines "$FD/peek.log"):$(mail_n):$(has "$FD/comment.1" "No immediate nudge was sent" && has "$FD/comment.1" "$frag" && echo y):$(wake_ev)" "0:0:1:y:skipped "
+}
+wake_pane() { # <name> <reason in the comment> — the pane is already in place: no wake-up, the mail still goes
+  chk "wake7 [$1] the pane does not read as an idle prompt: no wake-up, the author is still mailed, the comment says why" streq "$(wake_n):$(mail_n):$(has "$FD/comment.1" "No immediate nudge was sent" && has "$FD/comment.1" "$2" && echo y):$(wake_ev)" "0:1:y:skipped "
+}
+g_sw_wake() {
+  echo "── sweep: the wake-up nudge ──"
+  case_wake queued; sweep $((T0 + 1800))
+  chk "wake1 still queued at the limit and the recipient's pane idle: the author is mailed AND ONE immediate nudge goes to that recipient (--json, its own identity)" streq "$(mail_n):$(wake_n):$(grep -c -- "^session nudge $TO .* --delivery immediate --json\$" "$FD/nudge.argv"):$(tr '\n' ' ' < "$FD/peek.log")" "1:1:1:$TO "
+  W="$(cat "$FD/wake.text" 2>/dev/null)"
+  chk "wake1b the text names the bead and the GATE-FEEDBACK and is ONE short line (a long nudge reaches the pane truncated)" streq "$(has "$FD/wake.text" "$BEAD" && has "$FD/wake.text" "GATE-FEEDBACK" && echo y):$([ -n "$W" ] && [ "${#W}" -le 240 ] && echo short):$(printf '%s' "$W" | grep -c '')" "y:short:1"
+  chk "wake1c ... with no slash-command token: typed into a prompt, '/gate-done' is attached as the skill and would re-submit the unfixed work" streq "$([ -n "$W" ] && echo text):$(printf '%s' "$W" | grep -c -E '(^|[[:space:]])/[a-z]')" "text:0"
+  chk "wake1d the comment says the immediate nudge was DELIVERED (typed); the event and the settled record say wake=delivered" streq "$(has "$FD/comment.1" "immediate nudge" && has "$FD/comment.1" "DELIVERED" && echo y):$(wake_ev):$(cat "$GATE_RCPT_DIR"/settled/*.rec 2>/dev/null | sed -n 's/^wake=//p' | tr '\n' ' ')" "y:delivered :delivered "
+  sweep $((T0 + 5000)); chk "wake2 a settled receipt wakes nobody again" streq "$(wake_n):$(mail_n)" "1:1"
+  chk "wake2b the attempt is written into the record BEFORE anything is typed (a sweep that dies after the wake, or a settle that fails, must not type a second line)" has "$FD/rec.at-wake" "wake_attempt="
+  case_wake failed; printf 'wake_attempt=%s\n' "$T0" >> "$(recf "$BEAD" "$TO")"; sweep $((T0 + 600))
+  chk "wake2c a record that already carries an attempt (an earlier sweep died or could not settle it) is mailed again but NOT woken again, and no pane is read" streq "$(mail_n):$(wake_n):$(nlines "$FD/peek.log"):$(has "$FD/comment.1" "already tried" && echo y)" "1:0:0:y"
+  if [ "$(id -u)" != 0 ]; then
+    case_wake failed; chmod 444 "$(recf "$BEAD" "$TO")"; sweep $((T0 + 600))
+    chk "wake2d an attempt that cannot be written down is a skip (a wake-up nobody recorded could repeat on every sweep), the mail still goes" streq "$(wake_n):$(mail_n):$(has "$FD/comment.1" "could not be written down" && echo y)" "0:1:y"
+  fi
+  case_wake queued; sweep $((T0 + 1799))
+  chk "wake3 one second short of the limit nothing happens: no mail, no pane read, no wake-up" streq "$(mail_n):$(wake_n):$(nlines "$FD/peek.log")" "0:0:0"
+  case_wake failed; sweep $((T0 + 600))
+  chk "wake4 a nudge that is GONE (failed: the session restarted) wakes the new session at once, without waiting for the age rule" streq "$(mail_n):$(wake_n)" "1:1"
+  case_wake failed; put_bead "$BEAD" closed; sweep $((T0 + 600))
+  chk "wake5 a closed source bead is moot: no wake-up and no pane read" streq "$(wake_n):$(nlines "$FD/peek.log")" "0:0"
+  case_wake failed; put_bead "$BEAD" open gate:passed; sweep $((T0 + 600))
+  chk "wake5b so is a gate:passed one" streq "$(wake_n):$(nlines "$FD/peek.log")" "0:0"
+
+  wake_veto assignee-cleared "no longer assigned to" "" gate:needs-fix
+  wake_veto assignee-other "no longer assigned to" dog-remote-1 gate:needs-fix
+  wake_veto resubmitted-queued "back in the gate" author-x gate:needs-fix gate:queued
+  wake_veto resubmitted-reviewing "back in the gate" author-x gate:needs-fix gate:reviewing
+  wake_veto parked-for-humans "parked" author-x gate:needs-fix gate:needs-human:technical
+  case_wake failed; : > "$FD/show.fail"; sweep $((T0 + 600))
+  chk "wake6b the bead cannot be read: no wake-up (an interrupt on a guess), no pane read, the mail still goes, the comment says so" streq "$(wake_n):$(nlines "$FD/peek.log"):$(mail_n):$(has "$FD/comment.1" "No immediate nudge was sent" && has "$FD/comment.1" "still waits for the crew" && echo y)" "0:0:1:y"
+  case_wake failed; echo '[{"id":"wa-2h615v.7","status":"in_progress","assignee":"author-x","labels":"gate:needs-fix"}]' > "$FD/bead.$BEAD.json"; sweep $((T0 + 600))
+  chk "wake6e the labels cannot be read (a string, not a list): unknown is not 'no labels', so no wake-up and no pane read; the mail still goes" streq "$(wake_n):$(nlines "$FD/peek.log"):$(mail_n):$(has "$FD/comment.1" "labels could not be read" && echo y)" "0:0:1:y"
+  new_case; echo queued > "$FD/nudge.$TO"; BEAD_CITY="$RIGCITY" send "$BEAD" "$TO" "" "$MSG1" "$T0"; put_list open; put_list closed "$(nbead failed closed x $((T0 + 1)) "$MSG1")"; pane_is idle
+  ASG="" put_bead "$BEAD" in_progress gate:needs-fix; sweep $((T0 + 600))
+  chk "wake6d no author on the record and nobody assigned: two empty strings are not a match, so no wake-up" streq "$(wake_n):$(nlines "$FD/peek.log")" "0:0"
+  case_wake failed; ASG="$TO" put_bead "$BEAD" in_progress gate:needs-fix; sweep $((T0 + 600))
+  chk "wake6c the bead may be held under the recipient's own name instead of the author's (identity is spelled both ways): still woken" streq "$(wake_n)" "1"
+
+  case_wake failed; pane_is busy; sweep $((T0 + 600)); wake_pane busy "busy"
+  case_wake failed; pane_is dialog; sweep $((T0 + 600)); wake_pane "permission dialog (its option cursor is a '❯' too)" "dialog"
+  case_wake failed; pane_is ask; sweep $((T0 + 600)); wake_pane "selection menu (an AskUserQuestion waiting for the human)" "dialog"
+  case_wake failed; pane_is shell; sweep $((T0 + 600)); wake_pane "a shell prompt, no Claude Code" "not a Claude Code prompt"
+  case_wake failed; : > "$FD/pane.$TO"; sweep $((T0 + 600)); wake_pane "an empty pane" "could not be read"
+  case_wake failed; rm -f "$FD/pane.$TO"; : > "$FD/peek.fail"; sweep $((T0 + 600)); wake_pane "peek fails (session not found)" "could not be read"
+  case_wake failed; : > "$FD/peek.rc1"; sweep $((T0 + 600)); wake_pane "peek printed an idle pane and still exited 1 (cut short)" "could not be read"
+  case_wake failed; printf '%s' $'✻ Pondering…'"$CHROME" > "$FD/pane.$TO"; sweep $((T0 + 600)); wake_pane "a spinner whose timer cannot be read" "not a Claude Code prompt"
+  case_wake failed; printf '%s' $'esc to interrupt'"$CHROME" > "$FD/pane.$TO"; sweep $((T0 + 600)); wake_pane "an older build that only says 'esc to interrupt'" "busy"
+  case_wake failed; printf '%s' $'✢ Kneading… (45s · ↓ 1.2k tokens)'"$CHROME" > "$FD/pane.$TO"; sweep $((T0 + 600)); wake_pane "a timer in seconds" "busy"
+  case_wake failed; printf '%s' $'⏺ Vou verificar… e já volto\n'"$CHROME" > "$FD/pane.$TO"; sweep $((T0 + 600))
+  chk "wake7b an ellipsis in the crew's own prose is not a spinner: idle, woken" streq "$(wake_n)" "1"
+  case_wake failed; { echo "Do you want to proceed?  1. Yes  2. Yes, and don't ask again  3. No"; for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do echo "old scrollback $i"; done; cat "$SB/panes/idle.txt"; } > "$FD/pane.$TO"; sweep $((T0 + 600))
+  chk "wake7c dialog text only in OLD scrollback (outside the last lines) does not hold a wake-up back" streq "$(wake_n)" "1"
+  case_wake failed; printf '%s' $'✻ Baked for 2h 3m 4s · done 9:50 AM' > "$FD/pane.$TO"; sweep $((T0 + 600))
+  chk "wake7d a turn summary with an hours unit and no prompt box is idle" streq "$(wake_n)" "1"
+
+  for spec in queued:QUEUED:queued empty:UNCONFIRMED:unreadable garbage:UNCONFIRMED:unreadable notok:UNCONFIRMED:unreadable fail:FAILED:failed slow:"FAILED (rc 124":failed; do
+    mode="${spec%%:*}"; rest="${spec#*:}"; word="${rest%%:*}"; ev="${rest#*:}"
+    case_wake failed; echo "$mode" > "$FD/wake.$TO"; GATE_RCPT_WAKE_TIMEOUT_S=1 sweep $((T0 + 600))
+    chk "wake8 [$mode] the immediate nudge ended as '$ev': the comment says $word, NEVER DELIVERED; the event says wake=$ev; the receipt is settled and the author mailed" streq "$(has "$FD/comment.1" "$word" && echo y):$(has "$FD/comment.1" "DELIVERED" || echo n):$(wake_ev):$(mail_n):$(pending_n)" "y:n:$ev :1:0"
+  done
+  case_wake failed; GATE_RCPT_WAKE_TIMEOUT_S=7 sweep $((T0 + 600))
+  chk "wake13 BOTH gc calls of the wake-up (the pane read, the nudge) run under timeout with the configured bound: a hung engine must not hold the gate lock" streq "$(grep -c -- '^-k 5 7 gc --city .* session peek' "$FD/timeout.log"):$(grep -c -- '^-k 5 7 gc --city .* session nudge' "$FD/timeout.log")" "1:1"
+  for v in 0 abc ""; do
+    case_wake failed; GATE_RCPT_WAKE_TIMEOUT_S="$v" sweep $((T0 + 600))
+    chk "wake13b [bound '$v'] 0, text and empty fall back to 20 s (a literal 0 would mean no bound at all)" streq "$(grep -c -- '^-k 5 20 gc --city' "$FD/timeout.log")" "2"
+  done
+  case_wake failed; GATE_RCPT_WAKE=0 sweep $((T0 + 600))
+  chk "wake9 GATE_RCPT_WAKE=0: no pane read and no wake-up, the mail still goes, the comment says it is switched off" streq "$(wake_n):$(nlines "$FD/peek.log"):$(mail_n):$(has "$FD/comment.1" "switched off" && echo y)" "0:0:1:y"
+  case_wake failed; : > "$GC_CITY/.gc/gate-nudge-wake.off"; sweep $((T0 + 600))
+  chk "wake9b the off-file does the same (an env var is hard to change under launchd)" streq "$(wake_n):$(mail_n)" "0:1"
+  case_wake failed; echo x > "$FD/mailfail.$TO"; echo x > "$FD/mailfail.author-x"; sweep $((T0 + 600))
+  chk "wake10 mail that cannot be sent (escalated to the Mayor) does not stop the wake-up" streq "$(wake_n):$(settled_verdicts)" "1:escalated "
+  case_wake failed; ( unset -f notify_author_with_fallback; GATE_RCPT_NOW=$((T0 + 600)) PATH="$SANDBOX_PATH" gate_rcpt_sweep )
+  chk "wake11 no mail helper (the record stays for the next sweep): no wake-up either, or the next sweep would wake twice" streq "$(wake_n):$(mail_n):$(pending_n)" "0:0:1"
+  case_wake failed; : > "$FD/peek.fail"
+  chk "wake12 under set -euo pipefail with the pane unreadable a bare sweep still runs to its end" streq "$(bare_sweep_reaches_end $((T0 + 600)))" REACHED
+  case_wake failed; echo fail > "$FD/wake.$TO"
+  chk "wake12b ... and with the wake-up itself failing" streq "$(bare_sweep_reaches_end $((T0 + 600)))" REACHED
+}
+
 # ═════════════════════════════════════════════════ static ════════════════════════════════════════════════════════════════════════════════════════════
 g_static() {
   echo "── static ──"
@@ -414,7 +589,7 @@ g_static() {
   fi
 }
 
-GROUPS_ALL="send sw_inject sw_hook sw_gone sw_wait sw_age sw_unread sw_moot sw_escal sw_cap sw_damage sw_match sw_budget sw_switch static"
+GROUPS_ALL="send sw_inject sw_hook sw_gone sw_wait sw_age sw_unread sw_moot sw_escal sw_wake sw_cap sw_damage sw_match sw_budget sw_switch static"
 for g in ${GNR_GROUPS:-$GROUPS_ALL}; do "g_$g"; done
 
 # ═════════════════════════════════════════════════ mutants ═══════════════════════════════════════════════════════════════════════════════════════════
@@ -435,8 +610,8 @@ M = [
  ("l02", "lib", "    failed|expired|superseded) echo \"fallback:it ended as '$st'${rsn:+ ($rsn)} without reaching the session\"; return 0 ;;", "    failed|expired|superseded) ;;", "sw_gone", "failed/expired wait for the age rule instead of mailing now"),
  ("l03", "lib", 'if [ "$age" -ge "$max" ]; then', 'if [ "$age" -gt "$max" ]; then', "sw_wait", "off by one at the pending limit"),
  ("l04", "lib", 'else cls="UNREADABLE"; fi', 'else cls="NONE"; fi', "sw_unread", "an unreadable closed list is read as 'not found'"),
- ("l05", "lib", '    if [ "$st" = "closed" ]; then\n      _gate_rcpt_say', '    if [ "$st" = "never" ]; then\n      _gate_rcpt_say', "sw_moot", "a closed source bead still gets the mail"),
- ("l06", "lib", '    case " $labels " in *" gate:passed "*) st=closed ;; esac\n', '', "sw_moot", "gate:passed is no longer moot"),
+ ("l05", "lib", '    if [ "$st" = "closed" ]; then\n      _gate_rcpt_say', '    if [ "$st" = "never" ]; then\n      _gate_rcpt_say', "sw_moot sw_wake", "a closed source bead still gets the mail (and the wake-up)"),
+ ("l06", "lib", '    case " $labels " in *" gate:passed "*) st=closed ;; esac\n', '', "sw_moot sw_wake", "gate:passed is no longer moot"),
  ("l07", "lib", '  if [ -z "$st" ]; then\n    note=', '  if [ -n "$st" ]; then\n    note=', "sw_moot", "an unreadable source bead is not noted / a readable one is"),
  ("l08", "lib", '    [ "$age" -lt "${GATE_RCPT_MIN_AGE_S:-90}" ] && continue\n', '', "sw_age", "no minimum age"),
  ("l09", "lib", 'if [ -n "$last" ] && [ $((now - last)) -lt "${GATE_RCPT_RECHECK_S:-300}" ]; then continue; fi', 'if false; then continue; fi', "sw_age", "no re-check throttle"),
@@ -468,6 +643,49 @@ M = [
  ("d06", "disp", 'if [ "${GATE_RCPT_LIB_OK:-0}" = "1" ]; then gate_rcpt_sweep || true', 'if [ "${GATE_RCPT_LIB_OK:-0}" = "1" ]; then :', "static", "the sweep is never called"),
  ("d07", "disp", 'if [ "${GATE_PHASE_C_ONLY:-0}" != "1" ]; then\n  if [ "${GATE_RCPT_LIB_OK:-0}" = "1" ]', 'if true; then\n  if [ "${GATE_RCPT_LIB_OK:-0}" = "1" ]', "static", "the sweep runs in a Phase-C-only pass"),
  ("d08", "disp", 'gate_rcpt_record "$_bead_id" "${BEAD_CITY:-$GC_CITY}" "$_notified" "$_author" "${_noc:-unreadable}" "$_message" "$_fail_context" || true', 'gate_rcpt_record "$_bead_id" "${BEAD_CITY:-$GC_CITY}" "$_notified" "$_author" "${_noc:-unreadable}" "$_message" "$_fail_context"', "static", "the record call is no longer neutralised"),
+ # ── the wake-up (ga-9kxy44u) ──
+ ("w01", "lib", '"$txt" --delivery immediate --json || rc=$?', '"$txt" --delivery wait-idle --json || rc=$?', "sw_wake", "the wake-up is queued like the notice it stands in for"),
+ ("w02", "lib", '--delivery immediate --json || rc=$?', '--delivery immediate || rc=$?', "sw_wake", "the wake-up asks for no --json (its outcome cannot be read)"),
+ ("w03", "lib", '  wake=$(_gate_rcpt_wake "$bead" "$to" "$author" "$st" "$labels" "$asg") || wake="skipped|the wake-up check itself failed"', '  wake="skipped|x"', "sw_wake", "nobody is ever woken"),
+ ("w04", "lib", '    busy)    echo "skipped|its pane shows a turn running (busy): nothing is typed into it, the queued notice and the mail wait for its next prompt"; return 0 ;;', '    busy) ;;', "sw_wake", "a line is typed into a pane that is running a turn"),
+ ("w05a", "lib", r"""'Do you want to proceed\?|requires confirmation|Enter to select|Esc to cancel'""", r"""'Enter to select|Esc to cancel'""", "sw_wake", "a permission prompt is not recognised (its option cursor is a prompt glyph too)"),
+ ("w05b", "lib", r"""'Do you want to proceed\?|requires confirmation|Enter to select|Esc to cancel'""", r"""'Do you want to proceed\?|requires confirmation'""", "sw_wake", "a selection menu waiting for the human is typed into"),
+ ("w06", "lib", "tail_out=$(printf '%s\\n' \"$pane\" | tail -n 12)", 'tail_out="$pane"', "sw_wake", "dialog text left in old scrollback holds the wake-up back for good"),
+ ("w07", "lib", "| tail -n 12)", "| tail -n 2)", "sw_wake", "the dialog window is too small to reach the prompt"),
+ ("w08", "lib", 'then echo idle; else echo unknown; fi', 'then echo idle; else echo idle; fi', "sw_wake", "a shell prompt reads as idle"),
+ ("w09", "lib", 'if [ "$rc" != "0" ] || [ -z "$pane" ]; then echo unread; return 0; fi', 'if [ -z "$pane" ]; then echo unread; return 0; fi', "sw_wake", "a peek that was cut short is trusted"),
+ ("w10", "lib", 'if [ "$rc" != "0" ] || [ -z "$pane" ]; then echo unread; return 0; fi', 'if [ "$rc" != "0" ]; then echo unread; return 0; fi', "sw_wake", "an empty pane is read as a pane"),
+ ("w11", "lib", "dur='([0-9]+h[[:space:]]+)?([0-9]+m[[:space:]]+)?[0-9]+s'", "dur='([0-9]+m[[:space:]]+)?[0-9]+s'", "sw_wake", "the elapsed timer has no hours unit (a turn past 1 h reads as idle)"),
+ ("w12", "lib", "grep 'esc to interrupt'", "grep 'esc to interruptXX'", "sw_wake", "older builds' busy marker is lost"),
+ ("w13", "lib", r"""if printf '%s' "$pane" | grep -E "^[[:space:]]*${glyph}[[:space:]]+[^[:space:]]+(…|\.\.\.)" >/dev/null 2>&1; then echo unknown; return 0; fi""", 'if false; then echo unknown; return 0; fi', "sw_wake", "a spinner whose timer cannot be read reads as idle"),
+ ("w14", "lib", 'grep -E "^[[:space:]]*${glyph}[[:space:]]+[^[:space:]]+ for ${dur}"', 'grep -E "^[[:space:]]*${glyph}[[:space:]]+[^[:space:]]+ forXX ${dur}"', "sw_wake", "a finished turn's summary line is not recognised"),
+ ("w15a", "lib", '*" gate:queued "*|*" gate:reviewing "*)', '*" gate:reviewing "*)', "sw_wake", "a bead that is back in the gate (queued) is woken"),
+ ("w15b", "lib", '*" gate:queued "*|*" gate:reviewing "*)', '*" gate:queued "*)', "sw_wake", "a bead under review is woken"),
+ ("w16", "lib", '*" gate:needs-human"*) echo "skipped|the bead is parked for a human', '*" gate:never-human"*) echo "skipped|the bead is parked for a human', "sw_wake", "a bead parked for a human is told to fix and re-run"),
+ ("w17", "lib", 'if [ -z "$asg" ] || { [ "$asg" != "$author" ] && [ "$asg" != "$to" ]; }; then', 'if false; then', "sw_wake", "a bead that is no longer the author's is woken"),
+ ("w18", "lib", '{ [ "$asg" != "$author" ] && [ "$asg" != "$to" ]; }', '[ "$asg" != "$author" ]', "sw_wake", "the recipient's own name is not accepted as the owner"),
+ ("w19", "lib", 'if [ -z "$asg" ] || { [ "$asg" != "$author" ]', 'if { [ "$asg" != "$author" ]', "sw_wake", "two empty strings count as a match"),
+ ("w20", "lib", '  if [ -z "$st" ]; then echo "skipped|the bead\'s state could not be read', '  if false; then echo "skipped|the bead\'s state could not be read', "sw_wake", "an unreadable bead is woken on a guess"),
+ ("w21", "lib", 'queued)    echo "queued|the engine queued it instead of typing it" ;;', 'queued)    echo "delivered|typed into the session" ;;', "sw_wake", "a queued wake-up is reported as typed"),
+ ("w22", "lib", '*)         echo "unreadable|rc 0 but no readable outcome" ;;', '*)         echo "delivered|typed into the session" ;;', "sw_wake", "an unreadable outcome is reported as typed"),
+ ("w23", "lib", 'echo "failed|rc $rc"; return 0', 'echo "delivered|typed into the session"; return 0', "sw_wake", "a failed wake-up is reported as typed"),
+ ("w24", "lib", 'timeout -k 5 "$tmo" gc --city "${GC_CITY:-}" "$@" >"$out" 2>/dev/null || rc=$?', 'gc --city "${GC_CITY:-}" "$@" >"$out" 2>/dev/null || rc=$?', "sw_wake", "the gc calls of the wake-up have no time bound (a hung engine holds the gate lock)"),
+ ("w25", "lib", "case \"$tmo\" in ''|*[!0-9]*|0) tmo=20 ;; esac", "case \"$tmo\" in ''|*[!0-9]*) tmo=20 ;; esac", "sw_wake", "a bound of 0 means no bound at all"),
+ ("w26", "lib", 'case "${GATE_RCPT_WAKE:-1}" in 0) return 1 ;; esac', 'case "${GATE_RCPT_WAKE:-1}" in 99) return 1 ;; esac', "sw_wake", "GATE_RCPT_WAKE=0 does not switch the wake-up off"),
+ ("w27", "lib", '  [ -e "${GATE_RCPT_WAKE_OFF_FILE:-${GC_CITY:-/nonexistent}/.gc/gate-nudge-wake.off}" ] && return 1\n', '', "sw_wake", "the off-file does not switch the wake-up off"),
+ ("w28", "lib", 'if [ "$rc" = "99" ]; then\n    _gate_rcpt_warn "ga-5aovajz: notify_author_with_fallback is not defined', 'if [ "$rc" = "98" ]; then\n    _gate_rcpt_warn "ga-5aovajz: notify_author_with_fallback is not defined', "sw_wake", "a record kept for the next sweep (no mail helper) has already woken its author"),
+ ("w29", "lib", 'fix what they ask and run gate-done again."', 'fix what they ask and run /gate-done again."', "sw_wake", "the wake-up carries a slash-command token (attached as a skill)"),
+ ("w30", "lib", 'read the GATE-FEEDBACK and the gate comments', 'read the GATE-FEEDBACK\nand the gate comments', "sw_wake", "the wake-up is more than one line"),
+ ("w31", "lib", '  txt="Gate FAIL on $bead (the earlier notice may not have reached you): read the GATE-FEEDBACK and the gate comments on the bead (bd show $bead), fix what they ask and run gate-done again."', '  txt="Gate FAIL (the earlier notice may not have reached you): read the GATE-FEEDBACK and the gate comments on the bead, fix what they ask and run gate-done again."', "sw_wake", "the wake-up does not say which bead"),
+ ("w32", "lib", 'fix what they ask and run gate-done again."', 'fix what they ask and run gate-done again. ' + '.' * 260 + '"', "sw_wake", "the wake-up is long enough to arrive truncated"),
+ ("w33", "lib", '_gate_rcpt_gc "$f" session peek "$1" --lines 40 || rc=$?', '_gate_rcpt_gc "$f" session peek "nobody" --lines 40 || rc=$?', "sw_wake", "the pane read is of another session"),
+ ("w34", "lib", 'session nudge "$to" "$txt"', 'session nudge "nobody" "$txt"', "sw_wake", "the wake-up goes to another session"),
+ ("w35", "lib", 'age_s "$age" reason "$why" wake "$wres" wake_why "$wwhy" \\\n', 'age_s "$age" reason "$why" \\\n', "sw_wake", "the event does not carry the wake-up outcome"),
+ ("w36", "lib", "  printf 'wake=%s\\nwake_why=%s\\n' \"$wres\" \"$(_gate_rcpt_oneline \"$wwhy\")\" >> \"$f\" 2>/dev/null || true\n", '  :\n', "sw_wake", "the settled record does not carry the wake-up outcome"),
+ ("w37", "lib", '${how}${note}${wnote} A queued nudge', '${how}${note} A queued nudge', "sw_wake", "the bead comment does not say what happened to the wake-up"),
+ ("w39", "lib", '  if [ -n "$(_gate_rcpt_get "$f" wake_attempt)" ]; then', '  if false; then', "sw_wake", "a record that already carries a wake attempt is woken again"),
+ ("w40", "lib", "  elif ! printf 'wake_attempt=%s\\n' \"$(_gate_rcpt_now)\" >> \"$f\" 2>/dev/null; then", '  elif false; then', "sw_wake", "the wake attempt is not written down before it is typed"),
+ ("w38", "lib", '  if [ "$labels" = "?" ]; then echo "skipped|the bead\'s labels could not be read', '  if false; then echo "skipped|the bead\'s labels could not be read', "sw_wake", "labels that cannot be read count as no labels (a bead back in the gate is woken)"),
 ]
 bad = 0
 with open(os.path.join(out, "manifest.tsv"), "w") as man:
