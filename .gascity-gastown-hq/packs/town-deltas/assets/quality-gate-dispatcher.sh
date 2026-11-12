@@ -748,6 +748,34 @@ nudge_author_with_fallback() {
 }
 # SELFTEST-EXTRACT nudge-author-with-fallback: END
 
+# gate_rebase_nudge <bead_id> <target> <message> <context>
+# ga-9kxy44u.1: the needs-rebase / merge-conflict nudges ("rebase and re-run /gate-done") used to be a raw `session nudge --delivery wait-idle` with no --json
+# and no receipt. rc 0 of that call only means "accepted": with a busy or idle-but-unwoken target the text is just QUEUED, and a queued item dies silently
+# (session restart, expiry), so the author never learned their branch was blocked and nothing recorded that they were not told. This is the one-target sibling
+# of nudge_author_with_fallback (no candidate cascade: the caller already picked the identity verified alive for THIS decision, ga-6dp9 gate-fix-2): it reads
+# the outcome and, when it is anything but "delivered", records a `rebase` receipt (gate_rcpt_record) so the receipt sweep checks it, and mails the author
+# (and comments on the bead) if it died. Once the sweep wakes an idle crew after the mail (ga-9kxy44u), the rebase notice gets that wake too.
+# wait-idle stays: an `immediate` nudge types into whatever the pane shows (a permission dialog included); the wake belongs to the receipt sweep, which looks first.
+# Returns 0 if the nudge was accepted, 1 if it was not (empty target, or `session nudge` failed): the caller keeps its own `|| warn`.
+# A bead id is needed to record: without one the nudge is sent and simply not tracked. The record is optional (lib missing -> skipped) and never fails the gate path.
+# SELFTEST-EXTRACT gate-rebase-nudge: BEGIN
+gate_rebase_nudge() {
+  local _bead_id="${1:-}" _target="${2:-}" _message="${3:-}" _context="${4:-rebase nudge}" _nf="" _noc="" _rc=0
+  [ -n "$_target" ] || return 1
+  # The JSON goes to a FILE, not $(...): the call must stay in THIS shell (the selftests' gc stubs record it in variables).
+  _nf=$(mktemp "${TMPDIR:-/tmp}/gate-nudge-out.XXXXXX" 2>/dev/null) || _nf=""
+  gc --city "$GC_CITY" session nudge "$_target" "$_message" --delivery wait-idle --json >"${_nf:-/dev/null}" 2>/dev/null || _rc=$?
+  # vazio (rc 0 sem JSON legível) → outcome desconhecido, tratado como enfileirado; falhou (rc≠0) → não aceito, o chamador avisa
+  if [ "$_rc" = "0" ] && [ -n "$_nf" ]; then _noc=$(jq -er 'select(.ok == true) | .outcome' "$_nf" 2>/dev/null) || _noc=""; fi
+  [ -z "$_nf" ] || rm -f "$_nf" 2>/dev/null || true
+  [ "$_rc" = "0" ] || return 1
+  if [ "$_noc" != "delivered" ] && [ -n "$_bead_id" ] && declare -F gate_rcpt_record >/dev/null 2>&1; then
+    gate_rcpt_record "$_bead_id" "${BEAD_CITY:-$GC_CITY}" "$_target" "$_target" "${_noc:-unreadable}" "$_message" "$_context" rebase || true
+  fi
+  return 0
+}
+# SELFTEST-EXTRACT gate-rebase-nudge: END
+
 # ── ga-dupnv (bug 1): one branch = one authoritative gate-run. SIBLING_RUN_STALE
 # is the age (minutes) past which a still-running gate-run for a branch is judged
 # ABANDONED (its dispatcher died mid-run and never drove it terminal) and may be
@@ -18337,9 +18365,13 @@ if [ "$BRANCH_IS_CURRENT" != "1" ]; then
         # (gate_run=ga-wisp-bkb9q6) caught that this bounce decides "someone can
         # fix this" via REBASE_AUTHOR_ALIVE but then nudged the separate,
         # possibly-dead $AUTHOR — leaving no one actually notified.
-        gc --city "$GC_CITY" session nudge "$REBASE_AUTHOR" \
-          "GATE BLOCKED for branch $BRANCH: base is ${REBASE_BEHIND:-?} commits behind main (> ${GATE_REBASE_BEHIND_MAX} max) — this is permanent, not a transient race. Manually rebase onto origin/$DEFAULT_BRANCH and re-run /gate-done. Bead: $BEAD_ID" \
-          --delivery wait-idle 2>/dev/null || warn "Could not nudge author $REBASE_AUTHOR for rebase"
+        # ga-9kxy44u.1: one-target helper (outcome read + receipt when only QUEUED); the raw call is the same nudge for a shell that does not have the helper (selftest evals)
+        _RN_MSG="GATE BLOCKED for branch $BRANCH: base is ${REBASE_BEHIND:-?} commits behind main (> ${GATE_REBASE_BEHIND_MAX} max) — this is permanent, not a transient race. Manually rebase onto origin/$DEFAULT_BRANCH and re-run /gate-done. Bead: $BEAD_ID"
+        if declare -F gate_rebase_nudge >/dev/null 2>&1; then
+          gate_rebase_nudge "$BEAD_ID" "$REBASE_AUTHOR" "$_RN_MSG" "rebase nudge: behind-envelope bounce" || warn "Could not nudge author $REBASE_AUTHOR for rebase"
+        else
+          gc --city "$GC_CITY" session nudge "$REBASE_AUTHOR" "$_RN_MSG" --delivery wait-idle 2>/dev/null || warn "Could not nudge author $REBASE_AUTHOR for rebase"
+        fi
         REBASE_EVENT="dispatcher_needs_rebase_behind_envelope"
         REBASE_VERDICT="NEEDS_REBASE (main delta > envelope, author live, bounced)"
       else
@@ -18382,9 +18414,13 @@ if [ "$BRANCH_IS_CURRENT" != "1" ]; then
         # ga-ivzbuz: nudge the identity actually verified alive for THIS
         # decision (OWNER), not REBASE_AUTHOR (confirmed dead in this branch) —
         # same signal/target-matching discipline as ga-6dp9 gate-fix-2 above.
-        gc --city "$GC_CITY" session nudge "$OWNER" \
-          "GATE BLOCKED for branch $BRANCH: base is ${REBASE_BEHIND:-?} commits behind main (> ${GATE_REBASE_BEHIND_MAX} max) — this is permanent, not a transient race. Rebase author $REBASE_AUTHOR has no live session (likely already submitted and exited normally). You're the bead owner and live — please rebase onto origin/$DEFAULT_BRANCH and re-run /gate-done, or reassign. Bead: $BEAD_ID" \
-          --delivery wait-idle 2>/dev/null || warn "Could not nudge owner $OWNER for rebase"
+        # ga-9kxy44u.1: one-target helper (outcome read + receipt when only QUEUED); the raw call is the same nudge for a shell that does not have the helper (selftest evals)
+        _RN_MSG="GATE BLOCKED for branch $BRANCH: base is ${REBASE_BEHIND:-?} commits behind main (> ${GATE_REBASE_BEHIND_MAX} max) — this is permanent, not a transient race. Rebase author $REBASE_AUTHOR has no live session (likely already submitted and exited normally). You're the bead owner and live — please rebase onto origin/$DEFAULT_BRANCH and re-run /gate-done, or reassign. Bead: $BEAD_ID"
+        if declare -F gate_rebase_nudge >/dev/null 2>&1; then
+          gate_rebase_nudge "$BEAD_ID" "$OWNER" "$_RN_MSG" "rebase nudge: behind-envelope bounce (owner fallback)" || warn "Could not nudge owner $OWNER for rebase"
+        else
+          gc --city "$GC_CITY" session nudge "$OWNER" "$_RN_MSG" --delivery wait-idle 2>/dev/null || warn "Could not nudge owner $OWNER for rebase"
+        fi
         REBASE_EVENT="dispatcher_needs_rebase_behind_envelope_owner_fallback"
         REBASE_VERDICT="NEEDS_REBASE (main delta > envelope, rebase author dead, owner $OWNER live, bounced — ga-ivzbuz)"
       else
@@ -18450,9 +18486,13 @@ Action required: ${_REBASE_ACTION_ADVICE}." 2>/dev/null || true
         # ga-6dp9 (gate-fix-2): see the matching comment at the behind-envelope
         # bounce above — notify REBASE_AUTHOR (verified alive by this branch's
         # own gate), not the possibly-stale/dead $AUTHOR.
-        gc --city "$GC_CITY" session nudge "$REBASE_AUTHOR" \
-          "GATE BLOCKED for branch $BRANCH: stale with merge conflicts — auto-rebase cannot resolve. Conflicts: ${CONFLICT_FILES:-unknown}. Action required: ${_REBASE_ACTION_ADVICE}. Bead: $BEAD_ID" \
-          --delivery wait-idle 2>/dev/null || warn "Could not nudge author $REBASE_AUTHOR for rebase"
+        # ga-9kxy44u.1: one-target helper (outcome read + receipt when only QUEUED); the raw call is the same nudge for a shell that does not have the helper (selftest evals)
+        _RN_MSG="GATE BLOCKED for branch $BRANCH: stale with merge conflicts — auto-rebase cannot resolve. Conflicts: ${CONFLICT_FILES:-unknown}. Action required: ${_REBASE_ACTION_ADVICE}. Bead: $BEAD_ID"
+        if declare -F gate_rebase_nudge >/dev/null 2>&1; then
+          gate_rebase_nudge "$BEAD_ID" "$REBASE_AUTHOR" "$_RN_MSG" "rebase nudge: genuine merge conflict" || warn "Could not nudge author $REBASE_AUTHOR for rebase"
+        else
+          gc --city "$GC_CITY" session nudge "$REBASE_AUTHOR" "$_RN_MSG" --delivery wait-idle 2>/dev/null || warn "Could not nudge author $REBASE_AUTHOR for rebase"
+        fi
         REBASE_EVENT="dispatcher_needs_rebase"
         REBASE_VERDICT="NEEDS_REBASE (genuine merge conflict, author live, bounced)"
       else
@@ -18570,9 +18610,13 @@ Action required: ${_REBASE_ACTION_ADVICE}." 2>/dev/null || true
             bd -C "$BEAD_CITY" label add "$BEAD_ID" "gate:needs-rebase" -q 2>/dev/null || true
           fi
           # ga-6dp9 (gate-fix-2): same notify-identity fix — REBASE_AUTHOR, not $AUTHOR.
-          gc --city "$GC_CITY" session nudge "$REBASE_AUTHOR" \
-            "GATE ESCALATED for branch $BRANCH (${BEAD_ID:-unknown}): persistent transient auto-rebase failures after $MAX_REBASE_ATTEMPTS retries. Please check your branch and re-run /gate-done, or contact Mayor." \
-            --delivery wait-idle 2>/dev/null || true
+          # ga-9kxy44u.1: one-target helper (outcome read + receipt when only QUEUED); the raw call is the same nudge for a shell that does not have the helper (selftest evals)
+          _RN_MSG="GATE ESCALATED for branch $BRANCH (${BEAD_ID:-unknown}): persistent transient auto-rebase failures after $MAX_REBASE_ATTEMPTS retries. Please check your branch and re-run /gate-done, or contact Mayor."
+          if declare -F gate_rebase_nudge >/dev/null 2>&1; then
+            gate_rebase_nudge "$BEAD_ID" "$REBASE_AUTHOR" "$_RN_MSG" "rebase nudge: persistent transient auto-rebase failures" || true
+          else
+            gc --city "$GC_CITY" session nudge "$REBASE_AUTHOR" "$_RN_MSG" --delivery wait-idle 2>/dev/null || true
+          fi
           gc --city "$GC_CITY" mail send mayor \
             -s "Gate escalation: $BRANCH transient rebase race (live author, $MAX_REBASE_ATTEMPTS attempts)" \
             -m "Branch $BRANCH (bead ${BEAD_ID:-unknown}, rig ${RIG:-unknown}, marker $MARKER_ID) hit persistent transient auto-rebase failures ($MAX_REBASE_ATTEMPTS attempts) even with live author $REBASE_AUTHOR. ${CONFLICT_FILES:-unknown}. Possible stuck push race or corrupt ref. Parked at needs-rebase. (gt-4tk5m)" 2>/dev/null \

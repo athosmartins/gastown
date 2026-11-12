@@ -33,9 +33,11 @@
 # never sent on a guess. The outcome (delivered / queued / unconfirmed / failed / skipped) goes in the bead comment, the event (wake=) and the settled record,
 # and "typed" is claimed only for outcome=delivered.
 #
-# Detection, a notice and that one wake-up. It never re-sends the queued nudge, never writes the engine queue, and the nudge sites that do not go through
-# nudge_author_with_fallback (the rebase nudges, the Mayor pings) are NOT covered. An ephemeral pool author is not recorded (the dispatcher defers its
-# Mayor page on purpose: its session is gone and the bead returns to the pool by itself).
+# Detection, a notice and that one wake-up. It never re-sends the queued nudge, never writes the engine queue. Two kinds of notice are recorded: `fail`
+# (nudge_author_with_fallback, the gate FAIL) and `rebase` (gate_rebase_nudge, ga-9kxy44u.1: the needs-rebase / merge-conflict nudges that ask the author to
+# rebase and re-run /gate-done; the mail, the comment and the wake-up line say "rebase needed", never "FAIL"). The Mayor pings and the FYI retry nudges
+# ("no action needed") are NOT covered. An ephemeral pool author is not recorded (the dispatcher defers its Mayor page on purpose: its session is gone and
+# the bead returns to the pool by itself).
 #
 # THREE STATES, never two: a bead read that FAILS is "cannot tell", not "failed" and not "delivered" (the record waits until the age rule); a record
 # file that cannot be read is settled as `damaged` with a WARN (nothing to verify), never mailed from guesswork.
@@ -92,12 +94,14 @@ _gate_rcpt_get() { sed -n "s/^$2=//p" "$1" 2>/dev/null | head -n1 || true; }
 # _gate_rcpt_oneline <text> — newlines and CRs to spaces: the record is key=value lines.
 _gate_rcpt_oneline() { printf '%s' "$1" | tr '\n\r' '  '; }
 
-# gate_rcpt_record <bead_id> <bead_city> <to> <author> <outcome> <message> <fail_context>
-# Called by nudge_author_with_fallback after a nudge that was ACCEPTED but not typed. Always rc 0: a record that cannot be written is a WARN that says the
-# nudge will not be verified, never a failure of the gate path that called it.
+# gate_rcpt_record <bead_id> <bead_city> <to> <author> <outcome> <message> <fail_context> [kind]
+# Called by nudge_author_with_fallback (kind fail, the default) and gate_rebase_nudge (kind rebase) after a nudge that was ACCEPTED but not typed. The kind
+# only picks the WORDING of the later mail and comment (a rebase request must not read as a gate FAIL); any other value is recorded as fail. Always rc 0: a
+# record that cannot be written is a WARN that says the nudge will not be verified, never a failure of the gate path that called it.
 gate_rcpt_record() {
-  local bead="${1:-}" bcity="${2:-}" to="${3:-}" author="${4:-}" outcome="${5:-unreadable}" msg="${6:-}" fctx="${7:-}"
+  local bead="${1:-}" bcity="${2:-}" to="${3:-}" author="${4:-}" outcome="${5:-unreadable}" msg="${6:-}" fctx="${7:-}" kind="${8:-fail}"
   local d key probe tmp now
+  case "$kind" in rebase) ;; *) kind=fail ;; esac
   gate_rcpt_enabled || return 0
   [ "${DRY_RUN:-0}" = "1" ] && return 0
   if [ -z "$bead" ] || [ -z "$to" ] || [ -z "$msg" ]; then
@@ -116,9 +120,9 @@ gate_rcpt_record() {
   tmp="$d/pending/.$key.$$"
   # .msg first: the .rec is what the sweep discovers, so it must never exist without its text
   if printf '%s' "$msg" > "$tmp.msg" 2>/dev/null && mv "$tmp.msg" "$d/pending/$key.msg" 2>/dev/null \
-     && printf 'bead=%s\nbead_city=%s\nto=%s\nauthor=%s\nsent_at=%s\noutcome=%s\nprobe=%s\nfail_context=%s\n' \
+     && printf 'bead=%s\nbead_city=%s\nto=%s\nauthor=%s\nsent_at=%s\noutcome=%s\nprobe=%s\nfail_context=%s\nkind=%s\n' \
           "$(_gate_rcpt_oneline "$bead")" "$(_gate_rcpt_oneline "$bcity")" "$(_gate_rcpt_oneline "$to")" "$(_gate_rcpt_oneline "$author")" \
-          "$now" "$(_gate_rcpt_oneline "$outcome")" "$probe" "$(_gate_rcpt_oneline "$fctx")" > "$tmp.rec" 2>/dev/null \
+          "$now" "$(_gate_rcpt_oneline "$outcome")" "$probe" "$(_gate_rcpt_oneline "$fctx")" "$kind" > "$tmp.rec" 2>/dev/null \
      && mv "$tmp.rec" "$d/pending/$key.rec" 2>/dev/null; then
     rm -f "$d/pending/$key.chk" 2>/dev/null || true   # a replaced record starts its schedule again
     _gate_rcpt_say "ga-5aovajz: nudge to $to for $bead was QUEUED, not delivered (outcome=$outcome) — a receipt is checked on the next sweeps; if it does not land the author is mailed"
@@ -261,15 +265,15 @@ _gate_rcpt_pane_state() {
   return 0
 }
 
-# _gate_rcpt_wake <bead> <to> <author> <status> <labels> <assignee> — the wake-up: ONE short `--delivery immediate` nudge, typed into <to>'s pane. Prints
+# _gate_rcpt_wake <bead> <to> <author> <status> <labels> <assignee> [kind] — the wake-up: ONE short `--delivery immediate` nudge, typed into <to>'s pane. Prints
 # <result>|<detail>, result = delivered | queued | unreadable | failed | skipped. Only `outcome: delivered` is "typed" (the pilot reads it the same way). The
 # checks are cheap-first and every doubt is a skip: a status or labels that could not be read, a bead that is no longer the author's, that is back in the gate
 # or parked for a human, or a pane that is not an idle prompt. Always rc 0.
 _gate_rcpt_wake() {
-  local bead="$1" to="$2" author="$3" st="$4" labels="$5" asg="$6" ps f rc=0 out oc txt
+  local bead="$1" to="$2" author="$3" st="$4" labels="$5" asg="$6" kind="${7:-fail}" ps f rc=0 out oc txt
   if ! _gate_rcpt_wake_enabled; then echo "skipped|the wake-up is switched off (GATE_RCPT_WAKE=0 or the gate-nudge-wake.off file)"; return 0; fi
   # vazio (bd show não leu) → estado desconhecido: sem interrupção por palpite
-  if [ -z "$st" ]; then echo "skipped|the bead's state could not be read, so it is not known that this FAIL still waits for the crew"; return 0; fi
+  if [ -z "$st" ]; then echo "skipped|the bead's state could not be read, so it is not known that this $([ "$kind" = "rebase" ] && echo rebase || echo FAIL) still waits for the crew"; return 0; fi
   if [ "$labels" = "?" ]; then echo "skipped|the bead's labels could not be read, so it is not known whether it is back in the gate or parked for a human"; return 0; fi
   if [ -z "$asg" ] || { [ "$asg" != "$author" ] && [ "$asg" != "$to" ]; }; then
     echo "skipped|the bead is no longer assigned to ${author:-the author} (now: ${asg:-nobody})"; return 0
@@ -288,6 +292,10 @@ _gate_rcpt_wake() {
   esac
   # one line, no slash-command token (typed into a prompt, "/gate-done" would be attached as the skill and re-submit the unfixed work), short (a long nudge arrives truncated)
   txt="Gate FAIL on $bead (the earlier notice may not have reached you): read the GATE-FEEDBACK and the gate comments on the bead (bd show $bead), fix what they ask and run gate-done again."
+  # ga-9kxy44u.1: a rebase request is not a FAIL and has no GATE-FEEDBACK (same rule as the mail): only the kind "rebase" gets this wording, anything else keeps the FAIL line
+  if [ "$kind" = "rebase" ]; then
+    txt="Gate: $bead needs a rebase (the earlier notice may not have reached you): read the latest gate comment on the bead (bd show $bead), rebase on origin/main and run gate-done again."
+  fi
   # vazio (rc 0 sem JSON legível, ou mktemp que falha: a saída vai a /dev/null) → não confirmado ("unreadable"); falhou (rc≠0, estouro) → "failed": nunca "delivered"
   f=$(mktemp "${TMPDIR:-/tmp}/gate-wake-out.XXXXXX" 2>/dev/null) || f=""
   _gate_rcpt_gc "${f:-/dev/null}" session nudge "$to" "$txt" --delivery immediate --json || rc=$?
@@ -309,8 +317,12 @@ _gate_rcpt_wake() {
 # _gate_rcpt_fallback <dir> <key> <why> <age_s> — the author could not be told by nudge: mail them, say so on the bead, settle. Always rc 0.
 _gate_rcpt_fallback() {
   local d="$1" key="$2" why="$3" age="$4" f="$1/pending/$2.rec" bead bcity to author msg fctx src st labels asg rc=0 subj body note verdict how who wake wres wwhy wnote
+  local kind what evt_kind=""
   bead=$(_gate_rcpt_get "$f" bead); bcity=$(_gate_rcpt_get "$f" bead_city); to=$(_gate_rcpt_get "$f" to)
   author=$(_gate_rcpt_get "$f" author); fctx=$(_gate_rcpt_get "$f" fail_context)
+  # vazio (registro antigo, sem kind) → fail, o único tipo que existia; ilegível/desconhecido → também fail, mas nunca "rebase" por palpite
+  kind=$(_gate_rcpt_get "$f" kind); what="FAIL"
+  case "$kind" in rebase) what="rebase"; evt_kind="rebase" ;; esac
   # vazio/falhou (.msg sem texto ou ilegível) → o registro é liquidado como danificado, sem mail inventado
   msg=$(cat "$d/pending/$key.msg" 2>/dev/null) || msg=""
   if [ -z "$msg" ]; then
@@ -327,12 +339,12 @@ _gate_rcpt_fallback() {
   asg=$(printf '%s' "$src" | jq -r 'if type == "array" then .[0] else . end | .assignee // empty' 2>/dev/null) || asg=""
   note=""
   if [ -z "$st" ]; then
-    note=" (the bead's current state could not be read, so it is not known whether this FAIL is still current)"
+    note=" (the bead's current state could not be read, so it is not known whether this $what notice is still current)"
   else
     case " $labels " in *" gate:passed "*) st=closed ;; esac
     if [ "$st" = "closed" ]; then
-      _gate_rcpt_say "ga-5aovajz: $bead is closed or gate:passed — the FAIL notice to $to is moot, nobody mailed ($why)"
-      gate_rcpt_event author_nudge_receipt bead "$bead" to "$to" verdict moot age_s "$age" reason "$why" || true
+      _gate_rcpt_say "ga-5aovajz: $bead is closed or gate:passed — the $what notice to $to is moot, nobody mailed ($why)"
+      gate_rcpt_event author_nudge_receipt bead "$bead" to "$to" verdict moot age_s "$age" reason "$why" ${evt_kind:+kind "$evt_kind"} || true
       _gate_rcpt_settle "$d" "$key" moot "$why"
       return 0
     fi
@@ -341,6 +353,13 @@ _gate_rcpt_fallback() {
   body="The quality gate nudged $to about $bead, but it could not be confirmed that the nudge reached the session: $why.${note} Read the GATE-FEEDBACK comment on the bead; the original text follows.
 
 $msg"
+  if [ "$kind" = "rebase" ]; then
+    # ga-9kxy44u.1: a rebase request is not a FAIL and has no GATE-FEEDBACK: say what it is and where the details are (the latest gate comment on the bead)
+    subj="Gate: rebase needed for $bead — the nudge to $to may not have reached you (ga-9kxy44u.1)"
+    body="The quality gate nudged $to about $bead (its branch needs a rebase before the gate can run it), but it could not be confirmed that the nudge reached the session: $why.${note} Read the latest gate comment on the bead, rebase, and re-run /gate-done; the original text follows.
+
+$msg"
+  fi
   # Mail goes first to the recipient that accepted the nudge (the exact session identity), then the candidate cascade, then the Mayor; the bead is in its
   # own store, so BEAD_CITY is pointed there for the comment notify_author_with_fallback leaves on total failure.
   if declare -F notify_author_with_fallback >/dev/null 2>&1; then
@@ -361,7 +380,7 @@ $msg"
   elif ! printf 'wake_attempt=%s\n' "$(_gate_rcpt_now)" >> "$f" 2>/dev/null; then
     wake="skipped|the attempt could not be written down, and a wake-up that is not recorded could repeat on every sweep"
   else
-    wake=$(_gate_rcpt_wake "$bead" "$to" "$author" "$st" "$labels" "$asg") || wake="skipped|the wake-up check itself failed"
+    wake=$(_gate_rcpt_wake "$bead" "$to" "$author" "$st" "$labels" "$asg" "$kind") || wake="skipped|the wake-up check itself failed"
   fi
   wres="${wake%%|*}"; wwhy="${wake#*|}"
   case "$wres" in
@@ -376,10 +395,10 @@ $msg"
   else
     verdict="escalated"; how="Mailing the author failed too: a mail to the Mayor was attempted to relay it (whether it went out is not confirmed)."; who="UNREACHABLE (Mayor mail attempted)"
   fi
-  bd -C "${bcity:-${GC_CITY:-}}" comment "$bead" "GATE-NUDGE-RECEIPT (ga-5aovajz): the gate's FAIL nudge to $to could not be confirmed delivered — $why. ${how}${note}${wnote} A queued nudge is not a delivered one; this note keeps 'not told' from reading as 'told' (ga-fe5at)." \
+  bd -C "${bcity:-${GC_CITY:-}}" comment "$bead" "GATE-NUDGE-RECEIPT (ga-5aovajz): the gate's $what nudge to $to could not be confirmed delivered — $why. ${how}${note}${wnote} A queued nudge is not a delivered one; this note keeps 'not told' from reading as 'told' (ga-fe5at)." \
     2>/dev/null || _gate_rcpt_warn "ga-5aovajz: could not leave the GATE-NUDGE-RECEIPT comment on $bead (the mail above and the log line are the record)"
   _gate_rcpt_say "ga-5aovajz: $bead → $to: $why — author $who; wake-up: $wres ($wwhy)"
-  gate_rcpt_event author_nudge_receipt bead "$bead" to "$to" verdict "$verdict" age_s "$age" reason "$why" wake "$wres" wake_why "$wwhy" \
+  gate_rcpt_event author_nudge_receipt bead "$bead" to "$to" verdict "$verdict" age_s "$age" reason "$why" wake "$wres" wake_why "$wwhy" ${evt_kind:+kind "$evt_kind"} \
     || _gate_rcpt_warn "ga-5aovajz: could not write the author_nudge_receipt event for $bead (the bead comment and settled/ are the record)"
   printf 'wake=%s\nwake_why=%s\n' "$wres" "$(_gate_rcpt_oneline "$wwhy")" >> "$f" 2>/dev/null || true
   _gate_rcpt_settle "$d" "$key" "$verdict" "$why"
@@ -390,7 +409,7 @@ $msg"
 # than GATE_RCPT_RECHECK_S; reads the queue's nudge beads at most twice per sweep (open first, closed only when a record is not among the open ones).
 gate_rcpt_sweep() {
   local d now f key sent to bead probe age last day cls decide n=0 pending=0 oldest=0 max verdict open_ok=0 closed_ok=0 closed_loaded=0 open_json="" closed_json=""
-  local t0 budget
+  local t0 budget kind_sweep
   gate_rcpt_enabled || return 0
   [ "${DRY_RUN:-0}" = "1" ] && return 0
   d="$(gate_rcpt_dir)"
@@ -426,6 +445,8 @@ gate_rcpt_sweep() {
     fi
     n=$((n + 1))
     printf '%s' "$now" > "$d/pending/$key.chk" 2>/dev/null || true
+    # só "rebase" é tipo reconhecido; vazio (registro antigo) ou ilegível → sem campo kind no evento (o formato que sempre existiu)
+    kind_sweep=$(_gate_rcpt_get "$f" kind); case "$kind_sweep" in rebase) ;; *) kind_sweep="" ;; esac
     if [ "$open_ok" = "0" ]; then
       open_ok=2
       if open_json=$(_gate_rcpt_list open); then open_ok=1; fi
@@ -451,7 +472,8 @@ gate_rcpt_sweep() {
     case "$verdict" in
       settle)
         _gate_rcpt_say "ga-5aovajz: nudge to $to for $bead: ${decide#*:} (after ${age}s) — receipt settled"
-        gate_rcpt_event author_nudge_receipt bead "$bead" to "$to" verdict delivered age_s "$age" via "${decide#*:}" || true
+        gate_rcpt_event author_nudge_receipt bead "$bead" to "$to" verdict delivered age_s "$age" via "${decide#*:}" \
+          ${kind_sweep:+kind "$kind_sweep"} || true
         _gate_rcpt_settle "$d" "$key" delivered "${decide#*:}" ;;
       fallback)
         _gate_rcpt_fallback "$d" "$key" "${decide#*:}" "$age" ;;

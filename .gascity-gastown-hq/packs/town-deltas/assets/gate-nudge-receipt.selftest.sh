@@ -17,6 +17,9 @@
 #           prompt (busy, dialog, selection menu, shell, empty and cut-short peeks all skip, with the reason; the idle and busy fixtures are REAL
 #           wa-worker panes); the outcome (delivered / queued / unconfirmed / failed / skipped) is never worded as typed unless delivered; both gc
 #           calls run under timeout; failing mail, a missing mail helper and errexit leave it alone.
+#   rebase  gate_rebase_nudge (ga-9kxy44u.1), the one-target sibling used by the needs-rebase / merge-conflict nudges: same outcome read, a `rebase` record when the
+#           nudge was only queued, nothing when delivered / not accepted / no bead / no target; the sweep then words the mail and the comment as a REBASE
+#           request (never "Gate FAIL" / GATE-FEEDBACK), tags the event kind=rebase, and a record with no (or an unknown) kind keeps the FAIL wording.
 #   static  the live dispatcher loads the lib optionally, calls the sweep (not in a Phase-C-only pass), passes --json and keeps the nudge call in the
 #           current shell; both files pass bash -n.
 #   mutants each behaviour is broken on a copy (one exact-once edit) and this selftest, limited to the groups that cover it, must turn red.
@@ -135,12 +138,14 @@ selftest_fail_closed_arm cleanup
 extract_block() { sed -n "/# SELFTEST-EXTRACT $2: BEGIN/,/# SELFTEST-EXTRACT $2: END/p" "$1" | sed '1d;$d'; }
 NOTIFY_BLOCK="$(extract_block "$DISPATCHER" notify-author-with-fallback)"
 NUDGE_BLOCK="$(extract_block "$DISPATCHER" nudge-author-with-fallback)"
-[ -n "$NOTIFY_BLOCK" ] && [ -n "$NUDGE_BLOCK" ] || { echo "FATAL: SELFTEST-EXTRACT blocks not found in $DISPATCHER" >&2; exit 2; }
+REBASE_BLOCK="$(extract_block "$DISPATCHER" gate-rebase-nudge)"
+[ -n "$NOTIFY_BLOCK" ] && [ -n "$NUDGE_BLOCK" ] && [ -n "$REBASE_BLOCK" ] || { echo "FATAL: SELFTEST-EXTRACT blocks not found in $DISPATCHER" >&2; exit 2; }
 eval "$NOTIFY_BLOCK"
 eval "$NUDGE_BLOCK"
+eval "$REBASE_BLOCK"
 # shellcheck disable=SC1090
 . "$LIB" || { echo "FATAL: cannot source $LIB" >&2; exit 2; }
-for fn in nudge_author_with_fallback notify_author_with_fallback gate_rcpt_record gate_rcpt_sweep; do
+for fn in nudge_author_with_fallback notify_author_with_fallback gate_rebase_nudge gate_rcpt_record gate_rcpt_sweep; do
   declare -F "$fn" >/dev/null 2>&1 || { echo "FATAL: $fn not defined after loading" >&2; exit 2; }
 done
 warn() { printf '%s\n' "$*" >> "${WARN_LOG:-/dev/null}"; }
@@ -150,6 +155,8 @@ log()  { printf '%s\n' "$*" >> "${LOG_LOG:-/dev/null}"; }
 BEAD="wa-2h615v.7"; TO="peter-wa"; RIGCITY="/rig/whatsapp_automation"; T0=1790000000
 MSG1=$'QUALITY GATE FAILED for branch crew/peter/wa-2h615v.7. Blocking reasons: Reviewer 1 FAIL: VERDICT: FAIL\n\nBlocking issue 1: "quoted" text, $dollar, `tick`, back\\slash & more.\nGate run: ga-05z21u8. Fix the issues and re-run /gate-done when ready.'
 PROBE1='QUALITY GATE FAILED for branch crew/peter/wa-2h615v.7. Blocking reasons: Reviewer 1 FAIL: VERDICT: FAIL'
+RMSG=$'GATE BLOCKED for branch crew/peter/wa-2h615v.7: stale with merge conflicts — auto-rebase cannot resolve. Conflicts: "a b.go", $x, `y`.\nAction required: rebase onto origin/main and re-run /gate-done. Bead: wa-2h615v.7'
+RPROBE='GATE BLOCKED for branch crew/peter/wa-2h615v.7: stale with merge conflicts — auto-rebase cannot resolve. Conflicts: "a b.go", $x, `y`.'
 
 # Pane fixtures for the wake-up (ga-9kxy44u). idle / busy are REAL panes copied from the live wa-workers (`gc session peek`, 03/10, the same ones
 # scripts/tests/pool-idle-nobead-guard.selftest.sh carries), trimmed. All of them draw the "❯" prompt box: it is on EVERY pane (busy, idle, and the option
@@ -234,6 +241,7 @@ has() { grep -qF -- "$2" "$1" 2>/dev/null; }
 settled_verdicts() { cat "$GATE_RCPT_DIR"/settled/*.rec 2>/dev/null | sed -n 's/^verdict=//p' | tr '\n' ' '; }
 pending_n() { ls "$GATE_RCPT_DIR"/pending/*.rec 2>/dev/null | wc -l | tr -d ' '; }
 event_verdicts() { jq -r 'select(.event=="author_nudge_receipt") | .verdict' "$QG_LOG" 2>/dev/null | tr '\n' ' '; }
+event_kinds() { jq -r 'select(.event=="author_nudge_receipt") | (.kind // "-")' "$QG_LOG" 2>/dev/null | tr '\n' ' '; }
 mail_n() { nlines "$FD/mail.log"; }
 mail_to() { sed -n "${1}p" "$FD/mail.log" | cut -f1; }
 lists_n() { nlines "$FD/bd.lists"; }
@@ -246,6 +254,12 @@ mkrec() { # [sent] [bead] [message] [to]  — a nudge the queue ACCEPTED, record
   echo queued > "$FD/nudge.$to"; BEAD_CITY="$RIGCITY" send "$bead" "$to" author-x "$msg" "$sent"
 }
 sweep() { GATE_RCPT_NOW="$1" PATH="$SANDBOX_PATH" gate_rcpt_sweep; SWEEP_RC=$?; }
+# rsend <bead> <target> <message> [clock]   (the real gate_rebase_nudge on the sandbox PATH)
+rsend() { GATE_RCPT_NOW="${4:-$T0}" PATH="$SANDBOX_PATH" gate_rebase_nudge "$1" "$2" "$3" "ctx rebase $1"; SEND_RC=$?; }
+rcase() { # a rebase nudge the queue ACCEPTED at T0, recorded by the real code
+  new_case; put_bead "$BEAD" in_progress gate:needs-rebase; echo queued > "$FD/nudge.$TO"; BEAD_CITY="$RIGCITY" rsend "$BEAD" "$TO" "$RMSG" "$T0"; unset BEAD_CITY
+}
+rcase_closed() { rcase; put_list open; put_list closed "$(nbead "$1" closed "$2" "$((T0 + 1))" "$RMSG")"; } # <state> <reason>
 bare_sweep_reaches_end() { ( set -euo pipefail; PATH="$SANDBOX_PATH"; GATE_RCPT_NOW="$1"; gate_rcpt_sweep; echo REACHED ) 2>/dev/null; }
 case_closed() { # <state> <reason> [created offset]  → a record at T0 and one CLOSED nudge bead of that state
   new_case; mkrec "$T0"; put_list open; put_list closed "$(nbead "$1" closed "$2" "$((T0 + ${3:-1}))" "$MSG1")"
@@ -306,6 +320,78 @@ g_send() {
 
   new_case; echo queued > "$FD/nudge.$TO"
   chk "send11 under set -euo pipefail a queued send is a plain success (no unbound variable, no errexit)" streq "$( ( set -euo pipefail; PATH="$SANDBOX_PATH"; GATE_RCPT_NOW=5; nudge_author_with_fallback "$BEAD" "$TO" author-x m ctx; echo REACHED ) 2>/dev/null )" REACHED
+}
+
+# ═════════════════════════════════════════════════ rebase ════════════════════════════════════════════════════════════════════════════════════════════
+g_rebase() {
+  echo "── rebase: gate_rebase_nudge (ga-9kxy44u.1) ──"
+  new_case; echo delivered > "$FD/nudge.$TO"; rsend "$BEAD" "$TO" "$RMSG"
+  chk "rebase1 delivered: rc 0, the nudge asks for --delivery wait-idle --json, nothing recorded, nobody mailed" streq "$SEND_RC:$(has "$FD/nudge.argv" "--delivery wait-idle --json" && echo y):$(pending_n):$(mail_n)" "0:y:0:0"
+  chk "rebase1b delivered: it reaches the target it was given, once" streq "$(nlines "$FD/nudge.log"):$(sed -n 1p "$FD/nudge.log")" "1:$TO"
+
+  new_case; echo queued > "$FD/nudge.$TO"; BEAD_CITY="$RIGCITY" rsend "$BEAD" "$TO" "$RMSG" 1000000; R="$(recf "$BEAD" "$TO")"
+  chk "rebase2 queued: rc 0 (the gate path is not failed by it) and ONE record exists" streq "$SEND_RC:$(pending_n):$(test -f "$R" && echo y)" "0:1:y"
+  chk "rebase2b record: kind=rebase, to / author (the one nudged) / bead / bead_city / sent_at / outcome" streq "$(rget "$R" kind)|$(rget "$R" to)|$(rget "$R" author)|$(rget "$R" bead)|$(rget "$R" bead_city)|$(rget "$R" sent_at)|$(rget "$R" outcome)" "rebase|$TO|$TO|$BEAD|$RIGCITY|1000000|queued"
+  chk "rebase2c record: the probe is the first line of the text and the fail_context is the call's" streq "$(rget "$R" probe)|$(rget "$R" fail_context)" "$RPROBE|ctx rebase $BEAD"
+  printf '%s' "$RMSG" > "$CASE/expect.msg"
+  chk "rebase2d the text round-trips byte for byte (newlines, quotes, \$, backtick)" cmp -s "$CASE/expect.msg" "${R%.rec}.msg"
+  chk "rebase2e queued: nobody is mailed at send time" streq "$(mail_n)" 0
+
+  for mode in empty garbage notok; do
+    new_case; echo "$mode" > "$FD/nudge.$TO"; rsend "$BEAD" "$TO" "$RMSG"
+    chk "rebase3 [$mode] rc 0 and the outcome is recorded as unreadable (cannot tell is not told)" streq "$SEND_RC:$(rget "$(recf "$BEAD" "$TO")" outcome):$(rget "$(recf "$BEAD" "$TO")" kind)" "0:unreadable:rebase"
+  done
+
+  new_case; echo fail > "$FD/nudge.$TO"; rsend "$BEAD" "$TO" "$RMSG"
+  chk "rebase4 the nudge is NOT accepted: rc 1 (the caller keeps its warn) and nothing is recorded" streq "$SEND_RC:$(pending_n):$(mail_n)" "1:0:0"
+  new_case; rsend "$BEAD" "" "$RMSG"
+  chk "rebase5 no target: rc 1 and no nudge is even attempted" streq "$SEND_RC:$(nlines "$FD/nudge.log"):$(pending_n)" "1:0:0"
+  new_case; echo queued > "$FD/nudge.$TO"; rsend "" "$TO" "$RMSG"
+  chk "rebase6 no bead id: the nudge goes out (rc 0) and is simply not tracked" streq "$SEND_RC:$(nlines "$FD/nudge.log"):$(pending_n)" "0:1:0"
+  new_case; echo queued > "$FD/nudge.$TO"; ( unset -f gate_rcpt_record; rsend "$BEAD" "$TO" "$RMSG"; exit "$SEND_RC" ); SEND_RC=$?
+  chk "rebase7 a lib that is not loaded: the nudge still goes out, rc 0, nothing recorded" streq "$SEND_RC:$(nlines "$FD/nudge.log"):$(pending_n)" "0:1:0"
+  new_case; echo queued > "$FD/nudge.$TO"; GATE_RCPT_ENABLED=0 rsend "$BEAD" "$TO" "$RMSG"; chk8a="$SEND_RC:$(pending_n)"
+  new_case; echo queued > "$FD/nudge.$TO"; DRY_RUN=1 rsend "$BEAD" "$TO" "$RMSG"
+  chk "rebase8 the kill switch and DRY_RUN record nothing (the nudge itself still goes out)" streq "$chk8a:$SEND_RC:$(pending_n):$(nlines "$FD/nudge.log")" "0:0:0:0:1"
+  new_case; echo queued > "$FD/nudge.$TO"; rsend "$BEAD" "$TO" "$MSG1" 1000; rsend "$BEAD" "$TO" "$RMSG" 2000
+  chk "rebase9 a rebase notice and a FAIL notice for the same bead+recipient share ONE record: the later one replaces the earlier (new kind, probe and time)" streq "$(pending_n):$(rget "$(recf "$BEAD" "$TO")" kind):$(rget "$(recf "$BEAD" "$TO")" sent_at):$(rget "$(recf "$BEAD" "$TO")" probe)" "1:rebase:2000:$RPROBE"
+  new_case; echo queued > "$FD/nudge.$TO"
+  chk "rebase10 under set -euo pipefail a queued send is a plain success and a failing one is caught by the caller's ||" streq "$( ( set -euo pipefail; PATH="$SANDBOX_PATH"; GATE_RCPT_NOW=5; gate_rebase_nudge "$BEAD" "$TO" m ctx; echo fail > "$FD/nudge.$TO"; gate_rebase_nudge "$BEAD" "$TO" m ctx || echo CAUGHT; echo REACHED ) 2>/dev/null | tr '\n' ' ')" "CAUGHT REACHED "
+
+  echo "── rebase: the record in the lib ──"
+  new_case; PATH="$SANDBOX_PATH" gate_rcpt_record "$BEAD" "$RIGCITY" "$TO" a queued "$MSG1" ctx
+  chk "rebase11 gate_rcpt_record with no kind (every old caller): kind=fail" streq "$(rget "$(recf "$BEAD" "$TO")" kind)" fail
+  new_case; PATH="$SANDBOX_PATH" gate_rcpt_record "$BEAD" "$RIGCITY" "$TO" a queued "$MSG1" ctx weird
+  chk "rebase11b an unknown kind is recorded as fail (never invented as rebase)" streq "$(rget "$(recf "$BEAD" "$TO")" kind)" fail
+
+  echo "── rebase: the sweep ──"
+  rcase_closed failed "queued nudge session fence mismatch"; sweep $((T0 + 600))
+  chk "rebase12 failed: the author is mailed exactly once, at the identity that accepted the nudge" streq "$(mail_n):$(mail_to 1)" "1:$TO"
+  chk "rebase12b the subject says a REBASE is needed and names the bead and the recipient; it never says 'Gate FAIL'" streq "$(has "$FD/mail.log" "Gate: rebase needed for $BEAD — the nudge to $TO may not have reached you" && echo y):$(has "$FD/mail.log" "Gate FAIL" || echo n)" "y:n"
+  chk "rebase12c the body says what to do (rebase, re-run /gate-done), gives the reason, and never points at a GATE-FEEDBACK that does not exist" streq "$(has "$FD/mail.body.1" "needs a rebase before the gate can run it" && echo y):$(has "$FD/mail.body.1" "re-run /gate-done" && echo y):$(has "$FD/mail.body.1" "ended as 'failed' (queued nudge session fence mismatch)" && echo y):$(has "$FD/mail.body.1" "GATE-FEEDBACK" || echo n)" "y:y:y:n"
+  chk "rebase12d the whole original text ends the mail, byte for byte" streq "$(tail -c ${#RMSG} "$FD/mail.body.1")" "$RMSG"
+  chk "rebase12e the GATE-NUDGE-RECEIPT comment lands in the bead's own store and calls it a rebase nudge, not a FAIL nudge" streq "$(cut -f1,2 "$FD/bd.comments" | tr '\t' '|'):$(has "$FD/comment.1" "the gate's rebase nudge to $TO could not be confirmed delivered" && echo y):$(has "$FD/comment.1" "FAIL nudge" || echo n)" "$RIGCITY|$BEAD:y:n"
+  chk "rebase12f the event says verdict mailed, kind rebase; the record is settled" streq "$(event_verdicts)|$(event_kinds)|$(settled_verdicts):$(pending_n)" "mailed |rebase |mailed :0"
+  sweep $((T0 + 5000)); chk "rebase12g a second sweep mails nobody again" streq "$(mail_n):$(pending_n)" "1:0"
+
+  rcase_closed injected "nudge delivered via provider injection"; sweep $((T0 + 600))
+  chk "rebase13 injected: nobody mailed, settled as delivered, and the event still says kind rebase" streq "$(mail_n):$(settled_verdicts):$(event_verdicts)|$(event_kinds)" "0:delivered :delivered |rebase "
+  rcase_closed failed x; put_bead "$BEAD" closed; sweep $((T0 + 600))
+  chk "rebase14 a CLOSED source bead: moot, nobody mailed, the log and the event say rebase" streq "$(mail_n):$(event_verdicts)|$(event_kinds):$(has "$LOG_LOG" "the rebase notice to $TO is moot" && echo y)" "0:moot |rebase :y"
+  rcase_closed failed x; : > "$FD/show.fail"; sweep $((T0 + 600))
+  chk "rebase15 the bead cannot be read: still mailed, and the note says it is not known whether this rebase notice is still current" streq "$(mail_n):$(has "$FD/mail.body.1" "whether this rebase notice is still current" && echo y)" "1:y"
+  rcase_closed failed x; echo x > "$FD/mailfail.$TO"; echo x > "$FD/mailfail.$TO"; sweep $((T0 + 600))
+  chk "rebase16 the author cannot be mailed: the Mayor is mailed, verdict escalated, the event keeps kind rebase" streq "$(mail_to 2):$(settled_verdicts):$(event_kinds)" "mayor:escalated :rebase "
+
+  echo "── rebase: the FAIL records are untouched ──"
+  case_closed failed "queued nudge session fence mismatch"; sweep $((T0 + 600))
+  chk "rebase17 a FAIL record (the default kind): 'Gate FAIL' subject, GATE-FEEDBACK body, 'FAIL nudge' comment, an event with NO kind field" streq "$(has "$FD/mail.log" "Gate FAIL for $BEAD" && echo y):$(has "$FD/mail.body.1" "GATE-FEEDBACK" && echo y):$(has "$FD/comment.1" "the gate's FAIL nudge" && echo y):$(event_kinds)" "y:y:y:- "
+  case_closed failed x; sed -i.bak '/^kind=/d' "$(recf "$BEAD" "$TO")"; sweep $((T0 + 600))
+  chk "rebase18 an OLD record (written before there was a kind): FAIL wording, no kind on the event" streq "$(has "$FD/mail.log" "Gate FAIL for $BEAD" && echo y):$(event_kinds):$(settled_verdicts)" "y:- :mailed "
+  case_closed failed x; sed -i.bak 's/^kind=.*/kind=weird/' "$(recf "$BEAD" "$TO")"; sweep $((T0 + 600))
+  chk "rebase19 a record with an UNKNOWN kind is a FAIL record (never a rebase by guesswork)" streq "$(has "$FD/mail.log" "Gate FAIL for $BEAD" && echo y):$(event_kinds)" "y:- "
+  case_closed injected "nudge delivered via provider injection"; sed -i.bak 's/^kind=.*/kind=weird/' "$(recf "$BEAD" "$TO")"; sweep $((T0 + 600))
+  chk "rebase19b ... and a delivered one with an unknown kind has no kind on its event either" streq "$(event_verdicts)|$(event_kinds)" "delivered |- "
 }
 
 # ═════════════════════════════════════════════════ sweep groups ══════════════════════════════════════════════════════════════════════════════════════
@@ -505,6 +591,11 @@ g_sw_wake() {
     case_wake failed; chmod 444 "$(recf "$BEAD" "$TO")"; sweep $((T0 + 600))
     chk "wake2d an attempt that cannot be written down is a skip (a wake-up nobody recorded could repeat on every sweep), the mail still goes" streq "$(wake_n):$(mail_n):$(has "$FD/comment.1" "could not be written down" && echo y)" "0:1:y"
   fi
+  case_wake queued; sed -i.bak 's/^kind=.*/kind=rebase/' "$(recf "$BEAD" "$TO")"; sweep $((T0 + 1800))
+  RW="$(cat "$FD/wake.text" 2>/dev/null)"
+  chk "wake1e a REBASE record is woken with a REBASE line (ga-9kxy44u.1): names the bead and the rebase, ONE short line, never 'Gate FAIL' / GATE-FEEDBACK, no slash-command token" streq "$(wake_n):$(has "$FD/wake.text" "$BEAD" && has "$FD/wake.text" "rebase" && echo y):$(printf '%s' "$RW" | grep -c -E 'FAIL|GATE-FEEDBACK|(^|[[:space:]])/[a-z]'):$([ -n "$RW" ] && [ "${#RW}" -le 240 ] && echo short):$(printf '%s' "$RW" | grep -c '')" "1:y:0:short:1"
+  case_wake queued; sed -i.bak 's/^kind=.*/kind=weird/' "$(recf "$BEAD" "$TO")"; sweep $((T0 + 1800))
+  chk "wake1f an UNKNOWN kind is woken with the FAIL line (never a rebase by guesswork, same rule as the mail)" streq "$(wake_n):$(has "$FD/wake.text" "GATE-FEEDBACK" && echo y)" "1:y"
   case_wake queued; sweep $((T0 + 1799))
   chk "wake3 one second short of the limit nothing happens: no mail, no pane read, no wake-up" streq "$(mail_n):$(wake_n):$(nlines "$FD/peek.log")" "0:0:0"
   case_wake failed; sweep $((T0 + 600))
@@ -582,14 +673,18 @@ g_static() {
   chk "static3 not in a Phase-C-only child pass (the guard sits just above the call)" bash -c 'sed -n "$(( $2 - 4 )),$2p" "$1" | grep -qF "GATE_PHASE_C_ONLY:-0}\" != \"1\""' _ "$DISPATCHER" "${l_nr:-0}"
   chk "static4 a lib that did not load is said out loud by the sweep call site" bash -c 'sed -n "$2,$(( $2 + 2 ))p" "$1" | grep -qF "NOT being verified"' _ "$DISPATCHER" "${l_nr:-0}"
   chk "static5 the nudge asks for --json and the call stays in THIS shell (output to a file, no command substitution)" streq "$(grep -c 'if gc --city "$GC_CITY" session nudge "$_candidate" "$_message" --delivery wait-idle --json >' "$DISPATCHER"):$(grep -c '\$(gc --city "\$GC_CITY" session nudge' "$DISPATCHER")" "1:0"
-  chk "static6 the record call is guarded by declare -F (sibling selftests eval the function without the lib) and by the neutralising || true" streq "$(grep -c 'declare -F gate_rcpt_record' "$DISPATCHER"):$(grep -c 'gate_rcpt_record "\$_bead_id".* || true' "$DISPATCHER")" "1:1"
+  chk "static6 both record calls (the FAIL nudge and the rebase nudge) are guarded by declare -F (sibling selftests eval the function without the lib) and by the neutralising || true" streq "$(grep -c 'declare -F gate_rcpt_record' "$DISPATCHER"):$(grep -c 'gate_rcpt_record "\$_bead_id".* || true' "$DISPATCHER")" "2:2"
+  # ga-9kxy44u.1: the four rebase nudge sites go through the helper (guarded by declare -F so a sibling selftest that evals a block without it still has the raw nudge)
+  chk "static9 the four rebase nudge sites call gate_rebase_nudge with the source bead and the right target (3 x the rebase author, 1 x the owner), each behind declare -F" streq "$(grep -c 'gate_rebase_nudge "\$BEAD_ID" "\$REBASE_AUTHOR" "\$_RN_MSG"' "$DISPATCHER"):$(grep -c 'gate_rebase_nudge "\$BEAD_ID" "\$OWNER" "\$_RN_MSG"' "$DISPATCHER"):$(grep -c 'if declare -F gate_rebase_nudge' "$DISPATCHER")" "3:1:4"
+  chk "static10 each site keeps its own failure handling: 3 x warn, 1 x || true (the escalation), and the raw alternative sends the same text from \$_RN_MSG" streq "$(grep -c 'gate_rebase_nudge "\$BEAD_ID".* || warn "Could not nudge' "$DISPATCHER"):$(grep -c 'gate_rebase_nudge "\$BEAD_ID".* || true' "$DISPATCHER"):$(grep -c 'session nudge "\$[A-Z_]*" "\$_RN_MSG" --delivery wait-idle 2>/dev/null' "$DISPATCHER")" "3:1:4"
+  chk "static11 the two FYI retry nudges ('no action needed') stay raw: no record, no mail noise" streq "$(grep -c 'session nudge "\$REBASE_AUTHOR" \\$' "$DISPATCHER")" 2
   chk "static7 both files pass bash -n" bash -c 'bash -n "$1" && bash -n "$2"' _ "$DISPATCHER" "$LIB"
   if [ -n "${B32_BASH:-}" ] && [ -x "${B32_BASH:-}" ]; then
     chk "static8 and a real bash 3.2 (B32_BASH) accepts both, printing nothing" streq "$("$B32_BASH" -n "$DISPATCHER" 2>&1)$("$B32_BASH" -n "$LIB" 2>&1)" ""
   fi
 }
 
-GROUPS_ALL="send sw_inject sw_hook sw_gone sw_wait sw_age sw_unread sw_moot sw_escal sw_wake sw_cap sw_damage sw_match sw_budget sw_switch static"
+GROUPS_ALL="send rebase sw_inject sw_hook sw_gone sw_wait sw_age sw_unread sw_moot sw_escal sw_wake sw_cap sw_damage sw_match sw_budget sw_switch static"
 for g in ${GNR_GROUPS:-$GROUPS_ALL}; do "g_$g"; done
 
 # ═════════════════════════════════════════════════ mutants ═══════════════════════════════════════════════════════════════════════════════════════════
@@ -637,16 +732,35 @@ M = [
  ("l24", "lib", 'if [ "$n" -gt 0 ]; then find', 'if true; then find', "sw_budget", "an idle sweep trims too"),
  ("d01", "disp", 'if [ "$_noc" != "delivered" ] && [ "$_defer" != "1" ] && declare -F', 'if [ "$_defer" != "1" ] && declare -F', "send", "a delivered nudge is recorded too"),
  ("d02", "disp", 'if [ "$_noc" != "delivered" ] && [ "$_defer" != "1" ] && declare -F', 'if [ "$_noc" != "delivered" ] && declare -F', "send", "an ephemeral author is recorded"),
- ("d03", "disp", '--delivery wait-idle --json >"${_nf:-/dev/null}"', '--delivery wait-idle >"${_nf:-/dev/null}"', "send", "no --json"),
- ("d04", "disp", "jq -er 'select(.ok == true) | .outcome' \"$_nf\"", "jq -er '.outcome' \"$_nf\"", "send", "ok:false is believed"),
+ ("d03", "disp", '--delivery wait-idle --json >"${_nf:-/dev/null}" 2>/dev/null; then', '--delivery wait-idle >"${_nf:-/dev/null}" 2>/dev/null; then', "send", "no --json"),
+ ("d04", "disp", "if [ -n \"$_nf\" ]; then _noc=$(jq -er 'select(.ok == true) | .outcome' \"$_nf\"", "if [ -n \"$_nf\" ]; then _noc=$(jq -er '.outcome' \"$_nf\"", "send", "ok:false is believed"),
  ("d05", "disp", 'if gc --city "$GC_CITY" session nudge "$_candidate" "$_message" --delivery wait-idle --json >"${_nf:-/dev/null}" 2>/dev/null; then', 'if _x=$(gc --city "$GC_CITY" session nudge "$_candidate" "$_message" --delivery wait-idle --json 2>/dev/null); then', "static", "the nudge runs in a subshell"),
  ("d06", "disp", 'if [ "${GATE_RCPT_LIB_OK:-0}" = "1" ]; then gate_rcpt_sweep || true', 'if [ "${GATE_RCPT_LIB_OK:-0}" = "1" ]; then :', "static", "the sweep is never called"),
  ("d07", "disp", 'if [ "${GATE_PHASE_C_ONLY:-0}" != "1" ]; then\n  if [ "${GATE_RCPT_LIB_OK:-0}" = "1" ]', 'if true; then\n  if [ "${GATE_RCPT_LIB_OK:-0}" = "1" ]', "static", "the sweep runs in a Phase-C-only pass"),
+  # ga-9kxy44u.1 (rebase kind) ─ lib
+ ("l30", "lib", '"$(_gate_rcpt_oneline "$fctx")" "$kind" > "$tmp.rec"', '"$(_gate_rcpt_oneline "$fctx")" "fail" > "$tmp.rec"', "rebase", "the record never keeps the rebase kind"),
+ ("l31", "lib", 'case "$kind" in rebase) what="rebase"; evt_kind="rebase" ;; esac', 'case "$kind" in rebase_never) what="rebase"; evt_kind="rebase" ;; esac', "rebase", "the fallback ignores the kind (FAIL wording, no kind on the event)"),
+ ("l32", "lib", '  if [ "$kind" = "rebase" ]; then\n    # ga-9kxy44u.1: a rebase request', '  if false; then\n    # ga-9kxy44u.1: a rebase request', "rebase", "a rebase mail keeps the FAIL subject and the GATE-FEEDBACK body"),
+ ("l33", "lib", 'case "$kind_sweep" in rebase) ;; *) kind_sweep="" ;; esac', 'kind_sweep=""', "rebase", "a delivered rebase notice loses its kind on the event"),
+ ("l34", "lib", 'case "$kind" in rebase) ;; *) kind=fail ;; esac', 'case "$kind" in *) ;; esac', "rebase", "an unknown kind is recorded as given"),
+ ("l35", "lib", 'case "$kind" in rebase) what="rebase"; evt_kind="rebase" ;; esac', 'case "$kind" in ?*) what="rebase"; evt_kind="rebase" ;; esac', "rebase", "an unknown kind in a record is worded as a rebase by guesswork"),
+ ("l36", "lib", 'the $what notice to $to is moot, nobody mailed ($why)"', 'the FAIL notice to $to is moot, nobody mailed ($why)"', "rebase", "the moot log line says FAIL for a rebase notice"),
+ ("l37", "lib", "so it is not known whether this $what notice is still current)", "so it is not known whether this FAIL is still current)", "rebase", "the cannot-tell note says FAIL for a rebase notice"),
+ # ga-9kxy44u.1 (rebase kind) ─ dispatcher helper and sites
+ ("d09", "disp", 'if [ "$_noc" != "delivered" ] && [ -n "$_bead_id" ] && declare -F gate_rcpt_record', 'if [ -n "$_bead_id" ] && declare -F gate_rcpt_record', "rebase", "a delivered rebase nudge is recorded too"),
+ ("d10", "disp", '"$_target" "$_message" --delivery wait-idle --json >"${_nf:-/dev/null}" 2>/dev/null || _rc=$?', '"$_target" "$_message" --delivery wait-idle >"${_nf:-/dev/null}" 2>/dev/null || _rc=$?', "rebase", "the rebase nudge asks for no --json"),
+ ("d11", "disp", '"${_noc:-unreadable}" "$_message" "$_context" rebase || true', '"${_noc:-unreadable}" "$_message" "$_context" || true', "rebase", "the rebase nudge records a FAIL kind"),
+ ("d12", "disp", "if [ \"$_rc\" = \"0\" ] && [ -n \"$_nf\" ]; then _noc=$(jq -er 'select(.ok == true) | .outcome'", "if [ \"$_rc\" = \"0\" ] && [ -n \"$_nf\" ]; then _noc=$(jq -er '.outcome'", "rebase", "an ok:false answer is believed for a rebase nudge"),
+ ("d13", "disp", '  [ "$_rc" = "0" ] || return 1\n', '', "rebase", "a nudge that was not accepted reads as accepted"),
+ ("d14", "disp", '  [ -n "$_target" ] || return 1\n  # The JSON goes', '  # The JSON goes', "rebase", "an empty target is nudged anyway"),
+ ("d15", "disp", 'if declare -F gate_rebase_nudge >/dev/null 2>&1; then\n          gate_rebase_nudge "$BEAD_ID" "$OWNER"', 'if false; then\n          gate_rebase_nudge "$BEAD_ID" "$OWNER"', "static", "the owner-fallback site goes back to the raw nudge"),
+ ("d16", "disp", 'gate_rebase_nudge "$BEAD_ID" "$REBASE_AUTHOR" "$_RN_MSG" "rebase nudge: genuine merge conflict"', 'gate_rebase_nudge "" "$REBASE_AUTHOR" "$_RN_MSG" "rebase nudge: genuine merge conflict"', "static", "the merge-conflict site passes no bead id (never tracked)"),
+ ("d17", "disp", 'gate_rebase_nudge "$BEAD_ID" "$REBASE_AUTHOR" "$_RN_MSG" "rebase nudge: persistent transient auto-rebase failures" || true', 'gate_rebase_nudge "$BEAD_ID" "$REBASE_AUTHOR" "$_RN_MSG" "rebase nudge: persistent transient auto-rebase failures"', "static", "the escalation site is no longer neutralised (errexit)"),
  ("d08", "disp", 'gate_rcpt_record "$_bead_id" "${BEAD_CITY:-$GC_CITY}" "$_notified" "$_author" "${_noc:-unreadable}" "$_message" "$_fail_context" || true', 'gate_rcpt_record "$_bead_id" "${BEAD_CITY:-$GC_CITY}" "$_notified" "$_author" "${_noc:-unreadable}" "$_message" "$_fail_context"', "static", "the record call is no longer neutralised"),
  # ── the wake-up (ga-9kxy44u) ──
  ("w01", "lib", '"$txt" --delivery immediate --json || rc=$?', '"$txt" --delivery wait-idle --json || rc=$?', "sw_wake", "the wake-up is queued like the notice it stands in for"),
  ("w02", "lib", '--delivery immediate --json || rc=$?', '--delivery immediate || rc=$?', "sw_wake", "the wake-up asks for no --json (its outcome cannot be read)"),
- ("w03", "lib", '  wake=$(_gate_rcpt_wake "$bead" "$to" "$author" "$st" "$labels" "$asg") || wake="skipped|the wake-up check itself failed"', '  wake="skipped|x"', "sw_wake", "nobody is ever woken"),
+ ("w03", "lib", '  wake=$(_gate_rcpt_wake "$bead" "$to" "$author" "$st" "$labels" "$asg" "$kind") || wake="skipped|the wake-up check itself failed"', '  wake="skipped|x"', "sw_wake", "nobody is ever woken"),
  ("w04", "lib", '    busy)    echo "skipped|its pane shows a turn running (busy): nothing is typed into it, the queued notice and the mail wait for its next prompt"; return 0 ;;', '    busy) ;;', "sw_wake", "a line is typed into a pane that is running a turn"),
  ("w05a", "lib", r"""'Do you want to proceed\?|requires confirmation|Enter to select|Esc to cancel'""", r"""'Enter to select|Esc to cancel'""", "sw_wake", "a permission prompt is not recognised (its option cursor is a prompt glyph too)"),
  ("w05b", "lib", r"""'Do you want to proceed\?|requires confirmation|Enter to select|Esc to cancel'""", r"""'Do you want to proceed\?|requires confirmation'""", "sw_wake", "a selection menu waiting for the human is typed into"),
@@ -680,12 +794,14 @@ M = [
  ("w32", "lib", 'fix what they ask and run gate-done again."', 'fix what they ask and run gate-done again. ' + '.' * 260 + '"', "sw_wake", "the wake-up is long enough to arrive truncated"),
  ("w33", "lib", '_gate_rcpt_gc "$f" session peek "$1" --lines 40 || rc=$?', '_gate_rcpt_gc "$f" session peek "nobody" --lines 40 || rc=$?', "sw_wake", "the pane read is of another session"),
  ("w34", "lib", 'session nudge "$to" "$txt"', 'session nudge "nobody" "$txt"', "sw_wake", "the wake-up goes to another session"),
- ("w35", "lib", 'age_s "$age" reason "$why" wake "$wres" wake_why "$wwhy" \\\n', 'age_s "$age" reason "$why" \\\n', "sw_wake", "the event does not carry the wake-up outcome"),
+ ("w35", "lib", 'age_s "$age" reason "$why" wake "$wres" wake_why "$wwhy" ${evt_kind:+kind "$evt_kind"} \\\n', 'age_s "$age" reason "$why" ${evt_kind:+kind "$evt_kind"} \\\n', "sw_wake", "the event does not carry the wake-up outcome"),
  ("w36", "lib", "  printf 'wake=%s\\nwake_why=%s\\n' \"$wres\" \"$(_gate_rcpt_oneline \"$wwhy\")\" >> \"$f\" 2>/dev/null || true\n", '  :\n', "sw_wake", "the settled record does not carry the wake-up outcome"),
  ("w37", "lib", '${how}${note}${wnote} A queued nudge', '${how}${note} A queued nudge', "sw_wake", "the bead comment does not say what happened to the wake-up"),
  ("w39", "lib", '  if [ -n "$(_gate_rcpt_get "$f" wake_attempt)" ]; then', '  if false; then', "sw_wake", "a record that already carries a wake attempt is woken again"),
  ("w40", "lib", "  elif ! printf 'wake_attempt=%s\\n' \"$(_gate_rcpt_now)\" >> \"$f\" 2>/dev/null; then", '  elif false; then', "sw_wake", "the wake attempt is not written down before it is typed"),
  ("w38", "lib", '  if [ "$labels" = "?" ]; then echo "skipped|the bead\'s labels could not be read', '  if false; then echo "skipped|the bead\'s labels could not be read', "sw_wake", "labels that cannot be read count as no labels (a bead back in the gate is woken)"),
+ ("w41", "lib", '  if [ "$kind" = "rebase" ]; then\n    txt="Gate: $bead needs a rebase', '  if false; then\n    txt="Gate: $bead needs a rebase', "sw_wake", "a rebase record is woken with the Gate FAIL / GATE-FEEDBACK line"),
+ ("w42", "lib", '"$labels" "$asg" "$kind") ||', '"$labels" "$asg") ||', "sw_wake", "the wake-up never learns the record kind (a rebase record is woken with the FAIL line)"),
 ]
 bad = 0
 with open(os.path.join(out, "manifest.tsv"), "w") as man:

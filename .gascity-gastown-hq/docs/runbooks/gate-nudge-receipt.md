@@ -1,6 +1,7 @@
 ## Contents
 - [What it does](#what-it-does)
 - [The wake-up (ga-9kxy44u)](#the-wake-up-ga-9kxy44u)
+- [The rebase nudges (ga-9kxy44u.1)](#the-rebase-nudges-ga-9kxy44u1)
 - [Where the state lives](#where-the-state-lives)
 - [Reading what happened](#reading-what-happened)
 - [Knobs and kill switch](#knobs-and-kill-switch)
@@ -52,6 +53,23 @@ A closed or `gate:passed` bead is moot before any of this: nothing is sent. Both
 `failed` | `skipped`, plus `wake_why`) and in the settled record (`wake=`). At most one wake-up per record: the attempt (`wake_attempt=` in the record) is written before anything is typed, so a sweep that dies or a settle that fails cannot repeat it (the mail can repeat then, as before); with no mail helper the record stays for the next sweep and nobody is woken. A shorter `GATE_RCPT_PENDING_MAX_S`
 brings the mail and the wake-up earlier.
 
+## The rebase nudges (ga-9kxy44u.1)
+The four nudges that ask an author to rebase and re-run `/gate-done` (behind the envelope: to the rebase author, or to the bead owner when
+the rebase author has no session; a genuine merge conflict; persistent transient auto-rebase failures) used to be a raw
+`session nudge --delivery wait-idle`, with no `--json` and no receipt: a queued one died silently and the author never learned the branch
+was blocked. They now go through `gate_rebase_nudge <bead> <target> <text> <context>` (one target, no candidate cascade: the caller already
+picked the identity verified alive). Same read as above; anything but `delivered` is recorded with `kind=rebase`, and the sweep decides the
+same way. Only the wording differs: the mail subject is `Gate: rebase needed for <bead> — the nudge to <who> may not have reached you`, the
+body says the branch needs a rebase and to re-run `/gate-done` (no `GATE-FEEDBACK`), the bead comment says "rebase nudge", and the event
+carries `kind: rebase`. A record with no `kind` (written before this) or an unknown one is a FAIL record, as before.
+
+The nudge stays `wait-idle`: an `immediate` nudge types into whatever the pane shows, a permission dialog included. Waking an idle crew is the
+job of the sweep's wake after the mail (see "The wake-up" above): a rebase notice that was only queued gets it too, under the same checks, but with a rebase line
+("Gate: <bead> needs a rebase ... read the latest gate comment on the bead, rebase on origin/main and run gate-done again": never "Gate FAIL" / `GATE-FEEDBACK`). A record
+with no or an unknown `kind` is woken with the FAIL line, as for the mail. Note the `gate:queued` / `gate:reviewing` skip applies to rebase records too: a source bead that
+still carries one of those labels is not woken (the skip and its reason are in the comment and the event). `rc 1` from the helper means the nudge was not accepted; the site keeps its own `warn`. A notice with no bead id is
+sent and not tracked. A FAIL notice and a rebase notice for the same bead and recipient share one record (the later replaces the earlier).
+
 ## Where the state lives
 - Spool: `$GC_CITY/.gc/runtime/gate-author-nudge/pending/<bead>__<recipient>.{rec,msg,chk}` (the record, the text, the time of the
   last look) and `settled/<key>.<epoch>.{rec,msg}` (kept 30 days; the `verdict=` line says how it ended). One record per bead and
@@ -81,8 +99,9 @@ once a sweep spent this long: the sweep runs under the gate lock), `GATE_RCPT_DI
   in dead-letter where `gc nudge status` shows it. That is a patch under `docs/pending-engine-window/` and a window, not this.
 - Which closed state means what is read from the bead's `state`; a state the check does not know mails at once rather than guessing it
   was delivered. The recipient is matched by identity for ranking only.
-- Senders that do not go through `nudge_author_with_fallback`: the rebase nudges (`session nudge "$REBASE_AUTHOR"` / `"$OWNER"`) and the
-  Mayor pings in the same dispatcher, and every other script that nudges. They still treat rc 0 as "told".
+- Senders that go through neither `nudge_author_with_fallback` nor `gate_rebase_nudge`: the Mayor pings and the two FYI retry nudges
+  ("no action needed", block `ga-a6etc2-live-requeue`) in the dispatcher, the seven same-format "Could not nudge author" nudges in
+  `story-delivery.sh`, and every other script that nudges. They still treat rc 0 as "told".
 - An ephemeral pool author is not recorded: its session is gone by design and the bead returns to the pool by itself.
 - A recipient that is busy or inside a dialog when its record is settled is not woken (the sweep looks once per record): the queued nudge and the mail wait for its next prompt. A draft a human left in
   the input box is not detected, and neither is a dialog whose wording is not among the markers (`Do you want to proceed?`, `requires confirmation`, `Enter to select`, `Esc to cancel`).
