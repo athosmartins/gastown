@@ -445,6 +445,15 @@ else
   bad "S: the failure log lost the stdout text (dump: $(tr '\n' '|' < "$CALLS"))"
 fi
 
+echo "Scenario S2: the same failure answer PRETTY-PRINTED over several lines (CRLF here) is still ONE log line per attempt"
+run_spawn "wa-worker" "wa-id05b" 'printf "{\r\n  \"error\": \"store down\"\r\n}\r\n"; exit 1'
+# each CR and each LF of the answer became ONE space, so `"store down"` and the closing brace are two spaces apart on the same line
+if has_call "RC=1" && warn_has 'attempt 1/2' '"error": "store down"  }' && warn_has 'attempt 2/2' '"error": "store down"  }'; then
+  ok "S2: both attempts' warns carry the whole excerpt on their own line (a newline kept in it would cut the log record in two)"
+else
+  bad "S2: the multi-line stdout excerpt broke the log line (dump: $(tr '\n' '|' < "$CALLS"))"
+fi
+
 echo "Scenario T: the stderr scratch file cannot be created — RC=1 at once, gc is never run, NO retry, and the log says the spawn was NOT attempted"
 RS_TMPDIR="$WORK/no-such-dir" run_spawn "wa-worker" "wa-id06" 'echo "{\"session_name\":\"s-6\"}"; exit 0' 2>/dev/null
 if has_call "RC=1" && [ "$(gc_calls)" -eq 0 ] && warn_has 'NOT attempted — cannot create the stderr scratch file' \

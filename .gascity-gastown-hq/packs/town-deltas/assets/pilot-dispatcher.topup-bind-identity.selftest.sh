@@ -14,16 +14,20 @@
 # (Sweeps are minutes apart: scripts/com.gascity.pilot.plist says StartInterval 600 and a comment in the dispatcher says 300; the live launchd job
 # was not read from here. Either way two spawns 54 s apart are one loop, not two sweeps.)
 #
-# THE FIX under test: the spawn asks for `--json` and keeps what it printed; the bind writes the claim for THAT identity (the roster is
-# only asked for the work_dir and to refuse a session it shows dead); the title lookup stays as the fallback for an answer that carries no
-# identity; and the loop never opens a second session for the same bead in one pass, whatever the bind said ("cannot read" never opens
-# another session).
+# THE FIX under test: the spawn asks for `--json` and keeps what it printed; the bind writes the claim for THAT identity, but only for a
+# session the roster shows live (it also gives the work_dir): one it lists asleep, or does not list at all, is not claimed — the real roster
+# has live sessions only, so a session that ended is simply absent (D2-D3c; gate review of ga-qnarixf) — while a roster that cannot be
+# READ is no evidence either way and the claim is written on the answer, said; the title lookup stays as the fallback for an answer that
+# carries no identity; and the loop never opens a second session for the same bead in one pass, whatever the bind said ("cannot read" never
+# opens another session).
 #
 # This is the bead's own acceptance: a FAKE ENGINE (gc + a stateful bd, both real executables because `timeout` exec()s them) that
 # REWRITES the title, driving the REAL _pilot_pool_topup / _pilot_topup_spawn / _topup_bind_after_spawn / _topup_note_spawn extracted
-# verbatim from the dispatcher. On the dispatcher before the fix (PILOT_DISPATCHER_PATH=<pre-fix copy>) every scenario fails except the five
-# controls A-keep, A-slice, B2, F1 and F4, which pass on both. Eligibility filters and the order of the pick are stubbed (their selftests are
-# pilot-dispatcher.selftest.sh and pilot-dispatcher.topup-order.selftest.sh); what is under test is spawn -> identity -> claim -> loop.
+# verbatim from the dispatcher. On the dispatcher before the fix (PILOT_DISPATCHER_PATH=<pre-fix copy>) every scenario fails except the controls
+# A-keep, A-slice, B2, F1 and F4, which pass on both, and K1, which tests the fake and not the dispatcher (measured: 6 passed, 69 failed). Against
+# a07117baf, the tip the gate reviewed, D2, D3, D3c and the two \037 cases of G are RED as well (and S2 in the spawn-diagnostics selftest).
+# Eligibility filters and the order of the pick are stubbed (their selftests are pilot-dispatcher.selftest.sh and
+# pilot-dispatcher.topup-order.selftest.sh); what is under test is spawn -> identity -> claim -> loop.
 #
 # Exit 0 iff every scenario behaves as expected.
 
@@ -77,8 +81,9 @@ printf '%s\n' '# Step 1b2' 'X_CAND="$(' 'bd ready --metadata-field "gc.routed_to
 
 # ── the fake engine ─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
 # gc: `session new` registers a session in the roster with the title the ENGINE chooses (title.mode: keep|cap|nocolon|for|caps|slice) and
-# prints its identity ONLY when asked for --json (call.<n> can say noid = print something else, fail = exit 1, dead = the roster shows
-# it closed, wd = the answer carries its own work_dir). `session list --json` prints the roster (list.fail = the call fails, list.late = it
+# prints its identity ONLY when asked for --json (call.<n> can say noid = print something else, fail = exit 1, dead = the session is
+# registered CLOSED, which the real roster then does not list (K1), asleep = it is listed asleep, wd = the answer carries its own work_dir;
+# list.lag = `session new` does not register it at all). `session list --json` prints the roster (list.fail = the call fails, list.late = it
 # answers only after 6 s, which a bounded caller never sees, list.raw = it prints that text).
 cat > "$WORK/bin/gc" <<'GCEOF'
 #!/usr/bin/env bash
@@ -108,6 +113,7 @@ case "$*" in
     name="$(printf 'wa-worker-gawisp%03d' "$n")"
     closed=false; state=creating
     [ "$callmode" = "dead" ] && { closed=true; state=closed; }
+    [ "$callmode" = "asleep" ] && state=asleep
     [ -e "$E/list.lag" ] || jq -cn --arg n "$name" --arg i "ga-wisp-$n" --arg t "$title" --arg s "$state" --argjson c "$closed" \
       --arg wd "/rig/wa/crew/w$n" --arg ca "$(printf '2026-11-12T10:00:%02dZ' "$n")" \
       '{id: $i, name: $n, session_name: $n, alias: $n, agent_name: $n, template: "wa-worker", title: $t, state: $s, work_dir: $wd,
@@ -124,7 +130,11 @@ case "$*" in
     [ -e "$E/list.fail" ] && { echo "listing sessions: search wisps (merge): search wisps: invalid connection" >&2; exit 1; }
     [ -e "$E/list.late" ] && sleep 6 >/dev/null 2>&1
     [ -f "$E/list.raw" ] && { cat "$E/list.raw"; exit 0; }
-    if [ -f "$E/roster.ndjson" ]; then jq -sc '{ok: true, schema_version: "1", sessions: ., summary: {}}' "$E/roster.ndjson"
+    # The roster production returns lists LIVE sessions only: one that ended is not in the default listing, nor in `--state all` or
+    # `--state closed` — it just disappears (docs/runbooks/node-ghost-release.md). A fake that printed the closed row too proved a veto
+    # production never reaches (gate review of ga-qnarixf). list.showclosed prints it anyway, for the H table's unit tests of the jq rule; K1 pins this.
+    sc=false; [ -e "$E/list.showclosed" ] && sc=true
+    if [ -f "$E/roster.ndjson" ]; then jq -sc --argjson sc "$sc" '{ok: true, schema_version: "1", sessions: map(select($sc or (.closed != true and .state != "closed"))), summary: {}}' "$E/roster.ndjson"
     else echo '{"ok":true,"schema_version":"1","sessions":[],"summary":{}}'; fi
     exit 0 ;;
 esac
@@ -255,6 +265,20 @@ S1="wa-worker-gawisp001"; S2="wa-worker-gawisp002"
 
 echo "pilot-dispatcher.topup-bind-identity.selftest — the top-up binds the session it opened by the identity the spawn returned (ga-qnarixf)"
 
+# ── K: the fixture itself — a fake that agrees with the code by construction proves nothing ─────────────────────────────────────────────────
+echo "K. the fake roster has the shape production's has: a session that ended is not in it, one that is asleep is"
+fgc() { ( PATH="$SANDBOX_PATH"; FAKE_ENGINE="$E"; export FAKE_ENGINE; gc --city x "$@" ); }
+nrows() { jq '.sessions | length' 2>/dev/null; }
+new_engine cap; echo dead > "$E/call.1"; echo asleep > "$E/call.2"
+fgc session new wa-worker --no-attach --title-hint 'pool top-up: wa-p1' --json > /dev/null; fgc session new wa-worker --no-attach --title-hint 'pool top-up: wa-p2' --json > /dev/null
+_k_reg=$(jq -s 'length' "$E/roster.ndjson"); _k_def=$(fgc session list --json | nrows); _k_all=$(fgc session list --json --state all | nrows)
+_k_state=$(fgc session list --json | jq -r '.sessions[0].state // ""'); : > "$E/list.showclosed"; _k_sc=$(fgc session list --json | nrows); rm -f "$E/list.showclosed"
+if [ "$_k_reg" = 2 ] && [ "$_k_def" = 1 ] && [ "$_k_all" = 1 ] && [ "$_k_state" = asleep ] && [ "$_k_sc" = 2 ]; then
+  ok "K1 two sessions registered (one closed, one asleep): the default and the --state all listings carry only the asleep one; the closed row shows only on request (list.showclosed)"
+else
+  bad "K1: registered=$_k_reg default=$_k_def --state all=$_k_all state='$_k_state' with showclosed=$_k_sc (want 2/1/1/asleep/2)"
+fi
+
 # ── A: the bug, with the engine rewriting the title ────────────────────────────────────────────────────────────────
 echo "A. the engine REWRITES the title the Pilot asked for — one session, claimed by the identity the spawn returned"
 for mode in cap nocolon for caps; do
@@ -343,7 +367,7 @@ else
 fi
 
 # ── D: the identity path does not depend on the roster ─────────────────────────────────────────────────────────────────────────────────────
-echo "D. the identity is the engine's word; the roster only adds the work_dir and vetoes a dead session"
+echo "D. the identity is the engine's word that the session EXISTS; the roster says whether it is alive (and gives the work_dir)"
 new_engine cap; add_bead wa-p1 0; : > "$E/list.fail"
 run_pass 2
 if [ "$(spawns)" = "1" ] && [ "$(bead_asg wa-p1)" = "$S1" ] && [ -z "$(bead_meta wa-p1 gc.work_dir)" ] && [ "$(bead_meta wa-p1 gc.session_name)" = "$S1" ]; then
@@ -353,17 +377,31 @@ else
 fi
 new_engine cap; add_bead wa-p1 0; : > "$E/list.lag"
 run_pass 2
-if [ "$(spawns)" = "1" ] && [ "$(bead_asg wa-p1)" = "$S1" ] && [ -z "$(bead_meta wa-p1 gc.work_dir)" ]; then
-  ok "D2 the roster is readable but does not list the new session yet (lag): the claim is written, without gc.work_dir"
+if [ "$(spawns)" = "1" ] && [ "$(bead_asg wa-p1)" = "" ] && warned "UNVERIFIED" "$S1" && warned "$S1" "wa-p1" && ! logged "bound top-up session"; then
+  ok "D2 the roster ANSWERS but does not list the new session (not registered yet, or already ended: the real roster has live sessions only, so the two look alike): no claim on a session nothing confirms, an UNVERIFIED warn naming it and the bead, ONE session"
 else
-  bad "D2: spawns=$(spawns) assignee='$(bead_asg wa-p1)'"; dump
+  bad "D2: spawns=$(spawns) assignee='$(bead_asg wa-p1)' (want none: a roster that does not list the session confirms nothing)"; dump
 fi
 new_engine cap; add_bead wa-p1 0; echo dead > "$E/call.1"
 run_pass 2
-if [ "$(spawns)" = "1" ] && [ "$(bead_asg wa-p1)" = "" ] && warned "not live"; then
-  ok "D3 the roster shows the new session already CLOSED: no claim on a dead session, a WARN, and still ONE session"
+if [ "$(spawns)" = "1" ] && [ "$(bead_asg wa-p1)" = "" ] && warned "UNVERIFIED" "$S1"; then
+  ok "D3 the new session is already CLOSED, which in production means ABSENT from the roster (K1): no claim on a dead session, an UNVERIFIED warn, ONE session"
 else
-  bad "D3: spawns=$(spawns) assignee='$(bead_asg wa-p1)'"; dump
+  bad "D3: spawns=$(spawns) assignee='$(bead_asg wa-p1)' (want none)"; dump
+fi
+new_engine cap; add_bead wa-p1 0; echo asleep > "$E/call.1"
+run_pass 2
+if [ "$(spawns)" = "1" ] && [ "$(bead_asg wa-p1)" = "" ] && warned "$S1" "not live"; then
+  ok "D3b the roster LISTS the new session but asleep (a state production does show): the 'not live' veto fires, no claim, ONE session"
+else
+  bad "D3b: spawns=$(spawns) assignee='$(bead_asg wa-p1)'"; dump
+fi
+new_engine cap; add_bead wa-p1 0; echo dead > "$E/call.1"
+run_pass 2; run_pass 2
+if [ "$(spawns)" = "2" ] && [ "$(bead_asg wa-p1)" = "$S2" ]; then
+  ok "D3c the inert state is not a dead end: the session that died claimed nothing, so the NEXT sweep opens another and claims it ($S2)"
+else
+  bad "D3c: spawns=$(spawns) assignee='$(bead_asg wa-p1)' (want 2 spawns, claim on $S2)"; dump
 fi
 
 new_engine cap; add_bead wa-p1 0; : > "$E/list.late"
@@ -474,6 +512,8 @@ g_expect "a name starting with a dot (2)"        "2||"                     '{"se
 g_expect "a name with a space (2)"               "2||"                     '{"session_name":"a b"}'
 g_expect "a name with a shell metacharacter (2)" "2||"                     '{"session_name":"a;b"}'
 g_expect "a name with a newline (2)"             "2||"                     "$(jq -cn --arg n $'a\nb' '{session_name: $n}')"
+g_expect "a name with the \\037 pair separator (2: split on it, it would read as the valid name 'abc')" "2||"  "$(jq -cn --arg n $'abc\037def' '{session_name: $n}')"
+g_expect "a work_dir with the \\037 pair separator (2)" "2||"                "$(jq -cn --arg w $'/w\037x' '{session_name: "s-1", work_dir: $w}')"
 # The two states must also SAY different things: the caller's WARN is the only place the difference shows.
 why_of() { ( PATH="$SANDBOX_PATH"; eval "$FUNCS"; _TOPUP_SPAWN_OUT="$1"; _topup_spawn_identity 2>/dev/null; printf '%s' "${_TOPUP_IDENT_WHY:-}" ) || true; }
 w_empty="$(why_of '')"; w_obj="$(why_of '{"x":1}')"; w_text="$(why_of 'Session created.')"
@@ -490,7 +530,8 @@ rrow() { # rrow <session_name> <state> <closed true|false> <created_at> [alias] 
   jq -cn --arg n "$1" --arg s "$2" --argjson c "$3" --arg ca "$4" --arg al "${5:-$1}" --arg id "${6:-ga-wisp-$1}" --arg wd "${7:-/wd/$1}" \
     '{id: $id, name: $n, session_name: $n, alias: $al, agent_name: $n, template: "wa-worker", title: "x", state: $s, work_dir: $wd, created_at: $ca, closed: $c}'
 }
-roster() { rm -f "$E/list.fail" "$E/list.late" "$E/list.raw"; : > "$E/roster.ndjson"; local _r; for _r in "$@"; do printf '%s\n' "$_r" >> "$E/roster.ndjson"; done; }
+roster() { rm -f "$E/list.fail" "$E/list.late" "$E/list.raw" "$E/list.showclosed"; : > "$E/roster.ndjson"; local _r; for _r in "$@"; do printf '%s\n' "$_r" >> "$E/roster.ndjson"; done; }
+showclosed() { : > "$E/list.showclosed"; }   # the fake prints a closed row only on request (K1): the jq rule is unit-tested on such rows below
 by_name() { # by_name <name> [shell to eval first] -> "rc|stdout"
   ( PATH="$SANDBOX_PATH"; FAKE_ENGINE="$E"; export FAKE_ENGINE; GC_CITY="$WORK/city"
     eval "$FUNCS"; eval "${2:-:}"; _o=""; _brc=0; _o=$(_topup_session_by_name "$1") || _brc=$?; printf '%s|%s' "$_brc" "$_o" )
@@ -508,14 +549,15 @@ roster "$(rrow s-1 active false 2026-11-12T10:00:01Z)"
 h_expect "an active session is live (1) and its work_dir comes with it" "0|1${US}/wd/s-1" s-1
 roster "$(rrow s-1 creating false 2026-11-12T10:00:01Z)"; h_expect "creating is live" "0|1${US}/wd/s-1" s-1
 roster "$(rrow s-1 start-pending false 2026-11-12T10:00:01Z)"; h_expect "start-pending is live" "0|1${US}/wd/s-1" s-1
-roster "$(rrow s-1 active true 2026-11-12T10:00:01Z)"; h_expect "closed:true is NOT live (0) even when the state says active" "0|0${US}/wd/s-1" s-1
-roster "$(rrow s-1 closed false 2026-11-12T10:00:01Z)"; h_expect "state closed is not live" "0|0${US}/wd/s-1" s-1
+roster "$(rrow s-1 active true 2026-11-12T10:00:01Z)"; showclosed; h_expect "closed:true is NOT live (0) even when the state says active (defensive: production never lists it)" "0|0${US}/wd/s-1" s-1
+roster "$(rrow s-1 closed false 2026-11-12T10:00:01Z)"; showclosed; h_expect "state closed is not live (defensive, same)" "0|0${US}/wd/s-1" s-1
+roster "$(rrow s-1 closed true 2026-11-12T10:00:01Z)"; h_expect "a session that ENDED is not in the roster production returns: answered, nothing printed — never a live row" "0|" s-1
 roster "$(rrow s-1 asleep false 2026-11-12T10:00:01Z)"; h_expect "an asleep session builds nothing: not live" "0|0${US}/wd/s-1" s-1
 roster "$(rrow wa-w-9 active false 2026-11-12T10:00:01Z wa-alias-1)"; h_expect "found by its alias" "0|1${US}/wd/wa-w-9" wa-alias-1
 roster "$(rrow wa-w-9 active false 2026-11-12T10:00:01Z wa-alias-1 ga-wisp-77)"; h_expect "found by its id" "0|1${US}/wd/wa-w-9" ga-wisp-77
-roster "$(rrow s-1 active false 2026-11-12T10:00:01Z s-1 ga-wisp-1 /wd/old)" "$(rrow s-1 closed true 2026-11-12T10:00:09Z s-1 ga-wisp-2 /wd/new)"
+roster "$(rrow s-1 active false 2026-11-12T10:00:01Z s-1 ga-wisp-1 /wd/old)" "$(rrow s-1 closed true 2026-11-12T10:00:09Z s-1 ga-wisp-2 /wd/new)"; showclosed
 h_expect "two rows of the same name: the NEWEST one answers (a re-created session)" "0|0${US}/wd/new" s-1
-roster "$(rrow s-2 active false 2026-11-12T10:00:01Z)"; h_expect "not listed: answered, nothing printed (still registering)" "0|" s-1
+roster "$(rrow s-2 active false 2026-11-12T10:00:01Z)"; h_expect "not listed: answered, nothing printed (not registered yet, or ended: the same answer, so never proof of life)" "0|" s-1
 roster; h_expect "an empty roster: answered, nothing printed" "0|" s-1
 roster "$(rrow s-1 active false 2026-11-12T10:00:01Z)"; : > "$E/list.fail"; h_fails "the call fails: cannot tell, not 'not listed'" s-1
 roster "$(rrow s-1 active false 2026-11-12T10:00:01Z)"; echo 'not json' > "$E/list.raw"; h_fails "the roster is not JSON: cannot tell" s-1
