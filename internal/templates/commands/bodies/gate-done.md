@@ -12,7 +12,7 @@ allowed-tools: Bash(git status:*), Bash(git push:*), Bash(git rev-parse:*), Bash
 • Pre-flight Self-Audit: THE THIRD STATE (mandatory — before you push)
 • Pre-flight Check: NEW READS NEED A FAILURE TEST (mechanical — before you push)
 • Step 1: Push your branch (fail-closed verification) · Step 2: Gather context
-• Step 2b: Pre-gate self-review (CLOSED — nothing to run while .gc/pregate.off exists)
+• Step 2b: Pre-gate self-review (CLOSED — nothing to run)
 • Step 3: Create the ready-for-gate marker · Step 4: Report · Common Issues
 
 Signal that your work is complete and ready to pass through the quality gate.
