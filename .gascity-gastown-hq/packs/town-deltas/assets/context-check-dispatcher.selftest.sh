@@ -71,6 +71,14 @@ CONTEXT_CHECK_EXCLUDE_PREFIXES="type:quality-gate gate-status: nudge: reviewer-i
 # Pin heuristic thresholds so length-based assertions are deterministic.
 CONTEXT_CHECK_THIN_MAXLEN=40
 CONTEXT_CHECK_READY_MINLEN=120
+# ga-eplel5u: the canonical park vocabulary (scripts/bead_state.py — the one R8 of lifecycle-coherence-janitor.sh enforces) is
+# loaded ONCE, here at top level: a load inside $(...) would run in a subshell and be thrown away. Every context_check_is_parked
+# below then runs against this tree's REAL vocabulary; the unreadable cases are driven on purpose in Scenario 4a4.
+if declare -F context_check_park_vocab_load >/dev/null 2>&1; then
+  context_check_park_vocab_load
+else
+  bad "the dispatcher does not define context_check_park_vocab_load (ga-eplel5u): its park check is still a private list"
+fi
 
 # ── Scenario 1: type eligibility ──────────────────────────────────────────────
 echo "Scenario 1: type eligibility — bug/chore/task/debt + feature checkable; others not"
@@ -143,11 +151,19 @@ echo "Scenario 4a: park-exclusion — needs-human/pool:refused:*/story:blocked/p
   && ok "needs-human:technical (colon-suffixed) → parked (ga-r8haw)" || bad "needs-human:technical → expected parked (ga-r8haw)"
 [ "$(context_check_is_parked "lane:small,needs-human-decision,area:infra")" = "yes" ] \
   && ok "needs-human-decision mixed with unrelated labels → parked (ga-r8haw)" || bad "mixed labels → expected parked (ga-r8haw)"
-# Negative control: a label that merely SHARES the "needs-human" characters
-# without the "-"/":" separator must NOT false-positive (mirrors the "PREFIX
-# of needs-human → ok" negative control in quality-gate-park-unapproved.selftest.sh).
-[ "$(context_check_is_parked "needs-humanoid-unrelated")" = "no" ] \
-  && ok "needs-humanoid-unrelated (no separator) → NOT parked, no over-match (ga-r8haw)" || bad "needs-humanoid-unrelated → expected NOT parked (ga-r8haw)"
+# ga-r8haw's negative control was needs-humanoid-unrelated (the "needs-human"
+# characters WITHOUT the "-"/":" separator → NOT parked, no over-match). ga-eplel5u
+# reversed it on purpose: the canonical vocabulary matches the bare prefix
+# "needs-human" by raw startswith (bead_state.py: "startswith cru cobre exato +
+# ':...' + '-...' num só entry"), and R8 of the janitor strips the arm labels of a
+# bead carrying such a label — so a stricter reading here is half of a strip/re-arm
+# loop. Measured 12/11: no label of the 111 non-closed HQ beads is in that gap, so
+# nothing real changes. The over-match control that remains is a label that merely
+# CONTAINS the text instead of starting with it.
+[ "$(context_check_is_parked "needs-humanoid-unrelated")" = "yes" ] \
+  && ok "needs-humanoid-unrelated → parked (canonical raw startswith, ga-eplel5u; R8 strips its arm labels too)" || bad "needs-humanoid-unrelated → expected parked (canonical vocabulary, ga-eplel5u)"
+[ "$(context_check_is_parked "team:needs-human-followup")" = "no" ] \
+  && ok "team:needs-human-followup (contains the text, does not start with it) → NOT parked, no over-match" || bad "team:needs-human-followup → expected NOT parked"
 [ "$(context_check_is_parked "tech-debt,lane:small")" = "no" ] && ok "no park label → not parked" || bad "clean labels → expected not parked"
 [ "$(context_check_is_parked "")" = "no" ] && ok "empty labels → not parked" || bad "empty → expected not parked"
 # ga-66wc repro: a park label surviving ALONE (ctx:ready/exec:auto already stripped
@@ -194,12 +210,17 @@ echo "Scenario 4a3: park-exclusion (ga-7mbry) — blocked:*/pilot:refused-reason
 [ "$(context_check_is_parked "blocked:external-quota-motherduck")" = "yes" ] && ok "blocked:<reason> → parked (ga-7mbry, wa-ic1uw repro)" || bad "blocked:<reason> → expected parked"
 [ "$(context_check_is_parked "blocked:needs-remeasure")" = "yes" ] && ok "blocked:<other reason> prefix matches any suffix" || bad "blocked:<other> → expected parked"
 [ "$(context_check_is_parked "lane:small,blocked:external-quota-motherduck,area:infra")" = "yes" ] && ok "blocked:<reason> mixed with unrelated labels → parked" || bad "mixed labels → expected parked"
-# Negative control: "blocked-by:*" is a DIFFERENT label family (points at what
-# blocks a bead, not "this bead IS blocked") — must not false-positive through
-# the colon-only blocked:* match, mirroring the needs-humanoid negative control
-# above and pilot-dispatcher.sh's own ga-4iw15 "blocked:[^,]*" scope (colon only).
-[ "$(context_check_is_parked "blocked-by:wa-10srb")" = "no" ] \
-  && ok "blocked-by:<id> (different label family) → NOT parked, no over-match (ga-7mbry)" || bad "blocked-by:<id> → expected NOT parked"
+# "blocked-by:*" used to be the negative control here (a pointer at what blocks the
+# bead, not "this bead IS blocked", so the colon-only blocked:* match left it armable —
+# ga-7mbry). ga-eplel5u reversed it on purpose: the canonical vocabulary (bead_state.py
+# PARK_PREFIXES has "blocked-by:" and the bare "blocked") parks it and R8 of the janitor
+# strips the arm labels of a bead carrying it, so a daemon that re-armed it was one half
+# of a strip/re-arm loop. The over-match control that remains is a label that merely
+# ends in "blocked" without being in that family.
+[ "$(context_check_is_parked "blocked-by:wa-10srb")" = "yes" ] \
+  && ok "blocked-by:<id> → parked (canonical vocabulary, ga-eplel5u: R8 strips its arm labels, so it is never re-armed)" || bad "blocked-by:<id> → expected parked (canonical vocabulary, ga-eplel5u)"
+[ "$(context_check_is_parked "unblocked,notblocked:x")" = "no" ] \
+  && ok "labels that merely END in 'blocked' → NOT parked, no over-match" || bad "unblocked / notblocked:x → expected NOT parked"
 [ "$(context_check_is_parked "pilot:refused-reason:oracle-named-executor")" = "yes" ] && ok "pilot:refused-reason:<slug> → parked (ga-uvfs6 audit label)" || bad "pilot:refused-reason:<slug> → expected parked"
 [ "$(context_check_is_parked "story:in-flight,pilot:refused-reason:cross-rig-framework")" = "yes" ] && ok "pilot:refused-reason:<slug> mixed with unrelated labels → parked" || bad "mixed labels → expected parked"
 [ "$(context_check_is_parked "needs:engine-window")" = "yes" ] && ok "needs:engine-window → parked (ga-vhyd exact label)" || bad "needs:engine-window → expected parked"
@@ -212,6 +233,218 @@ echo "Scenario 4a3: park-exclusion (ga-7mbry) — blocked:*/pilot:refused-reason
 [ "$(context_check_is_candidate "wa-ic1uw" "bug" "blocked:external-quota-motherduck,lane:small" "false" "no")" = "no" ] \
   && ok "wa-ic1uw-shaped bead (parked via blocked:*, ctx:* stripped) → NOT a candidate (no re-arm, ga-7mbry)" \
   || bad "REGRESSION ga-7mbry: blocked:*-parked bead with ctx:* stripped would be re-judged and re-armed"
+
+# ── Scenario 4a4 (ga-eplel5u): ONE park vocabulary for the guard (R8) and for this daemon ──────────────────────────────────
+# R8 of lifecycle-coherence-janitor.sh strips ctx:ready/exec:auto from any bead that carries a label of bead_state.py's
+# PARK_PREFIXES (startswith) or PARK_EXACT. This daemon is the only writer of those two labels and judged "parked?" with a
+# private, shorter list: whatever the vocabulary had and that list lacked was re-armed after R8 stripped it, over and over
+# (ga-eplel5u reports 315-730 R8 strips a day). Measured on the live HQ, 12/11: 4 of 10 armed beads were such shapes. Proved here: the daemon follows
+# the vocabulary (not a copy of it), it agrees with R8's own predicate run as shipped, and a vocabulary it cannot read arms
+# nothing instead of reading as "no bead is parked".
+echo "Scenario 4a4: canonical park vocabulary (ga-eplel5u) — what R8 strips, this daemon never re-arms"
+_p4="$(mktemp -d)"
+_HQS="$SELF_DIR/../../../scripts"
+cat > "$_p4/vocab.py" <<'PYEOF'
+# argv: <scripts dir> <mode>. The REAL vocabulary, read the way R8's own `_park_vocab_json` reads it.
+import json, sys
+sys.path.insert(0, sys.argv[1])
+from bead_state import PARK_PREFIXES, PARK_EXACT
+mode = sys.argv[2]
+if mode == "counts":
+    print(len(PARK_PREFIXES), len(PARK_EXACT))
+elif mode == "json":
+    print(json.dumps({"prefixes": list(PARK_PREFIXES), "exact": list(PARK_EXACT)}))
+elif mode == "parked":   # every label the vocabulary parks: each prefix bare / + suffix / + ':' suffix, and each exact label
+    for p in PARK_PREFIXES:
+        print(p); print(p + "zz"); print(p + "zz:yy")
+    for e in sorted(PARK_EXACT):
+        print(e)
+elif mode == "free":     # an exact label plus a suffix that no prefix covers: exact means exact
+    for e in sorted(PARK_EXACT):
+        for v in (e + "-zz", e + ":zz"):
+            if not any(v.startswith(p) for p in PARK_PREFIXES):
+                print(v)
+elif mode == "subset":   # stdin: labels. Prints the ones the VOCABULARY ALONE does not park.
+    for l in sys.stdin.read().split():
+        if not (l in PARK_EXACT or any(l.startswith(p) for p in PARK_PREFIXES)):
+            print(l)
+PYEOF
+cat > "$_p4/r8.py" <<'PYEOF'
+# argv: <janitor.sh>. Prints R8's jq program exactly as the shipped janitor runs it (the text between its quotes).
+import re, sys
+src = open(sys.argv[1], encoding="utf-8").read()
+m = re.search(r"jq -r --argjson pv \"\$_park_vocab\" '(\.\[\] \| \(\[\.labels\[\]\?\]\) as \$l.*?)' 2>/dev/null\); do", src, re.S)
+if not m:
+    sys.exit(3)
+sys.stdout.write(m.group(1))
+PYEOF
+# _p4_cnt <array name> — its length, or "unset" (a tree without the loader has no such array, and `set -u` would kill the run).
+_p4_cnt() { if declare -p "$1" >/dev/null 2>&1; then eval "echo \${#$1[@]}"; else echo "unset"; fi; }
+_p4_want="$(python3 -I "$_p4/vocab.py" "$_HQS" counts 2>/dev/null || true)"
+if [ "${_CC_PARK_STATE:-unset}" = "ok" ] && [ -n "$_p4_want" ] && [ "$(_p4_cnt _CC_PARK_PREFIXES) $(_p4_cnt _CC_PARK_EXACT)" = "$_p4_want" ]; then
+  ok "4a4a: the vocabulary loads from this tree's scripts/bead_state.py — ${_p4_want% *} prefixes + ${_p4_want#* } exact labels, the counts of the source"
+else
+  bad "4a4a: the vocabulary did not load as the source has it (state=${_CC_PARK_STATE:-unset} loaded='$(_p4_cnt _CC_PARK_PREFIXES) $(_p4_cnt _CC_PARK_EXACT)' source='${_p4_want:-<unreadable>}' why='${_CC_PARK_WHY:-}')"
+fi
+# 4a4b/4a4c — driven by the LIVE vocabulary, so a label added to bead_state.py tomorrow is probed without editing this file.
+if python3 -I "$_p4/vocab.py" "$_HQS" parked > "$_p4/parked.txt" 2>/dev/null; then
+  _p4_n=0; _p4_miss=""
+  while IFS= read -r _p4_l; do
+    [ -n "$_p4_l" ] || continue
+    _p4_n=$((_p4_n+1))
+    [ "$(context_check_is_parked "$_p4_l")" = "yes" ] || _p4_miss="$_p4_miss $_p4_l"
+  done < "$_p4/parked.txt"
+  if [ "$_p4_n" -gt 0 ] && [ -z "$_p4_miss" ]; then
+    ok "4a4b: all $_p4_n labels the live vocabulary parks (each prefix bare, with a suffix and with a ':' suffix; each exact label) are parked here"
+  else
+    bad "4a4b: $_p4_n probed, NOT parked here:${_p4_miss:- <none probed>}"
+  fi
+else
+  bad "4a4b: could not read $_HQS/bead_state.py — the vocabulary probes prove nothing"
+fi
+if python3 -I "$_p4/vocab.py" "$_HQS" free > "$_p4/free.txt" 2>/dev/null; then
+  _p4_n=0; _p4_hit=""
+  while IFS= read -r _p4_l; do
+    [ -n "$_p4_l" ] || continue
+    _p4_n=$((_p4_n+1))
+    [ "$(context_check_is_parked "$_p4_l")" = "no" ] || _p4_hit="$_p4_hit $_p4_l"
+  done < "$_p4/free.txt"
+  if [ "$_p4_n" -gt 0 ] && [ -z "$_p4_hit" ]; then
+    ok "4a4c: $_p4_n labels that only EXTEND an exact vocabulary label (pilot:held-zz, on-device:zz...) are NOT parked — exact means exact"
+  else
+    bad "4a4c: $_p4_n probed, parked although only an exact label was extended:${_p4_hit:- <none probed>}"
+  fi
+else
+  bad "4a4c: could not read $_HQS/bead_state.py — the exact-means-exact probes prove nothing"
+fi
+# 4a4d — the shapes of the live census (12/11) and the near-misses that must stay armable.
+_p4_check() {   # <want yes|no|unknown> <labels_csv> <what it is>
+  local got; got="$(context_check_is_parked "$2")"
+  if [ "$got" = "$1" ]; then ok "4a4d: $3 → $1"; else bad "4a4d: $3 → expected $1, got $got (labels: $2)"; fi
+}
+_p4_check yes "pilot:held-until:1793144146" "ga-1wvxej0 shape, an EXPIRED stamp alone (R8 reads the flat vocabulary; R6 prunes it, the daemon must not arm it meanwhile)"
+_p4_check yes "pilot:held-until:4102444800" "ga-f7d9si4 shape, a live stamp alone (the Pilot treats it as a hold by itself)"
+_p4_check yes "waiting-on:disco-10gb-3dias" "ga-8iknst shape, waiting-on:<what>"
+_p4_check yes "next-action:athos-decide" "ga-lj4wnn1 shape, next-action:<who>"
+_p4_check yes "lane:small,next-action:mayor,area:infra" "next-action:mayor among unrelated labels"
+_p4_check yes "pilot:held" "the bare pilot:held"
+_p4_check yes "depends-on:ga-1,framework:engine" "depends-on:<id> / framework:engine"
+_p4_check yes "needs:rehome-property" "needs:rehome-<x>"
+_p4_check no  "pilot:held-count:ga-slug:2" "the pilot:held-count bookkeeping label (bead_state keeps it apart from the exact pilot:held)"
+_p4_check no  "lane:small,area:infra,story:approved" "ordinary working labels"
+_p4_check no  "needs-label-review" "needs-label-review (a heuristic flag, deliberately NOT a park label since ga-58bnot)"
+if [ "$(context_check_is_candidate "ga-1wvxej0" "task" "pilot:held-until:1793144146" "false" "no")" = "no" ] \
+   && [ "$(context_check_is_candidate "ga-lj4wnn1" "task" "next-action:athos-decide,area:infra" "false" "no")" = "no" ] \
+   && [ "$(context_check_is_candidate "wa-ok" "task" "lane:small" "false" "no")" = "yes" ]; then
+  ok "4a4d: is_candidate — the two census beads (pilot:held-until, next-action) are NOT candidates, a clean bead still is"
+else
+  bad "4a4d: is_candidate does not follow the vocabulary for the census beads"
+fi
+# 4a4e — parity with R8, executed: R8's jq program is pulled out of the SHIPPED janitor and run next to this daemon's predicate on
+# one corpus (the vocabulary's own labels, their near-misses, the private list's labels, ordinary labels). Any label R8 strips on
+# and this daemon would arm — or the other way round — is a strip/re-arm loop in the making.
+if _p4_r8prog="$(python3 -I "$_p4/r8.py" "$_HQS/lifecycle-coherence-janitor.sh" 2>/dev/null)" && [ -n "$_p4_r8prog" ]; then
+  { cat "$_p4/parked.txt" "$_p4/free.txt"
+    printf '%s\n' needs-human needs-human-decision needs-human:technical story:blocked pool:refused:x pilot:refused-reason:x blocked:x \
+      needs:engine-window gate:needs-human gate:needs-human:technical no-auto-dispatch pilot:no-auto-dispatch pilot:held-until:1793144146 \
+      waiting-on:x next-action:mayor blocked-by:x lane:small area:infra story:approved ctx:thin exec:manual pilot:held-count:ga-slug:2 \
+      unblocked notblocked:x needs-humanoid-unrelated team:no-auto-dispatch-followup needs-label-review
+  } | sort -u > "$_p4/corpus.txt"
+  _p4_beads="$(jq -R -s -c 'split("\n") | map(select(length>0)) | to_entries | map({id:("b"+(.key|tostring)), labels:[.value]})' "$_p4/corpus.txt")"
+  _p4_r8="$(printf '%s' "$_p4_beads" | jq -r --argjson pv "$(python3 -I "$_p4/vocab.py" "$_HQS" json)" "$_p4_r8prog" | sort)"
+  _p4_me=""; _p4_k=0
+  while IFS= read -r _p4_l; do
+    [ -n "$_p4_l" ] || continue
+    [ "$(context_check_is_parked "$_p4_l")" = "yes" ] && _p4_me="$_p4_me b$_p4_k"
+    _p4_k=$((_p4_k+1))
+  done < "$_p4/corpus.txt"
+  _p4_me="$(printf '%s\n' $_p4_me | sort)"
+  if [ "$_p4_k" -gt 20 ] && [ -n "$_p4_r8" ] && [ "$_p4_r8" = "$_p4_me" ]; then
+    ok "4a4e: R8's shipped predicate and this daemon's park check agree on all $_p4_k corpus labels ($(printf '%s\n' "$_p4_r8" | wc -l | tr -d ' ') parked)"
+  else
+    bad "4a4e: R8 and this daemon disagree (corpus $_p4_k labels): R8-only/daemon-only ids = $(diff <(printf '%s\n' "$_p4_r8") <(printf '%s\n' "$_p4_me") | grep '^[<>]' | tr '\n' ' ')"
+  fi
+else
+  bad "4a4e: could not pull R8's jq program out of the janitor (its layout changed?) — the parity proof is gone, restore it"
+fi
+# 4a4j — the claim in the dispatcher's own comment: every pattern of its private list (one example per `case` arm of
+# context_check_is_parked) is ALSO parked by the vocabulary alone, so the private list only decides when the vocabulary is unreadable.
+if _p4_missing="$(printf '%s\n' needs-human needs-human:technical needs-human-decision story:blocked pilot:no-auto-dispatch no-auto-dispatch \
+    pool:refused:x blocked:x pilot:refused-reason:x needs:engine-window gate:needs-human gate:needs-human:technical \
+    | python3 -I "$_p4/vocab.py" "$_HQS" subset 2>/dev/null)" && [ -z "$_p4_missing" ]; then
+  ok "4a4j: all 12 private-list patterns (an example of each case arm) are also parked by the canonical vocabulary alone"
+else
+  bad "4a4j: private-list labels the canonical vocabulary does NOT park (or the read failed): ${_p4_missing:-<could not read>} — the dispatcher's comment 'the private list only decides when the vocabulary is unreadable' is false"
+fi
+# 4a4f — a vocabulary the daemon cannot read is "unknown", never "no": a daemon that cannot tell parked from unparked arms nothing.
+# Each case loads through the override seam, then restores the real vocabulary below.
+# _p4_load <bead_state.py|""> [PATH] — the loader through the override seam ("" = the default path; PATH, when given, is the PATH it runs
+# with), or a state no assertion accepts on a tree that has no loader (so the run goes red instead of dying on "command not found").
+_p4_load() {
+  if declare -F context_check_park_vocab_load >/dev/null 2>&1; then PATH="${2:-$PATH}" CONTEXT_CHECK_BEAD_STATE_PY_OVERRIDE="$1" context_check_park_vocab_load
+  else _CC_PARK_STATE="no-loader"; fi
+}
+_p4_unavail() {   # <what is wrong with it> <path of the bead_state.py to load> <a phrase the WARN's reason must contain> [PATH to run with]
+  local why="$1" py="$2" want="$3" a b c d e f=no
+  _p4_load "$py" "${4:-}"
+  case "${_CC_PARK_WHY:-}" in *"$want"*) f=yes ;; esac
+  a="${_CC_PARK_STATE:-unset}"
+  b="$(context_check_is_parked "lane:small")"
+  c="$(context_check_is_candidate "wa-x" "bug" "lane:small" "false" "no")"
+  d="$(context_check_is_parked "needs-human")"
+  e="$(context_check_is_parked "")"
+  if [ "$a" = "unavailable" ] && [ "$b" = "unknown" ] && [ "$c" = "no" ] && [ "$d" = "yes" ] && [ "$e" = "no" ] \
+     && [ "$(_p4_cnt _CC_PARK_PREFIXES)" = "0" ] && [ "$(_p4_cnt _CC_PARK_EXACT)" = "0" ] && [ "$f" = "yes" ]; then
+    ok "4a4f: $why → unavailable, and the reason names the cause ('$want'): an ordinary label is 'unknown' not 'no', the bead is not a candidate, the private list still answers its own labels, no label list means not parked"
+  else
+    bad "4a4f: $why → state=$a ordinary=$b candidate=$c needs-human=$d empty=$e prefixes=$(_p4_cnt _CC_PARK_PREFIXES) exact=$(_p4_cnt _CC_PARK_EXACT) why='${_CC_PARK_WHY:-}' (want unavailable/unknown/no/yes/no/0/0/a reason containing '$want')"
+  fi
+}
+# _p4_fake <dir> <line>... — a bead_state.py with those lines, in its own dir (the loader imports `bead_state` from the dir of the path).
+_p4_fake() { local d="$_p4/$1"; shift; mkdir -p "$d"; printf '%s\n' "$@" > "$d/bead_state.py"; }
+_p4_fake raise 'raise RuntimeError("boom")'
+_p4_fake empty 'PARK_PREFIXES = ()' 'PARK_EXACT = frozenset()'
+_p4_fake emptystr 'PARK_PREFIXES = ("",)' 'PARK_EXACT = frozenset({"x"})'
+_p4_fake nonstr 'PARK_PREFIXES = (5,)' 'PARK_EXACT = frozenset({"x"})'
+_p4_fake noexact 'PARK_PREFIXES = ("zz-park:",)' 'PARK_EXACT = frozenset()'
+_p4_fake noise 'print("loading the vocabulary...")' 'PARK_PREFIXES = ("zz-park:",)' 'PARK_EXACT = frozenset({"zz-exact"})'
+_p4_fake noiseafter 'import atexit' 'atexit.register(lambda: print("bye"))' 'PARK_PREFIXES = ("zz-park:",)' 'PARK_EXACT = frozenset({"zz-exact"})'
+_p4_unavail "no bead_state.py at the path" "$_p4/missing/bead_state.py" "no bead_state.py at"
+_p4_unavail "a bead_state.py that raises on import" "$_p4/raise/bead_state.py" "RuntimeError: boom"
+_p4_unavail "an EMPTY vocabulary (must not read as 'nothing is parked')" "$_p4/empty/bead_state.py" "empty or malformed vocabulary"
+_p4_unavail "a vocabulary with an empty-string prefix (it would park every bead)" "$_p4/emptystr/bead_state.py" "empty or malformed vocabulary"
+_p4_unavail "a vocabulary with a non-string entry" "$_p4/nonstr/bead_state.py" "empty or malformed vocabulary"
+_p4_unavail "a vocabulary with no exact labels (truncated)" "$_p4/noexact/bead_state.py" "empty or malformed vocabulary"
+_p4_unavail "a valid vocabulary whose module also prints to stdout on import (the read cannot be trusted)" "$_p4/noise/bead_state.py" "unexpected output"
+_p4_unavail "a valid vocabulary followed by a stray line at exit (half of it is already parsed: it must not be left behind)" "$_p4/noiseafter/bead_state.py" "unexpected output"
+# The READ itself failing, with a perfectly good bead_state.py: no python3 on PATH at all, and a python3 that dies with exit 3.
+mkdir -p "$_p4/nobin" "$_p4/failbin"
+printf '%s\n' '#!/bin/sh' 'exit 3' > "$_p4/failbin/python3"; chmod +x "$_p4/failbin/python3"
+_p4_unavail "python3 absent from PATH (the real bead_state.py is fine)" "$_HQS/bead_state.py" "python3 not found on PATH" "$_p4/nobin"
+_p4_unavail "a python3 that exits 3 and prints nothing (the real bead_state.py is fine)" "$_HQS/bead_state.py" "python3 printed nothing" "$_p4/failbin:$PATH"
+# 4a4g — the daemon uses what it LOADED, not a copy: a tiny fake vocabulary parks exactly its own labels.
+_p4_fake fake 'PARK_PREFIXES = ("zz-park:",)' 'PARK_EXACT = frozenset({"zz-exact"})'
+_p4_load "$_p4/fake/bead_state.py"
+if [ "${_CC_PARK_STATE:-unset}" = "ok" ] && [ "$(context_check_is_parked "zz-park:x")" = "yes" ] && [ "$(context_check_is_parked "zz-exact")" = "yes" ] \
+   && [ "$(context_check_is_parked "waiting-on:x")" = "no" ] && [ "$(context_check_is_parked "lane:small")" = "no" ]; then
+  ok "4a4g: with a fake vocabulary loaded the daemon parks exactly the fake labels (waiting-on:x is no longer parked) — it reads the loaded vocabulary, it does not carry a copy"
+else
+  bad "4a4g: the daemon did not follow the loaded fake vocabulary (state=${_CC_PARK_STATE:-unset} zz-park:x=$(context_check_is_parked "zz-park:x") waiting-on:x=$(context_check_is_parked "waiting-on:x"))"
+fi
+_p4_load ""   # back to the real one for everything below
+if [ "${_CC_PARK_STATE:-unset}" = "ok" ] && [ "$(context_check_is_parked "waiting-on:x")" = "yes" ]; then
+  ok "4a4h: the real vocabulary is loaded again after the unreadable/fake cases"
+else
+  bad "4a4h: could not restore the real vocabulary (state=${_CC_PARK_STATE:-unset} why='${_CC_PARK_WHY:-}') — the scenarios below would run on a broken one"
+fi
+# 4a4i — drift guard: both ends read the SAME two constants of the SAME module. If one of them stops, they are two lists again.
+_p4_imp='from bead_state import PARK_PREFIXES, PARK_EXACT'
+if grep -F "$_p4_imp" "$DISPATCHER" >/dev/null && grep -F "$_p4_imp" "$_HQS/lifecycle-coherence-janitor.sh" >/dev/null; then
+  ok "4a4i: the dispatcher and R8 of the janitor both import PARK_PREFIXES/PARK_EXACT from bead_state.py (one vocabulary)"
+else
+  bad "4a4i: the dispatcher and the janitor no longer read the same vocabulary (an import of '$_p4_imp' is missing in one of them)"
+fi
+rm -rf "$_p4"
 
 # ── Scenario 4a2: sling-stub detection (ga-mzkx2) ──────────────────────────────
 echo "Scenario 4a2: context_check_is_sling_stub — Pilot-minted dispatch stubs are by-design empty, not thin"
@@ -1160,11 +1393,17 @@ _c14_log="$_c14/hq/.gc/logs/context-check-dispatcher.log"
 _c14_run() {
   : > "$C14_LEDGER"; : > "$C14_CALLS"; rm -f "$_c14_log"
   local -a _c14_env=(CONTEXT_CHECK_CITY_OVERRIDE="$_c14/hq" CONTEXT_CHECK_STORES="$_c14/hq $_c14/wa"
-    CONTEXT_CHECK_MAX_PER_SWEEP=3 CONTEXT_CHECK_MAX_SONNET_PER_SWEEP=0
+    CONTEXT_CHECK_MAX_PER_SWEEP="${C14_CAP:-3}" CONTEXT_CHECK_MAX_SONNET_PER_SWEEP=0
     CONTEXT_CHECK_EXEC_CLASS=0 PATH="$SANDBOX_PATH")
   [ "${C14_BLOCKED_SEAM:-on}" = "on" ] && _c14_env+=(CONTEXT_CHECK_TEST_BLOCKED_IDS="")
   [ "${C14_BUILT_SEAM:-on}" = "on" ] && _c14_env+=(CONTEXT_CHECK_TEST_BUILT_IDS="")
-  env "${_c14_env[@]}" timeout 120 bash "$1" >/dev/null 2>&1 || true
+  # ga-eplel5u: the park vocabulary is read from <script dir>/../../../scripts/bead_state.py. A COPY of the dispatcher sits in a temp
+  # dir where that is not there, so a copy is pointed at this tree's real one; the shipped file is NOT (its own default path is
+  # under test). C14_VOCAB, when set, wins over both: the park-vocabulary tests break the vocabulary on purpose.
+  if [ -n "${C14_VOCAB+x}" ]; then _c14_env+=(CONTEXT_CHECK_BEAD_STATE_PY_OVERRIDE="$C14_VOCAB")
+  elif [ "$1" != "$DISPATCHER" ]; then _c14_env+=(CONTEXT_CHECK_BEAD_STATE_PY_OVERRIDE="$SELF_DIR/../../../scripts/bead_state.py"); fi
+  C14_RC=0
+  env "${_c14_env[@]}" timeout 120 bash "$1" >/dev/null 2>&1 || C14_RC=$?
 }
 # _c14_judged — the ids that got a verdict, in the order the verdicts were written, space-separated.
 _c14_judged() { awk '$2=="label" && $3=="add" && ($5=="ctx:ready" || $5=="ctx:thin") {printf "%s%s", sep, $4; sep=" "}' "$C14_LEDGER"; }
@@ -1442,6 +1681,58 @@ if grep -E '^consumer[[:space:]]+packs/town-deltas/assets/context-check-dispatch
 else
   ok "14j: the context-check-dispatcher.sh consumer row is gone from work-order.registry.tsv"
 fi
+# ── Scenario 15 (ga-eplel5u): the SWEEP itself — a parked bead is never judged, an unreadable vocabulary judges nothing ─────
+# The two-store stub of Scenario 14 with other fixtures: three ordinary beads as positive controls (a bare one, one with working
+# labels, one with the pilot:held-count bookkeeping label that bead_state keeps apart from the exact pilot:held) and one bead per
+# shape that R8 strips on and the daemon's old private list did not know — the live census of 12/11 plus their relatives.
+echo "Scenario 15: ga-eplel5u — a sweep arms no bead R8 would strip, and a vocabulary it cannot read arms nothing"
+rm -f "$_c14/fix/"*.json
+_c15_future=$(( $(date +%s) + 2592000 ))
+_c15_bead() { _c14_bead "$1" task 2 2026-02-01T00:00:00Z | jq -c --arg l "$2" 'if $l == "" then . else .labels = [$l] end'; }
+_c15_ctl="c15-clean c15-lane c15-held-count"
+_c14_put hq task \
+  "$(_c15_bead c15-clean "")" \
+  "$(_c15_bead c15-lane "lane:small")" \
+  "$(_c15_bead c15-held-count "pilot:held-count:ga-slug:2")" \
+  "$(_c15_bead c15-held-expired "pilot:held-until:1793144146")" \
+  "$(_c15_bead c15-held-live "pilot:held-until:$_c15_future")" \
+  "$(_c15_bead c15-held-bare "pilot:held")" \
+  "$(_c15_bead c15-waiting "waiting-on:disco-10gb-3dias")" \
+  "$(_c15_bead c15-next-action "next-action:athos-decide")" \
+  "$(_c15_bead c15-blocked-by "blocked-by:wa-10srb")" \
+  "$(_c15_bead c15-engine "framework:engine")"
+_c15_sorted() { printf '%s\n' $1 | sort | tr '\n' ' '; }
+C14_CAP=20
+_c14_run "$DISPATCHER"
+_c15_got="$(_c15_sorted "$(_c14_judged)")"
+if [ "$_c15_got" = "$(_c15_sorted "$_c15_ctl")" ]; then
+  ok "15a: judged exactly the 3 ordinary beads — none of the 7 beads carrying a canonical park label (pilot:held-until expired/live, pilot:held, waiting-on, next-action, blocked-by, framework:engine) was armed"
+else
+  bad "15a: wrong beads judged (want: $(_c15_sorted "$_c15_ctl")| got: ${_c15_got:-<nothing>})"
+fi
+if [ "$C14_RC" = "0" ] && ! grep -E 'WARN.*ga-eplel5u' "$_c14_log" >/dev/null 2>&1; then
+  ok "15b: a healthy sweep exits 0 and writes no WARN naming ga-eplel5u (the new signal stays rare enough to be read)"
+else
+  bad "15b: healthy sweep rc=$C14_RC, ga-eplel5u WARNs: $(grep -E 'WARN.*ga-eplel5u' "$_c14_log" 2>/dev/null | head -2 | tr '\n' ';')"
+fi
+# 15c — a vocabulary the sweep cannot read (missing, then empty). Not "no bead is parked" (that would judge all 10 beads, the 7 parked ones too):
+# nothing is judged, nothing is written, not even a list is fetched, and the log says why. Same for an EMPTY vocabulary.
+mkdir -p "$_c14/nov" "$_c14/emptyv"
+printf '%s\n' 'PARK_PREFIXES = ()' 'PARK_EXACT = frozenset()' > "$_c14/emptyv/bead_state.py"
+for _c15_case in "missing:$_c14/nov/bead_state.py" "empty:$_c14/emptyv/bead_state.py"; do
+  C14_VOCAB="${_c15_case#*:}"
+  _c14_run "$DISPATCHER"
+  _c15_gotv="$(_c14_judged)"
+  if [ -z "$_c15_gotv" ] && [ ! -s "$C14_LEDGER" ] && ! grep ' list ' "$C14_CALLS" >/dev/null 2>&1 && [ "$C14_RC" = "0" ] \
+     && grep -E 'WARN.*ga-eplel5u: canonical park vocabulary unavailable .*NOTHING is judged' "$_c14_log" >/dev/null 2>&1 \
+     && grep -F 'Context-check sweep deferred (park vocabulary unavailable, ga-eplel5u)' "$_c14_log" >/dev/null 2>&1; then
+    ok "15c-${_c15_case%%:*}: a ${_c15_case%%:*} vocabulary → rc 0, NOTHING judged or written (no 'bd list' even), a WARN naming ga-eplel5u and a 'sweep deferred' line"
+  else
+    bad "15c-${_c15_case%%:*}: a ${_c15_case%%:*} vocabulary mishandled (judged: '${_c15_gotv:-<nothing>}', writes: $(wc -l < "$C14_LEDGER" | tr -d ' '), rc=$C14_RC, log: $(grep -E 'ga-eplel5u' "$_c14_log" 2>/dev/null | head -2 | tr '\n' ';'))"
+  fi
+done
+unset C14_VOCAB
+C14_CAP=3
 rm -rf "$_c14" "$_c14m" "$_c14n" "$_c14b" "$_c14k" "$_c14w" "$_c14d" "$_c14x" "$_c14y"
 
 echo ""

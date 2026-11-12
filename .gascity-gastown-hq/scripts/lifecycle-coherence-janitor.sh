@@ -667,6 +667,26 @@ _r5_strip_ctx_ready() {  # store id log-tag reason
   fi
 }
 
+# ── R6 held-until-alone (ga-eplel5u) ─────────────────────────────────────────────────────────────────────────────────────────
+# R6 finds holds with `bd list -l pilot:held`. A pilot:held-until stamp WITHOUT pilot:held is a hold too — the Pilot, the pool probes
+# and bead_state.derive() honour a future one by itself (ga-0eib9f) — but R6 never saw it, so once its epoch passed the label stayed
+# for ever. The Pilot and derive() read an expired stamp as "no hold"; R8 reads the flat vocabulary (PARK_PREFIXES has
+# "pilot:held-until:") with no notion of expiry and keeps stripping ctx:ready/exec:auto from the bead, which the context-check
+# dispatcher re-armed (ga-eplel5u reports every ~25 min; ga-1wvxej0 on the live HQ is an armed bead with exactly that expired stamp,
+# and ps-m0bn in property_scrapers is reported the same). The cure is to take the stale label
+# off, with derive()'s own rule (bead_state._labels_after_expired_hold — the selftest runs both on one corpus): the highest READABLE
+# epoch (digits only) is < now ⇒ the hold is over and every pilot:held-until label goes, unreadable ones too. A live stamp, or one
+# with no readable epoch, is never touched: "cannot tell" is not "expired", and the MAX decides because stamps accumulate (ga-4aree).
+# A bead that carries pilot:held belongs to the R6 loop in run_sweep. One tab-separated line per bead to prune: its id, then its
+# stamps. A named variable so the selftest runs this SHIPPED text against the oracle.
+_R6_STAMP_ALONE_JQ='
+  .[] | (.labels // []) as $L
+  | ($L | map(select(type == "string" and startswith("pilot:held-until:")))) as $raw
+  | ($raw | map(ltrimstr("pilot:held-until:") | select(test("^[0-9]+\\z")) | tonumber)) as $ep
+  | select(($ep | length) > 0 and ($ep | max) < $now and (($L | index("pilot:held")) == null))
+  | ([.id] + $raw) | @tsv
+'
+
 run_sweep() {
   if [ "$LCJ_ENABLED" != "1" ]; then log "disabled (LCJ_ENABLED!=1)"; return 0; fi
   # imp10: sweep-level mutual exclusion — only one janitor sweep at a time.
@@ -861,6 +881,8 @@ run_sweep() {
     # R6 (imp19 pilot:held expiry): pilot:held + pilot:held-until:<past-epoch> → strip both
     # (the hold expired). pilot:held + NO pilot:held-until:* → set a 24h default expiry so
     # permanent trapdoors are impossible: every hold now has a ceiling.
+    # (This loop only sees beads that carry pilot:held; an expired pilot:held-until stamp WITHOUT it is pruned by the "R6
+    # held-until-alone" block right after this loop — ga-eplel5u.)
     #
     # ga-sfj3i.1: since that fix, ga-lfvs6/ga-4zqwm ALSO set the bead's real
     # defer_until (bd ready's own field) alongside these labels — but nothing
@@ -899,6 +921,23 @@ run_sweep() {
         log "R6 pilot-held-no-expiry: $id ($(basename "$store")) — stamped default 24h expiry ($_default_expiry)"; n=$((n+1))
       fi
     done
+    # R6 held-until-alone (ga-eplel5u): a pilot:held-until stamp with NO pilot:held, expired — see _R6_STAMP_ALONE_JQ above. Strip
+    # only, never an undefer: a deferral this block did not stamp as a pair with pilot:held is not its to undo.
+    # vazio → nothing to prune, silent; falhou/ilegível (bd list fails, prints no JSON array, jq cannot read it) → one log line saying
+    # the stamps were NOT pruned (not 'none found'), nothing touched, the next sweep asks again.
+    _r6a_rc=0; _r6a_out=""
+    _r6a_json=$("$BD" -C "$store" list --json -n 0 2>/dev/null) || _r6a_rc=$?
+    if [ "$_r6a_rc" -ne 0 ] || ! _r6a_out=$(printf '%s' "$_r6a_json" | jq -r --argjson now "$_now_lcj" "$_R6_STAMP_ALONE_JQ" 2>/dev/null); then
+      log "R6 held-until-alone (ga-eplel5u): bd list failed or was unreadable in $(basename "$store") (bd rc=$_r6a_rc) — expired pilot:held-until stamps NOT pruned this sweep (not 'none found'); retried next sweep"
+    elif [ -n "$_r6a_out" ]; then
+      while IFS=$'\t' read -r -a _r6a_row; do
+        _r6a_id="${_r6a_row[0]:-}"
+        [ -n "$_r6a_id" ] || continue
+        _bead_locked "$_r6a_id" && { log "R6 skip-locked (imp10): $_r6a_id"; continue; }
+        for _r6a_stamp in "${_r6a_row[@]:1}"; do _strip "$store" "$_r6a_id" "$_r6a_stamp"; done
+        log "R6 held-until-alone-expired (ga-eplel5u): $_r6a_id ($(basename "$store")) — no pilot:held and every readable pilot:held-until stamp is past, stripped $(( ${#_r6a_row[@]} - 1 )) stamp(s)"; n=$((n+1))
+      done <<< "$_r6a_out"
+    fi
     # R5 (imp15 invariant auditor): ctx:ready + status=closed → strip ctx:ready + set
     # story:done. R1 already handles story:in-flight and story:approved on closed beads;
     # ctx:ready was missing. A closed bead carrying ctx:ready shows up in the Aprovadas
@@ -1543,6 +1582,17 @@ case "\$a" in
     echo '[{"id":"r9pd-closed","labels":["pilot:dispatched"]},{"id":"r9pd-locked","labels":["pilot:dispatched"]}]' ;;
   *"list -l pilot:dispatching --status closed"*)
     echo '[{"id":"r9pding-closed","labels":["pilot:dispatching"]}]' ;;
+  # R6 held-until-alone (ga-eplel5u): the one unfiltered \`list --json -n 0\` (every non-closed bead) the new R6 block reads — the old
+  # R6 reads \`list -l pilot:held\`. r6a-exp: one EXPIRED stamp alone; r6a-exp2: two expired + an ordinary label; r6a-live: a live
+  # stamp alone (a hold by itself); r6a-mixed: expired + live (the MAX decides); r6a-unreadable: a stamp with no epoch (cannot tell);
+  # r6a-exp-unreadable: expired + unreadable (derive() drops every stamp); r6a-with-held: has pilot:held (the OLD loop's bead, not this
+  # block's); r6a-locked: expired, advisory-locked; r6a-none / r6a-nolabels: nothing to prune; r6a-nonstr: an expired stamp next to a
+  # number and a null (a malformed entry must not take the store's R6 down). LCJ_TEST_R6A_FAIL=1 → bd fails,
+  # =garbage → bd prints no JSON.
+  *"list --json -n 0"*)
+    [ "\${LCJ_TEST_R6A_FAIL:-0}" = "1" ] && exit 1
+    [ "\${LCJ_TEST_R6A_FAIL:-0}" = "garbage" ] && { echo 'not json at all'; exit 0; }
+    echo '[{"id":"r6a-exp","labels":["pilot:held-until:1000000"]},{"id":"r6a-exp2","labels":["lane:small","pilot:held-until:1000000","pilot:held-until:1000001"]},{"id":"r6a-live","labels":["pilot:held-until:$(( $(date +%s) + 86400 ))"]},{"id":"r6a-mixed","labels":["pilot:held-until:1000000","pilot:held-until:$(( $(date +%s) + 86400 ))"]},{"id":"r6a-unreadable","labels":["pilot:held-until:soon"]},{"id":"r6a-exp-unreadable","labels":["pilot:held-until:1000000","pilot:held-until:soon"]},{"id":"r6a-with-held","labels":["pilot:held","pilot:held-until:1000000"]},{"id":"r6a-locked","labels":["pilot:held-until:1000000"]},{"id":"r6a-none","labels":["lane:small"]},{"id":"r6a-nolabels"},{"id":"r6a-nonstr","labels":["pilot:held-until:1000000",5,null]}]' ;;
   *"label remove"*|*"label add"*|*"update"*|*"dolt commit"*|*"undefer"*) echo "\$a" >> "$ACT" ;;
   *) echo '[]' ;;
 esac
@@ -1641,6 +1691,8 @@ GITSHIM
   echo "$$:$(date +%s)" > "$LIFECYCLE_LOCK_DIR/r8-locked"
   # ga-hqvel: same, for r9pd-locked (R9 closed-dispatched-vestigial must also honor it)
   echo "$$:$(date +%s)" > "$LIFECYCLE_LOCK_DIR/r9pd-locked"
+  # ga-eplel5u: same, for r6a-locked (R6 held-until-alone must also honor it)
+  echo "$$:$(date +%s)" > "$LIFECYCLE_LOCK_DIR/r6a-locked"
   run_sweep
   echo "Scenario: janitor normalizes R1-R5 incoherences, respects locks (imp10), never touches coherent beads"
   grep -q 'label remove cl-1 story:in-flight' "$ACT" && ok "R1: closed+story:in-flight → stripped"            || bad "R1 not stripped"
@@ -1682,6 +1734,24 @@ GITSHIM
   # trading "dispatched slightly early" for "stuck invisible forever".
   grep -q 'undefer r6-exp'    "$ACT" && ok "R6 (ga-sfj3i.1): expired hold → also undeferred (restores bd-ready visibility, not just the label)" || bad "R6 (ga-sfj3i.1) regression: expired hold did not undefer — a real-world hold would stay invisible forever"
   grep -q 'undefer r6-noexp'  "$ACT" && bad "R6 (ga-sfj3i.1) regression: undeferred a bead whose hold has NOT expired this pass (it just got a fresh default-ceiling stamp)" || ok "R6 (ga-sfj3i.1): did not undefer the fresh-ceiling bead (no expiry to act on yet)"
+  # R6 held-until-alone (ga-eplel5u): R6 found holds by `list -l pilot:held`, so a pilot:held-until stamp WITHOUT pilot:held — a hold the
+  # Pilot honours by itself — was never looked at. Once expired it stayed a park label for R8 (which reads the flat vocabulary, no
+  # expiry) for ever, while the Pilot and bead_state.derive() already read it as "no hold": ga-1wvxej0 / ps-m0bn. The rule is derive()'s
+  # (the oracle test below runs both): the highest READABLE epoch is past ⇒ every pilot:held-until stamp goes. Strip only — it never
+  # undefers: a deferral this block did not stamp as a pair with pilot:held is not its to undo.
+  grep -q 'label remove r6a-exp pilot:held-until:1000000' "$ACT" && ok "R6 held-until-alone (ga-eplel5u): an EXPIRED pilot:held-until stamp with no pilot:held → stripped (the ga-1wvxej0 / ps-m0bn shape)" || bad "R6 held-until-alone (ga-eplel5u): did not strip the expired stamp of r6a-exp (no pilot:held)"
+  { grep -q 'label remove r6a-exp2 pilot:held-until:1000000' "$ACT" && grep -q 'label remove r6a-exp2 pilot:held-until:1000001' "$ACT"; } && ok "R6 held-until-alone (ga-eplel5u): TWO expired stamps → both stripped (stamps accumulate, ga-4aree)" || bad "R6 held-until-alone (ga-eplel5u): r6a-exp2 did not lose both expired stamps"
+  grep -q 'label remove r6a-nonstr pilot:held-until:1000000' "$ACT" && ok "R6 held-until-alone (ga-eplel5u): a non-string entry among the labels (a number, a null) does not take the store's R6 down — its stamp, and every other bead's, is still stripped" || bad "R6 held-until-alone (ga-eplel5u): r6a-nonstr (a number and a null among its labels) was not processed — one malformed entry must not stop the whole store"
+  grep -q 'r6a-exp2 lane:small' "$ACT" && bad "R6 held-until-alone (ga-eplel5u): stripped a label that is not a pilot:held-until stamp" || ok "R6 held-until-alone (ga-eplel5u): only stamps are stripped, the ordinary label stays"
+  grep -q 'r6a-live' "$ACT" && bad "R6 held-until-alone (ga-eplel5u): touched a LIVE stamp alone — a hold by itself (ga-0eib9f)" || ok "R6 held-until-alone (ga-eplel5u): a live stamp alone is left alone"
+  grep -q 'r6a-mixed' "$ACT" && bad "R6 held-until-alone (ga-eplel5u): acted on an expired + LIVE pair — the highest epoch decides (ga-4aree), the hold is still live" || ok "R6 held-until-alone (ga-eplel5u): expired + live stamps → left alone (the MAX decides)"
+  grep -q 'r6a-unreadable ' "$ACT" && bad "R6 held-until-alone (ga-eplel5u): stripped an UNREADABLE stamp alone — 'cannot tell' is not 'expired'" || ok "R6 held-until-alone (ga-eplel5u): an unreadable stamp alone is left alone (cannot tell → inert)"
+  { grep -q 'label remove r6a-exp-unreadable pilot:held-until:1000000' "$ACT" && grep -q 'label remove r6a-exp-unreadable pilot:held-until:soon' "$ACT"; } && ok "R6 held-until-alone (ga-eplel5u): expired + unreadable → both go, as derive() drops every stamp once a readable one is past" || bad "R6 held-until-alone (ga-eplel5u): r6a-exp-unreadable kept a stamp derive() would drop"
+  grep -q 'r6a-with-held' "$ACT" && bad "R6 held-until-alone (ga-eplel5u): took a bead that has pilot:held — the pilot:held loop owns it" || ok "R6 held-until-alone (ga-eplel5u): a bead with pilot:held is not this block's (no double handling)"
+  grep -q 'r6a-locked' "$ACT" && bad "R6 held-until-alone (ga-eplel5u): touched an advisory-locked bead (must be skipped, R4-R9 convention)" || ok "R6 held-until-alone (ga-eplel5u): skipped the advisory-locked bead"
+  { grep -q 'r6a-none' "$ACT" || grep -q 'r6a-nolabels' "$ACT"; } && bad "R6 held-until-alone (ga-eplel5u): touched a bead with no stamp (or no labels at all)" || ok "R6 held-until-alone (ga-eplel5u): beads without a stamp, or without a labels key, are left alone"
+  grep -q 'undefer r6a' "$ACT" && bad "R6 held-until-alone (ga-eplel5u): undeferred a bead it only stripped a stamp from" || ok "R6 held-until-alone (ga-eplel5u): strip only, never an undefer"
+  [ "$(grep -c 'label remove r6-exp pilot:held-until:1000000' "$ACT")" = "1" ] && ok "R6 held-until-alone (ga-eplel5u): the old pilot:held bead r6-exp was stripped exactly once (the new block did not repeat it)" || bad "R6 held-until-alone (ga-eplel5u): r6-exp's stamp was stripped $(grep -c 'label remove r6-exp pilot:held-until:1000000' "$ACT") times"  # third-state-waiver: test assertion; a failed grep leaves an empty count, the comparison is false and the case reports bad
   grep -q 'label remove r5 ctx:ready'         "$ACT" && ok "R5 (imp15): closed+ctx:ready → stripped (Aprovadas zombie fix)" || bad "R5 did not strip ctx:ready"
   grep -q 'label add r5 story:done'           "$ACT" && ok "R5 (imp15): closed ctx:ready bead → set story:done" || bad "R5 did not set story:done"
 
@@ -1831,6 +1901,70 @@ GITSHIM
   grep -q 'update ip-noasg --status open' "$ACT" && bad "R3 fail-safe (ga-ibz0): fired despite a gate-active query FAILURE (should treat as protected, not as zero-active)" || ok "R3 fail-safe (ga-ibz0): gate-query failure → skipped mutation entirely"
   grep -q 'wa-o4kuh' "$ACT" && bad "R7 fail-safe (ga-ibz0): fired despite a gate-active query FAILURE (should treat as protected, not as zero-active)" || ok "R7 fail-safe (ga-ibz0): gate-query failure → skipped mutation entirely"
   grep -q 'lifecycle-coherence-janitor' "$NOTIFY_LOG" && ok "gate-query failure (ga-4zpf): notified — R3/R7 protection degradation is not silent" || bad "gate-query failure (ga-4zpf): did NOT notify — silent degradation of R3/R7 protection (ga-4zpf regression)"
+
+  # R6 held-until-alone FAIL-SAFE (ga-eplel5u): the unfiltered list FAILING, or printing something that is no JSON array, is "could
+  # not look" — never "no stale stamp to prune". Nothing is touched, and the log says the stamps were NOT pruned this sweep.
+  for _r6a_mode in 1 garbage; do
+    : > "$ACT"; : > "$LOG"; export LCJ_TEST_R6A_FAIL="$_r6a_mode"; run_sweep; export LCJ_TEST_R6A_FAIL=0
+    if ! grep -q 'r6a-' "$ACT" && grep -E "R6 held-until-alone \(ga-eplel5u\): bd list failed or was unreadable in .* NOT pruned this sweep \(not 'none found'\)" "$LOG" >/dev/null; then
+      ok "R6 held-until-alone fail-safe (ga-eplel5u): bd list '$_r6a_mode' → no stamp touched, and the log says NOT pruned (not 'none found')"
+    else
+      bad "R6 held-until-alone fail-safe (ga-eplel5u): bd list '$_r6a_mode' mishandled (actions on r6a-: $(grep -c 'r6a-' "$ACT"), log: $(grep -c 'R6 held-until-alone' "$LOG") line(s))"  # third-state-waiver: test diagnostic on a branch that already reports bad; the greps only print counts
+    fi
+  done
+  # R6 held-until-alone vs bead_state._labels_after_expired_hold — the rule is derive()'s, so it is RUN, not assumed: the jq program
+  # the sweep uses (_R6_STAMP_ALONE_JQ) and the oracle see the same label sets and must name the same stamps (and no bead with
+  # pilot:held — the old loop's — at all).
+  cat > "$TMP/r6a-oracle.py" <<'R6AEOF'
+import json, subprocess, sys
+libdir, prog, now = sys.argv[1], sys.argv[2], int(sys.argv[3])
+sys.path.insert(0, libdir)
+from bead_state import _labels_after_expired_hold
+H = "pilot:held-until:"
+past, past2, future = H + str(now - 1000), H + str(now - 2000), H + str(now + 1000)
+corpus = [[], ["lane:small"], [past], [future], [H + str(now)], [H + str(now - 1)], [past, future], [past, past2],
+          [past, H + "soon"], [future, H + "soon"], [H + "soon"], [H], [past, "lane:small", "needs-human"], [H + "007"],
+          ["pilot:held", past], ["pilot:held"], ["pilot:held", past, future], ["pilot:held-count:ga-x:2", past], ["pilot:held-count:ga-x:2"]]
+beads = [{"id": "c%d" % i, "labels": L} for i, L in enumerate(corpus)] + [{"id": "cnone"}]
+p = subprocess.run(["jq", "-r", "--argjson", "now", str(now), prog], input=json.dumps(beads), capture_output=True, text=True)
+if p.returncode != 0:
+    print("JQ-FAILED rc=%d %s" % (p.returncode, p.stderr[:200])); sys.exit(2)
+got = {}
+for line in p.stdout.splitlines():
+    f = line.split("\t"); got[f[0]] = sorted(f[1:])
+bad = []
+for b in beads:
+    L = b.get("labels") or []
+    want = [] if "pilot:held" in L else sorted(set(L) - set(_labels_after_expired_hold(frozenset(L), now)))
+    if got.get(b["id"], []) != want:
+        bad.append([b["id"], L, got.get(b["id"], []), want])
+print("OK %d label sets" % len(beads) if not bad else "MISMATCH " + json.dumps(bad))
+R6AEOF
+  _r6a_orc="$(python3 -I "$TMP/r6a-oracle.py" "$LCJ_BEAD_STATE_LIB" "${_R6_STAMP_ALONE_JQ:-}" "$(date +%s)" 2>&1 | head -c 600)"  # third-state-waiver: test oracle; one that fails or prints nothing lands in the case's * branch and reports bad
+  case "$_r6a_orc" in
+    "OK "*) ok "R6 held-until-alone (ga-eplel5u): the sweep's jq and bead_state._labels_after_expired_hold agree — $_r6a_orc" ;;
+    *)      bad "R6 held-until-alone (ga-eplel5u): the sweep's jq and bead_state._labels_after_expired_hold DISAGREE (or the oracle could not run): ${_r6a_orc:-<nothing>}" ;;
+  esac
+
+  # R6 held-until-alone COMMITS (ga-eplel5u): Dolt auto-commit is OFF, so a strip no `dolt commit` follows stays invisible to every other
+  # reader (the painel, a fresh bd). The sweep commits only when it counted something (n > 0), so the block must count what it strips:
+  # here it is the ONLY thing the sweep does (every other query answers []).
+  cat > "$TMP/bd-r6a" <<'R6ASHIM'
+#!/usr/bin/env bash
+case "$*" in
+  *"list --json -n 0"*) echo '[{"id":"solo","labels":["pilot:held-until:1000000"]}]' ;;
+  *"label remove"*|*"dolt commit"*) echo "$*" >> "$R6A_ACT" ;;
+  *) echo '[]' ;;
+esac
+R6ASHIM
+  chmod +x "$TMP/bd-r6a"
+  export R6A_ACT="$TMP/r6a-act"; : > "$R6A_ACT"; : > "$LOG"
+  _r6a_bd_main="$BD"; BD="$TMP/bd-r6a"; run_sweep; BD="$_r6a_bd_main"
+  if grep -q 'label remove solo pilot:held-until:1000000' "$R6A_ACT" && grep -q 'dolt commit' "$R6A_ACT"; then
+    ok "R6 held-until-alone (ga-eplel5u): a sweep whose only act is that strip is COUNTED — the Dolt working set is committed, so the strip is visible to other readers"
+  else
+    bad "R6 held-until-alone (ga-eplel5u): the lone strip was not committed (auto-commit is off: the strip would stay invisible) — recorded: $(tr '\n' ';' < "$R6A_ACT")"
+  fi
 
   # DRY-RUN makes no changes
   : > "$ACT"; LCJ_DRY_RUN=1; run_sweep

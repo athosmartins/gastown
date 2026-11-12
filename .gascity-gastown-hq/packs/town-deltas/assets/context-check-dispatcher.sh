@@ -293,11 +293,90 @@ context_check_lifecycle_skip() {
   echo "no"
 }
 
+# ── ga-eplel5u: the canonical PARK vocabulary — the very one R8 enforces ─────────────────────────────────────────────────────
+# R8 of lifecycle-coherence-janitor.sh strips ctx:ready/exec:auto from a bead carrying a label of scripts/bead_state.py's
+# PARK_PREFIXES (startswith) or PARK_EXACT (equality). This daemon is the only writer of those two labels, and it judged
+# "parked?" with the private list in context_check_is_parked below: 12 patterns against the vocabulary's 14 prefixes + 16 exact
+# labels. What the vocabulary had and that list lacked (pilot:held-until:*, waiting-on:*, next-action:*, the bare pilot:held,
+# blocked-by:*, framework:engine, ...) was re-armed after R8 stripped it: ga-eplel5u reports 315-730 R8 strips a day (09-12/11, the
+# 'R8 park-arm-invariant' lines of lifecycle-coherence-janitor.log), each a Dolt write, and a parked bead that read as dispatchable
+# in between. Measured on the live HQ 12/11: 4 of the 10 armed beads were such shapes.
+# The private list stays — every pattern in it is also in the vocabulary, so it only decides when the vocabulary is unreadable —
+# and the vocabulary is consulted on top of it.
+#
+# Read once per sweep by context_check_park_vocab_load, which the caller must run at TOP LEVEL: it sets globals, and a call inside
+# $(...) would set them in a subshell and throw them away. bead_state.py is found relative to THIS file (<assets>/../../../scripts),
+# not through $GC_CITY — the trap agent-stuck-escalation.sh documents (ga-9ozbby): a static city path is whichever tree happens to
+# sit there, and the selftests' fake city has no scripts/. CONTEXT_CHECK_BEAD_STATE_PY_OVERRIDE points a test, or a copy of this
+# file, at another bead_state.py.
+#
+# vazio → impossible: an empty or malformed vocabulary is read as UNREADABLE, never as "nothing is parked";
+# falhou/ilegível → state "unavailable": context_check_is_parked answers "unknown" for any label list its private list does not
+# settle, so context_check_is_candidate (which wants a literal "no") rejects the bead, and the sweep stops before it gathers
+# anything (see "ga-eplel5u" in the main flow). Inert plus a WARN, because not arming is the safe side of this daemon: arming
+# sends a builder to the bead, and a parked bead is parked on purpose.
+CONTEXT_CHECK_BEAD_STATE_PY_OVERRIDE="${CONTEXT_CHECK_BEAD_STATE_PY_OVERRIDE:-}"
+_CC_BEAD_STATE_PY_DEFAULT="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)/../../../scripts/bead_state.py"
+_CC_PARK_STATE="unloaded"   # unloaded | ok | unavailable
+_CC_PARK_WHY=""             # why it is not "ok" (for the WARN)
+_CC_PARK_PREFIXES=()        # plain indexed arrays: /bin/bash 3.2
+_CC_PARK_EXACT=()
+# Prints "P<TAB>prefix" / "E<TAB>exact" lines, or one "ERR<TAB>reason" line. Every failure — import error, SystemExit, a vocabulary
+# that is empty or holds an empty / non-string / tab-or-newline entry (an empty prefix would park every bead) — ends in ERR.
+_CC_PARK_PY='
+import sys
+sys.dont_write_bytecode = True   # a read-only daemon leaves no __pycache__ behind in the live scripts/ dir
+try:
+    sys.path.insert(0, sys.argv[1])
+    from bead_state import PARK_PREFIXES, PARK_EXACT
+    rows = [("P", p) for p in PARK_PREFIXES] + [("E", e) for e in sorted(PARK_EXACT)]
+    if not PARK_PREFIXES or not PARK_EXACT or not all(isinstance(v, str) and v and "\t" not in v and "\n" not in v for _, v in rows):
+        raise ValueError("empty or malformed vocabulary")
+    for kind, v in rows:
+        print(kind + "\t" + v)
+except BaseException as e:
+    print("ERR\t" + type(e).__name__ + ": " + str(e).replace("\n", " ")[:160])
+'
+# context_check_park_vocab_load — fill the globals above. ALWAYS returns 0 (this file runs under set -e); the verdict is
+#   _CC_PARK_STATE. On anything but "ok" the arrays are empty: a half-read vocabulary is never left behind.
+context_check_park_vocab_load() {
+  local _py="${CONTEXT_CHECK_BEAD_STATE_PY_OVERRIDE:-$_CC_BEAD_STATE_PY_DEFAULT}" _out="" _kind _val _bad=0
+  _CC_PARK_STATE="unavailable"; _CC_PARK_WHY=""; _CC_PARK_PREFIXES=(); _CC_PARK_EXACT=()
+  if ! command -v python3 >/dev/null 2>&1; then
+    _CC_PARK_WHY="python3 not found on PATH"; return 0
+  elif [ ! -f "$_py" ]; then
+    _CC_PARK_WHY="no bead_state.py at $_py"; return 0
+  fi
+  _out=$(python3 -I -c "$_CC_PARK_PY" "$(dirname "$_py")" 2>/dev/null) || _out=""
+  if [ -z "$_out" ]; then
+    _CC_PARK_WHY="python3 printed nothing reading $_py"; return 0
+  fi
+  while IFS=$'\t' read -r _kind _val; do
+    case "$_kind" in
+      P) _CC_PARK_PREFIXES[${#_CC_PARK_PREFIXES[@]}]="$_val" ;;
+      E) _CC_PARK_EXACT[${#_CC_PARK_EXACT[@]}]="$_val" ;;
+      ERR) _bad=1; _CC_PARK_WHY="reading $_py: $_val" ;;
+      *) _bad=1; [ -n "$_CC_PARK_WHY" ] || _CC_PARK_WHY="unexpected output reading $_py" ;;
+    esac
+  done <<< "$_out"
+  if [ "$_bad" -eq 0 ] && [ "${#_CC_PARK_PREFIXES[@]}" -gt 0 ] && [ "${#_CC_PARK_EXACT[@]}" -gt 0 ]; then
+    _CC_PARK_STATE="ok"
+  else
+    [ -n "$_CC_PARK_WHY" ] || _CC_PARK_WHY="the vocabulary of $_py has no prefixes or no exact labels"
+    _CC_PARK_PREFIXES=(); _CC_PARK_EXACT=()
+  fi
+  return 0
+}
+
 # context_check_is_parked <labels_csv>
 #   emit "yes" iff the bead has been deliberately PARKED — needs-human,
 #   pool:refused:<any reason>, story:blocked, pilot:no-auto-dispatch,
 #   blocked:<reason>, pilot:refused-reason:<slug>, needs:engine-window, or
-#   gate:needs-human(:<reason>) (ga-7mbry). A
+#   gate:needs-human(:<reason>) (ga-7mbry) — or carries ANY label of the
+#   canonical vocabulary above (ga-eplel5u: the one R8 strips arm labels on).
+#   emit "unknown" when the private list below settles nothing and the
+#   vocabulary is not loaded: a bead this daemon cannot tell is not a bead it
+#   may arm. emit "no" otherwise. A
 #   parked bead must NEVER be (re)armed with ctx:ready/exec:auto (ga-ipm4):
 #   parking and arming are orthogonal states that must never coexist, and
 #   today the ONLY way a parked bead loses ctx:ready is a human/dog explicitly
@@ -360,10 +439,13 @@ context_check_is_parked() {
       # elsewhere in this town — not invented for this fix. blocked:<reason>
       # mirrors pilot-dispatcher.sh's own human-gate check (ga-4iw15, same
       # "blocked:[^,]*" prefix scope — e.g. the ga-9uwbw incident's
-      # blocked:needs-remeasure); deliberately colon-only, NOT a "blocked-*"
-      # glob, so an unrelated dependency-pointer label like "blocked-by:*"
-      # (a different label family entirely — what blocks it, not "this bead
-      # IS blocked") can't false-positive through here. pilot:refused-reason:
+      # blocked:needs-remeasure); deliberately colon-only in THIS list, not a
+      # "blocked-*" glob — but blocked-by:* IS parked by the canonical
+      # vocabulary consulted after this loop (ga-eplel5u: R8 strips the arm
+      # labels of a bead carrying it, so re-arming it was half of a
+      # strip/re-arm loop; ga-7mbry's worry about a pointer label that is not
+      # "this bead IS blocked" lost to the vocabulary's own "blocked-by:"
+      # entry). pilot:refused-reason:
       # <slug> is inflight-reclaim-guard.py's PERMANENT refusal audit label
       # (ga-uvfs6) — its presence means a dog already refused this bead, not
       # merely never-judged. needs:engine-window is pilot-dispatcher.sh's
@@ -379,6 +461,21 @@ context_check_is_parked() {
       # too so this function doesn't depend on lifecycle_skip's coverage.
       blocked:*|pilot:refused-reason:*|needs:engine-window|gate:needs-human|gate:needs-human:*) echo "yes"; return ;;
     esac
+  done
+  # ga-eplel5u: the canonical vocabulary R8 enforces, on top of the private list. Same two rules as R8's jq: a prefix matches by
+  # startswith (a quoted "$p" in a case pattern is literal, the trailing * is the only wildcard), an exact label by equality.
+  # Not loaded, or unreadable → "unknown", never "no": see context_check_park_vocab_load.
+  if [ "$_CC_PARK_STATE" != "ok" ]; then
+    echo "unknown"; return
+  fi
+  local p e
+  for l in "${_lbls[@]+"${_lbls[@]}"}"; do
+    for p in "${_CC_PARK_PREFIXES[@]}"; do
+      case "$l" in "$p"*) echo "yes"; return ;; esac
+    done
+    for e in "${_CC_PARK_EXACT[@]}"; do
+      if [ "$l" = "$e" ]; then echo "yes"; return; fi
+    done
   done
   echo "no"
 }
@@ -416,7 +513,10 @@ context_check_is_sling_stub() {
 #     - NOT plumbing;
 #     - NOT already carrying a ctx:* verdict (idempotence / anti-loop);
 #     - NOT in a lifecycle-skip state (in-flight/done/gate-stuck/dispatched);
-#     - NOT parked (needs-human/pool:refused:*/story:blocked — ga-ipm4);
+#     - NOT parked (needs-human/pool:refused:*/story:blocked — ga-ipm4 — or any
+#       label of the canonical vocabulary R8 enforces, ga-eplel5u); a park
+#       check that cannot tell ("unknown": vocabulary not loaded) is not "no"
+#       either — the bead is not a candidate;
 #     - NOT a Pilot-minted sling-task dispatch stub (ga-mzkx2 — only checked
 #       when [title]/[desc_len] are BOTH supplied; omitted by a caller not
 #       exercising this dimension, e.g. existing selftest scenarios, preserves
@@ -1157,6 +1257,18 @@ if [ "$(_quiet_hours_blocks)" = "1" ]; then
   exit 0
 elif [ "$(_quiet_hours_unreadable)" = "1" ]; then
   log "Quiet-hours signal UNREADABLE (stale/corrupt ${QUIET_HOURS_LEVEL_FILE:-unset}) — fail-open, classification proceeding normally this sweep (ga-dxyvxr)."
+fi
+
+# ── ga-eplel5u: the park vocabulary must be readable before ANY bead is judged ─────────────────────────────────────────────
+# Without it this daemon cannot tell a bead R8 would strip from one it may arm (context_check_is_parked answers "unknown", so no
+# bead is a candidate): the sweep stops HERE — nothing gathered, nothing written. That is not "no bead is parked", a read that
+# would arm all of them; and not fail-open like the built/blocked sets below, which are refinements — this one is the invariant
+# "a parked bead is never armed" (ga-ipm4). The next sweep, 10 minutes on, asks again.
+context_check_park_vocab_load
+if [ "$_CC_PARK_STATE" != "ok" ]; then
+  warn "ga-eplel5u: canonical park vocabulary unavailable ($_CC_PARK_WHY) — cannot tell a parked bead from an unparked one, so NOTHING is judged or armed this sweep (not 'no bead is parked'); retried next sweep. R8 of lifecycle-coherence-janitor.sh strips what this daemon would arm."
+  log "Context-check sweep deferred (park vocabulary unavailable, ga-eplel5u). No mutation."
+  exit 0
 fi
 
 # ── Step 1: Gather candidates ──────────────────────────────────────────────────
