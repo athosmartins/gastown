@@ -1198,27 +1198,73 @@ nunca o vê ali. As três somadas: o witness nunca enxerga seu próprio wisp
 vivo, despeja um segundo, e o segundo pode vazar pro banco errado — um stray
 na HQ ficou 7 dias parado sem ninguém queimar (`ga-wisp-2ld24xp`).
 
+⚠️ **Quarto defeito (ga-6zrshxb, 12/11):** `gc hook` sai com 1 tanto para
+"vazio" quanto para ERRO (`gc hook: agent … not found in config`, `timed out
+after 30s` com a máquina em load 45-71: 4 casos entre 00:47 e 10:20 de 12/11,
+com o wisp existindo). O Step 1 antigo lia todo exit ≠ 0 como "nada no hook" e
+seguia para o Step 3, que despeja outro wisp. São TRÊS estados, nunca dois:
+**tem** / **não tem** (a leitura respondeu e veio vazia) / **não sei** (a
+leitura falhou ou veio ilegível). Só "não tem" autoriza um pour; "não sei" não
+faz pour.
+
 **Como aplicar** — troque o Step 1, o Step 3 e o bloco "CRITICAL: No Idle
 State" do prompt nativo pelos comandos abaixo. Deixe os Steps 2 e 4 do
 Startup Protocol nativo (mail, execução) como estão.
 
 **Step 1 substituto** — usa `gc hook`, que resolve por identidade de agente
 (`GC_AGENT`), não por cwd, e já foi comprovado achando o wisp certo nos 3
-rigs acima quando o `bd list` nativo falhava:
+rigs acima quando o `bd list` nativo falhava. Como `gc hook` sai 1 tanto para
+vazio quanto para erro, o bloco separa os dois: é VAZIO só com exit 1, nenhuma
+linha `gc hook:` no stderr e stdout vazio ou `[]` (um `warning:` no stderr não
+é erro); exit 0 com corpo é TEM; todo o resto (linha `gc hook:`, timeout, exit
+2/124/127, exit 0 sem corpo, stdout estranho) é NÃO SEI, e o bloco sai 1:
 ```bash
 # Step 1: gc hook acha seu wisp por identidade, mesmo se o agent-home
 # cair no store errado (o que o bd list abaixo NÃO consegue).
-if gc hook >/tmp/witness-hook.json 2>&1; then
-  cat /tmp/witness-hook.json   # há trabalho — siga a partir daqui
-else
-  : # nada no hook — segue para Step 2 (mail) e Step 3 (bootstrap)
+HOOK_ERR=$(mktemp) || { echo "HOOK=nao-sei (mktemp falhou) — NÃO faça pour; repita o Step 1." >&2; exit 1; }
+# vazio → HOOK=vazio (exit 1, sem linha "gc hook:", stdout vazio ou []); falhou/ilegível → HOOK=nao-sei (nunca vira "vazio")
+HOOK_OUT=$(gc hook 2>"$HOOK_ERR"); HOOK_RC=$?
+HOOK_BODY=${HOOK_OUT//[[:space:]]/}
+HOOK_ERRLINES=$(grep -c '^gc hook:' "$HOOK_ERR")
+HOOK_STATE=nao-sei
+if [ "$HOOK_RC" -eq 0 ] && [ -n "$HOOK_BODY" ]; then
+  HOOK_STATE=tem
+elif [ "$HOOK_RC" -eq 1 ] && [ "$HOOK_ERRLINES" = 0 ] && { [ -z "$HOOK_BODY" ] || [ "$HOOK_BODY" = '[]' ]; }; then
+  HOOK_STATE=vazio
 fi
+echo "HOOK=$HOOK_STATE (exit $HOOK_RC)"
+case "$HOOK_STATE" in
+  tem)   printf '%s\n' "$HOOK_OUT" ;;   # há trabalho — siga a partir daqui
+  vazio) ;;                              # nada no hook — segue para Step 2 (mail) e Step 3 (bootstrap)
+  *)     echo "NÃO é vazio — não faça o Step 3. stderr: $(head -c 300 "$HOOK_ERR")" >&2 ;;
+esac
+rm -f "$HOOK_ERR"
+[ "$HOOK_STATE" != nao-sei ]
 ```
 
-**Step 3 substituto** (bootstrap — só roda se Step 1 e Step 2 não acharam
-nada): pina o banco certo com `-C` e passa `rig_root` (só o override da HQ usa
+**Se o Step 1 imprimiu `HOOK=nao-sei`:** não é "vazio", e o Step 3 (o pour) fica
+PROIBIDO neste turno. Pode seguir para o Step 2 (mail); depois `sleep 60` e
+repita o Step 1. Três `nao-sei` seguidos: `gc session nudge mayor/ "witness
+<seu rig>: gc hook sem resposta 3x"` com o stderr que o bloco mostrou, e termine
+o turno sem pour (sem wisp não há patrulha neste ciclo, o que custa menos que um
+wisp duplicado).
+
+**Step 3 substituto** (bootstrap — só roda se o Step 1 disse `HOOK=vazio` e o
+Step 2 não achou nada): antes de qualquer pour ele LÊ o store pinado e só faz o
+pour se a leitura respondeu vazia (`[]` com exit 0); wisp seu já existente = não
+faz pour (retome-o); leitura que falhou ou veio ilegível = NÃO SEI = não faz
+pour. Pina o banco certo com `-C` e passa `rig_root` (só o override da HQ usa
 essa variável para repetir o pin nos ciclos seguintes; veja o fim desta seção):
 ```bash
+[ -n "$GC_AGENT" ] || { echo "Step 3: GC_AGENT vazio, não sei de quem é o wisp — NÃO faça pour." >&2; exit 1; }
+# vazio ([] com exit 0) → segue para o pour; tem (id) → NÃO faz pour, retome esse wisp; falhou/ilegível → NÃO SEI, NÃO faz pour
+HAVE_WISP=$(gc bd -C '{{ .RigRoot }}' list --assignee="$GC_AGENT" --type=molecule --include-infra --limit=1 --json) \
+  && HAVE_WISP=$(printf '%s' "$HAVE_WISP" | jq -er 'if type != "array" then error("not an array") elif length == 0 then "" else (.[0].id | if type == "string" and length > 0 then . else error("no id") end) end') \
+  || { echo "Step 3: NÃO SEI se já existe wisp meu (a leitura falhou ou veio ilegível) — NÃO faça pour; espere um minuto e repita o Step 1." >&2; exit 1; }
+if [ -n "$HAVE_WISP" ]; then
+  echo "Step 3: o wisp $HAVE_WISP já está atribuído a $GC_AGENT — NÃO faça pour; retome esse wisp."
+  exit 0
+fi
 NEW_WISP=$(gc bd -C '{{ .RigRoot }}' mol wisp mol-witness-patrol --root-only --var binding_prefix='{{ .BindingPrefix }}' --var rig_root='{{ .RigRoot }}' --json | jq -r '.new_epic_id // empty')
 if [ -z "$NEW_WISP" ] || ! gc bd -C '{{ .RigRoot }}' show "$NEW_WISP" --json >/dev/null 2>&1; then
   echo "Bootstrap pour failed or landed outside {{ .RigRoot }} (NEW_WISP='$NEW_WISP')." >&2
@@ -1230,7 +1276,9 @@ gc bd -C '{{ .RigRoot }}' update "$NEW_WISP" --assignee="$GC_ALIAS"
 **Bloco "CRITICAL: No Idle State" substituto** (corrige as 3 causas de uma
 vez: `--type=molecule --include-infra` em vez do `--type=wisp` inválido, e
 `-C` pinando o banco certo — com fallback gracioso pro cwd antigo só no caso
-extremo de um rig sem `RigRoot`, para não travar onde não há repo dedicado):
+extremo de um rig sem `RigRoot`, para não travar onde não há repo dedicado).
+As duas leituras (wisp em andamento e próximo wisp) saem em três estados: uma
+que falha ou vem ilegível NÃO vira "vazio" — sem pour e sem burn (ga-6zrshxb):
 ```bash
 BD_C=()
 if [ -n '{{ .RigRoot }}' ]; then
@@ -1238,11 +1286,20 @@ if [ -n '{{ .RigRoot }}' ]; then
 else
   echo "WARNING: {{ .RigRoot }} is empty -- falling back to cwd-based bd resolution here (the ga-3v2n4 wrong-store leak can still occur in this one fallback path)." >&2
 fi
+# wisp_id <filtros>: imprime o id do 1º wisp atribuído a mim (nada se não há) e sai 0; sai ≠ 0 = NÃO SEI (identidade vazia, leitura falhou ou ilegível)
+wisp_id() {
+  local out
+  [ -n "$GC_AGENT" ] || { echo "GC_AGENT vazio, não sei de quem é o wisp" >&2; return 1; }
+  out=$(gc bd "${BD_C[@]}" list --assignee="$GC_AGENT" "$@" --limit=1 --json) || return 1
+  printf '%s' "$out" | jq -er 'if type != "array" then error("not an array") elif length == 0 then "" else (.[0].id | if type == "string" and length > 0 then . else error("no id") end) end'
+}
 CURRENT_WISP=${GC_BEAD_ID:-}
 if [ -z "$CURRENT_WISP" ]; then
-  CURRENT_WISP=$(gc bd "${BD_C[@]}" list --assignee="$GC_AGENT" --status=in_progress --type=molecule --include-infra --limit=1 --json | jq -r '.[0].id // empty')
+  # vazio → CURRENT_WISP="" (nenhum em andamento); falhou/ilegível → NÃO SEI: sem pour e sem burn
+  CURRENT_WISP=$(wisp_id --status=in_progress --type=molecule --include-infra) || { echo "NÃO SEI qual é o meu wisp em andamento — sem pour e sem burn; repita depois." >&2; exit 1; }
 fi
-ASSIGNED_WISP=$(gc bd "${BD_C[@]}" list --assignee="$GC_AGENT" --status=open --type=molecule --include-infra --limit=1 --json | jq -r '.[0].id // empty')
+# vazio → ASSIGNED_WISP="" (o próximo ainda não existe); falhou/ilegível → NÃO SEI: sem pour e sem burn
+ASSIGNED_WISP=$(wisp_id --status=open --type=molecule --include-infra) || { echo "NÃO SEI se o próximo wisp já existe — sem pour e sem burn; repita depois." >&2; exit 1; }
 pour_next() {
   NEXT=$(gc bd "${BD_C[@]}" mol wisp mol-witness-patrol --root-only --var binding_prefix='{{ .BindingPrefix }}' --var rig_root='{{ .RigRoot }}' --json | jq -r '.new_epic_id // empty')
   if [ -z "$NEXT" ] || ! gc bd "${BD_C[@]}" show "$NEXT" --json >/dev/null 2>&1; then
