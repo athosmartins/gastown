@@ -366,7 +366,7 @@ else
   bad "C4: spawns=$(spawns) assignee='$(bead_asg wa-p1)'"; dump
 fi
 
-# ── D: the identity path does not depend on the roster ─────────────────────────────────────────────────────────────────────────────────────
+# ── D: the identity says the session EXISTS; the roster says whether it is alive ───────────────────────────────────────────────────────────
 echo "D. the identity is the engine's word that the session EXISTS; the roster says whether it is alive (and gives the work_dir)"
 new_engine cap; add_bead wa-p1 0; : > "$E/list.fail"
 run_pass 2
