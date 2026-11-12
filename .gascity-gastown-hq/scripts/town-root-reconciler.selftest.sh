@@ -242,12 +242,11 @@ ROOT="$_saved_ROOT"; REMOTE="$_saved_REMOTE"; BRANCH="$_saved_BRANCH"
 # falha nao imprime nada e quando acerta a linha vazia a mais some no $(...)).
 # NAO e' equivalente: 033544c743, o `rm -f` que fecha o clear_escalation, muda o status do PROPRIO ajudante; o caso do
 # carimbo-diretorio no cenario 22 le esse status. Tambem nao e': 24909e7bf1 (o `||` entre os dois cp do backup virando `&&`): o 2o cp, depois de um `cp -p` que deu certo, troca o mtime do
-# backup pela hora de agora (os bytes sao os mesmos); o cenario 21 le o mtime.
+# backup pela hora de agora (os bytes sao os mesmos); o cenario 21 le o mtime e, sem /tmp gravavel (a jaula do gate, onde ele ficava vivo), conta as chamadas de um `cp` de mentira (ga-0co26ac).
 # date devolve $FAKE_NOW para `date +%s` quando ele esta definido; git falha quando "<subcomando> <1o arg>" comeca por $GITFAIL.
 # EQUIVALENT 3bf5a69c5c 3ec1b3ce09 18e2ca9f08 8c15fc648f: `cmd || true` -> `cmd && true`: ninguem le o status e nao ha set -e
 # EQUIVALENT 4dd84a5bcb: o `|| true` que fecha a cadeia de cp do backup: ninguem le o status
 # EQUIVALENT 2a4dfbfe9d 7990ceb751 86e745f1c8 d0372d9f4c c3efbaf3cc d1fe4548ab: `$(git ... || echo "")` -> `&&`: quando o git falha nao imprime nada e quando acerta a linha vazia a mais some no $(...)
-# EQUIVALENT 24909e7bf1: JAULA, nao equivalencia: o `||` entre os dois cp virando `&&` troca o mtime do backup pela hora de agora e o cenario 21 o mata fora da jaula (medido 03/11: fora FAIL=1, na jaula PASS=78 FAIL=0); no rodizio fica vivo porque o backup vai para /tmp e a jaula so grava no slot
 date() { if [ "${1-}" = "+%s" ] && [ -n "${FAKE_NOW:-}" ]; then echo "$FAKE_NOW"; else command date "$@"; fi; }
 git() { if [ -n "${GITFAIL:-}" ]; then case "${3-} ${4-}" in "$GITFAIL"*) return 1 ;; esac; fi; command git "$@"; }
 fresh_stamps() { rm -f "$ESCALATE_STAMP" "$NTFY_STAMP"; }
@@ -368,7 +367,7 @@ touch -t 200001020304 "$W/trr-collide.sh"; : > "$TMP/mtime.ref"; touch -t 200001
   && ok "colisao identica: removida (com backup) e contada; o arquivo so-local nao e tocado" \
   || bad "untracked identica: rc=$rc count=$RECONCILE_COUNT list='$RECONCILE_DIFF_LIST'"
 # O backup e' feito por `cp -p ... || cp ...`: leva o mtime do arquivo, que diz de quando era o conteudo. Se o `cp` de reserva rodasse DEPOIS de um `cp -p` que deu certo
-# (24909e7bf1, o `||` virando `&&`) os bytes seriam os mesmos e o backup ficaria com a hora de agora. Sem /tmp gravavel (jaula do gate) nao ha backup para medir: o caso diz isso e nao conta.
+# (24909e7bf1, o `||` virando `&&`) os bytes seriam os mesmos e o backup ficaria com a hora de agora. Sem /tmp gravavel (jaula do gate) nao ha backup para medir: o caso diz isso e nao conta (os casos do cp de mentira, abaixo, rodam em qualquer lugar).
 _bk=""; for _f in /tmp/trr-collide.sh.backup.*.$$; do [ -f "$_f" ] && _bk="$_f"; done
 if [ -n "$_bk" ]; then
   { [ "$(cat "$_bk")" = "from-upstream" ] && [ ! "$_bk" -nt "$TMP/mtime.ref" ] && [ ! "$_bk" -ot "$TMP/mtime.ref" ]; } \
@@ -389,6 +388,16 @@ printf 'from-upstream\n' > "$W/trr-collide.sh"
 [ "$rc" = "0" ] && [ "$RECONCILE_COUNT" = "1" ] && [ -f "$W/trr-collide.sh" ] \
   && has_log "DRY_RUN — WOULD backup+remove identical untracked 'trr-collide.sh'" \
   && ok "DRY_RUN: conta e avisa, mas nao remove" || bad "untracked DRY_RUN: rc=$rc count=$RECONCILE_COUNT"
+# O backup vai para /tmp, que a jaula do gate nao grava: um `cp` de mentira (funcao deste shell: o subject esta carregado nele) so registra as chamadas. Um `cp -p` que da certo basta, o cp de reserva
+# NAO roda (24909e7bf1: o `||` virando `&&` o rodaria por cima); um `cp -p` que falha deixa o cp de reserva rodar. O arquivo identico ainda esta no lugar (o DRY_RUN nao o tirou).
+CPLOG="$TMP/cp.calls"; : > "$CPLOG"; cp() { printf '%s\n' "$*" >> "$CPLOG"; return 0; }
+: > "$LOG"; reconcile_untracked_for_ffpull "$W" origin/main >/dev/null 2>&1; rc=$?; unset -f cp
+[ "$rc" = "0" ] && [ ! -e "$W/trr-collide.sh" ] && [ "$(wc -l < "$CPLOG" | tr -d ' ')" = "1" ] && grep -q '^-p ' "$CPLOG" \
+  && ok "backup: o cp -p deu certo e o cp de reserva NAO roda (uma chamada so)" || bad "backup com o cp -p que da certo: rc=$rc chamadas=$(tr '\n' '|' < "$CPLOG")"
+printf 'from-upstream\n' > "$W/trr-collide.sh"; : > "$CPLOG"; cp() { printf '%s\n' "$*" >> "$CPLOG"; case "$1" in -p) return 1 ;; esac; return 0; }
+: > "$LOG"; reconcile_untracked_for_ffpull "$W" origin/main >/dev/null 2>&1; rc=$?; unset -f cp
+[ "$rc" = "0" ] && [ ! -e "$W/trr-collide.sh" ] && [ "$(wc -l < "$CPLOG" | tr -d ' ')" = "2" ] && sed -n 1p "$CPLOG" | grep -q '^-p ' && ! sed -n 2p "$CPLOG" | grep -q '^-p ' \
+  && ok "backup: o cp -p falhou, o cp de reserva roda (duas chamadas, a 2a sem -p)" || bad "backup com o cp -p que falha: rc=$rc chamadas=$(tr '\n' '|' < "$CPLOG")"
 
 echo "Scenario 22: maybe_ntfy e clear_escalation — status, mail que falha, limites exatos (45 min, 1 dia) e log de limpeza"
 fresh_stamps; reset_stubs; : > "$LOG"

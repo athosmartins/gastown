@@ -6,8 +6,9 @@
 #
 # CASOS (ga-qg1dw5z.3): auditoria LIMPA → nenhum alarme, relatório guardado, linha de heartbeat · ACHADO (rc 1) e NAO-CONSEGUI (rc 3) → UM alarme com o veredito no título, o RESULTADO e as linhas
 #   que não são LIMPO no corpo · auditoria QUEBRADA (rc estranho, rc 0/1/3 sem linha RESULTADO, ou RESULTADO que não bate com o rc) → alarme "QUEBRADA", nunca silêncio · notify que falha → rc 4 (o relatório fica) e exit 10/11
-#   do notify (guardado para as 7h / mesmo título há pouco) não são erro mas ficam escritos no log, 12 (teto de pushes) é falha · desligado por variável ou por arquivo · trava: dono vivo → nada, dono morto → segue · auditoria ausente ·
-#   relatório comprido é cortado · relatórios com mais de 30 dias saem.
+#   do notify (guardado para as 7h / mesmo título há pouco) não são erro mas ficam escritos no log, 12 (teto de pushes) é falha · desligado por variável ou por arquivo · trava: dono vivo → nada, dono morto → segue, dono morto que o rm
+#   não tira → rc 2 · auditoria ausente · pasta de saída que não dá para criar → rc 2 · sem GC_CITY_PATH/HETZNER_AUDIT_*: a auditoria é a vizinha do wrapper e a saída vai para a pasta da cidade padrão · sem HETZNER_AUDIT_NOTIFY: o
+#   notify que está no PATH · relatório comprido é cortado (8 achados cabem, o 9º vira "... e mais 1") · relatórios com mais de 30 dias saem.
 # CONTROLE NEGATIVO: sem alarmar NAO-CONSEGUI, sem conferir o RESULTADO com o rc, sem o rc do notify, sem a trava: o caso correspondente tem de enxergar a diferença.
 # HETZNER_AUDIT_DAILY_UNDER_TEST=<arquivo> roda o selftest contra uma cópia alterada (mutante).
 set -u
@@ -55,6 +56,11 @@ calls() { [ -f "$T/notify.log" ] && grep -c '^CALL' "$T/notify.log" || echo 0; }
 arg() { grep '^ARG ' "$T/notify.log" 2>/dev/null | sed 's/^ARG //'; }       # a 1ª linha de cada argumento de todas as chamadas, um por linha
 title() { cat "$T/notify.title" 2>/dev/null; }; body() { cat "$T/notify.last" 2>/dev/null; }
 audits() { [ -f "$T/audit-calls" ] && wc -l < "$T/audit-calls" | tr -d ' ' || echo 0; }
+wr() {  # wr WRAPPER [NAME=VALOR...] — o wrapper num ambiente LIMPO (env -i): só PATH (o notify falso na frente), HOME, T, FAKE_AUDIT_OUT e o que vier nos argumentos (NAME= repetido vale o último); stdout em $out, rc em $rc
+  local w=$1; shift
+  out=$(env -i PATH="$FAKE:$PATH" HOME="$T/home" T="$T" FAKE_AUDIT_OUT="$T/rep.txt" "$@" "$w" 2>"$T/err"); rc=$?
+}
+nach() { local i; { for i in $(seq 1 "$1"); do echo "AUDITORIA ACHADO dados: achado numero $i"; done; echo "AUDITORIA RESULTADO ACHADO (achados=$1 nao-consegui=0 limpos=0) em h t duracao=1s orcamento=540s"; } > "$T/rep.txt"; }   # nach N: N achados + o RESULTADO (rc 1)
 
 # --- limpo: nada de alarme, relatório guardado, heartbeat ---
 mk; rep "$LIMPO"; FAKE_AUDIT_RC=0 run; [ "$rc" = 0 ] && [ "$(calls)" = 0 ] && [ "$(audits)" = 1 ]; ok $? "auditoria LIMPA: rc 0, a auditoria rodou uma vez, NENHUM alarme"
@@ -91,6 +97,7 @@ mk; rep "$ACHADO"; FAKE_AUDIT_RC=1 FAKE_NOTIFY_RC=7 run; [ "$rc" = 4 ]; ok $? "n
 for c in 10 11; do mk; rep "$ACHADO"; FAKE_AUDIT_RC=1 FAKE_NOTIFY_RC=$c run; [ "$rc" = 0 ] && printf '%s\n' "$out" | grep -q "o notify saiu $c "; ok $? "notify saiu $c (guardado p/ as 7h / mesmo título há pouco): rc 0 (não é erro) e o log diz que o push pode não ter chegado"; done
 mk; rep "$ACHADO"; FAKE_AUDIT_RC=1 FAKE_NOTIFY_RC=12 run; [ "$rc" = 4 ]; ok $? "notify saiu 12 (teto de pushes): NÃO entregue, rc 4"
 mk; rep "$ACHADO"; FAKE_AUDIT_RC=1 NOTIFY_PATH=/nao/existe run; [ "$rc" = 4 ]; ok $? "notify ausente: rc 4"
+mk; rep "$ACHADO"; wr "$WRAP" FAKE_AUDIT_RC=1 GC_CITY_PATH="$CITY" HETZNER_AUDIT_SCRIPT="$FAKE/audit.sh"; [ "$rc" = 0 ] && [ "$(calls)" = 1 ]; ok $? "sem HETZNER_AUDIT_NOTIFY: acha o notify no PATH e o alarme sai (rc 0, UMA chamada)"
 
 # --- desligado ---
 mk; rep "$ACHADO"; GC_HETZNER_AUDIT=0 FAKE_AUDIT_RC=1 run; [ "$rc" = 0 ] && [ "$(audits)" = 0 ] && [ "$(calls)" = 0 ]; ok $? "GC_HETZNER_AUDIT=0: nada roda, nada alarma"; printf '%s\n' "$out" | grep -q 'desligado'; ok $? "  e diz que está desligado"
@@ -100,13 +107,30 @@ mk; rep "$LIMPO"; GC_HETZNER_AUDIT=1 FAKE_AUDIT_RC=0 run; [ "$(audits)" = 1 ]; o
 # --- trava ---
 mk; rep "$LIMPO"; mkdir -p "$OUT/lock"; sleep 30 & live=$!; echo "$live" > "$OUT/lock/pid"; FAKE_AUDIT_RC=0 run; kill "$live" 2>/dev/null; [ "$(audits)" = 0 ] && [ "$rc" = 0 ]; ok $? "trava com dono VIVO: nada roda"
 mk; rep "$LIMPO"; mkdir -p "$OUT/lock"; echo 999999 > "$OUT/lock/pid"; FAKE_AUDIT_RC=0 run; [ "$(audits)" = 1 ]; ok $? "trava com dono MORTO: assume e roda"; [ ! -e "$OUT/lock" ]; ok $? "  e solta a trava no fim"
+# um rm que não consegue apagar a pasta da trava (o que sobra de uma trava velha que não sai); o resto vai para o rm de verdade
+mkdir -p "$T/rmfail"; printf '%s\n' '#!/bin/bash' 'for a in "$@"; do case "$a" in */hetzner-audit/lock) exit 1 ;; esac; done' "exec $(command -v rm) \"\$@\"" > "$T/rmfail/rm"; chmod +x "$T/rmfail/rm"
+sleep 0 & dpid=$!; wait "$dpid" 2>/dev/null     # um pid que acabou de morrer: dono morto
+mk; rep "$LIMPO"; mkdir -p "$OUT/lock"; echo "$dpid" > "$OUT/lock/pid"; wr "$WRAP" PATH="$T/rmfail:$FAKE:$PATH" FAKE_AUDIT_RC=0 GC_CITY_PATH="$CITY" HETZNER_AUDIT_SCRIPT="$FAKE/audit.sh"; [ "$rc" = 2 ] && [ "$(audits)" = 0 ]; ok $? "trava velha (dono morto) que o rm NÃO tira: rc 2 e a auditoria não roda"
+printf '%s\n' "$out" | grep -q 'ERRO: não consegui pegar a trava'; ok $? "  e o log diz que não conseguiu pegar a trava"
+mk; rep "$LIMPO"; mkdir -p "$OUT/lock"; echo "$dpid" > "$OUT/lock/pid"; wr "$WRAP" FAKE_AUDIT_RC=0 GC_CITY_PATH="$CITY" HETZNER_AUDIT_SCRIPT="$FAKE/audit.sh"; [ "$rc" = 0 ] && [ "$(audits)" = 1 ]; ok $? "  controle: o mesmo cenário com o rm de verdade assume a trava e roda (o rm falso é a causa)"
 
 # --- auditoria ausente ---
 mk; AUDIT_PATH=/nao/existe run; [ "$(calls)" = 1 ]; ok $? "auditoria ausente: alarme (QUEBRADA), nunca silêncio"; title | grep -q 'QUEBRADA (rc=127)'; ok $? "  rc=127"
 
+# --- pasta de saída que não dá para criar (debaixo de um ARQUIVO: falha até como root) ---
+: > "$T/umarquivo"; mk; rep "$LIMPO"; HETZNER_AUDIT_DIR="$T/umarquivo/saida" FAKE_AUDIT_RC=0 run; [ "$rc" = 2 ] && [ "$(audits)" = 0 ] && [ "$(calls)" = 0 ]; ok $? "pasta de saída impossível de criar: rc 2, a auditoria não roda e nada alarma"
+printf '%s\n' "$out" | grep -q 'ERRO: não consegui criar'; ok $? "  e o log diz que não conseguiu criar a pasta"
+
+# --- sem GC_CITY_PATH nem HETZNER_AUDIT_*: a auditoria é a hetzner-audit.sh vizinha do wrapper e a saída vai para <pai da pasta do script>/.gc/hetzner-audit ---
+DT=$T/deftree; mkdir -p "$DT/scripts"; cp "$WRAP" "$DT/scripts/hetzner-audit-daily.sh"; cp "$FAKE/audit.sh" "$DT/scripts/hetzner-audit.sh"; chmod +x "$DT/scripts/hetzner-audit-daily.sh"
+mk; rep "$LIMPO"; wr "$DT/scripts/hetzner-audit-daily.sh"; [ "$rc" = 0 ] && [ "$(audits)" = 1 ]; ok $? "sem GC_CITY_PATH/HETZNER_AUDIT_SCRIPT: roda a hetzner-audit.sh vizinha do wrapper (uma vez, rc 0)"
+grep -q 'AUDITORIA RESULTADO LIMPO' "$DT/.gc/hetzner-audit/last.txt" 2>/dev/null; ok $? "  e o relatório vai para a pasta .gc/hetzner-audit da cidade padrão (o pai da pasta do script)"
+
 # --- corpo comprido e retenção ---
 mk; { for i in $(seq 1 30); do echo "AUDITORIA ACHADO dados: achado numero $i $(printf 'x%.0s' $(seq 1 300))"; done; echo "AUDITORIA RESULTADO ACHADO (achados=30 nao-consegui=0 limpos=0) em h t duracao=1s orcamento=540s"; } > "$T/rep.txt"; FAKE_AUDIT_RC=1 run
 b=$(body); [ "${#b}" -le 2200 ]; ok $? "30 achados de 300+ colunas: o corpo do push é cortado (${#b} caracteres)"; case "$b" in *"mais 22"*) true ;; *) false ;; esac; ok $? "  e diz quantos ficaram de fora"
+mk; nach 8; FAKE_AUDIT_RC=1 run; b=$(body); case "$b" in *"achado numero 8"*) case "$b" in *"e mais"*) false ;; *) true ;; esac ;; *) false ;; esac; ok $? "8 achados (o limite): o corpo traz os 8 e NÃO tem a linha '... e mais'"
+mk; nach 9; FAKE_AUDIT_RC=1 run; b=$(body); case "$b" in *"achado numero 8"*"... e mais 1"*) case "$b" in *"achado numero 9"*) false ;; *) true ;; esac ;; *) false ;; esac; ok $? "9 achados: o corpo traz 8 e a linha '... e mais 1' (o 9º fica de fora)"
 mk; rep "$LIMPO"; mkdir -p "$OUT"; : > "$OUT/2020-01-01.txt"; touch -t 202001010000 "$OUT/2020-01-01.txt"; : > "$OUT/2026-11-10.txt"; FAKE_AUDIT_RC=0 run; [ ! -e "$OUT/2020-01-01.txt" ] && [ -e "$OUT/2026-11-10.txt" ]; ok $? "relatório com mais de 30 dias sai, o recente fica"
 
 # --- fiação: o plist aponta para ESTE wrapper, 1x por dia, fora de :00/:30, sem RunAtLoad, com o PATH em que o notify mora ---

@@ -322,13 +322,41 @@ case_crash_and_siblings() { local SRC="${DETX:-$DET}"; newcity cr; conf mode=enf
   want 2 "a sibling that calls sys.exit(0) at import is blind too, never a silent rc 0" "NAO SEI.*SystemExit"; }
 case_crash_and_siblings
 echo "== D2. what the CLI prints and the defaults (ga-0qhveri) =="
-# The header, the --json fields, the defaults of every tunable AND their "0 = the default" fallback, the edges of the displayed lists, the arms file's counters, the router forms.
-# EQUIVALENT (not killable, proved by reading): scan_arms `t > last` -> `t >= last` (an equal ts assigns the same value) · flag_age `max(0, ...)` -> `max(1, ...)` (the age is only read through
-# `// 3600` and `> hours * 3600`, hours >= 1) · `datetime.now(UTC).replace(microsecond=0)` -> `microsecond=1` (the clock is only read at the second: strftime to minutes, int(timestamp()))
-# · load_sibling `fname[:-3]` -> `fname[:-4]` (the module name is never read: neither sibling looks at __name__ except for its own __main__ guard).
-# EQUIVALENT 51079d669b: flag_age `max(0, ...)` -> `max(1, ...)`: the age is only read through `// 3600` and `> hours * 3600`, hours >= 1
-# EQUIVALENT a0f591ad45: `datetime.now(UTC).replace(microsecond=0)` -> `microsecond=1`: the clock is only read at the second (strftime to minutes, int(timestamp()))
+# The header, the --json fields (the age of each flag too), the defaults of every tunable AND their "0 = the default" fallback, the edges of the displayed lists, the arms file's counters, the router forms, the real clock.
+# EQUIVALENT (not killable, proved by reading): scan_arms `t > last` -> `t >= last` (an equal ts assigns the same value) · load_sibling `fname[:-3]` -> `fname[:-4]` (the module name is never read: neither sibling
+# looks at __name__ except for its own __main__ guard).
+# Two that an earlier round declared equivalent were NOT (REVALIDAR, ga-0co26ac), and have a case below each: flag_age `max(0, ...)` -> `max(1, ...)` (51079d669b) shows in --json, which prints the age of every flag in
+# seconds (not only through `// 3600`); `datetime.now(UTC).replace(microsecond=0)` -> `microsecond=1` (a0f591ad45) moves the window start `now - 24h` off a whole second, so a verdict exactly at the start drops out.
 # EQUIVALENT 7e974aa472: load_sibling `fname[:-3]` -> `fname[:-4]`: the module name is never read (neither sibling looks at __name__ except for its own __main__ guard)
+case_flag_age_json() { newcity fj; conf mode=enforce
+  : > "$C/.gc/third-state-reads-check.off"; TZ=UTC touch -t 202610311330 "$C/.gc/third-state-reads-check.off"   # 1h30 before $NOW
+  : > "$C/.gc/gate-hardchecks.off"; TZ=UTC touch -t 202610311700 "$C/.gc/gate-hardchecks.off"   # 2h AFTER $NOW: a flag from a clock that ran ahead
+  ARGS="--json"; run; ARGS=""
+  printf '%s' "$OUT" | "$PY" -I -c '
+import json, sys
+d = json.load(sys.stdin)
+assert d["switches"] == [["third-state-reads-check.off", 5400], ["gate-hardchecks.off", 0]], d["switches"]
+' 2>"$W/fj.err" && ok "--json: every flag with its age in seconds (1h30 is 5400), and a flag from the future is 0, never negative" || bad "--json flag ages wrong :: $(tail -1 "$W/fj.err") :: $(printf '%s' "$OUT" | head -c 300)"; }
+case_real_clock() { newcity clk; conf mode=enforce; runs ga-e 5; v 2026-10-30T15:00:00Z ga-edge PASS   # the 6th verdict sits EXACTLY at the start of the 24h window that ends at 15:00:00 on the 31st
+  # no --now: the detector reads the real clock, so the test fixes it (a datetime subclass with a now() that has half a second on it) and calls main() in process
+  "$PY" -B -I -c '
+import contextlib, datetime, importlib.util, io, json, sys, types
+s = importlib.util.spec_from_file_location("d", sys.argv[1]); det = importlib.util.module_from_spec(s); s.loader.exec_module(det)
+class Clock(datetime.datetime):
+    sec = 0
+    @classmethod
+    def now(cls, tz=None):
+        return cls(2026, 10, 31, 15, 0, cls.sec, 500000, tzinfo=tz)
+det.datetime = types.SimpleNamespace(datetime=Clock, timedelta=datetime.timedelta, timezone=datetime.timezone)
+def runs_at(sec):
+    Clock.sec = sec
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out):
+        det.main(["--city", sys.argv[2], "--json", "--no-lock", "--no-alarm"])
+    return json.loads(out.getvalue())["runs"]
+got = (runs_at(0), runs_at(1))
+assert got == (6, 5), ("a verdict exactly at the window start counts at 15:00:00.5 (the half second is cut) and is out one second later", got)
+' "${DETX:-$DETB}" "$C" 2>"$W/rc.err" && ok "real clock (no --now): the half second is cut, so a verdict exactly 24h back is inside the window (6 beads), and one second later it is out (5)" || bad "real clock: $(tail -2 "$W/rc.err" | tr '\n' '|' | cut -c1-300)"; }
 case_header_and_json() { local E; newcity hj; conf mode=enforce enforce_pct=50; runs ga-j 6; arms ga-j 1 6
   run; want 0 "the header names the conf in force (mode and percentage)" "checagem: ligada \(mode=enforce enforce_pct=50\)"
   newcity hj2; run; want 0 "no conf at all: mode and percentage are '-', never 'None'" "checagem: nao-ligada \(mode=- enforce_pct=-\)"
@@ -450,7 +478,7 @@ case_diag_unavailable() { newcity du; conf mode=enforce; runs ga-d 6
   run; want 1 "no guard log at all: the diagnosis says it is ABSENT" "quality-gate-guard.log ausente\)"
   if [ "$IS_ROOT" = 0 ]; then mkdir -p "$C/.gc/logs/quality-gate-guard.log"; run; rmdir "$C/.gc/logs/quality-gate-guard.log"
     want 1 "a guard log that cannot be read (a directory): the diagnosis says UNREADABLE" "quality-gate-guard.log ilegivel\)"; fi; }
-case_header_and_json; case_tunables; case_tail_edges; case_arms_file_counts; case_first_line_undated; case_lists; case_flag_age_text; case_router_forms; case_help_and_env_city; case_order_no_alarm; case_alarm_in_process; case_diag_unavailable
+case_header_and_json; case_tunables; case_tail_edges; case_arms_file_counts; case_first_line_undated; case_lists; case_flag_age_text; case_flag_age_json; case_router_forms; case_help_and_env_city; case_order_no_alarm; case_alarm_in_process; case_real_clock; case_diag_unavailable
 if [ ! -d "$W/bin/__pycache__" ] && { [ "$HAD_PYC" = 1 ] || [ ! -d "$HERE/__pycache__" ]; }; then ok "no __pycache__ written next to the detector or its siblings"; else bad "the detector left a __pycache__ behind"; fi
 ORDER_TOML="$HERE/../orders/third-state-arm-coverage.toml"
 if "$PY" -I -c 'import tomllib' 2>/dev/null; then

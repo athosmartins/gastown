@@ -16,6 +16,7 @@
 #   5 missing link, --apply -> created                  6 second --apply -> rc 0 (idempotent)
 #   7 no <root>/.beads/formulas -> rc 2, nothing created   8 no rig-overrides/formulas -> rc 2
 #   9 bad argument -> rc 64, nothing changed
+#   10 --apply with a `ln` that fails after making the right link, and with a `readlink` that does not read it back -> FAILED, rc 1 (never FIXED on one of the two alone)
 # Exit 0 = all green, 1 = a case failed. Works under /bin/bash 3.2.
 
 set -u
@@ -98,6 +99,22 @@ if d="$(fresh c9)"; then
   run "$d" --bogus
   if [ "$RC" -eq 64 ] && [ "$(link_of "$d")" = "$d/native/mol-x.toml" ]; then ok "9 bad argument: rc 64, nothing changed"; else bad "9 rc=$RC out=$OUT"; fi
 else bad "9 setup"; fi
+
+# 10: FIXED needs BOTH: `ln` exited 0 AND the link reads back as the override. A `ln` that reports failure after it made the right link, and a readback that does not match after a `ln`
+# that exited 0, are each FAILED (rc 1). The scene with the real ln and readlink is case 2 (FIXED, rc 0). (ga-0co26ac: `ln ... && [ readlink = want ]` read as `||` was not caught)
+if d="$(fresh c10)"; then
+  mkdir -p "$d/bin"; REAL_LN="$(command -v ln)"
+  printf '%s\n' '#!/bin/sh' "\"$REAL_LN\" \"\$@\"" 'exit 1' > "$d/bin/ln"; chmod +x "$d/bin/ln"
+  OUT="$(PATH="$d/bin:$PATH" CITY_DIR="$d/city" ROOT="$d/root" bash "$TOOL" --apply 2>&1)"; RC=$?
+  case "$OUT" in *"FAILED "*) FAILED_SAID=1 ;; *) FAILED_SAID=0 ;; esac; case "$OUT" in *"FIXED "*) FIXED_SAID=1 ;; *) FIXED_SAID=0 ;; esac
+  if [ "$RC" -eq 1 ] && [ "$FAILED_SAID" -eq 1 ] && [ "$FIXED_SAID" -eq 0 ] && [ "$(link_of "$d")" = "$d/city/rig-overrides/formulas/mol-x.toml" ]; then ok "10 ln fails after making the link: FAILED, rc 1, not FIXED"; else bad "10 ln rc=$RC out=$OUT"; fi
+else bad "10 setup"; fi
+if d="$(fresh c10b)"; then
+  mkdir -p "$d/bin"; printf '%s\n' '#!/bin/sh' 'echo /not/the/override' > "$d/bin/readlink"; chmod +x "$d/bin/readlink"
+  OUT="$(PATH="$d/bin:$PATH" CITY_DIR="$d/city" ROOT="$d/root" bash "$TOOL" --apply 2>&1)"; RC=$?
+  case "$OUT" in *"FAILED "*) FAILED_SAID=1 ;; *) FAILED_SAID=0 ;; esac; case "$OUT" in *"FIXED "*) FIXED_SAID=1 ;; *) FIXED_SAID=0 ;; esac
+  if [ "$RC" -eq 1 ] && [ "$FAILED_SAID" -eq 1 ] && [ "$FIXED_SAID" -eq 0 ]; then ok "10 readback that does not match after a ln that exited 0: FAILED, rc 1, not FIXED"; else bad "10 readlink rc=$RC out=$OUT"; fi
+else bad "10b setup"; fi
 
 echo "== $PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ]

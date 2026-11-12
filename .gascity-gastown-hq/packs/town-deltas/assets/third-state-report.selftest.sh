@@ -192,12 +192,13 @@ bash -n "$0" && ok || bad "selftest does not parse"
 # L131 `(x[0], x[1])` -> `(x[0], x[0])` (05edbcba6f: `out` is appended in index order and sort() is stable, so a tie keeps it anyway),
 # L142 `j >= 0` -> `j > 0` and `j >= 1` (5a55c724af 7cf7c435c3: j is -1 or the position of a heading that starts AFTER i >= 0, so never 0),
 # L376 `SystemExit(2)` -> `SystemExit(3)` (e9d82eb6c4: the handler only reads `code == 0`, any other code ends in the same usage exit 64),
-# L152 `text=True` -> `text=False` (b10f971495: json.loads takes the bytes as well as the text, and `bd comments --json` prints UTF-8; only a
-# stdout holding an ENCODED lone surrogate would differ, which strict text mode rejects and bytes mode takes, and bd never prints one).
+# L152 `text=True` -> `text=False` (b10f971495: json.loads takes the bytes as well as the text, and `bd comments --json` prints UTF-8. Measured over 12 output shapes (plain JSON and a comment with no label, accents,
+# CRLF between tokens and inside a string, an invalid byte, a latin-1 byte or a NUL inside a string, 2 MB, an empty or non-JSON stdout, rc 1): the same answer. It differs only for a BOM, an ENCODED lone surrogate, UTF-16, or invalid UTF-8 on STDERR, which
+# strict text mode rejects (the read is None) and bytes mode takes; bd, a Go program that escapes what it prints, never writes those: ga-0co26ac).
 # EQUIVALENT 05edbcba6f: `(x[0], x[1])` -> `(x[0], x[0])`: `out` is appended in index order and sort() is stable, so a tie keeps it anyway
 # EQUIVALENT 5a55c724af 7cf7c435c3: `j >= 0` -> `j > 0` and `j >= 1`: j is -1 or the position of a heading that starts AFTER i >= 0, so never 0
 # EQUIVALENT e9d82eb6c4: `SystemExit(2)` -> `SystemExit(3)`: the handler only reads `code == 0`, any other code ends in the same usage exit 64
-# EQUIVALENT b10f971495: `text=True` -> `text=False`: json.loads takes the bytes as well as the text, and `bd comments --json` prints UTF-8
+# EQUIVALENT b10f971495: `text=True` -> `text=False`: json.loads takes the bytes as well as the text and `bd comments --json` prints UTF-8: 12 output shapes read the same (measured); only a BOM, an encoded lone surrogate, UTF-16 or invalid UTF-8 on stderr differ, and bd never prints those
 PYT='
 import contextlib, datetime, importlib.util, io, json, os, re, sys, time, types
 sys.dont_write_bytecode = True
