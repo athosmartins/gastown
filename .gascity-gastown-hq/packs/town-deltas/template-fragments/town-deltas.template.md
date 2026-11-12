@@ -698,10 +698,13 @@ toda confusão de repo/tree checando o binário que roda de verdade.
    roda um nível acima de `in/`; `--push` de caminho inexistente sai com rc 98,
    igual a "MBP fora"). rc 96..99 = MBP indisponível: espere, não volte pro
    mini. Receita e armadilhas: `docs/runbooks/mbp-offload.md`, "Go no MBP".
-2. **Gere o patch e commite ele** em
-   `$GC_CITY_PATH/docs/pending-engine-window/<bead>-<slug>.patch`
-   (`git -C <src> diff > …`). O patch é versionado; a árvore do engine carrega
-   mudança não-commitada por desenho, então patch fora dela é o que sobrevive.
+2. **Gere o patch num rascunho e entregue-o no MESMO ato: commit + push de um
+   worktree SEU, nunca um commit só local na raiz `~/gt` (ga-1bao0qs).** O
+   rascunho é `git -C <src> diff > <rascunho>` (caminho ABSOLUTO, fora de
+   `$GC_CITY_PATH`); o patch vai para
+   `$GC_CITY_PATH/docs/pending-engine-window/<bead>-<slug>.patch`. O patch é
+   versionado; a árvore do engine carrega mudança não-commitada por desenho,
+   então patch fora dela é o que sobrevive.
    **Caminho ANCORADO, nunca relativo** — nunca `docs/pending-engine-window/...`
    sozinho: `$GC_CITY_PATH` resolve sempre pra `~/gt/.gascity-gastown-hq`,
    qualquer que seja o cwd de quem commita; um caminho relativo, ao contrário,
@@ -711,15 +714,59 @@ toda confusão de repo/tree checando o binário que roda de verdade.
    minuto por dogs diferentes que "seguiram a instrução" ao pé da letra (ver
    memória engine-patch-town-root-invisible-to-window, bead ga-0ehtp). Um
    patch stageado errado é commitado, parece entregue, e a janela nunca o
-   enxerga.
-3. **Verifique que aplica limpo**: `git -C <src> apply --check <patch>`. Se já
-   estiver na árvore, `--check --reverse` passa — diga isso no comentário.
+   enxerga. No worktree vale o mesmo: o caminho leva o prefixo da cidade dentro
+   do repo (`REL` no bloco abaixo, `.gascity-gastown-hq/`).
+   **Por que o push é parte do commit:** o `town-root-reconciler` só avança a
+   raiz por `pull --ff-only`. Commit que fica só local em `~/gt` passa calado
+   até o gate mergear qualquer coisa no origin; aí a raiz vira DIVERGED e o
+   deploy de todo conserto de framework para até o Mayor fazer
+   stash/rebase/pop/push à mão (3 vezes em 12/11: ga-gn35963, ga-meokeks,
+   ga-3l2z0dz). Empurrar de DENTRO da raiz também não serve: ela é compartilhada,
+   o `git pull --rebase` recusa com edição alheia não-commitada (medido: "cannot
+   pull with rebase: You have unstaged changes") e `git push origin HEAD:main`
+   leva junto todo commit local que outro agente deixou lá. O worktree destacado
+   do `origin/main` carrega só o seu commit, e o rebase de um arquivo novo não
+   tem o que conflitar; o gesto é o do gate (`quality-gate-dispatcher.sh`:
+   `push origin <sha>:refs/heads/main`, só fast-forward). A raiz anda sozinha:
+   o reconciliador a puxa em ~25 s e o arquivo aparece em
+   `$GC_CITY_PATH/docs/pending-engine-window/`. Receita, de qualquer cwd
+   (`<src>` = o source do engine, `<bead>`/`<slug>` como acima):
+   ```bash
+   # falhou ou vazio → para aqui, nada é criado (REL vazio é VÁLIDO: cidade na raiz do repo)
+   ROOT=$(git -C "$GC_CITY_PATH" rev-parse --show-toplevel) && [ -n "$ROOT" ] \
+     && REL=$(git -C "$GC_CITY_PATH" rev-parse --show-prefix) || exit 1
+   PF=<caminho ABSOLUTO do rascunho>; WT="$ROOT/.gc-worktrees/<bead>-patch"; P="${REL}docs/pending-engine-window/<bead>-<slug>.patch"
+   if   git -C <src> apply --check "$PF" 2>/dev/null;           then echo "aplica limpo"
+   elif git -C <src> apply --check --reverse "$PF" 2>/dev/null; then echo "o fix já está na árvore (--reverse)"
+   else git -C <src> apply --check "$PF" >&2; echo "NÃO aplica nos dois sentidos (ou o rascunho está vazio)" >&2; exit 1; fi
+   git -C "$ROOT" worktree remove --force "$WT" 2>/dev/null || true
+   git -C "$ROOT" fetch origin main && git -C "$ROOT" worktree add --detach "$WT" origin/main || exit 1
+   mkdir -p "$WT/${REL}docs/pending-engine-window" && cp "$PF" "$WT/$P" || exit 1
+   git -C "$WT" add "$P" && git -C "$WT" commit -q -m "docs(<bead>): stage engine patch — <o que muda>" || exit 1
+   git -C "$WT" push origin HEAD:refs/heads/main \
+     || { git -C "$WT" fetch origin main && git -C "$WT" rebase origin/main \
+          && git -C "$WT" push origin HEAD:refs/heads/main; } || exit 1
+   git -C "$WT" rev-parse --short HEAD   # o sha vai no comentário (passo 5)
+   git -C "$ROOT" worktree remove --force "$WT"
+   ```
+   Push a `main` recusado por outro motivo que não `non-fast-forward` (hook,
+   rede): **não deixe o commit só local em lugar nenhum.** Empurre o mesmo
+   commit para um ramo (`git -C "$WT" push origin HEAD:refs/heads/fix/<bead>-<slug>`),
+   deixe o worktree onde está e conte ao Mayor na bead (label `next-action:mayor`
+   + comentário com ramo, sha e a mensagem do push). Sem `gate-done` aqui: o gate
+   fecha a bead no merge e o patch stageado ainda não está aplicado (ga-fbycg).
+3. **Verifique que aplica limpo**: `git -C <src> apply --check <patch>`; o bloco
+   do passo 2 já roda isto antes de criar o worktree. Se o fix já está na árvore,
+   `--check --reverse` passa e o bloco imprime qual dos dois valeu — diga isso no
+   comentário.
 4. **NÃO** rode `go build`, **NÃO** troque symlink, **NÃO** faça kickstart do
    supervisor. Aí sim aplique o label e devolva pro Mayor agendar a janela.
-5. No comentário do bead, diga o caminho do patch e o que ele entrega.
+5. No comentário do bead, diga o caminho do patch, o sha do commit que entrou
+   no `origin/main` (o que o bloco imprime) e o que o patch entrega.
 6. Se stageou no lugar errado por engano: `engine-window-backlog-guard.sh`
    (ga-0ehtp) alarma sozinho dentro de 1h (`gc order`, cooldown) — mas não
-   move o arquivo por você; mova-o manualmente pro caminho ancorado acima.
+   move o arquivo por você; mova-o manualmente pro caminho ancorado acima
+   (worktree novo, `git mv`, commit e push: o mesmo idioma do passo 2).
 
 Só use o refuse SEM patch quando o bead pedir literalmente o ato de deploy
 (ex.: "rodar a janela", "trocar o binário") e não haja conserto a escrever.
