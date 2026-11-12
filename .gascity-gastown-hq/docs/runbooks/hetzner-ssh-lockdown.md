@@ -2,11 +2,11 @@
 
 ## Contents
 
-• Estado medido em 11/11 · O que o Athos precisa dar (3 itens) · Instalação (root, uma vez)
-• A ordem e cada passo (admin → prova → fail2ban → ufw → rootcut) · As provas da história
-• Redes de segurança e como desfazer · Firewall da Hetzner Cloud (fica para quando houver token) · O que este script NÃO prova
-
-Bead ga-qg1dw5z.2 (trava 2 de 3; a 1 é o usuário `dados` sem sudo, a 3 é a auditoria). O alvo é o nó `hetzner-teste` (2.31.41.222). Tudo é um script só, `scripts/hetzner-ssh-lockdown.sh`, que roda **como root no nó** e tem selftest hermético (`scripts/hetzner-ssh-lockdown.selftest.sh`, 29 mutantes). Nenhum passo é comando improvisado ao vivo: cada um só avança com a PROVA do anterior e os dois que podem trancar o servidor para fora (`ufw`, `rootcut`) armam, antes de agir, um timer que desfaz sozinho em 10 min.
+• Estado medido em 11/11 · O que o Athos precisa dar (3 itens, nenhum é técnico)
+• Instalação (root, uma vez) · A ordem e cada passo
+• As provas da história (rodar depois do rootcut, antes do confirm)
+• Redes de segurança e como desfazer · Firewall da Hetzner Cloud (fica para quando houver token)
+• O que este script NÃO prova
 
 ## Estado medido em 11/11
 
