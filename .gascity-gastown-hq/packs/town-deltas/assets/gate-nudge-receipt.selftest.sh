@@ -342,6 +342,11 @@ g_rebase() {
     chk "rebase3 [$mode] rc 0 and the outcome is recorded as unreadable (cannot tell is not told)" streq "$SEND_RC:$(rget "$(recf "$BEAD" "$TO")" outcome):$(rget "$(recf "$BEAD" "$TO")" kind)" "0:unreadable:rebase"
   done
 
+  # quality-gate-dispatcher.sh gate_rebase_nudge: the outcome read itself fails: jq exits 1 (a stub ahead of the real one), the nudge was accepted → still recorded as unreadable, never as delivered
+  new_case; echo delivered > "$FD/nudge.$TO"; mkdir -p "$CASE/badjq"; printf '#!/bin/sh\nexit 1\n' > "$CASE/badjq/jq"; chmod +x "$CASE/badjq/jq"
+  SANDBOX_PATH_SAVE="$SANDBOX_PATH"; SANDBOX_PATH="$CASE/badjq:$SANDBOX_PATH"; rsend "$BEAD" "$TO" "$RMSG"; SANDBOX_PATH="$SANDBOX_PATH_SAVE"
+  chk "rebase3b the outcome read FAILS (jq exits 1) on an accepted nudge: rc 0, recorded as unreadable (a failed read is not 'delivered')" streq "$SEND_RC:$(rget "$(recf "$BEAD" "$TO")" outcome):$(rget "$(recf "$BEAD" "$TO")" kind)" "0:unreadable:rebase"
+
   new_case; echo fail > "$FD/nudge.$TO"; rsend "$BEAD" "$TO" "$RMSG"
   chk "rebase4 the nudge is NOT accepted: rc 1 (the caller keeps its warn) and nothing is recorded" streq "$SEND_RC:$(pending_n):$(mail_n)" "1:0:0"
   new_case; rsend "$BEAD" "" "$RMSG"
