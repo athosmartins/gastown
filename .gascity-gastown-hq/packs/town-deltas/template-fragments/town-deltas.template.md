@@ -1216,18 +1216,21 @@ Startup Protocol nativo (mail, execução) como estão.
 rigs acima quando o `bd list` nativo falhava. Como `gc hook` sai 1 tanto para
 vazio quanto para erro, o bloco separa os dois: é VAZIO só com exit 1, nenhuma
 linha `gc hook:` no stderr e stdout vazio ou `[]` (um `warning:` no stderr não
-é erro); exit 0 com corpo é TEM; todo o resto (linha `gc hook:`, timeout, exit
-2/124/127, exit 0 sem corpo, stdout estranho) é NÃO SEI, e o bloco sai 1:
+é erro); é TEM com exit 0 e um corpo que não seja só `[]` (o `gc hook` só sai 0
+quando há trabalho); todo o resto (linha `gc hook:`, timeout, exit 2/124/127,
+exit 0 sem corpo ou só com `[]`, exit 1 com stdout que não seja vazio nem `[]`)
+é NÃO SEI, e o bloco sai 1:
 ```bash
 # Step 1: gc hook acha seu wisp por identidade, mesmo se o agent-home
 # cair no store errado (o que o bd list abaixo NÃO consegue).
 HOOK_ERR=$(mktemp) || { echo "HOOK=nao-sei (mktemp falhou) — NÃO faça pour; repita o Step 1." >&2; exit 1; }
-# vazio → HOOK=vazio (exit 1, sem linha "gc hook:", stdout vazio ou []); falhou/ilegível → HOOK=nao-sei (nunca vira "vazio")
+# vazio → HOOK=vazio (exit 1, sem linha "gc hook:", stdout vazio ou []); falhou/ilegível → HOOK=nao-sei (o erro é reconhecido pelo prefixo "gc hook:": um erro do gc sem ele, com exit 1 e stdout vazio, lê como vazio)
 HOOK_OUT=$(gc hook 2>"$HOOK_ERR"); HOOK_RC=$?
 HOOK_BODY=${HOOK_OUT//[[:space:]]/}
 HOOK_ERRLINES=$(grep -c '^gc hook:' "$HOOK_ERR")
 HOOK_STATE=nao-sei
-if [ "$HOOK_RC" -eq 0 ] && [ -n "$HOOK_BODY" ]; then
+# exit 0 só vem com trabalho: exit 0 com [] contradiz o contrato do gc hook e fica nao-sei, não tem
+if [ "$HOOK_RC" -eq 0 ] && [ -n "$HOOK_BODY" ] && [ "$HOOK_BODY" != '[]' ]; then
   HOOK_STATE=tem
 elif [ "$HOOK_RC" -eq 1 ] && [ "$HOOK_ERRLINES" = 0 ] && { [ -z "$HOOK_BODY" ] || [ "$HOOK_BODY" = '[]' ]; }; then
   HOOK_STATE=vazio
@@ -1236,7 +1239,7 @@ echo "HOOK=$HOOK_STATE (exit $HOOK_RC)"
 case "$HOOK_STATE" in
   tem)   printf '%s\n' "$HOOK_OUT" ;;   # há trabalho — siga a partir daqui
   vazio) ;;                              # nada no hook — segue para Step 2 (mail) e Step 3 (bootstrap)
-  *)     echo "NÃO é vazio — não faça o Step 3. stderr: $(head -c 300 "$HOOK_ERR")" >&2 ;;
+  *)     echo "NÃO é vazio — não faça o Step 3. stderr: $(head -c 300 "$HOOK_ERR") | stdout: $(printf '%s' "$HOOK_OUT" | head -c 300)" >&2 ;;
 esac
 rm -f "$HOOK_ERR"
 [ "$HOOK_STATE" != nao-sei ]
@@ -1245,7 +1248,7 @@ rm -f "$HOOK_ERR"
 **Se o Step 1 imprimiu `HOOK=nao-sei`:** não é "vazio", e o Step 3 (o pour) fica
 PROIBIDO neste turno. Pode seguir para o Step 2 (mail); depois `sleep 60` e
 repita o Step 1. Três `nao-sei` seguidos: `gc session nudge mayor/ "witness
-<seu rig>: gc hook sem resposta 3x"` com o stderr que o bloco mostrou, e termine
+<seu rig>: gc hook sem resposta 3x"` com o stderr e o stdout que o bloco mostrou, e termine
 o turno sem pour (sem wisp não há patrulha neste ciclo, o que custa menos que um
 wisp duplicado).
 
@@ -1253,8 +1256,9 @@ wisp duplicado).
 Step 2 não achou nada): antes de qualquer pour ele LÊ o store pinado e só faz o
 pour se a leitura respondeu vazia (`[]` com exit 0); wisp seu já existente = não
 faz pour (retome-o); leitura que falhou ou veio ilegível = NÃO SEI = não faz
-pour. Pina o banco certo com `-C` e passa `rig_root` (só o override da HQ usa
-essa variável para repetir o pin nos ciclos seguintes; veja o fim desta seção):
+pour. Pina o banco certo com `-C` e passa `rig_root` (só o override usa essa
+variável, para repetir o pin nos ciclos seguintes; a formula nativa a ignora; veja
+o fim desta seção):
 ```bash
 [ -n "$GC_AGENT" ] || { echo "Step 3: GC_AGENT vazio, não sei de quem é o wisp — NÃO faça pour." >&2; exit 1; }
 # vazio ([] com exit 0) → segue para o pour; tem (id) → NÃO faz pour, retome esse wisp; falhou/ilegível → NÃO SEI, NÃO faz pour
@@ -1323,15 +1327,20 @@ fi
 gc hook
 ```
 
-**Onde a guarda da formula vale — e onde NÃO vale (ga-zo1bzza).** O override
+**Onde a guarda da formula vale — e onde NÃO vale (ga-zo1bzza; reescrito em ga-84wifto).** O override
 `packs/town-deltas/formulas/mol-witness-patrol.toml` (step `next-iteration` com
 `-C '{{ .RigRoot }}'` e verificação pós-pour antes de assign/burn; leitura do
-overlay de sessões com `-C "$GC_CITY_PATH"`) só é resolvido pelo store da HQ.
-Cada rig importa apenas o pack `gastown` (`[rigs.imports.gastown]` no
-`city.toml`) e, medido em 11/11 nos 5 rigs (ga-zo1bzza), o store de RIG resolve
-a formula NATIVA: sem `rig_root`, sem `-C`, sem verificação. Numa wisp de rig o
-texto dos steps é o nativo, então as guardas são as deste prompt — e quem as
-aplica é você:
+overlay de sessões com `-C "$GC_CITY_PATH"`) vale na HQ e chega aos rigs por duas
+ligações, porque cada rig importa apenas o pack `gastown`
+(`[rigs.imports.gastown]` no `city.toml`): `formulas_dir = "rig-overrides/formulas"`
+em cada rig (ga-p8ip28d), que só alcança os rigs sem `.beads/redirect`; nos que têm
+(hoje gastown, lexbh e marketing) o `bd` lê `~/gt/.beads/formulas/`, e o link de lá
+é estado local, fora do git, que `scripts/rig-formula-redirect-link.sh --apply`
+recria (ga-6pil72r). Só que o texto da SUA wisp foi gravado quando ela foi
+despejada: uma wisp anterior a essas ligações, ou de um rig que perdeu o link, segue
+com a formula NATIVA (sem `rig_root`, sem `-C`, sem verificação) até ser queimada.
+Confira no step `next-iteration` dela: com `-C` é o override; sem `-C` é a nativa, e
+então as guardas são as deste prompt — e quem as aplica é você:
 
 **Pour/burn (step `next-iteration`).** Se o step da sua wisp traz `gc bd mol
 wisp`, `show`, `update` ou `mol burn` sem `-C`, não os rode como estão: use o
@@ -1351,9 +1360,8 @@ DESCONHECIDO: resolva só pela lista viva de sessões e diga isso — nunca trat
 como "vazio".
 
 Qualquer pour manual (ex.: o Step 3 acima) precisa sempre passar `--var
-rig_root='{{ .RigRoot }}'` junto com `--var binding_prefix=...`: o override da
-HQ trata `rig_root` vazio como erro (mail pro mayor + aborta) em vez de cair em
-fallback silencioso; a formula nativa, nos rigs, aceita a variável e a ignora
-sem avisar.
+rig_root='{{ .RigRoot }}'` junto com `--var binding_prefix=...`: o override
+trata `rig_root` vazio como erro (mail pro mayor + aborta) em vez de cair em
+fallback silencioso; a formula nativa aceita a variável e a ignora sem avisar.
 {{ end -}}
 {{ end }}

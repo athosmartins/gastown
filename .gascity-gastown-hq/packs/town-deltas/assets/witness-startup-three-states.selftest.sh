@@ -18,6 +18,13 @@
 # first `BD_C=()` and the last `gc hook` line of the No-Idle block) and witness-patrol-liveness-read-failure.selftest.sh
 # (the session-bead overlay read). This file owns the behavior of the three blocks.
 #
+# ga-84wifto (the two low findings the gate carried from ga-6zrshxb, plus the stale paragraph): exit 0 with a bare `[]` is
+# NOT "has" (the contract is exit 0 = work, the same reading as pool-autoscale-watchdog.py _pool_probe_verdict, where exit 0
+# with an empty list is "unknown"), the nao-sei line carries stdout as well as stderr (an exit 0 + [] has an empty stderr),
+# the block's comment states the one limit of its error test (a hook error is recognized by its "gc hook:" prefix) and a case
+# keeps that comment and the code one claim, and Group D pins that the section no longer says the override is resolved by
+# the HQ store only (it reaches the rigs since ga-p8ip28d / ga-6pil72r) and that the scripts it points to exist.
+#
 # WITNESS_TEMPLATE_UNDER_TEST overrides the template (mutant runs, see the delivery of ga-6zrshxb).
 # Exit 0 iff every scenario holds.
 
@@ -187,11 +194,19 @@ step1_case "usage error (exit 2)"                                  2   ""       
 step1_case "killed by a timeout wrapper (exit 124)"                124 ""                       ""                                                         nao-sei 1
 step1_case "gc not executable (exit 127)"                          127 ""                       ""                                                         nao-sei 1
 step1_case "exit 0 without a body is not an answer"                0   ""                       ""                                                         nao-sei 1
+step1_case "exit 0 with [] contradicts the contract (exit 0 = work): not tem" 0 '[]'              ""                                                         nao-sei 1
+step1_case "exit 0 with [] padded by blanks and newlines is the same" 0 $'\n [ ]\n'              ""                                                         nao-sei 1
 step1_case "exit 1 with a body that is not a list"                 1   'Error: boom'            ""                                                         nao-sei 1
 step1_case "exit 1 with a non-empty list (not a clean empty)"      1   '[{"id":"x"}]'           ""                                                         nao-sei 1
+# KNOWN LIMIT, written in the block's own comment: a hook error is recognized by its "gc hook:" prefix, so an error WITHOUT it
+# (exit 1, empty stdout) reads as vazio. Pinned so that comment and the code stay one claim; tighten both together or neither.
+step1_case "KNOWN LIMIT: exit 1, empty stdout, stderr without the gc hook: prefix" 1 ""        'gc: unknown flag: --bogus'                                vazio   0
 # the error text must reach the witness, or "nao-sei" cannot be told from a flaky run
 run_block "$STEP1" STUB_HOOK_RC=1 STUB_HOOK_ERR='gc hook: work query timed out after 30s'
 if printf '%s\n' "$OUT" | grep -F -q 'timed out after 30s'; then ok "nao-sei carries the hook's own error line"; else bad "nao-sei hides WHY gc hook failed: $OUT"; fi
+# exit 0 with [] says nothing on stderr: the stdout is the only evidence the witness can hand the mayor after three of them
+run_block "$STEP1" STUB_HOOK_RC=0 STUB_HOOK_OUT='[]'
+if printf '%s\n' "$OUT" | grep -F -q 'stdout: []'; then ok "nao-sei carries the hook's stdout too (exit 0 + [] has no stderr to show)"; else bad "nao-sei for exit 0 + [] shows no stdout, so the report to the mayor would be blank: $OUT"; fi
 # mktemp is the block's own read of the world: if it fails the block cannot tell, so it says nao-sei
 run_block "$STEP1" STUB_MKTEMP_FAIL=1 STUB_HOOK_RC=1 STUB_HOOK_OUT='[]'
 if printf '%s\n' "$OUT" | grep -q '^HOOK=nao-sei' && [ "$RC" -eq 1 ] && [ "$(spy_n '^GC hook')" -eq 0 ] && printf '%s\n' "$OUT" | grep -F -q 'mktemp falhou'; then
@@ -335,6 +350,23 @@ if printf '%s\n' "$SECTION" | grep -F -q '/tmp/witness-hook.json'; then
 else
   ok "no shared /tmp/witness-hook.json (the block makes its own temp file and keeps stderr apart)"
 fi
+# ga-84wifto: the paragraph "Onde a guarda da formula vale" said the override is resolved by the HQ store only and that a rig
+# poured the NATIVE formula, true until ga-p8ip28d (formulas_dir) and ga-6pil72r (the ~/gt/.beads/formulas link of the rigs with a
+# .beads/redirect). A witness that believes the old text applies by hand a guard its wisp already carries and, worse, reads a
+# native wisp as "the override is in force". The old sentences must not come back, and the two wirings the new text names must exist.
+STALE=""
+for s in 'só é resolvido pelo store da HQ' 'só o override da HQ usa' 'a formula nativa, nos rigs, aceita' 'o store de RIG resolve'; do
+  printf '%s\n' "$SECTION" | grep -F -q -- "$s" && STALE="$STALE [$s]"
+done
+if [ -z "$STALE" ]; then ok "the section no longer says the override is resolved by the HQ store only"; else bad "the section still carries the pre-ga-p8ip28d claim:$STALE"; fi
+HQ_ROOT="$TOWN_DELTAS_ROOT/../.."
+for w in 'formulas_dir:city.toml:formulas_dir = "rig-overrides/formulas"' 'rig-formula-redirect-link.sh:scripts/rig-formula-redirect-link.sh:'; do
+  name="${w%%:*}"; rest="${w#*:}"; rel="${rest%%:*}"; want="${rest#*:}"
+  if ! printf '%s\n' "$SECTION" | grep -F -q -- "$name"; then bad "the section does not name $name (one of the two wirings that carry the override into the rigs)"; continue; fi
+  if [ ! -f "$HQ_ROOT/$rel" ]; then bad "the section names $name but $rel does not exist in this tree"; continue; fi
+  if [ -n "$want" ] && ! grep -F -q -- "$want" "$HQ_ROOT/$rel"; then bad "the section names $name but $rel has no '$want'"; continue; fi
+  ok "the section names $name and $rel backs it up"
+done
 
 echo ""
 echo "Results: $PASS passed, $FAIL failed"

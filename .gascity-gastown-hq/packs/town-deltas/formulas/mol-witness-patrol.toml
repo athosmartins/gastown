@@ -45,15 +45,22 @@
 # OVERLAY UNKNOWN now carries the read's own error line.
 #
 # WHERE THIS FILE IS RESOLVED -- read this before trusting any pin above:
-# only by the HQ store. city.toml imports town-deltas at city scope only and
-# each [[rigs]] imports just `gastown` ([rigs.imports.gastown]); measured on
-# 2026-11-11 (ga-zo1bzza report), in all 5 rigs `<rig>/.beads/formulas/mol-
-# witness-patrol*.toml` points at the NATIVE `.gc/system/packs/gastown/
-# formulas/` file, which has no rig_root and none of these pins. So in a rig
-# wisp the guards of this file are not in force, and the WITNESS section of
-# town-deltas.template.md is what tells the witness to apply the same -C pins
-# itself. Making rigs resolve this file is a city.toml layering change that
-# has not been made or verified.
+# the HQ store reads it directly (city.toml imports town-deltas at city scope).
+# A rig does not: each [[rigs]] imports just `gastown` ([rigs.imports.gastown]),
+# and measured on 2026-11-11 (ga-zo1bzza report) all 5 rigs resolved the NATIVE
+# `.gc/system/packs/gastown/formulas/` file, which has no rig_root and none of
+# these pins. Two wirings carry this file into the rigs now:
+#   - ga-p8ip28d: city.toml gives every rig `formulas_dir =
+#     "rig-overrides/formulas"` (a relative symlink to this file); it reaches
+#     only the rigs without a .beads/redirect.
+#   - ga-6pil72r: a rig with a .beads/redirect (gastown, lexbh, marketing) is
+#     read by bd through the redirect target and then ~/gt/.beads/formulas/,
+#     never <rig>/.beads/formulas/; the link there is local, untracked state,
+#     recreated by scripts/rig-formula-redirect-link.sh --apply.
+# A wisp keeps the text of the formula it was poured from, so a wisp older than
+# those wirings, or from a rig that lost its link, still runs the native text,
+# and the WITNESS section of town-deltas.template.md tells the witness to apply
+# the same -C pins itself when its wisp is native.
 #
 # Everything else in this file is an unmodified copy of the embedded
 # default (see .gc/system/packs/gastown/formulas/mol-witness-patrol.toml).

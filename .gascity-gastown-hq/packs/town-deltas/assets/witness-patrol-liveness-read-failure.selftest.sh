@@ -31,8 +31,8 @@
 # store a call would reach (no -C, or a -C that is not the city: the real "invalid issue type" error)
 # and logs every call (the spy). Scenarios 1, 2 and 6-8 pin the read to the city path, require that an
 # empty or unset GC_CITY_PATH makes NO call, require the read's own error line in OVERLAY UNKNOWN, and
-# EXECUTE the read commands the formula documents and the witness prompt prescribes (a rig witness runs
-# the NATIVE formula, so the prompt line is the effective guard there) instead of comparing their text.
+# EXECUTE the read commands the formula documents and the witness prompt prescribes (a wisp poured from the
+# NATIVE text, which a rig can still have, has only the prompt line as its guard) instead of comparing their text.
 # Verified both directions: against the pre-fix formula and prompt this file passes 20 and fails 10 (each
 # failure one of the symptoms above); against the fix it passes 30/30, also under a real bash 3.2.57
 # (harness and extracted block).
@@ -384,9 +384,9 @@ for mode in empty unset; do
 done
 
 # ── Scenario 8 (ga-zo1bzza): the reads written down for a witness run clean ─
-# The formula documents the roster read once above the recipe, and the prompt tells a RIG witness (whose
-# wisp text is the native formula, not this file) what to run for the overlay. A witness copies those
-# lines, so they are EXECUTED here under the same stub topology instead of being compared as text.
+# The formula documents the roster read once above the recipe, and the prompt tells a witness whose wisp
+# text is the NATIVE formula, not this file (a rig can still have one), what to run for the overlay. A
+# witness copies those lines, so they are EXECUTED here under the same stub topology, not compared as text.
 run_documented_reads() { # $1 = label, $2 = newline-separated command lines
   local label="$1" lines="$2" n=0 failed=0 line
   while IFS= read -r line; do
