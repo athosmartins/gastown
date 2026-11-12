@@ -1340,6 +1340,16 @@ except Exception:
 done
 }
 
+# Capture of the live conversation of every crew and of the Mayor (ga-esorlre.2), the last act before the shutdown. Runs as the user, not root (the tmux server and ~/.claude are the user's, and
+# root-owned files next to them would break the user later: see guard_sender_in_flight), bounded, and NEVER a veto: the safety re-check is behind us (no skip decision is left, only the
+# shutdown call itself can fail); if the capture fails or times out, the last value of the periodic capture (launchd, every 2 min) stands.
+CAPTURE_PY="${NIGHTLY_REBOOT_CAPTURE_PY:-${CITY}/scripts/live-conversation-capture.py}"
+CAPTURE_TIMEOUT="${NIGHTLY_REBOOT_CAPTURE_TIMEOUT_SECS:-30}"
+case "${CAPTURE_TIMEOUT}" in ''|*[!0-9]*|0) CAPTURE_TIMEOUT=30 ;; esac
+capture_live_conversations() {
+    sudo -u "${NOTIFY_AS_USER}" /usr/bin/env HOME="/Users/${NOTIFY_AS_USER}" GC_CITY_PATH="${CITY}" LCC_GC="${GC}" LCC_BD="${BD}" LCC_TMUX="${NIGHTLY_REBOOT_TMUX:-/opt/homebrew/bin/tmux}" "${PYTHON3_BIN}" "${CAPTURE_PY}" --final
+}
+
 # The shared tail: both modes end here (legacy at 01:00, drain at 23:40). Unindented
 # lines inside are a python -c string; do not re-indent them.
 reboot_now_sequence() {
@@ -1385,6 +1395,12 @@ if [ "${REBOOT_MODE}" = "drain" ]; then
     log "final safety re-check, just before the shutdown (the 23:40 verdict is minutes old)"
     safety_gate_wait || drain_skip_night
 fi
+
+# empty → n/a (only the rc matters); failed/timed out → only the log says so, the reboot proceeds
+CAP_OUT="$(mktemp -t nightly-reboot-capture.XXXXXX)"; run_bounded "${CAPTURE_TIMEOUT}" "${CAP_OUT}" capture_live_conversations; CAP_RC=$?
+CAP_NOTE=""; [ "${CAP_RC}" -eq 124 ] && CAP_NOTE=" (TIMED OUT)"
+log "capture: live conversations rc=${CAP_RC}${CAP_NOTE}: $(head -1 "${CAP_OUT}" 2>/dev/null | cut -c1-200) — the reboot proceeds"
+rm -f "${CAP_OUT}" "${CAP_OUT}.deadline"
 
 # The routine "Reiniciando" note is sent AFTER the re-check (gate FAIL 3/3): the re-check
 # can still turn the night into a SKIP — up to ~16 min later — and a "reiniciando às HH:MM"

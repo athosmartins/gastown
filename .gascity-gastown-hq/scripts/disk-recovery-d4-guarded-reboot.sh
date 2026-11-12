@@ -66,6 +66,7 @@ GCBIN="${DR_GC_BIN:-${GC_BIN:-gc}}"
 VOLUME="${DR4_VOLUME:-/System/Volumes/Data}"
 PY="${DR4_PYTHON:-/usr/bin/python3}"
 CALLS_PY="${DR4_CALLS_PY:-$D/disk-recovery-d4-calls-in-flight.py}"
+CAPTURE_PY="${DR4_CAPTURE_PY:-$D/live-conversation-capture.py}"
 SENDER_PY="${DR4_SENDER_SAFE_PY:-/Users/athos/gt/whatsapp_automation/scripts/central_sender_restart_safe.py}"
 NIGHTLY="${DR4_NIGHTLY:-$CITY/scripts/nightly-reboot.sh}"
 PGREP="${DR4_PGREP_BIN:-/usr/bin/pgrep}"
@@ -122,6 +123,7 @@ cfg HARD_STREAK_N 2    # com livre < HARD_MB e HARD_STREAK >= isto, também é t
 cfg CHEAP_S 25         # prazo de cada chamada do sqlite3 (leitura barata do envio, leitura e escrita da pausa)
 cfg DRAIN_S 150        # com o envio pausado, espera isto para esvaziar (um envio on-device leva ~2 min)
 cfg DRAIN_POLL_S 10    # intervalo entre as leituras baratas durante o esvaziamento
+cfg CAPTURE_TIMEOUT_S 30  # prazo da captura da conversa viva (--final) antes do reinício (ga-esorlre.2); estourou/falhou = só o log avisa
 
 now() { case "${DR4_NOW:-}" in ''|*[!0-9]*) date +%s ;; *) printf '%s' "$DR4_NOW" ;; esac; }
 hhmm() { date -r "$1" '+%H:%M' 2>/dev/null || printf '%s' "$1"; }
@@ -862,6 +864,12 @@ case "$grc" in
     send_notify 5 "Disco: reinício cancelado, guarda ilegível na última checagem" "Depois do aviso não consegui ler: ${UNK_WHY}. NÃO reiniciei. Tento de novo às $(hhmm "$S_DEFER_UNTIL")."
     emit 30 "não consegui reler guarda(s) (${UNK_NAMES}): ${UNK_WHY} — NÃO reinicio; espera até $(hhmm "$S_DEFER_UNTIL")" ;;
 esac
+
+# captura da conversa viva (ga-esorlre.2): guardas e cancelamentos ficaram para trás (só a marca e o pedido ainda podem falhar), então a conversa que cada crew e o Mayor usam AGORA vai para a
+# bead de sessão, o último ato antes da marca. NUNCA barra o reinício (o D4 existe para salvar o mini; vale o último valor da rodada periódica). vazio → n/a (só o rc importa); falhou/estourou o prazo → só o log avisa
+run_bounded "$CAPTURE_TIMEOUT_S" env GC_CITY_PATH="$CITY" "$PY" "$CAPTURE_PY" --final; crc=$?
+if [ "$crc" -eq 0 ]; then log "captura da conversa viva (--final): $(out_line)"; else log "WARN: captura da conversa viva (--final) rc=$crc ($(out_line)) — o reinício segue"; fi
+rb_clean
 
 # a marca vai para o disco ANTES do pedido e é CONFERIDA: o pedido derruba este processo (nada escrito depois conta), e reinício sem marca
 # gravada é o caminho do laço. Não gravou = não reinicia.
