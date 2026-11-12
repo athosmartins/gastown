@@ -90,7 +90,7 @@ def _fm(p: str):
     return lambda s: c.fullmatch(s) is not None
 
 
-ID = r"[A-Za-z][A-Za-z0-9]{0,15}(?:-[A-Za-z0-9]{1,16}){1,2}(?:\.[0-9]{1,4}){0,3}"  # 2 hífens são os wisps/mails reais (ga-wisp-0i6hr: 653/653 medidos em 14/10); 3 ou mais não existem
+ID = r"[A-Za-z][A-Za-z0-9]{0,15}(?:-[A-Za-z0-9]{1,16}){1,2}(?:\.[0-9]{1,4}){0,8}"  # 2 hífens são os wisps/mails reais (ga-wisp-0i6hr: 653/653 medidos em 14/10); 3 ou mais não existem. Até 8 níveis `.N`: `bd create --parent` aninha fatia de fatia sem teto e a cidade já tem id de 4 níveis (wa-p7ag21.14.2.2.1); com {0,3} o worker no nó tomava rc 77 em todo comando da bead (ga-k4r25iv). O teto é só de tamanho: depois de cada ponto continuam só dígitos
 
 
 def v_text(s: str) -> bool:

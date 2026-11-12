@@ -56,6 +56,14 @@ allowed "bd comment em wisp" bd comment ga-wisp-072rx feito
 allowed "bd close em wisp" bd close ga-wisp-072rx --reason ok
 allowed "bd update em wisp" bd update ga-wisp-072rx --set-metadata story.a=b
 allowed "bd list --parent/--id com ids de wisp" bd list --parent ga-wisp-0i6hr --id ga-wisp-072rx,wa-wisp-0a0mav
+# fatia de fatia: `bd create --parent` aninha sem teto, e a cidade já tem id com 4 níveis (wa-p7ag21.14.2.2.1). Com o teto antigo de 3 sufixos `.N` o worker
+# não conseguia comentar nem devolver a bead (rc 77) e o Pilot re-despachava em ciclo (ga-k4r25iv). O formato segue fechado: só dígitos depois de cada ponto.
+allowed "bd show em fatia de 4 níveis (wa-p7ag21.14.2.2.1)" bd show wa-p7ag21.14.2.2.1 --json
+allowed "bd comment em fatia de 4 níveis" bd comment wa-p7ag21.14.2.2.1 feito; lastis "argv=[comment][wa-p7ag21.14.2.2.1][feito]"; ok $? "  argv canônico, id inteiro (não truncado no 3º nível)"
+allowed "bd update em fatia de 4 níveis" bd update wa-p7ag21.14.2.2.1 --set-metadata story.a=b
+allowed "bd close em fatia de 5 níveis" bd close wa-p7ag21.14.2.2.1.3 --reason ok
+allowed "bd list --id com fatias de 4 e 5 níveis" bd list --id wa-p7ag21.14.2.2.1,ga-k4r25iv.1.2.3.4.5
+allowed "gc mail read com id de fatia profunda (8 níveis, o teto)" gc mail read ga-abc.1.2.3.4.5.6.7.8
 HOOKENV='{"GC_ALIAS":"gastown.dog-1","GC_AGENT":"gastown.dog-1","GC_SESSION_NAME":"dog-gavycydh","GC_MANAGED_SESSION_HOOK":"1","GC_HOOK_EVENT_NAME":"SessionStart"}'
 b=$(calls); wrap "$(rq gc "$HOOKENV" prime --hook)"; [ "$RC" = 0 ] && [ "$(calls)" = $((b+1)) ] && lastis "hook=1/SessionStart" && lastis "argv=[prime][--hook]"; ok $? "gc prime --hook (decisão do Mayor) + GC_MANAGED_SESSION_HOOK/GC_HOOK_EVENT_NAME chegam ao gc"
 b=$(calls); wrap "$(rq gc "$HOOKENV" prime --hook --hook-format codex)"; [ "$RC" = 0 ] && [ "$(calls)" = $((b+1)) ] && lastis "argv=[prime][--hook][--hook-format][codex]"; ok $? "gc prime --hook --hook-format codex (a forma que o hook REAL do mini manda)"
@@ -117,6 +125,11 @@ denied "id com segmento vazio" "fora do formato" bd show 'ga--x'
 denied "id terminado em hífen" "fora do formato" bd show 'ga-wisp-'
 denied "id com 3 hífens (o teto são 2: <prefixo>-wisp-<sufixo>)" "fora do formato" bd show 'ga-a-b-c'
 denied "id de wisp em --id com ';'" "fora do formato" bd list --id 'ga-wisp-1,ga-wisp-2;id'
+denied "id de fatia profunda com ';' (o teto maior não afrouxa o resto do formato)" "fora do formato" bd show 'wa-p7ag21.14.2.2.1;id'
+denied "id de fatia profunda com \$()" "fora do formato" bd show 'wa-p7ag21.14.2.2.1$(id)'
+denied "id com nível não numérico (wa-x.1.2.3.4.a)" "fora do formato" bd show wa-x.1.2.3.4.a
+denied "id com nível vazio (wa-x.1.2..3.4)" "fora do formato" bd show wa-x.1.2..3.4
+denied "id com 9 níveis (acima do teto de 8)" "fora do formato" bd show ga-abc.1.2.3.4.5.6.7.8.9
 denied "id começando com '-'" "flag fora da lista" bd show -ga-1
 denied "id com espaço" "fora do formato" bd show 'ga-1 ga-2'
 denied "bd -C fora das rotas" "não é a cidade nem um rig" bd -C /etc show ga-1
@@ -748,6 +761,8 @@ mutate 'and k.startswith(ALLOW_META) ' ''; ok $? "controle: a lista de prefixos 
 b=$(calls); withmutant call bd update ga-1 --set-metadata gc.routed_to=x; [ "$RC" = 0 ] && [ "$(calls)" = $((b+1)) ]; ok $? "  sem ela 'gc.routed_to=x' passa a rodar (o caso de recusa acima de fato a exercita)"
 mutate '"id": _fm(ID), ' '"id": lambda s: True, '; ok $? "controle: o formato do id existe"
 b=$(calls); withmutant call bd show 'ga-1;id'; [ "$RC" = 0 ] && [ "$(calls)" = $((b+1)) ]; ok $? "  sem ele 'ga-1;id' passa a rodar"
+mutate '(?:\.[0-9]{1,4}){0,8}"' '(?:\.[0-9]{1,4}){0,3}"'; ok $? "controle: o teto de níveis .N do id existe (ga-k4r25iv)"
+b=$(calls); withmutant call bd show wa-p7ag21.14.2.2.1; [ "$RC" = 77 ] && [ "$(calls)" = "$b" ]; ok $? "  com o teto antigo (3) o id de 4 níveis volta a ser recusado (o caso novo de fato o exercita)"
 mutate '    if len(doc["argv"]) > MAX_ARGS or' '    if False and len(doc["argv"]) > MAX_ARGS or'; ok $? "controle: o teto de argumentos existe"
 mutate 'if k not in ENV_VAL or not re.fullmatch(ENV_VAL[k], env[k])]' 'if False]'; ok $? "controle: a lista de variáveis de ambiente existe"
 BINREQ="$(rq bd '{"GC_ALIAS":"gastown.dog-1","GC_BIN":"/tmp/x"}' show ga-1)"
