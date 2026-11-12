@@ -15,10 +15,10 @@
 # (same convention as mcp-strict-headless-provider.selftest.sh — `gc config show` resolution
 # needs untracked local state such as .gc/site.toml that a clean checkout does not have):
 #   1. [providers.claude-rc] exists, is built on builtin:claude and adds --remote-control;
-#   2. claude-rc adds exactly --remote-control mayor + --model opus (the Mayor's; ga-ift2yeq names it), and
+#   2. claude-rc adds exactly --remote-control Mayor + --model opus (the Mayor's; ga-ift2yeq names it), and
 #      claude-rc-crew (unnamed fallback) adds exactly --remote-control + --model opus (Athos 2026-10-11: crews
 #      on Opus, supersedes the 2026-10-05 Sonnet), no other flags;
-#   3. peter-wa uses its own claude-rc-peter (ga-ift2yeq: fixed RC name "peter"), and its on-demand steady state (ga-3g2rjo, 2026-09-22: no
+#   3. peter-wa uses its own claude-rc-peter (ga-ift2yeq: fixed RC name "Peter"), and its on-demand steady state (ga-3g2rjo, 2026-09-22: no
 #      committed suspended=true -- the never-gets-a-bead dispatch-safety guarantee
 #      now lives independently in pilot-dispatcher.sh's _crew_is_suspended, see its
 #      own selftest Scenario 22e) leaves its session caps unchanged;
@@ -58,11 +58,11 @@ fi
 echo "── 2. claude-rc adds only RC + the Opus pin (ga-n56ase), nothing else ──"
 # ga-n56ase (Athos 2026-09-28): crews run Opus 5.5 by mandate, pinned here with the CLI's own
 # "opus" alias. Exact match on purpose: a different model id, or any extra flag, fails.
-# ga-ift2yeq (Athos 11/11): the RC session is named, so the Claude app shows "mayor" on every launch.
-if [ "$(args_of claude-rc)" = 'args_append = ["--remote-control", "mayor", "--model", "opus"]' ]; then
+# ga-ift2yeq (Athos 11/11): the RC session is named, so the Claude app shows "Mayor" on every launch (Proper Case, Athos 12/11).
+if [ "$(args_of claude-rc)" = 'args_append = ["--remote-control", "Mayor", "--model", "opus"]' ]; then
   ok "claude-rc.args_append is exactly RC 'mayor' + --model opus (MCP surface, effort and permissions untouched)"
 else
-  bad "claude-rc.args_append is not exactly [--remote-control, mayor, --model, opus]: $(args_of claude-rc)"
+  bad "claude-rc.args_append is not exactly [--remote-control, Mayor, --model, opus]: $(args_of claude-rc)"
 fi
 # Athos 2026-10-11 ("Manter Opus", supersedes the 2026-10-05 Sonnet): crews on the CLI's "opus" alias.
 # claude-rc-crew is the unnamed fallback since ga-ift2yeq. Exact match, same reason as above.
@@ -75,10 +75,10 @@ fi
 echo "── 3. peter-wa uses it and stays in its on-demand steady state (ga-3g2rjo) ──"
 grep -q '^provider = "claude-rc-peter"$' "$PETER_TOML" \
   && ok "peter-wa provider = claude-rc-peter" || bad "peter-wa does not use provider claude-rc-peter"
-if [ "$(args_of claude-rc-peter)" = 'args_append = ["--remote-control", "peter", "--model", "opus"]' ]; then
+if [ "$(args_of claude-rc-peter)" = 'args_append = ["--remote-control", "Peter", "--model", "opus"]' ]; then
   ok "claude-rc-peter is exactly RC 'peter' + --model opus"
 else
-  bad "claude-rc-peter.args_append is not exactly [--remote-control, peter, --model, opus]: $(args_of claude-rc-peter)"
+  bad "claude-rc-peter.args_append is not exactly [--remote-control, Peter, --model, opus]: $(args_of claude-rc-peter)"
 fi
 if grep -q '^suspended[[:space:]]*=[[:space:]]*true$' "$PETER_TOML"; then
   bad "peter-wa still commits 'suspended = true' -- ga-3g2rjo made on-demand access (no committed suspension) the steady state; the never-gets-a-bead guarantee now lives independently in pilot-dispatcher.sh's _crew_is_suspended (see its own selftest, Scenario 22e), so this line is expected to stay removed"

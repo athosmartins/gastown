@@ -29,24 +29,25 @@ bad() { echo "  ✗ $*"; FAIL=$((FAIL+1)); }
 [ -d "$AGENTS_DIR" ] || { echo "FATAL: agents dir not found at $AGENTS_DIR"; exit 1; }
 
 EXPECTED_EFFORT="high"
-# ga-ift2yeq: crew agent dir -> its fixed Remote Control name (= its provider claude-rc-<name>).
-CREW_RC_NAMES="batista-lx:batista-lx batista-ps:batista-ps batista-wa:batista digo-wa:digo mila-ma:mila-ma mila-wa:mila oracle-wa:oracle peter-wa:peter thies-ps:thies-ps thies-wa:thies"
+# ga-ift2yeq: crew agent dir -> its provider key (claude-rc-<key>) -> the Remote Control name the Claude
+# app shows. Athos 12/11: the shown name is Proper Case ("Batista", not "batista"); "_" stands for a space.
+CREW_RC_NAMES="batista-lx:batista-lx:Batista_LX batista-ps:batista-ps:Batista_PS batista-wa:batista:Batista digo-wa:digo:Digo mila-ma:mila-ma:Mila_MA mila-wa:mila:Mila oracle-wa:oracle:Oracle peter-wa:peter:Peter thies-ps:thies-ps:Thies_PS thies-wa:thies:Thies"
 block() { awk -v h="[providers.$1]" '$0==h{f=1; print; next} /^\[/{f=0} f' "$CITY_TOML"; }
 args_of() { block "$1" | grep '^args_append' || true; }
 
 echo "── 1+2. every named crew is on its own claude-rc-<name> and runs effort = $EXPECTED_EFFORT ──"
 n=0
 for pair in $CREW_RC_NAMES; do
-  crew="${pair%%:*}"; rcname="${pair#*:}"
+  crew="${pair%%:*}"; rest="${pair#*:}"; rcname="${rest%%:*}"; shown="$(printf '%s' "${rest#*:}" | tr '_' ' ')"
   f="$AGENTS_DIR/$crew/agent.toml"
   if [ ! -f "$f" ]; then bad "$crew: agent.toml not found"; continue; fi
   n=$((n+1))
   grep -q "^provider = \"claude-rc-$rcname\"\$" "$f" \
     && ok "$crew: provider = claude-rc-$rcname" || bad "$crew: not on claude-rc-$rcname ($(grep '^provider' "$f" || echo 'no provider line'))"
-  want="args_append = [\"--remote-control\", \"$rcname\", \"--model\", \"opus\"]"
+  want="args_append = [\"--remote-control\", \"$shown\", \"--model\", \"opus\"]"
   [ "$(args_of "claude-rc-$rcname")" = "$want" ] \
-    && ok "claude-rc-$rcname is exactly RC '$rcname' + --model opus" \
-    || bad "claude-rc-$rcname args are not [--remote-control, $rcname, --model, opus]: $(args_of "claude-rc-$rcname" | sed 's/^$/<no block>/')"
+    && ok "claude-rc-$rcname is exactly RC '$shown' + --model opus" \
+    || bad "claude-rc-$rcname args are not [--remote-control, $shown, --model, opus]: $(args_of "claude-rc-$rcname" | sed 's/^$/<no block>/')"
   if grep -q "^option_defaults = { effort = \"$EXPECTED_EFFORT\" }" "$f"; then
     ok "$crew: effort = $EXPECTED_EFFORT"
   else

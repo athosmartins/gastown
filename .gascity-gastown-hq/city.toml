@@ -28,7 +28,7 @@ ready_delay_ms = 0
 # ("mayor") instead of one generated per launch ("Gascity mayor worker"). `claude --help`: --remote-control [name].
 [providers.claude-rc]
 base = "builtin:claude"
-args_append = ["--remote-control", "mayor", "--model", "opus"]
+args_append = ["--remote-control", "Mayor", "--model", "opus"]
 ready_delay_ms = 0
 # Athos, 2026-10-11 06:5x (Mayor session, AskUserQuestion: "Manter Opus"): crews run on Opus with effort
 # high. Supersedes the 2026-10-05 instruction (crews on Sonnet + high). claude-rc above stays the Mayor's;
@@ -46,47 +46,47 @@ ready_delay_ms = 0
 # is only a fallback with no users). claude-rc-henrique is defined here so that switch needs no second merge.
 [providers.claude-rc-batista]
 base = "builtin:claude"
-args_append = ["--remote-control", "batista", "--model", "opus"]
+args_append = ["--remote-control", "Batista", "--model", "opus"]
 ready_delay_ms = 0
 [providers.claude-rc-digo]
 base = "builtin:claude"
-args_append = ["--remote-control", "digo", "--model", "opus"]
+args_append = ["--remote-control", "Digo", "--model", "opus"]
 ready_delay_ms = 0
 [providers.claude-rc-oracle]
 base = "builtin:claude"
-args_append = ["--remote-control", "oracle", "--model", "opus"]
+args_append = ["--remote-control", "Oracle", "--model", "opus"]
 ready_delay_ms = 0
 [providers.claude-rc-peter]
 base = "builtin:claude"
-args_append = ["--remote-control", "peter", "--model", "opus"]
+args_append = ["--remote-control", "Peter", "--model", "opus"]
 ready_delay_ms = 0
 [providers.claude-rc-thies]
 base = "builtin:claude"
-args_append = ["--remote-control", "thies", "--model", "opus"]
+args_append = ["--remote-control", "Thies", "--model", "opus"]
 ready_delay_ms = 0
 [providers.claude-rc-mila]
 base = "builtin:claude"
-args_append = ["--remote-control", "mila", "--model", "opus"]
+args_append = ["--remote-control", "Mila", "--model", "opus"]
 ready_delay_ms = 0
 [providers.claude-rc-batista-ps]
 base = "builtin:claude"
-args_append = ["--remote-control", "batista-ps", "--model", "opus"]
+args_append = ["--remote-control", "Batista PS", "--model", "opus"]
 ready_delay_ms = 0
 [providers.claude-rc-batista-lx]
 base = "builtin:claude"
-args_append = ["--remote-control", "batista-lx", "--model", "opus"]
+args_append = ["--remote-control", "Batista LX", "--model", "opus"]
 ready_delay_ms = 0
 [providers.claude-rc-thies-ps]
 base = "builtin:claude"
-args_append = ["--remote-control", "thies-ps", "--model", "opus"]
+args_append = ["--remote-control", "Thies PS", "--model", "opus"]
 ready_delay_ms = 0
 [providers.claude-rc-mila-ma]
 base = "builtin:claude"
-args_append = ["--remote-control", "mila-ma", "--model", "opus"]
+args_append = ["--remote-control", "Mila MA", "--model", "opus"]
 ready_delay_ms = 0
 [providers.claude-rc-henrique]
 base = "builtin:claude"
-args_append = ["--remote-control", "henrique", "--model", "opus"]
+args_append = ["--remote-control", "Henrique", "--model", "opus"]
 ready_delay_ms = 0
 [providers.claude-headless]
 base = "builtin:claude"
