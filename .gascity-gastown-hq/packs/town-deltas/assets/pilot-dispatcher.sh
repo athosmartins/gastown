@@ -10016,8 +10016,8 @@ _pilot_topup_spawn() {
   # vazio → _err="" (gc wrote nothing: the log prints "<no stderr captured>"); falhou/ilegível → _err names the scratch file that could not be read, never the "wrote nothing" marker
   { _err=$(<"$_errf"); } 2>/dev/null || _err="<could not read the stderr scratch file $_errf>"
   rm -f "$_errf"
-  # A failure whose stderr is empty may have said why on stdout (--json): keep its start, so the log is not blind about it.
-  if [ "$_rc" -ne 0 ] && [ -z "$_err" ] && [ -n "$_out" ]; then _err="(stdout) ${_out:0:300}"; fi
+  # A failure whose stderr is empty may have said why on stdout (--json): keep its start, on ONE line (gc may pretty-print the JSON), so the log is not blind about it.
+  if [ "$_rc" -ne 0 ] && [ -z "$_err" ] && [ -n "$_out" ]; then _err="${_out:0:300}"; _err="(stdout) ${_err//[$'\r\n']/ }"; fi
   _pilot_note_spawn_timing "$_rc" "$_t0"
   if [ "$_rc" -eq 0 ]; then
     _TOPUP_SPAWN_OUT="$_out"
@@ -10061,7 +10061,7 @@ _pilot_topup_spawn() {
   # (same three states as attempt 1 above)
   { _err=$(<"$_errf"); } 2>/dev/null || _err="<could not read the stderr scratch file $_errf>"
   rm -f "$_errf"
-  if [ "$_rc" -ne 0 ] && [ -z "$_err" ] && [ -n "$_out" ]; then _err="(stdout) ${_out:0:300}"; fi
+  if [ "$_rc" -ne 0 ] && [ -z "$_err" ] && [ -n "$_out" ]; then _err="${_out:0:300}"; _err="(stdout) ${_err//[$'\r\n']/ }"; fi
   _pilot_note_spawn_timing "$_rc" "$_t0"
   if [ "$_rc" -eq 0 ]; then
     _TOPUP_SPAWN_OUT="$_out"
@@ -10562,7 +10562,8 @@ _topup_session_for() {
 #   exit 0  an identity (set above);
 #   exit 1  the engine did not say who it opened: the answer is empty, or one object that names no session;
 #   exit 2  the answer cannot be read as one JSON object, or its name has a shape no session name has (a leading - or ., spaces, control
-#           characters): unreadable, and never used as an assignee.
+#           characters), or a field carries the \037 the pair is joined with (a split on it would cut the name short): unreadable, and
+#           never used as an assignee.
 # The TITLE the engine gave the session is not consulted anywhere here: 23 of 44 top-up sessions measured carry another title than the hint.
 _topup_spawn_identity() {
   local _out="${_TOPUP_SPAWN_OUT:-}" _row _start
@@ -10571,11 +10572,11 @@ _topup_spawn_identity() {
     _TOPUP_IDENT_WHY="the spawn printed nothing on stdout"
     return 1
   fi
-  # vazio → exit 1 above; falhou/ilegível (not JSON, not exactly one object) → exit 2, never an identity
-  if ! _row=$(printf '%s' "$_out" | jq -rs 'if length == 1 and (.[0] | type) == "object" then .[0] | [(.session_name // .alias // ""), (.work_dir // "")] | map(if type == "string" then . else "" end) | join("\u001f") else error("not exactly one object") end' 2>/dev/null); then
+  # vazio → exit 1 above; falhou/ilegível (not JSON, not exactly one object, a field with the \037 separator) → exit 2, never an identity
+  if ! _row=$(printf '%s' "$_out" | jq -rs 'if length == 1 and (.[0] | type) == "object" then .[0] | [(.session_name // .alias // ""), (.work_dir // "")] | map(if type == "string" then . else "" end) | if any(.[]; contains("\u001f")) then error("a field carries the separator") else join("\u001f") end else error("not exactly one object") end' 2>/dev/null); then
     # (the start of the answer, one line: plain expansions, no `| head` pipe — the C11 scan of error-empty-conflation-scan.sh counts those)
     _start="${_out:0:80}"; _start="${_start//$'\n'/ }"; _start="${_start//$'\r'/ }"
-    _TOPUP_IDENT_WHY="the spawn's answer is not one JSON object (it starts: $_start)"
+    _TOPUP_IDENT_WHY="the spawn's answer cannot be read as one JSON object with plain fields (not JSON, not one object, or the U+001F separator inside a field; it starts: $_start)"
     return 2
   fi
   _TOPUP_IDENT_NAME="${_row%%$'\037'*}"; _TOPUP_IDENT_WD="${_row#*$'\037'}"
@@ -10593,7 +10594,9 @@ _topup_spawn_identity() {
 # _topup_session_by_name <name> — ga-qnarixf: the roster row of the session the spawn named, from a FRESH `gc session list --json` (the
 # sweep-start roster cannot contain a session born this sweep). Prints "<live>\037<work_dir>" for the NEWEST row whose session_name, name,
 # alias or id is <name>; live is 1 for state active|creating|start-pending and not closed (the rule _topup_session_for uses), else 0.
-# Exit 0 = answered (nothing printed = the roster does not list it); exit 1 = CANNOT TELL (roster unreadable, not a roster, or timed out).
+# Exit 0 = answered (nothing printed = the roster does not list it: NOT "it never existed", NOT "it is alive" — the real roster has live
+# sessions only, an ended session just leaves it (docs/runbooks/node-ghost-release.md), so "not registered yet" and "ended" look alike);
+# exit 1 = CANNOT TELL (roster unreadable, not a roster, or timed out). A row with closed:true is defensive: production does not list one.
 _topup_session_by_name() {
   local _n="${1:-}" _json=""
   [ -n "$_n" ] || return 1
@@ -10638,9 +10641,11 @@ _topup_bind_claim() {
 # _topup_bind_after_spawn <pool> <bead-id> — right after a top-up spawn SUCCEEDED "for" <bead-id>: bind the new session to it, so its
 # worker resumes THAT bead (prompt Step 1a/1b: assigned work first) instead of running the generic probe and taking another. ga-qnarixf:
 # the session is the one the spawn NAMED in its own answer (_topup_spawn_identity), not one found again by a title the engine may have
-# rewritten. The roster is asked only for its work_dir and to refuse a session it shows dead; a roster that cannot be read, or that does not
-# list the session yet, does not stop the claim (the engine's own answer is the evidence the session exists). Only an answer with no
-# identity falls back to the title lookup in a FRESH roster. Fail-open and always exit 0: the spawn already happened, and a bind that did not
+# rewritten. The answer proves the session was CREATED, not that it is alive; the roster says that. A session the roster LISTS in another
+# state (asleep) or does not list at all is not claimed: said, and the bead stays unassigned for the next sweep (the real roster has live
+# sessions only, so an ended session is just absent, and "not registered yet" looks the same: UNVERIFIED). A roster that cannot be READ is
+# no evidence either way, so that one still claims on the answer, said. Only an answer with no identity falls back to the title lookup in a
+# FRESH roster. Fail-open and always exit 0: the spawn already happened, and a bind that did not
 # land is repaired by the next sweep's _pilot_priority_topup_building while the bead is a P0/P1 that waits; _pilot_pool_topup, for its part,
 # never spawns twice for one bead in one pass, whatever happened here. PILOT_TOPUP_BIND=0 = off.
 _topup_bind_after_spawn() {
@@ -10650,16 +10655,18 @@ _topup_bind_after_spawn() {
   _topup_spawn_identity || _irc=$?
   if [ "$_irc" -eq 0 ]; then
     _sess="$_TOPUP_IDENT_NAME"; _wd="$_TOPUP_IDENT_WD"; _how="by the identity the spawn returned"
-    # vazio (the roster does not list it) → claim; falhou/ilegível (roster unreadable) → claim, said; listed but NOT live → no claim. A claim carries the
-    # answer's own work_dir when it had one, else the roster row's, else none.
+    # vazio (the roster answered and does not list it: ended, or not registered yet) → UNVERIFIED, no claim; falhou/ilegível (roster unreadable) → claim, said;
+    # listed but NOT live → no claim. A claim carries the answer's own work_dir when it had one, else the roster row's, else none.
     _row=$(_topup_session_by_name "$_sess") || _lrc=$?
     if [ "$_lrc" -ne 0 ]; then
-      warn "ga-qnarixf: could not read the session roster to confirm $_sess, the session the spawn opened for $_id — claiming it on the spawn's own answer, without gc.work_dir (fail-open)."
-    elif [ -n "$_row" ]; then
-      if [ "${_row%%$'\037'*}" != "1" ]; then
-        warn "ga-qnarixf: $_sess, the session the spawn opened for $_id, is not live in the roster (closed, or in a state that builds nothing) — NOT writing a claim to it; $_id stays unassigned (fail-open; this pass opens no second session for it)."
-        return 0
-      fi
+      warn "ga-qnarixf: could not read the session roster to confirm $_sess, the session the spawn opened for $_id — claiming it on the spawn's own answer (gc.work_dir only if the answer carried one; fail-open)."
+    elif [ -z "$_row" ]; then
+      warn "ga-qnarixf: UNVERIFIED — the session roster does not list $_sess, the session the spawn opened for $_id (not registered yet, or already ended: the roster lists live sessions only) — NOT writing a claim to it; $_id stays unassigned (inert; this pass opens no second session for it, the next sweep decides again)."
+      return 0
+    elif [ "${_row%%$'\037'*}" != "1" ]; then
+      warn "ga-qnarixf: $_sess, the session the spawn opened for $_id, is listed but not live in the roster (a state that builds nothing) — NOT writing a claim to it; $_id stays unassigned (inert; this pass opens no second session for it)."
+      return 0
+    else
       [ -n "$_wd" ] || _wd="${_row#*$'\037'}"
     fi
   else
@@ -10670,7 +10677,7 @@ _topup_bind_after_spawn() {
       return 0
     fi
     if [ -z "$_row" ]; then
-      warn "ga-2lca0l: no live top-up session titled 'pool top-up: $_id' after the $_pool spawn (still registering?) — its claim is not written at spawn (fail-open; a P0/P1 is repaired by the next sweep's yield scan)."
+      warn "ga-2lca0l: no live top-up session titled 'pool top-up: $_id' after the $_pool spawn (not registered yet, already ended — the roster lists live sessions only — or titled otherwise by the engine) — its claim is not written at spawn (fail-open; a P0/P1 is repaired by the next sweep's yield scan)."
       return 0
     fi
     _sess="${_row%%$'\037'*}"; _wd="${_row#*$'\037'}"; _wd="${_wd%%$'\037'*}"
@@ -11140,7 +11147,7 @@ _pilot_pool_topup() {
     fi
     [ -z "$_pending" ] && break
     # ga-qnarixf: ONE session per bead per pass. This loop asks bd for the best pending bead again after every spawn, and a bead whose claim
-    # did not land (the bind could not tell, the write failed, the roster lagged) is still unassigned, so it comes back as the best again and
+    # did not land (the bind could not tell, the roster did not list the session, the write failed) is still unassigned, so it comes back as the best again and
     # the old code opened another session for it, up to the pool cap (wa-qawq7l.2, P0: 2 sessions in 54 s; cap 2 = the whole pool on one
     # bead). Whatever the bind said, a bead already spawned for in this pass is not spawned for twice: top-up for the pool stops here (inert:
     # nothing opened, nothing written), said out loud, and the next sweep reads again. So a bind that could not tell never ends in a second session.
