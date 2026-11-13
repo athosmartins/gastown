@@ -443,6 +443,10 @@
    "witness-startup": {
     "roles": []
    },
+   "patrol-bootstrap": {
+    "roles": [],
+    "_why": "ga-d8dfjg9: troca os blocos de pour do prompt NATIVO do refinery e do deacon por UM comando (patrol-next-wisp.sh). Nenhum papel de pool roda refinery ou deacon, então roles=[] (como witness-startup): a seção só vai a quem NÃO tem TD_ROLE, que é onde refinery e deacon moram."
+   },
    "mbp-offload-tests": {
     "roles": [
      "ps-worker",

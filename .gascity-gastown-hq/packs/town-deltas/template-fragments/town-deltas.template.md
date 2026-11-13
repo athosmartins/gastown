@@ -13,7 +13,7 @@ marcador de uma linha; `grep -n 'td:' <este arquivo>` lista os pontos de entrada
   engine-window-patch · nudge-permission-dialog · research-only-channels ·
   next-action-mayor-waiting · assignee-when-building · claudemd-carryover ·
   dolt-cleanup-hazards · e12-write-time-doctrine (título: Write-time doctrine — experiment E12 (ga-4q2zo5); GERADA por e12-crew-doctrine.sh a partir do e12_block_text; não edite o corpo à mão) ·
-  witness-startup
+  witness-startup · patrol-bootstrap
 */ -}}
 {{/* td:core:intro */ -}}
 ### Town Deltas (ADITIVO — não substitui operational-awareness nativo)
@@ -1432,5 +1432,37 @@ Qualquer pour manual (ex.: o Step 3 acima) precisa sempre passar `--var
 rig_root='{{ .RigRoot }}'` junto com `--var binding_prefix=...`: o override
 trata `rig_root` vazio como erro (mail pro mayor + aborta) em vez de cair em
 fallback silencioso; a formula nativa aceita a variável e a ignora sem avisar.
+{{ end -}}
+{{ if not .TD_ROLE -}}{{/* td:patrol-bootstrap */ -}}
+**REFINERY e DEACON: os blocos de pour do prompt nativo (bootstrap do Startup Protocol, Regras 1 e 2 do
+"Patrol Lifecycle Discipline", "No Idle State") estão QUEBRADOS — troque-os por UM comando (ga-d8dfjg9).**
+Vale só pros papéis refinery e deacon; se não é o seu, pule esta seção.
+
+⚠️ **Por quê:** o bloco de bootstrap despeja sem condição (nada no código lê antes) e um re-run depois de "pour ok,
+assign falhou" despeja outro; o assign não tem o exit lido (bootstrap) ou, quando tem, deixa o wisp recém-despejado
+SEM DONO (nenhuma leitura por assignee o acha e o reaper não o fecha); "qual é o meu wisp" é resolvido com
+`--type=wisp` (enum inválido) ou com `$GC_BEAD_ID` (fixado no início da sessão: da 2ª volta em diante é um wisp já
+queimado); e uma leitura que FALHOU vale como "não tenho wisp". Medido em 13/11: 4 wisps mol-deacon-patrol abertos
+e sem dono (a causa desses quatro não foi rastreada).
+
+**O comando** (troque `<formula>` por `mol-refinery-patrol` ou `mol-deacon-patrol`):
+```bash
+# início de sessão (onde o nativo faz WISP=$(... mol wisp ...) + update): só despeja se NÃO há wisp vivo
+bash "$GC_CITY_PATH/packs/town-deltas/assets/scripts/patrol-next-wisp.sh" bootstrap <formula> -- <flags --var do pour nativo>
+# fim de volta (Regra 1, "No Idle", Regra 2): garante o próximo wisp atribuído e queima o atual
+bash "$GC_CITY_PATH/packs/town-deltas/assets/scripts/patrol-next-wisp.sh" next <formula> --burn-current -- <flags --var do pour nativo>
+```
+`<flags --var do pour nativo>`: copie as flags `--var ...` da linha de pour do bloco que você está trocando
+(refinery: `target_branch`, `rig_name`, `binding_prefix`, `test_command`; deacon: `binding_prefix`), cada uma como UMA
+palavra (o `test_command`, que tem espaços, vai entre aspas).
+
+**Saída.** Exit 0 = no bootstrap, há um wisp vivo; no `next`, o próximo existe, está atribuído a `$GC_AGENT` e o atual
+foi queimado: siga em frente e NÃO rode de novo (um segundo `next` depois de um sucesso completo despeja outro).
+Exit 1 = não deu para confirmar (ele diz o motivo): não despeje por palpite, não queime à mão, não peça restart (Regra 2:
+`request-restart` só depois de exit 0). Espere um minuto e rode o MESMO comando de novo: ele lê antes de despejar, então
+repetir é seguro. Três exit 1 seguidos: `gc session nudge mayor/ "<seu papel>: patrol-next-wisp falhando 3x"` com a última
+linha que ele imprimiu.
+**Deacon:** o step `next-iteration` da fórmula já traz essa lógica inline (ga-x9jivyf). Use o script só no bootstrap e
+no fallback do "No Idle State" (e só se você saiu da volta sem rodar o `next-iteration`).
 {{ end -}}
 {{ end }}

@@ -197,6 +197,16 @@ patterns of failure).
 
 Close this step after assessment."""
 
+# ga-d8dfjg9 (same class as ga-x9jivyf / ga-jhsxo4p): the Step 1 block of this step read "failed" and "empty" as the same thing, in two places.
+# (1) `gc agents list --json --active | jq ... | while read` -- `gc agents list` does not exist in this gc: it exits 1 and prints a JSON ERROR object on
+#     stdout ({"ok":false,"error":{"code":"json_command_not_found",...}}, measured 2026-11-13), which the old `jq '.[] | .agent_id'` turned into no
+#     lines, so the loop never ran and a step that never ran read as "no active sessions". The session list is `gc session list --json --state
+#     active` now (an object: .ok, .sessions[].agent_name), and a failed or unreadable list prints one NAO-SEI line instead of nothing.
+# (2) per agent, A and B came from TWO `gc bd list` calls whose failure was only on stderr: both blank when the read failed (the step's prose
+#     only says "A > 0 and stale signal", so blank was free to be read as 0 and silence a starving queue, or as "no signal"), and A ok + B blank
+#     when only the second call failed (read as "work queued, no signal at all": a nudge and a warrant against a healthy session). Now ONE read per
+#     agent, its exit code read, its JSON validated, A and B derived from that one JSON; failed/unreadable = NAO-SEI on both columns.
+# Proof: packs/town-deltas/assets/deacon-queue-starvation-three-states.selftest.sh executes the block under a stateful fake gc.
 [[steps]]
 id = "queue-starvation-check"
 title = "Cross-check assigned work against visible work signal"
@@ -216,14 +226,43 @@ closes that gap.
 - `A` = count of open beads assigned to the session's agent identity
 - `B` = the most recent bead.updated_at across those beads (work signal)
 
+Every read here has THREE answers, never two: it answered with rows / it answered and is empty / it
+could not tell (failed, timed out, came back unreadable). The block prints `NAO-SEI` (not "0", not a
+blank) for the third, so a failed read can never look like an idle session or like a starving one.
+A and B come from ONE `gc bd list` per agent (two calls could disagree: the first answers, the second
+times out, and the line then says "work queued, no signal"). The session list is
+`gc session list --json --state active` (ga-d8dfjg9: `gc agents list`, which this step used to call, does
+not exist in this gc, so the old loop never ran and a step that never ran looked like "no sessions").
+
 ```bash
-gc agents list --json --active | jq -r '.[] | .agent_id' | while read -r AGENT; do
-    ASSIGNED=$(gc bd list --status=open --assignee="$AGENT" --json --limit=0 | jq 'length')
-    LATEST=$(gc bd list --status=open --assignee="$AGENT" --json --limit=0 \\
-        | jq -r '[.[].updated_at] | max // ""')
-    printf '%s\\t%s\\t%s\\n' "$AGENT" "$ASSIGNED" "$LATEST"
-done
+# vazio → the list answered (ok=true, sessions=[]) with no session: prints "0 active sessions" (a real answer); falhou/ilegível → one NAO-SEI line, never "no session"
+# (an EMPTY stdout is not an answer: jq -e on empty input exits 4, so it lands in the NAO-SEI branch; plain jq would call it an empty list)
+if ! LIST=$(gc session list --json --state active) ||
+   ! printf '%s' "$LIST" | jq -e '.ok == true and ((.sessions | type) == "array")' >/dev/null 2>&1 ||
+   ! AGENTS=$(printf '%s' "$LIST" | jq -r '.sessions | map(.agent_name // empty) | unique | .[]'); then
+    printf 'NAO-SEI\tNAO-SEI\tNAO-SEI\n'
+elif [ -z "$AGENTS" ]; then
+    echo "0 active sessions (the session list answered and is empty)"
+else
+    printf '%s\n' "$AGENTS" | while read -r AGENT; do
+        # vazio → [] = this agent holds no open bead: A=0, B blank (legitimate only with A=0); falhou/ilegível → NAO-SEI on both, nothing is inferred
+        if ! JSON=$(gc bd list --status=open --assignee="$AGENT" --json --limit=0) ||
+           ! printf '%s' "$JSON" | jq -e 'type == "array"' >/dev/null 2>&1; then
+            printf '%s\tNAO-SEI\tNAO-SEI\n' "$AGENT"
+            continue
+        fi
+        ASSIGNED=$(printf '%s' "$JSON" | jq 'length')
+        LATEST=$(printf '%s' "$JSON" | jq -r '[.[].updated_at // empty] | max // ""')
+        # every bead has updated_at: A > 0 with B blank means the rows were unreadable, not "no signal"
+        if [ "$ASSIGNED" -gt 0 ] && [ -z "$LATEST" ]; then LATEST=NAO-SEI; fi
+        printf '%s\t%s\t%s\n' "$AGENT" "$ASSIGNED" "$LATEST"
+    done
+fi
 ```
+
+Read the output line by line (TAB-separated `agent`, `A`, `B`): a line with `NAO-SEI` is "could not
+tell", NOT zero and NOT stale. No line at all cannot happen (an empty list prints "0 active
+sessions"). The block's own exit code says nothing: read the lines.
 
 The latest bead.updated_at is the cheapest proxy for "did this session
 move work recently?" — every claim, status transition, metadata update,
@@ -231,6 +270,11 @@ or note bumps it.
 
 **Step 2: Flag when queue > 0 and signal is stale (judgment call,
 guideline ~30min):**
+
+A line with `NAO-SEI` is never flagged: no nudge, no warrant, nothing inferred from it. Note it in this
+round's log and read that agent again next cycle; the same agent (or the session list itself) at
+`NAO-SEI` three cycles in a row is a Dolt/bd problem, not a queue problem: nudge the mayor
+(`gc session nudge mayor/ "deacon: queue-starvation-check cannot read <agent or session list> 3x"`).
 
 If `A > 0` AND `now - B` has grown well past the patrol's natural
 cadence (default guideline: 30min — roughly 6x the 300s max patrol
@@ -262,8 +306,8 @@ The dog runs `mol-shutdown-dance` and the controller respawns a fresh
 session that re-reads the queue with a correct filter.
 
 **Step 4: A genuinely-idle session (no assigned beads) is NOT flagged.**
-If `A == 0`, this step is a no-op for that session. Idle-but-ready
-refineries and witnesses are healthy.
+If `A == 0` (a real 0, from a read that answered), this step is a no-op for that session.
+Idle-but-ready refineries and witnesses are healthy. `NAO-SEI` is not 0: see Step 2.
 
 Close this step after the cross-check runs for every active session."""
 
