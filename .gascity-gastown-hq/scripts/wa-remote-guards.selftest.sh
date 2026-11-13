@@ -412,12 +412,11 @@ case_u_batch() { uc batch; }
 case_u_header() { uc header; }
 case_u_entries() { uc entries; }
 case_u_registry() { uc registry; }
-# Fora do alcance destes casos: 1d719f54b0 49ab621386 (equivalentes: nl == 0 só existe com pos == 0, onde o corte é vazio dos dois jeitos) e b451aff2f3 (o flush=True do print do handler de
-# erro interno: só se vê se o processo morre depois de escrever; o do say(), b82742161c, morre em kill_report). O a89c4d08ba (split(None, 3) -> 4 no ls-tree) NÃO é equivalente: o str.split()
+# Fora do alcance destes casos: 1d719f54b0 49ab621386 (equivalentes: nl == 0 só existe com pos == 0, onde o corte é vazio dos dois jeitos). O b451aff2f3 (o flush=True do print do handler de
+# erro interno) NÃO é equivalente: só se vê se o processo morre depois de escrever, e esse caso se arma (internal_error_kill, ga-s74662r; o do say(), b82742161c, morre em kill_report). O a89c4d08ba (split(None, 3) -> 4 no ls-tree) NÃO é equivalente: o str.split()
 # trata 0x1c-0x1f como espaço e o int() não, então só o original recusa um tamanho com esse byte colado; ele morre em u_tree (ga-3kdpcbj). A cena de G12 com 6+ plists (avisos_cap:
 # d414b9aca8 f6affd9302 a01c4377f4 82a7bd8828) e o guard de confiança que levanta depois de carregar (cut_120_run: d4b87a34d1) vieram depois (ga-r8nsaot).
 # EQUIVALENT 1d719f54b0 49ab621386: `nl == 0` so existe com pos == 0, onde o corte e vazio dos dois jeitos
-# EQUIVALENT b451aff2f3: `flush=True` -> False: so se ve se o processo morre depois de escrever
 case_u_git() { uc git; }
 case_u_tree() { uc tree; }
 case_u_blob() { uc blob; }
@@ -426,6 +425,14 @@ case_u_facade() { uc facade; }
 case_help() { ( cd "$T" && env -i PATH="$PATH_RUN" "$PY" -I -B "$EXE" -h ) >"$T/out" 2>"$T/err"; [ $? = 0 ] && has "$T/out" "usage: wa-remote-guards.py"; }
 case_scratch_parents() { local d="$T/par-$RANDOM-$$/p2"; SHA=$S_CLEAN; runx -- --scratch "$d/sc"; [ "$RC" = 0 ] && [ -d "$d/sc/tree" ]; }
 case_internal_error() { : > "$T/afile"; SHA=$S_CLEAN; runx -- --scratch "$T/afile/$(rep 200 d)"; [ "$RC" = 2 ] && grep -qE "erro interno NotADirectoryError: .{160}$" "$T/out" && grep -qxF "wa-remote-guards: RESULT=UNKNOWN sha=? trusted=?" "$T/out"; }
+# O print do handler de erro interno também sai com flush=True (b451aff2f3): se o processo morrer logo depois dele, a linha RESULT=UNKNOWN já está no stdout-arquivo (bloco, não linha). Aqui o runpy roda o
+# executável como __main__ com o sys.exit trocado por um SIGKILL do próprio processo, e o único sys.exit que o erro do internal_error alcança é o do handler: a morte vem logo depois da última escrita. rc 137 é a
+# pré-condição (sem ela a saída limpa teria esvaziado o buffer). O --scratch sob um ARQUIVO não cria pasta nenhuma, então o `mutant` pode re-rodar o caso no mesmo $T (o `control` logo abaixo da linha dele confere).
+KILLPY='import os, runpy, signal, sys
+sys.exit = lambda *a: os.kill(os.getpid(), signal.SIGKILL)
+sys.argv = sys.argv[1:]
+runpy.run_path(sys.argv[0], run_name="__main__")'
+case_internal_error_kill() { : > "$T/afile"; SHA=$S_CLEAN; ( cd "$T" && env -i HOME="$T/home" PATH="$PATH_RUN" TMPDIR="$T/tmp" LANG=en_US.UTF-8 "$PY" -I -B -c "$KILLPY" "$EXE" --repo "$RIG" --sha "$SHA" --scratch "$T/afile/x" ) > "$T/out" 2> "$T/err"; RC=$?; [ "$RC" = 137 ] && grep -qE "erro interno NotADirectoryError: " "$T/out" && grep -qxF "wa-remote-guards: RESULT=UNKNOWN sha=? trusted=?" "$T/out"; }
 case_cut_120() { SHA=$S_CLEAN; runx -- --trusted-ref refs/remotes/origin/longerr; [ "$RC" = 2 ] && grep -qE "ValueError: d{120}\)$" "$T/out" && grep -qE "G6 levantou RuntimeError: a{120}$" "$T/out" && grep -qE "G7 levantou RuntimeError: b{120}$" "$T/out" && grep -qE "G7b levantou RuntimeError: c{120}$" "$T/out"; }
 case_cut_120_run() { SHA=$S_CLEAN; runx -- --trusted-ref refs/remotes/origin/runerr; [ "$RC" = 2 ] && res UNKNOWN && gl G12 UNKNOWN && grep -qE "NÃO SEI: erro interno RuntimeError: e{120}$" "$T/out"; }
 case_avisos_cap() {  # a linha AVISO do G12 lista no máximo 5 plists por tipo: 6 ilegíveis (os 6 também sem entrypoint) e 6 agendados sem script, todos já no main (um ilegível JÁ no main só avisa)
@@ -504,6 +511,7 @@ ck u_facade "o atalho do subprocess: ls-files e diff devolvem rc 0 (texto ou byt
 ck help "-h imprime o uso e sai com 0"
 ck scratch_parents "--scratch cria as pastas que faltam no caminho"
 ck internal_error "erro fora do execute(): rc 2, a linha RESULT=UNKNOWN com sha=? e a mensagem cortada em 160"
+ck internal_error_kill "SIGKILL logo depois do print do handler de erro interno: a mensagem e a linha RESULT=UNKNOWN já estão no stdout-arquivo (rc 137)"
 ck u_registry "registro lido sem executar: docstring opcional, __future__ ignorado, uma só atribuição literal de dict; o resto (2ª docstring, chamada, outro import, outro nome, repetida, não-dict, ausente) → NÃO SEI"
 ck cut_120 "a mensagem de exceção do guard de confiança (G12 ao carregar, G6, G7, G7b ao rodar) entra no relatório cortada em 120 caracteres"
 ck cut_120_run "G12 de confiança que carrega e levanta ao RODAR (fora do try do guard): o NÃO SEI de erro interno leva a mensagem cortada em 120 caracteres"
@@ -536,6 +544,8 @@ mutant facade-git-que-falha-vira-lista-vazia git_diff_fails 'out = git(self.repo
 mutant g6-excecao-vira-passou guard_raises 'raise Unknown(f"G6 levantou {type(e).__name__}: {safe(e)[:120]}")' 'return "PASS", "", []'
 mutant say-sem-flush kill_report 'print(f"wa-remote-guards: {msg}", flush=True)' 'print(f"wa-remote-guards: {msg}", flush=False)'
 control kill_report
+mutant erro-interno-sem-flush internal_error_kill 'trusted=?", flush=True)' 'trusted=?", flush=False)'
+control internal_error_kill
 mutant nao-sei-nao-reprova git_diff_fails 'result = "BLOCKED" if "BLOCKED" in verdicts else "UNKNOWN" if "UNKNOWN" in verdicts else "PASS"' 'result = "BLOCKED" if "BLOCKED" in verdicts else "PASS"'
 mutant bloqueado-nao-reprova g12_blocks 'result = "BLOCKED" if "BLOCKED" in verdicts else "UNKNOWN"' 'result = "UNKNOWN"'
 mutant g12-codigo-do-sha tamper_all 'mod = load_trusted(c.repo, c.tsha, "g12", c.scratch)' 'mod = load_trusted(c.repo, c.sha, "g12", c.scratch)'

@@ -8,12 +8,14 @@
 #
 # ga-u6ueg0q: the return codes the lib documents as "always 0" (_eph_mode_summary, _eph_s3_fingerprint_state, _eph_epoch_utc) are pinned on every branch they have, and a writer
 # that shows up while the S3 proof is running is refused with rc 1, never reported as a release.
-# EQUIVALENT: in _eph_release_target and _eph_drop_empty_staging the check "pwd -P of the root equals pwd -P of dirname(<root>/<db>)" cannot fail for a db the case above it already
-# accepted (the dirname of <root>/<db> is <root>); in _eph_drop_empty_staging the case on the db name repeats what _eph_is_ephemeral has just refused; and the "real directory, not a
-# symlink" test there only picks WHICH rc 1 path a symlink or a file takes, because rmdir refuses both (rc 1, nothing removed, nothing logged, with or without the test).
-# ga-59jrj3d, the ids the sweep keeps listing for the three notes above: the pwd -P check of _eph_release_target (65b6c22ae3 `1 -> 0`, b2a4c3b098 no `|| return 1`) and of _eph_drop_empty_staging (60cfd44e9f, 4f8c1198ad); the db-name case of
-# _eph_drop_empty_staging (545ec062a7 `1 -> 0`: _eph_is_ephemeral opens with the very same case); its "real directory, not a symlink" test (578f525654 `&&` -> `||`, d54b0fee13 no `|| return 1`).
-# EQUIVALENT 65b6c22ae3 b2a4c3b098 60cfd44e9f 4f8c1198ad: the `pwd -P` equality of the root and dirname(<root>/<db>) cannot fail for a db the case above it already accepted (the dirname of <root>/<db> is <root>)
+# EQUIVALENT: in _eph_drop_empty_staging the case on the db name repeats what _eph_is_ephemeral has just refused; and the "real directory, not a symlink" test there only picks WHICH
+# rc 1 path a symlink or a file takes, because rmdir refuses both (rc 1, nothing removed, nothing logged, with or without the test).
+# NOT equivalent (ga-s74662r): the check "pwd -P of the root equals pwd -P of dirname(<root>/<db>)" of _eph_release_target and _eph_drop_empty_staging. For a db the case above it accepted, the
+# dirname of <root>/<db> is <root> as TEXT, but $(basename) and $(dirname) both strip a trailing newline: a root whose name ENDS in a newline passes the ".dolt-backup" test, and when the root
+# without that newline is not a directory this equality is what refuses it. 65b6c22ae3 `1 -> 0` and b2a4c3b098 no `|| return 1` (release_target), 60cfd44e9f and 4f8c1198ad (drop_empty_staging) die in the
+# "root whose name ends in a newline" cases below.
+# ga-59jrj3d, the ids the sweep keeps listing for the notes above: the db-name case of _eph_drop_empty_staging (545ec062a7 `1 -> 0`: _eph_is_ephemeral opens with the very same case); its
+# "real directory, not a symlink" test (578f525654 `&&` -> `||`, d54b0fee13 no `|| return 1`).
 # EQUIVALENT 545ec062a7: the db-name case of _eph_drop_empty_staging repeats what _eph_is_ephemeral has just refused
 # EQUIVALENT 578f525654 d54b0fee13: the "real directory, not a symlink" test only picks WHICH rc 1 path a symlink or a file takes, because rmdir refuses both
 set -uo pipefail
@@ -232,6 +234,11 @@ fresh_root; mkdir -p "$BACKUP_ROOT/hq"; : > "$BACKUP_ROOT/hq/manifest"
 _eph_release_target "$BACKUP_ROOT" hq >/dev/null && bad "empty manifest accepted" || ok "empty manifest refused"
 fresh_root
 _eph_release_target "$BACKUP_ROOT" hq >/dev/null && bad "absent dir accepted" || ok "absent dir refused"
+# ga-s74662r: a root whose NAME ends in a newline. $(basename) strips it, so it still reads ".dolt-backup"; the staging under it is a real dir with a manifest. Only the pwd -P equality refuses it:
+# $(dirname) strips the newline too, and the root without it ("$T/nlcity/.dolt-backup") is not a directory. The manifest test first: a setup that failed must read bad, not "refused".
+NLROOT="$T/nlcity/.dolt-backup"$'\n'; rm -rf "$T/nlcity"; mkdir -p "$NLROOT"; mkdir_backup "$NLROOT/hq" 3
+[ -s "$NLROOT/hq/manifest" ] && [ ! -d "$T/nlcity/.dolt-backup" ] && ! _eph_release_target "$NLROOT" hq >/dev/null \
+  && ok "a root whose name ends in a newline is refused (the staging under it is a real dir with a manifest)" || bad "root ending in a newline: setup failed or the root was accepted"
 
 # ═══ _eph_writer_active ═════════════════════════════════════════════════════════════════════
 echo "── _eph_writer_active (fake ps) ──"
@@ -472,6 +479,12 @@ _eph_drop_empty_staging hq "$BACKUP_ROOT/hq"; rc=$?
 rmdir "$BACKUP_ROOT/hq" "$BACKUP_ROOT"
 BACKUP_ROOT=""; _eph_drop_empty_staging hq "/hq"; rc=$?
 [ "$rc" -eq 1 ] && ok "BACKUP_ROOT unset → refused (never builds a path from nothing)" || bad "unset root gave rc $rc"
+BACKUP_ROOT="$OLD_BR"
+# ga-s74662r: a root whose name ends in a newline (see _eph_release_target above): refused, and the EMPTY staging under it is not removed. The directory must be there to begin with, or the case proves nothing.
+BACKUP_ROOT="$T/nlcity2/.dolt-backup"$'\n'; rm -rf "$T/nlcity2"; mkdir -p "$BACKUP_ROOT/hq"; : > "$LOGF"
+_eph_drop_empty_staging hq "$BACKUP_ROOT/hq"; rc=$?
+[ "$rc" -eq 1 ] && [ -d "$BACKUP_ROOT/hq" ] && [ ! -d "$T/nlcity2/.dolt-backup" ] && [ ! -s "$LOGF" ] \
+  && ok "a root whose name ends in a newline → refused (rc 1), the empty staging under it stays, nothing logged" || bad "root ending in a newline was not refused (rc=$rc): $(cat "$LOGF")"
 BACKUP_ROOT="$OLD_BR"
 mkdir "$BACKUP_ROOT/hq"; chmod 000 "$BACKUP_ROOT"
 if [ "$(id -u)" != "0" ]; then
