@@ -1,0 +1,40 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.gascity.login-rc-restore</string>
+
+  <!-- ga-bw9hmzg: every 60 s watches the transcripts of the Mayor and of each named crew for a /login ("Login successful. Remote Control disconnected.") or a
+       bare /remote-control, and brings them back with their FIXED Remote Control name (gc session kill -> the reconciler respawns with `claude remote-control <Name>`):
+       the session that had the event when idle, any crew on a login/limit screen or without a bridge within 30 min; ONE notify -p 4 at 20 min if any is still wrong.
+       The Mayor is only restarted while .gc/login-rc-restore.mayor-on exists. Contract and states: header of scripts/login-rc-restore.py. A pass ends in <= 45 s
+       (LRR_BUDGET_S) under an instance lock and prints ONE summary line to the .out.
+       INSTALL on the mini (until it is loaded the watchdog PRESENCE-DRIFT flags this file): first `/usr/bin/python3 scripts/login-rc-restore.py` with the dry-run option
+       (`alvos=` must list the Mayor and every live crew, `reiniciou=0`), then cp this plist to ~/Library/LaunchAgents/ and launchctl bootstrap gui/$(id -u) it.
+       ROLLBACK: touch .gc/login-rc-restore.off (next pass, no launchctl) or launchctl bootout gui/$(id -u)/com.gascity.login-rc-restore. -->
+  <key>ProgramArguments</key>
+  <array>
+    <string>/usr/bin/python3</string>
+    <string>/Users/athos/gt/.gascity-gastown-hq/scripts/login-rc-restore.py</string>
+  </array>
+
+  <key>WorkingDirectory</key>
+  <string>/Users/athos/gt/.gascity-gastown-hq</string>
+
+  <key>StartInterval</key><integer>60</integer>
+  <key>RunAtLoad</key><false/>
+
+  <key>StandardOutPath</key><string>/Users/athos/gt/.gascity-gastown-hq/.gc/logs/login-rc-restore-launchd.out</string>
+  <key>StandardErrorPath</key><string>/Users/athos/gt/.gascity-gastown-hq/.gc/logs/login-rc-restore-launchd.err</string>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:/Users/athos/go/bin:/Users/athos/.local/bin</string>
+    <key>HOME</key>
+    <string>/Users/athos</string>
+    <key>GC_CITY_PATH</key>
+    <string>/Users/athos/gt/.gascity-gastown-hq</string>
+  </dict>
+</dict>
+</plist>
