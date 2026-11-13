@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""test_live_conversation_capture.py (ga-esorlre.2): hermetic suite for scripts/live-conversation-capture.py. FakeIO emulates gc/bd/tmux/ps over REAL files in a temp tree; one test
+"""test_live_conversation_capture.py (ga-esorlre.2, .3): hermetic suite for scripts/live-conversation-capture.py (capture + the boot arming of ga-esorlre.3). FakeIO emulates gc/bd/tmux/ps over REAL files in a temp tree; one test
 drives a REAL tmux server (private socket) and the real ps. `python3 -I` on 3.9 and 3.12; LCC_UNDER_TEST=<copy> runs it against a mutant."""
 import contextlib
 import errno
@@ -23,6 +23,7 @@ _spec.loader.exec_module(L)
 U1, U2, U3 = ("%08d-0000-4000-8000-%012d" % (i, i) for i in (1, 2, 3))
 NOW = 1800000000.0
 K_ID, K_AT = "session.live_conversation_id", "session.live_conversation_at"
+K_ARM_ID, K_RES = "session.resume_armed_id", "session.resume_result"
 
 
 def rd(path):
@@ -33,7 +34,7 @@ def rd(path):
 class FakeIO:
     def __init__(self):
         self.t, self.calls, self.tmo, self.fail, self.on_sleep = NOW, [], [], {}, None
-        self.roster, self.panes, self.procs, self.meta = [], {}, {}, {}
+        self.roster, self.panes, self.procs, self.meta, self.nudges = [], {}, {}, {}, []
 
     def now(self):
         return self.t
@@ -51,10 +52,13 @@ class FakeIO:
         self.tmo.append(timeout)
         self.t += 0.05
         tool = os.path.basename(argv[0])
-        verb = next((v for v in ("update", "show") if v in argv), "")
+        verb = next((v for v in ("update", "show", "nudge", "query") if v in argv), "")
         f = self.fail.get(tool + ":" + verb, self.fail.get(tool, False))
         if f is not False:
             return f
+        if tool == "gc" and verb == "nudge":
+            self.nudges.append(argv[argv.index("nudge") + 1:])
+            return 0, "", ""
         if tool == "gc":
             return 0, json.dumps({"ok": True, "schema_version": "1", "sessions": self.roster}), ""
         if tool == "ps":  # procs: pid -> (ppid, start epoch); the age is what ps would say NOW, so every clock move keeps the world consistent
@@ -62,9 +66,16 @@ class FakeIO:
         if tool == "tmux":
             name = next(a for a in argv if a.startswith("="))[1:-1]
             return (0, "".join("%d\n" % p for p in self.panes[name]), "") if name in self.panes else (1, "", "can't find session: %s\n" % name)
+        if tool == "bd" and verb == "query":  # the session beads, as `bd query 'type=session AND status!=closed'` returns them
+            return 0, json.dumps([{"id": r["id"], "metadata": {"template": r["template"], "session_name": r["session_name"], "state": "awake" if r["state"] == "active" else r["state"]}}
+                                  for r in self.roster]), ""
         if tool == "bd" and verb == "update":
             sets = [a for i, a in enumerate(argv) if i and argv[i - 1] == "--set-metadata"]
-            self.meta.setdefault(argv[argv.index("update") + 1], {}).update(dict(a.split("=", 1) for a in sets))
+            m = self.meta.setdefault(argv[argv.index("update") + 1], {})
+            m.update(dict(a.split("=", 1) for a in sets))
+            for i, a in enumerate(argv):
+                if i and argv[i - 1] == "--unset-metadata":
+                    m.pop(a, None)
             return 0, "", ""
         if tool == "bd" and verb == "show":
             b = argv[argv.index("show") + 1]
@@ -100,6 +111,16 @@ class World:
     def transcript(self, sid):
         with open("%s/.claude/projects/-p/%s.jsonl" % (self.home, sid), "w") as fh:
             fh.write("{}\n")
+
+    def good_transcript(self, sid, tokens=50000, dangling=False, usage=True, pad=0):
+        """a real-shaped conversation: the last request carried `tokens`; dangling = ends in a tool_use nobody answered; pad = KB of junk BEFORE it (a tail read must cut a line)"""
+        u = {"input_tokens": tokens - 7, "cache_read_input_tokens": 3, "cache_creation_input_tokens": 4, "output_tokens": 5} if usage else None
+        a = lambda content: {"type": "assistant", "message": dict({"role": "assistant", "content": content}, **({"usage": u} if u else {}))}
+        recs = [{"type": "user", "message": {"role": "user", "content": [{"type": "text", "text": "x" * 1024}]}}] * pad
+        recs += [a([{"type": "tool_use", "id": "tu1", "name": "Bash", "input": {}}]), {"type": "user", "message": {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "tu1", "content": "ok"}]}}]
+        recs += [a([{"type": "tool_use", "id": "tu2", "name": "Bash", "input": {}}])] if dangling else [a([{"type": "text", "text": "done"}])]
+        with open("%s/.claude/projects/-p/%s.jsonl" % (self.home, sid), "w") as fh:
+            fh.write("".join(json.dumps(r) + "\n" for r in recs))
 
     def session(self, tmpl, bead, tname, base, sid, state="active", wd="/x/rig/crew/x"):
         """roster entry + tmux pane + the REAL shape of the tree (pane sh -> sh -c -> claude) + registry + transcript; returns the claude pid"""
@@ -292,13 +313,29 @@ class Pass(unittest.TestCase):
         for label, f in (("rc != 0", (1, "", "boom")), ("rc != 0 with a good body", (1, '{"sessions": []}', "boom")), ("timeout", (None, "", "")), ("garbage", (0, "{not json", "")),
                          ("no sessions key", (0, "{}", "")), ("sessions not a list", (0, '{"sessions": 7}', ""))):
             with self.subTest(label):
-                self.w.io.fail["gc"] = f
-                self.assertEqual((self.w.go()[0], self.w.io.n("bd")), (3, 0))
+                self.w.io.fail["gc"], self.w.io.fail["bd:query"] = f, f  # the roster has two sources: only when both are unreadable is the pass blind
+                self.assertEqual((self.w.go()[0], self.w.io.n("bd", "update"), self.w.io.n("bd", "show")), (3, 0, 0))
 
         self.w.io.fail.clear()  # and the list of crews: no agents/ (or no city) = cannot tell who the crews are
         self.assertEqual(self.w.go(GC_CITY_PATH="/nonexistent/city")[0], 3)
         shutil.rmtree(self.w.p("agents"))
-        self.assertEqual((self.w.go()[0], self.w.io.n("bd")), (3, 0))
+        self.w.io.calls.clear()
+        self.assertEqual((self.w.go()[0], self.w.io.n("bd")), (3, 0))  # without the crew list not even the roster is asked
+
+    def test_the_roster_has_two_sources_gc_for_a_normal_pass_the_beads_for_the_final_and_each_covers_the_other(self):
+        w = self.w
+        w.io.fail["gc"] = (None, "", "")  # `gc session list` took 22-60 s at load 77: it times out
+        self.assertEqual((w.go()[0], w.stored()), (0, U1))
+        w.io.fail.clear()
+        w.io.calls.clear()
+        w.go(final=True)
+        self.assertEqual((w.io.n("gc"), w.io.n("bd", "query")), (0, 1))  # the final asks the beads first and never needs gc when they answer
+        w.io.fail["bd:query"] = (None, "", "")
+        w.io.calls.clear()
+        self.assertEqual((w.go(final=True)[0], w.io.n("gc"), w.stored()), (0, 1, U1))  # ...and falls back to gc when they do not
+        w.io.roster[0]["state"] = "asleep"
+        w.io.fail.clear()
+        self.assertEqual(w.go(final=True)[1]["targets"], 0)  # a malformed/odd row is skipped and a non-active session is no target, through the bd source too
 
     def test_crew_rule_layer1_reads_agent_toml(self):
         w = World(self)
@@ -415,7 +452,7 @@ class Pass(unittest.TestCase):
         self.assertIn("UNKNOWN ga-wisp-aaa", dry[0])
         self.w.io.fail.clear()
         os.remove("%s/.claude/projects/-p/%s.jsonl" % (self.w.home, U1))
-        self.assertEqual(self.w.main("--final")[1], "live-conversation-capture[final]: alvos=1 gravou=0 igual=0 ausente=1 nao-sei=0 falhou=0\n")
+        self.assertEqual(self.w.main("--final")[1], "live-conversation-capture[final]: alvos=1 gravou=0 igual=0 ausente=1 nao-sei=0 falhou=0 armou=0 recusou=0\n")
 
     def test_exit_2_for_usage_and_3_for_a_lock_that_cannot_be_taken_which_is_not_busy(self):
         with mock.patch("fcntl.flock", side_effect=OSError(errno.ENOLCK, "no locks available")):
@@ -469,6 +506,298 @@ class Pass(unittest.TestCase):
     def test_etime_formats_of_ps(self):
         for s, want in (("05:10", 310), ("1:02:03", 3723), ("2-03:04:05", 183845), ("12", None), ("x-1:00", None)):
             self.assertEqual(L.parse_etime(s), want, s)
+
+
+LOG = lambda w: rd(w.p(".gc", "logs", "live-conversation-capture.log"))
+WOKE = lambda t: time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(t))  # the engine's last_woke_at
+
+
+class Nested(unittest.TestCase):
+    """the conversation in the pane is the OUTERMOST claude (thies at 00:01 had a helper claude under it)"""
+
+    def setUp(self):
+        self.w = World(self)
+
+    def test_a_claude_started_by_the_panes_claude_is_not_the_conversation_but_two_siblings_still_are_unknown(self):
+        w = self.w
+        outer = w.crew(sid=U1)
+        w.io.procs[outer + 5] = (outer, NOW - 100)  # a helper claude -p below the pane's claude
+        w.reg(outer + 5, U3, "thies-wa-gawispaaa")
+        w.transcript(U3)
+        self.assertEqual((w.go()[1]["wrote"], w.stored()), (1, U1))
+        w.io.panes["thies-wa-gawispaaa"].append(300)  # a SECOND claude directly under the pane's tmux root, not below the first: no way to tell which is "the" conversation
+        w.io.procs[300] = (1, NOW - 4000)
+        w.reg(300, U2, "thies-wa-gawispaaa")
+        w.transcript(U2)
+        w.stored_clear = w.io.meta.clear()
+        self.assertEqual((w.go()[1]["unknown"], w.stored()), (1, None))
+
+
+class Arm(unittest.TestCase):
+    def setUp(self):
+        self.w = World(self)
+        self.w.crew()
+        self.w.good_transcript(U1)
+        self.w.io.meta["ga-wisp-aaa"] = {"session_key": U3, "state": "awake", "started_config_hash": "v3:x"}
+
+    def meta(self):
+        return self.w.io.meta["ga-wisp-aaa"]
+
+    def refused(self, why, **meta):
+        self.w.io.meta["ga-wisp-aaa"].update(meta)
+        c = self.w.go(final=True)[1]
+        self.assertEqual((c["armed"], c["refused"]), (0, 1), LOG(self.w))
+        self.assertIn(why, LOG(self.w))
+        self.assertNotIn("sleep_reason", self.meta().keys() - {k for k in meta})  # nothing was armed
+        self.assertEqual(self.meta().get("session_key"), U3)  # the engine's own key is untouched
+
+    def test_final_arms_the_next_boot_with_the_live_conversation_in_one_update_that_is_read_back(self):
+        c = self.w.go(final=True)[1]
+        m = self.meta()
+        self.assertEqual((c["armed"], c["refused"], c["failed"]), (1, 0, 0), LOG(self.w))
+        self.assertEqual((m["session_key"], m["sleep_reason"], m[K_ARM_ID]), (U1, "city-stop", U1))  # the key is the LIVE id, not the one the bead minted (U3)
+        self.assertEqual(m[K_ID], U1)
+        self.assertEqual(json.loads(rd(self.w.p(".gc", "live-conversation-capture.state.json")))["beads"]["ga-wisp-aaa"]["armed"]["id"], U1)
+        self.assertEqual(sum(1 for c in self.w.io.calls if "update" in c and "sleep_reason=city-stop" in c), 1)
+        self.assertIn("ARMED ga-wisp-aaa", LOG(self.w))
+
+    def test_a_normal_pass_never_arms_and_the_kill_switch_keeps_final_to_the_capture(self):
+        self.w.go()
+        self.assertNotIn("sleep_reason", self.meta())
+        self.w.go(final=True, LCC_ARM="0")
+        self.assertEqual((self.meta().get("sleep_reason"), self.meta().get("session_key")), (None, U3))
+
+    def test_a_dry_final_judges_the_guards_and_writes_nothing(self):
+        out = self.w.main("--final", "--dry-run")[1]
+        self.assertIn("WOULD arm ga-wisp-aaa", out)
+        self.assertEqual((self.meta().get("sleep_reason"), self.meta().get(K_ID), self.w.io.n("bd", "update")), (None, None, 0))
+
+    def test_every_guard_refuses_and_leaves_the_engine_default_with_the_reason_logged(self):
+        for why, meta in (("wake_mode=fresh", {"wake_mode": "fresh"}), ("reset/restart pending", {"continuation_reset_pending": "true"}),
+                          ("reset/restart pending", {"restart_requested": "true"}), ("quarantined", {"quarantined_until": "2026-12-01T00:00:00Z"}),
+                          ("sleep_reason=quarantine", {"sleep_reason": "quarantine"}), ("sleep_reason=city-stop", {"sleep_reason": "city-stop"})):
+            with self.subTest(why=why, meta=meta):
+                self.setUp()
+                self.refused(why, **meta)
+
+    def test_a_leftover_arming_of_ours_is_re_armed_but_the_same_reason_without_our_marker_is_not(self):
+        self.meta().update(sleep_reason="city-stop", **{K_ARM_ID: U2})
+        self.assertEqual(self.w.go(final=True)[1]["armed"], 1)
+
+    def test_a_transcript_that_cannot_be_trusted_is_not_resumed(self):
+        for why, kw in (("tokens (> 700000)", dict(tokens=700001)), ("context size is unknown", dict(usage=False))):
+            with self.subTest(why=why):
+                self.setUp()
+                self.w.good_transcript(U1, **kw)
+                self.refused(why)
+        self.setUp()
+        self.w.good_transcript(U1, tokens=700000)  # the bar is exclusive: exactly the limit still fits
+        self.assertEqual(self.w.go(final=True)[1]["armed"], 1)
+        self.setUp()
+        self.w.good_transcript(U1, tokens=300001)  # what the first suggestion (300k) would have refused: crews really live here
+        self.assertEqual(self.w.go(final=True)[1]["armed"], 1)
+        self.setUp()
+        self.w.good_transcript(U1, tokens=300001)
+        c = self.w.go(final=True, LCC_MAX_RESUME_TOKENS="300000")[1]  # the knob moves the bar
+        self.assertEqual((c["armed"], c["refused"]), (0, 1))
+
+    def test_a_tool_call_in_flight_is_noted_not_refused_unless_the_knob_says_so(self):
+        self.w.good_transcript(U1, dangling=True)
+        c = self.w.go(final=True)[1]
+        self.assertEqual((c["armed"], c["refused"]), (1, 0), LOG(self.w))
+        self.assertIn("1 tool call(s) in flight", LOG(self.w))
+        self.setUp()
+        self.w.good_transcript(U1, dangling=True)
+        c = self.w.go(final=True, LCC_REFUSE_DANGLING="1")[1]
+        self.assertEqual((c["armed"], c["refused"]), (0, 1))
+        self.assertIn("tool_use with no result", LOG(self.w))
+
+    def test_the_transcript_tail_is_read_through_a_cut_first_line_and_a_huge_file_is_still_judged(self):
+        self.w.good_transcript(U1, pad=5000)  # ~5 MB of earlier conversation: only the last 4 MB are read, the first line of the tail is cut in half
+        self.assertEqual(self.w.go(final=True)[1]["armed"], 1, LOG(self.w))
+        self.setUp()
+        self.w.good_transcript(U1, dangling=True, pad=5000)
+        self.assertIn("1 tool call(s) in flight", L.transcript_check("%s/.claude/projects/-p/%s.jsonl" % (self.w.home, U1), 700000)[1])  # still found through the cut line
+
+    def test_a_transcript_that_cannot_be_read_is_not_resumed(self):
+        path = "%s/.claude/projects/-p/%s.jsonl" % (self.w.home, U1)
+        os.chmod(path, 0)
+        self.addCleanup(os.chmod, path, 0o600)
+        if os.access(path, os.R_OK):
+            self.skipTest("running as a user that ignores file modes")
+        self.refused("cannot read the transcript")
+
+    def test_unreadable_metadata_or_a_spent_budget_is_not_armed_and_never_a_guess(self):
+        self.w.io.fail["bd:show"] = (1, "", "boom")  # the dry-run judges on a read of its own (a real pass judges on the capture write's read-back: if that fails the capture FAILS and nothing is armed)
+        out = self.w.main("--final", "--dry-run")[1]
+        self.assertIn("NOT ARMED ga-wisp-aaa (thies-wa-gawispaaa): unknown: bead metadata unreadable", out)
+        self.assertIn("armou=0 recusou=1", out)
+        c = self.w.go(final=True)[1]
+        self.assertEqual((c["armed"], c["failed"], self.w.io.meta["ga-wisp-aaa"].get("sleep_reason")), (0, 1, None))
+
+    def test_an_update_that_fails_is_failed_and_not_remembered_as_armed(self):
+        real = self.w.io.run
+        self.w.io.run = lambda argv, timeout: (1, "", "dolt down") if "sleep_reason=city-stop" in argv else real(argv, timeout)  # the capture write works, the arming update does not
+        c = self.w.go(final=True)[1]
+        self.assertEqual((c["armed"], c["failed"]), (0, 1), LOG(self.w))
+        self.assertNotIn("armed", json.loads(rd(self.w.p(".gc", "live-conversation-capture.state.json")))["beads"]["ga-wisp-aaa"])
+        self.assertNotIn("sleep_reason", self.meta())
+        self.setUp()
+        self.w.io.fail["bd:update"] = (1, "", "dolt down")  # nothing can be written at all: the capture fails and there is nothing live to arm
+        c = self.w.go(final=True)[1]
+        self.assertEqual((c["armed"], c["failed"], self.w.io.n("bd", "show")), (0, 1, 0))
+
+    def test_an_update_that_may_have_landed_is_remembered_so_the_disarm_can_clean_it(self):
+        real, calls = self.w.io.run, []
+
+        def run(argv, timeout):
+            rc = real(argv, timeout)
+            if "sleep_reason=city-stop" in argv:
+                self.w.io.meta["ga-wisp-aaa"].pop("sleep_reason")  # the update said rc 0 but the read-back does not show it
+            return rc
+        self.w.io.run = run
+        c = self.w.go(final=True)[1]
+        self.assertEqual((c["armed"], c["failed"]), (0, 1), LOG(self.w))
+        self.assertEqual(json.loads(rd(self.w.p(".gc", "live-conversation-capture.state.json")))["beads"]["ga-wisp-aaa"]["armed"]["id"], U1)
+
+    def test_the_stale_reset_stamp_goes_with_the_arming_and_with_a_refusal_but_never_while_a_reset_is_pending(self):
+        self.meta()["reset_committed_at"] = "2026-10-21T13:43:19Z"
+        self.w.go(final=True)
+        self.assertNotIn("reset_committed_at", self.meta())
+        self.setUp()
+        self.meta().update(reset_committed_at="2026-10-21T13:43:19Z", wake_mode="fresh")
+        self.w.go(final=True)
+        self.assertNotIn("reset_committed_at", self.meta())  # the Mayor case: refused, but the stamp that only fakes a "reset stalled" is cleaned
+        self.setUp()
+        self.meta().update(reset_committed_at="2026-10-21T13:43:19Z", continuation_reset_pending="true")
+        self.w.go(final=True)
+        self.assertEqual(self.meta()["reset_committed_at"], "2026-10-21T13:43:19Z")
+
+    def test_six_targets_arm_side_by_side_and_one_crash_does_not_blind_the_rest(self):
+        for i, tm in enumerate(("digo-wa", "peter-wa", "batista-wa"), 1):
+            sid = "%08d-0000-4000-8000-%012d" % (10 + i, 10 + i)
+            self.w.crew(tm, "ga-wisp-b%02d" % i, 300 + 100 * i, sid)
+            self.w.good_transcript(sid)
+            self.w.io.meta["ga-wisp-b%02d" % i] = {"session_key": U3}
+        real = L.transcript_check
+        with mock.patch.object(L, "transcript_check", side_effect=lambda p, *a: 1 / 0 if "%08d" % 12 in p else real(p, *a)):
+            c = self.w.go(final=True, LCC_ARM_WORKERS="3")[1]
+        self.assertEqual((c["armed"], c["refused"]), (3, 1), LOG(self.w))
+        self.assertIn("unexpected ZeroDivisionError", LOG(self.w))
+
+
+class Boot(unittest.TestCase):
+    """normal passes after a boot: the verdict, the one nudge, the disarm"""
+
+    def setUp(self):
+        self.w = World(self)
+        self.w.crew()
+        self.w.good_transcript(U1)
+        self.w.io.meta["ga-wisp-aaa"] = {"session_key": U3}
+        self.w.go(final=True)  # captured + armed at NOW
+        self.armed_at = int(NOW)
+
+    def after_boot(self, sid, woke=None, **meta):
+        """the machine rebooted: the pane now holds `sid`, the engine stamped last_woke_at"""
+        w = self.w
+        w.io.t += 400
+        w.crew(sid=sid)
+        w.good_transcript(sid)
+        w.io.meta["ga-wisp-aaa"].update(last_woke_at=WOKE(w.io.t - 100 if woke is None else woke), **meta)
+
+    def m(self):
+        return self.w.io.meta["ga-wisp-aaa"]
+
+    def test_the_same_conversation_after_the_boot_is_recorded_as_resumed_without_a_nudge(self):
+        self.after_boot(U1)
+        self.w.go()
+        self.assertEqual((self.m()[K_RES], self.w.io.nudges), ("ok", []))
+        self.assertIn("RESUMED ga-wisp-aaa", LOG(self.w))
+        self.assertNotIn("armed", json.loads(rd(self.w.p(".gc", "live-conversation-capture.state.json")))["beads"]["ga-wisp-aaa"])
+        n = self.w.io.n("bd", "update")
+        self.w.go()
+        self.assertEqual(self.w.io.n("bd", "update"), n)  # settled: later passes add nothing
+
+    def test_another_conversation_after_the_boot_is_fresh_and_the_session_is_told_once_which_one_it_had(self):
+        self.after_boot(U2)
+        self.w.go()
+        self.w.go()
+        self.assertEqual(self.m()[K_RES], "fresh")
+        self.assertEqual(len(self.w.io.nudges), 1)
+        self.assertEqual(self.w.io.nudges[0][0], "thies-wa-gawispaaa")
+        self.assertIn(U1, self.w.io.nudges[0][1])
+        self.assertIn("claude --resume %s" % U1, self.w.io.nudges[0][1])
+
+    def test_a_nudge_that_fails_is_retried_not_marked_done(self):
+        self.after_boot(U2)
+        self.w.io.fail["gc:nudge"] = (1, "", "no such session")
+        self.w.go()
+        self.assertIn("NUDGE-FAILED", LOG(self.w))
+        self.w.io.fail.clear()
+        self.w.go()
+        self.w.go()
+        self.assertEqual(len(self.w.io.nudges), 1)  # told once, by the retry; the pass after it adds nothing
+        self.assertIn("NUDGED ga-wisp-aaa (thies-wa-gawispaaa): retry worked", LOG(self.w))
+
+    def test_a_nudge_that_never_works_is_given_up_after_three_tries(self):
+        self.after_boot(U2)
+        self.w.io.fail["gc:nudge"] = (1, "", "no such session")
+        for _ in range(8):
+            self.w.go()
+        self.assertEqual(self.w.io.n("gc", "nudge"), 3)
+
+    def test_a_guard_refusal_or_a_crash_restart_onto_another_conversation_is_also_told(self):
+        self.setUp()
+        self.w.io.meta["ga-wisp-aaa"].pop(K_ARM_ID)
+        st = L.load_state(self.w.p(".gc", "live-conversation-capture.state.json"))
+        st["ga-wisp-aaa"].pop("armed")  # never armed (a guard said no): only the last captured id is known
+        L.save_state(self.w.p(".gc", "live-conversation-capture.state.json"), st)
+        self.after_boot(U2)
+        self.w.go()
+        self.assertEqual(len(self.w.io.nudges), 1)
+
+    def test_switching_conversation_with_resume_inside_the_pane_is_not_a_restart_and_gets_no_nudge(self):
+        L.save_state(self.w.p(".gc", "live-conversation-capture.state.json"), {"ga-wisp-aaa": {"cid": U1, "at": int(NOW)}})  # not armed
+        self.w.io.t += 400
+        self.w.crew(sid=U2)
+        self.w.good_transcript(U2)
+        self.m()["last_woke_at"] = WOKE(NOW - 3600)  # the process has been up for an hour: the Athos only ran /resume
+        self.w.go()
+        self.assertEqual(self.w.io.nudges, [])
+
+    def test_an_unreadable_wake_stamp_or_bead_concludes_nothing_and_keeps_the_arming(self):
+        self.after_boot(U2)
+        self.m()["last_woke_at"] = "not a time"
+        self.w.go()
+        self.assertEqual((self.w.io.nudges, self.m().get(K_RES)), ([], None))
+        self.w.io.fail["bd:show"] = (1, "", "x")
+        self.w.go()
+        self.assertEqual((self.w.io.nudges, self.m().get(K_RES)), ([], None))
+        self.assertIn("armed", json.loads(rd(self.w.p(".gc", "live-conversation-capture.state.json")))["beads"]["ga-wisp-aaa"])
+
+    def test_an_arming_whose_reboot_never_came_is_taken_back_after_the_window_and_only_if_it_is_ours(self):
+        self.w.io.t += 800  # inside the 900 s window: wait
+        self.w.go()
+        self.assertEqual(self.m()["sleep_reason"], "city-stop")
+        self.w.io.t += 200  # past it, no restart since (last_woke_at is older than the arming)
+        self.m()["last_woke_at"] = WOKE(NOW - 5000)
+        self.w.go()
+        self.assertNotIn("sleep_reason", self.m())
+        self.assertEqual(self.m()["session_key"], U1)  # the aligned key is harmless and stays
+        self.assertIn("DISARMED ga-wisp-aaa", LOG(self.w))
+        self.assertNotIn("armed", json.loads(rd(self.w.p(".gc", "live-conversation-capture.state.json")))["beads"]["ga-wisp-aaa"])
+
+    def test_a_sleep_reason_that_is_not_ours_survives_the_disarm(self):
+        self.m()["sleep_reason"] = "user-hold"
+        self.w.io.t += 1000
+        self.m()["last_woke_at"] = WOKE(NOW - 5000)
+        self.w.go()
+        self.assertEqual(self.m()["sleep_reason"], "user-hold")
+
+    def test_dry_run_after_a_boot_writes_and_nudges_nothing(self):
+        self.after_boot(U2)
+        self.w.go(dry=True)
+        self.assertEqual((self.w.io.nudges, self.m().get(K_RES)), ([], None))
 
 
 class Real(unittest.TestCase):
