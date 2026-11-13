@@ -1603,6 +1603,20 @@ def list_inflight_beads():
     return list(merged.values())
 
 
+# ga-xxtwytk: o alias de slot do pool de dogs ('gastown.dog-1'), a forma que um claim de pool grava como assignee (ver alias_claim_predates_session). A varredura de
+# in_progress sem marcador não o via: _is_ephemeral_pool_assignee só conhece o template nu, o '-adhoc-<hex>' e o 'dog-<sufixo>', então uma bead que perdeu os rótulos de voo
+# com o dono de slot morto (wa-lytych, 13/11) não era candidata em lugar nenhum. NÃO entra em _is_ephemeral_pool_assignee: ali o run_cycle o classificaria "adhoc" e a
+# liveness iria para concrete_adhoc_session_is_live, que não tem a regra do gêmeo de alias (ga-lotseol, só em session_is_live) — as beads de slot COM rótulo, que hoje
+# passam por session_is_live, a perderiam. Aqui ele só faz a bead entrar na varredura; quem decide se o dono está vivo segue sendo session_is_live.
+_POOL_SLOT_ALIAS_RE = re.compile(r"gastown\.dog-[0-9]+")
+
+
+def _is_pool_slot_alias(assignee):
+    """True sse assignee é o alias de um slot do pool de dogs: 'gastown.dog-<dígitos>' inteiro (fullmatch: sem espaço, sem quebra de linha final, sem sufixo)."""
+    # vazio/None → False (sem dono não há alias); ilegível (não-str) → str() e o fullmatch decide: nada que não tenha a forma exata entra
+    return bool(assignee) and _POOL_SLOT_ALIAS_RE.fullmatch(str(assignee).lower()) is not None
+
+
 def is_reclaimable_inprogress_story(labels, assignee=None):
     """Pure predicate: True if an in_progress bead is a Pilot story stranded
     WITHOUT its story:in-flight label (the ga-vw26y blind spot), and is thus a
@@ -1630,12 +1644,17 @@ def is_reclaimable_inprogress_story(labels, assignee=None):
 
     ga-hkpwv / prefix fix: gate:needs-human:* variants (e.g. :on-device, :routing)
     are treated identically to the bare gate:needs-human — deliberately parked.
+
+    ga-xxtwytk: an assignee that is a dog-pool SLOT ALIAS ('gastown.dog-1', _is_pool_slot_alias) also qualifies, same as the pool forms above and for the same
+    reason (a pool claim leaves no Pilot marker, and the Pilot's NEVERSTARTED release can take them off). Only the sweep admits it: see _POOL_SLOT_ALIAS_RE.
     """
     is_pool_zombie_candidate = (
         assignee is not None and _is_ephemeral_pool_assignee(assignee)
     )
+    is_pool_slot_candidate = _is_pool_slot_alias(assignee)
     has_marker = (
         is_pool_zombie_candidate
+        or is_pool_slot_candidate
         or any(lbl in PILOT_STORY_MARKERS for lbl in labels)
         or any(lbl.startswith("pilot:reclaim-count:") for lbl in labels)
     )
@@ -6162,9 +6181,10 @@ def _selftest():
         def _wt_iso(epoch):
             return _irg_datetime.datetime.fromtimestamp(epoch, tz=_irg_datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
-        def _wt_cycle(bead_id, live=False, fail_git=None, stale_cycle_now=0):
+        def _wt_cycle(bead_id, live=False, fail_git=None, stale_cycle_now=0, marker_less=False, twin=False):
             """run_cycle de verdade: dono `gastown.dog-2` (alias de slot de dog, o do ga-lotseol) encalhado há RECLAIM_TTL + 10 min, trilho de branch real e SEM remote (REPOS=[]), `gc rig list` no rig de
-            teste. stale_cycle_now: o `now` que o run_cycle lê no começo fica tantos s para trás (passada 1 lenta). Devolve (state, reclaims pedidos ao do_reclaim, texto impresso)."""
+            teste. stale_cycle_now: o `now` que o run_cycle lê no começo fica tantos s para trás (passada 1 lenta). marker_less (ga-xxtwytk): a bead perdeu os rótulos de voo, então só a varredura de in_progress a
+            acha. twin: a sessão viva do alias nasceu DEPOIS da última escrita na bead (gêmeo do dono morto), não é quem a reivindicou. Devolve (state, reclaims pedidos ao do_reclaim, texto impresso)."""
             now = time.time()
             reclaims = []
             state = {bead_id: {"first_seen_stranded": now - RECLAIM_TTL - 600, "last_assignee": "gastown.dog-2"}}
@@ -6172,14 +6192,14 @@ def _selftest():
                        "created_at": _wt_iso(now - 86400), "closed": False}]
             if live:
                 roster.append({"id": "ga-wtdog2", "name": "gastown.dog-2", "session_name": "dog-gawtdog2", "alias": "gastown.dog-2", "agent_name": "gastown.dog-2", "template": "gastown.dog",
-                               "state": "active", "last_active": _wt_iso(now - 30), "created_at": _wt_iso(now - 86400), "closed": False})
+                               "state": "active", "last_active": _wt_iso(now - 30), "created_at": _wt_iso(now - (600 if twin else 86400)), "closed": False})
             bead = {"id": bead_id, "title": "e2e do trilho do worktree", "issue_type": "task", "status": "in_progress", "assignee": "gastown.dog-2", "rig_root": _wt_rig,
-                    "labels": ["story:in-flight", "pilot:dispatched"], "metadata": {}, "updated_at": _wt_iso(now - (60 if live else 7200))}
+                    "labels": ["exec:auto"] if marker_less else ["story:in-flight", "pilot:dispatched"], "metadata": {}, "updated_at": _wt_iso(now - (60 if live and not twin else 7200))}
             none = lambda *a, **k: None
-            stubs = dict(list_stranded_inprogress_beads=lambda: [], heal_orphan_sweep_false_resets=none, _note_query_failure=none, _note_query_success=none, _check_pool_dead=none, emit=none,
+            stubs = dict(list_stranded_inprogress_beads=lambda: [dict(bead)] if marker_less else [], heal_orphan_sweep_false_resets=none, _note_query_failure=none, _note_query_success=none, _check_pool_dead=none, emit=none,
                          list_suspended_agents=lambda: set(), list_gate_active_source_beads=lambda: frozenset(), list_live_sling_source_beads=lambda *a: frozenset(),
                          list_refused_sling_source_beads=lambda: {}, account_is_rate_limited=lambda: False, session_awaiting_human_input=lambda *a, **k: False, do_escalate=lambda *a, **k: [],
-                         list_inflight_beads=lambda: [dict(bead)], list_active_sessions=lambda: roster, compute_multi_assigned_assignees=lambda beads, parent_reader=None, notes=None: set(),
+                         list_inflight_beads=lambda: [] if marker_less else [dict(bead)], list_active_sessions=lambda: roster, compute_multi_assigned_assignees=lambda beads, parent_reader=None, notes=None: set(),
                          do_reclaim=lambda bid, title, rc, idle, labels, **kw: reclaims.append(bid) or True, _list_rig_stores=lambda: [("traco-bim", _wt_rig)], REPOS=[])
             saved, real_time, reads = {k: _wt_g[k] for k in stubs}, time.time, [0]
 
@@ -6217,6 +6237,16 @@ def _selftest():
         _wt_st, _wt_rec, _wt_t = _wt_cycle("tb-recent1", stale_cycle_now=1000)
         check("WT-E7: o `now` do ciclo ficou 1000 s para trás (passada 1 lenta: 2 git fetch por bead) → atividade de 5 min atrás segue 'recent', não 'carimbo no futuro' (o trilho lê o relógio na hora)",
               _wt_rec == [] and WT_RAIL_COUNTS == {"recent": 1, "unreadable": 0}, f"reclaims={_wt_rec!r} contagens={WT_RAIL_COUNTS!r} texto={_wt_t[-250:]!r}")
+
+        # --- ga-xxtwytk: a bead que perdeu os rótulos de voo (só a varredura de in_progress a acha), com dono de slot ('gastown.dog-2'), de ponta a ponta no run_cycle ---
+        _wt_st, _wt_rec, _wt_t = _wt_cycle("tb-nowt1", marker_less=True)
+        check("MS-E1 (ga-xxtwytk): sem nenhum rótulo de voo, dono de slot sem sessão no roster, encalhada há RECLAIM_TTL + 10 min → o run_cycle a reclama (que a varredura a traga até aqui é o AZ-10a/RGL-9)",
+              _wt_rec == ["tb-nowt1"], f"reclaims={_wt_rec!r} texto={_wt_t[-250:]!r}")
+        _wt_st, _wt_rec, _wt_t = _wt_cycle("tb-nowt1", marker_less=True, live=True, twin=True)
+        check("MS-E2: o alias foi reaproveitado por uma sessão que nasceu DEPOIS da última escrita na bead (gêmeo do dono morto) → não é o dono: reclama (a regra do ga-lotseol vale nesta varredura)",
+              _wt_rec == ["tb-nowt1"], f"reclaims={_wt_rec!r} texto={_wt_t[-250:]!r}")
+        _wt_st, _wt_rec, _wt_t = _wt_cycle("tb-recent1", marker_less=True, live=True)
+        check("MS-E3: a sessão do alias é mais velha que a bead e está viva (dono de verdade) → segura, nada reclamado", _wt_rec == [], f"reclaims={_wt_rec!r} texto={_wt_t[-250:]!r}")
 
         _wt_rc_src = _wt_inspect.getsource(run_cycle)
         check("WT-16a (deriva): run_cycle monta has_recent_branch por has_recent_progress(...) — tirada a chamada, o trilho some e todo teste de unidade segue verde",
@@ -6383,6 +6413,22 @@ def _selftest():
           _is_ephemeral_pool_assignee("wa-worker"))
     check("AZ-9b: is_reclaimable_inprogress_story: bare wa-worker still qualifies (regression check)",
           is_reclaimable_inprogress_story([], assignee="wa-worker"))
+
+    # --- AZ-10 (ga-xxtwytk): o alias de slot 'gastown.dog-N' entra na varredura sem marcador, e SÓ nela ---
+    # A bead que perdeu os rótulos de voo com o dono de slot morto (wa-lytych, 13/11) não era candidata: nenhum marcador e um dono que _is_ephemeral_pool_assignee não reconhecia.
+    check("AZ-10a: is_reclaimable_inprogress_story: gastown.dog-1 sem NENHUM marcador (a forma do incidente) → True",
+          is_reclaimable_inprogress_story(["exec:auto", "lane:small", "ctx:ready"], assignee="gastown.dog-1"))
+    check("AZ-10b: _is_pool_slot_alias: só 'gastown.dog-<dígitos>' inteiro (nu, adhoc, sufixo, espaço, quebra de linha final, vazio e None ficam de fora)",
+          all(_is_pool_slot_alias(a) for a in ("gastown.dog-1", "gastown.dog-12", "GASTOWN.DOG-3"))
+          and not any(_is_pool_slot_alias(a) for a in ("gastown.dog", "gastown.dog-", "gastown.dog-adhoc-1f", "gastown.dog-1x", "gastown.dogs-1", "xgastown.dog-1",
+                                                       "gastown.dog-1 ", "gastown.dog-1\n", "", None)))
+    check("AZ-10c: o alias de slot continua parqueado pelos rótulos terminais (gate:needs-human[:*]) e crew sem marcador segue fora",
+          not is_reclaimable_inprogress_story(["gate:needs-human"], assignee="gastown.dog-1")
+          and not is_reclaimable_inprogress_story(["gate:needs-human:on-device"], assignee="gastown.dog-1")
+          and not is_reclaimable_inprogress_story([], assignee="oracle-wa"))
+    # DE PROPÓSITO fora do predicado do pool: ele escolheria concrete_adhoc_session_is_live (sem a regra do gêmeo de alias, ga-lotseol) para as beads de slot COM rótulo.
+    check("AZ-10d: _is_ephemeral_pool_assignee('gastown.dog-1') segue False (a liveness do alias de slot continua em session_is_live, com a regra do gêmeo)",
+          not _is_ephemeral_pool_assignee("gastown.dog-1") and "gastown.dog-1" not in EPHEMERAL_POOL_ASSIGNEES)
 
     # --- AZ-DUP: duplicate identifier — dead first, live second → live wins (scan-all hardening) ---
     # Scenario: two sessions share the same concrete adhoc identifier.
@@ -10084,6 +10130,20 @@ def _selftest():
     )
     check("RGL-5 (ga-u8fly): rig-store bd list call includes --limit 0",
           _rig_calls_have_limit_0, f"calls={_rig_bd_list_calls}")
+
+    # RGL-9 (ga-xxtwytk): a varredura de in_progress devolve a bead que perdeu os rótulos de voo com dono de slot ('gastown.dog-1', a forma do wa-lytych) e continua
+    # sem devolver o que não é dela: crew sem marcador, slot com gate:needs-human, e quem só PARECE slot (sufixo, adhoc).
+    subprocess.run, _ = _rgl_stub(0, json.dumps({"rigs": []}), hq_inprogress=[
+        {"id": "ga-slot1", "status": "in_progress", "assignee": "gastown.dog-1", "labels": ["exec:auto", "lane:small"], "issue_type": "bug"},
+        {"id": "ga-crew1", "status": "in_progress", "assignee": "oracle-wa", "labels": ["exec:auto"], "issue_type": "bug"},
+        {"id": "ga-park1", "status": "in_progress", "assignee": "gastown.dog-2", "labels": ["gate:needs-human"], "issue_type": "bug"},
+        {"id": "ga-look1", "status": "in_progress", "assignee": "gastown.dog-1x", "labels": [], "issue_type": "bug"}])
+    try:
+        _rgl_result9 = list_stranded_inprogress_beads()
+    finally:
+        subprocess.run = _orig_run_rgl
+    check("RGL-9 (ga-xxtwytk): list_stranded_inprogress_beads() devolve a bead sem marcador com dono de slot e SÓ ela",
+          _rgl_result9 is not None and [b["id"] for b in _rgl_result9] == ["ga-slot1"], f"got {_rgl_result9!r}")
 
     # --- RGL-6..8 (ga-1qqoi, sibling of ga-x3e7p): three more list_*
     # functions call _list_rig_stores() via `... or []`, deliberately

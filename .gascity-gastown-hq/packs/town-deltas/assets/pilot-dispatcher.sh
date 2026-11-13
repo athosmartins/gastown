@@ -8895,6 +8895,73 @@ EOF
   return 1
 }
 
+# _pilot_owner_state <db> <bead_id> — ga-xxtwytk: prints "<status>|<assignee>" of the bead as it reads NOW (empty assignee = no owner; the status goes
+# first because the assignee is the only free-text field). rc 0 = the read answered and the bead has a status; rc 1 = DON'T KNOW (bd failed, answered
+# nothing, answered garbage, or the answer is not a bead): never read as "no owner".
+_pilot_owner_state() {
+  local _os_json _os_out
+  # vazio (sem saída) → rc 1, "não sei" e nunca "sem dono"; falhou/ilegível (rc≠0, JSON ruim, bead sem status) → rc 1 também
+  _os_json=$(timeout 15 bd -C "$1" show "$2" --json 2>/dev/null) || return 1
+  _os_out=$(printf '%s' "$_os_json" | jq -r 'if type == "array" then .[0] else . end | if type == "object" and (.status | type == "string") then "\(.status)|\(.assignee // "")" else empty end' 2>/dev/null) || return 1
+  [ -n "$_os_out" ] || return 1
+  printf '%s' "$_os_out"
+}
+
+# _pilot_release_owner <db> <bead_id> <judged_owner> — ga-xxtwytk: takes the owner off a bead the Pilot judged "never started" (NEVERSTARTED) or "crew
+# never engaged" (Stage 1.5) with the guarded write this repo already relies on (below), and CONFIRMS it by reading the bead back: no live bd was available
+# to try it on, so a refusal by bd shows up as rc 1 here instead of being assumed away. <judged_owner> = the assignee the Pilot's liveness checks were
+# about (from its own list row).
+#
+# Why: both release paths used to take the flight labels off and THEN run `bd assign <id> "" -q 2>/dev/null || true`. Since bd-98s5c, bd refuses that
+# assign while the bead is another actor's live in_progress claim (the Pilot is never the builder holding it) and the refusal was swallowed: the bead
+# stayed in_progress with its dead owner and without story:in-flight / pilot:dispatched. The NEVERSTARTED query selects on those labels, and so did the guard's
+# stranded-in_progress scan (its only other way in was a pool owner form, and the slot alias gastown.dog-N was not one until the same bead taught the scan to
+# admit it), so neither looked at it again (wa-lytych, 13/11: parked from 01:53Z until the witness found it by hand).
+#
+# How: ONE guarded write, the compare-and-swap that gate_clear_assignee_if_holder (quality-gate-dispatcher.sh, ga-yd8t6) uses instead of --force and the
+# same idiom as _pilot_node_first_rollback: `update --if-assignee <owner read now> --if-status <status read now> --assignee "" [--status open]`. It only
+# lets go of the bead that was read: never a newcomer's claim, never a bead that closed meanwhile. An in_progress bead goes back to open, the state the
+# other release paths leave (_pilot_node_first_rollback reads back "no owner, open"; the guard's do_reclaim resets the status before it clears the owner).
+# The effect is read back, not deduced from the exit code. A bead without owner is left as it is (status included): this only lets go of an owner.
+#   rc 0 = the bead has no owner (it had none, or the write landed and the read-back confirmed it; a bead that was in_progress is back to open)
+#   rc 1 = the owner is still there, or the bead is no longer the one that was judged (owner changed, bead closed, write refused or never applied)
+#   rc 2 = DON'T KNOW (the read before or after the write failed or came back unreadable)
+# On 1 and 2 the release is NOT confirmed and this says why with warn (a 2 after the write can still hide a write that landed; the next sweep reads the bead
+# again and converges); the caller must leave the flight labels and stamps where they are, so the bead stays visible to every query. Never reaches for
+# --force: nothing here has verified that the work is dead.
+_pilot_release_owner() {
+  local _ro_db="$1" _ro_id="$2" _ro_judged="${3:-}" _ro_now="" _ro_st="" _ro_asg="" _ro_after="" _ro_rc=0
+  # vazio/falhou/ilegível → rc 2 (NÃO sei quem tem a bead): nenhuma escrita sai
+  _ro_now=$(_pilot_owner_state "$_ro_db" "$_ro_id") || {
+    warn "ga-xxtwytk: $_ro_id NOT released — could not read it before clearing the owner (bd show failed or answered garbage); nothing written, flight labels and stamps stay (retry next sweep)"
+    return 2
+  }
+  _ro_st="${_ro_now%%|*}"; _ro_asg="${_ro_now#*|}"
+  if [ "$_ro_st" = "closed" ]; then
+    warn "ga-xxtwytk: $_ro_id NOT released — it is closed now (the builder finished after the Pilot judged it); left untouched"
+    return 1
+  fi
+  [ -n "$_ro_asg" ] || return 0   # no owner: nothing to take off (never claimed, or somebody already cleared it)
+  if [ "$_ro_asg" != "$_ro_judged" ]; then
+    warn "ga-xxtwytk: $_ro_id NOT released — the owner changed after the Pilot judged it (judged '${_ro_judged//[[:cntrl:]]/?}', now '${_ro_asg//[[:cntrl:]]/?}'); the new claimant keeps the bead, flight labels and stamps stay"
+    return 1
+  fi
+  if [ "$_ro_st" = "in_progress" ]; then
+    timeout 15 bd -C "$_ro_db" update "$_ro_id" --if-assignee "$_ro_asg" --if-status "$_ro_st" --assignee "" --status open -q >/dev/null 2>&1 || _ro_rc=$?
+  else
+    timeout 15 bd -C "$_ro_db" update "$_ro_id" --if-assignee "$_ro_asg" --if-status "$_ro_st" --assignee "" -q >/dev/null 2>&1 || _ro_rc=$?
+  fi
+  # vazio/falhou/ilegível → rc 2: a escrita pode ter pegado e eu não sei; nada é tirado agora, a próxima leitura conclui
+  _ro_after=$(_pilot_owner_state "$_ro_db" "$_ro_id") || {
+    warn "ga-xxtwytk: $_ro_id NOT confirmed — the owner write answered rc=$_ro_rc but the read-back failed; flight labels and stamps stay (next sweep reads the bead again)"
+    return 2
+  }
+  _ro_st="${_ro_after%%|*}"; _ro_asg="${_ro_after#*|}"
+  [ -z "$_ro_asg" ] && [ "$_ro_st" != "in_progress" ] && return 0
+  warn "ga-xxtwytk: $_ro_id NOT released — the owner write answered rc=$_ro_rc and the bead still reads assignee='${_ro_asg//[[:cntrl:]]/?}' status='$_ro_st' (bd refused it, lost a race or never applied it); flight labels and stamps stay"
+  return 1
+}
+
 # _neverstarted_recover_db <db_path> <now_epoch> — scan one DB for never-started
 # in-flight beads and release them. Decision rules (ALL must hold to release):
 #   - has story:in-flight AND pilot:dispatched (query selects both)
@@ -8923,7 +8990,7 @@ _neverstarted_recover_db() {
   [ "${_count:-0}" -le "0" ] 2>/dev/null && return 0
 
   echo "$_json" | jq -c '.[]' | while IFS= read -r _bead; do
-    local _bid _labels _stamp _age _sling _sling_json _sling_labels _asg _crew_owner _sling_upd
+    local _bid _labels _stamp _age _sling _sling_json _sling_labels _asg _crew_owner _sling_upd _ns_owner
     _bid=$(echo "$_bead" | jq -r '.id // ""' 2>/dev/null || echo "")
     [ -z "$_bid" ] && continue
     _labels=$(echo "$_bead" | jq -r '(.labels // []) | join(",")' 2>/dev/null || echo "")
@@ -9054,16 +9121,25 @@ _neverstarted_recover_db() {
     # Aged past threshold, no gate marker, no live worker, no branch → genuinely
     # never-started limbo. Release so the next sweep re-dispatches it.
     warn "NEVERSTARTED: releasing never-started in-flight bead $_bid (age=${_age}s > ${_thresh}s, no live worker, no branch, no gate marker, db=$_db) — back to story:approved for re-dispatch (ga-v3z4z)."
-    bd -C "$_db" label  remove "$_bid" "story:in-flight"   -q 2>/dev/null || true
-    bd -C "$_db" label  remove "$_bid" "pilot:dispatched"  -q 2>/dev/null || true
-    bd -C "$_db" label  remove "$_bid" "pilot:dispatching" -q 2>/dev/null || true
     # ga-mrfb: CLEAR the dead worker's assignee. _filter_candidates requires an empty
     # assignee (it never re-dispatches a bead someone "owns"); a never-started bead still
     # carries its dead builder's assignee, so without this it is released back to
     # story:approved yet stays INVISIBLE to every candidate query forever (ps-mrfb/ps-joc0
     # sat assigned to drained ps-worker-adhoc sessions). The gate-FAIL path already does
     # this unassign; NEVERSTARTED must too (beads that drained BEFORE reaching the gate).
-    bd -C "$_db" assign "$_bid" "" -q 2>/dev/null || true
+    # ga-xxtwytk: the owner goes FIRST, and a bead that HAS an owner only loses its flight labels and stamps after a CONFIRMED release. The
+    # bare `assign <id> ""` that used to sit here ran after the labels were off and bd 1.1.0 refuses it while the
+    # bead is another actor's in_progress claim (bd-98s5c); the refusal was swallowed, so wa-lytych (13/11) ended
+    # in_progress, owned by a dead dog and without story:in-flight / pilot:dispatched, the labels the queries here select on.
+    # Not confirmed = the labels and stamps stay (they keep it in those queries, the next sweep retries); _pilot_release_owner says why.
+    # vazio (a linha da lista não traz dono: nada a soltar, segue só com rótulos e carimbos, como antes) → ""; falhou/ilegível (o jq não leu a linha) → esta bead fica como está, a próxima varredura repete: nunca vira "sem dono"
+    _ns_owner=$(printf '%s' "$_bead" | jq -r '.assignee // ""' 2>/dev/null) || continue
+    if [ -n "$_ns_owner" ]; then
+      _pilot_release_owner "$_db" "$_bid" "$_ns_owner" || continue
+    fi
+    bd -C "$_db" label  remove "$_bid" "story:in-flight"   -q 2>/dev/null || true
+    bd -C "$_db" label  remove "$_bid" "pilot:dispatched"  -q 2>/dev/null || true
+    bd -C "$_db" label  remove "$_bid" "pilot:dispatching" -q 2>/dev/null || true
     bd -C "$_db" update "$_bid" --unset-metadata "pilot.dispatched_at"  -q 2>/dev/null || true
     bd -C "$_db" update "$_bid" --unset-metadata "pilot.dispatching_at" -q 2>/dev/null || true
     bd -C "$_db" update "$_bid" --unset-metadata "pilot.sling_bead"     -q 2>/dev/null || true
@@ -9361,10 +9437,15 @@ _pilot_crew_stale_reclaim() {
     fi
     if [ -z "$_cs_bs" ]; then
       warn "ga-c9qj8: reclaiming stale in-flight $_cs_id — crew assignee '$_cs_assignee' untouched > ${PILOT_STUCK_INFLIGHT_HOURS}h with NO crew/fix branch found anywhere (never engaged). Unassigning + clearing story:in-flight so it returns to the pool instead of staying wedged (set PILOT_CREW_STALE_RECLAIM=0 to disable)."
+      # ga-xxtwytk: same order as NEVERSTARTED — the owner goes FIRST (bd 1.1.0 refuses a bare `assign <id> ""` against a live
+      # in_progress claim, bd-98s5c, and it used to run after the labels were off with the refusal swallowed) and only a
+      # confirmed release takes the labels and stamps off; otherwise they stay, the bead stays visible to every query and the next sweep retries.
+      # _cs_assignee = the owner this row judged. A row without owner never gets here (the jq select above drops it); an empty
+      # one would still be safe: _pilot_release_owner only clears an owner that matches the judged one.
+      _pilot_release_owner "$_cs_city" "$_cs_id" "$_cs_assignee" || continue
       bd -C "$_cs_city" label  remove "$_cs_id" "story:in-flight"   -q 2>/dev/null || true
       bd -C "$_cs_city" label  remove "$_cs_id" "pilot:dispatched"  -q 2>/dev/null || true
       bd -C "$_cs_city" label  remove "$_cs_id" "pilot:dispatching" -q 2>/dev/null || true
-      bd -C "$_cs_city" assign "$_cs_id" "" -q 2>/dev/null || true
       bd -C "$_cs_city" update "$_cs_id" --unset-metadata "pilot.dispatched_at"  -q 2>/dev/null || true
       bd -C "$_cs_city" update "$_cs_id" --unset-metadata "pilot.dispatching_at" -q 2>/dev/null || true
       bd -C "$_cs_city" update "$_cs_id" --unset-metadata "pilot.sling_bead"     -q 2>/dev/null || true
