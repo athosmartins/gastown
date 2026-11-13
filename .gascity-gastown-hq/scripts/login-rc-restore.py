@@ -51,14 +51,11 @@ SCREEN_TAIL = 25
 NOT_BUSY = ("idle", "waiting")       # "shell" (a ! command running) counts as busy: never killed under it
 NOTIFY_OK = (0, 10, 11)
 
-
 def num(v, default):
     try:
-        n = int(str(v).strip())
+        return max(int(str(v).strip()), 0) or default
     except (TypeError, ValueError):
         return default
-    return n if n > 0 else default
-
 
 class Cfg:
     def __init__(self, env):
@@ -79,7 +76,6 @@ class Cfg:
         self.mayor_gate = os.path.join(gc_dir, "login-rc-restore.mayor-on")
         self.enabled = g("LRR_ENABLED", "1") != "0" and not os.path.exists(os.path.join(gc_dir, "login-rc-restore.off"))
 
-
 class RealIO:
     now = staticmethod(time.time)
 
@@ -92,7 +88,6 @@ class RealIO:
             return None, "", ""
         return p.returncode, p.stdout, p.stderr
 
-
 class Log:
     def __init__(self, path, dry):
         self.path, self.dry = path, dry
@@ -100,15 +95,13 @@ class Log:
     def __call__(self, msg):
         line = "[%s] %s" % (time.strftime("%Y-%m-%d %H:%M:%S"), msg)
         if self.dry:
-            print(line)
-            return
+            return print(line)
         try:
             os.makedirs(os.path.dirname(self.path), exist_ok=True)
             with open(self.path, "a", encoding="utf-8") as fh:
                 fh.write(line + "\n")
         except OSError as ex:
             sys.stderr.write("WARN: cannot append to %s: %s\n" % (self.path, ex))
-
 
 def crew_names(agents_dir):
     """Named crews (Layer-1 rule, as live-conversation-capture.py): work_dir .../crew/<slug>, slug != worker, max_active_sessions <= 1. None = unreadable."""
@@ -130,7 +123,6 @@ def crew_names(agents_dir):
         if slug and slug.group(1) != "worker" and not (mx and int(mx.group(1)) > 1):
             out.add(n)
     return out
-
 
 def rc_names(city_toml):
     """({provider: RC name | "" unnamed | None no RC}, Mayor's provider) from city.toml; None = unreadable."""
@@ -155,7 +147,6 @@ def rc_names(city_toml):
             mayor = p.group(1) if p else mayor
     return names, mayor
 
-
 def agent_provider(agents_dir, tpl):
     try:
         with open(os.path.join(agents_dir, tpl, "agent.toml"), encoding="utf-8") as fh:
@@ -163,7 +154,6 @@ def agent_provider(agents_dir, tpl):
     except OSError:
         return None
     return m.group(1) if m else None
-
 
 def load_roster(io, cfg, tmo):
     rc, out, _ = io.run(cfg.gc + ["session", "list", "--json"], tmo)
@@ -174,7 +164,6 @@ def load_roster(io, cfg, tmo):
     except (ValueError, AttributeError):
         return None
     return s if isinstance(s, list) else None
-
 
 def pick_targets(roster, crews):
     out = []
@@ -189,11 +178,9 @@ def pick_targets(roster, crews):
             out.append({"bead": bead, "tname": tname, "tpl": base, "mayor": mayor, "alias": "mayor" if mayor else (s.get("alias") or base)})
     return sorted(out, key=lambda t: (not t["mayor"], t["alias"]))
 
-
 def parse_etime(s):
     m = re.fullmatch(r"(?:(\d+)-)?(?:(\d+):)?(\d+):(\d+)", s)
     return None if not m else int(m.group(1) or 0) * 86400 + int(m.group(2) or 0) * 3600 + int(m.group(3)) * 60 + int(m.group(4))
-
 
 def ps_table(io, tmo):
     """{pid: (ppid, start epoch, args)}; None = ps unreadable (an empty table is unreadable too)."""
@@ -208,7 +195,6 @@ def ps_table(io, tmo):
             tab[int(f[0])] = (int(f[1]), t - age, f[3] if len(f) == 4 else "")
     return tab or None
 
-
 def descend(tab, roots):
     kids = {}
     for pid, v in tab.items():
@@ -218,7 +204,6 @@ def descend(tab, roots):
         level = [k for p in level for k in kids.get(p, []) if k not in seen]
         seen.update(level)
     return seen
-
 
 def read_entry(claude, pid, start):
     """("ok", entry) / ("none", None) / ("bad", why) for ~/.claude/sessions/<pid>.json of the live process that started at `start` (copied from live-conversation-capture.py)."""
@@ -239,7 +224,6 @@ def read_entry(claude, pid, start):
     if not isinstance(e, dict) or not isinstance(e.get("sessionId"), str) or not UUID_RE.fullmatch(e["sessionId"]) or e.get("pid") not in (None, pid):
         return "bad", "%s has no valid sessionId/pid" % os.path.basename(path)
     return ("ok", e) if e.get("kind") in (None, "interactive") else ("none", None)
-
 
 def observe(io, cfg, tgt, tab, tmo):
     """dict(st=live|absent|unknown, why, pid, start, entry, pane, args) for one target."""
@@ -270,7 +254,6 @@ def observe(io, cfg, tgt, tab, tmo):
     pid, (e, pane) = next(iter(found.items()))
     return {"st": "live", "why": "", "pid": pid, "start": tab[pid][1], "entry": e, "pane": pane, "args": tab[pid][2]}
 
-
 def screen(io, cfg, obs, tmo):
     """"stuck" / "clear" / "unknown" from the LAST lines of the pane (cached in obs)."""
     if "screen" not in obs:
@@ -282,13 +265,11 @@ def screen(io, cfg, obs, tmo):
             obs["screen"] = "stuck" if any(SCREEN_RE.search(ln) for ln in lines) else "clear"
     return obs["screen"]
 
-
 def iso_s(v):
     try:
         return datetime.datetime.strptime(v.replace("Z", "+0000"), "%Y-%m-%dT%H:%M:%S.%f%z").timestamp()
     except (AttributeError, ValueError):
         return None
-
 
 def match_event(e):
     """"login" / "rc-unnamed" / None for ONE transcript entry: only the structural shapes of the header, never a quote."""
@@ -312,7 +293,6 @@ def match_event(e):
             return "rc-unnamed"
     return None
 
-
 def transcript_path(claude, entry):
     sid, cwd = entry["sessionId"], entry.get("cwd")
     if isinstance(cwd, str) and cwd:
@@ -321,7 +301,6 @@ def transcript_path(claude, entry):
             return p
     g = glob.glob(os.path.join(glob.escape(claude), "projects", "*", sid + ".jsonl"))
     return g[0] if len(g) == 1 else None
-
 
 def scan(path, off, since):
     """("ok", [(kind, line offset)], new offset) / ("unknown", why, None). Reads complete lines only, at most MAX_READ bytes."""
@@ -348,7 +327,6 @@ def scan(path, off, since):
         pos += len(raw) + 1
     return "ok", hits, off + cut
 
-
 def load_state(path):
     try:
         with open(path, encoding="utf-8") as fh:
@@ -357,7 +335,6 @@ def load_state(path):
         return {}
     return s if isinstance(s, dict) else {}
 
-
 def save_state(path, st):
     os.makedirs(os.path.dirname(path), exist_ok=True)
     tmp = "%s.tmp%d" % (path, os.getpid())
@@ -365,16 +342,13 @@ def save_state(path, st):
         json.dump(st, fh, sort_keys=True)
     os.replace(tmp, path)
 
-
 def same_proc(e, obs):
     return obs.get("st") == "live" and obs["pid"] == e.get("pid") and abs(obs["start"] - e.get("start", 0)) <= START_SLACK_S + 1
-
 
 def run_pass(cfg, io, dry=False):
     """-> (exit code, counts, target aliases)."""
     log = Log(cfg.log, dry)
     t0 = io.now()
-    end = t0 + cfg.budget_s
 
     def left(cap):
         return max(1, min(cap, int(end - io.now())))
@@ -408,15 +382,10 @@ def run_pass(cfg, io, dry=False):
         if not path:
             continue
         rec = offsets.get(sid) if isinstance(offsets.get(sid), dict) else None
-        since = None
-        if rec is None:
+        if rec is None:  # first sight: from the end, or from 0 for a process born after the last pass
             started = (e.get("startedAt") or 0) / 1000.0
-            if last_pass is not None and started > last_pass:
-                rec, since = {"off": 0, "since": started}, started
-            else:
-                rec = {"off": None}
-        since = rec.get("since") if since is None else since
-        r, hits, new = scan(path, rec.get("off"), since)
+            rec = {"off": 0, "since": started} if last_pass is not None and started > last_pass else {"off": None}
+        r, hits, new = scan(path, rec.get("off"), rec.get("since"))
         if r != "ok":
             log("UNKNOWN %s transcript: %s" % (t["alias"], hits))
             continue
@@ -521,7 +490,6 @@ def run_pass(cfg, io, dry=False):
     c["open"] = sum(1 for e in events if now - e["ts"] < cfg.window_s)
     return 0, c, [t["alias"] + ("" if t["obs"]["st"] == "live" else "(%s)" % t["obs"]["st"]) for t in targets]
 
-
 def main(argv=None, env=None, io=None):
     argv = sys.argv[1:] if argv is None else argv
     if argv not in ([], ["--dry-run"]):
@@ -557,7 +525,6 @@ def main(argv=None, env=None, io=None):
     print("%s alvos=%d [%s] eventos-novos=%d janela-aberta=%d reiniciou=%d mayor-gate-off=%d alarmes=%d nao-sei=%d%s" % (
         tag, len(tg), ",".join(tg), c["events"], c["open"], c["killed"], c["would"], c["alarms"], c["unknown"], " (dry-run)" if dry else ""))
     return 0
-
 
 if __name__ == "__main__":
     sys.exit(main())
