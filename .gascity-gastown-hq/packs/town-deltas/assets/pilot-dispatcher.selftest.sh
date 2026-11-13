@@ -3931,6 +3931,106 @@ has "$DISPATCHER" '_beadid_live_crew_owner "\$_bid" "\$_db"' "live-crew-owner gu
 has "$DISPATCHER" 'pilot.dispatched_at='          "dispatch stamps pilot.dispatched_at (never-started clock)"
 has "$DISPATCHER" 'PILOT_NEVERSTARTED_MINUTES'    "never-started threshold knob is wired"
 
+# ── Scenario 16z (ga-9jrt3o7): a Traço BIM worktree with uncommitted work counts as "started" ──────────────────────────────────────────────────
+# wa-lytych (13/11): the Pilot released the bead as "never started" while ~/gt/traco-bim-wt/wa-lytych-e5 held +677/-56 uncommitted lines — the "did it
+# start?" test looked only at the town root and the rigs, and uncommitted work is invisible to a branch lookup anyway. REAL git here (no PILOT_TEST_BRANCH_BEADS
+# seam, which would bypass the very code under test): a throwaway traco-bim repo with real worktrees, fed to the dispatcher through PILOT_NS_EXTRA_REPOS.
+# `timeout` is not on this suite's PATH (/opt/homebrew/bin only; production's has it), so THESE runs get a pass-through shim in their own bin dir.
+echo "Scenario 16z: ga-9jrt3o7 — a dirty Traço BIM worktree is 'started'; unreadable → kept; clean/none/child → released"
+TB_ROOT="$WORK/ga9jrt3o7"
+TB_REPO="$TB_ROOT/traco-bim"
+TB_WT="$TB_ROOT/traco-bim-wt"
+TB_BIN="$TB_ROOT/bin"
+rm -rf "$TB_ROOT"; mkdir -p "$TB_REPO" "$TB_WT" "$TB_BIN"
+printf '#!/usr/bin/env bash\nshift\nexec "$@"\n' > "$TB_BIN/timeout"; chmod +x "$TB_BIN/timeout"
+mkdir -p "$TB_ROOT/bin-timeout-fails"; printf '#!/usr/bin/env bash\nexit 124\n' > "$TB_ROOT/bin-timeout-fails/timeout"; chmod +x "$TB_ROOT/bin-timeout-fails/timeout"
+git init -q "$TB_REPO"
+git -C "$TB_REPO" config user.email "selftest@example.com"
+git -C "$TB_REPO" config user.name "selftest"
+echo base > "$TB_REPO/base.txt"; git -C "$TB_REPO" add base.txt; git -C "$TB_REPO" commit -q -m base
+# dirty (tracked change) · untracked (new file only) · clean · child (dirty, but it is bead tt-tb-par.2, not tt-tb-par) · broken (.git points nowhere → status fails)
+git -C "$TB_REPO" worktree add -q --detach "$TB_WT/tt-tb-dirty-e5";  echo wip >> "$TB_WT/tt-tb-dirty-e5/base.txt"
+git -C "$TB_REPO" worktree add -q --detach "$TB_WT/tt-tb-untr-e5";   echo new > "$TB_WT/tt-tb-untr-e5/new.txt"
+git -C "$TB_REPO" worktree add -q --detach "$TB_WT/tt-tb-clean-e5"
+git -C "$TB_REPO" worktree add -q --detach "$TB_WT/tt-tb-par.2";     echo wip >> "$TB_WT/tt-tb-par.2/base.txt"
+git -C "$TB_REPO" worktree add -q --detach "$TB_WT/tt-tb-broken-e5"; printf 'gitdir: /nonexistent-ga9jrt3o7\n' > "$TB_WT/tt-tb-broken-e5/.git"
+# a dirty worktree whose DIRECTORY name says nothing, on a branch that names the bead · a branch with no worktree at all
+git -C "$TB_REPO" worktree add -q -b pool/tt-tb-bybranch "$TB_WT/slot-7"; echo wip >> "$TB_WT/slot-7/base.txt"
+git -C "$TB_REPO" branch pool/tt-tb-branch
+
+# 16z-1: the predicate itself (function extracted from the dispatcher, real git, hermetic: no gc, no rig list).
+_TB_FN="$(awk '/^_beadid_has_live_worktree\(\)/{f=1} f{print} f&&/^}$/{exit}' "$DISPATCHER")"
+[ -n "$_TB_FN" ] || { bad "_beadid_has_live_worktree not found in $DISPATCHER"; _TB_FN=':'; }
+_tbw() { # $1=bead id → rc of _beadid_has_live_worktree over the fixture repo  (extra: $2 = _NS_RIG_LIST_OK, $3 = PATH prefix)
+  ( eval "$_TB_FN"; warn() { :; }
+    PATH="${3:-$TB_BIN}:$PATH"; _NS_BRANCH_REPOS="$TB_REPO"; _NS_RIG_LIST_OK="${2:-1}"
+    _beadid_has_live_worktree "$1" ) >/dev/null 2>&1
+}
+_tbw tt-tb-dirty;   [ $? -eq 0 ] && ok "dirty worktree (tracked change) → started (rc 0)"                 || bad "dirty worktree not seen as started"
+_tbw tt-tb-untr;    [ $? -eq 0 ] && ok "worktree with only an untracked file → started"                    || bad "untracked-only worktree not seen as started"
+_tbw tt-tb-bybranch; [ $? -eq 0 ] && ok "dirty worktree found by its BRANCH name (directory name unrelated) → started" || bad "worktree matched by branch not seen as started"
+_tbw tt-tb-clean;   [ $? -eq 1 ] && ok "clean worktree → not started (rc 1)"                               || bad "clean worktree read as started (or error)"
+_tbw tt-tb-none;    [ $? -eq 1 ] && ok "no worktree of the bead → not started"                             || bad "bead without worktree read as started (or error)"
+_tbw tt-tb-par;     [ $? -eq 1 ] && ok "dirty worktree of CHILD tt-tb-par.2 does not make parent tt-tb-par started" || bad "child worktree leaked into its parent"
+_tbw tt-tb-par.2;   [ $? -eq 0 ] && ok "the child bead itself sees its own dirty worktree"                   || bad "child bead does not see its own worktree"
+_tbw tt-tb-broken;  [ $? -eq 0 ] && ok "worktree whose status cannot be read → treated as started (never 'not started')" || bad "unreadable worktree read as not started"
+_tbw tt-tb-clean 0; [ $? -eq 0 ] && ok "rig list failed (_NS_RIG_LIST_OK=0) → can't tell → started"          || bad "rig-list failure not mapped to 'started'"
+_tbw tt-tb-clean 1 "$TB_ROOT/bin-timeout-fails"; [ $? -eq 0 ] && ok "git call timing out (rc 124) → can't tell → started, not 'clean'" || bad "a timed-out git call read as 'not started'"
+( eval "$_TB_FN"; warn() { :; }; PATH="$TB_BIN:$PATH"; _NS_BRANCH_REPOS=""; _beadid_has_live_worktree tt-tb-clean ) >/dev/null 2>&1
+[ $? -eq 0 ] && ok "empty repo list → can't tell → started" || bad "empty repo list read as 'not started'"
+( eval "$_TB_FN"; warn() { :; }; PATH="$TB_BIN:$PATH"; _NS_BRANCH_REPOS="$TB_ROOT/not-a-repo
+$TB_REPO"; mkdir -p "$TB_ROOT/not-a-repo"; _beadid_has_live_worktree tt-tb-dirty ) >/dev/null 2>&1
+[ $? -eq 0 ] && ok "a non-repo directory in the list is skipped; the next repo still decides" || bad "non-repo entry in the list masked the real repo"
+
+# 16z-2: through the real dispatcher (git branch lookup AND worktree lookup real; repo list = town root + PILOT_NS_EXTRA_REPOS).
+run_neverstarted_wt() { # $1=FAKE_NEVERSTARTED_JSON  $2=PILOT_NS_EXTRA_REPOS
+  : > "$FIXCITY/.gc/logs/pilot-dispatcher.log"
+  reset_state
+  env -i \
+    DRAIN_WINDOW_OVERRIDE="OPEN" \
+    PATH="$SHIMBIN:$TB_BIN:/usr/bin:/bin:/usr/local/bin" \
+    HOME="$HOME" \
+    PILOT_RAM_LEVEL_FILE="/nonexistent-hermetic-ram-level-for-tests" \
+    DISK_FREE_OVERRIDE_MB="${PILOT_TEST_DISK_FREE_MB:-100000}" \
+    DRY_RUN=1 \
+    PILOT_CITY_OVERRIDE="$FIXCITY" \
+    PILOT_TEST_STATE="$STATE" \
+    PILOT_DISPATCHABLE_FILE="$FIXCITY/.gc/pilot-dispatchable.json" \
+    PILOT_NEVERSTARTED_MINUTES=15 \
+    PILOT_NS_EXTRA_REPOS="$2" \
+    FAKE_NEVERSTARTED_JSON="$1" \
+    FAKE_BLOCKED_IDS="" \
+    bash "$DISPATCHER" >/dev/null 2>&1 || true
+  cat "$FIXCITY/.gc/logs/pilot-dispatcher.log"
+}
+_tbj() { printf '{"id":"%s","description":"fixture body — context for veto test","status":"open","labels":["story:in-flight","pilot:dispatched"],"metadata":{"pilot.dispatched_at":"%s"}}' "$1" "$NS_OLD"; }
+NS_TB="[$(_tbj tt-tb-dirty),$(_tbj tt-tb-untr),$(_tbj tt-tb-clean),$(_tbj tt-tb-none),$(_tbj tt-tb-par),$(_tbj tt-tb-broken),$(_tbj tt-tb-branch)]"
+LOG16Z="$(run_neverstarted_wt "$NS_TB" "$TB_REPO")"
+_tb_rel() { echo "$LOG16Z" | grep -E "releasing never-started in-flight bead $1 " >/dev/null; }
+for _b in tt-tb-dirty tt-tb-untr tt-tb-broken tt-tb-branch; do
+  if _tb_rel "$_b"; then bad "REGRESSION (ga-9jrt3o7): released $_b although its Traço BIM work exists / cannot be ruled out"; else ok "dispatcher keeps $_b (Traço BIM work present or unreadable)"; fi
+done
+for _b in tt-tb-clean tt-tb-none tt-tb-par; do
+  if _tb_rel "$_b"; then ok "dispatcher still releases $_b (no work to lose — the guard did not turn into a deadlock)"; else bad "dispatcher no longer releases genuine orphan $_b"; fi
+done
+echo "$LOG16Z" | grep -E "tt-tb-dirty .*uncommitted work" >/dev/null && ok "the keep for the dirty worktree is logged with its reason" || bad "no log line explaining the dirty-worktree keep"
+echo "$LOG16Z" | grep -E "tt-tb-broken .*could not be read" >/dev/null && ok "the keep for the unreadable worktree is logged with its reason" || bad "no log line explaining the unreadable-worktree keep"
+# the pre-fix world, reproduced: the same dirty beads with traco-bim NOT in the repo list are released — this is the wa-lytych incident, and why the fix is the list.
+LOG16Z0="$(run_neverstarted_wt "$NS_TB" "")"
+if echo "$LOG16Z0" | grep -E "releasing never-started in-flight bead tt-tb-dirty " >/dev/null; then
+  ok "control: with traco-bim absent from the repo list the dirty bead IS released (the incident, reproduced)"
+else
+  bad "control failed: dirty bead kept even without traco-bim in the list — the scenario is not testing the repo list"
+fi
+
+# 16z-3: drift-guard — the pieces are wired, not just defined.
+echo "Scenario 16z-guard: ga-9jrt3o7 — worktree guard + extra repo wired into never-started recovery"
+has "$DISPATCHER" '_beadid_has_live_worktree\(\)'                                        "live-worktree predicate is defined (ga-9jrt3o7)"
+has "$DISPATCHER" '_ns_extra_repos\(\)'                                                  "extra-repo list is defined (ga-9jrt3o7)"
+has "$DISPATCHER" '_beadid_has_branch "\$_bid" \|\| _beadid_has_live_worktree "\$_bid"'  "live-worktree predicate guards the release next to the branch check (ga-9jrt3o7)"
+has "$DISPATCHER" '! _beadid_has_live_worktree "\$_bid" \\'                              "live-worktree predicate also guards the owner-grace path (ga-9jrt3o7)"
+has "$DISPATCHER" '^      _ns_extra_repos$'                                              "extra repos are appended to _NS_BRANCH_REPOS (ga-9jrt3o7)"
+
 # ── Scenario 17: domain-aware routing (gt-s1saw / wa-ihto) ────────────────────
 # Bug gt-s1saw: the Pilot dispatched by rig POOL only — blind to which crew owns
 # the bead's AREA. Three UI bugs touching lib/urblink_design_system.py (wa-tnl5,

@@ -7055,6 +7055,71 @@ _beadid_has_branch() {
   return 1
 }
 
+# _ns_extra_repos — ga-9jrt3o7: repos a bead's work can live in that are NOT a `gc rig` (so `gc rig list` never names them). Today that is
+# traco-bim (Traço BIM work: ~/gt/traco-bim, worktrees in ~/gt/traco-bim-wt/<bead>*, branches pool/<bead>*): the "did it start?" test
+# looked only at the town root + the rigs, so every interrupted Traço BIM build read as "never started" and was released with uncommitted work
+# in its worktree (wa-lytych, 13/11: +677/-56 lines saved by the witness). Prints one path per line. PILOT_NS_EXTRA_REPOS (space-separated) replaces the default.
+# vazio (nenhum repo extra / diretório ausente) → não imprime nada: o teste olha só o que já olhava, igual a antes; falhou/ilegível → idem (um caminho que
+# não é repo git é pulado pelos leitores abaixo, nunca vira "começou" nem "não começou")
+_ns_extra_repos() {
+  local _x
+  if [ -n "${PILOT_NS_EXTRA_REPOS+x}" ]; then
+    for _x in $PILOT_NS_EXTRA_REPOS; do printf '%s\n' "$_x"; done
+    return 0
+  fi
+  _x="$(dirname "$GC_CITY")/traco-bim"
+  [ -d "$_x" ] && printf '%s\n' "$_x"
+  return 0
+}
+
+# _beadid_has_live_worktree <bead_id> — ga-9jrt3o7: exit 0 iff a git WORKTREE of this bead (in any _NS_BRANCH_REPOS repo; named <bead> or <bead>-*, or on a
+# branch whose last component is named that way) holds uncommitted work — tracked changes OR untracked files — or its state cannot be read. Work that was
+# never committed is invisible to _beadid_has_branch, but it is the most expensive thing to lose (wa-lytych, 13/11: released with +677/-56 lines in its
+# worktree; only the witness saved them). A bead that counts as "started" is not released here: the reclaim path is the one that saves the worktree.
+# `.`-suffixed names are a bead's CHILDREN (wa-23664b.2 vs wa-23664b) and do not count.
+# Three states, never collapsed: has uncommitted work → 0 ("started"); clean / no such worktree → 1; could not tell (git failed, status failed, no repo
+# list) → 0, same safe side as _beadid_has_branch's "may exist → KEEP". A registered worktree whose directory is gone holds nothing → skipped.
+# Hermetic seams: PILOT_TEST_DIRTY_WORKTREE_BEADS (space-list of ids with such a worktree), consulted when DEFINED; PILOT_TEST_BRANCH_BEADS defined
+# (and the seam above not) means "no real git" → 1, so the scenarios that fake the branch check never reach a real repo.
+_beadid_has_live_worktree() {
+  local _bid="${1:-}" _repo _wts_raw _wts _wt _br _name _st
+  [ -n "$_bid" ] || return 1
+  if [ -n "${PILOT_TEST_DIRTY_WORKTREE_BEADS+x}" ]; then
+    case " $PILOT_TEST_DIRTY_WORKTREE_BEADS " in *" $_bid "*) return 0 ;; *) return 1 ;; esac
+  fi
+  [ -n "${PILOT_TEST_BRANCH_BEADS+x}" ] && return 1
+  command -v git >/dev/null 2>&1 || return 0
+  [ "${_NS_RIG_LIST_OK:-1}" = "0" ] && return 0
+  [ -n "${_NS_BRANCH_REPOS:-}" ] || return 0
+  while IFS= read -r _repo; do
+    [ -n "$_repo" ] && [ -d "$_repo" ] || continue
+    # vazio (o caminho não é repo git) → nada a achar aqui, pula; falhou/ilegível → idem: só o `rev-parse` decide se é repo, e quem É repo e não lista abaixo vira "não sei"
+    git -C "$_repo" rev-parse --git-dir >/dev/null 2>&1 || continue
+    # vazio (repo sem worktree extra: ainda vem 1 linha, a do próprio repo) → nenhum casa, segue; falhou/ilegível (git/timeout) → não sei → "começou" (KEEP)
+    _wts_raw=$(timeout 20 git -C "$_repo" worktree list --porcelain 2>/dev/null) || return 0
+    _wts=$(printf '%s\n' "$_wts_raw" \
+      | awk '/^worktree /{ if (p != "") print p "\t" b; p = substr($0, 10); b = "" } /^branch /{ b = substr($0, 8) } END{ if (p != "") print p "\t" b }')
+    while IFS=$'\t' read -r _wt _br; do
+      [ -n "$_wt" ] || continue
+      _name=0
+      case "${_wt##*/}" in "$_bid"|"$_bid"-*) _name=1 ;; esac
+      case "${_br##*/}" in "$_bid"|"$_bid"-*) _name=1 ;; esac
+      [ "$_name" = 1 ] || continue
+      [ -d "$_wt" ] || continue
+      # vazio (árvore limpa) → este worktree não prova nada, segue; falhou/ilegível (status falhou ou estourou o tempo) → não sei → "começou" (KEEP)
+      if ! _st=$(timeout 30 git -C "$_wt" status --porcelain 2>/dev/null); then
+        warn "NEVERSTARTED: $_bid has a worktree $_wt whose state could not be read — treating as started (ga-9jrt3o7)."
+        return 0
+      fi
+      if [ -n "$_st" ]; then
+        warn "NEVERSTARTED: $_bid has a worktree $_wt with uncommitted work — treating as started, not releasing (ga-9jrt3o7)."
+        return 0
+      fi
+    done <<< "$_wts"
+  done <<< "${_NS_BRANCH_REPOS:-}"
+  return 1
+}
+
 # _crew_progressed_since <crew> <since_epoch> — true (0) iff the crew has pushed a
 # branch (crew/<crew>/* or crew/<crew-short>/* in any _NS_BRANCH_REPOS) whose latest
 # commit is NEWER than <since_epoch>. Proof the crew is actively building (producing
@@ -8977,6 +9042,8 @@ _pilot_release_owner() {
 #       means a build is in flight (just slow to push) → KEEP. Roster untrustworthy
 #       (_DEADWORKER_OK!=1) → KEEP (cannot prove the worker dead).
 #   - NO branch in any repo (_beadid_has_branch).
+#   - NO worktree of the bead with uncommitted work (_beadid_has_live_worktree, ga-9jrt3o7) —
+#       the repos searched include non-rig ones (_ns_extra_repos: traco-bim).
 _neverstarted_recover_db() {
   local _db="$1" _now="$2"
   local _thresh=$(( PILOT_NEVERSTARTED_MINUTES * 60 ))
@@ -9104,6 +9171,7 @@ _neverstarted_recover_db() {
       _owner_grace=$(( ${PILOT_NEVERSTARTED_OWNER_GRACE_HOURS:-24} * 3600 ))
       if [ "$_age" -gt "$_owner_grace" ] 2>/dev/null \
          && ! _beadid_has_branch "$_bid" \
+         && ! _beadid_has_live_worktree "$_bid" \
          && _crew_progressed_since "$_crew_owner" "$_stamp"; then
         warn "NEVERSTARTED: $_bid owned by live crew '$_crew_owner' but NEVER started (no branch, age=${_age}s > owner-grace ${_owner_grace}s, owner pushed other branches since dispatch) — releasing as declined/skipped (ga-mfeip owner-grace)."
       else
@@ -9113,7 +9181,9 @@ _neverstarted_recover_db() {
     }
 
     # branch guard — a surviving crew branch means real work landed. KEEP.
-    if _beadid_has_branch "$_bid"; then
+    # ga-9jrt3o7: so does a worktree of the bead holding uncommitted work (Traço BIM builds live in traco-bim-wt/<bead>*; a branch alone is not
+    # the only trace of a build that was interrupted before its first commit). Checked after the branch so the cheap ref scan answers first.
+    if _beadid_has_branch "$_bid" || _beadid_has_live_worktree "$_bid"; then
       continue
     fi
 
@@ -9268,9 +9338,11 @@ if [ "${PILOT_NEVERSTARTED_MINUTES:-15}" != "0" ]; then
     _NS_RIG_LIST_OK=0
     warn "gc rig list failed while building _NS_BRANCH_REPOS — rig-side branch checks degraded to HQ-only this sweep; NEVERSTARTED-recovery treats every bead as 'branch may exist' (no reclaim) until it succeeds again (ga-07rb3)."
   fi
+  # ga-9jrt3o7: + repos that are not a rig but hold bead work (traco-bim) — see _ns_extra_repos.
   _NS_BRANCH_REPOS=$(
     { dirname "$GC_CITY"
       printf '%s' "$_ns_repos_json" | jq -r '.rigs[]?.path // empty' 2>/dev/null
+      _ns_extra_repos
     } | awk 'NF && !seen[$0]++'
   )
   _neverstarted_recover_db "$GC_CITY" "$_NS_NOW_EPOCH"
