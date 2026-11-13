@@ -8908,9 +8908,8 @@ _pilot_owner_state() {
 }
 
 # _pilot_release_owner <db> <bead_id> <judged_owner> — ga-xxtwytk: takes the owner off a bead the Pilot judged "never started" (NEVERSTARTED) or "crew
-# never engaged" (Stage 1.5) with the guarded write this repo already relies on (below), and CONFIRMS it by reading the bead back: no live bd was available
-# to try it on, so a refusal by bd shows up as rc 1 here instead of being assumed away. <judged_owner> = the assignee the Pilot's liveness checks were
-# about (from its own list row).
+# never engaged" (Stage 1.5) with the guarded write this repo already relies on (below), and CONFIRMS it by reading the bead back, so a refusal by bd shows
+# up as rc 1 here instead of being assumed away. <judged_owner> = the assignee the Pilot's liveness checks were about (from its own list row).
 #
 # Why: both release paths used to take the flight labels off and THEN run `bd assign <id> "" -q 2>/dev/null || true`. Since bd-98s5c, bd refuses that
 # assign while the bead is another actor's live in_progress claim (the Pilot is never the builder holding it) and the refusal was swallowed: the bead
