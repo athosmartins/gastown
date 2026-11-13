@@ -68,6 +68,17 @@
 # (OVERLAY UNKNOWN, read not attempted), never as an unpinned read, and
 # OVERLAY UNKNOWN now carries the read's own error line.
 #
+# ga-k56i5rl (same read, cost + one latent overwrite): the overlay read no longer
+# passes `--all`. `--all` brought every CLOSED session bead the city ever had
+# (13.390 rows, 48 MB; 45 s back-to-back under load 76 on 13/11, against 37 rows,
+# 118 KB, 5 s without it) and the witness runs the read every ~2 min, right at
+# the Dolt read_timeout (a timeout there is just OVERLAY UNKNOWN, but a pass is
+# pure load). Closed rows decide nothing: a closed bead only says ONE old
+# session of that identity ended, which the live list already answers, and
+# "closed" classifies the same as "absent" (orphaned). The jq below also skips a
+# closed row on its own, so the overlay can never write "closed" over a key the
+# live list resolved as live, even if bd's default ever starts returning them.
+#
 # WHERE THIS FILE IS RESOLVED -- read this before trusting any pin above:
 # the HQ store reads it directly (city.toml imports town-deltas at city scope).
 # A rig does not: each [[rigs]] imports just `gastown` ([rigs.imports.gastown]),
@@ -257,8 +268,10 @@ CITY store, so that read carries `-C "$GC_CITY_PATH"`; its failure handling is i
 the recipe below):
 ```bash
 gc session list --state=all --json
-gc bd -C "$GC_CITY_PATH" list --type=session --label=gc:session --include-infra --include-gates --all --json --limit=0
+gc bd -C "$GC_CITY_PATH" list --type=session --label=gc:session --include-infra --include-gates --json --limit=0
 ```
+(No `--all`: only the open session beads are read — a few dozen rows. `--all` adds
+every closed one, ~13k rows / 48 MB, and none of them changes a decision.)
 
 For each bead with an assignee, check **session-ID liveness** — NOT
 template pattern matching. Pool instances get new IDs on restart, so
@@ -304,7 +317,8 @@ a NEW session with a different ID — the old one never comes back.
    # store per agent-home.
    if [ -n "${GC_CITY_PATH:-}" ]; then
      # vazio → o overlay não soma nada e o roster fica só com a lista viva; falhou/ilegível (rc≠0, 0 bytes, JSON inválido) → OVERLAY UNKNOWN abaixo (declarado, não silencioso): o roster usa só a lista viva neste ciclo
-     gc bd -C "$GC_CITY_PATH" list --type=session --label=gc:session --include-infra --include-gates --all --json --limit=0 > "$SESSION_BEADS_FILE" 2>"$SESSION_BEADS_FILE.err"
+     # no --all: only OPEN session beads (a few dozen rows); the closed ones (~13k, 48 MB) decide nothing here — see ga-k56i5rl in the header
+     gc bd -C "$GC_CITY_PATH" list --type=session --label=gc:session --include-infra --include-gates --json --limit=0 > "$SESSION_BEADS_FILE" 2>"$SESSION_BEADS_FILE.err"
      SESSION_BEADS_RC=$?
    else
      echo "GC_CITY_PATH is empty: the session-bead read cannot be pinned to the city store, so it was not attempted" > "$SESSION_BEADS_FILE.err"
@@ -332,9 +346,13 @@ a NEW session with a different ID — the old one never comes back.
      exit 0
    fi
 
-   # The session-beads overlay (configured_named_identity) only ever ADDS
-   # entries on top of the live session list — it is never the sole source
-   # of liveness. A failed/empty/invalid read here means "we don't know",
+   # The session-beads overlay (configured_named_identity) maps each OPEN session
+   # bead's named identity to that bead's metadata.state, on top of the live
+   # session list — it is never the sole source of liveness. Where the live list
+   # already has the same key, the open bead's state REPLACES it (measured
+   # 13/11: 5 keys active -> awake, the same not-orphaned class). A closed bead
+   # never writes (skipped below): it says one old session ended, not that the
+   # identity has none. A failed/empty/invalid read here means "we don't know",
    # not "zero rows to overlay": say so explicitly and fall back to the
    # live list alone instead of silently proceeding as if the overlay had
    # legitimately contributed nothing.
@@ -356,8 +374,8 @@ a NEW session with a different ID — the old one never comes back.
        | add(.; $s.alias;      $s.state; ($s.closed // false))
        | add(.; $s.agent_name; $s.state; ($s.closed // false))
      )) as $from_sessions
-     | reduce ($session_beads[0] // [])[] as $b ($from_sessions;
-         add(.; $b.metadata.configured_named_identity; $b.metadata.state; ($b.status == "closed")))')
+     | reduce (($session_beads[0] // [])[] | select(.status != "closed")) as $b ($from_sessions;
+         add(.; $b.metadata.configured_named_identity; $b.metadata.state; false))')
 
    SESSION_COUNT=$(jq -r '(.sessions // []) | length' "$SESSIONS_FILE")
    MAP_COUNT=$(printf '%s' "$LIVENESS_MAP" | jq -r 'length')

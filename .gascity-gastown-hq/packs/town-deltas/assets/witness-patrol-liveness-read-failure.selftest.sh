@@ -411,6 +411,56 @@ echo "Scenario 8 (ga-zo1bzza): the documented and the prompted session-bead read
 run_documented_reads "formula roster listing" "$(grep -E '^gc bd .*--type=session' "$FORMULA")"
 run_documented_reads "witness prompt" "$(sed -n '/WITNESS: o Startup Protocol/,$p' "$TEMPLATE" | grep -E '^gc bd .*--type=session')"
 
+# ── Scenario 9 (ga-k56i5rl): the overlay read does not ask for the closed sessions ──
+# `--all` brought every closed session bead the city ever had (13.390 rows / 48 MB, 45 s under load vs 37 rows /
+# 5 s without it, measured 13/11) into a read the witness repeats every ~2 min. The stub spies the argv of the
+# call the extracted block really makes; the documented and prompted lines are checked as text because
+# Scenario 8 only proves they reach the city store, not what flags they carry.
+echo ""
+echo "Scenario 9 (THE BUG, ga-k56i5rl): the session-bead read carries no --all"
+run_scenario 0 "$TWO_LIVE_SESSIONS" 0 "$ONE_OVERLAY_ROW"
+if [ "$SCENARIO_BD_CALLS" -eq 1 ] && ! printf '%s\n' "$SCENARIO_BD_LOG" | grep -F -e '--all' >/dev/null; then
+  ok "the gc bd call the block makes has no --all"
+else
+  bad "REGRESSION (this is the bug): the overlay read asks for --all (every closed session bead). gc bd calls ($SCENARIO_BD_CALLS): $SCENARIO_BD_LOG"
+fi
+docs_all="$({ grep -E '^gc bd .*--type=session' "$FORMULA"; sed -n '/WITNESS: o Startup Protocol/,$p' "$TEMPLATE" | grep -E '^gc bd .*--type=session'; } | grep -F -e '--all')"
+if [ -z "$docs_all" ]; then
+  ok "neither the documented roster read nor the prompted one carries --all"
+else
+  bad "a documented/prompted session-bead read still carries --all: $docs_all"
+fi
+
+# ── Scenario 10 (ga-k56i5rl): a closed session bead never overwrites a live key ──
+# The overlay used to write "closed" for a closed row, and a later key overwrites an earlier one: an open row
+# (or the live list) saying "active" followed by a closed row of the same named identity became "closed" ==
+# orphaned, a false orphan for a live agent. With --all gone no closed row should arrive, but the guard must
+# hold on its own if bd's default ever returns them. The stub returns its body regardless of the flags, so this
+# feeds the block exactly the rows the old --all read would have produced.
+echo ""
+echo "Scenario 10 (THE BUG, ga-k56i5rl): a closed overlay row does not overwrite a live state"
+OPEN_THEN_CLOSED='[{"metadata":{"configured_named_identity":"lexbh/gastown.witness","state":"active"},"status":"open"},{"metadata":{"configured_named_identity":"lexbh/gastown.witness","state":"closed"},"status":"closed"}]'
+run_scenario 0 "$TWO_LIVE_SESSIONS" 0 "$OPEN_THEN_CLOSED"
+if [ "$(map_state lexbh/gastown.witness)" = "active" ]; then
+  ok "open row then closed row of one named identity: stays active"
+else
+  bad "REGRESSION (this is the bug): a closed overlay row overwrote the open one — lexbh/gastown.witness -> $(map_state lexbh/gastown.witness): $SCENARIO_OUT"
+fi
+LIVE_WITH_ALIAS='{"sessions":[{"id":"s3","name":"w3","alias":"lexbh/gastown.witness","state":"active","closed":false}]}'
+CLOSED_ONLY='[{"metadata":{"configured_named_identity":"lexbh/gastown.witness","state":"closed"},"status":"closed"}]'
+run_scenario 0 "$LIVE_WITH_ALIAS" 0 "$CLOSED_ONLY"
+if [ "$(map_state lexbh/gastown.witness)" = "active" ]; then
+  ok "a live key resolved by the live list stays active when the overlay only has a closed row"
+else
+  bad "REGRESSION (this is the bug): a closed overlay row turned a live key into '$(map_state lexbh/gastown.witness)': $SCENARIO_OUT"
+fi
+run_scenario 0 "$TWO_LIVE_SESSIONS" 0 "$ONE_OVERLAY_ROW"
+if [ "$(map_state lexbh/gastown.witness)" = "active" ]; then
+  ok "control: an open overlay row still contributes its state"
+else
+  bad "control broken: an open overlay row no longer contributes (lexbh/gastown.witness -> $(map_state lexbh/gastown.witness)): $SCENARIO_OUT"
+fi
+
 # ── Verdict ─────────────────────────────────────────────────────────────
 echo ""
 echo "Results: $PASS passed, $FAIL failed"

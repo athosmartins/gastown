@@ -1422,8 +1422,11 @@ property_scrapers isso é o store do rig e a leitura falha com `invalid issue
 type "session"`; onde o agent-home cai na HQ (item 3 acima) ela só acerta por
 acaso do cwd. Leia assim:
 ```bash
-gc bd -C "$GC_CITY_PATH" list --type=session --label=gc:session --include-infra --include-gates --all --json --limit=0
+gc bd -C "$GC_CITY_PATH" list --type=session --label=gc:session --include-infra --include-gates --json --limit=0
 ```
+Sem `--all`: só os beads de sessão ABERTOS (algumas dezenas de linhas). Com `--all`
+a leitura traz as ~13 mil sessões já fechadas (48 MB, 45 s sob carga em 13/11) e
+nenhuma muda decisão de órfão (ga-k56i5rl).
 Se `$GC_CITY_PATH` vier vazio, ou a leitura falhar ou vier ilegível, o overlay é
 DESCONHECIDO: resolva só pela lista viva de sessões e diga isso — nunca trate
 como "vazio".
