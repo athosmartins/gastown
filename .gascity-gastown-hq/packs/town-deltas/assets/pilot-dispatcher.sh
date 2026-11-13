@@ -492,7 +492,7 @@ PILOT_DEADWORKER_CHECK="${PILOT_DEADWORKER_CHECK:-1}"
 # agnostic: it does not care HOW the bead reached limbo, only that none of the
 # "real work happened" signals are present. FAIL-SAFE by construction — a bead is
 # released ONLY when EVERY positive signal is absent (no gate label, no live
-# worker, no branch) AND it has aged past the threshold measured from a dedicated
+# worker, no branch, no work in a sibling repo — ga-9jrt3o7) AND it has aged past the threshold measured from a dedicated
 # pilot.dispatched_at stamp (never updated_at — the ga-2azzj Defect-A discipline:
 # a missing stamp is stamped-now and never released on first sight). Distinct
 # from ga-e5yw2 (dead worker: a worker existed and died) and ga-mtlm6 (deliver to
@@ -7094,6 +7094,107 @@ _crew_progressed_since() {
   return 1
 }
 
+# ── ga-9jrt3o7: work in a repo BESIDE the town root counts as "the worker started" ─────────────────────────────────
+# _beadid_has_branch reads the refs of the town root + the repos `gc rig list` returns. traco-bim is NOT a gc rig (city.toml
+# registers ps/ma/lx/gt/wa only), so its branches were never searched, and nothing in NEVERSTARTED looks at the UNCOMMITTED
+# files of a worktree. A builder in ~/gt/traco-bim-wt/<bead>-<suffix> keeps its work uncommitted until it commits: wa-lytych
+# (13/11) was released as "never started" with +677/-56 uncommitted lines, per the witness's report (mail ga-wisp-uv4cy),
+# which saved them afterwards. The two helpers below add the repos that sit beside the town root and keep one tree per bead in
+# <repo>-wt/ (the layout worktree-reaper.sh sweeps, ga-ggj1wnv) to the "did it start?" question. Same contract as
+# _beadid_has_branch: rc 0 = the work MAY exist (found, or could not read: KEEP); rc 1 = nothing found and nothing unreadable.
+
+# _ns_sibling_repos — one repo per line: <town>/<name> for each directory <town>/<name>-wt that has a git repo beside it
+# (<town> = dirname "$GC_CITY"). rc 0 and no output = the town root was listed and has no such repo; rc 1 = it could not be listed.
+_ns_sibling_repos() {
+  local _town _d _name _repo
+  _town=$(dirname "$GC_CITY")
+  # vazio (nenhum <nome>-wt com repo ao lado) → rc 0 sem saída, nada a olhar; falhou/ilegível (a raiz não é um diretório que dê para listar) → rc 1, o chamador trata como dúvida
+  [ -d "$_town" ] && [ -r "$_town" ] && [ -x "$_town" ] || return 1
+  for _d in "$_town"/*-wt; do
+    [ -d "$_d" ] || continue
+    _name="${_d##*/}"
+    _name="${_name%-wt}"
+    [ -n "$_name" ] || continue
+    _repo="$_town/$_name"
+    if [ -d "$_repo/.git" ] || [ -f "$_repo/.git" ]; then
+      printf '%s\n' "$_repo"
+    fi
+  done
+  return 0
+}
+
+# _beadid_has_sibling_work <bead_id> — rc 0 = the bead may have started in a sibling repo (KEEP): _BSW_WHY says what was FOUND
+# (a branch naming the bead, or a worktree named for it with uncommitted files) or why it could not be read; rc 1 = every
+# sibling repo was read and none holds work for the bead (also the answer when the guard is off or the id is empty). Called
+# UNWRAPPED (never in $(...)), so _BSW_WHY reaches the caller. A "sibling repo" is any <town>/<name> that has a <name>-wt/ directory
+# beside it (_ns_sibling_repos), whether or not it is also a gc rig.
+#   - "names the bead" = case-insensitive substring, like _beadid_has_branch's grep -iF (a false keep only delays a release,
+#     a false release loses work: the incident), on the ref name and on the worktree's path;
+#   - a worktree counts only with uncommitted files (`git status --porcelain`: modified, staged, untracked; files git ignores
+#     are not). A clean one is nothing done; one registered in git whose directory is gone holds nothing (git worktree prune
+#     cleans the registry);
+#   - read-only: --no-optional-locks (a plain `git status` REWRITES the index of a live builder's worktree; measured) and
+#     core.fsmonitor=false (git's built-in fsmonitor must not start a daemon per tree looked at; the same flags as the worktree
+#     rail of inflight-reclaim-guard.py), every git call bounded by `timeout 8`;
+#   - PILOT_NS_SIBLING_WORK=0 turns it off (rc 1: the behaviour before ga-9jrt3o7). Test seam: PILOT_TEST_BRANCH_BEADS defined
+#     (even empty) means a test faked the branch world and has no real git, so there are no sibling repos either.
+_beadid_has_sibling_work() {
+  local _bid="${1:-}" _repos _repo _refs _hit _wl _cand _wt _st _rc _doubt=""
+  _BSW_WHY=""
+  [ -n "$_bid" ] || return 1
+  [ "${PILOT_NS_SIBLING_WORK:-1}" = "0" ] && return 1
+  [ -n "${PILOT_TEST_BRANCH_BEADS+x}" ] && return 1
+  command -v git >/dev/null 2>&1 || { _BSW_WHY="cannot read: git is not on PATH"; return 0; }
+  # vazio (nenhum repo irmão) → rc 1 no fim, nada a olhar; falhou/ilegível (a raiz da cidade não lista) → dúvida, rc 0 com o motivo
+  if ! _repos=$(_ns_sibling_repos); then
+    _BSW_WHY="cannot read: the town root $(dirname "$GC_CITY") cannot be listed"
+    return 0
+  fi
+  while IFS= read -r _repo; do
+    [ -n "$_repo" ] || continue
+    # vazio (nenhum branch) → sem acerto neste repo; falhou/ilegível (rc ≠ 0 ou estouro de 8 s) → dúvida: o repo fica sem veredito e o fim da função devolve rc 0
+    _rc=0
+    _refs=$(timeout 8 git -C "$_repo" for-each-ref --format='%(refname)' refs/heads refs/remotes 2>/dev/null </dev/null) || _rc=$?
+    if [ "$_rc" -ne 0 ]; then
+      _doubt="${_doubt:+$_doubt; }git for-each-ref rc=$_rc in $_repo"
+    elif _hit=$(grep -iF -m 1 -- "$_bid" <<< "$_refs"); then
+      _BSW_WHY="branch '$_hit' in $_repo"
+      return 0
+    fi
+    # vazio (só a árvore principal) → nenhuma árvore leva o id; falhou/ilegível (rc ≠ 0 ou estouro de 8 s) → dúvida: as árvores deste repo ficam sem veredito
+    _rc=0
+    _wl=$(timeout 8 git -C "$_repo" worktree list --porcelain 2>/dev/null </dev/null) || _rc=$?
+    if [ "$_rc" -ne 0 ]; then
+      _doubt="${_doubt:+$_doubt; }git worktree list rc=$_rc in $_repo"
+      continue
+    fi
+    # grep rc 1 = nenhuma árvore registrada leva o id no caminho (entrada em memória, não leitura do mundo)
+    _cand=$(grep '^worktree ' <<< "$_wl" | grep -iF -- "$_bid") || _cand=""
+    while IFS= read -r _wt; do
+      [ -n "$_wt" ] || continue
+      _wt="${_wt#worktree }"
+      # registrada mas o diretório sumiu → nenhuma árvore guarda trabalho (git worktree prune limpa o registro): não é achado nem dúvida
+      [ -d "$_wt" ] || continue
+      # vazio (status limpo) → esta árvore não tem trabalho; falhou/ilegível (rc ≠ 0 ou estouro de 8 s) → dúvida: a árvore fica sem veredito
+      _rc=0
+      _st=$(timeout 8 git -C "$_wt" --no-optional-locks -c core.fsmonitor=false status --porcelain 2>/dev/null </dev/null) || _rc=$?
+      if [ "$_rc" -ne 0 ]; then
+        _doubt="${_doubt:+$_doubt; }git status rc=$_rc in $_wt"
+        continue
+      fi
+      if [ -n "$_st" ]; then
+        _BSW_WHY="uncommitted changes in worktree $_wt"
+        return 0
+      fi
+    done <<< "$_cand"
+  done <<< "$_repos"
+  if [ -n "$_doubt" ]; then
+    _BSW_WHY="cannot read: $_doubt"
+    return 0
+  fi
+  return 1
+}
+
 # ── ga-htjni: ownership / in-flight collision guard helpers — RELOCATED (ga-2wcz6) ──
 # _ownership_guard_repos (and its memoization globals) used to be defined here —
 # AFTER _filter_built (which calls it) and after the unconditional top-level
@@ -8911,6 +9012,9 @@ EOF
 #       means a build is in flight (just slow to push) → KEEP. Roster untrustworthy
 #       (_DEADWORKER_OK!=1) → KEEP (cannot prove the worker dead).
 #   - NO branch in any repo (_beadid_has_branch).
+#   - NO work in a sibling repo (_beadid_has_sibling_work, ga-9jrt3o7): a branch naming the bead, or a worktree named for
+#       it with uncommitted files, in a repo beside the town root that has a <repo>-wt/ directory (traco-bim, which is not
+#       a gc rig). A read that fails keeps the bead. PILOT_NS_SIBLING_WORK=0 turns this rule off.
 _neverstarted_recover_db() {
   local _db="$1" _now="$2"
   local _thresh=$(( PILOT_NEVERSTARTED_MINUTES * 60 ))
@@ -9032,12 +9136,15 @@ _neverstarted_recover_db() {
     _crew_owner=$(_beadid_live_crew_owner "$_bid" "$_db") && {
       # ga-mfeip owner-grace: a live crew may OWN a bead it never started (assigned via
       # the rig ctx:ready dispatch but the busy crew never picked it up). Release ONLY
-      # when ALL hold: aged past the owner-grace window AND no branch for this bead AND
-      # the owner pushed branches for OTHER beads since this dispatch (working but skipped
-      # it). Otherwise KEEP (the conservative ga-9yb5s default — a slow build is safe).
+      # when ALL hold: aged past the owner-grace window AND no branch for this bead (nor
+      # sibling-repo work, ga-9jrt3o7: the log below must not promise a release the guard
+      # after it would veto) AND the owner pushed branches for OTHER beads since this
+      # dispatch (working but skipped it). Otherwise KEEP (the conservative ga-9yb5s
+      # default — a slow build is safe).
       _owner_grace=$(( ${PILOT_NEVERSTARTED_OWNER_GRACE_HOURS:-24} * 3600 ))
       if [ "$_age" -gt "$_owner_grace" ] 2>/dev/null \
          && ! _beadid_has_branch "$_bid" \
+         && ! _beadid_has_sibling_work "$_bid" \
          && _crew_progressed_since "$_crew_owner" "$_stamp"; then
         warn "NEVERSTARTED: $_bid owned by live crew '$_crew_owner' but NEVER started (no branch, age=${_age}s > owner-grace ${_owner_grace}s, owner pushed other branches since dispatch) — releasing as declined/skipped (ga-mfeip owner-grace)."
       else
@@ -9051,7 +9158,17 @@ _neverstarted_recover_db() {
       continue
     fi
 
-    # Aged past threshold, no gate marker, no live worker, no branch → genuinely
+    # sibling-repo guard (ga-9jrt3o7) — the guard above reads only the town root + the gc rig repos. A repo beside the town
+    # root with a <repo>-wt/ directory (traco-bim, which is not a gc rig) keeps its builders' work in <repo>-wt/<bead>*: a
+    # branch naming the bead, or a tree named for it with uncommitted files, means a builder DID start. KEEP and leave the
+    # bead to the other recovery paths; a read that fails is "cannot tell", also KEEP (_beadid_has_sibling_work). The wording
+    # avoids "releasing": the selftests grep that phrase to tell a release from a keep.
+    if _beadid_has_sibling_work "$_bid"; then
+      warn "NEVERSTARTED: $_bid kept in flight — a repo beside the town root: ${_BSW_WHY:-no reason recorded} (ga-9jrt3o7)."
+      continue
+    fi
+
+    # Aged past threshold, no gate marker, no live worker, no branch, no sibling-repo work → genuinely
     # never-started limbo. Release so the next sweep re-dispatches it.
     warn "NEVERSTARTED: releasing never-started in-flight bead $_bid (age=${_age}s > ${_thresh}s, no live worker, no branch, no gate marker, db=$_db) — back to story:approved for re-dispatch (ga-v3z4z)."
     bd -C "$_db" label  remove "$_bid" "story:in-flight"   -q 2>/dev/null || true
