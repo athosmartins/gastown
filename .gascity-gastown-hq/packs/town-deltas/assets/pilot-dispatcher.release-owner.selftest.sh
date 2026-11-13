@@ -15,7 +15,10 @@
 # gate_clear_assignee_if_holder (ga-yd8t6) uses instead of --force) and CONFIRMS it by reading the bead back; only rc 0 lets the caller take the flight
 # labels and stamps off. Any other outcome leaves the bead exactly as it was (flight labels and stamps in place, so
 # it stays visible and the next sweep retries) and says so loudly. THE invariant, asserted after every scenario:
-# a bead whose owner is still set never ends up without its flight labels ("sem rotulo + dono morto").
+# a bead whose owner is still set never ends up without its flight labels ("sem rotulo + dono morto"). One deliberate
+# exception to "read first": a NEVERSTARTED list row WITHOUT owner has nothing to let go of, so it neither reads nor
+# writes (NS-8/NS-8b) and is released as before; ga-9jrt3o7's selftest drives that function with a bd that only answers
+# `list` and its rows carry no owner, so this rule is also what keeps the two beads' selftests green on the merged tree.
 #
 # The fake bd models bd 1.1.0 as far as the repo documents it (gate-assignee-clear-holder-aware.selftest.sh, the
 # `bd assign` refusal of bd-98s5c; gate_clear_assignee_if_holder reads rc 13 as a lost compare-and-swap):
