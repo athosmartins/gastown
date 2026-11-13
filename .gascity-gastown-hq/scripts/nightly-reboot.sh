@@ -1387,10 +1387,11 @@ log "swapfiles before: $(ls /System/Volumes/VM/ 2>/dev/null | grep -c swapfile)"
 # install above, and none of them stops the central sender. Read it again as late as
 # possible; a send that started in the gap holds the reboot like one that was there at
 # 23:40. The streak is reset only after this, so a night that ends here as a SKIP keeps
-# counting. What is left between this read and the shutdown is the routine note below
-# (notify: not bounded here, see the header), the counters' bookkeeping (two local files;
-# the scraper-cut alarm mail is NOT sent from here, it rides in the pending file), the
-# pending file itself and `sync` — seconds, not minutes.
+# counting. What is left between this read and the shutdown is the live-conversation
+# capture below (bounded by NIGHTLY_REBOOT_CAPTURE_TIMEOUT_SECS, 30 s by default, and never
+# a veto), the routine note after it (notify: not bounded here, see the header), the
+# counters' bookkeeping (two local files; the scraper-cut alarm mail is NOT sent from here,
+# it rides in the pending file), the pending file itself and `sync` — seconds, not minutes.
 if [ "${REBOOT_MODE}" = "drain" ]; then
     log "final safety re-check, just before the shutdown (the 23:40 verdict is minutes old)"
     safety_gate_wait || drain_skip_night

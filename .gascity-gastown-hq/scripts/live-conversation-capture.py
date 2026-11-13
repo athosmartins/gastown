@@ -154,12 +154,14 @@ def ps_table(io, tmo):
 
 def pane_pids(io, cfg, tname, tmo):
     """("ok", [pane pids]) / ("absent", why) / ("unknown", why)."""
-    # vazio (rc 1: a sessão tmux não existe) → absent: sem pane não há claude vivo; falhou (estouro, tmux ausente, saída sem pid) → unknown
+    # vazio (rc 1 com "can't find session": o servidor tmux respondeu e a sessão não existe) → absent: sem pane não há claude vivo; falhou (estouro, tmux ausente, servidor fora/socket sem acesso
+    # — também rc 1, mas com outra mensagem —, saída sem pid) → unknown: não consegui perguntar não é "não existe"
     rc, out, err = io.run(cfg.tmux + ["list-panes", "-s", "-t", "=%s:" % tname, "-F", "#{pane_pid}"], tmo)
     if rc is None:
         return "unknown", "tmux did not answer (timeout or not runnable)"
     if rc != 0:
-        return "absent", "tmux rc=%d: %s" % (rc, (err or "").strip()[:80])
+        why = "tmux rc=%d: %s" % (rc, (err or "").strip()[:80])
+        return ("absent" if "can't find session" in (err or "") else "unknown"), why
     pids = [int(x) for x in out.split() if x.isdigit()]
     return ("ok", pids) if pids else ("unknown", "tmux answered with no pane pid")
 
@@ -247,12 +249,14 @@ def save_state(path, beads):
 
 
 def persist(io, cfg, bead, sid, at, tmo):
-    """(ok, why): ONE bd update with both keys, then a read-back of the id; only a value read back counts as written."""
+    """(ok, why): ONE bd update with both keys, then a read-back of the id; only a value read back counts as written.
+    The update and the read-back share ONE allowance (`tmo`, already clamped to the pass budget): the read-back gets what the update left of it (floor 1 s), so a slow Dolt cannot stretch a pass by a second full bd timeout."""
+    t0 = io.now()
     rc, _, err = io.run(cfg.bd + ["update", bead, "--set-metadata", "%s=%s" % (K_ID, sid), "--set-metadata", "%s=%d" % (K_AT, at)], tmo)
     if rc != 0:
         return False, "bd update rc=%s: %s" % (rc, (err or "").strip()[:100])
     # falhou/ilegível (rc≠0, estouro, JSON ruim, sem a chave) → não gravado: o estado não o registra e a próxima rodada escreve de novo
-    rc, out, _ = io.run(cfg.bd + ["show", bead, "--json"], tmo)
+    rc, out, _ = io.run(cfg.bd + ["show", bead, "--json"], max(1, int(tmo - (io.now() - t0))))
     if rc != 0:
         return False, "read-back failed (bd show rc=%s)" % rc
     try:

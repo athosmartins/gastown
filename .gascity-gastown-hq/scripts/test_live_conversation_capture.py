@@ -2,6 +2,7 @@
 """test_live_conversation_capture.py (ga-esorlre.2): hermetic suite for scripts/live-conversation-capture.py. FakeIO emulates gc/bd/tmux/ps over REAL files in a temp tree; one test
 drives a REAL tmux server (private socket) and the real ps. `python3 -I` on 3.9 and 3.12; LCC_UNDER_TEST=<copy> runs it against a mutant."""
 import contextlib
+import errno
 import importlib.util
 import io
 import json
@@ -258,7 +259,11 @@ class Resolve(unittest.TestCase):
 
     def test_tmux_failures(self):
         for label, f, want in (("session missing (rc 1)", (1, "", "can't find session: x"), "absent"), ("timeout / no binary", (None, "", ""), "unknown"),
-                               ("rc 0 but no pane pid", (0, "garbage\n", ""), "unknown")):
+                               ("rc 0 but no pane pid", (0, "garbage\n", ""), "unknown"),
+                               ("tmux server down (rc 1, real message)", (1, "", "error connecting to /private/tmp/tmux-501/gascity (No such file or directory)"), "unknown"),
+                               ("no server running (rc 1)", (1, "", "no server running on /private/tmp/tmux-501/gascity"), "unknown"),
+                               ("socket permission error (rc 1)", (1, "", "error connecting to /private/tmp/tmux-501/gascity (Permission denied)"), "unknown"),
+                               ("rc 1 with empty stderr", (1, "", ""), "unknown")):
             with self.subTest(label):
                 w = World(self)
                 w.crew()
@@ -413,7 +418,7 @@ class Pass(unittest.TestCase):
         self.assertEqual(self.w.main("--final")[1], "live-conversation-capture[final]: alvos=1 gravou=0 igual=0 ausente=1 nao-sei=0 falhou=0\n")
 
     def test_exit_2_for_usage_and_3_for_a_lock_that_cannot_be_taken_which_is_not_busy(self):
-        with mock.patch("fcntl.flock", side_effect=OSError(37, "no locks available")):
+        with mock.patch("fcntl.flock", side_effect=OSError(errno.ENOLCK, "no locks available")):
             self.assertEqual((self.w.main()[0], self.w.io.n("gc")), (3, 0))
         self.assertEqual(self.w.main(GC_CITY_PATH="/nonexistent/city")[0], 3)  # the lock file cannot even be opened
         self.assertEqual(self.w.main("--bogus")[0], 2)
@@ -447,6 +452,19 @@ class Pass(unittest.TestCase):
         w.io.run = slow
         code, c = w.go(LCC_BUDGET_S="30")
         self.assertEqual((code, c["wrote"], c["unknown"]), (0, 1, 1))  # the first target ate the budget: the second is unknown, never run past it
+
+    def test_the_write_and_its_read_back_share_one_bd_allowance(self):
+        w = self.w
+        real = w.io.run
+
+        def slow(argv, timeout):
+            if os.path.basename(argv[0]) == "bd" and "update" in argv:
+                w.io.t += 25  # Dolt is slow: the write alone eats 25 s of its 30 s
+            return real(argv, timeout)
+        w.io.run = slow
+        code, c = w.go()
+        bd = [t for t, a in zip(w.io.tmo, w.io.calls) if os.path.basename(a[0]) == "bd"]
+        self.assertEqual((code, c["wrote"], len(bd), bd[0], bd[1] <= 5), (0, 1, 2, 30, True))  # write: the full 30 s; read-back: what is left of it, not a second 30 s
 
     def test_etime_formats_of_ps(self):
         for s, want in (("05:10", 310), ("1:02:03", 3723), ("2-03:04:05", 183845), ("12", None), ("x-1:00", None)):
