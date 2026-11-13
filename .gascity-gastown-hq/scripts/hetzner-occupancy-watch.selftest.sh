@@ -12,14 +12,14 @@
 #   EQUIVALENTE (ga-u6ueg0q): `universal_newlines=True` no Popen de run_cmd não tem caso que o separe do False: com `errors="replace"` o subprocess já abre os canais em texto e traduz a quebra de linha,
 #   então as duas formas devolvem a mesma saída (id 06d87b11fa).
 #   EQUIVALENTES do rodízio de 03/11 (ga-59jrj3d, lidos no código; o (a) também por diferencial: 60000 blocos aleatórios contra cada um dos 2 mutantes, 0 divergências): (a) parse_stat, `lines[i + 1:lines.index(END, i + 1)]` com `i + 0` (ids 4fac5408e3 e c2c527c4eb): o corpo passa a incluir a linha
-#   do marcador BEGIN, que não começa por `cpu` e é ignorada, e `lines.index(END, i)` acha o mesmo END porque a linha i é o BEGIN; (b) `ensure_ascii=False` -> `True` nas duas gravações do ESTADO (ids f7961235bf e c91b413c99): o `new_st` só tem chaves fixas em ASCII e valores
-#   inteiros, decimais ou null (o baseline passa por `_baseline_ok`), então o JSON sai igual; nas gravações do diário e do JSONL, que carregam texto de fora, o `ensure_ascii` é coberto no grupo lastro.
+#   do marcador BEGIN, que não começa por `cpu` e é ignorada, e `lines.index(END, i)` acha o mesmo END porque a linha i é o BEGIN; (b) `ensure_ascii=False` -> `True` nas gravações do ESTADO (ids f7961235bf e c91b413c99): valia quando o `new_st` só tinha chaves fixas em ASCII e valores
+#   inteiros, decimais ou null; hoje ele leva o texto da ação pendente, COM acento, e o caso do D1 lê o arquivo (ver o `# EQUIVALENT` deles); nas gravações do diário e do JSONL, que carregam texto de fora, o `ensure_ascii` é coberto no grupo lastro.
 # COMO RODAR: hetzner-occupancy-watch.selftest.sh [grupo ...]   (sem argumento: todos os grupos e o controle negativo). HETZNER_OCC_UNDER_TEST=<script> roda a suíte contra outra cópia.
 #   HOCC_JOBS=N mutantes ao mesmo tempo (padrão 4; 1 = em série) · HOCC_NO_MUTANTS=1 pula o controle negativo (290 dos 370 casos, ~40 s no Linux) · HOCC_SLOW_START=N faz o python do vigia levar N s para subir, como o mini sob carga (com HOCC_NO_MUTANTS=1).
 #   Tudo: ~140 s no Linux; no mini, sob carga, a fatia 1 sozinha (238 verificações; hoje são 370) levou ~7 min (medido pelo gate em 19/10). RELÓGIO: nenhum caso mede o tempo de parede do vigia (no mini sob carga só subir o python já passou de 1 s, 19/10): a ordem das duas instâncias é por EVENTO (await) e o único prazo, o do run_cmd, é medido dentro do python.
 # EQUIVALENT 06d87b11fa: `universal_newlines=True` no Popen de run_cmd: com `errors="replace"` o subprocess ja abre os canais em texto, as duas formas devolvem a mesma saida
 # EQUIVALENT 4fac5408e3 c2c527c4eb: parse_stat `lines[i + 1:lines.index(END, i + 1)]` com `i + 0` (no corte ou no index): o corpo passa a incluir a linha BEGIN, que nao comeca por `cpu` e e ignorada, e `lines.index(END, i)` acha o mesmo END (60000 blocos aleatorios, 0 divergencias)
-# EQUIVALENT c91b413c99 f7961235bf: `ensure_ascii=False` -> `True` nas duas gravacoes do ESTADO (antes do mail e depois de um mail que falha): new_st so leva inteiros, null e o baseline de CPU que _baseline_ok aceitou ({epoch,busy,total}, o unico que o vigia grava), entao o JSON sai igual; so um baseline editado a mao com chave extra nao-ASCII os separaria
+# EQUIVALENT c91b413c99 f7961235bf: ids ENVELHECIDOS (ga-twb32km, 13/11): as duas gravacoes do ESTADO que eles descreviam hoje sao uma so (`save`, `ensure_ascii=False` na L1266) e o new_st de hoje leva texto com acento (pendentes[].o_que), entao a razao antiga (so inteiros e null) nao vale; o mutante de HOJE (`ensure_ascii=False` -> `True` ali) e morto pelo caso do D1 que le o arquivo do estado, e o motor nao gera mais mutante deste arquivo (denylist:tmux no texto), por isso so estes ids sobram
 set -u
 HERE="$(cd "$(dirname "$0")" && pwd)"
 WATCH="${HETZNER_OCC_UNDER_TEST:-$HERE/hetzner-occupancy-watch.py}"
@@ -1433,6 +1433,7 @@ g_escada() {
   has "o ssh de ação também: BatchMode (nunca espera senha), ConnectTimeout e o host" "BatchMode=yes -o ConnectTimeout=10 hetzner-teste" "$(cat "$T/stub/ssh.act")"
   eq "a tentativa e o relógio da ação JÁ estavam gravados quando o ssh de ação rodou (processo que morre no meio não repete sem conta)" "1/$NOW" "$(jv "$T/stub/act.state" degraus.d1.tentativas)/$(jv "$T/stub/act.state" ultima_acao_em)"
   eq "o estado fica com a tentativa e o relógio" "1/$NOW" "$(state_f degraus.d1.tentativas)/$(state_f ultima_acao_em)"
+  eq "... e o texto da ação pendente fica no arquivo COM acento (o JSON do estado não é escapado: ensure_ascii=False)" "1" "$(grep -c 'sessão(ões)' "$C/.gc/hetzner-occupancy.state.json")"
   eq "... e a ação pendente de medir: o antes (CPU 17,5 %, 2,8 núcleos, lastro 0,3, 11,7 livres)" "d1/17.5/2.8/0.3/11.7" "$(state_f pendentes.0.degrau)/$(state_f pendentes.0.antes.pct)/$(state_f pendentes.0.antes.nucleos)/$(state_f pendentes.0.antes.lastro)/$(state_f pendentes.0.antes.livres)"
   eq "o diário conta a ação do dia" 1 "$(jv "$dj" dias.2026-10-19.acoes)"
   xtick 900 255 30 50 150

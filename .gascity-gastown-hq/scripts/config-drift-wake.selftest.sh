@@ -12,7 +12,7 @@ trap 'chmod -R u+rwx "$T" 2>/dev/null; [ -n "$HOLD" ] && kill "$HOLD" 2>/dev/nul
 PASS=0; FAIL=0; N=0; W=""; OUT=""; RC=0
 mkdir -p "$T/bin"
 cat > "$T/fake.py" <<'EOF'
-# gc/bd falsos: o mundo vem de $CDW_WORLD (roster[.N].json, rigs.json, store.<loja>.json, show.<id>.json, *.mode = fail|garbage|empty|hang, wake.rc, comment.rc); toda chamada é registrada em calls.log
+# gc/bd falsos: o mundo vem de $CDW_WORLD (roster[.N].json, rigs.json, store.<loja>.json, show.<id>.json, *.mode = fail|garbage|empty|hang|killparent, wake.rc, comment.rc, comment.mode = hang); toda chamada é registrada em calls.log
 import os, sys, time
 W = os.environ["CDW_WORLD"]
 who, args = sys.argv[1], sys.argv[2:]
@@ -24,6 +24,9 @@ def rd(name, default=""):
 def serve(mode, path):
     if mode == "hang":
         time.sleep(60)
+    if mode == "killparent":   # mata o PROCESSO QUE ME CHAMOU (o job) por SIGKILL: o que ele já tinha gravado é tudo que sobra
+        os.kill(os.getppid(), 9)
+        time.sleep(5)
     if mode == "fail":
         sys.exit(1)
     if mode == "garbage":
@@ -66,6 +69,8 @@ if who == "bd" and args[:1] == ["-C"]:
         print(json.dumps(hit))
         sys.exit(0 if hit else 1)
     if rest[:1] == ["comment"] and len(rest) == 3:
+        if rd("comment.mode") == "hang":
+            time.sleep(60)
         sys.exit(int(rd("comment.rc", "0")))
 open(os.path.join(W, "calls.log"), "a").write("UNEXPECTED\n")
 sys.exit(99)
@@ -93,6 +98,14 @@ three() { world; rows "$(row ga-s1 dog-remote-1 dog-remote asleep config-drift)"
   store hq "$(bead ga-b1 dog-remote-1)" "$(bead ga-b2 dog-remote-2)" "$(bead ga-b3 dog-remote-3)"; }   # 3 candidatas, cada uma com a sua bead no HQ
 rows1() { world; rows "$(row ga-s1 dog-remote-3 dog-remote asleep config-drift)"; store hq "$(bead ga-b1 dog-remote-3)"; }   # o mundo mínimo: 1 candidata com bead viva no HQ
 
+# 0) dentro do módulo (importado, sem rodar; primeiro, para um mutante que mexe nestas constantes morrer em 2 s e não depois das chamadas travadas): o teto de leitura do bd é 60 s (5 s é o mínimo que vale) e _loads só lê texto (None, bytes e número são ilegíveis, sem levantar)
+PYIN='import importlib.util, sys
+sys.dont_write_bytecode = True   # -I ignora PYTHONDONTWRITEBYTECODE: sem isto o import deixa um __pycache__ ao lado do script
+sp = importlib.util.spec_from_file_location("cdw_in", sys.argv[1]); m = importlib.util.module_from_spec(sp); sp.loader.exec_module(m)
+print(m.BD_TIMEOUT, repr(m._loads(None)), repr(m._loads(b"[]")), repr(m._loads(7)), repr(m._loads("")), repr(m._loads("[1]\n2 issues")))'
+eq "0 BD_TIMEOUT padrão 60 e _loads só lê texto" "$(env -i PATH="$PATH" PYTHONDONTWRITEBYTECODE=1 "$PY" -I -B -c "$PYIN" "$SCRIPT" 2>&1)" "60 None None None None [1]"
+eq "0 BD_TIMEOUT=5 (o mínimo exato) vale" "$(env -i PATH="$PATH" PYTHONDONTWRITEBYTECODE=1 CONFIG_DRIFT_WAKE_BD_TIMEOUT=5 "$PY" -I -B -c "$PYIN" "$SCRIPT" 2>&1 | cut -d' ' -f1)" "5"
+
 # 1) o aceite: acorda SÓ a candidata com bead viva (2 lojas); sem bead, outro motivo, viva, fora do pool, bead estacionada e sessão fechada ficam quietas
 world
 rows "$(row ga-s1 dog-remote-3 dog-remote asleep config-drift)" "$(row ga-s2 wa-worker-remote-2 wa-worker-remote asleep config-drift)" "$(row ga-s3 dog-remote-4 dog-remote asleep config-drift)" \
@@ -115,7 +128,7 @@ has "1 o relógio guarda a tentativa" "$(cat "$W/hq/.gc/state/config-drift-wake.
 for m in fail garbage empty; do rows1; printf '%s' "$m" > "$W/roster.mode"; runit
   eq "2 roster $m: rc 1" "$RC" 1; has "2 roster $m: DEGRADED" "$OUT" "DEGRADED: gc session list"; eq "2 roster $m: só 1 chamada" "$(wc -l < "$W/calls.log" | tr -d ' ')" 1; done
 for body in '{"sessions":[]}' '{"sessions":[{"id":"a","status":"asleep"}]}' '{"x":1}'; do rows1; printf '%s' "$body" > "$W/roster.json"; runit; eq "2 roster $body: rc 1 sem wake" "$RC/$(wakes)" "1/"; done
-rows1; runit GC_BIN=/nonexistent/gc; eq "2 gc ausente: rc 1" "$RC" 1; has "2 gc ausente dito" "$OUT" "WARN: /nonexistent/gc session list --json falhou"
+rows1; runit GC_BIN=/nonexistent/gc; eq "2 gc ausente: rc 1" "$RC" 1; has "2 gc ausente dito" "$OUT" "WARN: /nonexistent/gc session list --json falhou"; has "2 gc ausente: a rodada diz DEGRADED (comando que nem roda = sem resposta, não um rc)" "$OUT" "DEGRADED: gc session list"
 
 # 3) loja ilegível: a candidata cuja bead pode estar lá é "não sei"; a que tem bead numa loja lida acorda; nenhuma loja lida = rc 1
 rows1; rows "$(row ga-s1 dog-remote-3 dog-remote asleep config-drift)" "$(row ga-s2 wa-worker-remote-2 wa-worker-remote asleep config-drift)"; store wa "$(bead wa-b2 wa-worker-remote-2)"; printf fail > "$W/store.hq.mode"; runit
@@ -285,7 +298,7 @@ world; rows '{"id":"ga-s1","alias":"dog-remote-1","template":"dog-remote","state
 eq "14d motivo na linha do roster é ignorado: a bead de sessão diz drained" "$(wakes)" ""; has "14d o census conta o motivo da bead" "$OUT" "motivos=drained:1"
 # 14e) a leitura da bead de sessão tem três estados: falhou/lixo/vazio/trava, OUTRA bead, sem metadata, metadata torta, bead inexistente = não sei (sem wake); motivo de tipo estranho = sem motivo
 for m in fail garbage empty; do rows1; printf '%s' "$m" > "$W/session.ga-s1.mode"; runit; eq "14e bd show da sessão ($m): sem wake, rc 1" "$RC/$(wakes)" "1/"; has "14e ($m) nao-sei" "$OUT" "motivos=nao-sei:1"; done
-rows1; printf hang > "$W/session.ga-s1.mode"; runit CONFIG_DRIFT_WAKE_BD_TIMEOUT=5; eq "14e bd show da sessão que trava: sem wake, rc 1" "$RC/$(wakes)" "1/"; has "14e o teto da chamada vira WARN" "$OUT" "TimeoutExpired"
+rows1; printf hang > "$W/session.ga-s1.mode"; runit CONFIG_DRIFT_WAKE_BD_TIMEOUT=5; eq "14e bd show da sessão que trava: sem wake, rc 1" "$RC/$(wakes)" "1/"; has "14e o teto da chamada vira WARN" "$OUT" "TimeoutExpired"; has "14e e a rodada segue até o census (a leitura sem resposta é não-sei)" "$OUT" "motivos=nao-sei:1"
 for body in "[$(bead outra-bead dog-remote-3)]" '[{"id":"ga-s1"}]' '[{"id":"ga-s1","metadata":"x"}]' '[{"id":"ga-s1","metadata":null}]' '{"id":"ga-s1"}' '[]'; do rows1; printf '%s' "$body" > "$W/session.ga-s1.json"; runit; eq "14e corpo $body: sem wake" "$(wakes)" ""; has "14e corpo $body: não sei" "$OUT" "motivos=nao-sei:1"; done
 rows1; rm -f "$W/session.ga-s1.json"; runit; eq "14e bead de sessão inexistente: sem wake" "$(wakes)" ""; has "14e inexistente: não sei" "$OUT" "motivos=nao-sei:1"
 rows1; printf '[{"id":"ga-s1","metadata":{"sleep_reason":5}}]' > "$W/session.ga-s1.json"; runit; eq "14e motivo que não é texto: sem wake, e é sem-motivo (a bead respondeu)" "$(wakes)" ""; has "14e sem-motivo" "$OUT" "motivos=sem-motivo:1"
@@ -310,6 +323,51 @@ rows1; store hq "$(bead 'ga-b1\n' dog-remote-3)"; runit; eq "14h bead com id ter
 # 14i) o custo da rodada: sem pool asleep = só o roster; pool asleep sem candidata = roster + UMA leitura de bead de sessão por sessão (sem rig list nem bd list); ativa, fora do pool e fechada não são lidas
 world; rows "$(row ga-s5 dog-remote-6 dog-remote active '')" "$(row ga-s6 mila-wa mila-wa asleep config-drift)" "$(row ga-s8 dog-remote-7 dog-remote asleep config-drift true)"; runit; eq "14i ativa, fora do pool e fechada: só o roster" "$RC/$(wc -l < "$W/calls.log" | tr -d ' ')" "0/1"
 world; rows "$(row ga-s4 dog-remote-5 dog-remote asleep idle-timeout)"; runit; eq "14i pool asleep sem candidata: roster + 1 leitura da bead de sessão" "$RC/$(wc -l < "$W/calls.log" | tr -d ' ')/$(ncalls ' show ga-s4 --json')" "0/2/1"
+
+# 15) lacunas que o lastro de mutantes apontou (ga-twb32km): comando que nem roda, rigs tortos e repetidos, homônimo vazio, MBP por um campo só, census com empate e teto, ordem do relógio, relógio FIXO nas bordas e a linha start que sobrevive a um SIGKILL
+# EQUIVALENT 0fb2fd68e8: `sys.path.insert(0, d)` -> `insert(1, d)`: iniciado como `python3 config-drift-wake.py` (plist e selftest) o sys.path[0] já é este diretório (ou, sob -I, um zip da stdlib que não existe), então o mesmo diretório no índice 0 ou 1 acha o mesmo bead_state; só um iniciador por `python -c` (sys.path[0] = cwd) distingue
+# EQUIVALENT db46a098d0: `text=True` -> `False` em _sh: o `errors="replace"` na mesma chamada já liga o modo texto do subprocess (Popen: text_mode = encoding or errors or text or universal_newlines); medido em 3.9, 3.12 e 3.14: stdout continua str
+# EQUIVALENT 3640d923c7: `getattr(e, "pos", 0)` -> `1` em _loads: json.loads de str só levanta JSONDecodeError (sempre com `pos`) ou o ValueError do limite de dígitos do int (medido em 3.9.25 e 3.12: sem `pos`, e a mensagem não diz "Extra data"): o padrão nunca é lido num erro "Extra data"
+# EQUIVALENT 6979eab9b3: `"Extra data" in str(e) and pos` -> `or pos` em _loads: medido sobre 3257661 textos (todos até 6 caracteres de um alfabeto JSON, mais JSON válido com sufixo de lixo e cada truncamento): o mesmo valor do original em todos; um mutante-controle (raw[:pos + 1]) diverge no mesmo espaço; só "Extra data" deixa um prefixo válido
+# 15a) lojas e rigs: `rig list` e `bd list` que TRAVAM são "sem resposta" (None), não um rc; rigs tortos, repetidos e com hq=true/false
+rows1; printf hang > "$W/rigs.mode"; printf hang > "$W/store.hq.mode"; runit CONFIG_DRIFT_WAKE_CALL_TIMEOUT=5 CONFIG_DRIFT_WAKE_BD_TIMEOUT=5
+eq "15 rig list e bd list que travam: rc 1, sem wake" "$RC/$(wakes)" "1/"; has "15 rig list que trava: lojas INCOMPLETAS ditas" "$OUT" "DEGRADED stores"
+has "15 bd list que trava: loja pulada, dita" "$OUT" "WARN: bd list in_progress falhou/ilegível em hq — loja pulada"; has "15 nenhuma loja legível dita" "$OUT" "nenhuma loja legível"
+world; rows "$(row ga-r1 wa-worker-remote-2 wa-worker-remote asleep config-drift)" "$(row ga-r2 dog-remote-4 dog-remote asleep config-drift)"
+printf '{"rigs":["junk",7,{"name":"semcaminho"},{"name":"numerico","path":7},{"name":"vazio","path":""},{"name":"hqfalso","path":"%s/outro-hq","hq":true},{"name":"whatsapp_automation","path":"%s/wa"},{"name":"wa-de-novo","path":"%s/wa"},{"name":"naohq","path":"%s/naohq","hq":false},{"name":"gascity","path":"%s/hq","hq":true}]}' "$W" "$W" "$W" "$W" "$W" > "$W/rigs.json"
+store naohq; store wa "$(bead wa-b1 wa-worker-remote-2)"; runit
+LISTS=$(sed -En "s#^bd -C (.*) list --status in_progress --limit 0 --json\$#[\1]#p" "$W/calls.log" | sed "s#$W/##" | sort | tr '\n' ' ')
+eq "15 rigs: lê o HQ, a wa (UMA vez) e a naohq (hq=false é rig comum); nunca o caminho de hq=true, o vazio, o numérico, o repetido nem o elemento torto" "$RC/$LISTS" "0/[hq] [naohq] [wa] "
+eq "15 rigs tortos: a candidata da wa acorda" "$(wakes)" "ga-r1"; has "15 rigs tortos: a outra é 'sem bead' (o conjunto de lojas é COMPLETO)" "$OUT" "SKIP ga-r2 alias=dog-remote-4 tpl=dog-remote — sem-bead"; lacks "15 rigs tortos: nenhuma loja pulada" "$OUT" "loja pulada"
+if [ -d /Users/athos/gt/whatsapp_automation ] || [ -d /Users/athos/gt/property_scrapers ]; then echo "SKIP: rigs estáticos (os diretórios do mini existem neste host)"; else
+  rows1; printf fail > "$W/rigs.mode"; mkdir -p "$W/cwd/whatsapp_automation" "$W/cwd/property_scrapers"
+  OUT=$(cd "$W/cwd" && env PYTHONDONTWRITEBYTECODE=1 GC_CITY_PATH="$W/hq" GC_BIN="$T/bin/gc" BD_BIN="$T/bin/bd" CDW_WORLD="$W" CONFIG_DRIFT_WAKE_DRY_RUN=0 "$PY" "$SCRIPT" 2>"$W/err"); RC=$?
+  eq "15 rig list falhou: a lista estática só entra com o diretório DELA (homônimos no cwd não contam)" "$RC/$(wakes)/$(ncalls 'Users/athos/gt')" "0/ga-s1/0"; fi
+# 15b) quem conta como a sessão: alias vazio nunca casa com assignee vazio; MBP pelo nome OU pelo template já tira do pool
+world; rows "$(row ga-e1 '' dog-remote asleep config-drift)"; store hq "$(bead ga-b1 '')"; runit
+eq "15 alias vazio: a bead sem dono (assignee vazio) não é dela" "$RC/$(wakes)" "0/"; has "15 alias vazio: sem-bead dito" "$OUT" "— sem-bead"
+world; rows "$(row ga-m1 dog-remote-mbp-1 dog-remote asleep config-drift)" "$(row ga-m2 wa-worker-remote-2 wa-worker-remote-mbp asleep config-drift)"; store hq "$(bead ga-b1 dog-remote-mbp-1)" "$(bead ga-b2 wa-worker-remote-2)"; runit
+eq "15 MBP só pelo nome ou só pelo template: ninguém acorda" "$RC/$(wakes)" "0/"; has "15 MBP: nenhuma das duas é sessão de pool" "$OUT" "asleep=2 pool_asleep=0"
+# 15c) census: no máximo 6 motivos, empate em ordem alfabética e não na de chegada (os ids chegam em ordem crescente com os motivos em ordem DEcrescente)
+world; R=(); for i in 1 2 3 4 5 6 7; do R+=("$(row "ga-c$i" "dog-remote-$i" dog-remote asleep "mot$((8-i))")"); done; rows "${R[@]}"; runit
+has "15 census: teto de 6 motivos e empate em ordem alfabética" "$OUT" "motivos=mot1:1,mot2:1,mot3:1,mot4:1,mot5:1,mot6:1"; lacks "15 census: o 7º motivo fica de fora" "$OUT" "mot7"
+# 15d) o relógio: chaves em ordem na gravação; comentário que trava (sem resposta) é aviso; a linha start já está no .out quando o job é morto por SIGKILL; o aviso de um comando que nem roda nomeia só os 4 primeiros argumentos
+rows1; mkdir -p "$W/hq/.gc/state"; printf '{"zz":{"at":%d},"aa":{"at":%d}}' "$NOW" "$NOW" > "$W/hq/.gc/state/config-drift-wake.json"; runit
+eq "15 o relógio é gravado com as chaves em ordem" "$("$PY" -c 'import json,sys; print(",".join(json.load(open(sys.argv[1]))))' "$W/hq/.gc/state/config-drift-wake.json")" "aa,ga-s1,zz"
+rows1; printf hang > "$W/comment.mode"; runit CONFIG_DRIFT_WAKE_BD_TIMEOUT=5
+eq "15 comentário que trava (sem resposta): o wake vale, rc 0" "$RC/$(wakes)" "0/ga-s1"; has "15 comentário sem resposta dito" "$OUT" "WARN: comentário em hq/ga-b1 não gravado"
+rows1; printf killparent > "$W/roster.mode"; runit PYTHONUNBUFFERED=
+eq "15 job morto por SIGKILL ao ler o roster: rc 137" "$RC" 137; has "15 a linha start (o batimento) já estava no .out" "$OUT" "[config-drift-wake] start enabled=True"
+rows1; runit BD_BIN=/nonexistent/bd; has "15 bd ausente: o aviso nomeia só os 4 primeiros argumentos, sem o id" "$OUT" "WARN: /nonexistent/bd -C $W/hq show falhou:"
+# 15e) bordas com o relógio FIXO (time.time trocado antes de rodar o script; o resto é o mesmo script): 86400 s exatos ficam, 86401 caem; 900 s exatos já não seguram, 899 sim
+runclk() { local t=$1; shift; OUT=$(env PYTHONDONTWRITEBYTECODE=1 GC_CITY_PATH="$W/hq" GC_BIN="$T/bin/gc" BD_BIN="$T/bin/bd" CDW_WORLD="$W" CONFIG_DRIFT_WAKE_DRY_RUN=0 "$@" "$PY" -c 'import runpy, sys, time; t = float(sys.argv[1]); time.time = lambda: t; runpy.run_path(sys.argv[2], run_name="__main__")' "$t" "$SCRIPT" 2>"$W/err"); RC=$?; }
+FIX=1800000000
+rows1; mkdir -p "$W/hq/.gc/state"; printf '{"fica":{"at":%d},"cai":{"at":%d}}' $((FIX-86400)) $((FIX-86401)) > "$W/hq/.gc/state/config-drift-wake.json"; runclk $FIX
+eq "15 relógio de 86400 s exatos fica, o de 86401 s cai (a rodada grava o que sobrou)" "$RC/$("$PY" -c 'import json,sys; print(",".join(json.load(open(sys.argv[1]))))' "$W/hq/.gc/state/config-drift-wake.json")" "0/fica,ga-s1"
+rows1; mkdir -p "$W/hq/.gc/state"; printf '{"ga-s1":{"at":%d,"bead":"ga-b1"}}' $((FIX-900)) > "$W/hq/.gc/state/config-drift-wake.json"; runclk $FIX
+eq "15 a tentativa de 900 s exatos já não segura" "$RC/$(wakes)" "0/ga-s1"
+rows1; mkdir -p "$W/hq/.gc/state"; printf '{"ga-s1":{"at":%d,"bead":"ga-b1"}}' $((FIX-899)) > "$W/hq/.gc/state/config-drift-wake.json"; runclk $FIX
+eq "15 a de 899 s ainda segura" "$RC/$(wakes)" "0/"; has "15 COOLDOWN dito" "$OUT" "COOLDOWN ga-s1"
 
 echo "config-drift-wake.selftest: PASS=$PASS FAIL=$FAIL"
 [ "$FAIL" = 0 ]
