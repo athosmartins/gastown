@@ -86,6 +86,13 @@ if [ -z "$RECLAIM_FN" ]; then
   echo "FATAL: _pilot_crew_stale_reclaim() not found in $DISPATCHER" >&2
   exit 2
 fi
+# ga-xxtwytk: the reclaim now takes the owner off through these two helpers (guarded write + read-back) BEFORE the flight
+# labels; a harness that cuts out only the reclaim runs it without them ('command not found') and nothing is ever reclaimed.
+OWNER_FN="$(sed -n '/^_pilot_owner_state() {/,/^}$/p;/^_pilot_release_owner() {/,/^}$/p' "$DISPATCHER")"
+if [ -z "$OWNER_FN" ]; then
+  echo "FATAL: _pilot_owner_state()/_pilot_release_owner() not found in $DISPATCHER" >&2
+  exit 2
+fi
 
 # run_reclaim <in-flight-json> <branch-signal-mode: noref|found> -> sets
 # $RC_EXIT to the exit code of the CALLING context, mirroring dispatcher
@@ -95,9 +102,12 @@ fi
 run_reclaim() {
   local input="$1" bs_mode="$2"
   : > "$WORK/bd.log"
+  rm -f "$WORK/cleared"
   cat > "$WORK/run.sh" <<EOF
 set -euo pipefail
 warn() { echo "[WARN] \$*" >&2; }
+# bd is a shell function here, which \`timeout 15 bd ...\` (the helpers' bounded call) cannot run: drop the bound
+timeout() { shift; "\$@"; }
 PILOT_STUCK_INFLIGHT_HOURS="\${PILOT_STUCK_INFLIGHT_HOURS:-2}"
 _ownership_guard_repos() { return 0; }
 # Mirrors the REAL _beadid_branch_signal's documented external contract
@@ -110,7 +120,17 @@ _beadid_branch_signal() {
   printf 'block\tsome-ref'
   return 0
 }
-bd() { echo "bd \$*" >> "$WORK/bd.log"; return 0; }
+# The bead reads as the crew's in_progress claim until an owner-clearing write lands, then as an open bead with no owner
+# (what bd answers once the guarded write went through); every call is logged.
+bd() {
+  echo "bd \$*" >> "$WORK/bd.log"
+  case " \$* " in
+    *" show "*) if [ -e "$WORK/cleared" ]; then printf '[{"status":"open"}]'; else printf '[{"status":"in_progress","assignee":"batista-wa"}]'; fi ;;
+    *" update "*"--assignee"*) : > "$WORK/cleared" ;;
+  esac
+  return 0
+}
+$OWNER_FN
 $RECLAIM_FN
 _pilot_crew_stale_reclaim '$input' 9999999999
 EOF
@@ -131,8 +151,11 @@ run_reclaim "$IN1" "noref"
 # ════════════════════════════════════════════════════════════════════════════
 echo ""
 echo "Scenario 2 (AC2): same bead — the reclaim itself must still fire"
-if grep -q "wa-90omi" "$WORK/bd.log" 2>/dev/null; then
-  ok "AC2: wa-90omi was actually reclaimed ($(wc -l < "$WORK/bd.log" | tr -d ' ') bd call(s))"
+# ga-xxtwytk: matching the bare id is no longer proof (the guarded owner write is preceded by a `show` that logs the id too):
+# the owner-clearing write AND the flight-label removal must both be in the log.
+if grep -q ' update wa-90omi --if-assignee batista-wa ' "$WORK/bd.log" 2>/dev/null \
+   && grep -q ' label remove wa-90omi story:in-flight ' "$WORK/bd.log" 2>/dev/null; then
+  ok "AC2: wa-90omi was actually reclaimed (owner cleared with the guarded write, flight label removed; $(wc -l < "$WORK/bd.log" | tr -d ' ') bd call(s))"
 else
   bad "AC2: no bd mutation fired for wa-90omi — reclaim silently suppressed (bd.log: $(cat "$WORK/bd.log" 2>/dev/null))"
 fi

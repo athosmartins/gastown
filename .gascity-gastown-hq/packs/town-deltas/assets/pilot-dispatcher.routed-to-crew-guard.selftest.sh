@@ -67,6 +67,14 @@ if [ -z "$RECLAIM_FN" ]; then
   echo "FATAL: _pilot_crew_stale_reclaim() not found in $DISPATCHER (pre-fix HEAD, or extraction pattern drifted)" >&2
   exit 2
 fi
+# ga-xxtwytk: the reclaim takes the owner off through these two helpers (guarded write + read-back) BEFORE the flight labels;
+# a harness that cuts out only the reclaim runs it without them ('command not found') and nothing is ever reclaimed.
+OWNER_FN="$(extract_fn '_pilot_owner_state')
+$(extract_fn '_pilot_release_owner')"
+if [ -z "$(extract_fn '_pilot_owner_state')" ] || [ -z "$(extract_fn '_pilot_release_owner')" ]; then
+  echo "FATAL: _pilot_owner_state()/_pilot_release_owner() not found in $DISPATCHER (extraction pattern drifted)" >&2
+  exit 2
+fi
 # _pilot_crew_stale_reclaim calls _beadid_branch_signal as a plain shell
 # function (no timeout wrapper) — override it with a test double rather than
 # extracting the real one, which would otherwise need a full git-repo sandbox.
@@ -235,9 +243,18 @@ if [ "\$1" = "-C" ]; then shift 2; fi
 case "\$1" in
   label|assign|update) echo "MUT \$*" >>"$MUT" ;;
 esac
+# ga-xxtwytk: the bead reads as the crew's in_progress claim until an owner-clearing write lands, then as an open bead
+# without owner (what bd answers once the guarded write went through); one marker per bead id (\$2 = the id)
+case "\$1" in
+  show) if [ -e "$WORK/cleared.\$2" ]; then printf '[{"status":"open"}]'; else printf '[{"status":"in_progress","assignee":"batista-wa"}]'; fi ;;
+  update) case "\$*" in *--assignee*) : > "$WORK/cleared.\$2" ;; esac ;;
+esac
 exit 0
 EOF
 chmod +x "$BIN/bd"
+# ga-xxtwytk: the helpers bound their bd calls with \`timeout 15\`; the sandbox PATH has none, so a stub that just runs the command
+printf '%s\n' '#!/bin/sh' 'shift' 'exec "$@"' > "$BIN/timeout"
+chmod +x "$BIN/timeout"
 
 # run_reclaim <in_flight_json> <branch_beads_space_list> [extra_env] — runs
 # the extracted function with stub _beadid_branch_signal + _ownership_guard_
@@ -251,6 +268,7 @@ chmod +x "$BIN/bd"
 run_reclaim() {
   local _json="$1" _has_branch="$2" _extra_env="${3:-}"
   : >"$MUT"
+  rm -f "$WORK"/cleared.*
   # _extra_env listed LAST so a caller-supplied override (e.g. TEST_REPOS_OK=0)
   # wins over the defaults to its left — env applies assignments in order and
   # the last one for a given name wins.
@@ -263,6 +281,7 @@ _beadid_branch_signal() {
     *) return 1 ;;
   esac
 }
+$OWNER_FN
 $RECLAIM_FN
 _pilot_crew_stale_reclaim '$_json' '$CUTOFF'
 "
@@ -273,7 +292,7 @@ J1=$(jq -n --arg id "wa-vm94r" --arg a "batista-wa" --arg u "$STALE_TS" --arg db
   '[{id:$id, assignee:$a, updated_at:$u, _rig_db:$db}]')
 run_reclaim "$J1" ""
 if grep -q '^MUT label remove wa-vm94r story:in-flight' "$MUT" \
-   && grep -q '^MUT assign wa-vm94r' "$MUT"; then
+   && grep -q '^MUT update wa-vm94r --if-assignee batista-wa ' "$MUT"; then
   ok "stale + crew assignee + no branch -> RECLAIMED (unassigned, story:in-flight cleared) — reproduces the wa-vm94r fix"
 else
   bad "stale + crew assignee + no branch -> expected reclaim mutations, got: $(cat "$MUT" 2>/dev/null | tr '\n' '|')"
@@ -344,7 +363,7 @@ J7=$(jq -n --arg id1 "wa-vm94r" --arg a1 "batista-wa" --arg u1 "$STALE_TS" --arg
   '[{id:$id1, assignee:$a1, updated_at:$u1, _rig_db:$db1},
     {id:$id2, assignee:$a2, updated_at:$u2, _rig_db:$db2}]')
 run_reclaim "$J7" ""
-if grep -q '^MUT assign wa-vm94r' "$MUT" && ! grep -q 'wa-pool1' "$MUT"; then
+if grep -q '^MUT update wa-vm94r --if-assignee batista-wa ' "$MUT" && ! grep -q 'wa-pool1' "$MUT"; then
   ok "mixed batch -> only the crew-assigned/no-branch bead is touched, the pool-assigned sibling is untouched"
 else
   bad "mixed batch -> expected only wa-vm94r touched, got: $(cat "$MUT" 2>/dev/null | tr '\n' '|')"

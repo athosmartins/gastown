@@ -412,23 +412,30 @@ FNS2="$TMP/fns2.sh"
 : > "$FNS2"
 for _fn in _delivery_branch_patterns_ready _delivery_branch_local_ref _delivery_branch_remote_hit \
            _target_has_real_branch _beadid_has_crew_branch _beadid_matched_crew_branch_ref _beadid_branch_signal \
-           _iso_to_epoch _sling_is_live _beadid_live_crew_owner _pilot_crew_stale_reclaim; do
+           _iso_to_epoch _sling_is_live _beadid_live_crew_owner _pilot_owner_state _pilot_release_owner _pilot_crew_stale_reclaim; do
   awk -v n="$_fn" '$0 ~ "^"n"\\(\\) *\\{" {f=1} f {print} f && /^}$/ {exit}' "$PD" >> "$FNS2"
 done
 cat >> "$FNS2" <<'STUBS2'
 _ownership_guard_repos() { return 0; }
 _session_is_live() { return 0; }
 warn() { printf 'WARN %s\n' "$*"; }
+# ga-xxtwytk: bd is a shell function here and `timeout 15 bd ...` (the bounded call of _pilot_release_owner) cannot run a function:
+# only THAT call skips the bound; every other command (the real probes' `timeout 8 git ls-remote`) still goes through the real timeout
+timeout() { local _d="$1"; shift; if [ "${1:-}" = bd ]; then "$@"; else command timeout "$_d" "$@"; fi; }
 bd() {
   if [ -n "${BDLOG:-}" ]; then printf '%s\n' "$*" >> "$BDLOG"; fi
   case "$*" in
-    *" show "*) printf '[{"assignee":"alice-wa","updated_at":"2020-01-01T00:00:00Z"}]' ;;
+    *" show "*)
+      # the crew's in_progress claim until an owner-clearing write lands, then an open bead without owner (what bd answers once the guarded write went through)
+      if [ -n "${BDLOG:-}" ] && [ -e "$BDLOG.cleared" ]; then printf '[{"status":"open","updated_at":"2020-01-01T00:00:00Z"}]'
+      else printf '[{"status":"in_progress","assignee":"alice-wa","updated_at":"2020-01-01T00:00:00Z"}]'; fi ;;
+    *" update "*"--assignee"*) if [ -n "${BDLOG:-}" ]; then : > "$BDLOG.cleared"; fi ;;
   esac
   return 0
 }
 STUBS2
 bash -n "$FNS2" 2>/dev/null || { echo "FATAL: section-9 functions do not parse" >&2; exit 2; }
-for _fn in _sling_is_live _beadid_live_crew_owner _pilot_crew_stale_reclaim _beadid_branch_signal; do
+for _fn in _sling_is_live _beadid_live_crew_owner _pilot_owner_state _pilot_release_owner _pilot_crew_stale_reclaim _beadid_branch_signal; do
   grep -q "^${_fn}()" "$FNS2" || { echo "FATAL: $_fn not extracted from $PD" >&2; exit 2; }
 done
 BDLOG="$TMP/bd.log"; : > "$BDLOG"
@@ -489,23 +496,23 @@ NOW_EPOCH="$(date +%s)"
 ROW_NONE='[{"id":"ga-none","_rig_db":"/stub-db","assignee":"alice-wa","updated_at":"2020-01-01T00:00:00Z"}]'
 ROW_FEAT='[{"id":"ga-feat","_rig_db":"/stub-db","assignee":"alice-wa","updated_at":"2020-01-01T00:00:00Z"}]'
 reclaim() { # <lib|nolib> <repos> <row-json>  → CXRC/CXOUT, and BDLOG holds every bd call the function made
-  : > "$BDLOG"
+  : > "$BDLOG"; rm -f "$BDLOG.cleared"
   cx "$1" "$2" "_pilot_crew_stale_reclaim '$3' $NOW_EPOCH"
 }
 reclaim lib "$R" "$ROW_NONE"
-if [ "$CXRC" = 0 ] && grep -q ' assign ga-none ' "$BDLOG"; then ok "no branch anywhere (every repo answered) → RECLAIMED: unassigned (the release path is reachable)"; else bad "reclaim of a branch-less stale bead did not happen — rc=$CXRC out='$CXOUT' bdlog='$(cat "$BDLOG")'"; fi
+if [ "$CXRC" = 0 ] && grep -q ' update ga-none --if-assignee alice-wa ' "$BDLOG" && grep -q ' label remove ga-none story:in-flight ' "$BDLOG"; then ok "no branch anywhere (every repo answered) → RECLAIMED: owner cleared with the guarded write, flight label off (the release path is reachable)"; else bad "reclaim of a branch-less stale bead did not happen — rc=$CXRC out='$CXOUT' bdlog='$(cat "$BDLOG")'"; fi
 reclaim lib "$R" "$ROW_FEAT"
-if [ "$CXRC" = 0 ] && ! grep -q ' assign ' "$BDLOG"; then ok "a delivery branch exists → NOT reclaimed"; else bad "bead with a branch was reclaimed — rc=$CXRC bdlog='$(cat "$BDLOG")'"; fi
+if [ "$CXRC" = 0 ] && ! grep -qE ' (update|label|assign|close) ' "$BDLOG"; then ok "a delivery branch exists → NOT reclaimed"; else bad "bead with a branch was reclaimed — rc=$CXRC bdlog='$(cat "$BDLOG")'"; fi
 reclaim nolib "$R" "$ROW_NONE"
-if [ "$CXRC" = 0 ] && ! grep -q ' assign ' "$BDLOG" && case "$CXOUT" in *"NOT reclaiming stale in-flight ga-none"*) true ;; *) false ;; esac; then
+if [ "$CXRC" = 0 ] && ! grep -qE ' (update|label|assign|close) ' "$BDLOG" && case "$CXOUT" in *"NOT reclaiming stale in-flight ga-none"*) true ;; *) false ;; esac; then
   ok "lib NOT loaded → could not tell → NOT reclaimed, and the log says why"
 else bad "lib-less sweep reclaimed (or stayed silent) — rc=$CXRC out='$CXOUT' bdlog='$(cat "$BDLOG")'"; fi
 reclaim lib "$DEADREMOTE" "$ROW_NONE"
-if [ "$CXRC" = 0 ] && ! grep -q ' assign ' "$BDLOG"; then ok "unreachable origin, no local branch → NOT reclaimed"; else bad "reclaimed on an unreachable origin — rc=$CXRC bdlog='$(cat "$BDLOG")'"; fi
+if [ "$CXRC" = 0 ] && ! grep -qE ' (update|label|assign|close) ' "$BDLOG"; then ok "unreachable origin, no local branch → NOT reclaimed"; else bad "reclaimed on an unreachable origin — rc=$CXRC bdlog='$(cat "$BDLOG")'"; fi
 reclaim lib "$BROKEN" "$ROW_NONE"
-if [ "$CXRC" = 0 ] && ! grep -q ' assign ' "$BDLOG"; then ok "repo git cannot open → NOT reclaimed"; else bad "reclaimed on an unreadable repo — rc=$CXRC bdlog='$(cat "$BDLOG")'"; fi
+if [ "$CXRC" = 0 ] && ! grep -qE ' (update|label|assign|close) ' "$BDLOG"; then ok "repo git cannot open → NOT reclaimed"; else bad "reclaimed on an unreadable repo — rc=$CXRC bdlog='$(cat "$BDLOG")'"; fi
 reclaim lib "$BROKEN"$'\n'"$R" "$ROW_NONE"
-if [ "$CXRC" = 0 ] && ! grep -q ' assign ' "$BDLOG"; then ok "one repo says none, another is unreadable → NOT reclaimed (none must be confirmed everywhere)"; else bad "reclaimed with an unreadable repo in the scan — rc=$CXRC bdlog='$(cat "$BDLOG")'"; fi
+if [ "$CXRC" = 0 ] && ! grep -qE ' (update|label|assign|close) ' "$BDLOG"; then ok "one repo says none, another is unreadable → NOT reclaimed (none must be confirmed everywhere)"; else bad "reclaimed with an unreadable repo in the scan — rc=$CXRC bdlog='$(cat "$BDLOG")'"; fi
 
 echo
 echo "── results: $PASS passed, $FAIL failed ──"

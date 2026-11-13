@@ -6550,8 +6550,12 @@ has "$DISPATCHER" '_filter_exec_manual \| _reconcile_empty_description_signal "\
 # empty assignee, so a bead released back to story:approved while still carrying its drained
 # builder's assignee is INVISIBLE to every candidate query forever (ps-mrfb/ps-joc0 stuck behind
 # dead ps-worker-adhoc sessions). The gate-FAIL path unassigns; NEVERSTARTED must too.
-has "$DISPATCHER" 'assign "\$_bid" ""' \
-  "NEVERSTARTED release clears the dead-worker assignee (ga-mrfb: else _filter_candidates hides the released bead)"
+# ga-xxtwytk: the clear is no longer a bare `bd assign <id> ""` (bd 1.1.0 refuses it against another actor's in_progress
+# claim, bd-98s5c, and the refusal was swallowed after the flight labels were already off): it is _pilot_release_owner, run
+# FIRST, and the labels only come off when it returns 0. What it does with each outcome is proven by
+# pilot-dispatcher.release-owner.selftest.sh; this line only keeps the wiring from drifting.
+has "$DISPATCHER" '_pilot_release_owner "\$_db" "\$_bid" "\$_ns_owner" \|\| continue' \
+  "NEVERSTARTED release clears the dead-worker assignee first, and keeps the flight labels if it cannot (ga-mrfb: else _filter_candidates hides the released bead; ga-xxtwytk: bd-98s5c refuses a bare assign)"
 
 # ── Scenario 22h: ownership guard exempts gate:needs-fix from the branch-exists refusal
 # A gate-failed bead in the gate-fix loop OWNS its branch crew/*/<bead> from the prior
