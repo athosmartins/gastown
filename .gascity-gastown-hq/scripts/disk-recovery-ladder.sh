@@ -98,7 +98,7 @@ SWAPNOTE=""  # " [swap NÃO verificado...]" quando o vm.swapusage não foi lido 
 LOCK_WHY=""  # por que o acquire_lock devolveu 2 (não consegui tomar nem verificar a trava)
 LOCK_HELD=0
 RC_FINAL=0
-SHED_WORKING=0  # 1 = o D3.5 desta rodada ainda tem o que cortar (rc 0 ou 10): o "precisa de um humano" do teto espera
+SHED_WORKING=0  # 1 = o D3.5 desta rodada ainda tem o que cortar (SÓ rc 0 ou 12): o "precisa de um humano" do teto espera
 SAVE_FAIL=0
 ASIDE=""     # estado ruim a guardar (.corrupt-<hora>, link duro) antes de o novo tomar o lugar dele por rename
 SEEN=" "     # chaves que o load_state viu no arquivo
