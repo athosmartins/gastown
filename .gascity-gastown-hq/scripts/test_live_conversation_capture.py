@@ -686,6 +686,62 @@ class Arm(unittest.TestCase):
         self.assertIn("unexpected ZeroDivisionError", LOG(self.w))
 
 
+class CorruptReads(unittest.TestCase):
+    """every JSON the arming reads can come back corrupt: it lands in the inert state (nothing armed, nothing concluded), never as a verdict"""
+
+    def setUp(self):
+        self.w = World(self)
+        self.w.crew()
+        self.w.good_transcript(U1)
+        self.w.io.meta["ga-wisp-aaa"] = {"session_key": U3}
+
+    def test_a_corrupt_bd_query_roster_is_unreadable_and_the_final_falls_back_to_gc_then_to_exit_3(self):
+        for body in ("{not json", "{}", '"text"', "7"):
+            with self.subTest(body=body):
+                self.w.io.fail["bd:query"] = (0, body, "")
+                self.assertEqual((self.w.go(final=True)[0], self.w.io.n("gc") > 0), (0, True))  # gc answers: the corrupt beads answer is not a roster, and not "no targets" either
+                self.w.io.calls.clear()
+                self.w.io.fail["gc"] = (0, "{not json", "")
+                self.assertEqual(self.w.go(final=True)[0], 3)  # both sources corrupt: the pass is blind, exit 3, nothing written
+                self.w.io.fail.clear()
+        self.w.io.fail["bd:query"] = (0, json.dumps([{"id": 5}, "x", {"id": "ga-wisp-q", "metadata": 3}, {"id": "ga-wisp-aaa", "metadata": {"template": "thies-wa", "session_name": "thies-wa-gawispaaa", "state": "awake"}}]), "")
+        self.assertEqual(self.w.go(final=True)[1]["targets"], 1)  # malformed rows are skipped one by one; the good row is still a target
+
+    def test_a_corrupt_read_back_after_the_capture_write_is_a_failed_write_and_arms_nothing(self):
+        self.w.io.fail["bd:show"] = (0, "{not json", "")
+        c = self.w.go(final=True)[1]
+        self.assertEqual((c["wrote"], c["failed"], c["armed"]), (0, 1, 0), LOG(self.w))
+        self.assertIn("read-back unreadable", LOG(self.w))
+        self.assertNotIn("sleep_reason", self.w.io.meta["ga-wisp-aaa"])
+
+    def test_corrupt_bead_metadata_is_unknown_for_the_arming_dry_run_and_for_the_boot_check(self):
+        for body in ("{not json", "[]", "[7]", '[{"metadata": 7}]'):
+            with self.subTest(body=body):
+                self.setUp()
+                self.w.io.fail["bd:show"] = (0, body, "")
+                out = self.w.main("--final", "--dry-run")[1]
+                self.assertIn("unknown: bead metadata unreadable", out)
+        # after a boot onto another conversation, a bead that cannot be read concludes nothing: no verdict, no nudge
+        self.setUp()
+        self.w.go(final=True)
+        self.w.io.t += 400
+        self.w.crew(sid=U2)
+        self.w.good_transcript(U2)
+        self.w.io.fail["bd:show"] = (0, "{not json", "")
+        self.w.go()
+        self.assertEqual((self.w.io.nudges, self.w.io.meta["ga-wisp-aaa"].get(K_RES)), ([], None))
+
+    def test_garbage_lines_in_a_transcript_are_skipped_and_the_rest_is_still_judged(self):
+        path = "%s/.claude/projects/-p/%s.jsonl" % (self.w.home, U1)
+        self.w.good_transcript(U1, tokens=1234)
+        with open(path, "a") as fh:
+            fh.write("{not json\n\n[1, 2]\n" + '{"type": "assistant", "message": {"content": "partial')  # a half-written last record, as a live claude leaves it
+        self.assertEqual(L.transcript_check(path, 700000), ("ok", "1234 tokens"))
+        with open(path, "w") as fh:
+            fh.write("{not json\n")
+        self.assertEqual(L.transcript_check(path, 700000)[0], "unknown")  # nothing readable = the size is unknown, never "fits"
+
+
 class Boot(unittest.TestCase):
     """normal passes after a boot: the verdict, the one nudge, the disarm"""
 
