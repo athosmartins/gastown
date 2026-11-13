@@ -462,7 +462,9 @@ def check_boot(io, cfg, log, bead, tname, sid, ent, tmo, dry):
     woke = parse_rfc3339(meta.get("last_woke_at"))
     since = arm.get("at") if arm and isinstance(arm.get("at"), (int, float)) else ent.get("at")
     since = since if isinstance(since, (int, float)) else 0
-    restarted = woke is not None and woke > since
+    if woke is None:
+        return  # the engine's wake stamp is unreadable: whether a restart happened is unknown, so nothing is concluded, nudged or disarmed (the next pass asks again)
+    restarted = woke > since
     if not restarted:
         if arm and io.now() - arm["at"] > cfg.disarm_s and not dry:
             if meta.get("sleep_reason") == CITY_STOP and meta.get(K_ARM_ID) == arm.get("id"):

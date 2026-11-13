@@ -826,6 +826,9 @@ class Boot(unittest.TestCase):
         self.m()["last_woke_at"] = "not a time"
         self.w.go()
         self.assertEqual((self.w.io.nudges, self.m().get(K_RES)), ([], None))
+        self.w.io.t += 2000  # even past the disarm window: an unreadable stamp is "do not know", not "the reboot did not happen"
+        self.w.go()
+        self.assertEqual((self.m().get("sleep_reason"), "DISARMED" in LOG(self.w)), ("city-stop", False))
         self.w.io.fail["bd:show"] = (1, "", "x")
         self.w.go()
         self.assertEqual((self.w.io.nudges, self.m().get(K_RES)), ([], None))
