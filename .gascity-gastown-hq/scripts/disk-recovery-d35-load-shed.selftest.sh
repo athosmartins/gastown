@@ -221,16 +221,16 @@ lt() {  # uma rodada do maestro (launchd) na hora $1, com o D3.5 de verdade; o D
     D35_CITY="$C/city" D35_ALLOWLIST="$ALLOW" D35_PLIST_DIR="$C/plists" D35_LAUNCHCTL_BIN="$W/bin/launchctl" D35_FREE_MB_FILE="$C/free" D35_NOW="$1" D35_UID=501 D35_SETTLE_S=0 D35_STOP_WAIT_S=1 D35_WATCH_S=1 D35_LC_TIMEOUT_S=3 \
     ${D35_ST_BASH:-bash} "$LAD" --run > "$C/maestro.out" 2>&1; RC=$?
 }
-for t in $(seq $NOW 300 $((NOW + 2400))); do lt "$t"; done
+for ((t = NOW; t <= NOW + 2400; t += 300)); do lt "$t"; done
 eq "$(mut)" 0 "antes de 2700 s com o disco < 3 GB o D3.5 não corta nada"
 lt $((NOW + 2700)); has "$(cat "$MSL")" "Disco: D3.5 cortou carga" "2700 s: o maestro chama o D3.5 e avisa"; has "$(cat "$MSL")" "Alfa [com.t.a], Beta [com.t.b], Gama [com.t.c]" "o aviso traz a LISTA do que parou"
 eq "$(muts)" "disable gui/501/com.t.a;bootout gui/501/com.t.a;disable gui/501/com.t.b;bootout gui/501/com.t.b;disable gui/501/com.t.c;bootout gui/501/com.t.c;" "pararam só os 3 primeiros da allowlist, disable antes do bootout"
-for t in $(seq $((NOW + 3000)) 300 $((NOW + 6300))); do lt "$t"; done
+for ((t = NOW + 3000; t <= NOW + 6300; t += 300)); do lt "$t"; done
 eq "$(grep -c 'degrau D4: rc=0' "$C/city/.gc/logs/disk-recovery.log"),$(grep -c -E 'sender|unlisted' "$LC/calls")" "1,0" "o D4 reiniciou UMA vez (rc 0; o teto de 6 h o segura); nada fora da allowlist foi consultado"
 eq "$(ls "$LC/loaded" | grep -c 'com.t.[abcde]$')" 0 "esgotada a lista, os 5 estão parados"
 has "$(cat "$MSL")" "preciso de um humano" "lista esgotada com o disco < 3 GB e o D4 no teto: o 'precisa de um humano' SAI"
 eq "$(awk '/Disco: D3.5 cortou carga/ { c = NR } /preciso de um humano/ { if (!h) h = NR } END { print (c && h && h > c) ? "depois" : "antes:" c "/" h }' "$MSL")" "depois" "…e só DEPOIS do último corte"
-echo 7000 > "$C/free"; for t in $(seq $((NOW + 6600)) 300 $((NOW + 9600))); do lt "$t"; done
+echo 7000 > "$C/free"; for ((t = NOW + 6600; t <= NOW + 9600; t += 300)); do lt "$t"; done
 eq "$(grep -c 'D3.5 religou um serviço' "$MSL")" 5 "disco >= 6 GB por 30 min: os 5 religados, um por rodada"
 has "$(grep 'D3.5 religou um serviço' "$MSL" | head -n 1)" "[com.t.e]" "o último parado volta primeiro"; has "$(grep 'D3.5 religou um serviço' "$MSL" | head -n 1)" "pid 1004 -> 5000" "e a prova é o pid NOVO"
 eq "$(ls "$LC/disabled" | wc -l | tr -d ' '),$(ls "$LC/loaded" | grep -c 'com.t.[abcde]$')" "0,5" "nada fica desabilitado e os 5 voltam a estar carregados"
