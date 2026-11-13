@@ -3,8 +3,9 @@
 <plist version="1.0">
 <dict>
   <key>Label</key><string>com.gascity.login-rc-restore</string>
-  <!-- ga-bw9hmzg: every 60 s, after a /login or a bare /remote-control, brings the Mayor and the named crews back with their FIXED Remote Control name
-       (gc session kill -> the reconciler respawns with the provider flag); ONE notify -p 4 at 20 min if any is still wrong. Mayor only with .gc/login-rc-restore.mayor-on.
+  <!-- ga-bw9hmzg: every 60 s, after a /login, brings the Mayor and the named crews back with their FIXED Remote Control name (gc session kill; the engine does not start a killed
+       session by itself, so the job reads it back, asks `gc session wake` while it sleeps, holds the other kills until it is back, and rings once if it does not come back: ga-otcbpvl).
+       A bare /remote-control kills nothing (the name is cosmetic). ONE notify -p 4 at 20 min if any is still wrong. Mayor only with .gc/login-rc-restore.mayor-on.
        Contract and states: header of scripts/login-rc-restore.py. ONE summary line per pass to the .out.
        INSTALL on the mini (until it is loaded the watchdog PRESENCE-DRIFT flags this file): first `/usr/bin/python3 scripts/login-rc-restore.py` with the dry-run option
        (`alvos=` must list the Mayor and every live crew, `reiniciou=0`), then cp this plist to ~/Library/LaunchAgents/ and launchctl bootstrap gui/$(id -u) it.

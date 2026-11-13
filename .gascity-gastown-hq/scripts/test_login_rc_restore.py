@@ -48,7 +48,8 @@ M, T, D = "gh-mayor", "ga-thies", "ga-digo"
 class FakeIO:
     def __init__(self):
         self.t, self.calls, self.fail, self.notify_rc = NOW, [], {}, 0
-        self.roster, self.panes, self.procs, self.screens, self.kills, self.notes = [], {}, {}, {}, [], []
+        self.roster, self.panes, self.procs, self.screens, self.kills, self.wakes, self.notes = [], {}, {}, {}, [], [], []
+        self.engine = lambda verb, bead: None  # World installs what the real engine does with a kill / a wake
 
     def now(self):
         return self.t
@@ -56,12 +57,16 @@ class FakeIO:
     def run(self, argv, timeout, env=None):
         self.calls.append(list(argv))
         tool = os.path.basename(argv[0])
-        verb = "kill" if "kill" in argv else "capture-pane" if "capture-pane" in argv else ""
+        verb = next((v for v in ("kill", "wake", "capture-pane") if v in argv), "")
         f = self.fail.get(tool + ":" + verb, self.fail.get(tool, False))
         if f is not False:
             return f
         if tool == "gc":
-            return (self.kills.append(argv[-1]) or (0, "", "")) if verb else (0, json.dumps({"sessions": self.roster}), "")
+            if verb:
+                (self.kills if verb == "kill" else self.wakes).append(argv[-1])
+                self.engine(verb, argv[-1])
+                return 0, "", ""
+            return 0, json.dumps({"sessions": self.roster}), ""
         if tool == "ps":
             return 0, "".join("%d %d %02d:%02d:%02d %s\n" % (p, pp, (self.t - st) // 3600, (self.t - st) % 3600 // 60, (self.t - st) % 60, args)
                               for p, (pp, st, args) in sorted(self.procs.items())), ""
@@ -81,6 +86,7 @@ class World:
         self.d = tempfile.mkdtemp(prefix="lrr-t-")
         tc.addCleanup(shutil.rmtree, self.d, True)
         self.city, self.home, self.io, self.sess = os.path.join(self.d, "city"), os.path.join(self.d, "home"), FakeIO(), {}
+        self.io.engine, self.wake_works = self.engine, True
         for p in ("city/.gc/logs", "city/agents", "home/.claude/sessions", "home/.claude/projects"):
             os.makedirs(os.path.join(self.d, p))
         with open(self.p("city.toml"), "w") as fh:
@@ -112,9 +118,28 @@ class World:
         cwd = cwd or "/x/rig/crew/%s" % bead
         tdir = os.path.join(self.home, ".claude", "projects", cwd.replace("/", "-").replace(".", "-").replace("_", "-"))
         os.makedirs(tdir, exist_ok=True)
-        self.sess[bead] = {"pid": cpid, "sid": sid, "cwd": cwd, "tname": tname, "tr": os.path.join(tdir, sid + ".jsonl")}
+        self.sess[bead] = {"pid": cpid, "base": base, "sid": sid, "cwd": cwd, "tname": tname, "tr": os.path.join(tdir, sid + ".jsonl")}
         self.reg(bead, bridge=bridge)
         self.say(bead, {"type": "user", "message": {"content": "hi"}})
+
+    def row(self, bead):
+        return next(r for r in self.io.roster if r["id"] == bead)
+
+    def die(self, bead):
+        """what a kill does (measured 13/11, five crews): tmux session and processes gone, the roster says asleep, and nothing brings it back by itself"""
+        s = self.sess[bead]
+        self.io.panes.pop(s["tname"], None)
+        s["dead"] = self.io.procs.pop(s["pid"])
+        self.io.procs.pop(s["base"], None)
+        self.row(bead)["state"] = "asleep"
+
+    def engine(self, verb, bead):
+        if verb == "kill":
+            self.die(bead)
+        elif self.wake_works:  # `gc session wake` is what brought them back (13/11), as a NEW conversation: the registry names another sessionId
+            self.restart(bead)
+            self.sess[bead]["sid"] = "f" + self.sess[bead]["sid"][1:]
+            self.reg(bead)
 
     def mayor(self, age=5000):
         self.session("gastown.mayor", M, 200, "Mayor", cwd="/x/.gascity-gastown-hq/.gc/agents/mayor", age=age)
@@ -131,9 +156,11 @@ class World:
         os.utime(path, (self.io.procs[s["pid"]][1] + 2,) * 2)
 
     def restart(self, bead, args=None, **kw):
-        """the reconciler respawned it: a new claude (new pid, started now) with its launch flag"""
+        """the reconciler (or a wake) respawned it: a new claude (new pid, started now) with its launch flag; a dead session gets its tmux session back"""
         s = self.sess[bead]
-        old = self.io.procs.pop(s["pid"])
+        old = s.pop("dead", None) or self.io.procs.pop(s["pid"])
+        self.io.panes[s["tname"]], self.io.procs[s["base"]] = ("%%%d" % s["base"], s["base"]), (1, self.io.t, "/bin/sh")
+        self.row(bead)["state"] = "active"
         s["pid"] += 1000
         self.io.procs[s["pid"]] = (old[0], self.io.t, args or old[2])
         self.reg(bead, **kw)
@@ -167,33 +194,34 @@ class World:
             return fh.read()
 
     def healed_mayor(self, **kw):
-        """/login in the Mayor with the gate on: killed, then respawned by the reconciler"""
+        """/login in the Mayor with the gate on: killed, respawned by the reconciler, and seen back by the next pass"""
         self.gate()
         self.say(M, LOGIN_OUT)
         self.go()
         self.restart(M, **kw)
+        self.go()
 
 class Events(unittest.TestCase):
     def test_only_the_structural_shapes_are_events(self):
-        for entries, kills, logged in (((LOGIN_CMD, LOGIN_OUT), [T], "EVENT login thies-wa"), ((RC_BARE,), [T], "EVENT rc-unnamed thies-wa"),
+        for entries, kills, logged in (((LOGIN_CMD, LOGIN_OUT), [T], "EVENT login thies-wa"), ((RC_BARE,), [], "NOTE rc-unnamed thies-wa"),
                                        ((RC_NAMED,), [], None), (QUOTED, [], None)):
             with self.subTest(entries=entries[0]):
                 w = World(self)
                 w.say(T, *entries)
                 rc, out = w.go()
                 self.assertEqual((rc, w.io.kills), (0, kills))
-                self.assertIn(logged, w.log()) if logged else self.assertNotIn("EVENT", w.log())
+                self.assertIn(logged, w.log()) if logged else self.assertNotRegex(w.log(), "EVENT|NOTE")
                 if kills:
                     self.assertIn("reiniciou=1", out)
-                    w.go(2)
-                    self.assertEqual(w.io.kills, kills, "once per event, even while the reconciler has not respawned it yet")
+                    w.go(3)
+                    self.assertEqual(w.io.kills, kills, "once per event: the wake that brings it back is not a second kill")
 
     def test_history_before_first_sight_never_triggers(self):
         w = World(self, first=False)
         w.say(T, LOGIN_CMD, LOGIN_OUT, RC_BARE)
         w.go(2)
         self.assertEqual(w.io.kills, [])
-        self.assertNotIn("EVENT", w.log())
+        self.assertNotRegex(w.log(), "EVENT|NOTE")
 
     def test_new_conversation_born_after_last_pass_is_read_from_its_start_but_not_its_copied_history(self):
         for back, kills in ((0, [M]), (3600, [])):  # 3600: a resume that copied old turns into a new file
@@ -255,6 +283,15 @@ class Kills(unittest.TestCase):
         rc, out = w.go()
         self.assertEqual((w.io.kills, "alvos=0" in out), ([], True))
 
+    def test_bare_remote_control_opens_no_window_for_the_other_crews_and_rings_nothing(self):
+        w = World(self)
+        w.reg(D, bridge=None)  # idle, no bridge: inside an open window it would be restarted
+        w.say(T, RC_BARE)
+        w.go(3)
+        self.assertEqual((w.io.kills, w.io.wakes), ([], []))
+        w.go(adv=1300)
+        self.assertEqual(w.io.notes, [], "the name of the Remote Control is cosmetic: not even an alarm 20 min later")
+
     def test_mayor_gate_off_logs_would_and_gate_on_kills(self):
         w = self.w
         w.say(M, LOGIN_OUT)
@@ -271,8 +308,8 @@ class Kills(unittest.TestCase):
         w.gate()
         w.login_in_busy_mayor()
         w.reg(T, bridge=None)
-        w.go()  # the event is recorded and thies (idle, no bridge) killed: the window is open
-        self.assertEqual(w.io.kills, [T])
+        w.go(3)  # the event is recorded, thies (idle, no bridge) killed, woken and seen back: the window is open and nothing is in flight
+        self.assertEqual((w.io.kills, w.io.wakes), ([T], [T]))
         w.io.kills.clear()
         w.reg(D, bridge=None)
         w.io.screens["%300"] = STUCK
@@ -307,7 +344,7 @@ class Alarm(unittest.TestCase):
         w.go(adv=120)
         self.assertEqual(len(w.io.notes), 1)
         argv, env = w.io.notes[0]
-        self.assertEqual((argv[1:3], env.get("NOTIFY_STRICT_EXIT")), (["-p", "4"], "1"))
+        self.assertEqual((argv[1:3], env), (["-p", "4"], {"NOTIFY_STRICT_EXIT": "1", "NOTIFY_FORCE_PUSH": "1"}))
         self.assertIn("mayor: não reiniciou depois do /login (gate do Mayor desligado)", argv[-1])
         self.assertNotIn("thies-wa", argv[-1])
         w.go(5)
@@ -349,6 +386,225 @@ class Alarm(unittest.TestCase):
         w.go(adv=600)
         w.go(adv=600)
         self.assertEqual(len(w.io.notes), 2)
+
+class Restore(unittest.TestCase):
+    """a kill is not trusted to be undone: the engine leaves a killed session asleep and nobody wakes it (13/11: five crews, runtime-missing)"""
+    def test_a_killed_session_left_asleep_is_woken_then_confirmed_back(self):
+        w = World(self)
+        w.say(T, LOGIN_OUT)
+        w.go()
+        self.assertEqual((w.io.kills, w.io.wakes, w.row(T)["state"]), ([T], [], "asleep"))
+        rc, out = w.go()
+        self.assertEqual(([c for c in w.io.calls if "wake" in c], "acordou=1 pendentes=1" in out), ([["gc", "--city", w.city, "session", "wake", T]], True))
+        rc, out = w.go()
+        self.assertIn("RESTORED thies-wa (ga-thies) 120 s after the kill, conversation 00000100 -> f0000100", w.log())
+        self.assertEqual((w.row(T)["state"], "acordou=0 pendentes=0" in out), ("active", True))
+        w.go(30)
+        self.assertEqual((w.io.kills, w.io.wakes, w.io.notes), ([T], [T], []))
+
+    def test_one_restart_in_flight_at_a_time_the_next_waits_until_it_is_back(self):
+        w = World(self)
+        w.login_in_busy_mayor()
+        w.reg(T, bridge=None)
+        w.reg(D, bridge=None)
+        w.go()
+        self.assertEqual(w.io.kills, [D], "digo-wa sorts first: killing both at once is what stranded five crews")
+        self.assertIn("HOLD kill thies-wa (ga-thies)", w.log())
+        self.assertIn("the restart of digo-wa (0 s ago) is not confirmed back yet", w.log())
+        w.go()
+        self.assertEqual((w.io.kills, w.io.wakes), ([D], [D]))
+        w.go()
+        self.assertEqual((w.io.kills, w.io.wakes), ([D, T], [D]))
+        self.assertEqual(w.log().count("HOLD kill thies-wa"), 1, "said once, not on every pass")
+
+    def test_a_restart_that_never_comes_back_rings_once_holds_the_rest_and_is_never_all_ok(self):
+        w = World(self)
+        w.wake_works = False
+        w.login_in_busy_mayor()
+        w.reg(T, bridge=None)
+        w.reg(D, bridge=None)
+        w.go(10)  # the kill at pass 1; wake requests 60, 240 and 420 s later; the 600 s deadline is not reached yet
+        self.assertEqual((w.io.kills, w.io.wakes, w.io.notes), ([D], [D, D, D], []))
+        w.go()  # 600 s after the kill
+        self.assertEqual((len(w.io.wakes), len(w.io.notes)), (4, 1))
+        for said in ("digo-wa", "NÃO voltou", "dormindo (asleep)", "gc session wake ga-digo"):
+            self.assertIn(said, w.io.notes[0][0][-1])
+        w.go(9)
+        self.assertEqual((w.io.kills, len(w.io.wakes), len(w.io.notes), w.log().count("HOLD kill thies-wa")), ([D], 4, 1, 1))
+        w.go(2)  # 20 min after the event: the report lists the dead one instead of saying everything is fine
+        self.assertIn("digo-wa: reiniciada e ainda não voltou", w.io.notes[1][0][-1])
+        self.assertNotIn("ALL OK", w.log())
+
+    def test_a_wake_that_fails_is_retried_later_and_never_more_than_four_times(self):
+        w = World(self, crews=("thies",))
+        w.io.fail = {"gc:wake": (1, "", "boom")}
+        w.say(T, LOGIN_OUT)
+        w.go(31)
+        self.assertEqual([c for c in w.io.calls if "wake" in c], [["gc", "--city", w.city, "session", "wake", T]] * 4)
+        self.assertIn("FAILED wake thies-wa", w.log())
+
+    def test_a_kill_that_gave_no_answer_may_have_happened_so_it_is_followed_up_like_one(self):
+        w = World(self, crews=("thies",))
+        w.io.fail = {"gc:kill": (None, "", "")}  # `gc session kill` timed out under load...
+        w.say(T, LOGIN_OUT)
+        w.go()
+        self.assertIn("FAILED kill thies-wa", w.log())
+        w.io.fail = {}
+        w.die(T)  # ...and the supervisor did it anyway
+        w.go()
+        self.assertEqual(w.io.wakes, [T])
+
+    def test_a_respawn_that_beat_a_slow_kill_back_to_its_caller_is_still_a_restored_session(self):
+        w = World(self, crews=("thies",))
+
+        def slow(verb, bead):  # the kill takes 30 s to return and the engine started the session again 10 s in
+            w.die(bead)
+            w.io.t += 10
+            w.restart(bead)
+            w.io.t += 20
+        w.io.engine = slow
+        w.say(T, LOGIN_OUT)
+        w.go(2)
+        self.assertIn("RESTORED thies-wa", w.log())
+        w.go(adv=700)
+        self.assertEqual(w.io.notes, [], "no false alarm that the old process lives on")
+
+    def test_a_kill_that_failed_outright_is_not_a_restart_in_flight_and_is_retried(self):
+        w = World(self, crews=("thies",))
+        w.io.fail = {"gc:kill": (1, "", "no such session")}
+        w.say(T, LOGIN_OUT)
+        w.go()
+        w.io.fail = {}
+        w.go()
+        self.assertEqual((w.io.kills, w.io.wakes), ([T], []))
+
+    def test_unreadable_roster_wakes_nothing_but_the_deadline_alarm_still_rings(self):
+        w = World(self, crews=("thies",))
+        w.say(T, LOGIN_OUT)
+        w.go()
+        w.io.fail = {"gc": (None, "", "")}
+        rc, out = w.go(adv=700)
+        self.assertEqual((rc, w.io.wakes, len(w.io.notes)), (3, [], 1))
+        self.assertIn("lista de sessões", w.io.notes[0][0][-1])
+        w.go()
+        self.assertEqual(len(w.io.notes), 1, "rang once: the mark is kept even when the pass could not evaluate")
+        w.io.fail = {}
+        w.go()
+        self.assertEqual(w.io.wakes, [T])
+
+    def test_the_alarm_says_where_the_restart_is_stuck(self):
+        quiet = lambda w: setattr(w.io, "engine", lambda verb, bead: None)  # the kill changed nothing: the old claude lives on
+        for pre, post, said in ((None, None, "dormindo (asleep)"), (None, lambda w: w.row(T).update(state="creating"), "ainda subindo (creating)"),
+                                (None, lambda w: w.io.roster.remove(w.row(T)), "fora da lista de sessões"), (None, lambda w: w.row(T).update(state="drained"), "estado drained"),
+                                (None, lambda w: w.row(T).update(state="active"), "ativa na lista mas sem claude vivo"), (None, lambda w: w.row(T).update(state="active", template="wa-worker"), "ativa na lista mas fora dos alvos"),
+                                (quiet, None, "o processo antigo segue vivo"),
+                                (quiet, lambda w: setattr(w.io, "fail", {"tmux": (None, "", "")}), "não consegui ler (tmux did not answer)"),
+                                (None, lambda w: setattr(w.io, "fail", {"gc": (None, "", "")}), "lista de sessões")):
+            with self.subTest(said=said):
+                w = World(self, crews=("thies",))
+                w.wake_works = False
+                (pre or (lambda w: None))(w)
+                w.say(T, LOGIN_OUT)
+                w.go()
+                (post or (lambda w: None))(w)
+                w.go(adv=700)
+                self.assertEqual(len(w.io.notes), 1)
+                self.assertIn(said, w.io.notes[0][0][-1])
+                self.assertNotIn("RESTORED thies-wa", w.log())
+                self.assertEqual(bool(w.io.wakes), said == "dormindo (asleep)", "only a session the roster calls asleep is asked to wake")
+
+    def test_undelivered_restart_alarm_is_retried_after_ten_minutes_not_marked(self):
+        w = World(self, crews=("thies",))
+        w.env.update(LRR_RESTORE_S="120", LRR_ALARM_S="99999")  # the 20-min report of the event is out of this picture
+        w.wake_works = False
+        w.say(T, LOGIN_OUT)
+        w.go()
+        w.io.notify_rc = 12
+        w.go(adv=120)
+        w.go()
+        self.assertEqual(len(w.io.notes), 1, "retry waits 10 min")
+        self.assertIn("NOT delivered (notify rc=12), retried in 10 min", w.log())
+        w.io.notify_rc = 0
+        w.go(adv=600)
+        self.assertEqual(len(w.io.notes), 2)
+        w.go(adv=700)
+        self.assertEqual(len(w.io.notes), 2, "once delivered, it does not ring again")
+
+    def test_an_unconfirmed_restart_holds_the_next_kill_for_an_hour_then_is_forgotten(self):
+        w = World(self)
+        w.wake_works = False
+        w.say(T, LOGIN_OUT)
+        w.go()
+        w.say(D, LOGIN_OUT)  # a second event while thies-wa is still unconfirmed
+        w.go(adv=3000)
+        self.assertEqual(w.io.kills, [T])
+        self.assertNotIn("GAVE UP", w.log())
+        w.go(adv=700)  # 3700 s after the kill
+        self.assertIn("GAVE UP thies-wa", w.log())
+        self.assertEqual(w.io.kills, [T, D])
+
+    def test_a_restart_record_that_is_not_what_this_job_wrote_is_dropped_not_trusted(self):
+        w = World(self, crews=("thies",))
+        state = json.loads(w.read(".gc", "login-rc-restore.state.json"))
+        state["pending"] = {T: {"ts": "yesterday", "wakes": 0, "wake_at": 0}, "ga-digo": {"alias": "digo-wa", "wakes": 0, "wake_at": 0}, "ga-x": "{not json"}
+        with open(w.p(".gc", "login-rc-restore.state.json"), "w") as fh:
+            json.dump(state, fh)
+        w.say(T, LOGIN_OUT)
+        rc, out = w.go()
+        self.assertEqual((rc, w.io.kills, "pendentes=1" in out), (0, [T], True))
+
+    def test_a_kill_that_changed_nothing_is_not_repeated_for_the_same_event_when_the_hold_ends(self):
+        w = World(self, crews=("thies",))
+        w.io.engine = lambda verb, bead: None  # the old claude lives on: idle, and still the process that had the event
+        w.say(T, LOGIN_OUT)
+        w.go()
+        w.go(adv=3700)
+        self.assertIn("GAVE UP thies-wa", w.log())
+        self.assertEqual(w.io.kills, [T], "once per event")
+
+    def test_a_pass_that_could_not_evaluate_leaves_a_state_file_with_nothing_in_flight_alone(self):
+        w = World(self, crews=("thies",))
+        state = json.loads(w.read(".gc", "login-rc-restore.state.json"))
+        state.pop("pending", None)  # as the version before this one wrote it
+        with open(w.p(".gc", "login-rc-restore.state.json"), "w") as fh:
+            json.dump(state, fh, sort_keys=True)
+        before = w.read(".gc", "login-rc-restore.state.json")
+        w.io.fail = {"gc": (None, "", "")}
+        rc, out = w.go()
+        self.assertEqual((rc, w.read(".gc", "login-rc-restore.state.json")), (3, before))
+
+    def test_dry_run_rings_nothing_for_a_restart_past_its_deadline(self):
+        w = World(self, crews=("thies",))
+        w.wake_works = False
+        w.say(T, LOGIN_OUT)
+        w.go()
+        rc, out = w.go(adv=700, dry=True)
+        self.assertEqual((w.io.notes, "WOULD notify: thies-wa foi reiniciada" in out), ([], True))
+
+    def test_a_stored_rc_unnamed_event_of_the_old_version_restarts_nothing(self):
+        w = World(self, crews=("thies",))
+        state, pid = json.loads(w.read(".gc", "login-rc-restore.state.json")), w.sess[T]["pid"]
+        state["events"] = [{"id": "old:1", "bead": T, "alias": "thies-wa", "kind": "rc-unnamed", "ts": w.io.t, "pid": pid, "start": w.io.procs[pid][1]}]
+        with open(w.p(".gc", "login-rc-restore.state.json"), "w") as fh:
+            json.dump(state, fh)
+        w.go(3)
+        self.assertEqual(w.io.kills, [])
+
+    def test_dry_run_holds_the_second_target_like_a_real_run(self):
+        w = World(self)
+        w.login_in_busy_mayor()
+        w.reg(T, bridge=None)
+        w.reg(D, bridge=None)
+        rc, out = w.go(dry=True)
+        self.assertEqual(("WOULD kill digo-wa" in out, "HOLD kill thies-wa" in out, "WOULD kill thies-wa" in out), (True, True, False))
+
+    def test_dry_run_with_a_restart_pending_asks_for_no_wake_and_writes_nothing(self):
+        w = World(self, crews=("thies",))
+        w.say(T, LOGIN_OUT)
+        w.go()
+        before = w.read(".gc", "login-rc-restore.state.json")
+        rc, out = w.go(dry=True)
+        self.assertEqual((w.io.wakes, "WOULD wake thies-wa" in out, w.read(".gc", "login-rc-restore.state.json")), ([], True, before))
 
 class Switches(unittest.TestCase):
     def test_kill_switch_does_nothing(self):
