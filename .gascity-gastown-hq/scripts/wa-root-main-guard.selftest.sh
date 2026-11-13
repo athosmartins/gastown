@@ -57,7 +57,8 @@
 # WA_ROOT_GUARD_ROOT/_CITY seams: the harness refuses one that does not (rc 2), because the script before ga-a7mti1 hard-codes
 # the production paths and would run on the live root.
 # EQUIVALENT 67d8e08a21 0faff75ea3 a3ee154e24 25da2feaa3 d6a86f1d8f: read_state and clear_episode return 0 on "no episode", and swapping that for 1 changes nothing: every caller runs them as a statement and the guard has no `set -e`
-# EQUIVALENT ad98949c9a 7bbefd0e06 af3fb25660: the early exits `[ -f "$STATE" ] || return 0` / `[ -e "$STATE" ] || return 0` and the `|| return 0` after the read can be dropped: with no file the read fails with k empty, and an empty k reaches the case's `*) return 0`
+# EQUIVALENT 7bbefd0e06: the `|| return 0` after the read can be dropped: with no file the read fails with k empty, and an empty k reaches the case's `*) return 0`
+# EQUIVALENT ad98949c9a af3fb25660: the early exits `[ -f "$STATE" ] || return 0` (read_state) / `[ -e "$STATE" ] || return 0` (clear_episode) can be dropped for every state the guard leaves behind: absent, empty, one line, torn, zero-padded, a directory, a link to a file or to /dev/null, an unreadable file (measured per shape: same result, same files); two shapes differ and only a hand puts them there: a FIFO (the mutant's read waits for a writer) and a dangling link (clear_episode would remove it)
 # EQUIVALENT f873cb19c6 b6208c9b8a e4394aaafb: the `|| true` of `mkdir -p "$HOOKS"` and of the stash push and the stash drop -> `&& true`: nobody reads the status of any of them and there is no `set -e`
 set -u
 
