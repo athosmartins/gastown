@@ -249,7 +249,7 @@ do_run() {
   read_registry || finish 30 "registro ilegível ($STATE): NÃO paro nada"
   read_free || finish 30 "não consegui ler o disco: NÃO paro nada"
   [ "$FREE" -lt "$STOP_BELOW_MB" ] || finish 10 "disco ok (livre=${FREE}MB >= ${STOP_BELOW_MB}MB): nada a cortar"
-  # 12 vale MESMO com a lista já esgotada: o efeito do último corte ainda não foi medido, e o humano só é chamado depois da janela (o 11 mais abaixo)
+  # 12 vale MESMO com a lista já esgotada: o efeito do último corte pode levar minutos a aparecer (a re-medição logo após o corte, SETTLE_S, é só a 1ª), e o humano só é chamado depois da janela (o 11 mais abaixo)
   if [ "$LAST_CUT" -gt 0 ] && [ "$NOW" -ge "$LAST_CUT" ] && [ $((NOW - LAST_CUT)) -lt "$SPACING_S" ]; then
     finish 12 "esperando o efeito do último corte (há $((NOW - LAST_CUT))s, < ${SPACING_S}s); livre=${FREE}MB"
   fi
