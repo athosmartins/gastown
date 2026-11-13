@@ -279,6 +279,16 @@ def c_tree():
     m.git = lambda *a, **kw: b"x" * 200 + b"\0"
     msg = unknown(m.tree_entries, "r", "sha")
     assert msg == "linha do ls-tree fora do formato: " + repr("x" * 80), msg
+    # o git imprime a coluna de tamanho do ls-tree -l so com digitos (ou "-"): o mesmo registro sem nada colado e lido, e um byte de controle 0x1c-0x1f
+    # colado nela e linha fora do formato, NAO SEI. O str.split() tiraria esse byte como espaco e o int() nao o aceita, entao com o split de 4 campos
+    # no lugar do de 3 o registro passaria (ga-3kdpcbj)
+    line = ("100644 blob %040x %7d" % (7, 12)).encode()
+    m.git = lambda *a, **kw: line + b"\tlib/a.py\0"
+    assert [(e.size, e.path) for e in m.tree_entries("r", "sha")] == [(12, "lib/a.py")]
+    for ctl in (b"\x1c", b"\x1d", b"\x1e", b"\x1f"):
+        m.git = (lambda r: (lambda *a, **kw: r))(line + ctl + b"\tlib/a.py\0")
+        msg = unknown(m.tree_entries, "r", "sha")
+        assert msg.startswith("linha do ls-tree fora do formato: "), (ctl, msg)
 
 
 def c_blob():
@@ -402,10 +412,11 @@ case_u_batch() { uc batch; }
 case_u_header() { uc header; }
 case_u_entries() { uc entries; }
 case_u_registry() { uc registry; }
-# Fora do alcance destes casos: a89c4d08ba 1d719f54b0 49ab621386 (equivalentes: o split do ls-tree cai no mesmo ValueError, e nl == 0 só existe com pos == 0, onde o corte é vazio dos
-# dois jeitos) e b451aff2f3 (o flush=True do print do handler de erro interno: só se vê se o processo morre depois de escrever; o do say(), b82742161c, morre em kill_report). A cena de G12
-# com 6+ plists (avisos_cap: d414b9aca8 f6affd9302 a01c4377f4 82a7bd8828) e o guard de confiança que levanta depois de carregar (cut_120_run: d4b87a34d1) vieram depois (ga-r8nsaot).
-# EQUIVALENT a89c4d08ba 1d719f54b0 49ab621386: o split do ls-tree cai no mesmo ValueError, e `nl == 0` so existe com pos == 0, onde o corte e vazio dos dois jeitos
+# Fora do alcance destes casos: 1d719f54b0 49ab621386 (equivalentes: nl == 0 só existe com pos == 0, onde o corte é vazio dos dois jeitos) e b451aff2f3 (o flush=True do print do handler de
+# erro interno: só se vê se o processo morre depois de escrever; o do say(), b82742161c, morre em kill_report). O a89c4d08ba (split(None, 3) -> 4 no ls-tree) NÃO é equivalente: o str.split()
+# trata 0x1c-0x1f como espaço e o int() não, então só o original recusa um tamanho com esse byte colado; ele morre em u_tree (ga-3kdpcbj). A cena de G12 com 6+ plists (avisos_cap:
+# d414b9aca8 f6affd9302 a01c4377f4 82a7bd8828) e o guard de confiança que levanta depois de carregar (cut_120_run: d4b87a34d1) vieram depois (ga-r8nsaot).
+# EQUIVALENT 1d719f54b0 49ab621386: `nl == 0` so existe com pos == 0, onde o corte e vazio dos dois jeitos
 # EQUIVALENT b451aff2f3: `flush=True` -> False: so se ve se o processo morre depois de escrever
 case_u_git() { uc git; }
 case_u_tree() { uc tree; }
@@ -486,7 +497,7 @@ ck u_batch "401 blobs saem em dois lotes do cat-file (400 e 1), todos gravados n
 ck u_header "cabeçalho do cat-file com 2 campos, oid outro, tipo que não é blob ou sem quebra de linha → NÃO SEI do blob, nunca gravado"
 ck u_entries "ls-tree: o gitlink (tamanho '-') vira 0 e o blob comum traz o tamanho dele"
 ck u_git "git(): timeout de 120 s; OSError cita o 1º argumento; rc != 0 cita os 3 primeiros e leva o stderr"
-ck u_tree "ls-tree com linha fora do formato: o NÃO SEI cita só os 80 primeiros caracteres dela"
+ck u_tree "ls-tree com linha fora do formato: o NÃO SEI cita só os 80 primeiros caracteres dela; um byte de controle 0x1c-0x1f colado no tamanho também é linha fora do formato (o mesmo registro sem ele é lido)"
 ck u_blob "blob com dado mais curto que o cabeçalho, ou com tamanho que o ls-tree não anunciou: NÃO SEI com os dois números"
 ck u_utf8 "arquivo de confiança que não é UTF-8: a mensagem cita os 12 primeiros hex do sha de confiança"
 ck u_facade "o atalho do subprocess: ls-files e diff devolvem rc 0 (texto ou bytes) e um comando de 7 palavras que não é git -C é recusado"
@@ -592,6 +603,7 @@ mutant git-timeout-em-121 u_git 'GIT_TIMEOUT = 120' 'GIT_TIMEOUT = 121'
 mutant git-oserror-cita-o-2o-argumento u_git "{args[0] if args else ''}" "{args[1] if args else ''}"
 mutant git-rc-cita-4-argumentos u_git "' '.join(args[:3])" "' '.join(args[:4])"
 mutant ls-tree-corta-em-81 u_tree 'safe(os.fsdecode(rec))[:80]!r' 'safe(os.fsdecode(rec))[:81]!r'
+mutant ls-tree-split-em-5-campos u_tree 'meta.decode().split(None, 3)' 'meta.decode().split(None, 4)'
 mutant blob-curto-passa u_blob 'if len(data) != size or size != e.size:' 'if len(data) != size and size != e.size:'
 mutant utf8-cita-13-hex u_utf8 'tsha[:12]} não é UTF-8' 'tsha[:13]} não é UTF-8'
 mutant atalho-ls-files-por-tamanho u_facade 'is_ls_files = len(a) == 7 and a[:2] == ["git", "-C"]' 'is_ls_files = len(a) == 7 or a[:2] == ["git", "-C"]'
