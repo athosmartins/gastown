@@ -8,9 +8,9 @@
 #   disco seguindo a cair (o swap sai do MESMO disco; 15/10 Dolt ENOSPC); o D3 reinicia os daemons de RAM e eles devolvem a mesma RAM em minutos. Aqui se PARA (launchctl disable + bootout: não restart, e o disable sobrevive ao reboot)
 #   serviço NÃO essencial da allowlist, em ordem, até o livre voltar a >= 3 GB; e se RELIGA sozinho quando o disco volta a >= 6 GB por 30 min (espelho do --resume do D2). Quem chama é o maestro (disk-recovery-ladder.sh).
 # USO   --run (real) · --dry-run (diz o que pararia; lê o launchd, não grava nada) · --resume (religa o que o --run parou; seguro de repetir a cada rodada do maestro)
-# CONTRATO  stdout: UMA linha ("D3.5 <modo>: ..."), sempre. Saída 0 agiu (parou N / religou 1) · 10 nada a fazer (disco ok, relógio de 30 min correndo, outra instância: NÃO diz "ainda corto") ·
-#   11 (--run e --dry-run) LISTA ESGOTADA: nada mais a parar e o disco segue < 3 GB (o maestro só então deixa o "precisa de um humano" sair) · 12 (--run) ESPERANDO o efeito do último corte, ainda há o que cortar (com o 0, o único
-#   código que segura o "precisa de um humano") · 20 falhou (disable/bootout/religar sem prova, registro que não grava) ·
+# CONTRATO  stdout: UMA linha ("D3.5 <modo>: ..."), sempre. Saída 0 agiu (parou N / religou 1) · 10 nada a fazer (disco ok, relógio de 30 min correndo, outra instância: NÃO diz que o corte está em curso) ·
+#   11 (--run e --dry-run) LISTA ESGOTADA: nada mais a parar e o disco segue < 3 GB (o maestro só então deixa o "precisa de um humano" sair) · 12 (--run) ESPERANDO o efeito do último corte: a janela de D35_SPACING_S vale MESMO que a lista já tenha
+#   acabado (o disco pode se recompor antes de se chamar um humano; passada a janela vem o 11) (com o 0, o único código que segura o "precisa de um humano") · 20 falhou (disable/bootout/religar sem prova, registro que não grava) ·
 #   30 não consegui ler o estado e por isso NÃO agi (df, allowlist, registro, launchctl) · 2 uso. Quem avisa o Athos (notify/mail) é o maestro: este degrau só escreve o próprio log.
 # A ALLOWLIST E A DENY-LIST. Só se mexe em label de scripts/disk-recovery-d35-allowlist.tsv (versionada; ver o cabeçalho dela). A deny-list vive AQUI e VENCE a allowlist, em duas travas independentes (porta e fragmento do label):
 #   sender, captura de inbound, voicebot/discador, túneis, Dolt, supervisor, HQ, classification, demand, map-viewer, frota, admin/daemon. Linha negada ou malformada é descartada e dita na linha de saída (quando o degrau chega a usar a lista).
@@ -20,6 +20,8 @@
 #   Ordem do corte = a do arquivo; a retomada é a inversa (o último parado volta primeiro), UM por chamada (a RAM volta aos poucos). Linha de registro cortada/ruim é ruído e é ignorada (um evento pela metade não apaga os anteriores).
 # RETOMAR  Só o que o registro diz que EU parei. Com livre >= 6144 MB seguidos por 1800 s (conto só leituras minhas: lacuna > 600 s ou queda abaixo de 6144 zera o relógio, em $D35_HIGH). enable ANTES do bootstrap (label desabilitado não sobe);
 #   a PROVA é o pid NOVO (diferente do que o parei) — job que não tinha pid ao parar (agendado): carregado. Sem prova = 20 e continua pendente (repete na chamada seguinte).
+#   LIMITE: job AGENDADO que TINHA pid ao ser parado e segue sem pid em D35_WATCH_S volta como RESUME_FAILED (20 + alerta); a chamada seguinte o acha carregado e habilitado, o registra ABANDONED ("já carregado por outro") e para de segui-lo: o alerta sai uma vez
+#   e quem o recebe confere se subiu. A allowlist enviada só tem servidor com porta; linha de lote (porta "-") é onde este limite pode aparecer.
 # TRÊS ESTADOS  tem / não-tem / não-consegui-saber. df, allowlist, registro, print-disabled e print ilegíveis NUNCA viram "disco bom", "lista esgotada" nem "nada a retomar": 30 e não age (label cujo `print` falha é pulado e conta como não lido).
 #   O rc de um launchctl não prova nada (estourou o prazo PODE ter aplicado): o disable, o bootout e o religar são provados RELENDO. Falha no meio desfaz (enable) ou diz INCONSISTENTE e o registro o deixa pendente.
 # VARIÁVEIS (todas opcionais; TESTE marcadas) D35_CITY D35_ALLOWLIST D35_STATE D35_HIGH D35_LOG D35_LOCK D35_PLIST_DIR D35_VOLUME D35_LAUNCHCTL_BIN D35_DF_BIN D35_DATE_BIN D35_PS_BIN D35_UID · DR_OFF_FILE · numéricas D35_STOP_BELOW_MB(3072) D35_RESUME_ABOVE_MB(6144)
@@ -247,20 +249,24 @@ do_run() {
   read_registry || finish 30 "registro ilegível ($STATE): NÃO paro nada"
   read_free || finish 30 "não consegui ler o disco: NÃO paro nada"
   [ "$FREE" -lt "$STOP_BELOW_MB" ] || finish 10 "disco ok (livre=${FREE}MB >= ${STOP_BELOW_MB}MB): nada a cortar"
+  # 12 vale MESMO com a lista já esgotada: o efeito do último corte ainda não foi medido, e o humano só é chamado depois da janela (o 11 mais abaixo)
   if [ "$LAST_CUT" -gt 0 ] && [ "$NOW" -ge "$LAST_CUT" ] && [ $((NOW - LAST_CUT)) -lt "$SPACING_S" ]; then
     finish 12 "esperando o efeito do último corte (há $((NOW - LAST_CUT))s, < ${SPACING_S}s); livre=${FREE}MB"
   fi
   read_disabled || finish 30 "não consegui ler os labels desabilitados (launchctl print-disabled): NÃO paro nada"
-  local label porta nome risco src pid0 before=$FREE cut=0 fail=0 unread=0 alheio=0 semplist=0 tried=0 meas=0 list="" failtxt="" txt rc=0 neg=""
+  local label porta nome risco src pid0 before=$FREE cut=0 fail=0 unread=0 alheio=0 meu=0 espera=0 naocarr=0 semplist=0 tried=0 meas=0 list="" failtxt="" txt rc=0 neg=""
   while IFS="$TAB" read -r label porta nome risco; do
     [ -n "$label" ] || continue
     [ "$cut" -lt "$MAX_PER_RUN" ] || break
     [ "$tried" -eq 0 ] || [ "$SECONDS" -lt "$BUDGET_S" ] || break
-    case "$FAILED" in *" $label "*) continue ;; esac
-    if in_disabled "$label"; then alheio=$((alheio + 1)); continue; fi
+    case "$FAILED" in *" $label "*) espera=$((espera + 1)); continue ;; esac   # falhou há < FAIL_COOL_S: fora por ora, volta depois
+    if in_disabled "$label"; then   # desabilitado: fui eu (o registro o tem pendente) ou foi decisão de outro (nunca toco nem religo)
+      case "$PENDING" in *"$TAB$label$TAB"*) meu=$((meu + 1)) ;; *) alheio=$((alheio + 1)) ;; esac
+      continue
+    fi
     if [ ! -f "$PLISTS/$label.plist" ]; then semplist=$((semplist + 1)); continue; fi
     lc_state "$label"
-    case "$ST" in loaded) ;; unloaded) continue ;; *) unread=$((unread + 1)); continue ;; esac
+    case "$ST" in loaded) ;; unloaded) naocarr=$((naocarr + 1)); continue ;; *) unread=$((unread + 1)); continue ;; esac
     if [ "$DRY" = 1 ]; then cut=$((cut + 1)); list="$list${list:+, }$nome [$label]"; continue; fi
     tried=$((tried + 1)); pid0=${PID:--}   # o lc_state da prova (dentro do stop_one) zera o PID: guardo o de antes
     stop_one "$label" "$pid0"; src=$?
@@ -279,7 +285,8 @@ EOF
   [ "$SKIP_N" -eq 0 ] || neg="; $SKIP_N negada(s)/ignorada(s) (deny-list ou linha malformada)"
   if [ "$cut" -eq 0 ] && [ "$fail" -eq 0 ]; then
     [ "$unread" -eq 0 ] || finish 30 "não consegui ler o estado de $unread label(s) no launchd (print): NÃO sei se a lista esgotou$neg"
-    finish 11 "lista esgotada: nada mais a parar ($alheio desligado(s) por decisão alheia, $semplist sem plist; os já parados por mim ficam no registro); livre=${FREE}MB < ${STOP_BELOW_MB}MB$neg"
+    # cada linha válida da lista cai em UM balde (aqui unread é 0): parados por mim, desligados por outro, sem plist, não carregados, falharam há pouco
+    finish 11 "lista esgotada: nada mais a parar (parados por mim: $meu; desligados por decisão alheia: $alheio; sem plist: $semplist; não carregados: $naocarr; falharam há < $((FAIL_COOL_S / 60)) min e esperam: $espera); livre=${FREE}MB < ${STOP_BELOW_MB}MB$neg"
   fi
   if [ "$DRY" = 1 ]; then finish 0 "pararia $cut: $list; livre=${FREE}MB$neg"; fi
   txt="parei $cut"; [ "$cut" -eq 0 ] || txt="$txt: $list"

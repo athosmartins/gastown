@@ -52,8 +52,8 @@
 #   hora por classe (marcas `.gc/disk-recovery.resume-{d4rc20,d4rc30,d4broken}`). D4 ausente ou sem execução: calado aqui (sem o script não há pausa dele; o run_rung já avisa quando o D4 é devido). Com o interruptor ligado nada roda: a pausa nossa espera.
 # CORTE DE CARGA (D3.5, ga-1p1i5jr.8) Athos 09/11: "se chegar a 3a necessidade e o reboot nao vem, o q acontece?". Com o cronômetro do D4 (livre < D4_MB) acima de D35_HOLD_S (2700 s, antes dos 3600 s do D4), TODA rodada chama ANTES do degrau da vez
 #   `disk-recovery-d35-load-shed.sh --run`: ele PARA (launchctl disable + bootout) serviço não essencial da allowlist dele, 3 por vez a cada 10 min, até o livre voltar a >= 3 GB; sem teto, e segue DEPOIS do teto do D4. rc 0 parou (notify -p 4; mail no máx. 1 por hora) ·
-#   10 nada/outra instância (SILÊNCIO) · 11 LISTA ESGOTADA com o disco ainda baixo · 12 esperando o efeito do último corte (ainda há o que cortar) · 20 falhou · 30 não li (notify -p 4, no máx. 1 por hora por classe). O "precisa de um humano" do teto (aqui e no D4, que recebe DR4_SHED_WORKING) FICA ADIADO enquanto o D3.5 ainda tem o que cortar
-#   (SÓ rc 0 ou 12: o 10 pode ser disco ok ou outra instância travada, e adiar o aviso por ele seria silêncio) e livre >= D4_HARD_MB; com 10, 11, 20, 30, ausente ou o disco sob o piso duro ele sai como sempre. Depois do resume do D4, toda rodada chama `--resume`: religa, um por vez, o que ELE parou (livre >= 6 GB por 30 min; o relógio é dele). Sem chave nova no estado: o cronômetro é o SINCE4.
+#   10 nada/outra instância (SILÊNCIO) · 11 LISTA ESGOTADA com o disco ainda baixo · 12 esperando o efeito do último corte (a janela de 10 min vale mesmo com a lista já esgotada: o disco pode se recompor antes de chamar um humano) · 20 falhou · 30 não li (notify -p 4, no máx. 1 por hora por classe). O "precisa de um humano" do teto (aqui e no D4, que recebe DR4_SHED_WORKING) FICA ADIADO enquanto o corte de carga do D3.5 está em curso
+#   (SÓ rc 0 ou 12, o corte EM CURSO: o 10 pode ser disco ok ou outra instância travada, e adiar o aviso por ele seria silêncio) e livre >= D4_HARD_MB; com 10, 11, 20, 30, ausente ou o disco sob o piso duro ele sai como sempre. Depois do resume do D4, toda rodada chama `--resume`: religa, um por vez, o que ELE parou (livre >= 6 GB por 30 min; o relógio é dele). Sem chave nova no estado: o cronômetro é o SINCE4.
 # FOTO DE RSS (ga-1p1i5jr.10) Rodada com livre <= D2_MB: os 10 maiores RSS (`ps -axo rss=,pid=,command=`: 3 palavras do comando, até 120 caracteres, para não carregar argumento com segredo) em `.gc/logs/disk-recovery-rss.log` (gira em RSS_LOG_MAX_KB). Só diagnóstico: nunca decide nada
 #   nem muda a saída; falha do `ps` (ausente, estouro de RSS_TIMEOUT_S) vira 1 linha WARN no log do maestro. 10/11 não havia como saber QUEM inchou a RAM (swap 0,7 -> 4,6 GB) porque nenhuma foto existia.
 # ESTADO, LOG, INTERRUPTORES
@@ -98,7 +98,7 @@ SWAPNOTE=""  # " [swap NÃO verificado...]" quando o vm.swapusage não foi lido 
 LOCK_WHY=""  # por que o acquire_lock devolveu 2 (não consegui tomar nem verificar a trava)
 LOCK_HELD=0
 RC_FINAL=0
-SHED_WORKING=0  # 1 = o D3.5 desta rodada ainda tem o que cortar (SÓ rc 0 ou 12): o "precisa de um humano" do teto espera
+SHED_WORKING=0  # 1 = corte de carga EM CURSO nesta rodada: o D3.5 acabou de parar algo (rc 0) ou espera o efeito do último corte (rc 12, mesmo com a lista já esgotada); SÓ esses dois: o "precisa de um humano" do teto espera
 SAVE_FAIL=0
 ASIDE=""     # estado ruim a guardar (.corrupt-<hora>, link duro) antes de o novo tomar o lugar dele por rename
 SEEN=" "     # chaves que o load_state viu no arquivo
@@ -471,7 +471,7 @@ held_of() {  # $1=n $2=agora → segundos que o cronômetro do nível está roda
 escalate_d4_cap() {  # $1=agora. D4 já foi disparado há menos de 6 h e o disco segue < limiar: NÃO reinicia de novo; escala UMA vez por episódio, e "uma vez" só vale com a entrega CONFIRMADA por algum canal (notify -p 5 ou mail):
   # este é o único "preciso de um humano" da escada (o D4 está no teto). Nenhum canal confirmou → esc4 fica 0 e a rodada seguinte (2 min) tenta de novo, como o escalate_low_after_reboot do D4; disco cheio, Dolt caído e rede falhando são o cenário ESPERADO aqui.
   [ "$ESC4" = 1 ] && return 0
-  if [ "$SHED_WORKING" = 1 ]; then log "ESCALA adiada: o D3.5 ainda corta carga (D4 no teto, livre=${FREE}MB): o 'precisa de um humano' sai quando a lista esgotar ou o corte falhar"; return 0; fi
+  if [ "$SHED_WORKING" = 1 ]; then log "ESCALA adiada: o corte de carga do D3.5 está em curso (D4 no teto, livre=${FREE}MB): o 'precisa de um humano' sai quando a lista esgotar e a janela do último corte passar, ou quando o corte falhar"; return 0; fi
   local age=$(( $1 - ACTED4_TS )) told=0
   note "ESCALA: D4 elegível (livre=${FREE}MB) mas o último disparo dele (ou a perda do estado salvo, que conto como disparo) foi há ${age}s (< ${D4_COOLDOWN_S}s): NÃO chamo de novo (sem reinício em laço)"
   send_notify 5 "Disco: segue baixo depois do reinício, preciso de um humano" "Livre ${FREE} MB, swap ${SWAP} MB. O último disparo do D4 (ou a perda do estado salvo da escada) foi há $((age / 60)) min e o disco segue abaixo do limiar. Não reinicio de novo antes de $((D4_COOLDOWN_S / 3600)) h." && told=1
@@ -823,7 +823,7 @@ main() {
 
   [ "$FREE" -le "$D2_MB" ] && log_rss   # ANTES de chamar um degrau: se o D4 reiniciar a máquina, a foto desta rodada já está no disco
   save_state
-  shed_d35   # ANTES do degrau da vez: o D3.5 corta carga e diz se ainda tem o que cortar (SHED_WORKING), que o teto do D4 lê para adiar o "precisa de um humano"
+  shed_d35   # ANTES do degrau da vez: o D3.5 corta carga e diz se o corte está em curso (SHED_WORKING), que o teto do D4 lê para adiar o "precisa de um humano"
   pick_and_run "$NOW"
   save_state
   resume_d2   # sempre DEPOIS do --run: o --resume lê o registro do D2 já com o que o --run acabou de parar; quem decide se o livre voltou é o próprio D2 (resume_above_mb > stop_below_mb: histerese dele, não minha)

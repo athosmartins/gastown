@@ -225,7 +225,7 @@ Dolt caído e rede falhando são o cenário esperado aqui. Se o D4 devolve 10 ou
 novo em 5 min (a guarda adiou, ou falhou sem reiniciar). O comentário na ga-1p1i5jr.4 pede que o próprio D4 tenha o cooldown dele
 também (defesa em profundidade); o maestro não depende disso.
 
-**O aviso fica ADIADO enquanto o D3.5 ainda tem o que cortar** (ver "D3.5"): o maestro adia o `escalate_d4_cap` e passa `DR4_SHED_WORKING=1` ao D4, que adia o dele (teto de 2 por 24 h). Sai com o D3.5 esgotado (rc 11), falhando (20/30), ausente ou com
+**O aviso fica ADIADO enquanto o corte de carga do D3.5 está em curso** (parou algo agora, ou espera o efeito do último corte; ver "D3.5"): o maestro adia o `escalate_d4_cap` e passa `DR4_SHED_WORKING=1` ao D4, que adia o dele (teto de 2 por 24 h). Sai com o D3.5 esgotado (rc 11), falhando (20/30), ausente ou com
 o livre abaixo do piso duro (1,5 GB): o silêncio é o lado perigoso.
 
 O `acted4_ts` também vale quando o estado salvo se perde pela metade (ver "Três estados"): ele passa a ser AGORA. Só se perde com
@@ -248,7 +248,8 @@ em 24 h, 6 h de cooldown) a escada só avisava, e o restart do D3 devolve a mesm
   classification, demand, map-viewer, frota, admin/daemon. Também não se para o que não tem plist (não dá para religar), não está carregado ou **já está desabilitado**: o que o Athos desligou por decisão é pulado e NUNCA religado.
 - **Allowlist.** Cópia versionada das linhas `emergency_off=sim` da action-table do Mayor (`.gc/agents/mayor/proc-review/action-table.tsv`) que são servidor com porta, a mesma que o botão Ligar/Desligar do admin usa (whatsapp_automation, `lib/servicos_toggle.py`).
   A tabela mora fora do repo e o nó que escreveu o degrau não a lê: lote sem porta que ela libera ainda não está lá (acrescente a linha com porta `-`). O selftest compara as duas quando a tabela existe na máquina.
-- **Contrato** (`--run`): 0 parou · 10 nada a fazer (silêncio) · **11 lista esgotada com o disco ainda baixo** · 12 esperando o efeito do último corte · 20 falhou · 30 não li. O 10, o 11 e o 20/30 deixam o "precisa de um humano" do teto sair; **só o 0 e o 12 o adiam** (o 10 pode ser disco ok ou outra instância travada: adiar o aviso por ele seria silêncio).
+- **Contrato** (`--run`): 0 parou · 10 nada a fazer (silêncio) · **11 lista esgotada com o disco ainda baixo** · 12 esperando o efeito do último corte (a janela de 10 min vale mesmo com a lista já esgotada: o disco pode se recompor antes de chamar um humano) · 20 falhou · 30 não li. O 10, o 11 e o 20/30 deixam o "precisa de um humano" do teto sair; **só o 0 e o 12 o adiam** (o 10 pode ser disco ok ou outra instância travada: adiar o aviso por ele seria silêncio).
+- **Limite da prova de religar.** A prova é o PID novo. Job AGENDADO que tinha pid ao ser parado e segue sem pid em 20 s volta RESUME_FAILED (rc 20 + alerta); a chamada seguinte o acha carregado e habilitado e o registra ABANDONED: o alerta sai uma vez e quem o recebe confere se subiu. A allowlist enviada só tem servidor com porta; linha de lote (porta `-`) é onde isto pode aparecer.
 - **Registro** `.gc/disk-recovery-d35.state` (só acréscimo): STOPPING gravado ANTES de agir → STOPPED (provado: sumiu do launchd) | STOP_FAILED (desfeito; fica de fora por 1 h) · RESUMED | RESUME_FAILED | ABANDONED (já carregado por outro).
   Falha no meio desfaz (`enable`) ou diz INCONSISTENTE e o registro o deixa pendente. Log: `.gc/logs/disk-recovery-d35.log`.
 - **Avisos** (do maestro): parou = `notify -p 4` com a LISTA + mail ao Mayor (no máx. 1 por hora); religou = `notify -p 3`; falha/não li/falha da chamada = `-p 4`, 1 por hora por classe.

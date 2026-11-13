@@ -99,15 +99,20 @@ std; r --run D35_MAX_PER_RUN=1; has "$OUT" "parei 1" "D35_MAX_PER_RUN manda no N
 std; r --run D35_BUDGET_S=0; has "$OUT" "parei 1" "orçamento de tempo esgotado: faz ao menos 1 e para"
 
 section "ritmo: espera o efeito do corte; depois o próximo lote; depois lista esgotada (rc 11)"
-std; r --run; NOW=1000599 r --run; eq "$RC" 12 "599 s depois do corte: espera (12, o código que diz 'ainda corto')"; has "$OUT" "esperando o efeito" "a linha diz que espera"; eq "$(mut)" 6 "esperar não toca em nada"
+std; r --run; NOW=1000599 r --run; eq "$RC" 12 "599 s depois do corte: espera (12: o corte está em curso)"; has "$OUT" "esperando o efeito" "a linha diz que espera"; eq "$(mut)" 6 "esperar não toca em nada"
 NOW=1000600 r --run; eq "$RC" 0 "600 s depois: corta o próximo lote"; has "$OUT" "parei 2" "os 2 que faltavam"; has "$OUT" "Epsilon [com.t.e]" "o último da lista"
+NOW=1000900 r --run; eq "$RC" 12 "lista JÁ esgotada mas a janela do último corte ainda corre (300 s < 600 s): 12 (o aviso de humano espera o efeito)"; has "$OUT" "esperando o efeito" "a linha diz que espera"; eq "$(mut)" 10 "e não toca em nada"
 NOW=1001300 r --run; eq "$RC" 11 "nada mais a parar com o disco baixo: lista esgotada (11)"; has "$OUT" "lista esgotada" "a linha diz esgotada"; eq "$(mut)" 10 "esgotada não toca em nada"
+has "$OUT" "parados por mim: 5; desligados por decisão alheia: 0; sem plist: 0; não carregados: 0; falharam há < 60 min e esperam: 0" "a linha fecha a conta: os 5 da lista são meus"
 std; r --run; NOW=999000 r --run; eq "$RC" 0 "carimbo do corte no FUTURO (relógio voltou) não cala o degrau"
 
 section "quem NÃO é meu: já desabilitado, não carregado, sem plist, ilegível no launchd"
 std; touch "$LC/disabled/com.t.a"; rm -f "$LC/loaded/com.t.b" "$C/plists/com.t.c.plist"; r --run
 has "$OUT" "parei 2" "pulou os 3 e parou d, e"; has "$OUT" "Delta [com.t.d]" "d parado"; eq "$(muts | grep -c 'com.t.[abc]')" 0 "desabilitado/não carregado/sem plist: nem disable nem bootout"
 eq "$(lastev com.t.a)" "" "o já desligado por decisão alheia nunca entra no registro"
+NOW=1000700 r --run; eq "$RC" 11 "…e com os 2 meus parados e o resto fora do meu alcance: lista esgotada (11)"; has "$OUT" "parados por mim: 2; desligados por decisão alheia: 1; sem plist: 1; não carregados: 1; falharam há < 60 min e esperam: 0" "a linha fecha a conta: cada linha da lista cai em UM balde (meu, alheio, sem plist, não carregado)"
+mk com.t.a com.t.ab; allow 'com.t.ab|9001|Ab|baixo' 'com.t.a|9002|A|baixo'; touch "$LC/disabled/com.t.a"; r --run D35_MAX_PER_RUN=1; NOW=1000700 r --run
+has "$OUT" "parados por mim: 1; desligados por decisão alheia: 1;" "label que é prefixo de outro (com.t.a e com.t.ab): o balanço não confunde o meu com o alheio"
 std; touch "$LC/mode/print.fail.com.t.a"; r --run; has "$OUT" "parei 3" "label cujo print falha é pulado, não vira 'parado' nem trava o resto"; eq "$(lastev com.t.a)" "" "print ilegível: nada gravado"
 std; touch "$LC/mode/print.fail"; r --run; eq "$RC" 30 "print falhando em TODOS: não li (30), nunca 'lista esgotada'"; eq "$(mut)" 0 "e nada é tocado"
 mk com.t.a; allow 'com.t.a|9001|Alfa|baixo'; touch "$LC/mode/print.hang"; r --run D35_LC_TIMEOUT_S=1; eq "$RC" 30 "print que pendura: estoura o prazo e é 'não li' (30), não 'carregado'"; eq "$(mut)" 0 "e nada é tocado"
@@ -143,7 +148,8 @@ else echo "SKIP - deriva da action-table: a tabela do Mayor não existe nesta m�
 
 section "falhas do launchctl: desfaz ou diz INCONSISTENTE; uma linha ruim não trava as outras"
 std; touch "$LC/mode/disable.fail.com.t.a"; r --run; eq "$RC" 20 "disable que falha: sai 20"; has "$OUT" "parei 3" "mas não trava: parou b, c, d"; has "$OUT" "FALHOU 1" "a linha diz a falha"; eq "$(lastev com.t.a)" STOP_FAILED "registro: STOP_FAILED"
-rm -f "$LC/mode/disable.fail.com.t.a"; : > "$LC/calls"; NOW=1000700 r --run; NOW=1003599 r --run; hasnt "$(muts)" "com.t.a" "a que falhou fica de fora por 1 h (3599 s ainda não)"; NOW=1003600 r --run; has "$(muts)" "disable gui/501/com.t.a" "passada 1 h (3600 s), tenta de novo"
+rm -f "$LC/mode/disable.fail.com.t.a"; : > "$LC/calls"; NOW=1000700 r --run; NOW=1003599 r --run; hasnt "$(muts)" "com.t.a" "a que falhou fica de fora por 1 h (3599 s ainda não)"
+has "$OUT" "parados por mim: 4; desligados por decisão alheia: 0; sem plist: 0; não carregados: 0; falharam há < 60 min e esperam: 1" "a linha conta a que falhou como EM ESPERA (carregada, volta em 1 h), não como esgotada de verdade"; NOW=1003600 r --run; has "$(muts)" "disable gui/501/com.t.a" "passada 1 h (3600 s), tenta de novo"
 std; printf '9999999\tSTOP_FAILED\tcom.t.a\t1000\t2500\tx\n' > "$ST"; r --run; has "$(muts)" "disable gui/501/com.t.a" "carimbo de falha no FUTURO (relógio voltou) não segura o label"
 std; touch "$LC/mode/bootout.noop"; r --run D35_BUDGET_S=0; eq "$RC" 20 "bootout que não tirou do launchd: sai 20"; has "$(muts)" "enable gui/501/com.t.a" "desfaz o disable (enable)"; eq "$(lastev com.t.a)" STOP_FAILED "registro: STOP_FAILED, não STOPPED"
 [ -e "$LC/disabled/com.t.a" ] && nope "depois do desfazer o label não fica desabilitado" || ok "depois do desfazer o label não fica desabilitado"
@@ -197,6 +203,7 @@ rs() { echo 7000 > "$C/free"; for t in 1001000 1001300 1001600 1001900 1002200 1
 std; r --run D35_MAX_PER_RUN=1; touch "$LC/mode/bootstrap.fail"; rs; eq "$RC" 20 "bootstrap que falha: 20"; has "$OUT" "FALHOU" "a linha diz"; eq "$(lastev com.t.a)" RESUME_FAILED "registro: RESUME_FAILED (continua pendente)"
 rm -f "$LC/mode/bootstrap.fail"; NOW=1003100 r --resume; eq "$RC" 0 "consertado o launchd, a próxima chamada religa"
 std; r --run D35_MAX_PER_RUN=1; touch "$LC/mode/bootstrap.nopid"; rs; eq "$RC" 20 "carregou mas sem pid novo (tinha pid): 20"; has "$OUT" "sem pid novo" "a linha diz"
+NOW=1003100 r --resume; eq "$RC,$(lastev com.t.a)" "10,ABANDONED" "…e a chamada seguinte o acha carregado e habilitado: 10 e ABANDONED (o alerta já saiu uma vez; o limite está no cabeçalho)"
 std; echo "" > "$LC/loaded/com.t.a"; r --run D35_MAX_PER_RUN=1; touch "$LC/mode/bootstrap.nopid"; rs; eq "$RC" 0 "job agendado (sem pid ao parar): a prova é estar carregado"
 std; r --run D35_MAX_PER_RUN=1; rm -f "$C/plists/com.t.a.plist"; rs; eq "$RC" 20 "plist sumiu: 20, sem enable às cegas"; eq "$(mut)" 2 "nenhuma chamada que muda o launchd depois do corte"
 std; touch "$LC/mode/bootout.noop" "$LC/mode/enable.fail"; r --run D35_BUDGET_S=0; rm -f "$LC/mode/enable.fail"; : > "$LC/calls"; rs
@@ -214,15 +221,18 @@ LAD="$HERE/disk-recovery-ladder.sh"; [ -f "$LAD" ] || { echo "FATAL: maestro nã
 mkdir -p "$W/ms"; printf '#!/bin/bash\nexit 10\n' > "$W/ms/idle"; printf '#!/bin/bash\n[ "${1:-}" = --resume ] && exit 10\necho "D4 (stub): reiniciou"\nexit 0\n' > "$W/ms/d4"; printf '#!/bin/bash\nexit 0\n' > "$W/ms/gc"
 printf '#!/bin/bash\necho "$*" >> "$MS_LOG"\nexit 0\n' > "$W/ms/notify"; chmod 755 "$W/ms/"*
 std; MSL="$C/notify.log"; : > "$MSL"; echo 0 > "$C/swap"
-lt() {  # uma rodada do maestro (launchd) na hora $1, com o D3.5 de verdade; o D4 é um stub que "reinicia" (rc 0)
+lt() {  # uma rodada do maestro (launchd) na hora $1, com o D3.5 de verdade; o D4 é um stub que "reinicia" (rc 0). OUT = a saída DELE (o nope() a imprime)
+  # relógio que não é inteiro (o seq do BSD imprime 1e+06) = o maestro "não decide nada" e todo "não corta" passaria VAZIO: falha alto, com a causa
+  case "$1" in ''|*[!0-9]*) OUT=""; nope "relógio do maestro não é um inteiro ('$1'): o seq do BSD imprime %g; use for ((...))"; return 1 ;; esac
   echo "$1" > "$C/now"
   env -i PATH="$W/bin:/usr/bin:/bin" HOME="$C/home" TMPDIR="$W" MS_LOG="$MSL" LC="$LC" FREE_FILE="$C/free" DR_CITY="$C/city" DR_STATE="$C/city/.gc/disk-recovery.state" DR_LOG="$C/city/.gc/logs/disk-recovery.log" \
     DR_FREE_MB_FILE="$C/free" DR_SWAP_MB_FILE="$C/swap" DR_NOW_FILE="$C/now" DR_D2_CMD="$W/ms/idle" DR_D3_CMD="$W/ms/idle" DR_D4_CMD="$W/ms/d4" DR_D35_CMD="$SUT" DR_NOTIFY_BIN="$W/ms/notify" DR_GC_BIN="$W/ms/gc" DR_SETTLE_S=0 \
     D35_CITY="$C/city" D35_ALLOWLIST="$ALLOW" D35_PLIST_DIR="$C/plists" D35_LAUNCHCTL_BIN="$W/bin/launchctl" D35_FREE_MB_FILE="$C/free" D35_NOW="$1" D35_UID=501 D35_SETTLE_S=0 D35_STOP_WAIT_S=1 D35_WATCH_S=1 D35_LC_TIMEOUT_S=3 \
-    ${D35_ST_BASH:-bash} "$LAD" --run > "$C/maestro.out" 2>&1; RC=$?
+    ${D35_ST_BASH:-bash} "$LAD" --run > "$C/maestro.out" 2>&1; RC=$?; OUT=$(cat "$C/maestro.out")
 }
+has "$( (lt 1e+06) 2>&1 )" "não é um inteiro" "o lt() recusa relógio que não é inteiro (o seq do BSD imprime 1e+06) em vez de deixar o teste passar vazio"
 for ((t = NOW; t <= NOW + 2400; t += 300)); do lt "$t"; done
-eq "$(mut)" 0 "antes de 2700 s com o disco < 3 GB o D3.5 não corta nada"
+eq "$(mut)" 0 "antes de 2700 s com o disco < 3 GB o D3.5 não corta nada"; eq "$OUT" "$(cat "$C/maestro.out")" "o lt() deixa a saída do maestro em OUT (é o que o nope() mostra)"
 lt $((NOW + 2700)); has "$(cat "$MSL")" "Disco: D3.5 cortou carga" "2700 s: o maestro chama o D3.5 e avisa"; has "$(cat "$MSL")" "Alfa [com.t.a], Beta [com.t.b], Gama [com.t.c]" "o aviso traz a LISTA do que parou"
 eq "$(muts)" "disable gui/501/com.t.a;bootout gui/501/com.t.a;disable gui/501/com.t.b;bootout gui/501/com.t.b;disable gui/501/com.t.c;bootout gui/501/com.t.c;" "pararam só os 3 primeiros da allowlist, disable antes do bootout"
 for ((t = NOW + 3000; t <= NOW + 6300; t += 300)); do lt "$t"; done
