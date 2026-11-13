@@ -119,10 +119,9 @@ echo "$NO_DATA" | grep -i "sem" >/dev/null && ok "message says explicitly there'
 
 echo ""
 echo "── Scenario: the module's own functions, edge by edge (ga-hq1qc5y, hq-mutants lastro) ──"
-# EQUIVALENT, documented: 63dc55df69 (sys.path.insert position: no other module of that name is on the path), c7bbe33248 (`base <= 0` -> `<` after `not base`: 0 is caught by `not base`,
+# EQUIVALENT, documented (63dc55df69, the sys.path.insert position, is NOT one: it dies to the namesake case at the end, ga-u7idiy2): c7bbe33248 (`base <= 0` -> `<` after `not base`: 0 is caught by `not base`,
 # a negative base by both), d0754f3e66 (`d and d > 0` -> `>=`: 0 is falsy before the comparison), 27cf8f8597 (sys.argv[1:] -> [0:]: the script path is not a flag).
 # One in-process python run: the pure functions are called with the numbers that sit ON each edge (the idle limit, the median ratio, the window), and cmd_top / main with a stub for the live sample.
-# EQUIVALENT 63dc55df69: sys.path.insert position: no other module of that name is on the path
 # EQUIVALENT c7bbe33248: `base <= 0` -> `<` after `not base`: 0 is caught by `not base`, a negative base by both
 # EQUIVALENT d0754f3e66: `d and d > 0` -> `>=`: 0 is falsy before the comparison
 # EQUIVALENT 27cf8f8597: `sys.argv[1:]` -> `[0:]`: the script path is not a flag
@@ -205,6 +204,19 @@ print("DONE %d" % len(bad))
 '
 PYOUT="$(python3 -c "$PYT" "$REPORT" 2>&1)"
 case "$PYOUT" in *"DONE 0") ok "pure functions and main: every edge answered as the contract says" ;; *) bad "module edges: $PYOUT" ;; esac
+echo ""
+echo "── Scenario: the sibling module comes from the script's own directory, never from a namesake in the cwd (ga-u7idiy2, hq-mutants lastro) ──"
+# `sys.path.insert(0, d)` puts the script's directory in front of everything; `insert(1, d)` puts it AFTER sys.path[0], which for a `python -c` run WITHOUT -I is the cwd: a ram_owner_lib.py there would win
+# (63dc55df69, declared equivalent until now). The PYT run above inserts the directory itself before it loads the module, so it could never see this. The control runs the same command with no namesake.
+mkdir -p "$TMP/voc/dir" "$TMP/voc/cwd" "$TMP/voc/vazio"; cp "$REPORT" "$SELF_DIR/ram_owner_lib.py" "$TMP/voc/dir/"; printf 'WHO = "namesake in the cwd"\n' > "$TMP/voc/cwd/ram_owner_lib.py"
+PYVOC='import importlib.util, sys
+sys.dont_write_bytecode = True
+sp = importlib.util.spec_from_file_location("rop_voc", sys.argv[1]); m = importlib.util.module_from_spec(sp); sp.loader.exec_module(m)
+print(getattr(m.lib, "WHO", "canonical"))'
+VOC0="$(cd "$TMP/voc/vazio" && env -i PATH="$PATH" PYTHONDONTWRITEBYTECODE=1 python3 -B -c "$PYVOC" "$TMP/voc/dir/ram-owner-report.py" 2>&1)"
+VOC1="$(cd "$TMP/voc/cwd" && env -i PATH="$PATH" PYTHONDONTWRITEBYTECODE=1 python3 -B -c "$PYVOC" "$TMP/voc/dir/ram-owner-report.py" 2>&1)"
+[ "$VOC0" = "canonical" ] && ok "control: with no namesake in the cwd the python -c run finds the ram_owner_lib next to the script" || bad "control: got [$VOC0]"
+[ "$VOC1" = "canonical" ] && ok "a ram_owner_lib.py in the cwd of a python -c run (no -I) does not shadow the one next to the script" || bad "the namesake in the cwd won: got [$VOC1]"
 echo ""
 echo "ram-owner-report selftest: PASS=$PASS FAIL=$FAIL"
 [ "$FAIL" -eq 0 ] && exit 0 || exit 1

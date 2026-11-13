@@ -332,11 +332,12 @@ o="$(PPM_GATE_LOG="$W/gate_nohist.jsonl" python3 "$TOOL" gate-rate --cutover 202
 # Em processo: cada funcao do script recebe a entrada exata (transcrito na idade-limite com o relogio fixo, sessao no segundo do corte, bead no
 # instante exato de cada janela, p exatamente 0.10, 40 beads). Os valores esperados saem das regras do docstring e de tabela de Wilson.
 # NAO matavel, de proposito: L327 `r["rig"] == rig` -> `!=` (67bdc90f2d: mech_fails so e chamada sem rig, o `rig is None` ja decide);
-# L332 `ts < hi_a` -> `<=` (7396ce259a: rig que so tem bead no instante hi_a entra na lista mas bucket() o exclui, e a linha so sai com n>0);
+# L332 `ts < hi_a` -> `<=` (7396ce259a: com o corte no passado ou em now, hi_a >= corte e nenhuma janela de bucket() contem hi_a: o rig entra na lista, fica com n=0 e a linha nao sai;
+#   so com o corte NO FUTURO eles divergem, ver o EQUIVALENT abaixo);
 # L189 `len(v) - 1` -> `len(v) - 0` (7c813362ab: ceil(0.9*n) - 1 e sempre menor que n, o min() nunca escolhe o outro lado).
 # EQUIVALENT 7c813362ab: `len(v) - 1` -> `len(v) - 0`: ceil(0.9*n) - 1 e sempre menor que n, o min() nunca escolhe o outro lado
 # EQUIVALENT 67bdc90f2d: `r["rig"] == rig` -> `!=`: mech_fails so e chamada sem rig, o `rig is None` ja decide
-# EQUIVALENT 7396ce259a: `ts < hi_a` -> `<=`: rig que so tem bead no instante hi_a entra na lista mas bucket() o exclui, e a linha so sai com n>0
+# EQUIVALENT 7396ce259a: `ts < hi_a` -> `<=` em rig_names: com o corte no passado ou em now (hi_a >= corte) nenhuma janela de bucket() contem hi_a, o rig fica com n=0 e a linha so sai com n>0; so com o corte NO FUTURO (hi_a = now cai dentro da janela ANTES) e um rig cujo unico bead esta EXATAMENTE em now os dois divergem (o mutante lista o rig que o ANTES ja conta, o original nao): o relogio real tem microssegundos e o log segundos, entao so um relogio fixo chega la, e um caso que o mate fixaria a omissao do original (medido em 3.9, 3.12 e 3.14, ga-u7idiy2)
 echo "== lastro: bordas, defaults e saidas (em processo)"
 cat > "$W/lastro.py" <<'EOF'
 import argparse, contextlib, datetime, importlib.util, io, json, os, sys, time

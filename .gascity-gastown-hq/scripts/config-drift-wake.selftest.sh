@@ -325,7 +325,8 @@ world; rows "$(row ga-s5 dog-remote-6 dog-remote active '')" "$(row ga-s6 mila-w
 world; rows "$(row ga-s4 dog-remote-5 dog-remote asleep idle-timeout)"; runit; eq "14i pool asleep sem candidata: roster + 1 leitura da bead de sessão" "$RC/$(wc -l < "$W/calls.log" | tr -d ' ')/$(ncalls ' show ga-s4 --json')" "0/2/1"
 
 # 15) lacunas que o lastro de mutantes apontou (ga-twb32km): comando que nem roda, rigs tortos e repetidos, homônimo vazio, MBP por um campo só, census com empate e teto, ordem do relógio, relógio FIXO nas bordas e a linha start que sobrevive a um SIGKILL
-# EQUIVALENT 0fb2fd68e8: `sys.path.insert(0, d)` -> `insert(1, d)`: iniciado como `python3 config-drift-wake.py` (plist e selftest) o sys.path[0] já é este diretório (ou, sob -I, um zip da stdlib que não existe), então o mesmo diretório no índice 0 ou 1 acha o mesmo bead_state; só um iniciador por `python -c` (sys.path[0] = cwd) distingue
+# NAO e' equivalente (ga-u7idiy2): 0fb2fd68e8, `sys.path.insert(0, d)` -> `insert(1, d)`, morre no caso 15f: num `python -c` SEM -I o cwd e o sys.path[0] e, com `insert(1, d)`, um bead_state homonimo
+# do cwd ganha do do diretorio do script. O texto antigo ja dizia que so um `python -c` distingue; o PYIN do caso 0 usa -I (la o sys.path[0] nao e o cwd) e nenhum caso punha um bead_state.py no cwd.
 # EQUIVALENT db46a098d0: `text=True` -> `False` em _sh: o `errors="replace"` na mesma chamada já liga o modo texto do subprocess (Popen: text_mode = encoding or errors or text or universal_newlines); medido em 3.9, 3.12 e 3.14: stdout continua str
 # EQUIVALENT 3640d923c7: `getattr(e, "pos", 0)` -> `1` em _loads: json.loads de str só levanta JSONDecodeError (sempre com `pos`) ou o ValueError do limite de dígitos do int (medido em 3.9.25 e 3.12: sem `pos`, e a mensagem não diz "Extra data"): o padrão nunca é lido num erro "Extra data"
 # EQUIVALENT 6979eab9b3: `"Extra data" in str(e) and pos` -> `or pos` em _loads: medido sobre 3257661 textos (todos até 6 caracteres de um alfabeto JSON, mais JSON válido com sufixo de lixo e cada truncamento): o mesmo valor do original em todos; um mutante-controle (raw[:pos + 1]) diverge no mesmo espaço; só "Extra data" deixa um prefixo válido
@@ -368,6 +369,16 @@ rows1; mkdir -p "$W/hq/.gc/state"; printf '{"ga-s1":{"at":%d,"bead":"ga-b1"}}' $
 eq "15 a tentativa de 900 s exatos já não segura" "$RC/$(wakes)" "0/ga-s1"
 rows1; mkdir -p "$W/hq/.gc/state"; printf '{"ga-s1":{"at":%d,"bead":"ga-b1"}}' $((FIX-899)) > "$W/hq/.gc/state/config-drift-wake.json"; runclk $FIX
 eq "15 a de 899 s ainda segura" "$RC/$(wakes)" "0/"; has "15 COOLDOWN dito" "$OUT" "COOLDOWN ga-s1"
+
+# 15f) o vocabulario canonico (bead_state) vem do diretorio do SCRIPT, nunca de um homonimo no cwd de quem o importa (lastro ga-u7idiy2): `insert(0, d)` poe o diretorio na frente de tudo, `insert(1, d)` o poe
+# DEPOIS do sys.path[0] (num `python -c` sem -I, o cwd): o homonimo ganha e e ele que vira `BS`. O controle roda o mesmo comando sem homonimo: o valor esperado e alcancavel.
+mkdir -p "$T/voc/dir" "$T/voc/cwd" "$T/voc/vazio"; cp "$SCRIPT" "$T/voc/dir/config-drift-wake.py"; cp "$HERE/bead_state.py" "$HERE/park_labels.py" "$T/voc/dir/"; printf 'WHO = "homonimo no cwd"\n' > "$T/voc/cwd/bead_state.py"
+PYVOC='import importlib.util, sys
+sys.dont_write_bytecode = True
+sp = importlib.util.spec_from_file_location("cdw_voc", sys.argv[1]); m = importlib.util.module_from_spec(sp); sp.loader.exec_module(m)
+print(m._IMPORT_ERR is None, getattr(m.BS, "WHO", "canonico"))'
+eq "15f controle: sem homonimo no cwd, o python -c acha o bead_state do diretorio do script" "$(cd "$T/voc/vazio" && env -i PATH="$PATH" PYTHONDONTWRITEBYTECODE=1 "$PY" -B -c "$PYVOC" "$T/voc/dir/config-drift-wake.py" 2>&1)" "True canonico"
+eq "15f com um bead_state homonimo no cwd (python -c sem -I): o do diretorio do script ganha" "$(cd "$T/voc/cwd" && env -i PATH="$PATH" PYTHONDONTWRITEBYTECODE=1 "$PY" -B -c "$PYVOC" "$T/voc/dir/config-drift-wake.py" 2>&1)" "True canonico"
 
 echo "config-drift-wake.selftest: PASS=$PASS FAIL=$FAIL"
 [ "$FAIL" = 0 ]
