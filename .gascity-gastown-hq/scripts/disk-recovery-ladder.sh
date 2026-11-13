@@ -50,6 +50,10 @@
 # RETOMADA DO D4 (ga-1p1i5jr.10) Toda rodada, depois do resume do D2, chama `disk-recovery-d4-guarded-reboot.sh --resume`: é o que SOLTA a pausa de envio que o D4 pôs antes de um reinício em estado terminal (depois do boot, ou quando o pedido pendente vence).
 #   Mesmo contrato do D2: 0 = soltou (notify -p 3) · 10 = nada a retomar ou ainda segurando (SILÊNCIO) · 20 = não soltou (notify -p 4 + mail; saída 20) · 30 = não li (notify -p 4; saída 30) · falha da chamada (estouro, rc estranho) = alerta; no máx. 1 aviso por
 #   hora por classe (marcas `.gc/disk-recovery.resume-{d4rc20,d4rc30,d4broken}`). D4 ausente ou sem execução: calado aqui (sem o script não há pausa dele; o run_rung já avisa quando o D4 é devido). Com o interruptor ligado nada roda: a pausa nossa espera.
+# CORTE DE CARGA (D3.5, ga-1p1i5jr.8) Athos 09/11: "se chegar a 3a necessidade e o reboot nao vem, o q acontece?". Com o cronômetro do D4 (livre < D4_MB) acima de D35_HOLD_S (2700 s, antes dos 3600 s do D4), TODA rodada chama ANTES do degrau da vez
+#   `disk-recovery-d35-load-shed.sh --run`: ele PARA (launchctl disable + bootout) serviço não essencial da allowlist dele, 3 por vez a cada 10 min, até o livre voltar a >= 3 GB; sem teto, e segue DEPOIS do teto do D4. rc 0 parou (notify -p 4; mail no máx. 1 por hora) ·
+#   10 nada/outra instância (SILÊNCIO) · 11 LISTA ESGOTADA com o disco ainda baixo · 12 esperando o efeito do último corte (ainda há o que cortar) · 20 falhou · 30 não li (notify -p 4, no máx. 1 por hora por classe). O "precisa de um humano" do teto (aqui e no D4, que recebe DR4_SHED_WORKING) FICA ADIADO enquanto o D3.5 ainda tem o que cortar
+#   (SÓ rc 0 ou 12: o 10 pode ser disco ok ou outra instância travada, e adiar o aviso por ele seria silêncio) e livre >= D4_HARD_MB; com 10, 11, 20, 30, ausente ou o disco sob o piso duro ele sai como sempre. Depois do resume do D4, toda rodada chama `--resume`: religa, um por vez, o que ELE parou (livre >= 6 GB por 30 min; o relógio é dele). Sem chave nova no estado: o cronômetro é o SINCE4.
 # FOTO DE RSS (ga-1p1i5jr.10) Rodada com livre <= D2_MB: os 10 maiores RSS (`ps -axo rss=,pid=,command=`: 3 palavras do comando, até 120 caracteres, para não carregar argumento com segredo) em `.gc/logs/disk-recovery-rss.log` (gira em RSS_LOG_MAX_KB). Só diagnóstico: nunca decide nada
 #   nem muda a saída; falha do `ps` (ausente, estouro de RSS_TIMEOUT_S) vira 1 linha WARN no log do maestro. 10/11 não havia como saber QUEM inchou a RAM (swap 0,7 -> 4,6 GB) porque nenhuma foto existia.
 # ESTADO, LOG, INTERRUPTORES
@@ -84,6 +88,7 @@ GCBIN="${DR_GC_BIN:-${GC_BIN:-gc}}"
 D2_CMD="${DR_D2_CMD:-$D/disk-recovery-d2-heavy-jobs.sh}"
 D3_CMD="${DR_D3_CMD:-$D/disk-recovery-d3-ram-daemons.sh}"
 D4_CMD="${DR_D4_CMD:-$D/disk-recovery-d4-guarded-reboot.sh}"
+D35_CMD="${DR_D35_CMD:-$D/disk-recovery-d35-load-shed.sh}"
 VOLUME="/System/Volumes/Data"
 
 DRY=""
@@ -93,6 +98,7 @@ SWAPNOTE=""  # " [swap NÃO verificado...]" quando o vm.swapusage não foi lido 
 LOCK_WHY=""  # por que o acquire_lock devolveu 2 (não consegui tomar nem verificar a trava)
 LOCK_HELD=0
 RC_FINAL=0
+SHED_WORKING=0  # 1 = o D3.5 desta rodada ainda tem o que cortar (rc 0 ou 10): o "precisa de um humano" do teto espera
 SAVE_FAIL=0
 ASIDE=""     # estado ruim a guardar (.corrupt-<hora>, link duro) antes de o novo tomar o lugar dele por rename
 SEEN=" "     # chaves que o load_state viu no arquivo
@@ -115,7 +121,7 @@ cfg D4_HARD_MB 1536; cfg D4_HARD_N 2 1; cfg D4_HARD_SPACE_S 100
 cfg HYST_MB 512; cfg GAP_S 600; cfg RETRY_S 300; cfg ACTED_REPEAT_S 1800; cfg D4_COOLDOWN_S 21600
 cfg RUNG_TIMEOUT_S 900; cfg SETTLE_S 15; cfg WARN_EVERY_S 3600; cfg HEARTBEAT_S 3600; cfg LOG_MAX_KB 5120
 cfg NOTIFY_TIMEOUT_S 30; cfg MAIL_TIMEOUT_S 60; cfg LOCK_MAX_MIN 60 1; cfg RESUME_TIMEOUT_S 120 1
-cfg RSS_TIMEOUT_S 15 1; cfg RSS_LOG_MAX_KB 1024
+cfg RSS_TIMEOUT_S 15 1; cfg RSS_LOG_MAX_KB 1024; cfg D35_HOLD_S 2700
 
 log()  { if [ "$DRY" = 1 ]; then printf '[dry-run] %s\n' "$*"; else printf '[%s] %s\n' "$(date '+%F %T')" "$*" >> "$LOG" 2>/dev/null || true; fi; }
 note() { log "$*"; [ "$DRY" = 1 ] || printf '%s\n' "$*"; }
@@ -390,7 +396,7 @@ run_rung() {  # $1=n $2=agora. rc 1 = degrau ausente (não gastou a rodada; o ch
       return 2
     fi
   fi
-  if [ "$n" = 4 ]; then run_bounded "$RUNG_TIMEOUT_S" env "DR4_HARD_STREAK=$HARD_N" "$cmd" "$mode"; rc=$?   # ao D4: quantas leituras seguidas < piso duro eu contei (o estado terminal dele usa)
+  if [ "$n" = 4 ]; then run_bounded "$RUNG_TIMEOUT_S" env "DR4_HARD_STREAK=$HARD_N" "DR4_SHED_WORKING=$SHED_WORKING" "$cmd" "$mode"; rc=$?   # ao D4: quantas leituras seguidas < piso duro eu contei (o estado terminal dele usa)
   else run_bounded "$RUNG_TIMEOUT_S" "$cmd" "$mode"; rc=$?; fi
   line=$(out_line); rb_clean
   case "$rc" in
@@ -465,6 +471,7 @@ held_of() {  # $1=n $2=agora → segundos que o cronômetro do nível está roda
 escalate_d4_cap() {  # $1=agora. D4 já foi disparado há menos de 6 h e o disco segue < limiar: NÃO reinicia de novo; escala UMA vez por episódio, e "uma vez" só vale com a entrega CONFIRMADA por algum canal (notify -p 5 ou mail):
   # este é o único "preciso de um humano" da escada (o D4 está no teto). Nenhum canal confirmou → esc4 fica 0 e a rodada seguinte (2 min) tenta de novo, como o escalate_low_after_reboot do D4; disco cheio, Dolt caído e rede falhando são o cenário ESPERADO aqui.
   [ "$ESC4" = 1 ] && return 0
+  if [ "$SHED_WORKING" = 1 ]; then log "ESCALA adiada: o D3.5 ainda corta carga (D4 no teto, livre=${FREE}MB): o 'precisa de um humano' sai quando a lista esgotar ou o corte falhar"; return 0; fi
   local age=$(( $1 - ACTED4_TS )) told=0
   note "ESCALA: D4 elegível (livre=${FREE}MB) mas o último disparo dele (ou a perda do estado salvo, que conto como disparo) foi há ${age}s (< ${D4_COOLDOWN_S}s): NÃO chamo de novo (sem reinício em laço)"
   send_notify 5 "Disco: segue baixo depois do reinício, preciso de um humano" "Livre ${FREE} MB, swap ${SWAP} MB. O último disparo do D4 (ou a perda do estado salvo da escada) foi há $((age / 60)) min e o disco segue abaixo do limiar. Não reinicio de novo antes de $((D4_COOLDOWN_S / 3600)) h." && told=1
@@ -680,6 +687,66 @@ Despause à mão (outreach_config.system_paused=0 ou o painel) se isto durar. Lo
   return 0
 }
 
+# ── corte de carga (D3.5, ga-1p1i5jr.8) ─────────────────────────────────────────────────────────────────────────────────────────
+shed_d35() {  # ANTES do pick_and_run, toda rodada com o cronômetro do D4 acima de D35_HOLD_S. rc do D3.5: 0 parou · 10 nada · 11 lista esgotada · 12 esperando o efeito do corte · 20 falhou · 30 não li. SHED_WORKING=1 (SÓ 0 e 12) segura o "precisa de um humano" do teto
+  local cmd="$D35_CMD" rc line t why
+  [ "$(held_of 4 "$NOW")" -ge "$D35_HOLD_S" ] || return 0
+  # mesma regra do D2/D3 sob o piso duro: com o D4 chamável a rodada espera o D4 (sob thrash cada chamada gasta o prazo todo)
+  if [ "$FREE" -lt "$D4_HARD_MB" ] && ! d4_capped "$NOW"; then log "D3.5 vencido, mas livre=${FREE}MB < ${D4_HARD_MB}MB e o D4 é chamável: o D3.5 não tem vez (a rodada espera o D4)"; return 0; fi
+  t=$(now) || t=$NOW
+  # vazio (D3.5 ausente ou sem execução) → AVISA, nunca o silêncio do rc 10: sem ele a escada não tem o degrau depois do teto do D4; falhou/ilegível → idem
+  if [ ! -f "$cmd" ] || [ ! -x "$cmd" ]; then
+    [ "$DRY" = 1 ] && return 0
+    note "WARN: D3.5 ausente ou sem permissão de execução ($cmd): sem corte de carga"
+    resume_alert d35broken "$t" 4 "Disco: o D3.5 (corte de carga) não executa" "$cmd não existe ou não executa: sem ele a escada não corta carga depois do teto do D4. (aviso no máximo 1 por hora)"
+    return 0
+  fi
+  if [ "$DRY" = 1 ]; then run_bounded "$RUNG_TIMEOUT_S" "$cmd" --dry-run; rc=$?; line=$(out_line); rb_clean; log "D3.5 --dry-run: rc=$rc: $line"; return 0; fi
+  run_bounded "$RUNG_TIMEOUT_S" "$cmd" --run; rc=$?
+  line=$(out_line); rb_clean
+  case "$rc" in
+    0)  SHED_WORKING=1; note "D3.5 cortou carga: $line"
+        send_notify 4 "Disco: D3.5 cortou carga" "$line (livre ${FREE} MB, swap ${SWAP} MB)"
+        if resume_mark_due d35mail "$t"; then send_mail "Disco: D3.5 cortou carga (livre ${FREE} MB)" "Escada de recuperação de disco (ga-1p1i5jr.8).
+O D3.5 PAROU serviço(s) não essencial(is) (launchctl disable + bootout) para aliviar RAM e swap: $line
+Religa sozinho, um por vez, quando o livre ficar >= 6 GB por 30 min. Registro: $CITY/.gc/disk-recovery-d35.state · log do maestro: $LOG · desligar a escada toda: touch $OFF" && resume_mark_set d35mail "$t"; fi ;;
+    10) log "D3.5: rc=10: $line" ;;
+    12) SHED_WORKING=1; log "D3.5: rc=12 (esperando o efeito do corte): $line" ;;
+    11) log "D3.5: lista esgotada com o disco ainda baixo: $line" ;;   # só log: o alarme é o "precisa de um humano" do teto, que agora SAI (SHED_WORKING=0)
+    20) note "ERROR: D3.5 FALHOU: rc=20: $line"; RC_FINAL=20
+        resume_alert d35rc20 "$t" 4 "Disco: o D3.5 (corte de carga) FALHOU" "$line (aviso no máximo 1 por hora)" ;;
+    30) note "WARN: D3.5 não leu o estado: $line"; [ "$RC_FINAL" = 0 ] && RC_FINAL=30
+        resume_alert d35rc30 "$t" 4 "Disco: o D3.5 não leu o estado" "D3.5 --run devolveu rc=30 (não li; não parei nada): $line (aviso no máximo 1 por hora)" ;;
+    *)  case "$rc" in 124) why="estourou ${RUNG_TIMEOUT_S}s e foi encerrado (TERM)" ;; 125) why="não consegui lançar (mktemp falhou?)" ;; *) why="rc inesperado $rc" ;; esac
+        note "WARN: D3.5 com falha na chamada: $why: $line"; [ "$rc" = 125 ] || RC_FINAL=20
+        resume_alert d35broken "$t" 4 "Disco: o D3.5 falhou na chamada" "$cmd --run: $why: $line. Não sei se parou algo. (aviso no máximo 1 por hora)" ;;
+  esac
+  [ "$FREE" -ge "$D4_HARD_MB" ] || SHED_WORKING=0   # sob o piso duro o aviso de humano não espera o corte
+  return 0
+}
+
+resume_d35() {  # toda rodada, DEPOIS do resume do D4: o D3.5 --resume religa, um por vez, o que ELE parou quando o livre fica >= 6 GB por 30 min (o relógio é dele). rc: 0 religou · 10 nada/espera (o ÚNICO silêncio) · 20 não religou · 30 não li
+  local cmd="$D35_CMD" rc line t why
+  [ "$DRY" = 1 ] && return 0
+  # vazio (D3.5 ausente ou sem execução) → calado: sem o script nada foi parado por ele (o shed_d35 avisa quando o corte é devido); falhou/ilegível → alerta
+  [ -f "$cmd" ] && [ -x "$cmd" ] || return 0
+  t=$(now) || t=$NOW
+  run_bounded "$RESUME_TIMEOUT_S" "$cmd" --resume; rc=$?
+  line=$(out_line); rb_clean
+  case "$rc" in
+    10) return 0 ;;
+    0)  note "retomada do D3.5: rc=0: $line"; send_notify 3 "Disco: D3.5 religou um serviço" "$line" ;;
+    20) note "ERROR: retomada do D3.5 FALHOU: rc=20: $line"; RC_FINAL=20
+        resume_alert d35rrc20 "$t" 4 "Disco: o D3.5 NÃO religou o serviço" "$line. Serviço parado pelo corte de carga segue parado: religue à mão (launchctl enable gui/<uid>/<label> e launchctl bootstrap gui/<uid> <plist>) se isto durar. (aviso no máximo 1 por hora)" ;;
+    30) note "WARN: retomada do D3.5: rc=30 (não consegui ler): $line"; [ "$RC_FINAL" = 0 ] && RC_FINAL=30
+        resume_alert d35rrc30 "$t" 4 "Disco: o D3.5 não leu o estado da retomada" "D3.5 --resume devolveu rc=30 (não li; não religou nada): $line. Serviço parado pode estar esperando. (aviso no máximo 1 por hora)" ;;
+    *)  case "$rc" in 124) why="estourou ${RESUME_TIMEOUT_S}s e foi encerrado (TERM)" ;; 125) why="não consegui lançar (mktemp falhou?)" ;; *) why="rc inesperado $rc" ;; esac
+        note "WARN: retomada do D3.5 com falha na chamada: $why: $line"; [ "$rc" = 125 ] || RC_FINAL=20
+        resume_alert d35rbroken "$t" 4 "Disco: a retomada do D3.5 falhou na chamada" "$cmd --resume: $why: $line. Não sei se há serviço parado esperando. (aviso no máximo 1 por hora)" ;;
+  esac
+  return 0
+}
+
 log_rss() {  # rodada com livre <= D2_MB: foto dos 10 maiores RSS num log PRÓPRIO que gira (RSS_LOG_MAX_KB). Só diagnóstico: nunca decide nada nem muda a saída. 10/11 não havia como saber QUEM inchou a RAM
   [ "$DRY" = 1 ] && return 0
   local rc kb
@@ -756,10 +823,12 @@ main() {
 
   [ "$FREE" -le "$D2_MB" ] && log_rss   # ANTES de chamar um degrau: se o D4 reiniciar a máquina, a foto desta rodada já está no disco
   save_state
+  shed_d35   # ANTES do degrau da vez: o D3.5 corta carga e diz se ainda tem o que cortar (SHED_WORKING), que o teto do D4 lê para adiar o "precisa de um humano"
   pick_and_run "$NOW"
   save_state
   resume_d2   # sempre DEPOIS do --run: o --resume lê o registro do D2 já com o que o --run acabou de parar; quem decide se o livre voltou é o próprio D2 (resume_above_mb > stop_below_mb: histerese dele, não minha)
   resume_d4   # idem: o D4 --resume solta a pausa de envio que ele pôs (depois do boot, ou quando o pedido de reinício pendente vence)
+  resume_d35  # idem: o D3.5 --resume religa o que o corte de carga parou
   if [ "$SAVE_FAIL" = 1 ]; then [ "$RC_FINAL" = 0 ] && RC_FINAL=30; nosave_warn; fi
   exit "$RC_FINAL"
 }

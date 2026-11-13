@@ -1,0 +1,48 @@
+# disk-recovery-d35-allowlist.tsv — a ALLOWLIST do degrau D3.5 (corte de carga) da escada de recuperação de disco (ga-1p1i5jr.8).
+#
+# ## Contents
+#   Formato · Origem · Ordem · Linhas ATIVAS · Como acrescentar
+#
+# FORMATO. Uma linha por job do launchd, 4 colunas separadas por TAB (nunca espaço; campo vazio = `-`). Linha em branco e linha que começa com `#` são ignoradas.
+#   1 label   label do launchd (gui/<uid>/<label>); o plist tem de existir em ~/Library/LaunchAgents/<label>.plist (sem ele não dá para religar, então não se para)
+#   2 porta   porta do serviço, ou `-` (lote sem porta)
+#   3 nome    como o Athos o conhece (vai na lista do aviso)
+#   4 risco   coluna `risk` da action-table do Mayor (baixo | - | medio)
+# ORIGEM. Linhas `emergency_off=sim` da action-table do Mayor (.gc/agents/mayor/proc-review/action-table.tsv, wa-g2fryg 09/11, 87 linhas), as de servidor com porta: a mesma cópia versionada que o
+#   botão Ligar/Desligar do admin usa (whatsapp_automation, lib/servicos_toggle.py `PERMITIDOS`). A tabela mora fora do repo, então o degrau não depende dela em tempo de execução (tabela sumida = nada
+#   parado; tabela errada = parar o que não devia): o selftest compara as duas quando a tabela existe na máquina. Lote sem porta que a tabela libera ainda NÃO está aqui (o nó que escreveu isto não lê a
+#   tabela): entra como linha com porta `-`.
+# NUNCA entra, mesmo que alguém escreva aqui (o script descarta a linha e diz): sender, captura de inbound, voicebot/discador, túneis, Dolt, supervisor, HQ (gascity/gastown), classification :8086,
+#   demand :8095, map-viewer :8099, frota :8203, admin/daemon — a deny-list vive em disk-recovery-d35-load-shed.sh (DENY_PORTS, DENY_FRAGS) e VENCE esta lista.
+# ORDEM. É a do arquivo: o degrau para de cima para baixo e religa de baixo para cima. Regra: menor risco primeiro (baixo, depois `-`, depois medio); dentro do risco, telas que ninguém abre antes das que
+#   o Athos usa, e os webhooks (perdem evento externo enquanto parados) por último. O selftest trava a ordem de risco. Sem o uso real das telas aqui, a ordem dentro do risco é julgamento: o Mayor reordena.
+# QUEM JÁ ESTÁ DESLIGADO (por decisão do Athos, wa-g2fryg 09/11) é pulado e NUNCA religado: o degrau só religa o que ele mesmo parou (registro em .gc/disk-recovery-d35.state).
+# COMO ACRESCENTAR. Confira `emergency_off=sim` na action-table, escreva a linha, rode scripts/disk-recovery-d35-load-shed.selftest.sh (ele recusa linha negada, ordem de risco quebrada e deriva da tabela).
+#
+# LINHAS ATIVAS
+com.whatsapp.getzip-dashboard	8767	GetZip	baixo
+br.urblink.processo	5050	Processos	baixo
+br.urblink.assertiva	8096	Assertiva	baixo
+com.whatsapp.analytics-dashboard	8083	Analytics	baixo
+br.urblink.empresas	5051	Oráculo de Empresas	baixo
+br.urblink.construtoras	5052	Construtoras	baixo
+com.whatsapp.public-docs-dashboard	8206	Estudos (público)	baixo
+com.whatsapp.procob-dashboard	8769	PROCOB	baixo
+br.urblink.motherduck-dashboard	8091	MotherDuck	baixo
+com.whatsapp.webhook-receiver	5555	Webhook Whapi (ligações)	baixo
+com.urblink.contacts-auth	5001	Contacts Auth	-
+com.urblink.chip-kpi-dashboard	8199	Chip KPI	-
+br.urblink.lexbh	7842	LexBH	-
+com.whatsapp.anuncios-dashboard	8204	Terrenos & Anúncios	-
+br.urbilink.scrapers.health	7843	Scrapers	-
+com.athos.mockup-server	8915	Servidor de mockups	-
+br.urblink.traco-bim	8916	Traço BIM	-
+com.urblink.painel-visibilidade	8202	Kanban de histórias	-
+com.whatsapp.campaign-dashboard	8081	Campanhas	-
+com.whatsapp.pipedrive-webhook	8208	Webhook do Pipedrive	-
+com.whatsapp.fleet-alert-confirm-webhook	8109	Fleet Alert Confirm	-
+com.whatsapp.pbh-dashboard	8098	PBH (CKAN)	medio
+com.whatsapp.clientes-dashboard	8104	Dashboard de Clientes	medio
+com.whatsapp.pix-lookup-api	8765	API de consulta PIX	medio
+com.whatsapp.campaign-api	8082	API de campanhas	medio
+com.whatsapp.ficha360	8207	Ficha 360°	medio

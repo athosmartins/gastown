@@ -50,7 +50,7 @@ hasnt() { case "$1" in *"$2"*) nope "$3 (não devia ter: $2)" ;; *) ok "$3" ;; e
 section() { printf '\n== %s\n' "$1"; }
 
 # ── stubs ───────────────────────────────────────────────────────────────────────────────────────────────────
-for n in d2 d3 d4; do
+for n in d2 d3 d4 d35; do
   cp /dev/null "$W/stubs/$n"
   cat > "$W/stubs/$n" <<'STUB'
 #!/bin/bash
@@ -70,6 +70,7 @@ fi
 echo "$n $1" >> "$STUB_DIR/calls"
 echo $$ > "$STUB_DIR/pid.$n"
 echo "${DR4_HARD_STREAK:-unset}" > "$STUB_DIR/hs.$n"                       # o que o maestro passou em DR4_HARD_STREAK (só ao D4)
+echo "${DR4_SHED_WORKING:-unset}" > "$STUB_DIR/sw.$n"                       # idem DR4_SHED_WORKING (ga-1p1i5jr.8: o D3.5 ainda corta?)
 cp "$DR_RSS_LOG" "$STUB_DIR/rss_at_call.$n" 2>/dev/null                    # a foto de RSS que já existia quando o degrau foi chamado
 cp "$DR_STATE" "$STUB_DIR/state_at_call.$n" 2>/dev/null
 [ -n "$setfree" ] && printf '%s' "$setfree" > "$DR_FREE_MB_FILE"
@@ -154,7 +155,7 @@ chmod 755 "$W/rssbin/ps"
 BASE=( "PATH=$W/rssbin:$PATH" "HOME=$W/home" "TMPDIR=$W/tmp" "STUB_DIR=$SD"
   "DR_CITY=$CITY" "DR_STATE=$STATE" "DR_LOG=$LOG" "DR_RSS_LOG=$RSSLOG" "DR_OFF_FILE=$OFF" "DR_LOCK=$LOCK"
   "DR_FREE_MB_FILE=$W/free" "DR_SWAP_MB_FILE=$W/swap" "DR_NOW_FILE=$W/now"
-  "DR_D2_CMD=$W/stubs/d2" "DR_D3_CMD=$W/stubs/d3" "DR_D4_CMD=$W/stubs/d4"
+  "DR_D2_CMD=$W/stubs/d2" "DR_D3_CMD=$W/stubs/d3" "DR_D4_CMD=$W/stubs/d4" "DR_D35_CMD=$W/stubs/d35"
   "DR_NOTIFY_BIN=$W/stubs/notify" "DR_GC_BIN=$W/stubs/gc" "DR_SETTLE_S=0" )
 XENV=()
 
@@ -165,7 +166,7 @@ setfree() { if [ "$1" = MISSING ]; then rm -f "$W/free"; else printf '%s' "$1" >
 setswap() { if [ "$1" = MISSING ]; then rm -f "$W/swap"; else printf '%s' "$1" > "$W/swap"; fi; }
 tick() { setfree "$1"; setswap "$2"; printf '%s' "$3" > "$W/now"; runl --run; }   # livre swap agora
 ncall()  { local n; n=$(grep -c -x -F "$1 $2" "$SD/calls" 2>/dev/null); echo "${n:-0}"; }
-ncallall() { local n; n=$(grep -v -x -F -e 'd2 --resume' -e 'd4 --resume' "$SD/calls" 2>/dev/null | grep -c .); echo "${n:-0}"; }   # chamadas de --run/--dry-run; o --resume (toda rodada) conta à parte em nresume / nresume4
+ncallall() { local n; n=$(grep -v -x -F -e 'd2 --resume' -e 'd4 --resume' -e 'd35 --resume' -e 'd35 --run' -e 'd35 --dry-run' "$SD/calls" 2>/dev/null | grep -c .); echo "${n:-0}"; }   # chamadas de --run/--dry-run; o --resume (toda rodada) conta à parte em nresume / nresume4
 nresume() { local n; n=$(grep -c -x -F 'd2 --resume' "$SD/calls" 2>/dev/null); echo "${n:-0}"; }
 nresume4() { local n; n=$(grep -c -x -F 'd4 --resume' "$SD/calls" 2>/dev/null); echo "${n:-0}"; }
 rmode() { printf '%s\n' "$@" > "$SD/mode.d2.resume"; }   # o que o D2 --resume devolve: rmode rrc=20 "rmsg='...'"
@@ -181,7 +182,7 @@ mode() { printf '%s\n' "${@:2}" > "$SD/mode.$1"; }
 reset() {
   rm -rf "$CITY" "$W/ro"; mkdir -p "$CITY/.gc/logs"
   rm -f "$SD"/* "$W/tmp"/* "$W/stubs/d2.alt" 2>/dev/null
-  : > "$SD/calls"; : > "$SD/notify.log"; : > "$SD/mail.log"
+  : > "$SD/calls"; : > "$SD/notify.log"; : > "$SD/mail.log"; printf 'rc=11\n' > "$SD/mode.d35"   # D3.5 calado por padrão: lista esgotada (só log, o aviso de humano do teto sai como sempre)
   XENV=(); setfree 20000; setswap 0; printf '%s' "$T0" > "$W/now"
 }
 WSEQ=""; WFIRST2=""; WFIRST3=""; WFIRST4=""; WMAX=0
@@ -200,6 +201,69 @@ walk() {  # livre swap de até passo: um tick a cada $5 s, de $3 a $4 (inclusive
 }
 
 # ═════════════════════════════════════════════════════════════════════════════════════════════════════════════
+section "D3.5 (corte de carga, ga-1p1i5jr.8): entra com o cronômetro do D4 acima de 2700 s, ANTES do degrau; só o rc 10 é silêncio; falha da CHAMADA é alerta"
+D35N0='p=4 force=1 t=Disco: D3.5 cortou carga'; D35N20='p=4 force=1 t=Disco: o D3.5 (corte de carga) FALHOU'; D35N30='p=4 force=1 t=Disco: o D3.5 não leu o estado'
+D35NB='p=4 force=1 t=Disco: o D3.5 falhou na chamada'; D35NA='p=4 force=1 t=Disco: o D3.5 (corte de carga) não executa'; HUM='preciso de um humano'
+nd35() { local n; n=$(grep -c -x -F 'd35 --run' "$SD/calls" 2>/dev/null); echo "${n:-0}"; }
+capped35() { reset; mode d4 rc=10; mode d35 "$@"; mkstate "$STATE" 0 0 $((T0 - 3700)) $((T0 - 1000)); }   # D4 no teto de 6 h (disparou há 1000 s) com o cronômetro dele em 3820 s na rodada
+reset; mode d2 rc=10; mode d3 rc=10; mode d4 rc=10; walk 2900 0 "$T0" $((T0 + 2400)) 300
+eq "$(nd35)" 0 "cronômetro do D4 em 2400 s (< 2700): o D3.5 não é chamado"
+tick 2900 0 $((T0 + 2700)); eq "$(nd35)" 1 "2700 s: o D3.5 é chamado (antes dos 3600 s do D4)"
+reset; mode d4 rc=10; mode d35 rc=0 "msg='D3.5 run: parei 2: Alfa [com.t.a], Beta [com.t.b]; livre 2500 -> 2800 MB'"; mkstate "$STATE" 0 0 $((T0 - 3700)); tick 2900 0 $((T0 + 120))
+eq "$RC,$(nd35),$(nnotify "$D35N0"),$(nmail 'D3.5 cortou carga')" "0,1,1,1" "rc 0 (parou): notify -p 4 FORÇADO + mail ao Mayor, saída 0"
+has "$(cat "$SD/notify.log")" "Alfa [com.t.a], Beta [com.t.b]" "rc 0: a LISTA do que parou vai no aviso"
+eq "$(cat "$SD/sw.d35" "$SD/sw.d4" 2>/dev/null | tr '\n' ',')" "unset,1," "o D4 (chamado na mesma rodada, DEPOIS do D3.5) recebe DR4_SHED_WORKING=1"
+tick 2900 0 $((T0 + 240)); eq "$(nnotify "$D35N0"),$(nmail 'D3.5 cortou carga')" "2,1" "2ª rodada com rc 0: notify de novo (a lista nova), mail só 1 por hora"
+walk 2900 0 $((T0 + 540)) $((T0 + 4000)) 300; eq "$(nmail 'D3.5 cortou carga')" 2 "…e passada 1 h o mail sai de novo"
+reset; mode d4 rc=10; mode d35 rc=12 "msg='D3.5 run: esperando o efeito do último corte'"; mkstate "$STATE" 0 0 $((T0 - 3700)); tick 2900 0 $((T0 + 120))
+eq "$RC,$(nd35),$(nnotify p=),$(nmail to=),$(cat "$SD/sw.d4")" "0,1,0,0,1" "rc 12 (esperando o efeito do corte): silêncio total, e o D4 recebe DR4_SHED_WORKING=1"
+reset; mode d4 rc=10; mode d35 rc=10; mkstate "$STATE" 0 0 $((T0 - 3700)); tick 2900 0 $((T0 + 120))
+eq "$RC,$(nd35),$(nnotify p=),$(nmail to=),$(cat "$SD/sw.d4")" "0,1,0,0,0" "rc 10 (nada a fazer): silêncio total, e o D4 recebe DR4_SHED_WORKING=0 (o 10 NÃO diz 'ainda corto')"
+capped35 rc=11 "msg='D3.5 run: lista esgotada'"; tick 2500 0 $((T0 + 120))
+eq "$RC,$(nd35),$(nnotify "$HUM"),$(nmail 'já disparou'),$(sv esc4)" "0,1,1,1,1" "rc 11 (lista esgotada) + D4 no teto: o 'precisa de um humano' SAI (esc4=1), só depois de o corte esgotar"
+hasnt "$OUT" "esgotada" "rc 11: sem linha no stdout (só log): o alarme é o do teto"
+capped35 rc=12; tick 2500 0 $((T0 + 120))
+eq "$(nnotify "$HUM"),$(nmail 'já disparou'),$(sv esc4)" "0,0,0" "rc 12 (D3.5 ainda corta) + D4 no teto: o 'precisa de um humano' fica ADIADO (esc4 segue 0)"
+has "$(logtxt)" "ESCALA adiada" "…e o log diz"
+mode d35 rc=11; tick 2500 0 $((T0 + 240)); eq "$(nnotify "$HUM"),$(sv esc4)" "1,1" "…e sai quando o D3.5 passa a dizer 'esgotada'"
+capped35 rc=10; tick 2500 0 $((T0 + 120)); eq "$(nnotify "$HUM"),$(sv esc4)" "1,1" "rc 10 (nada a fazer, p.ex. outra instância do D3.5 travada) + D4 no teto: o 'precisa de um humano' SAI (silêncio é o lado perigoso)"
+capped35 rc=0 "msg='D3.5 run: parei 1: X [x]'"; tick 2500 0 $((T0 + 120)); eq "$(nnotify "$HUM"),$(sv esc4),$(nnotify "$D35N0")" "0,0,1" "rc 0 (acabou de parar) + D4 no teto: avisa a lista e também adia o aviso de humano (o corte ainda anda)"
+capped35 rc=12; tick 1400 0 $((T0 + 120)); eq "$(nd35),$(nnotify "$HUM"),$(sv esc4)" "1,1,1" "livre < 1,5 GB: o aviso de humano NÃO espera o corte (SHED_WORKING zerado sob o piso duro, mesmo com rc 12)"
+capped35 rc=20 "msg='D3.5 run: parei 1: X [x]; FALHOU 1: y (disable não pegou)'"; tick 2500 0 $((T0 + 120))
+eq "$RC,$(nnotify "$D35N20"),$(nmail to=),$(nnotify "$HUM")" "20,1,1,1" "rc 20: saída 20, alerta -p 4 forçado (+ mail do 'preciso de humano'), e o aviso de humano NÃO é adiado"
+eq "$(cat "$CITY/.gc/disk-recovery.resume-d35rc20" 2>/dev/null)" "$((T0 + 120))" "rc 20: marca de 1 h (classe d35rc20) com a hora do aviso entregue"
+tick 2500 0 $((T0 + 240)); eq "$(nnotify "$D35N20")" 1 "rc 20 de novo 2 min depois: no máx. 1 alerta por hora"
+capped35 rc=30 "msg='D3.5 run: não consegui ler os labels'"; tick 2500 0 $((T0 + 120)); eq "$RC,$(nnotify "$D35N30"),$(nnotify "$HUM")" "30,1,1" "rc 30: saída 30, alerta, e o aviso de humano NÃO é adiado"
+capped35 rc=99; tick 2500 0 $((T0 + 120)); eq "$RC,$(nnotify "$D35NB"),$(nnotify "$HUM")" "20,1,1" "rc fora do contrato (99): alerta de falha da chamada, saída 20, aviso de humano não adiado"
+capped35 rc=0 slp=5; XENV=("DR_RUNG_TIMEOUT_S=1"); tick 2500 0 $((T0 + 120)); eq "$RC,$(nnotify "$D35NB"),$(nnotify "$HUM")" "20,1,1" "estourou o prazo (124): alerta de falha da chamada, aviso de humano não adiado"
+capped35 rc=10; XENV=("DR_D35_CMD=$W/stubs/nao-existe"); tick 2500 0 $((T0 + 120)); eq "$RC,$(nnotify "$D35NA"),$(nnotify "$HUM")" "0,1,1" "D3.5 ausente: alerta (nunca silêncio) e o aviso de humano sai como sempre"
+capped35 rc=10; XENV=("DR_D35_CMD=$W/stubs/noexec"); tick 2500 0 $((T0 + 120)); eq "$(nnotify "$D35NA"),$(nnotify "$HUM")" "1,1" "D3.5 sem permissão de execução: o mesmo"
+reset; mode d4 rc=10; mode d35 rc=10; mkstate "$STATE" 0 0 $((T0 - 3700)); tick 1400 0 $((T0 + 120))
+eq "$(nd35),$(ncall d4 --run),$(cat "$SD/sw.d4")" "0,1,0" "livre < 1,5 GB com o D4 CHAMÁVEL: o D3.5 não tem vez (a rodada espera o D4), e o D4 recebe DR4_SHED_WORKING=0"
+has "$(logtxt)" "o D3.5 não tem vez" "…e o log diz"
+reset; mode d35 rc=10; mkstate "$STATE" 0 0 $((T0 - 3700)); setfree 2900; setswap 0; printf '%s' $((T0 + 120)) > "$W/now"; runl --dry-run
+eq "$(grep -c -x -F 'd35 --dry-run' "$SD/calls"),$(nd35),$(nnotify p=)" "1,0,0" "dry-run: chama o D3.5 com --dry-run (e só ele), sem aviso"
+has "$OUT" "D3.5 --dry-run: rc=10" "…e mostra a linha dele (no stdout: o dry-run não grava log)"
+
+section "retomada do D3.5: --resume a cada rodada, DEPOIS do resume do D4; só o rc 10 é silêncio; falha da CHAMADA é alerta"
+D35R0='p=3 force= t=Disco: D3.5 religou um serviço'; D35R20='p=4 force=1 t=Disco: o D3.5 NÃO religou o serviço'; D35R30='p=4 force=1 t=Disco: o D3.5 não leu o estado da retomada'; D35RB='p=4 force=1 t=Disco: a retomada do D3.5 falhou na chamada'
+nres35() { local n; n=$(grep -c -x -F 'd35 --resume' "$SD/calls" 2>/dev/null); echo "${n:-0}"; }
+rmode35() { printf '%s\n' "$@" > "$SD/mode.d35.resume"; }
+reset; tick 20000 0 "$T0"; tick 20000 0 $((T0 + 120))
+eq "$RC,$(nres35),$(nnotify p=),$(nmail to=)" "0,2,0,0" "rc 10 (nada a retomar): chamado a CADA rodada, silêncio total"
+eq "$(tail -n 3 "$SD/calls" | tr '\n' ',')" "d2 --resume,d4 --resume,d35 --resume," "o resume do D3.5 vem DEPOIS dos do D2 e do D4, na mesma rodada"
+reset; rmode35 rrc=0 "rmsg='D3.5 resume: religou [com.t.b] (pid 1001 -> 5000); restam 1'"; tick 20000 0 "$T0"
+eq "$RC,$(nnotify "$D35R0"),$(nmail to=)" "0,1,0" "rc 0 (religou): notify -p 3 sem push forçado, sem mail, saída 0"; has "$(cat "$SD/notify.log")" "pid 1001 -> 5000" "…com a linha dele"
+reset; rmode35 rrc=20 "rmsg='FALHOU ao religar [com.t.b]: sem pid novo'"; tick 20000 0 "$T0"
+eq "$RC,$(nnotify "$D35R20"),$(cat "$CITY/.gc/disk-recovery.resume-d35rrc20" 2>/dev/null)" "20,1,$T0" "rc 20 (não religou): saída 20, alerta -p 4 forçado e marca de 1 h (classe d35rrc20)"
+has "$(cat "$SD/notify.log")" "religue à mão" "…e o alerta ensina a religar à mão"
+tick 20000 0 $((T0 + 120)); eq "$(nnotify "$D35R20")" 1 "rc 20 de novo 2 min depois: no máx. 1 alerta por hora"
+reset; rmode35 rrc=30 "rmsg='registro ilegível'"; tick 20000 0 "$T0"; eq "$RC,$(nnotify "$D35R30")" "30,1" "rc 30 (não li): saída 30 e alerta"
+reset; rmode35 rrc=99 "rmsg='???'"; tick 20000 0 "$T0"; eq "$RC,$(nnotify "$D35RB")" "20,1" "rc fora do contrato: alerta de falha da chamada, saída 20"
+reset; rmode35 rrc=0 rslp=5; XENV=("DR_RESUME_TIMEOUT_S=1"); tick 20000 0 "$T0"; eq "$RC,$(nnotify "$D35RB")" "20,1" "estourou o prazo da retomada (124): alerta de falha da chamada"
+reset; XENV=("DR_D35_CMD=$W/stubs/nao-existe"); tick 20000 0 "$T0"; eq "$RC,$(nnotify p=)" "0,0" "D3.5 ausente na retomada: calado (nada foi parado por ele; o corte é que avisa)"
+reset; setfree 20000; printf '%s' "$T0" > "$W/now"; runl --dry-run; eq "$(nres35)" 0 "dry-run não chama o --resume do D3.5"
+
 section "uso e rodada sem episódio"
 reset
 for a in "" "--bogus" "--run extra"; do runl $a; eq "$RC" 2 "argumentos '$a' → uso (2)"; done
@@ -229,7 +293,7 @@ eq "$(nnotify p=),$(nmail to=),$(nmarks)" "0,0,0" "rc 10 (nada a retomar): silê
 hasnt "$(logtxt)" "retomada do D2" "rc 10: nem uma linha no log do maestro (rodada a cada 2 min)"
 tick 20000 0 $((T0 + 120)); eq "$(nresume)" 2 "…e de novo na rodada seguinte"
 reset; tick 5000 0 "$T0"; tick 5000 0 $((T0 + 450)); tick 5000 0 $((T0 + 900))
-eq "$(tail -n 3 "$SD/calls" | tr '\n' ',')" "d2 --run,d2 --resume,d4 --resume," "escada em degrau: o --run vai primeiro e os dois --resume (D2, depois D4) depois, na MESMA rodada"
+eq "$(tail -n 4 "$SD/calls" | tr '\n' ',')" "d2 --run,d2 --resume,d4 --resume,d35 --resume," "escada em degrau: o --run vai primeiro e os três --resume (D2, D4 e D3.5, nessa ordem) depois, na MESMA rodada"
 reset; rmode rrc=0 "rmsg='retomou rfb --resume-run 1700000000-4242: de pé depois de 25s'"
 tick 20000 0 "$T0"
 eq "$RC,$(nnotify "$RN0"),$(nmail to=)" "0,1,0" "rc 0 (retomou): saída 0, 1 notify -p 3 'retomou' sem push forçado, sem mail"
@@ -350,7 +414,7 @@ reset; tick 20000 0 "$T0"; tick 20000 0 $((T0 + 120))
 eq "$RC,$(nresume4),$(nnotify p=),$(nmail to=)" "0,2,0,0" "rc 10 (nada a retomar): chamado a CADA rodada, silêncio total (nenhum aviso nem mail)"
 hasnt "$(logtxt)" "retomada do D4" "rc 10: nem uma linha no log do maestro"
 reset; rmode rrc=0 "rmsg='o D2 diz algo'"; tick 20000 0 "$T0"
-eq "$(tail -n 2 "$SD/calls" | tr '\n' ',')" "d2 --resume,d4 --resume," "o resume do D4 vem DEPOIS do resume do D2, na mesma rodada"
+eq "$(tail -n 3 "$SD/calls" | tr '\n' ',')" "d2 --resume,d4 --resume,d35 --resume," "o resume do D4 vem DEPOIS do resume do D2 (e antes do D3.5), na mesma rodada"
 reset; rmode4 rrc=0 "rmsg='marca da pausa de envio de 08:01 solta: pausa de envio nossa solta e conferida'"; tick 20000 0 "$T0"
 eq "$RC,$(nnotify "$D4N0"),$(nmail to=)" "0,1,0" "rc 0 (soltou): notify -p 3 'soltou' sem push forçado, sem mail, saída 0"
 has "$(cat "$SD/notify.log")" "pausa de envio nossa solta e conferida" "rc 0: a linha do D4 vai na mensagem"
@@ -561,7 +625,7 @@ section "leitor real: df do volume Data (nunca o /) e swap, com LC_ALL=C e com a
 BASE_FULL=("${BASE[@]}")
 BASE=( "PATH=$W/bin:/usr/bin:/bin:/usr/sbin:/sbin" "HOME=$W/home" "TMPDIR=$W/tmp" "STUB_DIR=$SD"
   "DR_CITY=$CITY" "DR_STATE=$STATE" "DR_LOG=$LOG" "DR_OFF_FILE=$OFF" "DR_LOCK=$LOCK" "DR_NOW_FILE=$W/now"
-  "DR_D2_CMD=$W/stubs/d2" "DR_D3_CMD=$W/stubs/d3" "DR_D4_CMD=$W/stubs/d4" "DR_NOTIFY_BIN=$W/stubs/notify" "DR_GC_BIN=$W/stubs/gc" )
+  "DR_D2_CMD=$W/stubs/d2" "DR_D3_CMD=$W/stubs/d3" "DR_D4_CMD=$W/stubs/d4" "DR_D35_CMD=$W/stubs/d35" "DR_NOTIFY_BIN=$W/stubs/notify" "DR_GC_BIN=$W/stubs/gc" )
 rm -f "$W/df.all" "$W/sysctl.all"
 real() {  # df-modo sysctl-modo [VAR=valor extra]: dry-run com os shims; acumula o que df/sysctl receberam (o reset apaga $SD)
   [ -f "$SD/df.args" ] && cat "$SD/df.args" >> "$W/df.all"; [ -f "$SD/sysctl.env" ] && cat "$SD/sysctl.env" >> "$W/sysctl.all"

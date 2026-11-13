@@ -343,6 +343,11 @@ run_sut --run;  check "cooldown: com exatamente 6 h já pode (kill 143; veio $RC
 mk_case cap; saved_state "$((NOW - 50000)),$((NOW - 30000))"
 run_sut --run;  expect_no_reboot "teto de 2 por 24 h" 10 "teto diário"
 check "teto: escalou" [ "$(n_mail)" = 1 ]
+mk_case cap_shed; saved_state "$((NOW - 50000)),$((NOW - 30000))"; setenv "DR4_SHED_WORKING=1"
+run_sut --run;  expect_no_reboot "teto de 2 por 24 h com o D3.5 ainda cortando (DR4_SHED_WORKING=1)" 10 "teto diário"
+chk "D3.5 ainda corta: a escalada fica ADIADA (sem notify, sem mail, sem esc_for) e a linha diz (veio: $OUT)" '[ "$(n_notify)" = 0 ] && [ "$(n_mail)" = 0 ] && state_has "esc_for=0" && contains "escalada adiada"'
+for v in 0 yes; do mk_case cap_shed_$v; saved_state "$((NOW - 50000)),$((NOW - 30000))"; setenv "DR4_SHED_WORKING=$v"
+run_sut --run;  chk "DR4_SHED_WORKING=$v não adia: escala como sempre (mail=$(n_mail); veio: $OUT)" '[ "$RC" = 10 ] && [ "$(n_mail)" = 1 ] && ! contains "escalada adiada"'; done
 mk_case cap_one; saved_state $((NOW - 30000)); touch "$C/reboot.dies"
 run_sut --run;  check "1 reinício em 24 h (> 6 h atrás) ainda pode (kill 143; veio $RC: $OUT)" [ "$RC" = 143 ]
 mk_case uptime; setenv "DR4_BOOT_EPOCH=$((NOW - 3000))"

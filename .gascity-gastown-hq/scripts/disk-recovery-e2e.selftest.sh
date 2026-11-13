@@ -166,6 +166,7 @@ SH
 for n in fdesetup defaults pgrep osascript launchctl-d4; do printf '#!/bin/bash\n' > "$BIN/$n"; done
 echo 'echo "FileVault is Off."' >> "$BIN/fdesetup"; echo 'echo athos' >> "$BIN/defaults"; echo 'exit 1' >> "$BIN/pgrep"
 echo 'echo "gui/501/x = { state = not running }"' >> "$BIN/launchctl-d4"
+printf '#!/bin/bash\necho "D3.5 (stub do e2e): nada a cortar"\nexit 10\n' > "$BIN/d35-idle"   # o D3.5 (ga-1p1i5jr.8) tem selftest próprio: aqui ele é ocioso, porque o real leria o df e o launchctl DE VERDADE do mini (nunca toca na máquina)
 for n in reboot shutdown sudo top secret; do printf '#!/bin/bash\necho "%s $*" >> "$E2E_W/forbidden"; exit 1\n' "$n" > "$BIN/$n"; done
 printf 'import sys\nsys.stdout.write("central_sender_restart_safe: fila sem envio em voo — pode reiniciar\\n")\n' > "$W/sender_stub.py"
 chmod 755 "$BIN"/*
@@ -234,7 +235,7 @@ world_boot() {  # o mini volta do reinício simulado: $1=base saudável, daemons
 }
 mkenv() {  # ENVV = o env do plist (PATH, HOME, GC_CITY_PATH, BD_ACTOR) + só as costuras de teste; a hora simulada de AGORA
   ENVV=( "PATH=$BIN:$PATH" "HOME=$W/home" "TMPDIR=$W/tmp" "GC_CITY_PATH=$CITY" "BD_ACTOR=automation" "E2E_W=$W"
-    "DR_NOW_FILE=$W/now" "DR_NOTIFY_BIN=$BIN/notify" "DR_GC_BIN=$BIN/gc" "DR_SETTLE_S=0" "DR_RUNG_TIMEOUT_S=120"
+    "DR_NOW_FILE=$W/now" "DR_NOTIFY_BIN=$BIN/notify" "DR_GC_BIN=$BIN/gc" "DR_SETTLE_S=0" "DR_RUNG_TIMEOUT_S=120" "DR_D35_CMD=$BIN/d35-idle"
     "D2_ALLOWLIST=$HERE/disk-recovery-d2-allowlist.tsv" "D2_PS_BIN=$BIN/ps-d2" "D2_DF_BIN=$BIN/df" "D2_AWS_BIN=$BIN/aws" "D2_LAUNCHCTL_BIN=$BIN/launchctl" "D2_NOW=$NOW_S" "D2_TERM_GRACE_S=10"
     "DR_D3_PIX_DB=$W/pix.db" "DR_D3_VOICE_DB=$W/vb.db" "DR_D3_GUARDED=$BIN/guarded" "DR_D3_FREEZE_CMD=$BIN/freeze" "DR_D3_SETTLE_S=0" "DR_D3_READY_S=10" "DR_D3_ROUND_LOCK=$W/round.lock"   # a trava da rodada da campanha: ausente aqui = livre (nunca a do /tmp real da maquina)
     "DR4_NOW=$NOW_S" "DR4_BOOT_EPOCH=$(cat "$WD/boot")" "DR4_FDESETUP_BIN=$BIN/fdesetup" "DR4_DEFAULTS_BIN=$BIN/defaults" "DR4_LAUNCHCTL_BIN=$BIN/launchctl-d4"

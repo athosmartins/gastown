@@ -533,6 +533,8 @@ ESC_NOTE=""   # o que a escalada fez, para o texto da linha de stdout ("escalado
 escalate_low_after_reboot() {  # $1=última marca de reinício $2=motivo. UMA vez por reinício (esc_for): o disco segue baixo e este degrau NÃO reinicia de novo
   [ "$DRY" = 1 ] && { ESC_NOTE="dry-run: não escalo"; return 0; }
   [ "$S_ESC_FOR" = "$1" ] && { log "escalada deste reinício ($1) já foi feita — não repito"; ESC_NOTE="escalada deste reinício já feita"; return 0; }
+  # ga-1p1i5jr.8: o maestro diz que o D3.5 (corte de carga) ainda tem o que cortar: o "precisa de um humano" espera o corte esgotar. Só o valor 1 adia (ausente, 0 ou lixo = escala como sempre: o silêncio é o lado perigoso)
+  [ "${DR4_SHED_WORKING:-0}" = 1 ] && { log "escalada adiada: o D3.5 ainda corta carga (DR4_SHED_WORKING=1)"; ESC_NOTE="escalada adiada: o D3.5 ainda corta carga"; return 0; }
   local ok=0
   send_notify 5 "Disco: segue baixo depois do reinício automático" "Livre ${FREE_MB} MB. $2 O D4 NÃO reinicia de novo. Precisa de um humano: o que está comendo o disco depois do boot? Log: $LOG" && ok=1
   send_mail "Disco: D4 não reinicia de novo e o disco segue baixo (livre ${FREE_MB} MB)" "O D4 da escada de disco (ga-1p1i5jr.4) recusou um novo reinício automático: $2 Livre agora: ${FREE_MB} MB. Isto é o fim da escada: precisa de um humano. Estado: $STATE · log: $LOG" && ok=1

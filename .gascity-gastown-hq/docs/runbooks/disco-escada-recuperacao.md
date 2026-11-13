@@ -9,6 +9,7 @@
 - Interruptor, arquivos, saídas
 - Três estados: o que o maestro faz quando não consegue ler
 - Teto de 6 h do reinício (D4)
+- D3.5: corte de carga (ga-1p1i5jr.8)
 - D1: temporários do pytest e do GoogleUpdater, e a trava do Chrome (ga-1p1i5jr.9)
 - Como testar
 - Prova ponta a ponta e canário de 24 h (D5)
@@ -30,6 +31,7 @@ por rodada. Não apaga, não para e não reinicia nada por conta própria.
 | D1 | `scripts/dolt-disk-floor-guard.sh` (já roda sozinho, a cada 5 min) | limpa arquivo (reapers, GOCACHE, órfãos…). O maestro NÃO o chama nem o reimplementa |
 | D2 | `scripts/disk-recovery-d2-heavy-jobs.sh` (bead ga-1p1i5jr.2) | para jobs pesados reiniciáveis da allowlist |
 | D3 | `scripts/disk-recovery-d3-ram-daemons.sh` (bead ga-1p1i5jr.3) | restart drenado dos daemons que mais usam RAM |
+| D3.5 | `scripts/disk-recovery-d35-load-shed.sh` (bead ga-1p1i5jr.8) | corte de carga: PARA serviços não essenciais da allowlist (`launchctl disable` + `bootout`) e religa sozinho. Também roda DEPOIS do teto do D4 |
 | D4 | `scripts/disk-recovery-d4-guarded-reboot.sh` (bead ga-1p1i5jr.4) | reinício guardado do mini |
 
 ## Estado de instalação
@@ -58,6 +60,7 @@ Data em 98% (`docs/runbooks/disk-guards-quem-age.md`).
 |---|---|---|
 | D2 | ≤ 5120 MB (5 GB) | ≥ 900 s (15 min) |
 | D3 | ≤ 4096 MB (4 GB) | ≥ 1800 s (30 min) |
+| D3.5 | < 3072 MB (3 GB), o cronômetro do D4 | ≥ 2700 s (45 min); roda toda rodada enquanto vencido e o próprio degrau cuida do ritmo |
 | D4 | < 3072 MB (3 GB) | ≥ 3600 s (60 min) |
 | D4, piso duro | < 1536 MB (1,5 GB) | 2 leituras SEGUIDAS, separadas por ≥ 100 s (2 rodadas do launchd), a qualquer hora |
 
@@ -222,9 +225,36 @@ Dolt caído e rede falhando são o cenário esperado aqui. Se o D4 devolve 10 ou
 novo em 5 min (a guarda adiou, ou falhou sem reiniciar). O comentário na ga-1p1i5jr.4 pede que o próprio D4 tenha o cooldown dele
 também (defesa em profundidade); o maestro não depende disso.
 
+**O aviso fica ADIADO enquanto o D3.5 ainda tem o que cortar** (ver "D3.5"): o maestro adia o `escalate_d4_cap` e passa `DR4_SHED_WORKING=1` ao D4, que adia o dele (teto de 2 por 24 h). Sai com o D3.5 esgotado (rc 11), falhando (20/30), ausente ou com
+o livre abaixo do piso duro (1,5 GB): o silêncio é o lado perigoso.
+
 O `acted4_ts` também vale quando o estado salvo se perde pela metade (ver "Três estados"): ele passa a ser AGORA. Só se perde com
 o arquivo de estado AUSENTE (apagado à mão). Apagar `.gc/disk-recovery.state` é, de propósito, o jeito de zerar tudo, inclusive o
 teto de 6 h: se o estado se perdeu e o D4 NÃO chegou a disparar, é isso que libera o D4.
+
+## D3.5: corte de carga (ga-1p1i5jr.8)
+
+Athos 09/11: "se chegar a 3a necessidade e o reboot nao vem, o q acontece? me parece que a gente fica travado". Depois do teto do D4 (2 reinícios
+em 24 h, 6 h de cooldown) a escada só avisava, e o restart do D3 devolve a mesma RAM em minutos. O D3.5 é o degrau que alivia RAM **sem reiniciar e sem teto**:
+`scripts/disk-recovery-d35-load-shed.sh` PARA (`launchctl disable` + `bootout`, não restart; o disable sobrevive ao reboot) serviço NÃO essencial da allowlist
+`scripts/disk-recovery-d35-allowlist.tsv`, na ordem do arquivo (menor risco primeiro), 3 por vez, com 10 min de espera entre cortes, até o livre voltar a ≥ 3 GB.
+
+| Quando | O que acontece |
+|---|---|
+| Cronômetro do D4 (livre < 3072 MB) em ≥ 2700 s | o maestro chama `--run` TODA rodada, ANTES do degrau da vez; segue DEPOIS do teto do D4. Sob o piso duro (< 1,5 GB) com o D4 chamável a rodada espera o D4 |
+| Livre ≥ 6144 MB por 1800 s seguidos (conta o D3.5, só leituras dele; lacuna > 600 s ou queda abaixo zera) | `--resume` (toda rodada) religa UM por vez, o último parado primeiro: `enable` antes do `bootstrap`, e a prova é o PID novo (job sem pid ao parar: carregado) |
+
+- **Quem nunca é parado.** Só label da allowlist; a deny-list em código VENCE a allowlist, em duas travas independentes (porta e fragmento do label): sender, captura de inbound, voicebot/discador, túneis, Dolt, supervisor, HQ,
+  classification, demand, map-viewer, frota, admin/daemon. Também não se para o que não tem plist (não dá para religar), não está carregado ou **já está desabilitado**: o que o Athos desligou por decisão é pulado e NUNCA religado.
+- **Allowlist.** Cópia versionada das linhas `emergency_off=sim` da action-table do Mayor (`.gc/agents/mayor/proc-review/action-table.tsv`) que são servidor com porta, a mesma que o botão Ligar/Desligar do admin usa (whatsapp_automation, `lib/servicos_toggle.py`).
+  A tabela mora fora do repo e o nó que escreveu o degrau não a lê: lote sem porta que ela libera ainda não está lá (acrescente a linha com porta `-`). O selftest compara as duas quando a tabela existe na máquina.
+- **Contrato** (`--run`): 0 parou · 10 nada a fazer (silêncio) · **11 lista esgotada com o disco ainda baixo** · 12 esperando o efeito do último corte · 20 falhou · 30 não li. O 10, o 11 e o 20/30 deixam o "precisa de um humano" do teto sair; **só o 0 e o 12 o adiam** (o 10 pode ser disco ok ou outra instância travada: adiar o aviso por ele seria silêncio).
+- **Registro** `.gc/disk-recovery-d35.state` (só acréscimo): STOPPING gravado ANTES de agir → STOPPED (provado: sumiu do launchd) | STOP_FAILED (desfeito; fica de fora por 1 h) · RESUMED | RESUME_FAILED | ABANDONED (já carregado por outro).
+  Falha no meio desfaz (`enable`) ou diz INCONSISTENTE e o registro o deixa pendente. Log: `.gc/logs/disk-recovery-d35.log`.
+- **Avisos** (do maestro): parou = `notify -p 4` com a LISTA + mail ao Mayor (no máx. 1 por hora); religou = `notify -p 3`; falha/não li/falha da chamada = `-p 4`, 1 por hora por classe.
+- **Mão.** `scripts/disk-recovery-d35-load-shed.sh --dry-run` diz o que pararia. Religar um serviço à mão: `launchctl enable gui/$(id -u)/<label> && launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/<label>.plist`.
+  Desligar tudo: `touch .gc/disk-recovery.off` (o mesmo interruptor do maestro).
+- **Não provado do nó (só o mini prova):** o formato real de `launchctl print` / `print-disabled`, o efeito da parada na RAM e no swap, e o `ps` do macOS na conferência da trava.
 
 ## D1: temporários do pytest e do GoogleUpdater, e a trava do Chrome (ga-1p1i5jr.9)
 
