@@ -10,6 +10,9 @@ WHAT IT REPORTS, for the previous local day (BRT) unless --day is given:
   2. approvals (PASS) that day   and verdicts, FAIL, pass rate over all verdicts
   3. median review minutes       dispatcher elapsed_s, PASS+FAIL
   4. gate queue depth now        from .gc/gate-focus.state (what gate-focus-mode.sh measured last), with its age
+  7. reviews per hour            the day's average, hours at >= 8/h, and the trailing 3 h (Athos 14/11: "ao menos 8
+                                 revisadas por hora"); counted by gate-throughput-meter.py, which also mails the Mayor
+                                 when the gate sits under 8/h for 3 h (ga-v8p1tx.1.1)
 plus: the switches (gate focus mode, E5, E11, E12, pre-gate) and the MODEL PER ROLE — the alias in each
 agents/<role>/agent.toml resolved through the newest Claude Code model catalog on this machine — compared with
 the previous run's snapshot. Athos, 07/10: "nunca rollback de modelo; nunca um modelo que já tem sucessor" —
@@ -24,7 +27,7 @@ Usage: gate-daily-report.py [--day YYYY-MM-DD] [--post] [--city PATH]
            comment is still not recorded, exit 1 and the notify says so (priority 4). A notify that itself fails
            (rc≠0, timeout, not found) also exits 1, with a WARN carrying notify's stderr.
 """
-import argparse, datetime, glob, json, os, re, statistics, subprocess, sys, time
+import argparse, datetime, glob, importlib.util, json, os, re, statistics, subprocess, sys, time
 
 TZ = datetime.timezone(datetime.timedelta(hours=-3))
 PROGRAM_BEAD = os.environ.get("GATE_DAILY_PROGRAM_BEAD", "ga-ufskhy")
@@ -35,6 +38,19 @@ ROLES = ("gate-reviewer", "wa-worker", "ps-worker", "refino-gate-reviewer", "aut
 
 def nm(why):
     return f"não medido ({why})"
+
+
+def throughput_line(city, day):
+    """Line 7: reviews per hour, computed by the sibling gate-throughput-meter.py (one counting rule, in one place)."""
+    # falhou (medidor ausente / import quebrado / qualquer exceção dele) → "não medido (<why>)", nunca um número
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "gate-throughput-meter.py")
+    try:
+        spec = importlib.util.spec_from_file_location("gate_throughput_meter", path)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        return mod.daily_summary(city, day)
+    except Exception as e:  # a broken meter must not take the other six lines of the report down with it
+        return nm("medidor indisponível: %s" % e.__class__.__name__)
 
 
 def read_jsonl_day(city, day):
@@ -296,6 +312,7 @@ def build(city, day):
     lv = levers(city, day)
     L.append(f"5) tempo estourado: {lv['timeouts']} | {lv['graced']} | E13: {lv['e13']}")
     L.append(f"6) E11 (teto 800 linhas de produção): {lv['e11']}")
+    L.append(f"7) revisadas por hora: {throughput_line(city, day)}")
     L.append("Chaves: " + "; ".join(f"{k}={v}" for k, v in sw.items()))
     L.append("Modelos por papel (" + catnote + "): " + "; ".join(f"{r}={v['alias'] or '-'}→{v['model']}" for r, v in models.items() if r in ('gate-reviewer','wa-worker','ps-worker','digo-wa')))
     for c in changes:
