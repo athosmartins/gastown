@@ -911,6 +911,42 @@ root), proceed normally. The production root must ALWAYS stay on main.
 DIRECTIVE
 }
 
+# resume_directive_for <bead_id> — ga-qcrgi9k: echo a prompt block (or nothing) that keeps the next builder from throwing away what a dead one left.
+# A builder that dies BEFORE its first commit leaves what it did UNCOMMITTED in its worktree; the next one, told only to create a worktree/branch
+# for the bead, either builds from scratch beside it or clears the path with `git worktree remove --force` (the idiom the town doctrine teaches for
+# scratch trees) and the work is gone. This tells it to resume in the existing worktree. Three states, from _beadid_dirty_worktrees: found → the
+# block that names the path(s); none → NOTHING (the prompt stays byte for byte what it was); could not tell → a generic caution, never silence.
+# Reach: the block goes into the task prompt, which a builder gets by nudge (named crews) or sling (HQ beads), and into the prompt of a rig bead lent
+# to a dog (_pilot_dog_lend_prompt). A POOL worker on a rig-native bead never sees that prompt — the Pilot only stamps gc.routed_to and the worker
+# self-serves the bead — so for the pools the same rule is written into the Build Protocol of the agents/wa-worker and agents/ps-worker prompt
+# templates (checked by pilot-dispatcher.empty-branch.selftest.sh).
+# It runs git per repo (bounded: 20 s per `worktree list`, 30 s per `status`), and dispatch_one() treats a failing call as "nothing to add":
+# it can slow a dispatch down, never stop one.
+resume_directive_for() {
+  local _bid="${1:-}" _out="" _rc=0 _wt _br
+  [ -n "$_bid" ] || return 0
+  # vazio (rc 1: todo repo foi lido e nenhum guarda worktree sujo do bead) → não diz nada; falhou/ilegível (rc 2) → o aviso genérico, o builder confere sozinho
+  _out=$(_beadid_dirty_worktrees "$_bid") || _rc=$?
+  case "$_rc" in
+    0)
+      printf '\n## ⚠️ Uncommitted work from a builder that died on this bead — RESUME it, do not recreate (ga-qcrgi9k)\n'
+      printf 'A previous builder died on %s before its first commit; its worktree still holds the only copy of what it did:\n' "$_bid"
+      while IFS=$'\t' read -r _wt _br; do
+        [ -z "$_wt" ] || printf '  %s   (branch %s)\n' "$_wt" "$_br"
+      done <<< "$_out"
+      printf 'Work THERE; do not create another worktree or branch for this bead: cd into it, read git status and git diff, finish, commit, push that branch, run gate-done from it.\n'
+      printf 'NEVER run git worktree remove (with or without --force), rm -rf, git clean, git checkout -- . or git reset --hard on it: they throw the work away. If you judge the work unusable, say why in a bd comment first.\n'
+      printf 'If that path does not exist on your machine you cannot resume it: say so in a bd comment and build from scratch.\n'
+      ;;
+    1) ;;
+    *)
+      printf '\n## Check for leftover work before you create a worktree (ga-qcrgi9k)\n'
+      printf 'The Pilot could not check whether a builder that died earlier left an uncommitted worktree for %s. Before you create one, run git worktree list in the rig repo: if a worktree or branch for this bead already exists, cd into it and resume; never remove a worktree that has uncommitted changes.\n' "$_bid"
+      ;;
+  esac
+  return 0
+}
+
 # ── Pool selection state (ga-mtlm6) ───────────────────────────────────────────
 # PILOT_BUSY_BUILDERS — builders currently holding LIVE in-flight work (computed
 #   once per sweep from IN_FLIGHT_JSON's sling-task assignees). A busy single-
@@ -5371,15 +5407,23 @@ _filter_built() {
             # carve-out _ownership_guard_should_refuse already applies inside
             # dispatch_one(), just too late: a bead with an orphan branch never
             # survives THIS filter to reach that check. Deliberately narrow: only
-            # "orphan" changes behavior here. "block"/"merged"/unclassifiable all
-            # preserve the EXACT pre-fix veto, so a classification miss (no git, no
-            # match via the independent _beadid_matched_crew_branch_ref lookup, etc.)
-            # fails toward the old behavior, never toward a new one.
+            # "orphan" and (ga-qcrgi9k) "empty" change behavior here. "block"/"merged"/
+            # unclassifiable all preserve the EXACT pre-fix veto, so a classification
+            # miss (no git, no match via the independent _beadid_matched_crew_branch_ref
+            # lookup, etc.) fails toward the old behavior, never toward a new one.
             _bf_json=$(printf '%s' "$arr" | jq -c --arg i "$id" '.[] | select(.id == $i)' 2>/dev/null | head -1)
             _bf_signal="$(_beadid_branch_signal "$id" "$_bf_json")"
             if [ "${_bf_signal%%$'\t'*}" = "orphan" ]; then
               _ownership_guard_flag_orphan_branch "$id" "$GC_CITY" "${_bf_signal#*$'\t'}"
               built_reasons="${built_reasons}${id}"$'\t'"branch $_matched_ref orphaned (unmerged+stale+unassigned) — not vetoing, flagged pilot:orphan-branch"$'\n'
+            elif [ "${_bf_signal%%$'\t'*}" = "empty" ]; then
+              # ga-qcrgi9k: the branch carries no commit of its own (its builder died before the first one), so it is no
+              # delivery and does not count as built. Whether the bead is kept is still decided below: a gate marker or a
+              # gate:* label (ingate_ids, computed at the top) drops it in the combine step exactly as before. Kept, it goes
+              # through dispatch_one()'s ownership guard like any candidate, and a worktree the dead builder left dirty is
+              # handed to the next builder to resume (resume_directive_for). Not a "built" reason, so the EXCLUÍDO trace
+              # below never names this branch.
+              log "[pilot] _filter_built: $id has branch $_matched_ref but no commit of its own (its tip is in origin/main and no commit there names the bead) — not counted as built (ga-qcrgi9k)" >&2
             else
               built_ids="${built_ids:+$built_ids }$id"
               built_reasons="${built_reasons}${id}"$'\t'"branch $_matched_ref exists"$'\n'
@@ -7120,6 +7164,62 @@ _beadid_has_live_worktree() {
   return 1
 }
 
+# _beadid_dirty_worktrees <bead_id> — ga-qcrgi9k: WHICH worktrees of this bead hold uncommitted work (tracked changes OR untracked files), where
+# _beadid_has_live_worktree just above only says whether one does. One "<path>\t<branch>" line each (<branch> is "(detached)" for none). The same
+# worktrees by the same rule: named <bead> or <bead>-*, or on a branch whose last component is named that way; `.`-suffixed names are a bead's
+# CHILDREN and do not count. A sibling and not a refactor of that function, on purpose: it warns in NEVERSTARTED's own words, and the selftests
+# that cut it out by name would lose a helper it started calling (the precedent this file already follows, see _beadid_needs_remerge_branch);
+# pilot-dispatcher.empty-branch.selftest.sh runs both on the same fixtures, so a drift between the two rules shows up there. Its one caller is
+# resume_directive_for (the dispatch prompt).
+# Three states: rc 0 at least one found (printed; one found anywhere wins over a repo that could not be read); rc 1 at least one repo was read, every
+# one that has a .git was read and none holds one; rc 2 could not tell — no git, no repo list, no repo read at all (a list of plain directories is not
+# "none"), a failed `gc rig list` (_NS_RIG_LIST_OK=0: the list is town-root-only), a repo that has a .git git will not open, or a `worktree list` /
+# `status` that failed or timed out. A worktree whose directory is gone holds nothing: skipped.
+_beadid_dirty_worktrees() {
+  local _bid="${1:-}" _repo _wts_raw _wts _wt _br _name _st _found=0 _unk=0 _read=0
+  [ -n "$_bid" ] || return 1
+  command -v git >/dev/null 2>&1 || return 2
+  [ -n "${_NS_BRANCH_REPOS:-}" ] || return 2
+  while IFS= read -r _repo; do
+    [ -n "$_repo" ] && [ -d "$_repo" ] || continue
+    if ! git -C "$_repo" rev-parse --git-dir >/dev/null 2>&1 </dev/null; then
+      # vazio (diretório sem .git: não é repo, não guarda worktree) → pula; falhou/ilegível (tem .git e o git não o abre) → não sei
+      [ -e "$_repo/.git" ] && _unk=1
+      continue
+    fi
+    # vazio (repo sem worktree extra: ainda vem 1 linha, a do próprio repo) → nenhum casa, segue; falhou/ilegível (git/timeout) → não sei, o repo não foi lido
+    if ! _wts_raw=$(timeout 20 git -C "$_repo" worktree list --porcelain 2>/dev/null </dev/null); then
+      _unk=1
+      continue
+    fi
+    _read=$((_read + 1))
+    _wts=$(printf '%s\n' "$_wts_raw" \
+      | awk '/^worktree /{ if (p != "") print p "\t" b; p = substr($0, 10); b = "" } /^branch /{ b = substr($0, 8) } END{ if (p != "") print p "\t" b }')
+    while IFS=$'\t' read -r _wt _br; do
+      [ -n "$_wt" ] || continue
+      _name=0
+      case "${_wt##*/}" in "$_bid"|"$_bid"-*) _name=1 ;; esac
+      case "${_br##*/}" in "$_bid"|"$_bid"-*) _name=1 ;; esac
+      [ "$_name" = 1 ] || continue
+      [ -d "$_wt" ] || continue
+      # vazio (árvore limpa) → este worktree não prova nada, segue; falhou/ilegível (status falhou ou estourou o tempo) → não sei, não é "limpo"
+      if ! _st=$(timeout 30 git -C "$_wt" status --porcelain 2>/dev/null </dev/null); then
+        _unk=1
+        continue
+      fi
+      if [ -n "$_st" ]; then
+        _br="${_br#refs/heads/}"
+        [ -n "$_br" ] || _br="(detached)"
+        printf '%s\t%s\n' "$_wt" "$_br"
+        _found=1
+      fi
+    done <<< "$_wts"
+  done <<< "$_NS_BRANCH_REPOS"
+  [ "$_found" -eq 0 ] || return 0
+  [ "$_unk" -eq 0 ] && [ "$_read" -gt 0 ] && [ "${_NS_RIG_LIST_OK:-1}" != "0" ] && return 1
+  return 2
+}
+
 # _crew_progressed_since <crew> <since_epoch> — true (0) iff the crew has pushed a
 # branch (crew/<crew>/* or crew/<crew-short>/* in any _NS_BRANCH_REPOS) whose latest
 # commit is NEWER than <since_epoch>. Proof the crew is actively building (producing
@@ -7373,9 +7473,19 @@ _beadid_matched_crew_branch_ref() {
 #                                           inspect) → preserve the EXACT
 #                                           pre-fix behaviour: refuse.
 #   merged \t <ref>                      — AC1a: `git merge-base --is-ancestor
-#                                           <ref> origin/main` succeeds → the
+#                                           <ref> origin/main` succeeds AND a
+#                                           commit of origin/main names the bead
+#                                           (or git could not answer that) → the
 #                                           build already shipped, this is NOT
 #                                           an in-flight signal.
+#   empty  \t <ref>                      — ga-qcrgi9k: the tip is in origin/main
+#                                           (so the ancestor test above passes)
+#                                           but NO commit of origin/main names
+#                                           the bead: the branch never got a
+#                                           commit of its own (a builder died
+#                                           after creating it; wa-eosi8l,
+#                                           13/11), so nothing was delivered. Not
+#                                           an in-flight signal and not "built".
 #   orphan \t <repo>\t<ref>\t<age_days>   — AC1b: unmerged, last commit older
 #                                           than PILOT_ORPHAN_BRANCH_STALE_HOURS,
 #                                           AND the bead's OWN snapshot assignee
@@ -7404,7 +7514,19 @@ _beadid_branch_signal() {
     esac
   elif command -v git >/dev/null 2>&1 \
      && git -C "$_repo" merge-base --is-ancestor "$_ref" origin/main 2>/dev/null; then
-    printf 'merged\t%s' "$_ref"
+    # ga-qcrgi9k: "the tip is in origin/main" is just as true of a branch that never got a commit (the builder died after
+    # creating it) as of one that was delivered, and only the second is built. By this repo's convention a delivery leaves a
+    # commit on main that names the bead (fix(<bead>): ...); none → nothing was delivered. A delivery whose commits never name
+    # the bead reads as empty: accepted, a wasted dispatch is cheaper than a bead that is never dispatched again.
+    # vazio (nenhum commit de origin/main cita o bead) → empty; achou → merged; falhou/ilegível (git log ≠ 0) → merged, o veto
+    # de antes: "não consegui ler o histórico" nunca vira "a branch está vazia"
+    local _own_hit="" _own_rc=0
+    _own_hit=$(git -C "$_repo" log origin/main -n 1 --format=%H -F --grep="$_bid" -- 2>/dev/null </dev/null) || _own_rc=$?
+    if [ "$_own_rc" -eq 0 ] && [ -z "$_own_hit" ]; then
+      printf 'empty\t%s' "$_ref"
+    else
+      printf 'merged\t%s' "$_ref"
+    fi
     return 0
   fi
   # Unmerged. Snapshot assignee is a defensive re-check, not the primary
@@ -7954,6 +8076,10 @@ _ownership_guard_should_refuse() {
             ;;
           merged)
             : # AC1a — build already shipped, not an in-flight signal; keep checking.
+            ;;
+          empty)
+            : # ga-qcrgi9k — the branch never got a commit of its own (its builder died first): nothing in flight, nothing
+              # shipped. Not a refusal; a live owner, an external claim, a gate artifact or an attached session still are.
             ;;
           orphan)
             # AC1b/AC3 — unmerged but abandoned (stale + unassigned): surface
@@ -9427,8 +9553,13 @@ fi
 # live/unmerged branch (class "block") or a flagged-but-ambiguous one (class
 # "orphan", already surfaced for triage by _ownership_guard_flag_orphan_branch)
 # means SOME work artifact exists — leave it rather than risk unassigning a
-# crew that is genuinely mid-build with no bd activity. Deliberately narrower
-# than "any stale+crew-assigned bead": it only fires on the exact
+# crew that is genuinely mid-build with no bd activity. A "merged" branch and,
+# since ga-qcrgi9k, an "empty" one (created and never committed to: its work may
+# sit uncommitted in the crew's worktree) are left alone too — that is not "never
+# engaged". (A POOL owner never gets here: Stage 2 and the inflight-reclaim-guard
+# own it; once such a bead is released, _filter_built no longer vetoes it for an
+# empty branch.)
+# Deliberately narrower than "any stale+crew-assigned bead": it only fires on the exact
 # never-engaged shape of the measured incident. Release recipe mirrors
 # _neverstarted_recover_db's proven one verbatim (same labels + metadata
 # cleared) so the bead is not just unassigned but actually re-dispatchable —
@@ -16109,6 +16240,10 @@ LIVESEC
   # land in a rig's bare production root (see worktree_directive_for). Fail-open.
   local WORKTREE_DIRECTIVE
   WORKTREE_DIRECTIVE=$(worktree_directive_for "$STORY_RIG" "$BUILDER_TARGET" 2>/dev/null || echo "")
+  # ga-qcrgi9k: a dead builder's UNCOMMITTED worktree is for the next builder to resume, not to recreate. Appended to the same slot, so the
+  # two prompt templates below stay untouched. vazio (nenhum worktree sujo) → nada se acrescenta, o prompt fica igual; falhou/ilegível
+  # (o próprio resume_directive_for falhou ou nem existe, ex.: uma harness que extraiu só esta função) → nada se acrescenta, o despacho segue
+  WORKTREE_DIRECTIVE="${WORKTREE_DIRECTIVE}$(resume_directive_for "$STORY_ID" 2>/dev/null || true)"
 
   # ── ga-j0f6: beads-repo fix ⇒ different DOCTRINE (upstream PR, not gate-done) ──
   # Computed once, used by both heredocs below. Normal-path text (both branches
@@ -18306,6 +18441,9 @@ You work in the RIG's repo — not in HQ, not in the city tree. Steps, in order:
 5. Commit, push the branch from THAT worktree, then run /gate-done from it. The gate and the delivery are autonomous; no human review.
 6. Close the loop: after /gate-done, finish your normal dog routine on THIS hook bead (close it, drain-ack).
 No-diff deliverable (report, data-op, verified-live / no-changes finding)? Never exit with the rig bead in_progress: acceptance already met by the artifact itself -> bd -C \"${_root}\" close ${_id} --reason citing it. Missing an Athos decision -> park it (next-action:athos-decide label + athos.acao metadata) and release the claim."
+  # ga-qcrgi9k: step 4 above has the dog create a worktree; one a dead builder left UNCOMMITTED is to be resumed instead. vazio (nenhum worktree sujo) →
+  # nada se acrescenta; falhou/ilegível (a chamada falhou ou a função nem existe) → nada se acrescenta, o empréstimo segue
+  _PDL_TASK="${_PDL_TASK}$(resume_directive_for "$_id" 2>/dev/null || true)"
 }
 
 # _pilot_dog_lend_one <bead-json (já relida)> — empresta UMA bead. Pré-condição: _PDL_POOL/_PDL_RIG/_PDL_ROOT são os desta bead e o veto/pool/dog/mini/nó já passaram. 0 = emprestada (ou "emprestaria", em shadow

@@ -6947,8 +6947,19 @@ git -C "$GJ8_REPO" remote add origin "$GJ8_BARE"
 git -C "$GJ8_REPO" push -q origin HEAD:refs/heads/main
 git -C "$GJ8_REPO" fetch -q origin   # populate refs/remotes/origin/main for merge-base
 
-# Fixture 1: MERGED — branched at the current main tip, never diverged.
-git -C "$GJ8_REPO" branch "fix/gj8-merged-slug" HEAD
+# Fixture 1: MERGED — a real delivery: a commit of its own that names the bead, fast-forwarded into main. (Until ga-qcrgi9k this was
+# "branched at the current main tip, never diverged" — a branch with NO commit, which is not a delivery: see fixture 1b.)
+git -C "$GJ8_REPO" checkout -q -b "fix/gj8-merged-slug"
+echo "delivered" > "$GJ8_REPO/delivered.txt"
+git -C "$GJ8_REPO" add delivered.txt
+git -C "$GJ8_REPO" commit -q -m "fix(gj8-merged): delivered work"
+git -C "$GJ8_REPO" checkout -q main
+git -C "$GJ8_REPO" merge -q --ff-only "fix/gj8-merged-slug"
+git -C "$GJ8_REPO" push -q origin HEAD:refs/heads/main
+git -C "$GJ8_REPO" fetch -q origin
+
+# Fixture 1b: EMPTY (ga-qcrgi9k) — branched at the current main tip, never committed to (a builder died right after creating it).
+git -C "$GJ8_REPO" branch "fix/gj8-empty-slug" HEAD
 
 # Fixture 2: OLD unmerged — 1 new commit, timestamp backdated 10 days (the field
 # _beadid_branch_signal actually reads, via `git log --format=%ct`, not the
@@ -6982,6 +6993,17 @@ GJ8_R_MERGED="$(
 case "$GJ8_R_MERGED" in
   merged*) ok "ga-8jxe1-b: REAL merge-base correctly classifies an already-merged branch as 'merged' (got: '$GJ8_R_MERGED')" ;;
   *) bad "ga-8jxe1-b: REAL merge-base check failed to classify a merged branch (got: '$GJ8_R_MERGED') — AC1a git predicate broken" ;;
+esac
+
+GJ8_R_EMPTY="$(
+  unset PILOT_TEST_CREW_BRANCH_BEADS PILOT_TEST_BRANCH_MERGED_BEADS PILOT_TEST_ORPHAN_BRANCH_BEADS
+  _ownership_guard_repos() { _OWNERSHIP_GUARD_REPOS="$GJ8_REPO"; printf '%s' "$GJ8_REPO"; }
+  eval "$_GJ8_MATCHED_FN"; eval "$_GJ8_SIGNAL_FN"
+  _beadid_branch_signal "gj8-empty" '{}'
+)"
+case "$GJ8_R_EMPTY" in
+  empty*) ok "ga-qcrgi9k: a branch with no commit of its own (tip in origin/main, no commit there names the bead) is 'empty', not 'merged' (got: '$GJ8_R_EMPTY')" ;;
+  *) bad "ga-qcrgi9k: a never-committed branch was not classified 'empty' (got: '$GJ8_R_EMPTY') — it would still be vetoed as 'built' forever" ;;
 esac
 
 GJ8_R_OLD="$(
