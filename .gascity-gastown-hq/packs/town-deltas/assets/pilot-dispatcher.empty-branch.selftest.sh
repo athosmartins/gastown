@@ -172,6 +172,15 @@ sig() { # <bead> [env assignments] [bead json]
   run "${2:-}" "_beadid_branch_signal $1 '$_j'"
 }
 
+echo "── S0. the wa-eosi8l shape, end to end: empty branch + dirty worktree + the dead (asleep) owner still on the bead ──"
+DEAD='{"id":"wa-empty01","assignee":"wa-worker-adhoc-9f68f8533a","status":"in_progress","labels":["pilot:dispatched","story:in-flight"]}'
+run "" "printf '%s' '[$DEAD]' | _filter_built | jq -c '[.[].id]'"
+eq "S0.1 _filter_built keeps the bead as a candidate (on the base: EXCLUÍDO … branch … exists, every sweep, forever)" '["wa-empty01"]' "$OUT"
+run "BD_CLEARED_FILE=$TMP/yes" "_DEADWORKER_OK=1; _ownership_guard_should_refuse wa-empty01 '$DEAD' /fake"
+eq "S0.2 the dispatch-time guard lets it through (roster trusted, owner not active)" "1:" "$RC:$OUT"
+run "" "resume_directive_for wa-empty01"
+has "S0.3 the next builder is told which worktree to RESUME" "crew/worker-wa-empty01" "$OUT"
+
 echo "── S1. _beadid_branch_signal: an empty branch is not 'merged' ──"
 sig wa-empty01;                  eq "branch with no commit of its own, tip older than main → empty" "empty" "$(class_of)"
 has "…and names the ref"         "crew/wa-worker/wa-empty01" "$OUT"
