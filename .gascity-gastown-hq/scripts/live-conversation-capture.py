@@ -363,7 +363,10 @@ def transcript_check(path, max_tokens, refuse_dangling=False):
                 results.add(b["tool_use_id"])
         u = msg.get("usage") if r.get("type") == "assistant" else None
         if isinstance(u, dict) and all(isinstance(u.get(k, 0), int) for k in ("input_tokens", "cache_read_input_tokens", "cache_creation_input_tokens")):
-            tokens = u.get("input_tokens", 0) + u.get("cache_read_input_tokens", 0) + u.get("cache_creation_input_tokens", 0)
+            total = u.get("input_tokens", 0) + u.get("cache_read_input_tokens", 0) + u.get("cache_creation_input_tokens", 0)
+            # vazio (usage zerado: o stub "<synthetic>" / "No response requested." que o claude grava na ponta; um request real sempre leva contexto > 0) → NÃO é medida: mantém a última real, ou "unknown" se não houver; falhou/ilegível → unknown (acima). ga-esorlre.6: o stub de 02:07 do oracle-wa sobrescreveu 272k por 0 e o arm passou "0 tokens"
+            if msg.get("model") != "<synthetic>" and total > 0:
+                tokens = total
     flying = len(uses - results)
     if flying and refuse_dangling:
         return "refuse", "the transcript ends in a tool_use with no result (%d)" % flying

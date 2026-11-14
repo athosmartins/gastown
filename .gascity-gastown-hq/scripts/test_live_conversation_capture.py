@@ -601,6 +601,42 @@ class Arm(unittest.TestCase):
         c = self.w.go(final=True, LCC_MAX_RESUME_TOKENS="300000")[1]  # the knob moves the bar
         self.assertEqual((c["armed"], c["refused"]), (0, 1))
 
+    def synthetic_tail(self, sid, **extra):
+        """what claude appends when a session is resumed/interrupted with nothing to answer: model "<synthetic>", all-zero usage, text "No response requested." (seen at the tail of the oracle-wa capture, ga-esorlre.6)"""
+        zero = {"input_tokens": 0, "output_tokens": 0, "cache_creation_input_tokens": 0, "cache_read_input_tokens": 0}
+        rec = {"type": "assistant", "message": dict({"role": "assistant", "model": "<synthetic>", "content": [{"type": "text", "text": "No response requested."}], "usage": zero}, **extra)}
+        with open("%s/.claude/projects/-p/%s.jsonl" % (self.w.home, sid), "a") as fh:
+            fh.write(json.dumps(rec) + "\n")
+        return "%s/.claude/projects/-p/%s.jsonl" % (self.w.home, sid)
+
+    def test_a_synthetic_zero_usage_tail_does_not_replace_the_real_context_size(self):
+        # vazio (usage zerado de um stub sintético) → não é medida, mantém a última real; só stub e nada real → unknown; falhou/ilegível → unknown (já coberto acima)
+        self.w.good_transcript(U1, tokens=271651)
+        path = self.synthetic_tail(U1)
+        self.assertEqual(L.transcript_check(path, 700000), ("ok", "271651 tokens"))  # base: ("ok", "0 tokens") — the guard reported a size nobody measured
+        self.w.good_transcript(U1, tokens=700001)
+        path = self.synthetic_tail(U1)
+        self.assertEqual(L.transcript_check(path, 700000)[0], "refuse")  # base: "ok" — a zero stub must never launder an oversized context
+        self.w.good_transcript(U1, usage=False)
+        path = self.synthetic_tail(U1)
+        self.assertEqual(L.transcript_check(path, 700000)[0], "unknown")  # only a stub to go by = the size is unknown, base: "ok, 0 tokens"
+
+    def test_an_all_zero_usage_is_never_a_measurement_even_without_the_synthetic_marker(self):
+        self.w.good_transcript(U1, tokens=123456)
+        path = self.synthetic_tail(U1, model="claude-opus-5-5")  # a real model name over a zero usage is still no request that carried a context
+        self.assertEqual(L.transcript_check(path, 700000), ("ok", "123456 tokens"))
+        self.w.good_transcript(U1, usage=False)
+        path = self.synthetic_tail(U1, model="claude-opus-5-5")
+        self.assertEqual(L.transcript_check(path, 700000)[0], "unknown")
+
+    def test_the_arm_of_a_transcript_ending_in_a_synthetic_stub_logs_the_real_size(self):
+        self.w.good_transcript(U1, tokens=271651)
+        self.synthetic_tail(U1)
+        c = self.w.go(final=True)[1]
+        self.assertEqual((c["armed"], c["refused"]), (1, 0), LOG(self.w))
+        self.assertIn("271651 tokens", LOG(self.w))
+        self.assertNotIn(" 0 tokens", LOG(self.w))
+
     def test_a_tool_call_in_flight_is_noted_not_refused_unless_the_knob_says_so(self):
         self.w.good_transcript(U1, dangling=True)
         c = self.w.go(final=True)[1]
