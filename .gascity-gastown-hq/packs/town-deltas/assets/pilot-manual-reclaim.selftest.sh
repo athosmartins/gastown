@@ -137,6 +137,41 @@ case "$sub" in
         # original 2.
         echo '[{"id":"'"$1"'","status":"open","labels":["pilot:dispatched","story:in-flight"],"metadata":{}}]' ;;
       not-stale) echo '[{"id":"'"$1"'","status":"in_progress","labels":["pilot:dispatched","story:in-flight"],"metadata":{}}]' ;;
+      story-restore)
+        # ga-w6a9xps: a STORY whose builder's claim dropped story:approved — 1st read: feature + in-flight, no approval; 2nd read (after the restore):
+        # approval is back, flight labels still on; 3rd read (final verification): everything cleared, approved kept, reclaim-count:1 set.
+        if [ "$_N" -eq 1 ]; then
+          echo '[{"id":"'"$1"'","status":"open","issue_type":"feature","labels":["pilot:dispatched","pilot:dispatching","story:in-flight"],"metadata":{"pilot.dispatched_at":"123"}}]'
+        elif [ "$_N" -eq 2 ]; then
+          echo '[{"id":"'"$1"'","status":"open","issue_type":"feature","labels":["pilot:dispatched","pilot:dispatching","story:in-flight","story:approved"],"metadata":{"pilot.dispatched_at":"123"}}]'
+        else
+          echo '[{"id":"'"$1"'","status":"open","issue_type":"feature","labels":["story:approved","pilot:reclaim-count:1"],"metadata":{}}]'
+        fi ;;
+      story-restore-refused)
+        # ga-w6a9xps: same story, but the restore never lands (the read-back still has no story:approved).
+        if [ "$_N" -eq 1 ]; then
+          echo '[{"id":"'"$1"'","status":"open","issue_type":"feature","labels":["pilot:dispatched","pilot:dispatching","story:in-flight"],"metadata":{"pilot.dispatched_at":"123"}}]'
+        else
+          echo '[{"id":"'"$1"'","status":"open","issue_type":"feature","labels":["pilot:dispatched","pilot:dispatching","story:in-flight"],"metadata":{"pilot.dispatched_at":"123"}}]'
+        fi ;;
+      bug-no-restore)
+        # ga-w6a9xps: a bug never had story:approved (dispatched without it) — it must NOT get one.
+        if [ "$_N" -eq 1 ]; then
+          echo '[{"id":"'"$1"'","status":"open","issue_type":"bug","labels":["pilot:dispatched","pilot:dispatching","story:in-flight"],"metadata":{"pilot.dispatched_at":"123"}}]'
+        else
+          echo '[{"id":"'"$1"'","status":"open","issue_type":"bug","labels":["pilot:reclaim-count:1"],"metadata":{}}]'
+        fi ;;
+      story-no-proof)
+        # ga-w6a9xps: a feature in flight with NO trace of Pilot dispatch or approval (no pilot:dispatched, no pilot.dispatched_at, no story.aprovado_por) —
+        # a bead somebody parked by hand. Released as before, but story:approved is NOT written: only Athos approves (Regra 4).
+        if [ "$_N" -eq 1 ]; then
+          echo '[{"id":"'"$1"'","status":"open","issue_type":"feature","labels":["story:in-flight"],"metadata":{}}]'
+        else
+          echo '[{"id":"'"$1"'","status":"open","issue_type":"feature","labels":["pilot:reclaim-count:1"],"metadata":{}}]'
+        fi ;;
+      story-unreadable-labels)
+        # ga-w6a9xps: the 1st read has a status but is not a bead object the verdict can read (labels is not a list): unknown, nothing is taken off.
+        echo '[{"id":"'"$1"'","status":"open","labels":"oops"}]' ;;
       missing)   echo '[]' ;;
       verify-empty)
         # status flips open on the 1st read; the 2nd read (post-removal
@@ -288,6 +323,46 @@ PY
   ck "MUTANTE $name: STALE-RECLAIM1 reprova (o mutante não sobrevive)" 0 "$got"
 }
 pmr_mutant limiar-do-rotulo-velho '[ "$CUR_RECLAIM_COUNT" -gt 0 ]' '[ "$CUR_RECLAIM_COUNT" -gt 1 ]'
+
+# STORY-RESTORE (ga-w6a9xps): a feature whose builder's claim dropped story:approved — the approval goes back BEFORE story:in-flight comes off, so the story
+# never reads as an untriaged idea to auto-refino's RAW sweep (wa-tvrs41.5, 13/11).
+: >"$MUT"
+rc=$(run_script story-restore)
+ck "STORY-RESTORE: exit code 0" 0 "$rc"
+ck "STORY-RESTORE: story:approved is added back" 1 "$(grep -qc 'MUT label add gt-testbead story:approved' "$MUT" >/dev/null 2>&1 && echo 1 || echo 0)"
+ck "STORY-RESTORE: story:in-flight still comes off (back to the pool)" 1 "$(grep -qc 'MUT label remove gt-testbead story:in-flight' "$MUT" >/dev/null 2>&1 && echo 1 || echo 0)"
+_add_ln=$(grep -n 'MUT label add gt-testbead story:approved' "$MUT" | head -1 | cut -d: -f1)
+_rm_ln=$(grep -n 'MUT label remove gt-testbead story:in-flight' "$MUT" | head -1 | cut -d: -f1)
+ck "STORY-RESTORE: the approval is written BEFORE story:in-flight is removed" 1 "$([ -n "$_add_ln" ] && [ -n "$_rm_ln" ] && [ "$_add_ln" -lt "$_rm_ln" ] && echo 1 || echo 0)"
+ck "STORY-RESTORE: never removes story:approved" 0 "$(grep -qc 'MUT label remove gt-testbead story:approved' "$MUT" >/dev/null 2>&1 && echo 1 || echo 0)"
+
+# STORY-RESTORE-REFUSED: the read-back says the approval did not land -> nothing is taken off, exit 1, loud.
+: >"$MUT"
+rc=$(run_script story-restore-refused)
+ck "STORY-RESTORE-REFUSED: exit code 1 (does not go on without the approval)" 1 "$rc"
+ck "STORY-RESTORE-REFUSED: no marker removed (story:in-flight and the Pilot markers stay)" 0 "$(grep -qE '^MUT (label remove|update) ' "$MUT" >/dev/null 2>&1 && echo 1 || echo 0)"
+ck "STORY-RESTORE-REFUSED: says the approval could not be confirmed" 1 "$(grep -qc 'story:approved could NOT be confirmed' "$WORK/err.log" >/dev/null 2>&1 && echo 1 || echo 0)"
+ck "STORY-RESTORE-REFUSED: does NOT claim markers cleared" 0 "$(grep -qc 'markers cleared' "$WORK/out.log" >/dev/null 2>&1 && echo 1 || echo 0)"
+
+# BUG-NO-RESTORE: a bug is released as before — never turned into an approved story.
+: >"$MUT"
+rc=$(run_script bug-no-restore)
+ck "BUG-NO-RESTORE: exit code 0" 0 "$rc"
+ck "BUG-NO-RESTORE: no story:approved added to a bug" 0 "$(grep -qc 'MUT label add gt-testbead story:approved' "$MUT" >/dev/null 2>&1 && echo 1 || echo 0)"
+ck "BUG-NO-RESTORE: story:in-flight removed as before" 1 "$(grep -qc 'MUT label remove gt-testbead story:in-flight' "$MUT" >/dev/null 2>&1 && echo 1 || echo 0)"
+
+# STORY-NO-PROOF: a feature with no trace of dispatch/approval is released as before, but never gets story:approved.
+: >"$MUT"
+rc=$(run_script story-no-proof)
+ck "STORY-NO-PROOF: exit code 0" 0 "$rc"
+ck "STORY-NO-PROOF: no story:approved added (no proof Athos approved it)" 0 "$(grep -qc 'MUT label add gt-testbead story:approved' "$MUT" >/dev/null 2>&1 && echo 1 || echo 0)"
+ck "STORY-NO-PROOF: story:in-flight removed as before" 1 "$(grep -qc 'MUT label remove gt-testbead story:in-flight' "$MUT" >/dev/null 2>&1 && echo 1 || echo 0)"
+
+# STORY-UNREADABLE-LABELS: the labels cannot be read -> unknown: nothing is taken off, exit 1.
+: >"$MUT"
+rc=$(run_script story-unreadable-labels)
+ck "STORY-UNREADABLE-LABELS: exit code 1" 1 "$rc"
+ck "STORY-UNREADABLE-LABELS: no marker removed, nothing written" 0 "$(grep -qE '^MUT (label|update) ' "$MUT" >/dev/null 2>&1 && echo 1 || echo 0)"
 
 echo "Results: $PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ]
