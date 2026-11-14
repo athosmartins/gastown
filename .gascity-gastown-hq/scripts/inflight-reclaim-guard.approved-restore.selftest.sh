@@ -14,6 +14,7 @@
 #   4. do_reclaim, bd drops the label: returns False and touches NOTHING (no remove, no assign, no status update)
 #   5. do_reclaim on a bug: no story:approved is ever added; reclaim completes as before
 #   6. do_reclaim, unreadable bead: returns False, nothing written
+#   7. do_reclaim on a tech-debt feature: the Pilot's Tier-1 dispatched it with NO approval, so no story:approved is invented (ga-btr2dof)
 set -u
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -68,6 +69,9 @@ else:
         ("story type, no trace",                        v(["story:in-flight"], typ="story"),                        "no-proof"),
         ("stamps present but empty",                    m._approved_verdict([{"labels": ["story:in-flight"], "issue_type": "feature", "metadata": {"pilot.dispatched_at": "", "story.aprovado_por": ""}}]), "no-proof"),
         ("metadata not a dict (never proof)",           m._approved_verdict([{"labels": ["story:in-flight"], "issue_type": "feature", "metadata": "oops"}]), "no-proof"),
+        ("tech-debt feature (Tier-1 dispatches it, no approval)", v(["story:in-flight", "pilot:dispatched", "tech-debt"]), "tier1-bypass"),
+        ("tech-debt story type",                        v(["story:in-flight", "pilot:dispatched", "tech-debt"], typ="story"), "tier1-bypass"),
+        ("tech-debt bug is just not a story",           v(["story:in-flight", "tech-debt"], typ="bug"),             "not-story"),
         ("already has story:approved",                  v(["story:in-flight", "story:approved"]),                   "has-approved"),
         ("no story:in-flight",                          v(["lane:small"]),                                          "not-in-flight"),
         ("in-flight + story:done (never overwrite)",    v(["story:in-flight", "story:done"]),                       "other-story-state"),
@@ -288,6 +292,18 @@ finally:
     uninstall(o)
 check(res is False, "do_reclaim returned False", "do_reclaim returned %r" % (res,))
 check(not s.writes(), "no write at all", "writes: %r" % s.writes()[:4])
+
+# ── Scenario 7: a tech-debt feature was dispatched by Tier-1 with NO approval ───
+print("Scenario 7 (ga-btr2dof): a tech-debt feature is reclaimed as before, with no story:approved invented")
+s = Store(["story:in-flight", "pilot:dispatched", "tech-debt"])
+o = install(s)
+try:
+    res = m.do_reclaim("wa-x", "some title", 0, 30.0, ["story:in-flight", "pilot:dispatched", "tech-debt"])
+finally:
+    uninstall(o)
+check(res is True, "do_reclaim returned True", "do_reclaim returned %r" % (res,))
+check("story:approved" not in s.labels and not any("story:approved" in c for c in s.calls), "no story:approved invented for a tech-debt feature", "labels=%r" % s.labels)
+check("story:in-flight" not in s.labels and s.assignee == "" and s.status == "open" and "tech-debt" in s.labels, "released as before, tech-debt kept", "labels=%r assignee=%r status=%r" % (s.labels, s.assignee, s.status))
 
 print("")
 print("Results: %d passed, %d failed" % (PASS, FAIL))

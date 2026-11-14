@@ -3523,6 +3523,8 @@ def _approved_verdict(bead):
     "restore"           feature/story carrying story:in-flight and NO other story:* label, WITH a trace that it was dispatched/approved
                         (pilot:dispatched, pilot.dispatched_at or story.aprovado_por) → story:approved must go back first
     "no-proof"          same shape but no such trace: never re-approved here (only Athos approves; may be parked by hand) → nothing to do
+    "tier1-bypass"      same shape + the tech-debt label (ga-btr2dof): the Pilot's Tier-1 dispatches tech-debt of ANY type with no approval (`bd list -l tech-debt`; same exemption as
+                        quality-gate-guard.sh gap1_backstop_action skip:tech-debt), so a dispatch trace proves nothing about Athos → nothing to do
     "has-approved"      story:approved already there                                       → nothing to do
     "not-in-flight"     no story:in-flight                                                  → nothing to do
     "other-story-state" another story:* label is present (done/triage/…)                    → nothing to do, never overwrite it
@@ -3546,6 +3548,8 @@ def _approved_verdict(bead):
     if any(x.startswith("story:") and x != "story:in-flight" for x in labels):
         return "other-story-state"
     if bead.get("issue_type") in ("feature", "story"):
+        if "tech-debt" in labels:
+            return "tier1-bypass"
         md = bead.get("metadata") if isinstance(bead.get("metadata"), dict) else {}
         # Proof that Athos's approval stood at dispatch: the Pilot only dispatches a story wearing story:approved, and stamps it; story.aprovado_por is
         # the approval recipe's own stamp. Without either, "in-flight without approved" is also what a bead Athos parked by hand looks like — never re-approved.
