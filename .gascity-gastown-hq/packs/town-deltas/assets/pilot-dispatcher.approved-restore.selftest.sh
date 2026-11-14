@@ -7,10 +7,13 @@
 # story:* label at all — which is exactly what auto-refino's RAW sweep (auto_refino_is_ingestable_raw) calls an untriaged idea. The Mayor restored
 # the bead by hand.
 #
-# FIX under test: _pilot_restore_approved <db> <bead> (+ its reader _pilot_approved_verdict) gives story:approved BACK before story:in-flight is
-# stripped, for a story (feature/story) that carries story:in-flight and no other story:* label, and CONFIRMS it by reading the bead back. rc 0 lets the
-# caller go on; rc 1 (not confirmed) / rc 2 (could not read) leave the bead exactly as it is (owner, flight labels, stamps) so it stays visible and the next
-# sweep retries. It never adds story:approved to a bug/task/chore and never overwrites another lifecycle state. Both release paths call it first.
+# FIX under test: _pilot_restore_approved <db> <bead> <judged owner> (+ its reader _pilot_approved_verdict) gives story:approved BACK before story:in-flight
+# is stripped, for a story (feature/story) that carries story:in-flight and no other story:* label, and CONFIRMS it by reading the bead back. rc 0 lets the
+# caller go on; rc 1 (not confirmed) / rc 2 (could not read) / rc 3 (the bead is closed, or someone else owns it now) leave the bead exactly as it is (owner,
+# flight labels, stamps) so it stays visible and the next sweep retries. It never adds story:approved to a bug/task/chore and never overwrites another
+# lifecycle state, nor to a tech-debt story (the Pilot's Tier-1 dispatches those with no approval). Both release paths call it first. A restore that landed
+# says so in the log and, when bd takes the write, in a pilot.approval_restored stamp that names the trace it relied on, so a story:approved the Pilot wrote
+# can be told from Athos's.
 #
 # THE invariants, asserted after every scenario:
 #   (1) no moment where the story reads as raw: the fake bd traces the number of story:* labels of every bead after EVERY write; a story must never
@@ -72,6 +75,8 @@ cat > "$WORK/bin/bd" <<'FAKE'
 # fake bd. World = $AR_WORLD/world.json: {"<id>": {status, assignee, issue_type, labels[], metadata{}}}.
 # AR_SHOW_MODE: ok | fail | empty | garbage | fail_after_add (show dies once a `label add` has landed)
 # AR_ADD_MODE (for `label add`; AR_ADD_ONLY=<id> restricts it to one bead): ok | refuse (rc 1, not applied) | lie (rc 0, not applied)
+# AR_LIST_ASSIGNEE (set, even to ""): `list` shows that owner on every row (empty = none) while `show` keeps the real one = claimed after the Pilot listed it
+# AR_SET_MODE (for `update --set-metadata`): ok | refuse (rc 1, not applied)
 W="${AR_WORLD:?}"; WJ="$W/world.json"
 echo "$*" >> "$W/calls.log"
 [ "${1:-}" = "-C" ] && shift 2
@@ -94,10 +99,11 @@ case "$cmd" in
   list)
     want=""
     while [ $# -gt 0 ]; do [ "$1" = "-l" ] && { want="$want $2"; shift; }; shift; done
-    jq -c --arg want "$want" '($want | split(" ") | map(select(length > 0))) as $w
+    over=0; [ "${AR_LIST_ASSIGNEE+x}" = x ] && over=1
+    jq -c --arg want "$want" --argjson over "$over" --arg la "${AR_LIST_ASSIGNEE:-}" '($want | split(" ") | map(select(length > 0))) as $w
       | [ to_entries[] | select(.value.status != "closed")
           | select(.value.labels as $l | all($w[]; . as $x | $l | index($x) != null))
-          | .value + {id: .key} | if .assignee == "" then del(.assignee) else . end ]' "$WJ" ;;
+          | .value + {id: .key} | if $over == 1 then .assignee = $la else . end | if .assignee == "" then del(.assignee) else . end ]' "$WJ" ;;
   label)
     sub="$1"; id="$2"; lab="$3"
     case "$sub" in
@@ -121,6 +127,9 @@ case "$cmd" in
         --assignee|-a) newa="$2"; has_newa=1; shift ;;
         --status)      news="$2"; has_news=1; shift ;;
         --unset-metadata) unsetm="$unsetm $2"; shift ;;
+        --set-metadata)
+          [ "${AR_SET_MODE:-ok}" = refuse ] && { echo "Error: metadata write refused" >&2; exit 1; }
+          wj_set --arg id "$id" --arg kv "$2" '.[$id].metadata[($kv | split("=")[0])] = ($kv | split("=")[1:] | join("="))'; shift ;;
       esac
       shift
     done
@@ -142,7 +151,7 @@ new_world() {   # $1 = name
   W="$WORK/w.$1"; mkdir -p "$W"
   echo '{}' > "$W/world.json"; : > "$W/calls.log"; : > "$W/warn.log"; : > "$W/trace.log"; rm -f "$W/added"
   export AR_WORLD="$W"
-  unset AR_SHOW_MODE AR_ADD_MODE AR_ADD_ONLY
+  unset AR_SHOW_MODE AR_ADD_MODE AR_ADD_ONLY AR_LIST_ASSIGNEE AR_SET_MODE
 }
 add_bead() {    # id status assignee issue_type "label label"   (the sling bead is the bead itself, like a self-dispatched story)
   jq --arg id "$1" --arg st "$2" --arg a "$3" --arg ty "$4" --arg l "$5" --argjson stamp "$STAMP" \
@@ -159,7 +168,7 @@ flight_n()  { w_get "$1" '[.labels[] | select(. == "story:in-flight" or . == "pi
 has_meta()  { [ "$(w_get "$1" ".metadata | has(\"$2\")")" = true ]; }
 calls_have() { grep -qF -- "$1" "$W/calls.log"; }
 warn_have()  { grep -qF -- "$1" "$W/warn.log"; }
-calls_line() { grep -nF -- "$1" "$W/calls.log" | head -1 | cut -d: -f1; }
+calls_line() { grep -nF -- "$1" "$W/calls.log" | sed -n '1s/:.*//p'; }   # sed reads to EOF: `head -1` would leave grep to die of SIGPIPE under pipefail
 # (1) the story never reads as raw between two writes of the Pilot
 never_raw() { ! grep -qx -- "$1 0" "$W/trace.log"; }
 # (2) the end state, as auto-refino's RAW classifier sees it ("yes" = it would ingest the bead as a fresh idea)
@@ -219,6 +228,8 @@ never_raw wa-tvrs41.5 && ok "(1) never a moment with zero story:* labels (trace:
 _a="$(calls_line 'label add wa-tvrs41.5 story:approved')"; _r="$(calls_line 'label remove wa-tvrs41.5 story:in-flight')"
 { [ -n "$_a" ] && [ -n "$_r" ] && [ "$_a" -lt "$_r" ]; } && ok "story:approved was written BEFORE story:in-flight came off (call $_a < $_r)" || bad "order: add at '$_a', remove at '$_r'"
 [ "$(w_get wa-tvrs41.5 '.labels | index("exec:auto") != null and index("ctx:ready") != null')" = true ] && ok "the other labels are untouched" || bad "other labels changed: $(labels_of wa-tvrs41.5)"
+{ warn_have "ga-w6a9xps: wa-tvrs41.5 — story:approved GIVEN BACK" && warn_have "trace relied on: pilot:dispatched,pilot.dispatched_at"; } && ok "the restore is logged, naming the trace it relied on" || bad "no restore log; warn.log: $(head -c 300 "$W/warn.log")"
+[ "$(w_get wa-tvrs41.5 '(.metadata["pilot.approval_restored"] // "") | test("^[0-9]+ pilot:dispatched,pilot.dispatched_at$")')" = true ] && ok "pilot.approval_restored stamp = epoch + the trace" || bad "stamp: '$(w_get wa-tvrs41.5 '.metadata["pilot.approval_restored"] // "none"')'"
 
 echo
 echo "CS-2: the story already carries another lifecycle state — left alone (story:approved is not added over it)"
@@ -246,7 +257,7 @@ add_bead wa-kept in_progress batista-wa feature "story:approved story:in-flight 
 run_cs "[$(cs_row wa-kept batista-wa)]"
 survived cs && ok "the reclaim survives" || bad "the reclaim died: rc=$RC"
 { [ "$(w_get wa-kept '[.labels[] | select(. == "story:approved")] | length')" = 1 ] && ! has_label wa-kept story:in-flight && [ -z "$(owner_of wa-kept)" ]; } && ok "one story:approved, in-flight off, owner released" || bad "labels: $(labels_of wa-kept) owner='$(owner_of wa-kept)'"
-! calls_have " label add " && ok "nothing to restore, nothing written" || bad "a label was added: $(grep ' label add ' "$W/calls.log" | tr '\n' '|')"
+{ ! calls_have " label add " && ! calls_have "--set-metadata"; } && ok "nothing to restore, nothing written (no label, no stamp)" || bad "wrote: $(grep -e ' label add ' -e '--set-metadata' "$W/calls.log" | tr '\n' '|')"
 [ "$(raw_verdict wa-kept)" = no ] && ok "(2) not an idea for auto-refino" || bad "(2) auto-refino would re-ingest it"
 
 echo
@@ -259,6 +270,7 @@ run_cs "[$(cs_row wa-refused batista-wa),$(cs_row wa-next batista-wa)]"
 survived cs && ok "a refused restore does not kill the sweep (rc $RC)" || bad "the sweep died: rc=$RC err=$(head -c 300 "$W/cs.err")"
 { [ "$(owner_of wa-refused)" = batista-wa ] && [ "$(flight_n wa-refused)" = 2 ] && has_meta wa-refused pilot.dispatched_at; } && ok "wa-refused: owner, both flight labels and stamps KEPT" || bad "wa-refused was touched: owner='$(owner_of wa-refused)' labels=$(labels_of wa-refused)"
 never_raw wa-refused && ok "wa-refused: never raw" || bad "wa-refused: LIMBO"
+! calls_have "update wa-refused --set-metadata" && ok "wa-refused: no stamp for a restore that did not land" || bad "wa-refused was stamped: $(grep 'wa-refused --set-metadata' "$W/calls.log" | tr '\n' '|')"
 warn_have "NOT released" && ok "logged loudly (NOT released)" || bad "no loud log; warn.log: $(head -c 300 "$W/warn.log")"
 { has_label wa-next story:approved && ! has_label wa-next story:in-flight && [ -z "$(owner_of wa-next)" ]; } && ok "wa-next: restored and released in the same pass (continue, not abort)" || bad "wa-next: labels=$(labels_of wa-next) owner='$(owner_of wa-next)'"
 
@@ -271,6 +283,7 @@ run_cs "[$(cs_row wa-lie batista-wa)]"
 survived cs && ok "the sweep survives" || bad "the sweep died: rc=$RC"
 { [ "$(owner_of wa-lie)" = batista-wa ] && [ "$(flight_n wa-lie)" = 2 ] && ! has_label wa-lie story:approved; } && ok "bead untouched (the exit code of the write was not believed)" || bad "owner='$(owner_of wa-lie)' labels=$(labels_of wa-lie)"
 never_raw wa-lie && ok "never raw" || bad "LIMBO after a restore that never landed"
+! calls_have "--set-metadata" && ok "no stamp for a restore bd only claimed to make" || bad "stamped a restore that never landed: $(grep -e '--set-metadata' "$W/calls.log" | tr '\n' '|')"
 
 echo
 echo "CS-7: the bead cannot be READ (fails / empty / garbled) — third state = unknown: nothing written, nothing released"
@@ -299,6 +312,46 @@ unset AR_SHOW_MODE
 run_cs "[$(cs_row wa-after batista-wa)]"
 { has_label wa-after story:approved && ! has_label wa-after story:in-flight && [ -z "$(owner_of wa-after)" ] && [ "$(raw_verdict wa-after)" = no ]; } && ok "converges: approved, released, not an idea" || bad "second sweep: labels=$(labels_of wa-after) owner='$(owner_of wa-after)'"
 
+echo
+echo "CS-9: a live claimant took the bead after the Pilot judged the row — NOTHING is written to it (no story:approved on its bead, no flight label touched); the next bead is still served"
+new_world cs9
+add_bead wa-moved in_progress oracle-wa feature "story:in-flight pilot:dispatched"
+add_bead wa-after9 in_progress batista-wa feature "story:in-flight pilot:dispatched"
+run_cs "[$(cs_row wa-moved batista-wa),$(cs_row wa-after9 batista-wa)]"
+survived cs && ok "the sweep survives (rc $RC)" || bad "the sweep died: rc=$RC err=$(head -c 300 "$W/cs.err")"
+{ [ "$(owner_of wa-moved)" = oracle-wa ] && [ "$(flight_n wa-moved)" = 2 ] && has_meta wa-moved pilot.dispatched_at; } && ok "wa-moved: the claimant, both flight labels and stamps KEPT" || bad "wa-moved was touched: owner='$(owner_of wa-moved)' labels=$(labels_of wa-moved)"
+{ ! has_label wa-moved story:approved && ! calls_have "label add wa-moved " && ! calls_have "update wa-moved --set-metadata"; } && ok "wa-moved: no story:approved written onto the claimant's bead, no stamp" || bad "wrote onto a bead somebody else owns: $(grep ' wa-moved ' "$W/calls.log" | tr '\n' '|')"
+warn_have "ga-w6a9xps: wa-moved NOT released" && warn_have "owner-changed" && ok "logged loudly (owner-changed)" || bad "no loud log; warn.log: $(head -c 300 "$W/warn.log")"
+{ has_label wa-after9 story:approved && [ "$(flight_n wa-after9)" = 0 ] && [ -z "$(owner_of wa-after9)" ]; } && ok "wa-after9: restored and released in the same pass (continue, not abort)" || bad "wa-after9: labels=$(labels_of wa-after9) owner='$(owner_of wa-after9)'"
+
+echo
+echo "CS-10: the bead CLOSED after the Pilot judged the row (the builder finished) — left untouched, no label write"
+new_world cs10
+add_bead wa-closed closed batista-wa feature "story:in-flight pilot:dispatched"
+run_cs "[$(cs_row wa-closed batista-wa)]"
+survived cs && ok "the sweep survives" || bad "the sweep died: rc=$RC"
+{ ! has_label wa-closed story:approved && ! calls_have " label " && [ "$(flight_n wa-closed)" = 2 ] && [ "$(owner_of wa-closed)" = batista-wa ]; } && ok "closed bead untouched (no label written, flight labels and owner kept)" || bad "labels=$(labels_of wa-closed) owner='$(owner_of wa-closed)'; calls: $(tr '\n' '|' < "$W/calls.log")"
+warn_have "ga-w6a9xps: wa-closed NOT released" && warn_have "closed" && ok "logged loudly (closed)" || bad "no loud log; warn.log: $(head -c 300 "$W/warn.log")"
+
+echo
+echo "CS-11: the audit stamp is refused by bd — the approval is already back and confirmed, so the release still goes on; the missing stamp is said loudly"
+new_world cs11
+add_bead wa-stamp in_progress batista-wa feature "story:in-flight pilot:dispatched"
+export AR_SET_MODE=refuse
+run_cs "[$(cs_row wa-stamp batista-wa)]"
+survived cs && ok "the sweep survives" || bad "the sweep died: rc=$RC err=$(head -c 300 "$W/cs.err")"
+{ has_label wa-stamp story:approved && ! has_label wa-stamp story:in-flight && [ -z "$(owner_of wa-stamp)" ]; } && ok "restored and released anyway" || bad "labels=$(labels_of wa-stamp) owner='$(owner_of wa-stamp)'"
+{ ! has_meta wa-stamp pilot.approval_restored && warn_have "pilot.approval_restored was NOT written"; } && ok "no stamp, and it says so" || bad "stamp=$(has_meta wa-stamp pilot.approval_restored && echo present || echo absent); warn.log: $(head -c 300 "$W/warn.log")"
+
+echo
+echo "CS-12 (ga-btr2dof): a tech-debt FEATURE in flight — the Pilot's Tier-1 dispatched it with NO approval, so none is invented: released as before, no story:approved, no stamp"
+new_world cs12
+add_bead wa-debt in_progress batista-wa feature "story:in-flight pilot:dispatched tech-debt"
+run_cs "[$(cs_row wa-debt batista-wa)]"
+survived cs && ok "the reclaim survives (rc $RC)" || bad "the reclaim died: rc=$RC err=$(head -c 300 "$W/cs.err")"
+{ ! has_label wa-debt story:approved && ! calls_have " label add " && ! calls_have "--set-metadata"; } && ok "no story:approved invented, no stamp" || bad "wrote onto a tech-debt feature: $(grep -e ' label add ' -e '--set-metadata' "$W/calls.log" | tr '\n' '|'); labels=$(labels_of wa-debt)"
+{ ! has_label wa-debt story:in-flight && has_label wa-debt tech-debt && [ -z "$(owner_of wa-debt)" ] && [ "$(status_of wa-debt)" = open ]; } && ok "released as before (in-flight off, tech-debt kept, owner off, open)" || bad "labels=$(labels_of wa-debt) owner='$(owner_of wa-debt)' status=$(status_of wa-debt)"
+
 # ═════════════════════════════════════════════════════════════════════════════
 echo
 echo "NS-1 (the NEVERSTARTED sibling): story whose builder claimed it and never started — released WITH its approval"
@@ -312,6 +365,7 @@ never_raw wa-ns1 && ok "(1) never a moment with zero story:* labels" || bad "(1)
 [ "$(raw_verdict wa-ns1)" = no ] && ok "(2) auto-refino's RAW sweep does NOT pick it up" || bad "(2) auto-refino would re-ingest it as a fresh idea (labels: $(labels_of wa-ns1))"
 _a="$(calls_line 'label add wa-ns1 story:approved')"; _r="$(calls_line 'label remove wa-ns1 story:in-flight')"
 { [ -n "$_a" ] && [ -n "$_r" ] && [ "$_a" -lt "$_r" ]; } && ok "story:approved written BEFORE story:in-flight came off" || bad "order: add at '$_a', remove at '$_r'"
+{ warn_have "ga-w6a9xps: wa-ns1 — story:approved GIVEN BACK" && has_meta wa-ns1 pilot.approval_restored; } && ok "logged and stamped" || bad "no restore log/stamp; warn.log: $(head -c 300 "$W/warn.log")"
 
 echo
 echo "NS-2: no owner on the row (the claim was already released by someone) and story:approved gone — still restored"
@@ -350,23 +404,62 @@ run_ns
 survived ns && ok "the sweep survives" || bad "the sweep died: rc=$RC"
 { [ "$(flight_n wa-ns5)" = 2 ] && ! calls_have " label " && ! calls_have " update "; } && ok "flight labels kept, no write" || bad "labels=$(labels_of wa-ns5); calls: $(tr '\n' '|' < "$W/calls.log")"
 
+echo
+echo "NS-6: the row had NO owner (so no owner release runs) but a live claimant took the bead since — nothing is written, the flight labels and stamps stay on its bead"
+new_world ns6
+add_bead wa-ns6 in_progress oracle-wa feature "story:in-flight pilot:dispatched"
+export AR_LIST_ASSIGNEE=""
+run_ns
+survived ns && ok "the sweep survives" || bad "the sweep died: rc=$RC err=$(head -c 300 "$W/ns.err")"
+{ [ "$(owner_of wa-ns6)" = oracle-wa ] && [ "$(flight_n wa-ns6)" = 2 ] && has_meta wa-ns6 pilot.dispatched_at && ! calls_have " label "; } && ok "the claimant's bead untouched: owner, both flight labels and stamps kept, no label write" || bad "owner='$(owner_of wa-ns6)' labels=$(labels_of wa-ns6); calls: $(tr '\n' '|' < "$W/calls.log")"
+warn_have "ga-w6a9xps: wa-ns6 NOT released" && ok "logged loudly" || bad "no loud log; warn.log: $(head -c 300 "$W/warn.log")"
+
+echo
+echo "NS-7 (ga-btr2dof): the same tech-debt feature in the NEVERSTARTED sweep — released as before, no story:approved, no stamp"
+new_world ns7
+add_bead wa-ns7 in_progress batista-wa feature "story:in-flight pilot:dispatched tech-debt"
+run_ns
+survived ns && ok "the sweep survives" || bad "the sweep died: rc=$RC err=$(head -c 300 "$W/ns.err")"
+{ ! has_label wa-ns7 story:approved && ! calls_have " label add " && ! calls_have "--set-metadata"; } && ok "no story:approved invented, no stamp" || bad "wrote onto a tech-debt feature: $(grep -e ' label add ' -e '--set-metadata' "$W/calls.log" | tr '\n' '|'); labels=$(labels_of wa-ns7)"
+{ [ "$(flight_n wa-ns7)" = 0 ] && has_label wa-ns7 tech-debt && [ -z "$(owner_of wa-ns7)" ]; } && ok "released as before (flight labels off, tech-debt kept, owner off)" || bad "labels=$(labels_of wa-ns7) owner='$(owner_of wa-ns7)'"
+
 # ═════════════════════════════════════════════════════════════════════════════
 echo
-echo "VERDICT: _pilot_approved_verdict (pure) — one word per shape; unreadable is rc 1 with NO word"
+echo "VERDICT: _pilot_approved_verdict <json> [<judged owner>] (pure) — one word per shape (restore: + the trace; moved: + why); unreadable is rc 1 with NO word"
 if [ -z "$(extract_fn _pilot_approved_verdict)" ]; then
   bad "_pilot_approved_verdict is not in the dispatcher (pre-fix tree)"
 else
   eval "$(extract_fn _pilot_approved_verdict)"
-  v() { _pilot_approved_verdict "$1" 2>/dev/null; }
-  chk() { # <expected word> <json> <label>
-    local got; got="$(v "$2")"
+  v() { _pilot_approved_verdict "$1" "${2:-}" 2>/dev/null; }
+  chk() { # <expected output> <json> <label> [<judged owner>]
+    local got; got="$(v "$2" "${4:-}")"
     [ "$got" = "$1" ] && ok "$3 → $1" || bad "$3: got '$got', want '$1'"
   }
-  chk restore           '[{"status":"in_progress","issue_type":"feature","labels":["story:in-flight","pilot:dispatched"]}]' "feature + in-flight, no approval"
-  chk restore           '[{"status":"in_progress","issue_type":"story","labels":["story:in-flight","pilot:dispatched"]}]' "story type + in-flight + dispatch label"
-  chk restore           '{"status":"open","issue_type":"feature","labels":["story:in-flight","pilot:dispatched"]}' "bare object (not an array)"
-  chk restore           '[{"status":"open","issue_type":"feature","labels":["story:in-flight"],"metadata":{"pilot.dispatched_at":"1790000000"}}]' "proof = pilot.dispatched_at stamp"
-  chk restore           '[{"status":"open","issue_type":"feature","labels":["story:in-flight"],"metadata":{"story.aprovado_por":"athos"}}]' "proof = story.aprovado_por stamp"
+  chk "restore pilot:dispatched" '[{"status":"in_progress","issue_type":"feature","labels":["story:in-flight","pilot:dispatched"]}]' "feature + in-flight, no approval"
+  chk "restore pilot:dispatched" '[{"status":"in_progress","issue_type":"story","labels":["story:in-flight","pilot:dispatched"]}]' "story type + in-flight + dispatch label"
+  chk "restore pilot:dispatched" '{"status":"open","issue_type":"feature","labels":["story:in-flight","pilot:dispatched"]}' "bare object (not an array)"
+  chk "restore pilot.dispatched_at" '[{"status":"open","issue_type":"feature","labels":["story:in-flight"],"metadata":{"pilot.dispatched_at":"1790000000"}}]' "proof = pilot.dispatched_at stamp"
+  chk "restore story.aprovado_por" '[{"status":"open","issue_type":"feature","labels":["story:in-flight"],"metadata":{"story.aprovado_por":"athos"}}]' "proof = story.aprovado_por stamp"
+  chk "restore pilot:dispatched,pilot.dispatched_at,story.aprovado_por" '[{"status":"open","issue_type":"feature","labels":["story:in-flight","pilot:dispatched"],"metadata":{"pilot.dispatched_at":"1790000000","story.aprovado_por":"athos"}}]' "all three traces, named in a fixed order"
+  # the bead is not the one the Pilot judged (closed, or another owner than the judged one): a write would land on a finished bead or one somebody holds → `moved`, never `restore`
+  chk "moved closed"        '[{"status":"closed","issue_type":"feature","labels":["story:in-flight","pilot:dispatched"],"assignee":"batista-wa"}]' "closed since the Pilot judged it" batista-wa
+  chk "moved owner-changed" '[{"status":"in_progress","issue_type":"feature","labels":["story:in-flight","pilot:dispatched"],"assignee":"oracle-wa"}]' "another owner than the judged one" batista-wa
+  chk "moved owner-changed" '[{"status":"in_progress","issue_type":"feature","labels":["story:in-flight","pilot:dispatched"],"assignee":"oracle-wa"}]' "claimed since a row WITHOUT owner was listed (judged owner empty)" ""
+  chk "restore pilot:dispatched" '[{"status":"in_progress","issue_type":"feature","labels":["story:in-flight","pilot:dispatched"],"assignee":"batista-wa"}]' "same owner as judged" batista-wa
+  chk "restore pilot:dispatched" '[{"status":"open","issue_type":"feature","labels":["story:in-flight","pilot:dispatched"]}]' "owner cleared meanwhile: still restore (the release has nothing to take off)" batista-wa
+  # `moved` only ever replaces `restore`: where nothing would be written the word is the one it always was
+  chk no-proof     '[{"status":"closed","issue_type":"feature","labels":["story:in-flight"],"assignee":"batista-wa"}]' "closed and no trace: no-proof" batista-wa
+  chk has-approved '[{"status":"in_progress","issue_type":"feature","labels":["story:approved","story:in-flight"],"assignee":"oracle-wa"}]' "approved + another owner: has-approved" batista-wa
+  chk not-story    '[{"status":"in_progress","issue_type":"bug","labels":["story:in-flight"],"assignee":"oracle-wa"}]' "a bug with another owner: not-story" batista-wa
+  # the stamp the Pilot leaves after a restore must never justify the next one (a circular proof would make a single mistake permanent)
+  chk no-proof     '[{"status":"in_progress","issue_type":"feature","labels":["story:in-flight"],"metadata":{"pilot.approval_restored":"1794700000 pilot:dispatched"}}]' "the Pilot's own pilot.approval_restored stamp is no trace"
+  # ga-btr2dof: the Pilot's Tier-1 dispatches tech-debt of any type but epic with NO approval (`bd list -l tech-debt`): for it pilot:dispatched proves nothing about Athos → `tier1-bypass`
+  chk tier1-bypass '[{"status":"in_progress","issue_type":"feature","labels":["story:in-flight","pilot:dispatched","tech-debt"],"metadata":{"pilot.dispatched_at":"1790000000"}}]' "tech-debt feature, dispatched: the trace is no proof of approval"
+  chk tier1-bypass '[{"status":"in_progress","issue_type":"story","labels":["story:in-flight","pilot:dispatched","tech-debt"]}]' "tech-debt, story type"
+  chk tier1-bypass '[{"status":"in_progress","issue_type":"feature","labels":["story:in-flight","tech-debt"],"metadata":{"story.aprovado_por":"athos"}}]' "tech-debt WITH story.aprovado_por: the exemption comes before the proof"
+  chk not-story    '[{"status":"in_progress","issue_type":"bug","labels":["story:in-flight","tech-debt"]}]' "tech-debt bug: just not a story"
+  chk has-approved '[{"status":"in_progress","issue_type":"feature","labels":["story:approved","story:in-flight","tech-debt"]}]' "tech-debt + approved: has-approved still first"
+  chk other-story-state '[{"status":"in_progress","issue_type":"feature","labels":["story:in-flight","story:done","tech-debt"]}]' "tech-debt + another story state: other-story-state still first"
   # no trace that Athos's approval ever stood (Regra 4: never inferred) → never re-approved: also what a bead Athos parked by hand looks like
   chk no-proof          '[{"status":"in_progress","issue_type":"feature","labels":["story:in-flight"]}]' "feature + in-flight, no trace at all"
   chk no-proof          '[{"status":"in_progress","issue_type":"story","labels":["story:in-flight"],"metadata":{}}]' "story type, empty metadata"
@@ -389,22 +482,45 @@ fi
 
 # ════════════════════════════════════════════════════════════════════════════
 echo
+echo "RC: _pilot_restore_approved <db> <id> <judged owner> — 0 = go on (restored, or nothing to do), 3 = the bead moved since the Pilot judged it: no write, the caller leaves it"
+rc_case() {   # <name> <status> <owner now> <judged owner> <want rc> <label written: yes|no>
+  new_world "rc$1"
+  add_bead wa-rc "$2" "$3" feature "story:in-flight pilot:dispatched"
+  run_fn "rc$1" "_pilot_restore_approved /fake/db wa-rc '$4'"
+  local _wrote=no; calls_have "label add wa-rc story:approved" && _wrote=yes
+  { [ "$RC" -eq "$5" ] && [ "$_wrote" = "$6" ]; } && ok "$1: rc $RC, story:approved written: $_wrote" || bad "$1: rc=$RC (want $5), written=$_wrote (want $6); err: $(head -c 200 "$W/rc$1.err")"
+}
+rc_case owner-changed        in_progress oracle-wa  batista-wa 3 no
+rc_case closed               closed      batista-wa batista-wa 3 no
+rc_case claimed-ownerless-row in_progress oracle-wa ""         3 no
+rc_case same-owner           in_progress batista-wa batista-wa 0 yes
+rc_case owner-cleared        open        ""         batista-wa 0 yes
+rc_case ownerless-both       open        ""         ""         0 yes
+
+# ════════════════════════════════════════════════════════════════════════════
+echo
 echo "NO-PROOF: a feature in flight with no dispatch/approval trace is released as before — story:approved is NOT written (only Athos approves)"
 new_world np
 add_bead wa-np in_progress batista-wa feature "story:in-flight"
 jq 'del(.["wa-np"].metadata["pilot.dispatched_at"])' "$W/world.json" > "$W/world.tmp" && mv "$W/world.tmp" "$W/world.json"
-run_fn np "_pilot_restore_approved /fake/db wa-np"
+run_fn np "_pilot_restore_approved /fake/db wa-np batista-wa"
 { [ "$RC" -eq 0 ] && grep -q '^DONE$' "$W/np.out"; } && ok "no-proof → rc 0 (the release may go on)" || bad "rc=$RC err: $(tr '\n' '|' < "$W/np.err")"
-! calls_have " label add " && ok "story:approved was NOT written" || bad "wrote a label: $(tr '\n' '|' < "$W/calls.log")"
+{ ! calls_have " label add " && ! calls_have "--set-metadata"; } && ok "story:approved was NOT written, and no stamp" || bad "wrote: $(tr '\n' '|' < "$W/calls.log")"
 ! has_label wa-np story:approved && ok "labels untouched ($(labels_of wa-np))" || bad "story:approved appeared on a bead with no proof"
 
 # ═════════════════════════════════════════════════════════════════════════════
 echo
-echo "STRUCTURE: the restore comes first, and a refusal skips the release"
+echo "STRUCTURE: the restore comes first, gets the owner the Pilot judged, and a refusal skips the release"
 for _fn in _neverstarted_recover_db _pilot_crew_stale_reclaim; do
-  _order="$(sed -n "/^$_fn() {/,/^}\$/p" "$DISPATCHER" | awk '/_pilot_restore_approved "/ && !r {r=NR} /_pilot_release_owner "/ && !c {c=NR} /label  remove/ && !l {l=NR} END {if (r && c && l && r < c && c < l) print "ok"; else print "r=" r+0 " c=" c+0 " l=" l+0}')"
+  # The function text is cut ONCE and every check reads it as a here-string. `sed | grep -q` let grep leave at its first match while sed still had text to
+  # write: sed died of SIGPIPE and `pipefail` turned a correct line into a failure (on the reviewed tip the match sat at line 163 of the 174-line
+  # _neverstarted_recover_db: red in 10 of 12 runs on the Linux node, the 89-line function never failed).
+  _ftxt="$(sed -n "/^$_fn() {/,/^}\$/p" "$DISPATCHER")"
+  case "$_fn" in _neverstarted_recover_db) _ov='_ns_owner' ;; *) _ov='_cs_assignee' ;; esac   # the variable that holds the owner the row judged
+  _order="$(awk '/_pilot_restore_approved "/ && !r {r=NR} /_pilot_release_owner "/ && !c {c=NR} /label  remove/ && !l {l=NR} END {if (r && c && l && r < c && c < l) print "ok"; else print "r=" r+0 " c=" c+0 " l=" l+0}' <<< "$_ftxt")"
   [ "$_order" = ok ] && ok "$_fn: _pilot_restore_approved → _pilot_release_owner → flight labels off" || bad "$_fn: wrong order or missing ($_order)"
-  sed -n "/^$_fn() {/,/^}\$/p" "$DISPATCHER" | grep -qE '_pilot_restore_approved "[^"]*" "[^"]*" \|\| continue' && ok "$_fn: a restore that is not confirmed skips the bead (|| continue)" || bad "$_fn: no '|| continue' on the restore"
+  _pat='_pilot_restore_approved "[^"]*" "[^"]*" "\$'"$_ov"'" \|\| continue'
+  grep -qE "$_pat" <<< "$_ftxt" && ok "$_fn: passes \$$_ov and a restore that is not confirmed skips the bead (|| continue)" || bad "$_fn: no '_pilot_restore_approved <db> <id> \"\$$_ov\" || continue'"
 done
 
 echo
