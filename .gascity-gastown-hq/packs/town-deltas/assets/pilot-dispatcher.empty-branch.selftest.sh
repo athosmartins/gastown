@@ -12,7 +12,9 @@
 #       for is class `empty`, not `merged` — also with a (dead) owner in the bead JSON, also as a fetched origin ref,
 #       also when the tip IS origin/main. A real delivery (a commit naming the bead is on main) stays `merged`; an
 #       unmerged branch stays `block`. Third state: when git cannot answer the history question the class stays
-#       `merged` (the veto of before), never `empty`.
+#       `merged` (the veto of before), never `empty`. S1b: that history search starts a day before the bead existed
+#       (a whole-history scan per bead per call is what a reboot would multiply) and falls back to the whole history
+#       when the bead has no usable created_at.
 #   S2  _filter_built: the empty-branch bead stays a candidate; merged / in-flight beads are still dropped; a gate:*
 #       label or an open gate marker still drops it ("no marker, no label" is part of the contract).
 #   S3  the two other callers: _ownership_guard_should_refuse does not refuse on `empty`, still refuses `block`;
@@ -82,12 +84,16 @@ git init -q --bare "$ORIGIN"
 git init -q "$R"
 git -C "$R" config user.email t@t.invalid
 git -C "$R" config user.name selftest
-N=0
-mkc() { N=$((N+1)); echo "$N" > "$R/f$N.txt"; git -C "$R" add "f$N.txt"; git -C "$R" commit -q -m "$1"; }
-echo base > "$R/README"; git -C "$R" add README; git -C "$R" commit -q -m "init"
+N=0; NOW="$(date +%s)"; D12=$((NOW - 12*86400)); D11=$((NOW - 11*86400)); D10=$((NOW - 10*86400))
+mkc() { # <message> [commit epoch]
+  N=$((N+1)); echo "$N" > "$R/f$N.txt"; git -C "$R" add "f$N.txt"
+  if [ -n "${2:-}" ]; then GIT_AUTHOR_DATE="@$2" GIT_COMMITTER_DATE="@$2" git -C "$R" commit -q -m "$1"; else git -C "$R" commit -q -m "$1"; fi
+}
+iso() { jq -rn --argjson e "$1" '$e | todate'; }
+echo base > "$R/README"; git -C "$R" add README; GIT_AUTHOR_DATE="@$D12" GIT_COMMITTER_DATE="@$D12" git -C "$R" commit -q -m "init"
 MAINBR="$(git -C "$R" symbolic-ref --short HEAD)"
-mkc "feat(wa-prior01): groundwork";            C1="$(git -C "$R" rev-parse HEAD)"
-mkc "fix(wa-done01): delivered work";          C2="$(git -C "$R" rev-parse HEAD)"
+mkc "feat(wa-prior01): groundwork" "$D11";     C1="$(git -C "$R" rev-parse HEAD)"
+mkc "fix(wa-done01): delivered work" "$D10";   C2="$(git -C "$R" rev-parse HEAD)"
 mkc "chore: later main work";                  C3="$(git -C "$R" rev-parse HEAD)"
 mkc "docs(wa-redo01): first attempt notes";    C4="$(git -C "$R" rev-parse HEAD)"
 mkc "chore: newest main commit";               C5="$(git -C "$R" rev-parse HEAD)"
@@ -124,10 +130,11 @@ echo "detached edit" >> "$R/crew/wa-det01/README"
 PLAIN="$TMP/plain"; mkdir -p "$PLAIN"                                                                                               # a directory with no git at all
 BROKEN="$TMP/broken"; mkdir -p "$BROKEN"; printf 'gitdir: /nonexistent/nowhere\n' > "$BROKEN/.git"                                 # has a .git git will not open
 # a git that fails when asked a given subcommand (SHIM_FAIL=log|status|worktree), everything else is the real one;
-# SHIM_ONLY=<repo path> narrows the failure to calls that also name that path (git -C <path> ...)
+# SHIM_ONLY=<repo path> narrows the failure to calls that also name that path (git -C <path> ...); SHIM_LOG=<file> records every call's arguments
 mkdir -p "$TMP/shim"
 cat > "$TMP/shim/git" <<'SHIM'
 #!/bin/sh
+[ -z "${SHIM_LOG:-}" ] || printf '%s\n' "$*" >> "$SHIM_LOG"
 if [ -n "${SHIM_FAIL:-}" ]; then
   hit=0; only=1
   for a in "$@"; do [ "$a" = "$SHIM_FAIL" ] && hit=1; done
@@ -181,6 +188,24 @@ sig wa-nobr01;                   eq "no branch at all → rc 1, no class" "1:" "
 # third state: git cannot read the history → not "no commit names the bead"
 sig wa-empty01 "SHIM_FAIL=log PATH=$TMP/shim:$PATH"
 eq "history unreadable (git log fails) → merged, NOT empty (failed is not empty)" "merged" "$(class_of)"
+
+echo "── S1b. the history search is bounded by the bead's creation (a whole-history scan per bead per call is what a reboot would multiply) ──"
+glog() { cat "$TMP/gitlog.txt"; }
+sig wa-done01 "" "{\"id\":\"wa-done01\",\"created_at\":\"$(iso "$D12")\"}"
+eq "a bead created before its delivery: the bounded search still finds the delivery → merged" "merged" "$(class_of)"
+sig wa-done01 "" "{\"id\":\"wa-done01\",\"created_at\":\"$(iso $((D10 + 18000)))\"}"
+eq "created 5 h AFTER the delivery commit (a retroactive bead): the 1-day margin still finds it → merged" "merged" "$(class_of)"
+sig wa-done01 "" "{\"id\":\"wa-done01\",\"created_at\":\"$(iso "$NOW")\"}"
+eq "created long AFTER that commit: it predates the bead, so it is not its delivery → empty" "empty" "$(class_of)"
+: > "$TMP/gitlog.txt"
+sig wa-empty01 "SHIM_LOG=$TMP/gitlog.txt PATH=$TMP/shim:$PATH" "{\"id\":\"wa-empty01\",\"created_at\":\"$(iso "$D12")\"}"
+has "the bound reaches git: --since=<created_at - 1 day>" "log origin/main -n 1 --format=%H -F --since=@$((D12 - 86400)) --grep=wa-empty01" "$(glog)"
+for _cj in '{}' '{"created_at":"not a date"}' 'this is not json at all' "{\"created_at\":\"$(iso $((NOW + 5*86400)))\"}"; do
+  : > "$TMP/gitlog.txt"
+  sig wa-done01 "SHIM_LOG=$TMP/gitlog.txt PATH=$TMP/shim:$PATH" "$_cj"
+  case "$(glog)" in *"log origin/main"*"--since"*) bad "created_at $_cj gave a bounded search" ;; *"log origin/main"*) ok "no usable created_at ($_cj) → the search is unbounded" ;; *) bad "git log was not called for $_cj" ;; esac
+  eq "…and the verdict does not change (merged)" "merged" "$(class_of)"
+done
 
 echo "── S2. _filter_built ──"
 ALL='[{"id":"wa-empty01","labels":[],"assignee":""},{"id":"wa-empty02","labels":[]},{"id":"wa-empty03","labels":[]},{"id":"wa-done01","labels":[]},{"id":"wa-redo01","labels":[]},{"id":"wa-live01","labels":[]},{"id":"wa-nobr01","labels":[]}]'

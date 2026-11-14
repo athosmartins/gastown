@@ -535,8 +535,9 @@ bd show <id>
 #    The branch MUST embed the bead id (crew/ps-worker/<id>) — the gate-done skill resolves the
 #    source bead from the branch name. A branch like "fix/foo" with no bead id makes the
 #    gate unable to find the bead and it circuit-breaks.
-#    FIRST look for one that is already there: git worktree list | grep <id>. A worker that died before its first commit
-#    leaves its work UNCOMMITTED in ../worker-<id>: cd into it and RESUME there, and skip the worktree add below.
+#    FIRST look for one that is already there: git worktree list | grep <id> (an <id>.N entry is a child bead's, not yours).
+#    A worker that died before its first commit leaves its work UNCOMMITTED in ../worker-<id>: cd into it and RESUME there,
+#    and skip the worktree add below.
 #    NEVER git worktree remove (with or without --force), rm -rf, git clean, git checkout -- . or git reset --hard a
 #    worktree whose git status is not clean: the uncommitted work is the only copy (ga-qcrgi9k).
 git worktree add ../worker-<id> -b crew/ps-worker/<id>

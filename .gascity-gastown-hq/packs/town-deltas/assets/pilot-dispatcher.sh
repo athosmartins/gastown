@@ -7518,10 +7518,17 @@ _beadid_branch_signal() {
     # creating it) as of one that was delivered, and only the second is built. By this repo's convention a delivery leaves a
     # commit on main that names the bead (fix(<bead>): ...); none → nothing was delivered. A delivery whose commits never name
     # the bead reads as empty: accepted, a wasted dispatch is cheaper than a bead that is never dispatched again.
+    # A delivery cannot precede its bead, so the search starts one day (clock skew, rebase) before the bead was created: a bead that
+    # nothing delivered would otherwise cost a scan of the WHOLE history on every call (0.42 s vs 0.02 s on 11.5k commits), and right
+    # after a reboot several beads are in that state at once.
+    # vazio (sem created_at) / ilegível (jq falhou, formato que o jq não lê) / no futuro (relógio) → sem limite: lê o histórico
+    # inteiro, só mais lento, o mesmo veredito; lido → limite --since
+    local _own_hit="" _own_rc=0 _own_since=""
+    _own_since=$(printf '%s' "$_json" | jq -r '(.created_at // "") | if . == "" then "" else (try (fromdateiso8601 - 86400) catch null) end | if type == "number" and . <= now then (floor | tostring) else "" end' 2>/dev/null) || _own_since=""
+    case "$_own_since" in *[!0-9]*) _own_since="" ;; esac
     # vazio (nenhum commit de origin/main cita o bead) → empty; achou → merged; falhou/ilegível (git log ≠ 0) → merged, o veto
     # de antes: "não consegui ler o histórico" nunca vira "a branch está vazia"
-    local _own_hit="" _own_rc=0
-    _own_hit=$(git -C "$_repo" log origin/main -n 1 --format=%H -F --grep="$_bid" -- 2>/dev/null </dev/null) || _own_rc=$?
+    _own_hit=$(git -C "$_repo" log origin/main -n 1 --format=%H -F ${_own_since:+--since=@$_own_since} --grep="$_bid" -- 2>/dev/null </dev/null) || _own_rc=$?
     if [ "$_own_rc" -eq 0 ] && [ -z "$_own_hit" ]; then
       printf 'empty\t%s' "$_ref"
     else
