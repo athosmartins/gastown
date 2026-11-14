@@ -175,5 +175,22 @@ L7="$(echo "$OUT9" | grep '^7)')"
 echo "$L7" | grep -q '^7) revisadas/hora (log do gate): dia 0,1/h (3 em 24 h; meta >= 8/h) | por hora 00h-23h: 0 0 0 0 0 0 0 0 0 2 0 0 0 0 1 0 0 0 0 0 0 0 0 0 | agora, últimas 3 h: 0,0/h$' && ok || bad "T9: line 7 with a log: $L7"
 echo "$OUT9" | grep -q 'Missão Athos 14/11' && ok || bad "T9: the mission line is missing"
 
+# T9b: the meter FAILS (exits non-zero with garbage / no JSON / the meter file missing / ok=false) -> line 7 says
+# "não medido" with the reason, never a rate, and the rest of the report still prints.
+D9="$W/d9"; mkdir -p "$D9"; cp "$HERE/gate-daily-report.py" "$D9/"
+printf 'import sys\nprint("not json")\nsys.exit(3)\n' > "$D9/gate-throughput-meter.py"
+OUT9="$(/usr/bin/python3 "$D9/gate-daily-report.py" --city "$C" --day 2026-10-06)"
+echo "$OUT9" | grep -q '^7) revisadas/hora: não medido (medidor falhou: JSONDecodeError)$' && echo "$OUT9" | grep -q '^1) ' && ok || bad "T9b: meter exits 3 with garbage: $(echo "$OUT9" | grep '^7)')"
+rm -f "$D9/gate-throughput-meter.py"
+OUT9="$(/usr/bin/python3 "$D9/gate-daily-report.py" --city "$C" --day 2026-10-06)"
+echo "$OUT9" | grep -q '^7) revisadas/hora: não medido (medidor falhou: JSONDecodeError)$' && ok || bad "T9b: meter missing: $(echo "$OUT9" | grep '^7)')"
+cat > "$D9/gate-throughput-meter.py" <<'STUB'
+import sys
+print('{"ok": false, "why": "log ilegível: PermissionError"}')
+sys.exit(1)
+STUB
+OUT9="$(/usr/bin/python3 "$D9/gate-daily-report.py" --city "$C" --day 2026-10-06)"
+echo "$OUT9" | grep -q '^7) revisadas/hora: não medido (log ilegível: PermissionError)$' && ok || bad "T9b: meter ok=false: $(echo "$OUT9" | grep '^7)')"
+
 echo "gate-daily-report selftest: $PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ]

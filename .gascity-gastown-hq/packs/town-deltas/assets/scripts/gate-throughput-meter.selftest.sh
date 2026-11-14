@@ -13,7 +13,7 @@ LOG="$C/.gc/logs/quality-gate-dispatcher.log"
 MAILLOG="$W/mail.log"; export MAILLOG
 cat > "$W/bin/gc" <<'EOF'
 #!/bin/sh
-if [ -n "${FAKE_GC_RC:-}" ]; then echo "boom" >&2; exit "$FAKE_GC_RC"; fi
+if [ -n "${FAKE_GC_RC:-}" ]; then echo "boom" >&2; exit 3; fi
 { echo MAIL; for a in "$@"; do printf '%s\n' "$a"; done; echo ENDMAIL; } >> "$MAILLOG"
 EOF
 chmod +x "$W/bin/gc"; export GATE_MEASURE_GC="$W/bin/gc"
@@ -84,6 +84,11 @@ reset; queue 0; FAKE_GC_RC=3 run --alarm >/dev/null 2>"$W/err"; RC=$?
 [ "$RC" = "1" ] && ok || bad "T6 rc want 1 got $RC"
 grep -q 'mail ao Mayor falhou' "$W/err" && ok || bad "T6 stderr: $(cat "$W/err")"
 run --alarm >/dev/null; [ "$(mails)" = "1" ] && ok || bad "T6 retry after a failed mail must send ($(mails))"
+
+# T6b: gc cannot even be started (not found) -> same: exit 1, WARN names the failure, cooldown not consumed
+reset; queue 0; GATE_MEASURE_GC="$W/bin/no-such-gc" run --alarm >/dev/null 2>"$W/err"; RC=$?
+[ "$RC" = "1" ] && grep -q 'mail ao Mayor falhou' "$W/err" && [ "$(mails)" = "0" ] && ok || bad "T6b rc=$RC err=$(cat "$W/err")"
+run --alarm >/dev/null; [ "$(mails)" = "1" ] && ok || bad "T6b retry after a missing gc must send ($(mails))"
 
 # T7: state unreadable (a directory where the file should be) -> inert: no mail, rc 1
 reset; queue 0; mkdir "$C/.gc/gate-throughput-meter.state"; run --alarm >/dev/null 2>"$W/err"; RC=$?
