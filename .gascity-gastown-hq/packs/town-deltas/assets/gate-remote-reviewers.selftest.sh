@@ -52,6 +52,13 @@ case "${FAKE_SSH_MODE:-room}" in
   empty)   : ;;
   full4)   printf 'dog-remote-adhoc-1\nwa-worker-remote-2\nx-3\ny-4\n' ;;
   revn)    i=0; while [ "$i" -lt "${FAKE_REV_N:-0}" ]; do i=$((i + 1)); printf 'gate-reviewer-remote-adhoc-%010d\n' "$i"; done ;;
+  byhost)  # the real provider: GC_SSH_HOST names ONE host (a host that is not in the config is refused); without it EVERY host of the config answers
+    case "${GC_SSH_HOST:-}" in
+      hetzner) printf 'dog-remote-adhoc-1\n' ;;
+      mbp)     printf 'wa-worker-remote-mbp-1\nwa-worker-remote-mbp-2\n' ;;
+      '')      printf 'dog-remote-adhoc-1\nwa-worker-remote-mbp-1\nwa-worker-remote-mbp-2\n' ;;
+      *)       echo "host '$GC_SSH_HOST' is not in the config" >&2; exit 1 ;;
+    esac ;;
   down)    echo "ssh: connect to host hetzner-teste port 22: Operation timed out" >&2; exit 1 ;;
   garbage) echo "Welcome to Ubuntu 24.04 - some banner" ;;
   partial) echo dog-remote-adhoc-aaaaaaaaaa; echo "second host unreachable" >&2; exit 1 ;;
@@ -89,6 +96,9 @@ sys.exit(rc)
 PY
 }
 flag_on()  { : > "$1/.gc/gate-remote-reviewers.on"; }
+# add_mbp <city>: the `mbp` block in the shape docs/runbooks/gc-session-ssh.md gives it (the one that entered the live config on 8/11 22:53 BRT): a laptop that
+# sleeps, with NO worktree_rigs and NO real_sessions_released_by, so any fact read from it instead of from the default host says `unready`.
+add_mbp() { cfg_edit "$1" "d['hosts']['mbp']={'ssh':'athos@athoss-macbook-pro','cap':2,'remote_root':'/Users/athos/gt-remote/bundle','remote_home':'/Users/athos','mini_home':'/Users/athos','path_extra':['/opt/homebrew/bin'],'session_env':{'path':['/usr/bin','/bin'],'claude':'/Users/athos/.local/bin/claude'},'presence_gate':True,'sleeps':True,'gui_agent':True}"; }
 cfg_edit() { python3 -I - "$1/.gc/session-ssh.json" "$2" <<'PY'
 import json, sys
 p, expr = sys.argv[1], sys.argv[2]
@@ -152,7 +162,7 @@ mkcity "$TMP/city-b"; flag_on "$TMP/city-b"; C="$TMP/city-b"
 # the host config: every unreadable cap is unknown, never an invented one
 for _case in "d['hosts']['hetzner'].pop('cap')|cap missing" "h.__setitem__('cap','4')|cap is text" "h.__setitem__('cap',-1)|cap negative" "h.__setitem__('cap',1.5)|cap fractional" \
              "d.__setitem__('hosts',{})|no hosts" "d.__setitem__('hosts',[1])|hosts is not an object" "d.__setitem__('default_host','nope')|default host not in config" \
-             "d['hosts'].__setitem__('other',dict(h))|two hosts, no GC_SSH_HOST"; do
+             "d['hosts'].__setitem__('other',dict(h)); d.pop('default_host')|two hosts, no default_host and no GC_SSH_HOST (with a default_host it is decided: section 2c)"; do
   mkcity "$TMP/c3"; flag_on "$TMP/c3"; cfg_edit "$TMP/c3" "${_case%%|*}"
   R="$(pick "$LIB" "$TMP/c3")"; eq "config: ${_case##*|} → local" "$(tpl "$R")/$(kind "$R")" "gate-reviewer/fallback"
 done
@@ -199,6 +209,37 @@ mkcity "$TMP/c5"; flag_on "$TMP/c5"; : > "$CLOG"
 R="$(pick "$LIB" "$C5" FAKE_SSH_MODE=full4 FAKE_CLAUDE_LOG="$CLOG")"; eq "node full: the Claude gate is not asked (no ssh for an answer that cannot change)" "$(wc -c < "$CLOG" | tr -d ' ')" 0
 R="$(env GC_CITY="$C5" FAKE_CLAUDE_MODE=quota /bin/bash -c 'set -euo pipefail; source "$0"; gate_remote_pick_template; printf "%s" "$GATE_REMOTE_PICK_TEMPLATE"' "$LIB" 2>&1)"
 eq "/bin/bash (3.2) under set -euo pipefail: a blocked login picks local" "$R" "gate-reviewer"
+
+echo "── 2c. several hosts: the default host serves the reviewer (ga-v8p1tx.1.4) ──"
+# 8/11 22:53 BRT: the `mbp` block entered the live session-ssh.json (ga-w7qwl1.2, still in shadow). The lib read "two hosts and no GC_SSH_HOST" as ambiguous, so from
+# 9/11 02:05Z no reviewer went to the node for five days while it sat idle (measured on the node: last remote reviewer 09/11 02:04:45Z, none after). The provider
+# routes `gate-reviewer-remote-adhoc-<10>` (the name asks for no host) to default_host; the lib has to answer for that SAME host and ask the probe about that host only.
+# The config edits are named once: section 6 replays the same scenarios against mutants of the lib.
+EDIT_CAP3="h.__setitem__('cap',3)"
+EDIT_DEFAULT_MBP="d.__setitem__('default_host','mbp'); h.pop('worktree_rigs'); d['hosts']['mbp'].update({'cap':4,'real_sessions_released_by':'mayor test','worktree_rigs':{'gate-reviewer':'gascity'}})"
+EDIT_NO_DEFAULT="d.pop('default_host')"
+EDIT_BOGUS_DEFAULT="d.__setitem__('default_host','nope')"
+EDIT_BAD_NAME="d['hosts']['bad host']=dict(h); d.__setitem__('default_host','bad host')"
+mkcity "$TMP/m1"; flag_on "$TMP/m1"; add_mbp "$TMP/m1"
+R="$(pick "$LIB" "$TMP/m1")";  eq "the live shape since 8/11 (hetzner + mbp, default_host=hetzner, no GC_SSH_HOST), the node has room → the REMOTE template" "$(tpl "$R")/$(kind "$R")" "gate-reviewer-remote/node"
+mkcity "$TMP/m1b"; flag_on "$TMP/m1b"; add_mbp "$TMP/m1b"; cfg_edit "$TMP/m1b" "$EDIT_CAP3"
+R="$(pick "$LIB" "$TMP/m1b" FAKE_SSH_MODE=byhost)"; eq "the probe asks about the default host ONLY: its 1 session plus the MBP's 2 would fill a cap of 3 if both counted, and must not" "$(tpl "$R")/$(kind "$R")" "gate-reviewer-remote/node"
+mkcity "$TMP/m2"; flag_on "$TMP/m2"; add_mbp "$TMP/m2"; cfg_edit "$TMP/m2" "$EDIT_DEFAULT_MBP"
+R="$(pick "$LIB" "$TMP/m2" FAKE_SSH_MODE=byhost)"; eq "default_host=mbp (it sorts AFTER hetzner, which here is unready): facts and probe are the DEFAULT host's, not the first key's" "$(tpl "$R")/$(kind "$R")" "gate-reviewer-remote/node"
+mkcity "$TMP/m3"; flag_on "$TMP/m3"; add_mbp "$TMP/m3"; cfg_edit "$TMP/m3" "$EDIT_NO_DEFAULT"
+R="$(pick "$LIB" "$TMP/m3")";  eq "two hosts and NO default_host: nobody says which host serves the reviewer → local, not a guess" "$(tpl "$R")/$(kind "$R")" "gate-reviewer/fallback"; has "…says unknown" "$R" "unknown"
+mkcity "$TMP/m4"; flag_on "$TMP/m4"; add_mbp "$TMP/m4"; cfg_edit "$TMP/m4" "$EDIT_BOGUS_DEFAULT"
+R="$(pick "$LIB" "$TMP/m4")";  eq "two hosts and a default_host that is not in the config → local" "$(tpl "$R")/$(kind "$R")" "gate-reviewer/fallback"; has "…says unknown" "$R" "unknown"
+R="$(pick "$LIB" "$TMP/m1" GC_SSH_HOST=mbp FAKE_SSH_MODE=byhost)"; eq "GC_SSH_HOST=mbp overrides the default: the MBP block has no worktree_rigs for gate-reviewer → local (the node's room is not lent to it)" "$(tpl "$R")/$(kind "$R")" "gate-reviewer/fallback"; has "…says unready" "$R" "unready"
+mkcity "$TMP/m5"; flag_on "$TMP/m5"; add_mbp "$TMP/m5"; cfg_edit "$TMP/m5" "$EDIT_BAD_NAME"
+R="$(pick "$LIB" "$TMP/m5" FAKE_SSH_MODE=byhost)"; eq "a default host whose name is not a plain token → local, refused as config (the name would go into GC_SSH_HOST and a space splits the facts line)" "$(tpl "$R")/$(kind "$R")" "gate-reviewer/fallback"; has "…and says why, not 'node probe failed'" "$R" "host config unreadable or ambiguous"
+# `$` in a regex also matches before a TRAILING newline (jq/Oniguruma, like Python's re): the name "hetzner\n" would pass a ^...$ check, its facts would be read from the
+# key "hetzner\n" and the probe (a command substitution drops the newline) would ask about "hetzner", another host. The name check anchors with \A ... \z.
+EDIT_NEWLINE_NAME="d['hosts']['hetzner\\n']=dict(h); d.__setitem__('default_host','hetzner\\n')"
+mkcity "$TMP/m5b"; flag_on "$TMP/m5b"; add_mbp "$TMP/m5b"; cfg_edit "$TMP/m5b" "$EDIT_NEWLINE_NAME"
+R="$(pick "$LIB" "$TMP/m5b" FAKE_SSH_MODE=byhost)"; eq "a default host whose name ENDS in a newline is not a plain token either → local, refused as config" "$(tpl "$R")/$(kind "$R")" "gate-reviewer/fallback"; has "…and says why" "$R" "host config unreadable or ambiguous"
+mkcity "$TMP/m6"; flag_on "$TMP/m6"; cfg_edit "$TMP/m6" "$EDIT_NO_DEFAULT"
+R="$(pick "$LIB" "$TMP/m6")";  eq "ONE host and no default_host (the shape before the MBP): that only host serves the reviewer → remote" "$(tpl "$R")/$(kind "$R")" "gate-reviewer-remote/node"
 
 echo "── 3. Bash 3.2 under the dispatcher's own strict mode ──"
 mkcity "$TMP/c4"; flag_on "$TMP/c4"
@@ -543,6 +584,36 @@ killed "the Claude gate runs unbounded" "$MLIB" "$(m_claude hang GATE_REMOTE_CLA
 m_cap() { mkcity "$MC"; flag_on "$MC"; cfg_edit "$MC" "h.__setitem__('cap',$((TCAP + 20)))"; tpl "$(pick "$MLIB" "$MC" FAKE_SSH_MODE=revn FAKE_REV_N="$TCAP")"; }
 MLIB="$(mutate_lib tcap 'if [ "$rem" -ge "$tcap" ]; then' 'if false; then')"
 killed "the template's own cap is ignored (only the host cap limits the remote reviewers)" "$MLIB" "$(m_cap)" "gate-reviewer"
+
+# vários hosts (ga-v8p1tx.1.4): cada regra da escolha do host tem que reprovar quando some. O 4º argumento é a resposta CERTA do cenário (a do lib sem mutação).
+m_multi() { # <modo do provider> [edição python da config] [KEY=VAL] → "template|kind|porquê" escolhido pela lib MLIB na cidade de dois hosts (hetzner + mbp)
+  mkcity "$MC"; flag_on "$MC"; add_mbp "$MC"; [ -n "${2:-}" ] && cfg_edit "$MC" "$2"; pick "$MLIB" "$MC" FAKE_SSH_MODE="$1" ${3:+"$3"}
+}
+killed_alive() { # como `killed`, mais um controle: sob a lib mutada a cidade simples (1 host, com room) ainda escolhe o nó; senão ela está quebrada e o "kill" não prova nada (kill vazio)
+  if [ -n "$2" ]; then
+    mkcity "$MC"; flag_on "$MC"
+    [ "$(tpl "$(pick "$2" "$MC")")" = "gate-reviewer-remote" ] || { bad "mutant '$1' is dead on arrival (the plain one-host city does not pick the node under it): its kill proves nothing"; return; }
+  fi
+  killed "$@"
+}
+MLIB="$(mutate_lib host-ambiguous '         elif ($dh|type) == "string" then $dh' '         elif ($dh|type) == "string" and ($hs|length) == 1 then $dh')"
+killed_alive "two hosts are read as ambiguous even with a default_host (the 9/11 outage)" "$MLIB" "$(tpl "$(m_multi room)")" "gate-reviewer-remote"
+MLIB="$(mutate_lib probe-unrestricted 'raw="$(GC_SSH_HOST="$host" "$tbin" -k 5 "$secs" "$ssh_bin" list-running 2>/dev/null)"' 'raw="$("$tbin" -k 5 "$secs" "$ssh_bin" list-running 2>/dev/null)"')"
+killed_alive "the probe is not restricted to the default host (the MBP's sessions count against the node's cap)" "$MLIB" "$(tpl "$(m_multi byhost "$EDIT_CAP3")")" "gate-reviewer-remote"
+MLIB="$(mutate_lib first-key '         elif ($dh|type) == "string" then $dh' '         elif ($dh|type) == "string" then ($hs|keys[0])')"
+killed_alive "the first host of the config is used instead of the default_host" "$MLIB" "$(tpl "$(m_multi byhost "$EDIT_DEFAULT_MBP")")" "gate-reviewer-remote"
+MLIB="$(mutate_lib guess-first '         elif $dh == null then (if ($hs|length) == 1 then ($hs|keys[0]) else "" end)' '         elif $dh == null then ($hs|keys[0])')"
+killed_alive "two hosts and no default_host: the first one is guessed" "$MLIB" "$(tpl "$(m_multi room "$EDIT_NO_DEFAULT")")" "gate-reviewer"
+MLIB="$(mutate_lib bogus-default '        else ($hs[$hn] // null) as $h' '        else ($hs[$hn] // ($hs|to_entries[0].value)) as $h')"
+killed_alive "a default_host that is not in the config falls back to the first host" "$MLIB" "$(tpl "$(m_multi room "$EDIT_BOGUS_DEFAULT")")" "gate-reviewer"
+MLIB="$(mutate_lib env-ignored '         elif $e != "" then $e' '         elif false then $e')"
+killed_alive "GC_SSH_HOST no longer overrides the default_host" "$MLIB" "$(tpl "$(m_multi byhost "" GC_SSH_HOST=mbp)")" "gate-reviewer"
+MLIB="$(mutate_lib name-unchecked '      | if ($hn|test("\\A[A-Za-z0-9_.-]+\\z")|not) then empty' '      | if ($hn == "") then empty')"
+killed_alive "a host name that is not a plain token is accepted (and split by the facts line)" "$MLIB" "$(m_multi byhost "$EDIT_BAD_NAME")" "gate-reviewer|fallback|unknown (host config unreadable or ambiguous (cap not read)) - local reviewer"
+MLIB="$(mutate_lib anchor-loose 'test("\\A[A-Za-z0-9_.-]+\\z")' 'test("^[A-Za-z0-9_.-]+$")')"
+killed_alive "the name check anchors with ^...\$ (a trailing newline slips through)" "$MLIB" "$(tpl "$(m_multi byhost "$EDIT_NEWLINE_NAME")")" "gate-reviewer"
+MLIB="$(mutate_lib single-host '         elif $dh == null then (if ($hs|length) == 1 then ($hs|keys[0]) else "" end)' '         elif $dh == null then ""')"
+killed_alive "one host and no default_host is read as ambiguous (the config before the MBP)" "$MLIB" "$(m_scen room "$EDIT_NO_DEFAULT")" "gate-reviewer-remote"
 echo
 echo "gate-remote-reviewers selftest: $PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ]

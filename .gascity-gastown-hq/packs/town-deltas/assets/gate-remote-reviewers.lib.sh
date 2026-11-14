@@ -63,10 +63,15 @@ _gate_remote_template_cap() {
   return 0
 }
 
-# _gate_remote_host_facts — "cap=<n> rig=<0|1> rel=<0|1>" do host que os revisores usam, ou nada.
-#   O host é $GC_SSH_HOST, senão o default_host (o nome `gate-reviewer-remote-adhoc-<10>` não pede host). Com mais de um host na config
-#   e sem $GC_SSH_HOST o `list-running` junta todos e o `cap` de um só não vale para a soma: imprime NADA.
-#   arquivo ausente/ilegível, jq ausente ou falhou, host fora da config, cap que não é inteiro >= 0 → imprime NADA (= unknown)
+# _gate_remote_host_facts — "cap=<n> rig=<0|1> rel=<0|1> host=<nome>" do host que serve o revisor remoto, ou nada.
+#   O host é o que o PROVIDER escolhe para o nome `gate-reviewer-remote-adhoc-<10>` (que não pede host): $GC_SSH_HOST, senão o default_host; só com UM host
+#   na config e sem default_host, esse host. Com 2+ hosts (o `mbp` entrou na config viva em 8/11 22:53 BRT, ga-w7qwl1.2) o `list-running` sem host junta todos
+#   e o `cap` de um só não vale para a soma: por isso quem pergunta ao nó leva `GC_SSH_HOST=<host>` (gate_remote_node_state). Sem $GC_SSH_HOST nem default_host
+#   que diga qual deles serve o revisor, ninguém disse: imprime NADA (= unknown), nunca o palpite "o primeiro". Até ga-v8p1tx.1.4 esta função lia "2+ hosts"
+#   como ambíguo MESMO com default_host; de 9/11 02:05Z a 14/11 nenhum revisor abriu no nó (medido) e a causa mais provável é essa leitura (INFERIDO: o log do
+#   dispatcher não se lê do nó; runbook, "Vários hosts"). O nome sai conferido ([A-Za-z0-9_.-], com \A e \z: o `$` casaria antes de um \n FINAL): vira GC_SSH_HOST na sonda e a linha é separada por espaço.
+#   arquivo ausente/ilegível, jq ausente ou falhou, `hosts` ausente ou que não é objeto, host fora da config, nome que não é um token simples, default_host que
+#   não é texto, cap que não é inteiro >= 0 → imprime NADA (= unknown)
 _gate_remote_host_facts() {
   local cfg="${GATE_REMOTE_SSH_CONFIG:-${GC_SSH_CONFIG:-${GC_CITY:-}/.gc/session-ssh.json}}" out=""
   [ -r "$cfg" ] || return 0
@@ -74,13 +79,17 @@ _gate_remote_host_facts() {
   out="$(jq -r '
       (env.GC_SSH_HOST // "") as $e
       | (.hosts // null) as $hs
-      | if ($hs|type) != "object" then empty
-        elif ($e == "" and ($hs|length) != 1) then empty
-        else (if $e != "" then $e else (.default_host // ($hs|keys[0])) end) as $hn
-          | ($hs[$hn] // null) as $h
+      | (.default_host // null) as $dh
+      | (if ($hs|type) != "object" then ""
+         elif $e != "" then $e
+         elif $dh == null then (if ($hs|length) == 1 then ($hs|keys[0]) else "" end)
+         elif ($dh|type) == "string" then $dh
+         else "" end) as $hn
+      | if ($hn|test("\\A[A-Za-z0-9_.-]+\\z")|not) then empty
+        else ($hs[$hn] // null) as $h
           | if ($h|type) != "object" then empty
             elif (($h.cap|type) != "number") or ($h.cap < 0) or (($h.cap|floor) != $h.cap) then empty
-            else "cap=\($h.cap) rig=\(if (($h.worktree_rigs|type) == "object") and (($h.worktree_rigs["gate-reviewer"]|type) == "string") and (($h.worktree_rigs["gate-reviewer"]|length) > 0) then 1 else 0 end) rel=\(if (($h.real_sessions_released_by|type) == "string") and (($h.real_sessions_released_by|length) > 0) then 1 else 0 end)"
+            else "cap=\($h.cap) rig=\(if (($h.worktree_rigs|type) == "object") and (($h.worktree_rigs["gate-reviewer"]|type) == "string") and (($h.worktree_rigs["gate-reviewer"]|length) > 0) then 1 else 0 end) rel=\(if (($h.real_sessions_released_by|type) == "string") and (($h.real_sessions_released_by|length) > 0) then 1 else 0 end) host=\($hn)"
             end
         end' "$cfg" 2>/dev/null)" || out=""
   printf '%s' "$out"
@@ -113,18 +122,20 @@ _gate_remote_claude_state() {
 # gate_remote_node_state — uma linha: "room", "full:<porquê>", "unready:<porquê>" ou "unknown:<porquê>".
 gate_remote_node_state() {
   local ssh_bin="${GATE_REMOTE_SSH_BIN:-${GC_CITY:-}/scripts/gc-session-ssh}" secs="$GATE_REMOTE_PROBE_SECS"
-  local tbin="" facts="" cap="" rig="" rel="" tcap="" raw="" rc=0 line="" total=0 rem=0 cg=""
+  local tbin="" facts="" cap="" rig="" rel="" host="" tcap="" raw="" rc=0 line="" total=0 rem=0 cg=""
   case "$secs" in ''|*[!0-9]*|0) secs=30 ;; esac
 
-  # Config do host. VAZIO ou ilegível = não sabemos os tetos = unknown (nunca "cabe").
+  # Config do host. VAZIO ou ilegível = não sabemos os tetos nem qual host serve o revisor = unknown (nunca "cabe"). A linha só vale inteira (cap, rig, rel E host):
+  # sem o `host=` não há como perguntar só por ele à sonda, e o cap de um host contra a contagem de todos não quer dizer nada.
   facts="$(_gate_remote_host_facts)" || facts=""
   case "$facts" in
-    "cap="*" rig="*" rel="*) : ;;
+    "cap="*" rig="*" rel="*" host="*) : ;;
     *) printf 'unknown:host config unreadable or ambiguous (cap not read)'; return 0 ;;
   esac
   cap="${facts#cap=}"; cap="${cap%% *}"
   rig="${facts#* rig=}"; rig="${rig%% *}"
   rel="${facts#* rel=}"; rel="${rel%% *}"
+  host="${facts#* host=}"; host="${host%% *}"
   if [ "$rel" != "1" ]; then printf 'unready:host has no real_sessions_released_by (the start would be refused)'; return 0; fi
   if [ "$rig" != "1" ]; then printf 'unready:host worktree_rigs has no "gate-reviewer" (the start would be refused, exit 13)'; return 0; fi
 
@@ -133,11 +144,12 @@ gate_remote_node_state() {
   [ -n "$tcap" ] || { printf 'unknown:template max_active_sessions unreadable'; return 0; }
 
   # Quem está vivo no nó. `list-running` imprime um nome por linha; rc≠0 é host fora do ar/lista parcial = unknown.
-  # Saída VAZIA com rc 0 é a resposta "nenhuma sessão" (cabe), e só vale com rc 0.
+  # Saída VAZIA com rc 0 é a resposta "nenhuma sessão" (cabe), e só vale com rc 0. A pergunta é só por $host (o host de que se leu o cap): sem GC_SSH_HOST o
+  # provider responde pela SOMA de todos os hosts da config, e com o `mbp` lá a conta do nó passaria a incluir as sessões do MBP.
   [ -x "$ssh_bin" ] || { printf 'unknown:%s not executable' "$ssh_bin"; return 0; }
   tbin="$(command -v timeout 2>/dev/null || command -v gtimeout 2>/dev/null || true)"
   [ -n "$tbin" ] || { printf 'unknown:no timeout/gtimeout binary to bound the node probe'; return 0; }
-  raw="$("$tbin" -k 5 "$secs" "$ssh_bin" list-running 2>/dev/null)" && rc=0 || rc=$?
+  raw="$(GC_SSH_HOST="$host" "$tbin" -k 5 "$secs" "$ssh_bin" list-running 2>/dev/null)" && rc=0 || rc=$?
   if [ "$rc" -ne 0 ]; then
     if [ "$rc" -eq 124 ] || [ "$rc" -eq 137 ]; then printf 'unknown:node probe timed out after %ss' "$secs"; else printf 'unknown:node probe failed (rc=%s)' "$rc"; fi
     return 0
