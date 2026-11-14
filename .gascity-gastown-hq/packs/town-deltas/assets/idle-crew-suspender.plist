@@ -1,0 +1,49 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.gascity.idle-crew-suspender</string>
+
+  <!-- idle-crew-suspender (ga-v8p1tx.1.6, mission gate-8h). Every 15 min, between
+       06:00 and 24:00 local, suspends (gc session suspend) named crews whose
+       newest transcript is >60 min old, with no in_progress bead, not attached,
+       never oracle*. Max 3 per run. Authorization: Athos 14/11/2026 14:25
+       ("Sim, suspende as paradas"), quoted in ga-v8p1tx.1.6.
+       Log: .gc/logs/idle-crew-suspender.log (one line per crew per run + a
+       "RUN done ..." summary; a run with nothing to do still writes the summary,
+       so a silent log means the job is NOT running).
+       Dry-run by hand:  ICS_DRY_RUN=1 bash packs/town-deltas/assets/idle-crew-suspender.sh
+       The launcher below is a no-op (prints a line to the .out file) until the
+       script exists in the city root, so the plist can be loaded before the
+       gate merge reaches the root. Wake a suspended crew: gc session wake <crew>.
+       Install: cp this file to ~/Library/LaunchAgents/ and
+         launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.gascity.idle-crew-suspender.plist -->
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/bash</string>
+    <string>-c</string>
+    <string>f=/Users/athos/gt/.gascity-gastown-hq/packs/town-deltas/assets/idle-crew-suspender.sh; [ -f "$f" ] || { echo "idle-crew-suspender: script not on disk yet ($f) - skipping"; exit 0; }; exec /bin/bash "$f"</string>
+  </array>
+
+  <key>WorkingDirectory</key>
+  <string>/Users/athos/gt/.gascity-gastown-hq</string>
+
+  <key>StartInterval</key><integer>900</integer>
+  <key>RunAtLoad</key><false/>
+  <!-- ga-9wv5: unset ProcessType = Standard, which macOS DAS can defer on a loaded box. -->
+  <key>ProcessType</key><string>Interactive</string>
+
+  <key>StandardOutPath</key><string>/Users/athos/gt/.gascity-gastown-hq/.gc/logs/idle-crew-suspender-launchd.out</string>
+  <key>StandardErrorPath</key><string>/Users/athos/gt/.gascity-gastown-hq/.gc/logs/idle-crew-suspender-launchd.err</string>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:/Users/athos/go/bin:/Users/athos/.local/bin</string>
+    <key>HOME</key>
+    <string>/Users/athos</string>
+    <key>GC_CITY_PATH</key>
+    <string>/Users/athos/gt/.gascity-gastown-hq</string>
+  </dict>
+</dict>
+</plist>
