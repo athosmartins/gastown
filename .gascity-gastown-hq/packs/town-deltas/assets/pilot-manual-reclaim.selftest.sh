@@ -172,6 +172,9 @@ case "$sub" in
       story-unreadable-labels)
         # ga-w6a9xps: the 1st read has a status but is not a bead object the verdict can read (labels is not a list): unknown, nothing is taken off.
         echo '[{"id":"'"$1"'","status":"open","labels":"oops"}]' ;;
+      table)
+        # ga-w6a9xps: the scenario hands over the JSON of read 1, read 2 and read 3 onwards (PMR_SHOW1..3), so one fixture serves every bead shape.
+        if [ "$_N" -eq 1 ]; then printf '%s\n' "$PMR_SHOW1"; elif [ "$_N" -eq 2 ]; then printf '%s\n' "$PMR_SHOW2"; else printf '%s\n' "$PMR_SHOW3"; fi ;;
       missing)   echo '[]' ;;
       verify-empty)
         # status flips open on the 1st read; the 2nd read (post-removal
@@ -363,6 +366,50 @@ ck "STORY-NO-PROOF: story:in-flight removed as before" 1 "$(grep -qc 'MUT label 
 rc=$(run_script story-unreadable-labels)
 ck "STORY-UNREADABLE-LABELS: exit code 1" 1 "$rc"
 ck "STORY-UNREADABLE-LABELS: no marker removed, nothing written" 0 "$(grep -qE '^MUT (label|update) ' "$MUT" >/dev/null 2>&1 && echo 1 || echo 0)"
+ck "STORY-UNREADABLE-LABELS: says the labels could not be read (the abort, not another exit 1)" 1 "$(grep -qc 'labels could NOT be read' "$WORK/err.log" >/dev/null 2>&1 && echo 1 || echo 0)"
+
+# STORY-READBACK-UNREADABLE (ga-w6a9xps): the label add goes out but the read-back is UNREADABLE (a failed read, not "story:approved absent") -> not confirmed:
+# nothing is taken off, exit 1, and the message says unreadable (not 'false').
+pmr_json() { echo '[{"id":"gt-testbead","status":"open","issue_type":"'"$1"'","labels":['"$2"'],"metadata":'"$3"'}]'; }   # tipo · corpo da lista de labels · metadata
+export PMR_SHOW1; PMR_SHOW1=$(pmr_json feature '"pilot:dispatched","story:in-flight"' '{"pilot.dispatched_at":"123"}')
+export PMR_SHOW2='not valid json {{{' PMR_SHOW3=''
+: >"$MUT"
+rc=$(run_script table)
+ck "STORY-READBACK-UNREADABLE: exit code 1" 1 "$rc"
+ck "STORY-READBACK-UNREADABLE: the restore was attempted (the read-back was reached)" 1 "$(grep -qc 'MUT label add gt-testbead story:approved' "$MUT" >/dev/null 2>&1 && echo 1 || echo 0)"
+ck "STORY-READBACK-UNREADABLE: no marker removed (story:in-flight and the Pilot markers stay)" 0 "$(grep -qE '^MUT (label remove|update) ' "$MUT" >/dev/null 2>&1 && echo 1 || echo 0)"
+ck "STORY-READBACK-UNREADABLE: says the read-back was unreadable" 1 "$(grep -qc "read-back said 'unreadable'" "$WORK/err.log" >/dev/null 2>&1 && echo 1 || echo 0)"
+ck "STORY-READBACK-UNREADABLE: does NOT claim markers cleared" 0 "$(grep -qc 'markers cleared' "$WORK/out.log" >/dev/null 2>&1 && echo 1 || echo 0)"
+
+# SHAPES (ga-w6a9xps): one bead shape per call — what the script says about it, whether story:approved is written, and that the release still goes through. The stub serves PMR_SHOW1..3:
+# read 1 = the shape; with a restore read 2 = the read-back (approved back) and read 3 = the final verification, without one read 2 = the final verification.
+pmr_shape() {   # nome · veredito esperado · escreve story:approved? (1/0) · tipo · labels (corpo da lista) · metadata · labels que ficam depois da liberacao
+  local kept="${7:+$7,}\"pilot:reclaim-count:1\""
+  export PMR_SHOW1 PMR_SHOW2 PMR_SHOW3
+  PMR_SHOW1=$(pmr_json "$4" "$5" "$6")
+  if [ "$3" = 1 ]; then PMR_SHOW2=$(pmr_json "$4" "$5,\"story:approved\"" "$6"); PMR_SHOW3=$(pmr_json "$4" "$kept" '{}')
+  else PMR_SHOW2=$(pmr_json "$4" "$kept" '{}'); PMR_SHOW3=$PMR_SHOW2; fi
+  : >"$MUT"
+  rc=$(run_script table)
+  ck "SHAPE $1: exit code 0" 0 "$rc"
+  ck "SHAPE $1: the script says verdict=$2" 1 "$(grep -qc "verdict=$2\$" "$WORK/out.log" >/dev/null 2>&1 && echo 1 || echo 0)"
+  ck "SHAPE $1: story:approved written = $3" "$3" "$(grep -qc 'MUT label add gt-testbead story:approved' "$MUT" >/dev/null 2>&1 && echo 1 || echo 0)"
+  ck "SHAPE $1: the release went through (story:in-flight removed)" 1 "$(grep -qc 'MUT label remove gt-testbead story:in-flight' "$MUT" >/dev/null 2>&1 && echo 1 || echo 0)"
+}
+# a story with a lifecycle label of its own (here: waiting for Athos) keeps it and is never auto-approved; one that is not in flight has nothing to give back
+pmr_shape other-story-state   other-story-state 0 feature '"pilot:dispatched","story:in-flight","story:needs-approval"' '{"pilot.dispatched_at":"123"}'  '"story:needs-approval"'
+pmr_shape not-in-flight       not-in-flight     0 feature '"pilot:dispatched"'                                          '{"pilot.dispatched_at":"123"}'  ''
+pmr_shape has-approved        has-approved      0 feature '"pilot:dispatched","story:in-flight","story:approved"'       '{}'                             '"story:approved"'
+# the Pilot's Tier-1 dispatches ANY type but epic labelled tech-debt with no approval (bd list -l tech-debt): such a story never had story:approved and a dispatch trace proves nothing about Athos
+pmr_shape tier1-bypass        tier1-bypass      0 feature '"pilot:dispatched","story:in-flight","tech-debt"'            '{"pilot.dispatched_at":"123"}'  '"tech-debt"'
+pmr_shape tier1-bypass-bug    not-story         0 bug     '"pilot:dispatched","story:in-flight","tech-debt"'            '{"pilot.dispatched_at":"123"}'  '"tech-debt"'
+pmr_shape no-proof            no-proof          0 feature '"story:in-flight"'                                           '{}'                             ''
+pmr_shape not-story           not-story         0 bug     '"pilot:dispatched","story:in-flight"'                        '{"pilot.dispatched_at":"123"}'  ''
+# each trace of proof ALONE is enough (STORY-RESTORE above carries two of them), and issue_type story counts like feature
+pmr_shape trace-label         restore           1 feature '"pilot:dispatched","story:in-flight"'                        '{}'                             '"story:approved"'
+pmr_shape trace-dispatched-at restore           1 feature '"story:in-flight"'                                           '{"pilot.dispatched_at":"123"}'  '"story:approved"'
+pmr_shape trace-aprovado-por  restore           1 feature '"story:in-flight"'                                           '{"story.aprovado_por":"athos"}' '"story:approved"'
+pmr_shape type-story          restore           1 story   '"pilot:dispatched","story:in-flight"'                        '{}'                             '"story:approved"'
 
 echo "Results: $PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ]

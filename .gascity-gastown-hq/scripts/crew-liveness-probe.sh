@@ -179,6 +179,7 @@ _record_heal_marker() {
 # _heal crew-id bead-id store-path session-identity
 # Strips in-flight labels, clears assignee, suspends the crew agent.
 # Called ONLY after 2-confirmation; SAFETY-critical.
+# Returns 3 when it ABORTS before touching anything (ga-w6a9xps: the story:approved check could not be completed); the caller then keeps its confirmation state.
 _heal() {
   local crew="$1" bead="$2" store="$3" ident="${4:-}"
   log "  HEAL: releasing bead $bead from crew $crew (store=$store)"
@@ -191,10 +192,13 @@ _heal() {
   # ga-w6a9xps: a STORY (feature/story) re-enters the pool WITH its story:approved. The builder's own claim dropped that label while the Pilot's
   # story:in-flight stayed; stripping story:in-flight below would leave the story with no story:* label at all, which auto-refino's RAW sweep reads as a
   # fresh idea and sends back to Athos for a second approval (wa-tvrs41.5, 13/11). So the approval goes back FIRST, confirmed by a fresh read, and only
-  # then do the strips run. Same rule as pilot-dispatcher.sh's _pilot_approved_verdict/_pilot_restore_approved: only a feature/story carrying
-  # story:in-flight and NO other story:* label, WITH a trace of the Pilot's dispatch or of Athos's approval (pilot:dispatched, pilot.dispatched_at or
-  # story.aprovado_por) — without one it may be a bead Athos parked by hand and only he approves ("no-proof": nothing written). A bug/task/chore never
-  # had story:approved and is left as before.
+  # then do the strips run. Same rule and verdict words as inflight-reclaim-guard.py's _approved_verdict (ga-w6a9xps slice 2 + ga-btr2dof) and the copy in
+  # pilot-manual-reclaim.sh; keep them in step: only a feature/story carrying story:in-flight and NO other story:* label, WITH a trace of the Pilot's dispatch or of Athos's approval
+  # (pilot:dispatched, pilot.dispatched_at or story.aprovado_por) gets "restore"; without a trace it may be a bead Athos parked by hand and only he approves
+  # ("no-proof"). With the tech-debt label the Pilot's Tier-1 dispatched it with NO approval at all (pilot-dispatcher.sh DEBT_JSON: bd list -l tech-debt, any
+  # type but epic), so a dispatch trace proves nothing about Athos ("tier1-bypass"). The other verdicts (has-approved, not-in-flight, other-story-state, not-story = a
+  # bug/task/chore, which never had story:approved) write nothing and the heal goes on as before. The verdict is logged either way, so the log tells a story
+  # left RAW on purpose from a non-story.
   # vazio (a leitura não é uma bead legível) → NÃO sei: nada é tirado, nada é suspenso, rc 3; falhou/ilegível na releitura → idem; só "restore" escreve.
   local _av_json _av _av_back
   _av_json=$("$BD" -C "$store" show "$bead" --json 2>/dev/null)
@@ -206,8 +210,10 @@ _heal() {
           elif ($l | index("story:in-flight")) == null then "not-in-flight"
           elif ($l | map(select(startswith("story:") and . != "story:in-flight")) | length) > 0 then "other-story-state"
           elif ($b.issue_type == "feature" or $b.issue_type == "story") then
-            ((if ($b.metadata | type) == "object" then $b.metadata else {} end) as $m
-             | if ($l | index("pilot:dispatched")) != null or (($m["pilot.dispatched_at"] // "") | tostring) != "" or (($m["story.aprovado_por"] // "") | tostring) != "" then "restore" else "no-proof" end)
+            (if ($l | index("tech-debt")) != null then "tier1-bypass"
+             else ((if ($b.metadata | type) == "object" then $b.metadata else {} end) as $m
+                   | if ($l | index("pilot:dispatched")) != null or (($m["pilot.dispatched_at"] // "") | tostring) != "" or (($m["story.aprovado_por"] // "") | tostring) != "" then "restore" else "no-proof" end)
+             end)
           else "not-story" end
       else empty end' 2>/dev/null)
   if [ -z "$_av" ]; then
@@ -215,6 +221,7 @@ _heal() {
     notify_fail "crew-liveness-probe: heal do bead $bead ABORTADO — nao consegui ler os labels pra saber se precisa devolver story:approved (sem isso o auto-refino leria a story como ideia nova). Nada foi tirado, crew $crew nao suspenso; o proximo ciclo tenta de novo"
     return 3
   fi
+  log "  HEAL: $bead story:approved check: verdict=$_av"
   if [ "$_av" = "restore" ]; then
     "$BD" -C "$store" label add "$bead" story:approved 2>/dev/null || true
     _av_back=$("$BD" -C "$store" show "$bead" --json 2>/dev/null \
@@ -568,7 +575,7 @@ _worktree_activity_since() {
 
 run_probe() {
   if [ "$CLP_ENABLED" != "1" ]; then log "disabled (CLP_ENABLED!=1)"; return 0; fi
-  local store id assignee updated_at stale_sec probed=0 healed=0 live_sessions
+  local store id assignee updated_at stale_sec probed=0 healed=0 heal_aborted=0 live_sessions _heal_rc
   local now; now=$(date +%s)
   local stale_threshold=$(( CLP_PROBE_STALE_MIN * 60 ))
 
@@ -658,12 +665,12 @@ run_probe() {
             _nudge "$assignee" "$id"
             probed=$(( probed + 1 ))
           else
-            # ga-w6a9xps: rc 3 = heal ABORTED before touching anything (story:approved could not be
-            # restored/confirmed). Keep the confirmation state so the next sweep retries the heal; do not count it as healed.
+            # ga-w6a9xps: rc 3 = heal ABORTED before touching anything (its labels could not be read, or story:approved could not be
+            # restored/confirmed). Keep the confirmation state so the next sweep retries the heal. It is neither healed nor nudged, so it has its own count.
             _heal "$assignee" "$id" "$store" "$(_session_identity "$assignee")"
             _heal_rc=$?
             if [ "$_heal_rc" -eq 3 ]; then
-              probed=$(( probed + 1 ))
+              heal_aborted=$(( heal_aborted + 1 ))
             else
               _clear_state "$id" "$assignee"
               healed=$(( healed + 1 ))
@@ -685,7 +692,7 @@ run_probe() {
     done < <("$BD" -C "$store" list -l story:in-flight -l pilot:dispatched --json -n 0 2>/dev/null \
               | jq -c '.[] | select((.assignee // "") != "")' 2>/dev/null)
   done
-  log "probe complete: nudged $probed crew(s), healed $healed$([ "$CLP_DRY_RUN" = "1" ] && echo ' (DRY)')"
+  log "probe complete: nudged $probed crew(s), healed $healed$([ "$heal_aborted" -gt 0 ] && echo ", heal-aborted $heal_aborted")$([ "$CLP_DRY_RUN" = "1" ] && echo ' (DRY)')"
 }
 
 # run_resume_scan — the other half of imp21's heal (ga-ld0ch): auto-resume a
@@ -899,7 +906,9 @@ case "\$*" in
     # \$TMP/refuse_approved makes bd accept-and-drop it). \$TMP/show_story_type
     # swaps the issue_type (bug shape). \$TMP/show_story_noproof drops pilot:dispatched
     # (and there is no pilot.dispatched_at / story.aprovado_por): a bead parked
-    # by hand, with no trace that Athos approved it.
+    # by hand, with no trace that Athos approved it. \$TMP/show_story_labels and
+    # \$TMP/show_story_meta (42h) name the labels (the body of a JSON list) and the
+    # metadata (a JSON object) the story carries, one verdict shape per scenario.
     if [ -f "${TMP}/show_garbage_json_always" ]; then
       echo 'not valid json {{{'
     elif [ -f "${TMP}/show_garbage_json" ] && [ -s "${HEAL_LOG}" ]; then
@@ -908,11 +917,10 @@ case "\$*" in
       echo '[{"id":"wa-stale","issue_type":"feature","status":"in_progress","assignee":"mila-wa","labels":["story:in-flight"]}]'
     elif [ -f "${TMP}/show_story" ]; then
       ST_TYPE=feature; [ -f "${TMP}/show_story_type" ] && ST_TYPE=\$(cat "${TMP}/show_story_type")  # third-state-waiver: leitura do proprio fixture do teste; arquivo ausente cai no default feature e o caso 42x afirma o tipo
-      if [ -f "${TMP}/approved_added" ]; then
-        echo '[{"id":"wa-stale","issue_type":"'"\$ST_TYPE"'","status":"in_progress","assignee":"mila-wa","labels":["pilot:dispatched","story:in-flight","story:approved"]}]'
-      else
-        echo '[{"id":"wa-stale","issue_type":"'"\$ST_TYPE"'","status":"in_progress","assignee":"mila-wa","labels":["pilot:dispatched","story:in-flight"]}]'
-      fi
+      ST_LABELS='"pilot:dispatched","story:in-flight"'; [ -f "${TMP}/show_story_labels" ] && ST_LABELS=\$(cat "${TMP}/show_story_labels")  # third-state-waiver: leitura do proprio fixture do teste; arquivo ausente cai nos rotulos do despacho e o caso 42x afirma o veredito
+      ST_META='{}'; [ -f "${TMP}/show_story_meta" ] && ST_META=\$(cat "${TMP}/show_story_meta")  # third-state-waiver: leitura do proprio fixture do teste; arquivo ausente cai em metadata vazia e o caso 42x afirma o veredito
+      ST_APP=''; [ -f "${TMP}/approved_added" ] && ST_APP=',"story:approved"'
+      echo '[{"id":"wa-stale","issue_type":"'"\$ST_TYPE"'","status":"in_progress","assignee":"mila-wa","labels":['"\$ST_LABELS\$ST_APP"'],"metadata":'"\$ST_META"'}]'
     elif [ -f "${TMP}/show_assignee_stuck" ]; then
       echo '[{"id":"wa-stale","status":"in_progress","assignee":"mila-wa","labels":["pilot:dispatched","story:in-flight"]}]'
     else
@@ -1570,10 +1578,12 @@ GCSHIM
 
   echo ""
   echo "=== Scenario 42 (ga-w6a9xps): _heal() on a STORY gives story:approved back (confirmed by read-back) BEFORE it strips story:in-flight — otherwise the story ends with no story:* label and auto-refino's RAW sweep takes it for a new idea (wa-tvrs41.5, 13/11) ==="
+  # $LOG is reset too: it is cumulative for the whole selftest, so a grep on it answers "did SOME scenario log this", never "did THIS one" (42e, gate FAIL 14/11)
   _s42_reset() {
-    : > "$HEAL_LOG"; : > "$SUSPEND_LOG"; : > "$COMMENT_LOG"; : > "$NOTIFY_LOG"; : > "$NUDGE_LOG"; : > "$TMP/suspended_state"
+    : > "$HEAL_LOG"; : > "$SUSPEND_LOG"; : > "$COMMENT_LOG"; : > "$NOTIFY_LOG"; : > "$NUDGE_LOG"; : > "$LOG"; : > "$TMP/suspended_state"
     rm -f "$CLP_STATE_DIR"/mila-wa.suspended-by-probe "$TMP"/approved_added "$TMP"/refuse_approved "$TMP"/show_story "$TMP"/show_story_noproof \
-          "$TMP"/show_story_type "$TMP"/show_garbage_json_always "$CLP_STATE_DIR"/wa-stale__mila-wa.nudged 2>/dev/null
+          "$TMP"/show_story_type "$TMP"/show_story_labels "$TMP"/show_story_meta "$TMP"/show_garbage_json "$TMP"/show_garbage_json_always \
+          "$CLP_STATE_DIR"/wa-stale__mila-wa.nudged 2>/dev/null
     CLP_DRY_RUN=0; CLP_HEAL_ENABLED=1
   }
 
@@ -1589,6 +1599,7 @@ GCSHIM
   grep -q 'label remove.*wa-stale.*pilot:dispatched' "$HEAL_LOG" && ok "42a: pilot:dispatched still stripped" || bad "42a: pilot:dispatched no longer stripped"
   grep -q 'agent suspend.*mila-wa' "$SUSPEND_LOG" && ok "42a: crew still suspended after a confirmed restore" || bad "42a: crew not suspended after a confirmed restore"
   [ "$RC42A" -eq 0 ] && ok "42a: _heal rc 0 on a completed heal" || bad "42a: _heal rc $RC42A on a completed heal"
+  grep -q 'story:approved check: verdict=restore$' "$LOG" && ok "42a: the log says verdict=restore" || bad "42a: the log does not say verdict=restore"
 
   # 42b — bd takes the add but the read-back does not show it: nothing stripped, crew not suspended, rc 3.
   _s42_reset
@@ -1600,6 +1611,7 @@ GCSHIM
   [ -s "$SUSPEND_LOG" ] && bad "42b: crew suspended although the heal could not complete" || ok "42b: crew NOT suspended when the heal aborts"
   [ "$RC42B" -eq 3 ] && ok "42b: _heal rc 3 (aborted) so the caller keeps the confirmation state" || bad "42b: _heal rc $RC42B (expected 3)"
   grep -qi "ABORTADO" "$NOTIFY_LOG" && ok "42b: the abort was notified" || bad "42b: the abort went unreported"
+  grep -q "read-back said 'false'" "$LOG" && ok "42b: the abort says the read-back showed no story:approved" || bad "42b: the abort does not say the read-back showed no story:approved"
 
   # 42c — a bug never had story:approved: no add, strips as before.
   _s42_reset
@@ -1609,6 +1621,7 @@ GCSHIM
   grep -q 'label add' "$HEAL_LOG" && bad "42c: added story:approved to a BUG (it never had one)" || ok "42c: a bug gets no story:approved"
   grep -q 'label remove.*wa-stale.*story:in-flight' "$HEAL_LOG" && ok "42c: bug still released (story:in-flight stripped)" || bad "42c: bug heal did not strip story:in-flight"
   [ "$RC42C" -eq 0 ] && ok "42c: _heal rc 0 for the bug" || bad "42c: _heal rc $RC42C for the bug"
+  grep -q 'story:approved check: verdict=not-story$' "$LOG" && ok "42c: the log says verdict=not-story" || bad "42c: the log does not say verdict=not-story"
 
   # 42d — the pre-write read is unreadable: cannot know → nothing is touched.
   _s42_reset
@@ -1618,6 +1631,7 @@ GCSHIM
   [ -s "$HEAL_LOG" ] && bad "42d: wrote to the bead although its labels were unreadable" || ok "42d: unreadable labels → no write at all"
   [ -s "$SUSPEND_LOG" ] && bad "42d: crew suspended although the heal could not read the bead" || ok "42d: unreadable labels → crew NOT suspended"
   [ "$RC42D" -eq 3 ] && ok "42d: _heal rc 3 on an unreadable pre-read" || bad "42d: _heal rc $RC42D (expected 3)"
+  grep -q 'could not read its labels' "$LOG" && ok "42d: the abort says the labels could not be read" || bad "42d: the abort does not say the labels could not be read"
 
   # 42f — a story in flight with NO trace of dispatch/approval: released as before, story:approved never written (only Athos approves).
   _s42_reset
@@ -1627,20 +1641,63 @@ GCSHIM
   grep -q 'label add.*story:approved' "$HEAL_LOG" && bad "42f: wrote story:approved on a bead with no proof of approval" || ok "42f: no proof → story:approved NOT written"
   grep -q 'label remove.*wa-stale.*story:in-flight' "$HEAL_LOG" && ok "42f: story:in-flight still stripped (released as before)" || bad "42f: no-proof bead not released"
   [ "$RC42F" -eq 0 ] && ok "42f: _heal rc 0 for the no-proof story" || bad "42f: _heal rc $RC42F for the no-proof story"
+  grep -q 'story:approved check: verdict=no-proof$' "$LOG" && ok "42f: the log says verdict=no-proof (a story left RAW on purpose, not a non-story)" || bad "42f: the log does not say verdict=no-proof"
 
-  # 42e — end to end through run_probe: an aborted heal keeps the confirmation state (retry next sweep) and is not counted as healed;
-  # a completed one clears it.
+  # 42g — the label add goes out but the read-back is UNREADABLE (a failed read, not "story:approved absent"): not confirmed, nothing stripped, rc 3.
+  _s42_reset
+  touch "$TMP/show_story" "$TMP/show_garbage_json"   # garbage only once a write has landed: the pre-read stays readable, the read-back does not
+  _load_sessions_json
+  _heal "mila-wa" "wa-stale" "$TMP" "$(_session_identity mila-wa)"; RC42G=$?
+  grep -q 'label add.*wa-stale.*story:approved' "$HEAL_LOG" && ok "42g: the restore was attempted (the read-back was reached)" || bad "42g: no restore attempt — the scenario never reached the read-back"
+  grep -q 'label remove' "$HEAL_LOG" && bad "42g: stripped labels on an UNREADABLE read-back (read as confirmed)" || ok "42g: nothing stripped when the read-back is unreadable"
+  [ -s "$SUSPEND_LOG" ] && bad "42g: crew suspended on an unreadable read-back" || ok "42g: crew NOT suspended on an unreadable read-back"
+  [ "$RC42G" -eq 3 ] && ok "42g: _heal rc 3 on an unreadable read-back" || bad "42g: _heal rc $RC42G (expected 3)"
+  grep -q "read-back said 'unreadable'" "$LOG" && ok "42g: the abort says the read-back was unreadable (not 'false')" || bad "42g: the abort does not name an unreadable read-back"
+
+  # 42h — the other verdicts and each trace of proof ALONE, one story shape per call: what the check says, whether story:approved is written, and that the heal still releases the bead.
+  s42_shape() {   # name · labels (body of a JSON list) · metadata (JSON object) · issue_type · expected verdict · story:approved written? (1/0)
+    _s42_reset
+    touch "$TMP/show_story"; printf '%s' "$2" > "$TMP/show_story_labels"; printf '%s' "$3" > "$TMP/show_story_meta"; printf '%s' "$4" > "$TMP/show_story_type"
+    _load_sessions_json
+    _heal "mila-wa" "wa-stale" "$TMP" "$(_session_identity mila-wa)"; S42_RC=$?
+    grep -q "story:approved check: verdict=$5\$" "$LOG" && ok "42h $1: the log says verdict=$5" || bad "42h $1: the log does not say verdict=$5"
+    if [ "$6" = 1 ]; then
+      grep -q 'label add.*wa-stale.*story:approved' "$HEAL_LOG" && ok "42h $1: story:approved written back" || bad "42h $1: story:approved NOT written back"
+    else
+      grep -q 'label add.*story:approved' "$HEAL_LOG" && bad "42h $1: wrote story:approved (verdict $5 must not)" || ok "42h $1: story:approved not written"
+    fi
+    grep -q 'label remove.*wa-stale.*story:in-flight' "$HEAL_LOG" && ok "42h $1: the bead was released (story:in-flight stripped)" || bad "42h $1: the bead was not released"
+    [ "$S42_RC" -eq 0 ] && ok "42h $1: _heal rc 0" || bad "42h $1: _heal rc $S42_RC"
+  }
+  # a story with a lifecycle label of its own (here: waiting for Athos) keeps it and is never auto-approved; one that is not in flight has nothing to give back
+  s42_shape other-story-state   '"pilot:dispatched","story:in-flight","story:needs-approval"' '{"pilot.dispatched_at":"123"}'  feature other-story-state 0
+  s42_shape not-in-flight       '"pilot:dispatched"'                                          '{"pilot.dispatched_at":"123"}'  feature not-in-flight     0
+  s42_shape has-approved        '"pilot:dispatched","story:in-flight","story:approved"'       '{}'                             feature has-approved      0
+  # the Pilot's Tier-1 dispatches ANY type but epic labelled tech-debt with no approval (bd list -l tech-debt): such a story never had story:approved and a dispatch trace proves nothing about Athos
+  s42_shape tier1-bypass        '"pilot:dispatched","story:in-flight","tech-debt"'            '{"pilot.dispatched_at":"123"}'  feature tier1-bypass      0
+  s42_shape tier1-bypass-bug    '"pilot:dispatched","story:in-flight","tech-debt"'            '{"pilot.dispatched_at":"123"}'  bug     not-story         0
+  # each trace alone is enough proof (the default fixture carries the label only; the real Pilot stamps the metadata too), and issue_type story counts like feature
+  s42_shape trace-label         '"pilot:dispatched","story:in-flight"'                        '{}'                             feature restore           1
+  s42_shape trace-dispatched-at '"story:in-flight"'                                           '{"pilot.dispatched_at":"123"}'  feature restore           1
+  s42_shape trace-aprovado-por  '"story:in-flight"'                                           '{"story.aprovado_por":"athos"}' feature restore           1
+  s42_shape type-story          '"pilot:dispatched","story:in-flight"'                        '{}'                             story   restore           1
+
+  # 42e — end to end through run_probe: an aborted heal keeps the confirmation state (retry next sweep) and is reported as ABORTED — not healed, not nudged;
+  # a completed one clears it and counts as healed. $LOG is emptied before EACH run, so the closing line checked is that run's own.
   _s42_reset
   touch "$TMP/show_story" "$TMP/refuse_approved"
   echo $(( NOW_ST - (8 * 60 + 60) )) > "$CLP_STATE_DIR/wa-stale__mila-wa.nudged"   # confirmed (2nd sweep)
   run_probe
+  grep -q 'label add.*wa-stale.*story:approved' "$HEAL_LOG" && ok "42e: run_probe reached the heal and tried the restore" || bad "42e: run_probe never tried the restore — the heal was not reached"
   grep -q 'label remove.*wa-stale.*story:in-flight' "$HEAL_LOG" && bad "42e: run_probe stripped story:in-flight without a confirmed restore" || ok "42e: run_probe did not strip without a confirmed restore"
   [ -f "$CLP_STATE_DIR/wa-stale__mila-wa.nudged" ] && ok "42e: confirmation state KEPT after an aborted heal (next sweep retries)" || bad "42e: confirmation state cleared after an aborted heal — the retry would start over from a first-sweep nudge"
-  grep -q 'probe complete: nudged 1 crew(s), healed 0' "$LOG" && ok "42e: the aborted heal is not counted as healed" || bad "42e: the aborted heal was counted as healed"
-  rm -f "$TMP/refuse_approved" "$TMP/approved_added"; : > "$HEAL_LOG"; : > "$SUSPEND_LOG"
+  grep -qi 'ABORTADO' "$NOTIFY_LOG" && ok "42e: the abort was notified" || bad "42e: the abort went unreported"
+  grep -q 'probe complete: nudged 0 crew(s), healed 0, heal-aborted 1$' "$LOG" && ok "42e: the aborted heal is counted as aborted — not healed, not nudged" || bad "42e: the closing line does not show 1 aborted heal with 0 healed and 0 nudged"
+  rm -f "$TMP/refuse_approved" "$TMP/approved_added"; : > "$HEAL_LOG"; : > "$SUSPEND_LOG"; : > "$LOG"
   run_probe   # the retry: bd now accepts the label
   grep -q 'label add.*wa-stale.*story:approved' "$HEAL_LOG" && grep -q 'label remove.*wa-stale.*story:in-flight' "$HEAL_LOG" && ok "42e: the retry restores and then releases" || bad "42e: the retry did not restore+release"
   [ -f "$CLP_STATE_DIR/wa-stale__mila-wa.nudged" ] && bad "42e: confirmation state NOT cleared after the completed heal" || ok "42e: confirmation state cleared after the completed heal"
+  grep -q 'probe complete: nudged 0 crew(s), healed 1$' "$LOG" && ok "42e: the completed heal is counted as healed (and no aborted suffix)" || bad "42e: the closing line does not show 1 healed heal with nothing aborted"
   _s42_reset
 
   echo ""

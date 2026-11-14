@@ -66,8 +66,12 @@ NEW_RECLAIM_COUNT=$((CUR_RECLAIM_COUNT + 1))
 # ga-w6a9xps: a STORY (feature/story) comes back to the pool with its story:approved. The builder's own claim drops that label while the Pilot's
 # story:in-flight stays; taking story:in-flight off below would leave the story with no story:* label at all, which auto-refino's RAW sweep reads as a fresh
 # idea and sends back to Athos for a second approval (wa-tvrs41.5, 13/11). So the approval goes back FIRST, confirmed by a fresh read, and only then do
-# the markers come off. Same rule as pilot-dispatcher.sh's _pilot_approved_verdict/_pilot_restore_approved (the Pilot's own release paths): only a feature/story
-# that carries story:in-flight and NO other story:* label; a bug/task/chore never had story:approved and is left as before.
+# the markers come off. Same rule and verdict words as inflight-reclaim-guard.py's _approved_verdict (ga-w6a9xps slice 2 + ga-btr2dof) and the copy in
+# crew-liveness-probe.sh; keep them in step. Only a feature/story carrying story:in-flight and NO other story:* label, WITH a trace of the Pilot's dispatch or of
+# Athos's approval (pilot:dispatched, pilot.dispatched_at or story.aprovado_por), gets "restore". Without a trace it may be a bead Athos parked by hand and only
+# he approves ("no-proof"). With the tech-debt label the Pilot's Tier-1 dispatched it with NO approval at all (pilot-dispatcher.sh DEBT_JSON: bd list -l tech-debt,
+# any type but epic), so a dispatch trace proves nothing about Athos ("tier1-bypass"). The other verdicts (has-approved, not-in-flight, other-story-state, not-story = a
+# bug/task/chore, which never had story:approved) write nothing. The verdict is printed either way, so the output tells a story released RAW on purpose from a non-story.
 # vazio (nenhuma palavra: o JSON da bead não é uma bead legível) → NÃO sei: nada é tirado, exit 1; falhou/ilegível na releitura → idem; "restore" é o único que escreve
 APPROVED_VERDICT=$(printf '%s' "$POST_RECLAIM_JSON" | jq -r '
   (if type == "array" then .[0] else . end) as $b
@@ -77,14 +81,17 @@ APPROVED_VERDICT=$(printf '%s' "$POST_RECLAIM_JSON" | jq -r '
         elif ($l | index("story:in-flight")) == null then "not-in-flight"
         elif ($l | map(select(startswith("story:") and . != "story:in-flight")) | length) > 0 then "other-story-state"
         elif ($b.issue_type == "feature" or $b.issue_type == "story") then
-          ((if ($b.metadata | type) == "object" then $b.metadata else {} end) as $m
-           | if ($l | index("pilot:dispatched")) != null or (($m["pilot.dispatched_at"] // "") | tostring) != "" or (($m["story.aprovado_por"] // "") | tostring) != "" then "restore" else "no-proof" end)
+          (if ($l | index("tech-debt")) != null then "tier1-bypass"
+           else ((if ($b.metadata | type) == "object" then $b.metadata else {} end) as $m
+                 | if ($l | index("pilot:dispatched")) != null or (($m["pilot.dispatched_at"] // "") | tostring) != "" or (($m["story.aprovado_por"] // "") | tostring) != "" then "restore" else "no-proof" end)
+           end)
         else "not-story" end
     else empty end' 2>/dev/null)
 if [ -z "$APPROVED_VERDICT" ]; then
   echo "pilot-manual-reclaim: $BEAD_ID reclaimed (status=open) but its labels could NOT be read to decide whether story:approved must be restored — Pilot claim markers and story:in-flight left untouched. Re-run bd show $BEAD_ID and restore by hand if it is a story." >&2
   exit 1
 fi
+echo "pilot-manual-reclaim: $BEAD_ID story:approved check: verdict=$APPROVED_VERDICT"
 if [ "$APPROVED_VERDICT" = "restore" ]; then
   "${BD[@]}" label add "$BEAD_ID" "story:approved" -q 2>/dev/null || true
   APPROVED_BACK=$("${BD[@]}" show "$BEAD_ID" --json 2>/dev/null | jq -r '(if type == "array" then .[0] else . end) | if type == "object" then ((.labels // []) | any(. == "story:approved")) else empty end' 2>/dev/null)
