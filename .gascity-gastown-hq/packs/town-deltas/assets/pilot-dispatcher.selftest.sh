@@ -9450,12 +9450,16 @@ GJ6_SHA="$(git -C "$GJ6_REPO" rev-parse HEAD)"
 
 # crew/-shape fixtures (regression: MUST stay detected) — one local head, one
 # synthesized remote-tracking ref (no real fetch needed; for-each-ref reads local refs).
-git -C "$GJ6_REPO" branch "crew/mila/gj6-crew-l" "$GJ6_SHA"
-git -C "$GJ6_REPO" update-ref "refs/remotes/origin/crew/mila/gj6-crew-r" "$GJ6_SHA"
+# ga-qcrgi9k: every branch below carries a commit of its OWN (a child of origin/main's tip). Until then they all pointed AT that tip — branches that
+# never got a commit, which are not "built" (Scenario ga-8jxe1-b, fixture 1b); this scenario is about the NAME SHAPES being recognised, so the branches
+# must be real in-flight work for the veto to apply.
+GJ6_WORK_SHA="$(git -C "$GJ6_REPO" commit-tree "$(git -C "$GJ6_REPO" rev-parse "$GJ6_SHA^{tree}")" -p "$GJ6_SHA" -m "fix(gj6): work in progress")"
+git -C "$GJ6_REPO" branch "crew/mila/gj6-crew-l" "$GJ6_WORK_SHA"
+git -C "$GJ6_REPO" update-ref "refs/remotes/origin/crew/mila/gj6-crew-r" "$GJ6_WORK_SHA"
 
 # fix/<bead>-<slug>-shape fixtures (ga-6jqr: the NEW case) — same local + remote-tracking split.
-git -C "$GJ6_REPO" branch "fix/gj6-fix-l-some-slug" "$GJ6_SHA"
-git -C "$GJ6_REPO" update-ref "refs/remotes/origin/fix/gj6-fix-r-other-slug" "$GJ6_SHA"
+git -C "$GJ6_REPO" branch "fix/gj6-fix-l-some-slug" "$GJ6_WORK_SHA"
+git -C "$GJ6_REPO" update-ref "refs/remotes/origin/fix/gj6-fix-r-other-slug" "$GJ6_WORK_SHA"
 
 # gj6-none: no branch anywhere (negative control).
 
