@@ -3517,6 +3517,83 @@ def _close_orphaned_sling(bd_prefix, sling_bead_id, target_bead_id, hold_secs):
     return True
 
 
+def _approved_verdict(bead):
+    """ga-w6a9xps: what a bead that is about to lose story:in-flight needs, from one `bd show --json` object.
+
+    "restore"           feature/story carrying story:in-flight and NO other story:* label, WITH a trace that it was dispatched/approved
+                        (pilot:dispatched, pilot.dispatched_at or story.aprovado_por) → story:approved must go back first
+    "no-proof"          same shape but no such trace: never re-approved here (only Athos approves; may be parked by hand) → nothing to do
+    "has-approved"      story:approved already there                                       → nothing to do
+    "not-in-flight"     no story:in-flight                                                  → nothing to do
+    "other-story-state" another story:* label is present (done/triage/…)                    → nothing to do, never overwrite it
+    "not-story"         bug/task/chore/unknown type: it never had story:approved            → nothing to do
+    None                not a bead object with a labels list                                → cannot know
+
+    Why: the builder's own claim drops story:approved while the Pilot's story:in-flight stays; taking story:in-flight off leaves the story with NO story:* label,
+    which auto-refino's RAW sweep reads as a fresh idea and sends back to Athos for a second approval (wa-tvrs41.5, 13/11). Same rule as pilot-dispatcher.sh's
+    _pilot_approved_verdict. Only "restore" writes.
+    vazio / não é uma bead / labels não é lista → None (NÃO sei); nunca "nada a fazer".
+    """
+    if isinstance(bead, list):
+        bead = bead[0] if bead else None
+    if not isinstance(bead, dict) or not isinstance(bead.get("labels"), list):
+        return None
+    labels = [str(x) for x in bead["labels"]]
+    if "story:approved" in labels:
+        return "has-approved"
+    if "story:in-flight" not in labels:
+        return "not-in-flight"
+    if any(x.startswith("story:") and x != "story:in-flight" for x in labels):
+        return "other-story-state"
+    if bead.get("issue_type") in ("feature", "story"):
+        md = bead.get("metadata") if isinstance(bead.get("metadata"), dict) else {}
+        # Proof that Athos's approval stood at dispatch: the Pilot only dispatches a story wearing story:approved, and stamps it; story.aprovado_por is
+        # the approval recipe's own stamp. Without either, "in-flight without approved" is also what a bead Athos parked by hand looks like — never re-approved.
+        if ("pilot:dispatched" in labels or str(md.get("pilot.dispatched_at") or "") != ""
+                or str(md.get("story.aprovado_por") or "") != ""):
+            return "restore"
+        return "no-proof"
+    return "not-story"
+
+
+def _restore_approved_verified(bd_prefix, bead_id, attempts=3, delay_secs=1.0):
+    """ga-w6a9xps: give story:approved back to a story BEFORE do_reclaim strips its story:in-flight, and confirm by reading the bead back (not by the exit code
+    of the write). True = nothing to restore, or restored and read back. False = could not read the bead, or the label did not show up after `attempts` tries —
+    the caller aborts the reclaim with the bead untouched (same contract as _remove_label_verified).
+    vazio (não li a bead) → False; falhou/ilegível → False; só o veredito "restore" escreve."""
+    def _show():
+        try:
+            r = subprocess.run(bd_prefix + ["show", bead_id, "--json"],
+                               capture_output=True, text=True, timeout=15)
+            if r.returncode != 0:
+                raise RuntimeError(f"bd show rc={r.returncode}: {(r.stderr or '').strip()[:200]}")
+            return json.loads(r.stdout)
+        except Exception as exc:
+            print(f"[INFLIGHT-RECLAIM] warn: ga-w6a9xps read {bead_id} before release: {exc}", flush=True)
+            return None
+
+    verdict = _approved_verdict(_show())
+    if verdict is None:
+        print(f"[INFLIGHT-RECLAIM] warn: ga-w6a9xps: could not read the labels of {bead_id} — cannot tell whether story:approved must go back; "
+              f"leaving the bead untouched, will retry next sweep", flush=True)
+        return False
+    if verdict != "restore":
+        return True
+    for attempt in range(1, attempts + 1):
+        try:
+            subprocess.run(bd_prefix + ["label", "add", bead_id, "story:approved", "-q"],
+                           capture_output=True, text=True, timeout=15)
+        except Exception as exc:
+            print(f"[INFLIGHT-RECLAIM] warn: ga-w6a9xps label add story:approved on {bead_id} attempt {attempt}/{attempts}: {exc}", flush=True)
+        back = _approved_verdict(_show())
+        if back == "has-approved":
+            print(f"[INFLIGHT-RECLAIM] ga-w6a9xps: {bead_id} gets story:approved back before story:in-flight is stripped (read back)", flush=True)
+            return True
+        if attempt < attempts:
+            time.sleep(delay_secs)
+    return False
+
+
 def do_reclaim(bead_id, bead_title, reclaim_count, idle_min, labels, rig_root=None,
                 has_explicit_refusal=False, refusal_count=0, bridge_sources=None,
                 sling_bead_id=None, never_had_owner=False, unset_metadata=()):
@@ -3607,6 +3684,14 @@ def do_reclaim(bead_id, bead_title, reclaim_count, idle_min, labels, rig_root=No
 
     # Build the bd prefix: rig-native beads route to their own store.
     _bd = ["bd", "-C", rig_root] if rig_root else ["bd"]
+
+    # 0b. ga-w6a9xps: a STORY goes back to the pool WITH its story:approved. The builder's claim dropped it; stripping story:in-flight below would leave the
+    #     story with no story:* label, and auto-refino's RAW sweep would take it for a new idea (wa-tvrs41.5). Restored first and read back; not confirmed →
+    #     abort here, before anything below is touched (same contract as the label removal that follows).
+    if "story:in-flight" in labels and not _restore_approved_verified(_bd, bead_id):
+        print(f"[INFLIGHT-RECLAIM] warn: could not confirm story:approved back on {bead_id} — aborting this reclaim before story:in-flight is stripped "
+              f"(ga-w6a9xps); will retry next sweep", flush=True)
+        return False
 
     # 1. Remove lifecycle labels that are actually present. ga-7m191:
     #    pilot:dispatched may be absent (stripped by a partial prior reclaim);

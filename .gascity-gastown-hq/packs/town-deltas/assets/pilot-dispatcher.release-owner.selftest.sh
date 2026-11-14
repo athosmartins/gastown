@@ -16,9 +16,10 @@
 # labels and stamps off. Any other outcome leaves the bead exactly as it was (flight labels and stamps in place, so
 # it stays visible and the next sweep retries) and says so loudly. THE invariant, asserted after every scenario:
 # a bead whose owner is still set never ends up without its flight labels ("sem rotulo + dono morto"). One deliberate
-# exception to "read first": a NEVERSTARTED list row WITHOUT owner has nothing to let go of, so it neither reads nor
-# writes (NS-8/NS-8b) and is released as before; ga-9jrt3o7's selftest drives that function with a bd that only answers
-# `list` and its rows carry no owner, so this rule is also what keeps the two beads' selftests green on the merged tree.
+# exception to "read first": a NEVERSTARTED list row WITHOUT owner has nothing to let go of, so _pilot_release_owner neither reads nor
+# writes for it (NS-8). ga-w6a9xps changed what the SWEEP does around that: before any release it reads the bead to give a story its story:approved
+# back (_pilot_restore_approved), so an ownerless row whose bead cannot be read is held back, not released blind (NS-8b; its own scenarios:
+# pilot-dispatcher.approved-restore.selftest.sh).
 #
 # The fake bd models bd 1.1.0 as far as the repo documents it (gate-assignee-clear-holder-aware.selftest.sh, the
 # `bd assign` refusal of bd-98s5c; gate_clear_assignee_if_holder reads rc 13 as a lost compare-and-swap):
@@ -58,8 +59,11 @@ for _f in NS_FN LBL_FN CS_FN; do
   [ -n "${!_f}" ] || { echo "FATAL: could not cut $_f out of $DISPATCHER (extraction pattern drifted)" >&2; exit 2; }
 done
 # Empty on a pre-fix dispatcher: the two functions above are then the old ones, which never call it.
+# ga-w6a9xps: both releases give a story its story:approved back first (_pilot_restore_approved), so the harness must carry it and its reader too.
 REL_FN="$(extract_fn _pilot_owner_state)
-$(extract_fn _pilot_release_owner)"
+$(extract_fn _pilot_release_owner)
+$(extract_fn _pilot_approved_verdict)
+$(extract_fn _pilot_restore_approved)"
 
 NOW=1794542500
 STAMP=$((NOW - 3600))   # dispatched an hour ago: past PILOT_NEVERSTARTED_MINUTES=15
@@ -279,7 +283,9 @@ for _mode in fail empty garbage rc1_valid nostatus; do
   survived ns && ok "[$_mode] the sweep survives (rc $RC)" || bad "[$_mode] the sweep died: rc=$RC"
   { [ "$(owner_of wa-blind)" = gastown.dog-1 ] && [ "$(flight_n wa-blind)" = 2 ]; } && ok "[$_mode] third state = unknown: owner and flight labels untouched" || bad "[$_mode] a bead that could not be read was changed: owner='$(owner_of wa-blind)' flight=$(flight_n wa-blind)"
   { ! calls_have " update wa-blind --if-assignee"; } && ok "[$_mode] no owner write was even attempted" || bad "[$_mode] an owner write was attempted without knowing the holder"
-  warn_have "could not read it before clearing the owner" && ok "[$_mode] the unreadable bead is logged loudly" || bad "[$_mode] no loud log of the failed read; warn.log: $(head -c 300 "$W/warn.log")"
+  # ga-w6a9xps: the first read of the bead is now the one that gives a story its story:approved back (_pilot_restore_approved), so that is the helper that
+  # refuses first; either helper's own "could not read" log is the loud one, and neither leaves a write behind (asserted above).
+  { warn_have "could not read it before clearing the owner" || warn_have "could not read its labels before restoring story:approved" || warn_have "its labels came back unreadable before restoring story:approved"; } && ok "[$_mode] the unreadable bead is logged loudly" || bad "[$_mode] no loud log of the failed read; warn.log: $(head -c 300 "$W/warn.log")"
 done
 
 echo
@@ -329,15 +335,17 @@ survived ns && ok "the sweep survives" || bad "the sweep died: rc=$RC"
 { ! calls_have "--assignee" && ! calls_have " assign "; } && ok "nothing to clear, so no owner write" || bad "an owner write was made on a bead with no owner"
 
 echo
-echo "NS-8b: the list row has no owner and bd cannot answer a show — nothing to let go of, so nothing to read: released as before"
-# (the sibling bead ga-9jrt3o7's selftest drives this function with a bd that only answers list; its rows carry no owner)
+echo "NS-8b: the list row has no owner and bd cannot answer a show — nothing to let go of, but the bead's labels cannot be read either: held back, retried next sweep"
+# ga-w6a9xps: this used to release (an ownerless row needed no read). It now needs one: the story:approved a builder's claim dropped has to be given back BEFORE
+# story:in-flight comes off, and a bead whose labels cannot be read may be exactly that story (third state = unknown → the inert state, flight labels stay).
+# (the sibling bead ga-9jrt3o7's selftest drives this function with a bd that only answers list; its rows carry no owner and its show answers: see NS-8)
 new_world ns8b
 add_bead wa-free2 open "" "story:in-flight pilot:dispatched"
 export RO_SHOW_MODE=fail
 run_ns
 survived ns && ok "the sweep survives" || bad "the sweep died: rc=$RC"
-{ [ "$(flight_n wa-free2)" = 0 ] && ! has_meta wa-free2 pilot.dispatched_at; } && ok "flight labels and stamp off although a show would have failed" || bad "an ownerless row was held back by a read it did not need: flight=$(flight_n wa-free2)"
-{ ! calls_have " show "; } && ok "no read, no write for an ownerless row" || bad "the helper was called for an ownerless row: $(tr '\n' '|' < "$W/calls.log")"
+{ [ "$(flight_n wa-free2)" = 2 ] && has_meta wa-free2 pilot.dispatched_at; } && ok "unreadable bead: flight labels and stamp stay (nothing released blind)" || bad "an unreadable bead was released: flight=$(flight_n wa-free2)"
+{ ! calls_have "--assignee" && ! calls_have " assign " && ! calls_have " label add "; } && ok "no write of any kind on a bead that could not be read" || bad "a write was made on an unreadable bead: $(tr '\n' '|' < "$W/calls.log")"
 
 echo
 echo "NS-9: owner on an OPEN bead (crew-assigned, never started) — owner cleared, status left alone"

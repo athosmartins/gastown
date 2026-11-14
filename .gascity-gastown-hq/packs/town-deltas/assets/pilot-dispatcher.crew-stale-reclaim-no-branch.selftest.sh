@@ -88,7 +88,8 @@ if [ -z "$RECLAIM_FN" ]; then
 fi
 # ga-xxtwytk: the reclaim now takes the owner off through these two helpers (guarded write + read-back) BEFORE the flight
 # labels; a harness that cuts out only the reclaim runs it without them ('command not found') and nothing is ever reclaimed.
-OWNER_FN="$(sed -n '/^_pilot_owner_state() {/,/^}$/p;/^_pilot_release_owner() {/,/^}$/p' "$DISPATCHER")"
+# ga-w6a9xps: + the two helpers that give a story its story:approved back before the release (this harness's beads are not stories: no-ops there).
+OWNER_FN="$(sed -n '/^_pilot_owner_state() {/,/^}$/p;/^_pilot_release_owner() {/,/^}$/p;/^_pilot_approved_verdict() {/,/^}$/p;/^_pilot_restore_approved() {/,/^}$/p' "$DISPATCHER")"
 if [ -z "$OWNER_FN" ]; then
   echo "FATAL: _pilot_owner_state()/_pilot_release_owner() not found in $DISPATCHER" >&2
   exit 2

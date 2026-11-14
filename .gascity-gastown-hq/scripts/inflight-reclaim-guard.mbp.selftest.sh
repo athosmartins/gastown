@@ -234,6 +234,7 @@ class R:
 real.subprocess.run = lambda cmd, **kw: (calls.append(list(cmd)), R())[1]
 real.preserve_unpushed_branch = lambda bead_id: []
 real._remove_label_verified = lambda bd, bead_id, lbl: True
+real._restore_approved_verified = lambda bd, bead_id, **kw: True   # ga-w6a9xps: a parte do story:approved tem o teste dela (inflight-reclaim-guard.approved-restore.selftest.sh); aqui o `bd show` é falso e vazio
 real.time.sleep = lambda s: None
 try:
     real.do_reclaim("wa-t1", "t", 0, 30.0, ["story:in-flight", "pilot:dispatched"], unset_metadata=(MARK,))

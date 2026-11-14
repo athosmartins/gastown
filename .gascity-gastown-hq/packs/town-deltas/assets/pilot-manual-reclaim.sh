@@ -63,6 +63,37 @@ CUR_RECLAIM_COUNT=$(printf '%s' "$POST_RECLAIM_JSON" | jq -r '
 case "$CUR_RECLAIM_COUNT" in ''|*[!0-9]*) CUR_RECLAIM_COUNT=0 ;; esac
 NEW_RECLAIM_COUNT=$((CUR_RECLAIM_COUNT + 1))
 
+# ga-w6a9xps: a STORY (feature/story) comes back to the pool with its story:approved. The builder's own claim drops that label while the Pilot's
+# story:in-flight stays; taking story:in-flight off below would leave the story with no story:* label at all, which auto-refino's RAW sweep reads as a fresh
+# idea and sends back to Athos for a second approval (wa-tvrs41.5, 13/11). So the approval goes back FIRST, confirmed by a fresh read, and only then do
+# the markers come off. Same rule as pilot-dispatcher.sh's _pilot_approved_verdict/_pilot_restore_approved (the Pilot's own release paths): only a feature/story
+# that carries story:in-flight and NO other story:* label; a bug/task/chore never had story:approved and is left as before.
+# vazio (nenhuma palavra: o JSON da bead não é uma bead legível) → NÃO sei: nada é tirado, exit 1; falhou/ilegível na releitura → idem; "restore" é o único que escreve
+APPROVED_VERDICT=$(printf '%s' "$POST_RECLAIM_JSON" | jq -r '
+  (if type == "array" then .[0] else . end) as $b
+  | if ($b | type) == "object" and ($b.status | type) == "string" then
+      (($b.labels // []) | map(tostring)) as $l
+      | if ($l | index("story:approved")) != null then "has-approved"
+        elif ($l | index("story:in-flight")) == null then "not-in-flight"
+        elif ($l | map(select(startswith("story:") and . != "story:in-flight")) | length) > 0 then "other-story-state"
+        elif ($b.issue_type == "feature" or $b.issue_type == "story") then
+          ((if ($b.metadata | type) == "object" then $b.metadata else {} end) as $m
+           | if ($l | index("pilot:dispatched")) != null or (($m["pilot.dispatched_at"] // "") | tostring) != "" or (($m["story.aprovado_por"] // "") | tostring) != "" then "restore" else "no-proof" end)
+        else "not-story" end
+    else empty end' 2>/dev/null)
+if [ -z "$APPROVED_VERDICT" ]; then
+  echo "pilot-manual-reclaim: $BEAD_ID reclaimed (status=open) but its labels could NOT be read to decide whether story:approved must be restored — Pilot claim markers and story:in-flight left untouched. Re-run bd show $BEAD_ID and restore by hand if it is a story." >&2
+  exit 1
+fi
+if [ "$APPROVED_VERDICT" = "restore" ]; then
+  "${BD[@]}" label add "$BEAD_ID" "story:approved" -q 2>/dev/null || true
+  APPROVED_BACK=$("${BD[@]}" show "$BEAD_ID" --json 2>/dev/null | jq -r '(if type == "array" then .[0] else . end) | if type == "object" then ((.labels // []) | any(. == "story:approved")) else empty end' 2>/dev/null)
+  if [ "$APPROVED_BACK" != "true" ]; then
+    echo "pilot-manual-reclaim: $BEAD_ID reclaimed (status=open) but story:approved could NOT be confirmed back on the story (read-back said '${APPROVED_BACK:-unreadable}') — Pilot claim markers and story:in-flight left untouched, so auto-refino does not take it for a new idea. Retry: bd label add $BEAD_ID story:approved, then re-run this script." >&2
+    exit 1
+  fi
+fi
+
 "${BD[@]}" label remove "$BEAD_ID" "pilot:dispatched"  -q 2>/dev/null || true
 "${BD[@]}" label remove "$BEAD_ID" "pilot:dispatching" -q 2>/dev/null || true
 "${BD[@]}" update "$BEAD_ID" --unset-metadata "pilot.dispatched_at" -q 2>/dev/null || true
