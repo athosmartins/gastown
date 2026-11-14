@@ -20,7 +20,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 WD="${GUARD_UNDER_TEST:-$SCRIPT_DIR/inflight-reclaim-guard.py}"
 
 /usr/bin/python3 - "$WD" <<'PY'
-import sys, importlib.util, json
+import sys, importlib.util, json, subprocess
 
 wd_path = sys.argv[1]
 spec = importlib.util.spec_from_file_location("inflight_reclaim_guard", wd_path)
@@ -89,11 +89,12 @@ else:
 class Store:
     """labels / assignee / status of ONE bead + the trace of every bd call. drop_approved=True: `label add story:approved` exits 0 but never lands.
     stale_show: the first N `show` calls AFTER an add still read the pre-add state."""
-    def __init__(self, labels, typ="feature", drop_approved=False, show_rc=0, show_out=None, stale_after_add=0):
+    def __init__(self, labels, typ="feature", drop_approved=False, show_rc=0, show_out=None, stale_after_add=0, show_raises=False, add_raises=False):
         self.labels = list(labels); self.typ = typ
         self.assignee = "wa-builder-1"; self.status = "in_progress"
         self.drop_approved = drop_approved
         self.show_rc, self.show_out = show_rc, show_out
+        self.show_raises, self.add_raises = show_raises, add_raises   # subprocess.run itself RAISES (bd missing / timed out), not just a non-zero exit
         self.stale_after_add = stale_after_add; self._stale_left = 0; self._pre_add = None
         self.calls = []; self.story_labels_trace = []
         self.had_story_label_at_start = any(x.startswith("story:") for x in labels)
@@ -111,6 +112,8 @@ class Store:
         verb = rest[0] if rest else ""
         out = R()
         if verb == "show":
+            if self.show_raises:
+                raise subprocess.TimeoutExpired(cmd, timeout)
             if self.show_rc != 0:
                 return R(self.show_rc, "", "bd: boom")
             if self.show_out is not None:
@@ -123,6 +126,8 @@ class Store:
         if verb == "label" and len(rest) >= 4:
             op, lbl = rest[1], rest[3]
             if op == "add":
+                if self.add_raises:
+                    raise OSError("bd: not executable")
                 if lbl == "story:approved" and self.drop_approved:
                     pass
                 elif lbl not in self.labels:
@@ -192,6 +197,7 @@ if have_verdict:
 
     for why, st in (("bd show fails", Store(["story:in-flight"], show_rc=1)),
                     ("bd show prints nothing", Store(["story:in-flight"], show_out="")),
+                    ("bd show raises (timeout)", Store(["story:in-flight"], show_raises=True)),
                     ("bd show prints garbage", Store(["story:in-flight"], show_out="not json {{{")),
                     ("bd show prints an error envelope", Store(["story:in-flight"], show_out='[{"error":"not found"}]'))):
         o = install(st)
@@ -200,6 +206,15 @@ if have_verdict:
         finally:
             uninstall(o)
         check(res is False and not st.writes(), "%s -> False and NOTHING written" % why, "%s: res=%r writes=%r" % (why, res, st.writes()))
+
+    st = Store(["story:in-flight", "pilot:dispatched"], add_raises=True)   # with proof of dispatch, so the verdict is "restore" and the write is attempted
+    o = install(st)
+    try:
+        res = m._restore_approved_verified(["bd"], "wa-x", attempts=2, delay_secs=0)
+    finally:
+        uninstall(o)
+    check(res is False and "story:approved" not in st.labels and "story:in-flight" in st.labels,
+          "bd label add raises (OSError) -> False, story:in-flight untouched", "res=%r labels=%r" % (res, st.labels))
 
     for typ in ("bug", "task", "chore"):
         st = Store(["story:in-flight"], typ=typ)
