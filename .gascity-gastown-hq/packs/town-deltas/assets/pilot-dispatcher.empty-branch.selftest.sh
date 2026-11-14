@@ -51,7 +51,7 @@ FNS="$TMP/fns.sh"
 : > "$FNS"
 for _fn in _delivery_branch_patterns_ready _delivery_branch_local_ref _delivery_branch_listed_ref _delivery_branch_remote_hit \
            _beadid_matched_crew_branch_ref _beadid_branch_signal _filter_built _ownership_guard_should_refuse \
-           _pilot_crew_stale_reclaim _pilot_owner_state _pilot_release_owner \
+           _pilot_crew_stale_reclaim _pilot_owner_state _pilot_release_owner _pilot_approved_verdict _pilot_restore_approved \
            _beadid_has_live_worktree _beadid_dirty_worktrees resume_directive_for _pilot_dog_lend_prompt; do
   awk -v n="$_fn" '$0 ~ "^"n"\\(\\) *\\{" {f=1} f {print} f && /^}$/ {exit}' "$PD" >> "$FNS"
 done

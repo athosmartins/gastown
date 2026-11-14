@@ -9159,6 +9159,74 @@ _pilot_release_owner() {
   return 1
 }
 
+# _pilot_approved_verdict <bd show --json output> — ga-w6a9xps: what a bead that is about to be taken off the flight (story:in-flight stripped) needs so
+# that "back to the pool" is true. One word on stdout, from the labels and the type of the bead as read:
+#   restore           = a story (feature/story) that carries story:in-flight and NO other story:* label, WITH a trace of the Pilot's dispatch or of Athos's approval
+#                       (pilot:dispatched, pilot.dispatched_at or story.aprovado_por): story:approved is gone and must come back
+#   no-proof          = same shape, no such trace: never re-approved here (only Athos approves; "in-flight without approved" is also a bead he parked by hand)
+#   has-approved      = story:approved is there (the Pilot keeps it on dispatch; nothing to do)
+#   other-story-state = it carries some other story:* label (done, cancelled, needs-approval, …): a lifecycle state somebody else owns, never overwritten
+#   not-story         = bug/task/chore/…: those are dispatched WITHOUT story:approved and never had one; adding it would turn them into stories
+#   not-in-flight     = no story:in-flight on it: this is not the flight being taken off, nothing to restore here
+# rc 1 + no output = unreadable (not JSON, not a bead, no status): the caller must treat it as "don't know", never as one of the words above.
+# vazio ([] / sem rótulos) → "not-in-flight" (uma bead sem story:in-flight não está sendo tirada do voo); falhou/ilegível → rc 1, sem palavra
+_pilot_approved_verdict() {
+  local _av=""
+  _av=$(printf '%s' "${1:-}" | jq -r '
+    (if type == "array" then .[0] else . end) as $b
+    | if ($b | type) == "object" and ($b.status | type) == "string" then
+        (($b.labels // []) | map(tostring)) as $l
+        | if ($l | index("story:approved")) != null then "has-approved"
+          elif ($l | index("story:in-flight")) == null then "not-in-flight"
+          elif ($l | map(select(startswith("story:") and . != "story:in-flight")) | length) > 0 then "other-story-state"
+          elif ($b.issue_type == "feature" or $b.issue_type == "story") then
+            ((if ($b.metadata | type) == "object" then $b.metadata else {} end) as $m
+             | if ($l | index("pilot:dispatched")) != null or (($m["pilot.dispatched_at"] // "") | tostring) != "" or (($m["story.aprovado_por"] // "") | tostring) != "" then "restore" else "no-proof" end)
+          else "not-story" end
+      else empty end' 2>/dev/null) || return 1
+  [ -n "$_av" ] || return 1
+  printf '%s' "$_av"
+}
+
+# _pilot_restore_approved <db> <bead_id> — ga-w6a9xps: gives story:approved BACK to a story the Pilot is about to take off the flight, BEFORE its
+# story:in-flight is stripped, and confirms it by reading the bead back (not by the exit code of the write).
+#
+# Why: the Pilot keeps story:approved on dispatch and adds story:in-flight next to it, but the builder's own claim drops story:approved. A release path
+# that then strips story:in-flight ("back to the pool") leaves a story with NO story:* label at all, which is exactly what the auto-refino RAW sweep
+# (auto_refino_is_ingestable_raw) reads as a fresh untriaged idea: wa-tvrs41.5 (approved by Athos 13/11) was re-ingested and went back to him for a
+# second approval. The label has to be back while the flight label is still on, so there is never a moment where the story reads as raw.
+#
+# What it touches: only a story (feature/story) that carries story:in-flight and no other story:* label AND a trace of the Pilot's dispatch or of Athos's
+# approval (_pilot_approved_verdict "restore"; without the trace it is "no-proof" and nothing is written — only Athos approves). It never adds
+# story:approved to a bug/task/chore (those never had it and are dispatched without it) and never overwrites another lifecycle state.
+#   rc 0 = nothing to restore, or story:approved is there now (the read-back confirmed it)
+#   rc 1 = the story needed it and the read-back says it is still not there (write refused or never applied)
+#   rc 2 = DON'T KNOW (the read before or after the write failed or came back unreadable)
+# On 1 and 2 this says why with warn; the caller must leave the bead exactly as it is (owner, flight labels, stamps) so it stays visible to every query
+# and the next sweep retries: a story released WITHOUT its approval is the bug this exists to prevent.
+_pilot_restore_approved() {
+  local _ra_db="$1" _ra_id="$2" _ra_json="" _ra_v="" _ra_rc=0
+  # vazio/falhou/ilegível → rc 2 (NÃO sei o que a bead carrega): nenhuma escrita sai
+  _ra_json=$(timeout 15 bd -C "$_ra_db" show "$_ra_id" --json 2>/dev/null) || {
+    warn "ga-w6a9xps: $_ra_id NOT released — could not read its labels before restoring story:approved (bd show failed); nothing written, owner/flight labels/stamps stay (retry next sweep)"
+    return 2
+  }
+  _ra_v=$(_pilot_approved_verdict "$_ra_json") || {
+    warn "ga-w6a9xps: $_ra_id NOT released — its labels came back unreadable before restoring story:approved; nothing written, owner/flight labels/stamps stay (retry next sweep)"
+    return 2
+  }
+  [ "$_ra_v" = "restore" ] || return 0   # has-approved / other-story-state / not-story / not-in-flight / no-proof: not this function's to touch
+  timeout 15 bd -C "$_ra_db" label add "$_ra_id" "story:approved" -q >/dev/null 2>&1 || _ra_rc=$?
+  # vazio/falhou/ilegível → rc 2: a escrita pode ter pegado e eu não sei; nada é solto agora, a próxima leitura conclui
+  _ra_json=$(timeout 15 bd -C "$_ra_db" show "$_ra_id" --json 2>/dev/null) && _ra_v=$(_pilot_approved_verdict "$_ra_json") || {
+    warn "ga-w6a9xps: $_ra_id NOT confirmed — the story:approved write answered rc=$_ra_rc but the read-back failed; owner/flight labels/stamps stay (next sweep reads the bead again)"
+    return 2
+  }
+  [ "$_ra_v" = "has-approved" ] && return 0
+  warn "ga-w6a9xps: $_ra_id NOT released — story:approved write answered rc=$_ra_rc and the bead still reads '$_ra_v' (bd refused it or never applied it); owner/flight labels/stamps stay"
+  return 1
+}
+
 # _neverstarted_recover_db <db_path> <now_epoch> — scan one DB for never-started
 # in-flight beads and release them. Decision rules (ALL must hold to release):
 #   - has story:in-flight AND pilot:dispatched (query selects both)
@@ -9336,6 +9404,10 @@ _neverstarted_recover_db() {
     # Not confirmed = the labels and stamps stay (they keep it in those queries, the next sweep retries); _pilot_release_owner says why.
     # vazio (a linha da lista não traz dono: nada a soltar, segue só com rótulos e carimbos, como antes) → ""; falhou/ilegível (o jq não leu a linha) → esta bead fica como está, a próxima varredura repete: nunca vira "sem dono"
     _ns_owner=$(printf '%s' "$_bead" | jq -r '.assignee // ""' 2>/dev/null) || continue
+    # ga-w6a9xps: the warn above says "back to story:approved", and for a story whose builder had claimed it that label is GONE (the claim drops it):
+    # strip story:in-flight below without giving it back and auto-refino's RAW sweep re-ingests it as an idea (wa-tvrs41.5). Restored first, read back;
+    # not confirmed (rc 1/2) → the bead stays as it is, owner and flight labels included, and the next sweep retries.
+    _pilot_restore_approved "$_db" "$_bid" || continue
     if [ -n "$_ns_owner" ]; then
       _pilot_release_owner "$_db" "$_bid" "$_ns_owner" || continue
     fi
@@ -9651,6 +9723,11 @@ _pilot_crew_stale_reclaim() {
       # confirmed release takes the labels and stamps off; otherwise they stay, the bead stays visible to every query and the next sweep retries.
       # _cs_assignee = the owner this row judged. A row without owner never gets here (the jq select above drops it); an empty
       # one would still be safe: _pilot_release_owner only clears an owner that matches the judged one.
+      # ga-w6a9xps: "returns to the pool" has to be true for a story too. The builder's claim dropped its story:approved, so stripping
+      # story:in-flight below would leave it with no story:* label at all, which auto-refino's RAW sweep reads as a fresh idea (wa-tvrs41.5, 13/11:
+      # approved by Athos, re-ingested, back in his queue for a second approval). The approval goes back FIRST, confirmed by reading the bead; a story
+      # it could not be restored on (rc 1) or read (rc 2) stays exactly as it is (owner, flight labels, stamps) and the next sweep retries.
+      _pilot_restore_approved "$_cs_city" "$_cs_id" || continue
       _pilot_release_owner "$_cs_city" "$_cs_id" "$_cs_assignee" || continue
       bd -C "$_cs_city" label  remove "$_cs_id" "story:in-flight"   -q 2>/dev/null || true
       bd -C "$_cs_city" label  remove "$_cs_id" "pilot:dispatched"  -q 2>/dev/null || true
