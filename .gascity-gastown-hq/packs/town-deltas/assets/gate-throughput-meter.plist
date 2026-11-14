@@ -1,0 +1,33 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>EnvironmentVariables</key>
+	<dict>
+		<key>GC_CITY</key>
+		<string>/Users/athos/gt/.gascity-gastown-hq</string>
+		<key>GC_CITY_PATH</key>
+		<string>/Users/athos/gt/.gascity-gastown-hq</string>
+		<key>HOME</key>
+		<string>/Users/athos</string>
+		<key>PATH</key>
+		<string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:/Users/athos/go/bin:/Users/athos/.local/bin</string>
+	</dict>
+	<key>Label</key>
+	<string>com.gascity.gate-throughput-meter</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>/usr/bin/python3</string>
+		<string>/Users/athos/gt/.gascity-gastown-hq/packs/town-deltas/assets/scripts/gate-throughput-meter.py</string>
+		<string>--alarm</string>
+	</array>
+	<key>RunAtLoad</key>
+	<true/>
+	<key>StandardErrorPath</key>
+	<string>/Users/athos/gt/.gascity-gastown-hq/.gc/logs/gate-throughput-meter-launchd.err</string>
+	<key>StandardOutPath</key>
+	<string>/Users/athos/gt/.gascity-gastown-hq/.gc/logs/gate-throughput-meter-launchd.out</string>
+	<key>StartInterval</key>
+	<integer>900</integer>
+</dict>
+</plist>

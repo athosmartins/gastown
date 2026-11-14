@@ -10,6 +10,8 @@ WHAT IT REPORTS, for the previous local day (BRT) unless --day is given:
   2. approvals (PASS) that day   and verdicts, FAIL, pass rate over all verdicts
   3. median review minutes       dispatcher elapsed_s, PASS+FAIL
   4. gate queue depth now        from .gc/gate-focus.state (what gate-focus-mode.sh measured last), with its age
+  7. reviews per hour          from the dispatcher log via gate-throughput-meter.py (ga-v8p1tx.1.1): the day's average,
+                               the 24 hourly buckets, and the trailing 3 h rate. Mission target, Athos 14/11: >= 8/h.
 plus: the switches (gate focus mode, E5, E11, E12, pre-gate) and the MODEL PER ROLE — the alias in each
 agents/<role>/agent.toml resolved through the newest Claude Code model catalog on this machine — compared with
 the previous run's snapshot. Athos, 07/10: "nunca rollback de modelo; nunca um modelo que já tem sucessor" —
@@ -271,6 +273,30 @@ def levers(city, day):
     return out
 
 
+def rate_line(city, day):
+    """Line 7: reviews per hour, from gate-throughput-meter.py --json (the dispatcher log is its only source)."""
+    meter = os.path.join(os.path.dirname(os.path.abspath(__file__)), "gate-throughput-meter.py")
+    # vazio → o medidor devolve avg=None com o motivo ("dia ainda em curso", "log só começa em ..."); falhou/ilegível
+    # (não roda, estoura o tempo, JSON ruim) → "não medido (...)" — nunca 0/h
+    try:
+        r = subprocess.run([sys.executable, meter, "--json", "--day", day.isoformat(), "--city", city],
+                           capture_output=True, timeout=60)
+        j = json.loads(r.stdout.decode("utf-8", "replace"))
+    except Exception as e:  # noqa: BLE001
+        return "7) revisadas/hora: " + nm(f"medidor falhou: {e.__class__.__name__}")
+    if not j.get("ok"):
+        return "7) revisadas/hora: " + nm(j.get("why") or "medidor sem motivo")
+    d = j.get("day") or {}
+    if d.get("avg") is None:
+        head = "dia: " + nm(d.get("why") or "sem motivo")
+    else:
+        head = f"dia {str(round(d['avg'], 1)).replace('.', ',')}/h ({d['total']} em 24 h; meta >= 8/h)"
+        head += " | por hora 00h-23h: " + " ".join(str(x) for x in d["hourly"])
+    w = j.get("window_rate")
+    now = "agora, últimas 3 h: " + (nm((j.get("why") or {}).get("window") or "sem motivo") if w is None else f"{str(round(w, 1)).replace('.', ',')}/h")
+    return f"7) revisadas/hora (log do gate): {head} | {now}"
+
+
 def pct(x):
     return nm("sem vereditos") if x is None else f"{x:.0%}"
 
@@ -296,10 +322,12 @@ def build(city, day):
     lv = levers(city, day)
     L.append(f"5) tempo estourado: {lv['timeouts']} | {lv['graced']} | E13: {lv['e13']}")
     L.append(f"6) E11 (teto 800 linhas de produção): {lv['e11']}")
+    L.append(rate_line(city, day))
     L.append("Chaves: " + "; ".join(f"{k}={v}" for k, v in sw.items()))
     L.append("Modelos por papel (" + catnote + "): " + "; ".join(f"{r}={v['alias'] or '-'}→{v['model']}" for r, v in models.items() if r in ('gate-reviewer','wa-worker','ps-worker','digo-wa')))
     for c in changes:
         L.append("⚠ " + c if c.startswith("MUDOU") else "• " + c)
+    L.append("Missão Athos 14/11: média >= 8 revisadas/h (ga-v8p1tx.1).")
     L.append("Metas (Athos 05/10 + 07/10): sex 10/10 ≥50% 1ª / ≤20 min / ≥45 aprovadas / fila <15; seg 13/10 ≥60% / ≥60.")
     return "\n".join(L), m
 

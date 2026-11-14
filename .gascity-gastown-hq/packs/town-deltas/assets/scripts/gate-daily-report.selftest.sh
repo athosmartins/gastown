@@ -157,5 +157,23 @@ FAKE_NOTIFY_RC=3 post_run 99 "$FB:$PATH"
 FAKE_NOTIFY_RC=3 post_run 0 "$FB:$PATH"
 [ "$PRC" = "1" ] && echo "$POUT" | grep 'WARN' | grep -q 'notify.*rc=3' && ok || bad "T8e: failing notify (recorded case) must exit 1 with a WARN (exit $PRC): $(echo "$POUT" | grep -E 'WARN|notify')"
 
+# T9: line 7 (ga-v8p1tx.1.1) — reviews per hour from the dispatcher log, via gate-throughput-meter.py.
+# No dispatcher log -> "não medido", never 0/h. With a log: day average, the 24 hourly buckets, and the trailing 3 h.
+mkdir -p "$C/.gc/logs"; rm -f "$C/.gc/logs/quality-gate-dispatcher.log"
+OUT9="$(/usr/bin/python3 "$HERE/gate-daily-report.py" --city "$C" --day 2026-10-06)"
+echo "$OUT9" | grep -q '^7) revisadas/hora: não medido (log ilegível' && ok || bad "T9: missing log must read não medido: $(echo "$OUT9" | grep '^7)')"
+echo "$OUT9" | grep '^7)' | grep -q '0/h' && bad "T9: a missing log printed as a rate" || ok
+cat > "$C/.gc/logs/quality-gate-dispatcher.log" <<'EOF'
+[2026-10-05 12:00:00] [quality-gate-dispatcher] Dispatcher sweep start
+[2026-10-06 09:10:00] [quality-gate-dispatcher] === Gate run complete: gate_run=a branch=b verdict=PASS elapsed=1s ===
+[2026-10-06 09:40:00] [quality-gate-dispatcher] === Gate run complete: gate_run=b branch=b verdict=FAIL elapsed=1s ===
+[2026-10-06 14:05:00] [quality-gate-dispatcher] === Gate run complete: gate_run=c branch=b verdict=PASS elapsed=1s ===
+[2026-10-06 14:06:00] [quality-gate-dispatcher] === Gate run complete: gate_run=d branch=b verdict=SKIPPED_BEAD_CLOSED elapsed=1s ===
+EOF
+OUT9="$(/usr/bin/python3 "$HERE/gate-daily-report.py" --city "$C" --day 2026-10-06)"
+L7="$(echo "$OUT9" | grep '^7)')"
+echo "$L7" | grep -q '^7) revisadas/hora (log do gate): dia 0,1/h (3 em 24 h; meta >= 8/h) | por hora 00h-23h: 0 0 0 0 0 0 0 0 0 2 0 0 0 0 1 0 0 0 0 0 0 0 0 0 | agora, últimas 3 h: 0,0/h$' && ok || bad "T9: line 7 with a log: $L7"
+echo "$OUT9" | grep -q 'Missão Athos 14/11' && ok || bad "T9: the mission line is missing"
+
 echo "gate-daily-report selftest: $PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ]
