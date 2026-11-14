@@ -69,12 +69,17 @@ if [ -z "$RECLAIM_FN" ]; then
 fi
 # ga-xxtwytk: the reclaim takes the owner off through these two helpers (guarded write + read-back) BEFORE the flight labels;
 # a harness that cuts out only the reclaim runs it without them ('command not found') and nothing is ever reclaimed.
+# ga-w6a9xps: and gives a story its story:approved back first (_pilot_restore_approved + _pilot_approved_verdict), same reason.
 OWNER_FN="$(extract_fn '_pilot_owner_state')
-$(extract_fn '_pilot_release_owner')"
-if [ -z "$(extract_fn '_pilot_owner_state')" ] || [ -z "$(extract_fn '_pilot_release_owner')" ]; then
-  echo "FATAL: _pilot_owner_state()/_pilot_release_owner() not found in $DISPATCHER (extraction pattern drifted)" >&2
-  exit 2
-fi
+$(extract_fn '_pilot_release_owner')
+$(extract_fn '_pilot_approved_verdict')
+$(extract_fn '_pilot_restore_approved')"
+for _need in _pilot_owner_state _pilot_release_owner _pilot_approved_verdict _pilot_restore_approved; do
+  if [ -z "$(extract_fn "$_need")" ]; then
+    echo "FATAL: $_need() not found in $DISPATCHER (extraction pattern drifted)" >&2
+    exit 2
+  fi
+done
 # _pilot_crew_stale_reclaim calls _beadid_branch_signal as a plain shell
 # function (no timeout wrapper) — override it with a test double rather than
 # extracting the real one, which would otherwise need a full git-repo sandbox.

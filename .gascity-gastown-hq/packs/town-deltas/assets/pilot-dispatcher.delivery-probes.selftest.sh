@@ -412,7 +412,7 @@ FNS2="$TMP/fns2.sh"
 : > "$FNS2"
 for _fn in _delivery_branch_patterns_ready _delivery_branch_local_ref _delivery_branch_remote_hit \
            _target_has_real_branch _beadid_has_crew_branch _beadid_matched_crew_branch_ref _beadid_branch_signal \
-           _iso_to_epoch _sling_is_live _beadid_live_crew_owner _pilot_owner_state _pilot_release_owner _pilot_crew_stale_reclaim; do
+           _iso_to_epoch _sling_is_live _beadid_live_crew_owner _pilot_owner_state _pilot_release_owner _pilot_approved_verdict _pilot_restore_approved _pilot_crew_stale_reclaim; do
   awk -v n="$_fn" '$0 ~ "^"n"\\(\\) *\\{" {f=1} f {print} f && /^}$/ {exit}' "$PD" >> "$FNS2"
 done
 cat >> "$FNS2" <<'STUBS2'
@@ -435,7 +435,7 @@ bd() {
 }
 STUBS2
 bash -n "$FNS2" 2>/dev/null || { echo "FATAL: section-9 functions do not parse" >&2; exit 2; }
-for _fn in _sling_is_live _beadid_live_crew_owner _pilot_owner_state _pilot_release_owner _pilot_crew_stale_reclaim _beadid_branch_signal; do
+for _fn in _sling_is_live _beadid_live_crew_owner _pilot_owner_state _pilot_release_owner _pilot_approved_verdict _pilot_restore_approved _pilot_crew_stale_reclaim _beadid_branch_signal; do
   grep -q "^${_fn}()" "$FNS2" || { echo "FATAL: $_fn not extracted from $PD" >&2; exit 2; }
 done
 BDLOG="$TMP/bd.log"; : > "$BDLOG"
