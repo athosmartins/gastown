@@ -57,7 +57,10 @@ QUORUM PROTOCOL:
        no majority     → DIVERGED: mark quorum:diverged + notify 🚨.
 
 VALID ACTIONS (crew votes must use one of these verbatim):
-  reclaim           — strip story:in-flight + reset bead to open for re-dispatch
+  reclaim           — strip story:in-flight + reset bead to open for re-dispatch. A feature/story that was
+                      dispatched/approved gets story:approved back FIRST (confirmed by reading the bead back;
+                      ga-btr2dof, same contract as ga-w6a9xps): the builder's claim had dropped it, and a story
+                      with no story:* label is read by auto-refino's RAW sweep as a new idea.
   reassign:<crew>   — update bead assignee to the named crew
   needs-human       — add gate:needs-human (park for human review)
   close:<reason>    — close the bead with the given reason
@@ -76,7 +79,10 @@ Silence = healthy. Emits on action only:
   [QUORUM] [CONVENED]  created quorum bead, nudged 3 crews
   [QUORUM] [RESOLVED]  2-of-3 agreed, action executed
   [QUORUM] [DIVERGED]  no majority after timeout, escalated 🚨
-  [QUORUM] [ERROR]     execution failed (logged; bead left in quorum:convening)
+  [QUORUM] [RECLAIM]   a reclaim read the bead and decided what story:approved needs (verdict)
+  [QUORUM] [RETRY]     2-of-3 still agree; the last execution was not confirmed, trying again
+  [QUORUM] [ERROR]     execution failed QUORUM_EXEC_MAX_ATTEMPTS times (logged; bead left as it was, in
+                       quorum:convening). An unconfirmed reclaim stops before stripping anything.
 """
 from __future__ import annotations
 
@@ -105,6 +111,7 @@ VOTE_TIMEOUT_SEC = int(os.environ.get("QUORUM_VOTE_TIMEOUT_SEC", "900"))   # 15m
 POLL_SEC = int(os.environ.get("QUORUM_POLL_SEC", "300"))                   # 5min
 BD_TIMEOUT = int(os.environ.get("QUORUM_BD_TIMEOUT", "25"))
 GC_TIMEOUT = int(os.environ.get("QUORUM_GC_TIMEOUT", "20"))
+EXEC_MAX_ATTEMPTS = int(os.environ.get("QUORUM_EXEC_MAX_ATTEMPTS", "3"))   # an unconfirmed action is retried once per poll, then given up
 
 STATE_FILE = os.path.join(CITY, ".gc/state/quorum-convergence-watchdog.json")
 KILL_SWITCH = os.path.join(CITY, ".gc/state/quorum-convergence-watchdog.disabled")
@@ -529,20 +536,115 @@ def _decide(votes: dict[str, str]) -> str | None:
     return None
 
 
+# ── reclaim: story:approved goes back BEFORE story:in-flight comes off (ga-btr2dof, same contract as ga-w6a9xps) ──
+
+def _labels_of(bead: object) -> list[str] | None:
+    """Labels of one `bd show --json` object (list-wrapped or bare). A bead with NO labels is []: bd OMITS the `labels` key (measured 14/11 on the real store, 11 of 11
+    label-less open beads), so a missing key on an object that has an id means "has none". Anything that is not a bead object — None, an error envelope, a `labels` that is not
+    a list — is None: "could not read" never passes for "has no labels"."""
+    if isinstance(bead, list):
+        bead = bead[0] if bead else None
+    if not isinstance(bead, dict):
+        return None
+    labels = bead.get("labels")
+    if isinstance(labels, list):
+        return [str(x) for x in labels]
+    if labels is None and bead.get("id") and "error" not in bead:
+        return []
+    return None
+
+
+def _approved_verdict(bead: object) -> str | None:
+    """What a bead about to lose story:in-flight needs, from one `bd show --json` object. Same table as inflight-reclaim-guard.py's _approved_verdict (ga-w6a9xps; both carry tier1-bypass since ga-btr2dof):
+
+    "restore"           feature/story carrying story:in-flight and NO other story:* label, WITH a trace that it was dispatched/approved (pilot:dispatched, pilot.dispatched_at
+                        or story.aprovado_por) → story:approved must go back first
+    "no-proof"          same shape, no such trace: never re-approved here (only Athos approves; it may be parked by hand) → nothing to write
+    "tier1-bypass"      same shape + the tech-debt label: the Pilot's Tier-1 dispatches tech-debt of ANY type with no approval (pilot-dispatcher.sh `bd list -l tech-debt`; the
+                        same exemption as quality-gate-guard.sh gap1_backstop_action skip:tech-debt), so a dispatch trace proves nothing about Athos → nothing to write
+    "has-approved" / "not-in-flight" / "other-story-state" (done/triage/…: never overwritten) / "not-story" (bug/task/chore/unknown type) → nothing to write
+    None                cannot know (see _labels_of). Only "restore" writes.
+
+    Why: the builder's own claim drops story:approved while the Pilot's story:in-flight stays; taking story:in-flight off leaves the story with NO story:* label, which auto-refino's
+    RAW sweep reads as a fresh idea and sends back to Athos for a second approval (wa-tvrs41.5, 13/11).
+    vazio (bead sem labels) → "not-in-flight"; falhou/ilegível → None (NÃO sei), nunca "nada a fazer"."""
+    labels = _labels_of(bead)
+    if labels is None:
+        return None
+    if isinstance(bead, list):
+        bead = bead[0]
+    if "story:approved" in labels:
+        return "has-approved"
+    if "story:in-flight" not in labels:
+        return "not-in-flight"
+    if any(x.startswith("story:") and x != "story:in-flight" for x in labels):
+        return "other-story-state"
+    if bead.get("issue_type") not in ("feature", "story"):
+        return "not-story"
+    if "tech-debt" in labels:
+        return "tier1-bypass"
+    md = bead.get("metadata") if isinstance(bead.get("metadata"), dict) else {}
+    # Proof that Athos's approval stood at dispatch: the Pilot dispatches a story wearing story:approved and stamps it; story.aprovado_por is the approval recipe's own stamp. Without
+    # either, "in-flight without approved" is also what a bead Athos parked by hand looks like — never re-approved.
+    if ("pilot:dispatched" in labels or str(md.get("pilot.dispatched_at") or "") != ""
+            or str(md.get("story.aprovado_por") or "") != ""):
+        return "restore"
+    return "no-proof"
+
+
+def _label_set_verified(bead_id: str, op: str, label: str, attempts: int = 3, delay_secs: float = 1.0) -> bool:
+    """`bd label <op> <bead_id> <label>` (op = add | remove), then READ the bead back: True only when the label really is there (add) / gone (remove). The exit code of the write is
+    not proof (ga-9tgos: a write can report success and not persist; ga-jzye0): the write is repeated up to `attempts` times and a read-back that cannot be made counts as not confirmed.
+    vazio → n/a (a write has no "empty"); falhou/ilegível → False, never True."""
+    want = op == "add"
+    for attempt in range(1, attempts + 1):
+        if _run([BD, "label", op, bead_id, label, "-q"], timeout=BD_TIMEOUT) is None:
+            _emit("WARN", f"bd label {op} {label} on {bead_id} failed (attempt {attempt}/{attempts})")
+        # vazio → bead sem labels = []: confirma a remoção, não a adição; falhou/ilegível → None: não confirma nada, tenta de novo e no fim devolve False
+        labels = _labels_of(_show_bead(bead_id))
+        if labels is not None and (label in labels) == want:
+            return True
+        if attempt < attempts:
+            time.sleep(delay_secs)
+    return False
+
+
+def _reclaim(bead_id: str) -> bool:
+    """Send a story:in-flight bead back to the pool. The bead is READ first; a story that was dispatched/approved gets story:approved back — confirmed by a read-back — BEFORE
+    story:in-flight comes off, so it never sits with zero story:* labels (ga-w6a9xps, wa-tvrs41.5). Each label is removed only if present and confirmed gone; the first failure
+    aborts BEFORE owner/status are touched. True = the labels are released (the owner/status calls were issued, not verified); False = something could not be confirmed and the
+    bead is left as it was, or approved+in-flight (what a building story looks like): the caller keeps the quorum open and tries again."""
+    # vazio → bead sem labels = []: nada a tirar, segue; falhou/ilegível → labels/verdict None: não escreve nada e devolve False
+    bead = _show_bead(bead_id)
+    labels, verdict = _labels_of(bead), _approved_verdict(bead)
+    if labels is None or verdict is None:
+        _emit("WARN", f"reclaim {bead_id}: cannot read its labels (bd show failed or unreadable) — cannot tell whether story:approved must go back; nothing touched")
+        return False
+    _emit("RECLAIM", f"{bead_id}: verdict={verdict}")
+    if verdict == "restore":
+        if not _label_set_verified(bead_id, "add", "story:approved"):
+            _emit("WARN", f"reclaim {bead_id}: story:approved could not be confirmed back — aborting before story:in-flight is stripped; nothing else touched")
+            return False
+        _emit("RECLAIM", f"{bead_id}: story:approved is back (read back) before story:in-flight is stripped")
+    for lbl in ("story:in-flight", "pilot:dispatched"):
+        if lbl in labels and not _label_set_verified(bead_id, "remove", lbl):
+            _emit("WARN", f"reclaim {bead_id}: {lbl} could not be confirmed removed — assignee/status untouched")
+            return False
+    # Owner and status: the two calls are unchanged from before ga-btr2dof and still UNVERIFIED (exit codes ignored, no read-back) — the contract above covers the labels only.
+    _run([BD, "update", bead_id, "--assignee", ""], timeout=BD_TIMEOUT)
+    _run([BD, "reopen", bead_id], timeout=BD_TIMEOUT)
+    return True
+
+
 # ── action execution ──────────────────────────────────────────────────────────
 
 def _execute_action(bead_id: str, action: str) -> bool:
-    """Execute the agreed quorum action on the original bead. Returns True on success."""
+    """Execute the agreed quorum action on the original bead. Returns True on success: for reclaim only after the labels were read back (see _reclaim); the other actions
+    still report the exit code of their one write."""
     action = action.strip().lower()
 
     if action == "reclaim":
-        # Strip story:in-flight, pilot:dispatched; reset status to open; clear assignee.
-        _run([BD, "label", "remove", bead_id, "story:in-flight", "-q"], timeout=BD_TIMEOUT)
-        _run([BD, "label", "remove", bead_id, "pilot:dispatched", "-q"], timeout=BD_TIMEOUT)
-        r = _run([BD, "update", bead_id, "--assignee", ""], timeout=BD_TIMEOUT)
-        # bd reopen resets status to open
-        _run([BD, "reopen", bead_id], timeout=BD_TIMEOUT)
-        return True
+        return _reclaim(bead_id)
 
     if action.startswith("reassign:"):
         crew = action.split(":", 1)[1].strip()
@@ -623,7 +725,8 @@ def _run_cycle(state: dict, now: float) -> None:
         agreed = _decide(votes)
 
         if agreed:
-            _emit("RESOLVED", f"blocker={bid} action={agreed} votes={votes}")
+            tries = int(session.get("exec_failures", 0))
+            _emit("RESOLVED" if tries == 0 else "RETRY", f"blocker={bid} action={agreed} votes={votes}")
             bead = _show_bead(bid)
             title = bead.get("title", bid) if bead else bid
 
@@ -644,8 +747,14 @@ def _run_cycle(state: dict, now: float) -> None:
                             capture_output=True, text=True, timeout=10)
                     except Exception:
                         pass
+                elif tries + 1 < EXEC_MAX_ATTEMPTS:
+                    # ga-btr2dof: an unconfirmed action leaves the bead as it was or in a consistent state (reclaim stops before stripping anything; a story:approved that landed
+                    # but could not be read back just sits next to story:in-flight): keep the quorum open — the next poll collects the votes again and executes again. The count lives in the persisted session, so QUORUM_EXEC_MAX_ATTEMPTS bounds it across restarts.
+                    session["exec_failures"] = tries + 1
+                    _emit("WARN", f"action={agreed} on {bid} not confirmed (attempt {tries + 1}/{EXEC_MAX_ATTEMPTS}) — bead left as it was; the quorum stays open for the next cycle")
+                    continue
                 else:
-                    _emit("ERROR", f"failed to execute action={agreed} on {bid}")
+                    _emit("ERROR", f"failed to execute action={agreed} on {bid} after {tries + 1} attempts")
                 session["decided"] = True
                 to_remove.append(quorum_id)
 
