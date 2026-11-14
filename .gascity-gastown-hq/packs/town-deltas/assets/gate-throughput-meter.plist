@@ -1,0 +1,34 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <key>Label</key><string>com.gascity.gate-throughput-meter</string>
+  <!-- Reviews per hour done by the gate (ga-v8p1tx.1.1; Athos 14/11: "ao menos 8 revisadas por hora").
+       Counts the 'Gate run complete' lines (PASS+FAIL) of quality-gate-dispatcher.log; under 8/h over 3 h → ONE mail
+       to the Mayor with the hourly counts, the 24 h average and the probable cause (empty queue = supply, full
+       queue = reviewers). Silence = healthy. One run reads the ~16 MB log in about 0.5 s of CPU, far under the
+       10 min interval, and a flock keeps a second instance out. Its own log: .gc/logs/gate-throughput-meter.log -->
+  <key>ProgramArguments</key><array>
+    <string>/usr/bin/python3</string>
+    <string>/Users/athos/gt/.gascity-gastown-hq/packs/town-deltas/assets/scripts/gate-throughput-meter.py</string>
+  </array>
+  <key>WorkingDirectory</key><string>/Users/athos/gt/.gascity-gastown-hq</string>
+  <key>StartInterval</key><integer>600</integer>
+  <key>RunAtLoad</key><true/>
+  <key>Nice</key><integer>10</integer>
+  <key>LowPriorityIO</key><true/>
+  <key>StandardOutPath</key><string>/Users/athos/gt/.gascity-gastown-hq/.gc/logs/gate-throughput-meter-launchd.out</string>
+  <key>StandardErrorPath</key><string>/Users/athos/gt/.gascity-gastown-hq/.gc/logs/gate-throughput-meter-launchd.err</string>
+  <key>EnvironmentVariables</key><dict>
+    <key>PATH</key><string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:/Users/athos/go/bin:/Users/athos/.local/bin</string>
+    <key>HOME</key><string>/Users/athos</string>
+    <key>GC_CITY_PATH</key><string>/Users/athos/gt/.gascity-gastown-hq</string>
+    <key>BD_ACTOR</key><string>automation</string>
+    <!-- Target reviews/hour (default 8) and window in hours (default 3). -->
+    <!-- <key>GTM_TARGET</key><string>8</string> -->
+    <!-- <key>GTM_WINDOW_H</key><string>3</string> -->
+    <!-- Dry run: decide and log, send no mail, write no state. -->
+    <!-- <key>GTM_DRY_RUN</key><string>1</string> -->
+    <!-- Kill-switch: GTM_ENABLED=0 turns the meter off entirely. -->
+    <!-- <key>GTM_ENABLED</key><string>1</string> -->
+  </dict>
+</dict></plist>

@@ -99,6 +99,31 @@ echo "$OUT6" | grep -q '6) E11 (teto 800 linhas de produção): 1 recusa(s)' && 
 OUT7=$(/usr/bin/python3 "$HERE/gate-daily-report.py" --city "$C" --day 2026-10-06 2>&1)
 echo "$OUT7" | grep -q '6) E11 (teto 800 linhas de produção): 0 decisões registradas' && ok || bad "empty guard log for the day = '0 decisões registradas' (distinct from unreadable): $(echo "$OUT7" | grep '^6)')"
 
+# ── ga-v8p1tx.1.1 14/11: line 7 — reviews per hour, from the dispatcher log's 'Gate run complete' lines (PASS+FAIL) ──
+OUT8=$(/usr/bin/python3 "$HERE/gate-daily-report.py" --city "$C" --day 2026-10-06 2>&1)
+echo "$OUT8" | grep -q '^7) revisadas por hora: não medido (log do dispatcher ilegível' && ! echo "$OUT8" | grep '^7)' | grep -q '0,0/h' && ok || bad "line 7 with no dispatcher log must read 'não medido', never 0/h: $(echo "$OUT8" | grep '^7)')"
+cat > "$C/.gc/logs/quality-gate-dispatcher.log" <<'EOF'
+[2026-10-05 12:00:00] [quality-gate-dispatcher] dispatcher start
+[2026-10-06 10:00:00] [quality-gate-dispatcher] === Gate run complete: gate_run=ga-a1 branch=b verdict=PASS elapsed=100s ===
+[2026-10-06 11:00:00] [quality-gate-dispatcher] === Gate run complete: gate_run=ga-a2 branch=b verdict=FAIL elapsed=100s ===
+[2026-10-06 11:05:00] [quality-gate-dispatcher] === Gate run complete: gate_run=ga-a2 branch=b verdict=FAIL elapsed=100s ===
+[2026-10-06 11:10:00] [quality-gate-dispatcher] === Gate run complete: gate_run=ga-a3 branch=b verdict=SKIPPED_BEAD_CLOSED elapsed=1s ===
+[2026-10-06 12:00:00] [quality-gate-dispatcher] === Gate run complete: gate_run=ga-a4 branch=b verdict=PASS elapsed=100s ===
+EOF
+OUT9=$(/usr/bin/python3 "$HERE/gate-daily-report.py" --city "$C" --day 2026-10-06 2>&1)
+echo "$OUT9" | grep -q '^7) revisadas por hora: 0,1/h no dia (3 revisadas em 24 h; 0 de 24 horas com ≥ 8,0); ' && echo "$OUT9" | grep '^7)' | grep -q 'meta ≥ 8,0/h$' && ok || bad "line 7: 3 distinct PASS/FAIL runs on the day (a repeated run and a SKIPPED do not count): $(echo "$OUT9" | grep '^7)')"
+# a log that starts after the day began cannot vouch for the day: the day part is 'não medido', not a low number
+printf '[2026-10-06 09:00:00] [quality-gate-dispatcher] === Gate run complete: gate_run=ga-b1 branch=b verdict=PASS elapsed=100s ===\n' > "$C/.gc/logs/quality-gate-dispatcher.log"
+OUT10=$(/usr/bin/python3 "$HERE/gate-daily-report.py" --city "$C" --day 2026-10-06 2>&1)
+echo "$OUT10" | grep -q '^7) revisadas por hora: não medido (o log do dispatcher só cobre desde 06/10 09:00)' && ok || bad "line 7 with a log shorter than the day: $(echo "$OUT10" | grep '^7)')"
+# a broken / missing meter must degrade line 7 only, never the whole report
+SOLO="$W/solo"; mkdir -p "$SOLO"; cp "$HERE/gate-daily-report.py" "$SOLO/"
+OUT11=$(/usr/bin/python3 "$SOLO/gate-daily-report.py" --city "$C" --day 2026-10-06 2>&1); RC11=$?
+[ "$RC11" = "0" ] && echo "$OUT11" | grep -q '^7) revisadas por hora: não medido (medidor indisponível: FileNotFoundError)' && echo "$OUT11" | grep -q '^6) E11' && ok || bad "line 7 with the meter missing (rc=$RC11): $(echo "$OUT11" | grep -E '^[67]\)')"
+printf 'raise RuntimeError("quebrado")\n' > "$SOLO/gate-throughput-meter.py"
+OUT12=$(/usr/bin/python3 "$SOLO/gate-daily-report.py" --city "$C" --day 2026-10-06 2>&1)
+echo "$OUT12" | grep -q '^7) revisadas por hora: não medido (medidor indisponível: RuntimeError)' && ok || bad "line 7 with a meter that raises: $(echo "$OUT12" | grep '^7)')"
+
 # ── ga-3xrr3l 24/10: --post must not lose the day silently. The bd comment is retried (3 tries), bd's own stderr is
 # shown, and when it still fails the notify says "NÃO gravado" at a higher priority (it used to be the normal notify,
 # so the phone got the numbers and nobody knew the bead — the record — was missing the day). Fake bd/notify come first

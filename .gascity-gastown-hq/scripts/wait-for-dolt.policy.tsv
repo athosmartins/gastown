@@ -39,6 +39,7 @@ com.gascity.dolt-load-attributor	isento	atribui a carga do Dolt a quem a causa: 
 com.gascity.dolt-remote-peer-audit	isento	audita os peers conectados ao Dolt: observador do Dolt
 com.gascity.gate-health-monitor	isento	KeepAlive: daemon que o launchd relança sozinho; o wrapper trocaria o respawn dele por uma espera de até o prazo
 com.gascity.gate-recovery-watchdog	isento	KeepAlive: daemon que o launchd relança sozinho; o wrapper trocaria o respawn dele por uma espera de até o prazo
+com.gascity.gate-throughput-meter	isento	mede lendo só arquivos (log do dispatcher e gate-focus.state), sem bd/dolt: com o Dolt fora ele continua medindo e avisa que está cego; o único ato com Dolt é o `gc mail send`, que sem Dolt falha, não carimba e repete na rodada seguinte
 com.gascity.hetzner-capacity-step	isento	leitura de capacidade do nó Hetzner (ssh + gc session list + bd list): sem o Dolt a leitura de sessões vira "desconhecido" e conta o nó cheio, e a de CPU/RAM segue valendo; o wrapper só adiaria a medição
 com.gascity.hetzner-occupancy-watch	isento	vigia de ocupação do nó Hetzner (gc session list + /proc/stat por ssh): sem o Dolt a leitura de sessões vira "desconhecido" e a de CPU segue valendo; o wrapper só adiaria a medição
 com.gascity.inflight-reclaim-guard	isento	KeepAlive: daemon que o launchd relança sozinho; o wrapper trocaria o respawn dele por uma espera de até o prazo
