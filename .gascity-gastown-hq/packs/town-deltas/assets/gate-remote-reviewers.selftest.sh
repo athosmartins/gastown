@@ -51,8 +51,7 @@ case "${FAKE_SSH_MODE:-room}" in
   room)    echo dog-remote-adhoc-aaaaaaaaaa ;;
   empty)   : ;;
   full4)   printf 'dog-remote-adhoc-1\nwa-worker-remote-2\nx-3\ny-4\n' ;;
-  rev2)    printf 'gate-reviewer-remote-adhoc-0000000001\ngate-reviewer-remote-adhoc-0000000002\n' ;;
-  rev3)    printf 'gate-reviewer-remote-adhoc-0000000001\ngate-reviewer-remote-adhoc-0000000002\ngate-reviewer-remote-adhoc-0000000003\n' ;;
+  revn)    i=0; while [ "$i" -lt "${FAKE_REV_N:-0}" ]; do i=$((i + 1)); printf 'gate-reviewer-remote-adhoc-%010d\n' "$i"; done ;;
   down)    echo "ssh: connect to host hetzner-teste port 22: Operation timed out" >&2; exit 1 ;;
   garbage) echo "Welcome to Ubuntu 24.04 - some banner" ;;
   partial) echo dog-remote-adhoc-aaaaaaaaaa; echo "second host unreachable" >&2; exit 1 ;;
@@ -131,8 +130,14 @@ R="$(pick "$LIB" "$C" FAKE_SSH_MODE=room FAKE_SSH_LOG="$SSHLOG")"; eq "one sessi
 eq "the question asked is exactly 'list-running'" "$(cat "$SSHLOG")" "list-running"
 R="$(pick "$LIB" "$C" FAKE_SSH_MODE=empty)";   eq "empty list with rc 0 = nobody there = room" "$(tpl "$R")" "gate-reviewer-remote"
 R="$(pick "$LIB" "$C" FAKE_SSH_MODE=full4)";   eq "4 of 4 sessions on the node → local" "$(tpl "$R")/$(kind "$R")" "gate-reviewer/fallback"; has "…and says full" "$R" "full"
-R="$(pick "$LIB" "$C" FAKE_SSH_MODE=rev2)";    eq "2 remote reviewers of the template cap 3 (host not full: 2 of 4) → still room → remote (ga-yjrg7n6: it was 2 of 2 → local)" "$(tpl "$R")/$(kind "$R")" "gate-reviewer-remote/node"
-R="$(pick "$LIB" "$C" FAKE_SSH_MODE=rev3)";    eq "3 of 3 remote reviewers (host not full: 3 of 4) → local by the TEMPLATE cap" "$(tpl "$R")/$(kind "$R")" "gate-reviewer/fallback"; has "…and says which cap" "$R" "node has 3 of 3 gate-reviewer-remote sessions"
+# The TEMPLATE cap is read from the real agent.toml, not written here: the Mayor moves it (2 → 3 in ga-yjrg7n6 → 7 in b4146d8f1, 01/11) and the copy of the
+# number that lived in this file turned the suite red when he did (3 assertions, untouched since 29/10). The host cap is raised far above it, so only the
+# template cap can answer `full`.
+TCAP="$(sed -n 's/^max_active_sessions *= *\([0-9][0-9]*\).*/\1/p' "$REMOTE_TOML" | head -n 1)"
+case "$TCAP" in ''|*[!0-9]*|0|1) bad "the template cap could not be read from $REMOTE_TOML (got [$TCAP])"; TCAP=3 ;; esac
+mkcity "$TMP/capc"; flag_on "$TMP/capc"; cfg_edit "$TMP/capc" "h.__setitem__('cap',$((TCAP + 20)))"
+R="$(pick "$LIB" "$TMP/capc" FAKE_SSH_MODE=revn FAKE_REV_N=$((TCAP - 1)))"; eq "$((TCAP - 1)) of $TCAP remote reviewers (host far from full) → still room → remote (ga-yjrg7n6: at the old cap, 2 of 2 → local)" "$(tpl "$R")/$(kind "$R")" "gate-reviewer-remote/node"
+R="$(pick "$LIB" "$TMP/capc" FAKE_SSH_MODE=revn FAKE_REV_N=$TCAP)";     eq "$TCAP of $TCAP remote reviewers (host far from full) → local by the TEMPLATE cap" "$(tpl "$R")/$(kind "$R")" "gate-reviewer/fallback"; has "…and says which cap" "$R" "node has $TCAP of $TCAP gate-reviewer-remote sessions"
 R="$(pick "$LIB" "$C" FAKE_SSH_MODE=down)";    eq "host unreachable (rc 1) → local, NOT room" "$(tpl "$R")" "gate-reviewer"; has "…says unknown" "$R" "unknown"
 R="$(pick "$LIB" "$C" FAKE_SSH_MODE=partial)"; eq "partial list + rc 1 (one host answered, another did not) → local" "$(tpl "$R")" "gate-reviewer"
 R="$(pick "$LIB" "$C" FAKE_SSH_MODE=garbage)"; eq "a line that is not a session name → local" "$(tpl "$R")" "gate-reviewer"
@@ -386,7 +391,11 @@ hasF "$DISPATCHER" 'the flag file exists but gate-remote-reviewers.lib.sh is NOT
 
 echo "── 5. the template: agent.toml, prompt, names ──"
 get() { sed -n "s/^$1 *= *\"\{0,1\}\([^\"]*\)\"\{0,1\} *\$/\1/p" "$REMOTE_TOML" | head -n1; }
-eq "max_active_sessions = 3 (ga-yjrg7n6; never 1: crew-session-dedup would read 1 as a singleton and kill the second session)" "$(get max_active_sessions)" "3"
+case "$(get max_active_sessions)" in
+  ''|*[!0-9]*) bad "max_active_sessions is not a number in the template" ;;
+  *) if [ "$(get max_active_sessions)" -ge 2 ]; then ok "max_active_sessions >= 2 (never 1: crew-session-dedup would read 1 as a singleton and kill the second session; the value itself is the Mayor's: 3 in ga-yjrg7n6, 7 on 01/11)"
+     else bad "max_active_sessions < 2: crew-session-dedup would read the template as a singleton and kill the second session"; fi ;;
+esac
 eq "min_active_sessions = 0 (no standing session: the slot is released when the review is done)" "$(get min_active_sessions)" "0"
 eq "provider = claude-headless" "$(get provider)" "claude-headless"
 eq "wake_mode = fresh" "$(get wake_mode)" "fresh"
@@ -529,6 +538,11 @@ MLIB="$(mutate_lib cl-empty '0:ok) printf '"'"'ok'"'"' ;;' '0:*) printf '"'"'ok'
 killed "a gate that said nothing (rc 0, empty) counts as ok" "$MLIB" "$(m_claude empty)" "gate-reviewer"
 MLIB="$(mutate_lib cl-timeout 'raw="$("$tbin" -k 5 "$secs" "$py" -I "$bin" gate 2>/dev/null </dev/null)"' 'raw="$("$py" -I "$bin" gate 2>/dev/null </dev/null)"')"
 killed "the Claude gate runs unbounded" "$MLIB" "$(m_claude hang GATE_REMOTE_CLAUDE_SECS=1)" "gate-reviewer"
+
+# o teto do próprio template: sem ele só o cap do host limita os revisores remotos (o selftest o fixava em 3 e ficou vermelho quando virou 7: ver TCAP, seção 2)
+m_cap() { mkcity "$MC"; flag_on "$MC"; cfg_edit "$MC" "h.__setitem__('cap',$((TCAP + 20)))"; tpl "$(pick "$MLIB" "$MC" FAKE_SSH_MODE=revn FAKE_REV_N="$TCAP")"; }
+MLIB="$(mutate_lib tcap 'if [ "$rem" -ge "$tcap" ]; then' 'if false; then')"
+killed "the template's own cap is ignored (only the host cap limits the remote reviewers)" "$MLIB" "$(m_cap)" "gate-reviewer"
 echo
 echo "gate-remote-reviewers selftest: $PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ]
