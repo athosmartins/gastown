@@ -59,6 +59,8 @@ COMO DECIDE (a 1ª regra que casa vale; tudo é lido da bead, nada é gravado ne
      que resolve para O MESMO arquivo; citar o nome numa string ou comentário não conta; candidato que não parseia é pulado e contado (`teste-importador-nao-parseou:N`). Passa pelos mesmos filtros do teste de nome (rsync, mac-only, espelho) e o par
      sai em `info` como `teste-importador:<código>=<teste>`. Só roda para código que não achou teste de nome; git/grep/leitura que falha -> unknown com `teste-derivado-ilegivel`.
      Achou -> node, basis `derivado` (`info`: teste-derivado:<código>=<teste>); mas se o texto tem palavra de ENVIO fora de identificador (envio(s), enviar, disparo(s), evolution, baileys: a tag `envio-acao`, BRAKE_SEND_RE; o freio de DERIVED_BLOCK_INFO; `dado-de-lead` saiu em ga-2hd02v.3.21 e `whatsapp`/`chip(s)`/`ban` saíram em ga-2hd02v.5.12: eram o nome do produto, não envio) -> mini, `freio-derivado:envio-acao`.
+     EXCEÇÃO (ga-v8p1tx.1.3): bead do tipo `bug` ou `feature` (BRAKE_FREE_TYPES: mudança de código por definição) NÃO é freada; a palavra só informa (`info`: `envio-acao` e `envio-liberado:<tipo>`) e quem decide a seguir são as moles (regra 4: credencial, banco e host Mac por evidência no código).
+     task, chore, tipo ausente ou ilegível seguem freando (é onde moram as operações: re-ler no aparelho, rodar em produção, migrar um job). Vale nas regras 6, 6b, 7 e 8; a regra 9 NÃO libera. Medição e leitura bead a bead: runbook hetzner-wa-node.md, «Medido em 14/11».
      Não achou -> unknown. Repo/git/espelho ilegível -> unknown com `info` `teste-derivado-ilegivel:<motivo>`; nunca vira node.
   7. CAMINHO DERIVADO (ga-2hd02v.3.20; só quando a bead NÃO cita nenhum arquivo de código — nome solto com extensão de código que não existe em lugar nenhum da árvore lida, o `part.py` de um script de
      diagnóstico, não conta como citado: `info` `caminho-solto-fora-da-arvore:<nome>`, ga-2hd02v.3.22; medido 30/10: 13 de 30 beads sondadas caíam em unknown `sem-prova-de-codigo-e-teste` porque o texto NOMEIA o módulo mas
@@ -69,7 +71,7 @@ COMO DECIDE (a 1ª regra que casa vale; tudo é lido da bead, nada é gravado ne
      conta só os vivos. Só há a cópia -> como antes: deriva e o filtro a freia. Não se generalizou para "ignora o que está fora do filtro": isso viraria o freio em preferência. (b) IRMÃS: os arquivos de código tocados pelos commits `fix|feat(<id>)` das beads de MESMO PAI (o campo `parent` ou o id sem o último `.N`; até 40 commits dos últimos 45 dias, WA_NODE_SIBLING_DAYS; um `git log`
      com prazo próprio, WA_NODE_SIBLING_TIMEOUT, 15 s) que ainda existem na árvore. Mais de 10 arquivos derivados no total = nenhum (`caminho-derivado-demais:N`; é palpite largo). Os caminhos derivados passam pelos MESMOS
      filtros dos citados, sem afrouxar nada: filtro do rsync (fora dele -> mini `caminho-derivado-fora-do-filtro:<p>`), lista mac-only (mini `caminho-derivado-so-no-mac:<p>`), as moles e o PII da regra 3/4 (que já rodaram antes)
-     e o freio de envio da regra 6 (mini `freio-derivado:envio-acao`). A prova do teste é a mesma da regra 6 (o teste que o repo já tem para o código derivado) ou, se a bead cita o teste, o próprio teste citado.
+     e o freio de envio da regra 6 (mini `freio-derivado:envio-acao`; com a exceção de bug/feature dela). A prova do teste é a mesma da regra 6 (o teste que o repo já tem para o código derivado) ou, se a bead cita o teste, o próprio teste citado.
      Achou -> node, basis `derivado`, motivo `prova-caminho-derivado:N-teste(s)+M-codigo(s)` (`info`: caminho-derivado:<nome:X|irmas>=<caminho>, teste-derivado:<código>=<teste>). Nada derivado ou nenhum teste -> unknown como antes.
      Falha de leitura (repo, git, rsync, mac-only, espelho, git log das irmãs sem resposta) -> unknown com `info` `caminho-derivado-ilegivel:<motivo>`; "falhou" nunca é "vazio" e nunca é node (nem pela regra 8: bead que cita teste e cuja regra 7 não leu fica unknown). Custo: os `git ls-tree`/`git log` só
      rodam com nome ou pai para consultar; o `git log` das irmãs fica num cache por pai (6 h; o cache nunca decide: o conteúdo dele passa pela árvore e pelos filtros, e cache ilegível/vencido/de outro pai é recalculado);
@@ -80,13 +82,13 @@ COMO DECIDE (a 1ª regra que casa vale; tudo é lido da bead, nada é gravado ne
      o nome é procurado na raiz, em lib/, daemons/ e scripts/ — as raízes do pytest.ini e dos `sys.path.insert` dos testes do WA — e na pasta do teste e na de cima) e JS/CJS/MJS/TS por `require('./x')`/`import … from './x'`/`import('./x')`
      (só caminho relativo; pacote npm e builtin não são do repo). Entram só arquivos de código (py/sh/js/mjs/cjs/ts, fora de tests/) que EXISTEM em origin/main; stdlib e pacote de terceiros não casam arquivo nenhum e somem sozinhos.
      Os arquivos achados passam pelos MESMOS filtros do citado, sem afrouxar nada: um que o filtro do rsync nega -> mini `codigo-do-teste-fora-do-filtro:<p>`; um da lista mac-only -> mini `codigo-do-teste-so-no-mac:<p>` (o teste não roda no nó sem
-     o módulo que importa); mais de 10 -> nenhum (`codigo-do-teste-demais:N`); o freio de envio da regra 6 vale. Achou e passou -> node, basis `derivado`, motivo `prova-codigo-derivado-do-teste:N-teste(s)+M-codigo(s)` (`info`: codigo-do-teste:<teste>=<código>).
+     o módulo que importa); mais de 10 -> nenhum (`codigo-do-teste-demais:N`); o freio de envio da regra 6 vale (com a exceção de bug/feature dela). Achou e passou -> node, basis `derivado`, motivo `prova-codigo-derivado-do-teste:N-teste(s)+M-codigo(s)` (`info`: codigo-do-teste:<teste>=<código>).
      Nada importado do repo -> unknown SEM nota (vazio é legítimo). Falha de leitura (repo, git show, teste que não parseia, rsync, mac-only) -> unknown com `info` `codigo-do-teste-ilegivel:<motivo>`; "falhou" nunca é "vazio" e nunca é node.
   9. ORÁCULO = TESTE VERMELHO EM MAIN (ga-2hd02v.5.13, A1; só quando a bead é do tipo `bug`, cita >=1 teste e NENHUM código, e as regras 7 e 8 LERAM e não derivaram código algum): o texto DIZ que o teste reprova em main, então o teste
      vermelho é a prova — quem constrói tem o que reproduzir e o que fazer ficar verde, sem módulo nomeado. "Diz" = na MESMA frase de um `main` (`origin/main` ou «em/no/na/do/da/de/ao main»; `main thread`, `main.py` e `main()` não são a branch) há uma palavra
      de vermelho (reprova, falha, vermelho/a(s), quebrado/a(s), fail(s)); a frase que nega colado antes da palavra («não reprova em main») ou que diz que passa/está verde/corrigido NÃO vale. Lê-se o texto normalizado (minúsculo, sem acento) e só ele.
      Cada teste citado tem de existir em origin/main (a árvore, uma leitura só: «vermelho em main» de teste que nem está em main é palpite); algum ausente -> unknown e `info` nomeia até 3 (`oraculo-teste-fora-de-main:<teste>`, o resto em `-mais:N`). Os testes passam
-     pelos mesmos filtros do citado (rsync, mac-only, espelho: já passaram na regra 3), pelo freio de envio da regra 6 (mini `freio-derivado:envio-acao`) e, já em PROOF por serem citados, o portão das moles (regra 4) os lê: um e2e que abre o banco real vai ao mini.
+     pelos mesmos filtros do citado (rsync, mac-only, espelho: já passaram na regra 3), pelo freio de envio da regra 6 (mini `freio-derivado:envio-acao`; aqui SEM a exceção de bug/feature: toda bead desta regra é bug, e a prova dela é só a afirmação do texto de que o teste está vermelho) e, já em PROOF por serem citados, o portão das moles (regra 4) os lê: um e2e que abre o banco real vai ao mini.
      Achou -> node, basis `derivado`, motivo `prova-oraculo-teste-vermelho:N-teste(s)`. Tarefa/feature/chore (o epic nem chega aqui: é `mini` na regra 2), bug que não diz que está vermelho em main, sem teste citado ou com código (citado ou derivado) -> unknown SEM nota (vazio é legítimo).
      Se a regra 7 ou a 8 NÃO CONSEGUIU LER (`caminho-derivado-ilegivel`, `codigo-do-teste-ilegivel`) a regra 9 NÃO roda: o código que a leitura que falhou não viu pode existir. "Falhou" nunca é "vazio" e nunca é node; a leitura da árvore da própria regra 9, se falhar,
      dá unknown com `oraculo-ilegivel:<motivo>` (rede de segurança: é a árvore que a regra 8 já leu e guardou, então hoje não é alcançável; sem caso no selftest). MEDIDO (05/11, as 171 beads WA abertas no wa-worker, classificador de antes × este, bead a bead): node 5 -> 11, unknown 64 -> 58, mini 102 -> 102; as únicas 6 mudanças são bugs com teste vermelho em main (wa-9b70jk, wa-appaph, wa-jzaa2w, wa-kjwmcv, wa-sb1jyl, wa-xy301a); wa-jhblfa (tarefa de achados do gate) segue unknown. Ver o runbook hetzner-wa-node.md.
@@ -178,8 +180,14 @@ MAX_DERIVED_TESTS = 100                                              # candidato
 # ga-2hd02v.5.12: o freio da prova derivada olha a tag ESTREITA `envio-acao` (palavra de ENVIO fora de identificador: BRAKE_SEND_RE), não mais a larga `envio-whatsapp`. Medido em 04/11 nas 132 beads WA abertas
 # que o Pilot segurava (94 mini + 38 unknown): 26 caíam em `freio-derivado:envio-whatsapp`; lidas uma a uma, 12 só tinham `whatsapp` (rótulo de launchd `com.whatsapp.*`, nome do produto), `chip(s)` (aparelho da frota) ou
 # `ban` (`ban-correlation-dashboard`) — nenhuma envia nada; das outras 14, só 1 (wa-gu0l2t.6, «PODE AUTO-ENVIAR») muda um caminho de envio sem dúvida (2 mexem na composição da fila de envio) e o resto cita a palavra em prosa. Aquelas palavras são o vocabulário do PRODUTO, o mesmo erro que tirou `dado-de-lead` aqui
-# em ga-2hd02v.3.21. A tag larga `envio-whatsapp` continua em `info` (a sombra mede com ela); só o FREIO passou a ler a estreita. Palavra de envio que sobra (envio, enviar, disparo, evolution, baileys) segue freando: o
+# em ga-2hd02v.3.21. A tag larga `envio-whatsapp` continua em `info` (a sombra mede com ela); só o FREIO passou a ler a estreita. Palavra de envio que sobra (envio, enviar, disparo, evolution, baileys) segue freando (desde a ga-v8p1tx.1.3, abaixo, só o que não é bug nem feature, e a regra 9): o
 # envio é irreversível (uma mensagem a lead não tem desfazer) e a superfície de envio do WA é larga demais (`whapi` em 275 arquivos, `human_sender` em 177) para trocar a palavra por evidência no código sem medir antes.
+# ga-v8p1tx.1.3: nas provas derivadas das regras 6, 6b, 7 e 8 o freio só vale para o que NÃO é mudança de código (task, chore, tipo ausente ou ilegível); bug e feature seguem direto às moles (regra 4). A regra 9 (oráculo) mantém o freio.
+# Medido em 14/11 nas 349 beads WA (o `bd show` de cada uma, o classificador contra `origin/main`, o recibo de banco só-schema do nó): 24 caíam em `freio-derivado:envio-acao` (10 bug, 4 feature, 10 task), todas por prova derivada. Lidas uma a uma (runbook hetzner-wa-node.md, «Medido em 14/11»):
+# a palavra era prosa na maioria («Fila de envio» e «p/ envio» são nome de tela e rótulo; «o envio abre o WhatsApp do usuário certo» descreve o sistema que se muda; «nenhum envio» é proibição). Sem NENHUM freio, 17 das 24 seguem no mini pelas MOLES (a evidência no código da prova, o portão que vem DEPOIS)
+# e 7 viram node: 4 são mudança de código (bug, feature) e 3 NÃO são código+teste, todas task: operação em aparelho de produção (wa-xzr0su), mudança de infra (wa-l4nveg), decisão de produto (wa-ay1zv6). Por isso o corte é o TIPO, que é um campo e não vocabulário. O nó não tem credencial, banco real nem
+# aparelho: um teste lá não envia nada, então o freio não o protege, e o que ele segurava a evidência das moles e o gate seguram. A regra 9 mantém o freio porque a prova dela é só o que o texto afirma (o teste está vermelho), a mais fraca de todas.
+BRAKE_FREE_TYPES = ("bug", "feature")                                # `issue_type` que libera o freio (tupla: um tipo que não é texto, lista por exemplo, não casa e não dá erro). Outro texto, vazio ou ausente = freia, como antes
 DERIVED_BLOCK_INFO = ("envio-acao",)                                 # palavra informativa que, só para a prova derivada (mais fraca), manda ao mini. `dado-de-lead` saiu (ga-2hd02v.3.21): é regex de VOCABULÁRIO (lead(s), cliente(s), cpf, cnpj, telefone(s), celular(es), conversa(s), dump, csv, xlsx, parquet, terreno(s), lote(s), construtora(s), proprietari*), não de dado, e segurava 18 beads (ga-2hd02v.3.17) — 4 das 15 P0/P1 WA aprovadas (30/10). O dado em si é barrado por portões que não mudam: filtro do rsync, varredura PII do espelho, dado-no-texto (telefone/CPF no JSON da bead — NOME, e-mail, CNPJ e endereço no texto NÃO o acionam: esse freio de vocabulário deixou de existir por pedido do Mayor) e as moles; banco e credencial já bloqueiam antes
 NAME_RE = re.compile(r"(?<![\w/.\-~$])([A-Za-z][A-Za-z0-9]*(?:[_\-][A-Za-z0-9]+)+)(?![\w/]|\.\w)")   # `ficha_donos`, `form-fill`: nome de módulo/tela/daemon SEM caminho (o que tem pasta ou extensão é caminho e já foi lido)
 MAX_NAME_TOKENS = 30                                                 # nomes distintos lidos de uma bead
@@ -838,9 +846,15 @@ def derive_code(b, text):
     return out, notes
 
 
+def brake_released(info):
+    """True iff o TIPO da bead libera o freio de envio da prova derivada (ga-v8p1tx.1.3): `classify_core` deixa `envio-liberado:<tipo>` em `info` quando a palavra de envio existe e o `issue_type` é de BRAKE_FREE_TYPES.
+    Só as regras 6, 6b, 7 e 8 (`judged_derived`) olham isto; o oráculo (regra 9, `judged_oracle`) não. As moles (regra 4) rodam depois de qualquer jeito."""
+    return any("envio-liberado:" + t in info for t in BRAKE_FREE_TYPES)
+
+
 def judged_derived(found, tag, paths, tests, info, dinfo):
-    """o veredito de uma prova DERIVADA (regras 6, 7 e 8): node `<tag>:N-teste(s)+M-codigo(s)`; mas envio no texto (DERIVED_BLOCK_INFO) manda ao mini, porque é uma prova mais fraca que o teste citado."""
-    blocked = [s for s in DERIVED_BLOCK_INFO if s in info]
+    """o veredito de uma prova DERIVADA (regras 6, 7 e 8): node `<tag>:N-teste(s)+M-codigo(s)`; mas envio no texto (DERIVED_BLOCK_INFO) manda ao mini, porque é uma prova mais fraca que o teste citado — a não ser que a bead seja de CÓDIGO (bug, feature: brake_released)."""
+    blocked = [] if brake_released(info) else [s for s in DERIVED_BLOCK_INFO if s in info]
     if blocked:
         return "mini", ["freio-derivado:" + ",".join(blocked)], paths, tests, info + dinfo
     for c in found:                                                 # os arquivos de código e de teste desta prova são onde as moles procuram evidência (regra 4); código só das irmãs é palpite: lido, mas só informa
@@ -1014,7 +1028,7 @@ def red_in_main(ntext):
 
 
 def judged_oracle(tests, paths, info, extra):
-    """o veredito da regra 9: node `prova-oraculo-teste-vermelho:N-teste(s)`; mas envio no texto (DERIVED_BLOCK_INFO) manda ao mini, porque o teste vermelho é uma prova mais fraca que o teste citado com o código (o mesmo freio das regras 6-8).
+    """o veredito da regra 9: node `prova-oraculo-teste-vermelho:N-teste(s)`; mas envio no texto (DERIVED_BLOCK_INFO) manda ao mini, porque o teste vermelho é uma prova mais fraca que o teste citado com o código (o freio das regras 6-8, SEM a exceção delas: não olha `brake_released`. Toda bead desta regra é bug, um dos tipos que libera o freio lá, e a prova daqui é só o que o texto afirma, a mais fraca de todas; ga-v8p1tx.1.3).
     Os testes já estão em PROOF desde a citação (classify_core): é neles que as moles (regra 4) procuram evidência de banco, credencial e host Mac, e o e2e que abre o banco real vai ao mini por ali."""
     blocked = [s for s in DERIVED_BLOCK_INFO if s in info]
     if blocked:
@@ -1322,6 +1336,10 @@ def classify_core(b):
     info =[slug for slug, rx in INFO_RE if rx.search(ntext)]
     if BRAKE_SEND_RE.search(ntext):   # a tag estreita que o freio da prova derivada lê (DERIVED_BLOCK_INFO); a larga `envio-whatsapp` acima só informa
         info.append("envio-acao")
+        # ga-v8p1tx.1.3: o tipo que libera o freio nas regras 6-8 (brake_released) fica em `info` ao lado da palavra, para a sombra medir quantas a liberação levou ao nó.
+        # vazio (sem `issue_type`) → nada é liberado, o freio vale; falhou/ilegível (tipo que não é texto: lista, número) → o mesmo, e nada quebra: `in` sobre a tupla compara por igualdade
+        if b.get("issue_type") in BRAKE_FREE_TYPES:
+            info.append("envio-liberado:" + b["issue_type"])
     if "node:mini" in labels:
         return "mini", ["etiqueta-node:mini"], [], [], info
     # `exec:manual` = um HUMANO executa à mão (criar chave em console, aparelho físico): um construtor do nó nunca faz isso. O Pilot já não roteia essas beads, mas a palavra mole ("chave", "secret") era o que as

@@ -10,7 +10,7 @@
 #   teto de 40 caminhos · códigos de saída 0/10/11/2 · as regexes de telefone/CPF são as do hetzner-pii-scan.py.
 #   · TESTE DERIVADO (ga-2hd02v.3.15, regra 6): um repo git de mentira faz o papel do repo do WA (origin/main; o working tree e o HEAD à frente não valem); node/derivado só com código rastreado + teste de nome do módulo
 #   que CITA o módulo (palavra inteira) + teste que o nó tem (rsync, mac-only, espelho); módulo mais longo, nome curto/genérico, prefixo sem `_`, extensão fora de py/js/cjs/mjs e código que não existe em origin/main NÃO ganham teste;
-#   envio no texto manda ao mini (freio-derivado; lead/terreno/lote/construtora NÃO freiam mais, ga-2hd02v.3.21); repo/ref/git/grep/espelho que falham dão unknown COM a nota e vazio dá unknown SEM nota (três estados).
+#   envio no texto manda ao mini (freio-derivado; lead/terreno/lote/construtora NÃO freiam mais, ga-2hd02v.3.21; bug/feature também não, ga-v8p1tx.1.3: só task/chore/sem tipo, e a regra 9 não muda); repo/ref/git/grep/espelho que falham dão unknown COM a nota e vazio dá unknown SEM nota (três estados).
 #   · CÓDIGO DERIVADO DO TESTE (ga-2hd02v.3.21, regra 8): teste citado e NENHUM código -> o código que o teste IMPORTA (import/from em Python por ast, require/import em JS, lidos em origin/main); só existente e de código (não tests/),
 #   pelos MESMOS filtros do citado (fora do filtro / só no Mac = mini; mais de 10 = nenhum); a regra 7 e a 5 vencem a 8; teste novo, sem import do repo, import dinâmico ou apoio de teste = unknown SEM nota; git show/parse/repo que falham = unknown COM a nota.
 #   · EVIDÊNCIA ≠ DEPENDÊNCIA (ga-t05a1z9): banco/log/json citado como PROVA vira `info` (evidencia-de-dado:/evidencia-de-doc:) e não barra, mas só com >=1 código citado que o filtro deixa passar; segue duro dado sem
@@ -737,6 +737,34 @@ export WA_NODE_CACHE="$T/cache-orq"   # nunca gravado (a falha do git não grava
 export WA_NODE_GIT="$T/git-log-quebra"; expect "ilegível: git log das irmãs com rc 2 (regra 7 falhou) -> unknown com a nota da regra 7; o oráculo não decide" "$(DESCBI wa-par1.2 'tests/test_orc_a.py reprova em main')" 11 "$(NOTA7 irmas-git-rc-2)"; unset WA_NODE_GIT
 [ ! -e "$T/cache-orq" ] && ok "ilegível: a falha do git das irmãs não gravou cache" || bad "ilegível: a falha do git das irmãs gravou cache"
 export WA_NODE_CACHE="$T/cache"
+# ---- ga-v8p1tx.1.3: bug/feature LIBERAM o freio de envio nas provas derivadas das regras 6, 6b, 7 e 8 (a palavra só informa: `envio-acao` + `envio-liberado:<tipo>` em info); task, chore, tipo ausente ou ilegível seguem freando;
+# o oráculo (regra 9) mantém o freio; as moles (regra 4) e as regras duras valem DEPOIS da liberação. Medido em 14/11 nas 349 beads WA (runbook hetzner-wa-node.md, «Medido em 14/11»): das 24 freadas, 14 são bug/feature (4 viram node,
+# 10 caem nas moles) e 10 são task (seguem freadas: operação em aparelho de produção, mudança de infra, decisão de produto, análise).
+FREE_TXT='Corrigir lib/foo_parser.py antes de enviar a mensagem'
+TYPED() { field "$(DESC "$1")" issue_type "\"$2\""; }   # TYPED <texto> <tipo>: a bead do DESC com `issue_type`
+FS_BRAKE='"reasons": \["freio-derivado:envio-acao"\]'
+expect "liberado 1.3 (regra 6): bug com palavra de envio NÃO é freado -> node derivado; a palavra e o tipo ficam em info" "$(TYPED "$FREE_TXT" bug)" 0 "$FB_NODE"'.*"info": \["envio-whatsapp", "envio-acao", "envio-liberado:bug", "teste-derivado:lib/foo_parser\.py='
+expect "liberado 1.3 (regra 6): feature também é liberada" "$(TYPED "$FREE_TXT" feature)" 0 "$FB_NODE"'.*"envio-acao", "envio-liberado:feature"'
+expect "liberado 1.3 (controle): task com a MESMA palavra segue freada (é onde moram as operações)" "$(TYPED "$FREE_TXT" task)" 10 "$FS_BRAKE"
+expect_not "liberado 1.3 (controle): ...e a task não leva a tag de liberação" "$(TYPED "$FREE_TXT" task)" 10 'envio-liberado'
+expect "liberado 1.3 (controle): chore segue freado" "$(TYPED "$FREE_TXT" chore)" 10 "$FS_BRAKE"
+expect "liberado 1.3 (controle): sem issue_type segue freado (todos os casos antigos de freio são assim)" "$(DESC "$FREE_TXT")" 10 "$FS_BRAKE"
+expect "liberado 1.3 (controle): issue_type vazio segue freado" "$(TYPED "$FREE_TXT" '')" 10 "$FS_BRAKE"
+expect "liberado 1.3 (controle): o tipo é comparado como está (Bug com maiúscula não libera: tipo desconhecido freia, a mesma regra do estado inerte)" "$(TYPED "$FREE_TXT" Bug)" 10 "$FS_BRAKE"
+expect "liberado 1.3 (controle): issue_type que não é texto (lista) segue freado e não derruba o classificador" "$(field "$(DESC "$FREE_TXT")" issue_type '["bug"]')" 10 "$FS_BRAKE"
+expect_not "liberado 1.3: sem palavra de envio a tag de liberação não aparece (bug sem envio = o caminho de sempre)" "$(TYPED 'Corrigir lib/foo_parser.py quando a entrada vem vazia.' bug)" 0 'envio-liberado'
+expect "liberado 1.3 (regra 6b): bug liberado também na prova pelo teste IMPORTADOR" "$(TYPED 'ajustar lib/impt_target.py e o envio por whatsapp' bug)" 0 "$FB_NODE"'.*"envio-liberado:bug".*teste-importador:lib/impt_target\.py'
+expect "liberado 1.3 (regra 7): bug liberado na prova por NOME do módulo (ficha_donos) -> node, com a origem do caminho em info" "$(TYPED 'revisar ficha_donos antes de enviar a mensagem' bug)" 0 "$FB_NODE"'.*"envio-liberado:bug".*"caminho-derivado:nome:ficha_donos=lib/ficha_donos\.py"'
+expect "liberado 1.3 (regra 7, controle): a mesma bead como task segue freada" "$(TYPED 'revisar ficha_donos antes de enviar a mensagem' task)" 10 "$FS_BRAKE"
+expect "liberado 1.3 (regra 8): bug liberado na prova pelo código que o teste citado IMPORTA -> node" "$(TYPED 'Corrigir o envio da mensagem; teste em tests/test_imp_a.py' bug)" 0 "$FB_NODE"'.*"envio-liberado:bug".*codigo-do-teste:tests/test_imp_a\.py=lib/imp_alpha\.py'
+expect "liberado 1.3 (regra 8, controle): a mesma bead como task segue freada" "$(TYPED 'Corrigir o envio da mensagem; teste em tests/test_imp_a.py' task)" 10 "$FS_BRAKE"
+# o oráculo (regra 9) NÃO libera: a prova dele é só o que o texto afirma, e toda bead dele é bug. A tag de liberação aparece em info (o texto tem a palavra e o tipo é bug), mas quem freia ignora
+expect "liberado 1.3 (regra 9): o oráculo segue freando o bug com palavra de envio (a liberação não vaza para ele)" "$(DESCB 'Corrigir o envio da mensagem: tests/test_orc_a.py reprova em main')" 10 "$FS_BRAKE"'.*"envio-liberado:bug"'
+# a liberação só tira o freio de PALAVRA: o resto do caminho vale como sempre
+expect "liberado 1.3 + moles: bug com palavra de envio liberado mas com evidência de credencial no código da prova vai ao mini pelas moles" "$(TYPED 'ajustar lib/mole_cred.py antes de enviar a mensagem' bug)" 10 'moles:credencial.*mole-evidencia:credencial=lib/mole_cred\.py\[argv:secret\]'
+expect "liberado 1.3 + duro: caminho que o filtro segura vence a liberação" "$(TYPED 'Corrigir lib/foo_parser.py e data/helper.py antes de enviar a mensagem' bug)" 10 'caminho-fora-do-filtro:data/helper\.py'
+expect "liberado 1.3 + duro: telefone no texto vence a liberação" "$(TYPED 'Corrigir lib/foo_parser.py antes de enviar ao (31) 98876-5432' bug)" 10 '"reasons": \["dado-no-texto"\]'
+expect "liberado 1.3 + etiqueta: node:mini (decisão humana) vence a liberação" "$(labels "$(TYPED "$FREE_TXT" bug)" '["node:mini"]')" 10 '"reasons": \["etiqueta-node:mini"\]'
 export WA_NODE_REPO="$T/wa-repo-ausente" WA_NODE_MIRROR="$T/espelho-ausente"
 
 # ---- moles por EVIDÊNCIA (ga-qkc02kk, regra 4): a palavra mole escrita na bead é PROSA; quem decide é o CÓDIGO dos arquivos de prova, lido em origin/main. Três estados: leu e achou -> `moles:` (mesmo sem palavra); leu e não achou -> a
@@ -1008,6 +1036,21 @@ mutant freio-sem-underscore      '(?<![\w/.])' '(?<![/.])' "$FB_ROTA" 0 "$FB_NOD
 mutant freio-sem-ponto-antes     '(?<![\w/.])' '(?<![\w/])' "$(DESC 'Corrigir lib/foo_parser.py no rotulo com.envio')" 0 "$FB_NODE" "$DV"
 mutant freio-sem-ponto-depois    'baileys)(?![\w/]|\.\w)' 'baileys)(?![\w/])' "$(DESC 'Corrigir lib/foo_parser.py e o servico envio.worker')" 0 "$FB_NODE" "$DV"
 mutant freio-tag-larga-some      '("envio-whatsapp", r"\b(whatsapp|' '("envio-wa-x", r"\b(whatsapp|' "$(DESC 'Corrigir lib/foo_parser.py; o daemon com.whatsapp.db-sync reinicia no deploy')" 0 "$FB_NODE.*\"envio-whatsapp\"" "$DV"
+# ga-v8p1tx.1.3: a liberação do freio por tipo. Cada mutante tem o seu caso designado (os do bloco «liberado 1.3» lá em cima); FB_NODE e FB_BRAKE são os do bloco do 5.12. O oráculo usa $DV (o mesmo ambiente do $C9, que só é definido mais abaixo)
+LIB_BUG="$(TYPED "$FREE_TXT" bug)"; LIB_TASK="$(TYPED "$FREE_TXT" task)"; LIB_CAM="$(TYPED 'revisar ficha_donos antes de enviar a mensagem' bug)"; LIB_IMP="$(TYPED 'Corrigir o envio da mensagem; teste em tests/test_imp_a.py' bug)"
+RET_ANY='    return any("envio-liberado:" + t in info for t in BRAKE_FREE_TYPES)'
+mutant liberado-nunca             "$RET_ANY" '    return False' "$LIB_BUG" 0 "$FB_NODE" "$DV"
+mutant liberado-nunca-caminho     "$RET_ANY" '    return False' "$LIB_CAM" 0 "$FB_NODE" "$DV"
+mutant liberado-nunca-importa     "$RET_ANY" '    return False' "$LIB_IMP" 0 "$FB_NODE" "$DV"
+mutant liberado-sempre            "$RET_ANY" '    return True'  "$LIB_TASK" 10 "$FB_BRAKE" "$DV"
+mutant liberado-sem-bug           'BRAKE_FREE_TYPES = ("bug", "feature")' 'BRAKE_FREE_TYPES = ("feature",)' "$LIB_BUG" 0 "$FB_NODE" "$DV"
+mutant liberado-sem-feature       'BRAKE_FREE_TYPES = ("bug", "feature")' 'BRAKE_FREE_TYPES = ("bug",)' "$(TYPED "$FREE_TXT" feature)" 0 "$FB_NODE" "$DV"
+mutant liberado-com-task          'BRAKE_FREE_TYPES = ("bug", "feature")' 'BRAKE_FREE_TYPES = ("bug", "feature", "task")' "$LIB_TASK" 10 "$FB_BRAKE" "$DV"
+mutant liberado-com-chore         'BRAKE_FREE_TYPES = ("bug", "feature")' 'BRAKE_FREE_TYPES = ("bug", "feature", "chore")' "$(TYPED "$FREE_TXT" chore)" 10 "$FB_BRAKE" "$DV"
+mutant liberado-sem-marca         '            info.append("envio-liberado:" + b["issue_type"])' '            pass' "$LIB_BUG" 0 "$FB_NODE" "$DV"
+mutant liberado-tipo-fixo         '            info.append("envio-liberado:" + b["issue_type"])' '            info.append("envio-liberado:bug")' "$(TYPED "$FREE_TXT" feature)" 0 "$FB_NODE"'.*"envio-acao", "envio-liberado:feature"' "$DV"
+mutant liberado-marca-sem-palavra 'if BRAKE_SEND_RE.search(ntext):' 'if True:' "$(TYPED 'Corrigir lib/foo_parser.py quando a entrada vem vazia.' bug)" 0 '"info": \["teste-derivado:lib/foo_parser\.py=' "$DV"
+mutant liberado-vaza-no-oraculo   '    blocked = [s for s in DERIVED_BLOCK_INFO if s in info]' '    blocked = [] if brake_released(info) else [s for s in DERIVED_BLOCK_INFO if s in info]' "$(DESCB 'Corrigir o envio da mensagem: tests/test_orc_a.py reprova em main')" 10 "$FB_BRAKE" "$DV"
 mutant derivado-basis-text      'basis = "derivado" if any(w.startswith(("prova-teste-derivado:", "prova-caminho-derivado:", "prova-codigo-derivado-do-teste:", "prova-oraculo-teste-vermelho:")) for w in why) else "text"' 'basis = "text"' "$D_FOO" 0 '"basis": "derivado"' "$DV"
 mutant derivado-sem-maior       ' and not any(rest == m or rest.startswith(m + "_") for m in longer))' ')' "$(DESC 'ajustar lib/bar_service.py')" 0 'prova-teste-derivado:1-teste\(s\)' "$DV"
 mutant derivado-sem-generico    ' and s not in GENERIC_STEMS'          ''                                           "$(DESC 'ajustar lib/utils.py')" 11 'sem-prova-de-codigo-e-teste' "$DV"
