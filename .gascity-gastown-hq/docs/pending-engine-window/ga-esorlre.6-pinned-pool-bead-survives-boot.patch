@@ -1,0 +1,251 @@
+diff --git a/cmd/gc/build_desired_state.go b/cmd/gc/build_desired_state.go
+index 4bf4150d1f..20e659064f 100644
+--- a/cmd/gc/build_desired_state.go
++++ b/cmd/gc/build_desired_state.go
+@@ -3140,7 +3140,7 @@ func reusablePoolSessionBead(bp *agentBuildParams, cfgAgent *config.Agent, templ
+ 	if isFailedCreateSessionBead(bead) {
+ 		return false
+ 	}
+-	if bead.Metadata["state"] == "asleep" {
++	if bead.Metadata["state"] == "asleep" && !reusableAsleepCityStopPoolBead(bp, cfgAgent, template, bead, used) {
+ 		return false
+ 	}
+ 	if isManualSessionBeadForAgent(bead, cfgAgent) {
+@@ -3158,6 +3158,45 @@ func reusablePoolSessionBead(bp *agentBuildParams, cfgAgent *config.Agent, templ
+ 	return resolvedSessionTemplate(bead, reuseTemplateConfig(bp)) == template
+ }
+ 
++// reusableAsleepCityStopPoolBead reports whether an ASLEEP pool bead may be
++// reused instead of planning a fresh one: only a bead put to sleep by `gc stop`
++// (sleep_reason=city-stop) of a template with min_active_sessions>0, and only
++// while the beads already taken for this template this tick are fewer than the
++// minimum. That is exactly the set ComputeAwakeSet revives with the
++// "min-active" reason (cityStopPoolBeads, #2739), so the two sides agree: the
++// bead is both desired and woken, never desired-but-cold (the deadlock the
++// blanket asleep skip above exists to prevent).
++//
++// Without this the reboot planned a fresh bead next to the asleep one, the
++// asleep one fell out of desiredState and was swept as "no assigned work", and
++// the conversation armed on it (session_key, session.resume_armed_id) was
++// orphaned with it: the crew came back on a NEW conversation (ga-esorlre.6,
++// oracle-wa 13/11, sweep 8 min after boot).
++//
++// Any other asleep bead (idle-timeout, drained, template without a minimum)
++// keeps the old rule: not reused, the reconciler closes it.
++// E12: vazio (sem sleep_reason, minimo 0, bp sem snapshot) -> NAO reaproveita,
++// como antes; falhou/ilegivel (sleep_reason de outro valor) -> NAO reaproveita.
++func reusableAsleepCityStopPoolBead(bp *agentBuildParams, cfgAgent *config.Agent, template string, bead beads.Bead, used map[string]bool) bool {
++	if bp == nil || bp.sessionBeads == nil || cfgAgent == nil {
++		return false
++	}
++	if strings.TrimSpace(bead.Metadata["sleep_reason"]) != sleepReasonCityStop {
++		return false
++	}
++	minActive := cfgAgent.EffectiveMinActiveSessions()
++	if minActive <= 0 {
++		return false
++	}
++	taken := 0
++	for _, other := range bp.sessionBeads.Open() {
++		if other.ID != bead.ID && used[other.ID] && resolvedSessionTemplate(other, reuseTemplateConfig(bp)) == template {
++			taken++
++		}
++	}
++	return taken < minActive
++}
++
+ func reusablePoolSessionBeads(bp *agentBuildParams, cfgAgent *config.Agent, template string, used map[string]bool) []beads.Bead {
+ 	if bp == nil || bp.sessionBeads == nil {
+ 		return nil
+@@ -3169,6 +3208,11 @@ func reusablePoolSessionBeads(bp *agentBuildParams, cfgAgent *config.Agent, temp
+ 		}
+ 	}
+ 	sortSessionBeadsByCreatedAtThenID(candidates)
++	// A live bead is taken before an asleep city-stop one: ComputeAwakeSet only
++	// revives the asleep ones for the deficit the live beads leave.
++	sort.SliceStable(candidates, func(i, j int) bool {
++		return candidates[i].Metadata["state"] != "asleep" && candidates[j].Metadata["state"] == "asleep"
++	})
+ 	return candidates
+ }
+ 
+diff --git a/cmd/gc/build_desired_state_test.go b/cmd/gc/build_desired_state_test.go
+index 66d8923214..9c61bdef99 100644
+--- a/cmd/gc/build_desired_state_test.go
++++ b/cmd/gc/build_desired_state_test.go
+@@ -9752,6 +9752,80 @@ func TestSelectOrCreatePoolSessionBead_SkipsAsleepBeads(t *testing.T) {
+ 	}
+ }
+ 
++// ga-esorlre.6: a min_active_sessions template's asleep city-stop bead is the
++// one ComputeAwakeSet revives ("min-active", #2739). Pool realization must pick
++// the SAME bead; planning a fresh one next to it orphaned the asleep bead (and
++// the conversation armed on it) and the sweep then closed it.
++func TestSelectOrCreatePoolSessionBead_ReusesAsleepCityStopBeadWithinMinActive(t *testing.T) {
++	mk := func(t *testing.T, store beads.Store, id, state, sleepReason string) beads.Bead {
++		t.Helper()
++		meta := map[string]string{
++			"template":     "oracle",
++			"session_name": "oracle-" + id,
++			"state":        state,
++			"pool_managed": "true",
++			"session_key":  "00000000-0000-4000-8000-" + id,
++		}
++		if sleepReason != "" {
++			meta["sleep_reason"] = sleepReason
++		}
++		b, err := store.Create(beads.Bead{Title: "oracle", Type: sessionBeadType, Labels: []string{sessionBeadLabel, "template:oracle"}, Metadata: meta})
++		if err != nil {
++			t.Fatal(err)
++		}
++		return b
++	}
++	run := func(t *testing.T, minActive int, sleepReason string, takenBefore int) (asleepID, gotID string) {
++		store := beads.NewMemStore()
++		cfgAgent := config.Agent{Name: "oracle", MinActiveSessions: intPtr(minActive), MaxActiveSessions: intPtr(3)}
++		used := map[string]bool{}
++		var all []beads.Bead
++		for i := 0; i < takenBefore; i++ {
++			live := mk(t, store, fmt.Sprintf("%012d", i+1), "active", "")
++			used[live.ID] = true
++			all = append(all, live)
++		}
++		asleep := mk(t, store, "000000000099", "asleep", sleepReason)
++		all = append(all, asleep)
++		bp := &agentBuildParams{beadStore: store, sessionBeads: newSessionBeadSnapshot(all), agents: []config.Agent{cfgAgent}}
++		got, _, err := selectOrCreatePoolSessionBead(bp, &cfgAgent, "oracle", nil, used, map[int]bool{})
++		if err != nil {
++			t.Fatalf("selectOrCreatePoolSessionBead: %v", err)
++		}
++		return asleep.ID, got.ID
++	}
++	t.Run("city-stop asleep bead of a min_active=1 template is the one reused", func(t *testing.T) {
++		asleep, got := run(t, 1, "city-stop", 0)
++		if got != asleep {
++			t.Fatalf("got %q, want the asleep city-stop bead %q (a fresh bead orphans the armed conversation)", got, asleep)
++		}
++	})
++	t.Run("idle-timeout asleep bead is not reused", func(t *testing.T) {
++		asleep, got := run(t, 1, "idle-timeout", 0)
++		if got == asleep {
++			t.Fatal("an idle-timeout asleep bead must keep the old rule: fresh session instead")
++		}
++	})
++	t.Run("no sleep_reason is not reused", func(t *testing.T) {
++		asleep, got := run(t, 1, "", 0)
++		if got == asleep {
++			t.Fatal("an asleep bead without city-stop must not be reused")
++		}
++	})
++	t.Run("template without a minimum is not reused", func(t *testing.T) {
++		asleep, got := run(t, 0, "city-stop", 0)
++		if got == asleep {
++			t.Fatal("min_active_sessions=0: ComputeAwakeSet does not revive it, so reusing it would leave it desired but cold")
++		}
++	})
++	t.Run("beyond the minimum is not reused", func(t *testing.T) {
++		asleep, got := run(t, 1, "city-stop", 1)
++		if got == asleep {
++			t.Fatal("the minimum is already met by a taken bead: ComputeAwakeSet would not revive this one")
++		}
++	})
++}
++
+ func TestSelectOrCreatePoolSessionBead_ReusesActiveBeforeCreatingNew(t *testing.T) {
+ 	// An active (awake) pool session IS reused — no fresh bead created.
+ 	store := beads.NewMemStore()
+diff --git a/cmd/gc/city_runtime.go b/cmd/gc/city_runtime.go
+index 9984c96e3a..3ef3faceaf 100644
+--- a/cmd/gc/city_runtime.go
++++ b/cmd/gc/city_runtime.go
+@@ -2414,6 +2414,16 @@ func sweepUndesiredPoolSessionBeads(
+ 		if isManualSessionBead(bead) || isNamedSessionBead(bead) {
+ 			continue
+ 		}
++		// pin_awake is the operator's durable "keep this session" (gc session
++		// pin; ga-84rm): it survives config churn, so it must survive this
++		// sweep too. The sweep closed oracle-wa's pinned bead 8 min after the
++		// 13/11 boot as "no assigned work" and took the conversation armed on
++		// it along (ga-esorlre.6). Unpin (gc session unpin) makes it sweepable.
++		// E12: vazio (sem pin_awake) -> varre como antes; falhou/ilegivel
++		// (valor que nao e exatamente "true") -> nao e pin, varre como antes.
++		if sessionPinnedAwake(bead) {
++			continue
++		}
+ 		// Don't sweep beads that the reconciler still considers "start
+ 		// requested" — their work assignment window hasn't opened. The
+ 		// pending_create_claim lease mirrors the reconciler's recovery model:
+diff --git a/cmd/gc/city_runtime_test.go b/cmd/gc/city_runtime_test.go
+index 6f1794eb42..e339ddabca 100644
+--- a/cmd/gc/city_runtime_test.go
++++ b/cmd/gc/city_runtime_test.go
+@@ -93,6 +93,69 @@ func TestSweepUndesiredPoolSessionBeads_KeepsRunningSessionsOpen(t *testing.T) {
+ 	}
+ }
+ 
++// ga-esorlre.6: the sweep closed oracle-wa's pinned bead (asleep, city-stop, no
++// runtime) 8 min after the 13/11 boot as "no assigned work", and the
++// conversation armed on it went with it. pin_awake is the operator's durable
++// "keep this session"; the unpinned twin must still be swept (the control keeps
++// this test from passing because the fixture was never sweepable).
++func TestSweepUndesiredPoolSessionBeads_SkipsPinnedAwakeBead(t *testing.T) {
++	for _, tc := range []struct {
++		name       string
++		pin        string
++		wantClosed int
++	}{
++		{"pinned is kept", "true", 0},
++		{"unpinned control is swept", "", 1},
++		{"unreadable pin value is not a pin", "yes", 1},
++	} {
++		t.Run(tc.name, func(t *testing.T) {
++			store := beads.NewMemStore()
++			meta := map[string]string{
++				"session_name":         "worker-bd-123",
++				"template":             "worker",
++				"agent_name":           "worker",
++				"pool_slot":            "1",
++				poolManagedMetadataKey: boolMetadata(true),
++				"state":                "asleep",
++				"sleep_reason":         "city-stop",
++				"continuation_epoch":   "1",
++				"generation":           "1",
++			}
++			if tc.pin != "" {
++				meta["pin_awake"] = tc.pin
++			}
++			bead, err := store.Create(beads.Bead{
++				Title:    "worker",
++				Type:     sessionBeadType,
++				Labels:   []string{sessionBeadLabel, "agent:worker"},
++				Metadata: meta,
++			})
++			if err != nil {
++				t.Fatalf("Create: %v", err)
++			}
++			closed := sweepUndesiredPoolSessionBeads(
++				store,
++				nil,
++				newSessionBeadSnapshot([]beads.Bead{bead}),
++				nil,
++				&config.City{Agents: []config.Agent{{Name: "worker", MinActiveSessions: intPtr(1), MaxActiveSessions: intPtr(1)}}},
++				runtime.NewFake(),
++				false,
++			)
++			if closed != tc.wantClosed {
++				t.Fatalf("closed = %d, want %d", closed, tc.wantClosed)
++			}
++			got, err := store.Get(bead.ID)
++			if err != nil {
++				t.Fatalf("Get: %v", err)
++			}
++			if wasClosed := got.Status == "closed"; wasClosed != (tc.wantClosed == 1) {
++				t.Fatalf("bead status = %q, want closed=%v", got.Status, tc.wantClosed == 1)
++			}
++		})
++	}
++}
++
+ func TestPoolSweepWouldDrain(t *testing.T) {
+ 	store := beads.NewMemStore()
+ 	bead, err := store.Create(beads.Bead{
