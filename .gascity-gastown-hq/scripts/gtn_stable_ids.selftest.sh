@@ -183,11 +183,12 @@ ck "controle: sem o espaço, o formato com T continua passando (o mutante só qu
 CITY="$T/city"; mkdir -p "$CITY/.gc/logs" "$CITY/.gc/run"
 cat > "$T/run-real.sh" <<'EOF'
 #!/usr/bin/env bash
-# faz o papel do mbp-run.sh: roda o pytest DE VERDADE no --dir com os argumentos da noite (-n 14 vira -n 2) e imprime as linhas de prova do canário
+# faz o papel do mbp-run.sh: roda o pytest DE VERDADE no --dir com os argumentos de UM lote da noite (-n auto vira -n 2) e imprime as linhas de prova do canário (isolamento, teto de memória, egress)
 d=""; while [ $# -gt 0 ]; do case "$1" in --dir) d=$2;; --) shift; break;; esac; shift; done
 echo "GTN-ISO: isolado (sonda barrou 5 tentativas)"
+echo "GTN-CAP: MemoryMax=8192M MemorySwapMax=0 workers=2 (MemAvailable=20000M reserva=6144M base=4096M por-worker=1800M cpus=4)"
 cd "$d" || exit 97
-a=("$@"); for i in "${!a[@]}"; do [ "${a[$i]}" = 14 ] && a[$i]=2; done
+a=("$@"); for i in "${!a[@]}"; do [ "${a[$i]}" = auto ] && a[$i]=2; done
 PYTHONPATH="$PLUGIN_DIR" PYTHONHASHSEED=0 "$GTN_PY" -m pytest -p no:cacheprovider "${a[@]}"
 rc=$?
 echo "GTN-EGRESS: attempts=3"
@@ -205,6 +206,7 @@ reset_city() { find "$LOGDIR" -mindepth 1 -delete 2>/dev/null; : > "$CITY/.gc/lo
 scenario() { # script → 3 noites; devolve 0 se o relatório disse a verdade nas 3
   local s=$1 ok=0
   reset_city; dash 'v.startswith("ok")'; commit "noite 1"; night "$s"
+  [ -n "${GTN_DEBUG:-}" ] && { echo "--- night.out (noite 1)" >&2; head -c 3000 "$T/night.out" >&2; echo "--- relatório" >&2; head -c 2500 "$REPORT" >&2; }
   [ "$(jq -r . "$LOGDIR/last-complete.failed" | LC_ALL=C sort -u | cmp -s - "$EXPECT"; echo $?)" = 0 ] || { echo "   noite 1: a baseline não tem os 7 ids inteiros" >&2; ok=1; }
   has "$REPORT" 'primeira rodada completa' || { echo "   noite 1: sem o texto de primeira rodada" >&2; ok=1; }
   dash 'v.startswith("ok") or v == "a - c"'; commit "noite 2"; night "$s"
@@ -219,12 +221,12 @@ ck "script: 3 noites com o pytest de verdade (ids com ' - ' inteiros, irmão nov
 # ---- controles do script: o mutante com o corte antigo (id da linha humana, cortado no 1º " - ", sem conferir n) TEM de ser reprovado pelo cenário; o neutro (só um comentário) TEM de passar
 # (sem o neutro, "reprovado" não prova nada: um mutante que não roda por faltar um arquivo irmão também é reprovado)
 neg() { ! "$@"; }
-cp "$HERE/hetzner-iso-run.sh" "$HERE/gtn_stable_ids.py" "$T/"
+cp "$HERE/hetzner-iso-run.sh" "$HERE/gtn_stable_ids.py" "$HERE/hetzner-mac-only.txt" "$HERE/hetzner-rsync-filter.wa.txt" "$HERE/hetzner-pii-scan.py" "$T/"   # os irmãos que o script procura ao lado de si
 rd() { local c; c=$(cat "$1"; echo x); printf '%s' "${c%x}"; }
 c=$(rd "$HERE/hetzner-nightly-tests.sh")
-old1="LC_ALL=C sed -n 's/^GTN-FAIL: //p' \"\$OUT\" 2>/dev/null |"
-new1="LC_ALL=C sed -n -E 's/^(FAILED|ERROR) (.*)\$/\\2/p' \"\$OUT\" 2>/dev/null | sed -E 's/ - .*\$//' | jq -R . |"
-old2='elif [ "$NIDS" -ne "$SN" ]; then'
+old1="LC_ALL=C sed -n 's/^GTN-FAIL: //p' \"\$f\" 2>/dev/null |"
+new1="LC_ALL=C sed -n -E 's/^(FAILED|ERROR) (.*)\$/\\2/p' \"\$f\" 2>/dev/null | sed -E 's/ - .*\$//' | jq -R . |"
+old2='elif [ "$nids" -ne "$sn" ]; then'
 case $c in *"$old1"*) ok1=1;; *) ok1=0;; esac; case $c in *"$old2"*) ok2=1;; *) ok2=0;; esac
 ck "controle: os dois trechos a trocar existem no script (senão o mutante é o original)" test "$ok1$ok2" = 11
 m=${c/"$old1"/"$new1"}; m=${m/"$old2"/'elif false; then'}
@@ -234,5 +236,59 @@ printf '%s' "$c" | sed '2i\
 ck "controle: o mutante com o corte antigo difere do original" test -n "$(diff "$HERE/hetzner-nightly-tests.sh" "$T/m-corte-antigo.sh")"
 ck "controle: o mutante neutro (só um comentário) PASSA o cenário de 3 noites (o mutante é executável neste diretório)" scenario "$T/m-neutro.sh"
 ck "controle: o corte antigo é REPROVADO pelo cenário de 3 noites" neg scenario "$T/m-corte-antigo.sh"
+# ---- (3) o escudo do relatório (ga-84gkpab): o conftest do WA roda `git ls-files` dentro do makereport de quem reprova com FileNotFoundError; com `subprocess.run` trocado por um falso (stdout=None) ele levanta
+#   AttributeError → INTERNALERROR → rc=3 e o lote inteiro (milhares de testes) vira «não rodou». Mesmo cenário aqui, com um conftest que faz o mesmo: com o plugin o pytest TEM de terminar normal (rc=1, os 2
+#   reprovados nos GTN-FAIL, n=2) e dizer `GTN-ESCUDO: n=1`; o teste que reprova de verdade NÃO vira verde. O mutante sem o escudo TEM de reproduzir o rc=3 (senão o cenário não prova nada).
+SH="$T/shield"; mkdir -p "$SH/tests"
+cat > "$SH/conftest.py" <<'EOF'
+import subprocess
+
+import pytest
+
+
+@pytest.hookimpl(hookwrapper=True)
+def pytest_runtest_makereport(item, call):
+    yield
+    if call.excinfo is None or not isinstance(call.excinfo.value, FileNotFoundError):
+        return
+    r = subprocess.run(["git", "--version"], capture_output=True, text=True, timeout=10)
+    entradas = [e for e in r.stdout.split("\0") if e]  # o mesmo r.stdout.split do conftest do WA
+    assert entradas is not None
+EOF
+cat > "$SH/tests/test_shield.py" <<'EOF'
+import subprocess
+import types
+
+
+def test_arquivo_que_o_no_nao_tem(monkeypatch):
+    monkeypatch.setattr(subprocess, "run", lambda *a, **k: types.SimpleNamespace(returncode=0, stdout=None))
+    open("/nao/existe/gtn-shield-xyz")
+
+
+def test_passa():
+    pass
+
+
+def test_reprova_de_verdade():
+    assert 1 == 2
+EOF
+runshield() { # <dir do plugin> <saída> args... — pytest de verdade no projeto do escudo; grava o rc na última linha
+  local plug=$1 out=$2; shift 2; ( cd "$SH" && PYTHONPATH="$plug" PYTHONHASHSEED=0 "$PY" -m pytest -p no:cacheprovider -p gtn_stable_ids tests/ -q -rfE --tb=line "$@" ) > "$out" 2>&1; echo "rc=$?" >> "$out"; }
+shieldok() { has "$1" '^rc=1$' && has "$1" '^GTN-ESCUDO: n=1$' && has "$1" '^GTN-FAILED: n=2 reports=2$' && hasnt "$1" 'INTERNALERROR' \
+  && has "$1" '^GTN-FAIL: "tests/test_shield.py::test_arquivo_que_o_no_nao_tem"$' && has "$1" '^GTN-FAIL: "tests/test_shield.py::test_reprova_de_verdade"$' && has "$1" '1 passed'; }
+shielddies() { has "$1" '^rc=3$' && has "$1" 'INTERNALERROR'; }
+for mode in "-n 2" "-n 0"; do
+  runshield "$T/plug" "$T/out-shield-${mode// /}" $mode
+  ck "escudo ($mode): hook da suíte que quebra no relatório NÃO derruba a sessão (rc=1, GTN-ESCUDO: n=1, os 2 reprovados nos GTN-FAIL, 1 passou)" shieldok "$T/out-shield-${mode// /}"
+done
+mkdir -p "$T/plug-noshield"; sed 's/except Exception as exc:/except KeyError as exc:/' "$HERE/gtn_stable_ids.py" > "$T/plug-noshield/gtn_stable_ids.py"
+ck "controle: o plugin sem o escudo difere do original" test -n "$(diff "$HERE/gtn_stable_ids.py" "$T/plug-noshield/gtn_stable_ids.py")"
+ck "controle: o plugin sem o escudo tem o mesmo número de aspas do original" sameq "$T/plug-noshield/gtn_stable_ids.py"
+runshield "$T/plug-neutral" "$T/out-shield-neutral" -n 2
+ck "controle: o mutante neutro (só um comentário) PASSA o cenário do escudo (o mutante é executável aqui)" shieldok "$T/out-shield-neutral"
+for mode in "-n 2" "-n 0"; do
+  runshield "$T/plug-noshield" "$T/out-noshield-${mode// /}" $mode
+  ck "controle: sem o escudo o mesmo cenário aborta com INTERNALERROR e rc=3 ($mode) — é o que derrubou o lote 1 do trial" shielddies "$T/out-noshield-${mode// /}"
+done
 echo "---"; echo "$((n-fails))/$n ok"
 [ $fails -eq 0 ] && echo "SELFTEST OK" || { echo "SELFTEST FALHOU ($fails)"; exit 1; }

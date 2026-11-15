@@ -1,7 +1,7 @@
 """gtn_stable_ids — plugin do pytest da bateria noturna do nó Linux (ga-9p6pte). Carregado com `-p gtn_stable_ids` (PYTHONPATH=~/gt-remote/bin).
 
 ## Contents
-  Por quê · O que muda · Ids reprovados
+  Por quê · O que muda · Ids reprovados · Escudo do relatório
 
 POR QUÊ: a suíte inteira sob xdist abortava com "Different tests were collected between gw0 and gw1". Medido no nó (16/10, 4 coletas de 68.479 testes em cópias separadas):
   duas coletas com a MESMA semente de hash (PYTHONHASHSEED=0) diferem em 2 ids, e com sementes aleatórias em 3. A semente cobre a ORDEM de parametrização por set; o que sobra
@@ -22,9 +22,18 @@ IDS REPROVADOS: o relatório da noite compara os ids que falharam com os da noit
     GTN-FAILED: n=<ids distintos> reports=<falhas + erros que o pytest contou>
   `reports` é o número que o resumo do pytest também mostra (failed + error); o script confere os dois e a quantidade de linhas GTN-FAIL contra `n`. Sem zero por engano:
     vazio (nenhuma falha) → emite `n=0 reports=0`;  falhou/ilegível (qualquer exceção ao montar a lista) → NÃO emite nada, e o script lê "sem lista" como comparação indisponível.
+ESCUDO DO RELATÓRIO (ga-84gkpab): no trial de 15/11 o lote 1 da noite em lotes MORREU com rc=3 (INTERNALERROR do xdist) aos ~14% e perdeu 7.997 testes por causa de UM. Causa: o conftest.py raiz do WA
+  (`_filtrado_pelo_espelho`, wa-fsatxi) roda `git ls-files` dentro de `pytest_runtest_makereport` quando um teste reprova com FileNotFoundError; o teste
+  `test_alimentador_lista_ok_false_alarme_wa_79apps.py::test_aviso_liga_strict_exit_e_o_timeout_cobre_o_autodispatch` troca `subprocess.run` por um falso (`stdout=None`) E lê `scripts/notify`, que o nó
+  não recebe: o `r.stdout.split(NUL)` do conftest levanta AttributeError, o worker sai e o controlador aborta a sessão. No mini o arquivo existe, o hook nem corre e ninguém vê. Reproduz em 30 s com o
+  arquivo sozinho (`-n 0`, rc=3). A correção de fato é de uma linha no conftest do WA (tratar `stdout` que não é texto como «não sei»); até lá, e para qualquer outro hook da suíte que quebre
+  do mesmo jeito, este plugin envolve a montagem do relatório por FORA: se um hook levanta exceção, o relatório é refeito do jeito padrão do pytest (`TestReport.from_item_and_call`), SEM o hook que
+  quebrou. O teste continua reprovando (o FileNotFoundError é de verdade: o nó não tem o arquivo), nada vira verde; só deixa de derrubar o lote. O relatório refeito leva a seção `GTN-ESCUDO` e o controlador
+  imprime `GTN-ESCUDO: n=<quantos>` (só quando n > 0). Se nem o relatório padrão sai, a exceção original segue adiante (o lote aborta e fica «não rodou», como antes).
 """
 import json
 import re
+import sys
 
 import pytest
 
@@ -40,9 +49,40 @@ def pytest_collection_modifyitems(session, config, items):
             item._nodeid = stable
 
 
+def _relatorio_sem_o_hook(item, call, exc):
+    """O relatório padrão do pytest para (item, call), marcado com a seção GTN-ESCUDO; None se nem ele sai."""
+    try:
+        rep = pytest.TestReport.from_item_and_call(item, call)
+        aviso = "GTN-ESCUDO: um hook da suíte quebrou ao montar o relatório (%s: %s) em %s [%s]; relatório refeito sem ele" % (
+            type(exc).__name__, exc, item.nodeid, call.when)
+        rep.sections.append(("GTN-ESCUDO", aviso))
+        sys.stderr.write(aviso + "\n")
+        return rep
+    except Exception:
+        return None
+
+
+@pytest.hookimpl(wrapper=True, tryfirst=True)
+def pytest_runtest_makereport(item, call):
+    try:
+        return (yield)
+    except Exception as exc:
+        rep = _relatorio_sem_o_hook(item, call, exc)
+        if rep is None:
+            raise
+        return rep
+
+
 def pytest_terminal_summary(terminalreporter, exitstatus, config):
     if hasattr(config, "workerinput"):  # worker do xdist: quem tem todos os relatórios é o controlador
         return
+    try:
+        escudos = sum(1 for lst in terminalreporter.stats.values() for r in lst
+                      if any(nome == "GTN-ESCUDO" for nome, _ in (getattr(r, "sections", None) or ())))
+        if escudos:
+            terminalreporter.write_line("GTN-ESCUDO: n=%d" % escudos)
+    except Exception:
+        pass  # contar o escudo é enfeite: nunca atrapalha a lista de ids abaixo
     try:
         reports = [r for key in ("failed", "error") for r in terminalreporter.stats.get(key, []) if getattr(r, "count_towards_summary", True)]
         ids = sorted({r.nodeid for r in reports})
