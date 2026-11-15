@@ -72,11 +72,12 @@ EOF
 # `refuse` recusa o escopo; qualquer outro comando é registrado em CALLS (SCOPE: ...) e executado
 cat > "$T/bin/systemd-run" <<'EOF'
 #!/usr/bin/env bash
-mm=""; swap=""
-while [ $# -gt 0 ]; do case "$1" in -p) case "$2" in MemoryMax=*) mm=${2#MemoryMax=} ;; MemorySwapMax=*) swap=${2#MemorySwapMax=} ;; esac; shift 2 ;; --) shift; break ;; *) shift ;; esac; done
+mm=""; swap=""; col=0
+while [ $# -gt 0 ]; do case "$1" in -p) case "$2" in MemoryMax=*) mm=${2#MemoryMax=} ;; MemorySwapMax=*) swap=${2#MemorySwapMax=} ;; esac; shift 2 ;; --collect) col=1; shift ;; --) shift; break ;; *) shift ;; esac; done
 [ "${SD_MODE:-ok}" != refuse ] || { echo "Failed to connect to bus: No medium found" >&2; exit 1; }
 case "$*" in *memory.max*) case "${SD_MODE:-ok}" in ok) echo $(( ${mm%M} * 1048576 )) ;; nocap) echo max ;; empty) ;; esac; exit 0 ;; esac
 printf 'SCOPE: MemoryMax=%s MemorySwapMax=%s\n' "$mm" "$swap" >> "$CALLS"
+printf 'COLLECT: %s\n' "$col" >> "$CALLS"
 exec "$@"
 EOF
 chmod +x "$T/helper-stub.sh" "$T/bin/sudo" "$T/bin/nproc" "$T/bin/systemd-run"
@@ -113,6 +114,7 @@ case_cap() {
   CMD_RC=0 go "$1" -- python -m pytest -n auto
   ck "AUTO: linha GTN-CAP diz o teto, os workers e o que foi lido" has "$OUT" '^GTN-CAP: MemoryMax=13387M MemorySwapMax=0 workers=9 \(MemAvailable=19531M reserva=6144M base=2048M por-worker=1200M cpus=16\)$'
   ck "AUTO: o comando roda DENTRO do escopo com o teto e sem swap" has "$CALLS" '^SCOPE: MemoryMax=13387M MemorySwapMax=0$'; ck "AUTO: o escopo vem antes do comando (o comando roda no escopo)" test "$(sed -n 1p "$CALLS")" = "SCOPE: MemoryMax=13387M MemorySwapMax=0"
+  ck "AUTO: o escopo leva --collect (sem ele, todo lote com rc != 0 deixa um escopo 'failed' listado no nó até alguém rodar reset-failed)" has "$CALLS" '^COLLECT: 1$'
   ck "AUTO: o número de workers do comando é o calculado" has "$CALLS" '^CMD: WA_PYTEST_MAX_WORKERS=9 '; ck "AUTO: o canário sai primeiro (a linha GTN-ISO vem antes da GTN-CAP)" test "$(grep -n -E '^GTN-(ISO|CAP):' "$OUT" | cut -d: -f2 | head -n 2 | tr '\n' ' ')" = "GTN-ISO GTN-CAP "
   # MemAvailable maior que o teto: 28000000 kB = 27343 − 6144 = 21199 → teto de 20480; (20480 − 2048) / 1200 = 15 → nproc 16 limita a 14
   printf 'MemAvailable:   28000000 kB\n' > "$T/meminfo.e"; GTN_MEMINFO="$T/meminfo.e" go "$1" -- python -m pytest; ck "AUTO com muita memória: o teto máximo (20480M) segura e a CPU limita a 14 workers" has "$OUT" '^GTN-CAP: MemoryMax=20480M MemorySwapMax=0 workers=14 '

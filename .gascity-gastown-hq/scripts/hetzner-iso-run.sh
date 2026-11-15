@@ -89,7 +89,7 @@ else
   CEIL=$(( AVAIL_MB - RESERVE )); [ "$CEIL" -le "$CEILMAX" ] || CEIL=$CEILMAX
   [ "$CEIL" -ge $(( BASE + PER )) ] || cap_inert "memoria-insuficiente (MemAvailable=${AVAIL_MB}M − reserva ${RESERVE}M = ${CEIL}M; um worker precisa de ${BASE}M de base + ${PER}M)"
   WORKERS=$(( (CEIL - BASE) / PER )); CPUMAX=$(( NCPU - 2 )); [ "$CPUMAX" -ge 1 ] || CPUMAX=1; [ "$WORKERS" -le "$CPUMAX" ] || WORKERS=$CPUMAX
-  CAP=(systemd-run --user --scope --quiet -p "MemoryMax=${CEIL}M" -p MemorySwapMax=0)
+  CAP=(systemd-run --user --scope --quiet --collect -p "MemoryMax=${CEIL}M" -p MemorySwapMax=0)
   # a prova do teto: um escopo igual, que lê o PRÓPRIO memory.max. vazio/`max`/outro valor/falhou (sem o controlador de memória delegado, sem barramento de usuário) → INERTE
   GOT=$("${CAP[@]}" -- sh -c 'cat "/sys/fs/cgroup$(cut -d: -f3 /proc/self/cgroup)/memory.max"' 2>/dev/null)
   [ "$GOT" = "$(( CEIL * 1048576 ))" ] || cap_inert "teto-nao-provado (pedi MemoryMax=${CEIL}M = $(( CEIL * 1048576 )) bytes; o cgroup do escopo diz '${GOT:-vazio}'; o comando NAO roda sem teto)"

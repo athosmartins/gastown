@@ -9,7 +9,9 @@
 # o veredito da noite é INERTE e o relatório diz o que falta. Nunca se roda a suíte sem a prova do canário (04/10: um teste de branch antiga mandou
 # e-mail de verdade).
 #
-# timeout 10800s (3h) > o prazo do próprio script (HZN_TIMEOUT_S=9000, repartido entre os lotes, + busca, envio e relatório), para o script conseguir registrar o desfecho;
+# timeout 13500s (3h45) > o prazo do próprio script (HZN_TIMEOUT_S=12600, repartido entre os lotes, + busca, envio e relatório), para o script conseguir registrar o desfecho;
+# começa 05:00Z, então termina no máximo ~08:45Z, ANTES do hetzner-node-reseed (08:55Z), que reinstala o venv do nó se o freeze mudou: uma noite que passasse dessa hora o pegaria no meio.
+# Medido em 15/11 (dia, nó com load ~18): lotes de ~8000 testes levaram 1113/947/868/1353 s, ~1070 s em média; 10 lotes ≈ 11000 s. Mudou o orçamento? Confira esta conta e a do reseed.
 # o script tem trava de instância única, então uma rodada que passe da hora não empilha com a seguinte.
 #
 # Conferir depois de um reload:  gc order show hetzner-nightly-tests          -> Source: .../packs/town-deltas/...
@@ -19,4 +21,4 @@ description = "Madrugada (02:00 local): pytest completo do WhatsApp no nó Hetzn
 trigger = "cron"
 schedule = "0 5 * * *"
 exec = "bash $PACK_DIR/../../scripts/hetzner-nightly-tests.sh"
-timeout = "10800s"
+timeout = "13500s"
