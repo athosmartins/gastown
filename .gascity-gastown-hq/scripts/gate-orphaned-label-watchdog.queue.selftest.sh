@@ -33,7 +33,7 @@
 # EQUIVALENT dd73e5fa9a: `[ -z "$_arts" ] || [ "$_arts" = "null" ]` -> `&&` in _gate_artifact_probe: an empty answer falls through to the jq classification, which prints nothing for empty input, and the `[ -z "$_out" ]` branch prints the same `0 none 0` line the early return printed; the literal null cannot reach the test (the jq before it wraps it into [null]); MEASURED with an empty, a null and an open-marker answer: exit status, log, comments, notify, mail and state identical, with a control that diverges
 # EQUIVALENT 88d2e8e6db a0c704c15e 6f5824ceaa 9b9232c632: the lock helpers: `|| echo ""` -> `&& echo ""` after the stat fallbacks (the extra empty line is stripped by $( ): same value), `|| true` -> `&& true` after the pid read (same value) and after the heartbeat write (that status is read by nobody: its two callers are statements, each followed by a `-s` check), and `return 0` -> `1` of _release_golw_lock (only used as the EXIT trap, whose status the shell drops: checked on bash 5.2 and 3.2.57); MEASURED at function level on bash 5.2 and 3.2.57 over missing, empty, directory, dead-pid, live-pid and malformed heartbeat shapes: identical outputs, only the two statuses described differ
 # EQUIVALENT ab858725f9: `return 1` -> `0` on the empty-heartbeat check after the dead-holder test in _acquire_golw_lock: an empty or absent heartbeat reads as an empty pid, which _golw_lock_holder_dead treats as ALIVE, so the function has already returned 1 at the first liveness check; only a heartbeat emptied between two reads would reach it (READ from the code)
-# EQUIVALENT d4cc8682cb eba58dae1b: `return 1` -> `0` after a heartbeat write that failed (right after a successful mkdir, and under the recovery sentinel) in _acquire_golw_lock: reachable only when the write itself fails (disk full, read-only filesystem), which no env seam of the script produces and an fsize limit would turn into a test of the OS: NOT killable here, left alive on purpose
+# EQUIVALENT eba58dae1b: `return 1` -> `0` after a heartbeat write that failed under the recovery sentinel in _acquire_golw_lock (a dead holder's lock taken over in place): reachable only when the write TRUNCATES the heartbeat and then fails (or a peer empties it in that instant), because the empty-heartbeat check a few lines above already sent an empty one back as ALIVE (READ from the code); no env seam and no PATH shim of the script produces that, and an fsize limit would turn it into a test of the OS: NOT killable here, left alive on purpose. Its sibling right after the lock's own mkdir (d4cc8682cb) was killable and is killed by run 24: a mkdir shim makes that directory mode 000, so the heartbeat cannot be written
 set -uo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SCRIPT="${GOLW_SCRIPT_UNDER_TEST:-$HERE/gate-orphaned-label-watchdog.sh}"
@@ -376,6 +376,28 @@ mkdir -p "$LD"; printf '%s:tok\n' "$dp" > "$LD/heartbeat"
 run GOLW_QUEUE_EVIDENCE_MIN=5 PATH="$T/mkpeer:$P0" QS_LIVE_PID="$$"
 { grep -q "backing off (single-instance guard" "$T/golw.log" && [ ! -s "$T/comments" ] && [ ! -e "$LD.reaping" ] && [ "$(head -n 1 "$LD/heartbeat")" = "$$:peer" ]; } && ok "run 23: a holder that came back under the sentinel is not reclaimed (sentinel released, peer heartbeat kept)" || bad "run 23: the lock of a holder that turned live under the sentinel was taken over, or the sentinel was left behind"
 find "$LD" "$LD.reaping" -depth -delete 2>/dev/null
+
+echo "run 24: the lock directory is made but its heartbeat cannot be written (a mkdir shim makes THAT directory mode 000) -> the run backs off: nothing swept, exit 0 (the same sweep without the shim does comment)"
+if [ "$(id -u)" = 0 ]; then ok "run 24: (root writes into a mode 000 directory, case skipped)"; else
+  printf '[{"id":"wa-a2iz7b.1","status":"open","updated_at":"%s","metadata":{"gc.routed_to":"wa-worker"},"labels":["gate:needs-fix","gate:fix-attempt:1"]}]\n' "$OLD_TS" > "$T/candidates.json"
+  # vazio → no real mkdir to build the shim on: the probe below says bad and the case does not run; falhou/ilegível → the same (a shim with no command would make the lock's own mkdir fail, the run would back off for THAT reason and the back-off check would pass empty)
+  hb_real_mkdir="$(PATH="$P0" command -v mkdir)"; mkdir -p "$T/mkhb"
+  printf '%s\n' '#!/bin/sh' 'case "$1" in *.lock.d) exec '"$hb_real_mkdir"' -m 000 "$@" ;; esac' "exec $hb_real_mkdir \"\$@\"" > "$T/mkhb/mkdir"; chmod +x "$T/mkhb/mkdir"
+  "$T/mkhb/mkdir" "$T/hbprobe.lock.d" 2>/dev/null
+  if [ -n "$hb_real_mkdir" ] && [ -d "$T/hbprobe.lock.d" ] && [ ! -w "$T/hbprobe.lock.d" ]; then
+    ok "run 24: the shim makes a lock directory nobody can write into"
+    chmod 700 "$T/hbprobe.lock.d"; find "$T/hbprobe.lock.d" -depth -delete 2>/dev/null
+    run GOLW_QUEUE_EVIDENCE_MIN=5
+    grep -q "comment:wa-a2iz7b.1" "$T/comments" && ok "run 24: without the shim the same sweep comments the bead (so the back-off below is the lock's)" || bad "run 24: the control sweep did not comment the bead"
+    run GOLW_QUEUE_EVIDENCE_MIN=5 PATH="$T/mkhb:$P0"
+    rc=$?
+    { grep -q "backing off (single-instance guard" "$T/golw.log" && [ ! -s "$T/comments" ]; } && ok "run 24: a lock whose heartbeat could not be written is not held: the run backed off and swept nothing" || bad "run 24: the run went on to sweep with a lock it could not stamp (or did not back off)"
+    [ "$rc" -eq 0 ] && ok "run 24: backing off from an unstamped lock exits 0" || bad "run 24: backing off from an unstamped lock exited $rc"
+    chmod 700 "$LD" 2>/dev/null; find "$LD" -depth -delete 2>/dev/null   # a mode 000 directory the back-off could not remove would make every later run back off too
+  else
+    bad "run 24: the mkdir shim did not make an unwritable lock directory (no real mkdir, or -m 000 refused): the case cannot run"
+  fi
+fi
 
 echo ""
 echo "gate-orphaned-label-watchdog.queue selftest: PASS=$PASS FAIL=$FAIL"

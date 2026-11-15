@@ -52,14 +52,17 @@
 #      (count 2) cannot tell `-gt 0` from `-gt 1` (2 passes both); count 1 is the
 #      edge. An embedded mutant (`-gt 0` -> `-gt 1`) must FAIL scenario 9.
 #
-# EQUIVALENT (ga-iu0fvlo; 825d7d2791 08ba2503b4 09f520a343 d4f03dc13b f51fd9aafb 288e1a3742 — the six
-# `... -q 2>/dev/null || true` lines flipped to `&& true`): the script has no `set -e` and nobody reads the
-# rc of those removal/add calls (the post-state is VERIFIED from a fresh `bd show` further down, which is
-# the whole point of the `|| true`), so `|| true` and `&& true` leave the same state and the same exit code;
-# there is no scenario that sees the difference.
+# EQUIVALENT (ga-iu0fvlo, aged by ga-w6a9xps.3, re-measured by ga-pkds7gz): the seven `... -q 2>/dev/null || true` lines flipped to `&& true` (L96 `label add story:approved`; L104-L106 the
+# pilot:dispatched / pilot:dispatching / pilot.dispatched_at removals; L113 story:in-flight; L115 and L117 the reclaim-count swap). The id carries the line number: ga-w6a9xps.3 put 38 lines above the six
+# that ga-iu0fvlo declared (825d7d2791 08ba2503b4 09f520a343 d4f03dc13b f51fd9aafb 288e1a3742), so they moved to new ids and the sweep listed them again, plus the new L96. The script has no `set -e`,
+# no ERR trap and nothing reads the rc of those calls (the post-state is VERIFIED from a fresh `bd show` further down, and story:approved by its own read-back, which is the whole point of the `|| true`),
+# so `|| true` and `&& true` leave the same state, the same output and the same exit code. MEASURED, not only read: the real script against a fake bd whose world lives in files and whose calls fail
+# on demand, either WITHOUT doing the work or AFTER doing it (the third state): 408 worlds (feature/bug/story, tech-debt, with and without a trace of the dispatch, reclaim-count none/1/2/5; each of the
+# twelve mutated call shapes failing alone, all together, and at random), on bash 5.2.21 and on 3.2.57. The seven mutants gave the original's stdout, stderr, exit code, call log and final labels/metadata
+# in all of them; a control that exits on the failing call (`|| exit 9`) diverged in 152 of the 408, and reading `$?` right after L117 made the L117 mutant diverge in 145.
 #
 # Run:  bash packs/town-deltas/assets/pilot-manual-reclaim.selftest.sh
-# EQUIVALENT 825d7d2791 08ba2503b4 09f520a343 d4f03dc13b f51fd9aafb 288e1a3742: `... -q 2>/dev/null || true` -> `&& true`: the script has no `set -e` and nobody reads the rc of those calls (the post-state is VERIFIED from a fresh `bd show` further down)
+# EQUIVALENT 56ed689ab8 ff01efdd31 3e9b804495 ae506b4e60 e7f5624f18 56fabea1d1 a2e6d0eab8: `... -q 2>/dev/null || true` -> `&& true` (L96, L104, L105, L106, L113, L115, L117): the script has no `set -e` and nobody reads the rc of those calls (the post-state is VERIFIED from a fresh `bd show` further down); MEASURED over 408 worlds with bd calls failing (with and without doing the work), bash 5.2.21 and 3.2.57: same stdout, stderr, exit code, call log and final state as the original
 set -u
 
 # Resolve relative to this selftest's own location (not a hardcoded main-
