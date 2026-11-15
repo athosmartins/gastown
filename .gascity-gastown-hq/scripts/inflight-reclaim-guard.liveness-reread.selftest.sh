@@ -9,7 +9,8 @@
 #   leu a lista de sessões no começo do ciclo e a foto envelhece (15/11 03:06:24: reclaim de wa-adn833.12.2 com a foto de 03:03:37, e o builder tinha subido às 03:04:26). Sessão viva na releitura → não
 #   reclama; releitura que FALHA → "não sei" → não reclama (nunca vira "sem sessão"); só "morta" libera. (3) A releitura que falha ciclo após ciclo é CONTADA e avisa o Mayor ([GUARD-BLIND]) ao passar do limite —
 #   fail-closed sem alarme adiaria todo reclaim para sempre em silêncio; o contador zera quando a leitura volta e NÃO zera num ciclo em que nenhuma bead pediu a releitura. Cada caso roda o `run_cycle` REAL do guard.
-# COMO RODA: bash scripts/inflight-reclaim-guard.liveness-reread.selftest.sh   (hermético: sem bd, gc, git nem rede; relógio e mundo simulados; ~1 s)
+# COMO RODA: bash scripts/inflight-reclaim-guard.liveness-reread.selftest.sh   (sem bd, gc, git nem rede; relógio e mundo simulados; ~1 s; NENHUMA escrita em ledger de produção: o escalate do T6 chama `_irg_ledger("human-touch", ...)`
+#   e aqui essa chamada é trocada por um registro E o gc_ledger é apontado para um diretório descartável com GC_SELFTEST=1 — dois cintos, e o T6b e o FIM provam os dois; ga-9r4zimt gate-fix 2/3)
 #   REREAD_GUARD_UNDER_TEST=<arquivo>   aponta para uma cópia do guard (o HEAD anterior, para provar que os casos reprovam lá; a cópia precisa dos irmãos bead_state.py e gc_ledger.py ao lado)
 # O MUNDO SIMULADO: beads in_progress de um dono nomeado (crew-x), sem branch, paradas além do teto de encalhe. `list_active_sessions` é trocada por um leitor que devolve a foto VELHA (sem o dono) na
 #   1ª leitura do ciclo e a foto do momento (com ou sem o dono vivo, ou falha) nas seguintes. `do_reclaim`/`do_escalate` registram o que o guard pediu e o mundo aplica o reclaim.
@@ -22,16 +23,24 @@ export REREAD_GUARD_UNDER_TEST="${REREAD_GUARD_UNDER_TEST:-$HERE/inflight-reclai
 python3 -I - <<'PY'
 import contextlib, copy, datetime, importlib.util, io, os, re, sys, tempfile, time as _real_time
 
+# O guard importa gc_ledger, que lê GC_LEDGER_DIR/GC_SELFTEST NO IMPORT. `python3 -I -` não tem flag --selftest em argv, então o gc_ledger não reconhece este processo como teste sozinho (ga-9d7it9):
+# sem as duas linhas abaixo o escalate do T6 anexaria linhas falsas (wa-t1) ao human-touch.jsonl de PRODUÇÃO a cada execução. Tem de vir ANTES do exec_module.
+_TMPD = tempfile.TemporaryDirectory(prefix="irg-reread-")
+_LEDGER_SCRATCH = os.path.join(_TMPD.name, "ledger")
+os.makedirs(_LEDGER_SCRATCH, exist_ok=True)
+os.environ["GC_SELFTEST"] = "1"
+os.environ["GC_LEDGER_DIR"] = _LEDGER_SCRATCH
+
 GUARD = os.environ["REREAD_GUARD_UNDER_TEST"]
 spec = importlib.util.spec_from_file_location("irg_reread_under_test", GUARD)
 g = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(g)
 
 # A contagem de releitura falha grava em STATE_FILE + ".query-fail": aqui o estado vai para um diretório temporário (nunca o .gc/state do cwd) e o `gc mail send` do alerta é registrado, não executado.
-_TMPD = tempfile.TemporaryDirectory(prefix="irg-reread-")
 g.STATE_FILE = os.path.join(_TMPD.name, "state.json")
 QF = g.STATE_FILE + ".query-fail"
 MAILS = []
+LEDGER_CALLS = []   # o que o guard pediu ao _irg_ledger (trocado no World._install): prova que o escalate chegou lá e que nada foi gravado
 
 
 class _MailProc:
@@ -49,6 +58,22 @@ def _mail_run(cmd, *a, **kw):
 
 
 g.subprocess.run = _mail_run
+
+
+_GL = sys.modules["gc_ledger"]   # o módulo que o guard importou (o mesmo LEDGER_DIR/LIVE_LEDGER_DIR que o guard enxerga)
+_LIVE_HT = os.path.join(_GL.LIVE_LEDGER_DIR, "human-touch.jsonl")
+
+
+def live_sig():
+    """(tamanho, mtime_ns) do human-touch.jsonl de PRODUÇÃO, ou None se ele não existe nesta máquina. Não existir e existir-igual valem o mesmo aqui: o que se prova é que a execução não o mexeu."""
+    try:
+        st = os.stat(_LIVE_HT)
+        return (st.st_size, st.st_mtime_ns)
+    except FileNotFoundError:
+        return None
+
+
+LIVE_BEFORE = live_sig()
 
 
 def qf_cycles():
@@ -96,6 +121,7 @@ class World:
         except FileNotFoundError:
             pass
         MAILS.clear()
+        LEDGER_CALLS.clear()
         self.tick_on_reclaim = tick_on_reclaim   # segundos que o relógio anda a cada reclaim pedido (uma leitura lenta entre duas beads do mesmo ciclo)
         self.now = T0
         self.reread = reread
@@ -143,6 +169,7 @@ class World:
         g._note_query_failure = lambda *a, **k: None
         g._note_query_success = lambda *a, **k: None
         g._check_pool_dead = lambda *a, **k: None
+        g._irg_ledger = lambda name, data, **k: LEDGER_CALLS.append((name, data))   # o escalate chama o ledger de human-touch: registra, não grava
         g.do_reclaim = lambda bead_id, *a, **kw: (w.reclaims.append(bead_id), setattr(w, "now", w.now + w.tick_on_reclaim), True)[2]
         g.do_escalate = lambda bead_id, *a, **kw: (w.escalations.append(bead_id), [])[1]
 
@@ -204,6 +231,16 @@ check("T6 escalate com o dono vivo na releitura: não escala", w.escalations == 
 w = World("dead", reclaim_count=g.MAX_RECLAIMS)
 w.run(8)
 check("T6 controle: com a morte confirmada, o teto estourado escala", len(w.escalations) >= 1, "escalations=%r reclaims=%r" % (w.escalations, w.reclaims))
+
+# ── T6b: o escalate do T6 pede o ledger de human-touch — e NADA disso pode chegar ao ledger de produção (ga-9r4zimt gate-fix 2/3: a versão anterior anexava 2 linhas falsas a cada execução no mini).
+# Dois cintos independentes: (a) o `_irg_ledger` do guard é trocado por um registro no World; (b) o gc_ledger aponta para um diretório descartável (GC_SELFTEST=1 + GC_LEDGER_DIR antes do import).
+check("T6b o escalate chegou ao ledger human-touch (o registro tem o pedido da bead wa-t1)", any(n == "human-touch" and isinstance(d, dict) and d.get("bead_id") == "wa-t1" for n, d in LEDGER_CALLS), "pedidos=%r" % (LEDGER_CALLS,))
+_real_ht = os.path.realpath(_GL.ledger_path("human-touch"))
+check("T6b gc_ledger.ledger_path('human-touch') cai no diretório descartável", _real_ht.startswith(os.path.realpath(_LEDGER_SCRATCH) + os.sep), "ledger_path=%r scratch=%r" % (_real_ht, _LEDGER_SCRATCH))
+check("T6b ... e não no diretório vivo de ledgers", not _real_ht.startswith(os.path.realpath(_GL.LIVE_LEDGER_DIR) + os.sep), "ledger_path=%r live=%r" % (_real_ht, _GL.LIVE_LEDGER_DIR))
+_GL.gc_ledger_append("human-touch", {"ts": "2026-01-01T00:00:00Z", "source_daemon": "inflight-reclaim-guard", "bead_id": "selftest-probe", "reason": "sonda do selftest liveness-reread"}, fail_open=False)   # o writer REAL, sem o registro do cinto (a)
+check("T6b o writer real do gc_ledger grava no descartável (cinto (b) vale sem o (a))", os.path.isfile(_real_ht) and "selftest-probe" in open(_real_ht, encoding="utf-8").read(), "arquivo=%r" % (_real_ht,))
+check("T6b o human-touch.jsonl de produção não mudou nesta execução (tamanho e mtime iguais, ou ausente nos dois lados)", live_sig() == LIVE_BEFORE, "antes=%r depois=%r" % (LIVE_BEFORE, live_sig()))
 
 # ── T7: o teto das chamadas gc/bd que tinham timeout=20. Constante padrão e a leitura de IRG_GC_CALL_TIMEOUT (vazio/ilegível/≤0 → padrão, nunca um teto que cegue o guard).
 default = getattr(g, "GC_CALL_TIMEOUT", None)
@@ -313,6 +350,9 @@ w.state["wa-t1"]["first_seen_stranded"] = w.now + POLL      # a bead volta para 
 w.cycle()
 check("T10 ciclo sem releitura pedida: a contagem fica onde estava (3), não zera", qf_cycles() == 3, "ciclos=%r estado=%r" % (qf_cycles(), w.state.get("wa-t1")))
 check("T10: e esse ciclo não gera linha [REREAD-BLIND] nova", len(blind_lines(w)) == n_before, "linhas=%r" % blind_lines(w))
+
+# ── fim: nenhum dos mundos acima (T1-T10) tocou o human-touch.jsonl de produção.
+check("FIM o human-touch.jsonl de produção segue como estava antes da bateria inteira", live_sig() == LIVE_BEFORE, "antes=%r depois=%r" % (LIVE_BEFORE, live_sig()))
 
 print("RESULT: %d passed, %d failed" % (PASS, FAIL))
 sys.exit(1 if FAIL else 0)

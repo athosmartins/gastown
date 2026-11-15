@@ -21,6 +21,8 @@ export MBP_GUARD_UNDER_TEST="${MBP_GUARD_UNDER_TEST:-$HERE/inflight-reclaim-guar
 export MBP_HERE="$HERE"
 [ -f "$MBP_GUARD_UNDER_TEST" ] || { echo "FATAL: guard ausente: $MBP_GUARD_UNDER_TEST"; exit 2; }
 
+# `python3 -I -` não tem --selftest em argv: sem este sinal o gc_ledger do guard não reconhece o teste e um escalate (ledger human-touch) iria para o ledger de PRODUÇÃO (ga-9d7it9; ga-9r4zimt gate-fix 2/3).
+export GC_SELFTEST=1
 python3 -I - <<'PY'
 import contextlib, copy, datetime, importlib.util, io, os, subprocess, sys, time as _real_time
 
