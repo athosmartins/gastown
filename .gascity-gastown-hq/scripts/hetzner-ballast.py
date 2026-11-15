@@ -117,6 +117,14 @@ def _ceiling(raw, test=False):
     raise ValueError("BALLAST_CEILING=%r inválido (systemd; off só no selftest)" % raw)
 
 
+def _shm_uid(env):
+    """De quem tem de ser a pasta de /dev/shm para a faxina olhá-la: o nosso usuário. BALLAST_SHM_UID só vale no selftest (BALLAST_TEST=1: ele não sabe criar pasta de outro dono sem root); em produção a variável é ignorada
+    e uma pasta de outro dono nunca é candidata, qualquer que seja o ambiente do cron."""
+    if env.get("BALLAST_TEST") == "1" and env.get("BALLAST_SHM_UID", "").strip():
+        return int(env["BALLAST_SHM_UID"])
+    return os.getuid()
+
+
 def load_config(env):
     home = env.get("BALLAST_HOME") or os.path.join(os.path.expanduser("~"), "gt-remote", "ballast")
     raw = env.get("BALLAST_NOW", "").strip()
@@ -142,6 +150,9 @@ def load_config(env):
         sess_window_s=_num(env, "BALLAST_SESS_WINDOW_S", 21600, int, 1), sess_gap_s=_num(env, "BALLAST_SESS_GAP_S", 1800, int, 1), sess_mb=_num(env, "BALLAST_SESS_MB", 1024, int, 0),
         sess_margin_mb=_num(env, "BALLAST_SESS_MARGIN_MB", 1024, int, 0), tmux=env.get("BALLAST_TMUX") or "tmux", tmux_socket=env.get("BALLAST_TMUX_SOCKET") or "gc-remote",
         tmux_timeout_s=_num(env, "BALLAST_TMUX_TIMEOUT_S", 5, int, 1), slots_carry_s=_num(env, "BALLAST_SLOTS_CARRY_S", 900, int, 0),
+        shm_root=env.get("BALLAST_SHM") or "/dev/shm", shm_every_s=_num(env, "BALLAST_SHM_EVERY_S", 600, int, 0), shm_age_s=_num(env, "BALLAST_SHM_AGE_S", 172800, int, 3600),
+        shm_min_mb=_num(env, "BALLAST_SHM_MIN_MB", 64, int, 1), shm_budget_s=_num(env, "BALLAST_SHM_BUDGET_S", 15, float, 0.0), shm_max_entries=_num(env, "BALLAST_SHM_MAX_ENTRIES", 3000000, int, 1),
+        shm_max_reap=_num(env, "BALLAST_SHM_MAX_REAP", 2, int, 1), shm_uid=_shm_uid(env),
         launch_prefix=_prefix(prefix, env.get("BALLAST_TEST") == "1"))
 
 
@@ -412,7 +423,7 @@ def eligibility(cfg, item, st, running_names):
 
 # ---- estado -------------------------------------------------------------------------------------------------------------------------------------------
 def fresh_state():
-    return {"v": 1, "last": None, "free_ticks": 0, "cooldown": {}, "term": {}, "killed": {}, "paused": False, "paused_ticks": 0, "sess": None, "slots_last": {}}
+    return {"v": 1, "last": None, "free_ticks": 0, "cooldown": {}, "term": {}, "killed": {}, "paused": False, "paused_ticks": 0, "sess": None, "slots_last": {}, "shm": None}
 
 
 def _int(x):
@@ -434,6 +445,10 @@ def state_ok(st):
                              and all(isinstance(k, str) and k.isdigit() and _int(v) and v >= 0 for k, v in sess["b"].items()))):
         return False
     if not (isinstance(sl, dict) and all(isinstance(v, dict) and _int(v.get("n")) and v["n"] >= 1 and _int(v.get("t")) for v in sl.values())):
+        return False
+    # shm (a última varredura do /dev/shm, ga-i6ghk4r): None ou {t: inteiro, ...}. Forma errada = estado corrompido; o carimbo é o que segura a próxima varredura
+    shm = st.get("shm")
+    if not (shm is None or (isinstance(shm, dict) and _int(shm.get("t")))):
         return False
     last = st.get("last")
     return (_int(st.get("free_ticks")) and st["free_ticks"] >= 0
@@ -1153,6 +1168,245 @@ def elastic_step(cfg, st, run, rec, mem, ok, floor=None):
         rec["elastic"].append({"item": r["item"], "run": r["run"], "from": cur, "to": want, "why": why})
 
 
+# ---- /dev/shm órfão (ga-i6ghk4r) ----------------------------------------------------------------------------------------------------------------------
+# Processos do usuário que o kernel esconde (não dumpáveis: cwd, root, exe, fd e maps negam leitura). Medidos no nó em 15/11: ssh-agent, gpg-agent, systemd --user, (sd-pam) e sshd. Nenhum usa pasta de /dev/shm.
+OPAQUE_OK = ("ssh-agent", "gpg-agent", "systemd", "(sd-pam)", "sshd")
+
+
+def shm_keep(cfg):
+    """({nomes}, motivo): a lista de exceções $BALLAST_HOME/shm-keep.txt (um nome de pasta por linha; # comenta; linha com / não é nome). Pasta que o dono quer manter parada em /dev/shm."""
+    # vazio (arquivo ausente) → nenhuma exceção; falhou/ilegível (é uma pasta, sem permissão) → motivo keep-ilegivel: a lista é DESCONHECIDA e quem chama não apaga nada
+    try:
+        with open(os.path.join(cfg.home, "shm-keep.txt"), "rb") as f:
+            raw = f.read().decode("utf-8", "replace")
+    except FileNotFoundError:
+        return set(), ""
+    except OSError:
+        return set(), "keep-ilegivel"
+    return {ln for ln in (x.strip() for x in raw.splitlines()) if ln and not ln.startswith("#") and "/" not in ln}, ""
+
+
+def shm_names_in(text, prefix, names):
+    """Quais `names` aparecem em `text` como prefix+nome seguido de um LIMITE (fim, `/`, espaço, NUL, `:`, aspas...): base-x não casa dentro de base-x-3, que é outra pasta."""
+    hit = set()
+    for nm in names:
+        key, start = prefix + nm, 0
+        while True:
+            i = text.find(key, start)
+            if i < 0:
+                break
+            j = i + len(key)
+            if j >= len(text) or not (text[j].isalnum() or text[j] in "_.~@+-"):
+                hit.add(nm)
+                break
+            start = i + 1
+    return hit
+
+
+def shm_holders(cfg, root, names):
+    """({nome: {pids}}, [comm de opaco conhecido], [comm de opaco desconhecido]): quais das pastas `names` (filhas diretas de `root`) algum processo do NOSSO usuário segura: cwd, root ou exe dentro dela, fd aberto, mapa de
+    memória ou o nome na linha de comando. Processo de outro usuário não escreve em pasta nossa e não conta. Processo nosso que o kernel esconde (EACCES) é opaco: só a linha de comando dele prova alguma coisa; com `comm` em
+    OPAQUE_OK ele não segura mais que isso, senão (ou com qualquer outro erro de leitura, comm '?') é incerteza e quem chama não apaga. Processo que some no meio é ignorado. Unreadable se a tabela de processos não abre."""
+    prefix = root.rstrip("/") + "/"
+    held, known, unknown = {}, set(), set()
+
+    def hit_path(tgt, pid):
+        if tgt.endswith(" (deleted)"):
+            tgt = tgt[:-len(" (deleted)")]
+        if tgt.startswith(prefix):
+            held.setdefault(tgt[len(prefix):].split("/", 1)[0], set()).add(pid)
+
+    # vazio (nenhum pid) → ninguém segura nada; falhou/ilegível (a pasta não lista) → Unreadable: sem saber quem segura, nada é órfão
+    try:
+        pids = [x for x in os.listdir(cfg.proc) if x.isdigit()]
+    except OSError as e:
+        raise Unreadable("%s: %s" % (cfg.proc, e))
+    for nm in pids:
+        d = os.path.join(cfg.proc, nm)
+        try:
+            if os.stat(d).st_uid != cfg.shm_uid:
+                continue
+        except OSError:
+            continue
+        pid, opaque, other = int(nm), False, False
+
+        def link(path):
+            nonlocal opaque, other
+            # vazio (sem o link: zumbi, thread de kernel, processo que sumiu) → nada a dizer; falhou/ilegível (EACCES) → opaco; qualquer outro erro → incerteza
+            try:
+                return os.readlink(path)
+            except FileNotFoundError:
+                return None
+            except PermissionError:
+                opaque = True
+            except OSError:
+                other = True
+            return None
+
+        for what in ("cwd", "root", "exe"):
+            tgt = link(os.path.join(d, what))
+            if tgt:
+                hit_path(tgt, pid)
+        try:
+            for fd in os.listdir(os.path.join(d, "fd")):
+                tgt = link(os.path.join(d, "fd", fd))
+                if tgt:
+                    hit_path(tgt, pid)
+        except FileNotFoundError:
+            pass
+        except PermissionError:
+            opaque = True
+        except OSError:
+            other = True
+        texts = []
+        for what in ("maps", "cmdline"):
+            try:
+                with open(os.path.join(d, what), "rb") as f:
+                    texts.append(f.read().decode("utf-8", "replace"))
+            except FileNotFoundError:
+                pass
+            except PermissionError:
+                if what == "maps":
+                    opaque = True
+            except OSError:
+                other = True
+        for text in texts:
+            for found in shm_names_in(text, prefix, names):
+                held.setdefault(found, set()).add(pid)
+        if opaque or other:
+            try:
+                with open(os.path.join(d, "comm"), "rb") as f:
+                    comm = f.read().decode("utf-8", "replace").strip() or "?"
+            except OSError:
+                comm = "?"
+            (unknown if other or comm not in OPAQUE_OK else known).add(comm)
+    return held, sorted(known), sorted(unknown)
+
+
+def shm_walk(path, dev, cutoff, budget):
+    """(mais novo, kb, estado) da árvore em `path`: o mais novo é o maior entre ctime e mtime de TUDO nela (o tar preserva o mtime da origem, o ctime é de quando o arquivo nasceu aqui), o tamanho vem dos blocos
+    (arquivo esparso não conta), e o estado é completa | ilegivel (subpasta que não abre, montagem dentro da árvore, entrada que sumiu) | orcamento (passou de BALLAST_SHM_MAX_ENTRIES ou do prazo de relógio). Para na primeira
+    coisa mais nova que `cutoff`: a pasta é jovem e o resto não importa. Nunca segue symlink."""
+    try:
+        top = os.lstat(path)
+    except OSError:
+        return 0, 0, "ilegivel"
+    newest, kb = max(top.st_ctime, top.st_mtime), top.st_blocks // 2
+    if newest > cutoff:
+        return newest, kb, "completa"
+    stack = [path]
+    while stack:
+        try:
+            with os.scandir(stack.pop()) as it:
+                kids = list(it)
+        except OSError:
+            return newest, kb, "ilegivel"
+        for k in kids:
+            budget.left -= 1
+            if budget.left < 0 or time.monotonic() >= budget.deadline:
+                return newest, kb, "orcamento"
+            try:
+                s = k.stat(follow_symlinks=False)
+            except OSError:
+                return newest, kb, "ilegivel"
+            newest = max(newest, s.st_ctime, s.st_mtime)
+            if newest > cutoff:
+                return newest, kb, "completa"
+            kb += s.st_blocks // 2
+            if stat.S_ISDIR(s.st_mode):
+                if s.st_dev != dev:
+                    return newest, kb, "ilegivel"
+                stack.append(k.path)
+    return newest, kb, "completa"
+
+
+def shm_scan(cfg):
+    """(resumo, órfãs): UMA varredura do /dev/shm. Órfã = pasta de verdade (nunca arquivo, nunca symlink) do nosso usuário, fora do namespace ballast-*, com >= BALLAST_SHM_MIN_MB, em que nada mudou há BALLAST_SHM_AGE_S
+    (ver shm_walk), que nenhum processo segura (shm_holders) e que o shm-keep.txt não poupa. O resumo vai ao registro e ao estado; `why` lista o que ficou incerto (vazio = tudo lido). Contas null = não deu para contar."""
+    out = {"t": cfg.now, "why": "", "orfaos_n": None, "orfaos_mb": None, "orfaos": [], "seguradas_n": None, "ilegiveis_n": None, "mantidas_n": None, "opacos": []}
+    root = cfg.shm_root
+    # vazio (pasta sem entradas) → 0 órfãs; ausente → why shm-ausente; não abre → why shm-ilegivel: nos dois a conta fica null, NUNCA 0 órfãs
+    try:
+        with os.scandir(root) as it:
+            entries = sorted(it, key=lambda e: e.name)
+    except FileNotFoundError:
+        out["why"] = "shm-ausente"
+        return out, []
+    except OSError:
+        out["why"] = "shm-ilegivel"
+        return out, []
+    why = []
+    keep, kwhy = shm_keep(cfg)
+    if kwhy:
+        why.append(kwhy)
+    budget = SimpleNamespace(left=cfg.shm_max_entries, deadline=time.monotonic() + cfg.shm_budget_s)
+    cutoff = cfg.now - cfg.shm_age_s
+    velhas, ilegiveis, mantidas = [], 0, 0
+    for e in entries:
+        if e.name.startswith("ballast-"):
+            continue
+        try:
+            s = e.stat(follow_symlinks=False)
+        except FileNotFoundError:
+            continue
+        except OSError:
+            ilegiveis += 1
+            continue
+        if not stat.S_ISDIR(s.st_mode) or s.st_uid != cfg.shm_uid:
+            continue
+        newest, kb, state = shm_walk(e.path, s.st_dev, cutoff, budget)
+        if state != "completa":
+            ilegiveis += 1
+            if state == "orcamento":
+                why.append("parcial")
+                break
+            continue
+        if newest > cutoff or kb // 1024 < cfg.shm_min_mb:
+            continue
+        if e.name in keep:
+            mantidas += 1
+            continue
+        velhas.append({"name": e.name, "mb": kb // 1024, "idle_h": round(max(0.0, cfg.now - newest) / 3600.0, 1)})
+    out["ilegiveis_n"], out["mantidas_n"] = ilegiveis, mantidas
+    held, known, unknown = {}, [], []
+    held_ok = True
+    if velhas:
+        # vazio (ninguém segura nada) → todas as velhas são órfãs; falhou/ilegível (tabela de processos) → why proc-ilegivel e NENHUMA é dada como órfã (sem saber quem segura, nada é órfão)
+        try:
+            held, known, unknown = shm_holders(cfg, root, [v["name"] for v in velhas])
+        except Unreadable as e:
+            print("hetzner-ballast: %s" % e, file=sys.stderr)
+            why.append("proc-ilegivel")
+            held_ok = False
+    out["opacos"] = sorted(set(known) | set(unknown))
+    why.extend("proc-opaco:%s" % c for c in unknown)
+    if held_ok:
+        orfaos = sorted((v for v in velhas if v["name"] not in held), key=lambda v: (-v["mb"], v["name"]))
+        out["seguradas_n"] = len(velhas) - len(orfaos)
+        out["orfaos_n"], out["orfaos_mb"], out["orfaos"] = len(orfaos), sum(v["mb"] for v in orfaos), orfaos[:10]
+    else:
+        orfaos = []
+    out["why"] = ",".join(why)
+    return out, orfaos
+
+
+def shm_step(cfg, st, rec):
+    """A varredura do /dev/shm a cada BALLAST_SHM_EVERY_S (o carimbo da última está em st['shm']['t']; carimbo no futuro, relógio que andou para trás, varre na hora). rec['shm'] = o resumo, ou null no tick em que não varreu.
+    Isolada: a faxina NUNCA derruba o tick (um erro que ninguém previu vira why erro-interno e o tick segue começando e matando como sempre)."""
+    rec["shm"] = None
+    last = st.get("shm")
+    t = last.get("t") if isinstance(last, dict) else None
+    if _int(t) and 0 <= cfg.now - t < cfg.shm_every_s:
+        return
+    try:
+        out, _orfaos = shm_scan(cfg)
+    except Exception as e:   # noqa: BLE001 — isolamento de falha: o que o tick faz de verdade (começar, matar, gravar) não pode depender da faxina
+        print("hetzner-ballast: shm: %s: %s" % (type(e).__name__, e), file=sys.stderr)
+        out = {"t": cfg.now, "why": "erro-interno", "orfaos_n": None, "orfaos_mb": None, "orfaos": [], "seguradas_n": None, "ilegiveis_n": None, "mantidas_n": None, "opacos": []}
+    st["shm"] = out
+    rec["shm"] = out
+
+
 def do_tick(cfg):
     # o que este tick NÃO leu fica null (mode, running, registry_errors, paused), nunca um valor padrão que pareça leitura; started/killed/reaped/skipped são o que o tick FEZ: vazio = nada
     rec = {"ts": iso(cfg.now), "t": cfg.now, "mode": None, "note": "", "started": [], "running": None, "killed": [], "reaped": [], "skipped": [], "registry_errors": None, "ram": None,
@@ -1282,6 +1536,7 @@ def do_tick(cfg):
             elastic_step(cfg, st, run, rec, mem, free_ok, floor)
     # vazio (nada roda) → []; falhou/ilegível (tabela de processos) → null, nunca []
     rec["running"] = sorted(r["item"] for r in run.values()) if procs is not None else None
+    shm_step(cfg, st, rec)   # antes de começar itens: o skipped ram deste tick já cita o /dev/shm órfão que ESTA varredura achou
     # começar itens: ligado, tudo lido, CPU livre por idle_ticks leituras seguidas, orçamento = núcleos livres - reserva. `work` primeiro; `filler` só com o que sobrar.
     # sem teto não começa nada: o nó já parou uma vez (29/10) por processo sem teto, e item sem teto é a mesma exposição; a nota fica no registro do tick e o motivo no stderr (cron.err)
     ceil_ok, ceil_why = ceiling_ready(cfg)
@@ -1442,7 +1697,7 @@ def do_stop(cfg):
 # ---- status -------------------------------------------------------------------------------------------------------------------------------------------
 def do_status(cfg):
     ceil_ok, ceil_why = ceiling_ready(cfg)
-    out = {"home": cfg.home, "mode": "ligado" if os.path.exists(os.path.join(cfg.home, "on")) else "desligado", "state": "ok", "items": [], "registry_errors": [], "running": [],
+    out = {"home": cfg.home, "mode": "ligado" if os.path.exists(os.path.join(cfg.home, "on")) else "desligado", "state": "ok", "items": [], "registry_errors": [], "running": [], "shm": None,
            "launch_prefix": cfg.launch_prefix if cfg.launch_prefix is not None else default_prefix(),
            "ceiling": {"mode": cfg.ceiling, "ready": ceil_ok, "why": ceil_why, "tasks_max": cfg.tasks_max, "mem_factor": cfg.mem_factor}}
     st = fresh_state()
@@ -1456,6 +1711,7 @@ def do_status(cfg):
         out["state"] = "ausente"
     except (OSError, ValueError, UnicodeDecodeError, RecursionError):
         out["state"] = "ilegivel"   # status só LÊ: ausente = "sem cooldown"; ilegível/de forma errada = "sem cooldown" MAS avisado em `state`, sem gravar nada
+    out["shm"] = st.get("shm")   # a última varredura do /dev/shm: o estado ilegível já virou fresh_state (shm None = nunca varreu OU não dá para saber, e `state` diz qual dos dois)
     try:
         items, out["registry_errors"] = load_registry(cfg)
     except Unreadable as e:

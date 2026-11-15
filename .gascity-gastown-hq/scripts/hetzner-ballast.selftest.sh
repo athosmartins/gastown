@@ -1159,12 +1159,117 @@ g_shm() {
   check "shm: Shmem que não é número → shmem_mb null, o resto do tick não muda" "null 28000" "$(jget shmem_mb) $(jget mem_avail_mb)"
 }
 
+# VARREDURA do /dev/shm (BALLAST_SHM; no selftest, uma pasta de mentira). Órfã = pasta de verdade (nunca arquivo nem symlink), do nosso usuário, fora do `ballast-*`, com >= BALLAST_SHM_MIN_MB, em que NADA (nenhum arquivo, nenhuma
+# subpasta) mudou há BALLAST_SHM_AGE_S (o maior entre ctime e mtime: o tar preserva o mtime da origem, o ctime é de quando o arquivo nasceu aqui) e que nenhum processo do usuário segura (cwd, root, exe, fd aberto, mapa de memória
+# ou linha de comando). Os arquivos do teste nascem AGORA (relógio real) e o relógio de mentira (NOW) anda: shm_age = 3 dias depois, tudo o que nasceu agora é velho.
+shm_up() {  # shm_up [IDADE_S=3600] [MIN_MB=1] — newhome + uma pasta /dev/shm de mentira ($SHM), varrida a CADA tick (EVERY_S=0); o relógio de mentira é o real (nada é velho ainda)
+  newhome; SHM="$T/shm$N"; mkdir -p "$SHM"; NOW=$(date +%s)
+  EXTRA_ENV="BALLAST_SHM=$SHM BALLAST_SHM_EVERY_S=0 BALLAST_SHM_AGE_S=${1:-3600} BALLAST_SHM_MIN_MB=${2:-1}"
+}
+shm_dir() {  # shm_dir NOME MB — pasta com MB megabytes de dado de verdade (o governo mede blocos: arquivo esparso valeria 0), num subdiretório
+  mkdir -p "$SHM/$1/sub"; head -c "$(( $2 * 1024 * 1024 ))" /dev/zero > "$SHM/$1/sub/blob"
+}
+shm_age() { NOW=$(( $(date +%s) + ${1:-259200} )); }   # o relógio de mentira anda N s (padrão 3 dias)
+shm_names() {  # os nomes das pastas órfãs do último tick, separados por espaço
+  printf '%s' "$OUT" | "$PY" -I -c 'import sys,json; d=json.load(sys.stdin).get("shm") or {}; print(" ".join(o["name"] for o in (d.get("orfaos") or [])))'
+}
+shm_rec() { echo "$(jget shm.orfaos_n) $(jget shm.orfaos_mb) $(jget shm.seguradas_n) $(jget shm.ilegiveis_n) $(jget shm.mantidas_n) [$(jget shm.why)]"; }   # a linha de contas do tick
+shm_proc() { member "$1" "$1"; }   # um processo de mentira legível (stat, statm, cmdline); os links cwd/root/exe/fd/maps ficam por conta do caso
+notroot() { [ "$(id -u)" != 0 ]; }   # os casos de permissão (chmod 000) não valem como root: viram skip, e skip NÃO conta como passou
+
+g_shmscan() {
+  local new ceil
+  shm_up; shm_dir velho 3; shm_age; bt
+  check "shm varredura: pasta de 3 MB parada há 3 dias (mínimo 1 h) é órfã: 1 órfã, 3 MB, o nome, e segue lá (a chave de apagar não existe)" "1 3 velho yes" "$(jget shm.orfaos_n) $(jget shm.orfaos_mb) $(shm_names) $([ -d "$SHM/velho" ] && echo yes || echo no)"
+  check "shm varredura: o registro traz o carimbo da varredura e nenhuma incerteza" "$NOW [] 1" "$(jget shm.t) [$(jget shm.why)] $(jget shm.orfaos.0.idle_h | "$PY" -I -c 'import sys; print(1 if float(sys.stdin.read()) > 70 else 0)')"
+  shm_up; shm_dir novo 3; bt
+  check "shm varredura: pasta que acabou de nascer não é órfã (0 órfãs, 0 MB: lido e vazio, não 'não li')" "0 0 0 0 0 []" "$(shm_rec)"
+  # fronteira exata: idade == mínimo é órfã, um segundo a menos não é. O relógio dos arquivos é o real, então o teste mede o mais novo e põe o relógio de mentira em cima dele.
+  shm_up 3600; shm_dir velho 3; new=$(find "$SHM/velho" -printf '%T@\n%C@\n' | LC_ALL=C sort -n | tail -n 1); ceil=$("$PY" -I -c 'import math,sys; print(math.ceil(float(sys.argv[1])))' "$new")
+  NOW=$(( ceil + 3600 )); bt; check "shm varredura: parada há EXATAMENTE a idade mínima (3600 s) já é órfã" "1" "$(jget shm.orfaos_n)"
+  NOW=$(( ceil + 3599 )); bt; check "shm varredura: um segundo a menos que a idade mínima não é órfã" "0" "$(jget shm.orfaos_n)"
+  shm_up; shm_dir velho 3; touch -d "@$(( $(date +%s) + 259200 - 60 ))" "$SHM/velho/sub/recente"; shm_age; bt
+  check "shm varredura: UM arquivo mexido há 60 s no fundo de uma subpasta mantém a árvore inteira jovem" "0" "$(jget shm.orfaos_n)"
+  shm_up 3600 2; shm_dir pequena 1; shm_dir grande 3; shm_age; bt
+  check "shm varredura: abaixo do mínimo de 2 MB a pasta nem entra na conta (a de 1 MB fica fora, a de 3 MB entra)" "grande 1 3" "$(shm_names) $(jget shm.orfaos_n) $(jget shm.orfaos_mb)"
+  shm_up; shm_dir velho 3; ln -s "$SHM/velho" "$SHM/atalho"; shm_dir ballast-wam-x 3; head -c 3145728 /dev/zero > "$SHM/arquivo.bin"; shm_age; bt
+  check "shm varredura: symlink para uma pasta, o namespace ballast-*, e arquivo solto de 3 MB NUNCA entram: só a pasta de verdade" "velho 1" "$(shm_names) $(jget shm.orfaos_n)"
+  shm_up; shm_dir velho 3; shm_age; EXTRA_ENV="$EXTRA_ENV BALLAST_SHM_UID=$(( $(id -u) + 1 ))"; bt
+  check "shm varredura: pasta de outro dono não é nossa: 0 órfãs" "0" "$(jget shm.orfaos_n)"
+  shm_up; shm_dir pequena 2; shm_dir grande 3; shm_age; bt
+  check "shm varredura: a maior primeiro, e os totais somam tudo (2 órfãs, 5 MB)" "grande pequena 2 5" "$(shm_names) $(jget shm.orfaos_n) $(jget shm.orfaos_mb)"
+  # o intervalo: a varredura anda a cada BALLAST_SHM_EVERY_S, e o último resultado fica no estado (status)
+  shm_up; EXTRA_ENV="$EXTRA_ENV BALLAST_SHM_EVERY_S=600"; shm_dir velho 3; shm_age; bt; a=$NOW
+  check "shm varredura: o 1º tick varre" "$a" "$(jget shm.t)"
+  NOW=$(( a + 60 )); bt; check "shm varredura: 60 s depois, dentro do intervalo de 600 s, o tick NÃO varre (shm null)" "null" "$(jget shm)"
+  bt status --json; check "shm varredura: o status mostra o último resultado (1 órfã, varrida em $a)" "1 $a" "$(jget shm.orfaos_n) $(jget shm.t)"
+  NOW=$(( a + 600 )); bt; check "shm varredura: no 600º segundo varre de novo" "$NOW" "$(jget shm.t)"
+  NOW=$(( a - 5 )); bt; check "shm varredura: relógio que andou para trás varre na hora (carimbo no futuro não segura a varredura)" "$NOW" "$(jget shm.t)"
+  # três estados da pasta: não existe / não abre / abre vazia / abre com coisa
+  shm_up; EXTRA_ENV="BALLAST_SHM=$T/nao-existe BALLAST_SHM_EVERY_S=0"; bt
+  check "shm varredura: pasta que não existe → why shm-ausente e contas null (NUNCA 0 órfãs)" "null null [shm-ausente]" "$(jget shm.orfaos_n) $(jget shm.orfaos_mb) [$(jget shm.why)]"
+  shm_up; bt; check "shm varredura: pasta vazia → 0 órfãs lidas, sem incerteza" "0 0 0 0 0 []" "$(shm_rec)"
+  if notroot; then
+    shm_up; shm_dir velho 3; shm_age; chmod 000 "$SHM"; bt; chmod 755 "$SHM"
+    check "shm varredura: pasta que não abre (sem permissão) → why shm-ilegivel e contas null, nunca 0" "null [shm-ilegivel]" "$(jget shm.orfaos_n) [$(jget shm.why)]"
+    shm_up; shm_dir velho 3; shm_age; chmod 000 "$SHM/velho/sub"; bt; chmod 755 "$SHM/velho/sub"
+    check "shm varredura: subpasta que não abre dentro da árvore → a árvore é ilegível (não órfã) e a varredura segue sem incerteza global" "0 1 []" "$(jget shm.orfaos_n) $(jget shm.ilegiveis_n) [$(jget shm.why)]"
+  else
+    echo "skip shm varredura: casos de permissão (chmod 000) não valem como root"
+  fi
+  # o orçamento: passou dele, a pasta não é órfã (não deu para ler tudo) e a varredura diz parcial
+  shm_up; shm_dir velho 3; shm_age; EXTRA_ENV="$EXTRA_ENV BALLAST_SHM_MAX_ENTRIES=1"; bt
+  check "shm varredura: a árvore tem 2 entradas (sub e blob) e o orçamento é 1 (BALLAST_SHM_MAX_ENTRIES) → a pasta não vale como órfã, ilegível 1, why parcial" "0 1 [parcial]" "$(jget shm.orfaos_n) $(jget shm.ilegiveis_n) [$(jget shm.why)]"
+  shm_up; shm_dir velho 3; shm_age; EXTRA_ENV="$EXTRA_ENV BALLAST_SHM_MAX_ENTRIES=2"; bt
+  check "shm varredura: com orçamento 2 (as 2 entradas cabem) a mesma pasta é órfã e a varredura é completa" "1 []" "$(jget shm.orfaos_n) [$(jget shm.why)]"
+  shm_up; shm_dir velho 3; shm_age; EXTRA_ENV="$EXTRA_ENV BALLAST_SHM_BUDGET_S=0"; bt
+  check "shm varredura: prazo de relógio zerado (BALLAST_SHM_BUDGET_S=0) → o mesmo: parcial, nada órfão" "0 [parcial]" "$(jget shm.orfaos_n) [$(jget shm.why)]"
+  # quem segura a pasta
+  shm_up; shm_dir velho 3; shm_dir outro 3; shm_proc 9001; ln -s "$SHM/velho/sub" "$FP/9001/cwd"; shm_age; bt
+  check "shm varredura: processo com o cwd dentro da pasta a segura (1 segurada, a outra segue órfã)" "outro 1 1" "$(shm_names) $(jget shm.orfaos_n) $(jget shm.seguradas_n)"
+  shm_up; shm_dir velho 3; shm_proc 9001; mkdir -p "$FP/9001/fd"; ln -s "$SHM/velho/sub/blob" "$FP/9001/fd/3"; shm_age; bt
+  check "shm varredura: arquivo aberto (fd) dentro da pasta a segura" "0 1" "$(jget shm.orfaos_n) $(jget shm.seguradas_n)"
+  shm_up; shm_dir velho 3; shm_proc 9001; printf '7f0000-7f1000 r-xp 00000000 00:1b 123 %s/velho/sub/blob\n' "$SHM" > "$FP/9001/maps"; shm_age; bt
+  check "shm varredura: mapa de memória (maps) dentro da pasta a segura" "0 1" "$(jget shm.orfaos_n) $(jget shm.seguradas_n)"
+  shm_up; shm_dir velho 3; shm_proc 9001; ln -s "$SHM/velho/sub/blob" "$FP/9001/exe"; shm_age; bt
+  check "shm varredura: o executável (exe) dentro da pasta a segura" "0 1" "$(jget shm.orfaos_n) $(jget shm.seguradas_n)"
+  shm_up; shm_dir velho 3; shm_proc 9001; ln -s "$SHM/velho" "$FP/9001/root"; shm_age; bt
+  check "shm varredura: a raiz (root) do processo na pasta a segura" "0 1" "$(jget shm.orfaos_n) $(jget shm.seguradas_n)"
+  shm_up; shm_dir velho 3; shm_proc 9001; printf 'python3\0--work=%s/velho/work\0' "$SHM" > "$FP/9001/cmdline"; shm_age; bt
+  check "shm varredura: a pasta citada na linha de comando (--work=...) a segura" "0 1" "$(jget shm.orfaos_n) $(jget shm.seguradas_n)"
+  shm_up; shm_dir base-x 3; shm_dir base-x-3 3; shm_proc 9001; ln -s "$SHM/base-x-3/sub" "$FP/9001/cwd"; printf 'python3\0--work=%s/base-x-3/work\0' "$SHM" > "$FP/9001/cmdline"; shm_age; bt
+  check "shm varredura: quem segura base-x-3 NÃO segura base-x (um nome é prefixo do outro): base-x órfã, base-x-3 segurada" "base-x 1 1" "$(shm_names) $(jget shm.orfaos_n) $(jget shm.seguradas_n)"
+  shm_up; shm_dir velho 3; mkdir -p "$FP/9002"; shm_age; bt
+  check "shm varredura: processo que sumiu no meio (pasta sem nada) não segura nada" "1 0 []" "$(jget shm.orfaos_n) $(jget shm.seguradas_n) [$(jget shm.why)]"
+  # processos que o kernel esconde (não dumpáveis: ssh-agent, gpg-agent, systemd --user, sshd; medido no nó em 15/11): cwd, fd e maps negam leitura
+  if notroot; then
+    shm_up; shm_dir velho 3; shm_proc 9003; mkdir -p "$FP/9003/fd"; chmod 000 "$FP/9003/fd"; : > "$FP/9003/maps"; chmod 000 "$FP/9003/maps"; printf 'sshd\n' > "$FP/9003/comm"; shm_age; bt; chmod 755 "$FP/9003/fd"
+    check "shm varredura: processo opaco de nome conhecido (sshd) não derruba a varredura: 1 órfã, sem incerteza, o nome aparece em opacos" "1 [] sshd" "$(jget shm.orfaos_n) [$(jget shm.why)] $(jget shm.opacos.0)"
+    shm_up; shm_dir velho 3; shm_proc 9003; mkdir -p "$FP/9003/fd"; chmod 000 "$FP/9003/fd"; printf 'sshd\n' > "$FP/9003/comm"; printf 'sshd\0%s/velho/x\0' "$SHM" > "$FP/9003/cmdline"; shm_age; bt; chmod 755 "$FP/9003/fd"
+    check "shm varredura: o opaco conhecido que cita a pasta na linha de comando a segura" "0 1" "$(jget shm.orfaos_n) $(jget shm.seguradas_n)"
+    shm_up; shm_dir velho 3; shm_proc 9003; mkdir -p "$FP/9003/fd"; chmod 000 "$FP/9003/fd"; printf 'ferramenta-nova\n' > "$FP/9003/comm"; shm_age; bt; chmod 755 "$FP/9003/fd"
+    check "shm varredura: opaco de nome DESCONHECIDO → incerteza global (why proc-opaco:ferramenta-nova); a candidata segue listada mas nada vale como certo" "1 [proc-opaco:ferramenta-nova]" "$(jget shm.orfaos_n) [$(jget shm.why)]"
+    shm_up; shm_dir velho 3; shm_age; chmod 111 "$FP"; bt; chmod 755 "$FP"
+    check "shm varredura: tabela de processos que não lista → why proc-ilegivel e órfãs null (sem saber quem segura, nada é órfão)" "null [proc-ilegivel]" "$(jget shm.orfaos_n) [$(jget shm.why)]"
+  else
+    echo "skip shm varredura: casos de processo opaco não valem como root"
+  fi
+  # shm-keep.txt: a válvula de escape (um nome por linha; # comenta; arquivo ausente = nada a manter; arquivo que não abre = incerteza)
+  shm_up; shm_dir velho 3; shm_dir outro 3; printf '# árvore do experimento X\n\nvelho\n' > "$H/shm-keep.txt"; shm_age; bt
+  check "shm varredura: shm-keep.txt tira da conta o que ele lista (comentário e linha em branco ignorados): só 'outro' é órfã, 1 mantida" "outro 1 1" "$(shm_names) $(jget shm.orfaos_n) $(jget shm.mantidas_n)"
+  shm_up; shm_dir velho 3; mkdir "$H/shm-keep.txt"; shm_age; bt
+  check "shm varredura: shm-keep.txt que não lê (é uma pasta) → why keep-ilegivel (a lista de exceções é desconhecida), a candidata segue listada" "1 [keep-ilegivel]" "$(jget shm.orfaos_n) [$(jget shm.why)]"
+  # o resto do tick não depende da varredura: um registro com a pasta de mentira inexistente ou cheia de coisa não impede nem muda o que começa
+  newhome; seed; good 50; good 50; good 50
+  check "shm varredura: o tick de sempre (sem BALLAST_SHM do caso) segue começando o item: o lixo do /dev/shm não é pré-requisito de ninguém" "hq" "$(jget started.0.item)"
+}
+
 if [ -n "${HB_MUTANT:-}" ]; then
-  if [ "${HB_MUTANT_GROUPS:-}" = teto ]; then g_ceil; g_cgrp; elif [ "${HB_MUTANT_GROUPS:-}" = elastico ]; then g_elastic; elif [ "${HB_MUTANT_GROUPS:-}" = piso ]; then g_floor; g_carry; g_startmb; elif [ "${HB_MUTANT_GROUPS:-}" = shm ]; then g_shm; else g_reg; g_tick; g_run; g_ram; g_reap; g_fill; g_off; g_state; g_logs; g_launch; g_send; fi
+  if [ "${HB_MUTANT_GROUPS:-}" = teto ]; then g_ceil; g_cgrp; elif [ "${HB_MUTANT_GROUPS:-}" = elastico ]; then g_elastic; elif [ "${HB_MUTANT_GROUPS:-}" = piso ]; then g_floor; g_carry; g_startmb; elif [ "${HB_MUTANT_GROUPS:-}" = shm ]; then g_shm; g_shmscan; else g_reg; g_tick; g_run; g_ram; g_reap; g_fill; g_off; g_state; g_logs; g_launch; g_send; fi
   echo "RESULT $fails/$n"; [ "$fails" = 0 ]; exit $?
 fi
 if [ -n "${HB_ONLY:-}" ]; then "g_$HB_ONLY"; echo "── $((n - fails))/$n ok (só g_$HB_ONLY)"; [ "$fails" = 0 ]; exit $?; fi
-g_reg; g_tick; g_run; g_ram; g_reap; g_fill; g_off; g_state; g_logs; g_launch; g_send; g_ceil; g_cgrp; g_elastic; g_floor; g_carry; g_startmb; g_shm
+g_reg; g_tick; g_run; g_ram; g_reap; g_fill; g_off; g_state; g_logs; g_launch; g_send; g_ceil; g_cgrp; g_elastic; g_floor; g_carry; g_startmb; g_shm; g_shmscan
 
 [ -n "${HB_NO_MUTANTS:-}" ] || {
   echo "── controle negativo: cada mutante tem que reprovar a bateria ──"
