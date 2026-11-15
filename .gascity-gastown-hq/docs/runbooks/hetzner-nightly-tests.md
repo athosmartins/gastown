@@ -2,7 +2,9 @@
 
 ## Contents
 
-• O que roda e quando · **Instalação (precisa de root, uma vez)** · Veredito e relatório · Lotes · Teto de memória · Ids reprovados e a comparação · Escudo do relatório · Vazamento medido · Limites honestos · Operação (desligar, rodar à mão, conferir)
+• O que roda e quando · Instalação (precisa de root, uma vez) · Veredito e relatório
+• Lotes (ga-84gkpab) · Teto de memória (ga-84gkpab) · Ids reprovados e a comparação
+• Escudo do relatório (ga-84gkpab) · Vazamento medido · Limites honestos · Operação
 
 ## O que roda e quando
 Todo dia às 02:00 local (`0 5 * * *`: o cron dos orders é em UTC) o order `hetzner-nightly-tests` (`packs/town-deltas/orders/`) chama `scripts/hetzner-nightly-tests.sh`:
