@@ -46,10 +46,13 @@
 # not in the future) goes with NO minimum age — at <6 GB the worker probes answer [] and pushes are refused, and <3 GB fires the D4 reboot, so the 30 min / 6 h waits cost more than they protect. Every proof
 # is the same one the normal paths use; any that cannot be answered (cherry failed, bead unreadable, status failed) leaves the tree where it is and counts it in critical_kept on the sweep line. The event
 # carries "reason":"critical" and the proof. Branch deletion stays merged-only (pool loop; loop 1 never deletes a branch).
-# ga-zgqssr7 cadence: ONE pass at a time (mkdir lock worktree-reaper.lock.d beside the log; a holder that is gone, or is not a worktree-reaper, or left an empty pid file for >600 s is a stale lock; a live
-# holder makes the tick log skipped_busy and exit), the launchd tick is 1800 s, and in NORMAL mode a tick within NORMAL_INTERVAL_S (6900) of the last pass's start exits with skipped_no_pressure (stamp file
-# worktree-reaper.last-pass; WORKTREE_REAPER_FORCE=1 ignores it) — so the normal rhythm stays ~2 h while pressure runs every tick. The sweep line carries duration_s and interval_s, and a pass longer than the
-# tick logs pass_exceeds_interval. Installed plist: scripts/com.gascity.worktree-reaper.plist (delivery does not reload it: unload + load).
+# ga-zgqssr7 cadence: ONE pass at a time (mkdir lock worktree-reaper.lock.d beside the log; a holder that is gone, or is not a worktree-reaper, or left an empty pid file for >600 s is a stale lock, taken over by a rename
+# that checks what it moved; a live holder makes the tick log skipped_busy, with why, and exit). A lock that could NOT be taken is not a busy tick: lock_unavailable (the directory cannot be made, or its pid written) and
+# lock_stale_uncleared (a dead holder's lock cannot be moved away) go to the log AND stderr, count on the sweep line, and the pass runs without the lock — the reaper is what frees disk, so it must not stop on the disk's errors.
+# The launchd tick is 1800 s, and in NORMAL mode a REAL pass (ENABLED=1) within NORMAL_INTERVAL_S (6900) of the last real pass's start exits with skipped_no_pressure (stamp file worktree-reaper.last-pass; a dry run neither
+# waits for it nor moves it; WORKTREE_REAPER_FORCE=1 ignores it; a df that gives no number, free_gb_unreadable on the sweep line, never skips) — so the normal rhythm stays ~2 h while pressure runs every tick. The sweep line
+# carries duration_s and interval_s, and a pass longer than the tick logs pass_exceeds_interval. scripts/com.gascity.worktree-reaper.plist is the template of the job; the installed plist is wrapped by wait-for-dolt, so
+# only its StartInterval is changed in place (see the comment in the plist), never a copy over it.
 # The one exception to "WITHOUT --force" is a LOCKED worktree (`remove -f -f`); it is reaped only
 # under the LOCK CONTRACT stated at ZOMBIE-LOCK DETECTION below, never because of its age alone.
 # A second, narrower exception (ga-he2c1u, town .gc-worktrees roots only): an UNLOCKED tree dirty with nothing but generated
@@ -190,8 +193,10 @@ _log_lock_event() {
 free_gb=$(df -g / 2>/dev/null | awk 'NR==2{print $4}')
 # ga-zgqssr7: seam for the selftest (and a dry run): the free GiB read, as a plain number. Anything else is ignored and df's answer stands.
 case "${WORKTREE_REAPER_FAKE_FREE_GB:-}" in ''|*[!0-9]*) : ;; *) free_gb="$WORKTREE_REAPER_FAKE_FREE_GB" ;; esac
-# vazio/falhou (no df, no number) → 99: neither pressure nor critical, the box is read as having room (the old behavior)
-[ -z "$free_gb" ] && free_gb=99
+# vazio/falhou/não numérico (no df, or an Available column that is not a number) → 99 as before: neither pressure nor critical, the box is read as having room — but never silently: free_gb_unreadable=1 goes on the sweep
+# line, and the cadence gate below does not take "could not read" for "no pressure"
+free_gb_unreadable=0
+case "$free_gb" in ''|*[!0-9]*) free_gb=99; free_gb_unreadable=1 ;; esac
 gate_hours="$STALE_HOURS"
 mode="normal"
 critical=0
@@ -205,7 +210,13 @@ if [ "$CRITICAL_FREE_GB" -gt 0 ] && [ "$free_gb" -lt "$CRITICAL_FREE_GB" ] 2>/de
 LOCK_DIR="${WORKTREE_REAPER_LOCK_DIR:-$(dirname "$LOG")/worktree-reaper.lock.d}"
 STAMP="${WORKTREE_REAPER_STAMP:-$(dirname "$LOG")/worktree-reaper.last-pass}"
 _LOCK_MINE=0
-_lock_release() { [ "$_LOCK_MINE" = "1" ] || return 0; _LOCK_MINE=0; rm -f "$LOCK_DIR/pid" 2>/dev/null; rmdir "$LOCK_DIR" 2>/dev/null; return 0; }
+# _lock_release — only a lock that is still THIS pass's. A later tick may have judged it stale and taken it over (its pid is then in it); vazio/falhou (the pid is another's, or cannot be read) → not mine to remove, left as it is
+_lock_release() {
+  [ "$_LOCK_MINE" = "1" ] || return 0
+  _LOCK_MINE=0
+  [ "$(cat "$LOCK_DIR/pid" 2>/dev/null)" = "$$" ] || return 0
+  rm -f "$LOCK_DIR/pid" 2>/dev/null; rmdir "$LOCK_DIR" 2>/dev/null; return 0
+}
 # _lock_holder_alive <pid> — 0 iff <pid> is a live process that is a worktree-reaper. A pid that is gone, or was reused by some other program, holds nothing.
 # vazio/ilegível/não numérico → not alive (the lock is stale); falhou (ps cannot run) → alive: the pass is skipped, never doubled on a guess
 _lock_holder_alive() {
@@ -215,38 +226,80 @@ _lock_holder_alive() {
   cmd="$(ps -p "$p" -o command= 2>/dev/null)" || return 0
   case "$cmd" in *worktree-reaper*) return 0 ;; *) return 1 ;; esac
 }
-# _lock_acquire — 0 = this process holds the lock; 1 = another pass holds it (its pid, or "unknown", in $_LOCK_HOLDER)
-_LOCK_HOLDER=""
+# _lock_note <event> <why> <holder> <detail> <note> — ONE json line to the log AND to stderr (launchd's .err): the log may be the very thing that cannot be written (a read-only logs directory, no room)
+_lock_note() {
+  local line
+  line="$(printf '{"ts":"%s","event":"%s","lock_dir":"%s","why":"%s","holder":"%s","detail":"%s","note":"%s"}' "$(ts)" "$1" "$(_json_esc "$LOCK_DIR")" "$2" "$(_json_esc "$3")" "$(_json_esc "$4")" "$5")"
+  printf '%s\n' "$line" >> "$LOG" 2>/dev/null
+  printf 'worktree-reaper: %s\n' "$line" >&2
+}
+# _lock_acquire — THREE answers, never two. 0 = this process holds the lock (its pid is in it). 1 = another pass holds it: a live holder, or one that cannot be told from a live one (its pid, or "unknown", in $_LOCK_HOLDER;
+# why in $_LOCK_WHY). 2 = could not tell: no pass is known to hold it and this one could not take it either ($_LOCK_EVENT lock_unavailable or lock_stale_uncleared, $_LOCK_WHY, and in $_LOCK_DETAIL the system's error text where there is one).
+# "Held" is only ever said of a lock directory that EXISTS and whose holder is alive or cannot be shown dead. A directory that cannot be made, a pid that cannot be written and a stale lock that cannot be moved away are ERRORS: said as "held",
+# they stopped the pass on exactly the disk errors (no room, read-only, permissions) the reaper exists to outlast, and looked like an ordinary busy tick.
+_LOCK_HOLDER=""; _LOCK_WHY=""; _LOCK_EVENT=""; _LOCK_DETAIL=""
 _lock_acquire() {
-  local pid tries=0
+  local pid prc tries=0 err lm aside
+  _LOCK_HOLDER=""; _LOCK_WHY=""; _LOCK_EVENT=""; _LOCK_DETAIL=""
+  # falhou (the directory above it cannot be made) → no answer yet: the mkdir below fails too, and says why
   mkdir -p "$(dirname "$LOCK_DIR")" 2>/dev/null
-  while [ "$tries" -lt 2 ]; do
-    if mkdir "$LOCK_DIR" 2>/dev/null; then printf '%s\n' "$$" > "$LOCK_DIR/pid" 2>/dev/null; _LOCK_MINE=1; return 0; fi
+  while [ "$tries" -lt 3 ]; do
+    tries=$((tries+1))
+    # falhou (mkdir refused) → below: the directory exists = a holder or a stale lock; it does not = the lock could not be made
+    if err="$(mkdir "$LOCK_DIR" 2>&1)"; then
+      # falhou to write the pid (no room, read-only) → nobody could tell whose lock this is, and the next tick would read it as a crashed holder's: not claimed, what was made is given back
+      if printf '%s\n' "$$" > "$LOCK_DIR/pid" 2>/dev/null; then _LOCK_MINE=1; return 0; fi
+      rm -f "$LOCK_DIR/pid" 2>/dev/null; rmdir "$LOCK_DIR" 2>/dev/null
+      _LOCK_EVENT=lock_unavailable; _LOCK_WHY=pid_write_failed; _LOCK_DETAIL="could not write the pid file in $LOCK_DIR"; return 2
+    fi
+    # not there (or not a directory) is NOT "another pass": ask again (it may have been released this very moment); the 3rd miss is "could not tell", with mkdir's own words
+    if [ ! -d "$LOCK_DIR" ]; then _LOCK_WHY=mkdir_failed; _LOCK_DETAIL="$err"; continue; fi
     # vazio (the holder is between mkdir and writing its pid) → held, "unknown" — UNLESS the lock directory is older than 600 s: a holder that crashed in that gap would otherwise
-    # keep every later tick out for good and silently switch the reaper off; falhou (pid unreadable, or the directory's age unreadable) → held, the same
-    pid="$(cat "$LOCK_DIR/pid" 2>/dev/null)"
+    # keep every later tick out for good and silently switch the reaper off; falhou (a pid file that is there but cannot be read, or the directory's age unreadable) → held, never taken over: "cannot read" is not "no holder"
+    pid="$(cat "$LOCK_DIR/pid" 2>/dev/null)"; prc=$?
+    if [ "$prc" -ne 0 ] && [ -e "$LOCK_DIR/pid" ]; then _LOCK_HOLDER=unknown; _LOCK_WHY=pid_unreadable; return 1; fi
     _LOCK_HOLDER="${pid:-unknown}"
     if [ -z "$pid" ]; then
-      local lm
       if [ "$_STAT_BSD" = "1" ]; then lm="$(stat -f %m "$LOCK_DIR" 2>/dev/null)"; else lm="$(stat -c %Y "$LOCK_DIR" 2>/dev/null)"; fi
-      case "$lm" in ''|*[!0-9]*) return 1 ;; esac
-      [ $(( $(date +%s) - lm )) -gt 600 ] || return 1
-    else
-      _lock_holder_alive "$pid" && return 1
+      case "$lm" in ''|*[!0-9]*) _LOCK_WHY=age_unreadable; return 1 ;; esac
+      [ $(( $(date +%s) - lm )) -gt 600 ] || { _LOCK_WHY=pid_not_written_yet; return 1; }
+    elif _lock_holder_alive "$pid"; then _LOCK_WHY=holder_alive; return 1
     fi
-    # the holder is gone: a stale lock, taken over (once — a second taker that loses the mkdir race finds it held)
-    rm -f "$LOCK_DIR/pid" 2>/dev/null; rmdir "$LOCK_DIR" 2>/dev/null
-    tries=$((tries+1))
+    # the holder is gone: take the lock over by RENAMING it away — atomic, so of two ticks that judged the same dead holder only one finds the name — and check what was moved against what was judged. A rename moves
+    # whatever holds the NAME now, which may be the fresh lock of a tick that took it over a moment ago: that one goes back, and this tick leaves it alone (keep the plain `mv <lock> <aside>` form: the selftest's mv shim reads $1 as the source)
+    aside="$LOCK_DIR.stale.$$.$(date +%s).$tries"
+    if ! err="$(mv "$LOCK_DIR" "$aside" 2>&1)"; then
+      # vazio (the name is gone, or holds another pid now: a faster tick took it over) → judge again; falhou with the same stale lock still there (not writable, read-only) → the holder is gone and the lock cannot be cleared: "uncleared", never "held"
+      [ -d "$LOCK_DIR" ] || continue
+      [ "$(cat "$LOCK_DIR/pid" 2>/dev/null)" = "$pid" ] || continue
+      _LOCK_EVENT=lock_stale_uncleared; _LOCK_WHY=mv_failed; _LOCK_DETAIL="$err"; return 2
+    fi
+    if [ "$(cat "$aside/pid" 2>/dev/null)" != "$pid" ]; then
+      # not the lock that was judged: put it back (only if the name is still free); the next round reads it as whatever it is now
+      [ -e "$LOCK_DIR" ] || mv "$aside" "$LOCK_DIR" 2>/dev/null
+      _LOCK_WHY=contended; continue
+    fi
+    # the stale lock is out of the way; what cannot be deleted of it stays under its stale name (garbage, not a lock)
+    rm -f "$aside/pid" 2>/dev/null; rmdir "$aside" 2>/dev/null
   done
-  return 1
+  # three rounds without an answer: a lock that kept changing hands is somebody's (this tick skips); one that could not be made at all is "could not tell"
+  if [ "$_LOCK_WHY" = "mkdir_failed" ]; then _LOCK_EVENT=lock_unavailable; return 2; fi
+  _LOCK_WHY=contended; _LOCK_HOLDER="${_LOCK_HOLDER:-unknown}"; return 1
 }
 trap '_lock_release' EXIT
-if ! _lock_acquire; then
-  printf '{"ts":"%s","event":"skipped_busy","holder":"%s","note":"another pass holds the lock; this tick does nothing"}\n' "$(ts)" "$(_json_esc "$_LOCK_HOLDER")" >> "$LOG" 2>/dev/null
+_lock_acquire; _lock_rc=$?
+lock_unavailable=0
+if [ "$_lock_rc" = "1" ]; then
+  printf '{"ts":"%s","event":"skipped_busy","holder":"%s","why":"%s","note":"another pass holds the lock; this tick does nothing"}\n' "$(ts)" "$(_json_esc "${_LOCK_HOLDER:-unknown}")" "$_LOCK_WHY" >> "$LOG" 2>/dev/null
   exit 0
+elif [ "$_lock_rc" != "0" ]; then
+  # could not tell (2, or anything unexpected): the reaper is what frees disk, so it runs — as it did before the lock existed — and says so loudly, in the log, on stderr and on the sweep line
+  lock_unavailable=1
+  _lock_note "${_LOCK_EVENT:-lock_unavailable}" "${_LOCK_WHY:-unknown}" "$_LOCK_HOLDER" "$_LOCK_DETAIL" "no pass is known to hold the lock and this one could not take it; the pass runs WITHOUT the lock"
 fi
-# the cadence gate: in normal mode a tick inside NORMAL_INTERVAL_S of the last pass's start does nothing. Pressure never waits.
-if [ "$mode" = "normal" ] && [ "$NORMAL_INTERVAL_S" -gt 0 ] && [ "${WORKTREE_REAPER_FORCE:-0}" != "1" ]; then
+# the cadence gate: in normal mode a REAL pass (ENABLED=1) inside NORMAL_INTERVAL_S of the last real pass's start does nothing. Pressure never waits. A dry run (ENABLED=0) removes nothing, so it is never held back and
+# never stamps; a df that gave no number (free_gb_unreadable) is not "no pressure": that tick runs.
+if [ "$ENABLED" = "1" ] && [ "$mode" = "normal" ] && [ "$free_gb_unreadable" = "0" ] && [ "$NORMAL_INTERVAL_S" -gt 0 ] && [ "${WORKTREE_REAPER_FORCE:-0}" != "1" ]; then
   # vazio/ilegível (no stamp, or not a number) → no earlier pass is known: this one runs; a stamp in the future (clock set back) → runs too
   _last="$(cat "$STAMP" 2>/dev/null)"
   case "$_last" in ''|*[!0-9]*) _last=0 ;; esac
@@ -256,8 +309,8 @@ if [ "$mode" = "normal" ] && [ "$NORMAL_INTERVAL_S" -gt 0 ] && [ "${WORKTREE_REA
     exit 0
   fi
 fi
-# the pass starts: its start is what the next normal-mode tick measures from. falhou (cannot write) → the stamp stays old and the next tick runs a pass: more work, never less
-printf '%s\n' "$START_S" > "$STAMP" 2>/dev/null
+# a real pass starts: its start is what the next normal-mode tick measures from. falhou (cannot write) → the stamp stays old and the next tick runs a pass: more work, never less. A dry run does not stamp.
+if [ "$ENABLED" = "1" ]; then printf '%s\n' "$START_S" > "$STAMP" 2>/dev/null; fi
 
 reaped=0; skipped_dirty=0; kept=0; branches_deleted=0; pool_reaped=0; zombie_reaped=0; preserved_dirty=0
 kept_session_list_unavailable=0   # ga-vs6shu: locks KEPT only because the session list could not be fetched
@@ -1850,6 +1903,6 @@ duration_s=$(( $(date +%s) - START_S ))
 if [ "$duration_s" -ge "$CADENCE_S" ] && [ "$CADENCE_S" -gt 0 ]; then
   printf '{"ts":"%s","event":"pass_exceeds_interval","duration_s":%s,"interval_s":%s,"note":"ticks that fell inside this pass found the lock held and did nothing"}\n' "$(ts)" "$duration_s" "$CADENCE_S" >> "$LOG" 2>/dev/null
 fi
-printf '{"ts":"%s","event":"sweep","mode":"%s","free_gb":%s,"gate_hours":%s,"reaped":%s,"pool_reaped":%s,"zombie_reaped":%s,"preserved_dirty":%s,"branches_deleted":%s,"skipped_dirty":%s,"kept":%s,"session_list":"%s","kept_session_list_unavailable":%s,"bead_lookup_failed":%s,"repo_unresolvable":%s,"critical":%s,"critical_free_gb":%s,"critical_reaped":%s,"critical_kept":%s,"duration_s":%s,"interval_s":%s}\n' \
-  "$(ts)" "$mode" "$free_gb" "$gate_hours" "$reaped" "$pool_reaped" "$zombie_reaped" "$preserved_dirty" "$branches_deleted" "$skipped_dirty" "$kept" "${_WT_REAPER_SESSION_STATE:-unused}" "$kept_session_list_unavailable" "$bead_lookup_failed" "$repo_unresolvable" "$critical" "$CRITICAL_FREE_GB" "$critical_reaped" "$critical_kept" "$duration_s" "$CADENCE_S" >> "$LOG" 2>/dev/null
+printf '{"ts":"%s","event":"sweep","mode":"%s","free_gb":%s,"gate_hours":%s,"reaped":%s,"pool_reaped":%s,"zombie_reaped":%s,"preserved_dirty":%s,"branches_deleted":%s,"skipped_dirty":%s,"kept":%s,"session_list":"%s","kept_session_list_unavailable":%s,"bead_lookup_failed":%s,"repo_unresolvable":%s,"critical":%s,"critical_free_gb":%s,"critical_reaped":%s,"critical_kept":%s,"free_gb_unreadable":%s,"lock_unavailable":%s,"duration_s":%s,"interval_s":%s}\n' \
+  "$(ts)" "$mode" "$free_gb" "$gate_hours" "$reaped" "$pool_reaped" "$zombie_reaped" "$preserved_dirty" "$branches_deleted" "$skipped_dirty" "$kept" "${_WT_REAPER_SESSION_STATE:-unused}" "$kept_session_list_unavailable" "$bead_lookup_failed" "$repo_unresolvable" "$critical" "$CRITICAL_FREE_GB" "$critical_reaped" "$critical_kept" "$free_gb_unreadable" "$lock_unavailable" "$duration_s" "$CADENCE_S" >> "$LOG" 2>/dev/null
 exit 0

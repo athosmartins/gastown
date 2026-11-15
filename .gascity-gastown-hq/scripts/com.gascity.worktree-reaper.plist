@@ -4,7 +4,11 @@
   <!-- ga-zgqssr7. StartInterval 1800 (era 7200): sob pressao de disco (livre < PRESSURE_FREE_GB) toda batida e uma passada; sem pressao o proprio script sai na hora se a ultima
        passada comecou ha menos de WORKTREE_REAPER_NORMAL_INTERVAL_S (6900 s), entao o ritmo normal continua ~7200 s. Uma passada dura mediana ~5 min, maxima medida ~27 min (< 1800 s);
        se passar disso o evento pass_exceeds_interval aparece no jsonl e o lock (worktree-reaper.lock.d) impede duas passadas ao mesmo tempo.
-       A entrega NAO aplica este arquivo: depois do merge, copiar para ~/Library/LaunchAgents/ e `launchctl unload` + `launchctl load` (ou bootout/bootstrap). -->
+       ESTE ARQUIVO E O MOLDE (sem wrapper), NAO O INSTALADO. O plist VIVO e embrulhado pelo wait-for-dolt (o primeiro item de ProgramArguments e o wait-for-dolt.sh; veja a linha do job em wait-for-dolt.policy.tsv) e pode carregar
+       ambiente proprio: copiar este arquivo por cima dele tira o wrapper. A entrega tambem NAO aplica nada. Depois do merge, mude SO o intervalo no instalado e recarregue (o RunAtLoad dispara uma batida na hora; o proprio script decide se corre):
+         plutil -replace StartInterval -integer 1800 ~/Library/LaunchAgents/com.gascity.worktree-reaper.plist
+         launchctl bootout gui/$(id -u)/com.gascity.worktree-reaper ; launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.gascity.worktree-reaper.plist
+       Confira com plutil -p que o primeiro item de ProgramArguments continua sendo o wait-for-dolt.sh e que StartInterval vale 1800. -->
   <key>Label</key><string>com.gascity.worktree-reaper</string>
   <key>ProgramArguments</key><array>
     <string>/bin/bash</string>

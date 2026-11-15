@@ -23,7 +23,7 @@ com.gascity.reclaim-cap-escalation-sweep	wrap	detector sobre beads reclamados (b
 com.gascity.suavez-first-watch	wrap	avisa na 1ª bead em needs-approval (bd list)
 com.gascity.wisp-reaper	wrap	esvazia wisps efêmeros (bd/gc; já tem gate próprio de gc dolt status)
 com.gascity.wisp-table-reaper	wrap	drena a tabela wisps do Dolt (gc dolt status + reaper)
-com.gascity.worktree-reaper	wrap	reapa worktree decidindo por `gc session list` (worktree-reaper.sh:498) e `bd list` (:733); no boot um session list estourado já virou `{}` = "nenhuma sessão viva" e reapou worktree vivo (:458-467). Hoje indisponível vira KEEP, e o wrapper evita o boot varrer às cegas; RunAtLoad + StartInterval 7200, sem KeepAlive
+com.gascity.worktree-reaper	wrap	reapa worktree decidindo por `gc session list` (worktree-reaper.sh:498) e `bd list` (:733); no boot um session list estourado já virou `{}` = "nenhuma sessão viva" e reapou worktree vivo (:458-467). Hoje indisponível vira KEEP, e o wrapper evita o boot varrer às cegas; RunAtLoad + StartInterval 1800 desde a ga-zgqssr7 (fora de pressão o próprio script sai na hora e o ritmo normal segue ~7200 s), sem KeepAlive
 com.gascity.athos-acao-guard	isento	KeepAlive: daemon que o launchd relança sozinho; o wrapper trocaria o respawn dele por uma espera de até o prazo
 com.gascity.city-night-window	isento	suspende/retoma a cidade (gc suspend/resume): ciclo de vida; o mecanismo está DESLIGADO hoje
 com.gascity.config-drift-watcher	isento	KeepAlive: daemon que o launchd relança sozinho; o wrapper trocaria o respawn dele por uma espera de até o prazo

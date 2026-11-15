@@ -1328,6 +1328,47 @@ chmod +x "$PE_BIN/git"
 # ga-ggj1wnv: the size a reap event carries comes from `du`; PE_DU=fail makes it exit 1 with no output (a log field must not stop the reap).
 export PE_REAL_DU="$(command -v du)"
 printf '#!/bin/sh\n[ "${PE_DU:-}" = "fail" ] && exit 1\nexec "$PE_REAL_DU" "$@"\n' > "$PE_BIN/du"; chmod +x "$PE_BIN/du"
+# ga-zgqssr7 gate-fix 1/3: shims for the failures the LOCK block must tell apart from "another pass holds it". Each passes through to the real tool unless its PE_* switch names the exact path under test, and none
+# depends on the user: a permission trick does not bite root, these do. PE_MKDIR=nopid:<dir> → `mkdir <dir>` also puts a DANGLING symlink named pid in it (the holder's pid write then fails, ENOENT; the symlink and the
+# directory can still be removed, so the claim can be given back).
+export PE_REAL_MKDIR="$(command -v mkdir)" PE_REAL_MV="$(command -v mv)" PE_REAL_DF="$(command -v df)" PE_REAL_STAT="$(command -v stat)"
+cat > "$PE_BIN/mkdir" <<'PEMKDIR'
+#!/bin/sh
+case "${PE_MKDIR:-}" in
+  nopid:*) if [ "${1:-}" = "${PE_MKDIR#nopid:}" ]; then "$PE_REAL_MKDIR" "$1" && ln -s /nonexistent-dir-of-the-selftest/pid "$1/pid"; exit $?; fi ;;
+esac
+exec "$PE_REAL_MKDIR" "$@"
+PEMKDIR
+# PE_MV=fail:<src> → `mv <src> …` fails (a stale lock that cannot be moved away); swap:<src>:<pid> → <src>/pid is rewritten with <pid> first, then the real mv runs (another tick took the lock over between this tick's read
+# and its rename); failswap:<src>:<pid> → the same rewrite, but the mv FAILS (the name moved on under this tick). The source is $1: the reaper calls the plain `mv <lock> <aside>`.
+cat > "$PE_BIN/mv" <<'PEMV'
+#!/bin/sh
+case "${PE_MV:-}" in
+  fail:*) if [ "${1:-}" = "${PE_MV#fail:}" ]; then echo "mv: injected failure" >&2; exit 1; fi ;;
+  swap:*) _r="${PE_MV#swap:}"; if [ "${1:-}" = "${_r%:*}" ]; then printf '%s\n' "${_r##*:}" > "$1/pid"; fi ;;
+  failswap:*) _r="${PE_MV#failswap:}"; if [ "${1:-}" = "${_r%:*}" ]; then printf '%s\n' "${_r##*:}" > "$1/pid"; echo "mv: injected failure" >&2; exit 1; fi ;;
+  failgone:*) if [ "${1:-}" = "${PE_MV#failgone:}" ]; then rm -f "$1/pid"; rmdir "$1"; echo "mv: injected failure" >&2; exit 1; fi ;;
+esac
+exec "$PE_REAL_MV" "$@"
+PEMV
+# PE_STAT=fail:<path> → `stat … <path>` exits 1 and prints nothing (the lock directory's age cannot be read)
+cat > "$PE_BIN/stat" <<'PESTAT'
+#!/bin/sh
+for _a in "$@"; do _l="$_a"; done
+case "${PE_STAT:-}" in fail:*) [ "${_l:-}" = "${PE_STAT#fail:}" ] && exit 1 ;; esac
+exec "$PE_REAL_STAT" "$@"
+PESTAT
+# PE_DF=fail → exit 1, nothing printed; garbage → a header and a line whose Available column is "-"; empty → exit 0, nothing printed
+cat > "$PE_BIN/df" <<'PEDF'
+#!/bin/sh
+case "${PE_DF:-}" in
+  fail) exit 1 ;;
+  garbage) printf 'Filesystem 1G-blocks Used Available Capacity Mounted on\n/dev/x 100 50 - 50%% /\n'; exit 0 ;;
+  empty) exit 0 ;;
+esac
+exec "$PE_REAL_DF" "$@"
+PEDF
+chmod +x "$PE_BIN/mkdir" "$PE_BIN/mv" "$PE_BIN/df" "$PE_BIN/stat"
 : > "$TMP/pe_nolsof.txt"
 
 pe_age() { touch -t "$(date -v-"${2:-3}"H +%Y%m%d%H%M 2>/dev/null || date -d "${2:-3} hours ago" +%Y%m%d%H%M)" "$1" 2>/dev/null || true; }
@@ -3084,6 +3125,165 @@ kz_mk cad_t1; cad_run cad_t1 "$KZ_CLOSED" WORKTREE_REAPER_NORMAL_INTERVAL_S=0 PE
   && ok "ga-zgqssr7 (time 1): a pass of >= 2 s against a 1 s tick logs pass_exceeds_interval (duration_s, interval_s), and the sweep line has duration_s >= 1" || bad "ga-zgqssr7 (time 1): exceeds=$(crt_ev cad_t1 pass_exceeds_interval) duration_s=$(crt_sweep cad_t1 duration_s)"
 kz_mk cad_t2; cad_run cad_t2 "$KZ_CLOSED" WORKTREE_REAPER_NORMAL_INTERVAL_S=0
 { [ "$(crt_ev cad_t2 pass_exceeds_interval)" = "0" ] && [ "$(crt_sweep cad_t2 interval_s)" = "1800" ]; } && ok "ga-zgqssr7 (time 2): control — a pass inside the 1800 s tick logs no overrun" || bad "ga-zgqssr7 (time 2): exceeds=$(crt_ev cad_t2 pass_exceeds_interval) interval_s=$(crt_sweep cad_t2 interval_s)"
+
+# ══ ga-zgqssr7 gate-fix 1/3 (gate_run ga-66q2k9i, blocking issue 1): "could not take the lock" was logged as "another pass holds the lock" ═════════════════════════════
+# A lock directory that cannot be made (read-only, no room, a parent that is a file), a pid that cannot be written and a stale lock that cannot be cleared all ended in skipped_busy and NO pass — on exactly the
+# disk errors the reaper exists to outlast. Three answers now: held (a live holder: skipped_busy, with why), taken, and could-not-tell (lock_unavailable / lock_stale_uncleared: logged to the jsonl AND stderr, counted on
+# the sweep line, and the pass runs without the lock, as it did before the lock existed). The takeover of a stale lock is a rename that checks what it moved; a pass releases only a lock that is still its own. From the same
+# review: a dry run neither waits for the cadence nor moves its stamp, and a df that gives no number is flagged on the sweep line and is not "no pressure" for the cadence gate.
+echo "── ga-zgqssr7 gate-fix 1/3: could-not-take ≠ held; a stale takeover checks what it moved; release only what is mine; dry run and unreadable df vs the cadence ──"
+GF_NOW="$(date +%s)"
+gf_dead_pid() { sh -c 'exit 0' & GF_DEAD=$!; wait "$GF_DEAD" 2>/dev/null; }   # sets GF_DEAD to a pid that is gone
+gf_run_err() { # gf_run_err <name> <beads-json> <stderr-file> [ENV=val ...] — a normal-mode pass (own lock dir and stamp, like cad_run) whose STDERR is kept: the lock events go there too
+  local name="$1" beads="$2" err="$3"; shift 3
+  printf '%s' "$beads" > "$TMP/$name.beads.json"
+  env PATH="$PE_BIN:$PATH" WORKTREE_REAPER_GT="$TMP/$name" WORKTREE_REAPER_LOG="$TMP/$name.jsonl" WORKTREE_REAPER_STALE_HOURS=24 WORKTREE_REAPER_ENABLED=1 \
+    WORKTREE_REAPER_FAKE_LSOF="$TMP/bc_nolsof.txt" WORKTREE_REAPER_FAKE_BEADS="$TMP/$name.beads.json" WORKTREE_REAPER_PRESSURE_FREE_GB=8 WORKTREE_REAPER_FAKE_FREE_GB=20 \
+    WORKTREE_REAPER_LOCK_DIR="$TMP/$name.lock.d" WORKTREE_REAPER_STAMP="$TMP/$name.stamp" "$@" bash "$REAPER" >/dev/null 2>"$err"
+}
+# gf_unavail <name> <event> <why> <label> — the pass RAN without the lock: its sweep line counts lock_unavailable=1, the 14 h tree is gone, <event> was logged ONCE (lock_dir, why, detail) to the jsonl AND to stderr, and
+# there was never a skipped_busy
+gf_unavail() {
+  local n="$1" ev="$2" why="$3" lbl="$4"
+  if cad_ran "$n" && ! kz_wt "$n" && [ "$(crt_ev "$n" "$ev")" = "1" ] && [ "$(crt_ev "$n" skipped_busy)" = "0" ] && [ "$(crt_sweep "$n" lock_unavailable)" = "1" ] \
+     && grep -q "\"event\":\"$ev\"" "$TMP/$n.err" 2>/dev/null \
+     && jq -e -s --arg ev "$ev" --arg why "$why" 'map(select(.event==$ev)) | .[0] | .why==$why and (.lock_dir|length)>0 and (.detail|length)>0' "$TMP/$n.jsonl" >/dev/null 2>&1; then
+    ok "ga-zgqssr7 gate-fix ($lbl) → the pass RAN without the lock; $ev logged once (lock_dir, why=$why, detail) to the jsonl and stderr, no skipped_busy, lock_unavailable=1 on the sweep line"
+  else bad "ga-zgqssr7 gate-fix ($lbl) → ran=$(cad_ran "$n" && echo y || echo n) tree=$(kz_wt "$n" && echo KEPT || echo gone) $ev=$(crt_ev "$n" "$ev") skipped_busy=$(crt_ev "$n" skipped_busy) lock_unavailable=$(crt_sweep "$n" lock_unavailable) stderr=$(grep -c "\"event\":\"$ev\"" "$TMP/$n.err" 2>/dev/null) :: $(grep -E "\"event\":\"($ev|skipped_busy)\"" "$TMP/$n.jsonl" 2>/dev/null | head -n 1)"; fi
+}
+
+# (u1) the lock directory cannot be made: its parent is a regular file (ENOTDIR, root or not) — was skipped_busy "another pass holds the lock" and NO pass
+kz_mk cad_u1; : > "$TMP/cad_u1.notadir"; gf_run_err cad_u1 "$KZ_CLOSED" "$TMP/cad_u1.err" WORKTREE_REAPER_LOCK_DIR="$TMP/cad_u1.notadir/lock.d"
+gf_unavail cad_u1 lock_unavailable mkdir_failed "u1: the lock directory cannot be made (its parent is a file)"
+# (u2) the reviewer's repro (b): the WHOLE logs directory is read-only — the lock cannot be made and nothing can be logged. The pass still runs, and the event reaches STDERR (launchd's .err), the only place left
+if [ "$(id -u)" = "0" ]; then echo "  (skipped: gate-fix u2 needs a non-root user — root writes into a read-only directory; u1 and u4 inject the same failures for root too)"
+else
+  kz_mk cad_u2; mkdir "$TMP/cad_u2.ro"; chmod 555 "$TMP/cad_u2.ro"
+  gf_run_err cad_u2 "$KZ_CLOSED" "$TMP/cad_u2.err" WORKTREE_REAPER_LOG="$TMP/cad_u2.ro/worktree-reaper.jsonl" WORKTREE_REAPER_LOCK_DIR="$TMP/cad_u2.ro/worktree-reaper.lock.d"
+  chmod 755 "$TMP/cad_u2.ro"
+  { ! kz_wt cad_u2 && grep -q '"event":"lock_unavailable"' "$TMP/cad_u2.err" && ! grep -q 'skipped_busy' "$TMP/cad_u2.err"; } \
+    && ok "ga-zgqssr7 gate-fix (u2): a read-only logs directory → the pass RAN without the lock and lock_unavailable is on stderr (the log cannot take it)" \
+    || bad "ga-zgqssr7 gate-fix (u2): tree=$(kz_wt cad_u2 && echo KEPT || echo gone) stderr: $(head -c 300 "$TMP/cad_u2.err" 2>/dev/null)"
+fi
+# (u4) the directory is made but its pid cannot be written (a dangling symlink named pid is in the way): nobody could tell whose lock it is, so it is not claimed — what the claim made is given back, and the pass runs without it
+kz_mk cad_u4; gf_run_err cad_u4 "$KZ_CLOSED" "$TMP/cad_u4.err" PE_MKDIR="nopid:$TMP/cad_u4.lock.d"
+gf_unavail cad_u4 lock_unavailable pid_write_failed "u4: the directory is made but its pid cannot be written"
+[ ! -e "$TMP/cad_u4.lock.d" ] && [ ! -L "$TMP/cad_u4.lock.d/pid" ] && ok "ga-zgqssr7 gate-fix (u4): the lock directory the failed claim made is given back (nothing left that the next tick would read as a crashed holder's)" \
+  || bad "ga-zgqssr7 gate-fix (u4): the failed claim left $TMP/cad_u4.lock.d behind"
+# (u5) a DEAD holder's lock that cannot be moved away: the holder is gone, the lock is uncleared — never "held"
+kz_mk cad_u5; mkdir "$TMP/cad_u5.lock.d"; gf_dead_pid; echo "$GF_DEAD" > "$TMP/cad_u5.lock.d/pid"
+gf_run_err cad_u5 "$KZ_CLOSED" "$TMP/cad_u5.err" PE_MV="fail:$TMP/cad_u5.lock.d"
+gf_unavail cad_u5 lock_stale_uncleared mv_failed "u5: a dead holder's lock cannot be moved away"
+jq -e -s --arg h "$GF_DEAD" 'map(select(.event=="lock_stale_uncleared")) | .[0].holder==$h' "$TMP/cad_u5.jsonl" >/dev/null 2>&1 \
+  && ok "ga-zgqssr7 gate-fix (u5): the event names the dead holder" || bad "ga-zgqssr7 gate-fix (u5): the event does not name the dead holder $GF_DEAD: $(grep lock_stale_uncleared "$TMP/cad_u5.jsonl" 2>/dev/null | head -n 1)"
+# (u6) the reviewer's repro (c): a dead holder's lock with a file in it that cannot be deleted (the directory is read-only). The takeover is a RENAME (the parent is writable), so the pass takes a lock of its own
+if [ "$(id -u)" = "0" ]; then echo "  (skipped: gate-fix u6 needs a non-root user; u5 injects the failed takeover for root too)"
+else
+  kz_mk cad_u6; mkdir "$TMP/cad_u6.lock.d"; gf_dead_pid; echo "$GF_DEAD" > "$TMP/cad_u6.lock.d/pid"; echo stray > "$TMP/cad_u6.lock.d/stray.txt"; chmod 555 "$TMP/cad_u6.lock.d"
+  gf_run_err cad_u6 "$KZ_CLOSED" "$TMP/cad_u6.err"
+  chmod -R u+w "$TMP"/cad_u6.lock.d* 2>/dev/null
+  # whether a read-only DIRECTORY can be renamed is the file system's say (Linux: yes, the parent is what counts; others may refuse): either answer is a true one, and never "another pass holds it" —
+  # (taken) the rename worked: the pass ran holding a lock of its own and released it; (not taken) it did not: lock_stale_uncleared, counted, and the pass ran without the lock
+  { cad_ran cad_u6 && ! kz_wt cad_u6 && [ "$(crt_ev cad_u6 skipped_busy)" = "0" ] \
+    && { { [ "$(crt_ev cad_u6 lock_stale_uncleared)" = "0" ] && [ "$(crt_sweep cad_u6 lock_unavailable)" = "0" ] && [ ! -e "$TMP/cad_u6.lock.d" ]; } \
+      || { [ "$(crt_ev cad_u6 lock_stale_uncleared)" = "1" ] && [ "$(crt_sweep cad_u6 lock_unavailable)" = "1" ]; }; }; } \
+    && ok "ga-zgqssr7 gate-fix (u6): a dead holder's lock holding a file that cannot be deleted → the pass RAN, never skipped_busy (took the lock over by rename, or lock_stale_uncleared and no lock)" \
+    || bad "ga-zgqssr7 gate-fix (u6): ran=$(cad_ran cad_u6 && echo y || echo n) skipped_busy=$(crt_ev cad_u6 skipped_busy) uncleared=$(crt_ev cad_u6 lock_stale_uncleared) lock_unavailable=$(crt_sweep cad_u6 lock_unavailable) lock=$([ -e "$TMP/cad_u6.lock.d" ] && echo left || echo gone)"
+fi
+# (u7) another tick takes the stale lock over between this tick's read and its rename: the rename moves ITS fresh lock; the pid inside is not the one judged dead, so the lock is put back and this tick leaves it alone
+kz_mk cad_u7; mkdir "$TMP/cad_u7.lock.d"; gf_dead_pid; echo "$GF_DEAD" > "$TMP/cad_u7.lock.d/pid"; bash -c 'sleep 30; :' worktree-reaper-fake & LK_PID=$!
+gf_run_err cad_u7 "$KZ_CLOSED" "$TMP/cad_u7.err" PE_MV="swap:$TMP/cad_u7.lock.d:$LK_PID"; kill "$LK_PID" 2>/dev/null; wait "$LK_PID" 2>/dev/null
+{ cad_idle cad_u7 && jq -e -s --arg h "$LK_PID" 'map(select(.event=="skipped_busy")) | length==1 and .[0].holder==$h and .[0].why=="holder_alive"' "$TMP/cad_u7.jsonl" >/dev/null 2>&1 \
+  && [ "$(cat "$TMP/cad_u7.lock.d/pid" 2>/dev/null)" = "$LK_PID" ] && ! ls -d "$TMP"/cad_u7.lock.d.stale.* >/dev/null 2>&1; } \
+  && ok "ga-zgqssr7 gate-fix (u7): a lock taken over under this tick's feet is put back untouched (the live taker is the holder, skipped_busy names it, nothing left aside), no pass" \
+  || bad "ga-zgqssr7 gate-fix (u7): idle=$(cad_idle cad_u7 && echo y || echo n) busy=$(crt_ev cad_u7 skipped_busy) pid-in-lock=$(cat "$TMP/cad_u7.lock.d/pid" 2>/dev/null) aside=$(ls -d "$TMP"/cad_u7.lock.d.stale.* 2>/dev/null | head -n 1)"
+# (u7b) the rename FAILS because the name moved on (another tick took the stale lock over and its fresh lock is there now): that is not "uncleared" — this tick judges the lock again and finds a live holder
+kz_mk cad_u7b; mkdir "$TMP/cad_u7b.lock.d"; gf_dead_pid; echo "$GF_DEAD" > "$TMP/cad_u7b.lock.d/pid"; bash -c 'sleep 30; :' worktree-reaper-fake & LK_PID=$!
+gf_run_err cad_u7b "$KZ_CLOSED" "$TMP/cad_u7b.err" PE_MV="failswap:$TMP/cad_u7b.lock.d:$LK_PID"; kill "$LK_PID" 2>/dev/null; wait "$LK_PID" 2>/dev/null
+{ cad_idle cad_u7b && [ "$(crt_ev cad_u7b lock_stale_uncleared)" = "0" ] && jq -e -s --arg h "$LK_PID" 'map(select(.event=="skipped_busy")) | length==1 and .[0].holder==$h and .[0].why=="holder_alive"' "$TMP/cad_u7b.jsonl" >/dev/null 2>&1; } \
+  && ok "ga-zgqssr7 gate-fix (u7b): a failed rename of a lock that changed hands is judged again (live taker → skipped_busy), never reported as lock_stale_uncleared" \
+  || bad "ga-zgqssr7 gate-fix (u7b): idle=$(cad_idle cad_u7b && echo y || echo n) uncleared=$(crt_ev cad_u7b lock_stale_uncleared) busy=$(grep skipped_busy "$TMP/cad_u7b.jsonl" 2>/dev/null | head -n 1)"
+# (u7c) the rename FAILS because the lock is already gone (a faster tick took it over and released it): an EMPTY pid read back as empty is not a stale lock still in the way — the name is free, so this tick takes the lock itself
+kz_mk cad_u7c; mkdir "$TMP/cad_u7c.lock.d"; : > "$TMP/cad_u7c.lock.d/pid"; pe_age "$TMP/cad_u7c.lock.d" 3
+gf_run_err cad_u7c "$KZ_CLOSED" "$TMP/cad_u7c.err" PE_MV="failgone:$TMP/cad_u7c.lock.d"
+{ cad_ran cad_u7c && ! kz_wt cad_u7c && [ "$(crt_ev cad_u7c lock_stale_uncleared)" = "0" ] && [ "$(crt_ev cad_u7c skipped_busy)" = "0" ] && [ "$(crt_sweep cad_u7c lock_unavailable)" = "0" ] && [ ! -e "$TMP/cad_u7c.lock.d" ]; } \
+  && ok "ga-zgqssr7 gate-fix (u7c): a rename that fails because the lock is already gone is not 'uncleared': the name is free, the pass takes the lock and runs holding it" \
+  || bad "ga-zgqssr7 gate-fix (u7c): ran=$(cad_ran cad_u7c && echo y || echo n) uncleared=$(crt_ev cad_u7c lock_stale_uncleared) busy=$(crt_ev cad_u7c skipped_busy) lock_unavailable=$(crt_sweep cad_u7c lock_unavailable)"
+# (u8) a pass whose lock was taken over meanwhile (a tick judged it stale) must not delete the TAKER's lock when it ends
+kz_mk cad_u8; bash -c 'sleep 30; :' worktree-reaper-fake & LK_PID=$!
+( gf_run_err cad_u8 "$KZ_CLOSED" "$TMP/cad_u8.err" PE_WTLIST_SLEEP=4 ) & GF_RUN=$!
+gf_i=0; while [ ! -s "$TMP/cad_u8.lock.d/pid" ] && [ "$gf_i" -lt 240 ]; do sleep 0.25; gf_i=$((gf_i+1)); done   # up to 60 s for the pass to take the lock (a loaded box), then it sleeps 4 s inside `worktree list`
+echo "$LK_PID" > "$TMP/cad_u8.lock.d/pid"; wait "$GF_RUN" 2>/dev/null; kill "$LK_PID" 2>/dev/null; wait "$LK_PID" 2>/dev/null
+{ cad_ran cad_u8 && [ "$(cat "$TMP/cad_u8.lock.d/pid" 2>/dev/null)" = "$LK_PID" ]; } \
+  && ok "ga-zgqssr7 gate-fix (u8): the pass that lost its lock to a taker leaves the taker's lock alone when it ends" \
+  || bad "ga-zgqssr7 gate-fix (u8): ran=$(cad_ran cad_u8 && echo y || echo n) pid-in-lock='$(cat "$TMP/cad_u8.lock.d/pid" 2>/dev/null)' (want $LK_PID)"
+# (u11) control: the plain stale takeover — taken, the pass runs, the lock is released, nothing is left aside, nothing is counted as unavailable
+kz_mk cad_u11; mkdir "$TMP/cad_u11.lock.d"; gf_dead_pid; echo "$GF_DEAD" > "$TMP/cad_u11.lock.d/pid"; gf_run_err cad_u11 "$KZ_CLOSED" "$TMP/cad_u11.err"
+{ cad_ran cad_u11 && ! kz_wt cad_u11 && [ ! -e "$TMP/cad_u11.lock.d" ] && ! ls -d "$TMP"/cad_u11.lock.d.stale.* >/dev/null 2>&1 && [ "$(crt_sweep cad_u11 lock_unavailable)" = "0" ] && [ "$(crt_ev cad_u11 lock_unavailable)" = "0" ]; } \
+  && ok "ga-zgqssr7 gate-fix (u11): control — a dead holder's lock is taken over: the pass runs, the lock is released, nothing left aside, lock_unavailable=0" \
+  || bad "ga-zgqssr7 gate-fix (u11): ran=$(cad_ran cad_u11 && echo y || echo n) lock=$([ -e "$TMP/cad_u11.lock.d" ] && echo left || echo gone) aside=$(ls -d "$TMP"/cad_u11.lock.d.stale.* 2>/dev/null | head -n 1) lock_unavailable=$(crt_sweep cad_u11 lock_unavailable)"
+# (w1)(w2) skipped_busy says WHY: a live holder, and a holder that has not written its pid yet are different things (the holder was "unknown" for both)
+kz_mk cad_w1; mkdir "$TMP/cad_w1.lock.d"; bash -c 'sleep 30; :' worktree-reaper-fake & LK_PID=$!; echo "$LK_PID" > "$TMP/cad_w1.lock.d/pid"
+gf_run_err cad_w1 "$KZ_CLOSED" "$TMP/cad_w1.err"; kill "$LK_PID" 2>/dev/null; wait "$LK_PID" 2>/dev/null
+{ cad_idle cad_w1 && jq -e -s --arg h "$LK_PID" 'map(select(.event=="skipped_busy")) | length==1 and .[0].holder==$h and .[0].why=="holder_alive"' "$TMP/cad_w1.jsonl" >/dev/null 2>&1; } \
+  && ok "ga-zgqssr7 gate-fix (w1): a live holder → skipped_busy with why=holder_alive" || bad "ga-zgqssr7 gate-fix (w1): $(grep skipped_busy "$TMP/cad_w1.jsonl" 2>/dev/null | head -n 1)"
+kz_mk cad_w2; mkdir "$TMP/cad_w2.lock.d"; : > "$TMP/cad_w2.lock.d/pid"; gf_run_err cad_w2 "$KZ_CLOSED" "$TMP/cad_w2.err"
+{ cad_idle cad_w2 && jq -e -s 'map(select(.event=="skipped_busy")) | length==1 and .[0].holder=="unknown" and .[0].why=="pid_not_written_yet"' "$TMP/cad_w2.jsonl" >/dev/null 2>&1; } \
+  && ok "ga-zgqssr7 gate-fix (w2): an empty pid file on a fresh lock → skipped_busy with why=pid_not_written_yet" || bad "ga-zgqssr7 gate-fix (w2): $(grep skipped_busy "$TMP/cad_w2.jsonl" 2>/dev/null | head -n 1)"
+# (w3) an empty pid on a lock directory 3 h old WOULD be taken over (lock 5) — but when its age cannot be read, nothing says it is old: held, never taken over on a guess, and the why says so
+kz_mk cad_w3; mkdir "$TMP/cad_w3.lock.d"; : > "$TMP/cad_w3.lock.d/pid"; pe_age "$TMP/cad_w3.lock.d" 3; gf_run_err cad_w3 "$KZ_CLOSED" "$TMP/cad_w3.err" PE_STAT="fail:$TMP/cad_w3.lock.d"
+{ cad_idle cad_w3 && jq -e -s 'map(select(.event=="skipped_busy")) | length==1 and .[0].holder=="unknown" and .[0].why=="age_unreadable"' "$TMP/cad_w3.jsonl" >/dev/null 2>&1; } \
+  && ok "ga-zgqssr7 gate-fix (w3): an empty pid whose lock age cannot be read → held (skipped_busy why=age_unreadable), not taken over although the directory is 3 h old" || bad "ga-zgqssr7 gate-fix (w3): idle=$(cad_idle cad_w3 && echo y || echo n) $(grep skipped_busy "$TMP/cad_w3.jsonl" 2>/dev/null | head -n 1)"
+
+# (w4) a pid file that IS there but cannot be read (here: a directory named pid — unreadable as a file, root too) on a lock directory 3 h old: "cannot read" is not "no pid yet" and not "no holder" — held, never taken over
+kz_mk cad_w4; mkdir "$TMP/cad_w4.lock.d" "$TMP/cad_w4.lock.d/pid"; pe_age "$TMP/cad_w4.lock.d" 3; gf_run_err cad_w4 "$KZ_CLOSED" "$TMP/cad_w4.err"
+{ cad_idle cad_w4 && jq -e -s 'map(select(.event=="skipped_busy")) | length==1 and .[0].holder=="unknown" and .[0].why=="pid_unreadable"' "$TMP/cad_w4.jsonl" >/dev/null 2>&1 && ! ls -d "$TMP"/cad_w4.lock.d.stale.* >/dev/null 2>&1; } \
+  && ok "ga-zgqssr7 gate-fix (w4): a pid file that is there but cannot be read, on a lock directory 3 h old → held (skipped_busy why=pid_unreadable), nothing taken over or moved aside" \
+  || bad "ga-zgqssr7 gate-fix (w4): idle=$(cad_idle cad_w4 && echo y || echo n) $(grep skipped_busy "$TMP/cad_w4.jsonl" 2>/dev/null | head -n 1) aside=$(ls -d "$TMP"/cad_w4.lock.d.stale.* 2>/dev/null | head -n 1)"
+# (w5) control for w4: NO pid file at all (a holder that died between its mkdir and the pid write) on a lock directory 3 h old IS taken over — "missing" is not "unreadable", or one crash in that gap would switch the reaper off for good
+kz_mk cad_w5; mkdir "$TMP/cad_w5.lock.d"; pe_age "$TMP/cad_w5.lock.d" 3; gf_run_err cad_w5 "$KZ_CLOSED" "$TMP/cad_w5.err"
+{ cad_ran cad_w5 && ! kz_wt cad_w5 && [ "$(crt_ev cad_w5 skipped_busy)" = "0" ] && [ "$(crt_sweep cad_w5 lock_unavailable)" = "0" ]; } \
+  && ok "ga-zgqssr7 gate-fix (w5): control — a lock directory 3 h old with NO pid file is a crashed holder's: taken over, the pass runs" || bad "ga-zgqssr7 gate-fix (w5): ran=$(cad_ran cad_w5 && echo y || echo n) busy=$(grep skipped_busy "$TMP/cad_w5.jsonl" 2>/dev/null | head -n 1)"
+
+# ── the cadence: a DRY RUN (ENABLED=0) is not a pass — inside the window it still runs (it removes nothing), and it never writes or moves the stamp
+kz_mk cad_g9; echo "$((GF_NOW - 600))" > "$TMP/cad_g9.stamp"; cad_run cad_g9 "$KZ_CLOSED" WORKTREE_REAPER_NORMAL_INTERVAL_S=6900 WORKTREE_REAPER_ENABLED=0
+{ cad_ran cad_g9 && [ "$(crt_ev cad_g9 skipped_no_pressure)" = "0" ] && [ "$(cat "$TMP/cad_g9.stamp")" = "$((GF_NOW - 600))" ] && kz_wt cad_g9 && [ "$(crt_ev cad_g9 would_reap_pool)" = "1" ]; } \
+  && ok "ga-zgqssr7 gate-fix (g9): a dry run inside the window is not held back (it reports what would go), removes nothing, and leaves the stamp where it was" \
+  || bad "ga-zgqssr7 gate-fix (g9): ran=$(cad_ran cad_g9 && echo y || echo n) skipped_no_pressure=$(crt_ev cad_g9 skipped_no_pressure) stamp=$(cat "$TMP/cad_g9.stamp") would_reap_pool=$(crt_ev cad_g9 would_reap_pool)"
+kz_mk cad_g10; rm -f "$TMP/cad_g10.stamp"; cad_run cad_g10 "$KZ_CLOSED" WORKTREE_REAPER_NORMAL_INTERVAL_S=6900 WORKTREE_REAPER_ENABLED=0
+{ cad_ran cad_g10 && [ ! -e "$TMP/cad_g10.stamp" ]; } && ok "ga-zgqssr7 gate-fix (g10): a dry run does not create the stamp (the next REAL pass is not held back by it)" || bad "ga-zgqssr7 gate-fix (g10): stamp=$([ -e "$TMP/cad_g10.stamp" ] && echo written || echo none)"
+# ── an unreadable df is a third state: flagged on the sweep line (free_gb=99 as before), and NOT "no pressure" for the cadence gate (a tick inside the window still runs the pass)
+kz_mk cad_f1; echo "$((GF_NOW - 600))" > "$TMP/cad_f1.stamp"; cad_run cad_f1 "$KZ_CLOSED" WORKTREE_REAPER_NORMAL_INTERVAL_S=6900 WORKTREE_REAPER_FAKE_FREE_GB= PE_DF=fail
+{ cad_ran cad_f1 && [ "$(crt_ev cad_f1 skipped_no_pressure)" = "0" ] && jq -e -s 'map(select(.event=="sweep")) | .[0].free_gb_unreadable==1 and .[0].free_gb==99 and .[0].mode=="normal"' "$TMP/cad_f1.jsonl" >/dev/null 2>&1; } \
+  && ok "ga-zgqssr7 gate-fix (f1): df fails → free_gb_unreadable=1 (free_gb=99, normal mode as before) and the cadence gate does not skip the tick" \
+  || bad "ga-zgqssr7 gate-fix (f1): ran=$(cad_ran cad_f1 && echo y || echo n) skipped=$(crt_ev cad_f1 skipped_no_pressure) :: $(grep '"event":"sweep"' "$TMP/cad_f1.jsonl" 2>/dev/null | tail -n 1)"
+kz_mk cad_f2; cad_run cad_f2 "$KZ_CLOSED" WORKTREE_REAPER_NORMAL_INTERVAL_S=0 WORKTREE_REAPER_FAKE_FREE_GB= PE_DF=garbage
+{ cad_ran cad_f2 && jq -e . "$TMP/cad_f2.jsonl" >/dev/null 2>&1 && jq -e -s 'map(select(.event=="sweep")) | .[0].free_gb_unreadable==1 and .[0].free_gb==99' "$TMP/cad_f2.jsonl" >/dev/null 2>&1; } \
+  && ok "ga-zgqssr7 gate-fix (f2): df prints a non-number in the Available column → the same, and every log line is still JSON" \
+  || bad "ga-zgqssr7 gate-fix (f2): $(grep '"event":"sweep"' "$TMP/cad_f2.jsonl" 2>/dev/null | tail -n 1)"
+kz_mk cad_f3; cad_run cad_f3 "$KZ_CLOSED" WORKTREE_REAPER_NORMAL_INTERVAL_S=0
+{ cad_ran cad_f3 && jq -e -s 'map(select(.event=="sweep")) | .[0].free_gb_unreadable==0 and .[0].free_gb==20' "$TMP/cad_f3.jsonl" >/dev/null 2>&1; } \
+  && ok "ga-zgqssr7 gate-fix (f3): control — a df that answers (free=20) → free_gb_unreadable=0" || bad "ga-zgqssr7 gate-fix (f3): $(grep '"event":"sweep"' "$TMP/cad_f3.jsonl" 2>/dev/null | tail -n 1)"
+kz_mk cad_f4; echo "$((GF_NOW - 600))" > "$TMP/cad_f4.stamp"; cad_run cad_f4 "$KZ_CLOSED" WORKTREE_REAPER_NORMAL_INTERVAL_S=6900
+{ cad_idle cad_f4 && [ "$(crt_ev cad_f4 skipped_no_pressure)" = "1" ]; } \
+  && ok "ga-zgqssr7 gate-fix (f4): control — a df that answers (free=20) inside the window still skips the tick (the gate is intact)" || bad "ga-zgqssr7 gate-fix (f4): idle=$(cad_idle cad_f4 && echo y || echo n) skipped=$(crt_ev cad_f4 skipped_no_pressure)"
+
+# ── the "no lock" criterion must be told apart by a scenario: cz_n15 / ct_n6 stay kept even without the guard (their lock reason holds no dead pid, and the lock contract refuses a 1 h tree anyway). A YOUNG delivered tree
+# whose lock holder is a DEAD pid is what the guard is for: without it the critical proof would call the tree "merged", skip the age gate and hand it to the lock contract, which reaps a zombie's tree. With it the tree is
+# kept (the lock keeps its own contract and its own age rules); the OLD tree with the same lock is the control — the contract does reap it, so the fixture's holder really is a zombie. Both loops.
+GF_PS="$TMP/gf_ps.txt"; echo "1001 dead 0 0" > "$GF_PS"
+kz_mk cz_z1 "" 1; git -C "$TMP/cz_z1/rig" worktree lock --reason "claude agent agent-z1 pid 1001 start x" crew/worker-kz >/dev/null 2>&1
+run_kz cz_z1 "$CZ_CLOSED10" $CZ_ENV WORKTREE_REAPER_FAKE_PS="$GF_PS"; crt_kept cz_z1 "gate-fix (z1): a YOUNG delivered tree locked by a DEAD holder (the lock contract keeps its own age rules)"
+kz_mk cz_z2 "" 14; git -C "$TMP/cz_z2/rig" worktree lock --reason "claude agent agent-z2 pid 1001 start x" crew/worker-kz >/dev/null 2>&1
+run_kz cz_z2 "$CZ_CLOSED10" $CZ_ENV WORKTREE_REAPER_FAKE_PS="$GF_PS"
+kz_wt cz_z2 && bad "ga-zgqssr7 gate-fix (z2): control — the same dead-holder lock on a 14 h tree was NOT reaped by the lock contract (the fixture does not make a zombie)" \
+  || ok "ga-zgqssr7 gate-fix (z2): control — the same dead-holder lock on a 14 h tree IS reaped by the lock contract (the holder really is a zombie)"
+crt_town cz_z3; git -C "$TMP/cz_z3" worktree lock --reason "claude agent agent-z3 pid 1001 start x" ".gc-worktrees/$CRT_TID-build" >/dev/null 2>&1
+run_dg cz_z3 "$CT_CLOSED10" $CZ_ENV WORKTREE_REAPER_FAKE_PS="$GF_PS"; crt_tkept cz_z3 "gate-fix (z3): a YOUNG delivered town tree locked by a DEAD holder"
+crt_town cz_z4 "" 14; git -C "$TMP/cz_z4" worktree lock --reason "claude agent agent-z4 pid 1001 start x" ".gc-worktrees/$CRT_TID-build" >/dev/null 2>&1
+run_dg cz_z4 "$CT_CLOSED10" $CZ_ENV WORKTREE_REAPER_FAKE_PS="$GF_PS"
+crt_twt cz_z4 && bad "ga-zgqssr7 gate-fix (z4): control — the same dead-holder lock on a 14 h town tree was NOT reaped by the lock contract" \
+  || ok "ga-zgqssr7 gate-fix (z4): control — the same dead-holder lock on a 14 h town tree IS reaped by the lock contract (the holder really is a zombie)"
 
 echo ""
 echo "── RESULTS: $PASS passed, $FAIL failed ──"
