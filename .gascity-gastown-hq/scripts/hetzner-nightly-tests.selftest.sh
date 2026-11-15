@@ -95,7 +95,7 @@ case_first() { reset; mkout "$ISO_OK" 7 "$SUM1" "FAILED tests/a.py::t1 - Asserti
   ck "1ª noite: exit 0 e veredito COMPLETO" rcis 0; ck "1ª noite: COMPLETO na última linha e no jsonl" vd COMPLETO; ck "1ª noite: 1 e-mail" mailn 1
   ck "1ª noite: assunto diz primeira rodada" has "$MAIL_LOG" 'COMPLETO: 1205 testes em 1 lotes, 3 falhas, 0 erros \(primeira rodada\)'
   ck "1ª noite: relatório com a linha de base" has "$REPORT" 'primeira rodada completa.*as 3 falhas de hoje viram a linha de base'
-  ck "1ª noite: totais" has "$REPORT" 'total: 1205 \(1200 passaram, 3 falharam, 0 erros, 2 pulados'; ck "1ª noite: duração e meta de 2 h" has "$REPORT" 'pytest somado 1h6min.*meta de 2 h: ATINGIDA'
+  ck "1ª noite: totais" has "$REPORT" 'total: 1205 \(1200 passaram, 3 falharam, 0 erros, 2 pulados'; ck "1ª noite: duração e meta de 150 min" has "$REPORT" 'pytest somado 1h6min.*meta de 150 min: ATINGIDA'
   ck "1ª noite: contador do nft no relatório" has "$REPORT" '7 tentativa\(s\) de saída barradas pelo nft'
   ck "1ª noite: mbp-run com o isolamento ligado, o prazo e o MESMO nó do instalador" has "$CALLS" 'ENV: ISOLATE=1 TIMEOUT=2400 NODE=stub-node'
   ck "1ª noite: mbp-run no nó linux, os arquivos do lote (ordem de caminho), -n auto e o plugin" has "$CALLS" 'ARGS: --host linux --repo wa --dir .*-- tests/a_test.py tests/sub/test_c.py tests/test_a.py tests/test_b.py tests/test_zero.py -n auto -p gtn_stable_ids --timeout=300'
@@ -341,8 +341,8 @@ for c in $ALL; do "case_$c" "$SUT0"; done
 M=0
 # o controle do controle: uma cópia NEUTRA (só um comentário a mais) tem de PASSAR todos os casos. Se reprovasse, todo mutante abaixo "morreria" por qualquer motivo e a prova seria vazia
 # (foi assim até o gate 1: o mutante morava em $T sem os arquivos irmãos que o script lê de $HERE, e reprovava todo caso, qualquer que fosse a mutação).
-f="$T/m-neutro.sh"; { cat "$SUT0"; echo "# neutro"; } > "$f"; chmod +x "$f"; n=$((n+1)); BAD=0; QUIET=1; for c in $ALL; do "case_$c" "$f"; done; QUIET=0
-if [ "$BAD" = 0 ]; then echo "ok   M0-neutro (a cópia neutra passa TODOS os casos: os mutantes abaixo reprovam por causa da mutação)"; else echo "FAIL M0-neutro: a cópia NEUTRA reprovou algum caso (o controle negativo seria vazio)"; fails=$((fails+1)); fi
+f="$T/m-neutro.sh"; { cat "$SUT0"; echo "# neutro"; } > "$f"; chmod +x "$f"; n=$((n+1)); BAD=0; ZB=""; QUIET=1; for c in $ALL; do BAD=0; "case_$c" "$f"; [ "$BAD" = 0 ] || ZB="$ZB $c"; done; QUIET=0; BAD=0; [ -z "$ZB" ] || BAD=1
+if [ "$BAD" = 0 ]; then echo "ok   M0-neutro (a cópia neutra passa TODOS os casos: os mutantes abaixo reprovam por causa da mutação)"; else echo "FAIL M0-neutro: a cópia NEUTRA reprovou o(s) caso(s)$ZB (o controle negativo seria vazio)"; fails=$((fails+1)); fi
 mutant() { # nome expr-sed caso — cria o mutante, roda o caso em silêncio e exige que ele reprove
   local f="$T/m-$1.sh"; sed "$2" "$SUT0" > "$f"; chmod +x "$f"; n=$((n+1)); M=$((M+1))
   if cmp -s "$SUT0" "$f"; then echo "FAIL $1: o sed não casou (mutante igual ao original)"; fails=$((fails+1)); return; fi

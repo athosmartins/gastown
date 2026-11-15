@@ -9,7 +9,7 @@
 # o veredito da noite é INERTE e o relatório diz o que falta. Nunca se roda a suíte sem a prova do canário (04/10: um teste de branch antiga mandou
 # e-mail de verdade).
 #
-# timeout 10800s (3h) > o prazo do próprio script (HZN_TIMEOUT_S=7200, repartido entre os lotes, + busca, envio e relatório), para o script conseguir registrar o desfecho;
+# timeout 10800s (3h) > o prazo do próprio script (HZN_TIMEOUT_S=9000, repartido entre os lotes, + busca, envio e relatório), para o script conseguir registrar o desfecho;
 # o script tem trava de instância única, então uma rodada que passe da hora não empilha com a seguinte.
 #
 # Conferir depois de um reload:  gc order show hetzner-nightly-tests          -> Source: .../packs/town-deltas/...

@@ -78,7 +78,7 @@ if [ -n "${GTN_WORKERS:-}" ]; then
   WORKERS=$GTN_WORKERS
   echo "GTN-CAP: sem-teto (GTN_WORKERS=$WORKERS explícito: o governo de quem chamou decide a memória)"
 else
-  RESERVE=${GTN_RESERVE_MB:-6144}; CEILMAX=${GTN_CEIL_MAX_MB:-20480}; BASE=${GTN_BASE_MB:-4096}; PER=${GTN_PERWORKER_MB:-1800}
+  RESERVE=${GTN_RESERVE_MB:-6144}; CEILMAX=${GTN_CEIL_MAX_MB:-20480}; BASE=${GTN_BASE_MB:-2048}; PER=${GTN_PERWORKER_MB:-1200}
   for v in "$RESERVE" "$CEILMAX" "$BASE" "$PER"; do num "$v" && [ "$v" -ge 1 ] || cap_inert "constante-invalida (reserva=$RESERVE teto-max=$CEILMAX base=$BASE por-worker=$PER)"; done
   MEMINFO=${GTN_MEMINFO:-/proc/meminfo}
   AVAIL_KB=$(awk '/^MemAvailable:/ { print $2; exit }' "$MEMINFO" 2>/dev/null)
@@ -97,6 +97,7 @@ else
 fi
 # WA_PYTEST_MAX_WORKERS: sem ele o conftest do WA limita o xdist a 2 workers (wa-9c620). O número é o de cima (AUTO: o que cabe na memória lida AGORA; explícito: o do chamador). NÃO é verdade que 14 workers
 # cabem no nó: medido em ga-2hd02v.5.8/5.9 cada worker nasce com ~2 GB (coleta a árvore inteira) e cresce sem platô; quem segura o estouro é o lote (poucos arquivos por pytest) e o teto acima.
+# Medido em ga-84gkpab (15/11, lote de 554 arquivos / ~8000 testes, 7 workers): pico do escopo ≈ 5,8 GB (~0,9 GB de base + 0,7–0,8 GB por worker) — daí base 2048 e por-worker 1200 (folga de ~50% sobre o medido), no lugar dos alvos 4096/1800.
 # PYTHONHASHSEED=0: a ordem de parametrização por set é a mesma em todos os workers (medido: com semente aleatória duas coletas diferem na ordem de um teste de launchd).
 # PYTHONPATH: onde está o plugin gtn_stable_ids (ids com relógio dentro; o pytest o carrega com `-p gtn_stable_ids`, passado por quem chama).
 # NODE_PATH (ga-yoyyj1): onde o hetzner-nodejs.sh põe o jsdom. O mbp-run.sh a exporta no job, mas o sudo e o env -i do helper a descartariam; sem repassá-la, teste que chama o node sem NODE_PATH não acha o módulo na bateria noturna.

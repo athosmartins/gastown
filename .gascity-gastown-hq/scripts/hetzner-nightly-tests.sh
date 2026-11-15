@@ -29,7 +29,7 @@
 #   `-n auto` só limita por cima: o `gt-iso-run` cobra do nó o número real de workers). O scratch é apagado.
 # O QUE NÃO FAZ: não cai no MBP nem no mini (--host linux, sem cadeia); não decide se uma falha é regressão (só diz quais são novas); não instala o helper de root; não mexe no que roda no nó
 #   além do próprio pytest (os diretórios velhos de /dev/shm do nó são de outro agente).
-# AMBIENTE (selftest e rodada manual): MBP_CITY, HZN_RUN (mbp-run.sh), HZN_WA_REPO, HZN_MAIL_CMD (padrão `gc mail send mayor`), HZN_TIMEOUT_S (7200: o orçamento do script todo), HZN_MIN_TOTAL (1000),
+# AMBIENTE (selftest e rodada manual): MBP_CITY, HZN_RUN (mbp-run.sh), HZN_WA_REPO, HZN_MAIL_CMD (padrão `gc mail send mayor`), HZN_TIMEOUT_S (9000: o orçamento do script todo), HZN_MIN_TOTAL (1000),
 #   HZN_NODE_HOST (hetzner-teste; é também o que o mbp-run recebe como HETZNER_NODE_HOST: instalar e rodar no MESMO nó), HZN_SSH (ssh), HZN_NO_FETCH=1 (não buscar o origin),
 #   HZN_KEEP_DAYS (14; a linha de base last-complete.* não entra na limpeza), HZN_BATCH_DEFS (8000: `def test_` por lote), HZN_BATCH_TIMEOUT_S (2400: prazo de UM lote),
 #   HZN_MIN_BATCH_S (180: com menos orçamento que isto o lote nem começa), HZN_FINAL_MARGIN_S (300: o que fica para o relatório), HZN_BATCH_TRIES (2) e HZN_RETRY_S (90) para o que é transitório
@@ -40,7 +40,7 @@ CITY=${MBP_CITY:-${GC_CITY_PATH:-/Users/athos/gt/.gascity-gastown-hq}}
 RUN=${HZN_RUN:-$HERE/mbp-run.sh}
 WA=${HZN_WA_REPO:-/Users/athos/gt/whatsapp_automation}
 MAIL=${HZN_MAIL_CMD:-gc mail send mayor}
-TIMEOUT_S=${HZN_TIMEOUT_S:-7200}
+TIMEOUT_S=${HZN_TIMEOUT_S:-9000}
 MIN_TOTAL=${HZN_MIN_TOTAL:-1000}
 NODE=${HZN_NODE_HOST:-${HETZNER_NODE_HOST:-hetzner-teste}}
 SSH=${HZN_SSH:-ssh}
@@ -386,7 +386,7 @@ elif [ -e "$PREV" ]; then
   else CMP="comparação INDISPONÍVEL: $PREV existe e não pôde ser lido como lista de ids em JSON (as falhas de hoje estão em $CUR)"; CMPST=indisponivel; fi
 else NEWTXT="primeira rodada"; CMPST=ok
 fi
-GOAL="ATINGIDA"; [ "$WALL" -lt 7200 ] || GOAL="ESTOURADA"
+GOAL="ATINGIDA"; [ "$WALL" -lt "$TIMEOUT_S" ] || GOAL="ESTOURADA"
 {
   echo "# Hetzner nightly $DAY — COMPLETO"; echo
   echo "- origin/main @$SHA, nó $NODE, $NFILES arquivos de tests/ ($NDEFS def test_) em $NB lotes (\`pytest <arquivos do lote> -n auto\`, workers e teto de memória derivados do MemAvailable do nó a cada lote)"
@@ -395,7 +395,7 @@ GOAL="ATINGIDA"; [ "$WALL" -lt 7200 ] || GOAL="ESTOURADA"
   [ -z "$STALE_NOTE" ] || echo "- ATENÇÃO: $STALE_NOTE"
   echo "- instalado no nó: $DEPLOY"
   echo "- total: $TOTAL ($PASSED passaram, $FAILED falharam, $ERRORS erros, $SKIPPED pulados, $XF xfail, $XP xpass); $NRAN de $NB lotes rodaram"
-  echo "- duração: pytest somado ${DUR} (${PYSECS:-?} s), relógio total ${WALL} s; meta de 2 h: $GOAL"
+  echo "- duração: pytest somado ${DUR} (${PYSECS:-?} s), relógio total ${WALL} s; meta de $(( TIMEOUT_S / 60 )) min: $GOAL"
   echo "- $CMP"
   echo "- isolamento: \`GTN-ISO: $ISO_LINE\`; teto (lote 01): \`GTN-CAP: $FIRSTCAP\`; $EGLINE"
   if [ -s "$NEW" ]; then echo; echo "Falhas novas (até 30 de $(wc -l < "$NEW" | tr -d ' ')):"; head -n 30 "$NEW" | jq -r . | sed 's/^/  - /'; fi

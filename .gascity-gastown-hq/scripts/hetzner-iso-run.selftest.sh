@@ -80,7 +80,7 @@ printf 'SCOPE: MemoryMax=%s MemorySwapMax=%s\n' "$mm" "$swap" >> "$CALLS"
 exec "$@"
 EOF
 chmod +x "$T/helper-stub.sh" "$T/bin/sudo" "$T/bin/nproc" "$T/bin/systemd-run"
-printf 'MemTotal:       32020516 kB\nMemFree:         1000000 kB\nMemAvailable:   28000000 kB\nSwapTotal:             0 kB\n' > "$T/meminfo"
+printf 'MemTotal:       32020516 kB\nMemFree:         1000000 kB\nMemAvailable:   20000000 kB\nSwapTotal:             0 kB\n' > "$T/meminfo"
 export PATH="$T/bin:$PATH" GT_NETNS_HELPER="$T/helper-stub.sh" CALLS HOME="$T/home" GTN_MEMINFO="$T/meminfo"
 n=0; fails=0; BAD=0; QUIET=0
 ck() { local l=$1; shift; [ "$QUIET" = 1 ] || n=$((n+1)); if "$@"; then [ "$QUIET" = 1 ] || echo "ok   $l"; else [ "$QUIET" = 1 ] || { echo "FAIL $l"; fails=$((fails+1)); }; BAD=1; fi; }
@@ -109,17 +109,19 @@ case_run() { CMD_RC=5 go "$1" -- python -m pytest tests/ -n auto
   GT_NETNS_HELPER="$T/nao-existe" go "$1" -- true; ck "helper ausente: o comando NÃO roda" nocalls
   go "$1"; ck "sem argumentos: rc 97 e uso" rcis 97; go "$1" --; ck "-- sem comando: rc 97" rcis 97; }
 case_cap() {
-  # AUTO (sem GTN_WORKERS): 28000000 kB = 27343 MB − reserva 6144 = 21199 → teto de 20480; (20480 − 4096) / 1800 = 9 workers; nproc 16 → no máximo 14
+  # AUTO (sem GTN_WORKERS): 20000000 kB = 19531 MB − reserva 6144 = 13387 (abaixo do teto de 20480); (13387 − 2048) / 1200 = 9 workers; nproc 16 → no máximo 14
   CMD_RC=0 go "$1" -- python -m pytest -n auto
-  ck "AUTO: linha GTN-CAP diz o teto, os workers e o que foi lido" has "$OUT" '^GTN-CAP: MemoryMax=20480M MemorySwapMax=0 workers=9 \(MemAvailable=27343M reserva=6144M base=4096M por-worker=1800M cpus=16\)$'
-  ck "AUTO: o comando roda DENTRO do escopo com o teto e sem swap" has "$CALLS" '^SCOPE: MemoryMax=20480M MemorySwapMax=0$'; ck "AUTO: o escopo vem antes do comando (o comando roda no escopo)" test "$(sed -n 1p "$CALLS")" = "SCOPE: MemoryMax=20480M MemorySwapMax=0"
+  ck "AUTO: linha GTN-CAP diz o teto, os workers e o que foi lido" has "$OUT" '^GTN-CAP: MemoryMax=13387M MemorySwapMax=0 workers=9 \(MemAvailable=19531M reserva=6144M base=2048M por-worker=1200M cpus=16\)$'
+  ck "AUTO: o comando roda DENTRO do escopo com o teto e sem swap" has "$CALLS" '^SCOPE: MemoryMax=13387M MemorySwapMax=0$'; ck "AUTO: o escopo vem antes do comando (o comando roda no escopo)" test "$(sed -n 1p "$CALLS")" = "SCOPE: MemoryMax=13387M MemorySwapMax=0"
   ck "AUTO: o número de workers do comando é o calculado" has "$CALLS" '^CMD: WA_PYTEST_MAX_WORKERS=9 '; ck "AUTO: o canário sai primeiro (a linha GTN-ISO vem antes da GTN-CAP)" test "$(grep -n -E '^GTN-(ISO|CAP):' "$OUT" | cut -d: -f2 | head -n 2 | tr '\n' ' ')" = "GTN-ISO GTN-CAP "
-  # MemAvailable menor: 16000000 kB = 15625 − 6144 = 9481 → 2 workers
-  printf 'MemAvailable:   16000000 kB\n' > "$T/meminfo.b"; GTN_MEMINFO="$T/meminfo.b" go "$1" -- python -m pytest; ck "AUTO com menos memória: teto 9481M e 2 workers" has "$OUT" '^GTN-CAP: MemoryMax=9481M MemorySwapMax=0 workers=2 '; ck "AUTO com menos memória: o comando leva 2" has "$CALLS" '^CMD: WA_PYTEST_MAX_WORKERS=2 '
+  # MemAvailable maior que o teto: 28000000 kB = 27343 − 6144 = 21199 → teto de 20480; (20480 − 2048) / 1200 = 15 → nproc 16 limita a 14
+  printf 'MemAvailable:   28000000 kB\n' > "$T/meminfo.e"; GTN_MEMINFO="$T/meminfo.e" go "$1" -- python -m pytest; ck "AUTO com muita memória: o teto máximo (20480M) segura e a CPU limita a 14 workers" has "$OUT" '^GTN-CAP: MemoryMax=20480M MemorySwapMax=0 workers=14 '
+  # MemAvailable menor: 16000000 kB = 15625 − 6144 = 9481 → (9481 − 2048) / 1200 = 6 workers
+  printf 'MemAvailable:   16000000 kB\n' > "$T/meminfo.b"; GTN_MEMINFO="$T/meminfo.b" go "$1" -- python -m pytest; ck "AUTO com menos memória: teto 9481M e 6 workers" has "$OUT" '^GTN-CAP: MemoryMax=9481M MemorySwapMax=0 workers=6 '; ck "AUTO com menos memória: o comando leva 6" has "$CALLS" '^CMD: WA_PYTEST_MAX_WORKERS=6 '
   # CPU limita por cima: 4 núcleos → 2 workers (nproc − 2); 3 núcleos → 1
   NPROC=4 go "$1" -- true; ck "nproc 4: no máximo 2 workers" has "$OUT" 'workers=2 .*cpus=4\)'; NPROC=2 go "$1" -- true; ck "nproc 2: nunca 0 workers (1)" has "$OUT" 'workers=1 '
-  # memória que não cabe nem um worker (base 4096 + 1800 = 5896): 10000000 kB = 9765 − 6144 = 3621
-  printf 'MemAvailable:   10000000 kB\n' > "$T/meminfo.c"; GTN_MEMINFO="$T/meminfo.c" go "$1" -- touch /tmp/NUNCA; ck "memória que não cabe um worker: INERTE rc 97" rcis 97; ck "memória que não cabe um worker: diz o porquê" has "$OUT" '^GTN-CAP: inerte memoria-insuficiente \(MemAvailable=9765M'; ck "memória que não cabe um worker: o comando NÃO roda" nocalls
+  # memória que não cabe nem um worker (base 2048 + 1200 = 3248): 9000000 kB = 8789 − 6144 = 2645
+  printf 'MemAvailable:   9000000 kB\n' > "$T/meminfo.c"; GTN_MEMINFO="$T/meminfo.c" go "$1" -- touch /tmp/NUNCA; ck "memória que não cabe um worker: INERTE rc 97" rcis 97; ck "memória que não cabe um worker: diz o porquê" has "$OUT" '^GTN-CAP: inerte memoria-insuficiente \(MemAvailable=8789M'; ck "memória que não cabe um worker: o comando NÃO roda" nocalls
   # MemAvailable ilegível: sem a linha / vazio / não numérico / zero / arquivo ausente → INERTE, nunca um padrão
   local i
   for i in 'MemTotal: 1 kB' 'MemAvailable:' 'MemAvailable: abc kB' 'MemAvailable: 0 kB'; do
