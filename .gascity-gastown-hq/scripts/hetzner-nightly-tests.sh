@@ -56,11 +56,11 @@ cleanup() { [ -z "$SCR" ] || find "$SCR" -mindepth 1 -delete 2>/dev/null; [ -z "
 trap cleanup EXIT
 mkdir -p "$LOGDIR" 2>/dev/null || { say "FALHOU — não consegui criar $LOGDIR"; exit 1; }
 
-SHA="?"; ISO_LINE=""; EGRESS="?"; MAILRC=0; FETCHST="?"; CMPST="-"; STALE_NOTE=""; DEPLOY=""; NB=0; NRAN=0; NSKIP=0
+SHA="?"; ISO_LINE=""; EGRESS="?"; MAILRC=0; FETCHST="?"; CMPST="-"; STALE_NOTE=""; DEPLOY=""; NB=0; NRAN=0; NSKIP=0; NMAC=0
 jline() { # veredito motivo — a linha do jsonl desta noite (também a das noites PULADAS por lock: uma por noite)
   jq -cn --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" --arg v "$1" --arg why "$2" --arg sha "$SHA" --arg iso "$ISO_LINE" --arg egress "$EGRESS" --arg fetch "$FETCHST" --arg cmp "$CMPST" \
-     --argjson wall "$(( $(date +%s) - T0 ))" --argjson mailrc "$MAILRC" --argjson nb "$NB" --argjson nr "$NRAN" --argjson ns "$NSKIP" \
-     '{ts:$ts,verdict:$v,reason:$why,sha:$sha,isolation:$iso,egress_attempts:$egress,fetch:$fetch,compare:$cmp,wall_s:$wall,mail_failed:$mailrc,batches:$nb,batches_ran:$nr,batches_skipped:$ns}' >> "$JSONL" 2>/dev/null \
+     --argjson wall "$(( $(date +%s) - T0 ))" --argjson mailrc "$MAILRC" --argjson nb "$NB" --argjson nr "$NRAN" --argjson ns "$NSKIP" --argjson nm "$NMAC" \
+     '{ts:$ts,verdict:$v,reason:$why,sha:$sha,isolation:$iso,egress_attempts:$egress,fetch:$fetch,compare:$cmp,wall_s:$wall,mail_failed:$mailrc,batches:$nb,batches_ran:$nr,batches_skipped:$ns,mac_only_excluded:$nm}' >> "$JSONL" 2>/dev/null \
      || say "WARN: não gravei $JSONL"
 }
 finish() { # veredito motivo [exit] — grava o relatório, o jsonl, manda o e-mail (salvo PULADO) e sai
@@ -141,8 +141,34 @@ TREE="$SCR/whatsapp_automation"; FILES="$SCR/files.lst"; WGT="$SCR/weights.lst"
 [ -d "$TREE/tests" ] || finish FALHOU "a árvore de origin/main@$SHA não tem tests/: nada a rodar" 1
 ( cd "$TREE" && find tests -type d \( -name '.*' -o -name crew -o -name archive -o -name '*.egg' -o -name _darcs -o -name build -o -name CVS -o -name dist -o -name node_modules -o -name venv -o -name '{arch}' \) -prune \
     -o -type f \( -name 'test_*.py' -o -name '*_test.py' \) -print ) 2>/dev/null | LC_ALL=C sort > "$FILES"
+[ -s "$FILES" ] || finish FALHOU "nenhum arquivo test_*.py/*_test.py em tests/ de origin/main@$SHA: nada a rodar" 1
+# MAC-ONLY: o mbp-run manda a bateria INTEIRA para fora do nó (rc 98, "mac-only") se UM alvo casar com scripts/hetzner-mac-only.txt (+ a lista aprendida da sombra); `tests/` inteiro, como era antes dos lotes,
+# nunca casava. Por regra do nó esses arquivos não rodam no Linux (launchd, osascript, /Users…): ficam FORA da rodada, contados e listados no relatório, e rodam no MBP/mini. Mesma regra de leitura do
+# mbp-run: glob por linha, `#` comenta, `case` sobre o caminho relativo; lista que não abre = FALHOU (sem ela não se sabe o que tem de ficar no Mac).
+MACLIST=${HETZNER_MAC_ONLY_LIST:-$HERE/hetzner-mac-only.txt}; MACLEARN="$CITY/.gc/hetzner-mac-only.learned"; MACX="$LOGDIR/$DAY.mac-only.lst"
+{ [ -f "$MACLIST" ] && [ -r "$MACLIST" ]; } || finish FALHOU "a lista mac-only ($MACLIST) não abre: sem ela não se sabe o que tem de ficar no Mac; nada rodou" 1
+if [ -e "$MACLEARN" ]; then { [ -f "$MACLEARN" ] && [ -r "$MACLEARN" ]; } || finish FALHOU "a lista mac-only aprendida ($MACLEARN) existe e não abre; nada rodou" 1; fi
+GLOBS=(); while IFS= read -r g || [ -n "$g" ]; do
+  g=${g#"${g%%[![:space:]]*}"}; g=${g%"${g##*[![:space:]]}"}
+  case "$g" in ''|'#'*) continue ;; esac
+  GLOBS[${#GLOBS[@]}]=$g
+done < <(cat "$MACLIST" "$MACLEARN" 2>/dev/null)
+: > "$MACX"
+if [ "${#GLOBS[@]}" -gt 0 ]; then
+  : > "$SCR/files.keep"
+  while IFS= read -r f; do
+    hit=0
+    for g in "${GLOBS[@]}"; do
+      # shellcheck disable=SC2254
+      case "$f" in $g) hit=1; break ;; esac
+    done
+    if [ "$hit" = 1 ]; then printf '%s\n' "$f" >> "$MACX"; else printf '%s\n' "$f" >> "$SCR/files.keep"; fi
+  done < "$FILES"
+  mv -f "$SCR/files.keep" "$FILES"
+fi
+NMAC=$(wc -l < "$MACX" | tr -d ' ')
 NFILES=$(wc -l < "$FILES" | tr -d ' ')
-[ "$NFILES" -ge 1 ] || finish FALHOU "nenhum arquivo test_*.py/*_test.py em tests/ de origin/main@$SHA: nada a rodar" 1
+[ "$NFILES" -ge 1 ] || finish FALHOU "todos os arquivos de tests/ de origin/main@$SHA estão na lista mac-only ($NMAC): nada a rodar no nó" 1
 BADNAME=$(LC_ALL=C grep -cvE '^[A-Za-z0-9_./-]+$' "$FILES"); [ "${BADNAME:-0}" -eq 0 ] || finish FALHOU "$BADNAME arquivo(s) de teste com nome fora de [A-Za-z0-9_./-] (primeiro: $(LC_ALL=C grep -vE '^[A-Za-z0-9_./-]+$' "$FILES" | head -n 1)): não passam seguros na linha de comando; nada rodou" 1
 # o peso do arquivo é o nº de `def test_` (mínimo 1): barato, estável e na ordem certa de grandeza do tempo/memória; o nº de lotes SAI da árvore, nunca é fixo
 ( cd "$TREE" && tr '\n' '\0' < "$FILES" | xargs -0 grep -c -H -E '^[[:space:]]*(async[[:space:]]+)?def[[:space:]]+test_' ) > "$WGT" 2>/dev/null
@@ -164,7 +190,7 @@ rm -f "$LOGDIR/$DAY".b*.out 2>/dev/null; : > "$OUT"
 TABLE="$SCR/table.md"; : > "$TABLE"; : > "$SCR/ids.all"
 DEADLINE=$(( T0 + TIMEOUT_S - MARGIN ))
 NRAN=0; NSKIP=0; SKIPLIST=""; TP=0; TF=0; TE=0; TS=0; TXF=0; TXP=0; LISTOK=1; LISTWHY=""; PYSECS=0; PYUNK=0; EGSUM=0; EGUNK=0; EGSEEN=0; FIRSTCAP=""
-say "rodando a suíte do WA @$SHA em $NODE: $NFILES arquivos, $NDEFS def test_, $NB lotes de ~$BATCH_DEFS (orçamento $(( DEADLINE - $(date +%s) ))s de ${TIMEOUT_S}s)"
+say "rodando a suíte do WA @$SHA em $NODE: $NFILES arquivos ($NMAC mac-only ficaram de fora), $NDEFS def test_, $NB lotes de ~$BATCH_DEFS (orçamento $(( DEADLINE - $(date +%s) ))s de ${TIMEOUT_S}s)"
 
 tail1() { grep . "$1" 2>/dev/null | tail -n 1 | cut -c1-200; }
 cnt() { printf '%s' "$SUM" | sed -n -E "s/.*[^0-9]([0-9]+) $1.*/\1/p;s/^([0-9]+) $1.*/\1/p" | head -n 1; }
@@ -311,6 +337,7 @@ CUR="$LOGDIR/$DAY.failed"; LC_ALL=C sort -u "$SCR/ids.all" > "$CUR"
 if [ "$NSKIP" -gt 0 ]; then
   { echo "# Hetzner nightly $DAY — FALHOU: $NSKIP de $NB lotes NÃO RODARAM"; echo
     echo "- origin/main @$SHA, nó $NODE, $NFILES arquivos de tests/ ($NDEFS def test_) em $NB lotes de ~$BATCH_DEFS"
+    [ "$NMAC" -eq 0 ] || echo "- fora da rodada por regra do nó: $NMAC arquivos mac-only (lista em $MACX; rodam no MBP/mini)"
     [ -z "$STALE_NOTE" ] || echo "- ATENÇÃO: $STALE_NOTE"
     echo "- instalado no nó: $DEPLOY"
     echo "- lotes que NÃO rodaram: $SKIPLIST (motivo na tabela). Sem eles a suíte NÃO foi completa: não há veredito verde, não há comparação com a noite anterior e a linha de base não foi tocada"
@@ -343,6 +370,7 @@ GOAL="ATINGIDA"; [ "$WALL" -lt 7200 ] || GOAL="ESTOURADA"
 {
   echo "# Hetzner nightly $DAY — COMPLETO"; echo
   echo "- origin/main @$SHA, nó $NODE, $NFILES arquivos de tests/ ($NDEFS def test_) em $NB lotes (\`pytest <arquivos do lote> -n auto\`, workers e teto de memória derivados do MemAvailable do nó a cada lote)"
+  [ "$NMAC" -eq 0 ] || echo "- fora da rodada por regra do nó: $NMAC arquivos mac-only (scripts/hetzner-mac-only.txt; lista em $MACX; rodam no MBP/mini, esta bateria NÃO os cobre)"
   [ -z "$STALE_NOTE" ] || echo "- ATENÇÃO: $STALE_NOTE"
   echo "- instalado no nó: $DEPLOY"
   echo "- total: $TOTAL ($PASSED passaram, $FAILED falharam, $ERRORS erros, $SKIPPED pulados, $XF xfail, $XP xpass); $NRAN de $NB lotes rodaram"

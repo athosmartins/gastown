@@ -19,7 +19,7 @@
 #   duração ilegível sai "?" (não 0h0min) · ids com " - " ficam distintos (irmãos de parametrize) · lista parcial / sem a linha GTN-FAILED / contagem que não bate / linha que não é JSON =
 #   comparação INDISPONÍVEL com a baseline intacta · fetch que falha aparece no relatório · lock velho com pid reaproveitado é tomado · PULADO por lock deixa linha no jsonl ·
 #   a limpeza de 14 dias não apaga a baseline · nao-isolado (vazamento medido) é FALHOU, não INERTE · o nó do mbp-run é o mesmo do instalador · o que foi ao nó fica no relatório.
-# CONTROLES NEGATIVOS: cada mutante do script (M1-M52, mais M0 neutro) tem de ser REPROVADO pelo caso correspondente (o caso falha quando roda no mutante). Antes deles, um mutante NEUTRO (cópia que só muda
+# CONTROLES NEGATIVOS: cada mutante do script (M1-M57, mais M0 neutro) tem de ser REPROVADO pelo caso correspondente (o caso falha quando roda no mutante). Antes deles, um mutante NEUTRO (cópia que só muda
 #   um comentário) tem de PASSAR: sem isso o controle não prova nada (a falta dos arquivos irmãos no diretório do mutante reprovava TODO caso, qualquer que fosse a mutação).
 set -u
 HERE="$(cd "$(dirname "$0")" && pwd)"
@@ -37,6 +37,7 @@ git init -q -b main "$T/wa" && ( cd "$T/wa" && echo hi > marker.txt
   mkdefs tests/a_test.py 4; mkdefs tests/sub/test_c.py 6; mkdefs tests/test_a.py 6; mkdefs tests/test_zero.py 0
   mkdefs tests/test_b.py 5; printf 'class T:\n    def test_m(self):\n        pass\nasync def test_y():\n    pass\n' >> tests/test_b.py
   # o que a poda (norecursedirs do pytest.ini) e o padrão de nome têm de deixar de fora
+  mkdefs tests/test_mac_launchd.py 3; mkdefs tests/mac/test_x.py 2   # os da lista mac-only (abaixo): ficam FORA da rodada, o mbp-run mandaria a bateria inteira ao Mac (rc 98)
   for d in venv .hidden crew archive node_modules; do mkdefs "tests/$d/test_x.py" 3; done; mkdefs tests/helper.py 3; echo "def test_n" > tests/test_notes.txt
   git add -A && git -c user.name=t -c user.email=t@t commit -qm m && git update-ref refs/remotes/origin/main HEAD && echo wip > untracked.txt )
 git init -q -b main "$T/wa-notests" && ( cd "$T/wa-notests" && echo hi > marker.txt && git add -A && git -c user.name=t -c user.email=t@t commit -qm m && git update-ref refs/remotes/origin/main HEAD )
@@ -62,6 +63,7 @@ EOF
 chmod +x "$T"/*-stub.sh
 cp "$HERE/hetzner-iso-run.sh" "$HERE/gtn_stable_ids.py" "$T/"   # o script lê os dois do diretório DELE ($HERE): o mutante, que mora em $T, precisa deles ao lado
 export MBP_CITY="$C" HZN_RUN="$T/run-stub.sh" HZN_WA_REPO="$T/wa" HZN_MAIL_CMD="$T/mail-stub.sh" HZN_SSH="$T/ssh-stub.sh" HZN_NODE_HOST=stub-node HZN_NO_FETCH=1
+printf '# comentário\n\n  tests/test_mac_*.py  \ntests/mac/*\n' > "$T/mac-only.txt"; export HETZNER_MAC_ONLY_LIST="$T/mac-only.txt"   # glob por linha, espaços e comentário como no mbp-run
 export LOCK_PATH="$LOCK" MAIL_LOG STUB_CALLS="$CALLS" STUB_OUT STUB_DIR_SEEN="$T/dirseen" SSH_LOG="$T/ssh.log" STUB_CNT="$T/stub.cnt" HZN_RETRY_S=0
 n=0; fails=0; BAD=0; QUIET=0
 reset() { find "$LOGDIR" -mindepth 1 -delete 2>/dev/null; : > "$JSONL"; : > "$MAIL_LOG"; : > "$CALLS"; : > "$SSH_LOG"; rm -f "$STUB_OUT" "$STUB_OUT".* "$STUB_CNT"; chmod -R u+rwx "$LOCK" 2>/dev/null
@@ -94,6 +96,8 @@ case_first() { reset; mkout "$ISO_OK" 7 "$SUM1" "FAILED tests/a.py::t1 - Asserti
   ck "1ª noite: mbp-run com o isolamento ligado, o prazo e o MESMO nó do instalador" has "$CALLS" 'ENV: ISOLATE=1 TIMEOUT=2400 NODE=stub-node'
   ck "1ª noite: mbp-run no nó linux, os arquivos do lote (ordem de caminho), -n auto e o plugin" has "$CALLS" 'ARGS: --host linux --repo wa --dir .*-- tests/a_test.py tests/sub/test_c.py tests/test_a.py tests/test_b.py tests/test_zero.py -n auto -p gtn_stable_ids --timeout=300'
   ck "1ª noite: a poda do pytest.ini (venv, .hidden, crew, archive, node_modules) e o que não é test_*.py ficam de fora" hasnt "$CALLS" 'venv|hidden|crew|archive|node_modules|helper\.py|notes'
+  ck "1ª noite: os arquivos mac-only (lista do mbp-run) ficam FORA do lote" hasnt "$CALLS" 'test_mac_|tests/mac/'; ck "1ª noite: o jsonl conta 2 mac-only fora" test "$(tail -n 1 "$JSONL" | jq -c .mac_only_excluded)" = 2
+  ck "1ª noite: o relatório diz que a bateria NÃO cobre os mac-only" has "$REPORT" 'fora da rodada por regra do nó: 2 arquivos mac-only .*NÃO os cobre'; ck "1ª noite: a lista dos excluídos fica em arquivo" has "$LOGDIR/$DAY.mac-only.lst" '^tests/mac/test_x.py$'
   ck "1ª noite: UMA chamada do mbp-run (todos os arquivos cabem em 1 lote)" test "$(grep -c '^ARGS:' "$CALLS")" = 1; ck "1ª noite: o jsonl conta 1 lote, 1 rodou, 0 pulados" test "$(tail -n 1 "$JSONL" | jq -c '[.batches,.batches_ran,.batches_skipped]')" = '[1,1,0]'
   ck "1ª noite: o relatório diz o teto" has "$REPORT" 'teto \(lote 01\): `GTN-CAP: MemoryMax=20480M MemorySwapMax=0 workers=9'; ck "1ª noite: tabela com o lote 01 (5 arquivos, 23 defs, 9 workers)" has "$REPORT" '^\| 01 \| 5 \| 23 \| 9 \| '
   ck "1ª noite: a saída do lote fica em arquivo próprio" test -s "$LOGDIR/$DAY.b01.out"
@@ -297,7 +301,19 @@ case_badconst() { reset; mkout "$ISO_OK" 0 "1500 passed in 3000.00s" "$(fl 0)"; 
   reset; mkout "$ISO_OK" 0 "1500 passed in 3000.00s" "$(fl 0)"; STUB_RC=0 HZN_FINAL_MARGIN_S=abc go "$1"; ck "margem não numérica: FALHOU, exit 1" rcis 1; ck "margem não numérica: diz qual" has "$MAIL_LOG" 'constante inválida: MARGIN='; ck "margem não numérica: nada rodou" empty_dir_file "$CALLS"; }
 case_notests() { reset; HZN_WA_REPO="$T/wa-notests" go "$1"; ck "origin/main sem tests/: FALHOU, exit 1" rcis 1; ck "origin/main sem tests/: diz que não tem tests/" has "$MAIL_LOG" 'não tem tests/'; ck "origin/main sem tests/: nada rodou" empty_dir_file "$CALLS"; }
 
-ALL="first second cleanslate xfail inerte leak 97_sem_iso pulado timeout abort noiso nosum implausible lock lock_stale prev_unreadable mailfail egress ssh no_origin stale_report listfail prev_format dash partial fetch keep provenance dur batches batch_list overbudget batch_killed crash nocap cap_inert cap_retry cap_late leak_mid flag_mid badconst notests"
+case_maconly() { reset; mkout "$ISO_OK" 0 "1500 passed in 3000.00s" "$(fl 0)"
+  # lista aprendida pela sombra: lida junto da estática
+  printf 'tests/sub/test_c.py\n' > "$C/.gc/hetzner-mac-only.learned"; STUB_RC=0 go "$1"; rm -f "$C/.gc/hetzner-mac-only.learned"
+  ck "mac-only aprendido: exit 0 e COMPLETO" rcis 0; ck "mac-only aprendido: o arquivo aprendido fica fora do lote" hasnt "$CALLS" 'tests/sub/test_c.py'; ck "mac-only aprendido: sobram 4 arquivos (e 3 fora)" has "$REPORT" '^\| 01 \| 4 \| 17 \| '
+  ck "mac-only aprendido: o relatório conta 3 fora" has "$REPORT" 'fora da rodada por regra do nó: 3 arquivos mac-only'
+  # lista estática que não abre: sem ela não se sabe o que tem de ficar no Mac
+  reset; STUB_RC=0 HETZNER_MAC_ONLY_LIST="$T/nao-existe.txt" go "$1"; ck "lista mac-only ilegível: FALHOU, exit 1" rcis 1; ck "lista mac-only ilegível: diz que não abre" has "$MAIL_LOG" 'lista mac-only .* não abre'; ck "lista mac-only ilegível: nada rodou" empty_dir_file "$CALLS"
+  # tudo mac-only: nada a rodar no nó, nunca um verde vazio
+  reset; printf 'tests/*\n' > "$T/mac-all.txt"; STUB_RC=0 HETZNER_MAC_ONLY_LIST="$T/mac-all.txt" go "$1"; ck "tudo mac-only: FALHOU, exit 1" rcis 1; ck "tudo mac-only: diz o porquê" has "$MAIL_LOG" 'estão na lista mac-only'; ck "tudo mac-only: nada rodou" empty_dir_file "$CALLS"
+  # lista só com comentário (nenhum glob): nada é excluído, como no mbp-run
+  reset; mkout "$ISO_OK" 0 "1500 passed in 3000.00s" "$(fl 0)"; printf '# nada\n' > "$T/mac-none.txt"; STUB_RC=0 HETZNER_MAC_ONLY_LIST="$T/mac-none.txt" go "$1"; ck "lista sem globs: nada excluído (7 arquivos)" has "$REPORT" '^\| 01 \| 7 \| 28 \| '; }
+
+ALL="first second cleanslate xfail inerte leak 97_sem_iso pulado timeout abort noiso nosum implausible lock lock_stale prev_unreadable mailfail egress ssh no_origin stale_report listfail prev_format dash partial fetch keep provenance dur maconly batches batch_list overbudget batch_killed crash nocap cap_inert cap_retry cap_late leak_mid flag_mid badconst notests"
 for c in $ALL; do "case_$c" "$SUT0"; done
 
 # ---- controles negativos: o caso correspondente tem de FALHAR quando roda no mutante -----------------------------------------
@@ -370,6 +386,11 @@ mutantl M45-constante-invalida-aceita badconst "''|*[!0-9]*) finish FALHOU \"con
 mutantl M46-nó-desligado-no-meio-vira-pulado flag_mid '[ "$i" -ne 1 ] || finish PULADO' 'finish PULADO'
 mutantl M50-prazo-do-lote-ignora-o-que-resta overbudget 'bt=$BATCH_T; [ "$left" -ge "$bt" ] || bt=$left' 'bt=$BATCH_T'
 mutantl M52-sem-prova-no-meio-nao-para nocap $'    sem-prova)\n      { echo "# Hetzner nightly $DAY — FALHOU: lote $nn sem prova' $'    nunca_casa)\n      { echo "# Hetzner nightly $DAY — FALHOU: lote $nn sem prova'
+mutantl M53-mac-only-nao-excluido first 'if [ "$hit" = 1 ]; then ' 'if false; then '
+mutantl M54-lista-mac-only-ilegivel-aceita maconly '|| finish FALHOU "a lista mac-only ($MACLIST) não abre' '|| : "a lista mac-only ($MACLIST) não abre'
+mutantl M55-lista-aprendida-ignorada maconly 'done < <(cat "$MACLIST" "$MACLEARN" 2>/dev/null)' 'done < <(cat "$MACLIST" 2>/dev/null)'
+mutantl M56-tudo-mac-only-aceito maconly '[ "$NFILES" -ge 1 ] || finish FALHOU "todos os arquivos' '[ "$NFILES" -ge 1 ] || : "todos os arquivos'
+mutantl M57-glob-sem-aparar-espacos maconly 'g=${g#"${g%%[![:space:]]*}"}; g=${g%"${g##*[![:space:]]}"}' ':'
 reset
 echo "---"; echo "$((n-fails))/$n ok ($M mutantes)"
 [ $fails -eq 0 ] && echo "SELFTEST OK" || { echo "SELFTEST FALHOU ($fails)"; exit 1; }
