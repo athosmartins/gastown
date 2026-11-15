@@ -337,6 +337,32 @@ REFUSAL_LIVE_GRACE_SECS = 2 * 600  # 20min
 POLL_SEC = int(os.environ.get("RECLAIM_POLL_SEC", "600"))  # default 10min; was 5min
 REALERT_SEC = 900        # 15min re-alert cadence for escalated beads
 
+# ga-9r4zimt: teto de CADA chamada `gc`/`bd` do guard (leituras e os mails de alerta). Era 20 s, e `gc session list --json` leva 41-43 s com o mini a load 42: depois do boot de 15/11 o guard
+# pulou 4 de 5 ciclos ("session list failed" / "gc rig list timeout 20s") — cego justo quando um worker morre. 150 s é a mesma régua do node-ghost-release (ga-pdyayy2: 40 -> 150).
+# O guard é um daemon KeepAlive (um processo, laço sequencial com sleep(POLL_SEC) DEPOIS do ciclo — sem StartInterval), então uma leitura lenta alonga o ciclo mas nunca empilha instâncias.
+# Leitura que passa de 150 s continua falhando FECHADO (None -> o ciclo é pulado), nunca vira "sem sessão".
+GC_CALL_TIMEOUT_DEFAULT = 150
+
+
+def _gc_call_timeout(raw):
+    """Teto, em segundos, de cada chamada gc/bd. vazio (variável ausente ou "") → GC_CALL_TIMEOUT_DEFAULT; ilegível ou ≤ 0 → GC_CALL_TIMEOUT_DEFAULT também, em silêncio (um teto de 0 ou negativo
+    mataria toda leitura na hora e cegaria o guard) — o valor que vale aparece na linha [STARTUP] (call_timeout=N), que é por onde se prova o que foi carregado."""
+    if raw is None or str(raw).strip() == "":
+        return GC_CALL_TIMEOUT_DEFAULT
+    try:
+        v = int(str(raw).strip())
+    except (TypeError, ValueError):
+        return GC_CALL_TIMEOUT_DEFAULT
+    return v if v > 0 else GC_CALL_TIMEOUT_DEFAULT
+
+
+GC_CALL_TIMEOUT = _gc_call_timeout(os.environ.get("IRG_GC_CALL_TIMEOUT"))
+
+# ga-9r4zimt: idade máxima, em segundos, da releitura de liveness que o Pass 2 faz ANTES de cada reclaim/escalate. O Pass 1 lê a lista de sessões uma vez no começo do ciclo; com a leitura
+# levando 40+ s e o ciclo mais, a foto envelhece — caso medido 15/11 03:06:24: reclaim de wa-adn833.12.2 com a foto de 03:03:37, e o builder tinha subido às 03:04:26. Duas beads
+# acionadas em sequência dividem a MESMA releitura se ela for mais nova que isto.
+LIVENESS_REREAD_MAX_AGE_SECS = 30
+
 # Pool-dead alert configuration (ga-dbibq)
 # Emit a [POOL-DEAD] Mayor mail when >= POOL_DEAD_MIN beads from the SAME pool
 # are zombie (no branch + dead session + stranded > TTL) for 2 consecutive cycles.
@@ -445,7 +471,7 @@ def _list_rig_stores():
     try:
         result = subprocess.run(
             ["gc", "--city", GC_CITY, "rig", "list", "--json"],
-            capture_output=True, text=True, timeout=20)
+            capture_output=True, text=True, timeout=GC_CALL_TIMEOUT)
         if result.returncode != 0 or not result.stdout.strip():
             _RIG_LIST_ERR = (f"rc={result.returncode}: {(result.stderr or '').strip()[:120]}"
                              if result.returncode != 0 else "empty output")
@@ -1400,7 +1426,7 @@ def _check_pool_dead(pool_zombies, now):
                      "-m", (f"{n} beads dispatched to {pool} are in_progress with no branch "
                             f"and no live worker for >TTL: {ids_str}. The pool is not building. "
                             f"Existing healers notified via flow-authority.")],
-                    timeout=20, capture_output=True)
+                    timeout=GC_CALL_TIMEOUT, capture_output=True)
                 if result.returncode != 0:
                     print(f"[INFLIGHT-RECLAIM] [POOL-DEAD] mail non-zero exit (pool={pool} rc={result.returncode}): "
                           f"{result.stderr.decode(errors='replace').strip()}", flush=True)
@@ -1485,7 +1511,7 @@ def _note_query_failure(reason, now):
                             f"cannot currently detect or reclaim stranded beads. This usually "
                             f"self-resolves with the underlying Dolt contention; escalating "
                             f"because the safety net itself is blind in the meantime.")],
-                    timeout=20, capture_output=True)
+                    timeout=GC_CALL_TIMEOUT, capture_output=True)
                 if result.returncode != 0:
                     print(f"[INFLIGHT-RECLAIM] [GUARD-BLIND] mail non-zero exit rc={result.returncode}: "
                           f"{result.stderr.decode(errors='replace').strip()}", flush=True)
@@ -1553,7 +1579,7 @@ def list_inflight_beads():
              "--label", "story:in-flight",
              "--status", "open,in_progress",
              "--json", "--limit", "0"],
-            capture_output=True, text=True, timeout=20)
+            capture_output=True, text=True, timeout=GC_CALL_TIMEOUT)
         if result.returncode != 0 or not result.stdout.strip():
             return None
         data = json.loads(result.stdout)
@@ -1586,7 +1612,7 @@ def list_inflight_beads():
                  "--label", "story:in-flight",
                  "--status", "open,in_progress",
                  "--json", "--limit", "0"],
-                capture_output=True, text=True, timeout=20)
+                capture_output=True, text=True, timeout=GC_CALL_TIMEOUT)
             if r.returncode != 0 or not r.stdout.strip():
                 continue
             rig_data = json.loads(r.stdout)
@@ -1699,7 +1725,7 @@ def list_stranded_inprogress_beads():
             ["bd", "list",
              "--status", "in_progress",
              "--json", "--limit", "0"],
-            capture_output=True, text=True, timeout=20)
+            capture_output=True, text=True, timeout=GC_CALL_TIMEOUT)
         if result.returncode != 0 or not result.stdout.strip():
             return None
         data = json.loads(result.stdout)
@@ -1730,7 +1756,7 @@ def list_stranded_inprogress_beads():
                  "list",
                  "--status", "in_progress",
                  "--json", "--limit", "0"],
-                capture_output=True, text=True, timeout=20)
+                capture_output=True, text=True, timeout=GC_CALL_TIMEOUT)
             if r.returncode != 0 or not r.stdout.strip():
                 continue
             rig_data = json.loads(r.stdout)
@@ -1756,7 +1782,7 @@ def list_active_sessions():
     try:
         result = subprocess.run(
             ["gc", "session", "list", "--json"],
-            capture_output=True, text=True, timeout=20)
+            capture_output=True, text=True, timeout=GC_CALL_TIMEOUT)
         if result.returncode != 0 or not result.stdout.strip():
             return None
         stdout = result.stdout.strip()
@@ -1793,7 +1819,7 @@ def list_suspended_agents():
     try:
         result = subprocess.run(
             ["gc", "agent", "list", "--json"],
-            capture_output=True, text=True, timeout=20)
+            capture_output=True, text=True, timeout=GC_CALL_TIMEOUT)
         out = (result.stdout or "").strip()
         idx = out.find("{")
         if result.returncode != 0 or idx < 0:
@@ -1934,7 +1960,7 @@ def list_gate_active_source_beads():
                  "--label", type_lbl,
                  "--label", gate_lbl,
                  "--json", "--limit", "0"],
-                capture_output=True, text=True, timeout=20)
+                capture_output=True, text=True, timeout=GC_CALL_TIMEOUT)
             if result.returncode != 0:
                 # A sub-query FAILURE (e.g. transient Dolt contention) is not the
                 # same as "no beads matched" — conflating them silently drops that
@@ -1974,7 +2000,7 @@ def list_gate_active_source_beads():
         try:
             result = subprocess.run(
                 ["bd", "show", *_lookup_ids, "--json"],
-                capture_output=True, text=True, timeout=20)
+                capture_output=True, text=True, timeout=GC_CALL_TIMEOUT)
             if result.returncode == 0 and result.stdout.strip():
                 data = json.loads(result.stdout)
                 if isinstance(data, list):
@@ -2306,7 +2332,7 @@ def list_live_sling_source_beads(sessions, now):
     try:
         result = subprocess.run(
             ["bd", "list", "--status", "in_progress", "--json", "--limit", "0"],
-            capture_output=True, text=True, timeout=20)
+            capture_output=True, text=True, timeout=GC_CALL_TIMEOUT)
         if result.returncode != 0 or not result.stdout.strip():
             return None
         data = json.loads(result.stdout)
@@ -2337,7 +2363,7 @@ def list_live_sling_source_beads(sessions, now):
             r = subprocess.run(
                 ["bd", "-C", rig_path, "list", "--status", "in_progress",
                  "--json", "--limit", "0"],
-                capture_output=True, text=True, timeout=20)
+                capture_output=True, text=True, timeout=GC_CALL_TIMEOUT)
             if r.returncode != 0 or not r.stdout.strip():
                 continue
             rig_data = json.loads(r.stdout)
@@ -2495,7 +2521,7 @@ def list_refused_sling_source_beads():
         try:
             result = subprocess.run(
                 ["bd", "list", "--status", status, "--json", "--limit", "0"],
-                capture_output=True, text=True, timeout=20)
+                capture_output=True, text=True, timeout=GC_CALL_TIMEOUT)
             if result.returncode != 0 or not result.stdout.strip():
                 continue
             data = json.loads(result.stdout)
@@ -2521,7 +2547,7 @@ def list_refused_sling_source_beads():
                 r = subprocess.run(
                     ["bd", "-C", rig_path, "list", "--status", status,
                      "--json", "--limit", "0"],
-                    capture_output=True, text=True, timeout=20)
+                    capture_output=True, text=True, timeout=GC_CALL_TIMEOUT)
                 if r.returncode != 0 or not r.stdout.strip():
                     continue
                 rig_data = json.loads(r.stdout)
@@ -4155,7 +4181,7 @@ def alert_mayor_refusal_parked(bead_id, title, assignee, reason_slugs, refusal_n
             f"a bead that carries it, so NOTHING will dispatch it again until you act — re-route or re-scope it and remove that label, or close it. A second "
             f"independent refusal escalates it to gate:needs-human. (ga-32a4bo: this first refusal used to be silent; ga-8hcnvb.3 sat parked 21 h.)")
     try:
-        r = subprocess.run(["gc", "mail", "send", "mayor", "-s", subject, "-m", body], timeout=20, capture_output=True, text=True)
+        r = subprocess.run(["gc", "mail", "send", "mayor", "-s", subject, "-m", body], timeout=GC_CALL_TIMEOUT, capture_output=True, text=True)
         if r.returncode != 0:
             print(f"[INFLIGHT-RECLAIM] warn: refusal-parked mail to the Mayor failed for {bead_id} rc={r.returncode}: {(r.stderr or '').strip()[:200]}", flush=True)
             return False
@@ -4203,7 +4229,7 @@ def list_orphan_sweep_false_resets():
             ["bd", "list", "--status", "open",
              "--has-metadata-key", "gc.session_name",
              "--no-assignee", "--json", "--limit", "0"],
-            capture_output=True, text=True, timeout=20)
+            capture_output=True, text=True, timeout=GC_CALL_TIMEOUT)
         if result.returncode == 0 and result.stdout.strip():
             data = json.loads(result.stdout)
             if isinstance(data, list):
@@ -4231,7 +4257,7 @@ def list_orphan_sweep_false_resets():
                 ["bd", "-C", rig_path, "list", "--status", "open",
                  "--has-metadata-key", "gc.session_name",
                  "--no-assignee", "--json", "--limit", "0"],
-                capture_output=True, text=True, timeout=20)
+                capture_output=True, text=True, timeout=GC_CALL_TIMEOUT)
             if r.returncode != 0 or not r.stdout.strip():
                 continue
             rig_data = json.loads(r.stdout)
@@ -4988,6 +5014,69 @@ def compute_multi_assigned_assignees(beads, parent_reader=None, notes=None):
 # Main poll cycle
 # ---------------------------------------------------------------------------
 
+def _has_live_session_for(bead_id, assignee, sessions, now, bead_update_age,
+                          multi_assigned_assignees, live_sling_owner_beads):
+    """True se ALGUMA sessao do roster `sessions` responde por esta bead (ga-9r4zimt: extraida do Pass 1 do run_cycle para que o Pass 2 reaplique a MESMA conta sobre a lista relida).
+
+    Tres formas de dono (ga-hkpwv): template de pool nu ("wa-worker": vale QUALQUER worker vivo do pool, pool_has_live_worker), adhoc concreto ("wa-worker-adhoc-faac43db2d": so
+    aquela sessao, concrete_adhoc_session_is_live) e dono nomeado (session_is_live). ga-zbrbt: o desempate por bead (session_multi_assigned) so faz sentido numa sessao CONCRETA — o template nu
+    nao tem uma identidade unica para desempatar e segue com a semantica grossa do pool inteiro. ga-qfo3: o assignee da propria bead pode estar vazio porque o Pilot pos o builder vivo no
+    wrapper de sling dela (list_live_sling_source_beads); sessao viva do wrapper conta como dono (o falso reclaim do ga-z6uo, sob um dog vivo e construindo)."""
+    is_bare = assignee in EPHEMERAL_POOL_ASSIGNEES
+    is_adhoc = (not is_bare) and _is_ephemeral_pool_assignee(assignee)
+    multi_assigned = assignee in multi_assigned_assignees
+    if is_bare:
+        live = pool_has_live_worker(assignee, sessions, now, bead_update_age)
+    elif is_adhoc:
+        live = concrete_adhoc_session_is_live(
+            assignee, sessions, now, bead_update_age,
+            session_multi_assigned=multi_assigned)
+    else:
+        live = session_is_live(
+            assignee, sessions, now, bead_update_age,
+            session_multi_assigned=multi_assigned)
+    if not live and bead_id in live_sling_owner_beads:
+        live = True
+    return live
+
+
+def _fresh_sessions(cache):
+    """A lista de sessoes RELIDA para o Pass 2 (ga-9r4zimt) — `cache` e o dict do ciclo ({} no inicio). Uma leitura serve as beads acionadas em sequencia enquanto tiver menos de
+    LIVENESS_REREAD_MAX_AGE_SECS (contada do FIM da leitura, que e quando a foto vale); mais velha, le de novo. Devolve a lista, ou None quando a leitura falhou — e a falha tambem fica no cache
+    pela mesma janela: sem isso um `gc session list` que estoura os 150 s repetiria os 150 s para CADA bead acionada."""
+    read_at = cache.get("read_at")
+    if read_at is not None and (time.time() - read_at) <= LIVENESS_REREAD_MAX_AGE_SECS:
+        return cache.get("sessions")
+    # vazio ([]) → roster sem sessao nenhuma: a conta de liveness segue (nenhuma vouches); falhou/ilegivel (None) → "nao sei" para quem chama, NUNCA "sem sessao" — nao reclama
+    fresh = list_active_sessions()
+    cache["sessions"] = fresh
+    cache["read_at"] = time.time()
+    return fresh
+
+
+def reread_liveness_verdict(bead_id, assignee, bead_update_epoch, multi_assigned_assignees,
+                            live_sling_owner_beads, cache):
+    """Veredito de liveness NA HORA da decisao (ga-9r4zimt): ("dead", "") | ("live", por_que) | ("unknown", por_que). So "dead" libera o reclaim/escalate.
+
+    Por que existe: o Pass 1 le a lista de sessoes uma vez, no inicio do ciclo, e o Pass 2 atua minutos depois com essa foto. Com `gc session list` levando 41-43 s sob carga, a foto envelhece:
+    15/11 03:06:24 reclaimou wa-adn833.12.2 com a foto de 03:03:37, e o builder tinha subido as 03:04:26 (foi tirado de baixo de um builder vivo). Tres estados, nao dois: a releitura que
+    FALHA e "unknown" (nao sei) e nao reclama — nunca colapsa em "sem sessao"; o estado que fica e o INERTE (a bead segue como esta; o proximo ciclo decide). A unica leitura e list_active_sessions (via _fresh_sessions); mbp_owner_state sobre a lista nova mantem o hold do alias do MBP (ga-w7qwl1.2.3) se ele reapareceu."""
+    try:
+        fresh = _fresh_sessions(cache)
+        if fresh is None:
+            return "unknown", "session list failed on the re-read"
+        t = time.time()
+        age = (t - bead_update_epoch) if bead_update_epoch is not None else None
+        if _has_live_session_for(bead_id, assignee, fresh, t, age,
+                                 multi_assigned_assignees, live_sling_owner_beads):
+            return "live", "a live session owns it on the re-read"
+        if mbp_owner_state(assignee, fresh) == "hold":
+            return "live", "the MBP-node owner is on the re-read roster (hold)"
+        return "dead", ""
+    except Exception as exc:
+        return "unknown", f"liveness re-read raised {type(exc).__name__}: {exc}"
+
+
 def run_cycle(state, escalated_alerted):
     """Single poll cycle. Mutates state and escalated_alerted in place.
     Returns (inflight_count, stranded_count) for diagnostics.
@@ -5098,6 +5187,8 @@ def run_cycle(state, escalated_alerted):
     # ga-dbibq: two-pass structure so pool-dead alert fires BEFORE per-bead actuation.
     classified = []    # (bead_id, title, labels, assignee, action, idle_min, reclaim_count, rig_root, bridge_sources, sling_bead_id)
     pool_zombies = {}  # pool -> [bead_id] for beads classified zombie this cycle
+    liveness_ctx = {}  # ga-9r4zimt: bead_id -> (epoch do updated_at da bead, None = ilegivel; has_live_session que o Pass 1 achou), para o Pass 2 reaplicar a conta de liveness sobre a lista de sessoes RELIDA
+    reread_cache = {}  # ga-9r4zimt: a releitura do Pass 2 (uma, dividida entre as beads acionadas em sequencia) — ver _fresh_sessions()
 
     # --- Pass 1: classify all beads (no actuation yet) ---
     for bead in beads:
@@ -5176,31 +5267,12 @@ def run_cycle(state, escalated_alerted):
             and _is_ephemeral_pool_assignee(assignee)
         )
         is_pool_zombie_bead = is_bare_pool_zombie or is_adhoc_pool_zombie
-        # ga-zbrbt: only meaningful for a CONCRETE per-session match (adhoc or
-        # named) — a bare pool template (assignee == the template string
-        # itself, handled by pool_has_live_worker below) has no single session
-        # identity to disambiguate against, so it keeps its existing coarser
-        # pool-wide semantics unchanged.
-        session_multi_assigned = assignee in multi_assigned_assignees
-        if is_bare_pool_zombie:
-            has_live_session = pool_has_live_worker(assignee, sessions, now, bead_update_age)
-        elif is_adhoc_pool_zombie:
-            has_live_session = concrete_adhoc_session_is_live(
-                assignee, sessions, now, bead_update_age,
-                session_multi_assigned=session_multi_assigned)
-        else:
-            has_live_session = session_is_live(
-                assignee, sessions, now, bead_update_age,
-                session_multi_assigned=session_multi_assigned)
-
-        # ga-qfo3: this bead's OWN assignee may be empty because Pilot assigned
-        # the live builder session to its SLING wrapper bead instead (see
-        # list_live_sling_source_beads' docstring). Treat it as owned when the
-        # sling bead's session is live — closes the false-reclaim gap that let
-        # ga-z6uo get reclaimed out from under a fully live, actively-building
-        # dog session.
-        if not has_live_session and bead_id in live_sling_owner_beads:
-            has_live_session = True
+        # ga-9r4zimt: a conta de "tem sessão viva?" (3 formas de dono + o dono via sling, ga-qfo3) mora em _has_live_session_for(), a MESMA que o Pass 2 reaplica sobre a lista de sessões relida
+        # na hora do reclaim — duas cópias da regra divergiriam.
+        has_live_session = _has_live_session_for(
+            bead_id, assignee, sessions, now, bead_update_age,
+            multi_assigned_assignees, live_sling_owner_beads)
+        liveness_ctx[bead_id] = (bead_update_epoch, has_live_session)
 
         # ga-32a4bo: a duplicate-of-in-flight refusal says the extra DISPATCH was redundant because a builder is already on this bead — it is no refusal of the
         # BEAD: hidden from the decision (a bridged one always, one on the bead itself while its builder is live), so it can neither age into a reclaim
@@ -5384,6 +5456,24 @@ def run_cycle(state, escalated_alerted):
         has_explicit_refusal = _has_refusal_label(labels)
         refusal_count = parse_refusal_count(labels)
 
+        # ga-9r4zimt: o veredito do Pass 1 usou a lista de sessoes do INICIO do ciclo; antes de reclamar (ou escalar) bead de alguem, releia a liveness AGORA. "live" → o builder subiu depois da
+        # foto: nao toca (o proximo ciclo zera o relogio de encalhe pela sessao viva). "unknown" → a releitura falhou: nao sei, nao reclama. So "dead" segue. O estado de ambos e o INERTE: sem
+        # do_reclaim/do_escalate e sem state.pop (o relogio de encalhe e o contador ficam como estavam). So se reler quando o Pass 1 concluiu "SEM sessao viva": e essa conclusao que a foto velha
+        # pode ter errado. Reclaim/escalate que o Pass 1 decidiu COM sessao viva (a recusa genuina de um worker vivo, ga-5ure2d/ga-32a4bo) nao depende da morte do dono — reler ali so
+        # trocaria uma decisao deliberada por um veto. Sem o contexto do Pass 1 (nao deveria faltar), relê: sob duvida, o estado inerte.
+        _lv_ctx = liveness_ctx.get(bead_id)
+        _pass1_saw_live = _lv_ctx is not None and _lv_ctx[1]
+        if action in ("reclaim", "escalate") and not _pass1_saw_live and not (
+                action == "escalate" and now - escalated_alerted.get(bead_id, 0) <= REALERT_SEC):
+            _lv, _lv_why = reread_liveness_verdict(
+                bead_id, assignee, _lv_ctx[0] if _lv_ctx is not None else None, multi_assigned_assignees,
+                live_sling_owner_beads, reread_cache)
+            if _lv != "dead":
+                print(f"[INFLIGHT-RECLAIM] [DEFERRED] bead={bead_id} assignee={assignee!r} action={action} "
+                      f"liveness re-read={_lv} ({_lv_why}) — NOT actuating this cycle (ga-9r4zimt) title={title!r}",
+                      flush=True)
+                continue
+
         if action == "reclaim":
             ok = do_reclaim(bead_id, title, reclaim_count, idle_min, labels, rig_root=rig_root,
                              has_explicit_refusal=has_explicit_refusal, refusal_count=refusal_count,
@@ -5456,7 +5546,7 @@ def run_cycle(state, escalated_alerted):
                                         f"{refusal_count + 1} workers already agreed it isn't buildable "
                                         f"as specified. Marked gate:needs-human:refused. Needs human "
                                         f"re-route/re-scope, then re-queue.")],
-                                timeout=20, capture_output=True)
+                                timeout=GC_CALL_TIMEOUT, capture_output=True)
                         else:
                             subprocess.run(
                                 ["gc", "mail", "send", "mayor",
@@ -5465,7 +5555,7 @@ def run_cycle(state, escalated_alerted):
                                         f"({reclaim_count}/{MAX_RECLAIMS}) with assignee={assignee!r}, "
                                         f"no branch, no active pool session. Marked gate:needs-human. "
                                         f"Needs human investigation + re-queue.")],
-                                timeout=20, capture_output=True)
+                                timeout=GC_CALL_TIMEOUT, capture_output=True)
                     except Exception as _exc:
                         print(f"[INFLIGHT-RECLAIM] warn: pool-zombie escalation mail ({bead_id}): {_exc}",
                               flush=True)
@@ -11069,8 +11159,12 @@ def _selftest():
           session_is_live(_ls_alias, [_ls_old, _ls_dog()], now=T_ls, bead_update_age=3600) is True)
     import inspect as _ls_inspect
     _ls_rc_src = _ls_inspect.getsource(run_cycle)
-    check("LS-8 (drift guard): run_cycle still hands the bead's own update age to session_is_live — dropped, bead_update_age=None switches the rule off without a sound",
-          "has_live_session = session_is_live(\n                assignee, sessions, now, bead_update_age," in _ls_rc_src)
+    # ga-9r4zimt: a conta de liveness saiu do run_cycle para _has_live_session_for (o Pass 2 a reaplica sobre a lista relida): a idade da bead agora viaja em DOIS saltos, e os dois são prendidos.
+    import re as _ls8_re
+    check("LS-8a (drift guard): run_cycle still hands the bead's own update age to _has_live_session_for — dropped, bead_update_age=None switches the rule off without a sound",
+          _ls8_re.search(r"has_live_session\s*=\s*_has_live_session_for\(\s*bead_id,\s*assignee,\s*sessions,\s*now,\s*bead_update_age\s*,", _ls_rc_src) is not None)
+    check("LS-8b (drift guard): _has_live_session_for still hands that age on to session_is_live (the named-owner branch)",
+          _ls8_re.search(r"live\s*=\s*session_is_live\(\s*assignee,\s*sessions,\s*now,\s*bead_update_age\s*,", _ls_inspect.getsource(_has_live_session_for)) is not None)
     import re as _ls_re
     check("LS-9 (drift guard): list_live_sling_source_beads (sling-wrapper liveness) still hands the sling's own update age to session_is_live — dropped, the rule is off for wrappers with no sound",
           _ls_re.search(r"session_is_live\(\s*assignee,\s*sessions,\s*now,\s*bead_update_age\s*,", _ls_inspect.getsource(list_live_sling_source_beads)) is not None)
@@ -11094,7 +11188,7 @@ def main():
     _install_timestamped_streams()
     emit(
         f"[INFLIGHT-RECLAIM] [STARTUP] reclaim_ttl={RECLAIM_TTL}s ({RECLAIM_TTL // 60}min) "
-        f"max_reclaims={MAX_RECLAIMS} poll={POLL_SEC}s"
+        f"max_reclaims={MAX_RECLAIMS} poll={POLL_SEC}s call_timeout={GC_CALL_TIMEOUT}s"
     )
 
     state = load_state()

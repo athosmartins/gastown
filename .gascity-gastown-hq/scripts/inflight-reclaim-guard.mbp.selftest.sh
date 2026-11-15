@@ -162,6 +162,10 @@ check("T1: a marca do nó continua na bead", w.bead["metadata"].get(MARK) == ALI
 w = World(session={"state": "asleep", "age": 3600})
 w.run(18)   # 3 h
 check("T2 ssh cai (roster asleep): o guard não reclama", w.reclaims == [], "reclaims=%d" % len(w.reclaims))
+# ga-9r4zimt: o Pass 2 agora RELÊ a liveness e também segura o alias do MBP que reaparece no roster (mbp_owner_state == "hold"), então "não reclama" sozinho já não distingue o hold do Pass 1 (o mutante
+# hold-nao-chega-na-decisao sobreviveu). O que só o Pass 1 faz: tratar a bead segura como NÃO encalhada — o relógio de encalhe nem começa (`first_seen_stranded`), e nenhum DEFERRED é emitido.
+check("T2: a bead segura do MBP não começa relógio de encalhe (o hold é do Pass 1, não só da releitura do Pass 2)", "first_seen_stranded" not in w.state.get(w.bead["id"], {}), "estado=%r" % w.state.get(w.bead["id"]))
+check("T2: nenhum DEFERRED — a releitura do Pass 2 nem chega a ser pedida para uma bead que o Pass 1 já segurou", not any("[DEFERRED]" in m for m in w.emitted), "emitidos=%r" % [m for m in w.emitted if "DEFERRED" in m][:1])
 one_owner(w, "T2", ALIAS)
 
 # ── T3: o ssh volta. 90 min de queda, depois a sessão responde de novo (active, atividade fresca).

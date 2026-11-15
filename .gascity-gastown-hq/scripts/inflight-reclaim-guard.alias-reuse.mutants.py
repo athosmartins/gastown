@@ -53,9 +53,13 @@ MUTANTS = [
     ("return-no-lugar-de-continue", "guard", _CALL, _CALL.replace("continue", "return False"), ["LS-7a"]),
     ("regra-desligada-no-session-is-live", "guard", _CALL, _CALL.replace("alias_claim_predates_session(assignee, s, bead_update_age, now)", "False"), ["LS-1", "LS-3c"]),
     ("sling-nao-passa-a-idade-da-bead", "guard", "        if session_is_live(assignee, sessions, now, bead_update_age,\n", "        if session_is_live(assignee, sessions, now, None,\n", ["LS-9"]),
+    # ga-9r4zimt: a conta de liveness saiu do run_cycle para _has_live_session_for; a idade da bead viaja run_cycle -> helper -> session_is_live, e cada salto tem o seu mutante e o seu check (LS-8a / LS-8b).
     ("run-cycle-nao-passa-a-idade-da-bead", "guard",
-     "has_live_session = session_is_live(\n                assignee, sessions, now, bead_update_age,",
-     "has_live_session = session_is_live(\n                assignee, sessions, now, None,", ["LS-8"]),
+     "has_live_session = _has_live_session_for(\n            bead_id, assignee, sessions, now, bead_update_age,",
+     "has_live_session = _has_live_session_for(\n            bead_id, assignee, sessions, now, None,", ["LS-8a"]),
+    ("helper-nao-passa-a-idade-da-bead", "guard",
+     "        live = session_is_live(\n            assignee, sessions, now, bead_update_age,",
+     "        live = session_is_live(\n            assignee, sessions, now, None,", ["LS-8b"]),
     ("sem-checagem-de-idade-ilegivel", "lib", "    if bead_update_age is None:\n        return False\n", "    if False:\n        return False\n", ["Traceback"]),
     ("sem-checagem-de-nascimento-ilegivel", "lib", "    if born is None:\n        return False\n", "    if False:\n        return False\n", ["Traceback"]),
 ]
