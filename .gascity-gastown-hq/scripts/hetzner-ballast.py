@@ -1203,19 +1203,29 @@ def shm_names_in(text, prefix, names):
     return hit
 
 
+def proc_read(fn, *args):
+    """(valor, estado) de UMA leitura em /proc/<pid>/…: ok · sumiu (ENOENT/ESRCH: o processo ou o link já não existe) · opaco (EACCES: o kernel esconde o que não é dumpável) · erro (qualquer outra coisa)."""
+    try:
+        return fn(*args), "ok"
+    except (FileNotFoundError, ProcessLookupError):
+        return None, "sumiu"
+    except PermissionError:
+        return None, "opaco"
+    except OSError:
+        return None, "erro"
+
+
+def read_utf8(path):
+    with open(path, "rb") as f:
+        return f.read().decode("utf-8", "replace")
+
+
 def shm_holders(cfg, root, names):
     """({nome: {pids}}, [comm de opaco conhecido], [comm de opaco desconhecido]): quais das pastas `names` (filhas diretas de `root`) algum processo do NOSSO usuário segura: cwd, root ou exe dentro dela, fd aberto, mapa de
     memória ou o nome na linha de comando. Processo de outro usuário não escreve em pasta nossa e não conta. Processo nosso que o kernel esconde (EACCES) é opaco: só a linha de comando dele prova alguma coisa; com `comm` em
-    OPAQUE_OK ele não segura mais que isso, senão (ou com qualquer outro erro de leitura, comm '?') é incerteza e quem chama não apaga. Processo que some no meio é ignorado. Unreadable se a tabela de processos não abre."""
+    OPAQUE_OK ele não segura mais que isso, senão (ou com qualquer outro erro de leitura, ou comm que não leu: '?') é incerteza e quem chama não apaga. Processo que some no meio é ignorado. Unreadable se a tabela de processos não abre."""
     prefix = root.rstrip("/") + "/"
     held, known, unknown = {}, set(), set()
-
-    def hit_path(tgt, pid):
-        if tgt.endswith(" (deleted)"):
-            tgt = tgt[:-len(" (deleted)")]
-        if tgt.startswith(prefix):
-            held.setdefault(tgt[len(prefix):].split("/", 1)[0], set()).add(pid)
-
     # vazio (nenhum pid) → ninguém segura nada; falhou/ilegível (a pasta não lista) → Unreadable: sem saber quem segura, nada é órfão
     try:
         pids = [x for x in os.listdir(cfg.proc) if x.isdigit()]
@@ -1228,58 +1238,32 @@ def shm_holders(cfg, root, names):
                 continue
         except OSError:
             continue
-        pid, opaque, other = int(nm), False, False
-
-        def link(path):
-            nonlocal opaque, other
-            # vazio (sem o link: zumbi, thread de kernel, processo que sumiu) → nada a dizer; falhou/ilegível (EACCES) → opaco; qualquer outro erro → incerteza
-            try:
-                return os.readlink(path)
-            except FileNotFoundError:
-                return None
-            except PermissionError:
-                opaque = True
-            except OSError:
-                other = True
-            return None
-
+        # cada leitura devolve um estado: sumiu (zumbi, thread de kernel, processo que foi embora) não diz nada; opaco e erro marcam o processo como incerteza (sorteada abaixo pelo nome dele)
+        states, targets = [], []
         for what in ("cwd", "root", "exe"):
-            tgt = link(os.path.join(d, what))
-            if tgt:
-                hit_path(tgt, pid)
-        try:
-            for fd in os.listdir(os.path.join(d, "fd")):
-                tgt = link(os.path.join(d, "fd", fd))
-                if tgt:
-                    hit_path(tgt, pid)
-        except FileNotFoundError:
-            pass
-        except PermissionError:
-            opaque = True
-        except OSError:
-            other = True
+            v, s = proc_read(os.readlink, os.path.join(d, what))
+            states.append(s)
+            targets.append(v)
+        fds, s = proc_read(os.listdir, os.path.join(d, "fd"))
+        states.append(s)
+        for fd in fds or []:
+            v, s = proc_read(os.readlink, os.path.join(d, "fd", fd))
+            states.append(s)
+            targets.append(v)
         texts = []
         for what in ("maps", "cmdline"):
-            try:
-                with open(os.path.join(d, what), "rb") as f:
-                    texts.append(f.read().decode("utf-8", "replace"))
-            except FileNotFoundError:
-                pass
-            except PermissionError:
-                if what == "maps":
-                    opaque = True
-            except OSError:
-                other = True
+            v, s = proc_read(read_utf8, os.path.join(d, what))
+            states.append(s)
+            texts.append(v)
+        for tgt in targets:
+            if tgt and tgt.startswith(prefix):
+                held.setdefault(tgt[len(prefix):].split("/", 1)[0], set()).add(int(nm))
         for text in texts:
-            for found in shm_names_in(text, prefix, names):
-                held.setdefault(found, set()).add(pid)
-        if opaque or other:
-            try:
-                with open(os.path.join(d, "comm"), "rb") as f:
-                    comm = f.read().decode("utf-8", "replace").strip() or "?"
-            except OSError:
-                comm = "?"
-            (unknown if other or comm not in OPAQUE_OK else known).add(comm)
+            for found in shm_names_in(text or "", prefix, names):
+                held.setdefault(found, set()).add(int(nm))
+        if "opaco" in states or "erro" in states:
+            comm = (proc_read(read_utf8, os.path.join(d, "comm"))[0] or "").strip() or "?"
+            (unknown if "erro" in states or comm not in OPAQUE_OK else known).add(comm)
     return held, sorted(known), sorted(unknown)
 
 
