@@ -1390,6 +1390,91 @@ def shm_scan(cfg):
     return out, orfaos
 
 
+def rm_tree(path, dev, deadline=None):
+    """Apaga a pasta `path` por dentro, de baixo para cima: unlink em tudo o que não é pasta (symlink inclusive: o LINK sai, o alvo NÃO) e rmdir em cada pasta depois do conteúdo. Nunca segue symlink, não entra em pasta de outro
+    dispositivo (uma montagem dentro da árvore) e para no `deadline` (time.monotonic). Devolve o número de erros: 0 = a árvore inteira saiu; o que ficou fica, e quem chama não conta como apagada."""
+    errs = 0
+    stack = [(path, False)]
+    while stack:
+        p, done = stack.pop()
+        if deadline is not None and time.monotonic() >= deadline:
+            return errs + 1
+        if done:
+            try:
+                os.rmdir(p)
+            except OSError:
+                errs += 1
+            continue
+        stack.append((p, True))
+        try:
+            with os.scandir(p) as it:
+                kids = list(it)
+        except OSError:
+            errs += 1
+            continue
+        for k in kids:
+            try:
+                s = k.stat(follow_symlinks=False)
+                if not stat.S_ISDIR(s.st_mode):
+                    os.unlink(k.path)
+                elif s.st_dev == dev:
+                    stack.append((k.path, False))
+                else:
+                    errs += 1
+            except OSError:
+                errs += 1
+    return errs
+
+
+def shm_faxina(cfg, out, orfaos):
+    """Apaga as órfãs que a varredura achou e põe o resultado em `out` (reap, reaped, falhou, log). Só com a chave $BALLAST_HOME/shm-reap.on E com a varredura sem incerteza nenhuma (why vazio); as maiores primeiro, até
+    BALLAST_SHM_MAX_REAP por varredura e dentro do prazo. A pasta é reconferida logo antes (ainda uma pasta de verdade do nosso usuário: virou symlink, arquivo ou sumiu → não mexe). reap: desligado (sem a chave) · inerte (chave
+    ligada mas a varredura teve incerteza: a lista de órfãs não é certa) · nada (lida e sem órfã) · feito · parcial (alguma não saiu inteira, ou o prazo acabou)."""
+    out.update({"reap": "desligado", "reaped": [], "falhou": [], "log": ""})
+    # vazio (sem a chave) → desligado; falhou/ilegível (stat negado) → desligado TAMBÉM: aqui o 'ligado' é o lado perigoso (nas chaves elastic.off e ram-floor.fixed é o contrário), e os dois estados vazio e falhou dão o mesmo lado: não apaga
+    if not os.path.exists(os.path.join(cfg.home, "shm-reap.on")):
+        return
+    if out["why"]:
+        out["reap"] = "inerte"
+        return
+    if not orfaos:
+        out["reap"] = "nada"
+        return
+    deadline = time.monotonic() + cfg.shm_budget_s
+    alvos = orfaos[:cfg.shm_max_reap]
+    reaped, falhou = [], []
+    for o in alvos:
+        if time.monotonic() >= deadline:
+            break
+        path = os.path.join(cfg.shm_root, o["name"])
+        try:
+            s = os.lstat(path)
+        except OSError:
+            falhou.append(o["name"])
+            continue
+        if not stat.S_ISDIR(s.st_mode) or s.st_uid != cfg.shm_uid:
+            falhou.append(o["name"])
+        elif rm_tree(path, s.st_dev, deadline):
+            falhou.append(o["name"])
+        else:
+            reaped.append(o)
+    gone = {r["name"] for r in reaped}
+    rest = [o for o in orfaos if o["name"] not in gone]
+    out.update({"reaped": reaped, "falhou": falhou, "orfaos": rest[:10], "orfaos_n": len(rest), "orfaos_mb": sum(o["mb"] for o in rest)})
+    out["reap"] = "parcial" if falhou or len(reaped) < len(alvos) else "feito"
+    # o log é auxiliar: não gravar nele não desfaz nem segura o que já saiu (o tick diz log falhou)
+    try:
+        logp = os.path.join(cfg.home, "shm-reap.log")
+        trim_log(logp, 262144, 65536)
+        with open(logp, "a", encoding="utf-8", errors="backslashreplace") as f:
+            for r in reaped:
+                f.write("%s apagada %s %d MB parada %.1f h\n" % (iso(cfg.now), r["name"], r["mb"], r["idle_h"]))
+            for nm in falhou:
+                f.write("%s FALHOU %s\n" % (iso(cfg.now), nm))
+    except OSError:
+        out["log"] = "falhou"
+
+
 def shm_step(cfg, st, rec):
     """A varredura do /dev/shm a cada BALLAST_SHM_EVERY_S (o carimbo da última está em st['shm']['t']; carimbo no futuro, relógio que andou para trás, varre na hora). rec['shm'] = o resumo, ou null no tick em que não varreu.
     Isolada: a faxina NUNCA derruba o tick (um erro que ninguém previu vira why erro-interno e o tick segue começando e matando como sempre)."""
@@ -1399,10 +1484,11 @@ def shm_step(cfg, st, rec):
     if _int(t) and 0 <= cfg.now - t < cfg.shm_every_s:
         return
     try:
-        out, _orfaos = shm_scan(cfg)
+        out, orfaos = shm_scan(cfg)
+        shm_faxina(cfg, out, orfaos)
     except Exception as e:   # noqa: BLE001 — isolamento de falha: o que o tick faz de verdade (começar, matar, gravar) não pode depender da faxina
         print("hetzner-ballast: shm: %s: %s" % (type(e).__name__, e), file=sys.stderr)
-        out = {"t": cfg.now, "why": "erro-interno", "orfaos_n": None, "orfaos_mb": None, "orfaos": [], "seguradas_n": None, "ilegiveis_n": None, "mantidas_n": None, "opacos": []}
+        out = {"t": cfg.now, "why": "erro-interno", "orfaos_n": None, "orfaos_mb": None, "orfaos": [], "seguradas_n": None, "ilegiveis_n": None, "mantidas_n": None, "opacos": [], "reap": "inerte", "reaped": [], "falhou": [], "log": ""}
     st["shm"] = out
     rec["shm"] = out
 

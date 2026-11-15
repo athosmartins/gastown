@@ -1262,14 +1262,107 @@ g_shmscan() {
   # o resto do tick não depende da varredura: um registro com a pasta de mentira inexistente ou cheia de coisa não impede nem muda o que começa
   newhome; seed; good 50; good 50; good 50
   check "shm varredura: o tick de sempre (sem BALLAST_SHM do caso) segue começando o item: o lixo do /dev/shm não é pré-requisito de ninguém" "hq" "$(jget started.0.item)"
+  # o skipped ram cita o órfão que a varredura do MESMO tick achou (falta_mb e shm_orfao_mb lado a lado: a conta que custou horas)
+  shm_up; shm_dir velho 3; shm_age; seed; setmem 15000; good 50; good 50; good 50
+  check "shm varredura: o skipped ram do tick traz falta_mb e o shm_orfao_mb (3 MB órfãos) da varredura do mesmo tick" "ram 360 3" "$(jget skipped.0.why) $(jget skipped.0.falta_mb) $(jget skipped.0.shm_orfao_mb)"
+  newhome; seed; setmem 15000; good 50; good 50; good 50
+  check "shm varredura: sem varredura que leia (pasta ausente) o shm_orfao_mb do skipped é null, nunca 0" "ram null" "$(jget skipped.0.why) $(jget skipped.0.shm_orfao_mb)"
+}
+
+# FAXINA: só com a chave shm-reap.on em $BALLAST_HOME (nasce DESLIGADA; o Mayor liga depois de ver o que a varredura acha) e só quando a varredura leu TUDO (why vazio). Apaga as maiores primeiro, até BALLAST_SHM_MAX_REAP por
+# varredura e dentro do prazo, só pasta de verdade do nosso usuário; nunca segue symlink nem entra em outro dispositivo. O resultado vai no tick (reap, reaped, falhou, log) e numa linha de $BALLAST_HOME/shm-reap.log.
+unit() {  # unit 'CÓDIGO PYTHON' [ARG…] — carrega o governo sob teste como módulo (hb) e roda o código; sys.argv[1:] são os ARG…; imprime o que o código imprime
+  "$PY" -I -c 'import importlib.util, sys
+spec = importlib.util.spec_from_file_location("hb", sys.argv[1]); hb = importlib.util.module_from_spec(spec); spec.loader.exec_module(hb)
+sys.argv = sys.argv[1:]
+'"$1" "$P" "${@:2}"
+}
+shm_ls() { LC_ALL=C ls -1 "$SHM" | tr '\n' ' ' | sed 's/ $//'; }   # o que sobrou no /dev/shm de mentira (ordem de byte: não depende do locale do host)
+g_shmreap() {
+  local c
+  shm_up; shm_dir velho 3; shm_age; bt
+  check "shm faxina: sem a chave shm-reap.on nada sai: a órfã segue lá e o tick diz desligado" "desligado velho" "$(jget shm.reap) $(shm_ls)"
+  shm_up; shm_dir velho 3; : > "$H/shm-reap.on"; shm_age; bt
+  check "shm faxina: com a chave a órfã sai e o tick conta: feito, 1 apagada de 3 MB, nada sobrou nem falhou" "feito velho 3 0 0 0 []" "$(jget shm.reap) $(jget shm.reaped.0.name) $(jget shm.reaped.0.mb) $(jget shm.orfaos_n) $(jget shm.orfaos_mb) $(shm_ls | wc -c | tr -d ' ') [$(jget shm.log)]"
+  check "shm faxina: a pasta de /dev/shm em si continua lá" "yes" "$([ -d "$SHM" ] && echo yes || echo no)"
+  check "shm faxina: uma linha em shm-reap.log com o nome e o tamanho" "1 1" "$(grep -c 'velho' "$H/shm-reap.log") $(grep -c '3 MB' "$H/shm-reap.log")"
+  bt status --json; check "shm faxina: o status mostra o resultado da última faxina" "feito" "$(jget shm.reap)"
+  # só a órfã: tudo o mais fica
+  shm_up 3600 2; shm_dir velho 3; shm_dir novo 3; shm_dir segura 3; shm_dir pequena 1; shm_dir mantida 3; shm_dir ballast-wam-x 3; shm_dir parada 3
+  ln -s "$SHM/velho" "$SHM/atalho"; head -c 3145728 /dev/zero > "$SHM/arquivo.bin"; printf 'mantida\n' > "$H/shm-keep.txt"; : > "$H/shm-reap.on"; shm_proc 9001; ln -s "$SHM/segura/sub" "$FP/9001/cwd"
+  shm_age; touch -d "@$(( NOW - 60 ))" "$SHM/novo/sub/blob"; bt
+  check "shm faxina: só as órfãs saem (velho e parada); jovem, segurada, pequena, mantida, ballast-*, symlink e arquivo ficam" "arquivo.bin atalho ballast-wam-x mantida novo pequena segura" "$(shm_ls)"
+  check "shm faxina: 2 apagadas (a de 3 MB e a outra de 3 MB) e o resumo diz que sobrou 0" "feito 2 0" "$(jget shm.reap) $(printf '%s' "$OUT" | "$PY" -I -c 'import sys,json; print(len(json.load(sys.stdin)["shm"]["reaped"]))') $(jget shm.orfaos_n)"
+  # symlink DENTRO da órfã: sai o link, o alvo NÃO
+  shm_up; shm_dir velho 3; mkdir -p "$T/canario$N"; echo vivo > "$T/canario$N/arq"; ln -s "$T/canario$N" "$SHM/velho/sub/pasta"; ln -s "$T/canario$N/arq" "$SHM/velho/sub/arq"; : > "$H/shm-reap.on"; shm_age; bt
+  check "shm faxina: symlink dentro da órfã (para pasta e para arquivo) sai com ela e o ALVO fica inteiro" "feito vivo" "$(jget shm.reap) $(cat "$T/canario$N/arq" 2> /dev/null)"
+  # o limite por varredura: as maiores primeiro, uma por tick
+  shm_up; shm_dir pequena 2; shm_dir grande 3; : > "$H/shm-reap.on"; EXTRA_ENV="$EXTRA_ENV BALLAST_SHM_MAX_REAP=1"; shm_age; bt
+  check "shm faxina: BALLAST_SHM_MAX_REAP=1 apaga só a maior (3 MB) neste tick; a outra (2 MB) fica e segue órfã no resumo" "feito pequena 1 2" "$(jget shm.reap) $(shm_ls) $(jget shm.orfaos_n) $(jget shm.orfaos_mb)"
+  NOW=$(( NOW + 1 )); bt; check "shm faxina: no tick seguinte a outra sai" "feito 0" "$(jget shm.reap) $(shm_ls | wc -c | tr -d ' ')"
+  # sem incerteza zero de efeito: qualquer why vazio vira inerte
+  shm_up; shm_dir velho 3; : > "$H/shm-reap.on"; mkdir "$H/shm-keep.txt"; shm_age; bt
+  check "shm faxina: com a chave ligada mas a lista de exceções ilegível (keep-ilegivel) a faxina fica INERTE e nada sai" "inerte velho" "$(jget shm.reap) $(shm_ls)"
+  shm_up; shm_dir velho 3; : > "$H/shm-reap.on"; EXTRA_ENV="$EXTRA_ENV BALLAST_SHM_MAX_ENTRIES=1"; shm_age; bt
+  check "shm faxina: varredura parcial (orçamento estourado) → inerte, nada sai" "inerte velho" "$(jget shm.reap) $(shm_ls)"
+  shm_up; : > "$H/shm-reap.on"; EXTRA_ENV="BALLAST_SHM=$T/nao-existe BALLAST_SHM_EVERY_S=0"; bt
+  check "shm faxina: pasta de /dev/shm ausente com a chave ligada → inerte (não deu para varrer)" "inerte" "$(jget shm.reap)"
+  shm_up; : > "$H/shm-reap.on"; shm_age; bt
+  check "shm faxina: chave ligada e nada órfão → 'nada' (lido e vazio, diferente de inerte)" "nada" "$(jget shm.reap)"
+  shm_up; shm_dir velho 3; : > "$H/shm-reap.on"; EXTRA_ENV="$EXTRA_ENV BALLAST_SHM_UID=$(( $(id -u) + 1 ))"; shm_age; bt
+  check "shm faxina: pasta de outro dono NUNCA sai, mesmo com a chave: nada" "nada velho" "$(jget shm.reap) $(shm_ls)"
+  shm_up; shm_dir velho 3; : > "$H/shm-reap.on"; EXTRA_ENV="$EXTRA_ENV BALLAST_SHM_BUDGET_S=0"; shm_age; bt
+  check "shm faxina: prazo de relógio zerado → a varredura já é parcial (inerte) e nada sai" "inerte velho" "$(jget shm.reap) $(shm_ls)"
+  if notroot; then
+    shm_up; shm_dir velho 3; : > "$H/shm-reap.on"; shm_proc 9003; mkdir -p "$FP/9003/fd"; chmod 000 "$FP/9003/fd"; printf 'ferramenta-nova\n' > "$FP/9003/comm"; shm_age; bt; chmod 755 "$FP/9003/fd"
+    check "shm faxina: processo opaco de nome desconhecido (proc-opaco) → inerte, nada sai" "inerte velho" "$(jget shm.reap) $(shm_ls)"
+    shm_up; shm_dir velho 3; : > "$H/shm-reap.on"; shm_age; chmod 555 "$SHM"; bt; chmod 755 "$SHM"
+    check "shm faxina: a pasta de /dev/shm não deixa tirar a entrada (sem escrita): o conteúdo sai, a pasta fica, o tick diz parcial e nomeia a que falhou" "parcial velho 0 0" "$(jget shm.reap) $(jget shm.falhou.0) $(jget shm.reaped | "$PY" -I -c 'import sys,json; print(len(json.load(sys.stdin)))') $(ls -A "$SHM/velho" | wc -l | tr -d ' ')"
+  else
+    echo "skip shm faxina: casos de permissão (chmod) e de processo opaco não valem como root"
+  fi
+  # o log é auxiliar: não escrever nele não segura a faxina
+  shm_up; shm_dir velho 3; : > "$H/shm-reap.on"; mkdir "$H/shm-reap.log"; shm_age; bt
+  check "shm faxina: shm-reap.log que não grava (é uma pasta) → a pasta sai do mesmo jeito e o tick diz log falhou" "feito falhou" "$(jget shm.reap) $(jget shm.log)"
+  # unitários (o selftest carrega o governo como módulo): a guarda de dispositivo, a reconferência de identidade e o isolamento de falha do passo
+  shm_up; shm_dir velho 3; mkdir -p "$T/fora$N"; echo vivo > "$T/fora$N/arq"
+  c=$(unit 'import os
+root, = sys.argv[1:2]
+print(hb.rm_tree(os.path.join(root, "velho"), -1))' "$SHM")
+  check "shm faxina (unit): rm_tree não entra em pasta de OUTRO dispositivo (dev errado): devolve erro e o arquivo dentro fica" "1+ yes" "$([ "$c" -ge 1 ] && echo '1+') $([ -f "$SHM/velho/sub/blob" ] && echo yes || echo no)"
+  c=$(unit 'import os
+root, = sys.argv[1:2]
+b = hb.SimpleNamespace(left=100, deadline=hb.time.monotonic() + 100)
+print(hb.shm_walk(os.path.join(root, "velho"), -1, 1e18, b)[2])' "$SHM")
+  check "shm faxina (unit): shm_walk com o dev errado trata a subpasta como ilegível (não como árvore completa)" "ilegivel" "$c"
+  shm_up; mkdir -p "$T/fora$N"; echo vivo > "$T/fora$N/arq"; ln -s "$T/fora$N" "$SHM/velho"; : > "$H/shm-reap.on"
+  c=$(unit 'import os
+cfg = hb.load_config({"BALLAST_HOME": sys.argv[2], "BALLAST_SHM": sys.argv[1], "BALLAST_NOW": "1"})
+out = {"why": "", "orfaos": [], "orfaos_n": 1, "orfaos_mb": 3}
+hb.shm_faxina(cfg, out, [{"name": "velho", "mb": 3, "idle_h": 99.0}])
+print(out["reap"], out["falhou"], out["reaped"])' "$SHM" "$H")
+  check "shm faxina (unit): a pasta julgada (velho) virou um SYMLINK entre a varredura e a faxina → não mexe: falhou, nada apagado, o link e o ALVO dele ficam" "parcial ['velho'] [] yes yes" "$c $([ -L "$SHM/velho" ] && echo yes || echo no) $([ -f "$T/fora$N/arq" ] && echo yes || echo no)"
+  shm_up; : > "$H/shm-reap.on"
+  c=$(unit 'import os
+cfg = hb.load_config({"BALLAST_HOME": sys.argv[2], "BALLAST_SHM": sys.argv[1], "BALLAST_NOW": "5000"})
+def boom(c):
+    raise RuntimeError("falha que ninguém previu")
+hb.shm_scan = boom
+st, rec = {"shm": None}, {}
+hb.shm_step(cfg, st, rec)
+print(rec["shm"]["why"], rec["shm"]["orfaos_n"], st["shm"]["t"])' "$SHM" "$H" 2> /dev/null)
+  check "shm faxina (unit): erro imprevisto na varredura NÃO sobe: vira why erro-interno com contas null e o carimbo da tentativa (o tick segue)" "erro-interno None 5000" "$c"
+  # o tick inteiro com a pasta cheia de coisa e a chave ligada ainda começa o item de sempre
+  shm_up; shm_dir velho 3; : > "$H/shm-reap.on"; shm_age; seed; good 50; good 50; good 50
+  check "shm faxina: o tick que apaga também começa o item (a faxina não segura nem atrasa o resto do tick)" "hq" "$(jget started.0.item)"
 }
 
 if [ -n "${HB_MUTANT:-}" ]; then
-  if [ "${HB_MUTANT_GROUPS:-}" = teto ]; then g_ceil; g_cgrp; elif [ "${HB_MUTANT_GROUPS:-}" = elastico ]; then g_elastic; elif [ "${HB_MUTANT_GROUPS:-}" = piso ]; then g_floor; g_carry; g_startmb; elif [ "${HB_MUTANT_GROUPS:-}" = shm ]; then g_shm; g_shmscan; else g_reg; g_tick; g_run; g_ram; g_reap; g_fill; g_off; g_state; g_logs; g_launch; g_send; fi
+  if [ "${HB_MUTANT_GROUPS:-}" = teto ]; then g_ceil; g_cgrp; elif [ "${HB_MUTANT_GROUPS:-}" = elastico ]; then g_elastic; elif [ "${HB_MUTANT_GROUPS:-}" = piso ]; then g_floor; g_carry; g_startmb; elif [ "${HB_MUTANT_GROUPS:-}" = shm ]; then g_shm; g_shmscan; g_shmreap; else g_reg; g_tick; g_run; g_ram; g_reap; g_fill; g_off; g_state; g_logs; g_launch; g_send; fi
   echo "RESULT $fails/$n"; [ "$fails" = 0 ]; exit $?
 fi
 if [ -n "${HB_ONLY:-}" ]; then "g_$HB_ONLY"; echo "── $((n - fails))/$n ok (só g_$HB_ONLY)"; [ "$fails" = 0 ]; exit $?; fi
-g_reg; g_tick; g_run; g_ram; g_reap; g_fill; g_off; g_state; g_logs; g_launch; g_send; g_ceil; g_cgrp; g_elastic; g_floor; g_carry; g_startmb; g_shm; g_shmscan
+g_reg; g_tick; g_run; g_ram; g_reap; g_fill; g_off; g_state; g_logs; g_launch; g_send; g_ceil; g_cgrp; g_elastic; g_floor; g_carry; g_startmb; g_shm; g_shmscan; g_shmreap
 
 [ -n "${HB_NO_MUTANTS:-}" ] || {
   echo "── controle negativo: cada mutante tem que reprovar a bateria ──"
