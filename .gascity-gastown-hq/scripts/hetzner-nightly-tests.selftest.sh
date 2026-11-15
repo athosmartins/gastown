@@ -19,7 +19,7 @@
 #   duração ilegível sai "?" (não 0h0min) · ids com " - " ficam distintos (irmãos de parametrize) · lista parcial / sem a linha GTN-FAILED / contagem que não bate / linha que não é JSON =
 #   comparação INDISPONÍVEL com a baseline intacta · fetch que falha aparece no relatório · lock velho com pid reaproveitado é tomado · PULADO por lock deixa linha no jsonl ·
 #   a limpeza de 14 dias não apaga a baseline · nao-isolado (vazamento medido) é FALHOU, não INERTE · o nó do mbp-run é o mesmo do instalador · o que foi ao nó fica no relatório.
-# CONTROLES NEGATIVOS: cada mutante do script (M1-M57, mais M0 neutro) tem de ser REPROVADO pelo caso correspondente (o caso falha quando roda no mutante). Antes deles, um mutante NEUTRO (cópia que só muda
+# CONTROLES NEGATIVOS: cada mutante do script (M1-M65, mais M0 neutro) tem de ser REPROVADO pelo caso correspondente (o caso falha quando roda no mutante). Antes deles, um mutante NEUTRO (cópia que só muda
 #   um comentário) tem de PASSAR: sem isso o controle não prova nada (a falta dos arquivos irmãos no diretório do mutante reprovava TODO caso, qualquer que fosse a mutação).
 set -u
 HERE="$(cd "$(dirname "$0")" && pwd)"
@@ -38,6 +38,8 @@ git init -q -b main "$T/wa" && ( cd "$T/wa" && echo hi > marker.txt
   mkdefs tests/test_b.py 5; printf 'class T:\n    def test_m(self):\n        pass\nasync def test_y():\n    pass\n' >> tests/test_b.py
   # o que a poda (norecursedirs do pytest.ini) e o padrão de nome têm de deixar de fora
   mkdefs tests/test_mac_launchd.py 3; mkdefs tests/mac/test_x.py 2   # os da lista mac-only (abaixo): ficam FORA da rodada, o mbp-run mandaria a bateria inteira ao Mac (rc 98)
+  # lista de CPFs (forma de CPF, valores de mentira): o hetzner-pii-scan.py retém (>=3) e o nó NUNCA recebe; o alvo que não chega ao nó faz o pytest abortar o lote inteiro (rc 4/5)
+  printf 'CPFS = ["123.456.789-09", "987.654.321-00", "111.222.333-96"]\ndef test_p1():\n    pass\ndef test_p2():\n    pass\n' > tests/test_pii_lista.py
   for d in venv .hidden crew archive node_modules; do mkdefs "tests/$d/test_x.py" 3; done; mkdefs tests/helper.py 3; echo "def test_n" > tests/test_notes.txt
   git add -A && git -c user.name=t -c user.email=t@t commit -qm m && git update-ref refs/remotes/origin/main HEAD && echo wip > untracked.txt )
 git init -q -b main "$T/wa-notests" && ( cd "$T/wa-notests" && echo hi > marker.txt && git add -A && git -c user.name=t -c user.email=t@t commit -qm m && git update-ref refs/remotes/origin/main HEAD )
@@ -61,8 +63,10 @@ cat > "$T/ssh-stub.sh" <<'EOF'
 cat > /dev/null; echo "ssh $*" >> "$SSH_LOG"; exit "${SSH_RC:-0}"
 EOF
 chmod +x "$T"/*-stub.sh
-cp "$HERE/hetzner-iso-run.sh" "$HERE/gtn_stable_ids.py" "$T/"   # o script lê os dois do diretório DELE ($HERE): o mutante, que mora em $T, precisa deles ao lado
+cp "$HERE/hetzner-iso-run.sh" "$HERE/gtn_stable_ids.py" "$HERE/hetzner-pii-scan.py" "$HERE/hetzner-rsync-filter.wa.txt" "$T/"   # o script lê os dois do diretório DELE ($HERE): o mutante, que mora em $T, precisa deles ao lado
 export MBP_CITY="$C" HZN_RUN="$T/run-stub.sh" HZN_WA_REPO="$T/wa" HZN_MAIL_CMD="$T/mail-stub.sh" HZN_SSH="$T/ssh-stub.sh" HZN_NODE_HOST=stub-node HZN_NO_FETCH=1
+printf '# filtro de mentira: barra tests/test_zero.py por nome\n- /tests/test_zero.py\n+ /tests/***\n+ /marker.txt\n- *\n' > "$T/filter-bar.txt"; printf '+ /marker.txt\n- *\n' > "$T/filter-none.txt"
+printf '#!/bin/sh\nexit 3\n' > "$T/pii-fail.sh"; printf '#!/bin/sh\nprintf "marker.txt\\ntests/a_test.py\\n"; exit 23\n' > "$T/rsync-partial.sh"; printf '#!/bin/sh\nexit 0\n' > "$T/rsync-empty.sh"; chmod +x "$T/rsync-partial.sh" "$T/rsync-empty.sh"
 printf '# comentário\n\n  tests/test_mac_*.py  \ntests/mac/*\n' > "$T/mac-only.txt"; export HETZNER_MAC_ONLY_LIST="$T/mac-only.txt"   # glob por linha, espaços e comentário como no mbp-run
 export LOCK_PATH="$LOCK" MAIL_LOG STUB_CALLS="$CALLS" STUB_OUT STUB_DIR_SEEN="$T/dirseen" SSH_LOG="$T/ssh.log" STUB_CNT="$T/stub.cnt" HZN_RETRY_S=0
 n=0; fails=0; BAD=0; QUIET=0
@@ -98,6 +102,8 @@ case_first() { reset; mkout "$ISO_OK" 7 "$SUM1" "FAILED tests/a.py::t1 - Asserti
   ck "1ª noite: a poda do pytest.ini (venv, .hidden, crew, archive, node_modules) e o que não é test_*.py ficam de fora" hasnt "$CALLS" 'venv|hidden|crew|archive|node_modules|helper\.py|notes'
   ck "1ª noite: os arquivos mac-only (lista do mbp-run) ficam FORA do lote" hasnt "$CALLS" 'test_mac_|tests/mac/'; ck "1ª noite: o jsonl conta 2 mac-only fora" test "$(tail -n 1 "$JSONL" | jq -c .mac_only_excluded)" = 2
   ck "1ª noite: o relatório diz que a bateria NÃO cobre os mac-only" has "$REPORT" 'fora da rodada por regra do nó: 2 arquivos mac-only .*NÃO os cobre'; ck "1ª noite: a lista dos excluídos fica em arquivo" has "$LOGDIR/$DAY.mac-only.lst" '^tests/mac/test_x.py$'
+  ck "1ª noite: o arquivo com lista de CPFs (que o nó nunca recebe) fica FORA do lote" hasnt "$CALLS" 'test_pii_lista'; ck "1ª noite: o jsonl conta 1 arquivo que o nó não recebe" test "$(tail -n 1 "$JSONL" | jq -c .node_held_excluded)" = 1
+  ck "1ª noite: o relatório diz que a bateria NÃO cobre o que o nó não recebe" has "$REPORT" 'fora da rodada porque o nó não os recebe: 1 arquivos \(0 barrados pelo filtro do rsync, 1 com lista de telefones/CPFs.*NÃO os cobre'; ck "1ª noite: a lista dos retidos fica em arquivo" has "$LOGDIR/$DAY.retidos.lst" '^tests/test_pii_lista\.py$'
   ck "1ª noite: UMA chamada do mbp-run (todos os arquivos cabem em 1 lote)" test "$(grep -c '^ARGS:' "$CALLS")" = 1; ck "1ª noite: o jsonl conta 1 lote, 1 rodou, 0 pulados" test "$(tail -n 1 "$JSONL" | jq -c '[.batches,.batches_ran,.batches_skipped]')" = '[1,1,0]'
   ck "1ª noite: o relatório diz o teto" has "$REPORT" 'teto \(lote 01\): `GTN-CAP: MemoryMax=20480M MemorySwapMax=0 workers=9'; ck "1ª noite: tabela com o lote 01 (5 arquivos, 23 defs, 9 workers)" has "$REPORT" '^\| 01 \| 5 \| 23 \| 9 \| '
   ck "1ª noite: a saída do lote fica em arquivo próprio" test -s "$LOGDIR/$DAY.b01.out"
@@ -309,11 +315,26 @@ case_maconly() { reset; mkout "$ISO_OK" 0 "1500 passed in 3000.00s" "$(fl 0)"
   # lista estática que não abre: sem ela não se sabe o que tem de ficar no Mac
   reset; STUB_RC=0 HETZNER_MAC_ONLY_LIST="$T/nao-existe.txt" go "$1"; ck "lista mac-only ilegível: FALHOU, exit 1" rcis 1; ck "lista mac-only ilegível: diz que não abre" has "$MAIL_LOG" 'lista mac-only .* não abre'; ck "lista mac-only ilegível: nada rodou" empty_dir_file "$CALLS"
   # tudo mac-only: nada a rodar no nó, nunca um verde vazio
-  reset; printf 'tests/*\n' > "$T/mac-all.txt"; STUB_RC=0 HETZNER_MAC_ONLY_LIST="$T/mac-all.txt" go "$1"; ck "tudo mac-only: FALHOU, exit 1" rcis 1; ck "tudo mac-only: diz o porquê" has "$MAIL_LOG" 'estão na lista mac-only'; ck "tudo mac-only: nada rodou" empty_dir_file "$CALLS"
+  reset; printf 'tests/*\n' > "$T/mac-all.txt"; STUB_RC=0 HETZNER_MAC_ONLY_LIST="$T/mac-all.txt" go "$1"; ck "tudo mac-only: FALHOU, exit 1" rcis 1; ck "tudo mac-only: diz o porquê" has "$MAIL_LOG" 'ficam no mini \(mac-only'; ck "tudo mac-only: nada rodou" empty_dir_file "$CALLS"
   # lista só com comentário (nenhum glob): nada é excluído, como no mbp-run
   reset; mkout "$ISO_OK" 0 "1500 passed in 3000.00s" "$(fl 0)"; printf '# nada\n' > "$T/mac-none.txt"; STUB_RC=0 HETZNER_MAC_ONLY_LIST="$T/mac-none.txt" go "$1"; ck "lista sem globs: nada excluído (7 arquivos)" has "$REPORT" '^\| 01 \| 7 \| 28 \| '; }
 
-ALL="first second cleanslate xfail inerte leak 97_sem_iso pulado timeout abort noiso nosum implausible lock lock_stale prev_unreadable mailfail egress ssh no_origin stale_report listfail prev_format dash partial fetch keep provenance dur maconly batches batch_list overbudget batch_killed crash nocap cap_inert cap_retry cap_late leak_mid flag_mid badconst notests"
+case_retidos() { reset; mkout "$ISO_OK" 0 "1500 passed in 3000.00s" "$(fl 0)"
+  # o filtro do rsync barra um arquivo por NOME (além do que a varredura de CPFs retém): os dois ficam fora, e a conta separa os dois motivos
+  HETZNER_RSYNC_FILTER="$T/filter-bar.txt" STUB_RC=0 go "$1"
+  ck "filtro barra 1 + varredura retém 1: exit 0 e COMPLETO" rcis 0; ck "filtro barra 1 + varredura retém 1: nenhum dos dois vai ao nó" hasnt "$CALLS" 'test_zero|test_pii_lista'
+  ck "filtro barra 1 + varredura retém 1: o relatório separa os motivos" has "$REPORT" 'fora da rodada porque o nó não os recebe: 2 arquivos \(1 barrados pelo filtro do rsync, 1 com lista de telefones/CPFs'; ck "filtro barra 1 + varredura retém 1: sobram 4 arquivos" has "$REPORT" '^\| 01 \| 4 \| 23 \| '
+  ck "filtro barra 1 + varredura retém 1: a lista dos retidos tem os dois" test "$(sort "$LOGDIR/$DAY.retidos.lst" | tr '\n' ' ')" = "tests/test_pii_lista.py tests/test_zero.py "
+  # fecha-falha: sem saber o que o nó recebe, nada roda (nunca "recebe tudo")
+  reset; STUB_RC=0 HETZNER_RSYNC_FILTER="$T/nao-existe.txt" go "$1"; ck "filtro do nó ilegível: FALHOU, exit 1" rcis 1; ck "filtro do nó ilegível: diz que não abre" has "$MAIL_LOG" 'filtro do rsync do nó .* não abre'; ck "filtro do nó ilegível: nada rodou" empty_dir_file "$CALLS"
+  reset; STUB_RC=0 MBP_RSYNC="$T/rsync-partial.sh" go "$1"; ck "rsync -n sai com erro: FALHOU, exit 1" rcis 1; ck "rsync -n sai com erro: diz que não listou" has "$MAIL_LOG" 'rsync -n do filtro do nó .* não listou'; ck "rsync -n sai com erro: nada rodou" empty_dir_file "$CALLS"
+  reset; STUB_RC=0 MBP_RSYNC="$T/rsync-empty.sh" go "$1"; ck "rsync -n sem lista: FALHOU, exit 1" rcis 1; ck "rsync -n sem lista: diz que não listou" has "$MAIL_LOG" 'rsync -n do filtro do nó .* não listou'; ck "rsync -n sem lista: nada rodou" empty_dir_file "$CALLS"
+  reset; STUB_RC=0 HZN_PII_SCAN="$T/pii-fail.sh" go "$1"; ck "varredura de CPFs falha: FALHOU, exit 1" rcis 1; ck "varredura de CPFs falha: diz que não terminou" has "$MAIL_LOG" 'varredura de telefones/CPFs .* não terminou'; ck "varredura de CPFs falha: nada rodou" empty_dir_file "$CALLS"
+  reset; STUB_RC=0 HZN_PII_SCAN="$T/nao-existe.py" go "$1"; ck "scanner de PII ausente: FALHOU, exit 1" rcis 1; ck "scanner de PII ausente: diz que não existe" has "$MAIL_LOG" 'scanner de PII .* não existe'; ck "scanner de PII ausente: nada rodou" empty_dir_file "$CALLS"
+  # nada chega ao nó: nunca um verde vazio
+  reset; STUB_RC=0 HETZNER_RSYNC_FILTER="$T/filter-none.txt" go "$1"; ck "o nó não recebe nenhum teste: FALHOU, exit 1" rcis 1; ck "o nó não recebe nenhum teste: diz o porquê" has "$MAIL_LOG" 'ficam no mini \(mac-only'; ck "o nó não recebe nenhum teste: nada rodou" empty_dir_file "$CALLS"; }
+
+ALL="first second cleanslate xfail inerte leak 97_sem_iso pulado timeout abort noiso nosum implausible lock lock_stale prev_unreadable mailfail egress ssh no_origin stale_report listfail prev_format dash partial fetch keep provenance dur maconly retidos batches batch_list overbudget batch_killed crash nocap cap_inert cap_retry cap_late leak_mid flag_mid badconst notests"
 for c in $ALL; do "case_$c" "$SUT0"; done
 
 # ---- controles negativos: o caso correspondente tem de FALHAR quando roda no mutante -----------------------------------------
@@ -391,6 +412,14 @@ mutantl M54-lista-mac-only-ilegivel-aceita maconly '|| finish FALHOU "a lista ma
 mutantl M55-lista-aprendida-ignorada maconly 'done < <(cat "$MACLIST" "$MACLEARN" 2>/dev/null)' 'done < <(cat "$MACLIST" 2>/dev/null)'
 mutantl M56-tudo-mac-only-aceito maconly '[ "$NFILES" -ge 1 ] || finish FALHOU "todos os arquivos' '[ "$NFILES" -ge 1 ] || : "todos os arquivos'
 mutantl M57-glob-sem-aparar-espacos maconly 'g=${g#"${g%%[![:space:]]*}"}; g=${g%"${g##*[![:space:]]}"}' ':'
+mutantl M58-arquivo-retido-pela-varredura-vai-ao-no first 'if [ "$NHELD" -gt 0 ]; then LC_ALL=C grep -vxF' 'if false; then LC_ALL=C grep -vxF'
+mutantl M59-arquivo-barrado-pelo-filtro-vai-ao-no retidos 'LC_ALL=C grep -vxF -f "$SCR/pf.sent" "$FILES" > "$SCR/pf.nosend"' ':'
+mutantl M60-varredura-que-nao-termina-aceita retidos '|| finish FALHOU "a varredura de telefones/CPFs' '|| : "a varredura de telefones/CPFs'
+mutantl M61-rsync-com-erro-aceito retidos '{ [ "${PIPESTATUS[0]}" -eq 0 ] && [ -s "$SCR/pf.sent" ]; }' '{ [ -s "$SCR/pf.sent" ]; }'
+mutantl M62-lista-vazia-do-rsync-aceita retidos '{ [ "${PIPESTATUS[0]}" -eq 0 ] && [ -s "$SCR/pf.sent" ]; }' '{ [ "${PIPESTATUS[0]}" -eq 0 ]; }'
+mutantl M63-retidos-da-varredura-ignorados first 'if [ -s "$SCR/pf.hp" ]; then LC_ALL=C grep -xF' 'if false; then LC_ALL=C grep -xF'
+mutantl M64-filtro-ilegivel-aceito retidos '|| finish FALHOU "o filtro do rsync do nó ($NFILTER) não abre' '|| : "o filtro do rsync do nó ($NFILTER) não abre'
+mutantl M65-scanner-ausente-aceito retidos '[ -f "$PIISCAN" ] || finish FALHOU' '[ -f "$PIISCAN" ] || : '
 reset
 echo "---"; echo "$((n-fails))/$n ok ($M mutantes)"
 [ $fails -eq 0 ] && echo "SELFTEST OK" || { echo "SELFTEST FALHOU ($fails)"; exit 1; }

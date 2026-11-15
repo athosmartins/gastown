@@ -6,7 +6,7 @@
 #
 # POR QUÊ: em 04/10 um teste de branch antiga mandou um e-mail de verdade. Rodar a suíte inteira toda noite só é aceitável com a saída de rede PROVADA
 #   cortada (canário do hetzner-iso-run.sh + helper de root hetzner-netns-run.sh) e ambiente limpo. Sem essa prova nada roda.
-# LOTES (ga-84gkpab): um pytest só com 14 workers sobre a árvore inteira (3779+ arquivos, ~100 mil testes) cresce sem platô — cada worker nasce com ~2 GB (coleta tudo) e a soma passou
+# LOTES (ga-84gkpab): um pytest só com 14 workers sobre a árvore inteira (4614 arquivos, ~76 mil testes em origin/main de 15/11) cresce sem platô — cada worker nasce com ~2 GB (coleta tudo) e a soma passou
 #   dos 31 GB do nó: o OOM do kernel matou o job com rc=137 aos ~1700 s em 13, 14 e 15/11. Agora: os arquivos test_*.py/*_test.py de tests/ (menos o que o pytest.ini manda ignorar) são
 #   agrupados em ordem de caminho em lotes de ~HZN_BATCH_DEFS `def test_` (o nº de lotes sai da árvore, nunca fixo) e CADA lote é um `mbp-run.sh` + um pytest NOVO (a memória zera). Quem limita a
 #   memória é o `gt-iso-run` no nó (hetzner-iso-run.sh): lê o MemAvailable na hora, deriva os workers (nunca um número fixo), roda o pytest dentro de
@@ -56,11 +56,11 @@ cleanup() { [ -z "$SCR" ] || find "$SCR" -mindepth 1 -delete 2>/dev/null; [ -z "
 trap cleanup EXIT
 mkdir -p "$LOGDIR" 2>/dev/null || { say "FALHOU — não consegui criar $LOGDIR"; exit 1; }
 
-SHA="?"; ISO_LINE=""; EGRESS="?"; MAILRC=0; FETCHST="?"; CMPST="-"; STALE_NOTE=""; DEPLOY=""; NB=0; NRAN=0; NSKIP=0; NMAC=0
+SHA="?"; ISO_LINE=""; EGRESS="?"; MAILRC=0; FETCHST="?"; CMPST="-"; STALE_NOTE=""; DEPLOY=""; NB=0; NRAN=0; NSKIP=0; NMAC=0; NHELD=0; NHF=0; NHP=0
 jline() { # veredito motivo — a linha do jsonl desta noite (também a das noites PULADAS por lock: uma por noite)
   jq -cn --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" --arg v "$1" --arg why "$2" --arg sha "$SHA" --arg iso "$ISO_LINE" --arg egress "$EGRESS" --arg fetch "$FETCHST" --arg cmp "$CMPST" \
-     --argjson wall "$(( $(date +%s) - T0 ))" --argjson mailrc "$MAILRC" --argjson nb "$NB" --argjson nr "$NRAN" --argjson ns "$NSKIP" --argjson nm "$NMAC" \
-     '{ts:$ts,verdict:$v,reason:$why,sha:$sha,isolation:$iso,egress_attempts:$egress,fetch:$fetch,compare:$cmp,wall_s:$wall,mail_failed:$mailrc,batches:$nb,batches_ran:$nr,batches_skipped:$ns,mac_only_excluded:$nm}' >> "$JSONL" 2>/dev/null \
+     --argjson wall "$(( $(date +%s) - T0 ))" --argjson mailrc "$MAILRC" --argjson nb "$NB" --argjson nr "$NRAN" --argjson ns "$NSKIP" --argjson nm "$NMAC" --argjson nh "$NHELD" \
+     '{ts:$ts,verdict:$v,reason:$why,sha:$sha,isolation:$iso,egress_attempts:$egress,fetch:$fetch,compare:$cmp,wall_s:$wall,mail_failed:$mailrc,batches:$nb,batches_ran:$nr,batches_skipped:$ns,mac_only_excluded:$nm,node_held_excluded:$nh}' >> "$JSONL" 2>/dev/null \
      || say "WARN: não gravei $JSONL"
 }
 finish() { # veredito motivo [exit] — grava o relatório, o jsonl, manda o e-mail (salvo PULADO) e sai
@@ -167,8 +167,27 @@ if [ "${#GLOBS[@]}" -gt 0 ]; then
   mv -f "$SCR/files.keep" "$FILES"
 fi
 NMAC=$(wc -l < "$MACX" | tr -d ' ')
+# RETIDOS NO MINI: o mbp-run não manda ao nó (a) o que o filtro do rsync barra por NOME/pasta e (b) o arquivo com LISTA de telefones/CPFs (node_guard: hetzner-pii-scan.py). Alvo que não chega ao nó
+# faz o pytest abortar o LOTE INTEIRO (rc 4, ou rc 5 "no tests ran" sob xdist, sem dizer qual arquivo): 16 arquivos de tests/ em 15/11, e a noite teria 10 lotes "não rodou" por causa deles. Mesma conta
+# do node_guard (o mesmo filtro, o mesmo scanner, a mesma árvore): a lista que o rsync enviaria menos o que a varredura retém. Fica FORA da rodada, contado e listado no relatório (rodam no mini).
+# FALHA FECHADA como no mbp-run: filtro que não abre, rsync -n sem resposta, lista vazia ou varredura que não terminou (rc != 0) = FALHOU, nada rodou; "não sei o que o nó recebe" não é "recebe tudo".
+NFILTER=${HETZNER_RSYNC_FILTER:-$HERE/hetzner-rsync-filter.wa.txt}; PIISCAN=${HZN_PII_SCAN:-$HERE/hetzner-pii-scan.py}; HELDX="$LOGDIR/$DAY.retidos.lst"; RSYNC_BIN=${MBP_RSYNC:-rsync}
+{ [ -f "$NFILTER" ] && [ -r "$NFILTER" ]; } || finish FALHOU "o filtro do rsync do nó ($NFILTER) não abre: sem ele não se sabe o que o nó recebe; nada rodou" 1
+[ -f "$PIISCAN" ] || finish FALHOU "o scanner de PII ($PIISCAN) não existe: sem ele não se sabe o que o nó recebe; nada rodou" 1
+mkdir "$SCR/pf.dst" 2>/dev/null || finish FALHOU "não criei $SCR/pf.dst" 1
+"$RSYNC_BIN" -a -n --out-format='%n' --filter=". $NFILTER" "$TREE"/ "$SCR/pf.dst"/ 2>/dev/null | grep -v '/$' > "$SCR/pf.sent"
+{ [ "${PIPESTATUS[0]}" -eq 0 ] && [ -s "$SCR/pf.sent" ]; } || finish FALHOU "o rsync -n do filtro do nó ($NFILTER) não listou o que seria enviado: não sei o que o nó recebe; nada rodou" 1
+python3 -I "$PIISCAN" "$TREE" --rules "$SCR/pf.rules" < "$SCR/pf.sent" > "$SCR/pf.held" 2>/dev/null || finish FALHOU "a varredura de telefones/CPFs ($PIISCAN) não terminou (rc != 0): não sei o que o nó recebe; nada rodou" 1
+cut -f3- "$SCR/pf.held" > "$SCR/pf.hp"
+: > "$SCR/pf.nosend"; : > "$SCR/pf.heldt"
+LC_ALL=C grep -vxF -f "$SCR/pf.sent" "$FILES" > "$SCR/pf.nosend"; [ $? -le 1 ] || finish FALHOU "não comparei a lista de testes com o que o nó recebe: nada rodou" 1
+if [ -s "$SCR/pf.hp" ]; then LC_ALL=C grep -xF -f "$SCR/pf.hp" "$FILES" > "$SCR/pf.heldt"; [ $? -le 1 ] || finish FALHOU "não comparei a lista de testes com os arquivos retidos pela varredura: nada rodou" 1; fi
+NHF=$(wc -l < "$SCR/pf.nosend" | tr -d ' '); NHP=$(wc -l < "$SCR/pf.heldt" | tr -d ' ')
+cat "$SCR/pf.nosend" "$SCR/pf.heldt" | LC_ALL=C sort -u > "$HELDX"
+NHELD=$(wc -l < "$HELDX" | tr -d ' ')
+if [ "$NHELD" -gt 0 ]; then LC_ALL=C grep -vxF -f "$HELDX" "$FILES" > "$SCR/files.keep"; [ $? -le 1 ] || finish FALHOU "não tirei da lista os $NHELD arquivos que o nó não recebe: nada rodou" 1; mv -f "$SCR/files.keep" "$FILES"; fi
 NFILES=$(wc -l < "$FILES" | tr -d ' ')
-[ "$NFILES" -ge 1 ] || finish FALHOU "todos os arquivos de tests/ de origin/main@$SHA estão na lista mac-only ($NMAC): nada a rodar no nó" 1
+[ "$NFILES" -ge 1 ] || finish FALHOU "todos os arquivos de tests/ de origin/main@$SHA ficam no mini (mac-only $NMAC, não enviados ao nó $NHELD): nada a rodar no nó" 1
 BADNAME=$(LC_ALL=C grep -cvE '^[A-Za-z0-9_./-]+$' "$FILES"); [ "${BADNAME:-0}" -eq 0 ] || finish FALHOU "$BADNAME arquivo(s) de teste com nome fora de [A-Za-z0-9_./-] (primeiro: $(LC_ALL=C grep -vE '^[A-Za-z0-9_./-]+$' "$FILES" | head -n 1)): não passam seguros na linha de comando; nada rodou" 1
 # o peso do arquivo é o nº de `def test_` (mínimo 1): barato, estável e na ordem certa de grandeza do tempo/memória; o nº de lotes SAI da árvore, nunca é fixo
 ( cd "$TREE" && tr '\n' '\0' < "$FILES" | xargs -0 grep -c -H -E '^[[:space:]]*(async[[:space:]]+)?def[[:space:]]+test_' ) > "$WGT" 2>/dev/null
@@ -190,7 +209,7 @@ rm -f "$LOGDIR/$DAY".b*.out 2>/dev/null; : > "$OUT"
 TABLE="$SCR/table.md"; : > "$TABLE"; : > "$SCR/ids.all"
 DEADLINE=$(( T0 + TIMEOUT_S - MARGIN ))
 NRAN=0; NSKIP=0; SKIPLIST=""; TP=0; TF=0; TE=0; TS=0; TXF=0; TXP=0; LISTOK=1; LISTWHY=""; PYSECS=0; PYUNK=0; EGSUM=0; EGUNK=0; EGSEEN=0; FIRSTCAP=""
-say "rodando a suíte do WA @$SHA em $NODE: $NFILES arquivos ($NMAC mac-only ficaram de fora), $NDEFS def test_, $NB lotes de ~$BATCH_DEFS (orçamento $(( DEADLINE - $(date +%s) ))s de ${TIMEOUT_S}s)"
+say "rodando a suíte do WA @$SHA em $NODE: $NFILES arquivos ($NMAC mac-only e $NHELD não enviados ao nó ficaram de fora), $NDEFS def test_, $NB lotes de ~$BATCH_DEFS (orçamento $(( DEADLINE - $(date +%s) ))s de ${TIMEOUT_S}s)"
 
 tail1() { grep . "$1" 2>/dev/null | tail -n 1 | cut -c1-200; }
 cnt() { printf '%s' "$SUM" | sed -n -E "s/.*[^0-9]([0-9]+) $1.*/\1/p;s/^([0-9]+) $1.*/\1/p" | head -n 1; }
@@ -338,6 +357,7 @@ if [ "$NSKIP" -gt 0 ]; then
   { echo "# Hetzner nightly $DAY — FALHOU: $NSKIP de $NB lotes NÃO RODARAM"; echo
     echo "- origin/main @$SHA, nó $NODE, $NFILES arquivos de tests/ ($NDEFS def test_) em $NB lotes de ~$BATCH_DEFS"
     [ "$NMAC" -eq 0 ] || echo "- fora da rodada por regra do nó: $NMAC arquivos mac-only (lista em $MACX; rodam no MBP/mini)"
+    [ "$NHELD" -eq 0 ] || echo "- fora da rodada porque o nó não os recebe: $NHELD arquivos ($NHF barrados pelo filtro do rsync, $NHP com lista de telefones/CPFs; lista em $HELDX; rodam no mini)"
     [ -z "$STALE_NOTE" ] || echo "- ATENÇÃO: $STALE_NOTE"
     echo "- instalado no nó: $DEPLOY"
     echo "- lotes que NÃO rodaram: $SKIPLIST (motivo na tabela). Sem eles a suíte NÃO foi completa: não há veredito verde, não há comparação com a noite anterior e a linha de base não foi tocada"
@@ -371,6 +391,7 @@ GOAL="ATINGIDA"; [ "$WALL" -lt 7200 ] || GOAL="ESTOURADA"
   echo "# Hetzner nightly $DAY — COMPLETO"; echo
   echo "- origin/main @$SHA, nó $NODE, $NFILES arquivos de tests/ ($NDEFS def test_) em $NB lotes (\`pytest <arquivos do lote> -n auto\`, workers e teto de memória derivados do MemAvailable do nó a cada lote)"
   [ "$NMAC" -eq 0 ] || echo "- fora da rodada por regra do nó: $NMAC arquivos mac-only (scripts/hetzner-mac-only.txt; lista em $MACX; rodam no MBP/mini, esta bateria NÃO os cobre)"
+  [ "$NHELD" -eq 0 ] || echo "- fora da rodada porque o nó não os recebe: $NHELD arquivos ($NHF barrados pelo filtro do rsync, $NHP com lista de telefones/CPFs; lista em $HELDX; rodam no mini, esta bateria NÃO os cobre)"
   [ -z "$STALE_NOTE" ] || echo "- ATENÇÃO: $STALE_NOTE"
   echo "- instalado no nó: $DEPLOY"
   echo "- total: $TOTAL ($PASSED passaram, $FAILED falharam, $ERRORS erros, $SKIPPED pulados, $XF xfail, $XP xpass); $NRAN de $NB lotes rodaram"
