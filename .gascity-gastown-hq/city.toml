@@ -173,7 +173,9 @@ source = "packs/town-deltas"
 # both labels are in the daemon-presence-watchdog's DPW_CRITICAL, which re-bootstraps a booted-out critical label whose plist is still in ~/Library/LaunchAgents unless it is disabled.
 # prod-tests/gascity/story-ga-7sxdmb.sh and story-ga-c0939v.{2,7}.sh assert this state (orders not listed, plists loaded).
 [orders]
-skip = ["wisp-compact", "nudge-on-route", "mol-dog-jsonl", "jsonl-export", "jsonl-hourly-offsite"]
+# ga-84gkpab.1 (Mayor 15/11): hetzner-nightly-tests desligado até o redesenho em lotes de ga-84gkpab — -n 14 sem teto
+# estoura a RAM do nó toda noite (rc=137, ~41 workers mortos) e não dá sinal. Rollback = tirar o nome daqui (é o aceite de ga-84gkpab).
+skip = ["wisp-compact", "nudge-on-route", "mol-dog-jsonl", "jsonl-export", "jsonl-hourly-offsite", "hetzner-nightly-tests"]
 
 # ga-e6ottw: same trap, three more orders — orphan-sweep, mol-dog-reaper, order-tracking-sweep.
 # The maintenance pack registers each once per scope (city + 5 rigs) and the town-deltas
