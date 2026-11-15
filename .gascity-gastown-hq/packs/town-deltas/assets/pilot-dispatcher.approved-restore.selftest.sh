@@ -396,13 +396,29 @@ survived ns && ok "the sweep survives" || bad "the sweep died: rc=$RC"
 { has_label wa-ns4b story:approved && [ "$(flight_n wa-ns4b)" = 0 ] && [ -z "$(owner_of wa-ns4b)" ]; } && ok "wa-ns4b restored and released in the same pass" || bad "wa-ns4b: labels=$(labels_of wa-ns4b) owner='$(owner_of wa-ns4b)'"
 
 echo
-echo "NS-5: the row has no owner and the bead cannot be read — unknown: nothing released blind, nothing written"
-new_world ns5
-add_bead wa-ns5 open "" feature "story:in-flight pilot:dispatched"
-export AR_SHOW_MODE=fail
+echo "NS-5: the row has no owner and the bead cannot be read (fails / empty / garbled) — unknown: nothing released blind, nothing written (no owner release runs here to notice it)"
+for _mode in fail empty garbage; do
+  new_world ns5$_mode
+  add_bead wa-ns5 open "" feature "story:in-flight pilot:dispatched"
+  export AR_SHOW_MODE=$_mode
+  run_ns
+  survived ns && ok "[$_mode] the sweep survives" || bad "[$_mode] the sweep died: rc=$RC"
+  { [ "$(flight_n wa-ns5)" = 2 ] && ! calls_have " label " && ! calls_have " update "; } && ok "[$_mode] flight labels kept, no write" || bad "[$_mode] labels=$(labels_of wa-ns5); calls: $(tr '\n' '|' < "$W/calls.log")"
+done
+
+echo
+echo "NS-5b: the row had NO owner and the restore LANDED but the read-back dies — unknown: the flight labels stay (the approval that landed stays too), the next sweep converges"
+new_world ns8
+add_bead wa-ns8 open "" feature "story:in-flight pilot:dispatched"
+export AR_SHOW_MODE=fail_after_add
 run_ns
-survived ns && ok "the sweep survives" || bad "the sweep died: rc=$RC"
-{ [ "$(flight_n wa-ns5)" = 2 ] && ! calls_have " label " && ! calls_have " update "; } && ok "flight labels kept, no write" || bad "labels=$(labels_of wa-ns5); calls: $(tr '\n' '|' < "$W/calls.log")"
+survived ns && ok "the sweep survives" || bad "the sweep died: rc=$RC err=$(head -c 300 "$W/ns.err")"
+{ [ "$(flight_n wa-ns8)" = 2 ] && has_label wa-ns8 story:approved; } && ok "flight labels kept, the approval that landed is there" || bad "labels=$(labels_of wa-ns8)"
+never_raw wa-ns8 && ok "never raw" || bad "LIMBO"
+echo "  (second sweep, bd readable again)"
+unset AR_SHOW_MODE
+run_ns
+{ has_label wa-ns8 story:approved && [ "$(flight_n wa-ns8)" = 0 ] && [ "$(raw_verdict wa-ns8)" = no ]; } && ok "converges: approved, released, not an idea" || bad "second sweep: labels=$(labels_of wa-ns8)"
 
 echo
 echo "NS-6: the row had NO owner (so no owner release runs) but a live claimant took the bead since — nothing is written, the flight labels and stamps stay on its bead"
