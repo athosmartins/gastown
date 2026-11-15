@@ -183,6 +183,21 @@ def read_mem_avail_mb(root):
     raise Unreadable("/proc/meminfo: sem MemAvailable")
 
 
+def read_shmem_mb(root):
+    """Shmem do meminfo (a tmpfs inteira do nó: o que NÃO volta como MemAvailable, e o que /dev/shm órfão ocupa), em MB inteiros."""
+    # vazio (sem a linha) → Unreadable, nunca 0 MB; falhou/ilegível → Unreadable (o chamador grava null: o Shmem só EXPLICA o skipped ram, não decide nada)
+    for ln in read_text(os.path.join(root, "meminfo")).splitlines():
+        if ln.startswith("Shmem:"):
+            try:
+                kb = int(ln.split()[1])
+            except (ValueError, IndexError):
+                raise Unreadable("/proc/meminfo: Shmem não numérico")
+            if kb < 0:
+                raise Unreadable("/proc/meminfo: Shmem negativo")
+            return kb // 1024
+    raise Unreadable("/proc/meminfo: sem Shmem")
+
+
 def read_psi_io(root):
     """avg10 de `some` e de `full` do pressure/io (em %): (some, full). vazio (arquivo sem as duas linhas) / falhou / ilegível (ausente: kernel sem PSI; número que não é número, NaN) → Unreadable: o disco NÃO foi lido, nunca 'calmo'"""
     out = {}
@@ -1051,6 +1066,14 @@ def carry_slots(cfg, st, item, cores, mem_left, floor):
     return max(cores, min(last["n"], item["cores_max"], cores + extra))
 
 
+def ram_skip(st, rec, it, floor, mem_left):
+    """O item não começa por RAM. O tick diz QUANTO falta (falta_mb = piso + start_mb - o MemAvailable que sobrou depois do que este tick já planejou: sempre > 0, é a condição que falhou) e quanto de /dev/shm órfão a
+    última varredura achou (shm_orfao_mb; null = ainda não varreu ou não leu): sem os dois números, `skipped ram` custou 3 dias do wa-suite parado e uma investigação de horas (ga-i6ghk4r)."""
+    shm = st.get("shm")
+    rec["skipped"].append({"item": it["name"], "why": "ram", "falta_mb": floor + it["start_mb"] - mem_left, "shm_orfao_mb": shm.get("orfaos_mb") if isinstance(shm, dict) else None})
+    rec["ram"] = "baixa"
+
+
 def ram_step(cfg, st, run, mem, rec):
     """RAM: abaixo do piso crítico mata o maior na hora; abaixo do de pausa congela (SIGSTOP) e, se não passar em N leituras, mata o maior; com folga retoma (SIGCONT)."""
     biggest = max(run.values(), key=lambda r: r["rss_kb"]) if run else None
@@ -1190,7 +1213,13 @@ def do_tick(cfg):
         print("hetzner-ballast: %s" % e, file=sys.stderr)
     if bad:
         notes.append("leitura-ilegivel")
-    rec["ncpu"], rec["mem_avail_mb"] = ncpu, mem
+    # vazio (meminfo sem a linha Shmem) → null; falhou/ilegível → null: o Shmem só EXPLICA um skipped ram, não decide nada (não entra em `bad`, nada começa nem para por causa dele), e null nunca vira 0 MB
+    shmem = None
+    try:
+        shmem = read_shmem_mb(cfg.proc)
+    except Unreadable:
+        pass
+    rec["ncpu"], rec["mem_avail_mb"], rec["shmem_mb"] = ncpu, mem, shmem
     # sessões vivas no tmux do provider → piso de RAM do tick. vazio (sem servidor) → 0 sessões; falhou/ilegível (tmux) → None: piso FIXO e o histórico não anda (a razão fica no registro: ram_floor_why)
     try:
         n_sess = read_sessions(cfg)
@@ -1276,8 +1305,7 @@ def do_tick(cfg):
             if not ok or cores < 1 or used + cores > budget:
                 continue
             if mem_left - it["start_mb"] < floor:
-                rec["skipped"].append({"item": it["name"], "why": "ram"})
-                rec["ram"] = "baixa"
+                ram_skip(st, rec, it, floor, mem_left)
                 continue
             plan.append((it, cores, carry_slots(cfg, st, it, cores, mem_left, floor)))
             used += cores
@@ -1305,8 +1333,7 @@ def do_tick(cfg):
             if not ok or cores < 1 or (it["cores"] != "auto" and fill_used + cores > budget):
                 continue
             if mem_left - it["start_mb"] < floor:
-                rec["skipped"].append({"item": it["name"], "why": "ram"})
-                rec["ram"] = "baixa"
+                ram_skip(st, rec, it, floor, mem_left)
                 continue
             try:
                 rec["started"].append(start_item(cfg, it, cores))

@@ -106,7 +106,7 @@ member() {  # member PID SID [RSS_KB] — um filho do item (mesma sessão)
 gone() { rm -rf "$FP/$1"; }   # o processo sumiu do /proc
 bt() {  # bt [ARGS…] → $OUT (stdout), $RC. Padrão: tick
   [ $# -gt 0 ] || set -- tick
-  OUT=$(env PATH="$W/bin:$PATH" BALLAST_HOME="$H" BALLAST_PROC="$FP" BALLAST_NOW="$NOW" BALLAST_LAUNCH_PREFIX="$LP" BALLAST_TEST=1 BALLAST_CEILING="${CEIL:-off}" BALLAST_LINGER_DIR="$T/linger" $EXTRA_ENV "$PY" -I "$P" "$@" 2>"$W/err"); RC=$?
+  OUT=$(env PATH="$W/bin:$PATH" BALLAST_HOME="$H" BALLAST_PROC="$FP" BALLAST_NOW="$NOW" BALLAST_LAUNCH_PREFIX="$LP" BALLAST_TEST=1 BALLAST_CEILING="${CEIL:-off}" BALLAST_LINGER_DIR="$T/linger" BALLAST_SHM="$T/noshm" $EXTRA_ENV "$PY" -I "$P" "$@" 2>"$W/err"); RC=$?
 }
 jget() {  # jget CAMPO.PONTADO → valor do $OUT (JSON), texto simples; índice de lista como número; null/ausente → "null"
   printf '%s' "$OUT" | "$PY" -I -c 'import sys,json
@@ -1137,12 +1137,34 @@ g_startmb() {
   check "start_mb: o registro lê a 9ª coluna (700), ausente vale o teto (4096) e 4096 = teto vale; 0, 4097 (> teto), texto e uma 10ª coluna são 4 erros visíveis" "700 4096 4096 4" "$(jget items.0.start_mb) $(jget items.1.start_mb) $(jget items.2.start_mb) $(printf '%s' "$OUT" | "$PY" -I -c 'import sys,json; print(len(json.load(sys.stdin)["registry_errors"]))')"
 }
 
+# ── g_shm ──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+# ga-i6ghk4r (Hetzner abaixo de 85% por 6 h): o wa-suite, o único item que não depende de commit, ficou 3 dias sem começar porque a conta de partida pede MemAvailable >= 27648 MB e o nó ficava em ~24300: 4,6 GB eram
+# /dev/shm de sessões mortas (Shmem não volta como MemAvailable) e o tick só dizia `skipped ram`, sem número nenhum. O governo agora diz QUANTO falta em todo skipped ram (falta_mb), mede o Shmem do nó (shmem_mb) e
+# varre o /dev/shm atrás de pasta órfã (ver mais abaixo).
+setshmem() {  # setshmem KB — a linha Shmem do /proc/meminfo de mentira (a tmpfs inteira do nó, em kB), depois da MemAvailable que o setmem escreveu
+  printf 'Shmem:          %s kB\n' "$1" >> "$FP/meminfo"
+}
+g_shm() {
+  newhome; seed; setmem 15000; good 50; good 50; good 50
+  check "shm: skipped ram traz falta_mb = piso + start_mb - MemAvailable (14336 + 1024 - 15000 = 360)" "ram 360" "$(jget skipped.0.why) $(jget skipped.0.falta_mb)"
+  sm_home 15400
+  check "shm: o 2º item do mesmo tick desconta o que o 1º já planejou (14336 + 1024 - (15400 - 1024) = 984)" "sm2 984" "$(jget skipped.0.item) $(jget skipped.0.falta_mb)"
+  newhome; : > "$H/items.tsv"; reg 'qf|filler|2|1024|3600|0|-|sleeper.sh'; seed; setmem 15000; good 50; good 50; good 50
+  check "shm: o filler pulado por RAM também diz quanto falta (360)" "qf ram 360" "$(jget skipped.0.item) $(jget skipped.0.why) $(jget skipped.0.falta_mb)"
+  newhome; seed; setmem 28000; setshmem 4782336; good 50
+  check "shm: shmem_mb é o Shmem do meminfo em MB inteiros (4782336 kB = 4670 MB)" "4670" "$(jget shmem_mb)"
+  newhome; seed; good 50
+  check "shm: meminfo sem a linha Shmem → shmem_mb null (nunca 0) e o tick segue normal (mem_avail_mb lido)" "null 28000" "$(jget shmem_mb) $(jget mem_avail_mb)"
+  newhome; seed; setmem 28000; setshmem abc; good 50
+  check "shm: Shmem que não é número → shmem_mb null, o resto do tick não muda" "null 28000" "$(jget shmem_mb) $(jget mem_avail_mb)"
+}
+
 if [ -n "${HB_MUTANT:-}" ]; then
-  if [ "${HB_MUTANT_GROUPS:-}" = teto ]; then g_ceil; g_cgrp; elif [ "${HB_MUTANT_GROUPS:-}" = elastico ]; then g_elastic; elif [ "${HB_MUTANT_GROUPS:-}" = piso ]; then g_floor; g_carry; g_startmb; else g_reg; g_tick; g_run; g_ram; g_reap; g_fill; g_off; g_state; g_logs; g_launch; g_send; fi
+  if [ "${HB_MUTANT_GROUPS:-}" = teto ]; then g_ceil; g_cgrp; elif [ "${HB_MUTANT_GROUPS:-}" = elastico ]; then g_elastic; elif [ "${HB_MUTANT_GROUPS:-}" = piso ]; then g_floor; g_carry; g_startmb; elif [ "${HB_MUTANT_GROUPS:-}" = shm ]; then g_shm; else g_reg; g_tick; g_run; g_ram; g_reap; g_fill; g_off; g_state; g_logs; g_launch; g_send; fi
   echo "RESULT $fails/$n"; [ "$fails" = 0 ]; exit $?
 fi
 if [ -n "${HB_ONLY:-}" ]; then "g_$HB_ONLY"; echo "── $((n - fails))/$n ok (só g_$HB_ONLY)"; [ "$fails" = 0 ]; exit $?; fi
-g_reg; g_tick; g_run; g_ram; g_reap; g_fill; g_off; g_state; g_logs; g_launch; g_send; g_ceil; g_cgrp; g_elastic; g_floor; g_carry; g_startmb
+g_reg; g_tick; g_run; g_ram; g_reap; g_fill; g_off; g_state; g_logs; g_launch; g_send; g_ceil; g_cgrp; g_elastic; g_floor; g_carry; g_startmb; g_shm
 
 [ -n "${HB_NO_MUTANTS:-}" ] || {
   echo "── controle negativo: cada mutante tem que reprovar a bateria ──"
@@ -1486,23 +1508,19 @@ def read_cpu_prev(cfg):
 [piso] a descida por RAM do elástico ignora o piso dinâmico (retomada + 1 GB fixo)@@    if mem < min(cfg.ram_resume_mb + 1024, floor):@@    if mem < cfg.ram_resume_mb + 1024:
 [piso] o elástico sobe pelo piso FIXO e não pelo do tick@@int((mem - floor) // cfg.slot_mb))@@int((mem - cfg.ram_start_mb) // cfg.slot_mb))
 [piso] a partida do work usa o piso fixo e não o do tick@@            if mem_left - it["start_mb"] < floor:
-                rec["skipped"].append({"item": it["name"], "why": "ram"})
-                rec["ram"] = "baixa"
+                ram_skip(st, rec, it, floor, mem_left)
                 continue
             plan.append(@@            if mem_left - it["rss_mb"] < cfg.ram_start_mb:
-                rec["skipped"].append({"item": it["name"], "why": "ram"})
-                rec["ram"] = "baixa"
+                ram_skip(st, rec, it, floor, mem_left)
                 continue
             plan.append(
 [piso] o estado aceita balde que não é número@@and all(isinstance(k, str) and k.isdigit() and _int(v) and v >= 0 for k, v in sess["b"].items())@@and all(isinstance(k, str) and _int(v) and v >= 0 for k, v in sess["b"].items())
 [piso] o estado aceita slots_last de n texto@@isinstance(v, dict) and _int(v.get("n")) and v["n"] >= 1 and _int(v.get("t"))@@isinstance(v, dict)
 [piso] a conta de partida do work volta a descontar o teto e não o start_mb@@            if mem_left - it["start_mb"] < floor:
-                rec["skipped"].append({"item": it["name"], "why": "ram"})
-                rec["ram"] = "baixa"
+                ram_skip(st, rec, it, floor, mem_left)
                 continue
             plan.append(@@            if mem_left - it["rss_mb"] < floor:
-                rec["skipped"].append({"item": it["name"], "why": "ram"})
-                rec["ram"] = "baixa"
+                ram_skip(st, rec, it, floor, mem_left)
                 continue
             plan.append(
 [piso] o item planejado não desconta o start_mb de mem_left@@            used += cores
