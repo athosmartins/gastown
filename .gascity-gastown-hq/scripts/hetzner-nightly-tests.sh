@@ -56,11 +56,13 @@ cleanup() { [ -z "$SCR" ] || find "$SCR" -mindepth 1 -delete 2>/dev/null; [ -z "
 trap cleanup EXIT
 mkdir -p "$LOGDIR" 2>/dev/null || { say "FALHOU — não consegui criar $LOGDIR"; exit 1; }
 
-SHA="?"; ISO_LINE=""; EGRESS="?"; MAILRC=0; FETCHST="?"; CMPST="-"; STALE_NOTE=""; DEPLOY=""; NB=0; NRAN=0; NSKIP=0; NMAC=0; NHELD=0; NHF=0; NHP=0
+SHA="?"; ISO_LINE=""; EGRESS="?"; MAILRC=0; FETCHST="?"; CMPST="-"; STALE_NOTE=""; DEPLOY=""; NB=0; NRAN=0; NSKIP=0; NMAC=0; NHELD=0; NHF=0; NHP=0; ESCSUM=0; ESCUNK=0
 jline() { # veredito motivo — a linha do jsonl desta noite (também a das noites PULADAS por lock: uma por noite)
+  local escj=null   # escudo: nenhum lote rodou ou a linha GTN-ESCUDO de algum lote veio ilegível → null (não afirmo 0 sem ter lido)
+  [ "$ESCUNK" = 0 ] && [ "$NRAN" -gt 0 ] && escj=$ESCSUM
   jq -cn --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" --arg v "$1" --arg why "$2" --arg sha "$SHA" --arg iso "$ISO_LINE" --arg egress "$EGRESS" --arg fetch "$FETCHST" --arg cmp "$CMPST" \
-     --argjson wall "$(( $(date +%s) - T0 ))" --argjson mailrc "$MAILRC" --argjson nb "$NB" --argjson nr "$NRAN" --argjson ns "$NSKIP" --argjson nm "$NMAC" --argjson nh "$NHELD" \
-     '{ts:$ts,verdict:$v,reason:$why,sha:$sha,isolation:$iso,egress_attempts:$egress,fetch:$fetch,compare:$cmp,wall_s:$wall,mail_failed:$mailrc,batches:$nb,batches_ran:$nr,batches_skipped:$ns,mac_only_excluded:$nm,node_held_excluded:$nh}' >> "$JSONL" 2>/dev/null \
+     --argjson wall "$(( $(date +%s) - T0 ))" --argjson mailrc "$MAILRC" --argjson nb "$NB" --argjson nr "$NRAN" --argjson ns "$NSKIP" --argjson nm "$NMAC" --argjson nh "$NHELD" --argjson esc "$escj" \
+     '{ts:$ts,verdict:$v,reason:$why,sha:$sha,isolation:$iso,egress_attempts:$egress,fetch:$fetch,compare:$cmp,wall_s:$wall,mail_failed:$mailrc,batches:$nb,batches_ran:$nr,batches_skipped:$ns,mac_only_excluded:$nm,node_held_excluded:$nh,escudo_reports:$esc}' >> "$JSONL" 2>/dev/null \
      || say "WARN: não gravei $JSONL"
 }
 finish() { # veredito motivo [exit] — grava o relatório, o jsonl, manda o e-mail (salvo PULADO) e sai
@@ -198,8 +200,10 @@ LC_ALL=C awk -F: -v max="$BATCH_DEFS" -v amax="$ARGS_MAX" -v dir="$SCR" '
     if (b==0) b=1
     print f > (dir "/batch." b); acc+=w; bytes+=length(f)+1; cnt++; defs+=d }
   END { if (cnt>0) meta[b]=cnt" "defs; for (i=1;i<=b;i++) print i, meta[i] > (dir "/batch.meta"); }' "$WGT"
-NB=$(wc -l < "$SCR/batch.meta" 2>/dev/null | tr -d ' ')
-case "$NB" in ''|0|*[!0-9]*) finish FALHOU "não montei os lotes ($NFILES arquivos pesados): nada rodou" 1 ;; esac
+# vazio → batch.meta sem linha = nada a rodar, FALHOU; falhou/ilegível (arquivo ausente, wc quebrado) → o mesmo FALHOU, e NB fica 0: o jline passa $NB ao jq (--argjson), lixo ali derrubava a linha do jsonl da noite
+NBX=$(wc -l < "$SCR/batch.meta" 2>/dev/null | tr -d ' ')
+case "$NBX" in ''|0|*[!0-9]*) finish FALHOU "não montei os lotes ($NFILES arquivos pesados): nada rodou" 1 ;; esac
+NB=$NBX
 NDEFS=$(awk '{s+=$3} END{print s+0}' "$SCR/batch.meta")
 
 # ── a rodada ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
@@ -310,6 +314,9 @@ while [ "$i" -lt "$NB" ]; do
   eg=$(sed -n 's/^GTN-EGRESS: attempts=//p' "$BOUT" 2>/dev/null | tail -n 1)
   case "$eg" in ''|*[!0-9]*) [ "$B_ST" != ran ] || EGUNK=1 ;; *) EGSUM=$(( EGSUM + eg )); EGSEEN=1 ;; esac
   if [ "$EGUNK" = 0 ] && [ "$EGSEEN" = 1 ]; then EGRESS=$EGSUM; else EGRESS="?"; fi
+  # escudo do relatório (gtn_stable_ids): o plugin só imprime `GTN-ESCUDO: n=<n>` com n > 0, então a linha AUSENTE num lote que rodou é 0; linha presente e ilegível → "?" (não afirmo zero)
+  es=$(sed -n 's/^GTN-ESCUDO: n=//p' "$BOUT" 2>/dev/null | tail -n 1)
+  case "$es" in '') ;; *[!0-9]*) ESCUNK=1 ;; *) ESCSUM=$(( ESCSUM + es )) ;; esac
   case "$B_ST" in ran) ROW_S="rodou" ;; *) ROW_S="NÃO RODOU" ;; esac
   printf '| %s | %s | %s | %s | %s | %s | %s |\n' "$nn" "$nf" "$nd" "$WK" "$BSEC" "$ROW_S" "$(printf '%s' "${B_WHY:--}" | tr '|\n' '/ ')" >> "$TABLE"
   WALL=$(( $(date +%s) - T0 ))
@@ -387,6 +394,9 @@ elif [ -e "$PREV" ]; then
 else NEWTXT="primeira rodada"; CMPST=ok
 fi
 GOAL="ATINGIDA"; [ "$WALL" -lt "$TIMEOUT_S" ] || GOAL="ESTOURADA"
+ESCTXT="$ESCSUM relatório(s) refeito(s) sem o hook da suíte que quebrou (o teste continua reprovando; linha GTN-ESCUDO nas saídas dos lotes)"
+[ "$ESCSUM" -gt 0 ] || ESCTXT="0 (nenhum hook da suíte quebrou ao montar o relatório)"
+[ "$ESCUNK" = 0 ] || ESCTXT="contagem ILEGÍVEL em algum lote (linha GTN-ESCUDO que não é um número) — não afirmo zero"
 {
   echo "# Hetzner nightly $DAY — COMPLETO"; echo
   echo "- origin/main @$SHA, nó $NODE, $NFILES arquivos de tests/ ($NDEFS def test_) em $NB lotes (\`pytest <arquivos do lote> -n auto\`, workers e teto de memória derivados do MemAvailable do nó a cada lote)"
@@ -398,6 +408,7 @@ GOAL="ATINGIDA"; [ "$WALL" -lt "$TIMEOUT_S" ] || GOAL="ESTOURADA"
   echo "- duração: pytest somado ${DUR} (${PYSECS:-?} s), relógio total ${WALL} s; meta de $(( TIMEOUT_S / 60 )) min: $GOAL"
   echo "- $CMP"
   echo "- isolamento: \`GTN-ISO: $ISO_LINE\`; teto (lote 01): \`GTN-CAP: $FIRSTCAP\`; $EGLINE"
+  echo "- escudo do relatório (plugin gtn_stable_ids): $ESCTXT"
   if [ -s "$NEW" ]; then echo; echo "Falhas novas (até 30 de $(wc -l < "$NEW" | tr -d ' ')):"; head -n 30 "$NEW" | jq -r . | sed 's/^/  - /'; fi
   echo; emit_table
   if [ "$LISTOK" = 1 ]; then echo; echo "Saída por lote: $LOGDIR/$DAY.bNN.out; junta: $OUT; ids reprovados (um JSON por linha; \`jq -r .\` para ler): $CUR"

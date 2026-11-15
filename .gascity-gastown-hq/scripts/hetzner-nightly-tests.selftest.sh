@@ -10,7 +10,7 @@
 #   ignorar (venv, .hidden, crew, archive, node_modules, helper.py). Com HZN_BATCH_DEFS=10 dá 3 lotes; o stub devolve uma saída e um rc POR CHAMADA (STUB_OUT.<n>, STUB_RC_<n>).
 #   Casos de lote: batches (soma, união de ids, poda, 3 chamadas) · batch_list (lista de um lote inconsistente = comparação indisponível) · overbudget (lote que não coube no orçamento NÃO RODOU) ·
 #   batch_killed (rc 137) · crash (worker do xdist caiu) · nocap (sem a prova do teto) · cap_inert / cap_retry / cap_late (teto inerte: INERTE no 1º lote, retry, não rodou nos outros) ·
-#   leak_mid (vazamento no meio para tudo) · flag_mid · badconst · notests.
+#   leak_mid (vazamento no meio para tudo) · flag_mid · badconst · notests · nobatch (não montou os lotes: a noite AINDA grava a linha do jsonl) · escudo (GTN-ESCUDO somado no relatório e no jsonl; ilegível = "?"/null).
 # CASOS: 1ª noite COMPLETO (linha de base, argumentos do mbp-run, árvore só do versionado, scratch apagado) · 2ª noite (novas/corrigidas) · sem falhas e depois
 #   falha contra baseline vazio · xfailed/xpassed/error contados à parte · INERTE (inerte e nao-isolado: nada divulgado, baseline intacta) · rc 97 sem linha de
 #   isolamento é FALHOU · PULADO (rc 99, sem e-mail) · prazo (124) · pytest abortado · terminou SEM prova de isolamento · sem resumo · total implausível ·
@@ -19,7 +19,7 @@
 #   duração ilegível sai "?" (não 0h0min) · ids com " - " ficam distintos (irmãos de parametrize) · lista parcial / sem a linha GTN-FAILED / contagem que não bate / linha que não é JSON =
 #   comparação INDISPONÍVEL com a baseline intacta · fetch que falha aparece no relatório · lock velho com pid reaproveitado é tomado · PULADO por lock deixa linha no jsonl ·
 #   a limpeza de 14 dias não apaga a baseline · nao-isolado (vazamento medido) é FALHOU, não INERTE · o nó do mbp-run é o mesmo do instalador · o que foi ao nó fica no relatório.
-# CONTROLES NEGATIVOS: cada mutante do script (M1-M65, mais M0 neutro) tem de ser REPROVADO pelo caso correspondente (o caso falha quando roda no mutante). Antes deles, um mutante NEUTRO (cópia que só muda
+# CONTROLES NEGATIVOS: cada mutante do script (M1-M69, mais M0 neutro) tem de ser REPROVADO pelo caso correspondente (o caso falha quando roda no mutante). Antes deles, um mutante NEUTRO (cópia que só muda
 #   um comentário) tem de PASSAR: sem isso o controle não prova nada (a falta dos arquivos irmãos no diretório do mutante reprovava TODO caso, qualquer que fosse a mutação).
 set -u
 HERE="$(cd "$(dirname "$0")" && pwd)"
@@ -95,7 +95,7 @@ case_first() { reset; mkout "$ISO_OK" 7 "$SUM1" "FAILED tests/a.py::t1 - Asserti
   ck "1ª noite: exit 0 e veredito COMPLETO" rcis 0; ck "1ª noite: COMPLETO na última linha e no jsonl" vd COMPLETO; ck "1ª noite: 1 e-mail" mailn 1
   ck "1ª noite: assunto diz primeira rodada" has "$MAIL_LOG" 'COMPLETO: 1205 testes em 1 lotes, 3 falhas, 0 erros \(primeira rodada\)'
   ck "1ª noite: relatório com a linha de base" has "$REPORT" 'primeira rodada completa.*as 3 falhas de hoje viram a linha de base'
-  ck "1ª noite: totais" has "$REPORT" 'total: 1205 \(1200 passaram, 3 falharam, 0 erros, 2 pulados'; ck "1ª noite: duração e meta de 150 min" has "$REPORT" 'pytest somado 1h6min.*meta de 150 min: ATINGIDA'
+  ck "1ª noite: totais" has "$REPORT" 'total: 1205 \(1200 passaram, 3 falharam, 0 erros, 2 pulados'; ck "1ª noite: duração e meta de 210 min (o padrão de produção, HZN_TIMEOUT_S=12600)" has "$REPORT" 'pytest somado 1h6min.*meta de 210 min: ATINGIDA'
   ck "1ª noite: contador do nft no relatório" has "$REPORT" '7 tentativa\(s\) de saída barradas pelo nft'
   ck "1ª noite: mbp-run com o isolamento ligado, o prazo e o MESMO nó do instalador" has "$CALLS" 'ENV: ISOLATE=1 TIMEOUT=2400 NODE=stub-node'
   ck "1ª noite: mbp-run no nó linux, os arquivos do lote (ordem de caminho), -n auto e o plugin" has "$CALLS" 'ARGS: --host linux --repo wa --dir .*-- tests/a_test.py tests/sub/test_c.py tests/test_a.py tests/test_b.py tests/test_zero.py -n auto -p gtn_stable_ids --timeout=300'
@@ -117,6 +117,7 @@ case_cleanslate() { reset; seed_prev tests/a.py::t1 tests/old.py::gone; mkout "$
   ck "sem falhas: COMPLETO, 0 novas e 2 corrigidas" has "$REPORT" '0 falhas NOVAS, 2 corrigidas'; ck "sem falhas: baseline vazia" empty_dir_file "$PREV"
   mkout "$ISO_OK" 1 "1 failed, 1499 passed in 3000.00s (0:50:00)" "FAILED tests/c.py::t3" "$(fl 1 tests/c.py::t3)"; STUB_RC=1 go "$1"
   ck "baseline vazia existe: toda falha é nova" has "$REPORT" '1 falhas NOVAS, 0 corrigidas'; }
+not_same() { ! cmp -s "$1" "$2"; }
 empty_dir_file() { [ -e "$1" ] && [ ! -s "$1" ]; }
 case_xfail() { reset; mkout "$ISO_OK" 1 "2 failed, 1000 passed, 1 error, 3 xfailed, 1 xpassed in 1500.50s (0:25:00)" "FAILED tests/a.py::t1" "$(fl 3 tests/a.py::t1 tests/a.py::t2 tests/a.py::t3)"; STUB_RC=1 go "$1"
   ck "categorias: failed não conta xfailed, error conta singular" has "$REPORT" 'total: 1007 \(1000 passaram, 2 falharam, 1 erros, 0 pulados, 3 xfail, 1 xpass\)'; }
@@ -334,7 +335,30 @@ case_retidos() { reset; mkout "$ISO_OK" 0 "1500 passed in 3000.00s" "$(fl 0)"
   # nada chega ao nó: nunca um verde vazio
   reset; STUB_RC=0 HETZNER_RSYNC_FILTER="$T/filter-none.txt" go "$1"; ck "o nó não recebe nenhum teste: FALHOU, exit 1" rcis 1; ck "o nó não recebe nenhum teste: diz o porquê" has "$MAIL_LOG" 'ficam no mini \(mac-only'; ck "o nó não recebe nenhum teste: nada rodou" empty_dir_file "$CALLS"; }
 
-ALL="first second cleanslate xfail inerte leak 97_sem_iso pulado timeout abort noiso nosum implausible lock lock_stale prev_unreadable mailfail egress ssh no_origin stale_report listfail prev_format dash partial fetch keep provenance dur maconly retidos batches batch_list overbudget batch_killed crash nocap cap_inert cap_retry cap_late leak_mid flag_mid badconst notests"
+case_nobatch() { reset; mkout "$ISO_OK" 0 "1500 passed in 3000.00s" "$(fl 0)"
+  # o awk que monta os lotes não consegue escrever o batch.meta (o diretório de destino não existe): NB vem VAZIO do wc; a noite FALHA e tem de gravar a linha do jsonl mesmo assim (NB vazio derrubava o jq do jline)
+  # (o SUT põe /usr/bin na frente do PATH, então um shim de awk no PATH não pega: a cópia do SUT é que aponta o awk para um diretório que não existe)
+  local X="$T/m-nobatch-run.sh"; sed 's|-v dir="\$SCR"|-v dir="$SCR/nao-existe"|' "$1" > "$X"; chmod +x "$X"
+  ck "sem lotes montados: a cópia do SUT mudou a chamada do awk (senão o caso não prova nada)" not_same "$1" "$X"
+  STUB_RC=0 go "$X"
+  ck "sem lotes montados: FALHOU, exit 1" rcis 1; ck "sem lotes montados: diz que não montou" has "$MAIL_LOG" 'não montei os lotes'; ck "sem lotes montados: nada rodou" empty_dir_file "$CALLS"
+  ck "sem lotes montados: o jsonl TEM a linha da noite (veredito FALHOU, 0 lotes)" test "$(tail -n 1 "$JSONL" | jq -c '[.verdict,.batches,.batches_ran]' 2>/dev/null)" = '["FALHOU",0,0]'
+  ck "sem lotes montados: nenhum aviso de jsonl não gravado" hasnt "$OUT" 'não gravei'; ck "sem lotes montados: o escudo é null (nada rodou)" test "$(tail -n 1 "$JSONL" | jq -c .escudo_reports 2>/dev/null)" = null; }
+case_escudo() { reset; local A='tests/a_test.py::t1'
+  # lote 1 refez 2 relatórios, lote 2 nenhum (o plugin não imprime a linha com n=0), lote 3 refez 1: soma 3
+  EG=0 okb 1 "1 failed, 400 passed in 100.00s" 1 "$A"; printf 'GTN-ESCUDO: n=2\n' >> "$STUB_OUT.1"
+  okb 2 "500 passed in 200.00s" 0; okb 3 "300 passed in 50.00s" 0; printf 'GTN-ESCUDO: n=1\n' >> "$STUB_OUT.3"
+  STUB_RC_1=1 STUB_RC_2=0 STUB_RC_3=0 HZN_BATCH_DEFS=10 go "$1"
+  ck "escudo: COMPLETO, exit 0" vd COMPLETO; ck "escudo: o relatório soma os lotes (2+0+1 = 3)" has "$REPORT" 'escudo do relatório \(plugin gtn_stable_ids\): 3 relatório\(s\) refeito\(s\) sem o hook da suíte que quebrou'
+  ck "escudo: o jsonl tem escudo_reports=3" test "$(tail -n 1 "$JSONL" | jq -c .escudo_reports)" = 3
+  # sem nenhuma linha GTN-ESCUDO: lote que rodou = 0 (o plugin só imprime com n > 0)
+  reset; mkout "$ISO_OK" 0 "1500 passed in 3000.00s" "$(fl 0)"; STUB_RC=0 go "$1"
+  ck "escudo: sem a linha em lote que rodou = 0 no relatório" has "$REPORT" 'escudo do relatório \(plugin gtn_stable_ids\): 0 \(nenhum hook da suíte quebrou'; ck "escudo: sem a linha = 0 no jsonl (não null)" test "$(tail -n 1 "$JSONL" | jq -c .escudo_reports)" = 0
+  # linha presente e ilegível = "?" e null, nunca 0
+  reset; mkout "$ISO_OK" 0 "1500 passed in 3000.00s" "$(fl 0)"; printf 'GTN-ESCUDO: n=abc\n' >> "$STUB_OUT"; STUB_RC=0 go "$1"
+  ck "escudo ilegível: segue COMPLETO (o escudo não muda o veredito)" vd COMPLETO; ck "escudo ilegível: o relatório diz ILEGÍVEL e não afirma zero" has "$REPORT" 'escudo do relatório \(plugin gtn_stable_ids\): contagem ILEGÍVEL'
+  ck "escudo ilegível: o jsonl tem null (não 0)" test "$(tail -n 1 "$JSONL" | jq -c .escudo_reports)" = null; }
+ALL="first second cleanslate xfail inerte leak 97_sem_iso pulado timeout abort noiso nosum implausible lock lock_stale prev_unreadable mailfail egress ssh no_origin stale_report listfail prev_format dash partial fetch keep provenance dur maconly retidos batches batch_list overbudget batch_killed crash nocap cap_inert cap_retry cap_late leak_mid flag_mid badconst notests nobatch escudo"
 for c in $ALL; do "case_$c" "$SUT0"; done
 
 # ---- controles negativos: o caso correspondente tem de FALHAR quando roda no mutante -----------------------------------------
@@ -420,6 +444,10 @@ mutantl M62-lista-vazia-do-rsync-aceita retidos '{ [ "${PIPESTATUS[0]}" -eq 0 ] 
 mutantl M63-retidos-da-varredura-ignorados first 'if [ -s "$SCR/pf.hp" ]; then LC_ALL=C grep -xF' 'if false; then LC_ALL=C grep -xF'
 mutantl M64-filtro-ilegivel-aceito retidos '|| finish FALHOU "o filtro do rsync do nó ($NFILTER) não abre' '|| : "o filtro do rsync do nó ($NFILTER) não abre'
 mutantl M65-scanner-ausente-aceito retidos '[ -f "$PIISCAN" ] || finish FALHOU' '[ -f "$PIISCAN" ] || : '
+mutantl M66-nb-lixo-derruba-a-linha-do-jsonl nobatch 'NBX=$(wc -l < "$SCR/batch.meta"' 'NB=$(wc -l < "$SCR/batch.meta"' 'case "$NBX" in' 'case "$NB" in' $'\nNB=$NBX\n' $'\n'
+mutantl M67-escudo-nao-somado escudo 'ESCSUM=$(( ESCSUM + es ))' 'ESCSUM=$ESCSUM'
+mutantl M68-escudo-ilegivel-vira-zero escudo '*[!0-9]*) ESCUNK=1 ;;' '*[!0-9]*) ;;'
+mutantl M69-escudo-fora-do-relatorio escudo $'  echo "- escudo do relatório (plugin gtn_stable_ids): $ESCTXT"\n' ''
 reset
 echo "---"; echo "$((n-fails))/$n ok ($M mutantes)"
 [ $fails -eq 0 ] && echo "SELFTEST OK" || { echo "SELFTEST FALHOU ($fails)"; exit 1; }
