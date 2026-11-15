@@ -6,6 +6,11 @@
 #
 # IDS REPROVADOS: vêm do plugin (linhas `GTN-FAIL: <id em JSON>` + `GTN-FAILED: n=.. reports=..`), nunca da linha humana `FAILED <id> - <msg>` (id de parametrize pode ter " - "). A saída de
 #   mentira traz AS DUAS formas, como o pytest de verdade, com ids que têm " - " dentro.
+# LOTES (ga-84gkpab): a suíte roda em lotes por arquivo (um mbp-run + um pytest NOVO por lote). O WA de mentira tem 5 arquivos de teste de verdade em tests/ (23 `def test_`) e 6 que a poda tem de
+#   ignorar (venv, .hidden, crew, archive, node_modules, helper.py). Com HZN_BATCH_DEFS=10 dá 3 lotes; o stub devolve uma saída e um rc POR CHAMADA (STUB_OUT.<n>, STUB_RC_<n>).
+#   Casos de lote: batches (soma, união de ids, poda, 3 chamadas) · batch_list (lista de um lote inconsistente = comparação indisponível) · overbudget (lote que não coube no orçamento NÃO RODOU) ·
+#   batch_killed (rc 137) · crash (worker do xdist caiu) · nocap (sem a prova do teto) · cap_inert / cap_retry / cap_late (teto inerte: INERTE no 1º lote, retry, não rodou nos outros) ·
+#   leak_mid (vazamento no meio para tudo) · flag_mid · badconst · notests.
 # CASOS: 1ª noite COMPLETO (linha de base, argumentos do mbp-run, árvore só do versionado, scratch apagado) · 2ª noite (novas/corrigidas) · sem falhas e depois
 #   falha contra baseline vazio · xfailed/xpassed/error contados à parte · INERTE (inerte e nao-isolado: nada divulgado, baseline intacta) · rc 97 sem linha de
 #   isolamento é FALHOU · PULADO (rc 99, sem e-mail) · prazo (124) · pytest abortado · terminou SEM prova de isolamento · sem resumo · total implausível ·
@@ -14,7 +19,7 @@
 #   duração ilegível sai "?" (não 0h0min) · ids com " - " ficam distintos (irmãos de parametrize) · lista parcial / sem a linha GTN-FAILED / contagem que não bate / linha que não é JSON =
 #   comparação INDISPONÍVEL com a baseline intacta · fetch que falha aparece no relatório · lock velho com pid reaproveitado é tomado · PULADO por lock deixa linha no jsonl ·
 #   a limpeza de 14 dias não apaga a baseline · nao-isolado (vazamento medido) é FALHOU, não INERTE · o nó do mbp-run é o mesmo do instalador · o que foi ao nó fica no relatório.
-# CONTROLES NEGATIVOS: cada mutante do script (M1-M31, mais M0 neutro) tem de ser REPROVADO pelo caso correspondente (o caso falha quando roda no mutante). Antes deles, um mutante NEUTRO (cópia que só muda
+# CONTROLES NEGATIVOS: cada mutante do script (M1-M52, mais M0 neutro) tem de ser REPROVADO pelo caso correspondente (o caso falha quando roda no mutante). Antes deles, um mutante NEUTRO (cópia que só muda
 #   um comentário) tem de PASSAR: sem isso o controle não prova nada (a falta dos arquivos irmãos no diretório do mutante reprovava TODO caso, qualquer que fosse a mutação).
 set -u
 HERE="$(cd "$(dirname "$0")" && pwd)"
@@ -27,14 +32,24 @@ LOGDIR="$C/.gc/logs/hetzner-nightly"; JSONL="$C/.gc/logs/hetzner-nightly.jsonl";
 DAY=$(date +%Y-%m-%d); REPORT="$LOGDIR/$DAY.md"; PREV="$LOGDIR/last-complete.failed"
 MAIL_LOG="$T/mail.log"; CALLS="$T/calls"; STUB_OUT="$T/pytest.out"; OUT="$T/out"
 # o WA de mentira: um arquivo versionado em origin/main e um untracked que NÃO pode chegar ao nó
-git init -q -b main "$T/wa" && ( cd "$T/wa" && echo hi > marker.txt && git add marker.txt && git -c user.name=t -c user.email=t@t commit -qm m && git update-ref refs/remotes/origin/main HEAD && echo wip > untracked.txt )
+mkdefs() { local f=$1 k=$2 i; mkdir -p "$(dirname "$f")"; : > "$f"; for ((i=1;i<=k;i++)); do printf 'def test_%s():\n    pass\n' "$i" >> "$f"; done; }
+git init -q -b main "$T/wa" && ( cd "$T/wa" && echo hi > marker.txt
+  mkdefs tests/a_test.py 4; mkdefs tests/sub/test_c.py 6; mkdefs tests/test_a.py 6; mkdefs tests/test_zero.py 0
+  mkdefs tests/test_b.py 5; printf 'class T:\n    def test_m(self):\n        pass\nasync def test_y():\n    pass\n' >> tests/test_b.py
+  # o que a poda (norecursedirs do pytest.ini) e o padrão de nome têm de deixar de fora
+  for d in venv .hidden crew archive node_modules; do mkdefs "tests/$d/test_x.py" 3; done; mkdefs tests/helper.py 3; echo "def test_n" > tests/test_notes.txt
+  git add -A && git -c user.name=t -c user.email=t@t commit -qm m && git update-ref refs/remotes/origin/main HEAD && echo wip > untracked.txt )
+git init -q -b main "$T/wa-notests" && ( cd "$T/wa-notests" && echo hi > marker.txt && git add -A && git -c user.name=t -c user.email=t@t commit -qm m && git update-ref refs/remotes/origin/main HEAD )
 cat > "$T/run-stub.sh" <<'EOF'
 #!/usr/bin/env bash
 echo "ARGS: $*" >> "$STUB_CALLS"; echo "ENV: ISOLATE=${HETZNER_ISOLATE:-} TIMEOUT=${MBP_RUN_TIMEOUT_S:-} NODE=${HETZNER_NODE_HOST:-}" >> "$STUB_CALLS"
 d=""; while [ $# -gt 0 ]; do [ "$1" = --dir ] && d=$2; shift; done
 [ -n "$(find "$LOCK_PATH" -maxdepth 0 -mmin +5 2>/dev/null)" ] && echo "lock-velho-durante-a-rodada" >> "$STUB_CALLS"
 [ -f "$d/marker.txt" ] && echo "tree-ok" >> "$STUB_CALLS"; [ -e "$d/untracked.txt" ] && echo "untracked-leaked" >> "$STUB_CALLS"
-echo "$d" > "$STUB_DIR_SEEN"; cat "$STUB_OUT" 2>/dev/null; exit "${STUB_RC:-0}"
+echo "$d" > "$STUB_DIR_SEEN"
+# uma saída e um rc POR CHAMADA: STUB_OUT.<n> e STUB_RC_<n> (a n-ésima chamada); sem eles, STUB_OUT e STUB_RC valem para todas
+c=$(cat "$STUB_CNT" 2>/dev/null || echo 0); c=$((c+1)); echo "$c" > "$STUB_CNT"; [ -z "${STUB_SLEEP:-}" ] || sleep "$STUB_SLEEP"
+o="$STUB_OUT.$c"; [ -f "$o" ] || o="$STUB_OUT"; cat "$o" 2>/dev/null; v="STUB_RC_$c"; exit "${!v:-${STUB_RC:-0}}"
 EOF
 cat > "$T/mail-stub.sh" <<'EOF'
 #!/usr/bin/env bash
@@ -47,10 +62,10 @@ EOF
 chmod +x "$T"/*-stub.sh
 cp "$HERE/hetzner-iso-run.sh" "$HERE/gtn_stable_ids.py" "$T/"   # o script lê os dois do diretório DELE ($HERE): o mutante, que mora em $T, precisa deles ao lado
 export MBP_CITY="$C" HZN_RUN="$T/run-stub.sh" HZN_WA_REPO="$T/wa" HZN_MAIL_CMD="$T/mail-stub.sh" HZN_SSH="$T/ssh-stub.sh" HZN_NODE_HOST=stub-node HZN_NO_FETCH=1
-export LOCK_PATH="$LOCK" MAIL_LOG STUB_CALLS="$CALLS" STUB_OUT STUB_DIR_SEEN="$T/dirseen" SSH_LOG="$T/ssh.log"
+export LOCK_PATH="$LOCK" MAIL_LOG STUB_CALLS="$CALLS" STUB_OUT STUB_DIR_SEEN="$T/dirseen" SSH_LOG="$T/ssh.log" STUB_CNT="$T/stub.cnt" HZN_RETRY_S=0
 n=0; fails=0; BAD=0; QUIET=0
-reset() { find "$LOGDIR" -mindepth 1 -delete 2>/dev/null; : > "$JSONL"; : > "$MAIL_LOG"; : > "$CALLS"; : > "$SSH_LOG"; rm -f "$STUB_OUT"; chmod -R u+rwx "$LOCK" 2>/dev/null
-          find "$LOCK" -mindepth 1 -delete 2>/dev/null; rmdir "$LOCK" 2>/dev/null; mkdir -p "$LOGDIR"; unset STUB_RC MAIL_RC SSH_RC HZN_MIN_TOTAL; export HZN_WA_REPO="$T/wa"; }
+reset() { find "$LOGDIR" -mindepth 1 -delete 2>/dev/null; : > "$JSONL"; : > "$MAIL_LOG"; : > "$CALLS"; : > "$SSH_LOG"; rm -f "$STUB_OUT" "$STUB_OUT".* "$STUB_CNT"; chmod -R u+rwx "$LOCK" 2>/dev/null
+          find "$LOCK" -mindepth 1 -delete 2>/dev/null; rmdir "$LOCK" 2>/dev/null; mkdir -p "$LOGDIR"; unset STUB_RC MAIL_RC SSH_RC HZN_MIN_TOTAL STUB_SLEEP STUB_RC_1 STUB_RC_2 STUB_RC_3 STUB_RC_4; export HZN_WA_REPO="$T/wa"; }
 go() { "$1" > "$OUT" 2> "$T/err"; RC=$?; }
 ck() { local l=$1; shift; [ "$QUIET" = 1 ] || n=$((n+1)); if "$@"; then [ "$QUIET" = 1 ] || echo "ok   $l"; else [ "$QUIET" = 1 ] || { echo "FAIL $l"; fails=$((fails+1)); }; BAD=1; fi; }
 rcis() { [ "$RC" = "$1" ]; }
@@ -61,8 +76,10 @@ mailn() { [ "$(grep -c '^MAIL-CALL' "$MAIL_LOG")" = "$1" ]; }
 empty_dir() { [ -z "$(ls -A "$1" 2>/dev/null)" ]; }
 mkout() { # iso egress summary [linhas...] → saída do pytest de mentira
   local iso=$1 eg=$2 sum=$3; shift 3
-  { [ -z "$iso" ] || echo "GTN-ISO: $iso"; echo "collected ..."; for l in "$@"; do echo "$l"; done; [ -z "$sum" ] || echo "$sum"; [ -z "$eg" ] || echo "GTN-EGRESS: attempts=$eg"; } > "$STUB_OUT"; }
-ISO_OK="isolado (sonda barrou 5 tentativas)"; SUM1="3 failed, 1200 passed, 2 skipped in 4000.12s (1:06:40)"
+  { [ -z "$iso" ] || echo "GTN-ISO: $iso"
+    case "$iso" in isolado*) [ -z "${CAPLINE-$CAP_OK}" ] || echo "GTN-CAP: ${CAPLINE-$CAP_OK}" ;; esac   # CAPLINE="" omite a linha; CAPLINE=<texto> troca o texto (o iso-run imprime a do teto logo depois da do canário)
+    echo "collected ..."; for l in "$@"; do echo "$l"; done; [ -z "$sum" ] || echo "$sum"; [ -z "$eg" ] || echo "GTN-EGRESS: attempts=$eg"; } > "${MK_TO:-$STUB_OUT}"; }
+ISO_OK="isolado (sonda barrou 5 tentativas)"; CAP_OK="MemoryMax=20480M MemorySwapMax=0 workers=9 (MemAvailable=28125M reserva=6144M base=4096M por-worker=1800M cpus=16)"; SUM1="3 failed, 1200 passed, 2 skipped in 4000.12s (1:06:40)"
 seed_prev() { local i; for i in "$@"; do jq -cn --arg i "$i" '$i'; done | LC_ALL=C sort -u > "$PREV"; echo "2026-01-01 @abc" > "$LOGDIR/last-complete.meta"; }
 # o que o plugin imprime: fl <reports> <id>... → uma linha GTN-FAIL por id (JSON ASCII) e a linha GTN-FAILED (n = nº de ids, reports = falhas+erros que o pytest contou)
 fl() { local r=$1 i; shift; for i in "$@"; do printf 'GTN-FAIL: %s\n' "$(jq -cn --arg i "$i" '$i')"; done; printf 'GTN-FAILED: n=%s reports=%s' "${FL_N:-$#}" "$r"; }   # FL_N: o n que o plugin AFIRMA (diferente do nº de linhas = lista parcial)
@@ -70,18 +87,22 @@ decoded() { jq -r . "$1"; }
 
 case_first() { reset; mkout "$ISO_OK" 7 "$SUM1" "FAILED tests/a.py::t1 - AssertionError: x" "FAILED tests/c.py::t3 - y" "ERROR tests/b.py::t2 - ValueError" "$(fl 3 tests/a.py::t1 tests/b.py::t2 tests/c.py::t3)"; STUB_RC=1 go "$1"
   ck "1ª noite: exit 0 e veredito COMPLETO" rcis 0; ck "1ª noite: COMPLETO na última linha e no jsonl" vd COMPLETO; ck "1ª noite: 1 e-mail" mailn 1
-  ck "1ª noite: assunto diz primeira rodada" has "$MAIL_LOG" 'COMPLETO: 1205 testes, 3 falhas, 0 erros \(primeira rodada\)'
+  ck "1ª noite: assunto diz primeira rodada" has "$MAIL_LOG" 'COMPLETO: 1205 testes em 1 lotes, 3 falhas, 0 erros \(primeira rodada\)'
   ck "1ª noite: relatório com a linha de base" has "$REPORT" 'primeira rodada completa.*as 3 falhas de hoje viram a linha de base'
-  ck "1ª noite: totais" has "$REPORT" 'total: 1205 \(1200 passaram, 3 falharam, 0 erros, 2 pulados'; ck "1ª noite: duração e meta de 2 h" has "$REPORT" 'pytest 1h6min.*meta de 2 h: ATINGIDA'
+  ck "1ª noite: totais" has "$REPORT" 'total: 1205 \(1200 passaram, 3 falharam, 0 erros, 2 pulados'; ck "1ª noite: duração e meta de 2 h" has "$REPORT" 'pytest somado 1h6min.*meta de 2 h: ATINGIDA'
   ck "1ª noite: contador do nft no relatório" has "$REPORT" '7 tentativa\(s\) de saída barradas pelo nft'
-  ck "1ª noite: mbp-run com o isolamento ligado, o prazo e o MESMO nó do instalador" has "$CALLS" 'ENV: ISOLATE=1 TIMEOUT=7200 NODE=stub-node'
-  ck "1ª noite: mbp-run no nó linux, pytest -n 14 com o plugin" has "$CALLS" 'ARGS: --host linux --repo wa --dir .*-- tests/ -n 14 -p gtn_stable_ids'
+  ck "1ª noite: mbp-run com o isolamento ligado, o prazo e o MESMO nó do instalador" has "$CALLS" 'ENV: ISOLATE=1 TIMEOUT=2400 NODE=stub-node'
+  ck "1ª noite: mbp-run no nó linux, os arquivos do lote (ordem de caminho), -n auto e o plugin" has "$CALLS" 'ARGS: --host linux --repo wa --dir .*-- tests/a_test.py tests/sub/test_c.py tests/test_a.py tests/test_b.py tests/test_zero.py -n auto -p gtn_stable_ids --timeout=300'
+  ck "1ª noite: a poda do pytest.ini (venv, .hidden, crew, archive, node_modules) e o que não é test_*.py ficam de fora" hasnt "$CALLS" 'venv|hidden|crew|archive|node_modules|helper\.py|notes'
+  ck "1ª noite: UMA chamada do mbp-run (todos os arquivos cabem em 1 lote)" test "$(grep -c '^ARGS:' "$CALLS")" = 1; ck "1ª noite: o jsonl conta 1 lote, 1 rodou, 0 pulados" test "$(tail -n 1 "$JSONL" | jq -c '[.batches,.batches_ran,.batches_skipped]')" = '[1,1,0]'
+  ck "1ª noite: o relatório diz o teto" has "$REPORT" 'teto \(lote 01\): `GTN-CAP: MemoryMax=20480M MemorySwapMax=0 workers=9'; ck "1ª noite: tabela com o lote 01 (5 arquivos, 23 defs, 9 workers)" has "$REPORT" '^\| 01 \| 5 \| 23 \| 9 \| '
+  ck "1ª noite: a saída do lote fica em arquivo próprio" test -s "$LOGDIR/$DAY.b01.out"
   ck "1ª noite: árvore do origin/main chegou" has "$CALLS" '^tree-ok$'; ck "1ª noite: untracked NÃO chegou" hasnt "$CALLS" 'untracked-leaked'
   ck "1ª noite: scratch apagado" empty_dir "$C/.gc/run"; ck "1ª noite: baseline gravada (ids em JSON)" has "$PREV" '^"tests/b.py::t2"$'; ck "1ª noite: o wrapper e o plugin foram ao nó" has "$T/ssh.log" 'gtn_stable_ids.py'; }
 case_second() { reset; seed_prev tests/a.py::t1 tests/old.py::gone; mkout "$ISO_OK" 0 "1 failed, 1 error, 1200 passed, 2 skipped in 4000.12s (1:06:40)" "FAILED tests/a.py::t1 - x" "ERROR tests/b.py::t2" "$(fl 2 tests/a.py::t1 tests/b.py::t2)"; STUB_RC=1 go "$1"
   ck "2ª noite: COMPLETO" vd COMPLETO; ck "2ª noite: 1 nova e 1 corrigida" has "$REPORT" '2026-01-01 @abc\): 1 falhas NOVAS, 1 corrigidas'; ck "2ª noite: a nova está na lista (decodificada, não em JSON)" has "$REPORT" '^  - tests/b.py::t2$'
   ck "2ª noite: a antiga não é listada como nova" hasnt "$REPORT" '^  - tests/a.py::t1$'; ck "2ª noite: assunto com (1 novas)" has "$MAIL_LOG" '\(1 novas\)'
-  ck "2ª noite: baseline avançou" has "$PREV" '^"tests/b.py::t2"$'; ck "2ª noite: a corrigida saiu da baseline" hasnt "$PREV" 'old.py'; ck "2ª noite: 0 tentativas dito como lido" has "$REPORT" '0 tentativas de saída \(contador do nft lido\)'; }
+  ck "2ª noite: baseline avançou" has "$PREV" '^"tests/b.py::t2"$'; ck "2ª noite: a corrigida saiu da baseline" hasnt "$PREV" 'old.py'; ck "2ª noite: 0 tentativas dito como lido" has "$REPORT" '0 tentativas de saída \(contador do nft lido em todos'; }
 case_cleanslate() { reset; seed_prev tests/a.py::t1 tests/old.py::gone; mkout "$ISO_OK" 1 "1500 passed in 3000.00s (0:50:00)" "$(fl 0)"; STUB_RC=0 go "$1"
   ck "sem falhas: COMPLETO, 0 novas e 2 corrigidas" has "$REPORT" '0 falhas NOVAS, 2 corrigidas'; ck "sem falhas: baseline vazia" empty_dir_file "$PREV"
   mkout "$ISO_OK" 1 "1 failed, 1499 passed in 3000.00s (0:50:00)" "FAILED tests/c.py::t3" "$(fl 1 tests/c.py::t3)"; STUB_RC=1 go "$1"
@@ -100,7 +121,7 @@ case_leak() { reset; seed_prev tests/a.py::t1; cp "$PREV" "$T/prev.before"; mkou
 case_97_sem_iso() { reset; mkout "" "" "" "mbp-run: algo quebrou"; STUB_RC=97 go "$1"; ck "rc 97 sem linha GTN-ISO: FALHOU, exit 1" rcis 1; ck "rc 97 sem linha: veredito FALHOU, não INERTE" vd FALHOU; ck "rc 97 sem linha: diz que não rodou" has "$MAIL_LOG" 'não rodou a suíte \(rc=97\)'; }
 case_pulado() { reset; mkout "" "" ""; STUB_RC=99 go "$1"; ck "PULADO: exit 0" rcis 0; ck "PULADO: veredito" vd PULADO; ck "PULADO: nenhum e-mail" mailn 0; }
 case_timeout() { reset; seed_prev tests/a.py::t1; cp "$PREV" "$T/prev.before"; mkout "$ISO_OK" "" "" "...."; STUB_RC=124 go "$1"
-  ck "prazo: exit 1 e FALHOU" rcis 1; ck "prazo: veredito" vd FALHOU; ck "prazo: diz que estourou" has "$MAIL_LOG" 'estourou o prazo de 7200s'; ck "prazo: baseline intacta" cmp -s "$PREV" "$T/prev.before"; }
+  ck "prazo: exit 1 e FALHOU" rcis 1; ck "prazo: veredito" vd FALHOU; ck "prazo: o lote que estourou NÃO RODOU, com o prazo dele" has "$MAIL_LOG" 'NÃO RODOU.*estourou o prazo do lote \([0-9]+s\)'; ck "prazo: o assunto conta os lotes que não rodaram" has "$MAIL_LOG" '1 de 1 lotes NÃO RODARAM \(01\)'; ck "prazo: nada de COMPLETO" hasnt "$MAIL_LOG" 'COMPLETO'; ck "prazo: baseline intacta" cmp -s "$PREV" "$T/prev.before"; }
 case_abort() { reset; mkout "$ISO_OK" "" "" "INTERNALERROR> boom"; STUB_RC=2 go "$1"; ck "pytest abortado: FALHOU com o rc" has "$MAIL_LOG" 'o pytest abortou \(rc=2\)'; ck "pytest abortado: exit 1" rcis 1; }
 case_noiso() { reset; seed_prev tests/a.py::t1; cp "$PREV" "$T/prev.before"; mkout "" 7 "3 failed, 1200 passed in 100.00s" "FAILED tests/z.py::z"; STUB_RC=1 go "$1"
   ck "sem prova de isolamento: FALHOU" vd FALHOU; ck "sem prova: exit 1" rcis 1; ck "sem prova: aviso alto" has "$MAIL_LOG" 'ATENÇÃO.*SEM a linha de prova do isolamento'; ck "sem prova: o número não é divulgado" hasnt "$REPORT" '1203'; ck "sem prova: baseline intacta" cmp -s "$PREV" "$T/prev.before"; }
@@ -116,16 +137,16 @@ case_prev_unreadable() { [ "$(id -u)" -ne 0 ] || return 0; reset; seed_prev test
   ck "baseline ilegível: relatório diz INDISPONÍVEL" has "$REPORT" 'comparação INDISPONÍVEL'; ck "baseline ilegível: o assunto nunca diz 0 novas" hasnt "$MAIL_LOG" '0 novas'; ck "baseline ilegível: assunto diz sem comparação" has "$MAIL_LOG" '\(sem comparação\)'; }
 case_mailfail() { reset; mkout "$ISO_OK" 1 "1500 passed in 3000.00s"; MAIL_RC=1 STUB_RC=0 go "$1"
   ck "e-mail falhou: exit 1" rcis 1; ck "e-mail falhou: o veredito continua COMPLETO" has "$OUT" 'VEREDITO: COMPLETO'; ck "e-mail falhou: jsonl diz mail_failed=1" test "$(tail -n 1 "$JSONL" | jq .mail_failed)" = 1; ck "e-mail falhou: relatório no disco" has "$REPORT" 'COMPLETO'; }
-case_egress() { reset; mkout "$ISO_OK" "?" "1500 passed in 3000.00s"; STUB_RC=0 go "$1"; ck "contador '?': não afirma zero" has "$REPORT" 'ILEGÍVEL — não afirmo zero'
+case_egress() { reset; mkout "$ISO_OK" "?" "1500 passed in 3000.00s"; STUB_RC=0 go "$1"; ck "contador '?': não afirma zero" has "$REPORT" 'ILEGÍVEL em algum lote — não afirmo zero'
   reset; mkout "$ISO_OK" "" "1500 passed in 3000.00s"; STUB_RC=0 go "$1"; ck "sem linha do contador: ILEGÍVEL" has "$REPORT" 'ILEGÍVEL'; ck "sem linha do contador: jsonl guarda ?" test "$(tail -n 1 "$JSONL" | jq -r .egress_attempts)" = "?"
-  reset; mkout "$ISO_OK" 0 "1500 passed in 3000.00s"; STUB_RC=0 go "$1"; ck "contador 0: dito como lido" has "$REPORT" '0 tentativas de saída \(contador do nft lido\)'; }
+  reset; mkout "$ISO_OK" 0 "1500 passed in 3000.00s"; STUB_RC=0 go "$1"; ck "contador 0: dito como lido" has "$REPORT" '0 tentativas de saída \(contador do nft lido em todos'; }
 case_ssh() { reset; mkout "$ISO_OK" 1 "1500 passed in 3000.00s"; SSH_RC=255 go "$1"; ck "ssh falha: FALHOU, exit 1" rcis 1; ck "ssh falha: diz o que não instalou" has "$MAIL_LOG" 'não consegui instalar gt-iso-run em stub-node'; ck "ssh falha: o mbp-run não rodou" empty_dir_file "$CALLS"; }
 case_no_origin() { reset; HZN_WA_REPO="$T/nowhere" go "$1"; ck "origin/main ilegível: FALHOU" has "$MAIL_LOG" 'origin/main do WA ilegível'; ck "origin/main ilegível: nada rodou" empty_dir_file "$CALLS"; }
 case_stale_report() { reset; echo "RELATORIO-VELHO" > "$REPORT"; SSH_RC=1 go "$1"; ck "relatório velho do mesmo dia: não vira o e-mail de hoje" hasnt "$MAIL_LOG" 'RELATORIO-VELHO'; ck "relatório velho: o de hoje é FALHOU" has "$REPORT" 'FALHOU'; }
 case_listfail() { reset; seed_prev tests/a.py::t1; cp "$PREV" "$T/prev.before"; echo "2026-01-01 @abc" > "$LOGDIR/last-complete.meta"
   # o resumo diz 3 falhas e o plugin não imprimiu nada (não rodou, ou falhou ao montar a lista)
   mkout "$ISO_OK" 1 "3 failed, 1500 passed in 3000.00s" "FAILED tests/a.py::t1 - x"; STUB_RC=1 go "$1"
-  ck "sem a linha GTN-FAILED: segue COMPLETO" vd COMPLETO; ck "sem a linha GTN-FAILED: relatório diz INDISPONÍVEL e por quê" has "$REPORT" 'comparação INDISPONÍVEL: o pytest não imprimiu a linha GTN-FAILED'
+  ck "sem a linha GTN-FAILED: segue COMPLETO" vd COMPLETO; ck "sem a linha GTN-FAILED: relatório diz INDISPONÍVEL e por quê" has "$REPORT" 'comparação INDISPONÍVEL: lote 01: o pytest não imprimiu a linha GTN-FAILED'
   ck "sem a linha GTN-FAILED: nunca 0 novas" hasnt "$MAIL_LOG" '0 novas'; ck "sem a linha GTN-FAILED: baseline intacta" cmp -s "$PREV" "$T/prev.before"; ck "sem a linha GTN-FAILED: avisa no log" has "$OUT" 'lista de falhas ilegível'
   ck "sem a linha GTN-FAILED: o jsonl diz compare=indisponivel" test "$(tail -n 1 "$JSONL" | jq -r .compare)" = indisponivel
   # SEM falhas no resumo e sem a linha do plugin: "zero falhas" não se distingue de "o plugin não rodou" → também INDISPONÍVEL, a baseline antiga não é zerada
@@ -155,11 +176,11 @@ case_partial() { local A='tests/t.py::test_dash[a - b]' B='tests/t.py::test_dash
       4) mkout "$ISO_OK" 1 "3 failed, 1500 passed in 3000.00s" "$(fl 3 "$A" "$B" "$C")" "GTN-FAIL: tests/t.py::sem_aspas" ;;
       5) mkout "$ISO_OK" 1 "3 failed, 1500 passed in 3000.00s" "GTN-FAIL: \"$A\"" "GTN-FAIL: \"$B\"" "GTN-FAIL: \"$C\"" "GTN-FAILED: n=tres reports=3" ;;
     esac
-    case $why in 1) STUB_RC=1 go "$1"; ck "lista parcial: INDISPONÍVEL e diz que é parcial" has "$REPORT" 'comparação INDISPONÍVEL: o plugin diz 3 ids e 2 foram lidos \(lista parcial\)' ;;
-      2) STUB_RC=1 go "$1"; ck "contagem do plugin x resumo: INDISPONÍVEL e diz os dois números" has "$REPORT" 'comparação INDISPONÍVEL: o plugin contou 3 falhas/erros e o resumo do pytest diz 4' ;;
-      3) STUB_RC=1 go "$1"; ck "duas linhas GTN-FAILED: INDISPONÍVEL" has "$REPORT" 'comparação INDISPONÍVEL: a linha GTN-FAILED aparece 2 vezes' ;;
-      4) STUB_RC=1 go "$1"; ck "linha GTN-FAIL que não é JSON: INDISPONÍVEL" has "$REPORT" 'comparação INDISPONÍVEL: há linha GTN-FAIL que não é um id em JSON' ;;
-      5) STUB_RC=1 go "$1"; ck "linha GTN-FAILED ilegível: INDISPONÍVEL" has "$REPORT" 'comparação INDISPONÍVEL: a linha GTN-FAILED está ilegível' ;; esac
+    case $why in 1) STUB_RC=1 go "$1"; ck "lista parcial: INDISPONÍVEL e diz que é parcial" has "$REPORT" 'comparação INDISPONÍVEL: lote 01: o plugin diz 3 ids e 2 foram lidos \(lista parcial\)' ;;
+      2) STUB_RC=1 go "$1"; ck "contagem do plugin x resumo: INDISPONÍVEL e diz os dois números" has "$REPORT" 'comparação INDISPONÍVEL: lote 01: o plugin contou 3 falhas/erros e o resumo do pytest diz 4' ;;
+      3) STUB_RC=1 go "$1"; ck "duas linhas GTN-FAILED: INDISPONÍVEL" has "$REPORT" 'comparação INDISPONÍVEL: lote 01: a linha GTN-FAILED aparece 2 vezes' ;;
+      4) STUB_RC=1 go "$1"; ck "linha GTN-FAIL que não é JSON: INDISPONÍVEL" has "$REPORT" 'comparação INDISPONÍVEL: lote 01: há linha GTN-FAIL que não é um id em JSON' ;;
+      5) STUB_RC=1 go "$1"; ck "linha GTN-FAILED ilegível: INDISPONÍVEL" has "$REPORT" 'comparação INDISPONÍVEL: lote 01: a linha GTN-FAILED está ilegível' ;; esac
     ck "caso $why (lista não confiável): nunca 0 novas" hasnt "$MAIL_LOG" '0 novas'; ck "caso $why: baseline intacta" cmp -s "$PREV" "$T/prev.before"; ck "caso $why: segue COMPLETO (o número do pytest é dado)" vd COMPLETO
     ck "caso $why: o rodapé não chama a lista de ids reprovados confiável" has "$REPORT" 'lista de ids NÃO confiável'
   done; }
@@ -187,9 +208,96 @@ case_keep() { reset; seed_prev tests/a.py::t1
   ck "limpeza: relatório velho apagado" test ! -e "$LOGDIR/2020-01-01.out"; ck "limpeza: a baseline de 20 dias fica" test -e "$PREV"; ck "limpeza: o meta da baseline fica" test -e "$LOGDIR/last-complete.meta"; }
 case_provenance() { reset; mkout "$ISO_OK" 1 "1500 passed in 3000.00s" "$(fl 0)"; STUB_RC=0 go "$1"
   ck "relatório diz o que foi instalado no nó (com sha)" has "$REPORT" 'instalado no nó: gt-iso-run sha256:[0-9a-f]{12} \(.*\); gtn_stable_ids.py sha256:[0-9a-f]{12} \(.*\)'; ck "o estado git de quem foi ao nó nunca fica em branco" hasnt "$REPORT" 'sha256:[0-9a-f?]+ \(\)'; }
-case_dur() { reset; mkout "$ISO_OK" 1 "1500 passed in 7s"; STUB_RC=0 go "$1"; ck "duração ilegível: o relatório diz ?" has "$REPORT" 'duração: pytest \? \(\? s\)'; ck "duração ilegível: nunca 0h0min" hasnt "$REPORT" '0h0min'; }
+case_dur() { reset; mkout "$ISO_OK" 1 "1500 passed in 7s"; STUB_RC=0 go "$1"; ck "duração ilegível: o relatório diz ?" has "$REPORT" 'duração: pytest somado \? \(\? s\)'; ck "duração ilegível: nunca 0h0min" hasnt "$REPORT" '0h0min'; }
 
-ALL="first second cleanslate xfail inerte leak 97_sem_iso pulado timeout abort noiso nosum implausible lock lock_stale prev_unreadable mailfail egress ssh no_origin stale_report listfail prev_format dash partial fetch keep provenance dur"
+# ---- lotes (ga-84gkpab) ----------------------------------------------------------------------------------------------------------------------------------------------------------------
+okb() { # n iso-resumo ids... → saída do lote n (n-ésima chamada) com o resumo dado e os ids que o plugin lista (FL_R = nº de falhas+erros do resumo)
+  local n=$1 sum=$2 r=$3; shift 3; MK_TO="$STUB_OUT.$n" mkout "$ISO_OK" "${EG:-0}" "$sum" "$(fl "$r" "$@")"; }
+case_batches() { reset; seed_prev tests/old.py::gone
+  local A='tests/a_test.py::t1' B='tests/test_b.py::t2' C='tests/test_b.py::t3'
+  EG=2 okb 1 "1 failed, 400 passed in 100.00s (0:01:40)" 1 "$A"
+  okb 2 "500 passed, 1 skipped in 200.00s (0:03:20)" 0; EG=0 okb 3 "1 failed, 1 error, 300 passed in 50.00s" 2 "$B" "$C"
+  STUB_RC_1=1 STUB_RC_2=0 STUB_RC_3=1 HZN_BATCH_DEFS=10 go "$1"
+  ck "lotes: COMPLETO, exit 0" vd COMPLETO; ck "lotes: exit 0" rcis 0; ck "lotes: 1 e-mail" mailn 1
+  ck "lotes: 3 chamadas do mbp-run, uma por lote" test "$(grep -c '^ARGS:' "$CALLS")" = 3
+  ck "lotes: lote 1 = os dois primeiros arquivos (peso 4+6 cabe em 10)" has "$CALLS" '-- tests/a_test.py tests/sub/test_c.py -n auto -p gtn_stable_ids'
+  ck "lotes: lote 2 = tests/test_a.py sozinho (o próximo, de peso 7, não cabe)" has "$CALLS" '-- tests/test_a.py -n auto -p gtn_stable_ids'
+  ck "lotes: lote 3 = test_b e test_zero (peso mínimo 1 para arquivo sem def)" has "$CALLS" '-- tests/test_b.py tests/test_zero.py -n auto -p gtn_stable_ids'
+  ck "lotes: nenhum arquivo em dois lotes e nenhum fora" test "$(grep '^ARGS:' "$CALLS" | grep -o 'tests/[A-Za-z_/]*\.py' | sort | tr '\n' ' ')" = 'tests/a_test.py tests/sub/test_c.py tests/test_a.py tests/test_b.py tests/test_zero.py '
+  ck "lotes: cada lote com o prazo do lote (não o do script inteiro)" test "$(grep -c 'TIMEOUT=2400 ' "$CALLS")" = 3
+  ck "lotes: totais SOMADOS dos 3 lotes" has "$REPORT" 'total: 1204 \(1200 passaram, 2 falharam, 1 erros, 1 pulados, 0 xfail, 0 xpass\); 3 de 3 lotes rodaram'
+  ck "lotes: duração somada (100+200+50 s)" has "$REPORT" 'pytest somado 0h5min \(350 s\)'; ck "lotes: contador do nft somado (2+0+0)" has "$REPORT" '2 tentativa\(s\) de saída barradas pelo nft'
+  ck "lotes: o assunto diz os 3 lotes" has "$MAIL_LOG" 'COMPLETO: 1204 testes em 3 lotes, 2 falhas, 1 erros'; ck "lotes: o jsonl diz 3/3/0" test "$(tail -n 1 "$JSONL" | jq -c '[.batches,.batches_ran,.batches_skipped]')" = '[3,3,0]'
+  ck "lotes: ids dos 3 lotes na lista de hoje" test "$(wc -l < "$LOGDIR/$DAY.failed" | tr -d ' ')" = 3; ck "lotes: 3 novas e 1 corrigida contra a noite anterior" has "$REPORT" '3 falhas NOVAS, 1 corrigidas'
+  ck "lotes: a baseline avançou com a união" test "$(decoded "$PREV" | grep -c 'a_test\|test_b')" = 3
+  ck "lotes: a tabela tem os 3 lotes com arquivos, defs e workers" has "$REPORT" '^\| 01 \| 2 \| 10 \| 9 \| '; ck "lotes: lote 3" has "$REPORT" '^\| 03 \| 2 \| 7 \| 9 \| [0-9]+ \| rodou \| '
+  ck "lotes: uma saída por lote" test -s "$LOGDIR/$DAY.b03.out"; ck "lotes: a junta tem os cabeçalhos" has "$LOGDIR/$DAY.out" '^=== lote 02: 1 arquivos, 6 def test_'; }
+case_batch_list() { reset; seed_prev tests/old.py::gone; cp "$PREV" "$T/prev.before"
+  okb 1 "1 failed, 400 passed in 100.00s" 1 tests/a_test.py::t1
+  # o lote 2 diz 2 falhas e o plugin não imprimiu a lista dele: a comparação toda fica indisponível, a baseline não anda, mas o total continua dado do pytest
+  MK_TO="$STUB_OUT.2" mkout "$ISO_OK" 0 "2 failed, 500 passed in 200.00s" "FAILED tests/test_a.py::x"
+  okb 3 "300 passed in 50.00s" 0
+  STUB_RC_1=1 STUB_RC_2=1 STUB_RC_3=0 HZN_BATCH_DEFS=10 go "$1"
+  ck "lista de um lote inconsistente: segue COMPLETO (número do pytest é dado)" vd COMPLETO; ck "lista de um lote inconsistente: diz de que lote" has "$REPORT" 'comparação INDISPONÍVEL: lote 02: o pytest não imprimiu a linha GTN-FAILED'
+  ck "lista de um lote inconsistente: baseline intacta" cmp -s "$PREV" "$T/prev.before"; ck "lista de um lote inconsistente: nunca 0 novas" hasnt "$MAIL_LOG" '0 novas'; ck "lista de um lote inconsistente: os 3 lotes somam" has "$REPORT" 'total: 1203 '; }
+case_overbudget() { reset; seed_prev tests/a.py::t1; cp "$PREV" "$T/prev.before"
+  okb 1 "1200 passed in 100.00s" 0
+  # orçamento de 12 s − 2 s de margem; o lote 1 leva 6 s; sobram ~3 s (< 5 s de mínimo): os lotes 2 e 3 NÃO começam
+  STUB_RC_1=0 STUB_SLEEP=6 HZN_BATCH_DEFS=10 HZN_TIMEOUT_S=12 HZN_FINAL_MARGIN_S=2 HZN_MIN_BATCH_S=5 go "$1"
+  ck "orçamento esgotado: FALHOU, exit 1" rcis 1; ck "orçamento esgotado: veredito FALHOU (nunca COMPLETO)" vd FALHOU; ck "orçamento esgotado: o assunto diz quais lotes não rodaram" has "$MAIL_LOG" 'FALHOU: 2 de 3 lotes NÃO RODARAM \(02, 03\)'
+  ck "orçamento esgotado: a tabela diz por quê" has "$REPORT" '^\| 02 \| 1 \| 6 \| .* NÃO RODOU \| orçamento esgotado: restam'; ck "orçamento esgotado: só 1 chamada ao mbp-run" test "$(grep -c '^ARGS:' "$CALLS")" = 1
+  ck "orçamento esgotado: o 1º lote recebeu o que restava do orçamento, não 2400 s" has "$CALLS" 'TIMEOUT=(9|10) '; ck "orçamento esgotado: o parcial vem marcado como parcial" has "$REPORT" 'parcial, NÃO é o total da suíte'
+  ck "orçamento esgotado: baseline intacta" cmp -s "$PREV" "$T/prev.before"; ck "orçamento esgotado: nunca 0 novas" hasnt "$MAIL_LOG" '0 novas'; ck "orçamento esgotado: o jsonl diz 3/1/2" test "$(tail -n 1 "$JSONL" | jq -c '[.batches,.batches_ran,.batches_skipped]')" = '[3,1,2]'; }
+case_batch_killed() { reset; seed_prev tests/a.py::t1; cp "$PREV" "$T/prev.before"
+  okb 1 "600 passed in 100.00s" 0; MK_TO="$STUB_OUT.2" mkout "$ISO_OK" 0 "" "Killed"; okb 3 "600 passed in 100.00s" 0
+  STUB_RC_1=0 STUB_RC_2=137 STUB_RC_3=0 HZN_BATCH_DEFS=10 go "$1"
+  ck "lote morto (137): FALHOU, exit 1" rcis 1; ck "lote morto: veredito FALHOU" vd FALHOU; ck "lote morto: só o 02 não rodou" has "$MAIL_LOG" '1 de 3 lotes NÃO RODARAM \(02\)'
+  ck "lote morto: a tabela diz MORTO e o rc" has "$REPORT" 'NÃO RODOU \| o pytest foi MORTO \(rc=137'; ck "lote morto: os outros lotes rodaram (3 chamadas)" test "$(grep -c '^ARGS:' "$CALLS")" = 3
+  ck "lote morto: parcial dos 2 que rodaram" has "$REPORT" 'só dos 2 lotes que rodaram.*1200 testes'; ck "lote morto: baseline intacta" cmp -s "$PREV" "$T/prev.before"; ck "lote morto: nunca 0 novas" hasnt "$MAIL_LOG" '0 novas'
+  ck "lote morto: o jsonl diz 3/2/1" test "$(tail -n 1 "$JSONL" | jq -c '[.batches,.batches_ran,.batches_skipped]')" = '[3,2,1]'; }
+case_crash() { reset; seed_prev tests/a.py::t1; cp "$PREV" "$T/prev.before"
+  mkout "$ISO_OK" 0 "1 failed, 1500 passed in 3000.00s" "worker 'gw3' crashed while running 'tests/x.py::t'" "FAILED tests/x.py::t - worker 'gw3' crashed" "$(fl 1 tests/x.py::t)"; STUB_RC=1 go "$1"
+  ck "worker caído: FALHOU, o lote NÃO RODOU" vd FALHOU; ck "worker caído: a tabela diz o motivo" has "$REPORT" 'worker do xdist caiu'; ck "worker caído: baseline intacta" cmp -s "$PREV" "$T/prev.before"; ck "worker caído: nenhum total divulgado como completo" hasnt "$REPORT" '— COMPLETO'; }
+case_nocap() { local cl
+  for cl in "" "sem-teto (GTN_WORKERS=5 explícito: o governo de quem chamou decide a memória)"; do
+    reset; seed_prev tests/a.py::t1; cp "$PREV" "$T/prev.before"; CAPLINE="$cl" mkout "$ISO_OK" 0 "1500 passed in 3000.00s" "$(fl 0)"
+    STUB_RC=0 HZN_BATCH_DEFS=10 go "$1"
+    ck "sem prova do teto ('${cl:-vazio}'): FALHOU, exit 1" rcis 1; ck "sem prova do teto: veredito FALHOU" vd FALHOU; ck "sem prova do teto: aviso alto" has "$MAIL_LOG" 'ATENÇÃO.*SEM a linha de prova do teto de memória'
+    ck "sem prova do teto: PARA no 1º lote (os outros iriam sem o teto também)" test "$(grep -c '^ARGS:' "$CALLS")" = 1; ck "sem prova do teto: baseline intacta" cmp -s "$PREV" "$T/prev.before"; ck "sem prova do teto: o número não é divulgado" hasnt "$REPORT" 'total:'
+  done; }
+case_cap_inert() { reset; seed_prev tests/a.py::t1; cp "$PREV" "$T/prev.before"
+  CAPLINE="inerte memavailable-ilegivel (MemAvailable='' em /proc/meminfo)" mkout "$ISO_OK" "" ""
+  STUB_RC=97 HZN_BATCH_DEFS=10 go "$1"
+  ck "teto inerte no 1º lote: INERTE, exit 0" rcis 0; ck "teto inerte no 1º lote: veredito INERTE" vd INERTE; ck "teto inerte: e-mail ao Mayor" mailn 1; ck "teto inerte: relatório diz que o teto não foi provado" has "$REPORT" 'Teto de memória NÃO provado.*memavailable-ilegivel'
+  ck "teto inerte: tentou 2 vezes o lote 1 e parou (não varreu os lotes seguintes)" test "$(grep -c '^ARGS:' "$CALLS")" = 2; ck "teto inerte: nenhum total divulgado" hasnt "$REPORT" 'total:'; ck "teto inerte: baseline intacta" cmp -s "$PREV" "$T/prev.before"
+  ck "teto inerte: o jsonl diz 3 lotes, 0 rodaram, 0 pulados" test "$(tail -n 1 "$JSONL" | jq -c '[.batches,.batches_ran,.batches_skipped]')" = '[3,0,0]'; }
+case_cap_retry() { reset
+  CAPLINE="inerte memoria-insuficiente (MemAvailable=7000M)" MK_TO="$STUB_OUT.1" mkout "$ISO_OK" "" ""; mkout "$ISO_OK" 0 "1500 passed in 3000.00s" "$(fl 0)"
+  STUB_RC_1=97 STUB_RC_2=0 go "$1"
+  ck "teto inerte uma vez e bom na 2ª tentativa: COMPLETO" vd COMPLETO; ck "teto inerte uma vez: 2 chamadas" test "$(grep -c '^ARGS:' "$CALLS")" = 2; ck "teto inerte uma vez: o log diz a nova tentativa" has "$OUT" 'lote 01: teto de memória NÃO provado.*nova tentativa'; }
+case_cap_late() { reset; seed_prev tests/a.py::t1; cp "$PREV" "$T/prev.before"
+  okb 1 "600 passed in 100.00s" 0; okb 4 "600 passed in 100.00s" 0
+  CAPLINE="inerte memoria-insuficiente (MemAvailable=7000M)" MK_TO="$STUB_OUT.2" mkout "$ISO_OK" "" ""; CAPLINE="inerte memoria-insuficiente (MemAvailable=7000M)" MK_TO="$STUB_OUT.3" mkout "$ISO_OK" "" ""
+  STUB_RC_1=0 STUB_RC_2=97 STUB_RC_3=97 STUB_RC_4=0 HZN_BATCH_DEFS=10 go "$1"
+  ck "teto inerte num lote que não é o 1º: NÃO é INERTE (já rodou coisa): FALHOU" vd FALHOU; ck "teto inerte tardio: o lote 02 NÃO RODOU e diz as tentativas" has "$REPORT" 'NÃO RODOU \| teto de memória NÃO provado.*\(após 2 tentativa\(s\)\)'
+  ck "teto inerte tardio: o 3º lote ainda rodou (4 chamadas = 1 + 2 tentativas + 1)" test "$(grep -c '^ARGS:' "$CALLS")" = 4; ck "teto inerte tardio: assunto" has "$MAIL_LOG" '1 de 3 lotes NÃO RODARAM \(02\)'; ck "teto inerte tardio: baseline intacta" cmp -s "$PREV" "$T/prev.before"; }
+case_leak_mid() { reset; seed_prev tests/a.py::t1; cp "$PREV" "$T/prev.before"
+  okb 1 "600 passed in 100.00s" 0; MK_TO="$STUB_OUT.2" mkout "nao-isolado tcp:1.1.1.1:53" "" ""; okb 3 "600 passed in 100.00s" 0
+  STUB_RC_1=0 STUB_RC_2=97 STUB_RC_3=0 HZN_BATCH_DEFS=10 go "$1"
+  ck "vazamento no lote 2: FALHOU, exit 1" rcis 1; ck "vazamento no lote 2: veredito FALHOU" vd FALHOU; ck "vazamento no lote 2: o assunto diz VAZAMENTO, o que vazou e o lote" has "$MAIL_LOG" 'FALHOU: VAZAMENTO.*tcp:1\.1\.1\.1:53.*lote 02'
+  ck "vazamento no lote 2: PARA (o lote 3 não roda)" test "$(grep -c '^ARGS:' "$CALLS")" = 2; ck "vazamento no lote 2: baseline intacta" cmp -s "$PREV" "$T/prev.before"; ck "vazamento no lote 2: nunca COMPLETO" hasnt "$MAIL_LOG" 'COMPLETO'; }
+case_flag_mid() { reset; seed_prev tests/a.py::t1; cp "$PREV" "$T/prev.before"
+  okb 1 "600 passed in 100.00s" 0; MK_TO="$STUB_OUT.2" mkout "" "" ""; okb 3 "600 passed in 100.00s" 0
+  STUB_RC_1=0 STUB_RC_2=99 STUB_RC_3=0 HZN_BATCH_DEFS=10 go "$1"
+  ck "nó desligado no meio: NÃO é PULADO (já rodou lote): FALHOU" vd FALHOU; ck "nó desligado no meio: diz que desligou no meio" has "$REPORT" 'o nó foi desligado no meio da rodada'; ck "nó desligado no meio: baseline intacta" cmp -s "$PREV" "$T/prev.before"; }
+case_badconst() { reset; mkout "$ISO_OK" 0 "1500 passed in 3000.00s" "$(fl 0)"; STUB_RC=0 HZN_BATCH_DEFS=abc go "$1"
+  ck "constante inválida: FALHOU, exit 1" rcis 1; ck "constante inválida: diz qual" has "$MAIL_LOG" 'constante inválida: BATCH_DEFS='; ck "constante inválida: nada rodou" empty_dir_file "$CALLS"
+  reset; STUB_RC=0 HZN_BATCH_DEFS=0 go "$1"; ck "constante zero onde precisa >= 1: FALHOU" has "$MAIL_LOG" 'constante inválida: BATCH_DEFS=0'
+  # as que só a 1ª checagem cobre (a 2ª só olha BATCH_DEFS/BATCH_T/TRIES/ARGS_MAX): sem ela, 'abc' entraria numa conta aritmética e viraria 0 em silêncio
+  reset; mkout "$ISO_OK" 0 "1500 passed in 3000.00s" "$(fl 0)"; STUB_RC=0 HZN_FINAL_MARGIN_S=abc go "$1"; ck "margem não numérica: FALHOU, exit 1" rcis 1; ck "margem não numérica: diz qual" has "$MAIL_LOG" 'constante inválida: MARGIN='; ck "margem não numérica: nada rodou" empty_dir_file "$CALLS"; }
+case_notests() { reset; HZN_WA_REPO="$T/wa-notests" go "$1"; ck "origin/main sem tests/: FALHOU, exit 1" rcis 1; ck "origin/main sem tests/: diz que não tem tests/" has "$MAIL_LOG" 'não tem tests/'; ck "origin/main sem tests/: nada rodou" empty_dir_file "$CALLS"; }
+
+ALL="first second cleanslate xfail inerte leak 97_sem_iso pulado timeout abort noiso nosum implausible lock lock_stale prev_unreadable mailfail egress ssh no_origin stale_report listfail prev_format dash partial fetch keep provenance dur batches batch_list overbudget batch_killed crash nocap cap_inert cap_retry cap_late leak_mid flag_mid badconst notests"
 for c in $ALL; do "case_$c" "$SUT0"; done
 
 # ---- controles negativos: o caso correspondente tem de FALHAR quando roda no mutante -----------------------------------------
@@ -204,9 +312,6 @@ mutant() { # nome expr-sed caso — cria o mutante, roda o caso em silêncio e e
   bash -n "$f" 2>/dev/null || { echo "FAIL $1: o mutante tem erro de sintaxe (a prova seria vazia)"; fails=$((fails+1)); return; }
   BAD=0; QUIET=1; "case_$3" "$f"; QUIET=0
   if [ "$BAD" = 1 ]; then echo "ok   $1 (o caso '$3' reprova o mutante)"; else echo "FAIL $1: o caso '$3' NÃO reprovou o mutante"; fails=$((fails+1)); fi; }
-mutant M1-sem-prova-de-isolamento 's/^case "\$ISO_LINE" in isolado\*) ;; \*) finish FALHOU.*$/true/' noiso
-mutant M2-prazo-124-ignorado 's/^  124) finish FALHOU.*$/  124) ;;/' timeout
-mutant M3-inerte-vira-falhou 's/^      inerte\*) /      nunca_casa) /' inerte
 mutant M4-novas-lidas-como-comuns 's/comm -13 /comm -12 /' second
 mutant M5-pulado-manda-email 's/if \[ "\$v" != PULADO \]; then/if true; then/' pulado
 mutant M6-sem-comparacao-vira-0-novas 's/NEWTXT="sem comparação"/NEWTXT="0 novas"/' prev_unreadable
@@ -216,9 +321,6 @@ mutant M9-relatorio-velho-nao-truncado 's/^: > "\$REPORT".*$/true/' stale_report
 mutant M10-error-singular-nao-contado "s/cnt 'errors?'/cnt 'errors'/" xfail
 mutant M11-lock-vivo-ignorado 's/if \[ -n "\$op" \] && \[ -z "\$old" \] && kill -0 "\$op" 2>\/dev\/null; then/if false; then/' lock
 mutant M12-ssh-ignorado 's/if ! \$SSH /if false \&\& ! $SSH /' ssh
-mutant M13-contador-ilegivel-vira-0 's/\[ -n "\$EGRESS" \] || EGRESS="?"/EGRESS=${EGRESS:-0}/' egress
-mutant M14-pytest-abortado-segue 's/^  \*) finish FALHOU "o pytest abortou.*$/  *) ;;/' abort
-mutant M16-duracao-ilegivel-vira-0h0min 's/^DUR="?"; \[ -z "\$PYSECS" \] || /true; /' dur
 mutant M24-fetch-falho-sem-aviso 's/^else FETCHST=falhou; STALE_NOTE=/else FETCHST=falhou; STALE_X=/' fetch
 mutant M25-lock-velho-ignorado 's/ \&\& \[ -z "\$old" \] \&\& kill -0/ \&\& kill -0/' lock_stale
 mutant M26-pulado-por-lock-sem-jsonl 's/^    jline PULADO "outra rodada em andamento (pid \$op)"; say/    say/' lock
@@ -235,15 +337,39 @@ mutantl() { # nome caso old new [old new]... — cada par é uma troca literal n
   bash -n "$f" 2>/dev/null || { echo "FAIL $1: o mutante tem erro de sintaxe (a prova seria vazia)"; fails=$((fails+1)); return; }
   BAD=0; QUIET=1; "case_$2" "$f"; QUIET=0
   if [ "$BAD" = 1 ]; then echo "ok   $1 (o caso '$2' reprova o mutante)"; else echo "FAIL $1: o caso '$2' NÃO reprovou o mutante"; fails=$((fails+1)); fi; }
-mutantl M15-lista-parcial-vira-completa partial 'elif [ "$NIDS" -ne "$SN" ]; then' 'elif false; then'
-mutantl M17-contagem-do-plugin-x-resumo-ignorada partial 'elif [ "$SR" -ne $(( FAILED + ERRORS )) ]; then' 'elif false; then'
-mutantl M18-sem-linha-do-plugin-e-sem-falhas-vira-zero listfail 'if [ "$NSENT" -eq 0 ]; then LISTWHY=' 'if [ "$NSENT" -eq 0 ] && [ $(( FAILED + ERRORS )) -eq 0 ]; then LISTOK=1
-elif [ "$NSENT" -eq 0 ]; then LISTWHY='
-mutantl M19-id-lido-da-linha-humana-cortada-no-1o-traco dash "LC_ALL=C sed -n 's/^GTN-FAIL: //p' \"\$OUT\" 2>/dev/null |" "LC_ALL=C sed -n -E 's/^(FAILED|ERROR) (.*)\$/\\2/p' \"\$OUT\" 2>/dev/null | sed -E 's/ - .*\$//; s/^(.*)\$/\"\\1\"/' |"
-mutantl M20-o-bug-original-sem-a-conferencia-de-n dash "LC_ALL=C sed -n 's/^GTN-FAIL: //p' \"\$OUT\" 2>/dev/null |" "LC_ALL=C sed -n -E 's/^(FAILED|ERROR) (.*)\$/\\2/p' \"\$OUT\" 2>/dev/null | sed -E 's/ - .*\$//; s/^(.*)\$/\"\\1\"/' |" 'elif [ "$NIDS" -ne "$SN" ]; then' 'elif false; then'
-mutantl M21-json-nao-validado partial 'elif ! jq -en '"'"'[inputs | type == "string"] | all'"'"' "$CUR" >/dev/null 2>&1; then' 'elif false; then'
-mutantl M22-sentinela-duplicada-aceita partial 'elif [ "$NSENT" -gt 1 ]; then LISTWHY=' 'elif false; then LISTWHY='
+mutantl M15-lista-parcial-vira-completa partial 'elif [ "$nids" -ne "$sn" ]; then' 'elif false; then'
+mutantl M17-contagem-do-plugin-x-resumo-ignorada partial 'elif [ "$sr" -ne $(( FAILED + ERRORS )) ]; then' 'elif false; then'
+mutantl M18-sem-linha-do-plugin-e-sem-falhas-vira-zero listfail 'if [ "$nsent" -eq 0 ]; then w=' 'if [ "$nsent" -eq 0 ] && [ $(( FAILED + ERRORS )) -eq 0 ]; then w=""
+  elif [ "$nsent" -eq 0 ]; then w='
+mutantl M19-id-lido-da-linha-humana-cortada-no-1o-traco dash "LC_ALL=C sed -n 's/^GTN-FAIL: //p' \"\$f\" 2>/dev/null |" "LC_ALL=C sed -n -E 's/^(FAILED|ERROR) (.*)\$/\\2/p' \"\$f\" 2>/dev/null | sed -E 's/ - .*\$//; s/^(.*)\$/\"\\1\"/' |"
+mutantl M20-o-bug-original-sem-a-conferencia-de-n dash "LC_ALL=C sed -n 's/^GTN-FAIL: //p' \"\$f\" 2>/dev/null |" "LC_ALL=C sed -n -E 's/^(FAILED|ERROR) (.*)\$/\\2/p' \"\$f\" 2>/dev/null | sed -E 's/ - .*\$//; s/^(.*)\$/\"\\1\"/' |" 'elif [ "$nids" -ne "$sn" ]; then' 'elif false; then'
+mutantl M21-json-nao-validado partial 'elif ! jq -en '"'"'[inputs | type == "string"] | all'"'"' "$SCR/ids.b" >/dev/null 2>&1; then' 'elif false; then'
+mutantl M22-sentinela-duplicada-aceita partial 'elif [ "$nsent" -gt 1 ]; then w=' 'elif false; then w='
 mutantl M23-baseline-de-outro-formato-aceita prev_format "jq -en '[inputs | type == \"string\"] | all' \"\$PREV\" >/dev/null 2>&1 && " ''
+# mutantes do desenho em lotes (ga-84gkpab) e os que antes eram sed de uma linha que deixou de existir
+mutantl M1-sem-prova-de-isolamento noiso '*) B_ST=sem-prova; B_WHY="ATENÇÃO: o lote terminou SEM a linha de prova do isolamento' 'nunca_casa) B_ST=sem-prova; B_WHY="ATENÇÃO: o lote terminou SEM a linha de prova do isolamento'
+mutantl M2-prazo-124-ignorado timeout '124) B_WHY="estourou' 'nunca_casa) B_WHY="estourou'
+mutantl M3-inerte-vira-falhou inerte 'inerte*) B_ST=inerte-iso;' 'nunca_casa) B_ST=inerte-iso;'
+mutantl M13-contador-ilegivel-vira-0 egress 'if [ "$EGUNK" = 0 ] && [ "$EGSEEN" = 1 ]; then EGRESS=$EGSUM; else EGRESS="?"; fi' 'EGRESS=$EGSUM'
+mutantl M14-pytest-abortado-segue abort '0|1) ;;' '0|1|2) ;;'
+mutantl M16-duracao-ilegivel-vira-0h0min dur '[ "$PYUNK" = 0 ] || PYSECS=""; ' ''
+mutantl M32-lotes-colapsados-em-um batches 'if (cnt>0 && (acc+w>max || bytes+length(f)+1>amax))' 'if (0)'
+mutantl M33-lote-que-nao-rodou-vira-verde overbudget 'if [ "$NSKIP" -gt 0 ]; then' 'if false; then'
+mutantl M34-orcamento-de-tempo-ignorado overbudget 'if [ "$left" -lt "$MIN_BATCH" ]; then' 'if false; then'
+mutantl M35-teto-de-memoria-sem-prova-aceito nocap 'MemoryMax=*MemorySwapMax=0*) ;; *) B_ST=sem-prova;' '*) ;; nunca_casa) B_ST=sem-prova;'
+mutantl M36-rc-137-aceito-como-rodou batch_killed '0|1) ;;' '0|1|137) ;;'
+mutantl M37-worker-caido-ignorado crash 'if [ -n "$mk" ]; then B_WHY=' 'if false; then B_WHY='
+mutantl M38-sem-retry-do-transitorio cap_retry 'if [ "$tries" -lt "$TRIES" ] &&' 'if false &&'
+mutantl M39-teto-inerte-no-1o-lote-vira-falhou cap_inert 'finish INERTE "teto de memória não provado no nó' 'finish FALHOU "teto de memória não provado no nó'
+mutantl M40-vazamento-no-meio-nao-para leak_mid 'B_ST=vazamento; B_WHY="o canário SAIU pela rede' 'B_ST=nao-rodou; B_WHY="o canário SAIU pela rede'
+mutantl M41-ids-dos-lotes-nao-unidos batches 'cat "$SCR/ids.b" >> "$SCR/ids.all"' 'true'
+mutantl M42-soma-so-do-ultimo-lote batches 'TP=$(( TP + PASSED ))' 'TP=$PASSED'
+mutantl M43-lista-inconsistente-de-um-lote-ignorada batch_list 'if [ -n "$w" ]; then LISTOK=0;' 'if false; then LISTOK=0;'
+mutantl M44-poda-do-pytest-ini-esquecida first '-o -name crew -o -name archive ' ''
+mutantl M45-constante-invalida-aceita badconst "''|*[!0-9]*) finish FALHOU \"constante inválida: \$v='\$x'" "nunca_casa) finish FALHOU \"constante inválida: \$v='\$x'"
+mutantl M46-nó-desligado-no-meio-vira-pulado flag_mid '[ "$i" -ne 1 ] || finish PULADO' 'finish PULADO'
+mutantl M50-prazo-do-lote-ignora-o-que-resta overbudget 'bt=$BATCH_T; [ "$left" -ge "$bt" ] || bt=$left' 'bt=$BATCH_T'
+mutantl M52-sem-prova-no-meio-nao-para nocap $'    sem-prova)\n      { echo "# Hetzner nightly $DAY — FALHOU: lote $nn sem prova' $'    nunca_casa)\n      { echo "# Hetzner nightly $DAY — FALHOU: lote $nn sem prova'
 reset
 echo "---"; echo "$((n-fails))/$n ok ($M mutantes)"
 [ $fails -eq 0 ] && echo "SELFTEST OK" || { echo "SELFTEST FALHOU ($fails)"; exit 1; }

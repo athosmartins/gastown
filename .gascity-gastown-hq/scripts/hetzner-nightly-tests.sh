@@ -1,28 +1,39 @@
 #!/usr/bin/env bash
-# hetzner-nightly-tests.sh — a suíte INTEIRA do WA no nó Linux (Hetzner), toda madrugada, sem rede de saída e sem segredo, com relatório ao Mayor (ga-9p6pte).
+# hetzner-nightly-tests.sh — a suíte INTEIRA do WA no nó Linux (Hetzner), toda madrugada, em LOTES por arquivo, sem rede de saída e sem segredo, com relatório ao Mayor (ga-9p6pte, ga-84gkpab).
 #
 # ## Contents
-#   Por quê · Veredito · Como roda · O que NÃO faz · Ambiente
+#   Por quê · Lotes · Veredito · Como roda · O que NÃO faz · Ambiente
 #
 # POR QUÊ: em 04/10 um teste de branch antiga mandou um e-mail de verdade. Rodar a suíte inteira toda noite só é aceitável com a saída de rede PROVADA
 #   cortada (canário do hetzner-iso-run.sh + helper de root hetzner-netns-run.sh) e ambiente limpo. Sem essa prova nada roda.
+# LOTES (ga-84gkpab): um pytest só com 14 workers sobre a árvore inteira (3779+ arquivos, ~100 mil testes) cresce sem platô — cada worker nasce com ~2 GB (coleta tudo) e a soma passou
+#   dos 31 GB do nó: o OOM do kernel matou o job com rc=137 aos ~1700 s em 13, 14 e 15/11. Agora: os arquivos test_*.py/*_test.py de tests/ (menos o que o pytest.ini manda ignorar) são
+#   agrupados em ordem de caminho em lotes de ~HZN_BATCH_DEFS `def test_` (o nº de lotes sai da árvore, nunca fixo) e CADA lote é um `mbp-run.sh` + um pytest NOVO (a memória zera). Quem limita a
+#   memória é o `gt-iso-run` no nó (hetzner-iso-run.sh): lê o MemAvailable na hora, deriva os workers (nunca um número fixo), roda o pytest dentro de
+#   `systemd-run --user --scope -p MemoryMax=<teto> -p MemorySwapMax=0` e fica INERTE se não leu ou não provou o teto. O orçamento de tempo é do script inteiro (HZN_TIMEOUT_S − margem): lote que
+#   não começou por falta de orçamento, que estourou o prazo dele, que morreu (rc 137 = teto/OOM, worker caído) ou ficou inerte é "NÃO RODOU" e aparece assim — nunca como verde. Sem todos os
+#   lotes rodados não há COMPLETO, não há comparação e a linha de base não anda.
 # VEREDITO (última linha do stdout `VEREDITO: <x>`; uma linha jsonl por noite em $CITY/.gc/logs/hetzner-nightly.jsonl; um e-mail ao Mayor, salvo PULADO)
-#   COMPLETO  a suíte rodou DENTRO do isolamento provado e o resumo do pytest foi lido: total, falhas, novas falhas contra a última noite COMPLETA, duração.
+#   COMPLETO  TODOS os lotes rodaram DENTRO do isolamento provado e o resumo do pytest de cada um foi lido: total (somado), falhas, novas falhas contra a última noite COMPLETA, duração.
 #             Teste que falha é dado do relatório, não falha do job (exit 0).
-#   INERTE    o isolamento não foi provado (helper de root não instalado, canário `inerte`, wrapper ausente): NADA rodou. Exit 0, e-mail diz o que falta.
-#   FALHOU    o que impede de dizer o que aconteceu: nó fora, sync/guard recusado, estouro de prazo (2 h), pytest abortado (rc>=2), resumo ilegível ou total
-#             implausível, rodou sem a linha de prova do isolamento (o número NÃO é divulgado como resultado), e `nao-isolado` do canário: a sonda SAIU pela rede,
-#             um vazamento MEDIDO (não é "falta instalar": o assunto diz VAZAMENTO). Exit 1.
-#   PULADO    por escolha, com evidência: bandeira do nó desligada (rc 99 do mbp-run) ou outra rodada em andamento. Sem e-mail, exit 0; a linha do jsonl sai mesmo assim (uma por noite).
+#   INERTE    o isolamento não foi provado (helper de root não instalado, canário `inerte`, wrapper ausente) ou o nó não deixou provar o teto de memória / ler o MemAvailable no 1º lote:
+#             NADA rodou. Exit 0, e-mail diz o que falta.
+#   FALHOU    o que impede de dizer o que aconteceu: nó fora, sync/guard recusado, lote que NÃO RODOU (orçamento, prazo do lote, rc 137, pytest abortado, worker caído, sem resumo, sem a
+#             linha de prova do isolamento), total implausível, e `nao-isolado` do canário: a sonda SAIU pela rede, um vazamento MEDIDO (o assunto diz VAZAMENTO). Exit 1.
+#   PULADO    por escolha, com evidência: bandeira do nó desligada (rc 99 do mbp-run no 1º lote) ou outra rodada em andamento. Sem e-mail, exit 0; a linha do jsonl sai mesmo assim (uma por noite).
 # IDS REPROVADOS (a comparação com a noite anterior): vêm do PLUGIN gtn_stable_ids.py (`GTN-FAIL: <id em JSON>` por id e `GTN-FAILED: n=.. reports=..`), nunca da linha humana
-#   `FAILED <id> - <msg>`: um id de parametrize pode ter " - " (`[ADE V - Setor 4]`) e o corte no primeiro " - " juntava irmãos numa linha só. O script confere a quantidade de linhas com `n`
-#   e `reports` com o resumo do pytest; qualquer divergência ou ausência = comparação INDISPONÍVEL e a linha de base não anda (nunca "0 novas").
+#   `FAILED <id> - <msg>`: um id de parametrize pode ter " - " (`[ADE V - Setor 4]`) e o corte no primeiro " - " juntava irmãos numa linha só. Por LOTE o script confere a quantidade de linhas
+#   com `n` e `reports` com o resumo do pytest do lote; qualquer divergência ou ausência em qualquer lote = comparação INDISPONÍVEL e a linha de base não anda (nunca "0 novas").
 # COMO RODA: gc order (packs/town-deltas/orders/hetzner-nightly-tests.toml, 02:00 local = 05:00 UTC). `git archive origin/main` do WA (nada de WIP de agente, nada de untracked) para um scratch,
-#   `HETZNER_ISOLATE=1 mbp-run.sh --host linux --repo wa -- tests/ -n 14 ...` (o filtro, o node_guard, o slot e a supervisão são os do gate, sem cópia), e o scratch é apagado.
-# O QUE NÃO FAZ: não cai no MBP nem no mini (--host linux, sem cadeia); não decide se uma falha é regressão (só diz quais são novas); não instala o helper de root.
-# AMBIENTE (selftest e rodada manual): MBP_CITY, HZN_RUN (mbp-run.sh), HZN_WA_REPO, HZN_MAIL_CMD (padrão `gc mail send mayor`), HZN_TIMEOUT_S (7200), HZN_MIN_TOTAL (1000),
+#   e por lote `HETZNER_ISOLATE=1 mbp-run.sh --host linux --repo wa -- <arquivos> -n auto -p gtn_stable_ids ...` (o filtro, o node_guard, o slot e a supervisão são os do gate, sem cópia;
+#   `-n auto` só limita por cima: o `gt-iso-run` cobra do nó o número real de workers). O scratch é apagado.
+# O QUE NÃO FAZ: não cai no MBP nem no mini (--host linux, sem cadeia); não decide se uma falha é regressão (só diz quais são novas); não instala o helper de root; não mexe no que roda no nó
+#   além do próprio pytest (os diretórios velhos de /dev/shm do nó são de outro agente).
+# AMBIENTE (selftest e rodada manual): MBP_CITY, HZN_RUN (mbp-run.sh), HZN_WA_REPO, HZN_MAIL_CMD (padrão `gc mail send mayor`), HZN_TIMEOUT_S (7200: o orçamento do script todo), HZN_MIN_TOTAL (1000),
 #   HZN_NODE_HOST (hetzner-teste; é também o que o mbp-run recebe como HETZNER_NODE_HOST: instalar e rodar no MESMO nó), HZN_SSH (ssh), HZN_NO_FETCH=1 (não buscar o origin),
-#   HZN_KEEP_DAYS (14; a linha de base last-complete.* não entra na limpeza).
+#   HZN_KEEP_DAYS (14; a linha de base last-complete.* não entra na limpeza), HZN_BATCH_DEFS (8000: `def test_` por lote), HZN_BATCH_TIMEOUT_S (2400: prazo de UM lote),
+#   HZN_MIN_BATCH_S (180: com menos orçamento que isto o lote nem começa), HZN_FINAL_MARGIN_S (300: o que fica para o relatório), HZN_BATCH_TRIES (2) e HZN_RETRY_S (90) para o que é transitório
+#   (teto/MemAvailable inerte, sem slot, ssh/rsync caído).
 set -uo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 CITY=${MBP_CITY:-${GC_CITY_PATH:-/Users/athos/gt/.gascity-gastown-hq}}
@@ -45,10 +56,11 @@ cleanup() { [ -z "$SCR" ] || find "$SCR" -mindepth 1 -delete 2>/dev/null; [ -z "
 trap cleanup EXIT
 mkdir -p "$LOGDIR" 2>/dev/null || { say "FALHOU — não consegui criar $LOGDIR"; exit 1; }
 
-SHA="?"; ISO_LINE=""; EGRESS="?"; MAILRC=0; FETCHST="?"; CMPST="-"; STALE_NOTE=""; DEPLOY=""
+SHA="?"; ISO_LINE=""; EGRESS="?"; MAILRC=0; FETCHST="?"; CMPST="-"; STALE_NOTE=""; DEPLOY=""; NB=0; NRAN=0; NSKIP=0
 jline() { # veredito motivo — a linha do jsonl desta noite (também a das noites PULADAS por lock: uma por noite)
   jq -cn --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" --arg v "$1" --arg why "$2" --arg sha "$SHA" --arg iso "$ISO_LINE" --arg egress "$EGRESS" --arg fetch "$FETCHST" --arg cmp "$CMPST" \
-     --argjson wall "$(( $(date +%s) - T0 ))" --argjson mailrc "$MAILRC" '{ts:$ts,verdict:$v,reason:$why,sha:$sha,isolation:$iso,egress_attempts:$egress,fetch:$fetch,compare:$cmp,wall_s:$wall,mail_failed:$mailrc}' >> "$JSONL" 2>/dev/null \
+     --argjson wall "$(( $(date +%s) - T0 ))" --argjson mailrc "$MAILRC" --argjson nb "$NB" --argjson nr "$NRAN" --argjson ns "$NSKIP" \
+     '{ts:$ts,verdict:$v,reason:$why,sha:$sha,isolation:$iso,egress_attempts:$egress,fetch:$fetch,compare:$cmp,wall_s:$wall,mail_failed:$mailrc,batches:$nb,batches_ran:$nr,batches_skipped:$ns}' >> "$JSONL" 2>/dev/null \
      || say "WARN: não gravei $JSONL"
 }
 finish() { # veredito motivo [exit] — grava o relatório, o jsonl, manda o e-mail (salvo PULADO) e sai
@@ -112,68 +124,210 @@ for f in hetzner-iso-run.sh:gt-iso-run gtn_stable_ids.py:gtn_stable_ids.py; do
   fi
 done
 
-say "rodando a suíte do WA @$SHA em $NODE (prazo ${TIMEOUT_S}s)"
-HETZNER_ISOLATE=1 HETZNER_NODE_HOST="$NODE" MBP_RUN_TIMEOUT_S="$TIMEOUT_S" "$RUN" --host linux --repo wa --dir "$SCR/whatsapp_automation" -- tests/ -n 14 -p gtn_stable_ids --timeout=300 -q -rfE --tb=line --continue-on-collection-errors > "$OUT" 2>&1
-RC=$?
-WALL=$(( $(date +%s) - T0 ))
-# vazio (nenhuma linha GTN-ISO) → a prova NÃO existe; falhou/ilegível → mesma coisa. Só uma linha que COMEÇA com "isolado" vale como prova.
-ISO_LINE=$(sed -n 's/^GTN-ISO: //p' "$OUT" 2>/dev/null | head -n 1)
-# vazio/ilegível (sem a linha GTN-EGRESS, ou `?`) → "?" no relatório: não afirmo zero tentativas sem ter lido o contador
-EGRESS=$(sed -n 's/^GTN-EGRESS: attempts=//p' "$OUT" 2>/dev/null | tail -n 1); [ -n "$EGRESS" ] || EGRESS="?"
-# vazio/ilegível (saída vazia ou sem leitura) → o motivo do FALHOU sai sem a última linha da saída; o veredito não muda
-TAIL3=$(grep . "$OUT" 2>/dev/null | tail -n 3 | cut -c1-200)
+# ── constantes: inteiro ou nada (vazio/ilegível → FALHOU, nunca um padrão escolhido por mim às cegas) ─────────────────────────────────────────────────────────────────────────────────────
+BATCH_DEFS=${HZN_BATCH_DEFS:-8000}; BATCH_T=${HZN_BATCH_TIMEOUT_S:-2400}; MIN_BATCH=${HZN_MIN_BATCH_S:-180}; MARGIN=${HZN_FINAL_MARGIN_S:-300}
+TRIES=${HZN_BATCH_TRIES:-2}; RETRY_S=${HZN_RETRY_S:-90}; ARGS_MAX=${HZN_BATCH_ARGS_MAX:-60000}
+for v in TIMEOUT_S MIN_TOTAL BATCH_DEFS BATCH_T MIN_BATCH MARGIN TRIES RETRY_S ARGS_MAX; do
+  x=${!v}; case "$x" in ''|*[!0-9]*) finish FALHOU "constante inválida: $v='$x' (precisa ser inteiro >= 0); nada rodou" 1 ;; esac
+done
+for v in BATCH_DEFS BATCH_T TRIES ARGS_MAX; do x=${!v}; [ "$x" -ge 1 ] || finish FALHOU "constante inválida: $v=$x (precisa ser >= 1); nada rodou" 1; done
 
-case "$RC" in
-  99) finish PULADO "nó Linux desligado (falta $CITY/.gc/hetzner-node.on)" 0 ;;
-  96|97|98)
-    case "$ISO_LINE" in
-      inerte*) { echo "# Hetzner nightly $DAY — INERTE (nada rodou)"; echo; echo "Isolamento de rede NÃO provado: \`GTN-ISO: $ISO_LINE\`"; echo "Sem essa prova a suíte não roda (04/10: um teste mandou e-mail de verdade)."; echo "Instalar o helper de root: docs/runbooks/hetzner-nightly-tests.md, seção Instalação."; echo; echo "origin/main @$SHA"; [ -z "$STALE_NOTE" ] || echo "ATENÇÃO: $STALE_NOTE"; } > "$REPORT"
-        finish INERTE "isolamento não provado ($ISO_LINE)" 0 ;;
-      nao-isolado*) { echo "# Hetzner nightly $DAY — FALHOU: VAZAMENTO DE REDE MEDIDO (nada rodou)"; echo; echo "A sonda do canário SAIU pela rede (ou achou interface/segredo): \`GTN-ISO: $ISO_LINE\`"; echo "Não é \"falta instalar\": o isolamento existe e NÃO segura. A suíte não rodou. Não reative a bateria antes de entender o que vazou (runbook, seção Vazamento medido)."; echo; echo "origin/main @$SHA"; } > "$REPORT"
-        finish FALHOU "VAZAMENTO MEDIDO: o canário saiu pela rede ($ISO_LINE); a suíte não rodou" 1 ;;
-      *) finish FALHOU "o mbp-run não rodou a suíte (rc=$RC): $(printf '%s' "$TAIL3" | tail -n 1)" 1 ;;
-    esac ;;
-  124) finish FALHOU "estourou o prazo de ${TIMEOUT_S}s (meta: menos de 2 h)" 1 ;;
-  0|1) ;;
-  *) finish FALHOU "o pytest abortou (rc=$RC): $(printf '%s' "$TAIL3" | tail -n 1)" 1 ;;
-esac
+# ── os lotes ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+# Lista: os test_*.py / *_test.py de tests/ DA ÁRVORE QUE VAI AO NÓ (o git archive acima), em ordem de caminho (LC_ALL=C), menos as pastas que o pytest.ini manda ignorar (norecursedirs: os
+# padrões do pytest + crew + archive). A poda é nossa porque o pytest só aplica norecursedirs ao DESCER numa pasta: arquivo passado pelo nome é coletado de qualquer jeito. Mesmo escopo da noite
+# única de antes (`tests/`); lib/predictive_dialer, processo_lookup/tests e experiments/code_mode/tests do testpaths nunca estiveram nesta bateria.
+# vazio (nenhum arquivo) / falhou (find, pesagem) / nome fora de [A-Za-z0-9_./-] (não passa seguro na linha de comando do ssh) → FALHOU: lote que cala sobre arquivo que não pôde rodar é verde falso.
+TREE="$SCR/whatsapp_automation"; FILES="$SCR/files.lst"; WGT="$SCR/weights.lst"
+[ -d "$TREE/tests" ] || finish FALHOU "a árvore de origin/main@$SHA não tem tests/: nada a rodar" 1
+( cd "$TREE" && find tests -type d \( -name '.*' -o -name crew -o -name archive -o -name '*.egg' -o -name _darcs -o -name build -o -name CVS -o -name dist -o -name node_modules -o -name venv -o -name '{arch}' \) -prune \
+    -o -type f \( -name 'test_*.py' -o -name '*_test.py' \) -print ) 2>/dev/null | LC_ALL=C sort > "$FILES"
+NFILES=$(wc -l < "$FILES" | tr -d ' ')
+[ "$NFILES" -ge 1 ] || finish FALHOU "nenhum arquivo test_*.py/*_test.py em tests/ de origin/main@$SHA: nada a rodar" 1
+BADNAME=$(LC_ALL=C grep -cvE '^[A-Za-z0-9_./-]+$' "$FILES"); [ "${BADNAME:-0}" -eq 0 ] || finish FALHOU "$BADNAME arquivo(s) de teste com nome fora de [A-Za-z0-9_./-] (primeiro: $(LC_ALL=C grep -vE '^[A-Za-z0-9_./-]+$' "$FILES" | head -n 1)): não passam seguros na linha de comando; nada rodou" 1
+# o peso do arquivo é o nº de `def test_` (mínimo 1): barato, estável e na ordem certa de grandeza do tempo/memória; o nº de lotes SAI da árvore, nunca é fixo
+( cd "$TREE" && tr '\n' '\0' < "$FILES" | xargs -0 grep -c -H -E '^[[:space:]]*(async[[:space:]]+)?def[[:space:]]+test_' ) > "$WGT" 2>/dev/null
+[ "$(wc -l < "$WGT" | tr -d ' ')" -eq "$NFILES" ] || finish FALHOU "não consegui pesar os $NFILES arquivos de teste ($(wc -l < "$WGT" | tr -d ' ') linhas lidas): nada rodou" 1
+LC_ALL=C awk -F: -v max="$BATCH_DEFS" -v amax="$ARGS_MAX" -v dir="$SCR" '
+  { f=$1; d=$2+0; w=(d<1?1:d)
+    if (cnt>0 && (acc+w>max || bytes+length(f)+1>amax)) { meta[b]=cnt" "defs; b++; acc=0; bytes=0; cnt=0; defs=0 }
+    if (b==0) b=1
+    print f > (dir "/batch." b); acc+=w; bytes+=length(f)+1; cnt++; defs+=d }
+  END { if (cnt>0) meta[b]=cnt" "defs; for (i=1;i<=b;i++) print i, meta[i] > (dir "/batch.meta"); }' "$WGT"
+NB=$(wc -l < "$SCR/batch.meta" 2>/dev/null | tr -d ' ')
+case "$NB" in ''|0|*[!0-9]*) finish FALHOU "não montei os lotes ($NFILES arquivos pesados): nada rodou" 1 ;; esac
+NDEFS=$(awk '{s+=$3} END{print s+0}' "$SCR/batch.meta")
 
-# sem prova de isolamento o resultado NÃO é divulgado como rodada (pode ter rodado sem o wrapper: o aviso é alto)
-case "$ISO_LINE" in isolado*) ;; *) finish FALHOU "ATENÇÃO: a suíte terminou SEM a linha de prova do isolamento (GTN-ISO: '${ISO_LINE:-vazio}'); resultado descartado, confira o hook HETZNER_ISOLATE do mbp-run.sh" 1 ;; esac
+# ── a rodada ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+# O orçamento é do SCRIPT: DEADLINE = T0 + TIMEOUT_S − margem do relatório. Cada lote recebe min(o que resta, HZN_BATCH_TIMEOUT_S); com menos que HZN_MIN_BATCH_S ele nem começa.
+# Estado de um lote (B_ST): ran | nao-rodou | retry-cap | retry-mbp | inerte-iso | vazamento | sem-prova | pulado — só `ran` entra na soma; o resto é "NÃO RODOU" no relatório.
+rm -f "$LOGDIR/$DAY".b*.out 2>/dev/null; : > "$OUT"
+TABLE="$SCR/table.md"; : > "$TABLE"; : > "$SCR/ids.all"
+DEADLINE=$(( T0 + TIMEOUT_S - MARGIN ))
+NRAN=0; NSKIP=0; SKIPLIST=""; TP=0; TF=0; TE=0; TS=0; TXF=0; TXP=0; LISTOK=1; LISTWHY=""; PYSECS=0; PYUNK=0; EGSUM=0; EGUNK=0; EGSEEN=0; FIRSTCAP=""
+say "rodando a suíte do WA @$SHA em $NODE: $NFILES arquivos, $NDEFS def test_, $NB lotes de ~$BATCH_DEFS (orçamento $(( DEADLINE - $(date +%s) ))s de ${TIMEOUT_S}s)"
 
-# vazio (a categoria não aparece na linha) → 0, o pytest omite o que é zero; falhou/ilegível (nenhuma linha de resumo "... in N s") → FALHOU, nenhum número é inventado
-SUM=$(grep -E '^(=+ )?([0-9]+ [a-z]+.*|no tests ran) in [0-9.]+s' "$OUT" 2>/dev/null | tail -n 1)
-[ -n "$SUM" ] || finish FALHOU "sem linha de resumo do pytest na saída (rc=$RC): $(printf '%s' "$TAIL3" | tail -n 1)" 1
+tail1() { grep . "$1" 2>/dev/null | tail -n 1 | cut -c1-200; }
 cnt() { printf '%s' "$SUM" | sed -n -E "s/.*[^0-9]([0-9]+) $1.*/\1/p;s/^([0-9]+) $1.*/\1/p" | head -n 1; }
-PASSED=$(cnt passed); FAILED=$(cnt failed); ERRORS=$(cnt 'errors?'); SKIPPED=$(cnt skipped); XF=$(cnt xfailed); XP=$(cnt xpassed)
-PASSED=${PASSED:-0}; FAILED=${FAILED:-0}; ERRORS=${ERRORS:-0}; SKIPPED=${SKIPPED:-0}; XF=${XF:-0}; XP=${XP:-0}
-TOTAL=$(( PASSED + FAILED + ERRORS + SKIPPED + XF + XP ))
-# vazio/ilegível (a linha de resumo não traz "in N.NNs") → PYSECS vazio: o relatório mostra "?" (não 0h0min) e a meta de 2 h é medida pelo relógio total
-PYSECS=$(printf '%s' "$SUM" | sed -n -E 's/.* in ([0-9]+)\.[0-9]+s.*/\1/p')
-[ "$TOTAL" -ge "$MIN_TOTAL" ] || finish FALHOU "total implausível ($TOTAL testes < $MIN_TOTAL; resumo: $SUM)" 1
+classify() { # saída-do-lote rc → B_ST B_WHY B_ISO B_CAP B_SUM (vazio/ilegível em qualquer leitura → nunca `ran`)
+  local f=$1 rc=$2 t1 mk
+  B_ISO=$(sed -n 's/^GTN-ISO: //p' "$f" 2>/dev/null | head -n 1)   # só uma linha que COMEÇA com "isolado" vale como prova de isolamento
+  B_CAP=$(sed -n 's/^GTN-CAP: //p' "$f" 2>/dev/null | head -n 1)   # só `MemoryMax=… MemorySwapMax=0 …` vale como prova do teto de memória
+  B_SUM=""; B_ST=nao-rodou; B_WHY=""; t1=$(tail1 "$f")
+  case "$rc" in
+    99) B_ST=pulado; B_WHY="nó Linux desligado (falta $CITY/.gc/hetzner-node.on)"; return ;;
+    96|97|98)
+      case "$B_ISO" in
+        nao-isolado*) B_ST=vazamento; B_WHY="o canário SAIU pela rede: GTN-ISO: $B_ISO"; return ;;
+        inerte*) B_ST=inerte-iso; B_WHY="isolamento de rede NÃO provado: GTN-ISO: $B_ISO"; return ;;
+      esac
+      case "$B_CAP" in
+        inerte*) B_ST=retry-cap; B_WHY="teto de memória NÃO provado no nó: GTN-CAP: $B_CAP" ;;
+        *) B_ST=retry-mbp; B_WHY="o mbp-run não rodou a suíte (rc=$rc): $t1" ;;
+      esac
+      return ;;
+    124) B_WHY="estourou o prazo do lote (${bt}s)"; return ;;
+    0|1) ;;
+    *) if [ "$rc" -ge 128 ]; then B_WHY="o pytest foi MORTO (rc=$rc; com o teto de memória é o OOM do cgroup: o lote é pesado demais para o MemAvailable de hoje): $t1"
+       else B_WHY="o pytest abortou (rc=$rc): $t1"; fi
+       return ;;
+  esac
+  case "$B_ISO" in isolado*) ;; *) B_ST=sem-prova; B_WHY="ATENÇÃO: o lote terminou SEM a linha de prova do isolamento (GTN-ISO: '${B_ISO:-vazio}'); resultado descartado, confira o hook HETZNER_ISOLATE do mbp-run.sh"; return ;; esac
+  case "$B_CAP" in MemoryMax=*MemorySwapMax=0*) ;; *) B_ST=sem-prova; B_WHY="ATENÇÃO: o lote terminou SEM a linha de prova do teto de memória (GTN-CAP: '${B_CAP:-vazio}'); resultado descartado, confira se o gt-iso-run instalado no nó é o do repo"; return ;; esac
+  mk=$(grep -E -m 1 "worker '[^']*' crashed|maximum crashed workers reached|^node down:|Not properly terminated" "$f" 2>/dev/null | cut -c1-160)
+  if [ -n "$mk" ]; then B_WHY="worker do xdist caiu (com o teto de memória, em geral o OOM do cgroup; o resultado do lote não é confiável): $mk"; return; fi
+  B_SUM=$(grep -E '^(=+ )?([0-9]+ [a-z]+.*|no tests ran) in [0-9.]+s' "$f" 2>/dev/null | tail -n 1)
+  if [ -z "$B_SUM" ]; then B_WHY="sem linha de resumo do pytest (rc=$rc): $t1"; return; fi
+  B_ST=ran
+}
+agg_batch() { # nn → soma os números do lote e confere a lista de ids dele (vazio → 0, o pytest omite o que é zero; inconsistente → LISTOK=0)
+  local f=$1 nn=$2 nids nsent sl sn sr w="" py
+  SUM=$B_SUM
+  PASSED=$(cnt passed); FAILED=$(cnt failed); ERRORS=$(cnt 'errors?'); SKIPPED=$(cnt skipped); XF=$(cnt xfailed); XP=$(cnt xpassed)
+  PASSED=${PASSED:-0}; FAILED=${FAILED:-0}; ERRORS=${ERRORS:-0}; SKIPPED=${SKIPPED:-0}; XF=${XF:-0}; XP=${XP:-0}
+  TP=$(( TP + PASSED )); TF=$(( TF + FAILED )); TE=$(( TE + ERRORS )); TS=$(( TS + SKIPPED )); TXF=$(( TXF + XF )); TXP=$(( TXP + XP ))
+  py=$(printf '%s' "$SUM" | sed -n -E 's/.* in ([0-9]+)\.[0-9]+s.*/\1/p')
+  if [ -n "$py" ]; then PYSECS=$(( PYSECS + py )); else PYUNK=1; fi
+  # ids do PLUGIN (gtn_stable_ids.py): `GTN-FAIL: <id em JSON>` por id e uma `GTN-FAILED: n=<ids> reports=<falhas+erros>`; nunca da linha humana `FAILED <id> - <msg>` (o id pode ter " - ")
+  LC_ALL=C sed -n 's/^GTN-FAIL: //p' "$f" 2>/dev/null | LC_ALL=C sort -u > "$SCR/ids.b"
+  nids=$(wc -l < "$SCR/ids.b" | tr -d ' ')
+  nsent=$(LC_ALL=C grep -c '^GTN-FAILED: ' "$f" 2>/dev/null); nsent=${nsent:-0}
+  sl=$(LC_ALL=C sed -n 's/^GTN-FAILED: //p' "$f" 2>/dev/null | head -n 1)
+  sn=$(printf '%s' "$sl" | sed -n -E 's/^n=([0-9]+) reports=([0-9]+)$/\1/p'); sr=$(printf '%s' "$sl" | sed -n -E 's/^n=([0-9]+) reports=([0-9]+)$/\2/p')
+  if [ "$nsent" -eq 0 ]; then w="o pytest não imprimiu a linha GTN-FAILED (o plugin gtn_stable_ids não rodou ou falhou ao montar a lista)"
+  elif [ "$nsent" -gt 1 ]; then w="a linha GTN-FAILED aparece $nsent vezes"
+  elif [ -z "$sn" ] || [ -z "$sr" ]; then w="a linha GTN-FAILED está ilegível ($sl)"
+  elif ! jq -en '[inputs | type == "string"] | all' "$SCR/ids.b" >/dev/null 2>&1; then w="há linha GTN-FAIL que não é um id em JSON"
+  elif [ "$nids" -ne "$sn" ]; then w="o plugin diz $sn ids e $nids foram lidos (lista parcial)"
+  elif [ "$sr" -ne $(( FAILED + ERRORS )) ]; then w="o plugin contou $sr falhas/erros e o resumo do pytest diz $((FAILED + ERRORS))"; fi
+  if [ -n "$w" ]; then LISTOK=0; [ -n "$LISTWHY" ] || LISTWHY="lote $nn: $w"; fi
+  cat "$SCR/ids.b" >> "$SCR/ids.all"
+}
+emit_table() {
+  echo "| lote | arquivos | def test_ | workers | s | situação | detalhe |"; echo "|---|---|---|---|---|---|---|"; cat "$TABLE"
+}
 
-# ids reprovados desta noite, do PLUGIN (gtn_stable_ids.py): uma linha `GTN-FAIL: <id em JSON>` por id e uma `GTN-FAILED: n=<ids> reports=<falhas+erros>`. Nunca da linha humana
-# `FAILED <id> - <msg>`: o id de parametrize pode ter " - ", e cortar no primeiro juntava irmãos numa linha só (gate 1 do ga-9p6pte, com o pytest 9 + xdist de verdade).
-# vazio (n=0 reports=0 e o resumo também diz zero) → "zero falhas", baseline vazia; falhou/ilegível — sem a linha GTN-FAILED, mais de uma, ilegível, linha GTN-FAIL que não é JSON, `n` diferente das
-# linhas lidas (lista parcial) ou `reports` diferente de falhas+erros do resumo — → LISTOK=0: comparação INDISPONÍVEL e a linha de base fica como estava. Nunca "0 novas" por falta de leitura.
-CUR="$LOGDIR/$DAY.failed"
-LC_ALL=C sed -n 's/^GTN-FAIL: //p' "$OUT" 2>/dev/null | LC_ALL=C sort -u > "$CUR"
+i=0
+while [ "$i" -lt "$NB" ]; do
+  i=$((i+1)); nn=$(printf '%02d' "$i")
+  BOUT="$LOGDIR/$DAY.b$nn.out"; : > "$BOUT"; BSEC=0; tries=0; bt=0; LASTWHY=""
+  meta=$(awk -v b="$i" '$1==b{print $2" "$3}' "$SCR/batch.meta"); nf=${meta%% *}; nd=${meta##* }
+  BF=(); while IFS= read -r l; do BF[${#BF[@]}]=$l; done < "$SCR/batch.$i"
+  B_ST=nao-rodou; B_WHY=""; B_ISO=""; B_CAP=""; B_SUM=""
+  while :; do
+    tries=$((tries+1))
+    left=$(( DEADLINE - $(date +%s) ))
+    if [ "$left" -lt "$MIN_BATCH" ]; then
+      B_ST=nao-rodou; B_WHY="orçamento esgotado: restam ${left}s (< ${MIN_BATCH}s) e o lote não começou${LASTWHY:+ (antes: $LASTWHY)}"; break
+    fi
+    bt=$BATCH_T; [ "$left" -ge "$bt" ] || bt=$left
+    say "lote $nn/$NB: $nf arquivos, $nd def test_, prazo ${bt}s (restam ${left}s do orçamento)${LASTWHY:+; tentativa $tries}"
+    t1=$(date +%s)
+    HETZNER_ISOLATE=1 HETZNER_NODE_HOST="$NODE" MBP_RUN_TIMEOUT_S="$bt" "$RUN" --host linux --repo wa --dir "$TREE" -- "${BF[@]}" -n auto -p gtn_stable_ids --timeout=300 -q -rfE --tb=line --continue-on-collection-errors > "$BOUT" 2>&1
+    RC=$?
+    BSEC=$(( $(date +%s) - t1 ))
+    classify "$BOUT" "$RC"
+    case "$B_ST" in
+      retry-*) # transitório (teto/MemAvailable inerte, sem slot, ssh/rsync caído): tenta de novo se ainda couber no orçamento
+        if [ "$tries" -lt "$TRIES" ] && [ $(( DEADLINE - $(date +%s) )) -gt $(( RETRY_S + MIN_BATCH )) ]; then LASTWHY=$B_WHY; say "lote $nn: $B_WHY; nova tentativa em ${RETRY_S}s"; sleep "$RETRY_S"; continue; fi
+        B_WHY="$B_WHY (após $tries tentativa(s))"; break ;;
+      *) break ;;
+    esac
+  done
+  if [ "$B_ST" = pulado ]; then   # bandeira do nó desligada: no 1º lote é PULADO (nada rodou, sem e-mail); no meio da rodada o lote simplesmente NÃO RODOU
+    [ "$i" -ne 1 ] || finish PULADO "nó Linux desligado (falta $CITY/.gc/hetzner-node.on)" 0
+    B_ST=nao-rodou; B_WHY="o nó foi desligado no meio da rodada: $B_WHY"
+  fi
+  { echo "=== lote $nn: $nf arquivos, $nd def test_, ${BSEC}s, $B_ST ==="; cat "$BOUT"; echo; } >> "$OUT"
+  WK=$(printf '%s' "$B_CAP" | sed -n -E 's/.*workers=([0-9]+).*/\1/p'); WK=${WK:-?}
+  [ -n "$FIRSTCAP" ] || FIRSTCAP=$B_CAP
+  [ -n "${ISO_LINE:-}" ] || ISO_LINE=$B_ISO
+  # o contador do nft de cada lote que o imprimiu soma no total; lote que RODOU sem ler o contador torna o total "?" (não afirmo zero sem ter lido)
+  eg=$(sed -n 's/^GTN-EGRESS: attempts=//p' "$BOUT" 2>/dev/null | tail -n 1)
+  case "$eg" in ''|*[!0-9]*) [ "$B_ST" != ran ] || EGUNK=1 ;; *) EGSUM=$(( EGSUM + eg )); EGSEEN=1 ;; esac
+  if [ "$EGUNK" = 0 ] && [ "$EGSEEN" = 1 ]; then EGRESS=$EGSUM; else EGRESS="?"; fi
+  case "$B_ST" in ran) ROW_S="rodou" ;; *) ROW_S="NÃO RODOU" ;; esac
+  printf '| %s | %s | %s | %s | %s | %s | %s |\n' "$nn" "$nf" "$nd" "$WK" "$BSEC" "$ROW_S" "$(printf '%s' "${B_WHY:--}" | tr '|\n' '/ ')" >> "$TABLE"
+  WALL=$(( $(date +%s) - T0 ))
+  case "$B_ST" in
+    vazamento)
+      { echo "# Hetzner nightly $DAY — FALHOU: VAZAMENTO DE REDE MEDIDO (lote $nn de $NB; os lotes seguintes NÃO rodaram)"; echo
+        echo "A sonda do canário SAIU pela rede (ou achou interface/segredo): \`GTN-ISO: $B_ISO\`"
+        echo "Não é \"falta instalar\": o isolamento existe e NÃO segura. Não reative a bateria antes de entender o que vazou (runbook, seção Vazamento medido)."
+        echo; echo "origin/main @$SHA"; echo; emit_table; } > "$REPORT"
+      finish FALHOU "VAZAMENTO MEDIDO: o canário saiu pela rede ($B_ISO) no lote $nn; a suíte não terminou" 1 ;;
+    sem-prova)
+      { echo "# Hetzner nightly $DAY — FALHOU: lote $nn sem prova (os lotes seguintes NÃO rodaram)"; echo; echo "$B_WHY"; echo; echo "origin/main @$SHA"; echo; emit_table; } > "$REPORT"
+      finish FALHOU "$B_WHY" 1 ;;
+    inerte-iso)
+      if [ "$i" -eq 1 ]; then
+        { echo "# Hetzner nightly $DAY — INERTE (nada rodou)"; echo; echo "Isolamento de rede NÃO provado: \`GTN-ISO: $B_ISO\`"; echo "Sem essa prova a suíte não roda (04/10: um teste mandou e-mail de verdade)."; echo "Instalar o helper de root: docs/runbooks/hetzner-nightly-tests.md, seção Instalação."; echo; echo "origin/main @$SHA"; [ -z "$STALE_NOTE" ] || echo "ATENÇÃO: $STALE_NOTE"; } > "$REPORT"
+        finish INERTE "isolamento não provado ($B_ISO)" 0
+      fi
+      B_ST=nao-rodou ;;
+    retry-cap)
+      if [ "$i" -eq 1 ]; then
+        { echo "# Hetzner nightly $DAY — INERTE (nada rodou)"; echo; echo "Teto de memória NÃO provado no nó: \`GTN-CAP: $B_CAP\` (${tries} tentativa(s))"
+          echo "Sem ler o MemAvailable e sem provar o \`systemd-run --user --scope -p MemoryMax=…\` a suíte não roda: foi a falta desse teto que deu o OOM (rc=137) de 13, 14 e 15/11 (ga-84gkpab)."
+          echo "Ver docs/runbooks/hetzner-nightly-tests.md, seção Teto de memória."; echo; echo "origin/main @$SHA"; [ -z "$STALE_NOTE" ] || echo "ATENÇÃO: $STALE_NOTE"; } > "$REPORT"
+        finish INERTE "teto de memória não provado no nó (GTN-CAP: $B_CAP)" 0
+      fi
+      B_ST=nao-rodou ;;
+    retry-mbp)
+      [ "$i" -ne 1 ] || finish FALHOU "$B_WHY" 1
+      B_ST=nao-rodou ;;
+  esac
+  if [ "$B_ST" = ran ]; then NRAN=$(( NRAN + 1 )); agg_batch "$BOUT" "$nn"
+  else NSKIP=$(( NSKIP + 1 )); SKIPLIST="$SKIPLIST${SKIPLIST:+, }$nn"; say "lote $nn NÃO RODOU: $B_WHY"; fi
+done
+WALL=$(( $(date +%s) - T0 ))
+TOTAL=$(( TP + TF + TE + TS + TXF + TXP ))
+PASSED=$TP; FAILED=$TF; ERRORS=$TE; SKIPPED=$TS; XF=$TXF; XP=$TXP
+DUR="?"; [ "$PYUNK" = 0 ] || PYSECS=""; [ -z "$PYSECS" ] || DUR="$(( PYSECS / 3600 ))h$(( (PYSECS % 3600) / 60 ))min"
+EGLINE="$EGRESS tentativa(s) de saída barradas pelo nft"
+case "$EGRESS" in 0) EGLINE="0 tentativas de saída (contador do nft lido em todos os lotes que rodaram)" ;; '?') EGLINE="contador do nft ILEGÍVEL em algum lote — não afirmo zero tentativas" ;; esac
+CUR="$LOGDIR/$DAY.failed"; LC_ALL=C sort -u "$SCR/ids.all" > "$CUR"
+
+# algum lote não rodou → FALHOU: sem total confiável, sem comparação, sem avançar a linha de base (a lista de falhas dos que rodaram fica em $CUR, só para leitura)
+if [ "$NSKIP" -gt 0 ]; then
+  { echo "# Hetzner nightly $DAY — FALHOU: $NSKIP de $NB lotes NÃO RODARAM"; echo
+    echo "- origin/main @$SHA, nó $NODE, $NFILES arquivos de tests/ ($NDEFS def test_) em $NB lotes de ~$BATCH_DEFS"
+    [ -z "$STALE_NOTE" ] || echo "- ATENÇÃO: $STALE_NOTE"
+    echo "- instalado no nó: $DEPLOY"
+    echo "- lotes que NÃO rodaram: $SKIPLIST (motivo na tabela). Sem eles a suíte NÃO foi completa: não há veredito verde, não há comparação com a noite anterior e a linha de base não foi tocada"
+    echo "- só dos $NRAN lotes que rodaram (parcial, NÃO é o total da suíte): $TOTAL testes ($PASSED passaram, $FAILED falharam, $ERRORS erros, $SKIPPED pulados, $XF xfail, $XP xpass); relógio total ${WALL} s"
+    echo "- isolamento: \`GTN-ISO: ${ISO_LINE:-vazio}\`; teto: \`GTN-CAP: ${FIRSTCAP:-vazio}\`; $EGLINE"
+    echo; emit_table; echo
+    echo "Saída por lote: $LOGDIR/$DAY.bNN.out; junta: $OUT; ids reprovados dos lotes que rodaram (um JSON por linha; \`jq -r .\` para ler): $CUR"; } > "$REPORT"
+  finish FALHOU "$NSKIP de $NB lotes NÃO RODARAM ($SKIPLIST); parcial dos $NRAN que rodaram: $TOTAL testes, $FAILED falhas, $ERRORS erros" 1
+fi
+case "$ISO_LINE" in isolado*) ;; *) finish FALHOU "ATENÇÃO: nenhum lote trouxe a linha de prova do isolamento (GTN-ISO: '${ISO_LINE:-vazio}'); resultado descartado" 1 ;; esac
+[ "$TOTAL" -ge "$MIN_TOTAL" ] || finish FALHOU "total implausível ($TOTAL testes < $MIN_TOTAL em $NB lotes)" 1
+
+# comparação com a última noite COMPLETA. vazio (arquivo existe e está vazio) → toda falha de hoje é nova; ausente → 1ª rodada; falhou/ilegível (existe e não abre/ordena, lista inconsistente) → "comparação
+# INDISPONÍVEL", NUNCA "0 novas", e a linha de base fica como estava.
 NIDS=$(wc -l < "$CUR" | tr -d ' ')
-NSENT=$(LC_ALL=C grep -c '^GTN-FAILED: ' "$OUT" 2>/dev/null); NSENT=${NSENT:-0}
-SL=$(LC_ALL=C sed -n 's/^GTN-FAILED: //p' "$OUT" 2>/dev/null | head -n 1)
-SN=$(printf '%s' "$SL" | sed -n -E 's/^n=([0-9]+) reports=([0-9]+)$/\1/p'); SR=$(printf '%s' "$SL" | sed -n -E 's/^n=([0-9]+) reports=([0-9]+)$/\2/p')
-LISTOK=0
-if [ "$NSENT" -eq 0 ]; then LISTWHY="o pytest não imprimiu a linha GTN-FAILED (o plugin gtn_stable_ids não rodou ou falhou ao montar a lista)"
-elif [ "$NSENT" -gt 1 ]; then LISTWHY="a linha GTN-FAILED aparece $NSENT vezes"
-elif [ -z "$SN" ] || [ -z "$SR" ]; then LISTWHY="a linha GTN-FAILED está ilegível ($SL)"
-elif ! jq -en '[inputs | type == "string"] | all' "$CUR" >/dev/null 2>&1; then LISTWHY="há linha GTN-FAIL que não é um id em JSON"
-elif [ "$NIDS" -ne "$SN" ]; then LISTWHY="o plugin diz $SN ids e $NIDS foram lidos (lista parcial)"
-elif [ "$SR" -ne $(( FAILED + ERRORS )) ]; then LISTWHY="o plugin contou $SR falhas/erros e o resumo do pytest diz $((FAILED + ERRORS))"
-else LISTOK=1; fi
 PREV="$LOGDIR/last-complete.failed"; PMETA="$LOGDIR/last-complete.meta"
-# vazio (o arquivo existe e está vazio) → a última noite COMPLETA não teve falha, toda falha de hoje é nova; ausente → 1ª rodada, nada a comparar;
-# falhou/ilegível (existe e não abre/ordena) → "comparação indisponível", NUNCA "0 novas"
-CMP="primeira rodada completa: não há noite anterior para comparar; as $(wc -l < "$CUR" | tr -d ' ') falhas de hoje viram a linha de base"
+CMP="primeira rodada completa: não há noite anterior para comparar; as $NIDS falhas de hoje viram a linha de base"
 NEW="$LOGDIR/$DAY.new"; : > "$NEW"; NEWTXT="sem comparação"
 if [ "$LISTOK" = 0 ]; then CMP="comparação INDISPONÍVEL: $LISTWHY (a linha de base não foi tocada)"; CMPST=indisponivel
 elif [ -e "$PREV" ]; then
@@ -185,24 +339,22 @@ elif [ -e "$PREV" ]; then
   else CMP="comparação INDISPONÍVEL: $PREV existe e não pôde ser lido como lista de ids em JSON (as falhas de hoje estão em $CUR)"; CMPST=indisponivel; fi
 else NEWTXT="primeira rodada"; CMPST=ok
 fi
-DUR="?"; [ -z "$PYSECS" ] || DUR="$(( PYSECS / 3600 ))h$(( (PYSECS % 3600) / 60 ))min"
-GOAL="ATINGIDA"; [ "${PYSECS:-$WALL}" -lt 7200 ] || GOAL="ESTOURADA"
-EGLINE="$EGRESS tentativa(s) de saída barradas pelo nft"
-case "$EGRESS" in 0) EGLINE="0 tentativas de saída (contador do nft lido)" ;; '?') EGLINE="contador do nft ILEGÍVEL — não afirmo zero tentativas" ;; esac
+GOAL="ATINGIDA"; [ "$WALL" -lt 7200 ] || GOAL="ESTOURADA"
 {
   echo "# Hetzner nightly $DAY — COMPLETO"; echo
-  echo "- origin/main @$SHA, nó $NODE, \`pytest tests/ -n 14\`"
+  echo "- origin/main @$SHA, nó $NODE, $NFILES arquivos de tests/ ($NDEFS def test_) em $NB lotes (\`pytest <arquivos do lote> -n auto\`, workers e teto de memória derivados do MemAvailable do nó a cada lote)"
   [ -z "$STALE_NOTE" ] || echo "- ATENÇÃO: $STALE_NOTE"
   echo "- instalado no nó: $DEPLOY"
-  echo "- total: $TOTAL ($PASSED passaram, $FAILED falharam, $ERRORS erros, $SKIPPED pulados, $XF xfail, $XP xpass)"
-  echo "- duração: pytest ${DUR} (${PYSECS:-?} s), relógio total ${WALL} s; meta de 2 h: $GOAL"
+  echo "- total: $TOTAL ($PASSED passaram, $FAILED falharam, $ERRORS erros, $SKIPPED pulados, $XF xfail, $XP xpass); $NRAN de $NB lotes rodaram"
+  echo "- duração: pytest somado ${DUR} (${PYSECS:-?} s), relógio total ${WALL} s; meta de 2 h: $GOAL"
   echo "- $CMP"
-  echo "- isolamento: \`GTN-ISO: $ISO_LINE\`; $EGLINE"
+  echo "- isolamento: \`GTN-ISO: $ISO_LINE\`; teto (lote 01): \`GTN-CAP: $FIRSTCAP\`; $EGLINE"
   if [ -s "$NEW" ]; then echo; echo "Falhas novas (até 30 de $(wc -l < "$NEW" | tr -d ' ')):"; head -n 30 "$NEW" | jq -r . | sed 's/^/  - /'; fi
-  if [ "$LISTOK" = 1 ]; then echo; echo "Saída completa: $OUT; ids reprovados (um JSON por linha; \`jq -r .\` para ler): $CUR"
-  else echo; echo "Saída completa: $OUT; lista de ids NÃO confiável (parcial ou ausente), não use para comparar: $CUR"; fi
+  echo; emit_table
+  if [ "$LISTOK" = 1 ]; then echo; echo "Saída por lote: $LOGDIR/$DAY.bNN.out; junta: $OUT; ids reprovados (um JSON por linha; \`jq -r .\` para ler): $CUR"
+  else echo; echo "Saída por lote: $LOGDIR/$DAY.bNN.out; junta: $OUT; lista de ids NÃO confiável (parcial ou ausente), não use para comparar: $CUR"; fi
 } > "$REPORT"
-# a linha de base só avança numa noite COMPLETA (gravação atômica; nunca com a de uma noite inerte ou que falhou)
+# a linha de base só avança numa noite COMPLETA (gravação atômica; nunca com a de uma noite inerte, que falhou ou em que algum lote não rodou)
 if [ "$LISTOK" = 1 ]; then cp "$CUR" "$PREV.new" && mv -f "$PREV.new" "$PREV" && echo "$DAY @$SHA" > "$PMETA" || say "WARN: não avancei a linha de base ($PREV)"
 else say "WARN: lista de falhas ilegível; a linha de base ($PREV) ficou como estava"; fi
-finish COMPLETO "$TOTAL testes, $FAILED falhas, $ERRORS erros ($NEWTXT), pytest ${DUR}" 0
+finish COMPLETO "$TOTAL testes em $NB lotes, $FAILED falhas, $ERRORS erros ($NEWTXT), pytest ${DUR}" 0

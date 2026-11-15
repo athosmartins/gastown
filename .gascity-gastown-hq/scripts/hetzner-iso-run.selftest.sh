@@ -7,7 +7,10 @@
 # CASOS: canário isolado / vazou (nao-isolado) / sem veredito / sonda com rc≠0 / sem contador / contador zerado / helper que falhou na montagem (98) / helper ausente →
 #   o comando só roda quando o veredito é `isolado` e sai com o rc dele, com o ambiente certo (workers, semente de hash, PYTHONPATH do plugin) · veredito da PRÓPRIA sonda
 #   (TCP, UDP, DNS, interface extra, variável com cara de segredo) com um `socket` de mentira.
-# CONTROLES NEGATIVOS: mutantes W1-W6 (wrapper) e P1-P5 (sonda) têm de ser REPROVADOS pelo caso correspondente (o caso falha no mutante).
+# TETO DE MEMÓRIA E WORKERS (ga-84gkpab): sem GTN_WORKERS os workers saem do MemAvailable lido na hora (teto de 20 GiB, reserva de 6 GiB, nproc−2), o comando roda DENTRO do escopo
+#   systemd-run com MemoryMax e MemorySwapMax=0, e o teto só vale com a prova (o escopo lê o próprio memory.max); MemAvailable ilegível/zero, memória que não cabe um worker, escopo recusado
+#   ou teto que não aparece no cgroup = INERTE (rc 97, o comando NÃO roda). Com GTN_WORKERS (o lastro) nada muda.
+# CONTROLES NEGATIVOS: mutantes W1-W7 (wrapper), P1-P5 (sonda) e C1-C8 (teto/workers) têm de ser REPROVADOS pelo caso correspondente (o caso falha no mutante).
 # O QUE NÃO PROVA: que o helper de root isola de verdade num kernel real. Isso só o canário prova, no nó, depois que o root instalar o helper (`gt-iso-run --canary`).
 set -u
 HERE="$(cd "$(dirname "$0")" && pwd)"
@@ -61,8 +64,24 @@ real = os.listdir
 os.listdir = lambda p: (["lo", "gtn0"] + (["eth0"] if mode == "if" else [])) if p == "/sys/class/net" else real(p)
 exec(compile(open(path).read(), "probe", "exec"), {"__name__": "__main__"})
 EOF
-chmod +x "$T/helper-stub.sh" "$T/bin/sudo"
-export PATH="$T/bin:$PATH" GT_NETNS_HELPER="$T/helper-stub.sh" CALLS HOME="$T/home"
+cat > "$T/bin/nproc" <<'EOF'
+#!/usr/bin/env bash
+[ "${NPROC:-16}" = vazio ] || echo "${NPROC:-16}"
+EOF
+# systemd-run de mentira: `--user --scope --quiet -p MemoryMax=XM -p MemorySwapMax=0 -- cmd`. A prova do teto (o comando que lê memory.max) devolve o valor pedido em bytes (SD_MODE=ok), `max` (nocap) ou nada (empty);
+# `refuse` recusa o escopo; qualquer outro comando é registrado em CALLS (SCOPE: ...) e executado
+cat > "$T/bin/systemd-run" <<'EOF'
+#!/usr/bin/env bash
+mm=""; swap=""
+while [ $# -gt 0 ]; do case "$1" in -p) case "$2" in MemoryMax=*) mm=${2#MemoryMax=} ;; MemorySwapMax=*) swap=${2#MemorySwapMax=} ;; esac; shift 2 ;; --) shift; break ;; *) shift ;; esac; done
+[ "${SD_MODE:-ok}" != refuse ] || { echo "Failed to connect to bus: No medium found" >&2; exit 1; }
+case "$*" in *memory.max*) case "${SD_MODE:-ok}" in ok) echo $(( ${mm%M} * 1048576 )) ;; nocap) echo max ;; empty) ;; esac; exit 0 ;; esac
+printf 'SCOPE: MemoryMax=%s MemorySwapMax=%s\n' "$mm" "$swap" >> "$CALLS"
+exec "$@"
+EOF
+chmod +x "$T/helper-stub.sh" "$T/bin/sudo" "$T/bin/nproc" "$T/bin/systemd-run"
+printf 'MemTotal:       32020516 kB\nMemFree:         1000000 kB\nMemAvailable:   28000000 kB\nSwapTotal:             0 kB\n' > "$T/meminfo"
+export PATH="$T/bin:$PATH" GT_NETNS_HELPER="$T/helper-stub.sh" CALLS HOME="$T/home" GTN_MEMINFO="$T/meminfo"
 n=0; fails=0; BAD=0; QUIET=0
 ck() { local l=$1; shift; [ "$QUIET" = 1 ] || n=$((n+1)); if "$@"; then [ "$QUIET" = 1 ] || echo "ok   $l"; else [ "$QUIET" = 1 ] || { echo "FAIL $l"; fails=$((fails+1)); }; BAD=1; fi; }
 rcis() { [ "$RC" = "$1" ]; }
@@ -81,20 +100,46 @@ case_canary() { local m
   CNT=0 go "$1" --canary; ck "contador zerado: inerte (a regra não viu a sonda)" has "$OUT" '^GTN-ISO: inerte contador-zerado'
   PROBE_MODE=setup go "$1" --canary; ck "helper que não montou o isolamento: inerte" has "$OUT" '^GTN-ISO: inerte sem-veredito rc=98.*setup-falhou:nft'
   GT_NETNS_HELPER="$T/nao-existe" go "$1" --canary; ck "helper ausente: inerte helper-ausente" has "$OUT" '^GTN-ISO: inerte helper-ausente'; ck "helper ausente: rc 97" rcis 97; }
-case_run() { CMD_RC=5 go "$1" -- python -m pytest tests/ -n 14
-  ck "isolado: o comando roda e o rc dele é o do wrapper" rcis 5; ck "isolado: ambiente do comando (workers, semente, plugin)" has "$CALLS" "^CMD: WA_PYTEST_MAX_WORKERS=14 PYTHONHASHSEED=0 PYTHONPATH=$T/home/gt-remote/bin PATH=.* python -m pytest tests/ -n 14$"
+case_run() { CMD_RC=5 go "$1" -- python -m pytest tests/ -n auto
+  ck "isolado: o comando roda e o rc dele é o do wrapper" rcis 5; ck "isolado: ambiente do comando (workers lidos do nó, semente, plugin)" has "$CALLS" "^CMD: WA_PYTEST_MAX_WORKERS=9 PYTHONHASHSEED=0 PYTHONPATH=$T/home/gt-remote/bin PATH=.* python -m pytest tests/ -n auto$"
   ck "isolado: o NODE_PATH do jsdom do nó chega ao comando (ga-yoyyj1)" has "$CALLS" "^CMD: .* NODE_PATH=$T/home/.local/share/cdp-drive/node_modules python -m pytest"
   GTN_WORKERS=4 go "$1" -- true; ck "GTN_WORKERS troca o número de workers" has "$CALLS" 'WA_PYTEST_MAX_WORKERS=4 '
   PROBE_MODE=leak go "$1" -- touch /tmp/NUNCA; ck "vazou: o comando NÃO roda" nocalls; ck "vazou: rc 97" rcis 97
   CNT=0 go "$1" -- true; ck "contador zerado: o comando NÃO roda" nocalls
   GT_NETNS_HELPER="$T/nao-existe" go "$1" -- true; ck "helper ausente: o comando NÃO roda" nocalls
   go "$1"; ck "sem argumentos: rc 97 e uso" rcis 97; go "$1" --; ck "-- sem comando: rc 97" rcis 97; }
+case_cap() {
+  # AUTO (sem GTN_WORKERS): 28000000 kB = 27343 MB − reserva 6144 = 21199 → teto de 20480; (20480 − 4096) / 1800 = 9 workers; nproc 16 → no máximo 14
+  CMD_RC=0 go "$1" -- python -m pytest -n auto
+  ck "AUTO: linha GTN-CAP diz o teto, os workers e o que foi lido" has "$OUT" '^GTN-CAP: MemoryMax=20480M MemorySwapMax=0 workers=9 \(MemAvailable=27343M reserva=6144M base=4096M por-worker=1800M cpus=16\)$'
+  ck "AUTO: o comando roda DENTRO do escopo com o teto e sem swap" has "$CALLS" '^SCOPE: MemoryMax=20480M MemorySwapMax=0$'; ck "AUTO: o escopo vem antes do comando (o comando roda no escopo)" test "$(sed -n 1p "$CALLS")" = "SCOPE: MemoryMax=20480M MemorySwapMax=0"
+  ck "AUTO: o número de workers do comando é o calculado" has "$CALLS" '^CMD: WA_PYTEST_MAX_WORKERS=9 '; ck "AUTO: o canário sai primeiro (a linha GTN-ISO vem antes da GTN-CAP)" test "$(grep -n -E '^GTN-(ISO|CAP):' "$OUT" | cut -d: -f2 | head -n 2 | tr '\n' ' ')" = "GTN-ISO GTN-CAP "
+  # MemAvailable menor: 16000000 kB = 15625 − 6144 = 9481 → 2 workers
+  printf 'MemAvailable:   16000000 kB\n' > "$T/meminfo.b"; GTN_MEMINFO="$T/meminfo.b" go "$1" -- python -m pytest; ck "AUTO com menos memória: teto 9481M e 2 workers" has "$OUT" '^GTN-CAP: MemoryMax=9481M MemorySwapMax=0 workers=2 '; ck "AUTO com menos memória: o comando leva 2" has "$CALLS" '^CMD: WA_PYTEST_MAX_WORKERS=2 '
+  # CPU limita por cima: 4 núcleos → 2 workers (nproc − 2); 3 núcleos → 1
+  NPROC=4 go "$1" -- true; ck "nproc 4: no máximo 2 workers" has "$OUT" 'workers=2 .*cpus=4\)'; NPROC=2 go "$1" -- true; ck "nproc 2: nunca 0 workers (1)" has "$OUT" 'workers=1 '
+  # memória que não cabe nem um worker (base 4096 + 1800 = 5896): 10000000 kB = 9765 − 6144 = 3621
+  printf 'MemAvailable:   10000000 kB\n' > "$T/meminfo.c"; GTN_MEMINFO="$T/meminfo.c" go "$1" -- touch /tmp/NUNCA; ck "memória que não cabe um worker: INERTE rc 97" rcis 97; ck "memória que não cabe um worker: diz o porquê" has "$OUT" '^GTN-CAP: inerte memoria-insuficiente \(MemAvailable=9765M'; ck "memória que não cabe um worker: o comando NÃO roda" nocalls
+  # MemAvailable ilegível: sem a linha / vazio / não numérico / zero / arquivo ausente → INERTE, nunca um padrão
+  local i
+  for i in 'MemTotal: 1 kB' 'MemAvailable:' 'MemAvailable: abc kB' 'MemAvailable: 0 kB'; do
+    printf '%s\n' "$i" > "$T/meminfo.d"; GTN_MEMINFO="$T/meminfo.d" go "$1" -- touch /tmp/NUNCA
+    ck "MemAvailable ilegível ('$i'): INERTE rc 97" rcis 97; ck "MemAvailable ilegível ('$i'): diz memavailable-ilegivel" has "$OUT" '^GTN-CAP: inerte memavailable-ilegivel'; ck "MemAvailable ilegível ('$i'): o comando NÃO roda" nocalls; done
+  GTN_MEMINFO="$T/nao-existe" go "$1" -- touch /tmp/NUNCA; ck "meminfo ausente: INERTE rc 97 e o comando NÃO roda" test "$RC" = 97 -a ! -s "$CALLS"
+  NPROC=vazio go "$1" -- true; ck "nproc ilegível: INERTE rc 97" rcis 97; ck "nproc ilegível: diz nproc-ilegivel" has "$OUT" '^GTN-CAP: inerte nproc-ilegivel'
+  GTN_PERWORKER_MB=abc go "$1" -- true; ck "constante inválida: INERTE (nunca cai no padrão)" has "$OUT" '^GTN-CAP: inerte constante-invalida'; ck "constante inválida: rc 97" rcis 97
+  # o teto tem de ser PROVADO: escopo recusado / cgroup sem teto (`max`) / sem leitura → INERTE e o comando NÃO roda
+  for i in refuse nocap empty; do SD_MODE=$i go "$1" -- touch /tmp/NUNCA; ck "teto sem prova ($i): INERTE rc 97" rcis 97; ck "teto sem prova ($i): diz teto-nao-provado" has "$OUT" '^GTN-CAP: inerte teto-nao-provado'; ck "teto sem prova ($i): o comando NÃO roda" nocalls; done
+  # GTN_WORKERS explícito (o lastro): nada muda — sem escopo, sem leitura de MemAvailable (mesmo ilegível)
+  GTN_MEMINFO="$T/nao-existe" GTN_WORKERS=4 go "$1" -- true; ck "GTN_WORKERS explícito: sem teto novo, diz que é do chamador" has "$OUT" '^GTN-CAP: sem-teto \(GTN_WORKERS=4 explícito'; ck "GTN_WORKERS explícito: o comando NÃO passa por escopo" hasnt "$CALLS" '^SCOPE:'; ck "GTN_WORKERS explícito: roda com 4" has "$CALLS" '^CMD: WA_PYTEST_MAX_WORKERS=4 '
+  # vazou: o canário vence — nem MemAvailable é lido (a linha GTN-CAP não sai)
+  PROBE_MODE=leak go "$1" -- true; ck "vazou: não há linha GTN-CAP (o canário vem primeiro)" hasnt "$OUT" '^GTN-CAP:'; }
 case_probe() { extract "$1" > "$T/probe.py"; local m exp
   for m in "ok:isolated" "tcp:leak tcp:8.8.8.8:443" "udp:leak udp:1.1.1.1:53" "dns:leak dns" "if:leak if:eth0" "env:leak env:GITHUB_TOKEN"; do
     python3 -I "$T/probe-drv.py" "${m%%:*}" "$T/probe.py" > "$OUT" 2>&1; RC=$?; exp=${m#*:}
     ck "sonda ($m): veredito" has "$OUT" "^GTN-PROBE: $exp"; [ "${m%%:*}" = ok ] && ck "sonda (ok): sem vazamento e rc 0" rcis 0 || ck "sonda (${m%%:*}): rc 1" rcis 1; done; }
 
-for c in canary run probe; do "case_$c" "$SUT0"; done
+for c in canary run cap probe; do "case_$c" "$SUT0"; done
 
 M=0
 mutant() { # nome expr-sed caso
@@ -110,6 +155,14 @@ mutant W4-helper-ausente-nao-checado 's/^  \[ -x "\$HELPER" \] || inert.*$/  tru
 mutant W5-comando-sem-canario 's/^canary$/true/' run
 mutant W6-sem-semente-de-hash 's/ PYTHONHASHSEED=0//' run
 mutant W7-sem-node-path 's/ NODE_PATH="\$HOME\/\.local\/share\/cdp-drive\/node_modules"//' run
+mutant C1-memavailable-ilegivel-vira-padrao 's/^  num "\$AVAIL_KB" \&\& \[ "\$AVAIL_KB" -gt 0 \] || cap_inert.*$/  AVAIL_KB=${AVAIL_KB:-30000000}; [ "$AVAIL_KB" -gt 0 ] || AVAIL_KB=30000000/' cap
+mutant C2-teto-nao-provado-aceito 's/^  \[ "\$GOT" = .*$/  true/' cap
+mutant C3-comando-fora-do-escopo 's/^exec \${CAP\[@\]+"\${CAP\[@\]}" --} sudo/exec sudo/' cap
+mutant C4-memoria-que-nao-cabe-aceita 's/^  \[ "\$CEIL" -ge \$(( BASE + PER )) \] || cap_inert.*$/  [ "$CEIL" -ge 1 ] || CEIL=1/' cap
+mutant C5-cpu-nao-limita 's/; \[ "\$WORKERS" -le "\$CPUMAX" \] || WORKERS=\$CPUMAX//' cap
+mutant C6-sem-limite-de-swap 's/ -p MemorySwapMax=0)/)/' cap
+mutant C7-reserva-ignorada 's/^  CEIL=\$(( AVAIL_MB - RESERVE ))/  CEIL=$(( AVAIL_MB ))/' cap
+mutant C8-workers-explicitos-ignorados 's/^if \[ -n "\${GTN_WORKERS:-}" \]; then/if false; then/' cap
 mutant P1-sonda-sem-segredo 's/^if sec: leak.append.*$/pass/' probe
 mutant P2-sonda-sem-dns 's/; leak.append("dns")/; pass/' probe
 mutant P3-sonda-sem-interface 's/^if bad: leak.append.*$/pass/' probe
