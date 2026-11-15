@@ -4,10 +4,11 @@
 # Contents
 #   O que prova · Como roda · O mundo simulado · Casos · Saída
 #
-# O QUE PROVA: (1) toda leitura gc/bd do guard tem teto de 150 s (era 20 s; `gc session list --json` leva 41-43 s com o mini a load 42 e o guard pulou 4 de 5 ciclos depois do boot de 15/11), com a
+# O QUE PROVA: (1) as chamadas gc/bd que tinham timeout=20 (listagens de sessões e de beads, rig list, mails de alerta) têm teto de 150 s (era 20 s; `gc session list --json` leva 41-43 s com o mini a load 42 e o guard pulou 4 de 5 ciclos depois do boot de 15/11), com a
 #   variável IRG_GC_CALL_TIMEOUT mudando o teto e valor ilegível/zero/negativo caindo no padrão (nunca num teto que mataria toda leitura). (2) Antes de reclamar ou escalar, o Pass 2 RELÊ a liveness: o Pass 1
 #   leu a lista de sessões no começo do ciclo e a foto envelhece (15/11 03:06:24: reclaim de wa-adn833.12.2 com a foto de 03:03:37, e o builder tinha subido às 03:04:26). Sessão viva na releitura → não
-#   reclama; releitura que FALHA → "não sei" → não reclama (nunca vira "sem sessão"); só "morta" libera. Cada caso roda o `run_cycle` REAL do guard.
+#   reclama; releitura que FALHA → "não sei" → não reclama (nunca vira "sem sessão"); só "morta" libera. (3) A releitura que falha ciclo após ciclo é CONTADA e avisa o Mayor ([GUARD-BLIND]) ao passar do limite —
+#   fail-closed sem alarme adiaria todo reclaim para sempre em silêncio; o contador zera quando a leitura volta e NÃO zera num ciclo em que nenhuma bead pediu a releitura. Cada caso roda o `run_cycle` REAL do guard.
 # COMO RODA: bash scripts/inflight-reclaim-guard.liveness-reread.selftest.sh   (hermético: sem bd, gc, git nem rede; relógio e mundo simulados; ~1 s)
 #   REREAD_GUARD_UNDER_TEST=<arquivo>   aponta para uma cópia do guard (o HEAD anterior, para provar que os casos reprovam lá; a cópia precisa dos irmãos bead_state.py e gc_ledger.py ao lado)
 # O MUNDO SIMULADO: beads in_progress de um dono nomeado (crew-x), sem branch, paradas além do teto de encalhe. `list_active_sessions` é trocada por um leitor que devolve a foto VELHA (sem o dono) na
@@ -19,12 +20,41 @@ export REREAD_GUARD_UNDER_TEST="${REREAD_GUARD_UNDER_TEST:-$HERE/inflight-reclai
 [ -f "$REREAD_GUARD_UNDER_TEST" ] || { echo "FATAL: guard ausente: $REREAD_GUARD_UNDER_TEST"; exit 2; }
 
 python3 -I - <<'PY'
-import contextlib, copy, datetime, importlib.util, io, os, re, sys, time as _real_time
+import contextlib, copy, datetime, importlib.util, io, os, re, sys, tempfile, time as _real_time
 
 GUARD = os.environ["REREAD_GUARD_UNDER_TEST"]
 spec = importlib.util.spec_from_file_location("irg_reread_under_test", GUARD)
 g = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(g)
+
+# A contagem de releitura falha grava em STATE_FILE + ".query-fail": aqui o estado vai para um diretório temporário (nunca o .gc/state do cwd) e o `gc mail send` do alerta é registrado, não executado.
+_TMPD = tempfile.TemporaryDirectory(prefix="irg-reread-")
+g.STATE_FILE = os.path.join(_TMPD.name, "state.json")
+QF = g.STATE_FILE + ".query-fail"
+MAILS = []
+
+
+class _MailProc:
+    returncode, stdout, stderr = 0, b"", b""
+
+
+_real_subprocess_run = g.subprocess.run
+
+
+def _mail_run(cmd, *a, **kw):
+    if list(cmd)[:3] == ["gc", "mail", "send"]:
+        MAILS.append(list(cmd))
+        return _MailProc()
+    return _real_subprocess_run(cmd, *a, **kw)
+
+
+g.subprocess.run = _mail_run
+
+
+def qf_cycles():
+    """A contagem persistida de ciclos seguidos com a releitura falha (0 se o arquivo não existe)."""
+    return g._load_query_fail_state().get("reread_fail_cycles", 0)
+
 
 T0 = 1_800_000_000.0
 OWNER = "crew-x"
@@ -60,7 +90,13 @@ class Clock:
 
 class World:
     """reread: o que as leituras 2+ do ciclo devolvem — "dead" (a mesma foto sem o dono), "live" (o dono apareceu), "fail" (None)."""
-    def __init__(self, reread, ids=("wa-t1",), reclaim_count=0):
+    def __init__(self, reread, ids=("wa-t1",), reclaim_count=0, tick_on_reclaim=0):
+        try:
+            os.remove(QF)               # cada mundo começa sem contagem de releitura falha (o arquivo é compartilhado pelo módulo)
+        except FileNotFoundError:
+            pass
+        MAILS.clear()
+        self.tick_on_reclaim = tick_on_reclaim   # segundos que o relógio anda a cada reclaim pedido (uma leitura lenta entre duas beads do mesmo ciclo)
         self.now = T0
         self.reread = reread
         self.beads = [{"id": i, "title": "bead de teste " + i, "issue_type": "task", "status": "in_progress", "assignee": OWNER,
@@ -107,7 +143,7 @@ class World:
         g._note_query_failure = lambda *a, **k: None
         g._note_query_success = lambda *a, **k: None
         g._check_pool_dead = lambda *a, **k: None
-        g.do_reclaim = lambda bead_id, *a, **kw: (w.reclaims.append(bead_id), True)[1]
+        g.do_reclaim = lambda bead_id, *a, **kw: (w.reclaims.append(bead_id), setattr(w, "now", w.now + w.tick_on_reclaim), True)[2]
         g.do_escalate = lambda bead_id, *a, **kw: (w.escalations.append(bead_id), [])[1]
 
     def cycle(self, dt=POLL):
@@ -169,7 +205,7 @@ w = World("dead", reclaim_count=g.MAX_RECLAIMS)
 w.run(8)
 check("T6 controle: com a morte confirmada, o teto estourado escala", len(w.escalations) >= 1, "escalations=%r reclaims=%r" % (w.escalations, w.reclaims))
 
-# ── T7: o teto de cada chamada gc/bd. Constante padrão e a leitura de IRG_GC_CALL_TIMEOUT (vazio/ilegível/≤0 → padrão, nunca um teto que cegue o guard).
+# ── T7: o teto das chamadas gc/bd que tinham timeout=20. Constante padrão e a leitura de IRG_GC_CALL_TIMEOUT (vazio/ilegível/≤0 → padrão, nunca um teto que cegue o guard).
 default = getattr(g, "GC_CALL_TIMEOUT", None)
 check("T7 o teto padrão das leituras é 150 s", default == 150, "GC_CALL_TIMEOUT=%r" % (default,))
 fn = getattr(g, "_gc_call_timeout", None)
@@ -214,6 +250,69 @@ check("T8 as listagens do bd rodam todas com timeout=150 (nenhuma com os 20 s an
 src = open(GUARD, encoding="utf-8").read()
 left = [i + 1 for i, l in enumerate(src.splitlines()) if re.search(r"timeout\s*=\s*20\b", l)]
 check("T8 deriva: nenhuma chamada subprocess do guard volta a `timeout=20`", left == [], "linhas=%r" % (left,))
+
+# ── T9: a releitura vale 30 s (LIVENESS_REREAD_MAX_AGE_SECS) e depois EXPIRA. Duas beads acionadas no mesmo ciclo, com uma leitura lenta entre elas (o relógio anda a cada reclaim): passou de 30 s → lê de novo.
+w = World("dead", ids=("wa-t1", "wa-t2"), tick_on_reclaim=g.LIVENESS_REREAD_MAX_AGE_SECS + 1)
+w.run(3)
+w.reads = 0
+w.cycle()
+check("T9 a releitura de 31 s é velha: a 2ª bead do ciclo relê (1 + 2 leituras)", w.reads == 3, "leituras=%d reclaims=%r" % (w.reads, w.reclaims))
+w = World("dead", ids=("wa-t1", "wa-t2"), tick_on_reclaim=5)
+w.run(3)
+w.reads = 0
+w.cycle()
+check("T9 controle: a releitura de 5 s ainda vale (1 + 1 leituras)", w.reads == 2, "leituras=%d" % w.reads)
+
+# ── T10: releitura que falha CICLO APÓS CICLO é contada e avisa o Mayor (fail-closed sem alarme adiaria todo reclaim para sempre, em silêncio).
+LIM = g.QUERY_FAIL_MIN_CYCLES
+
+
+def run_until(w, want, limit=60):
+    n = 0
+    while qf_cycles() < want and n < limit:
+        w.cycle()
+        n += 1
+    return qf_cycles()
+
+
+def blind_lines(w):
+    return [m for m in w.emitted if "[REREAD-BLIND]" in m]
+
+
+w = World("fail")
+check("T10 a contagem começa em 0 (nada lido ainda)", qf_cycles() == 0, "ciclos=%r" % qf_cycles())
+check("T10 1º ciclo com a releitura falha: contagem 1 e uma linha [REREAD-BLIND] no log", run_until(w, 1) == 1 and len(blind_lines(w)) == 1, "ciclos=%r linhas=%r" % (qf_cycles(), blind_lines(w)))
+check("T10: a linha diz quantas beads ficaram sem verificação", any("1/1 triggered bead(s)" in m for m in blind_lines(w)), "linhas=%r" % blind_lines(w))
+run_until(w, LIM - 1)
+check("T10 um ciclo abaixo do limite (%d): nenhum aviso ao Mayor" % LIM, qf_cycles() == LIM - 1 and MAILS == [] and not any("[GUARD-BLIND]" in m for m in w.emitted), "ciclos=%r mails=%r" % (qf_cycles(), MAILS))
+w.cycle()
+check("T10 no limite (%d ciclos seguidos): UM mail [GUARD-BLIND] para o Mayor" % LIM, qf_cycles() == LIM and len(MAILS) == 1 and MAILS[0][3] == "mayor" and "[GUARD-BLIND]" in MAILS[0][5], "ciclos=%r mails=%r" % (qf_cycles(), MAILS))
+check("T10: o aviso é emitido no log também, com a contagem", any("[GUARD-BLIND] liveness re-read failed %d consecutive cycles" % LIM in m for m in w.emitted), "emitidos=%r" % [m for m in w.emitted if "GUARD-BLIND" in m])
+w.cycle()
+check("T10 dentro do cooldown (ciclo seguinte, %d s < %d s): sem 2º mail" % (g.POLL_SEC if hasattr(g, "POLL_SEC") else 600, g.QUERY_FAIL_COOLDOWN), len(MAILS) == 1, "mails=%d" % len(MAILS))
+check("T10: a falha persistente nunca virou reclaim (fail-closed segue valendo)", w.reclaims == [] and w.escalations == [], "reclaims=%r escalations=%r" % (w.reclaims, w.escalations))
+check("T10: as chaves do [GUARD-BLIND] do Pass 1 não foram tocadas (contador separado)", g._load_query_fail_state().get("consecutive_cycles", 0) == 0, "estado=%r" % g._load_query_fail_state())
+
+# a releitura volta a responder → zera (inclusive quando a resposta é 'viva': a LEITURA funcionou, o veredito é outro assunto)
+w = World("fail")
+run_until(w, 3)
+w.reread = "live"
+w.cycle()
+check("T10 a releitura voltou a responder: a contagem zera", qf_cycles() == 0, "ciclos=%r" % qf_cycles())
+w = World("fail")
+run_until(w, 3)
+w.reread = "dead"
+w.cycle()
+check("T10 a releitura voltou (e confirmou a morte): zera e o guard reclama", qf_cycles() == 0 and len(w.reclaims) >= 1, "ciclos=%r reclaims=%r" % (qf_cycles(), w.reclaims))
+
+# ciclo em que NENHUMA bead pediu a releitura: não prova que a leitura voltou → não zera (e não conta)
+w = World("fail")
+run_until(w, 3)
+n_before = len(blind_lines(w))
+w.state["wa-t1"]["first_seen_stranded"] = w.now + POLL      # a bead volta para dentro da carência de encalhe: o Pass 1 a classifica noop, ninguém pede a releitura
+w.cycle()
+check("T10 ciclo sem releitura pedida: a contagem fica onde estava (3), não zera", qf_cycles() == 3, "ciclos=%r estado=%r" % (qf_cycles(), w.state.get("wa-t1")))
+check("T10: e esse ciclo não gera linha [REREAD-BLIND] nova", len(blind_lines(w)) == n_before, "linhas=%r" % blind_lines(w))
 
 print("RESULT: %d passed, %d failed" % (PASS, FAIL))
 sys.exit(1 if FAIL else 0)

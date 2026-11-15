@@ -337,15 +337,16 @@ REFUSAL_LIVE_GRACE_SECS = 2 * 600  # 20min
 POLL_SEC = int(os.environ.get("RECLAIM_POLL_SEC", "600"))  # default 10min; was 5min
 REALERT_SEC = 900        # 15min re-alert cadence for escalated beads
 
-# ga-9r4zimt: teto de CADA chamada `gc`/`bd` do guard (leituras e os mails de alerta). Era 20 s, e `gc session list --json` leva 41-43 s com o mini a load 42: depois do boot de 15/11 o guard
+# ga-9r4zimt: teto das chamadas `gc`/`bd` que tinham o prazo de 20 s (as listagens de sessoes e de beads, o `gc rig list` e os mails de alerta — 20 sites). Era 20 s, e `gc session list --json` leva 41-43 s com o mini a load 42: depois do boot de 15/11 o guard
 # pulou 4 de 5 ciclos ("session list failed" / "gc rig list timeout 20s") — cego justo quando um worker morre. 150 s é a mesma régua do node-ghost-release (ga-pdyayy2: 40 -> 150).
 # O guard é um daemon KeepAlive (um processo, laço sequencial com sleep(POLL_SEC) DEPOIS do ciclo — sem StartInterval), então uma leitura lenta alonga o ciclo mas nunca empilha instâncias.
 # Leitura que passa de 150 s continua falhando FECHADO (None -> o ciclo é pulado), nunca vira "sem sessão".
+# NAO mudaram, de proposito: as chamadas pontuais por bead (bd show/comment/assign/label ~15 s, peek do pane 15 s, quota 18 s, git 30 s) — nao sao a leitura de 41-43 s, e cada uma ja falha fechado por bead.
 GC_CALL_TIMEOUT_DEFAULT = 150
 
 
 def _gc_call_timeout(raw):
-    """Teto, em segundos, de cada chamada gc/bd. vazio (variável ausente ou "") → GC_CALL_TIMEOUT_DEFAULT; ilegível ou ≤ 0 → GC_CALL_TIMEOUT_DEFAULT também, em silêncio (um teto de 0 ou negativo
+    """Teto, em segundos, das chamadas gc/bd que usam GC_CALL_TIMEOUT (as listagens e os mails de alerta; as pontuais de 10-30 s seguem com o prazo proprio). vazio (variável ausente ou "") → GC_CALL_TIMEOUT_DEFAULT; ilegível ou ≤ 0 → GC_CALL_TIMEOUT_DEFAULT também, em silêncio (um teto de 0 ou negativo
     mataria toda leitura na hora e cegaria o guard) — o valor que vale aparece na linha [STARTUP] (call_timeout=N), que é por onde se prova o que foi carregado."""
     if raw is None or str(raw).strip() == "":
         return GC_CALL_TIMEOUT_DEFAULT
@@ -5016,7 +5017,7 @@ def compute_multi_assigned_assignees(beads, parent_reader=None, notes=None):
 
 def _has_live_session_for(bead_id, assignee, sessions, now, bead_update_age,
                           multi_assigned_assignees, live_sling_owner_beads):
-    """True se ALGUMA sessao do roster `sessions` responde por esta bead (ga-9r4zimt: extraida do Pass 1 do run_cycle para que o Pass 2 reaplique a MESMA conta sobre a lista relida).
+    """True se ALGUMA sessao do roster `sessions` responde por esta bead (ga-9r4zimt: extraida do Pass 1 do run_cycle para que o Pass 2 reaplique a MESMA conta sobre a lista relida (so o roster muda: a idade da bead e o conjunto de sling-owners seguem os da foto do Pass 1 — ver a LACUNA CONHECIDA em reread_liveness_verdict)).
 
     Tres formas de dono (ga-hkpwv): template de pool nu ("wa-worker": vale QUALQUER worker vivo do pool, pool_has_live_worker), adhoc concreto ("wa-worker-adhoc-faac43db2d": so
     aquela sessao, concrete_adhoc_session_is_live) e dono nomeado (session_is_live). ga-zbrbt: o desempate por bead (session_multi_assigned) so faz sentido numa sessao CONCRETA — o template nu
@@ -5060,7 +5061,11 @@ def reread_liveness_verdict(bead_id, assignee, bead_update_epoch, multi_assigned
 
     Por que existe: o Pass 1 le a lista de sessoes uma vez, no inicio do ciclo, e o Pass 2 atua minutos depois com essa foto. Com `gc session list` levando 41-43 s sob carga, a foto envelhece:
     15/11 03:06:24 reclaimou wa-adn833.12.2 com a foto de 03:03:37, e o builder tinha subido as 03:04:26 (foi tirado de baixo de um builder vivo). Tres estados, nao dois: a releitura que
-    FALHA e "unknown" (nao sei) e nao reclama — nunca colapsa em "sem sessao"; o estado que fica e o INERTE (a bead segue como esta; o proximo ciclo decide). A unica leitura e list_active_sessions (via _fresh_sessions); mbp_owner_state sobre a lista nova mantem o hold do alias do MBP (ga-w7qwl1.2.3) se ele reapareceu."""
+    FALHA e "unknown" (nao sei) e nao reclama — nunca colapsa em "sem sessao"; o estado que fica e o INERTE (a bead segue como esta; o proximo ciclo decide). A unica leitura e list_active_sessions (via _fresh_sessions); mbp_owner_state sobre a lista nova mantem o hold do alias do MBP (ga-w7qwl1.2.3) se ele reapareceu.
+
+    LACUNA CONHECIDA (revisor do gate, ga-9r4zimt): so o ROSTER e relido. O updated_at da bead (bead_update_epoch) e o conjunto live_sling_owner_beads seguem os da foto do Pass 1. Para dono por alias de slot de
+    pool (ex. gastown.dog-2) cuja incarnacao nasceu DEPOIS da foto e ja reivindicou a bead, a regra do alias reaproveitado (ga-lotseol) le a sessao nova como 'nao e dela' (a bead e mais velha que a sessao) e
+    o veredito sai ('dead', ''). Nao e regressao (a base reclamava igual); a protecao desta releitura vale integralmente para dono por session_name (crew-x) e para o hold do MBP."""
     try:
         fresh = _fresh_sessions(cache)
         if fresh is None:
@@ -5075,6 +5080,51 @@ def reread_liveness_verdict(bead_id, assignee, bead_update_epoch, multi_assigned
         return "dead", ""
     except Exception as exc:
         return "unknown", f"liveness re-read raised {type(exc).__name__}: {exc}"
+
+
+def _note_reread_outcome(asked, unknown, now):
+    """Conta os ciclos SEGUIDOS em que a releitura de liveness do Pass 2 falhou e avisa o Mayor quando passa do limite (ga-9r4zimt, gate-fix 1).
+
+    Por que existe: a releitura que falha e fail-closed ("unknown" → nao reclama), e isso esta certo — mas sem contagem, um `gc session list` que estoura o teto ciclo apos ciclo adia para sempre todo
+    reclaim/escalate que depende da releitura (a bead que o Pass 1 achou SEM sessao viva, inclusive o escalate da bead com o teto de reclaims estourado) com um unico rastro: uma linha DEFERRED por bead por ciclo. O [GUARD-BLIND] do Pass 1 nao cobre isto: o
+    _note_query_success() roda ANTES do Pass 2 e zeraria o contador dele a cada ciclo. Por isso a contagem e propria: chaves reread_fail_cycles / reread_last_alert_epoch no MESMO arquivo .query-fail (cada
+    funcao le o arquivo todo, mexe nas suas chaves e grava o resto como estava — as chaves do GUARD-BLIND ficam intactas).
+
+    asked = quantas beads pediram a releitura neste ciclo; unknown = em quantas delas ela FALHOU (leitura None ou excecao). TRES estados: asked == 0 → nao ha o que medir: nao conta e NAO zera (um ciclo em que
+    nenhuma bead foi acionada nao prova que a leitura voltou); asked > 0 e unknown == 0 → a leitura respondeu: zera; unknown > 0 → conta e avisa. Nunca levanta: o aviso e best-effort, a decisao ja foi tomada
+    (nao reclamou) antes de chegar aqui."""
+    try:
+        if asked <= 0:
+            return
+        # vazio (arquivo sem as chaves) → contador 0; falhou/ilegivel (arquivo corrompido) → _load_query_fail_state devolve o padrao: recomeca em 0 (nunca inventa uma contagem alta que dispararia o alarme)
+        qs = _load_query_fail_state()
+        before = qs.get("reread_fail_cycles", 0)
+        if unknown <= 0:
+            if before > 0:
+                qs["reread_fail_cycles"] = 0
+                _save_query_fail_state(qs)
+            return
+        n = before + 1
+        qs["reread_fail_cycles"] = n
+        print(f"[INFLIGHT-RECLAIM] [REREAD-BLIND] liveness re-read failed for {unknown}/{asked} triggered bead(s) this cycle — nothing actuated for them; {n} consecutive cycle(s) (ga-9r4zimt)", flush=True)
+        if n >= QUERY_FAIL_MIN_CYCLES and now - qs.get("reread_last_alert_epoch", 0) > QUERY_FAIL_COOLDOWN:
+            emit(f"[INFLIGHT-RECLAIM] [GUARD-BLIND] liveness re-read failed {n} consecutive cycles — every reclaim/escalate that needs the re-read is being deferred (unverified)")
+            try:
+                result = subprocess.run(
+                    ["gc", "mail", "send", "mayor",
+                     "-s", "[GUARD-BLIND] inflight-reclaim-guard cannot re-verify liveness",
+                     "-m", (f"inflight-reclaim-guard's liveness re-read (gc session list, run by Pass 2 right before each reclaim/escalate) has failed for {n} consecutive cycles. "
+                            f"Fail-closed: a bead the guard found with no live session is neither reclaimed nor escalated while the re-read cannot answer, so beads stuck on a dead session stay stuck until it recovers. "
+                            f"Usually self-resolves with the load that made `gc session list` exceed {GC_CALL_TIMEOUT}s; escalating because the safety net is deferring those reclaims in the meantime.")],
+                    timeout=GC_CALL_TIMEOUT, capture_output=True)
+                if result.returncode != 0:
+                    print(f"[INFLIGHT-RECLAIM] [REREAD-BLIND] mail non-zero exit rc={result.returncode}: {result.stderr.decode(errors='replace').strip()}", flush=True)
+            except Exception as exc:
+                print(f"[INFLIGHT-RECLAIM] [REREAD-BLIND] mail failed: {exc}", flush=True)
+            qs["reread_last_alert_epoch"] = now
+        _save_query_fail_state(qs)
+    except Exception as exc:
+        print(f"[INFLIGHT-RECLAIM] warn: _note_reread_outcome failed: {exc}", flush=True)
 
 
 def run_cycle(state, escalated_alerted):
@@ -5448,6 +5498,7 @@ def run_cycle(state, escalated_alerted):
     _check_pool_dead(pool_zombies, now)
 
     # --- Pass 2: per-bead actuation (logic unchanged from prior single-pass) ---
+    reread_asked = reread_unknown = 0   # ga-9r4zimt: quantas beads pediram a releitura neste ciclo / em quantas ela FALHOU (alimenta _note_reread_outcome depois do laco)
     for (bead_id, title, labels, assignee, action, idle_min, reclaim_count,
          rig_root, bridge_sources, sling_bead_id, never_had_owner) in classified:
         # ga-be4x: re-derive from labels (already in the tuple — no new fields
@@ -5468,6 +5519,8 @@ def run_cycle(state, escalated_alerted):
             _lv, _lv_why = reread_liveness_verdict(
                 bead_id, assignee, _lv_ctx[0] if _lv_ctx is not None else None, multi_assigned_assignees,
                 live_sling_owner_beads, reread_cache)
+            reread_asked += 1
+            reread_unknown += (_lv == "unknown")
             if _lv != "dead":
                 print(f"[INFLIGHT-RECLAIM] [DEFERRED] bead={bead_id} assignee={assignee!r} action={action} "
                       f"liveness re-read={_lv} ({_lv_why}) — NOT actuating this cycle (ga-9r4zimt) title={title!r}",
@@ -5566,6 +5619,9 @@ def run_cycle(state, escalated_alerted):
             state.pop(bead_id, None)
 
         # action == "noop" → silence
+
+    # ga-9r4zimt: depois do laco (nao dentro: os `continue` do DEFERRED pulariam) — a contagem de ciclos seguidos com a releitura falha
+    _note_reread_outcome(reread_asked, reread_unknown, now)
 
     # Prune state entries for beads no longer in the in-flight+dispatched query
     gone = set(state.keys()) - active_bead_ids
@@ -6375,7 +6431,7 @@ def _selftest():
             bead = {"id": bead_id, "title": "e2e do trilho do worktree", "issue_type": "task", "status": "in_progress", "assignee": "gastown.dog-2", "rig_root": _wt_rig,
                     "labels": ["exec:auto"] if marker_less else ["story:in-flight", "pilot:dispatched"], "metadata": {}, "updated_at": _wt_iso(now - (60 if live and not twin else 7200))}
             none = lambda *a, **k: None
-            stubs = dict(list_stranded_inprogress_beads=lambda: [dict(bead)] if marker_less else [], heal_orphan_sweep_false_resets=none, _note_query_failure=none, _note_query_success=none, _check_pool_dead=none, emit=none,
+            stubs = dict(list_stranded_inprogress_beads=lambda: [dict(bead)] if marker_less else [], heal_orphan_sweep_false_resets=none, _note_query_failure=none, _note_query_success=none, _note_reread_outcome=none, _check_pool_dead=none, emit=none,
                          list_suspended_agents=lambda: set(), list_gate_active_source_beads=lambda: frozenset(), list_live_sling_source_beads=lambda *a: frozenset(),
                          list_refused_sling_source_beads=lambda: {}, account_is_rate_limited=lambda: False, session_awaiting_human_input=lambda *a, **k: False, do_escalate=lambda *a, **k: [],
                          list_inflight_beads=lambda: [] if marker_less else [dict(bead)], list_active_sessions=lambda: roster, compute_multi_assigned_assignees=lambda beads, parent_reader=None, notes=None: set(),
@@ -10943,7 +10999,7 @@ def _selftest():
             "list_gate_active_source_beads": lambda: frozenset(), "list_live_sling_source_beads": lambda *a, **k: frozenset(),
             "list_refused_sling_source_beads": lambda: ({"ga-dup1": list(bridged)} if bridged else {}),
             "account_is_rate_limited": lambda: False, "get_branch_recent": lambda *a, **k: False, "get_worktree_progress": lambda *a, **k: WT_QUIET,   # ga-s90p58a: o trilho do worktree é mais uma consulta do ciclo (gc rig list + git)
-            "_check_pool_dead": lambda *a, **k: None, "_irg_ledger": lambda *a, **k: None, "emit": lambda msg: None,
+            "_check_pool_dead": lambda *a, **k: None, "_note_reread_outcome": lambda *a, **k: None, "_irg_ledger": lambda *a, **k: None, "emit": lambda msg: None,
             "do_reclaim": _rec("reclaim", reclaim_ok), "do_escalate": _rec("escalate", []), "alert_mayor_refusal_parked": _rec("alert", True),
         }
         state = {"ga-dup1": {"last_assignee": assignee}}

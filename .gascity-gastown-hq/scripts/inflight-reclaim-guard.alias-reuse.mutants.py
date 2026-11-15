@@ -8,7 +8,7 @@ O QUE FAZ: cada mutante troca UM trecho numa CÓPIA (o original nunca é tocado)
   que prendem aquela guarda reprovarem (ou, nos dois mutantes que tiram uma checagem de "não consegui ler", se o selftest quebrar com Traceback: sem a checagem a comparação com None estoura).
   Reprovar por OUTRO motivo (cópia que nem abre, SyntaxError) NÃO mata: sem isto, um mutante quebrado contaria como pego. Antes dos mutantes roda um CONTROLE: a cópia sem mutação tem de passar,
   senão "todos mortos" seria o harness quebrado reprovando tudo. O trecho trocado tem de aparecer EXATAMENTE uma vez no arquivo-alvo (senão o executor para: o alvo mudou e o mutante ficou velho).
-COMO RODA: python3 -I scripts/inflight-reclaim-guard.alias-reuse.mutants.py   (14 mutantes + 1 controle, 3 cópias por vez; cada filho com teto de 512 MB por arquivo e 120 s; ~35 s no nó Linux)
+COMO RODA: python3 -I scripts/inflight-reclaim-guard.alias-reuse.mutants.py   (15 mutantes + 1 controle, 3 cópias por vez; cada filho com teto de 512 MB por arquivo e 120 s; ~35 s no nó Linux)
   ALIAS_MUTANTS_GUARD=<arquivo>   aponta para outro guard (o selftest usa isto para provar o FATAL de guard ausente)
   ALIAS_MUTANTS_LIB=<arquivo>     aponta para outra bead_state.py (idem, para o FATAL de lib ausente ou de trecho velho nela)
   Cada filho roda com GC_SELFTEST=1 e GC_LEDGER_DIR num diretório descartável: nenhuma linha vai para os ledgers de produção.

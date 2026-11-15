@@ -22,7 +22,7 @@ export MBP_HERE="$HERE"
 [ -f "$MBP_GUARD_UNDER_TEST" ] || { echo "FATAL: guard ausente: $MBP_GUARD_UNDER_TEST"; exit 2; }
 
 python3 -I - <<'PY'
-import copy, datetime, importlib.util, os, subprocess, sys, time as _real_time
+import contextlib, copy, datetime, importlib.util, io, os, subprocess, sys, time as _real_time
 
 REAL_RUN = subprocess.run   # o do_reclaim abaixo roda com `subprocess.run` trocado por um falso (o módulo é o mesmo): o executor de mutantes usa este
 GUARD = os.environ["MBP_GUARD_UNDER_TEST"]
@@ -76,7 +76,7 @@ class World:
         self.mbp_alive = mbp_alive      # a sessão do notebook segue com a bead na cabeça, mesmo sem ssh
         self.mini = False               # a bead foi entregue a um construtor do mini
         self.state, self.alerted = {}, {}
-        self.reclaims, self.emitted = [], []
+        self.reclaims, self.emitted, self.printed = [], [], []   # printed: o que o guard imprime por print() (o DEFERRED sai por aí, não por emit)
         self._install()
 
     def roster(self):
@@ -121,13 +121,17 @@ class World:
         g.session_awaiting_human_input = lambda *a, **k: False   # o peek do pane vai por ssh: sem ssh, "não está esperando resposta"
         g._note_query_failure = lambda *a, **k: None
         g._note_query_success = lambda *a, **k: None
+        g._note_reread_outcome = lambda *a, **k: None   # a contagem de releitura falha grava em .gc/state/ (relativo ao cwd): o mundo hermético não escreve em disco
         g._check_pool_dead = lambda *a, **k: None
         g.do_reclaim = lambda bead_id, title, rc, idle, labels, **kw: w.apply_reclaim(bead_id, kw)
         g.do_escalate = lambda *a, **k: []
 
     def cycle(self, dt=POLL):
         self.now += dt
-        g.run_cycle(self.state, self.alerted)
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):       # o DEFERRED sai por print (não por emit): sem capturar o stdout do ciclo, `emitted` nunca o vê e um check sobre ele não reprova nunca (gate-fix ga-9r4zimt)
+            g.run_cycle(self.state, self.alerted)
+        self.printed.extend(l for l in buf.getvalue().splitlines() if l.strip())
         b = self.bead
         if b["status"] == "open" and not b["assignee"]:      # o despachante do mini pega toda bead aberta e sem dono
             b["status"], b["assignee"] = "in_progress", MINI
@@ -165,7 +169,7 @@ check("T2 ssh cai (roster asleep): o guard não reclama", w.reclaims == [], "rec
 # ga-9r4zimt: o Pass 2 agora RELÊ a liveness e também segura o alias do MBP que reaparece no roster (mbp_owner_state == "hold"), então "não reclama" sozinho já não distingue o hold do Pass 1 (o mutante
 # hold-nao-chega-na-decisao sobreviveu). O que só o Pass 1 faz: tratar a bead segura como NÃO encalhada — o relógio de encalhe nem começa (`first_seen_stranded`), e nenhum DEFERRED é emitido.
 check("T2: a bead segura do MBP não começa relógio de encalhe (o hold é do Pass 1, não só da releitura do Pass 2)", "first_seen_stranded" not in w.state.get(w.bead["id"], {}), "estado=%r" % w.state.get(w.bead["id"]))
-check("T2: nenhum DEFERRED — a releitura do Pass 2 nem chega a ser pedida para uma bead que o Pass 1 já segurou", not any("[DEFERRED]" in m for m in w.emitted), "emitidos=%r" % [m for m in w.emitted if "DEFERRED" in m][:1])
+check("T2: nenhum DEFERRED — a releitura do Pass 2 nem chega a ser pedida para uma bead que o Pass 1 já segurou", not any("[DEFERRED]" in m for m in w.printed), "impressos=%r" % [m for m in w.printed if "DEFERRED" in m][:1])
 one_owner(w, "T2", ALIAS)
 
 # ── T3: o ssh volta. 90 min de queda, depois a sessão responde de novo (active, atividade fresca).
@@ -183,6 +187,7 @@ w.cycle(); w.cycle(); w.cycle()
 check("T4 sessão some de vez: a histerese de 25 min vale (nada nos 30 primeiros minutos)", w.reclaims == [], "reclaims=%d" % len(w.reclaims))
 w.run(5)
 check("T4: a bead é reclamada uma vez, depois do prazo", len(w.reclaims) == 1, "reclaims=%d" % len(w.reclaims))
+check("T4 (controle da captura do T2): o stdout do ciclo chega em `printed` — o guard imprime 'started stranded clock' por print(), o mesmo canal do DEFERRED, e é por aí que o T2 enxergaria um DEFERRED", any("started stranded clock" in m for m in w.printed), "impressos=%r" % w.printed[:2])
 check("T4: o reclaim manda tirar a marca pilot.wa_node_alias", bool(w.reclaims) and MARK in (w.reclaims[0].get("unset_metadata") or ()), "kw=%r" % (w.reclaims[:1],))
 check("T4: a bead não fica com a marca de um alias que não é mais dono", MARK not in w.bead["metadata"], "metadata=%r" % w.bead["metadata"])
 one_owner(w, "T4", MINI)
