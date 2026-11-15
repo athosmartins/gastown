@@ -17,7 +17,7 @@
 # do `submit` (uma raiz do rfb de brinquedo em bash puro, sob $TMPDIR) com KeepAlive, e o `reap` mata o que sobrar. Pid LIDO DE ARQUIVO (os .sup/.pid do launchctl de brinquedo, o toy.pid) só leva sinal se a linha de
 # comando dele carregar o diretório temporário DESTA instância (own_pid/kill_own; o stub exige ainda que o job seja filho do supervisor dele): um arquivo de pid velho, cujo número o macOS já deu a outro programa, não
 # leva KILL (S18); sem poder provar de quem é o pid, ninguém recebe sinal. O pior que escreve em disco são alguns KB em $TMPDIR. Duração ~2 min.
-# EQUIVALENT 4b4d08ab9e: TRANSITORIO: sobrevivente velho; a linha 52 do estado virou comentario e o motor hoje pula o arquivo (denylist:launchctl), entao nao ha mais codigo ali; sai do estado sozinho e esta linha pode ser apagada
+# EQUIVALENT 4b4d08ab9e: ENTRADA CONGELADA, nao transitoria: o motor pula o arquivo em todo plano (denylist:launchctl) e nada no motor poda entradas do estado, entao o id NAO sai sozinho; NAO apague esta linha: o id voltaria a pendente sem mutante a matar (apply recusa o arquivo, rc 6). Nao ha codigo ali (a linha 52 do estado virou comentario); so sai se o arquivo deixar de ser pulado e o motor o varrer de novo
 set -uo pipefail
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
