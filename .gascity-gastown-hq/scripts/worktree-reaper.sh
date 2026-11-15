@@ -41,6 +41,15 @@
 # read that as "nothing to sweep" (the witness found 21 trees of closed beads in property_scrapers and no event of that rig in the log since 30/06). A bare repo is now swept through its own `git worktree list`
 # (its own entry, marked `bare`, is skipped; <rig>-wt is the container's sibling directory), and a repo git cannot read (what it is, or its worktree list) is skipped WITH an event (skip_repo_unresolvable: path,
 # rc, why) and counted on the sweep line (repo_unresolvable).
+# ga-zgqssr7: CRITICAL tier. Free disk < CRITICAL_FREE_GB (default 6; 0 = off) is pressure plus one more arm in BOTH loops (town .gc-worktrees and pool): a tree whose HEAD is in main as an equivalent patch
+# (`git cherry`, rc 0, no '+', or in the local trunk for a repo with no remote), CLEAN, UNLOCKED, with no process inside and ALL its beads closed (no BEAD_CLOSED_HOURS wait, but closed_at must be readable and
+# not in the future) goes with NO minimum age — at <6 GB the worker probes answer [] and pushes are refused, and <3 GB fires the D4 reboot, so the 30 min / 6 h waits cost more than they protect. Every proof
+# is the same one the normal paths use; any that cannot be answered (cherry failed, bead unreadable, status failed) leaves the tree where it is and counts it in critical_kept on the sweep line. The event
+# carries "reason":"critical" and the proof. Branch deletion stays merged-only (pool loop; loop 1 never deletes a branch).
+# ga-zgqssr7 cadence: ONE pass at a time (mkdir lock worktree-reaper.lock.d beside the log; a holder that is gone, or is not a worktree-reaper, or left an empty pid file for >600 s is a stale lock; a live
+# holder makes the tick log skipped_busy and exit), the launchd tick is 1800 s, and in NORMAL mode a tick within NORMAL_INTERVAL_S (6900) of the last pass's start exits with skipped_no_pressure (stamp file
+# worktree-reaper.last-pass; WORKTREE_REAPER_FORCE=1 ignores it) — so the normal rhythm stays ~2 h while pressure runs every tick. The sweep line carries duration_s and interval_s, and a pass longer than the
+# tick logs pass_exceeds_interval. Installed plist: scripts/com.gascity.worktree-reaper.plist (delivery does not reload it: unload + load).
 # The one exception to "WITHOUT --force" is a LOCKED worktree (`remove -f -f`); it is reaped only
 # under the LOCK CONTRACT stated at ZOMBIE-LOCK DETECTION below, never because of its age alone.
 # A second, narrower exception (ga-he2c1u, town .gc-worktrees roots only): an UNLOCKED tree dirty with nothing but generated
@@ -87,6 +96,18 @@ PRESSURE_REAP_UNMERGED="${WORKTREE_REAPER_PRESSURE_REAP_UNMERGED:-0}"
 # so no commit is lost, and the pool no longer starves for disk behind the trees of finished beads. Only 0 = the ga-m5i7e6 rule (every unmerged tree kept under pressure).
 PRESSURE_REAP_CLOSED="${WORKTREE_REAPER_PRESSURE_REAP_CLOSED:-1}"
 PRESSURE_SIZE_BUDGET=20     # du runs for at most this many pressure keeps per sweep (a huge tree costs seconds); the rest log size_kb null
+# ga-zgqssr7: the CRITICAL tier. Below CRITICAL_FREE_GB (GiB free) waiting is what costs: <5 GB the worker probes return [] and heavy-guard refuses pushes, <3 GB the D4 reboot fires (27/10: ~20 delivered trees sat out
+# their 30 min / 6 h waits while the disk went from 6 to 2 GB). In that tier an UNLOCKED, clean, unused tree whose commits are ALL in main (as patches or ancestors, `git cherry` rc 0 and no '+') and whose beads are ALL
+# closed goes with NO minimum age and NO BEAD_CLOSED_HOURS wait. Every other proof is as before; a tree that cannot be proven stays, counted on the sweep line (critical_kept). 0 = the tier is off.
+CRITICAL_FREE_GB="${WORKTREE_REAPER_CRITICAL_FREE_GB:-6}"
+case "$CRITICAL_FREE_GB" in ''|*[!0-9]*) CRITICAL_FREE_GB=6 ;; esac   # not a number → the default, never a threshold that could be read as "always critical"
+# ga-zgqssr7: CADENCE. launchd ticks every CADENCE_S (30 min, the plist's StartInterval); below PRESSURE_FREE_GB every tick is a full pass, above it a pass runs only when NORMAL_INTERVAL_S (the old 2 h, minus slack for
+# launchd jitter) have gone by since the last one started, and a tick in between exits at once. 0 = no gate (every start is a pass). WORKTREE_REAPER_FORCE=1 = a manual run that ignores the gate.
+CADENCE_S="${WORKTREE_REAPER_CADENCE_S:-1800}"
+case "$CADENCE_S" in ''|*[!0-9]*) CADENCE_S=1800 ;; esac
+NORMAL_INTERVAL_S="${WORKTREE_REAPER_NORMAL_INTERVAL_S:-6900}"
+case "$NORMAL_INTERVAL_S" in ''|*[!0-9]*) NORMAL_INTERVAL_S=6900 ;; esac
+START_S=$(date +%s)
 # vazio/falhou → treated as GNU stat (-c %Y); if that is wrong too, every freshness read fails and every tree is KEPT
 case "$(stat -f %m / 2>/dev/null)" in ''|*[!0-9]*) _STAT_BSD=0 ;; *) _STAT_BSD=1 ;; esac
 # ga-xpoj67: `git worktree remove` counts only tracked and untracked files as dirt, so what git IGNORES goes with the tree — the battery outputs
@@ -167,10 +188,76 @@ _log_lock_event() {
 }
 
 free_gb=$(df -g / 2>/dev/null | awk 'NR==2{print $4}')
+# ga-zgqssr7: seam for the selftest (and a dry run): the free GiB read, as a plain number. Anything else is ignored and df's answer stands.
+case "${WORKTREE_REAPER_FAKE_FREE_GB:-}" in ''|*[!0-9]*) : ;; *) free_gb="$WORKTREE_REAPER_FAKE_FREE_GB" ;; esac
+# vazio/falhou (no df, no number) → 99: neither pressure nor critical, the box is read as having room (the old behavior)
 [ -z "$free_gb" ] && free_gb=99
 gate_hours="$STALE_HOURS"
 mode="normal"
+critical=0
 if [ "$free_gb" -lt "$PRESSURE_FREE_GB" ] 2>/dev/null; then gate_hours="$PRESSURE_HOURS"; mode="pressure"; fi
+# ga-zgqssr7: critical implies pressure (a CRITICAL_FREE_GB set above PRESSURE_FREE_GB still gets the pressure rules)
+if [ "$CRITICAL_FREE_GB" -gt 0 ] && [ "$free_gb" -lt "$CRITICAL_FREE_GB" ] 2>/dev/null; then critical=1; gate_hours="$PRESSURE_HOURS"; mode="pressure"; fi
+
+# ── ga-zgqssr7: ONE pass at a time, and the cadence gate ──────────────────────────────────────────────────────────────
+# A pass takes minutes (median ~5, up to ~27 under load, measured from the log) and the tick is CADENCE_S (30 min): launchd does not start a job that is still running, but a manual run, a RunAtLoad
+# right after a reload or a hung pass could overlap one, and two passes racing on the same trees would double every bd lookup and every remove. mkdir is the atomic lock (no flock on macOS).
+LOCK_DIR="${WORKTREE_REAPER_LOCK_DIR:-$(dirname "$LOG")/worktree-reaper.lock.d}"
+STAMP="${WORKTREE_REAPER_STAMP:-$(dirname "$LOG")/worktree-reaper.last-pass}"
+_LOCK_MINE=0
+_lock_release() { [ "$_LOCK_MINE" = "1" ] || return 0; _LOCK_MINE=0; rm -f "$LOCK_DIR/pid" 2>/dev/null; rmdir "$LOCK_DIR" 2>/dev/null; return 0; }
+# _lock_holder_alive <pid> — 0 iff <pid> is a live process that is a worktree-reaper. A pid that is gone, or was reused by some other program, holds nothing.
+# vazio/ilegível/não numérico → not alive (the lock is stale); falhou (ps cannot run) → alive: the pass is skipped, never doubled on a guess
+_lock_holder_alive() {
+  local p="$1" cmd
+  case "$p" in ''|*[!0-9]*) return 1 ;; esac
+  kill -0 "$p" 2>/dev/null || return 1
+  cmd="$(ps -p "$p" -o command= 2>/dev/null)" || return 0
+  case "$cmd" in *worktree-reaper*) return 0 ;; *) return 1 ;; esac
+}
+# _lock_acquire — 0 = this process holds the lock; 1 = another pass holds it (its pid, or "unknown", in $_LOCK_HOLDER)
+_LOCK_HOLDER=""
+_lock_acquire() {
+  local pid tries=0
+  mkdir -p "$(dirname "$LOCK_DIR")" 2>/dev/null
+  while [ "$tries" -lt 2 ]; do
+    if mkdir "$LOCK_DIR" 2>/dev/null; then printf '%s\n' "$$" > "$LOCK_DIR/pid" 2>/dev/null; _LOCK_MINE=1; return 0; fi
+    # vazio (the holder is between mkdir and writing its pid) → held, "unknown" — UNLESS the lock directory is older than 600 s: a holder that crashed in that gap would otherwise
+    # keep every later tick out for good and silently switch the reaper off; falhou (pid unreadable, or the directory's age unreadable) → held, the same
+    pid="$(cat "$LOCK_DIR/pid" 2>/dev/null)"
+    _LOCK_HOLDER="${pid:-unknown}"
+    if [ -z "$pid" ]; then
+      local lm
+      if [ "$_STAT_BSD" = "1" ]; then lm="$(stat -f %m "$LOCK_DIR" 2>/dev/null)"; else lm="$(stat -c %Y "$LOCK_DIR" 2>/dev/null)"; fi
+      case "$lm" in ''|*[!0-9]*) return 1 ;; esac
+      [ $(( $(date +%s) - lm )) -gt 600 ] || return 1
+    else
+      _lock_holder_alive "$pid" && return 1
+    fi
+    # the holder is gone: a stale lock, taken over (once — a second taker that loses the mkdir race finds it held)
+    rm -f "$LOCK_DIR/pid" 2>/dev/null; rmdir "$LOCK_DIR" 2>/dev/null
+    tries=$((tries+1))
+  done
+  return 1
+}
+trap '_lock_release' EXIT
+if ! _lock_acquire; then
+  printf '{"ts":"%s","event":"skipped_busy","holder":"%s","note":"another pass holds the lock; this tick does nothing"}\n' "$(ts)" "$(_json_esc "$_LOCK_HOLDER")" >> "$LOG" 2>/dev/null
+  exit 0
+fi
+# the cadence gate: in normal mode a tick inside NORMAL_INTERVAL_S of the last pass's start does nothing. Pressure never waits.
+if [ "$mode" = "normal" ] && [ "$NORMAL_INTERVAL_S" -gt 0 ] && [ "${WORKTREE_REAPER_FORCE:-0}" != "1" ]; then
+  # vazio/ilegível (no stamp, or not a number) → no earlier pass is known: this one runs; a stamp in the future (clock set back) → runs too
+  _last="$(cat "$STAMP" 2>/dev/null)"
+  case "$_last" in ''|*[!0-9]*) _last=0 ;; esac
+  if [ "$_last" -le "$START_S" ] && [ $((START_S - _last)) -lt "$NORMAL_INTERVAL_S" ]; then
+    printf '{"ts":"%s","event":"skipped_no_pressure","free_gb":%s,"since_last_pass_s":%s,"normal_interval_s":%s,"note":"no pressure and the last pass is recent; WORKTREE_REAPER_FORCE=1 runs anyway"}\n' \
+      "$(ts)" "$free_gb" "$((START_S - _last))" "$NORMAL_INTERVAL_S" >> "$LOG" 2>/dev/null
+    exit 0
+  fi
+fi
+# the pass starts: its start is what the next normal-mode tick measures from. falhou (cannot write) → the stamp stays old and the next tick runs a pass: more work, never less
+printf '%s\n' "$START_S" > "$STAMP" 2>/dev/null
 
 reaped=0; skipped_dirty=0; kept=0; branches_deleted=0; pool_reaped=0; zombie_reaped=0; preserved_dirty=0
 kept_session_list_unavailable=0   # ga-vs6shu: locks KEPT only because the session list could not be fetched
@@ -180,6 +267,9 @@ _BC_FAILED_SEEN=""                # ga-yw18yk: repos whose failed lookup is alre
 _BC_PROOF_IDS=""                  # ga-yw18yk: _bead_closed_proof's answer, handed to its caller: the closed bead ids it relied on
 _BC_PROOF_FIRST=""                # ... and the first of them (the label of a rescue/ branch)
 _BC_ROWS=""; _BC_FOUND_IDS=""; _BC_FOUND_PFX=""   # ga-yw18yk: _bead_ask's working set while one proof is being decided
+critical_reaped=0                 # ga-zgqssr7: trees released by the CRITICAL tier (no minimum age, no BEAD_CLOSED_HOURS wait) and removed this pass
+critical_kept=0                   # ga-zgqssr7: trees the critical tier looked at and could NOT prove (cherry '+' or failed, dirty, a bead open or unreadable, an operation under way): they stay, inert
+_CR_JSON=""; _CR_DEL=""           # ga-zgqssr7: _critical_shipped_and_closed's answer to its caller: the event fields, and the proof the orphan branch may be deleted on ("" = none)
 _KU_PROOF_JSON=""                 # ga-ggj1wnv: _keep_unsafe's answer to its caller: the event fields of a tree it let through on the closed-bead proof ("" = it did not)
 repo_unresolvable=0               # ga-ryykl9l: repos the pool loop could not read (each skipped and logged as skip_repo_unresolvable); the sweep line carries the count
 _RR_ROOT=""                       # ga-ryykl9l: _resolve_repo_root's answer to its caller: the repo's own tree (a work tree's root, or the directory a bare container was found under)
@@ -1125,6 +1215,8 @@ EOF
 # worktree can live in a rig repo). Any lookup that cannot be answered ends it: not proven.
 _bead_closed_proof() {
   local repo="$1" wt="$2" br="$3" cur cands q hq c cp rest="" bid st ce now_s need n_found=0 first="" closed_ids="" tab
+  # ga-zgqssr7: a 4th argument = the hours a bead must have been closed (the CRITICAL tier passes 0: closed is closed); a missing one or a non-number = BEAD_CLOSED_HOURS, never fewer hours on a guess
+  local need_h="${4-}"; case "$need_h" in ''|*[!0-9]*) need_h="$BEAD_CLOSED_HOURS" ;; esac
   _BC_PROOF_IDS=""; _BC_PROOF_FIRST=""; _BC_ROWS=""; _BC_FOUND_IDS=""; _BC_FOUND_PFX=""
   _worktree_op_in_progress "$wt" && return 1
   cur="$(git -C "$wt" symbolic-ref -q --short HEAD 2>/dev/null)"; [ -n "$cur" ] || cur="$br"
@@ -1147,7 +1239,7 @@ $cands
 EOF
     if [ -n "$rest" ]; then _bead_ask "$repo" "$hq" "$rest" || return 1; fi
   fi
-  now_s=$(date +%s); need=$((BEAD_CLOSED_HOURS * 3600)); tab="$(printf '\t')"
+  now_s=$(date +%s); need=$((need_h * 3600)); tab="$(printf '\t')"
   while IFS="$tab" read -r bid st ce; do
     [ -n "$bid" ] || continue
     [ "$st" = "closed" ] || return 1                      # any named bead not closed: the worker may be live
@@ -1400,6 +1492,36 @@ _pool_shipped_and_closed() {
   _bead_closed_proof "$repo" "$wt" "$br"
 }
 
+# ── _critical_shipped_and_closed <repo> <wt> <br> — ga-zgqssr7: the CRITICAL tier's proof (free < CRITICAL_FREE_GB, see the knob). The same four facts as _pool_shipped_and_closed — and the same rule that any
+# one that cannot be answered is "not proven", the tree stays — with the two waits taken out: the caller does not ask for MERGED_MIN_AGE_MIN, and the bead need only be closed (_bead_closed_proof 0), not for BEAD_CLOSED_HOURS.
+# 0 iff ALL of these hold (the caller asks it for an UNLOCKED tree only; a lock has its own contract):
+#   (1) no rebase / merge / cherry-pick / revert / bisect under way;
+#   (2) HEAD readable and delivered: every commit it has that origin/<default> lacks is there as an equivalent patch, no merge commit among them, `git cherry` exited 0 with no '+' (_ref_patch_equivalent; an
+#       ancestor of main passes it too: nothing is ahead), or — a repo with NO remote — HEAD in its local trunk (_head_in_local_trunk);
+#   (3) `git status` ran and printed nothing;
+#   (4) every bead the tree is named for is CLOSED, closed_at known (a bead that is open, missing, unreadable, or whose lookup fails or times out is "could not tell").
+# The caller still asks _keep_unsafe (a process cwd/open file in the tree, ignored data) before the remove, which is the plain non --force one: a tree that turns dirty after (3) is refused by git.
+# On 0 the event fields are in $_CR_JSON (proof, beads, size_kb, "reason":"critical") and the proof the orphan BRANCH may be deleted on in $_CR_DEL (patch_equivalent, or "" = delete none: a local-trunk tree).
+# On 1 the tree is counted (critical_kept) — the sweep line says how many trees the tier looked at and left. Main shell only (it counts, and _bead_closed_proof hands its answer through globals).
+_critical_shipped_and_closed() {
+  local repo="$1" wt="$2" br="$3" head st proof kb
+  _CR_JSON=""; _CR_DEL=""; _BC_PROOF_IDS=""
+  # vazio/falhou in each read below → the tree is NOT proven: it stays and is counted
+  if _worktree_op_in_progress "$wt"; then critical_kept=$((critical_kept+1)); return 1; fi
+  head="$(git -C "$wt" rev-parse HEAD 2>/dev/null)"
+  if [ -z "$head" ]; then critical_kept=$((critical_kept+1)); return 1; fi
+  if _ref_patch_equivalent "$repo" "$head"; then proof="patch_equivalent"; _CR_DEL="patch_equivalent"
+  elif _head_in_local_trunk "$repo" "$wt"; then proof="local_trunk"
+  else critical_kept=$((critical_kept+1)); return 1; fi
+  st="$(git -C "$wt" status --porcelain 2>/dev/null)" || { critical_kept=$((critical_kept+1)); _CR_DEL=""; return 1; }
+  if [ -n "$st" ]; then critical_kept=$((critical_kept+1)); _CR_DEL=""; return 1; fi
+  if ! _bead_closed_proof "$repo" "$wt" "$br" 0; then critical_kept=$((critical_kept+1)); _CR_DEL=""; return 1; fi
+  # vazio/falhou → size_kb null: a log field only, the tree goes either way
+  kb="$(du -sk "$wt" 2>/dev/null | awk '{print $1}')"; case "$kb" in ''|*[!0-9]*) kb=null ;; esac
+  _CR_JSON=",\"proof\":\"$proof bead_closed\",\"beads\":\"$(_json_esc "$_BC_PROOF_IDS")\",\"size_kb\":$kb,\"reason\":\"critical\""
+  return 0
+}
+
 # ── _log_repo_unresolvable <repo> <rc> <why> — ga-ryykl9l: the ONE event for a repo the pool loop could not read (its path, the rc of the first read that failed — --show-toplevel or the worktree list —, and why),
 # and the count the sweep line carries. A repo that cannot be read is not a repo with nothing to sweep: without this line the two looked the same in the log (a rig container went unswept, unlogged). Main shell only: it counts.
 _log_repo_unresolvable() {
@@ -1509,15 +1631,19 @@ reap_pool_worktrees() {
         # reap/would-reap event then carries the proof, and the orphan branch goes on the same patch-equivalence proof.
         # ga-ggj1wnv: and a tree of a repo with NO remote (traco-bim: no origin/<default> to be an ancestor of) is "merged" when its HEAD is in the repo's local
         # trunk (_head_in_local_trunk); unlocked trees only; mproof stays empty, so no branch is ever deleted on it.
-        local merged=0 mproof="" mproof_json=""
+        local merged=0 mproof="" mproof_json="" crit_tree=0
+        # ga-zgqssr7: under CRITICAL disk the patch-equivalence arm below is replaced by _critical_shipped_and_closed — the same proof with no minimum age and no BEAD_CLOSED_HOURS wait (see the knob)
         if [ "$age_min" -ge "$MERGED_MIN_AGE_MIN" ]; then
           if _worktree_head_merged "$repo" "$wt"; then merged=1
           elif [ -z "$lock" ] && _head_in_local_trunk "$repo" "$wt"; then
             merged=1; mproof_json=",\"proof\":\"local_trunk\""
-          elif [ -z "$lock" ] && _pool_shipped_and_closed "$repo" "$wt" "$br"; then
+          elif [ -z "$lock" ] && [ "$critical" != "1" ] && _pool_shipped_and_closed "$repo" "$wt" "$br"; then
             merged=1; mproof="patch_equivalent"
             mproof_json=",\"proof\":\"patch_equivalent bead_closed\",\"beads\":\"$(_json_esc "$_BC_PROOF_IDS")\""
           fi
+        fi
+        if [ "$merged" != "1" ] && [ "$critical" = "1" ] && [ -z "$lock" ] && _critical_shipped_and_closed "$repo" "$wt" "$br"; then
+          merged=1; crit_tree=1; mproof="$_CR_DEL"; mproof_json="$_CR_JSON"
         fi
         if [ "$age" -le "$gate_hours" ] 2>/dev/null && [ "$merged" != "1" ]; then kept=$((kept+1)); wt=""; br=""; lock=""; continue; fi
         # ga-m5i7e6: in use / disk-pressure-unmerged is checked for every tree about to be removed (it used to be the merged
@@ -1526,6 +1652,7 @@ reap_pool_worktrees() {
         if [ "$merged" = "1" ] || [ -z "$lock" ]; then
           if _keep_unsafe "$repo" "$wt" "$br" "$age" "$merged"; then
             kept=$((kept+1))
+            [ "$crit_tree" = "1" ] && critical_kept=$((critical_kept+1))   # ga-zgqssr7: proven, but a process is in it (or ignored data): it stays, counted with the ones the proof refused
             wt=""; br=""; lock=""; continue
           fi
           # ga-ggj1wnv: a tree let through on the closed-bead proof carries it (proof, beads, size_kb, reason) on its event; set only when _keep_unsafe ran for THIS tree
@@ -1571,7 +1698,7 @@ reap_pool_worktrees() {
           wt=""; br=""; lock=""; continue
         fi
         if git -C "$repo" worktree remove "$wt" 2>/dev/null; then
-          pool_reaped=$((pool_reaped+1))
+          pool_reaped=$((pool_reaped+1)); [ "$crit_tree" = "1" ] && critical_reaped=$((critical_reaped+1))
           printf '{"ts":"%s","event":"reaped_pool","repo":"%s","wt":"%s","branch":"%s","age_h":%s,"mode":"%s"%s}\n' "$(ts)" "$(basename "$repo")" "$(basename "$wt")" "$br" "$age" "$mode" "$mproof_json" >> "$LOG" 2>/dev/null
           delete_merged_local_branch "$repo" "$br" "$mproof"
         elif preserve_and_reap_dirty "$repo" "$wt" "$br" "$age"; then
@@ -1616,17 +1743,26 @@ for WT_DIR in $WT_DIRS; do
     # ga-t14of: gated on MERGED_MIN_AGE_MIN — see reap_pool_worktrees for why a bare
     # "merged" check alone would reap a just-created, not-yet-touched worktree too.
     if [ "$age_min" -ge "$MERGED_MIN_AGE_MIN" ] && _worktree_head_merged "$GT" "$d"; then merged=1; fi
+    tproof_json=""   # ga-ggj1wnv: the closed-bead proof's event fields, set only when _keep_unsafe ran for THIS tree and let it through on that proof
+    crit_tree=0; lock_reason=""; lock_read=0
+    # ga-zgqssr7: this loop had no patch-equivalence arm at all (a gate-rebased tree is never an ancestor of main), so its delivered trees waited for the age gate. Under CRITICAL disk an UNLOCKED tree is proven
+    # by _critical_shipped_and_closed (no minimum age, no BEAD_CLOSED_HOURS wait); a lock is read here, earlier than below, only for the trees that get this far. vazio → not locked; falhou → the same, and git
+    # still refuses a locked tree at the remove.
+    if [ "$merged" != "1" ] && [ "$critical" = "1" ]; then
+      lock_reason="$(_wt_lock_reason "$GT" "$d")"; lock_read=1
+      if [ -z "$lock_reason" ] && _critical_shipped_and_closed "$GT" "$d" ""; then merged=1; crit_tree=1; tproof_json="$_CR_JSON"; fi
+    fi
     if [ "$age" -le "$gate_hours" ] && [ "$merged" != "1" ]; then kept=$((kept+1)); continue; fi
     # ga-m5i7e6: in use / disk-pressure-unmerged for every tree about to go (was: merged only). A LOCKED unmerged tree is left
     # to the lock contract below instead: its own proofs (zombie holder, closed bead) are what frees disk under pressure.
-    lock_reason="$(_wt_lock_reason "$GT" "$d")"
-    tproof_json=""   # ga-ggj1wnv: the closed-bead proof's event fields, set only when _keep_unsafe ran for THIS tree and let it through on that proof
+    [ "$lock_read" = "1" ] || lock_reason="$(_wt_lock_reason "$GT" "$d")"
     if [ "$merged" = "1" ] || [ -z "$lock_reason" ]; then
       if _keep_unsafe "$GT" "$d" "" "$age" "$merged"; then
         kept=$((kept+1))
+        [ "$crit_tree" = "1" ] && critical_kept=$((critical_kept+1))   # ga-zgqssr7: proven, but a process is in it (or ignored data): it stays, counted with the ones the proof refused
         continue
       fi
-      tproof_json="$_KU_PROOF_JSON"
+      [ -z "$_KU_PROOF_JSON" ] || tproof_json="$_KU_PROOF_JSON"   # (a critical tree is "merged": _keep_unsafe leaves this empty for it, and its own fields stay)
     fi
     if [ "$ENABLED" != "1" ]; then
       printf '{"ts":"%s","event":"would_reap","wt":"%s","age_h":%s,"mode":"%s","merged":%s%s}\n' "$(ts)" "$(basename "$d")" "$age" "$mode" "$merged" "$tproof_json" >> "$LOG" 2>/dev/null
@@ -1634,7 +1770,7 @@ for WT_DIR in $WT_DIRS; do
     fi
     # no --force: a worktree with uncommitted WIP (a live build) is REFUSED → protected.
     if git -C "$GT" worktree remove "$d" 2>/dev/null; then
-      reaped=$((reaped+1))
+      reaped=$((reaped+1)); [ "$crit_tree" = "1" ] && critical_reaped=$((critical_reaped+1))
       printf '{"ts":"%s","event":"reaped","wt":"%s","age_h":%s,"mode":"%s","merged":%s%s}\n' "$(ts)" "$(basename "$d")" "$age" "$mode" "$merged" "$tproof_json" >> "$LOG" 2>/dev/null
     elif _reap_dirty_generated_only "$GT" "$d" "" "$age" "town"; then
       # ga-he2c1u: refused only because of generated files, delivered, bead closed — see the function
@@ -1708,6 +1844,12 @@ for _repo in "$GT"/*/; do
   fi
 done
 
-printf '{"ts":"%s","event":"sweep","mode":"%s","free_gb":%s,"gate_hours":%s,"reaped":%s,"pool_reaped":%s,"zombie_reaped":%s,"preserved_dirty":%s,"branches_deleted":%s,"skipped_dirty":%s,"kept":%s,"session_list":"%s","kept_session_list_unavailable":%s,"bead_lookup_failed":%s,"repo_unresolvable":%s}\n' \
-  "$(ts)" "$mode" "$free_gb" "$gate_hours" "$reaped" "$pool_reaped" "$zombie_reaped" "$preserved_dirty" "$branches_deleted" "$skipped_dirty" "$kept" "${_WT_REAPER_SESSION_STATE:-unused}" "$kept_session_list_unavailable" "$bead_lookup_failed" "$repo_unresolvable" >> "$LOG" 2>/dev/null
+# ga-zgqssr7: how long THIS pass took, and the tick it must fit in. A pass that outlasts CADENCE_S is logged by itself (pass_exceeds_interval): the next tick(s) found the lock held and did nothing, so the cadence is longer than the
+# plist says — the line is what tells the Mayor to raise the interval or cut the work, instead of that going unseen.
+duration_s=$(( $(date +%s) - START_S ))
+if [ "$duration_s" -ge "$CADENCE_S" ] && [ "$CADENCE_S" -gt 0 ]; then
+  printf '{"ts":"%s","event":"pass_exceeds_interval","duration_s":%s,"interval_s":%s,"note":"ticks that fell inside this pass found the lock held and did nothing"}\n' "$(ts)" "$duration_s" "$CADENCE_S" >> "$LOG" 2>/dev/null
+fi
+printf '{"ts":"%s","event":"sweep","mode":"%s","free_gb":%s,"gate_hours":%s,"reaped":%s,"pool_reaped":%s,"zombie_reaped":%s,"preserved_dirty":%s,"branches_deleted":%s,"skipped_dirty":%s,"kept":%s,"session_list":"%s","kept_session_list_unavailable":%s,"bead_lookup_failed":%s,"repo_unresolvable":%s,"critical":%s,"critical_free_gb":%s,"critical_reaped":%s,"critical_kept":%s,"duration_s":%s,"interval_s":%s}\n' \
+  "$(ts)" "$mode" "$free_gb" "$gate_hours" "$reaped" "$pool_reaped" "$zombie_reaped" "$preserved_dirty" "$branches_deleted" "$skipped_dirty" "$kept" "${_WT_REAPER_SESSION_STATE:-unused}" "$kept_session_list_unavailable" "$bead_lookup_failed" "$repo_unresolvable" "$critical" "$CRITICAL_FREE_GB" "$critical_reaped" "$critical_kept" "$duration_s" "$CADENCE_S" >> "$LOG" 2>/dev/null
 exit 0

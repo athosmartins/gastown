@@ -29,6 +29,9 @@
 # own entry is never a candidate, <rig>-wt comes from the container's physical path — and a repo git cannot read (what it is, or its worktree list) is skipped with a skip_repo_unresolvable event, counted on the sweep line, and left untouched;
 # the SIGTERM guard kills a crew claude proc
 # but never a supervisor/pilot; kill is default-OFF; the feature has a kill-switch + dry-run.
+# ga-zgqssr7: free disk < CRITICAL_FREE_GB (seam WORKTREE_REAPER_FAKE_FREE_GB) → a 1 h tree, delivered by patch (cherry), clean, unlocked, unused, bead closed 10 min ago, is removed in BOTH loops (reason=critical)
+# and kept for a cherry '+', an open/in_progress/unreadable/future-closed bead, a process inside, dirt, a lock, a merge under way, a failing cherry/status/rev-parse/rev-list, free=7, free=6 and the tier off; plus the
+# single-instance lock (live/dead/foreign/empty/garbage holder), the cadence gate (skipped_no_pressure, stamp, FORCE, pressure) and the pass duration (pass_exceeds_interval).
 # Process probes are faked so it's hermetic. Exit 0 iff all hold.
 set -uo pipefail
 
@@ -65,6 +68,10 @@ export WORKTREE_REAPER_FAKE_SESSION_LIST="$EMPTY_SESSIONS"
 # make the suite depend on the machine either. A scenario that wants pressure mode sets the
 # variable on its own `bash "$REAPER"` call, which overrides this per call.
 export WORKTREE_REAPER_PRESSURE_FREE_GB=0
+# ga-zgqssr7: the same hermeticity for the CRITICAL tier (off: the disk this suite runs on must not decide which scenarios see it) and for the CADENCE gate (off: a scenario that runs the
+# reaper twice against one log directory must not find the second pass held back by the first one's stamp). The ga-zgqssr7 scenarios switch each on per call.
+export WORKTREE_REAPER_CRITICAL_FREE_GB=0
+export WORKTREE_REAPER_NORMAL_INTERVAL_S=0
 
 # ga-m5i7e6: two more pins, both for the scenarios that PREDATE it. (1) A tree's age is now its FRESHEST sign of life (index,
 # HEAD commit, any file inside), but those scenarios backdate ONLY the root directory — the index, files and commits of their
@@ -1301,6 +1308,7 @@ for a in "$@"; do
       partial) echo true; exit 1 ;;
     esac
   fi
+  if [ "$a" = "list" ] && [ "$wk" = "1" ] && [ -n "${PE_WTLIST_SLEEP:-}" ]; then sleep "$PE_WTLIST_SLEEP"; fi   # ga-zgqssr7: PE_WTLIST_SLEEP=<s> makes every `worktree list` slow, so a pass takes a measurable time
   if [ "$a" = "list" ] && [ "$wk" = "1" ] && [ "${PE_WTLIST:-}" = "fail" ]; then echo "fatal: injected worktree list failure" >&2; exit 128; fi
   if [ "$a" = "HEAD" ] && [ "$rp" = "1" ] && [ "${PE_REVPARSE:-}" = "fail" ]; then exit 128; fi
   if [ "$a" = "status" ] && [ "${PE_STATUS:-}" = "fail" ]; then exit 128; fi
@@ -2914,6 +2922,168 @@ run_kz ct_esc '[]'
   && [ -n "$(jq -r 'select(.event=="skip_repo_unresolvable") | .why' "$TMP/ct_esc.jsonl" 2>/dev/null)" ]; } \
   && ok "ga-ryykl9l (h10): a repo directory named with a quote and a backslash — every log line parses as JSON, repo and path round-trip, the why is there" \
   || bad "ga-ryykl9l (h10): hostile directory name — jq says: $(jq -e . "$TMP/ct_esc.jsonl" 2>&1 >/dev/null | head -n 1) repo=$(jq -r 'select(.event=="skip_repo_unresolvable") | .repo' "$TMP/ct_esc.jsonl" 2>/dev/null)"
+
+# ══ ga-zgqssr7: the CRITICAL tier — free < CRITICAL_FREE_GB: a delivered, clean, unused tree of a CLOSED bead goes with NO minimum age and NO closed-hours wait ═══
+# 27/10: ~20 delivered trees waited out MERGED_MIN_AGE_MIN / BEAD_CLOSED_HOURS while the disk went from 6 to 2 GB (probes returned [], pushes refused, the D4 reboot fired). Every scenario below breaks
+# exactly ONE proof (or the hypothesis: the disk is not critical) and must KEEP the tree; (a)/(a0) are the positive controls, and the free=7 / free=6 / tier-off ones show that the SAME tree stays
+# whenever the disk is not critical. Then the single-instance lock, the cadence gate and the pass duration.
+echo "── ga-zgqssr7: critical disk → delivered + clean + unused + bead closed goes with no wait; any proof missing → kept; one pass at a time; cadence ──"
+CZ_ENV="WORKTREE_REAPER_CRITICAL_FREE_GB=6 WORKTREE_REAPER_PRESSURE_FREE_GB=8 WORKTREE_REAPER_FAKE_FREE_GB=4"
+crt_ago() { date -u -v-"$1"M +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u -d "$1 minutes ago" +%Y-%m-%dT%H:%M:%SZ; }
+crt_bead() { printf '{"id":"%s","status":"%s","closed_at":"%s"}' "$1" "$2" "$(crt_ago "$3")"; }   # crt_bead <id> <status> <minutes since closed>
+CZ_CLOSED10="[$(crt_bead "$KZ_ID" closed 10)]"
+crt_sweep() { jq -r "select(.event==\"sweep\") | .$2" "$TMP/$1.jsonl" 2>/dev/null | tail -n 1; }   # crt_sweep <name> <field> — of the LAST sweep line
+crt_ev() { events "$1" "$2"; }
+# crt_kept <name> <label> [<critical_kept expected on the sweep line>] — tree + branch intact, nothing reaped (pool or town), the sweep line says what the tier did
+crt_kept() {
+  if kz_wt "$1" && kz_br "$1" && [ "$(crt_ev "$1" reaped_pool)" = "0" ] && [ "$(crt_sweep "$1" critical_reaped)" = "0" ] && { [ -z "${3:-}" ] || [ "$(crt_sweep "$1" critical_kept)" = "$3" ]; }; then
+    ok "ga-zgqssr7: $2 → KEPT (tree + branch intact, critical_reaped=0${3:+, critical_kept=$3})"
+  else bad "ga-zgqssr7: $2 → NOT kept (wt=$(kz_wt "$1" && echo y || echo n) br=$(kz_br "$1" && echo y || echo n) reaped_pool=$(crt_ev "$1" reaped_pool) critical_reaped=$(crt_sweep "$1" critical_reaped) critical_kept=$(crt_sweep "$1" critical_kept))"; fi
+}
+
+# (a) the bug: tree 1 h old, rebased (patch-equivalent, NOT an ancestor), clean, bead closed 10 MIN ago, free=4 → REMOVED, branch with it (same proof), the event says why
+kz_mk cz_a "" 1
+{ [ -z "$(git -C "$TMP/cz_a/rig" cherry origin/main "crew/kz/$KZ_ID" 2>/dev/null | grep -v '^- ')" ] && ! git -C "$TMP/cz_a/rig" merge-base --is-ancestor "crew/kz/$KZ_ID" origin/main 2>/dev/null; } \
+  && ok "ga-zgqssr7 (fixture): the tree is patch-equivalent ('-' only) and its HEAD is not an ancestor of main" || bad "ga-zgqssr7 (fixture): the rebased fixture is wrong"
+run_kz cz_a "$CZ_CLOSED10" $CZ_ENV
+kz_wt cz_a && bad "ga-zgqssr7 (a): 1 h tree, delivered, bead closed 10 min ago, free=4 GB NOT removed — the bug" || ok "ga-zgqssr7 (a): 1 h tree, delivered, bead closed 10 min ago, free=4 GB → REMOVED"
+jq -e -s 'map(select(.event=="reaped_pool")) | length==1 and .[0].reason=="critical" and .[0].proof=="patch_equivalent bead_closed" and .[0].beads=="'"$KZ_ID"'" and (.[0].size_kb|type)=="number"' "$TMP/cz_a.jsonl" >/dev/null 2>&1 \
+  && ok "ga-zgqssr7 (a): ONE reaped_pool event, reason=critical, proof and bead named, size_kb a number" || bad "ga-zgqssr7 (a): the reap event is wrong: $(grep reaped_pool "$TMP/cz_a.jsonl" 2>/dev/null | head -1)"
+kz_br cz_a && bad "ga-zgqssr7 (a): the shipped orphan branch was left behind" || ok "ga-zgqssr7 (a): the orphan branch goes with it (deleted on the patch-equivalence proof, merged-only as always)"
+jq -e -s 'map(select(.event=="sweep")) | length==1 and .[0].critical==1 and .[0].critical_reaped==1 and .[0].critical_free_gb==6 and .[0].free_gb==4 and .[0].mode=="pressure" and (.[0].duration_s|type)=="number" and .[0].interval_s==1800' "$TMP/cz_a.jsonl" >/dev/null 2>&1 \
+  && ok "ga-zgqssr7 (a): the sweep line carries critical=1, critical_reaped=1, the threshold, free_gb, duration_s and interval_s" || bad "ga-zgqssr7 (a): the sweep line is wrong: $(grep '"event":"sweep"' "$TMP/cz_a.jsonl" 2>/dev/null | tail -1)"
+jq -e . "$TMP/cz_a.jsonl" >/dev/null 2>&1 && ok "ga-zgqssr7 (a): every line of the log parses as JSON" || bad "ga-zgqssr7 (a): the log has a line that is not JSON"
+# (a0) NO minimum age at all: a tree touched this minute, bead closed 1 minute ago
+kz_mk cz_a0 "" 0; run_kz cz_a0 "[$(crt_bead "$KZ_ID" closed 1)]" $CZ_ENV
+kz_wt cz_a0 && bad "ga-zgqssr7 (a0): a 0-minute tree of a bead closed 1 min ago NOT removed (a minimum age is still in the way)" || ok "ga-zgqssr7 (a0): a 0-minute tree of a bead closed 1 min ago → REMOVED (no minimum age, no closed-hours wait)"
+
+# the SAME tree and bead when the disk is not critical: free=7 (pressure only), free=6 (the boundary: not < 6), the tier switched off, a threshold that is not a number (→ default 6, so it IS critical)
+kz_mk cz_c1 "" 1; run_kz cz_c1 "$CZ_CLOSED10" $CZ_ENV WORKTREE_REAPER_FAKE_FREE_GB=7;   crt_kept cz_c1 "control: free=7 GB (pressure, not critical), same tree and bead"
+[ "$(crt_sweep cz_c1 critical)" = "0" ] && ok "ga-zgqssr7 (c1): the sweep line says critical=0" || bad "ga-zgqssr7 (c1): critical=$(crt_sweep cz_c1 critical)"
+kz_mk cz_c2 "" 1; run_kz cz_c2 "$CZ_CLOSED10" $CZ_ENV WORKTREE_REAPER_FAKE_FREE_GB=6;   crt_kept cz_c2 "control: free=6 GB (the boundary, not below 6)"
+kz_mk cz_c3 "" 1; run_kz cz_c3 "$CZ_CLOSED10" $CZ_ENV WORKTREE_REAPER_CRITICAL_FREE_GB=0; crt_kept cz_c3 "control: the tier switched off (CRITICAL_FREE_GB=0) at free=4"
+kz_mk cz_c4 "" 1; run_kz cz_c4 "$CZ_CLOSED10" $CZ_ENV WORKTREE_REAPER_CRITICAL_FREE_GB=abc
+kz_wt cz_c4 && bad "ga-zgqssr7 (c4): a threshold that is not a number was read as 'tier off' (it must fall back to 6)" || ok "ga-zgqssr7 (c4): a threshold that is not a number falls back to 6 → critical at free=4"
+
+# one proof missing each → KEPT, and the tier counts the tree it could not prove (critical_kept=1)
+kz_mk cz_n1 'echo unshipped > unshipped.txt && git add unshipped.txt && git commit -qm unshipped' 1; run_kz cz_n1 "$CZ_CLOSED10" $CZ_ENV; crt_kept cz_n1 "a commit main lacks (cherry '+')" 1
+kz_mk cz_n2 "" 1; run_kz cz_n2 "[$(bc_bead "$KZ_ID" open)]" $CZ_ENV;        crt_kept cz_n2 "bead OPEN" 1
+kz_mk cz_n3 "" 1; run_kz cz_n3 "[$(bc_bead "$KZ_ID" in_progress)]" $CZ_ENV; crt_kept cz_n3 "bead IN_PROGRESS" 1
+kz_mk cz_n4 "" 1; run_kz cz_n4 "@missing" $CZ_ENV;                           crt_kept cz_n4 "bead lookup FAILED (bd unreadable)" 1
+[ "$(crt_ev cz_n4 bead_lookup_failed)" = "1" ] && ok "ga-zgqssr7 (n4): the failed lookup is logged once (bead_lookup_failed) — counted, never read as closed" || bad "ga-zgqssr7 (n4): bead_lookup_failed=$(crt_ev cz_n4 bead_lookup_failed)"
+kz_mk cz_n5 "" 1; run_kz cz_n5 "[$(bc_bead "$KZ_ID" closed)]" $CZ_ENV;       crt_kept cz_n5 "bead closed but closed_at unknown" 1
+kz_mk cz_n6 "" 1; run_kz cz_n6 "[{\"id\":\"$KZ_ID\",\"status\":\"closed\",\"closed_at\":\"$(date -u -v+30M +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u -d '30 minutes' +%Y-%m-%dT%H:%M:%SZ)\"}]" $CZ_ENV; crt_kept cz_n6 "bead 'closed' in the FUTURE (clock skew)" 1
+kz_mk cz_n7 "" 1; ( cd "$TMP/cz_n7/rig/crew/worker-kz" && pwd -P ) > "$TMP/cz_n7.lsof"; run_kz cz_n7 "$CZ_CLOSED10" $CZ_ENV WORKTREE_REAPER_FAKE_LSOF="$TMP/cz_n7.lsof"
+crt_kept cz_n7 "a live process has its cwd in the tree" 1
+kz_mk cz_n8 'echo wip > wip.txt' 1; run_kz cz_n8 "$CZ_CLOSED10" $CZ_ENV;     crt_kept cz_n8 "dirty (an untracked file)" 1
+[ -e "$TMP/cz_n8/rig/crew/worker-kz/wip.txt" ] && ok "ga-zgqssr7 (n8): the file is still there" || bad "ga-zgqssr7 (n8): the dirty tree lost its file"
+kz_mk cz_n9 "" 1;  run_kz cz_n9  "$CZ_CLOSED10" $CZ_ENV PE_CHERRY=fail;     crt_kept cz_n9  "git cherry FAILS (rc 128, no output)" 1
+kz_mk cz_n10 "" 1; run_kz cz_n10 "$CZ_CLOSED10" $CZ_ENV PE_CHERRY=garbage;  crt_kept cz_n10 "git cherry prints something that is not its format" 1
+kz_mk cz_n11 "" 1; run_kz cz_n11 "$CZ_CLOSED10" $CZ_ENV PE_CHERRY=partial;  crt_kept cz_n11 "git cherry prints a '-' line and THEN fails" 1
+kz_mk cz_n12 "" 1; run_kz cz_n12 "$CZ_CLOSED10" $CZ_ENV PE_STATUS=fail;     crt_kept cz_n12 "git status FAILS" 1
+kz_mk cz_n13 "" 1; run_kz cz_n13 "$CZ_CLOSED10" $CZ_ENV PE_REVPARSE=fail;   crt_kept cz_n13 "git rev-parse HEAD FAILS" 1
+kz_mk cz_n14 "" 1; run_kz cz_n14 "$CZ_CLOSED10" $CZ_ENV PE_REVLIST=fail;    crt_kept cz_n14 "the merge-commit check (rev-list --merges) FAILS" 1
+kz_mk cz_n15 "" 1; git -C "$TMP/cz_n15/rig" worktree lock --reason "$KZ_ID active build" crew/worker-kz >/dev/null 2>&1
+run_kz cz_n15 "$CZ_CLOSED10" $CZ_ENV;                                         crt_kept cz_n15 "LOCKED tree (a lock has its own contract)"
+kz_mk cz_n16 "" 1; touch "$(git -C "$TMP/cz_n16/rig/crew/worker-kz" rev-parse --git-path MERGE_HEAD)" 2>/dev/null
+run_kz cz_n16 "$CZ_CLOSED10" $CZ_ENV;                                         crt_kept cz_n16 "a merge under way (MERGE_HEAD)" 1
+# dry-run: the event says what WOULD go, nothing goes
+kz_mk cz_d1 "" 1; run_kz cz_d1 "$CZ_CLOSED10" $CZ_ENV WORKTREE_REAPER_ENABLED=0
+{ kz_wt cz_d1 && kz_br cz_d1 && jq -e -s 'map(select(.event=="would_reap_pool")) | length==1 and .[0].reason=="critical"' "$TMP/cz_d1.jsonl" >/dev/null 2>&1; } \
+  && ok "ga-zgqssr7 (d1): dry-run logs would_reap_pool with reason=critical and removes nothing" || bad "ga-zgqssr7 (d1): dry-run — wt=$(kz_wt cz_d1 && echo y || echo n) $(grep would_reap "$TMP/cz_d1.jsonl" 2>/dev/null | head -1)"
+
+# ── the TOWN loop (.gc-worktrees of the town repo) had no patch-equivalence arm at all: a gate-rebased tree there was never "merged"
+CRT_TID="ga-cr1xyz"
+crt_town() { # <name> [<setup run inside the tree>] [<age h, default 1>] — town repo $TMP/<name>, ONE tree .gc-worktrees/ga-cr1xyz-build whose commit main took as an equivalent patch (HEAD NOT an ancestor)
+  local name="$1" extra="${2:-}" town="$TMP/$1"
+  mkdir -p "$town/.gc-worktrees" "$town/.gascity-gastown-hq"; git init -q --bare "$TMP/$name.git"; git init -q -b main "$town"
+  ( cd "$town" || exit 1
+    git remote add origin "$TMP/$name.git"; echo t > t.txt; git add t.txt; git commit -qm t
+    git push -q origin main; git fetch -q origin; git remote set-head origin main 2>/dev/null || true
+    git worktree add -q ".gc-worktrees/$CRT_TID-build" -b "fix/$CRT_TID-build" main
+    ( cd ".gc-worktrees/$CRT_TID-build" && echo shipped > shipped.txt && git add shipped.txt && git commit -qm shipped )
+    git cherry-pick -x "fix/$CRT_TID-build" && git push -q origin main && git fetch -q origin
+    [ -z "$extra" ] || ( cd ".gc-worktrees/$CRT_TID-build" && eval "$extra" )
+  ) >/dev/null 2>&1
+  pe_age "$town/.gc-worktrees/$CRT_TID-build" "${3:-1}"
+}
+crt_twt() { git -C "$TMP/$1" worktree list --porcelain 2>/dev/null | grep -E "/\.gc-worktrees/$CRT_TID-build\$" >/dev/null; }
+crt_tbr() { git -C "$TMP/$1" rev-parse --verify -q "refs/heads/fix/$CRT_TID-build" >/dev/null 2>&1; }
+crt_tkept() { # <name> <label> — the town tree and its branch intact, no reaped event, critical_reaped=0
+  if crt_twt "$1" && crt_tbr "$1" && [ "$(crt_ev "$1" reaped)" = "0" ] && [ "$(crt_sweep "$1" critical_reaped)" = "0" ]; then ok "ga-zgqssr7 (town): $2 → KEPT (tree + branch intact, critical_reaped=0)"
+  else bad "ga-zgqssr7 (town): $2 → NOT kept (wt=$(crt_twt "$1" && echo y || echo n) reaped=$(crt_ev "$1" reaped) critical_reaped=$(crt_sweep "$1" critical_reaped))"; fi
+}
+CT_CLOSED10="[$(crt_bead "$CRT_TID" closed 10)]"
+crt_town ct_a; run_dg ct_a "$CT_CLOSED10" $CZ_ENV
+crt_twt ct_a && bad "ga-zgqssr7 (town a): 1 h town tree, delivered by patch, bead closed 10 min ago, free=4 GB NOT removed" || ok "ga-zgqssr7 (town a): 1 h town tree, delivered by patch, bead closed 10 min ago, free=4 GB → REMOVED"
+jq -e -s 'map(select(.event=="reaped")) | length==1 and .[0].reason=="critical" and .[0].merged==1 and .[0].proof=="patch_equivalent bead_closed" and .[0].beads=="'"$CRT_TID"'" and (.[0].size_kb|type)=="number"' "$TMP/ct_a.jsonl" >/dev/null 2>&1 \
+  && ok "ga-zgqssr7 (town a): ONE reaped event, reason=critical, merged=1, proof and bead named" || bad "ga-zgqssr7 (town a): the reaped event is wrong: $(grep '"event":"reaped"' "$TMP/ct_a.jsonl" 2>/dev/null | head -1)"
+crt_tbr ct_a && ok "ga-zgqssr7 (town a): the town loop never deletes a branch" || bad "ga-zgqssr7 (town a): the branch was deleted"
+[ "$(crt_sweep ct_a critical_reaped)" = "1" ] && [ "$(crt_sweep ct_a reaped)" = "1" ] && ok "ga-zgqssr7 (town a): the sweep line counts it (reaped=1, critical_reaped=1)" || bad "ga-zgqssr7 (town a): sweep reaped=$(crt_sweep ct_a reaped) critical_reaped=$(crt_sweep ct_a critical_reaped)"
+crt_town ct_c; run_dg ct_c "$CT_CLOSED10" $CZ_ENV WORKTREE_REAPER_FAKE_FREE_GB=7;   crt_tkept ct_c "control: free=7 GB, same tree and bead"
+crt_town ct_n1 'echo unshipped > unshipped.txt && git add unshipped.txt && git commit -qm unshipped'; run_dg ct_n1 "$CT_CLOSED10" $CZ_ENV; crt_tkept ct_n1 "a commit main lacks (cherry '+')"
+crt_town ct_n2; run_dg ct_n2 "[$(bc_bead "$CRT_TID" open)]" $CZ_ENV;                crt_tkept ct_n2 "bead OPEN"
+crt_town ct_n3; ( cd "$TMP/ct_n3/.gc-worktrees/$CRT_TID-build" && pwd -P ) > "$TMP/ct_n3.lsof"; run_dg ct_n3 "$CT_CLOSED10" $CZ_ENV WORKTREE_REAPER_FAKE_LSOF="$TMP/ct_n3.lsof"; crt_tkept ct_n3 "a live process in the tree"
+crt_town ct_n4 'echo wip > wip.txt'; run_dg ct_n4 "$CT_CLOSED10" $CZ_ENV;           crt_tkept ct_n4 "dirty (an untracked file)"
+crt_town ct_n5; run_dg ct_n5 "$CT_CLOSED10" $CZ_ENV PE_CHERRY=fail PATH="$PE_BIN:$PATH"; crt_tkept ct_n5 "git cherry FAILS"
+crt_town ct_n6; git -C "$TMP/ct_n6" worktree lock --reason "$CRT_TID build" ".gc-worktrees/$CRT_TID-build" >/dev/null 2>&1; run_dg ct_n6 "$CT_CLOSED10" $CZ_ENV; crt_tkept ct_n6 "LOCKED tree"
+crt_town ct_d1; run_dg ct_d1 "$CT_CLOSED10" $CZ_ENV WORKTREE_REAPER_ENABLED=0
+{ crt_twt ct_d1 && jq -e -s 'map(select(.event=="would_reap")) | length==1 and .[0].reason=="critical"' "$TMP/ct_d1.jsonl" >/dev/null 2>&1; } \
+  && ok "ga-zgqssr7 (town d1): dry-run logs would_reap with reason=critical and removes nothing" || bad "ga-zgqssr7 (town d1): $(grep would_reap "$TMP/ct_d1.jsonl" 2>/dev/null | head -1)"
+
+# ── ONE pass at a time: a lock held by a live reaper makes the tick do nothing; a dead or foreign holder is a stale lock; an empty pid file is held until the directory is old
+# cad_run <name> <beads> [ENV=val ...] — NORMAL mode (free=20) with its own lock dir and stamp; the fixture tree (14 h idle, bead closed 10 h ago) is one a normal pass REMOVES, so "removed" = "a pass ran"
+cad_run() { local n="$1" b="$2"; shift 2; run_kz "$n" "$b" WORKTREE_REAPER_PRESSURE_FREE_GB=8 WORKTREE_REAPER_FAKE_FREE_GB=20 WORKTREE_REAPER_LOCK_DIR="$TMP/$n.lock.d" WORKTREE_REAPER_STAMP="$TMP/$n.stamp" "$@"; }
+cad_ran() { [ "$(crt_ev "$1" sweep)" = "1" ]; }       # a pass ran: it wrote its sweep line (a skipped tick writes none)
+cad_idle() { [ "$(crt_ev "$1" sweep)" = "0" ] && kz_wt "$1" && kz_br "$1"; }   # no pass: no sweep line, tree and branch untouched
+# (l1) a live reaper holds the lock → skipped_busy (naming the holder), no sweep, tree untouched, the holder's lock left alone
+kz_mk cad_l1; mkdir "$TMP/cad_l1.lock.d"; bash -c 'sleep 30; :' worktree-reaper-fake & LK_PID=$!; echo "$LK_PID" > "$TMP/cad_l1.lock.d/pid"
+cad_run cad_l1 "$KZ_CLOSED"; kill "$LK_PID" 2>/dev/null; wait "$LK_PID" 2>/dev/null
+{ cad_idle cad_l1 && [ "$(crt_ev cad_l1 skipped_busy)" = "1" ] && grep '"event":"skipped_busy"' "$TMP/cad_l1.jsonl" | grep -F "\"holder\":\"$LK_PID\"" >/dev/null && [ "$(cat "$TMP/cad_l1.lock.d/pid" 2>/dev/null)" = "$LK_PID" ]; } \
+  && ok "ga-zgqssr7 (lock 1): a live reaper holds the lock → skipped_busy names it, no sweep, tree untouched, the lock is still the holder's" || bad "ga-zgqssr7 (lock 1): idle=$(cad_idle cad_l1 && echo y || echo n) busy=$(crt_ev cad_l1 skipped_busy) sweep=$(crt_ev cad_l1 sweep)"
+# (l2) the holder is DEAD → stale: taken over, the pass runs, and the lock is released at the end
+kz_mk cad_l2; mkdir "$TMP/cad_l2.lock.d"; sh -c 'exit 0' & LK_PID=$!; wait "$LK_PID" 2>/dev/null; echo "$LK_PID" > "$TMP/cad_l2.lock.d/pid"
+cad_run cad_l2 "$KZ_CLOSED"
+{ cad_ran cad_l2 && [ ! -e "$TMP/cad_l2.lock.d" ]; } && ok "ga-zgqssr7 (lock 2): a dead holder is a stale lock → the pass runs, and the lock directory is gone afterwards" || bad "ga-zgqssr7 (lock 2): ran=$(cad_ran cad_l2 && echo y || echo n) lock=$([ -e "$TMP/cad_l2.lock.d" ] && echo left || echo gone)"
+# (l3) the pid is alive but is NOT a reaper (reused by some other program) → stale
+kz_mk cad_l3; mkdir "$TMP/cad_l3.lock.d"; sleep 30 & LK_PID=$!; echo "$LK_PID" > "$TMP/cad_l3.lock.d/pid"
+cad_run cad_l3 "$KZ_CLOSED"; kill "$LK_PID" 2>/dev/null; wait "$LK_PID" 2>/dev/null
+cad_ran cad_l3 && ok "ga-zgqssr7 (lock 3): a live pid that is not a worktree-reaper holds nothing → the pass runs" || bad "ga-zgqssr7 (lock 3): the pass did not run behind a foreign pid"
+# (l4) an EMPTY pid file on a fresh directory = a holder between mkdir and its pid write → held; (l5) the same on a directory 3 h old → a crashed holder, taken over; (l6) garbage in the pid file → stale
+kz_mk cad_l4; mkdir "$TMP/cad_l4.lock.d"; : > "$TMP/cad_l4.lock.d/pid"; cad_run cad_l4 "$KZ_CLOSED"
+{ cad_idle cad_l4 && [ "$(crt_ev cad_l4 skipped_busy)" = "1" ]; } && ok "ga-zgqssr7 (lock 4): an empty pid file on a fresh lock → held (skipped_busy), nothing touched" || bad "ga-zgqssr7 (lock 4): idle=$(cad_idle cad_l4 && echo y || echo n)"
+kz_mk cad_l5; mkdir "$TMP/cad_l5.lock.d"; : > "$TMP/cad_l5.lock.d/pid"; pe_age "$TMP/cad_l5.lock.d" 3; cad_run cad_l5 "$KZ_CLOSED"
+cad_ran cad_l5 && ok "ga-zgqssr7 (lock 5): an empty pid file on a lock directory 3 h old → a crashed holder, taken over (the cadence cannot be stuck for good)" || bad "ga-zgqssr7 (lock 5): the pass did not run behind a 3 h old empty lock"
+kz_mk cad_l6; mkdir "$TMP/cad_l6.lock.d"; echo "not-a-pid" > "$TMP/cad_l6.lock.d/pid"; cad_run cad_l6 "$KZ_CLOSED"
+cad_ran cad_l6 && ok "ga-zgqssr7 (lock 6): garbage in the pid file → stale → the pass runs" || bad "ga-zgqssr7 (lock 6): the pass did not run behind a garbage pid file"
+
+# ── the cadence gate: NORMAL mode runs a pass only when NORMAL_INTERVAL_S (6900) have gone by since the last one STARTED; pressure never waits
+CAD_NOW="$(date +%s)"
+kz_mk cad_g1; echo "$((CAD_NOW - 600))" > "$TMP/cad_g1.stamp"; cad_run cad_g1 "$KZ_CLOSED" WORKTREE_REAPER_NORMAL_INTERVAL_S=6900
+{ cad_idle cad_g1 && [ "$(crt_ev cad_g1 skipped_no_pressure)" = "1" ] && [ ! -e "$TMP/cad_g1.lock.d" ] && [ "$(cat "$TMP/cad_g1.stamp")" = "$((CAD_NOW - 600))" ]; } \
+  && ok "ga-zgqssr7 (gate 1): no pressure, last pass 10 min ago → the tick exits at once (skipped_no_pressure), nothing touched, lock released, stamp unchanged" || bad "ga-zgqssr7 (gate 1): idle=$(cad_idle cad_g1 && echo y || echo n) skipped=$(crt_ev cad_g1 skipped_no_pressure)"
+kz_mk cad_g2; echo "$((CAD_NOW - 7000))" > "$TMP/cad_g2.stamp"; cad_run cad_g2 "$KZ_CLOSED" WORKTREE_REAPER_NORMAL_INTERVAL_S=6900
+{ cad_ran cad_g2 && [ "$(cat "$TMP/cad_g2.stamp")" -ge "$CAD_NOW" ]; } && ok "ga-zgqssr7 (gate 2): last pass 7000 s ago (> 6900) → the pass runs, and the stamp moves to its start" || bad "ga-zgqssr7 (gate 2): ran=$(cad_ran cad_g2 && echo y || echo n) stamp=$(cat "$TMP/cad_g2.stamp")"
+kz_mk cad_g3; rm -f "$TMP/cad_g3.stamp"; cad_run cad_g3 "$KZ_CLOSED" WORKTREE_REAPER_NORMAL_INTERVAL_S=6900
+cad_ran cad_g3 && ok "ga-zgqssr7 (gate 3): no stamp (first run, or a reload) → the pass runs" || bad "ga-zgqssr7 (gate 3): no pass without a stamp"
+kz_mk cad_g4; echo "$((CAD_NOW + 3600))" > "$TMP/cad_g4.stamp"; cad_run cad_g4 "$KZ_CLOSED" WORKTREE_REAPER_NORMAL_INTERVAL_S=6900
+cad_ran cad_g4 && ok "ga-zgqssr7 (gate 4): a stamp in the FUTURE (clock set back) → the pass runs" || bad "ga-zgqssr7 (gate 4): a future stamp held the pass back"
+kz_mk cad_g5; echo "not-a-number" > "$TMP/cad_g5.stamp"; cad_run cad_g5 "$KZ_CLOSED" WORKTREE_REAPER_NORMAL_INTERVAL_S=6900
+cad_ran cad_g5 && ok "ga-zgqssr7 (gate 5): an unreadable stamp → the pass runs" || bad "ga-zgqssr7 (gate 5): an unreadable stamp held the pass back"
+kz_mk cad_g6; echo "$((CAD_NOW - 600))" > "$TMP/cad_g6.stamp"; cad_run cad_g6 "$KZ_CLOSED" WORKTREE_REAPER_NORMAL_INTERVAL_S=6900 WORKTREE_REAPER_FORCE=1
+cad_ran cad_g6 && ok "ga-zgqssr7 (gate 6): WORKTREE_REAPER_FORCE=1 (a manual run) ignores the gate" || bad "ga-zgqssr7 (gate 6): FORCE did not run the pass"
+kz_mk cad_g7; echo "$((CAD_NOW - 60))" > "$TMP/cad_g7.stamp"; cad_run cad_g7 "$KZ_CLOSED" WORKTREE_REAPER_NORMAL_INTERVAL_S=6900 WORKTREE_REAPER_FAKE_FREE_GB=5
+{ cad_ran cad_g7 && [ "$(crt_sweep cad_g7 mode)" = "pressure" ]; } && ok "ga-zgqssr7 (gate 7): below PRESSURE_FREE_GB every tick is a pass, whatever the stamp (last pass 60 s ago)" || bad "ga-zgqssr7 (gate 7): pressure waited for the stamp"
+kz_mk cad_g8; echo "$((CAD_NOW - 600))" > "$TMP/cad_g8.stamp"; cad_run cad_g8 "$KZ_CLOSED" WORKTREE_REAPER_NORMAL_INTERVAL_S=0
+cad_ran cad_g8 && ok "ga-zgqssr7 (gate 8): NORMAL_INTERVAL_S=0 switches the gate off (every start is a pass)" || bad "ga-zgqssr7 (gate 8): the gate was not off"
+
+# ── the pass duration: measured on the sweep line; a pass longer than the tick is logged by itself (the ticks inside it found the lock held)
+kz_mk cad_t1; cad_run cad_t1 "$KZ_CLOSED" WORKTREE_REAPER_NORMAL_INTERVAL_S=0 PE_WTLIST_SLEEP=2 WORKTREE_REAPER_CADENCE_S=1
+{ [ "$(crt_ev cad_t1 pass_exceeds_interval)" = "1" ] && jq -e -s 'map(select(.event=="pass_exceeds_interval")) | .[0].interval_s==1 and .[0].duration_s>=1' "$TMP/cad_t1.jsonl" >/dev/null 2>&1 \
+  && [ "$(crt_sweep cad_t1 duration_s)" -ge 1 ]; } 2>/dev/null \
+  && ok "ga-zgqssr7 (time 1): a pass of >= 2 s against a 1 s tick logs pass_exceeds_interval (duration_s, interval_s), and the sweep line has duration_s >= 1" || bad "ga-zgqssr7 (time 1): exceeds=$(crt_ev cad_t1 pass_exceeds_interval) duration_s=$(crt_sweep cad_t1 duration_s)"
+kz_mk cad_t2; cad_run cad_t2 "$KZ_CLOSED" WORKTREE_REAPER_NORMAL_INTERVAL_S=0
+{ [ "$(crt_ev cad_t2 pass_exceeds_interval)" = "0" ] && [ "$(crt_sweep cad_t2 interval_s)" = "1800" ]; } && ok "ga-zgqssr7 (time 2): control — a pass inside the 1800 s tick logs no overrun" || bad "ga-zgqssr7 (time 2): exceeds=$(crt_ev cad_t2 pass_exceeds_interval) interval_s=$(crt_sweep cad_t2 interval_s)"
 
 echo ""
 echo "── RESULTS: $PASS passed, $FAIL failed ──"
