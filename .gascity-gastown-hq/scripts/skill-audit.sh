@@ -305,9 +305,10 @@ consumer_sinks() {
 phys_dir() {
     PHYS=""
     local here="$PWD"
-    cd -P -- "$1" 2>/dev/null || return 1
+    # CDPATH= : with it exported, `cd` looks a relative path up there and PRINTS the directory it found on stdout (the audit's JSON stream).
+    CDPATH= cd -P -- "$1" >/dev/null 2>&1 || return 1
     PHYS="$PWD"
-    cd -- "$here" 2>/dev/null || cd / || return 1
+    CDPATH= cd -- "$here" >/dev/null 2>&1 || cd / || return 1
     return 0
 }
 

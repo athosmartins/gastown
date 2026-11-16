@@ -376,8 +376,8 @@ done
 # EQUIVALENT, documented: b7c9d8d8cd (`info`'s `return 0` -> `1`: nobody reads info's status and there is no set -e), 0eee0688b9 (`list_city_skills`'s `return 0` -> `1`: it is only
 # ever the command of an assignment), 6c338436aa and 9a09ceee49 (`$ok && exit 0 || exit 1` is the last
 # command: falling off the end exits with the status of `$ok`, which is 1 exactly when the explicit exit would have been).
-# 20adc40c2f (`if command -v realpath` -> `if ! command -v realpath`) is equivalent on any PATH that HAS realpath (both branches print the physical path) and is killed by the last scenario,
-# which runs the audit on a PATH without it (ga-r8nsaot).
+# 20adc40c2f (`if command -v realpath` -> `if ! command -v realpath`) is equivalent on any PATH that HAS realpath (both branches print the physical path) and is killed by the scenario
+# "realpath missing from PATH", which audits a link to a FILE on a PATH without realpath and checks the resolved path in the reason (ga-r8nsaot; since ga-6gdsknp a directory link no longer reaches realpath_of).
 # EQUIVALENT b7c9d8d8cd: `info`'s `return 0` -> `1`: nobody reads info's status and there is no set -e
 # EQUIVALENT 0eee0688b9: `list_city_skills`'s `return 0` -> `1`: it is only ever the command of an assignment
 # EQUIVALENT 6c338436aa 9a09ceee49: `$ok && exit 0 || exit 1` is the last command: falling off the end exits with the status of `$ok`, which is 1 exactly when the explicit exit would have been
@@ -410,9 +410,25 @@ for f in none inside toplevel status clean; do
 done
 rm -rf "$ROOT" "$GSTUB"
 
+# reasons_of <json> — every divergence reason, one per line (the TEXT is what tells a right answer from a wrong one: drift_count alone is 1 for "resolved elsewhere" and for "resolved nothing").
+reasons_of() {
+    printf '%s' "$1" | python3 -c 'import json,sys; print("\n".join(d.get("reason","") for d in json.load(sys.stdin).get("divergences",[])))' 2>/dev/null
+}
+# phys_of <dir> — the physical path of <dir> (mktemp -d is under /var on macOS, which is a link to /private/var: the audit prints the resolved one).
+phys_of() { ( CDPATH= cd -P -- "$1" 2>/dev/null && pwd ); }
+
+# Since ga-6gdsknp a link to a DIRECTORY never reaches realpath_of (the audit resolves it with cd -P), so a fixture with only directory links no longer says anything about realpath_of or its python
+# fallback. What does reach it is a link to a FILE (and a dir the shell cannot enter): that fixture is the one used below, and what is asserted is the ANSWER (the resolved path in the reason),
+# not just that a drift was counted — "resolved to <R>/elsewhere" and "resolved to nothing" (dangling) both count 1.
+file_link_fixture() { # ROOT — clean fixture whose a1 sink is a link to the FILE $ROOT/elsewhere
+    make_fixture "$1"; write_manifest "$1/city"
+    rm -f "$1/city/.gc/agents/a1/.claude/skills/demo"; printf 'x\n' > "$1/elsewhere"
+    ln -s "$1/elsewhere" "$1/city/.gc/agents/a1/.claude/skills/demo"
+}
+
 # realpath_of has a fallback for hosts without realpath (older macOS): on every other PATH the first branch answers and the fallback never runs. This PATH holds a link for every executable of
-# the current one EXCEPT realpath; with the fallback gone (or the test inverted) every symlinked consumer reads as dangling, and the clean fixture stops being clean.
-scenario "realpath missing from PATH: the python fallback still resolves the consumer symlinks"
+# the current one EXCEPT realpath, so the file-link sink below can only be answered by the python fallback; with the fallback gone, or answering abspath, the reason text changes.
+scenario "realpath missing from PATH: the python fallback resolves a link to a file (directory links do not reach it)"
 NORP="$(mktemp -d)"; _oldifs="$IFS"; IFS=:
 for _d in $PATH; do [[ -d "$_d" ]] && ln -s "$_d"/* "$NORP"/ 2>/dev/null; done
 IFS="$_oldifs"; rm -f "$NORP/realpath"
@@ -421,7 +437,13 @@ ROOT="$(mktemp -d)"; make_fixture "$ROOT"; write_manifest "$ROOT/city"
 OUT="$(PATH="$NORP" run_audit "$ROOT/city" "$ROOT/wa" "$ROOT/city/.gc/state/skill-manifest.json" "$SKILLS_JSON")"
 RC=$?
 note "json: $OUT"
-[[ "$(json_field "$OUT" drift_count)" == "0" && "$(json_field "$OUT" offpath_count)" == "0" && "$RC" == "0" ]] && ok "clean fixture stays clean (drift=0, offpath=0, exit 0) through the python fallback" || bad "without realpath the clean fixture is not clean: rc=$RC json=$OUT"
+[[ "$(json_field "$OUT" drift_count)" == "0" && "$(json_field "$OUT" offpath_count)" == "0" && "$RC" == "0" ]] && ok "clean fixture (directory links) stays clean without realpath on PATH" || bad "without realpath the clean fixture is not clean: rc=$RC json=$OUT"
+rm -rf "$ROOT"
+ROOT="$(mktemp -d)"; file_link_fixture "$ROOT"; RROOT="$(phys_of "$ROOT")"
+OUT="$(PATH="$NORP" run_audit "$ROOT/city" "$ROOT/wa" "$ROOT/city/.gc/state/skill-manifest.json" "$SKILLS_JSON")"
+note "json: $OUT"
+[[ "$(json_field "$OUT" drift_count)" == "1" ]] && ok "a link to a file is drift through the python fallback" || bad "link to a file without realpath: drift_count=$(json_field "$OUT" drift_count) json=$OUT"
+[[ "$(reasons_of "$OUT")" == "symlink resolves to $RROOT/elsewhere, not canonical "* ]] && ok "and the fallback answered the physical path ($RROOT/elsewhere)" || bad "python fallback gave the wrong answer: reasons=[$(reasons_of "$OUT")] (want: symlink resolves to $RROOT/elsewhere, not canonical ...)"
 rm -rf "$ROOT" "$NORP"
 
 # ga-6gdsknp: the audit runs every 300 s over ~900 symlink sinks. It used to fork two `realpath` per sink; a directory link is now resolved by `cd -P` in the audit's own shell.
@@ -436,14 +458,24 @@ OUT="$(PATH="$RPSTUB:$PATH" RPSTUB_REAL="$RPREAL" RPSTUB_LOG="$ROOT/rp.log" run_
 n="$(wc -l < "$ROOT/rp.log" | tr -d ' ')"
 [[ "$(json_field "$OUT" drift_count)" == "0" ]] && ok "control: the clean fixture is clean through the stub" || bad "control: drift_count != 0: $OUT"
 [[ "$n" == "0" ]] && ok "3 directory links resolved with 0 realpath processes" || bad "realpath was started $n times for 3 directory links (was 6 before ga-6gdsknp)"
-# a sink that is a link to a FILE: cd -P cannot answer, realpath_of must, and the link is still drift
+# a sink that is a link to a FILE: cd -P cannot answer, realpath_of must, and the link is still drift. The answer is checked by the reason text (the resolved path), not by the count alone.
+RROOT="$(phys_of "$ROOT")"
 rm -f "$ROOT/city/.gc/agents/a1/.claude/skills/demo"; printf 'x\n' > "$ROOT/elsewhere"; ln -s "$ROOT/elsewhere" "$ROOT/city/.gc/agents/a1/.claude/skills/demo"
 : > "$ROOT/rp.log"
 OUT="$(PATH="$RPSTUB:$PATH" RPSTUB_REAL="$RPREAL" RPSTUB_LOG="$ROOT/rp.log" run_audit "$ROOT/city" "$ROOT/wa" "$ROOT/city/.gc/state/skill-manifest.json" "$SKILLS_JSON")"
 n="$(wc -l < "$ROOT/rp.log" | tr -d ' ')"
 [[ "$(json_field "$OUT" drift_count)" == "1" ]] && ok "a link to a file is still reported as drift" || bad "link to a file: drift_count=$(json_field "$OUT" drift_count) json=$OUT"
 [[ "$n" -ge 1 ]] && ok "and it took the realpath fallback ($n call)" || bad "link to a file never reached realpath_of (n=$n)"
+[[ "$(reasons_of "$OUT")" == "symlink resolves to $RROOT/elsewhere, not canonical "* ]] && ok "and realpath_of answered the physical path ($RROOT/elsewhere), not nothing (dangling) and not the link itself" || bad "realpath_of gave the wrong answer: reasons=[$(reasons_of "$OUT")] (want: symlink resolves to $RROOT/elsewhere, not canonical ...)"
 rm -rf "$ROOT" "$RPSTUB"
+
+# cd -P resolves a relative path through an exported CDPATH and prints what it found; phys_dir runs in the audit's own shell, so that line would land in the JSON stream (gate review of ga-6gdsknp).
+# Unsupported setup in production (CITY is absolute) — the check is only that stdout stays ONE JSON object.
+scenario "CDPATH exported + relative city: stdout is still a single JSON object"
+ROOT="$(mktemp -d)"; make_fixture "$ROOT"; write_manifest "$ROOT/city"; RROOT="$(phys_of "$ROOT")"
+OUT="$(cd "$RROOT" && CDPATH="$RROOT" SKILL_AUDIT_CITY="city" SKILL_AUDIT_WA="wa" SKILL_AUDIT_MANIFEST="city/.gc/state/skill-manifest.json" SKILL_AUDIT_SKILLS_JSON="$SKILLS_JSON" "$AUDIT" --json-only --quiet 2>/dev/null)"
+printf '%s' "$OUT" | python3 -c 'import json,sys; json.load(sys.stdin)' 2>/dev/null && ok "stdout parses as one JSON document" || bad "stdout is not a single JSON document: [$OUT]"
+rm -rf "$ROOT"
 
 # ── Summary ───────────────────────────────────────────────────────────────────
 echo
