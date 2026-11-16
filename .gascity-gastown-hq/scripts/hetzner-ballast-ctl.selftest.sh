@@ -51,6 +51,15 @@ if cmd == "status":
         ceil.update(ready=False, why="sem linger para o usuario (/var/lib/systemd/linger/runner ausente): o gerenciador de usuario do systemd so existe com sessao aberta e o cron nao acha o barramento")
     if not os.path.exists(os.path.expanduser("~/gov.ceiling.absent")):
         out["ceiling"] = ceil
+    shm = None   # ~/gov.shm.orfas: 25 órfãs de 4596 MB, faxina desligada · ~/gov.shm.cega: pasta ausente, contas null · ~/gov.shm.incerta: 3 órfãs lidas mas com incerteza · nenhum: nunca varreu (null) · ~/gov.shm.absent: governo antigo (sem a chave)
+    if os.path.exists(os.path.expanduser("~/gov.shm.orfas")):
+        shm = {"orfaos_n": 25, "orfaos_mb": 4596, "seguradas_n": 0, "reap": "desligado", "why": ""}
+    elif os.path.exists(os.path.expanduser("~/gov.shm.cega")):
+        shm = {"orfaos_n": None, "orfaos_mb": None, "seguradas_n": None, "reap": "inerte", "why": "shm-ausente"}
+    elif os.path.exists(os.path.expanduser("~/gov.shm.incerta")):
+        shm = {"orfaos_n": 3, "orfaos_mb": 600, "seguradas_n": 1, "reap": "inerte", "why": "proc-opaco:x"}
+    if not os.path.exists(os.path.expanduser("~/gov.shm.absent")):
+        out["shm"] = shm
     print(json.dumps(out))
 elif cmd == "stop":
     print(json.dumps({"stopped": []}))
@@ -257,6 +266,17 @@ g_ctl() {
   check "status: teto NÃO pronto → 'teto: NÃO PRONTO' com o motivo (estado, não leitura que falhou: rc 0)" "0 1 1" "$RC $(printf '%s' "$OUT" | grep -c 'teto: NÃO PRONTO') $(printf '%s' "$OUT" | grep -c 'gerenciador de usuario')"
   newenv; ctl install; : > "$NODE/gov.ceiling.absent"; ctl status
   check "status: governo antigo sem teto → diz que o governo instalado NÃO tem teto (rode install), nunca 'teto: pronto'" "1 0" "$(printf '%s' "$OUT" | grep -c 'NÃO tem teto') $(printf '%s' "$OUT" | grep -c 'teto: pronto')"
+  # a linha shm: (ga-i6ghk4r): a varredura do /dev/shm órfão do governo, no comando que o Mayor roda
+  newenv; ctl install; : > "$NODE/gov.shm.orfas"; ctl status
+  check "status: a varredura achou 25 órfãs de 4596 MB → 'shm: órfãs=25 (4596 MB) seguradas=0 faxina=desligado', sem ATENÇÃO, rc 0" "0 1 0" "$RC $(printf '%s' "$OUT" | grep -c 'shm: órfãs=25 (4596 MB) seguradas=0 faxina=desligado$') $(printf '%s' "$OUT" | grep -c 'shm:.*ATENÇÃO')"
+  newenv; ctl install; : > "$NODE/gov.shm.cega"; ctl status
+  check "status: a pasta de /dev/shm não existe (contas null) → 'órfãs=NÃO SEI' com ATENÇÃO=shm-ausente, NUNCA 'órfãs=0'" "1 1 0" "$(printf '%s' "$OUT" | grep -c 'shm: órfãs=NÃO SEI') $(printf '%s' "$OUT" | grep -c 'ATENÇÃO=shm-ausente') $(printf '%s' "$OUT" | grep -c 'órfãs=0')"
+  newenv; ctl install; : > "$NODE/gov.shm.incerta"; ctl status
+  check "status: órfãs lidas mas com incerteza → mostra o número E o motivo (órfãs=3 (600 MB) ... ATENÇÃO=proc-opaco:x)" "1" "$(printf '%s' "$OUT" | grep -c 'shm: órfãs=3 (600 MB) seguradas=1 faxina=inerte ATENÇÃO=proc-opaco:x')"
+  newenv; ctl install; ctl status
+  check "status: governo que nunca varreu (shm null) → 'sem varredura', nunca 'órfãs=0'" "1 0" "$(printf '%s' "$OUT" | grep -c 'shm: sem varredura') $(printf '%s' "$OUT" | grep -c 'órfãs=0')"
+  newenv; ctl install; : > "$NODE/gov.shm.absent"; ctl status
+  check "status: governo antigo (o status nem tem a chave shm) → 'sem varredura' e o resto do status segue (rc 0)" "0 1" "$RC $(printf '%s' "$OUT" | grep -c 'shm: sem varredura')"
   # o governo de VERDADE respondendo pelo ssh (gate 1 da ga-kgnjkt8). O de mentira acima devolve o que mandam, então não vê a diferença entre "há barramento" (quem pergunta por ssh tem sessão)
   # e "o cron acha o barramento": aqui o governo é o real, com systemd-run e barramento de brinquedo e a pasta de linger escolhida pelo teste (o ssh de mentira herda as variáveis).
   real_gov() {  # real_gov PASTA_DO_LINGER
@@ -352,6 +372,10 @@ nota do tick que não é texto vira 'sem nota'@@ else " NOTA=ILEGÍVEL")@@ else 
 burn aceita argumento fora de on|off@@  burn)      [ $# -eq 2 ] && case "$2" in on|off) true ;; *) false ;; esac || die 2@@  burn)      true || die 2
 o status mostra só o mínimo do item elástico@@        nuc = "%s-%s" % (it.get("cores"), cm) if isinstance(cm, int) and not isinstance(cm, bool) else it.get("cores")@@        nuc = it.get("cores")
 o status mostra o traço mesmo sem máximo@@isinstance(cm, int) and not isinstance(cm, bool) else it.get("cores")@@True else it.get("cores")
+a linha shm: mostra órfãs=0 quando as contas são null (não sei vira zero)@@ else "órfãs=NÃO SEI"@@ else "órfãs=0"
+a linha shm: não mostra o motivo da incerteza@@" ATENÇÃO=%s" % sh.get("why") if sh.get("why") else ""@@""
+a linha shm: governo que nunca varreu aparece como zero órfãs@@print("shm: sem varredura (governo antigo, ou ainda não varreu)")@@print("shm: órfãs=0 (0 MB)")
+a linha shm: conta null passa pela guarda e vira 'órfãs=None (None MB)'@@isinstance(n, int) and not isinstance(n, bool) and isinstance(mb, int) and not isinstance(mb, bool)@@True
 MUT
   "$PY" -I - "$P" "$T/mutants.txt" "$T" > "$T/mutants.idx" <<'PYEOF'
 import re, sys

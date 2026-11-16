@@ -2,7 +2,7 @@
 """hetzner-ballast.py — o lastro do nó Hetzner: trabalho útil de baixa prioridade que ocupa a CPU que sobra e cede na hora. (ga-2hd02v.5) Python 3.9+, só biblioteca padrão.
 
 Contents
-  Para que serve · Roda ONDE · O contrato do nice · Teto de sistema por item · Slots elásticos · Piso de RAM dinâmico e start_mb · Slots que atravessam a rodada · Um tick · Itens · Três estados · Arquivos · Uso
+  Para que serve · Roda ONDE · O contrato do nice · Teto de sistema por item · Slots elásticos · Piso de RAM dinâmico e start_mb · Slots que atravessam a rodada · /dev/shm órfão · Um tick · Itens · Três estados · Arquivos · Uso
 
 PARA QUE SERVE
   Athos (20/10): "se está 100% ocupado a gente fica feliz; o que não pode é ficar menos". Mesmo com toda bead elegível indo ao nó, a fila tem buracos (madrugada de 20/10: 7 h em 0-15% de CPU).
@@ -36,6 +36,12 @@ PISO DE RAM DINÂMICO E START_MB  (ga-03rqsr0; runbook: "Piso de RAM dinâmico")
 SLOTS QUE ATRAVESSAM A RODADA  (ga-03rqsr0)
   Cada tick elástico grava em state.json slots_last[item] = {n, t} (o limite que o motor segue AGORA). A rodada que começa dentro de BALLAST_SLOTS_CARRY_S (900 s) desse t nasce com n slots (menos o que a RAM não paga: slot_mb cada, sobre o que sobra acima do piso
   depois do start_mb) em vez do mínimo: a rampa de volta (+2 por minuto) deixava 1-2 núcleos parados a cada fim de rodada. Fora da janela, com elastic.off ou sem o estado: o mínimo de sempre. O motor já lê o arquivo de slots ao começar (poll_slots).
+/DEV/SHM ÓRFÃO  (ga-i6ghk4r; runbook: "/dev/shm órfão")
+  O wa-suite, o único item que não depende de commit, ficou 3 dias sem começar: a conta de partida pedia MemAvailable >= 27648 MB e o nó ficava em ~24300, porque 4,6 GB eram /dev/shm de sessões mortas (tmpfs é Shmem e não volta como MemAvailable) e o tick só
+  dizia `skipped ram`. Agora todo skipped ram traz falta_mb (e shm_orfao_mb, o que a última varredura achou), todo tick grava shmem_mb, e a cada BALLAST_SHM_EVERY_S (600 s) o tick varre BALLAST_SHM (/dev/shm) atrás de pasta ÓRFÃ: pasta de verdade do nosso
+  usuário, fora de ballast-*, com >= BALLAST_SHM_MIN_MB, em que nada mudou há BALLAST_SHM_AGE_S (o maior entre ctime e mtime de tudo: o tar preserva o mtime da origem) e que nenhum processo do usuário segura (cwd/root/exe, fd, maps ou o caminho na linha de comando; processo
+  que o kernel esconde só vale como inofensivo com o nome em OPAQUE_OK). O resumo (rec['shm'], state['shm'], `status`) tem contas null quando não deu para contar e `why` com o que ficou incerto. A FAXINA só roda com a chave shm-reap.on (nasce DESLIGADA) e `why` vazio: apaga as
+  maiores primeiro, até BALLAST_SHM_MAX_REAP por varredura e dentro do prazo, sem seguir symlink nem cruzar dispositivo; shm-keep.txt poupa nomes. A varredura é isolada: erro dela vira why erro-interno e o tick segue.
 UM TICK  (exit 0 sempre que "não consegui ler" — vira nota no registro; 3 só se não dá para gravar)
   1 lê o registro, /proc/stat, /proc/meminfo e a tabela de processos  2 dá fim aos itens que acabaram (results.jsonl); item que bateu no teto de sistema leva KILL; sobrevivente na sessão de um item que já gravou o rc (órfão) leva TERM depois
   de BALLAST_ORPHAN_GRACE_S (180 s) e a rodada fecha pelo rc do item, com `orfaos` na linha  3 sem a chave `on`: mata o que roda e sai  4 RAM: pausa (SIGSTOP),
@@ -51,10 +57,10 @@ TRÊS ESTADOS
   state.json corrompido ou de forma errada vai para <arquivo>.corrupt-<época> e recomeça; ilegível por permissão = rc 3 (inerte). A escrita da pasta é conferida ANTES de qualquer efeito.
   O que o tick não leu fica null no registro (running, registry_errors, mode), nunca [].
 ARQUIVOS  (em $BALLAST_HOME, padrão ~/gt-remote/ballast)
-  items.tsv · items/ · on (a chave: presente = ligado) · elastic.off (presente = slots elásticos no mínimo) · ram-floor.fixed (presente = piso de RAM fixo) · state.json · cpu.prev · lock · ticks.jsonl · results.jsonl · runs/<rodada>/{meta.json,log,rc,final,cgroup,ceiling,slots}
+  items.tsv · items/ · on (a chave: presente = ligado) · elastic.off (presente = slots elásticos no mínimo) · ram-floor.fixed (presente = piso de RAM fixo) · shm-reap.on (presente = a faxina apaga o /dev/shm órfão; ausente OU ilegível = só detecta) · shm-keep.txt (nomes a poupar) · shm-reap.log · state.json · cpu.prev · lock · ticks.jsonl · results.jsonl · runs/<rodada>/{meta.json,log,rc,final,cgroup,ceiling,slots}
 STOP  rc 0 = a sessão de cada item esvaziou (TERM+CONT, KILL 3 s depois no que sobrar) · 3 = não li os processos, nada foi morto · 5 = sobrou processo vivo (`survivors`) ou a tabela ficou
   ilegível depois do TERM (`unverified`): NÃO diz que parou · outro = o stop não rodou. `cgroup_unverified` (rc 0): rodadas com teto cujo cgroup.kill não deu para confirmar (quem fez setsid pode ter sobrado).
-USO  hetzner-ballast.py tick | status [--json] | stop      env: BALLAST_HOME BALLAST_PROC BALLAST_NOW BALLAST_ITEMS BALLAST_ITEMS_DIR BALLAST_LAUNCH_PREFIX (JSON, com `nice`; BALLAST_TEST=1 só no selftest) BALLAST_CEILING (systemd; off só no selftest) BALLAST_TASKS_MAX BALLAST_MEM_FACTOR BALLAST_RUNTIME_DIR BALLAST_LINGER_DIR BALLAST_CGROUP_ROOT BALLAST_SLOT_MB BALLAST_IO_FULL_MAX BALLAST_ELASTIC_STEP BALLAST_ELASTIC_ROOM BALLAST_PARTIAL_COOLDOWN_S BALLAST_PARTIAL_MIN_S BALLAST_SESS_WINDOW_S BALLAST_SESS_GAP_S BALLAST_SESS_MB BALLAST_SESS_MARGIN_MB BALLAST_TMUX BALLAST_TMUX_SOCKET BALLAST_TMUX_TIMEOUT_S BALLAST_SLOTS_CARRY_S e os limites BALLAST_* de load_config
+USO  hetzner-ballast.py tick | status [--json] | stop      env: BALLAST_HOME BALLAST_PROC BALLAST_NOW BALLAST_ITEMS BALLAST_ITEMS_DIR BALLAST_LAUNCH_PREFIX (JSON, com `nice`; BALLAST_TEST=1 só no selftest) BALLAST_CEILING (systemd; off só no selftest) BALLAST_TASKS_MAX BALLAST_MEM_FACTOR BALLAST_RUNTIME_DIR BALLAST_LINGER_DIR BALLAST_CGROUP_ROOT BALLAST_SLOT_MB BALLAST_IO_FULL_MAX BALLAST_ELASTIC_STEP BALLAST_ELASTIC_ROOM BALLAST_PARTIAL_COOLDOWN_S BALLAST_PARTIAL_MIN_S BALLAST_SESS_WINDOW_S BALLAST_SESS_GAP_S BALLAST_SESS_MB BALLAST_SESS_MARGIN_MB BALLAST_TMUX BALLAST_TMUX_SOCKET BALLAST_TMUX_TIMEOUT_S BALLAST_SLOTS_CARRY_S BALLAST_SHM BALLAST_SHM_EVERY_S BALLAST_SHM_AGE_S BALLAST_SHM_MIN_MB BALLAST_SHM_BUDGET_S BALLAST_SHM_MAX_ENTRIES BALLAST_SHM_MAX_REAP (BALLAST_SHM_UID só no selftest) e os limites BALLAST_* de load_config
 """
 import fcntl
 import json
@@ -152,7 +158,7 @@ def load_config(env):
         tmux_timeout_s=_num(env, "BALLAST_TMUX_TIMEOUT_S", 5, int, 1), slots_carry_s=_num(env, "BALLAST_SLOTS_CARRY_S", 900, int, 0),
         shm_root=env.get("BALLAST_SHM") or "/dev/shm", shm_every_s=_num(env, "BALLAST_SHM_EVERY_S", 600, int, 0), shm_age_s=_num(env, "BALLAST_SHM_AGE_S", 172800, int, 3600),
         shm_min_mb=_num(env, "BALLAST_SHM_MIN_MB", 64, int, 1), shm_budget_s=_num(env, "BALLAST_SHM_BUDGET_S", 15, float, 0.0), shm_max_entries=_num(env, "BALLAST_SHM_MAX_ENTRIES", 3000000, int, 1),
-        shm_max_reap=_num(env, "BALLAST_SHM_MAX_REAP", 2, int, 1), shm_uid=_shm_uid(env),
+        shm_max_reap=_num(env, "BALLAST_SHM_MAX_REAP", 10, int, 1), shm_uid=_shm_uid(env),
         launch_prefix=_prefix(prefix, env.get("BALLAST_TEST") == "1"))
 
 
@@ -1084,8 +1090,9 @@ def carry_slots(cfg, st, item, cores, mem_left, floor):
 def ram_skip(st, rec, it, floor, mem_left):
     """O item não começa por RAM. O tick diz QUANTO falta (falta_mb = piso + start_mb - o MemAvailable que sobrou depois do que este tick já planejou: sempre > 0, é a condição que falhou) e quanto de /dev/shm órfão a
     última varredura achou (shm_orfao_mb; null = ainda não varreu ou não leu): sem os dois números, `skipped ram` custou 3 dias do wa-suite parado e uma investigação de horas (ga-i6ghk4r)."""
-    shm = st.get("shm")
-    rec["skipped"].append({"item": it["name"], "why": "ram", "falta_mb": floor + it["start_mb"] - mem_left, "shm_orfao_mb": shm.get("orfaos_mb") if isinstance(shm, dict) else None})
+    # vazio (estado sem varredura: shm None) → null; o estado nunca guarda outra forma (state_ok): null aqui é 'não sei', nunca 0 MB
+    shm = st.get("shm") or {}
+    rec["skipped"].append({"item": it["name"], "why": "ram", "falta_mb": floor + it["start_mb"] - mem_left, "shm_orfao_mb": shm.get("orfaos_mb")})
     rec["ram"] = "baixa"
 
 
@@ -1233,10 +1240,14 @@ def shm_holders(cfg, root, names):
         raise Unreadable("%s: %s" % (cfg.proc, e))
     for nm in pids:
         d = os.path.join(cfg.proc, nm)
+        # vazio (o processo já saiu: ENOENT) → ignora; falhou/ilegível (qualquer outro erro) → incerteza '?': sem ler o dono não sei se o processo é nosso, e um processo nosso que eu não vi poderia estar segurando a pasta
         try:
             if os.stat(d).st_uid != cfg.shm_uid:
                 continue
+        except FileNotFoundError:
+            continue
         except OSError:
+            unknown.add("?")
             continue
         # cada leitura devolve um estado: sumiu (zumbi, thread de kernel, processo que foi embora) não diz nada; opaco e erro marcam o processo como incerteza (sorteada abaixo pelo nome dele)
         states, targets = [], []
@@ -1271,6 +1282,7 @@ def shm_walk(path, dev, cutoff, budget):
     """(mais novo, kb, estado) da árvore em `path`: o mais novo é o maior entre ctime e mtime de TUDO nela (o tar preserva o mtime da origem, o ctime é de quando o arquivo nasceu aqui), o tamanho vem dos blocos
     (arquivo esparso não conta), e o estado é completa | ilegivel (subpasta que não abre, montagem dentro da árvore, entrada que sumiu) | orcamento (passou de BALLAST_SHM_MAX_ENTRIES ou do prazo de relógio). Para na primeira
     coisa mais nova que `cutoff`: a pasta é jovem e o resto não importa. Nunca segue symlink."""
+    # vazio (a pasta sumiu) → ilegivel; falhou/ilegível → ilegivel: nenhuma das duas vira 'árvore velha e completa'
     try:
         top = os.lstat(path)
     except OSError:
@@ -1280,6 +1292,7 @@ def shm_walk(path, dev, cutoff, budget):
         return newest, kb, "completa"
     stack = [path]
     while stack:
+        # vazio (subpasta sem entradas) → nada a somar; falhou/ilegível (sem permissão, sumiu) → a árvore inteira vira ilegivel, nunca 'completa'
         try:
             with os.scandir(stack.pop()) as it:
                 kids = list(it)
@@ -1289,6 +1302,7 @@ def shm_walk(path, dev, cutoff, budget):
             budget.left -= 1
             if budget.left < 0 or time.monotonic() >= budget.deadline:
                 return newest, kb, "orcamento"
+            # vazio (a entrada sumiu entre listar e ler) / falhou/ilegível → ilegivel: sem ler o ctime e o mtime dela não sei se a árvore está parada
             try:
                 s = k.stat(follow_symlinks=False)
             except OSError:
@@ -1306,7 +1320,8 @@ def shm_walk(path, dev, cutoff, budget):
 
 def shm_scan(cfg):
     """(resumo, órfãs): UMA varredura do /dev/shm. Órfã = pasta de verdade (nunca arquivo, nunca symlink) do nosso usuário, fora do namespace ballast-*, com >= BALLAST_SHM_MIN_MB, em que nada mudou há BALLAST_SHM_AGE_S
-    (ver shm_walk), que nenhum processo segura (shm_holders) e que o shm-keep.txt não poupa. O resumo vai ao registro e ao estado; `why` lista o que ficou incerto (vazio = tudo lido). Contas null = não deu para contar."""
+    (ver shm_walk), que nenhum processo segura (shm_holders) e que o shm-keep.txt não poupa. O resumo vai ao registro e ao estado; `why` lista as incertezas GLOBAIS (vazio = nenhuma: a pasta que não deu para ler inteira só entra em ilegiveis_n,
+    nunca é órfã nem é apagada, e não trava as outras). Contas null = não deu para contar."""
     out = {"t": cfg.now, "why": "", "orfaos_n": None, "orfaos_mb": None, "orfaos": [], "seguradas_n": None, "ilegiveis_n": None, "mantidas_n": None, "opacos": []}
     root = cfg.shm_root
     # vazio (pasta sem entradas) → 0 órfãs; ausente → why shm-ausente; não abre → why shm-ilegivel: nos dois a conta fica null, NUNCA 0 órfãs
@@ -1329,6 +1344,7 @@ def shm_scan(cfg):
     for e in entries:
         if e.name.startswith("ballast-"):
             continue
+        # vazio (a entrada sumiu entre listar e ler) → ignora; falhou/ilegível → conta em ilegiveis_n (nunca vira órfã nem 'não existe')
         try:
             s = e.stat(follow_symlinks=False)
         except FileNotFoundError:
@@ -1411,8 +1427,8 @@ def rm_tree(path, dev, deadline=None):
 
 
 def shm_faxina(cfg, out, orfaos):
-    """Apaga as órfãs que a varredura achou e põe o resultado em `out` (reap, reaped, falhou, log). Só com a chave $BALLAST_HOME/shm-reap.on E com a varredura sem incerteza nenhuma (why vazio); as maiores primeiro, até
-    BALLAST_SHM_MAX_REAP por varredura e dentro do prazo. A pasta é reconferida logo antes (ainda uma pasta de verdade do nosso usuário: virou symlink, arquivo ou sumiu → não mexe). reap: desligado (sem a chave) · inerte (chave
+    """Apaga as órfãs que a varredura achou e põe o resultado em `out` (reap, reaped, falhou, log). Só com a chave $BALLAST_HOME/shm-reap.on E com a varredura sem incerteza global (why vazio); as maiores primeiro, até
+    BALLAST_SHM_MAX_REAP por varredura e dentro do prazo (se o prazo acaba NO MEIO de uma árvore, o que sobrou dela só volta a ser órfão 48 h depois: apagar muda o mtime das pastas). A pasta é reconferida logo antes (ainda uma pasta de verdade do nosso usuário: virou symlink, arquivo ou sumiu → não mexe). reap: desligado (sem a chave) · inerte (chave
     ligada mas a varredura teve incerteza: a lista de órfãs não é certa) · nada (lida e sem órfã) · feito · parcial (alguma não saiu inteira, ou o prazo acabou)."""
     out.update({"reap": "desligado", "reaped": [], "falhou": [], "log": ""})
     # vazio (sem a chave) → desligado; falhou/ilegível (stat negado) → desligado TAMBÉM: aqui o 'ligado' é o lado perigoso (nas chaves elastic.off e ram-floor.fixed é o contrário), e os dois estados vazio e falhou dão o mesmo lado: não apaga
@@ -1431,6 +1447,7 @@ def shm_faxina(cfg, out, orfaos):
         if time.monotonic() >= deadline:
             break
         path = os.path.join(cfg.shm_root, o["name"])
+        # vazio (a pasta sumiu desde a varredura) → não apagou, vai para `falhou`; falhou/ilegível → o mesmo: sem reler a identidade não apaga
         try:
             s = os.lstat(path)
         except OSError:

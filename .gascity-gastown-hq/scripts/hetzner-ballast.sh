@@ -9,7 +9,7 @@
 #   uninstall                tira a linha marcada da crontab e para o que roda (stop). Os arquivos e os resultados ficam no nó.
 #   on | off                 cria / apaga a chave `on` no nó (off também para o que roda). Sem `on` o governo só mede e não começa nada. `on` RECUSA (rc 3) se o governo do nó não confirma o teto de sistema pronto (ga-kgnjkt8).
 #   burn on | off            liga / desliga o item `queima` (CPU pura quando não há trabalho útil; nasce DESLIGADO).
-#   status                   o que roda, a chave, a crontab, a linha `teto:` (pronto / NÃO PRONTO / governo antigo sem teto) e a idade do último tick (PARADO = cron instalado e último tick com mais de 5 min, ou nenhum tick 5 min depois do install).
+#   status                   o que roda, a chave, a crontab, a linha `teto:` (pronto / NÃO PRONTO / governo antigo sem teto), a linha `shm:` (as pastas órfãs de /dev/shm que a última varredura achou e a faxina: ga-i6ghk4r) e a idade do último tick (PARADO = cron instalado e último tick com mais de 5 min, ou nenhum tick 5 min depois do install).
 #   pull                     traz results.jsonl do nó para <cidade>/.gc/hetzner-ballast/results.jsonl: só a lista branca de campos, valores curtos, sem duplicar a rodada.
 # CÓDIGOS DE SAÍDA: 0 ok · 2 uso · 3 recusado ou NÃO consegui (árvore suja, arquivo que chegou diferente, git ilegível, crontab ilegível, stop que não parou, results.jsonl ilegível, status com leitura que falhou)
 #   · 98 ssh fora (não conectou, ou caiu antes de eu ler o resultado de um stop ou da crontab: o que não deu para ler não vale como feito) · 99 nó desligado (falta .gc/hetzner-node.on)
@@ -273,6 +273,13 @@ if isinstance(st, dict) and isinstance(st.get("items"), list):
         print("teto: NÃO PRONTO — nenhum item começa: %s" % c.get("why"))
     else:
         print("teto: o governo instalado no nó NÃO tem teto (rode install com o commit do teto)")
+    sh = st.get("shm")   # /dev/shm órfão (ga-i6ghk4r): a última varredura do governo. null/ausente = nunca varreu OU governo antigo (nunca "0 órfãs"); contas null = não consegui contar; why = o que ficou incerto
+    if isinstance(sh, dict):
+        n, mb = sh.get("orfaos_n"), sh.get("orfaos_mb")
+        cont = "órfãs=%s (%s MB)" % (n, mb) if isinstance(n, int) and not isinstance(n, bool) and isinstance(mb, int) and not isinstance(mb, bool) else "órfãs=NÃO SEI"
+        print("shm: %s seguradas=%s faxina=%s%s" % (cont, sh.get("seguradas_n"), sh.get("reap"), " ATENÇÃO=%s" % sh.get("why") if sh.get("why") else ""))
+    else:
+        print("shm: sem varredura (governo antigo, ou ainda não varreu)")
     if "running" in st and st["running"] is None:
         bad = 1
         print("  rodando: o governo NÃO conseguiu ler os processos")

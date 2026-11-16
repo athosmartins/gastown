@@ -28,8 +28,13 @@
 #     cgroup do item e o mata (teto-processos / teto-memoria; contador ilegível ≠ zero estouros) · o caminho do cgroup só vale se for o escopo DESTA rodada na ballast.slice · fim de rodada e stop mandam
 #     cgroup.kill (pega quem fez setsid) · os picos do item entram em results.jsonl. g_cgrp só roda onde há systemd --user (senão `skip`, que NÃO conta como passou): fork em laço e alocador, ambos LIMITADOS por construção.
 #   elástico (g_elastic, ga-2hd02v.5.11): o registro `N-M` e os slots que sobem e descem pela CPU ociosa, a RAM e o PSI de disco (e a chave elastic.off) · o fg líquido do tempo de kernel do próprio lastro (cpu.stat) · o cooldown curto da rodada `parcial`.
-# CONTROLE NEGATIVO: cada mutante (um trecho do script trocado) TEM que reprovar a bateria. Mutante com descrição `[teto]` roda só os grupos do teto; com `[elastico]`, só o g_elastic.
-# VARIÁVEIS: HB_UNDER_TEST (script a testar) · HB_PY (interpretador; padrão /usr/bin/python3) · HB_NO_MUTANTS=1 · HB_MUTANTS_ONLY=teto|elastico (só os mutantes do teto, ou dos slots elásticos) · HB_ONLY=<grupo> (reg tick run ram reap fill off state logs launch send ceil cgrp elastic; sem mutantes)
+#   /dev/shm órfão (g_shm, g_shmscan, g_shmreap, ga-i6ghk4r): skipped ram com falta_mb (e shm_orfao_mb) e o shmem_mb do tick (null, nunca 0, quando a linha falta, não é número ou é negativa) · a varredura do /dev/shm: órfã = pasta de verdade
+#     (nunca arquivo nem symlink) do nosso usuário, fora de ballast-*, >= o mínimo de MB (inclusivo), parada há a idade mínima EXATA (maior entre ctime e mtime: a cópia por tar de árvore velha é jovem), tamanho pelos blocos, que nenhum processo segura
+#     (cwd, root, exe, fd, maps, linha de comando; base-x não casa em base-x-3; opaco só vale com nome conhecido) e que o shm-keep.txt não poupa · três estados (pasta ausente/ilegível, tabela de processos ilegível, orçamento, lista de exceções ilegível:
+#     contas null e `why`, nunca 0 órfãs) · o intervalo e o relógio que anda para trás · o estado e o status · a FAXINA (chave shm-reap.on; só com `why` vazio; as maiores primeiro; o limite por varredura; nunca symlink nem outro dispositivo; troca
+#     da pasta por symlink entre a varredura e a faxina; falha parcial; log que não grava; erro imprevisto da varredura) · config (padrões, pisos, BALLAST_SHM_UID só no selftest). Os casos `(unit)` carregam o governo como módulo (função `unit`).
+# CONTROLE NEGATIVO: cada mutante (um trecho do script trocado) TEM que reprovar a bateria. Mutante com descrição `[teto]` roda só os grupos do teto; com `[elastico]`, só o g_elastic; com `[shm]`, só os três grupos do /dev/shm.
+# VARIÁVEIS: HB_UNDER_TEST (script a testar) · HB_PY (interpretador; padrão /usr/bin/python3) · HB_NO_MUTANTS=1 · HB_MUTANTS_ONLY=teto|elastico|piso|shm (só os mutantes do teto, dos slots elásticos, do piso de RAM ou do /dev/shm) · HB_ONLY=<grupo> (reg tick run ram reap fill off state logs launch send ceil cgrp elastic floor carry startmb shm shmscan shmreap; sem mutantes)
 set -u
 # argumentos (o mbp-run.sh --repo hq só leva argumentos ao selftest, não variáveis de ambiente): --only GRUPO = HB_ONLY, --no-mutants = HB_NO_MUTANTS=1, --mutants-only GRUPO = HB_MUTANTS_ONLY, --under-test = HB_UNDER_TEST
 while [ $# -gt 0 ]; do
@@ -38,7 +43,7 @@ while [ $# -gt 0 ]; do
     --no-mutants) HB_NO_MUTANTS=1; shift ;;
     --mutants-only) HB_MUTANTS_ONLY="${2:?--mutants-only GRUPO}"; shift 2 ;;
     --under-test) HB_UNDER_TEST="$(cd "$(dirname "${2:?--under-test CAMINHO}")" && pwd)/$(basename "$2")"; shift 2 ;;   # o governo a testar (a prova de que um teste novo reprova no anterior)
-    *) echo "uso: $0 [--only GRUPO] [--no-mutants] [--mutants-only teto|elastico|piso] [--under-test CAMINHO]" >&2; exit 2 ;;
+    *) echo "uso: $0 [--only GRUPO] [--no-mutants] [--mutants-only teto|elastico|piso|shm] [--under-test CAMINHO]" >&2; exit 2 ;;
   esac
 done
 HERE="$(cd "$(dirname "$0")" && pwd)"
@@ -1145,6 +1150,7 @@ setshmem() {  # setshmem KB — a linha Shmem do /proc/meminfo de mentira (a tmp
   printf 'Shmem:          %s kB\n' "$1" >> "$FP/meminfo"
 }
 g_shm() {
+  local c
   newhome; seed; setmem 15000; good 50; good 50; good 50
   check "shm: skipped ram traz falta_mb = piso + start_mb - MemAvailable (14336 + 1024 - 15000 = 360)" "ram 360" "$(jget skipped.0.why) $(jget skipped.0.falta_mb)"
   sm_home 15400
@@ -1157,6 +1163,14 @@ g_shm() {
   check "shm: meminfo sem a linha Shmem → shmem_mb null (nunca 0) e o tick segue normal (mem_avail_mb lido)" "null 28000" "$(jget shmem_mb) $(jget mem_avail_mb)"
   newhome; seed; setmem 28000; setshmem abc; good 50
   check "shm: Shmem que não é número → shmem_mb null, o resto do tick não muda" "null 28000" "$(jget shmem_mb) $(jget mem_avail_mb)"
+  c=$(unit 'it = {"name": "x", "start_mb": 100}
+out = []
+for st in ({}, {"shm": None}, {"shm": {"orfaos_mb": 7}}):
+    rec = {"skipped": []}
+    hb.ram_skip(st, rec, it, 1000, 800)
+    out.append("%s %s %s" % (rec["skipped"][0]["shm_orfao_mb"], rec["skipped"][0]["falta_mb"], rec["ram"]))
+print("; ".join(out))')
+  check "shm (unit): ram_skip cita o shm_orfao_mb do estado (7) e dá null (nunca 0) quando o estado não tem varredura (sem a chave, ou null); falta_mb = 1000 + 100 - 800 = 300" "None 300 baixa; None 300 baixa; 7 300 baixa" "$c"
   newhome; seed; setmem 28000; setshmem -5; good 50
   check "shm: Shmem negativo é leitura ilegível → shmem_mb null (nunca um número que pareça medida)" "null" "$(jget shmem_mb)"
   newhome; seed; setmem 28000; printf 'ShmemHugePages:        0 kB\n' >> "$FP/meminfo"; setshmem 4782336; good 50
@@ -1205,6 +1219,11 @@ g_shmscan() {
   shm_up; mkdir -p "$T/src$N/sub"; head -c 3145728 /dev/zero > "$T/src$N/sub/blob"; touch -d '2001-09-09 00:00:00' "$T/src$N/sub/blob" "$T/src$N/sub" "$T/src$N"; mkdir -p "$SHM/copia"; tar -C "$T/src$N" -cf - . | tar -C "$SHM/copia" -xpf -; bt
   check "shm varredura: cópia por tar de uma árvore de 2001 (o mtime velho veio junto) que acabou de nascer aqui é JOVEM: o ctime manda, não é órfã" "0" "$(jget shm.orfaos_n)"
   shm_age; bt; check "shm varredura: a mesma cópia 3 dias depois é órfã" "copia" "$(shm_names)"
+  # só o ctime de um FILHO é novo (a pasta de cima e o mtime de tudo são velhos): um chmod/chown muda o ctime e não o mtime
+  shm_up 3600; mkdir -p "$SHM/velho/sub"; touch -d '2001-09-09 00:00:00' "$SHM/velho/sub" "$SHM/velho"; sleep 3; head -c 3145728 /dev/zero > "$SHM/velho/sub/blob"; touch -d '2001-09-09 00:00:00' "$SHM/velho/sub/blob" "$SHM/velho/sub"
+  c=$(stat -c %Z "$SHM/velho/sub/blob"); NOW=$(( c + 3599 )); bt
+  check "shm varredura: pasta de cima velha e mtime de tudo velho, mas o ctime de um filho tem menos que a idade mínima → JOVEM (o ctime do filho conta, não só o da pasta de cima)" "0" "$(jget shm.orfaos_n)"
+  NOW=$(( c + 3605 )); bt; check "shm varredura: seis segundos depois o mesmo filho já passou da idade mínima: órfã (o caso acima mede o ctime do filho, não outra coisa)" "1" "$(jget shm.orfaos_n)"
   shm_up; shm_dir velho 3; shm_age; touch -d "@$(( NOW - 60 ))" "$SHM/velho"; bt
   check "shm varredura: só a PRÓPRIA pasta mexida há 60 s (mtime do topo; entrar e sair arquivo muda o mtime dela) a mantém jovem" "0" "$(jget shm.orfaos_n)"
   shm_up; mkdir -p "$SHM/esparsa/sub"; truncate -s 10M "$SHM/esparsa/sub/blob"; shm_dir real 3; shm_age; bt
@@ -1269,6 +1288,8 @@ g_shmscan() {
   done
   shm_up; shm_dir velho 3; shm_proc 9003; printf 'sshd\n' > "$FP/9003/comm"; : > "$FP/9003/fd"; shm_age; bt
   check "shm varredura: fd que não é pasta (listdir dá erro de leitura) → incerteza global (proc-opaco:sshd)" "1 [proc-opaco:sshd]" "$(jget shm.orfaos_n) [$(jget shm.why)]"
+  shm_up; shm_dir velho 3; ln -s 9004 "$FP/9004"; shm_age; bt
+  check "shm varredura: pid cujo dono não se lê por um erro que NÃO é 'sumiu' (aqui um laço de symlink: ELOOP) → incerteza global (proc-opaco:?), nunca 'processo que saiu'" "1 [proc-opaco:?]" "$(jget shm.orfaos_n) [$(jget shm.why)]"
   # processos que o kernel esconde (não dumpáveis: ssh-agent, gpg-agent, systemd --user, sshd; medido no nó em 15/11): cwd, fd e maps negam leitura
   if notroot; then
     shm_up; shm_dir velho 3; shm_proc 9003; : > "$FP/9003/maps"; chmod 000 "$FP/9003/maps"; printf 'ferramenta-nova\n' > "$FP/9003/comm"; shm_age; bt
@@ -1420,7 +1441,7 @@ print(out["reap"], out["falhou"], out["reaped"])' "$SHM" "$H")
   # a configuração: padrões, o piso de 1 h da idade, e BALLAST_SHM_UID só vale no selftest
   c=$(unit 'cfg = hb.load_config({"BALLAST_HOME": "/x"})
 print(cfg.shm_root, cfg.shm_every_s, cfg.shm_age_s, cfg.shm_min_mb, cfg.shm_budget_s, cfg.shm_max_entries, cfg.shm_max_reap)')
-  check "shm config (unit): padrões — /dev/shm, varre a cada 600 s, parada há 48 h, mínimo 64 MB, prazo 15 s, 3 mi de entradas, 2 por varredura" "/dev/shm 600 172800 64 15.0 3000000 2" "$c"
+  check "shm config (unit): padrões — /dev/shm, varre a cada 600 s, parada há 48 h, mínimo 64 MB, prazo 15 s, 3 mi de entradas, 10 por varredura" "/dev/shm 600 172800 64 15.0 3000000 10" "$c"
   c=$(unit 'import os
 a = hb.load_config({"BALLAST_HOME": "/x", "BALLAST_SHM_UID": "7"}).shm_uid == os.getuid()
 b = hb.load_config({"BALLAST_HOME": "/x", "BALLAST_SHM_UID": "7", "BALLAST_TEST": "1"}).shm_uid
@@ -1816,6 +1837,116 @@ def read_cpu_prev(cfg):
 [piso] start_mb acima do teto é aceito@@            if not 1 <= start_mb <= rss_mb:@@            if not 1 <= start_mb:
 [piso] start_mb 0 é aceito@@            if not 1 <= start_mb <= rss_mb:@@            if not 0 <= start_mb <= rss_mb:
 [piso] uma 10ª coluna é aceita@@        if len(c) not in (8, 9):@@        if len(c) not in (8, 9, 10):
+[shm] falta_mb com o sinal trocado@@"falta_mb": floor + it["start_mb"] - mem_left@@"falta_mb": mem_left - floor - it["start_mb"]
+[shm] falta_mb ignora o start_mb do item@@"falta_mb": floor + it["start_mb"] - mem_left@@"falta_mb": floor - mem_left
+[shm] o shm_orfao_mb de quem não varreu vira 0@@    shm = st.get("shm") or {}@@    shm = st.get("shm") or {"orfaos_mb": 0}
+[shm] o shm_orfao_mb sem a chave vira 0 (default do get)@@"shm_orfao_mb": shm.get("orfaos_mb")}@@"shm_orfao_mb": shm.get("orfaos_mb", 0)}
+[shm] o skipped ram nunca cita o shm_orfao_mb@@"shm_orfao_mb": shm.get("orfaos_mb")}@@"shm_orfao_mb": None}
+[shm] pid cujo dono não se lê por erro vira 'processo que saiu'@@        except OSError:
+            unknown.add("?")
+            continue@@        except OSError:
+            continue
+[shm] Shmem ausente vira 0 MB@@    raise Unreadable("/proc/meminfo: sem Shmem")@@    return 0
+[shm] Shmem que não é número vira 0 MB@@                raise Unreadable("/proc/meminfo: Shmem não numérico")@@                return 0
+[shm] Shmem negativo é aceito@@            if kb < 0:@@            if False:
+[shm] Shmem fica em kB (sem converter para MB)@@            return kb // 1024@@            return kb
+[shm] a linha ShmemHugePages vale como Shmem@@        if ln.startswith("Shmem:"):@@        if ln.startswith("Shmem"):
+[shm] o corte da idade deixa de ser inclusivo (>= no veredito)@@        if newest > cutoff or kb // 1024 < cfg.shm_min_mb:@@        if newest >= cutoff or kb // 1024 < cfg.shm_min_mb:
+[shm] o mínimo de MB deixa de ser inclusivo@@kb // 1024 < cfg.shm_min_mb:@@kb // 1024 <= cfg.shm_min_mb:
+[shm] o tamanho vem do st_size aparente e não dos blocos@@            kb += s.st_blocks // 2@@            kb += s.st_size // 1024
+[shm] a varredura segue symlink (stat sem follow_symlinks=False)@@            s = e.stat(follow_symlinks=False)@@            s = e.stat()
+[shm] arquivo solto e symlink valem como pasta@@        if not stat.S_ISDIR(s.st_mode) or s.st_uid != cfg.shm_uid:
+            continue@@        if s.st_uid != cfg.shm_uid:
+            continue
+[shm] pasta de outro dono vale como candidata@@        if not stat.S_ISDIR(s.st_mode) or s.st_uid != cfg.shm_uid:
+            continue@@        if not stat.S_ISDIR(s.st_mode):
+            continue
+[shm] o namespace ballast-* vale como órfã@@        if e.name.startswith("ballast-"):@@        if False:
+[shm] a lista shm-keep.txt é ignorada@@        if e.name in keep:@@        if False:
+[shm] lista de exceções ilegível não vira incerteza@@    if kwhy:
+        why.append(kwhy)@@    if False:
+        why.append(kwhy)
+[shm] lista de exceções AUSENTE vira incerteza@@    except FileNotFoundError:
+        return set(), ""@@    except FileNotFoundError:
+        return set(), "keep-ilegivel"
+[shm] lista de exceções ilegível vira lista vazia sem motivo@@        return set(), "keep-ilegivel"@@        return set(), ""
+[shm] o orçamento de entradas é ignorado@@            if budget.left < 0 or time.monotonic() >= budget.deadline:@@            if time.monotonic() >= budget.deadline:
+[shm] o prazo de relógio da varredura é ignorado@@            if budget.left < 0 or time.monotonic() >= budget.deadline:@@            if budget.left < 0:
+[shm] orçamento estourado não vira parcial@@                why.append("parcial")@@                pass
+[shm] orçamento estourado não para a varredura@@                why.append("parcial")
+                break@@                why.append("parcial")
+[shm] pasta que não leu inteira vale como lida (estado não conferido)@@        if state != "completa":@@        if False:
+[shm] subpasta em outro dispositivo entra na árvore@@                if s.st_dev != dev:@@                if False:
+[shm] o mais novo da árvore ignora o ctime (só mtime)@@            newest = max(newest, s.st_ctime, s.st_mtime)@@            newest = max(newest, s.st_mtime)
+[shm] o mais novo da árvore ignora o mtime (só ctime)@@            newest = max(newest, s.st_ctime, s.st_mtime)@@            newest = max(newest, s.st_ctime)
+[shm] o mais novo da pasta de cima ignora o mtime dela@@    newest, kb = max(top.st_ctime, top.st_mtime), top.st_blocks // 2@@    newest, kb = top.st_ctime, top.st_blocks // 2
+[shm] processo que a tabela não deixa ler vale como 'ninguém segura'@@            held_ok = False@@            held_ok = True
+[shm] tabela de processos ilegível não vira incerteza@@            why.append("proc-ilegivel")@@            pass
+[shm] pasta segurada vale como órfã@@(v for v in velhas if v["name"] not in held)@@(v for v in velhas if True)
+[shm] a menor primeiro@@key=lambda v: (-v["mb"], v["name"])@@key=lambda v: (v["mb"], v["name"])
+[shm] o resumo lista TODAS as órfãs (sem o corte de 10)@@sum(v["mb"] for v in orfaos), orfaos[:10]@@sum(v["mb"] for v in orfaos), orfaos
+[shm] a idade em horas sai em minutos@@/ 3600.0, 1)@@/ 60.0, 1)
+[shm] opacos mostra só os desconhecidos@@    out["opacos"] = sorted(set(known) | set(unknown))@@    out["opacos"] = sorted(set(unknown))
+[shm] opaco desconhecido não vira incerteza@@    why.extend("proc-opaco:%s" % c for c in unknown)@@    why.extend([])
+[shm] todo opaco vale como conhecido (o nome não é conferido)@@            (unknown if "erro" in states or comm not in OPAQUE_OK else known).add(comm)@@            (unknown if "erro" in states else known).add(comm)
+[shm] erro de leitura que não é permissão não é incerteza@@            (unknown if "erro" in states or comm not in OPAQUE_OK else known).add(comm)@@            (unknown if comm not in OPAQUE_OK else known).add(comm)
+[shm] a permissão negada (opaco) não marca o processo@@        if "opaco" in states or "erro" in states:@@        if "erro" in states:
+[shm] o cwd não segura@@        for what in ("cwd", "root", "exe"):@@        for what in ("root", "exe"):
+[shm] a raiz do processo não segura@@        for what in ("cwd", "root", "exe"):@@        for what in ("cwd", "exe"):
+[shm] o executável não segura@@        for what in ("cwd", "root", "exe"):@@        for what in ("cwd", "root"):
+[shm] o fd aberto não segura@@        for fd in fds or []:@@        for fd in []:
+[shm] o mapa de memória não segura@@        for what in ("maps", "cmdline"):@@        for what in ("cmdline",)
+[shm] a linha de comando não segura@@        for what in ("maps", "cmdline"):@@        for what in ("maps",)
+[shm] processo de outro usuário também segura@@            if os.stat(d).st_uid != cfg.shm_uid:@@            if False:
+[shm] um nome que é prefixo de outro vale como segurado@@            if j >= len(text) or not (text[j].isalnum() or text[j] in "_.~@+-"):@@            if True:
+[shm] o hífen não é caractere de nome (base-x casa dentro de base-x-3)@@ or text[j] in "_.~@+-"):@@ or text[j] in "_.~@+"):
+[shm] a busca em texto desiste na 1ª ocorrência que não é limite@@            start = i + 1@@            break
+[shm] relógio no futuro segura a varredura@@    if _int(t) and 0 <= cfg.now - t < cfg.shm_every_s:@@    if _int(t) and cfg.now - t < cfg.shm_every_s:
+[shm] varre cedo demais (intervalo inclusivo)@@    if _int(t) and 0 <= cfg.now - t < cfg.shm_every_s:@@    if _int(t) and 0 <= cfg.now - t <= cfg.shm_every_s:
+[shm] o resultado da varredura não vai ao estado@@    st["shm"] = out@@    pass
+[shm] o resultado da varredura não vai ao tick@@    rec["shm"] = out@@    pass
+[shm] o tick nem varre@@    shm_step(cfg, st, rec)@@    pass
+[shm] erro imprevisto da varredura derruba o tick@@    except Exception as e:   # noqa: BLE001@@    except OSError as e:   # noqa: BLE001
+[shm] o status não mostra a varredura@@    out["shm"] = st.get("shm")@@    out["shm"] = None
+[shm] o estado aceita shm sem carimbo inteiro@@    if not (shm is None or (isinstance(shm, dict) and _int(shm.get("t")))):@@    if not (shm is None or isinstance(shm, dict)):
+[shm] o estado aceita shm que não é objeto@@    if not (shm is None or (isinstance(shm, dict) and _int(shm.get("t")))):@@    if not (shm is None or _int(shm.get("t"))):
+[shm] a chave shm-reap.on não é conferida@@    if not os.path.exists(os.path.join(cfg.home, "shm-reap.on")):@@    if False:
+[shm] a faxina roda com a varredura incerta@@    if out["why"]:@@    if False:
+[shm] chave ligada sem órfã diz feito e não nada@@        out["reap"] = "nada"@@        out["reap"] = "feito"
+[shm] a faxina ignora o limite por varredura@@    alvos = orfaos[:cfg.shm_max_reap]@@    alvos = orfaos
+[shm] a faxina ignora o prazo@@        if time.monotonic() >= deadline:
+            break@@        if False:
+            break
+[shm] a faxina não reconfere a identidade da pasta@@        if not stat.S_ISDIR(s.st_mode) or s.st_uid != cfg.shm_uid:
+            falhou.append(o["name"])@@        if False:
+            falhou.append(o["name"])
+[shm] a faxina não reconfere o dono@@        if not stat.S_ISDIR(s.st_mode) or s.st_uid != cfg.shm_uid:
+            falhou.append(o["name"])@@        if not stat.S_ISDIR(s.st_mode):
+            falhou.append(o["name"])
+[shm] pasta que não saiu inteira conta como apagada@@        elif rm_tree(path, s.st_dev, deadline):@@        elif False:
+[shm] a faxina diz feito mesmo com falha ou prazo vencido@@    out["reap"] = "parcial" if falhou or len(reaped) < len(alvos) else "feito"@@    out["reap"] = "feito"
+[shm] prazo vencido sem falha vira feito@@    out["reap"] = "parcial" if falhou or len(reaped) < len(alvos) else "feito"@@    out["reap"] = "parcial" if falhou else "feito"
+[shm] as apagadas continuam na lista de órfãs@@    rest = [o for o in orfaos if o["name"] not in gone]@@    rest = orfaos
+[shm] o log que não grava passa calado@@        out["log"] = "falhou"@@        pass
+[shm] o log que não grava derruba a faxina@@    except OSError:
+        out["log"] = "falhou"@@    except ZeroDivisionError:
+        out["log"] = "falhou"
+[shm] o rm_tree segue symlink@@                s = k.stat(follow_symlinks=False)
+                if not stat.S_ISDIR(s.st_mode):@@                s = k.stat()
+                if not stat.S_ISDIR(s.st_mode):
+[shm] o rm_tree entra em outro dispositivo@@                elif s.st_dev == dev:@@                elif True:
+[shm] o rm_tree ignora o prazo@@        if deadline is not None and time.monotonic() >= deadline:@@        if False:
+[shm] o rm_tree não tira a pasta do topo (sem rmdir)@@            try:
+                os.rmdir(p)@@            try:
+                pass
+[shm] a idade padrão cai para 24 h@@"BALLAST_SHM_AGE_S", 172800@@"BALLAST_SHM_AGE_S", 86400
+[shm] o mínimo padrão cai para 1 MB@@"BALLAST_SHM_MIN_MB", 64@@"BALLAST_SHM_MIN_MB", 1
+[shm] o intervalo padrão cai para 60 s@@"BALLAST_SHM_EVERY_S", 600@@"BALLAST_SHM_EVERY_S", 60
+[shm] a idade aceita menos de 1 h@@"BALLAST_SHM_AGE_S", 172800, int, 3600@@"BALLAST_SHM_AGE_S", 172800, int, 0
+[shm] BALLAST_SHM_UID vale fora do selftest@@    if env.get("BALLAST_TEST") == "1" and env.get("BALLAST_SHM_UID", "").strip():@@    if env.get("BALLAST_SHM_UID", "").strip():
+[shm] a pasta padrão não é /dev/shm@@env.get("BALLAST_SHM") or "/dev/shm"@@env.get("BALLAST_SHM") or "/tmp"
+[shm] o padrão apaga 1 pasta por varredura@@"BALLAST_SHM_MAX_REAP", 10@@"BALLAST_SHM_MAX_REAP", 1
+[shm] o prazo padrão é de 150 s@@"BALLAST_SHM_BUDGET_S", 15,@@"BALLAST_SHM_BUDGET_S", 150,
 MUT
   "$PY" -I - "$P" "$T/mutants.txt" "$T" > "$T/mutants.idx" <<'PYEOF'
 import re, sys
@@ -1842,7 +1973,7 @@ PYEOF
   while IFS="$(printf '\t')" read -r idx st desc; do
     if [ "$st" != OK ]; then ok 1 "mutante '$desc': a âncora não casa exatamente 1 vez (o script mudou?)"; continue; fi
     case "$desc" in "[linux]"*) [ -r /proc/self/oom_score_adj ] || { echo "skip mutante '$desc' (sem /proc/self/oom_score_adj neste host)"; continue; };; esac
-    grp=""; case "$desc" in "[teto]"*|"[teto-linux]"*) grp=teto ;; "[elastico]"*) grp=elastico ;; "[piso]"*) grp=piso ;; esac
+    grp=""; case "$desc" in "[teto]"*|"[teto-linux]"*) grp=teto ;; "[elastico]"*) grp=elastico ;; "[piso]"*) grp=piso ;; "[shm]"*) grp=shm ;; esac
     [ -z "${HB_MUTANTS_ONLY:-}" ] || [ "$grp" = "$HB_MUTANTS_ONLY" ] || continue
     case "$desc" in "[teto-linux]"*) cgrp_ok || { echo "skip mutante '$desc' (sem systemd-run --user utilizável neste host)"; continue; };; esac
     while [ "$(jobs -r | wc -l | tr -d ' ')" -ge "$JOBS" ]; do sleep 0.3; done
