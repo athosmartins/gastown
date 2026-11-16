@@ -3750,8 +3750,11 @@ gate_fail_assignee_action() {
   #     (wa-worker-*): its prompt says the bead "volta do gate sem assignee" and the idle session closes by itself in
   #     15 min, so a still-live Kimi author at FAIL time must take "clear" (route back to kimi-lane, Pilot re-dispatches),
   #     not "keep" (assignee kept, route unset, a nudge to a disposable slot).
+  #   - kimi-worker-wa-remote / kimi-worker-wa-remote-* : ga-do1ixn.6.1 (gate-fix 4). The WA twin of the slot above (alias
+  #     kimi-worker-wa-remote-1). `kimi-worker-remote-*` does NOT match it (the `-wa-` sits before `remote`), so without its own
+  #     entry a live WA Kimi author took "keep" and woke the Mayor on every FAIL instead of deferring (rule 3).
   case "$author" in
-    ''|mayor|gastown.mayor|gastown__mayor|gastown.dog|gastown.dog-*|dog-*|wa-worker|wa-worker-*|ps-worker|ps-worker-*|kimi-worker-remote|kimi-worker-remote-*)
+    ''|mayor|gastown.mayor|gastown__mayor|gastown.dog|gastown.dog-*|dog-*|wa-worker|wa-worker-*|ps-worker|ps-worker-*|kimi-worker-remote|kimi-worker-remote-*|kimi-worker-wa-remote|kimi-worker-wa-remote-*)
       printf 'clear'; return 0 ;;
   esac
   if [ "$author_alive" = "1" ]; then
@@ -3763,7 +3766,7 @@ gate_fail_assignee_action() {
 
 # gate_fail_author_is_ephemeral <author> — pure; selftest-sourceable.
 # ga-aijm2v.5 (rule 3): true (rc 0) when <author> is a disposable pool slot — wa-worker,
-# ps-worker, gastown.dog, dog-*, kimi-worker-remote* — or the "mayor" routing sentinel the author normalizer
+# ps-worker, gastown.dog, dog-*, kimi-worker-remote*, kimi-worker-wa-remote* — or the "mayor" routing sentinel the author normalizer
 # substitutes for an unreachable one. Deliberately NOT a second pattern list: it asks
 # gate_fail_assignee_action with alive=1, whose deny-list (ga-nkkku / ga-mgrma) already IS
 # this codebase's definition of "never a named crew, regardless of liveness", so the two

@@ -89,6 +89,18 @@ eq "kimi-worker-remote-1 (the Hetzner Kimi pool slot, ga-do1ixn.3), alive → cl
 eq "kimi-worker-remote (bare), alive → clear" \
   "$(gate_fail_assignee_action "kimi-worker-remote" "1")" \
   "clear"
+eq "kimi-worker-wa-remote-1 (the WA Kimi pool slot, ga-do1ixn.6.1), alive → clear" \
+  "$(gate_fail_assignee_action "kimi-worker-wa-remote-1" "1")" \
+  "clear"
+eq "kimi-worker-wa-remote-gawisp8wtc8 (session-name form of the WA Kimi slot), alive → clear" \
+  "$(gate_fail_assignee_action "kimi-worker-wa-remote-gawisp8wtc8" "1")" \
+  "clear"
+eq "kimi-worker-wa-remote (bare, what the -adhoc- normalizer yields), alive → clear" \
+  "$(gate_fail_assignee_action "kimi-worker-wa-remote" "1")" \
+  "clear"
+eq "kimi-worker-wa (not a pool slot name), alive → keep" \
+  "$(gate_fail_assignee_action "kimi-worker-wa" "1")" \
+  "keep"
 eq "kimi-worker (not a pool slot name), alive → keep (the pattern is not a prefix match on 'kimi')" \
   "$(gate_fail_assignee_action "kimi-worker" "1")" \
   "keep"
