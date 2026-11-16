@@ -11,9 +11,11 @@
 # This order packs loose objects in bounded batches once they pass 256MiB, merges the small
 # packs those batches leave into ONE pack when they hold >= 256MiB (ga-3sf9r8: `repack -f` over
 # just those packs, so the per-batch first copies of a giant file collapse; the big old pack is
-# never touched), and runs one consolidating gc when packs pile up (>= 8). It never shortens
-# history — the S3 mirror copies only the working tree, so the git history has no offsite
-# copy. Full rationale, the alarm rule and the failure states: header of
+# never touched), and runs one consolidating gc when packs pile up (>= 8). THIS order never
+# shortens history — the S3 mirror copies only the working tree, so the git history has no offsite
+# copy; what bounds the history is the separate order jsonl-archive-history-cap (ga-zfy8j4x: only the
+# last 3 days are kept, 12.969 commits = 2,9 GB took the disk down on 16/11), which shares this
+# order's lock. Full rationale, the alarm rule and the failure states: header of
 # assets/scripts/jsonl-archive-compact.sh.
 #
 # interval 30m: at ~243MiB/h of new loose blobs the 256MiB limit is crossed about hourly; 30m

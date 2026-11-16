@@ -1,0 +1,36 @@
+# ga-zfy8j4x: keep only the last N days (3) of the jsonl-archive git history.
+#
+# mol-dog-jsonl commits the exported beads every ~15 min; jsonl-archive-compact.sh packs the loose objects but never shortens
+# history, and the history is what grew: 12.969 commits = 2,9 GB of .git on 16/11/2026, which took the mini's disk down (the Mayor
+# cut it by hand that day). Nothing reads that history back — the S3 mirror copies only the working tree (.git is excluded), no
+# restore walks it, and the exporter's spike detection compares against the PREVIOUS commit only — so the ceiling is policy.
+#
+# This order does by script what the Mayor did by hand, without a gc/repack of the big repo: it re-writes the kept commits with
+# the same tree/author/committer/message (the oldest one without a parent), fetches just those into a NEW git dir under a
+# free-space watch, verifies every kept tree and `git fsck --connectivity-only`, swaps the two .git dirs (checked right after,
+# undone if it differs) and only then deletes the old one. It acts at most about once a day (the oldest commit must be 12h past the
+# window), or at once when .git is over 1GiB. It stays INERT — repo untouched, exit 0 — on a remote, a second ref, a merge,
+# a shallow/unknown layout, git's own lock files, another repacker or the exporter running, an unreadable free-space figure.
+# Alarm (mail to mayor/, rate-limited): .git over 1GiB after the run, or a run that failed / was rolled back / hit a swap conflict.
+# Full rationale, the swap steps and the failure states: header of assets/scripts/jsonl-archive-history-cap.sh.
+#
+# It shares jsonl-archive-compact's lock ($GC_CITY_RUNTIME_DIR/jsonl-archive-compact.lock): one repo writer at a time, and the
+# exporter starts no background maintenance while that lock is held. While the compactor's night gc holds it (up to ~6h) this
+# order answers "in flight" (exit 0) and only measures and alarms.
+#
+# interval 1h: the run is cheap when there is nothing to cut (one `du` and one `git log`), and 1h bounds how long a .git over
+# 1GiB goes unnoticed. timeout 3000s (50m) is above the script's own 2400s deadline, so a run ends itself and logs its outcome
+# long before any kill; a killed run is still safe (the exit trap puts the old .git back if the swap was cut in half, and the
+# next run cleans up the rest). selftest S11 fails if the timeout stops covering the deadline or the interval drops under it.
+#
+# Only ONE instance exists (this pack's orders register for the city scope); the script is single-flight anyway.
+#
+# Verify after a reload:  gc order show jsonl-archive-history-cap   -> Source: .../town-deltas/...
+#                         bash $GC_CITY_PATH/packs/town-deltas/assets/scripts/jsonl-archive-history-cap.sh --check
+#                         tail -3 $GC_CITY_PATH/.gc/logs/jsonl-archive-history-cap.log
+[order]
+description = "Keep only the last 3 days of the jsonl-archive git history (re-write + swap, no big gc) and mail mayor/ when .git is over 1GiB"
+trigger = "cooldown"
+interval = "1h"
+timeout = "3000s"
+exec = "$PACK_DIR/assets/scripts/jsonl-archive-history-cap.sh"
