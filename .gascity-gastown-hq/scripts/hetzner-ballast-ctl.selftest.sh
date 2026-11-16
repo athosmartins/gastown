@@ -53,11 +53,11 @@ if cmd == "status":
         out["ceiling"] = ceil
     shm = None   # ~/gov.shm.orfas: 25 órfãs de 4596 MB, faxina desligada · ~/gov.shm.cega: pasta ausente, contas null · ~/gov.shm.incerta: 3 órfãs lidas mas com incerteza · nenhum: nunca varreu (null) · ~/gov.shm.absent: governo antigo (sem a chave)
     if os.path.exists(os.path.expanduser("~/gov.shm.orfas")):
-        shm = {"orfaos_n": 25, "orfaos_mb": 4596, "seguradas_n": 0, "reap": "desligado", "why": ""}
+        shm = {"orfaos_n": 25, "orfaos_mb": 4596, "seguradas_n": 0, "mantidas_n": 0, "reap": "desligado", "why": ""}
     elif os.path.exists(os.path.expanduser("~/gov.shm.cega")):
-        shm = {"orfaos_n": None, "orfaos_mb": None, "seguradas_n": None, "reap": "inerte", "why": "shm-ausente"}
+        shm = {"orfaos_n": None, "orfaos_mb": None, "seguradas_n": None, "mantidas_n": None, "reap": "inerte", "why": "shm-ausente"}
     elif os.path.exists(os.path.expanduser("~/gov.shm.incerta")):
-        shm = {"orfaos_n": 3, "orfaos_mb": 600, "seguradas_n": 1, "reap": "inerte", "why": "proc-opaco:x"}
+        shm = {"orfaos_n": 3, "orfaos_mb": 600, "seguradas_n": 1, "mantidas_n": 2, "reap": "inerte", "why": "proc-opaco:x"}
     if not os.path.exists(os.path.expanduser("~/gov.shm.absent")):
         out["shm"] = shm
     print(json.dumps(out))
@@ -268,11 +268,11 @@ g_ctl() {
   check "status: governo antigo sem teto → diz que o governo instalado NÃO tem teto (rode install), nunca 'teto: pronto'" "1 0" "$(printf '%s' "$OUT" | grep -c 'NÃO tem teto') $(printf '%s' "$OUT" | grep -c 'teto: pronto')"
   # a linha shm: (ga-i6ghk4r): a varredura do /dev/shm órfão do governo, no comando que o Mayor roda
   newenv; ctl install; : > "$NODE/gov.shm.orfas"; ctl status
-  check "status: a varredura achou 25 órfãs de 4596 MB → 'shm: órfãs=25 (4596 MB) seguradas=0 faxina=desligado', sem ATENÇÃO, rc 0" "0 1 0" "$RC $(printf '%s' "$OUT" | grep -c 'shm: órfãs=25 (4596 MB) seguradas=0 faxina=desligado$') $(printf '%s' "$OUT" | grep -c 'shm:.*ATENÇÃO')"
+  check "status: a varredura achou 25 órfãs de 4596 MB → 'shm: órfãs=25 (4596 MB) seguradas=0 mantidas=0 faxina=desligado', sem ATENÇÃO, rc 0" "0 1 0" "$RC $(printf '%s' "$OUT" | grep -c 'shm: órfãs=25 (4596 MB) seguradas=0 mantidas=0 faxina=desligado$') $(printf '%s' "$OUT" | grep -c 'shm:.*ATENÇÃO')"
   newenv; ctl install; : > "$NODE/gov.shm.cega"; ctl status
-  check "status: a pasta de /dev/shm não existe (contas null) → 'órfãs=NÃO SEI' com ATENÇÃO=shm-ausente, NUNCA 'órfãs=0'" "1 1 0" "$(printf '%s' "$OUT" | grep -c 'shm: órfãs=NÃO SEI') $(printf '%s' "$OUT" | grep -c 'ATENÇÃO=shm-ausente') $(printf '%s' "$OUT" | grep -c 'órfãs=0')"
+  check "status: a pasta de /dev/shm não existe (contas null) → 'órfãs=NÃO SEI' (e seguradas/mantidas NÃO SEI, nunca None) com ATENÇÃO=shm-ausente, NUNCA 'órfãs=0'" "1 1 0 0" "$(printf '%s' "$OUT" | grep -c 'shm: órfãs=NÃO SEI seguradas=NÃO SEI mantidas=NÃO SEI') $(printf '%s' "$OUT" | grep -c 'ATENÇÃO=shm-ausente') $(printf '%s' "$OUT" | grep -c 'órfãs=0') $(printf '%s' "$OUT" | grep -c 'None')"
   newenv; ctl install; : > "$NODE/gov.shm.incerta"; ctl status
-  check "status: órfãs lidas mas com incerteza → mostra o número E o motivo (órfãs=3 (600 MB) ... ATENÇÃO=proc-opaco:x)" "1" "$(printf '%s' "$OUT" | grep -c 'shm: órfãs=3 (600 MB) seguradas=1 faxina=inerte ATENÇÃO=proc-opaco:x')"
+  check "status: órfãs lidas mas com incerteza → mostra o número, as seguradas, as mantidas pela lista e o motivo (órfãs=3 (600 MB) seguradas=1 mantidas=2 ... ATENÇÃO=proc-opaco:x)" "1" "$(printf '%s' "$OUT" | grep -c 'shm: órfãs=3 (600 MB) seguradas=1 mantidas=2 faxina=inerte ATENÇÃO=proc-opaco:x')"
   newenv; ctl install; ctl status
   check "status: governo que nunca varreu (shm null) → 'sem varredura', nunca 'órfãs=0'" "1 0" "$(printf '%s' "$OUT" | grep -c 'shm: sem varredura') $(printf '%s' "$OUT" | grep -c 'órfãs=0')"
   newenv; ctl install; : > "$NODE/gov.shm.absent"; ctl status
@@ -376,6 +376,8 @@ a linha shm: mostra órfãs=0 quando as contas são null (não sei vira zero)@@ 
 a linha shm: não mostra o motivo da incerteza@@" ATENÇÃO=%s" % sh.get("why") if sh.get("why") else ""@@""
 a linha shm: governo que nunca varreu aparece como zero órfãs@@print("shm: sem varredura (governo antigo, ou ainda não varreu)")@@print("shm: órfãs=0 (0 MB)")
 a linha shm: conta null passa pela guarda e vira 'órfãs=None (None MB)'@@isinstance(n, int) and not isinstance(n, bool) and isinstance(mb, int) and not isinstance(mb, bool)@@True
+a linha shm: seguradas e mantidas null aparecem como None (não sei vira texto de programa)@@num = lambda v: v if isinstance(v, int) and not isinstance(v, bool) else "NÃO SEI"@@num = lambda v: v
+a linha shm: mostra as seguradas no lugar das mantidas pela lista@@num(sh.get("mantidas_n"))@@num(sh.get("seguradas_n"))
 MUT
   "$PY" -I - "$P" "$T/mutants.txt" "$T" > "$T/mutants.idx" <<'PYEOF'
 import re, sys

@@ -277,7 +277,8 @@ if isinstance(st, dict) and isinstance(st.get("items"), list):
     if isinstance(sh, dict):
         n, mb = sh.get("orfaos_n"), sh.get("orfaos_mb")
         cont = "órfãs=%s (%s MB)" % (n, mb) if isinstance(n, int) and not isinstance(n, bool) and isinstance(mb, int) and not isinstance(mb, bool) else "órfãs=NÃO SEI"
-        print("shm: %s seguradas=%s faxina=%s%s" % (cont, sh.get("seguradas_n"), sh.get("reap"), " ATENÇÃO=%s" % sh.get("why") if sh.get("why") else ""))
+        num = lambda v: v if isinstance(v, int) and not isinstance(v, bool) else "NÃO SEI"   # seguradas e mantidas: null ou ausente = não consegui contar, nunca None nem 0
+        print("shm: %s seguradas=%s mantidas=%s faxina=%s%s" % (cont, num(sh.get("seguradas_n")), num(sh.get("mantidas_n")), sh.get("reap"), " ATENÇÃO=%s" % sh.get("why") if sh.get("why") else ""))
     else:
         print("shm: sem varredura (governo antigo, ou ainda não varreu)")
     if "running" in st and st["running"] is None:

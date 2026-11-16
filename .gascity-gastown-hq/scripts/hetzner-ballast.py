@@ -1181,8 +1181,8 @@ OPAQUE_OK = ("ssh-agent", "gpg-agent", "systemd", "(sd-pam)", "sshd")
 
 
 def shm_keep(cfg):
-    """({nomes}, motivo): a lista de exceções $BALLAST_HOME/shm-keep.txt (um nome de pasta por linha; # comenta; linha com / não é nome). Pasta que o dono quer manter parada em /dev/shm."""
-    # vazio (arquivo ausente) → nenhuma exceção; falhou/ilegível (é uma pasta, sem permissão) → motivo keep-ilegivel: a lista é DESCONHECIDA e quem chama não apaga nada
+    """({nomes}, motivo): a lista de exceções $BALLAST_HOME/shm-keep.txt: um nome de pasta por linha, só com os caracteres de nome de shm_names_in (letras, dígitos e _ . ~ @ + -); linha em branco ou que começa com # é comentário. Pasta que o dono quer manter parada em /dev/shm."""
+    # vazio (arquivo ausente) → nenhuma exceção; falhou/ilegível (é uma pasta, sem permissão) OU linha que não é um nome (barra, # no meio, curinga, aspas, BOM, '.', '..') → motivo keep-ilegivel: a lista é DESCONHECIDA (não sei o que a linha poupa) e quem chama não apaga nada
     try:
         with open(os.path.join(cfg.home, "shm-keep.txt"), "rb") as f:
             raw = f.read().decode("utf-8", "replace")
@@ -1190,7 +1190,9 @@ def shm_keep(cfg):
         return set(), ""
     except OSError:
         return set(), "keep-ilegivel"
-    return {ln for ln in (x.strip() for x in raw.splitlines()) if ln and not ln.startswith("#") and "/" not in ln}, ""
+    nomes = {ln for ln in (x.strip() for x in raw.splitlines()) if ln and not ln.startswith("#")}
+    ruim = any(n in (".", "..") or not all(c.isalnum() or c in "_.~@+-" for c in n) for n in nomes)
+    return nomes, "keep-ilegivel" if ruim else ""
 
 
 def shm_names_in(text, prefix, names):
@@ -1229,7 +1231,7 @@ def read_utf8(path):
 
 def shm_holders(cfg, root, names):
     """({nome: {pids}}, [comm de opaco conhecido], [comm de opaco desconhecido]): quais das pastas `names` (filhas diretas de `root`) algum processo do NOSSO usuário segura: cwd, root ou exe dentro dela, fd aberto, mapa de
-    memória ou o nome na linha de comando. Processo de outro usuário não escreve em pasta nossa e não conta. Processo nosso que o kernel esconde (EACCES) é opaco: só a linha de comando dele prova alguma coisa; com `comm` em
+    memória ou o nome na linha de comando. Processo de OUTRO usuário (root, por exemplo) não é visto e não conta: é um limite (runbook, "Não coberto"), não uma garantia. Processo nosso que o kernel esconde (EACCES) é opaco: só a linha de comando dele prova alguma coisa; com `comm` em
     OPAQUE_OK ele não segura mais que isso, senão (ou com qualquer outro erro de leitura, ou comm que não leu: '?') é incerteza e quem chama não apaga. Processo que some no meio é ignorado. Unreadable se a tabela de processos não abre."""
     # o kernel mostra o caminho RESOLVIDO em cwd/fd/maps e a linha de comando traz o que o processo DIGITOU: vale um prefixo ou o outro (BALLAST_SHM pode ser um symlink, como o /dev/shm -> /run/shm de algumas distros)
     prefixes = {root.rstrip("/") + "/", os.path.realpath(root).rstrip("/") + "/"}
@@ -1368,7 +1370,7 @@ def shm_scan(cfg):
         if e.name in keep:
             mantidas += 1
             continue
-        velhas.append({"name": e.name, "mb": kb // 1024, "idle_h": round(max(0.0, cfg.now - newest) / 3600.0, 1)})
+        velhas.append({"name": e.name, "mb": kb // 1024, "idle_h": round(max(0.0, cfg.now - newest) / 3600.0, 1), "id": (s.st_dev, s.st_ino)})
     out["ilegiveis_n"], out["mantidas_n"] = ilegiveis, mantidas
     held, known, unknown = {}, [], []
     held_ok = True
@@ -1430,7 +1432,7 @@ def rm_tree(path, dev, deadline=None):
 
 def shm_faxina(cfg, out, orfaos):
     """Apaga as órfãs que a varredura achou e põe o resultado em `out` (reap, reaped, falhou, log). Só com a chave $BALLAST_HOME/shm-reap.on E com a varredura sem incerteza global (why vazio); as maiores primeiro, até
-    BALLAST_SHM_MAX_REAP por varredura e dentro do prazo (se o prazo acaba NO MEIO de uma árvore, o que sobrou dela só volta a ser órfão 48 h depois: apagar muda o mtime das pastas). A pasta é reconferida logo antes (ainda uma pasta de verdade do nosso usuário: virou symlink, arquivo ou sumiu → não mexe). reap: desligado (sem a chave) · inerte (chave
+    BALLAST_SHM_MAX_REAP por varredura e dentro do prazo (se o prazo acaba NO MEIO de uma árvore, o que sobrou dela só volta a ser órfão 48 h depois: apagar muda o mtime das pastas). A pasta é reconferida logo antes (ainda a MESMA que a varredura julgou, por dispositivo e inode, e ainda uma pasta de verdade do nosso usuário: virou symlink, arquivo, outra pasta ou sumiu → não mexe). reap: desligado (sem a chave) · inerte (chave
     ligada mas a varredura teve incerteza: a lista de órfãs não é certa) · nada (lida e sem órfã) · feito · parcial (alguma não saiu inteira, ou o prazo acabou)."""
     out.update({"reap": "desligado", "reaped": [], "falhou": [], "log": ""})
     # vazio (sem a chave) → desligado; falhou/ilegível (stat negado) → desligado TAMBÉM: aqui o 'ligado' é o lado perigoso (nas chaves elastic.off e ram-floor.fixed é o contrário), e os dois estados vazio e falhou dão o mesmo lado: não apaga
@@ -1455,7 +1457,8 @@ def shm_faxina(cfg, out, orfaos):
         except OSError:
             falhou.append(o["name"])
             continue
-        if not stat.S_ISDIR(s.st_mode) or s.st_uid != cfg.shm_uid:
+        # tem de ser a MESMA pasta que a varredura julgou (dispositivo e inode): apagada e recriada com o mesmo nome por um processo vivo não é a órfã. vazio (a varredura não guardou o id) → não é a mesma, vai para `falhou`; falhou/ilegível → n/a (o id vem em memória da própria varredura)
+        if not stat.S_ISDIR(s.st_mode) or s.st_uid != cfg.shm_uid or (s.st_dev, s.st_ino) != o.get("id"):
             falhou.append(o["name"])
         elif rm_tree(path, s.st_dev, deadline):
             falhou.append(o["name"])

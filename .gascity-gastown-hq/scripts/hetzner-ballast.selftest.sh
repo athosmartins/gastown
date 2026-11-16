@@ -30,9 +30,9 @@
 #   elástico (g_elastic, ga-2hd02v.5.11): o registro `N-M` e os slots que sobem e descem pela CPU ociosa, a RAM e o PSI de disco (e a chave elastic.off) · o fg líquido do tempo de kernel do próprio lastro (cpu.stat) · o cooldown curto da rodada `parcial`.
 #   /dev/shm órfão (g_shm, g_shmscan, g_shmreap, ga-i6ghk4r): skipped ram com falta_mb (e shm_orfao_mb) e o shmem_mb do tick (null, nunca 0, quando a linha falta, não é número ou é negativa) · a varredura do /dev/shm: órfã = pasta de verdade
 #     (nunca arquivo nem symlink) do nosso usuário, fora de ballast-*, >= o mínimo de MB (inclusivo), parada há a idade mínima EXATA (maior entre ctime e mtime: a cópia por tar de árvore velha é jovem), tamanho pelos blocos, que nenhum processo segura
-#     (cwd, root, exe, fd, maps, linha de comando; base-x não casa em base-x-3; opaco só vale com nome conhecido) e que o shm-keep.txt não poupa · três estados (pasta ausente/ilegível, tabela de processos ilegível, orçamento, lista de exceções ilegível:
+#     (cwd, root, exe, fd, maps, linha de comando; base-x não casa em base-x-3; opaco só vale com nome conhecido) e que o shm-keep.txt não poupa · três estados (pasta ausente/ilegível, tabela de processos ilegível, orçamento, lista de exceções ilegível ou com linha que não é um nome:
 #     contas null e `why`, nunca 0 órfãs) · o intervalo e o relógio que anda para trás · o estado e o status · a FAXINA (chave shm-reap.on; só com `why` vazio; as maiores primeiro; o limite por varredura; nunca symlink nem outro dispositivo; troca
-#     da pasta por symlink entre a varredura e a faxina; falha parcial; log que não grava; erro imprevisto da varredura) · config (padrões, pisos, BALLAST_SHM_UID só no selftest). Os casos `(unit)` carregam o governo como módulo (função `unit`).
+#     da pasta por symlink ou por outra pasta (outro inode) entre a varredura e a faxina; falha parcial; log que não grava; erro imprevisto da varredura) · config (padrões, pisos, BALLAST_SHM_UID só no selftest). Os casos `(unit)` carregam o governo como módulo (função `unit`).
 # CONTROLE NEGATIVO: cada mutante (um trecho do script trocado) TEM que reprovar a bateria. Mutante com descrição `[teto]` roda só os grupos do teto; com `[elastico]`, só o g_elastic; com `[shm]`, só os três grupos do /dev/shm.
 # VARIÁVEIS: HB_UNDER_TEST (script a testar) · HB_PY (interpretador; padrão /usr/bin/python3) · HB_NO_MUTANTS=1 · HB_MUTANTS_ONLY=teto|elastico|piso|shm (só os mutantes do teto, dos slots elásticos, do piso de RAM ou do /dev/shm) · HB_ONLY=<grupo> (reg tick run ram reap fill off state logs launch send ceil cgrp elastic floor carry startmb shm shmscan shmreap; sem mutantes)
 set -u
@@ -1312,7 +1312,7 @@ g_shmscan() {
   else
     echo "skip shm varredura: casos de processo opaco não valem como root"
   fi
-  # shm-keep.txt: a válvula de escape (um nome por linha; # comenta; arquivo ausente = nada a manter; arquivo que não abre = incerteza)
+  # shm-keep.txt: a válvula de escape (um nome por linha; # comenta; arquivo ausente = nada a manter; arquivo que não abre ou linha que não é um nome = incerteza)
   shm_up; shm_dir velho 3; shm_dir outro 3; printf '# árvore do experimento X\n\nvelho\n' > "$H/shm-keep.txt"; shm_age; bt
   check "shm varredura: shm-keep.txt tira da conta o que ele lista (comentário e linha em branco ignorados): só 'outro' é órfã, 1 mantida" "outro 1 1" "$(shm_names) $(jget shm.orfaos_n) $(jget shm.mantidas_n)"
   shm_up; shm_dir velho 3; mkdir "$H/shm-keep.txt"; shm_age; bt
@@ -1377,6 +1377,14 @@ g_shmreap() {
   # sem incerteza zero de efeito: qualquer why vazio vira inerte
   shm_up; shm_dir velho 3; : > "$H/shm-reap.on"; mkdir "$H/shm-keep.txt"; shm_age; bt
   check "shm faxina: com a chave ligada mas a lista de exceções ilegível (keep-ilegivel) a faxina fica INERTE e nada sai" "inerte velho" "$(jget shm.reap) $(shm_ls)"
+  # linha que o código não sabe honrar (não é um nome: barra, # no meio, curinga, aspas, barra invertida, BOM, NUL, '.', '..') = lista DESCONHECIDA, nunca "sem exceção" calada; com 'velho' como linha boa ao lado (a ruim não pode ser engolida pela boa)
+  for bad in 'velho/' '@SHM@/velho' 'velho   # experimento X' 'vel*' 'vel?o' '[v]elho' '"velho"' 'vel\\ho' '\xef\xbb\xbfvelho' 'vel\0ho' '.' '..'; do
+    shm_up; shm_dir velho 3; shm_dir outro 3; printf 'velho\n%b\n' "${bad//@SHM@/$SHM}" > "$H/shm-keep.txt"; : > "$H/shm-reap.on"; shm_age; bt
+    check "shm faxina: shm-keep.txt com a linha '$bad' (não é um nome) → keep-ilegivel, faxina INERTE e as duas pastas ficam" "inerte [keep-ilegivel] outro velho" "$(jget shm.reap) [$(jget shm.why)] $(shm_ls)"
+  done
+  # o que a lista honra segue honrado (o controle do laço acima): comentário, linha em branco, CRLF e espaço nas pontas, e um nome com todos os caracteres de nome
+  shm_up; shm_dir velho 3; shm_dir outro 3; shm_dir 'mut-sq4rl2_5.a@b+c~d' 3; printf '# nota\r\n\r\nmut-sq4rl2_5.a@b+c~d\r\n  velho \t\r\n' > "$H/shm-keep.txt"; : > "$H/shm-reap.on"; shm_age; bt
+  check "shm faxina: lista com comentário, linha em branco, CRLF, espaço nas pontas e um nome com letras, dígitos e _ . ~ @ + - é lida inteira: faxina armada (why vazio), 2 mantidas e só 'outro' sai" "feito [] 2 mut-sq4rl2_5.a@b+c~d velho" "$(jget shm.reap) [$(jget shm.why)] $(jget shm.mantidas_n) $(shm_ls)"
   shm_up; shm_dir velho 3; : > "$H/shm-reap.on"; EXTRA_ENV="$EXTRA_ENV BALLAST_SHM_MAX_ENTRIES=1"; shm_age; bt
   check "shm faxina: varredura parcial (orçamento estourado) → inerte, nada sai" "inerte velho" "$(jget shm.reap) $(shm_ls)"
   shm_up; : > "$H/shm-reap.on"; EXTRA_ENV="BALLAST_SHM=$T/nao-existe BALLAST_SHM_EVERY_S=0"; bt
@@ -1413,7 +1421,8 @@ print(hb.shm_walk(os.path.join(root, "velho"), -1, 1e18, b)[2])' "$SHM")
   c=$(unit 'import os
 cfg = hb.load_config({"BALLAST_HOME": sys.argv[2], "BALLAST_SHM": sys.argv[1], "BALLAST_NOW": "1"})
 out = {"why": "", "orfaos": [], "orfaos_n": 1, "orfaos_mb": 3}
-hb.shm_faxina(cfg, out, [{"name": "velho", "mb": 3, "idle_h": 99.0}])
+s = os.lstat(os.path.join(sys.argv[1], "velho"))
+hb.shm_faxina(cfg, out, [{"name": "velho", "mb": 3, "idle_h": 99.0, "id": (s.st_dev, s.st_ino)}])
 print(out["reap"], out["falhou"], out["reaped"])' "$SHM" "$H")
   check "shm faxina (unit): a pasta julgada (velho) virou um SYMLINK entre a varredura e a faxina → não mexe: falhou, nada apagado, o link e o ALVO dele ficam" "parcial ['velho'] [] yes yes" "$c $([ -L "$SHM/velho" ] && echo yes || echo no) $([ -f "$T/fora$N/arq" ] && echo yes || echo no)"
   shm_up; : > "$H/shm-reap.on"
@@ -1434,9 +1443,21 @@ print(hb.rm_tree(os.path.join(sys.argv[1], "velho"), os.lstat(sys.argv[1]).st_de
   c=$(unit 'import os
 env = {"BALLAST_HOME": sys.argv[2], "BALLAST_SHM": sys.argv[1], "BALLAST_NOW": "1", "BALLAST_TEST": "1", "BALLAST_SHM_UID": str(os.getuid() + 1)}
 out = {"why": "", "orfaos": [], "orfaos_n": 1, "orfaos_mb": 3}
-hb.shm_faxina(hb.load_config(env), out, [{"name": "velho", "mb": 3, "idle_h": 99.0}])
+s = os.lstat(os.path.join(sys.argv[1], "velho"))
+hb.shm_faxina(hb.load_config(env), out, [{"name": "velho", "mb": 3, "idle_h": 99.0, "id": (s.st_dev, s.st_ino)}])
 print(out["reap"], out["falhou"], out["reaped"])' "$SHM" "$H")
   check "shm faxina (unit): na reconferência a pasta julgada é de OUTRO dono → não mexe: parcial, falhou, nada apagado" "parcial ['velho'] [] yes" "$c $([ -d "$SHM/velho/sub" ] && echo yes || echo no)"
+  shm_up; shm_dir velho 3; : > "$H/shm-reap.on"
+  c=$(unit 'import os
+cfg = hb.load_config({"BALLAST_HOME": sys.argv[2], "BALLAST_SHM": sys.argv[1], "BALLAST_NOW": "1"})
+s, o, r = os.lstat(os.path.join(sys.argv[1], "velho")), {"name": "velho", "mb": 3, "idle_h": 99.0}, []
+for ident in ((s.st_dev + 1, s.st_ino), (s.st_dev, s.st_ino + 1), None):
+    out = {"why": "", "orfaos": [], "orfaos_n": 1, "orfaos_mb": 3}
+    hb.shm_faxina(cfg, out, [o if ident is None else dict(o, id=ident)])
+    r.append("%s %s %s" % (out["reap"], out["falhou"], out["reaped"]))
+print("; ".join(r))' "$SHM" "$H")
+  check "shm faxina (unit): a pasta que está lá NÃO é a que a varredura julgou (outro dispositivo, outro inode ou sem identidade: apagada e recriada com o mesmo nome por um processo vivo) → não mexe nas 3: parcial, falhou, nada apagado" "parcial ['velho'] []; parcial ['velho'] []; parcial ['velho'] [] yes" "$c $([ -d "$SHM/velho/sub" ] && echo yes || echo no)"
+  shm_up; shm_dir velho 3; : > "$H/shm-reap.on"
   c=$(unit 'import os
 env = {"BALLAST_HOME": sys.argv[2], "BALLAST_SHM": sys.argv[1], "BALLAST_NOW": "1", "BALLAST_SHM_BUDGET_S": "0"}
 out = {"why": "", "orfaos": [], "orfaos_n": 1, "orfaos_mb": 3}
@@ -1875,6 +1896,18 @@ def read_cpu_prev(cfg):
         return set(), ""@@    except FileNotFoundError:
         return set(), "keep-ilegivel"
 [shm] lista de exceções ilegível vira lista vazia sem motivo@@        return set(), "keep-ilegivel"@@        return set(), ""
+[shm] linha da lista que não é um nome vira 'sem exceção' calada@@    return nomes, "keep-ilegivel" if ruim else ""@@    return nomes, ""
+[shm] uma linha boa da lista esconde a ruim (any vira all)@@    ruim = any(n in (".", "..")@@    ruim = all(n in (".", "..")
+[shm] '.' e '..' valem como nome@@n in (".", "..") or not all(@@not all(
+[shm] só letra vale como nome (dígito vira linha ruim)@@not all(c.isalnum() or@@not all(c.isalpha() or
+[shm] os caracteres de nome além de letra e dígito deixam de valer@@c in "_.~@+-" for c in n@@c in "" for c in n
+[shm] a linha da lista não é aparada (espaço nas pontas vira linha ruim)@@(x.strip() for x in raw.splitlines())@@(x for x in raw.splitlines())
+[shm] a linha de comentário (#) da lista vira linha ruim@@if ln and not ln.startswith("#")}@@if ln}
+[shm] a faxina não reconfere se é a MESMA pasta que a varredura julgou@@ or (s.st_dev, s.st_ino) != o.get("id"):@@:
+[shm] a identidade da pasta vale só pelo inode (o dispositivo é ignorado)@@(s.st_dev, s.st_ino) != o.get("id")@@s.st_ino != (o.get("id") or (0, 0))[1]
+[shm] a identidade da pasta vale só pelo dispositivo (o inode é ignorado)@@(s.st_dev, s.st_ino) != o.get("id")@@s.st_dev != (o.get("id") or (0, 0))[0]
+[shm] pasta sem identidade da varredura vale como a mesma@@(s.st_dev, s.st_ino) != o.get("id")@@(s.st_dev, s.st_ino) != o.get("id", (s.st_dev, s.st_ino))
+[shm] a varredura não guarda a identidade da pasta que julgou@@, "id": (s.st_dev, s.st_ino)})@@})
 [shm] o orçamento de entradas é ignorado@@            if budget.left < 0 or time.monotonic() >= budget.deadline:@@            if time.monotonic() >= budget.deadline:
 [shm] o prazo de relógio da varredura é ignorado@@            if budget.left < 0 or time.monotonic() >= budget.deadline:@@            if budget.left < 0:
 [shm] orçamento estourado não vira parcial@@                why.append("parcial")@@                pass
@@ -1922,11 +1955,11 @@ def read_cpu_prev(cfg):
 [shm] a faxina ignora o prazo@@        if time.monotonic() >= deadline:
             break@@        if False:
             break
-[shm] a faxina não reconfere a identidade da pasta@@        if not stat.S_ISDIR(s.st_mode) or s.st_uid != cfg.shm_uid:
+[shm] a faxina não reconfere a identidade da pasta@@        if not stat.S_ISDIR(s.st_mode) or s.st_uid != cfg.shm_uid or (s.st_dev, s.st_ino) != o.get("id"):
             falhou.append(o["name"])@@        if False:
             falhou.append(o["name"])
-[shm] a faxina não reconfere o dono@@        if not stat.S_ISDIR(s.st_mode) or s.st_uid != cfg.shm_uid:
-            falhou.append(o["name"])@@        if not stat.S_ISDIR(s.st_mode):
+[shm] a faxina não reconfere o dono@@        if not stat.S_ISDIR(s.st_mode) or s.st_uid != cfg.shm_uid or (s.st_dev, s.st_ino) != o.get("id"):
+            falhou.append(o["name"])@@        if not stat.S_ISDIR(s.st_mode) or (s.st_dev, s.st_ino) != o.get("id"):
             falhou.append(o["name"])
 [shm] pasta que não saiu inteira conta como apagada@@        elif rm_tree(path, s.st_dev, deadline):@@        elif False:
 [shm] a faxina diz feito mesmo com falha ou prazo vencido@@    out["reap"] = "parcial" if falhou or len(reaped) < len(alvos) else "feito"@@    out["reap"] = "feito"
