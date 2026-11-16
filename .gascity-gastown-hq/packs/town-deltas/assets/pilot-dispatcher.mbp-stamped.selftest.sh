@@ -796,6 +796,7 @@ if [ -z "${MBP_STAMPED_SELFTEST_FILE:-}" ]; then
 case "${1:-}" in
   show) if [ -n "${FAKE_ROUTE:-}" ]; then printf '[{"id":"wa-hz1","title":"t","status":"open","metadata":{"gc.routed_to":"%s"}}]\n' "$FAKE_ROUTE"; else printf '[{"id":"wa-hz1","title":"t","status":"open","metadata":{}}]\n'; fi ;;
   list) printf '[]\n' ;;
+  blocked) printf '[]\n' ;;   # ga-0qcsdce: o apply real lê `bd -C <loja> blocked --json` antes de classificar; aqui nada está bloqueado
   *) exit 1 ;;
 esac
 EOF

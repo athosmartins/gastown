@@ -51,6 +51,8 @@ if cmd == "list":
     if os.environ.get("STUB_LIST_GARBAGE"): print("not a list"); sys.exit(0)
     o = {rest[i]: rest[i + 1] for i in range(len(rest) - 1) if rest[i].startswith("--")}
     print(json.dumps([b for b in st.values() if isinstance(b, dict) and b.get("assignee") == o.get("--assignee") and b.get("status") == o.get("--status")])); sys.exit(0)
+if cmd == "blocked":   # ga-0qcsdce: o apply real lê `bd -C <loja> blocked --json` antes de classificar; aqui nada está bloqueado (a lista vazia que o bd imprime) até STUB_BLOCKED trocar a saída crua
+    sys.stdout.write(os.environ.get("STUB_BLOCKED", "[]")); sys.exit(0)
 if cmd == "comment":
     st[rest[0]].setdefault("comments", []).append(rest[1]); save(); sys.exit(0)
 if cmd == "update":
@@ -116,7 +118,7 @@ fresh() { # fresh [json mesclado na ps-t1]
   printf '{"ps-t1":{"id":"ps-t1","title":"t","status":"open","assignee":"","metadata":{}},"wa-t1":{"id":"wa-t1","title":"t","status":"open","assignee":"","metadata":{}},"ga-x":{"id":"ga-x","title":"t","status":"open","assignee":"","metadata":{}}}' > "$STATE"
   if [ -n "${1:-}" ]; then jq -c --argjson m "$1" '."ps-t1" += $m' "$STATE" > "$STATE.n" && mv "$STATE.n" "$STATE"; fi
   : > "$CALLS"; : > "$GCCALLS"; rm -f "$CITY/.gc/ps-node-route.jsonl" "$CITY/.gc/wa-node-route.jsonl"; echo '{"ok":true,"sessions":[]}' > "$SESS"; cls "$NODE_TEXT" 0; cap "$CAP_NODE" 0
-  unset STUB_FAIL_SHOW STUB_UPDATE_RC STUB_NOOP_UPDATE STUB_FAIL_GC STUB_LAND_RC STUB_FAIL_LIST
+  unset STUB_FAIL_SHOW STUB_UPDATE_RC STUB_NOOP_UPDATE STUB_FAIL_GC STUB_LAND_RC STUB_FAIL_LIST STUB_BLOCKED
   unset WA_NODE_ALIAS WA_NODE_ROUTE_TEMPLATE WA_NODE_CLASSIFY WA_NODE_LOG WA_NODE_SELF WA_NODE_STORY PS_NODE_DISPATCH WA_NODE_SPAWN WA_NODE_SLOTS WA_NODE_ALIAS_PREFIX
 }
 SCRIPT="$REAL"; OUT=""; RC=0
@@ -148,6 +150,9 @@ fresh; d release wa-t1; expect_rc "release: bead wa-* -> 11" 11 w0
 fresh; d apply "";      expect_rc "apply: id vazio -> 11" 11 w0
 fresh; d apply;         expect_rc "sem argumentos -> uso (2)" 2
 fresh; d apply ps-t1 --dry-run; expect_rc "apply --dry-run -> 0 sem escrita" 0 w0
+# ---- ga-0qcsdce: a recusa do despachante real por dependência aberta (bd blocked) ou rótulo de parada explícita sai 14, e o 14 chega ao chamador com o código dele, sem escrita
+fresh; STUB_BLOCKED='[{"id":"ps-t1"}]' d apply ps-t1; expect_rc "apply: bead de PS no bd blocked -> 14 (o código do despachante real chega ao chamador) sem escrita" 14 w0
+fresh '{"labels":["pilot:no-auto-dispatch"]}'; d apply ps-t1; expect_rc "apply: bead de PS com pilot:no-auto-dispatch -> 14 sem escrita" 14 w0
 # ---- despachante real ausente
 fresh; PS_NODE_DISPATCH="$T/nao-existe.sh" d apply ps-t1; expect_rc "despachante real ausente -> 11 sem escrita" 11 w0
 # ---- o prazo de teste (PS_NODE_TIMEOUT) chega ao despachante como WA_NODE_TIMEOUT; sem ele o WA_NODE_TIMEOUT do ambiente fica como está (ga-u6ueg0q)

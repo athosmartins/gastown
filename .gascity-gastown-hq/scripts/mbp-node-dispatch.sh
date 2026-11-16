@@ -17,7 +17,7 @@
 #   2. só bead `wa-*`: id de outro prefixo sai 11 sem rodar nada;
 #   3. nada a decidir sozinha: o código do despachante real chega ao chamador; ausente ou não executável = 11. Em dúvida o código é 10-13, nunca 0;
 #   4. slots: 2 (o teto do agente); MBP_NODE_SLOTS=1 baixa para 1 (canário); qualquer outro valor definido (vazio, 0, 3, texto) vale 1: erro de digitação nunca vira mais sessões.
-# SAÍDA: a do wa-node-dispatch.sh (0 feito · 10 fica no mini · 11 não consegui decidir · 12 não elegível/sem vaga · 13 escrita não confirmada · 2 uso). Env de teste: MBP_NODE_{BD,GC,PY,TIMEOUT,SESSION_TIMEOUT} (repassados como WA_NODE_*),
+# SAÍDA: a do wa-node-dispatch.sh (0 feito · 10 fica no mini · 11 não consegui decidir · 12 não elegível/sem vaga · 13 escrita não confirmada · 14 bead bloqueada ou vetada (ga-0qcsdce) · 2 uso). Env de teste: MBP_NODE_{BD,GC,PY,TIMEOUT,SESSION_TIMEOUT} (repassados como WA_NODE_*),
 #   MBP_NODE_{CAPACITY,CLASSIFY,LOG,DISPATCH,SLOTS}.
 set -u
 HERE="$(cd "$(dirname "$0")" && pwd)"

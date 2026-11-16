@@ -322,6 +322,7 @@ if [ -z "${MBP_NODE_SELFTEST_FILE:-}" ]; then
 case "${1:-}" in
   show) printf '[{"id":"wa-hz1","title":"t","status":"open","metadata":{}}]\n' ;;
   list) printf '[]\n' ;;
+  blocked) printf '[]\n' ;;   # ga-0qcsdce: o apply real lê `bd -C <loja> blocked --json` antes de classificar; aqui nada está bloqueado
   *) exit 1 ;;
 esac
 EOF

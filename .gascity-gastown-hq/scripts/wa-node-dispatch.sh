@@ -10,9 +10,10 @@
 #       --store DIR  pasta do store da bead (default: o que routes.jsonl diz para o prefixo do id)
 # SAÍDA: 0 feito (check: "roda no nó") · 10 fica no mini · 11 não consegui ler/decidir · 12 não elegível agora (bead já tem dono/rota, INCLUSIVE a que já é do nó; slot do nó ocupado; corrida perdida) ·
 #   13 escrita não confirmada: a conferência reprovou (a mensagem diz se a atribuição foi desfeita ou não) OU o bd update falhou (rc ≠ 0 e ≠ 13) e a releitura não achou nada nosso — mas uma escrita morta por prazo
-#   ainda pode entrar, então nada está garantido e o Pilot segura a bead e relê na próxima varredura · 2 uso. Em dúvida o código é 10-13, nunca 0; a única exceção é a releitura PROVAR o estado (o bd update disse
-#   que falhou e a releitura confere a bead inteira do nó = 0, anotado no log). O Pilot lê 10/11/12 como "fica no mini" só para a bead que ELE leu como não-do-nó; a que já é do nó ele segura (2) sem olhar o rc.
-# O QUE FAZ (apply): relê a bead → exige aberta, sem dono e sem rota → classifica (scripts/wa-node-classify.py, na MESMA leitura; o exit code só vale se o JSON concorda — falha, saída ilegível ou código e veredito que discordam = 11, nunca 0) → exige o slot do nó livre (nenhuma bead em andamento do alias
+#   ainda pode entrar, então nada está garantido e o Pilot segura a bead e relê na próxima varredura · 14 a PRÓPRIA bead não é despachável agora (dependência aberta no `bd blocked` ou rótulo de parada explícita, ga-0qcsdce): o motivo é da bead,
+#   não do nó, e o Pilot NÃO o lê como «nó cheio» (o 12 para a passada de WA como capacity; o 14 só pula a bead) · 2 uso. Em dúvida o código é 10-13, nunca 0; a única exceção é a releitura PROVAR o estado (o bd update disse
+#   que falhou e a releitura confere a bead inteira do nó = 0, anotado no log). O Pilot lê 10/11/12/14 como "fica no mini" só para a bead que ELE leu como não-do-nó; a que já é do nó ele segura (2) sem olhar o rc.
+# O QUE FAZ (apply): relê a bead → exige aberta, sem dono e sem rota → recusa (14) a que traz `pilot:no-auto-dispatch` ou `no-auto-dispatch` ou que está no `bd blocked` da loja (rótulos ilegíveis ou `bd blocked` que não responde = 11) → classifica (scripts/wa-node-classify.py, na MESMA leitura; o exit code só vale se o JSON concorda — falha, saída ilegível ou código e veredito que discordam = 11, nunca 0) → exige o slot do nó livre (nenhuma bead em andamento do alias
 #   e nenhuma sessão do template — no modo pilot, uma sessão viva OCIOSA e sem bead conta como vaga, ver N SLOTS) → UMA escrita com comparação atômica (bd update --if-assignee '' --if-status open: quem chegou antes vence, rc 13 do bd) que atribui ao alias, põe
 #   em andamento e carimba gc.routed_to → relê e confere → comenta. Falha na conferência desfaz. A escrita que o bd diz ter falhado (rc ≠ 0 e ≠ 13) cai na MESMA releitura: o rc de um update que não respondeu não diz o estado.
 #   `release` só mexe em bead que é do alias E da rota.
@@ -66,6 +67,8 @@ case "$STMO" in ''|*[!0-9]*) STMO=60 ;; esac
 # ga-31u0zl7: WA_NODE_ACCEPT_UNKNOWN. vazio (variável ausente ou vazia) → desligado, o de sempre; ilegível (qualquer valor que não seja exatamente `sem-prova`) → desligado também: a promoção de unknown a node
 # NUNCA liga por erro de digitação. Ver promote_sem_prova.
 ACCEPT_UNKNOWN="${WA_NODE_ACCEPT_UNKNOWN:-}"; [ "$ACCEPT_UNKNOWN" = sem-prova ] || ACCEPT_UNKNOWN=""
+# ga-0qcsdce: os rótulos de parada explícita (a decisão do Mayor ou de um humano de NÃO despachar a bead), nas duas grafias que o Pilot trata como uma só em _filter_candidates (`pilot:no-auto-dispatch`, ga-1mqdz, e a sem prefixo, ga-rfpm9). Casa o nome INTEIRO.
+VETOS="pilot:no-auto-dispatch no-auto-dispatch"
 # ga-2hd02v.3.12: quietude mínima de uma sessão sem bead para valer como vaga (só modo pilot). vazio → 300 s; ilegível (letra, sinal, ponto, espaço, mais de 9 dígitos) → 300 s também: o erro cai no prazo mais LONGO,
 # nunca no mais curto. 0 vale (qualquer sessão sem bead). Zero à esquerda é decimal (0300 = 300: o bash o leria como octal sem o 10#).
 IDLE="${WA_NODE_IDLE_SECS:-300}"; case "$IDLE" in ''|*[!0-9]*) IDLE=300 ;; *) if [ "${#IDLE}" -le 9 ]; then IDLE=$((10#$IDLE)); else IDLE=300; fi ;; esac
@@ -158,6 +161,14 @@ check)
 apply)
   st=$(printf '%s' "$B" | jq -r '.status // ""'); as=$(printf '%s' "$B" | jq -r '.assignee // ""'); rt=$(printf '%s' "$B" | jq -r '.metadata["gc.routed_to"] // ""')
   [ "$st" = open ] && [ -z "$as" ] && [ -z "$rt" ] || { jlog apply "$id" 12 "nao-elegivel status=$st assignee=$as rota=$rt"; die 12 "$id não está livre (status=$st assignee=${as:-—} rota=${rt:-—}) — não mexo"; }
+  # ga-0qcsdce: a PRÓPRIA bead pode não ser despachável agora, e isso não é problema do nó: (1) rótulo de parada explícita (VETOS) e (2) dependência aberta (`bd blocked`, o conjunto que o Pilot lê em _filter_unblocked). rc 14, PRÓPRIO: o 12 é «não livre / nó cheio»
+  # e a passada de WA do Pilot PARA nele como `capacity`. Nenhuma escrita. As duas leituras vêm ANTES da classificação e dos slots (o barato primeiro) e valem também no --dry-run (a sonda do disk floor não promete o que o apply recusa).
+  # vazio (sem a chave labels: o bd a omite quando não há nenhum) → nenhum veto, segue; falhou/ilegível (labels que não é lista de textos) → 11 sem escrita, NUNCA «sem veto»
+  lb=$(printf '%s' "$B" | jq -r '(.labels // []) | if type=="array" and all(.[]; type=="string") then join(",") else error("labels") end' 2>/dev/null) || { jlog apply "$id" 11 "rotulos-ilegiveis"; die 11 "não consegui ler os rótulos de $id — fica no mini"; }
+  for vt in $VETOS; do case ",$lb," in *",$vt,"*) jlog apply "$id" 14 "vetada:$vt"; die 14 "$id traz o rótulo $vt (parada explícita: não despachar) — não mexo" ;; esac; done
+  # vazio (saída vazia, `[]` ou `null` com rc 0: nada bloqueado na loja) → segue; falhou/ilegível (rc ≠ 0, prazo, texto que não é JSON, objeto em vez de lista, item sem id) → 11 sem escrita, NUNCA «livre por engano»
+  bl=$(T "$BD" -C "$store" blocked --json 2>/dev/null) && bl=$(printf '%s' "$bl" | jq -r 'if . == null then empty elif type=="array" and all(.[]; type=="object" and (.id | type)=="string") then .[].id else error("blocked") end' 2>/dev/null) || { jlog apply "$id" 11 "bloqueio-ilegivel"; die 11 "não consegui ler o que está bloqueado (bd blocked) — fica no mini"; }
+  if printf '%s\n' "$bl" | grep -qxF -- "$id"; then jlog apply "$id" 14 "bloqueada-por-dependencia"; die 14 "$id tem dependência aberta (bd blocked) — não mexo"; fi
   classify_checked
   promote_sem_prova
   if [ "$rc" != 0 ]; then jlog apply "$id" "$rc" "classificador:$(printf '%s' "$out" | jq -r '(.verdict // "?") + " " + ((.reasons // []) | join(","))' 2>/dev/null)"; say "veredito não é 'roda no nó' (rc=$rc): $out"; exit "$rc"; fi

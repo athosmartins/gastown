@@ -15,6 +15,9 @@
 #   token ilegível (glob, aspas, ;) é IGNORADO, nunca vira «pular todos» · vazio = o de sempre.
 #   IDENTIDADE (ga-2hd02v.3): WA_NODE_SELF e WA_NODE_STORY trocam o nome que as mensagens e o comentário da bead usam e a bead que o comentário cita (o wrapper da bead de PS) · padrão = o texto da 1.10 byte a byte
 #   nas partes fixas · vazio = padrão · valor com espaço, aspa, $, crase, ;, barra, quebra de linha ou acima de 64 caracteres = padrão (o valor vai para um comentário DA BEAD) · 64 exatos passam.
+#   BEAD NÃO DESPACHÁVEL (ga-0qcsdce): o apply recusa com rc 14 (PRÓPRIO, não o 12 que a passada do Pilot lê como «nó cheio») a bead no `bd blocked` da loja e a que traz `pilot:no-auto-dispatch` ou `no-auto-dispatch` (nome inteiro) · sem escrita,
+#   antes da classificação e dos slots, também no --dry-run e no modo pilot · rótulos ilegíveis ou `bd blocked` que falha, devolve texto que não é JSON, objeto em vez de lista ou item sem id = 11, nunca «livre»; saída vazia, `[]` e `null` = nada bloqueado ·
+#   `check` e `release` não leem nada disso.
 # CONTROLE NEGATIVO: cada mutante troca UMA linha numa cópia do script e o caso designado tem de reprovar; mutante que sobrevive reprova esta bateria.
 # COMO RODAR: bash scripts/wa-node-dispatch.selftest.sh   (macOS /bin/bash 3.2 e Linux; precisa de jq e python3)
 set -u
@@ -55,6 +58,9 @@ if cmd == "list":
     o = {rest[i]: rest[i + 1] for i in range(len(rest) - 1) if rest[i].startswith("--")}
     if os.environ.get("STUB_FAIL_LIST_ALIAS") and o.get("--assignee") == os.environ["STUB_FAIL_LIST_ALIAS"]: sys.exit(1)   # a leitura de UM alias falha, as outras respondem
     print(json.dumps([b for b in st.values() if isinstance(b, dict) and b.get("assignee") == o.get("--assignee") and b.get("status") == o.get("--status")])); sys.exit(0)
+if cmd == "blocked":   # o que `bd -C <loja> blocked --json` devolve: a lista das beads com dependência aberta (cada uma com `id`). STUB_BLOCKED = a saída crua escolhida (ausente = a lista vazia), STUB_FAIL_BLOCKED = o comando falha
+    if os.environ.get("STUB_FAIL_BLOCKED"): sys.exit(1)
+    sys.stdout.write(os.environ["STUB_BLOCKED"] if "STUB_BLOCKED" in os.environ else "[]"); sys.exit(0)
 if cmd == "comment":
     st[rest[0]].setdefault("comments", []).append(rest[1]); save(); sys.exit(0)
 if cmd == "update":
@@ -131,7 +137,7 @@ fresh() { # fresh [extra json mesclado na wa-t1]
   if [ -n "${1:-}" ]; then jq -c --argjson m "$1" '."wa-t1" += $m' "$STATE" > "$STATE.n" && mv "$STATE.n" "$STATE"; fi
   : > "$CALLS"; : > "$GCCALLS"; : > "$CITY/.gc/wa-node-route.jsonl"; echo '{"ok":true,"sessions":[]}' > "$SESS"; cls "$NODE_TEXT" 0
   cap "$CAP_OK" 0; : > "$CAPCALLS"
-  unset STUB_FAIL_SHOW STUB_SHOW_OTHER STUB_FAIL_LIST STUB_LIST_GARBAGE STUB_UPDATE_RC STUB_NOOP_UPDATE STUB_PARTIAL_UPDATE STUB_UNDO_RC STUB_FAIL_GC STUB_GC_SLEEP STUB_LAND_RC STUB_FAIL_SHOW_AFTER_UPDATE STUB_FAIL_LIST_ALIAS STUB_CAP_SLEEP STUB_DROP_META STUB_KEEP_META
+  unset STUB_FAIL_SHOW STUB_SHOW_OTHER STUB_FAIL_LIST STUB_LIST_GARBAGE STUB_UPDATE_RC STUB_NOOP_UPDATE STUB_PARTIAL_UPDATE STUB_UNDO_RC STUB_FAIL_GC STUB_GC_SLEEP STUB_LAND_RC STUB_FAIL_SHOW_AFTER_UPDATE STUB_FAIL_LIST_ALIAS STUB_CAP_SLEEP STUB_DROP_META STUB_KEEP_META STUB_BLOCKED STUB_FAIL_BLOCKED
 }
 SCRIPT="$REAL"; OUT=""; RC=0; MUT_NAME=""; MUT_M=""
 d() { OUT=$("$SCRIPT" "$@" 2>&1); RC=$?; }                       # roda e guarda saída + rc
@@ -162,6 +168,44 @@ fresh '{"assignee":"mila-wa"}';                   d apply wa-t1; expect_rc "appl
 fresh '{"metadata":{"gc.routed_to":"wa-worker"}}'; d apply wa-t1; expect_rc "apply: bead já com rota -> 12 sem escrita" 12 w0
 fresh '{"status":"in_progress"}';                 d apply wa-t1; expect_rc "apply: bead em andamento -> 12 sem escrita" 12 w0
 fresh '{"status":"closed"}';                      d apply wa-t1; expect_rc "apply: bead fechada -> 12 sem escrita" 12 w0
+# ---- apply: a PRÓPRIA bead não é despachável agora — dependência aberta (bd blocked) ou rótulo de parada explícita (ga-0qcsdce). Medido 16/11: o Mayor mandou 4 beads ao nó à mão e as 4 tinham blocker aberto ou veto, porque o
+#      apply só olhava status, dono e rota. rc 14, PRÓPRIO: o 12 é «bead não livre / nó cheio» e a passada de WA do Pilot PARA nele como `capacity`; aqui o motivo é da bead, não do nó. Nada é escrito, e as duas leituras vêm
+#      ANTES da classificação e dos slots (o barato primeiro).
+blk() { export STUB_BLOCKED="$1"; }   # a saída crua que o `bd blocked --json` do stub imprime
+logline() { jq -r 'select(.event=="apply") | (.rc|tostring)+" "+.detail' "$CITY/.gc/wa-node-route.jsonl" | tail -n 1; }
+fresh; blk '[{"id":"wa-t1","status":"open"}]'; d apply wa-t1;  expect_rc "bloqueio: a bead está no bd blocked -> 14 sem escrita" 14 w0
+printf '%s' "$OUT" | grep -q 'dependência aberta' && ok "bloqueio: a mensagem diz a causa (dependência aberta)" || bad "bloqueio: mensagem: $OUT"
+[ "$(logline)" = "14 bloqueada-por-dependencia" ] && ok "bloqueio: o log diz 14 bloqueada-por-dependencia" || bad "bloqueio: log: $(cat "$CITY/.gc/wa-node-route.jsonl")"
+grep -q -- "^-C|$STORE|blocked|--json\$" "$CALLS" && ok "bloqueio: lê o bd blocked da LOJA da bead (-C <loja> blocked --json)" || bad "bloqueio: chamada ao bd: $(grep blocked "$CALLS")"
+[ "$(bead '."wa-t1".status')" = open ] && [ -z "$(bead '."wa-t1".assignee')" ] && ok "bloqueio: a bead segue aberta e sem dono" || bad "bloqueio: estado: $(jq -c '."wa-t1"' "$STATE")"
+fresh; blk '[{"id":"wa-outra"},{"id":"wa-t1-irma"}]'; d apply wa-t1;  expect_rc "bloqueio: OUTRAS beads no bd blocked (uma de id parecido) não seguram esta -> 0" 0
+fresh; blk '';     d apply wa-t1;  expect_rc "bloqueio: bd blocked sem nenhuma saída (rc 0) = nada bloqueado -> 0" 0
+fresh; blk 'null'; d apply wa-t1;  expect_rc "bloqueio: bd blocked com null = nada bloqueado -> 0" 0
+fresh; export STUB_FAIL_BLOCKED=1;  d apply wa-t1; expect_rc "bloqueio: bd blocked falha -> 11 sem escrita (não sei se está bloqueada: nunca livre por engano)" 11 w0
+[ "$(logline)" = "11 bloqueio-ilegivel" ] && ok "bloqueio: o log diz 11 bloqueio-ilegivel" || bad "bloqueio: log da leitura que falhou: $(cat "$CITY/.gc/wa-node-route.jsonl")"
+fresh; blk 'isto não é json';              d apply wa-t1; expect_rc "bloqueio: bd blocked com texto que não é JSON -> 11 sem escrita" 11 w0
+fresh; blk '[{"title":"sem id"}]';         d apply wa-t1; expect_rc "bloqueio: item sem id na lista -> 11 sem escrita" 11 w0
+fresh; blk '{"issues":[{"id":"wa-t1"}]}';  d apply wa-t1; expect_rc "bloqueio: objeto no lugar da lista (formato que não conheço) -> 11 sem escrita" 11 w0
+fresh; blk '[{"id":"wa-t1"}]'; d apply wa-t1 --dry-run;  expect_rc "bloqueio: --dry-run também recusa (a sonda do disk floor não promete o que o apply recusa) -> 14" 14 w0
+fresh; blk '[{"id":"wa-t1"}]'; cls "$MINI" 10; d apply wa-t1;  expect_rc "bloqueio: bloqueada e o classificador diria mini -> 14 (a leitura vem antes da classificação)" 14 w0
+fresh; blk '[{"id":"wa-t1"}]'; d check wa-t1;  expect_rc "bloqueio: check NÃO muda (só classifica) -> 0" 0 w0
+fresh '{"status":"in_progress","assignee":"wa-worker-remote-1","metadata":{"gc.routed_to":"wa-worker-remote"}}'; export STUB_FAIL_BLOCKED=1; d release wa-t1; expect_rc "bloqueio: release não lê o bd blocked (soltar a bead do nó não depende dele) -> 0" 0
+fresh '{"labels":["story:approved","pilot:no-auto-dispatch"]}'; d apply wa-t1;  expect_rc "veto: pilot:no-auto-dispatch -> 14 sem escrita" 14 w0
+printf '%s' "$OUT" | grep -q 'pilot:no-auto-dispatch' && ok "veto: a mensagem nomeia o rótulo" || bad "veto: mensagem: $OUT"
+[ "$(logline)" = "14 vetada:pilot:no-auto-dispatch" ] && ok "veto: o log diz 14 vetada:<rótulo>" || bad "veto: log: $(cat "$CITY/.gc/wa-node-route.jsonl")"
+grep -q '|blocked|' "$CALLS" && bad "veto: leu o bd blocked à toa (o veto é de graça, vem antes)" || ok "veto: o veto vem antes do bd blocked (nem o chama)"
+fresh '{"labels":["no-auto-dispatch"]}'; d apply wa-t1;  expect_rc "veto: no-auto-dispatch (a grafia sem pilot:, o mesmo veto para o Pilot) -> 14 sem escrita" 14 w0
+for l in pilot:no-auto-dispatch-x xno-auto-dispatch pilot:no-auto-dispatc story:approved node:ok; do
+  fresh "{\"labels\":[\"$l\"]}"; d apply wa-t1;  expect_rc "veto: o rótulo '$l' NÃO é a parada explícita (casa o nome inteiro) -> 0" 0
+done
+fresh '{"labels":[]}';                                d apply wa-t1;  expect_rc "veto: labels vazio -> 0" 0
+fresh '{"labels":"pilot:no-auto-dispatch"}';          d apply wa-t1;  expect_rc "veto: labels que não é lista -> 11 sem escrita (não sei se há veto)" 11 w0
+[ "$(logline)" = "11 rotulos-ilegiveis" ] && ok "veto: o log diz 11 rotulos-ilegiveis" || bad "veto: log dos rótulos ilegíveis: $(cat "$CITY/.gc/wa-node-route.jsonl")"
+fresh '{"labels":["story:approved",7]}';             d apply wa-t1;  expect_rc "veto: labels com item que não é texto -> 11 sem escrita" 11 w0
+fresh '{"labels":["pilot:no-auto-dispatch"]}';        d apply wa-t1 --dry-run;  expect_rc "veto: --dry-run também recusa -> 14" 14 w0
+fresh '{"labels":["pilot:no-auto-dispatch"]}'; export STUB_FAIL_BLOCKED=1; d apply wa-t1;  expect_rc "veto: o veto vence a leitura do bd blocked que falharia -> 14, não 11" 14 w0
+fresh '{"labels":["pilot:no-auto-dispatch"]}'; blk '[{"id":"wa-t1"}]'; d apply wa-t1;  expect_rc "veto + bloqueio juntos -> 14 sem escrita" 14 w0
+fresh '{"labels":["pilot:no-auto-dispatch"]}'; d check wa-t1;  expect_rc "veto: check NÃO muda (só classifica) -> 0" 0 w0
 # ---- apply: veredito
 fresh; cls "$MINI" 10; d apply wa-t1; expect_rc "apply: mini -> 10 sem escrita" 10 w0
 fresh; cls "$UNK" 11;  d apply wa-t1; expect_rc "apply: unknown -> 11 sem escrita" 11 w0
@@ -468,6 +512,10 @@ fresh; cap '{"verdict":"node","free":2}' 0; busyat 1; busyat 2; pm apply wa-t1; 
 fresh; pm apply wa-t1 --dry-run; expect_rc "slots: --dry-run -> 0 sem escrita" 0 w0
 printf '%s' "$OUT" | grep -q 'iria para wa-worker-remote-1' && ok "slots: o dry-run diz para qual alias iria" || bad "slots: dry-run: $OUT"
 fresh; cap "$CAP_LOCAL" 1; pm apply wa-t1 --dry-run; expect_rc "slots: --dry-run com o oráculo dizendo local -> 12" 12 w0
+# -- ga-0qcsdce no modo pilot: a bead bloqueada ou vetada é recusada ANTES do oráculo de capacidade e dos slots (a leitura lenta vem por último), e o rc 14 vence o 12 de «sem vaga» (o que a passada lê como capacity)
+fresh; blk '[{"id":"wa-t1"}]'; cap "$CAP_LOCAL" 1; pm apply wa-t1; expect_rc "pilot: bloqueada com o oráculo dizendo local -> 14 (o motivo é da bead, não do nó)" 14 w0
+[ "$(ncap)" = 0 ] && ok "pilot: bloqueada: o oráculo nem é consultado" || bad "pilot: consultou o oráculo para uma bead bloqueada"
+fresh '{"labels":["pilot:no-auto-dispatch"]}'; busyat 1; busyat 2; busyat 3; pm apply wa-t1; expect_rc "pilot: vetada com os 3 slots ocupados -> 14 (e não 12 slot-ocupado)" 14 w0
 # -- modo pool (padrão) não muda: 1 slot, rota, sem oráculo
 fresh; WA_NODE_SLOTS=3 d apply wa-t1; expect_rc "pool com WA_NODE_SLOTS=3 -> 0" 0
 [ "$(who)" = wa-worker-remote-1 ] && [ "$(rota)" = wa-worker-remote ] && [ "$(mark)" = vazio ] && ok "pool: continua alias -1 com a rota e SEM a marca do Pilot" || bad "pool: estado: $(jq -c '."wa-t1"' "$STATE")"
@@ -666,7 +714,7 @@ EOF
 }
 mdone() { rm -f "${MUT_M:-}"; SCRIPT="$REAL"; }
 survived() { bad "mutante $MUT_NAME SOBREVIVEU (o caso designado ainda passa)"; mdone; }
-killed()   { ok "mutante $MUT_NAME morreu"; mdone; }
+killed()   { ok "mutante $MUT_NAME morreu (rc=$RC)"; mdone; }
 
 mutant sem-elegibilidade '[ "$st" = open ] && [ -z "$as" ] && [ -z "$rt" ] ||' 'true ||'
 # o rc 12 sozinho não basta: sem a elegibilidade a comparação atômica ainda devolve 12 (defesa em profundidade) — o que prova a elegibilidade é NÃO ter tentado escrever
@@ -867,6 +915,40 @@ mutant au-apply-sem-promocao $'  classify_checked\n  promote_sem_prova\n  if [ "
 fresh; cls "$UNK" 11; WA_NODE_ACCEPT_UNKNOWN=sem-prova d apply wa-t1; if [ "$RC" = 0 ]; then survived; else killed; fi
 mutant au-sem-aviso '[ "$b" = sem-prova ] && who="$who SEM PROVA' ': # SEM PROVA'
 fresh; cls "$UNK" 11; WA_NODE_ACCEPT_UNKNOWN=sem-prova d apply wa-t1; if bead '."wa-t1".comments[0]' | grep -q 'SEM PROVA'; then survived; else killed; fi
+
+# ---- ga-0qcsdce: mutantes da recusa por rótulo de parada e por dependência aberta. Cada um desliga UMA defesa; o caso designado tem de falhar (e a cópia mutada ainda é bash válido: `killed` mostra o rc que o caso viu).
+mutant veto-ignorado 'for vt in $VETOS; do case' 'for vt in ; do case'
+fresh '{"labels":["pilot:no-auto-dispatch"]}'; d apply wa-t1; if [ "$RC" = 14 ]; then survived; else killed; fi
+mutant veto-so-a-grafia-com-prefixo 'VETOS="pilot:no-auto-dispatch no-auto-dispatch"' 'VETOS="pilot:no-auto-dispatch"'
+fresh '{"labels":["no-auto-dispatch"]}'; d apply wa-t1; if [ "$RC" = 14 ]; then survived; else killed; fi
+mutant veto-por-trecho '*",$vt,"*) jlog apply' '*"$vt"*) jlog apply'
+fresh '{"labels":["xno-auto-dispatch"]}'; d apply wa-t1; if [ "$RC" = 0 ]; then survived; else killed; fi
+mutant veto-rc-12 'die 14 "$id traz o rótulo' 'die 12 "$id traz o rótulo'
+fresh '{"labels":["pilot:no-auto-dispatch"]}'; d apply wa-t1; if [ "$RC" = 14 ]; then survived; else killed; fi
+mutant rotulos-ilegiveis-viram-sem-veto '|| { jlog apply "$id" 11 "rotulos-ilegiveis"; die 11 "não consegui ler os rótulos de $id — fica no mini"; }' '|| lb=""'
+fresh '{"labels":"pilot:no-auto-dispatch"}'; d apply wa-t1; if [ "$RC" = 11 ]; then survived; else killed; fi
+mutant rotulo-que-nao-e-texto-passa 'all(.[]; type=="string") then join(",")' 'true then join(",")'
+fresh '{"labels":["story:approved",7]}'; d apply wa-t1; if [ "$RC" = 11 ]; then survived; else killed; fi
+mutant bloqueio-ignorado 'if printf '"'"'%s\n'"'"' "$bl" | grep -qxF -- "$id"; then' 'if false; then'
+fresh; blk '[{"id":"wa-t1"}]'; d apply wa-t1; if [ "$RC" = 14 ]; then survived; else killed; fi
+mutant bloqueio-por-trecho 'printf '"'"'%s\n'"'"' "$bl" | grep -qxF -- "$id"' 'printf '"'"'%s\n'"'"' "$bl" | grep -qF -- "$id"'
+fresh; blk '[{"id":"wa-t1-irma"}]'; d apply wa-t1; if [ "$RC" = 0 ]; then survived; else killed; fi
+mutant bloqueio-rc-12 'die 14 "$id tem dependência aberta' 'die 12 "$id tem dependência aberta'
+fresh; blk '[{"id":"wa-t1"}]'; d apply wa-t1; if [ "$RC" = 14 ]; then survived; else killed; fi
+mutant bloqueio-que-falha-vira-livre '|| { jlog apply "$id" 11 "bloqueio-ilegivel"; die 11 "não consegui ler o que está bloqueado (bd blocked) — fica no mini"; }' '|| bl=""'
+fresh; export STUB_FAIL_BLOCKED=1; d apply wa-t1; if [ "$RC" = 11 ]; then survived; else killed; fi
+mutant bloqueio-formato-estranho-vira-livre 'if . == null then empty elif type=="array" and all(.[]; type=="object" and (.id | type)=="string") then .[].id else error("blocked") end' '(.[]?.id?) // empty'
+fresh; blk '{"issues":[{"id":"wa-t1"}]}'; d apply wa-t1; if [ "$RC" = 11 ]; then survived; else killed; fi
+mutant bloqueio-item-sem-id-vira-livre 'if . == null then empty elif type=="array" and all(.[]; type=="object" and (.id | type)=="string") then .[].id else error("blocked") end' '(.[]?.id) // empty'
+fresh; blk '[{"title":"sem id"}]'; d apply wa-t1; if [ "$RC" = 11 ]; then survived; else killed; fi
+mutant bloqueio-null-vira-erro 'if . == null then empty elif type=="array"' 'if type=="array"'
+fresh; blk 'null'; d apply wa-t1; if [ "$RC" = 0 ]; then survived; else killed; fi
+mutant bloqueio-lista-vazia-vira-erro "jq -r 'if . == null then empty" "jq -er 'if . == null then empty"
+fresh; blk '[]'; d apply wa-t1; if [ "$RC" = 0 ]; then survived; else killed; fi
+mutant bloqueio-loja-errada 'T "$BD" -C "$store" blocked --json' 'T "$BD" blocked --json'
+fresh; d apply wa-t1; if grep -q -- "^-C|$STORE|blocked|--json\$" "$CALLS"; then survived; else killed; fi
+mutant bloqueio-lido-no-check $'  classify_checked\n  promote_sem_prova\n  printf' $'  T "$BD" -C "$store" blocked --json >/dev/null 2>&1 || die 11 "bd blocked falhou"\n  classify_checked\n  promote_sem_prova\n  printf'
+fresh; export STUB_FAIL_BLOCKED=1; d check wa-t1; if [ "$RC" = 0 ]; then survived; else killed; fi
 
 echo "---"; echo "$((n-fails))/$n ok"
 [ $fails -eq 0 ] && echo "SELFTEST OK" || { echo "SELFTEST FALHOU ($fails)"; exit 1; }

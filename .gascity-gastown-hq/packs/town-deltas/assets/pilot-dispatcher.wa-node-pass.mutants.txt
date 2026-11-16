@@ -91,9 +91,9 @@ valor novo do memo_hit libera a P2	mini) _pw_wv=out ;; *) _pw_wv=blind ;; esac	m
 o resumo nao grava class_blind	held:$hd,class_blind:$cb,hold_expired:$hx	held:$hd,hold_expired:$hx
 pre-filtro ilegivel do waiter vira out (padrao da tabela)	*) printf 'blind' ;;	*) printf 'out' ;;
 o pre-filtro do waiter nao usa a tabela (sempre out)	_pw_wv=$(_pilot_wa_node_pass_why_verdict "${_PWP_WHY:-}"); fi; continue; fi	_pw_wv=out; fi; continue; fi
-recusa do pool lida (refused) deixa de ser definitiva	not-wa|has-owner|no-node-ok|node:mini|routed:*|veto:*|refused:*) printf 'out' ;;	not-wa|has-owner|no-node-ok|node:mini|routed:*|veto:*) printf 'out' ;;
-node:mini deixa de ser definitivo para o waiter	not-wa|has-owner|no-node-ok|node:mini|routed:*|veto:*|refused:*) printf 'out' ;;	not-wa|has-owner|no-node-ok|routed:*|veto:*|refused:*) printf 'out' ;;
-dono do waiter deixa de ser definitivo	not-wa|has-owner|no-node-ok|node:mini|routed:*|veto:*|refused:*) printf 'out' ;;	not-wa|no-node-ok|node:mini|routed:*|veto:*|refused:*) printf 'out' ;;
+recusa do pool lida (refused) deixa de ser definitiva	not-wa|has-owner|no-node-ok|node:mini|routed:*|veto:*|refused:*|persistent-owner:*) printf 'out' ;;	not-wa|has-owner|no-node-ok|node:mini|routed:*|veto:*|persistent-owner:*) printf 'out' ;;
+node:mini deixa de ser definitivo para o waiter	not-wa|has-owner|no-node-ok|node:mini|routed:*|veto:*|refused:*|persistent-owner:*) printf 'out' ;;	not-wa|has-owner|no-node-ok|routed:*|veto:*|refused:*|persistent-owner:*) printf 'out' ;;
+dono do waiter deixa de ser definitivo	not-wa|has-owner|no-node-ok|node:mini|routed:*|veto:*|refused:*|persistent-owner:*) printf 'out' ;;	not-wa|no-node-ok|node:mini|routed:*|veto:*|refused:*|persistent-owner:*) printf 'out' ;;
 apply rc 11 do waiter deixa wv em node	11) _pw_fails=$((_pw_fails + 1)); _pilot_wa_node_pass_memo_put "$_pw_id" "$_pw_upd" unknown; if [ "$_pw_isw" = 1 ]; then _pw_wv=blind; fi ;;	11) _pw_fails=$((_pw_fails + 1)); _pilot_wa_node_pass_memo_put "$_pw_id" "$_pw_upd" unknown ;;
 waiter sem apply deixa wv em node	'') _pw_fails=$((_pw_fails + 1)); _pilot_wa_node_pass_released_memo "$_pw_pick" "$_pw_id" "$_pw_upd"; if [ "$_pw_isw" = 1 ]; then _pw_wv=blind; fi ;;	'') _pw_fails=$((_pw_fails + 1)); _pilot_wa_node_pass_released_memo "$_pw_pick" "$_pw_id" "$_pw_upd" ;;
 apply rc 10 do waiter nao marca out	10) _pw_fails=$((_pw_fails + 1)); _pilot_wa_node_pass_memo_put "$_pw_id" "$_pw_upd" mini; if [ "$_pw_isw" = 1 ]; then _pw_wv=out; fi ;;	10) _pw_fails=$((_pw_fails + 1)); _pilot_wa_node_pass_memo_put "$_pw_id" "$_pw_upd" mini ;;
@@ -214,3 +214,18 @@ u2n: o mini nao conta como resposta	case "$_PWP_V" in node|mini|unknown) _pw_ans
 u2n: a resposta nunca e contada	_pw_ans=$((_pw_ans + 1)) ;; esac	: ;; esac
 gancho: o veto de rotulo nao vale	    if [ -n "$_bv" ]; then\n      log "  ga-31u0zl7:	    if false; then\n      log "  ga-31u0zl7:
 gancho: rotulos ilegiveis viram sem veto	fica no mini, nada escrito"; return 1 ;;\n    esac	fica no mini, nada escrito" ;;\n    esac
+0qcsdce: dono persistente nao e pulado	if _pilot_wa_node_pass_persistent_owner "$_pw_pick"; then	if false; then
+0qcsdce: o motivo do pulo nao entra nas puladas	_pw_skipped="$_pw_skipped persistent-owner"	:
+0qcsdce: o waiter de dono persistente fica blind	if [ "$_pw_isw" = 1 ]; then _pw_wv=$(_pilot_wa_node_pass_why_verdict "$_PWP_WHY"); fi	if [ "$_pw_isw" = 1 ]; then _pw_wv=blind; fi
+0qcsdce: o dominio e calculado antes da memoria	if _pilot_wa_node_pass_memo_hit "$_pw_id" "$_pw_upd"; then	if _pilot_wa_node_pass_persistent_owner "$_pw_pick" || _pilot_wa_node_pass_memo_hit "$_pw_id" "$_pw_upd"; then
+0qcsdce: story.rig explicito ignorado (sempre WA)	case "$_po_rig" in ''|null) _po_rig=whatsapp_automation ;; esac	_po_rig=whatsapp_automation
+0qcsdce: story.rig vazio nao cai no rig do prefixo	''|null) _po_rig=whatsapp_automation ;;	null) _po_rig=whatsapp_automation ;;
+0qcsdce: story.rig texto null nao cai no rig do prefixo	''|null) _po_rig=whatsapp_automation ;;	'') _po_rig=whatsapp_automation ;;
+0qcsdce: bead_domain que falha vira dono persistente	_po_dom=$(bead_domain "$_po_b" 2>/dev/null) || _po_dom=""	_po_dom=$(bead_domain "$_po_b" 2>/dev/null) || _po_dom=warming
+0qcsdce: a condicao do dono persistente invertida	rig_domain_requires_persistent_owner "$_po_rig" "$_po_dom" || return 1	rig_domain_requires_persistent_owner "$_po_rig" "$_po_dom" && return 1
+0qcsdce: o motivo persistent-owner nao e definitivo para o waiter	refused:*|persistent-owner:*) printf 'out' ;;	refused:*) printf 'out' ;;
+0qcsdce: apply rc 14 volta a parar a passada	14) _pw_fails=$((_pw_fails + 1)); if [ "$_pw_isw" = 1 ]; then _pw_wv=out; fi; _pilot_wa_node_pass_released_memo "$_pw_pick" "$_pw_id" "$_pw_upd" ;;	99) : ;;
+0qcsdce: apply rc 14 nao conta falha	14) _pw_fails=$((_pw_fails + 1)); if	14) if
+0qcsdce: apply rc 14 memoriza mini	fi; _pilot_wa_node_pass_released_memo "$_pw_pick" "$_pw_id" "$_pw_upd" ;;	fi; _pilot_wa_node_pass_memo_put "$_pw_id" "$_pw_upd" mini ;;
+0qcsdce: apply rc 14 memoriza tambem a P0/P1	fi; _pilot_wa_node_pass_released_memo "$_pw_pick" "$_pw_id" "$_pw_upd" ;;	fi; _pilot_wa_node_pass_memo_put "$_pw_id" "$_pw_upd" released ;;
+0qcsdce: o waiter com apply rc 14 fica blind	14) _pw_fails=$((_pw_fails + 1)); if [ "$_pw_isw" = 1 ]; then _pw_wv=out; fi;	14) _pw_fails=$((_pw_fails + 1)); if [ "$_pw_isw" = 1 ]; then _pw_wv=blind; fi;

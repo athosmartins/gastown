@@ -19,7 +19,9 @@
 #   (6g, ga-7xd8g8f) a CLASSE manda primeiro, a pista só desempata: duas rodadas (hot = P0/P1, rest = P2+ e prioridade ilegível) sobre as mesmas pistas e os mesmos contadores — a P0/P1 com veredito node passa à frente de qualquer P2+ de QUALQUER pista, no nó e no orçamento
 #   de sondas; a P0/P1 mini-only não segura a P2+ (política A do Athos); a partição não perde nem duplica bead; sem a biblioteca de ordem a passada anda como antes e AVISA; a linha da sonda guarda a prioridade que a passada leu (ilegível → null) ·
 #   (7z, ga-2hd02v.3.25) o conjunto _PWP_NODE_BOUND: o que a passada JULGOU node e NÃO despachou (retida pelo waiter, Dolt saturado, apply rc fora da tabela) é o único que o «Hetzner primeiro» segura do MBP;
-#   despachada, mini/unknown/released (apply rc 10/11/sem apply), não sondada (orçamento de segundos/sondas, limite de vagas) e rc 12 (nó cheio) NÃO constam, e o conjunto zera a cada passada.
+#   despachada, mini/unknown/released (apply rc 10/11/sem apply), não sondada (orçamento de segundos/sondas, limite de vagas) e rc 12 (nó cheio) NÃO constam, e o conjunto zera a cada passada ·
+#   (6i, ga-0qcsdce) o domínio que EXIGE dono persistente (warming → oracle-wa, hex → batista-wa; a classificação do dispatch_one) é pulado ANTES da sonda e da claim, sem memória, só para quem ia ser sondada, e o waiter com esse motivo é out ·
+#   o apply rc 14 (a PRÓPRIA bead bloqueada ou vetada, nada escrito) NÃO para a passada como o rc 12: conta uma falha, memoriza released (só P2+) e segue com a próxima; o gancho o devolve como rc 1 e deixa _PWN_APPLY_RC=14.
 # COMO RODA: as funções e as regiões são extraídas VERBATIM do dispatcher (awk) e rodam em shells filhos sob `set -euo pipefail`, PATH de sandbox (selftest-sandbox-path.lib.sh: sem gc/bd reais), bd e
 #   wa-node-dispatch.sh falsos. Contra um dispatcher sem a fatia o arquivo se recusa a começar — o vermelho honesto.
 # CONTROLE NEGATIVO: cada guarda desligada numa cópia do dispatcher (WNP_NO_MUTANTS=1 pula) tem que reprovar este arquivo.
@@ -73,6 +75,9 @@ F_RMEMO="$(fn_src _pilot_wa_node_pass_released_memo)"; F_RSON="$(fn_src _pilot_n
 F_RSFOR="$(fn_src _pilot_node_reserved_for)"; F_P2HOLD="$(fn_src _pilot_node_p2_hold_for)"
 # ga-31u0zl7: o modo do botão unknown→nó. fn_src, não need_fn, DE PROPÓSITO: num dispatcher sem a fatia o arquivo tem de reprovar caso a caso nos testes (6h), não abortar com FATAL
 F_U2N="$(fn_src _pilot_wa_node_pass_u2n_mode)"
+# ga-0qcsdce: o domínio que o dispatch_one usa para escolher o alvo (bead_domain + rig_domain_requires_persistent_owner: funções puras, só jq/grep) e o helper da passada que o aplica ANTES da claim. need_fn nas duas que já existem; fn_src, não need_fn, no helper
+# DE PROPÓSITO: num dispatcher sem a fatia o arquivo tem de reprovar caso a caso nos testes (6i), não abortar com FATAL
+F_BDOM="$(need_fn bead_domain)"; F_RDPO="$(need_fn rig_domain_requires_persistent_owner)"; F_PPO="$(fn_src _pilot_wa_node_pass_persistent_owner)"
 VETO_LINE="$(grep -E '^PILOT_NODE_FIRST_VETO_LABELS="' "$DISPATCHER" | head -1)"
 PWP_INIT="$(grep -E '^(_PWP_[A-Z_]+|_PNR_[A-Z_]+|_PNH_[A-Z_]+|_PILOT_WA_NODE_PASS|_PWN_APPLY_RC|_PWN_BJ)=' "$DISPATCHER")"
 EXEMPT_LINE="$(grep -E '^PILOT_WA_NODE_EXEMPT="' "$DISPATCHER" | head -1)"
@@ -173,7 +178,7 @@ PRELUDE='
   PILOT_WA_NODE_PASS_MEMO="$WORK/city/.gc/wa-node-pass-memo.tsv"; PILOT_WA_NODE_PASS_LOG="$WORK/city/.gc/wa-node-exempt.jsonl"
   PILOT_WA_NODE_PASS_HOLD_STATE="${T_HOLD_STATE-$WORK/city/.gc/wa-node-pass-hold.tsv}"
   [ -z "${T_HOLD_MAX+x}" ] || PILOT_WA_NODE_PASS_HOLD_MAX_SWEEPS="$T_HOLD_MAX"
-  eval "$F_VETO"; eval "$F_SPAWN"; eval "$F_MODE"; eval "$F_PRE"; eval "$F_MHIT"; eval "$F_MPUT"; eval "$F_CHECK"; eval "$F_STATE"; eval "$F_ADOPT"; eval "$F_UNADOPT"; eval "$F_CLASS"; eval "$F_HOLD"; eval "$F_WLANE"; eval "$F_WHYV"; eval "$F_U2N"; eval "$F_HPRIOR"; eval "$F_HPUT"; eval "$F_RMEMO"; eval "$F_RSON"; eval "$F_RSSET"; eval "$F_RSCLR"; eval "$F_RSFOR"; eval "$F_P2HOLD"; eval "$F_PASS"; eval "$F_PNOTE"
+  eval "$F_VETO"; eval "$F_SPAWN"; eval "$F_MODE"; eval "$F_PRE"; eval "$F_MHIT"; eval "$F_MPUT"; eval "$F_CHECK"; eval "$F_STATE"; eval "$F_ADOPT"; eval "$F_UNADOPT"; eval "$F_CLASS"; eval "$F_HOLD"; eval "$F_WLANE"; eval "$F_WHYV"; eval "$F_U2N"; eval "$F_HPRIOR"; eval "$F_HPUT"; eval "$F_RMEMO"; eval "$F_RSON"; eval "$F_RSSET"; eval "$F_RSCLR"; eval "$F_RSFOR"; eval "$F_P2HOLD"; eval "$F_BDOM"; eval "$F_RDPO"; eval "$F_PPO"; eval "$F_PASS"; eval "$F_PNOTE"
   _PY_WAIT_ID="${T_WAIT-}"; _PY_WAIT_PRIO=1   # o waiter da cessão (ga-5fn5p3), como a varredura do waiter o deixa antes da passada; vazio = nenhum P0/P1 espera
   # T_REFUSAL vale para toda bead; com T_REFUSAL_ID, SÓ para a bead desse id (as demais: ninguém recusa) — é como o waiter tem a recusa ilegível e a P2 não
   _pilot_priority_refusal_of() { local _ri=""; if [ -n "${T_REFUSAL_ID-}" ]; then _ri=$(printf "%s" "$1" | jq -r ".id // empty" 2>/dev/null) || _ri=""; [ "$_ri" = "$T_REFUSAL_ID" ] || return 0; fi; case "${T_REFUSAL-}" in FAIL) return 1 ;; *) printf "%s" "${T_REFUSAL-}"; return 0 ;; esac; }
@@ -1148,6 +1153,72 @@ L_EXP=$(grep -n 'export WA_NODE_ACCEPT_UNKNOWN' "$DISPATCHER" | head -1 | cut -d
 { [ -n "$L_EXP" ] && [ -n "$L_D1" ] && [ -n "$L_UN" ] && [ "$L_EXP" -lt "$L_D1" ] && [ "$L_D1" -lt "$L_UN" ]; } && ok "export ($L_EXP) → dispatch_one ($L_D1) → unset ($L_UN): a variável existe só durante o despacho" || bad "escopo do export: export=$L_EXP dispatch=$L_D1 unset=$L_UN"
 grep -qE '^  _pilot_wa_node_pass_check "\$\{1:-\}" "\$\{2:-\}"$' "$DISPATCHER" && ok "o OUTRO chamador do check (passo do MBP) segue sem o 3º argumento: a promoção é só da passada de WA" || bad "o passo do MBP mudou a chamada do check"
 
+echo "── (6i) ga-0qcsdce: dono persistente NUNCA vai ao nó (pulada antes da sonda e da claim) e o apply rc 14 (bead bloqueada/vetada) pula a bead sem parar a passada"
+# Medido 16/11 (dog-1, ga-384rcm6): wa-yc9qdn (P3, domain=warming → oracle-wa) era sondada TODA volta e nunca chegava ao nó — o dispatch_one a claimava, via «alvo oracle-wa não é o pool wa-worker» e a soltava (~3 escritas bd + 1 sonda por volta, 20 das 26 sondas node
+# de 6 h eram esta bead). O apply recusava com rc 12 a bead com dependência aberta/veto, o que a passada lê como «nó cheio» e PARA; agora é o rc 14, e a passada pula a bead e segue.
+PW1="$(jbp 2 wa-pw1 U1 wa-worker story:approved,domain:warming)"; PH1="$(jbp 2 wa-ph1 U1 wa-worker story:approved,domain:hex)"; PD1="$(jbp 2 wa-pd1 U1 wa-worker story:approved,domain:data)"
+PT1="$(jq -cn '{id:"wa-pt1",updated_at:"U1",priority:2,status:"open",title:"warm-up do chip no aparelho: ajustar a rampa",labels:["story:approved"],metadata:{"gc.routed_to":"wa-worker"}}')"
+runpo() { local j="$1"; ( eval "$PRELUDE"; x=0; _pilot_wa_node_pass_persistent_owner "$j" || x=$?; echo "$x ${_PWP_WHY:-}" ) 2>&1 | tail -1; }
+r=$(runpo "$PW1");  [ "$r" = "0 persistent-owner:warming" ] && ok "(6i) domain:warming (rótulo de domínio): exige dono persistente — motivo persistent-owner:warming" || bad "(6i) warming por rótulo: '$r'"
+r=$(runpo "$PT1");  [ "$r" = "0 persistent-owner:warming" ] && ok "(6i) warming derivado do TEXTO (a mesma classificação que o dispatch_one faz): exige dono persistente" || bad "(6i) warming por texto: '$r'"
+r=$(runpo "$PH1");  [ "$r" = "0 persistent-owner:hex" ] && ok "(6i) domain:hex (batista-wa): exige dono persistente" || bad "(6i) hex: '$r'"
+r=$(runpo "$PD1");  [ "$r" = "1 " ] && ok "(6i) domain:data (o pool wa-worker absorve): NÃO exige dono persistente — segue para a sonda" || bad "(6i) data: '$r'"
+r=$(runpo "$(jb wa-pn1 U1 wa-worker story:approved)"); [ "$r" = "1 " ] && ok "(6i) bead sem domínio: segue para a sonda (vazio nunca vira dono persistente)" || bad "(6i) sem domínio: '$r'"
+for rg in '"wa"' '"whatsapp_automation"' '""' '"null"'; do
+  r=$(runpo "$(jq -c --argjson g "$rg" '.metadata["story.rig"]=$g' <<<"$PW1")"); [ "$r" = "0 persistent-owner:warming" ] && ok "(6i) story.rig=$rg: o rig é o do prefixo wa- (WA) — exige dono persistente, como no dispatch_one" || bad "(6i) story.rig=$rg: '$r'"
+done
+r=$(runpo "$(jq -c '.metadata["story.rig"]="gascity"' <<<"$PW1")"); [ "$r" = "1 " ] && ok "(6i) story.rig=gascity explícito: o dispatch_one NÃO a leva ao dono do WA (cai no pool de dog) — o helper não a pula por isto" || bad "(6i) story.rig=gascity: '$r'"
+r=$(runpo "isto não é json"); [ "$r" = "1 " ] && ok "(6i) JSON ilegível: domínio vazio — segue como antes (o dispatch_one decide e solta), nunca «dono persistente» por palpite" || bad "(6i) JSON ilegível: '$r'"
+r=$(runpo ""); [ "$r" = "1 " ] && ok "(6i) entrada vazia: segue como antes" || bad "(6i) entrada vazia: '$r'"
+r=$( ( eval "$PRELUDE"; bead_domain() { return 1; }; x=0; _pilot_wa_node_pass_persistent_owner "$PW1" || x=$?; echo "$x ${_PWP_WHY:-}" ) 2>&1 | tail -1 ); [ "$r" = "1 " ] && ok "(6i) bead_domain que FALHA: domínio vazio, a bead segue como antes (o dispatch_one decide e solta) — nunca «dono persistente» por palpite" || bad "(6i) bead_domain que falha: '$r'"
+r=$( ( eval "$PRELUDE"; unset -f bead_domain; x=0; _pilot_wa_node_pass_persistent_owner "$PW1" || x=$?; echo "$x ${_PWP_WHY:-}" ) 2>&1 | tail -1 ); [ "$r" = "1 " ] && ok "(6i) bead_domain AUSENTE (biblioteca não carregada): segue como antes" || bad "(6i) bead_domain ausente: '$r'"
+# a passada inteira: a de dono persistente não é sondada, não chega ao dispatch_one (a claim mora lá), não entra na memória; a de dados, sim
+reset; chk wa-pw1 0; chk wa-ph1 0; chk wa-pd1 0; setok wa-pd1
+pass "[$PW1,$PH1,$PD1]" >/dev/null
+[ "$(wnd_calls)" = 1 ] && grep -q 'wa-pd1' "$WORK/wnd.calls" && ok "(6i) a passada sonda SÓ a de dados: warming e hex não gastam sonda" || bad "(6i) sondas: $(tr '\n' '|' < "$WORK/wnd.calls" 2>/dev/null)"
+[ "$(d1)" = "wa-pd1 small feature pass=1;" ] && ok "(6i) só a de dados chega ao dispatch_one — warming e hex nem são claimadas (o custo de 3 escritas por volta some)" || bad "(6i) dispatch_one: $(d1)"
+[ "$(memo_of)" = "-" ] && ok "(6i) a pulada não entra na memória (nada de released/mini a vencer de 15 em 15 min)" || bad "(6i) memória: $(memo_of)"
+summ | jq -e '.skipped["persistent-owner"]==2 and .probed==1 and .kept==1 and .released==0' >/dev/null 2>&1 && ok "(6i) resumo: skipped.persistent-owner=2 probed=1 kept=1 released=0" || bad "(6i) resumo: $(summ | cut -c1-300)"
+grep -q 'persistent-owner=2' "$WORK/lines" 2>/dev/null && ok "(6i) o log da varredura diz «puladas: persistent-owner=2»" || bad "(6i) log: $(grep 'passada de WA' "$WORK/lines" 2>/dev/null | cut -c1-300)"
+# a pulada NÃO segura nem consome nada: as demais seguem na ordem (a pulada fica no meio de duas que vão ao nó, com 2 vagas)
+reset; chk wa-pd1 0; chk wa-pw1 0; chk wa-p2a 0; setok wa-pd1 wa-pw1 wa-p2a
+T_SPAWN=pilot T_SLOTS=2 pass "[$PD1,$PW1,$P2A]" >/dev/null
+[ "$(d1)" = "wa-pd1 small feature pass=1;wa-p2a small feature pass=1;" ] && ok "(6i) a pulada no meio da fila não consome vaga do nó: as duas P2 de verdade vão ao nó" || bad "(6i) fila com a pulada no meio: $(d1)"
+# o domínio só é calculado para quem ia ser sondada: bead com memória fresca NÃO paga o jq+grep (o custo por candidata de ~85 por varredura)
+domcalls() { [ -f "$WORK/dom.calls" ] && wc -l < "$WORK/dom.calls" | tr -d ' ' || echo 0; }
+DOMSTUB='bead_domain() { echo x >> "$WORK/dom.calls"; echo ""; }'
+reset; ( eval "$PRELUDE"; _pilot_wa_node_pass_memo_put wa-pd1 U1 mini ) >/dev/null 2>&1
+PX_PRE="$DOMSTUB" passx "[$PD1]" 'true' >/dev/null
+[ "$(domcalls)" = 0 ] && [ "$(wnd_calls)" = 0 ] && ok "(6i) bead com memória fresca (mini): o domínio NÃO é calculado e ela não é sondada" || bad "(6i) memória fresca: domínio=$(domcalls) sondas=$(wnd_calls)"
+reset; chk wa-pd1 10
+PX_PRE="$DOMSTUB" passx "[$PD1]" 'true' >/dev/null
+[ "$(domcalls)" = 1 ] && [ "$(wnd_calls)" = 1 ] && ok "(6i) bead sem memória: o domínio é calculado UMA vez, antes da sonda" || bad "(6i) sem memória: domínio=$(domcalls) sondas=$(wnd_calls)"
+# o waiter: a de dono persistente que é o waiter da cessão NÃO vai ao nó e isso é DEFINITIVO (out) — não segura a P2+ num palpite (blind) sobre um waiter que nunca irá ao nó
+r=$(whyv "persistent-owner:warming"); [ "$r" = "[out]" ] && ok "(6i) motivo persistent-owner:warming (definitivo): o waiter é out" || bad "(6i) waiter persistent-owner: $r"
+r=$(whyv "persistent-owner:hex");     [ "$r" = "[out]" ] && ok "(6i) motivo persistent-owner:hex: o waiter é out" || bad "(6i) waiter persistent-owner hex: $r"
+PW9="$(jbp 1 wa-pw9 U1 wa-worker story:approved,domain:warming)"
+reset; chk wa-pd1 0; setok wa-pd1
+T_WAIT=wa-pw9 pass "[$PW9,$PD1]" >/dev/null
+[ "$(d1)" = "wa-pd1 small feature pass=1;" ] && [ "$(wnd_calls)" = 1 ] && summ | jq -e '.held==0 and .p2_to_node==1 and .waiter_verdict=="out" and .skipped["persistent-owner"]==1' >/dev/null 2>&1 && ok "(6i) waiter P1 de dono persistente: a P2 de dados vai ao nó (o waiter é out, held=0) — sem sondar o waiter" || bad "(6i) waiter de dono persistente: d1=$(d1) $(summ | cut -c1-300)"
+# o apply rc 14: a PRÓPRIA bead não é despachável (dependência aberta ou veto) — a passada NÃO para (o 12 é o único que para como capacity), conta UMA falha e memoriza released (só P2+), e segue com a próxima
+reset; chk wa-m1 10; chk wa-n1 0; chk wa-n2 0; echo 1 > "$WORK/d1.rc.wa-n1"; echo 14 > "$WORK/d1.apply.wa-n1"; echo 0 > "$WORK/d1.rc.wa-n2"
+pass "$S3" >/dev/null
+[ "$(d1)" = "wa-n1 small feature pass=1;wa-n2 small feature pass=1;" ] && ok "(6i) apply rc 14 em n1: a passada NÃO para — n2 é tentada e vai ao nó" || bad "(6i) rc 14 parou a passada: $(d1)"
+[ "$(memo_of)" = "wa-m1:mini,wa-n1:released," ] && ok "(6i) apply rc 14: a P2 fica memorizada released (15 min: o bloqueio pode cair), NUNCA mini (6 h) nem unknown (1 h)" || bad "(6i) memória do rc 14: '$(memo_of)'"
+summ | jq -e '.stopped=="none" and .released==1 and .kept==1' >/dev/null 2>&1 && ok "(6i) apply rc 14: resumo stopped=none released=1 kept=1 (não é capacity nem hook-held)" || bad "(6i) resumo do rc 14: $(summ | cut -c1-300)"
+reset; chk wa-r1 0; chk wa-n2 0; echo 1 > "$WORK/d1.rc.wa-r1"; echo 14 > "$WORK/d1.apply.wa-r1"; echo 0 > "$WORK/d1.rc.wa-n2"
+pass "[$P1R,$(jb wa-n2 U1 wa-worker story:approved)]" >/dev/null
+[ "$(d1)" = "wa-r1 small feature pass=1;wa-n2 small feature pass=1;" ] && [ "$(memo_of)" = "-" ] && ok "(6i) apply rc 14 numa P1: a passada segue e a P1 NÃO é memorizada (P0/P1 é tentada de novo na próxima varredura)" || bad "(6i) rc 14 numa P1: d1=$(d1) memo=$(memo_of)"
+reset; chk wa-w1 0; chk wa-p2a 0; echo 1 > "$WORK/d1.rc.wa-w1"; echo 14 > "$WORK/d1.apply.wa-w1"; setok wa-p2a
+T_WAIT=wa-w1 T_SPAWN=pilot T_SLOTS=3 pass "[$W1,$P2A]" >/dev/null
+[ "$(d1)" = "wa-w1 small feature pass=1;wa-p2a small feature pass=1;" ] && summ | jq -e '.held==0 and .p2_to_node==1 and .waiter_verdict=="out"' >/dev/null 2>&1 && ok "(6i) waiter node + apply rc 14 (bloqueado/vetado: DEFINITIVO, ele não vai a lugar nenhum): a P2 vai ao nó na mesma passada, waiter_verdict=out" || bad "(6i) waiter + rc 14: d1=$(d1) $(summ | cut -c1-300)"
+reset; for i in a b c d e; do chk wa-$i 0; echo 1 > "$WORK/d1.rc.wa-$i"; echo 14 > "$WORK/d1.apply.wa-$i"; done
+pass "$L5" >/dev/null
+[ "$(grep -c . "$WORK/d1.calls")" = 3 ] && ok "(6i) apply rc 14 conta como falha: 5 candidatas, 3 tentativas (o teto de falhas da passada vale)" || bad "(6i) rc 14 e o teto de falhas: $(d1)"
+reset; chk wa-n1 0; chk wa-n2 0; echo 1 > "$WORK/d1.rc.wa-n1"; echo 15 > "$WORK/d1.apply.wa-n1"
+pass "$S3" >/dev/null
+[ "$(d1)" = "wa-n1 small feature pass=1;" ] && ! grep -q 'wa-n1' "$MEMO" 2>/dev/null && ok "(6i) um rc fora da tabela que NÃO é o 14 (15) segue parando a passada sem memorizar: a escrita pode ter acontecido" || bad "(6i) rc 15: d1=$(d1) memo=$(memo_of)"
+
 echo "── (7) dispatch_one: o bloco do yield e o braço do pool (regiões VERBATIM)"
 run_block() {
   (
@@ -1261,6 +1332,7 @@ dec() { ( eval "$PRELUDE"; eval "$F_DECIDE"; _pilot_wa_node_open() { return 0; }
           x=0; _pilot_wa_node_decide wa-a "$WORK/store" wa-worker || x=$?; echo "ret=$x apply_rc=${_PWN_APPLY_RC:-<vazio>}" ) 2>&1 | tail -1; }
 reset; bead "$BEAD_FREE"; echo 12 > "$WORK/apply.rc"; r=$(dec);  [ "$r" = "ret=1 apply_rc=12" ] && ok "apply rc 12: o gancho devolve 1 e deixa _PWN_APPLY_RC=12" || bad "exporta rc 12: $r"
 reset; bead "$BEAD_FREE"; echo 10 > "$WORK/apply.rc"; r=$(dec);  [ "$r" = "ret=1 apply_rc=10" ] && ok "apply rc 10: _PWN_APPLY_RC=10" || bad "exporta rc 10: $r"
+reset; bead "$BEAD_FREE"; echo 14 > "$WORK/apply.rc"; r=$(dec);  [ "$r" = "ret=1 apply_rc=14" ] && ok "apply rc 14 (ga-0qcsdce: bead bloqueada ou vetada, nada escrito): o gancho devolve 1 — NUNCA 2 («segura», que reservaria o nó) — e deixa _PWN_APPLY_RC=14 para a passada" || bad "exporta rc 14: $r"
 reset; bead "$BEAD_FREE"; echo 0 > "$WORK/apply.rc";  r=$(dec);  [ "$r" = "ret=0 apply_rc=0" ] && ok "apply rc 0 (modo pool): _PWN_APPLY_RC=0 e o gancho devolve 0" || bad "exporta rc 0: $r"
 # ga-31u0zl7 (gate-fix 1): o gancho que o dispatch_one chama lê o MESMO veto de rótulo da passada (PILOT_NODE_FIRST_VETO_LABELS): a bead que o worker do nó devolveu (node:never) não chama o apply e não deixa rc; rótulos que não se leem = 1 também
 reset; bead '{"id":"wa-a","status":"open","labels":["story:approved","node:never"],"metadata":{}}'; echo 0 > "$WORK/apply.rc"; r=$(dec)

@@ -14444,6 +14444,23 @@ EOF_PWP_PRE
   return 0
 }
 
+# _pilot_wa_node_pass_persistent_owner <bead-json> — exit 0 iff o domínio da bead EXIGE dono persistente (warming → oracle-wa, hex → batista-wa: rig_domain_requires_persistent_owner); deixa _PWP_WHY=persistent-owner:<domínio>. NENHUMA escrita (ga-0qcsdce).
+# Por quê: o dispatch_one deriva o alvo deste MESMO domínio e despacha o dono direto (ou adia, com o pool excluído): o alvo nunca é o wa-worker que o gancho do nó atende. A passada, sem isto, sondava a bead, o dispatch_one a claimava, via «alvo oracle-wa não
+# é o pool wa-worker» e a soltava, a cada volta (dog-1 mediu em 16/11, ga-384rcm6, com wa-yc9qdn: ~3 escritas bd + 1 sonda por varredura, 20 das 26 sondas node de 6 h). É a MESMA classificação (bead_domain sobre o JSON da candidata + rig_domain_requires_persistent_owner),
+# com o mesmo rig: story.rig explícito, senão o do prefixo wa-. Roda só DEPOIS da memória: o jq+grep de bead_domain não é pago pelas ~70 candidatas com veredito fresco.
+_pilot_wa_node_pass_persistent_owner() {
+  local _po_b="${1:-}" _po_rig _po_dom
+  _PWP_WHY=""
+  # vazio (sem story.rig, ou "null") → o rig do prefixo wa-, whatsapp_automation; falhou/ilegível (JSON que o jq não lê) → o mesmo rig: sem domínio legível a bead segue como antes
+  _po_rig=$(printf '%s' "$_po_b" | jq -r '.metadata["story.rig"] // ""' 2>/dev/null) || _po_rig=""
+  case "$_po_rig" in ''|null) _po_rig=whatsapp_automation ;; esac
+  # vazio (nenhum domínio reconhecido) → "" e exit 1: segue para a sonda; falhou/ilegível (bead_domain ausente ou que falha) → "" também: a bead SEGUE como antes e o dispatch_one decide e solta — nunca «dono persistente» por palpite
+  _po_dom=$(bead_domain "$_po_b" 2>/dev/null) || _po_dom=""
+  rig_domain_requires_persistent_owner "$_po_rig" "$_po_dom" || return 1
+  _PWP_WHY="persistent-owner:$_po_dom"
+  return 0
+}
+
 # _pilot_wa_node_pass_memo_hit <id> <updated_at> — exit 0 iff há veredito FRESCO para esta versão da bead (linhas `epoch<TAB>id<TAB>updated_at<TAB>veredito`; a ÚLTIMA linha da bead vale). TTL por veredito: mini 21600 s,
 # unknown 3600 s, released 900 s, sampled 21600 s (PILOT_WA_NODE_PASS_{MINI,UNKNOWN,RELEASED,SAMPLED}_TTL; ilegível = padrão). `sampled` é a bead que o shadow do passo da carimbada já mediu como node (ga-w7qwl1.2.6). Deixa o veredito em _PWP_MEMO_V.
 # vazio (sem arquivo, sem id/updated_at = sem chave) → sem memória: sonda; falhou/ilegível (arquivo que não abre, awk que falha, linha ruim) → também sem memória — a sonda decide, NUNCA "mini" por chute.
@@ -14717,13 +14734,13 @@ _pilot_node_p2_hold_for() {
   return 1
 }
 
-# _pilot_wa_node_pass_why_verdict <_PWP_WHY> — o veredito do WAITER quando _pilot_wa_node_pass_pre diz não: imprime `out` (motivo DEFINITIVO: a passada SABE que ele não irá ao nó — dono, veto, rota alheia, node:mini, recusa do pool que
-# se leu, id que não é de WA, falta de node:ok no modo label) ou `blind` (NÃO SE SABE: unreadable, refusal-unknown — a bead ou a recusa do pool que não se leu —, motivo vazio e qualquer motivo que esta lista não conheça). Só `blind` segura a P2+.
+# _pilot_wa_node_pass_why_verdict <_PWP_WHY> — o veredito do WAITER quando _pilot_wa_node_pass_pre (ou _pilot_wa_node_pass_persistent_owner) diz não: imprime `out` (motivo DEFINITIVO: a passada SABE que ele não irá ao nó — dono, veto, rota alheia, node:mini, recusa do pool que
+# se leu, id que não é de WA, falta de node:ok no modo label, domínio que exige dono persistente) ou `blind` (NÃO SE SABE: unreadable, refusal-unknown — a bead ou a recusa do pool que não se leu —, motivo vazio e qualquer motivo que esta lista não conheça). Só `blind` segura a P2+.
 # O padrão é blind de propósito: um motivo NOVO do pré-filtro nunca solta a P2+ por omissão — tem de ser posto na lista de `out` por quem sabe que ele é definitivo (ga-2hd02v.3.16, gate 1: "não consegui ler" virava `out` e soltava a P2+).
 # vazio (motivo vazio) → blind; falhou/ilegível (motivo que a função não conhece) → blind também. Sempre devolve 0; não escreve nada.
 _pilot_wa_node_pass_why_verdict() {
   case "${1:-}" in
-    not-wa|has-owner|no-node-ok|node:mini|routed:*|veto:*|refused:*) printf 'out' ;;
+    not-wa|has-owner|no-node-ok|node:mini|routed:*|veto:*|refused:*|persistent-owner:*) printf 'out' ;;
     *) printf 'blind' ;;
   esac
 }
@@ -14779,8 +14796,9 @@ _pilot_wa_node_pass_released_memo() {
 }
 
 # _pilot_wa_node_pass — a passada. Uma vez por varredura, antes das pistas. Sempre devolve 0 (nada aqui derruba a varredura). Lê e, no modo on, reescreve SMALL_/BIG_CANDIDATES, _SLOTS e _COUNT e soma DISPATCHED.
-# Ordem de cada candidata: pré (sem escrita) → memória → orçamento (sondas e segundos) → `check` → (shadow: registra) / (on: dispatch_one). Para: despacho parado · vagas do nó esgotadas (_PWN_SLOTS) · falhas demais ·
-# apply rc 12 (nó cheio: capacidade é do nó, a bead NÃO é memorizada) · apply com outro rc (a escrita pode ter acontecido: para sem memorizar) · Dolt saturado (antes de escrever) · script ausente. Falha por bead (apply 10/11, ou nada chegou ao apply) é memorizada.
+# Ordem de cada candidata: pré (sem escrita) → memória → domínio que exige dono persistente (pula, ga-0qcsdce) → orçamento (sondas e segundos) → `check` → (shadow: registra) / (on: dispatch_one). Para: despacho parado · vagas do nó esgotadas (_PWN_SLOTS) · falhas demais ·
+# apply rc 12 (nó cheio: capacidade é do nó, a bead NÃO é memorizada) · apply com outro rc fora da tabela 10/11/12/14 (a escrita pode ter acontecido: para sem memorizar) · Dolt saturado (antes de escrever) · script ausente. Falha por bead (apply 10/11/14, ou nada chegou ao apply)
+# é memorizada e a passada segue (o 14, a bead bloqueada ou vetada, e o «nada chegou» só como released e nunca para P0/P1).
 _pilot_wa_node_pass() {
   local _pw_lane _pw_pool _pw_slots _pw_wa _pw_n _pw_pick _pw_id _pw_upd _pw_tier _pw_rc _pw_keepmax _pw_cap _pw_secs _pw_maxfail _pw_t0 _pw_log _pw_sk _pw_skj _pw_rsn="" _pw_rsj _pw_rs
   local _pw_total=0 _pw_elig=0 _pw_memo=0 _pw_probed=0 _pw_node=0 _pw_mini=0 _pw_unk=0 _pw_tmo=0 _pw_err=0 _pw_kept=0 _pw_rel=0 _pw_fails=0 _pw_stop="" _pw_skipped=""
@@ -14907,6 +14925,13 @@ _pilot_wa_node_pass() {
         fi
         continue
       fi
+      # ga-0qcsdce: domínio que EXIGE dono persistente (warming → oracle-wa, hex → batista-wa) nunca vai ao nó: pula ANTES da sonda e da claim, sem escrever e sem memorizar (o motivo é permanente e a checagem é barata). O waiter com este motivo é `out` (a tabela
+      # de _pilot_wa_node_pass_why_verdict): ele não irá ao nó, então não segura a P2+. Só chega aqui quem ia ser sondada (a memória fresca já saiu acima).
+      if _pilot_wa_node_pass_persistent_owner "$_pw_pick"; then
+        _pw_skipped="$_pw_skipped persistent-owner"
+        if [ "$_pw_isw" = 1 ]; then _pw_wv=$(_pilot_wa_node_pass_why_verdict "$_PWP_WHY"); fi
+        continue
+      fi
       if [ "$_pw_probed" -ge "$_pw_cap" ]; then _pw_stop="budget-probes"; break; fi
       if [ $(( SECONDS - _pw_t0 )) -ge "$_pw_secs" ]; then _pw_stop="budget-secs"; break; fi
       _pw_probed=$((_pw_probed + 1))
@@ -14995,6 +15020,9 @@ _pilot_wa_node_pass() {
           10) _pw_fails=$((_pw_fails + 1)); _pilot_wa_node_pass_memo_put "$_pw_id" "$_pw_upd" mini; if [ "$_pw_isw" = 1 ]; then _pw_wv=out; fi ;;
           11) _pw_fails=$((_pw_fails + 1)); _pilot_wa_node_pass_memo_put "$_pw_id" "$_pw_upd" unknown; if [ "$_pw_isw" = 1 ]; then _pw_wv=blind; fi ;;
           '') _pw_fails=$((_pw_fails + 1)); _pilot_wa_node_pass_released_memo "$_pw_pick" "$_pw_id" "$_pw_upd"; if [ "$_pw_isw" = 1 ]; then _pw_wv=blind; fi ;;
+          # ga-0qcsdce: rc 14 = a PRÓPRIA bead não é despachável (dependência aberta no bd blocked ou rótulo de parada explícita; nada escrito): o motivo é da bead e NÃO do nó, então a passada NÃO para (só o 12 é capacity). Conta uma falha (a claim e a soltura já custaram escritas),
+          # memoriza released (15 min: o bloqueio pode cair; P0/P1 não) e o waiter com este veredito é `out`: não vai a lugar nenhum agora, e não segura a P2+
+          14) _pw_fails=$((_pw_fails + 1)); if [ "$_pw_isw" = 1 ]; then _pw_wv=out; fi; _pilot_wa_node_pass_released_memo "$_pw_pick" "$_pw_id" "$_pw_upd" ;;
           12) _pw_stop="capacity"; break ;;
           # ga-2hd02v.3.25: rc do apply fora da tabela = a escrita pode ter acontecido e o estado desta bead NÃO se sabe: ela entra no conjunto e fica fora do MBP nesta varredura (mesma regra de id legível)
           *)  if [ "$_pw_isw" = 1 ]; then _pw_wv=blind; fi; case "$_pw_id" in *[!A-Za-z0-9._-]*) ;; *) _PWP_NODE_BOUND="$_PWP_NODE_BOUND $_pw_id" ;; esac; _pw_stop="hook-held"; break ;;

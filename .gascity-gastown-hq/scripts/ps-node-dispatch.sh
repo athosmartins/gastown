@@ -17,7 +17,7 @@
 #      nunca faz uma bead de PS ser carimbada com a rota do WA, nem o contrário, e um WA_NODE_SPAWN=pool herdado nunca devolve a bead do PS ao pool que não a enxerga. 1 slot (o alias único ps-worker-remote-1): o agente
 #      ps-worker-remote tem max 1 sessão; mais slots é mudar o agente e esta casca juntos;
 #   2. só bead `ps-*`: id de outro prefixo sai 11 sem rodar nada ("não sei decidir", fica onde está), porque o classificador, o filtro e o alias aqui são do PS;
-#   3. não há nada a decidir sozinha: qualquer falha do despachante real chega ao chamador com o código dele (0/10/11/12/13/2, ver wa-node-dispatch.sh); despachante ausente ou não executável = 11.
+#   3. não há nada a decidir sozinha: qualquer falha do despachante real chega ao chamador com o código dele (0/10/11/12/13/14/2, ver wa-node-dispatch.sh); despachante ausente ou não executável = 11.
 # SAÍDA: a do wa-node-dispatch.sh. Em dúvida o código é 10-13, nunca 0. O apply no modo pilot também consulta o oráculo de capacidade do nó (hetzner-capacity.py), o mesmo do WA: sem vaga → 12, a bead fica no mini.
 # Env (teste): PS_NODE_BD, PS_NODE_GC, PS_NODE_PY, PS_NODE_TIMEOUT, PS_NODE_SESSION_TIMEOUT, PS_NODE_CAPACITY (o oráculo; repassados como WA_NODE_*), PS_NODE_CLASSIFY, PS_NODE_ALIAS, PS_NODE_ROUTE_TEMPLATE, PS_NODE_LOG, PS_NODE_DISPATCH (o despachante real).
 set -u
