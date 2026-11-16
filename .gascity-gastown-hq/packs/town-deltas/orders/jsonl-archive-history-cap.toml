@@ -8,8 +8,8 @@
 # This order does by script what the Mayor did by hand, without a gc/repack of the big repo: it re-writes the kept commits with
 # the same tree/author/committer/message (the oldest one without a parent), fetches just those into a NEW git dir under a
 # free-space watch, verifies every kept tree and `git fsck --connectivity-only`, swaps the two .git dirs (checked right after,
-# undone if it differs) and only then deletes the old one. It acts at most about once a day (the oldest commit must be 12h past the
-# window), or at once when .git is over 1GiB. It stays INERT — repo untouched, exit 0 — on a remote, a second ref, a merge,
+# undone if it differs) and only then deletes the old one. It acts at most about every 12 h (the oldest kept commit must be 12h past the
+# window, and right after a cap it is ~3 d old, so it crosses that line again ~12 h later), or at once when .git is over 1GiB. It stays INERT — repo untouched, exit 0 — on a remote, a second ref, a merge,
 # a shallow/unknown layout, git's own lock files, another repacker or the exporter running, an unreadable free-space figure.
 # Alarm (mail to mayor/, rate-limited): .git over 1GiB after the run, or a run that failed / was rolled back / hit a swap conflict.
 # Full rationale, the swap steps and the failure states: header of assets/scripts/jsonl-archive-history-cap.sh.

@@ -8,15 +8,19 @@
 #   S2  slack: a root just past the window is left alone (ok-within-slack) until the .git is over the alarm size, and then it is cut
 #   S3  KEEP_MIN: commits that are ALL older than the window still leave KEEP_MIN of them
 #   S4  inert on doubt, the repo byte-for-byte untouched: remote, second branch, merge commit, shallow file, unknown .git entry, git's own lock files, detached HEAD,
-#       corrupt object, not enough free space, free space that cannot be read, no repo, empty repo, a lock held by a live run, a running exporter
+#       corrupt object, not enough free space, free space that cannot be read, a baseline-tree read that fails or comes back empty (gate fix 1/3: it used to size
+#       the tree at 0 and go on to rewrite, fetch, swap and delete), a non-empty .git/branches, a staged-but-uncommitted index (before the build and while it runs),
+#       no repo, empty repo, a lock held by a live run, a running exporter
 #   S5  a stale lock (dead owner, old) is reclaimed and the run goes on; a live exporter that finishes during the wait lets the run go on
 #   S6  failures leave the live repo as it was: fetch failing, the disk watch killing the fetch (no process left), a wrong head fetched (verify), a commit landing in the gap
 #       (rolled-back, the old .git back WITH that commit), something recreating .git in the gap (conflict: both dirs kept, nothing deleted), SIGTERM between the two
 #       renames (the old .git put back by the exit trap); and each of them mails once (rate-limited), a failing mail command is logged and not fatal
 #   S7  leftovers of an interrupted run: a stale new dir is removed, an old dir with no .git is moved back, an old dir with the same head tree is deleted, an old dir
-#       with another tree (or next to a new dir) is KEPT and the run ends leftover-kept
+#       whose head tree is in the live history (the exporter committed since) is deleted too, an old dir with a tree the live repo does not have (or next to a new
+#       dir) is KEPT and the run ends leftover-kept
 #   S8  a commit that lands while the fetch runs is followed (catch-up) and is in the result
-#   S9  the alarm: .git over the alarm size mails once and is rate-limited; --check exits 3 over it and 0 under it
+#   S9  the alarm: .git over the alarm size mails once and is rate-limited; a mail that FAILS is tried again after JHC_ALERT_RETRY_S, not after the full rate limit;
+#       --check exits 3 over it and 0 under it
 #   S10 BOUNDED: 20 days of 4 commits a day, one run a day — .git stays under a fixed bound all along while the same history without the cap grows past it, and the
 #       tree never changes
 #   S11 configuration and order: a non-number or a window of 0 is refused (exit 2); the order file's interval/timeout/exec agree with the script's deadline
@@ -32,11 +36,15 @@ ulimit -f 262144 2>/dev/null || { echo "selftest: cannot set ulimit -f (512-byte
 command -v jq >/dev/null 2>&1 || { echo "selftest: jq is required" >&2; exit 2; }
 # a repo built here must not read the operator's git config (hooks, templates, signing)
 export GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null GIT_CONFIG_NOSYSTEM=1 GIT_TERMINAL_PROMPT=0
+# a repo built here must not depend on the host's git template either: this one is the Debian/Ubuntu shape (an empty .git/branches), so every case below runs on a
+# repo that has it (and a macOS git without it is covered by the same script path: an absent entry is simply not listed)
+# GIT_TEMPLATE_DIR is exported below, once ROOT exists
 export GIT_AUTHOR_NAME=tester GIT_AUTHOR_EMAIL=t@example.invalid GIT_COMMITTER_NAME=tester GIT_COMMITTER_EMAIL=t@example.invalid
 
 ROOT="$(mktemp -d "${TMPDIR:-/tmp}/jhc-selftest.XXXXXX")" || exit 2
 : > "$ROOT/.jhc-selftest-root"
 BIN="$ROOT/bin"; mkdir -p "$BIN"
+TPL="$ROOT/git-template"; mkdir -p "$TPL/branches"; export GIT_TEMPLATE_DIR="$TPL"
 BGPIDS=""
 cleanup() {
   local p
@@ -65,7 +73,11 @@ EOF
 cat > "$BIN/git-wrap" <<'EOF'
 #!/bin/bash
 # GITBIN wrapper: misbehaves on `fetch` when told to, passes everything else through
-is_fetch=0; for a in "$@"; do [ "$a" = fetch ] && is_fetch=1; done
+is_fetch=0; is_lstree=0; for a in "$@"; do [ "$a" = fetch ] && is_fetch=1; [ "$a" = ls-tree ] && is_lstree=1; done
+if [ "$is_lstree" = 1 ]; then
+  if [ -n "${WRAP_LSTREE_FAIL:-}" ]; then echo "wrapper: ls-tree refused" >&2; exit 9; fi
+  if [ -n "${WRAP_LSTREE_EMPTY:-}" ]; then exit 0; fi
+fi
 if [ "$is_fetch" = 1 ]; then
   if [ -n "${WRAP_FETCH_FAIL:-}" ]; then echo "wrapper: fetch refused" >&2; exit 9; fi
   if [ -n "${WRAP_PRE_FETCH:-}" ] && [ ! -e "${WRAP_MARK:-/nonexistent}" ]; then : > "$WRAP_MARK"; bash -c "$WRAP_PRE_FETCH"; fi
@@ -201,6 +213,13 @@ SETUP=': > "$REPO/.git/index.lock"'; inert index-lock skipped-busy
 SETUP=': > "$REPO/.git/gc.pid"'; inert gc-pid skipped-busy
 SETUP='git -C "$REPO" checkout -q --detach'; inert detached skipped-unreadable
 SETUP='h="$(git -C "$REPO" rev-parse HEAD)"; rm -f "$REPO/.git/objects/${h%"${h#??}"}/${h#??}"'; inert corrupt skipped-unreadable
+SETUP=''; inert lstree-fails skipped-unreadable JHC_GIT="$BIN/git-wrap" WRAP_LSTREE_FAIL=1
+has "ls-tree fails: the log says why (a failure is not a success)" "cannot size the baseline tree"
+eq "ls-tree fails: no rewrite, fetch or swap was logged" "$(grep -c -E 'step [1256]' "$C/cap.log" 2>/dev/null)" 0
+SETUP=''; inert lstree-empty skipped-unreadable JHC_GIT="$BIN/git-wrap" WRAP_LSTREE_EMPTY=1
+eq "ls-tree empty: no rewrite, fetch or swap was logged" "$(grep -c -E 'step [1256]' "$C/cap.log" 2>/dev/null)" 0
+SETUP='mkdir -p "$REPO/.git/branches" && echo x > "$REPO/.git/branches/x"'; inert branches-nonempty skipped-layout
+SETUP='echo x > "$REPO/staged.txt" && git -C "$REPO" add staged.txt'; inert staged-index skipped-staged
 SETUP=''; inert low-disk skipped-low-disk JHC_FREE_KIB=100
 SETUP=''; inert free-unreadable skipped-low-disk JHC_FREE_KIB=garbage
 newcase s4-norepo; run_cap; eq "no repo: status" "$(st)" skipped-no-repo; eq "no repo: rc" "$RC" 0
@@ -266,7 +285,11 @@ newcase s7-old-nogit; mk_repo 6 4 5; mv "$REPO/.git" "$REPO.history-cap-old"
 run_cap; eq "old dir and no .git: status" "$(st)" capped; has "old dir and no .git" "back in place"; expect "old dir and no .git: no leftover dirs" no_leftovers; eq "...cut" "$(gl rev-list --count HEAD)" "$(expected_kept 6 4 3 2)"
 newcase s7-old-same; mk_repo 6 4 5; cp -R "$REPO/.git" "$REPO.history-cap-old"
 run_cap; eq "old dir, same head tree: status" "$(st)" capped; expect "old dir, same head tree: deleted" no_leftovers
-newcase s7-old-other; mk_repo 6 4 5; cp -R "$REPO/.git" "$REPO.history-cap-old"; echo more > "$REPO/more.txt"; git -C "$REPO" add -A >/dev/null; git -C "$REPO" commit -q -m more; B="$(snap)"
+# the exporter commits every 15 min: by the next run the live head has moved on, and the old dir's head tree is only a commit in the live history (gate fix 1/3)
+newcase s7-old-history; mk_repo 6 4 5; cp -R "$REPO/.git" "$REPO.history-cap-old"; echo more > "$REPO/more.txt"; git -C "$REPO" add -A >/dev/null; git -C "$REPO" commit -q -m more
+run_cap; eq "old dir, head tree in the live history: status" "$(st)" capped; expect "old dir, head tree in the live history: deleted" no_leftovers; eq "old dir, head tree in the live history: the live commit survived" "$(gl log -n 1 --format=%s)" more
+# the other way: the old dir holds a tree the live repo does NOT have — never deleted by a script
+newcase s7-old-other; mk_repo 6 4 5; echo more > "$REPO/more.txt"; git -C "$REPO" add -A >/dev/null; git -C "$REPO" commit -q -m more; cp -R "$REPO/.git" "$REPO.history-cap-old"; git -C "$REPO" reset -q --hard HEAD~1; B="$(snap)"
 run_cap; eq "old dir, other tree: status" "$(st)" leftover-kept; eq "old dir, other tree: rc" "$RC" 1; expect "old dir, other tree: kept" test -d "$REPO.history-cap-old/objects"; eq "old dir, other tree: live repo untouched" "$(snap)" "$B"
 
 # ── S8 catch-up ──
@@ -280,9 +303,17 @@ eq "catch-up: work tree clean" "$(git -C "$REPO" status --porcelain | wc -l | tr
 newcase s9; mk_repo 2 2 5
 run_cap JHC_ALARM_KIB=1; eq "over the alarm size: mail" "$(mails)" 1; run_cap JHC_ALARM_KIB=1; eq "rate limited" "$(mails)" 1
 run_cap JHC_ALARM_KIB=1 JHC_ALERT_EVERY_S=0; eq "rate limit 0" "$(mails)" 2
-OUT="$(env JHC_REPO="$REPO" /bin/bash "$SCRIPT" --check JHC_ALARM_KIB=1 2>&1)"; RC=$?; OUT="$(env JHC_REPO="$REPO" JHC_ALARM_KIB=1 /bin/bash "$SCRIPT" --check 2>&1)"; RC=$?
+OUT="$(env JHC_REPO="$REPO" JHC_ALARM_KIB=1 /bin/bash "$SCRIPT" --check 2>&1)"; RC=$?
 eq "--check over the alarm size: exit 3" "$RC" 3; has "--check" "over the alarm size"
 OUT="$(env JHC_REPO="$REPO" /bin/bash "$SCRIPT" --check 2>&1)"; RC=$?; eq "--check under it: exit 0" "$RC" 0; has "--check says what it would do" "would_cap=no"
+# the alarm mail is the only channel of the HIGH alert: a send that FAILS must come back after JHC_ALERT_RETRY_S, not after the full rate limit (gate fix 1/3)
+newcase s9c; mk_repo 2 2 5
+run_cap JHC_ALARM_KIB=1 GC_STUB_RC=1; eq "failing mail: attempted once" "$(mails)" 1; has "failing mail: logged" "alarm mail NOT sent"
+run_cap JHC_ALARM_KIB=1; eq "failing mail, default retry (1h): a run right after is still held back" "$(mails)" 1
+newcase s9d; mk_repo 2 2 5
+run_cap JHC_ALARM_KIB=1 GC_STUB_RC=1 JHC_ALERT_RETRY_S=0; eq "failing mail, retry 0: attempted once" "$(mails)" 1
+run_cap JHC_ALARM_KIB=1 JHC_ALERT_RETRY_S=0; eq "failing mail, retry 0: the next run tries again" "$(mails)" 2
+run_cap JHC_ALARM_KIB=1 JHC_ALERT_RETRY_S=0; eq "a mail that went out: the clock is the full rate limit again" "$(mails)" 2
 newcase s9b; mk_repo 40 4 5; B="$(snap)"; OUT="$(env JHC_REPO="$REPO" /bin/bash "$SCRIPT" --check 2>&1)"; RC=$?; eq "--check changes nothing" "$(snap)" "$B"; has "--check plan" "would_cap=yes"; eq "--check on a cuttable repo: exit 0" "$RC" 0
 
 # ── S10 bounded over time ──

@@ -19,21 +19,23 @@
 #      the tree its original had (so the working tree and the content of each kept snapshot are unchanged), and
 #      `git fsck --connectivity-only` passes;
 #   4. config, hooks, info and the INDEX of the old .git are copied over (the index only matches its tree when nothing was committed
-#      in between: the exporter must not be running, there must be no index.lock, and a commit that landed meanwhile is re-written
+#      in between: the exporter must not be running, there must be no index.lock, the index must hold nothing staged that HEAD lacks
+#      (git diff-index --cached; staged blobs live only in the old repo), and a commit that landed meanwhile is re-written
 #      and fetched too — a bounded catch-up — or the run gives up and tries again next hour);
 #   5. the swap is two `mv`s back to back: .git -> <repo>.history-cap-old, <repo>.history-cap-new -> .git. It is checked right after
 #      (head tree, commit count, the old head still being the one that was re-written) and UNDONE if any of it differs;
-#   6. only then the old .git is deleted — the one step that frees the disk.
+#   6. only then the old .git is deleted — the one step that frees the disk. A delete that did not finish is picked up by the next run when the old
+#      dir still reads as a repo whose head tree the live repo has (its head, or a commit in its history: the exporter commits every 15 min).
 # Peak disk use is the size of the kept window's pack, not of the old repo.
 #
 # INERT ON DOUBT (three states for every read — has / has not / cannot know, and "cannot know" never acts): a remote (a push would
-# diverge), more than one ref, a merge commit, a shallow or alternates file, a git dir with an entry this script does not know, a
-# lock file of git, another repacker or the exporter running, a free-space reading that fails, a log line that is not a sha and a
+# diverge), more than one ref, a merge commit, a shallow or alternates file, a git dir with an entry this script does not know (an EMPTY .git/branches, which the Debian git template makes, is known), a staged-but-uncommitted index, a
+# lock file of git, another repacker or the exporter running, a free-space reading that fails, a baseline-tree size that cannot be read, a log line that is not a sha and a
 # time — each ends the run as skipped-<why>, exit 0, repo untouched. The jsonl-archive-compact lock ($RUNTIME/jsonl-archive-compact.lock)
 # is the SAME lock: one repo writer at a time, and the exporter (which looks at it) starts no background maintenance while it is held.
 #
 # ALARM: the .git over JHC_ALARM_KIB (1GiB) after the run, or a run that failed / was rolled back / could not finish its swap, mails
-# mayor/ (rate-limited: JHC_ALERT_EVERY_S, recorded BEFORE the send). A failed run before the swap leaves the live repo as it was
+# mayor/ (rate-limited: JHC_ALERT_EVERY_S, recorded BEFORE the send; a send that FAILS moves the clock back so the next try is JHC_ALERT_RETRY_S (1h) away, not 6h). A failed run before the swap leaves the live repo as it was
 # (refs, index, packs, config: the only addition is the few small unreachable commit objects written in step 1, which git prunes later).
 #
 # Modes: (none) run | --check  measure only, print the plan, no lock, no write — exit 3 when .git is over the alarm size | --print-config
@@ -52,7 +54,7 @@ GCBIN="${JHC_GC:-gc}"
 GITBIN="${JHC_GIT:-git}"                             # test seam: a wrapper that can slow the fetch down
 KEEP_DAYS="${JHC_KEEP_DAYS:-3}"                      # history kept: commits newer than this many days
 KEEP_MIN="${JHC_KEEP_MIN:-2}"                        # ...and never fewer than this many commits (spike detection reads the previous one)
-SLACK_H="${JHC_SLACK_H:-12}"                         # the oldest commit must be this many hours past the window before a run acts: one rebuild a day, not one an hour
+SLACK_H="${JHC_SLACK_H:-12}"                         # the oldest commit must be this many hours past the window before a run acts: a rebuild about every SLACK_H hours at most, not one an hour (right after a cap the oldest kept commit is ~3 d old and crosses window+SLACK_H again SLACK_H hours later)
 ALARM_KIB="${JHC_ALARM_KIB:-1048576}"                # .git over 1GiB after the run = mail
 FLOOR_KIB="${JHC_FLOOR_KIB:-1048576}"                # free space that must REMAIN after the new pack is built (need = estimate + this)
 ABORT_FLOOR_KIB="${JHC_ABORT_FLOOR_KIB:-524288}"     # the fetch is killed when the free space falls under this
@@ -64,6 +66,7 @@ EXPORT_RE="${JHC_EXPORT_RE:-jsonl-export\\.sh}"
 POLL_S="${JHC_POLL_S:-2}"
 CATCHUP_MAX="${JHC_CATCHUP_MAX:-3}"
 ALERT_EVERY_S="${JHC_ALERT_EVERY_S:-21600}"
+ALERT_RETRY_S="${JHC_ALERT_RETRY_S:-3600}"           # when the alarm mail itself FAILS, the next try is this many seconds later (not ALERT_EVERY_S)
 MAIL_TIMEOUT_S="${JHC_MAIL_TIMEOUT_S:-45}"
 LOCK_STALE_MIN="${JHC_LOCK_STALE_MIN:-90}"
 LOCK_GRACE_S=600                                     # a lock holder that wrote its end time (the compactor's night gc) is alive this long after it
@@ -80,7 +83,7 @@ case "${1:-}" in
 esac
 
 is_uint() { case "${1:-}" in ''|*[!0-9]*) return 1 ;; *) return 0 ;; esac; }
-for _v in KEEP_DAYS KEEP_MIN SLACK_H ALARM_KIB FLOOR_KIB ABORT_FLOOR_KIB DEADLINE_S FETCH_TIMEOUT_S GIT_TIMEOUT_S EXPORT_WAIT_S POLL_S CATCHUP_MAX ALERT_EVERY_S MAIL_TIMEOUT_S LOCK_STALE_MIN; do
+for _v in KEEP_DAYS KEEP_MIN SLACK_H ALARM_KIB FLOOR_KIB ABORT_FLOOR_KIB DEADLINE_S FETCH_TIMEOUT_S GIT_TIMEOUT_S EXPORT_WAIT_S POLL_S CATCHUP_MAX ALERT_EVERY_S ALERT_RETRY_S MAIL_TIMEOUT_S LOCK_STALE_MIN; do
   if ! is_uint "${!_v}"; then echo "jsonl-archive-history-cap: $_v='${!_v}' is not a number — refusing to run on a misread configuration" >&2; exit 2; fi
 done
 if [ "$KEEP_DAYS" -lt 1 ] || [ "$KEEP_MIN" -lt 1 ] || [ "$POLL_S" -lt 1 ]; then
@@ -92,7 +95,7 @@ if [ "$MODE" = print ]; then
 repo=$REPO keep_days=$KEEP_DAYS keep_min=$KEEP_MIN slack_h=$SLACK_H
 alarm_kib=$ALARM_KIB floor_kib=$FLOOR_KIB abort_floor_kib=$ABORT_FLOOR_KIB
 deadline_s=$DEADLINE_S fetch_timeout_s=$FETCH_TIMEOUT_S git_timeout_s=$GIT_TIMEOUT_S export_wait_s=$EXPORT_WAIT_S catchup_max=$CATCHUP_MAX
-alert_every_s=$ALERT_EVERY_S mail_timeout_s=$MAIL_TIMEOUT_S lock_stale_min=$LOCK_STALE_MIN
+alert_every_s=$ALERT_EVERY_S alert_retry_s=$ALERT_RETRY_S mail_timeout_s=$MAIL_TIMEOUT_S lock_stale_min=$LOCK_STALE_MIN
 state=$STATE log=$LOG lock=$LOCK new_dir=$NEWDIR old_dir=$OLDDIR
 EOF
   exit 0   # benign[print-config]: only prints the effective configuration — nothing ran, so there is no failure for this exit to hide
@@ -139,8 +142,22 @@ STATUS=""; WHY=""; BR=""; N=0; KEEP_N=0; DROP_N=0; G_KIB=""; EST_KIB=0
 C_SHA=(); C_CT=()
 skip() { STATUS="$1"; WHY="$2"; return 1; }
 
+# The index is copied to the new repo as it is, which is right only when it equals HEAD's tree: a staged-but-uncommitted state (the exporter's commit failed, or it was
+# killed between add and commit) points at blobs that sit loose in the OLD repo only, and the new pack does not hold them. 0 = clean (or no index file); 1 = STATUS/WHY say why not.
+check_index() {
+  local irc
+  [ -f "$REPO/.git/index" ] || return 0   # no index file: nothing to copy, and git rebuilds it from HEAD
+  # vazio/clean (rc 0) → fine; staged changes (rc 1) → inert; falhou/timeout (any other rc) → cannot know: inert too, never the same result as "clean"
+  G diff-index --cached --quiet HEAD >/dev/null 2>&1; irc=$?
+  case "$irc" in
+    0) return 0 ;;
+    1) skip skipped-staged "the index holds staged changes that are not in HEAD (an exporter commit that did not finish) — its blobs are not in the new pack" ; return 1 ;;
+    *) skip skipped-unreadable "cannot compare the index with HEAD (git diff-index rc=$irc)"; return 1 ;;
+  esac
+}
+
 inspect() {  # 0 = the repo can be evaluated (C_SHA/C_CT newest first, BR, N); 1 = STATUS/WHY say why not. Nothing here writes.
-  local ent ref refs out line sha ct
+  local ent ref refs out line sha ct bo
   if [ -L "$REPO/.git" ]; then skip skipped-layout ".git is a symlink"; return 1; fi
   if [ ! -d "$REPO/.git" ]; then skip skipped-no-repo "no $REPO/.git (the exporter creates it)"; return 1; fi
   # vazio → an empty git dir is no repo and the rev-parse below says so; falhou (ls) → cannot know the layout: inert
@@ -148,6 +165,11 @@ inspect() {  # 0 = the repo can be evaluated (C_SHA/C_CT newest first, BR, N); 1
   for ent in $out; do
     case "$ent" in
       HEAD|config|description|hooks|info|index|logs|objects|refs|packed-refs|ORIG_HEAD|FETCH_HEAD|COMMIT_EDITMSG|gc.log|.DS_Store) ;;
+      branches)  # the Debian/Ubuntu git template makes an EMPTY .git/branches (legacy, unused); a plain repo may carry it, anything inside (or a non-directory) is not the plain layout
+        if [ -L "$REPO/.git/branches" ] || [ ! -d "$REPO/.git/branches" ]; then skip skipped-layout "'branches' in .git is not a plain directory"; return 1; fi
+        # vazio → the template's empty dir, fine; falhou (ls) → cannot know the layout: inert; has → not the plain layout
+        bo="$(ls -A "$REPO/.git/branches" 2>&1)" || { skip skipped-unreadable "cannot list $REPO/.git/branches: $(printf '%s' "$bo" | head -n 1)"; return 1; }
+        if [ -n "$bo" ]; then skip skipped-layout "'branches' in .git holds entries"; return 1; fi ;;
       index.lock|HEAD.lock|config.lock|packed-refs.lock|gc.pid|maintenance.lock) skip skipped-busy "git's own lock $ent is present"; return 1 ;;
       *) skip skipped-layout "unknown entry '$ent' in .git (shallow, worktrees, modules...) — this script only knows a plain repo"; return 1 ;;
     esac
@@ -183,6 +205,7 @@ inspect() {  # 0 = the repo can be evaluated (C_SHA/C_CT newest first, BR, N); 1
 $out
 EOF
   if [ "$N" -eq 0 ]; then skip ok-empty "the branch has no commit"; return 1; fi
+  check_index || return 1
   return 0
 }
 
@@ -206,8 +229,13 @@ plan() {  # fills KEEP_N DROP_N CUTOFF ACT; sets STATUS to ok-* when there is no
 # estimate of the NEW pack, in KiB: never more than the old .git, never more than the uncompressed baseline tree (a full copy of it is
 # the worst a pack of that tree can be) plus 64MiB for the commits and trees. vazio/falhou → "" (cannot know: the caller stays inert)
 estimate_kib() {
-  local base="${C_SHA[$((KEEP_N - 1))]}" tree
-  tree="$(G ls-tree -r -l "$base" 2>/dev/null | awk '$4 ~ /^[0-9]+$/ {s += $4} END {print int(s / 1024)}')"
+  local base="${C_SHA[$((KEEP_N - 1))]}" out tree
+  # vazio → return 1 (a commit always has files: no listing = cannot know); falhou/timeout (ls-tree rc != 0) → return 1 (cannot know). The status is taken from ls-tree ITSELF,
+  # not from a pipe: `ls-tree | awk` ends with awk's status and awk's END prints a number for an empty input, so a failed read used to size the tree at "0" (gate fix 1/3).
+  out="$(G ls-tree -r -l "$base" 2>/dev/null)" || return 1
+  [ -n "$out" ] || return 1
+  # no line with a numeric size → no sum at all (tree stays empty and is_uint refuses it); a real 0 is only a tree whose files are all empty
+  tree="$(printf '%s\n' "$out" | awk '$4 ~ /^[0-9]+$/ {s += $4; n++} END {if (n > 0) print int(s / 1024)}')"
   is_uint "$tree" || return 1
   EST_KIB=$(( tree + 65536 ))
   if is_uint "$G_KIB" && [ "$G_KIB" -lt "$EST_KIB" ]; then EST_KIB="$G_KIB"; fi
@@ -266,7 +294,7 @@ finish() {  # finish <status> [why] — records the run, rings the alarm when du
   if is_bad "$STATUS"; then streak=$((streak + 1)); else streak=0; fi
   if is_bad "$STATUS"; then reason="the run ended $STATUS"; fi
   if is_uint "$G_KIB" && [ "$G_KIB" -gt "$ALARM_KIB" ]; then reason="${reason:+$reason; }the .git is over $(fmt "$ALARM_KIB")"; fi
-  if [ -n "$reason" ] && [ $(( nowe - last )) -lt "$ALERT_EVERY_S" ]; then reason=""; fi   # rate limit: the clock is the LAST mail's, recorded below before every send
+  if [ -n "$reason" ] && [ $(( nowe - last )) -lt "$ALERT_EVERY_S" ]; then reason=""; fi   # rate limit: the clock is the LAST mail's, recorded below before the send (a send that fails moves it back, see the retry)
   [ -n "$reason" ] && grew=1
   [ "$grew" -eq 1 ] && last="$nowe"
   new="$(jq --arg st "$STATUS" --arg why "$WHY" --argjson now "$nowe" --argjson last "$last" --argjson streak "$streak" --arg g "${G_KIB:-}" --arg n "$N" --arg k "$KEEP_N" \
@@ -285,7 +313,17 @@ finish() {  # finish <status> [why] — records the run, rings the alarm when du
   log "run end: status=$STATUS${WHY:+ ($WHY)} gitdir=$(fmt "$G_KIB") commits=${N} kept=${KEEP_N} elapsed=$(elapsed)s"
   if [ "$grew" -eq 1 ]; then
     log "ALARM: $reason — mailing mayor/"
-    if send_alarm "$reason"; then log "alarm mail sent"; else log "alarm mail NOT sent: rc/err: ${ALARM_ERR:-none} (recorded as sent: the next try is in ${ALERT_EVERY_S}s)"; fi
+    if send_alarm "$reason"; then log "alarm mail sent"; else
+      # the mail is the only channel of this alert: a send that FAILED must not silence it for the whole ALERT_EVERY_S — move the recorded clock back so the next try is ALERT_RETRY_S away
+      if [ "$ALERT_RETRY_S" -lt "$ALERT_EVERY_S" ]; then last=$(( nowe - ALERT_EVERY_S + ALERT_RETRY_S )); fi
+      if new="$(jq --argjson last "$last" '.last_alert_epoch = $last' <<<"$(state_json)" 2>/dev/null)" && jq -e 'type == "object"' <<<"$new" >/dev/null 2>&1 \
+         && printf '%s\n' "$new" > "$STATE.tmp.$$" 2>/dev/null && mv "$STATE.tmp.$$" "$STATE" 2>/dev/null; then
+        log "alarm mail NOT sent: rc/err: ${ALARM_ERR:-none} (the next try is in ${ALERT_RETRY_S}s)"
+      else
+        rm -f "$STATE.tmp.$$" 2>/dev/null   # benign[state-tmp]: a leftover temp file after a write already reported below
+        log "alarm mail NOT sent: rc/err: ${ALARM_ERR:-none}; the retry clock could NOT be recorded either — the next try is in ${ALERT_EVERY_S}s"
+      fi
+    fi
   fi
   if is_bad "$STATUS"; then exit 1; fi
   exit 0
@@ -369,15 +407,24 @@ if [ -e "$OLDDIR" ] || [ -L "$OLDDIR" ]; then
   if [ ! -e "$REPO/.git" ] && [ ! -L "$REPO/.git" ]; then
     mv "$OLDDIR" "$REPO/.git" && log "leftover $OLDDIR and no .git: the old repo is back in place (an interrupted swap)" || finish failed-leftover "could not move $OLDDIR back to .git"
   else
-    # the old .git of a swap that did not get to delete it: safe to delete only when the live repo is readable and the head TREE is the same one
+    # the old .git of a swap that did not get to delete it: safe to delete only when the live repo is readable and the old head's TREE is content the live repo holds —
+    # the live head's tree, or (the exporter commits every 15 min, so by the next run the head has moved) the tree of a commit still in the live history
+    # vazio/falhou (rev-parse, log: an unreadable or half-deleted old dir) → "" and same=0: cannot know, both dirs are kept for a human
     lt="$(G rev-parse 'HEAD^{tree}' 2>/dev/null)"
     ot="$("$GITBIN" --git-dir="$OLDDIR" rev-parse 'HEAD^{tree}' 2>/dev/null)"
-    if [ -n "$lt" ] && [ "$lt" = "$ot" ] && G fsck --connectivity-only --no-dangling >/dev/null 2>&1; then
-      log "leftover $OLDDIR holds the same head tree as the live repo — deleting it"
+    same=0
+    if [ -n "$lt" ] && [ -n "$ot" ]; then
+      if [ "$lt" = "$ot" ]; then same=1
+      else
+        hist="$(G log --format=%T HEAD 2>/dev/null)" && [ -n "$hist" ] && printf '%s\n' "$hist" | grep -q -x -F -- "$ot" && same=1
+      fi
+    fi
+    if [ "$same" -eq 1 ] && G fsck --connectivity-only --no-dangling >/dev/null 2>&1; then
+      log "leftover $OLDDIR holds a head tree the live repo has (its head or a commit in its history) — deleting it"
       rm_tree "$OLDDIR" || finish failed-leftover "could not delete the leftover $OLDDIR"
     else
       CONFLICT=1   # keep both dirs for a human: the exit trap must not remove the new one
-      finish leftover-kept "$OLDDIR exists next to a live .git whose head tree is not the same (or is unreadable) — a human decides which is the repo; no cap until then ($NEWDIR, if there, is kept too)"
+      finish leftover-kept "$OLDDIR exists next to a live .git whose history does not hold the old head's tree (or one of them is unreadable) — a human decides which is the repo; no cap until then ($NEWDIR, if there, is kept too)"
     fi
   fi
 fi
@@ -391,7 +438,7 @@ if [ "$(elapsed)" -ge "$DEADLINE_S" ]; then finish failed-deadline "the run had 
 G_KIB="$(gitdir_kib "$REPO/.git")"
 if ! inspect; then finish "$STATUS" "$WHY"; fi
 if ! plan; then finish "$STATUS" "$WHY"; fi
-log "plan: $N commits, keep $KEEP_N (since $(date -u -r "$CUTOFF" +%FT%TZ 2>/dev/null)), drop $DROP_N; .git $(fmt "$G_KIB")"   # benign[plan-date]: the date only decorates the line
+log "plan: $N commits, keep $KEEP_N (since $(date -u -r "$CUTOFF" +%FT%TZ 2>/dev/null || date -u -d "@$CUTOFF" +%FT%TZ 2>/dev/null)), drop $DROP_N; .git $(fmt "$G_KIB")"   # benign[plan-date]: the date only decorates the line (BSD date -r, GNU date -d)
 
 # disk: the new pack must fit with FLOOR_KIB to spare. unreadable → inert.
 if ! estimate_kib; then finish skipped-unreadable "cannot size the baseline tree"; fi
@@ -553,6 +600,7 @@ verify_new || finish failed-verify "$WHY"
 log "step 3: the new repo is verified: ${#K_NEW[@]} commit(s), every kept tree identical, connectivity ok"
 
 # the index of the live repo matches its tree now (nothing is committing); the new repo takes it over as it is
+check_index || finish "$STATUS" "$WHY"   # again, right before the copy: something may have been staged while the fetch ran
 if [ -f "$REPO/.git/index" ]; then cp -p "$REPO/.git/index" "$NEWDIR/index" || finish failed-build "could not copy the index"; fi
 if [ "$(elapsed)" -ge "$DEADLINE_S" ]; then finish failed-deadline "the run's budget ended before the swap — nothing installed"; fi
 
@@ -591,6 +639,6 @@ fi
 log "step 5: swapped; the live .git is the new repo"
 
 # ---- step 6: the old .git goes
-if ! rm_tree "$OLDDIR"; then finish failed-cleanup "the cap is installed but the old .git at $OLDDIR could not be deleted (the next run retries)"; fi
+if ! rm_tree "$OLDDIR"; then finish failed-cleanup "the cap is installed but the old .git at $OLDDIR could not be deleted — the next run deletes it if it still reads as a repo whose head tree the live history holds; if the delete got half-way and it no longer reads, that run ends leftover-kept and a human removes the directory"; fi
 log "step 6: the old .git is deleted (was $(fmt "$BEFORE_KIB"))"
 finish capped "dropped $DROP_N of $N commits; .git $(fmt "$BEFORE_KIB") -> $(fmt "$(gitdir_kib "$REPO/.git")")"
