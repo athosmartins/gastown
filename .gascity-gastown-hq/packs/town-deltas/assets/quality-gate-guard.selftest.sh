@@ -136,6 +136,22 @@ r=$(classify_parent_gap2 0 0 1 0 1); [ "$r" = "skip:not-dispatched" ] && ok "not
 r=$(classify_parent_gap2 1 1 1 0 1); [ "$r" = "skip:live-assignee" ] && ok "live assignee → skip:live-assignee (never race a live builder)" || bad "live-assignee got '$r'"
 r=$(classify_parent_gap2 1 0 0 0 0); [ "$r" = "skip:no-sling" ] && ok "no 'Sling task bead' comment found → skip:no-sling" || bad "no-sling got '$r'"
 r=$(classify_parent_gap2 1 0 1 0 0); [ "$r" = "skip:active-sling" ] && ok "sling still open/active → skip:active-sling" || bad "active-sling got '$r'"
+# ga-0il094s: self-sling (the "Sling task bead:" id IS the parent). The parent's own
+# gate:needs-fix from the previous attempt reads as sling_needs_fix=1 and, with the
+# builder on a remote slot (live_assignee=0), used to strip story:in-flight +
+# pilot:dispatched minutes after every dispatch (ga-do1ixn.6.1: 564 commits/24 h).
+r=$(classify_parent_gap2 1 0 1 1 0 0 0 0 1); [ "$r" = "skip:self-sling" ] && ok "self-sling with its own gate:needs-fix → skip:self-sling (the loop fed through free:fail-stranded)" || bad "self-sling+needs-fix got '$r'"
+r=$(classify_parent_gap2 1 0 1 0 1 0 0 0 1); [ "$r" = "skip:self-sling" ] && ok "self-sling already closed → skip:self-sling, never free:pass-stranded" || bad "self-sling+closed got '$r'"
+r=$(classify_parent_gap2 1 0 1 0 0 0 0 0 1); [ "$r" = "skip:self-sling" ] && ok "self-sling open → skip:self-sling" || bad "self-sling open got '$r'"
+r=$(classify_parent_gap2 1 0 1 1 0 0 0 0 0); [ "$r" = "free:fail-stranded" ] && ok "a DIFFERENT sling that gate-failed still → free:fail-stranded (9th arg 0 changes nothing)" || bad "distinct sling+needs-fix got '$r'"
+r=$(classify_parent_gap2 1 0 1 1 0);          [ "$r" = "free:fail-stranded" ] && ok "9th arg omitted → old routing (backward compat)" || bad "omitted 9th arg got '$r'"
+r=$(classify_parent_gap2 1 0 0 0 0 0 0 0 1); [ "$r" = "skip:no-sling" ] && ok "no sling found outranks the self flag → skip:no-sling" || bad "no-sling+self got '$r'"
+r=$(classify_parent_gap2 0 0 1 1 0 0 0 0 1); [ "$r" = "skip:not-dispatched" ] && ok "not dispatched outranks the self flag → skip:not-dispatched" || bad "not-dispatched+self got '$r'"
+r=$(classify_parent_gap2 1 1 1 1 0 0 0 0 1); [ "$r" = "skip:live-assignee" ] && ok "live assignee outranks the self flag → skip:live-assignee" || bad "live+self got '$r'"
+# Wiring: the loop must compute the flag from sling id == parent id and hand it to the classifier.
+grep -qF '[ "$SLING_ID" = "$SC_ID" ] && SLING_IS_SELF=1' "$GUARD" && ok "Step 0c.2 sets SLING_IS_SELF when SLING_ID = SC_ID" || bad "Step 0c.2 never derives SLING_IS_SELF from SLING_ID = SC_ID"
+grep -qF '"$SLING_JANITOR_CLOSED" "$SLING_IS_SELF")' "$GUARD" && ok "Step 0c.2 passes SLING_IS_SELF as the 9th classify_parent_gap2 arg" || bad "Step 0c.2 does not pass SLING_IS_SELF to classify_parent_gap2"
+grep -qE '^      skip:self-sling\)' "$GUARD" && ok "Step 0c.2 case has a skip:self-sling arm (no label write)" || bad "Step 0c.2 case has no skip:self-sling arm"
 # ga-eu75w: every line above omits the 6th arg entirely (the pre-existing 5-arg
 # call shape) — this whole block passing unchanged IS the backward-compat proof
 # that sling_refused defaults to 0 and reproduces the exact old routing.

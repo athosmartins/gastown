@@ -1274,12 +1274,31 @@ _gap1_ensure_lifecycle_backstop() {
 #   Verdict is skip, never free: it writes no gate:* label (above all never
 #   gate:needs-remerge) and removes none; gap2_skip_janitor_stranded only
 #   releases the parent's orphaned story:in-flight/pilot:dispatched.
-# Returns: free:fail-stranded | free:refused-stranded | free:pass-stranded | skip:not-dispatched | skip:live-assignee | skip:no-sling | skip:active-sling | skip:janitor-stranded | skip:no-changes-stranded
+# sling_is_self (ga-0il094s, optional, defaults to 0 — old 8-arg callers unchanged):
+#   1 if the "Sling task bead:" id the Pilot wrote on the parent IS the parent's
+#   own id (a self-sling: Pilot re-dispatches a bead that already carries a
+#   gate:needs-fix and slings the bead itself — measured live on ga-do1ixn.6.1,
+#   564 commits/24 h). There is no second bead whose gate verdict could be read:
+#   the "sling" labels are the parent's own, so its gate:needs-fix from the
+#   PREVIOUS attempt was read as "the sling gate-failed", and with the builder on
+#   a remote slot (kimi-worker-remote-N, absent from this host's session list, so
+#   has_live_assignee=0) the arm stripped story:in-flight + pilot:dispatched
+#   minutes after each dispatch. Pilot then re-dispatched, a new paid session
+#   started, and every lap wrote ~3 bd commits (labels x2, comment) into the Dolt
+#   history that dolt_gc cannot reclaim. The verdict is skip, never free: a
+#   self-sling carries no independent evidence, so the only action that cannot be
+#   wrong is none. Whether a dead remote builder is reclaimed is the job of the
+#   in-flight reclaimers (inflight-reclaim-guard reads the bead's own assignee);
+#   this reader only judges a SEPARATE sling bead, and a self-sling has none.
+#   Checked right after skip:no-sling and BEFORE sling_needs_fix: it must outrank
+#   the one arm the bug fed through.
+# Returns: free:fail-stranded | free:refused-stranded | free:pass-stranded | skip:not-dispatched | skip:live-assignee | skip:no-sling | skip:self-sling | skip:active-sling | skip:janitor-stranded | skip:no-changes-stranded
 classify_parent_gap2() {
-  local has_pilot_dispatched="$1" has_live_assignee="$2" sling_found="$3" sling_needs_fix="$4" sling_closed="$5" sling_refused="${6:-0}" sling_no_changes="${7:-0}" sling_janitor_closed="${8:-0}"
+  local has_pilot_dispatched="$1" has_live_assignee="$2" sling_found="$3" sling_needs_fix="$4" sling_closed="$5" sling_refused="${6:-0}" sling_no_changes="${7:-0}" sling_janitor_closed="${8:-0}" sling_is_self="${9:-0}"
   [ "$has_pilot_dispatched" != "1" ] && { echo "skip:not-dispatched"; return; }
   [ "$has_live_assignee" = "1" ]     && { echo "skip:live-assignee"; return; }
   [ "$sling_found" != "1" ]          && { echo "skip:no-sling"; return; }
+  [ "$sling_is_self" = "1" ]         && { echo "skip:self-sling"; return; }
   [ "$sling_needs_fix" = "1" ]       && { echo "free:fail-stranded"; return; }
   [ "$sling_closed" != "1" ]         && { echo "skip:active-sling"; return; }
   [ "$sling_refused" = "1" ]         && { echo "free:refused-stranded"; return; }
@@ -7456,6 +7475,8 @@ if [ "$INFLIGHT_COUNT" -gt 0 ]; then
     ' 2>/dev/null | head -1 || echo "")
 
     SLING_FOUND=0
+    # ga-0il094s: 1 when the sling id is the parent itself (see classify_parent_gap2).
+    SLING_IS_SELF=0
     SLING_NEEDS_FIX=0
     SLING_CLOSED=0
     SLING_REFUSED=0
@@ -7467,6 +7488,7 @@ if [ "$INFLIGHT_COUNT" -gt 0 ]; then
 
     if [ -n "$SLING_ID" ] && [ "$SLING_ID" != "null" ]; then
       SLING_FOUND=1
+      [ "$SLING_ID" = "$SC_ID" ] && SLING_IS_SELF=1
       SLING_JSON=$(bd -C "$GC_CITY" show "$SLING_ID" --json 2>/dev/null \
         | jq 'if type=="array" then .[0] else . end' 2>/dev/null || echo "")
       SLING_STATUS=$(echo "$SLING_JSON" | jq -r '.status // ""' 2>/dev/null || echo "")
@@ -7505,7 +7527,7 @@ if [ "$INFLIGHT_COUNT" -gt 0 ]; then
       [ -n "$SLING_JANITOR_TOKEN" ] && SLING_JANITOR_CLOSED=1 || true
     fi
 
-    ACTION=$(classify_parent_gap2 "1" "$HAS_SC_ASSIGNEE" "$SLING_FOUND" "$SLING_NEEDS_FIX" "$SLING_CLOSED" "$SLING_REFUSED" "$SLING_NO_CHANGES" "$SLING_JANITOR_CLOSED")
+    ACTION=$(classify_parent_gap2 "1" "$HAS_SC_ASSIGNEE" "$SLING_FOUND" "$SLING_NEEDS_FIX" "$SLING_CLOSED" "$SLING_REFUSED" "$SLING_NO_CHANGES" "$SLING_JANITOR_CLOSED" "$SLING_IS_SELF")
 
     case "$ACTION" in
       free:fail-stranded)
@@ -7768,6 +7790,10 @@ Propagated from $SLING_ID: $GATE_FEEDBACK" 2>/dev/null || true
         ;;
       skip:no-sling)
         log "GAP-2: $SC_ID — no 'Sling task bead' comment found — safe-skip"
+        ;;
+      skip:self-sling)
+        # ga-0il094s: the sling id is the parent itself — no second bead to read a verdict from.
+        log "GAP-2: $SC_ID sling is the parent itself (self-sling) — no verdict to read, labels untouched — skip"
         ;;
       skip:active-sling)
         log "GAP-2: $SC_ID sling $SLING_ID is active (status=$SLING_STATUS) — skip"
