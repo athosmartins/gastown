@@ -590,6 +590,11 @@ g_mbp() {
   GC_SSH_HOST=m pv list-running w- </dev/null; [ "$(cat "$T/out")" = w-remote-m-3 ]; ok $? "mbp: \$GC_SSH_HOST fixa o list-running num host só"
   FAKE_SSH_FAIL_HOST=fakembp pv list-running w- </dev/null; [ $RC = 1 ] && has "$T/err" fakembp; ok $? "mbp: notebook fora do ar COM sessão nossa registrada → list-running é erro (não sei o que há lá)"
   pv stop w-remote-m-3 </dev/null; FAKE_SSH_FAIL_HOST=fakembp pv list-running w- </dev/null; [ $RC = 0 ] && has "$T/out" w-a-1 && has "$T/state/m/session-ssh.log" 'não conta'; ok $? "mbp: notebook fora do ar SEM sessão nossa → só ele sai da lista (a do servidor continua), e o log diz"
+  # ga-mswg06s: com o fato "fora" guardado (list_down_cache_s) a linha 'não conta' sai UMA vez por janela, não a cada list-running (o session-ssh.log chegou a 208 MB com o MBP fora)
+  cfgm '{"list_cache_s":30,"list_down_cache_s":30}'; rm -rf "$T/state/m/lr"; : > "$T/state/m/session-ssh.log"; fresh; nf=0
+  for i in $(seq 1 30); do GC_SSH_HOST=m FAKE_SSH_FAIL_HOST=fakembp pv list-running w- </dev/null; [ $RC = 0 ] && [ ! -s "$T/out" ] || nf=$((nf+1)); done
+  [ "$nf" = 0 ] && [ "$(grep -c 'não conta' "$T/state/m/session-ssh.log")" = 1 ] && [ "$(grep -c fakembp "$T/ssh.log")" = 1 ]; ok $? "mbp: 30 list-running com o notebook fora e sem sessão nossa (todos rc 0, lista vazia): 1 ssh e 1 linha 'não conta' no log (linhas=$(grep -c 'não conta' "$T/state/m/session-ssh.log"), falhas=$nf)"
+  cfgm
   pv stop w-a-1 </dev/null
   FAKE_SSH_FAIL_HOST=fakehost pv list-running w- </dev/null; [ $RC = 1 ] && has "$T/err" fakehost; ok $? "mbp: o host que NÃO dorme, fora do ar e sem sessão registrada, continua sendo erro (nunca lista vazia)"
   mode livre; pv start w-remote-m-4 < <(req "$HOLD"); tmux -L "${SOCK}m" kill-session -t =w-remote-m-4 2>/dev/null; pv list-running w- </dev/null; [ ! -e "$T/state/m/running/w-remote-m-4" ]; ok $? "mbp: sessão que o host já não tem sai do registro quando o host responde (o registro se corrige sozinho)"
@@ -1541,7 +1546,7 @@ g_lr() {
 g_lrd() {
   local LR="$T/state/a/lr" D="$T/state/a/lr/down.json" i s t0 bad x
   down() { rm -rf "$LR"; FAKE_SSH_FAIL=1 lrv list-running "" </dev/null; }  # estado limpo (sem lista guardada que esconda a falha) + o host fora visto uma vez: o fato 'fora' fica guardado
-  cfg 3 25 '{"list_cache_s":30,"list_down_cache_s":30}'; rm -rf "$LR"; fresh
+  cfg 3 25 '{"list_cache_s":30,"list_down_cache_s":30}'; rm -rf "$LR"; fresh; mkdir -p "$T/state/a"; : > "$T/state/a/session-ssh.log"
   t0=$SECONDS; bad=0
   for i in $(seq 1 20); do
     FAKE_SSH_FAIL=1 FAKE_SSH_FAIL_AFTER=1 lrv list-running "" </dev/null; [ $RC = 1 ] && [ ! -s "$T/out" ] || bad=$((bad+1))
@@ -1551,10 +1556,22 @@ g_lrd() {
   [ "$(calls)" = 1 ]; ok $? "lrd: ...e só a 1ª chamada tenta o ssh (ssh=$(calls); sem o cache do host fora seriam 20)"
   [ "$s" -lt 12 ]; ok $? "lrd: ...as 20 chamadas levam ${s}s (sem o cache do host fora: 20 s ou mais, o ssh leva 1 s para falhar)"
   has "$T/err" 'Connection timed out' && has "$T/err" 'guardado'; ok $? "lrd: o erro rápido leva o motivo do ssh e diz que veio do que está guardado"
+  # ga-mswg06s: as 19 chamadas que só leram o fato guardado não escrevem no session-ssh.log; só a que tentou o ssh registra a queda (com o MBP fora o log chegou a 208 MB)
+  [ "$(grep -c 'list-running.*FALHOU' "$T/state/a/session-ssh.log")" = 1 ] && [ "$(wc -c < "$T/state/a/session-ssh.log" | tr -d ' ')" -lt 2000 ]; ok $? "lrd: ...e só a que tentou o ssh vai para o session-ssh.log: 1 linha em 20 chamadas ($(grep -c . "$T/state/a/session-ssh.log") linhas, $(wc -c < "$T/state/a/session-ssh.log" | tr -d ' ') bytes)"
+  : > "$T/state/a/session-ssh.log"; bad=0
+  for i in $(seq 1 100); do FAKE_SSH_FAIL=1 lrv list-running "" </dev/null; [ $RC = 1 ] || bad=$((bad+1)); done  # o MBP fora por vários minutos, uma chamada atrás da outra
+  [ "$bad" = 0 ] && [ "$(wc -c < "$T/state/a/session-ssh.log" | tr -d ' ')" -lt 2000 ]; ok $? "lrd: 100 chamadas seguidas com o host fora (todas rc 1) deixam o session-ssh.log abaixo de 2 KB, não 14 KB (agora $(wc -c < "$T/state/a/session-ssh.log" | tr -d ' ') bytes, falhas=$bad)"
+  # erro misto: um host só pelo fato guardado e outro que falhou DE VERDADE agora → a falha nova é registrada, não some junto com a repetida
+  rm -rf "$LR"; FAKE_SSH_FAIL=1 pv list-running "" </dev/null; : > "$T/state/a/session-ssh.log"; FAKE_SSH_FAIL=1 pv list-running "" </dev/null
+  [ $RC = 1 ] && has "$T/err" 'guardado' && [ "$(grep -c 'list-running.*FALHOU' "$T/state/a/session-ssh.log")" = 1 ]; ok $? "lrd: dois hosts fora, um pelo fato guardado e o outro pelo ssh de verdade: a falha nova é registrada (rc=$RC, linhas=$(grep -c 'list-running.*FALHOU' "$T/state/a/session-ssh.log"))"
+  rm -rf "$LR"; : > "$T/state/a/session-ssh.log"
   [ ! -e "$LR/cache.json" ]; ok $? "lrd: o host fora não deixa LISTA guardada (cache.json ausente)"
   # --- vence o prazo: pergunta ao host de novo; o host de volta apaga o fato ---
   age "$D" 100; fresh; FAKE_SSH_FAIL=1 lrv list-running "" </dev/null; [ $RC = 1 ] && [ "$(calls)" = 1 ] && jq -e '.ts > (now - 20)' "$D" >/dev/null; ok $? "lrd: fato vencido pergunta ao host de novo e, ainda fora, renova o carimbo (rc=$RC)"
-  age "$D" 100; fresh; lrv list-running "" </dev/null; [ $RC = 0 ] && [ ! -s "$T/out" ] && [ "$(calls)" = 1 ] && [ ! -e "$D" ] && [ -s "$LR/cache.json" ]; ok $? "lrd: host de volta = a resposta de verdade, o fato 'fora' some e a lista passa a ser guardada (rc=$RC)"
+  # o fato vencido volta a ser pergunta ao host: a queda que ainda dura é registrada de novo (uma linha por janela, não uma por chamada)
+  : > "$T/state/a/session-ssh.log"; age "$D" 100; fresh; FAKE_SSH_FAIL=1 lrv list-running "" </dev/null; FAKE_SSH_FAIL=1 lrv list-running "" </dev/null; [ "$(grep -c 'list-running.*FALHOU' "$T/state/a/session-ssh.log")" = 1 ] && [ "$(calls)" = 1 ]; ok $? "lrd: fato vencido e host ainda fora: UMA linha nova no log (a que tentou o ssh), a 2ª chamada da janela não escreve (ssh=$(calls))"
+  age "$D" 100
+  fresh; lrv list-running "" </dev/null; [ $RC = 0 ] && [ ! -s "$T/out" ] && [ "$(calls)" = 1 ] && [ ! -e "$D" ] && [ -s "$LR/cache.json" ]; ok $? "lrd: host de volta = a resposta de verdade, o fato 'fora' some e a lista passa a ser guardada (rc=$RC)"
   # --- só "não respondeu" é guardado: resposta cortada e sem marcadores continuam erro de cada chamada ---
   rm -rf "$LR"
   fresh; FAKE_SSH_CUT=1 lrv list-running "" </dev/null; [ $RC = 1 ] && [ ! -e "$D" ] && [ ! -e "$LR/cache.json" ]; ok $? "lrd: resposta cortada (o host respondeu torto) = erro e NADA guardado: nem lista nem 'fora' (rc=$RC)"
@@ -1917,6 +1934,10 @@ case "$shn" in [1-9]*) ;; *) shard_bad;; esac
   mutant lrd "list_down_cache_s sem teto" 's/or not 0 <= self.down_ttl <= LIST_DOWN_TTL_MAX:/or not 0 <= self.down_ttl:/'
   mutant lrd "list_down_cache_s booleano aceito" 's/ or isinstance(self.down_ttl, bool)//'
   mutant lrd "sem list_down_cache_s o fato 'fora' fica desligado" 's/h.get("list_down_cache_s", LIST_DOWN_TTL)/h.get("list_down_cache_s", 0)/'
+  mutant lrd,mbp "o fato guardado volta a ser registrado no log (UnreachableCached vira Unreachable)" 's/raise UnreachableCached(f"/raise Unreachable(f"/'
+  mutant lrd "erro que só repete o fato guardado volta a ser registrado no log" 's/        if isinstance(e, FailCached):  # só o fato guardado/        if False:  # só o fato guardado/'
+  mutant lrd "falha nova de um host fora some junto com a repetida do fato guardado" 's/                bad_fresh = bad_fresh or not isinstance(e, UnreachableCached)/                pass/'
+  mutant mbp "linha 'não conta' do host que dorme sai a cada chamada" 's/                if not isinstance(e, UnreachableCached):  # a do fato guardado/                if True:  # a do fato guardado/'
   mutant lrd "list_cache_s 0 ainda guarda o fato 'fora'" 's/    gen = None if dry or not cfg.list_ttl else lr_gen(cfg)/    gen = None if dry else lr_gen(cfg)/'
   mutant lrd "dry-run usa o fato 'fora'" 's/    gen = None if dry or not cfg.list_ttl else lr_gen(cfg)/    gen = None if not cfg.list_ttl else lr_gen(cfg)/'
   mutant abort "stop não grava a marca <nome>.stop" 's/mkdir -p @RUN@ && : > @RUN@\/@NAME@\.stop/true/'

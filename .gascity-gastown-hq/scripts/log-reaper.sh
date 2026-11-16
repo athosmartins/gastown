@@ -82,6 +82,19 @@
 # O_APPEND would keep writing at its old offset after the truncate and turn
 # the file sparse (st_size back over the cap), so do not add a path here
 # before checking how its writer opens it.
+# ga-mswg06s (2026-11-16): three more files joined the list after the disk fell from
+# 7.7 to 4.9 GB (under the Pilot's 5120 MB floor, so the mini stopped building) with
+# these three unbounded: .gc/runtime/session-ssh/mbp/session-ssh.log 208MB (the MBP
+# was down and every list-running call wrote a line), .gc/ram-owner-samples.jsonl
+# 108MB and .gc/runtime/packs/dolt/dolt.log 108MB. Every writer was checked for
+# O_APPEND before the path went in (the paragraph above): session-ssh
+# (`open(..., "a")` in Cfg.log), ram-owner-sampler.py (`open(OUT, "a")`) and the dolt
+# server (measured 16/11 19:40: after the Mayor cut it to 2MB it was 2.01MB and dense,
+# 3936 blocks, not a 108MB-offset sparse file). The .jsonl keeps a partial first line
+# after a cut; both readers (ram-owner-report.load, the sampler's own rotation) skip
+# a line that is not JSON. The sampler also rotates by itself (RAM_OWNER_ROTATE_MAX_
+# BYTES, 16MB, below this class's 20MB), so this entry is the backstop for a
+# sampler that stopped running, not the first line.
 # Paths: LOG_REAPER_CAP_PATHS (empty value = none, which is how a test turns
 # the class off; unset = the real list below, except in library mode — a
 # sourced selftest never targets production paths it did not name).
@@ -164,7 +177,10 @@ $CITY/.gc/logs/scratchpad-reaper.log
 $CITY/.gc/logs/gate-merge-survival-sweep.log
 $CITY/.gc/logs/gate-merge-survival-sweep-launchd.out
 $CITY/.gc/logs/lifecycle-coherence-janitor.log
-$CITY/.gc/logs/production-drift-guard-launchd.err"
+$CITY/.gc/logs/production-drift-guard-launchd.err
+$CITY/.gc/runtime/session-ssh/mbp/session-ssh.log
+$CITY/.gc/ram-owner-samples.jsonl
+$CITY/.gc/runtime/packs/dolt/dolt.log"
 
 # wa-4j6gip glob class (see header): directories whose top-level *.log files are
 # capped. Same newline-joined-string idiom.

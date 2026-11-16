@@ -511,7 +511,7 @@ echo "=== tail-cap class: script run standalone (non-library) never reaches the 
 # The true production shape: the script itself, with the first-class list pointed
 # at a fixture and nothing said about the capped list. With PROD unset the
 # sentinel must turn the capped class into a dry-run, so this cannot truncate
-# any of the seven real files whatever their size.
+# any of the real files whatever their size.
 SA_LOG="$CAPDIR/standalone.log"
 : > "$SA_LOG"
 env -u LOG_REAPER_LIB -u LOG_REAPER_CAP_PATHS -u LOG_REAPER_PROD LOG_REAPER_LOG="$SA_LOG" LOG_REAPER_PATHS="$CAPDIR/none.log" bash "$SCRIPT"
@@ -733,6 +733,69 @@ GD="$CAPDIR/glob-standalone"; rm -rf "$GD"; mkdir -p "$GD"; mkfile "$GD/s.log" 6
 env -u LOG_REAPER_LIB -u LOG_REAPER_PROD LOG_REAPER_LOG="$SA_LOG" LOG_REAPER_PATHS="$CAPDIR/none.log" LOG_REAPER_CAP_PATHS="" LOG_REAPER_GLOB_DIRS="$GD" LOG_REAPER_CAP_MB=2 LOG_REAPER_KEEP_MB=1 bash "$SCRIPT"
 [ "$(_file_size_bytes "$GD/s.log")" = "$KEEP" ] && ok "standalone, LOG_REAPER_GLOB_DIRS=<fixture>: the knob is read and the file is cut" || bad "standalone (glob fixture): size '$(_file_size_bytes "$GD/s.log")' — log: $(cat "$SA_LOG")"
 
+echo ""
+echo "=== ga-mswg06s: session-ssh.log, ram-owner-samples.jsonl and dolt.log are capped in the real list ==="
+# The three real paths are members of the shipped list (not just "the list has ten lines").
+for want in ".gc/runtime/session-ssh/mbp/session-ssh.log" ".gc/ram-owner-samples.jsonl" ".gc/runtime/packs/dolt/dolt.log"; do
+  case "
+$PRODUCTION_CAP_REAL_DEFAULT_PATHS
+" in
+    *"/.gascity-gastown-hq/$want
+"*) ok "production list names $want" ;;
+    *) bad "production capped list does not name $want" ;;
+  esac
+done
+# End to end, with fixtures shaped like each file: a log that is one line repeated (session-ssh with
+# the MBP down), a JSONL of records (ram-owner-samples) and a plain server log (dolt). All three are
+# over a 2MB cap and must come back to the last 1MB, in place.
+CAP_MB=2; KEEP_MB=1
+LOG_REAPER_PATHS=""
+LOG_REAPER_REAL_DEFAULT_PATHS="/tmp/log-reaper-nonexistent-marker-m-$$"
+LOG_REAPER_CAP_REAL_DEFAULT_PATHS="/tmp/log-reaper-nonexistent-cap-marker-m-$$"
+ENABLED=1; DRY_RUN=0; PROD=0
+MS_SSH="$CAPDIR/session-ssh.log"; MS_RAM="$CAPDIR/ram-owner-samples.jsonl"; MS_DOLT="$CAPDIR/dolt.log"
+awk 'BEGIN{for(i=1;i<=17000;i++) print "2026-11-16T22:38:10Z mbp list-running: host sem resposta e sem sessao nossa registrada, nao conta: ssh falhou [fato guardado ha 12s, vale 30s: este ssh nem foi tentado]"}' > "$MS_SSH"
+awk 'BEGIN{for(i=1;i<=9000;i++) printf "{\"ts\": %d, \"by_owner\": {\"claude\": %d}, \"pad\": \"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\"}\n", 1790000000 + i * 300, i}' > "$MS_RAM"
+mkfile "$MS_DOLT" 60000
+MS_BYTES=$(( 1 * 1024 * 1024 ))
+for f in "$MS_SSH" "$MS_RAM" "$MS_DOLT"; do
+  [ "$(_file_size_bytes "$f")" -ge $(( 2 * 1024 * 1024 )) ] || bad "fixture $f is under the 2MB cap, the scenario below proves nothing"
+done
+LOG_REAPER_CAP_PATHS="$MS_SSH
+$MS_RAM
+$MS_DOLT"
+: > "$LOG_REAPER_LOG"
+main
+for f in "$MS_SSH" "$MS_RAM" "$MS_DOLT"; do
+  [ "$(_file_size_bytes "$f")" = "$MS_BYTES" ] && ok "${f##*/}: cut to its last keep-MB, in place" || bad "${f##*/}: size '$(_file_size_bytes "$f")' after the cycle"
+done
+grep -q "cap cycle complete: checked=3 capped=3 skipped=0 missing=0 unreadable=0 failed=0 " "$LOG_REAPER_LOG" && ok "summary: three capped, none failed or unreadable" || bad "summary mismatch — got: $(grep 'cap cycle complete' "$LOG_REAPER_LOG")"
+# The JSONL keeps a partial first line after a cut; every other line must still be a whole record,
+# and the newest record must survive (the cut keeps the END of the file).
+python3 -I - "$MS_RAM" <<'PYEOF' && ok "ram-owner-samples.jsonl: after the cut every line but the first is a whole JSON record, newest record kept" || bad "ram-owner-samples.jsonl: lines after the cut are not whole records"
+import json, sys
+lines = open(sys.argv[1]).read().split("\n")
+assert lines[-1] == "", "file must end with a newline"
+lines = lines[:-1]
+recs = [json.loads(x) for x in lines[1:]]  # the first line may be partial; all others must parse
+assert len(recs) > 100
+assert recs[-1]["ts"] == 1790000000 + 9000 * 300
+PYEOF
+# A second cycle on the capped files changes nothing (no rewrite every cycle once under the cap).
+MS_SUM="$(cksum < "$MS_SSH") $(cksum < "$MS_RAM") $(cksum < "$MS_DOLT")"
+: > "$LOG_REAPER_LOG"
+main
+[ "$MS_SUM" = "$(cksum < "$MS_SSH") $(cksum < "$MS_RAM") $(cksum < "$MS_DOLT")" ] && grep -q "capped=0 " "$LOG_REAPER_LOG" && ok "second cycle: nothing under the cap is touched" || bad "second cycle changed a file under the cap"
+# An O_APPEND writer that holds session-ssh.log open (it opens, writes one line, closes, like Cfg.log) keeps
+# landing at the end of the cut file: the size grows by exactly its line, no hole.
+mkfile "$MS_SSH" 60000
+main
+BEFORE="$(_file_size_bytes "$MS_SSH")"
+printf 'ainda escrevendo\n' >> "$MS_SSH"
+[ "$(_file_size_bytes "$MS_SSH")" = "$(( BEFORE + 17 ))" ] && ok "session-ssh.log: a later append lands right after the kept tail" || bad "session-ssh.log: append after the cut gave size '$(_file_size_bytes "$MS_SSH")' (was $BEFORE)"
+LOG_REAPER_CAP_PATHS=""
+rm -f "$MS_SSH" "$MS_RAM" "$MS_DOLT"
+
 rm -rf "$CAPDIR"
 
 echo ""
@@ -756,8 +819,11 @@ EXPECTED_CAP_PATHS="/Users/athos/gt/.gascity-gastown-hq/.gc/runtime/control-disp
 /Users/athos/gt/.gascity-gastown-hq/.gc/logs/gate-merge-survival-sweep.log
 /Users/athos/gt/.gascity-gastown-hq/.gc/logs/gate-merge-survival-sweep-launchd.out
 /Users/athos/gt/.gascity-gastown-hq/.gc/logs/lifecycle-coherence-janitor.log
-/Users/athos/gt/.gascity-gastown-hq/.gc/logs/production-drift-guard-launchd.err"
-[ "$PRODUCTION_CAP_REAL_DEFAULT_PATHS" = "$EXPECTED_CAP_PATHS" ] && ok "production constant: capped-log list matches the seven files from ga-52drsg" || bad "production constant drifted (capped list): got '$PRODUCTION_CAP_REAL_DEFAULT_PATHS'"
+/Users/athos/gt/.gascity-gastown-hq/.gc/logs/production-drift-guard-launchd.err
+/Users/athos/gt/.gascity-gastown-hq/.gc/runtime/session-ssh/mbp/session-ssh.log
+/Users/athos/gt/.gascity-gastown-hq/.gc/ram-owner-samples.jsonl
+/Users/athos/gt/.gascity-gastown-hq/.gc/runtime/packs/dolt/dolt.log"
+[ "$PRODUCTION_CAP_REAL_DEFAULT_PATHS" = "$EXPECTED_CAP_PATHS" ] && ok "production constant: capped-log list matches the seven files from ga-52drsg plus the three of ga-mswg06s" || bad "production constant drifted (capped list): got '$PRODUCTION_CAP_REAL_DEFAULT_PATHS'"
 
 [ "$PRODUCTION_GLOB_REAL_DEFAULT_DIRS" = "/Users/athos/shared/logs" ] && ok "production constant: the glob directory is the app-log directory of wa-4j6gip" || bad "production constant drifted (glob dir): got '$PRODUCTION_GLOB_REAL_DEFAULT_DIRS'"
 

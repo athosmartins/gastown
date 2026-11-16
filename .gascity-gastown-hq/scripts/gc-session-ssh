@@ -431,6 +431,16 @@ class Unreachable(Fail):
     """O host não respondeu (ssh 255 ou tempo esgotado): a ÚNICA falha que um host `sleeps` pode tirar da lista em silêncio."""
 
 
+class UnreachableCached(Unreachable):
+    """O mesmo "o host não respondeu", mas LIDO do fato guardado (lr_down_read): o ssh nem foi tentado. Já é Unreachable para todo efeito (erro rápido, host `sleeps` o tira da lista);
+    o que muda é só o log. ga-mswg06s: com o MBP fora, cada list-running gravava uma linha, e o fato guardado repete a mesma a cada chamada: 208 MB em session-ssh.log, o disco do mini abaixo do piso.
+    Quem registra a queda é a chamada que TENTOU o ssh (uma por janela de list_down_cache_s s); a que só leu o fato guardado não tem nada novo a dizer."""
+
+
+class FailCached(Fail):
+    """O erro de um list-running em que TODA falha veio do fato guardado (UnreachableCached): sai no stderr e no exit 1 como qualquer Fail, mas não vira linha de log (ga-mswg06s, ver UnreachableCached)."""
+
+
 def load_config() -> tuple:
     """(cidade, caminho, objeto) da configuração; ausente ou ilegível = Fail."""
     city = os.path.dirname(os.path.dirname(os.path.realpath(sys.argv[0])))
@@ -1366,7 +1376,7 @@ def host_live(cfg: Cfg, dry: bool) -> tuple:
             return hit, None
         down = lr_down_read(cfg, gen) if cfg.down_ttl else None
         if down is not None:  # o host não respondeu há pouco: ERRO rápido (Unreachable, como o ssh que falha de verdade), nunca lista, e o ssh nem é tentado
-            raise Unreachable(f"{down[0]} [fato guardado há {down[1]}s, vale {cfg.down_ttl}s: este ssh nem foi tentado]")
+            raise UnreachableCached(f"{down[0]} [fato guardado há {down[1]}s, vale {cfg.down_ttl}s: este ssh nem foi tentado]")
     t0 = time.time()
     try:
         _, out, _ = run(cfg, "list-running", "sessions", dry)
@@ -1395,18 +1405,22 @@ def op_list_running(prefix: str, dry: bool) -> int:
     if not hosts:
         raise Fail("a configuração não tem nenhum host")
     bad = []
+    bad_fresh = False  # alguma falha que NÃO veio do fato guardado: vazio → só as guardadas (FailCached, sem linha de log); qualquer outra, ou não saber → Fail comum, que é registrada
     for h in hosts:
         cfg = Cfg(host=h)
         try:
             live, t0 = host_live(cfg, dry)
         except Unreachable as e:  # só "não respondeu"; resposta truncada, tmux ilegível ou ssh que nem roda continuam erro
             if cfg.sleeps and not cfg.known():
-                cfg.log(f"list-running: host sem resposta e sem sessão nossa registrada, não conta: {e}")
+                if not isinstance(e, UnreachableCached):  # a do fato guardado repete a linha da chamada que tentou o ssh (ga-mswg06s)
+                    cfg.log(f"list-running: host sem resposta e sem sessão nossa registrada, não conta: {e}")
             else:
                 bad.append(str(e))
+                bad_fresh = bad_fresh or not isinstance(e, UnreachableCached)
             continue
         except Fail as e:
             bad.append(str(e))
+            bad_fresh = True
             continue
         for x in live:
             if x.startswith(prefix):
@@ -1420,7 +1434,7 @@ def op_list_running(prefix: str, dry: bool) -> int:
             except OSError:
                 pass  # sem registro legível não há o que acertar; o próximo start o refaz
     if bad:
-        raise Fail("; ".join(bad))
+        raise (Fail if bad_fresh else FailCached)("; ".join(bad))
     return 0
 
 
@@ -1566,6 +1580,8 @@ def main(argv: list) -> int:
         return OPS[op](cfg, arg, rest[1:], dry)
     except Fail as e:
         sys.stderr.write(f"gc-session-ssh {op}: {e}\n")
+        if isinstance(e, FailCached):  # só o fato guardado: a chamada que tentou o ssh já registrou a queda (ga-mswg06s)
+            return 1
         try:
             (cfg or Cfg()).log(f"{op} {arg} FALHOU: {e}")
         except Fail:

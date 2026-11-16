@@ -21,6 +21,14 @@ copytruncates known noise logs to near-zero, but this JSONL's whole purpose
 is the "faixa histórica" (item 2 of the bead) a truncate-to-empty would erase
 every cycle. Instead: keep the trailing RAM_OWNER_ROTATE_MAX_DAYS of records,
 checked cheaply (file size) before paying for a full read+rewrite.
+
+SIZE CAP (ga-mswg06s): the age rule alone let the file reach 108MB (a record is
+~26KB, measured 16/11, so 288 a day is ~7.5MB/day) and the disk of the mini fell
+under the Pilot's floor. Past RAM_OWNER_ROTATE_MAX_BYTES (16MB, ~2 days) the oldest
+WHOLE records are dropped until RAM_OWNER_ROTATE_KEEP_BYTES (8MB, ~1 day) remain,
+so the JSONL never starts on a half line. 16MB is deliberately below log-reaper.sh's 20MB
+tail cap on this same file: the reaper (which cuts at a byte, not at a record) is
+the backstop for a sampler that stopped running, never the normal path.
 """
 import json
 import os
@@ -38,6 +46,8 @@ ROTATE_MAX_DAYS = float(os.environ.get("RAM_OWNER_ROTATE_MAX_DAYS", "30"))
 # already substantial. A "light" time series (bead's own word) at one record
 # every 5min is roughly a few hundred KB per month, so this rarely fires.
 ROTATE_CHECK_MIN_BYTES = int(os.environ.get("RAM_OWNER_ROTATE_CHECK_MIN_BYTES", str(2 * 1024 * 1024)))
+ROTATE_MAX_BYTES = int(os.environ.get("RAM_OWNER_ROTATE_MAX_BYTES", str(16 * 1024 * 1024)))
+ROTATE_KEEP_BYTES = int(os.environ.get("RAM_OWNER_ROTATE_KEEP_BYTES", str(8 * 1024 * 1024)))
 NOW = int(os.environ.get("RAM_OWNER_NOW_EPOCH", str(int(time.time()))))
 PS_FIXTURE = os.environ.get("RAM_OWNER_PS_FIXTURE")
 SESSIONS_FIXTURE = os.environ.get("RAM_OWNER_SESSIONS_FIXTURE")
@@ -53,10 +63,16 @@ def notify_fail(msg):
 
 
 def rotate_if_needed(path, max_days, now):
-    """Keep only records newer than now - max_days. No-ops if the file is
-    small (cheap stat-only path) or doesn't exist yet."""
+    """Keep only records newer than now - max_days, and at most ROTATE_KEEP_BYTES
+    of them once the file passes ROTATE_MAX_BYTES. No-ops if the file is small
+    (cheap stat-only path) or doesn't exist yet."""
     try:
-        if not os.path.exists(path) or os.path.getsize(path) < ROTATE_CHECK_MIN_BYTES:
+        try:
+            size = os.stat(path).st_size
+        except FileNotFoundError:
+            return  # vazio → o arquivo ainda não existe: nada a girar (a 1ª amostra o cria)
+        # falhou/ilegível → qualquer outro erro do stat sobe para o except de fora: avisa e NÃO gira; um tamanho que não se leu nunca vale 0
+        if size < min(ROTATE_CHECK_MIN_BYTES, ROTATE_MAX_BYTES):
             return
         cutoff = now - max_days * 86400
         kept = []
@@ -71,6 +87,17 @@ def rotate_if_needed(path, max_days, now):
                     continue  # a corrupt line is dropped, not fatal — matches "unreadable != zero" only for RSS accounting, not for log hygiene
                 if rec.get("ts", 0) >= cutoff:
                     kept.append(line)
+        # teto de bytes (ga-mswg06s): vazio → nada a cortar; passou do teto → larga os registros MAIS ANTIGOS inteiros até sobrar ROTATE_KEEP_BYTES
+        total = sum(len(l.encode("utf-8")) + 1 for l in kept)
+        if kept and total > ROTATE_MAX_BYTES:
+            acc, start = 0, len(kept) - 1  # o registro mais novo fica sempre, mesmo que sozinho passe do KEEP
+            for i in range(len(kept) - 1, -1, -1):
+                n = len(kept[i].encode("utf-8")) + 1
+                if acc + n > ROTATE_KEEP_BYTES:
+                    break
+                acc += n
+                start = i
+            kept = kept[start:]
         tmp = path + ".rotate.tmp"
         with open(tmp, "w") as f:
             f.write("\n".join(kept) + ("\n" if kept else ""))

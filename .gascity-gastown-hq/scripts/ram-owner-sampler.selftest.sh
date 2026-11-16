@@ -86,6 +86,82 @@ grep -q "\"ts\": $RECENT_TS" "$TMP/rotate.jsonl" && ok "1-day-old record survive
 tail -1 "$TMP/rotate.jsonl" | grep '"gastown.dog-2"' >/dev/null && ok "new sample still appended after rotation" || bad "new sample missing after rotation"
 
 echo ""
+echo "── Scenario: byte cap (ga-mswg06s) — all records recent, file over 16MB: oldest whole records go, newest stay, no half line ──"
+NOW_T=1787700000
+python3 -I - "$TMP/bytecap.jsonl" "$NOW_T" <<'PYEOF'
+import json, sys
+out, now = sys.argv[1], int(sys.argv[2])
+pad = "x" * 1500
+with open(out, "w") as f:
+    for i in range(11500):  # ~1.6KB each: ~18MB, every record from the last 2 days (the age rule drops none)
+        f.write(json.dumps({"ts": now - 172800 + i * 10, "by_owner": {"pad": i}, "by_rig": {}, "owner_kind": {}, "total_rss_kb": 1, "unresolved_kb": 0, "pad": pad}) + "\n")
+PYEOF
+BEFORE_B=$(wc -c < "$TMP/bytecap.jsonl")
+[ "$BEFORE_B" -gt $((16*1024*1024)) ] || bad "fixture bytecap.jsonl is only $BEFORE_B bytes, under the 16MB default cap: the cases below prove nothing"
+run_sampler "$TMP/bytecap.jsonl" "$NOW_T" >/dev/null 2>"$TMP/stderr_bc"
+AFTER_B=$(wc -c < "$TMP/bytecap.jsonl")
+[ "$AFTER_B" -le $((8*1024*1024 + 4096)) ] && [ "$AFTER_B" -gt $((7*1024*1024)) ] && ok "file over the cap comes back to ~8MB (was $BEFORE_B, now $AFTER_B)" || bad "after the cut the file has $AFTER_B bytes (was $BEFORE_B), expected ~8MB"
+python3 -I - "$TMP/bytecap.jsonl" "$NOW_T" <<'PYEOF' && ok "every line after the cut is a whole JSON record, the oldest are gone, the newest kept, the new sample last" || bad "byte-cap cut left a half line, lost the newest record or kept the oldest"
+import json, sys
+lines = open(sys.argv[1]).read().split("\n")
+assert lines[-1] == "", "ends with a newline"
+recs = [json.loads(x) for x in lines[:-1]]
+now = int(sys.argv[2])
+by = [r["by_owner"].get("pad") for r in recs]
+assert by[0] is not None and by[0] > 1000, f"oldest kept = {by[0]}, the oldest records should be gone"
+assert 11499 in by, "newest fixture record lost"
+assert by[-1] is None and "gastown.dog-2" in recs[-1]["by_owner"], "the sample of this cycle is the last line"
+pads = [b for b in by if b is not None]
+assert pads == sorted(pads) and pads == list(range(pads[0], pads[0] + len(pads))), "kept records are one contiguous run, in order"
+PYEOF
+[ ! -s "$TMP/stderr_bc" ] && [ ! -e "$TMP/bytecap.jsonl.rotate.tmp" ] && ok "byte-cap cut is silent and leaves no .rotate.tmp" || bad "byte-cap cut wrote to stderr or left a tmp: $(head -c 200 "$TMP/stderr_bc")"
+# under the cap (and over the 2MB check threshold) nothing but the age rule applies: all records stay
+python3 -I - "$TMP/undercap.jsonl" "$NOW_T" <<'PYEOF'
+import json, sys
+out, now = sys.argv[1], int(sys.argv[2])
+with open(out, "w") as f:
+    for i in range(2500):  # ~4MB
+        f.write(json.dumps({"ts": now - 3600 + i, "by_owner": {"pad": i}, "by_rig": {}, "owner_kind": {}, "total_rss_kb": 1, "unresolved_kb": 0, "pad": "y" * 1500}) + "\n")
+PYEOF
+run_sampler "$TMP/undercap.jsonl" "$NOW_T" >/dev/null 2>&1
+[ "$(wc -l < "$TMP/undercap.jsonl" | tr -d ' ')" = 2501 ] && ok "file between 2MB and the cap loses nothing (2500 records + the new sample)" || bad "under-cap file lost records: $(wc -l < "$TMP/undercap.jsonl") lines"
+# the knobs: a small RAM_OWNER_ROTATE_MAX_BYTES / KEEP_BYTES cut a small file, and the newest record survives even when it alone exceeds KEEP
+python3 -I - "$TMP/knob.jsonl" "$NOW_T" <<'PYEOF'
+import json, sys
+out, now = sys.argv[1], int(sys.argv[2])
+with open(out, "w") as f:
+    for i in range(400):
+        f.write(json.dumps({"ts": now - 3600 + i, "by_owner": {"pad": i}, "by_rig": {}, "owner_kind": {}, "total_rss_kb": 1, "unresolved_kb": 0, "pad": "z" * 1000}) + "\n")
+PYEOF
+RAM_OWNER_ROTATE_MAX_BYTES=300000 RAM_OWNER_ROTATE_KEEP_BYTES=100000 run_sampler "$TMP/knob.jsonl" "$NOW_T" >/dev/null 2>&1
+KB=$(wc -c < "$TMP/knob.jsonl")
+[ "$KB" -le 101500 ] && [ "$KB" -gt 90000 ] && ok "RAM_OWNER_ROTATE_MAX_BYTES / KEEP_BYTES are honored (400KB file → ~100KB, now $KB)" || bad "knobs ignored: knob.jsonl has $KB bytes"
+NEWEST_BEFORE=$(tail -1 "$TMP/knob.jsonl")
+RAM_OWNER_ROTATE_MAX_BYTES=1000 RAM_OWNER_ROTATE_KEEP_BYTES=10 run_sampler "$TMP/knob.jsonl" "$NOW_T" >/dev/null 2>&1
+[ "$(head -1 "$TMP/knob.jsonl")" = "$NEWEST_BEFORE" ] && [ "$(wc -l < "$TMP/knob.jsonl" | tr -d ' ')" = 2 ] && ok "a KEEP smaller than one record still keeps the newest record (never empties the file)" || bad "KEEP smaller than a record emptied or kept too much: $(wc -l < "$TMP/knob.jsonl") lines"
+# unreadable size (stat fails for a reason other than "missing") → warn, do NOT cut, never treated as 0
+if [ "$(id -u)" != 0 ]; then
+  mkdir -p "$TMP/noperm"; cp "$TMP/knob.jsonl" "$TMP/noperm/s.jsonl"; chmod 000 "$TMP/noperm"
+  SAMPLER_PATH="$SAMPLER" RAM_OWNER_ROTATE_MAX_BYTES=1 RAM_OWNER_ROTATE_CHECK_MIN_BYTES=1 python3 -I - "$TMP/noperm/s.jsonl" "$NOW_T" 2>"$TMP/stderr_np" <<'PYEOF'
+import importlib.util, os, sys
+path, now = sys.argv[1], int(sys.argv[2])
+spec = importlib.util.spec_from_file_location("sampler", os.environ["SAMPLER_PATH"])
+m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
+m.rotate_if_needed(path, 30, now)
+PYEOF
+  chmod 755 "$TMP/noperm"
+  grep -q "aviso: rotação falhou" "$TMP/stderr_np" && [ "$(wc -l < "$TMP/noperm/s.jsonl" | tr -d ' ')" = "$(wc -l < "$TMP/knob.jsonl" | tr -d ' ')" ] && [ ! -e "$TMP/noperm/s.jsonl.rotate.tmp" ] && ok "size unreadable (EACCES) → warns, file untouched, no tmp (not read as 0)" || bad "unreadable-size case: stderr='$(head -c 200 "$TMP/stderr_np")'"
+fi
+# no file yet → silent no-op (the first sample creates it)
+python3 -I - "$SAMPLER" "$NOW_T" 2>"$TMP/stderr_nf" <<'PYEOF'
+import importlib.util, sys, os
+spec = importlib.util.spec_from_file_location("sampler", sys.argv[1])
+m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
+m.rotate_if_needed("/nonexistent-dir-ga-mswg06s/none.jsonl", 30, int(sys.argv[2]))
+PYEOF
+[ ! -s "$TMP/stderr_nf" ] && ok "missing file → silent no-op" || bad "missing file warned: $(head -c 200 "$TMP/stderr_nf")"
+
+echo ""
 echo "── Scenario: OUT path unwritable -> uncaught exception must notify (mirrors machine-utilization-sampler's own contract) ──"
 cat > "$TMP/notify" <<EOF
 #!/usr/bin/env bash
