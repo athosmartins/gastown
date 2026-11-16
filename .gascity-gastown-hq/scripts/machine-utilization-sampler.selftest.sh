@@ -63,7 +63,7 @@ fi
 
 echo ""
 echo "── Scenario: the sampler's reading, world by world (ga-hq1qc5y, hq-mutants lastro) ──"
-# One in-process python run. Every external read (sh, bd_list, ps_count, dolt_ok) is a stub, so each case is a small world whose record is known by hand: every flag of the
+# One in-process python run. Every external read (sh, bd_list, bd_store_rows, ps_lines, dolt_ok) is a stub, so each case is a small world whose record is known by hand: every flag of the
 # record is read on both sides of its edge (a bead exactly BUILD_FRESH_SEC old, a marker exactly GATE_STALL_MIN old, the 3-column row of `gc session list`).
 # EQUIVALENT, documented: 304e0ebd20 (`a > gate_oldest_queued_min` -> `>=`: at equality it assigns the same number).
 # EQUIVALENT 304e0ebd20: `a > gate_oldest_queued_min` -> `>=`: at equality it assigns the same number
@@ -100,37 +100,82 @@ m.sh = fake_sh("{\"issues\": [1], \"beads\": [2]}"); eq("bd_list: the issues key
 m.sh = fake_sh(""); eq("bd_list: silence is an empty list", m.bd_list("S"), [])
 eq("age_sec: none or junk is 2^30 s, a good stamp is the difference", (m.age_sec(""), m.age_sec("junk"), m.age_sec(iso(10))), (1073741824, 1073741824, 10))
 eq("labels_of: the list, else empty", (m.labels_of({"labels": ["a"]}), m.labels_of({}), m.labels_of({"labels": None})), (["a"], [], []))
-m.sh = fake_sh("3\n"); eq("ps_count: the number", m.ps_count("p"), 3)
-m.sh = fake_sh("xx"); eq("ps_count: junk is 0", m.ps_count("p"), 0)
-m.sh = fake_sh(""); eq("ps_count: silence is 0", m.ps_count("p"), 0)
+eq("ps_count: the lines the pattern matches", m.ps_count("[c]laude.*gate-reviewer", ["u 1 claude --x gate-reviewer", "u 2 grep [c]laude.*gate-reviewer", "u 3 claude", "gate-reviewer claude"]), 1)
+eq("ps_count: none is 0", m.ps_count("p", ["a", "b"]), 0)
+m.subprocess.run = lambda args, **kw: (seen.append((args, kw)), types.SimpleNamespace(returncode=0, stdout="USER PID %CPU\nu 1 2.0 x\n"))[1]
+os.environ["LC_ALL"] = "pt_BR.UTF-8"
+eq("ps_lines: one `ps aux`, C locale even when the caller runs pt-BR, the lines", (m.ps_lines(), seen[-1][0], seen[-1][1]["env"]["LC_ALL"]), (["USER PID %CPU", "u 1 2.0 x"], ["ps", "aux"], "C"))
+m.subprocess.run = lambda args, **kw: types.SimpleNamespace(returncode=1, stdout="USER PID\nu 1\n"); eq("ps_lines: a failing ps is None, not an empty list", m.ps_lines(), None)
+m.subprocess.run = lambda args, **kw: types.SimpleNamespace(returncode=0, stdout=" \n"); eq("ps_lines: silence is None, not an empty list", m.ps_lines(), None)
+def _boom(args, **kw):
+    raise OSError("no ps")
+m.subprocess.run = _boom; eq("ps_lines: a ps that cannot start is None", m.ps_lines(), None)
+m.subprocess.run = real_run
 m.sh = fake_sh("ID TEMPLATE STATE AGE\ns1 gastown.dog active 5m\ns2 x active\ns3 y\nID z active\ns4 x asleep\ns5 x active 1m\n")
 eq("active_sessions: header, short and asleep rows skipped, three columns are enough, 25 s", (m.active_sessions(), calls[-1][1]), ({"gastown.dog": 1, "x": 2}, 25))
 m.sh = fake_sh("1\n"); eq("dolt_ok: 10 s, true on a 1", (m.dolt_ok(), calls[-1][1]), (True, 10))
 m.sh = fake_sh(""); eq("dolt_ok: false on silence", m.dolt_ok(), False)
-m.sh = fake_sh("196.94"); eq("dolt_cpu_pct: one decimal, 8 s", (m.dolt_cpu_pct(), calls[-1][1]), (196.9, 8))
-m.sh = fake_sh("x"); eq("dolt_cpu_pct: junk is None", m.dolt_cpu_pct(), None)
-m.dolt_ok = lambda: False; m.dolt_cpu_pct = lambda: 12.5
+DL = "u 9 %s 0.1 1 2 ?? S 1 0:01 /x/dolt sql-server --config c"
+eq("dolt_cpu_pct: summed over the dolt lines, one decimal", m.dolt_cpu_pct(["hdr", DL % "100.04", "u 1 7.0 claude", DL % "96.9"]), 196.9)
+eq("dolt_cpu_pct: no dolt line is 0.0 (ps answered, dolt is cold)", m.dolt_cpu_pct(["hdr", "u 1 7.0 claude"]), 0.0)
+eq("dolt_cpu_pct: a dolt line with junk %CPU is None", m.dolt_cpu_pct([DL % "x"]), None)
+eq("dolt_cpu_pct: a dolt line too short to hold a %CPU is None", m.dolt_cpu_pct(["dolt sql-server"]), None)
+eq("dolt_cpu_pct: no ps lines is None", m.dolt_cpu_pct(None), None)
+good = json.dumps([{"id": "a", "labels": ["story:approved"]}])
+def fake_run(rc, out):
+    def f(args, **kw):
+        seen.append((args, kw))
+        return types.SimpleNamespace(returncode=rc, stdout=out)
+    return f
+m.subprocess.run = fake_run(0, good)
+eq("bd_store_rows: ONE cached `bd list --label-any` over the six labels, 20 s, the rows", (m.bd_store_rows("S"), seen[-1][0], seen[-1][1]["timeout"]), ([{"id": "a", "labels": ["story:approved"]}], ["bash", m.BD_LIST_CACHED, "-C", "S", "list", "--status", "open", "--json", "--label-any", "story:in-flight,story:approved,ctx:ready,story:triage,story:unrefined,story:refino-escalado"], 20))
+m.subprocess.run = fake_run(0, "[]"); eq("bd_store_rows: a real empty answer is an empty list, not a failure", m.bd_store_rows("S"), [])
+m.subprocess.run = fake_run(0, "{\"issues\": [1]}"); eq("bd_store_rows: the issues key", m.bd_store_rows("S"), [1])
+m.subprocess.run = fake_run(1, good); eq("bd_store_rows: a non-zero exit is None even with rows on stdout", m.bd_store_rows("S"), None)
+m.subprocess.run = fake_run(0, ""); eq("bd_store_rows: silence is None (a read that returned nothing), not []", m.bd_store_rows("S"), None)
+m.subprocess.run = fake_run(0, "not json"); eq("bd_store_rows: garbage is None", m.bd_store_rows("S"), None)
+m.subprocess.run = fake_run(0, "{\"id\": \"a\"}"); eq("bd_store_rows: an object with no list is None", m.bd_store_rows("S"), None)
+m.subprocess.run = fake_run(0, "{\"issues\": \"x\"}"); eq("bd_store_rows: an issues key that is not a list is None", m.bd_store_rows("S"), None)
+m.subprocess.run = fake_run(0, "5"); eq("bd_store_rows: a bare number is None", m.bd_store_rows("S"), None)
+m.subprocess.run = _boom; eq("bd_store_rows: a bd that cannot start is None", m.bd_store_rows("S"), None)
+m.subprocess.run = real_run
+R = [{"labels": ["story:approved", "ctx:ready"]}, {"labels": ["story:triage"]}, {}, {"labels": None}]
+eq("rows_with: a bead carrying two labels answers to both; no labels answers to none", ([len(m.rows_with(R, l)) for l in ("story:approved", "ctx:ready", "story:triage", "story:unrefined")]), [1, 1, 1, 0])
+m.dolt_ok = lambda: False; m.dolt_cpu_pct = lambda lines: 12.5; m.ps_lines = lambda: ["ps"]
 eq("sample: Dolt down is state unknown and nothing counted", m.sample(), {"ts": E, "working": 0, "had_work": 0, "state": "unknown", "dolt_ok": False, "reviewing": 0, "building": 0, "refining": 0, "dolt_cpu": 12.5})
-m.dolt_ok = lambda: True
+m.dolt_ok = lambda: True; m.ps_lines = lambda: None
+eq("sample: a ps that did not answer is state unknown (never zero reviewers), named", m.sample(), {"ts": E, "working": 0, "had_work": 0, "state": "unknown", "dolt_ok": True, "reviewing": 0, "building": 0, "refining": 0, "dolt_cpu": None, "read_failed": "ps"})
+m.ps_lines = lambda: ["ps"]; m.bd_list = lambda *a, **k: []
+m.bd_store_rows = lambda store: None if store == m.RIG_STORES[0] else []
+eq("sample: one store whose read failed is state unknown (never no-work-there), named", m.sample(), {"ts": E, "working": 0, "had_work": 0, "state": "unknown", "dolt_ok": True, "reviewing": 0, "building": 0, "refining": 0, "dolt_cpu": 12.5, "read_failed": m.RIG_STORES[0]})
+# the cut itself (ga-6gdsknp): a whole sample is 4 bd reads (markers + one per store) + 1 ps + 1 Dolt probe = 6 spawns, not 23
+def spawn_world(args, **kw):
+    seen.append((args, kw))
+    if args[:2] == ["ps", "aux"]:
+        return types.SimpleNamespace(returncode=0, stdout="USER PID %CPU\nu 9 5.0 x dolt sql-server\n")
+    if args[0] == "bash" and len(args) > 1 and args[1] == m.BD_LIST_CACHED:
+        return types.SimpleNamespace(returncode=0, stdout="[]")
+    return types.SimpleNamespace(returncode=0, stdout="1")
+m2 = importlib.util.module_from_spec(spec); spec.loader.exec_module(m2)
+m2.subprocess.run = spawn_world; n0 = len(seen); rec = m2.sample(); m2.subprocess.run = real_run
+eq("sample: six spawns in all (4 bd + ps + Dolt probe)", len(seen) - n0, 6)
+eq("sample: the Dolt %CPU is read from that one ps", (rec["dolt_cpu"], rec["state"]), (5.0, "idle_correct"))
+m.dolt_ok = lambda: True; m.ps_lines = lambda: ["ps"]; m.dolt_cpu_pct = lambda lines: 12.5
 def world(markers=(), inflight=(), approved=0, ready=(), refine=0, rev=0, ref=0):
     def bd(store, *labels, status="open", include_infra=False):
+        eq("only the marker read is still per label", (store, labels[0]), (m.HQ, "type:quality-gate-marker"))
+        eq("the marker read asks for infra beads", include_infra, True)
+        return [{"labels": [labels[0], "gate-status:" + s], "updated_at": iso(a * 60)} for s, a in markers]
+    def rows(store):
         if store != m.HQ:
             return []
-        l = labels[0]
-        if l == "type:quality-gate-marker":
-            eq("the marker read asks for infra beads", include_infra, True)
-            return [{"labels": [l, "gate-status:" + s], "updated_at": iso(a * 60)} for s, a in markers]
-        if l == "story:in-flight":
-            return [{"updated_at": iso(a)} for a in inflight]
-        if l == "story:approved":
-            return [{}] * approved
-        if l == "ctx:ready":
-            return [{"labels": x} for x in ready]
-        if l == "story:triage":
-            return [{}] * refine
-        return []
+        return ([{"labels": ["story:in-flight"], "updated_at": iso(a)} for a in inflight]
+                + [{"labels": ["story:approved"]}] * approved
+                + [{"labels": ["ctx:ready"] + x} for x in ready]
+                + [{"labels": ["story:triage"]}] * refine)
     m.bd_list = bd
-    m.ps_count = lambda pat: rev if "gate-reviewer" in pat else ref
+    m.bd_store_rows = rows
+    m.ps_count = lambda pat, lines: rev if "gate-reviewer" in pat else ref
     return m.sample()
 def chk(name, w, **want):
     eq(name, {k: w[k] for k in want}, want)
@@ -149,6 +194,8 @@ chk("refining with work, refining alone, work with no refiner", world(refine=2, 
 chk("refine work alone", world(refine=1), state="idle_stalled", refino_state="idle_stalled", had_work=1, working=0)
 chk("a refiner alone", world(ref=1), state="winding_down", refino_state="winding_down", refining=1, working=1, had_work=0)
 chk("ready bugs: exec:auto and not already in flight", world(ready=[["exec:auto"], ["exec:auto", "x"], ["exec:auto", "story:in-flight"], ["x"], []]), build_state="idle_stalled", avail_ready_bugs=2, had_work=1)
+m.bd_store_rows = lambda store: [{"labels": ["story:triage", "story:unrefined", "story:approved", "ctx:ready", "exec:auto", "story:in-flight"], "updated_at": iso(5)}] if store == m.HQ else []
+chk("one bead on six labels is read once and counted once per label, as six reads counted it", m.sample(), avail_refine_pending=2, avail_approved=1, avail_ready_bugs=0, n_inflight_total=1, n_building_fresh=1)
 m.subprocess.run = lambda args, **kw: seen.append((args, kw))
 m.NOTIFY = "/n"; m.notify_fail("boom")
 eq("notify_fail: titled, priority 4, captured, 10 s", seen[-1], (["/n", "-t", "Machine Utilization Sampler", "-p", "4", "\U0001f6a8 boom"], {"capture_output": True, "timeout": 10}))

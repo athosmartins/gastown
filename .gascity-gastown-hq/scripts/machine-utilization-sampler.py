@@ -29,10 +29,12 @@ The four cells the report cares about:
   !working + !had_work-> IDLE-CORRECT   (fine — empty backlog is not a failure)
 
 Runs 1x/min via launchd (com.gascity.machine-utilization-sampler). Cheap + read-only:
-a few `bd list` + one `ps` + one `gc session list`. Never mutates anything.
+4 `bd list` (the gate markers + one per store, ga-6gdsknp) + one `ps aux` + one Dolt probe.
+Never mutates anything.
 """
 import json
 import os
+import re
 import subprocess
 import sys
 import time
@@ -90,6 +92,38 @@ def bd_list(store, *labels, status="open", include_infra=False):
         return []
 
 
+# ga-6gdsknp: the per-store reads (in-flight, approved, ctx:ready and the three refine
+# labels) were six `bd list -l X` per store — 18 spawns of bash + python + bd every minute,
+# the sampler's whole cost. ONE `--label-any` read per store returns the same rows (a bead
+# with two of the labels comes once; `rows_with` splits them again, so every label is
+# counted exactly as its own read counted it).
+STORE_LABELS = ("story:in-flight", "story:approved", "ctx:ready",
+                "story:triage", "story:unrefined", "story:refino-escalado")
+
+
+def bd_store_rows(store):
+    """Open beads of `store` that carry ANY of STORE_LABELS; None when the read FAILED.
+    `bd list --json` prints `[]` for an empty answer, so empty/garbled stdout or a
+    non-zero exit is "I could not read", never "there is nothing": the caller turns it
+    into state=unknown (a measurement gap the report leaves out), not into an idle minute."""
+    args = ["bash", BD_LIST_CACHED, "-C", store, "list", "--status", "open", "--json",
+            "--label-any", ",".join(STORE_LABELS)]
+    try:
+        r = subprocess.run(args, capture_output=True, text=True, errors="replace", timeout=20)
+        if r.returncode != 0:
+            return None
+        d = json.loads(r.stdout)
+    except Exception:
+        return None
+    if isinstance(d, dict):
+        d = d.get("issues", d.get("beads"))
+    return d if isinstance(d, list) else None
+
+
+def rows_with(rows, label):
+    return [b for b in rows if label in labels_of(b)]
+
+
 def age_sec(iso):
     if not iso:
         return 1 << 30
@@ -106,12 +140,24 @@ def labels_of(b):
 
 
 # ── liveness sources ──────────────────────────────────────────────────────────
-def ps_count(pattern):
-    out = sh(["bash", "-c", f"ps aux 2>/dev/null | grep -acE '{pattern}'"])
+def ps_lines():
+    """ONE `ps aux` per sample (ga-6gdsknp: it was read three times — two process counts
+    and the Dolt %CPU — each as bash + ps + grep [+ awk]). None when the read FAILED: a
+    failed or empty `ps aux` is "I could not see the processes", never "zero reviewers"
+    (the old `grep -c` printed 0 for both). LC_ALL=C forces period decimals — this is a
+    pt-BR box where ps prints "196,9"."""
     try:
-        return int(out.strip() or "0")
+        r = subprocess.run(["ps", "aux"], capture_output=True, text=True, errors="replace",
+                           timeout=15, env=dict(os.environ, LC_ALL="C"))
     except Exception:
-        return 0
+        return None
+    if r.returncode != 0 or not r.stdout.strip():
+        return None
+    return r.stdout.splitlines()
+
+
+def ps_count(pattern, lines):
+    return sum(1 for ln in lines if re.search(pattern, ln))
 
 
 def active_sessions():
@@ -144,24 +190,28 @@ def dolt_ok():
     return "1" in out
 
 
-def dolt_cpu_pct():
+def dolt_cpu_pct(lines):
     """Best-effort total %CPU of the dolt sql-server process(es) — summed across
-    matching procs (can exceed 100% = multi-core). FREE: reads `ps`, never queries
-    Dolt (so this health probe never adds to the load it measures). Returns a float
-    or None on failure (the panel shows '—' for None). This is what surfaces the
+    matching procs (can exceed 100% = multi-core). FREE: reads the `ps aux` lines the
+    sample already holds, never queries Dolt (so this health probe never adds to the
+    load it measures). Returns a float, or None when there are no ps lines or a dolt
+    line has no readable %CPU (the panel shows '—' for None). This is what surfaces the
     Dolt-heat KPI the Mayor tracks (the 280%→21% cooling)."""
-    # LC_ALL=C forces period decimals — this is a pt-BR box where ps prints "196,9",
-    # which float() can't parse (silently yielded None before this guard).
-    out = sh(["bash", "-c",
-              "LC_ALL=C ps aux | grep '[d]olt sql-server' | LC_ALL=C awk '{s+=$3} END{printf \"%.1f\", s}'"],
-             timeout=8)
-    try:
-        return round(float(out.strip()), 1)
-    except Exception:
+    if lines is None:
         return None
+    total = 0.0
+    for ln in lines:
+        if "dolt sql-server" not in ln:
+            continue
+        try:
+            total += float(ln.split()[2])
+        except (IndexError, ValueError):
+            return None
+    return round(total, 1)
 
 
 def sample():
+    lines = ps_lines()
     if not dolt_ok():
         # measurement gap — do NOT blame the machine for our own read failure. Still
         # record dolt_cpu (ps is independent of Dolt reachability) so the heat KPI keeps
@@ -169,7 +219,15 @@ def sample():
         return {
             "ts": SAMPLE_EPOCH, "working": 0, "had_work": 0, "state": "unknown",
             "dolt_ok": False, "reviewing": 0, "building": 0, "refining": 0,
-            "dolt_cpu": dolt_cpu_pct(),
+            "dolt_cpu": dolt_cpu_pct(lines),
+        }
+    if lines is None:
+        # ga-6gdsknp: the reviewer/refino counts come from ps; a ps that did not answer is
+        # a measurement gap, not "no reviewer, no refiner" (which would flip the minute).
+        return {
+            "ts": SAMPLE_EPOCH, "working": 0, "had_work": 0, "state": "unknown",
+            "dolt_ok": True, "reviewing": 0, "building": 0, "refining": 0,
+            "dolt_cpu": None, "read_failed": "ps",
         }
     hq_markers = bd_list(HQ, "type:quality-gate-marker", include_infra=True)
     def marker_status(b):
@@ -190,14 +248,27 @@ def sample():
             if a > gate_oldest_queued_min:
                 gate_oldest_queued_min = a
 
-    reviewer_procs = ps_count(r"[c]laude.*gate-reviewer")
-    refino_procs = ps_count(r"[c]laude.*(refino|refin)")
+    reviewer_procs = ps_count(r"[c]laude.*gate-reviewer", lines)
+    refino_procs = ps_count(r"[c]laude.*(refino|refin)", lines)
 
     # in-flight, fresh (a genuinely-live builder touches its bead; stale = zombie)
+    store_rows = {}
+    for store in [HQ] + RIG_STORES:
+        rows = bd_store_rows(store)
+        if rows is None:
+            # ga-6gdsknp: one failed store read must not read as "that store has no work":
+            # the minute is a measurement gap (state=unknown), as when Dolt is down.
+            return {
+                "ts": SAMPLE_EPOCH, "working": 0, "had_work": 0, "state": "unknown",
+                "dolt_ok": True, "reviewing": 0, "building": 0, "refining": 0,
+                "dolt_cpu": dolt_cpu_pct(lines), "read_failed": store,
+            }
+        store_rows[store] = rows
+
     building = 0
     inflight_total = 0
     for store in [HQ] + RIG_STORES:
-        for b in bd_list(store, "story:in-flight"):
+        for b in rows_with(store_rows[store], "story:in-flight"):
             inflight_total += 1
             if age_sec(b.get("updated_at", "")) < BUILD_FRESH_SEC:
                 building += 1
@@ -207,13 +278,13 @@ def sample():
     ready_bugs = 0
     refine_pending = 0
     for store in [HQ] + RIG_STORES:
-        approved += len(bd_list(store, "story:approved"))
-        for b in bd_list(store, "ctx:ready"):
+        approved += len(rows_with(store_rows[store], "story:approved"))
+        for b in rows_with(store_rows[store], "ctx:ready"):
             ls = labels_of(b)
             if "exec:auto" in ls and "story:in-flight" not in ls:
                 ready_bugs += 1
         for lbl in ("story:triage", "story:unrefined", "story:refino-escalado"):
-            refine_pending += len(bd_list(store, lbl))
+            refine_pending += len(rows_with(store_rows[store], lbl))
 
     reviewing = 1 if (reviewer_procs > 0 or active_review_markers > 0) else 0
     is_building = 1 if building > 0 else 0
@@ -260,7 +331,7 @@ def sample():
         "working": working,
         "had_work": had_work,
         "dolt_ok": True,
-        "dolt_cpu": dolt_cpu_pct(),
+        "dolt_cpu": dolt_cpu_pct(lines),
         "state": (
             "productive" if (working and had_work)
             else "idle_stalled" if (had_work and not working)
