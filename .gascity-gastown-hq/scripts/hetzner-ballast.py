@@ -1231,7 +1231,8 @@ def shm_holders(cfg, root, names):
     """({nome: {pids}}, [comm de opaco conhecido], [comm de opaco desconhecido]): quais das pastas `names` (filhas diretas de `root`) algum processo do NOSSO usuário segura: cwd, root ou exe dentro dela, fd aberto, mapa de
     memória ou o nome na linha de comando. Processo de outro usuário não escreve em pasta nossa e não conta. Processo nosso que o kernel esconde (EACCES) é opaco: só a linha de comando dele prova alguma coisa; com `comm` em
     OPAQUE_OK ele não segura mais que isso, senão (ou com qualquer outro erro de leitura, ou comm que não leu: '?') é incerteza e quem chama não apaga. Processo que some no meio é ignorado. Unreadable se a tabela de processos não abre."""
-    prefix = root.rstrip("/") + "/"
+    # o kernel mostra o caminho RESOLVIDO em cwd/fd/maps e a linha de comando traz o que o processo DIGITOU: vale um prefixo ou o outro (BALLAST_SHM pode ser um symlink, como o /dev/shm -> /run/shm de algumas distros)
+    prefixes = {root.rstrip("/") + "/", os.path.realpath(root).rstrip("/") + "/"}
     held, known, unknown = {}, set(), set()
     # vazio (nenhum pid) → ninguém segura nada; falhou/ilegível (a pasta não lista) → Unreadable: sem saber quem segura, nada é órfão
     try:
@@ -1249,7 +1250,7 @@ def shm_holders(cfg, root, names):
         except OSError:
             unknown.add("?")
             continue
-        # cada leitura devolve um estado: sumiu (zumbi, thread de kernel, processo que foi embora) não diz nada; opaco e erro marcam o processo como incerteza (sorteada abaixo pelo nome dele)
+        # cada leitura devolve um estado: sumiu (zumbi, thread de kernel, processo que foi embora) não diz nada; opaco e erro marcam o processo como incerteza (classificada abaixo pelo nome dele)
         states, targets = [], []
         for what in ("cwd", "root", "exe"):
             v, s = proc_read(os.readlink, os.path.join(d, what))
@@ -1266,12 +1267,13 @@ def shm_holders(cfg, root, names):
             v, s = proc_read(read_utf8, os.path.join(d, what))
             states.append(s)
             texts.append(v)
-        for tgt in targets:
-            if tgt and tgt.startswith(prefix):
-                held.setdefault(tgt[len(prefix):].split("/", 1)[0], set()).add(int(nm))
-        for text in texts:
-            for found in shm_names_in(text or "", prefix, names):
-                held.setdefault(found, set()).add(int(nm))
+        for prefix in prefixes:
+            for tgt in targets:
+                if tgt and tgt.startswith(prefix):
+                    held.setdefault(tgt[len(prefix):].split("/", 1)[0], set()).add(int(nm))
+            for text in texts:
+                for found in shm_names_in(text or "", prefix, names):
+                    held.setdefault(found, set()).add(int(nm))
         if "opaco" in states or "erro" in states:
             comm = (proc_read(read_utf8, os.path.join(d, "comm"))[0] or "").strip() or "?"
             (unknown if "erro" in states or comm not in OPAQUE_OK else known).add(comm)

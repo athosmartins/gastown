@@ -1279,6 +1279,11 @@ g_shmscan() {
   check "shm varredura: quem segura base-x-3 NÃO segura base-x (um nome é prefixo do outro): base-x órfã, base-x-3 segurada" "base-x 1 1" "$(shm_names) $(jget shm.orfaos_n) $(jget shm.seguradas_n)"
   shm_up; shm_dir base-x 3; shm_dir base-x-3 3; shm_proc 9001; printf 'python3\0--a=%s/base-x-3/z\0--b=%s/base-x/w\0' "$SHM" "$SHM" > "$FP/9001/cmdline"; shm_age; bt
   check "shm varredura: a linha de comando cita base-x-3 primeiro e base-x depois: as DUAS são seguradas (a colisão da 1ª ocorrência não esconde a verdadeira da 2ª)" "0 2" "$(jget shm.orfaos_n) $(jget shm.seguradas_n)"
+  # BALLAST_SHM pode ser um symlink (o /dev/shm -> /run/shm de algumas distros): o kernel mostra o caminho RESOLVIDO em cwd/fd/maps, e a linha de comando traz o que o processo DIGITOU
+  shm_up; shm_dir velho 3; ln -s "$SHM" "$T/shmlink$N"; EXTRA_ENV="$EXTRA_ENV BALLAST_SHM=$T/shmlink$N"; shm_proc 9001; ln -s "$SHM/velho/sub" "$FP/9001/cwd"; shm_age; bt
+  check "shm varredura: com BALLAST_SHM symlink, o cwd (que o kernel mostra pelo caminho RESOLVIDO) segura a pasta" "0 1" "$(jget shm.orfaos_n) $(jget shm.seguradas_n)"
+  shm_up; shm_dir velho 3; ln -s "$SHM" "$T/shmlink$N"; EXTRA_ENV="$EXTRA_ENV BALLAST_SHM=$T/shmlink$N"; shm_proc 9001; printf 'python3\0--work=%s/velho/w\0' "$T/shmlink$N" > "$FP/9001/cmdline"; shm_age; bt
+  check "shm varredura: com BALLAST_SHM symlink, o caminho DIGITADO (o do symlink) na linha de comando também segura a pasta" "0 1" "$(jget shm.orfaos_n) $(jget shm.seguradas_n)"
   shm_up; shm_dir velho 3; mkdir -p "$FP/9002"; shm_age; bt
   check "shm varredura: processo que sumiu no meio (pasta sem nada) não segura nada" "1 0 []" "$(jget shm.orfaos_n) $(jget shm.seguradas_n) [$(jget shm.why)]"
   # qualquer leitura de /proc/<pid>/… que falha por OUTRO motivo que não 'não existe' ou 'sem permissão' é incerteza, mesmo com o nome do processo na lista dos conhecidos (aqui o link é uma pasta: o readlink dá EINVAL)
@@ -1947,6 +1952,8 @@ def read_cpu_prev(cfg):
 [shm] a pasta padrão não é /dev/shm@@env.get("BALLAST_SHM") or "/dev/shm"@@env.get("BALLAST_SHM") or "/tmp"
 [shm] o padrão apaga 1 pasta por varredura@@"BALLAST_SHM_MAX_REAP", 10@@"BALLAST_SHM_MAX_REAP", 1
 [shm] o prazo padrão é de 150 s@@"BALLAST_SHM_BUDGET_S", 15,@@"BALLAST_SHM_BUDGET_S", 150,
+[shm] só o prefixo digitado vale (o caminho resolvido de um symlink não casa)@@    prefixes = {root.rstrip("/") + "/", os.path.realpath(root).rstrip("/") + "/"}@@    prefixes = {root.rstrip("/") + "/"}
+[shm] só o caminho resolvido vale (o digitado na linha de comando não casa)@@    prefixes = {root.rstrip("/") + "/", os.path.realpath(root).rstrip("/") + "/"}@@    prefixes = {os.path.realpath(root).rstrip("/") + "/"}
 MUT
   "$PY" -I - "$P" "$T/mutants.txt" "$T" > "$T/mutants.idx" <<'PYEOF'
 import re, sys
