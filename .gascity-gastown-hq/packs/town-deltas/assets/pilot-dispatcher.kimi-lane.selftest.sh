@@ -251,6 +251,7 @@ run_kd_seq() {
   ) 2>&1 | tail -1
 }
 # evs — a linha do pilot_sweep que a passada acabou de emitir (a do _pilot_sweep_emit REAL), resumida: c=candidates d=dispatched g=refused_by_guard f=failed_other u=unclassified
+cnt() { cat "$WORK/pass.counters" 2>/dev/null || echo "sem-arquivo"; }
 evs() { [ -s "$EV" ] || { echo "sem-evento"; return 0; }; tail -1 "$EV" | jq -c '{c:.candidates, d:.dispatched, g:.refused_by_guard, f:.failed_other, u:.unclassified}' 2>/dev/null || echo "evento-ilegivel"; }
 cset() { printf '%s\n' "$2" > "$WORK/comments.$1"; }   # cset <id> <json>: o que `bd comments <id> --json` imprime para esse id
 cj() { jq -cn --arg t "$1" '[{author:"mayor", created_at:"2026-10-28T12:00:00Z", id:"c1", issue_id:"ga-x", text:$t}]'; }   # UM comentário, no formato do bd
@@ -270,9 +271,14 @@ reset; on; r=$(run_pass "[$KW,$N1]" "[$K1,$K2]")
 grep -q "^check wa-k3 --store $WORK/rigs/whatsapp_automation$" "$WORK/wa-check.log" && ! grep -q apply "$WORK/wa-check.log" && ok "a elegibilidade usa o classificador real via check, na loja WA — nunca apply" || bad "classificador WA: $(cat "$WORK/wa-check.log" 2>/dev/null)"
 reset; on; r=$(run_pass "[$NW]" "[]")
 [ "$r" = "small=wa-n4 big= n=1/0 dispatched=0" ] && [ ! -s "$DCALLS" ] && [ ! -e "$WORK/wa-check.log" ] && ok "CONTROLE nos dois lados: bead WA sem lane:kimi fica na pista normal e nunca chega ao Kimi nem ao classificador" || bad "WA sem lane:kimi: '$r' / $(cat "$DCALLS" "$WORK/wa-check.log" 2>/dev/null)"
-for wv in mini unknown timeout malformed missing unreadable; do
+for wv in mini unknown; do
+  reset; on; r=$(KL_WA="$wv" run_pass "[$KW]" "[]")
+  [ ! -s "$DCALLS" ] && grep -q "wa-k3 espera.*$wv" "$LINES" && [ "$(evs)" = '{"c":1,"d":0,"g":{"kimi_lane_wait":1},"f":0,"u":0}' ] && [ "$(cnt)" = "waiting=1 nqf=0" ] && ok "WA $wv (resposta do classificador): não vai ao Kimi; espera de propósito, sem falha" || bad "WA $wv: '$r' evs=$(evs) cnt=$(cnt) / $(cat "$DCALLS" "$LINES" 2>/dev/null)"
+done
+# gate-fix 3: classificador SEM resposta (timeout/erro/ausente/ilegível) não é espera calma: falha visível (failed_other + NONQUEUE_FAILS) e WARN
+for wv in timeout malformed missing unreadable; do
   reset; on; r=$(KL_WA="$wv" run_pass "[$KW]" "[]"); want="$wv"; case "$wv" in malformed|unreadable) want=error ;; esac
-  [ ! -s "$DCALLS" ] && grep -q "wa-k3 espera.*$want" "$LINES" && ok "WA $wv: não vai ao Kimi; espera com o veredito $want" || bad "WA $wv despachou ou não explicou: '$r' / $(cat "$DCALLS" "$LINES" 2>/dev/null)"
+  [ ! -s "$DCALLS" ] && grep -q "^WARN .*wa-k3 não avaliada.*$want" "$LINES" && [ "$(evs)" = '{"c":1,"d":0,"g":{},"f":1,"u":0}' ] && [ "$(cnt)" = "waiting=1 nqf=1" ] && ok "WA $wv (classificador sem resposta): não vai ao Kimi e conta como FALHA (f:1, nqf=1), com WARN" || bad "WA $wv: '$r' evs=$(evs) cnt=$(cnt) / $(cat "$DCALLS" "$LINES" 2>/dev/null)"
 done
 reset; on; r=$(KL_WA=mini run_pass "[$KW]" "[]")
 grep -q 'só node vai ao kimi-worker-wa-remote' "$LINES" &&
@@ -281,7 +287,7 @@ grep -q 'só node vai ao kimi-worker-wa-remote' "$LINES" &&
   bad "aviso WA com template errado: $(cat "$LINES")"
 for ws in error malformed absent; do
   reset; on; r=$(KL_WA_STORE="$ws" run_pass "[$KW]" "[]")
-  [ ! -s "$DCALLS" ] && grep -q 'wa-k3 espera' "$LINES" && ok "loja WA $ws: falha fechada, sem classificador e sem Kimi" || bad "loja WA $ws: '$r' / $(cat "$DCALLS" "$LINES" 2>/dev/null)"
+  [ ! -s "$DCALLS" ] && grep -q '^WARN .*wa-k3' "$LINES" && [ "$(evs)" = '{"c":1,"d":0,"g":{},"f":1,"u":0}' ] && case "$(cnt)" in "waiting=1 nqf=0"|*nqf=-*|*nqf=\?) false ;; *nqf=*) true ;; *) false ;; esac && ok "loja WA $ws: falha fechada, sem classificador e sem Kimi, e conta como FALHA (f:1, nqf>=1, WARN)" || bad "loja WA $ws: '$r' evs=$(evs) cnt=$(cnt) / $(cat "$DCALLS" "$LINES" 2>/dev/null)"
 done
 reset; on; r=$(run_pass "[$OP]" "[]")
 [ ! -s "$DCALLS" ] && grep -q 'ps-p8 espera' "$LINES" && ok "controle de escopo: prefixo fora de ga/wa continua fora da faixa Kimi" || bad "prefixo não permitido: $(cat "$DCALLS" "$LINES" 2>/dev/null)"

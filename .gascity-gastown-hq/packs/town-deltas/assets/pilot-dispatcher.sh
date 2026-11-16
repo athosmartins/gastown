@@ -13455,13 +13455,22 @@ _pilot_kimi_lane_pass() {
           wa-*)
             _kl_city=$(rig_root_path whatsapp_automation)
             if [ -z "$_kl_city" ]; then
-              _kl_other=$((_kl_other + 1)); log "  faixa Kimi: $_kl_id espera — loja whatsapp_automation ausente/ilegível; nada foi despachado"; continue
+              # não consegui saber (gc rig list falhou/ilegível) ≠ espera de propósito: soma como FALHA (failed_other + NONQUEUE_FAILS), nada vai ao nó (gate-fix 3)
+              _kl_dfault=$((_kl_dfault + 1)); _pilot_sweep_note "$_kl_id" 1 kimi_lane_failed
+              warn "ga-do1ixn.6.1: faixa Kimi: $_kl_id não avaliada — loja whatsapp_automation ausente/ilegível; nada foi despachado"; continue
             fi
             # O MESMO classificador do wa-worker decide, sem apply nem escrita: só um veredito node afirmativo pode ir ao nó. Base viva (mini), desconhecido, erro e timeout ficam fora do Kimi.
             _pilot_wa_node_pass_check "$_kl_id" "$_kl_city"
-            if [ "${_PWP_V:-error}" != node ]; then
-              _kl_other=$((_kl_other + 1)); log "  faixa Kimi: $_kl_id espera — classificador WA=$_PWP_V (só node vai ao kimi-worker-wa-remote; mini/desconhecido/falha não vai ao nó)"; continue
-            fi ;;
+            case "${_PWP_V:-error}" in
+              node) ;;
+              mini|unknown)
+                # resposta do classificador: espera de propósito (só node vai ao kimi-worker-wa-remote)
+                _kl_other=$((_kl_other + 1)); log "  faixa Kimi: $_kl_id espera — classificador WA=$_PWP_V (só node vai ao kimi-worker-wa-remote)"; continue ;;
+              *)
+                # timeout/error/missing = o classificador NÃO respondeu: FALHA visível (failed_other + NONQUEUE_FAILS), nunca espera calma; nada vai ao nó (gate-fix 3)
+                _kl_dfault=$((_kl_dfault + 1)); _pilot_sweep_note "$_kl_id" 1 kimi_lane_failed
+                warn "ga-do1ixn.6.1: faixa Kimi: $_kl_id não avaliada — classificador WA sem resposta ($_PWP_V); nada foi despachado"; continue ;;
+            esac ;;
           *) _kl_other=$((_kl_other + 1)); log "  faixa Kimi: $_kl_id espera — lane:kimi vale somente para ga-/wa- neste papel"; continue ;;
         esac
         _kl_tries=$((_kl_tries + 1))
