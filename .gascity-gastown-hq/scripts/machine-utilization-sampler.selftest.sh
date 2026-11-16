@@ -128,8 +128,17 @@ def fake_run(rc, out):
         return types.SimpleNamespace(returncode=rc, stdout=out)
     return f
 m.subprocess.run = fake_run(0, good)
-eq("bd_store_rows: ONE cached `bd list --label-any` over the six labels, 20 s, the rows", (m.bd_store_rows("S"), seen[-1][0], seen[-1][1]["timeout"]), ([{"id": "a", "labels": ["story:approved"]}], ["bash", m.BD_LIST_CACHED, "-C", "S", "list", "--status", "open", "--json", "--label-any", "story:in-flight,story:approved,ctx:ready,story:triage,story:unrefined,story:refino-escalado"], 20))
+eq("bd_store_rows: ONE cached `bd list --label-any` over the six labels, 20 s, the rows", (m.bd_store_rows("S"), seen[-1][0], seen[-1][1]["timeout"]), ([{"id": "a", "labels": ["story:approved"]}], ["bash", m.BD_LIST_CACHED, "-C", "S", "list", "--status", "open", "--json", "--label-any", "story:in-flight,story:approved,ctx:ready,story:triage,story:unrefined,story:refino-escalado", "--limit", "0"], 20))
 m.subprocess.run = fake_run(0, "[]"); eq("bd_store_rows: a real empty answer is an empty list, not a failure", m.bd_store_rows("S"), [])
+# bd list cuts at 50 rows unless `--limit 0` is in argv (ga-21kmp): fake that. 60 beads on the store, the in-flight one LAST (a low-priority bead sorts after the 50 that fit).
+BIG = [{"id": "b%d" % i, "labels": ["story:approved"]} for i in range(59)] + [{"id": "last", "labels": ["story:in-flight"]}]
+def fake_bd_cut_at_50(args, **kw):
+    i = args.index("--limit") if "--limit" in args else -1
+    uncut = i >= 0 and i + 1 < len(args) and args[i + 1] == "0"
+    return types.SimpleNamespace(returncode=0, stdout=json.dumps(BIG if uncut else BIG[:50]))
+m.subprocess.run = fake_bd_cut_at_50
+got = m.bd_store_rows("S")
+eq("bd_store_rows: a store with more than 50 beads comes back whole, the in-flight row last included", (len(got), [b["id"] for b in m.rows_with(got, "story:in-flight")]), (60, ["last"]))
 m.subprocess.run = fake_run(0, "{\"issues\": [1]}"); eq("bd_store_rows: the issues key", m.bd_store_rows("S"), [1])
 m.subprocess.run = fake_run(1, good); eq("bd_store_rows: a non-zero exit is None even with rows on stdout", m.bd_store_rows("S"), None)
 m.subprocess.run = fake_run(0, ""); eq("bd_store_rows: silence is None (a read that returned nothing), not []", m.bd_store_rows("S"), None)

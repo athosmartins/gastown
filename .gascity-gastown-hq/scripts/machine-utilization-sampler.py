@@ -96,7 +96,7 @@ def bd_list(store, *labels, status="open", include_infra=False):
 # labels) were six `bd list -l X` per store — 18 spawns of bash + python + bd every minute,
 # the sampler's whole cost. ONE `--label-any` read per store returns the same rows (a bead
 # with two of the labels comes once; `rows_with` splits them again, so every label is
-# counted exactly as its own read counted it).
+# counted exactly as its own read counted it) — provided the read is NOT cut at bd's default 50 rows, hence `--limit 0` below.
 STORE_LABELS = ("story:in-flight", "story:approved", "ctx:ready",
                 "story:triage", "story:unrefined", "story:refino-escalado")
 
@@ -106,8 +106,11 @@ def bd_store_rows(store):
     `bd list --json` prints `[]` for an empty answer, so empty/garbled stdout or a
     non-zero exit is "I could not read", never "there is nothing": the caller turns it
     into state=unknown (a measurement gap the report leaves out), not into an idle minute."""
+    # `--limit 0`: bd list cuts at 50 rows with no sign in the JSON (ga-21kmp). The six labels share this ONE read now, so
+    # a cut would drop whole labels (a P3 in-flight bead behind 50 P0-P2 approved ones) and sample() would read the
+    # missing rows as "nobody is building" — the same collapse of "could not see" into "nothing" this function guards against.
     args = ["bash", BD_LIST_CACHED, "-C", store, "list", "--status", "open", "--json",
-            "--label-any", ",".join(STORE_LABELS)]
+            "--label-any", ",".join(STORE_LABELS), "--limit", "0"]
     try:
         r = subprocess.run(args, capture_output=True, text=True, errors="replace", timeout=20)
         if r.returncode != 0:
