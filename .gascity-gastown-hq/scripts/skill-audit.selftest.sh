@@ -424,6 +424,27 @@ note "json: $OUT"
 [[ "$(json_field "$OUT" drift_count)" == "0" && "$(json_field "$OUT" offpath_count)" == "0" && "$RC" == "0" ]] && ok "clean fixture stays clean (drift=0, offpath=0, exit 0) through the python fallback" || bad "without realpath the clean fixture is not clean: rc=$RC json=$OUT"
 rm -rf "$ROOT" "$NORP"
 
+# ga-6gdsknp: the audit runs every 300 s over ~900 symlink sinks. It used to fork two `realpath` per sink; a directory link is now resolved by `cd -P` in the audit's own shell.
+# The stub counts every `realpath` the audit starts (then runs the real one). A healthy symlink fixture must start none; a link that is not a directory must still take the
+# realpath path and still be flagged — the fast path is a shortcut for the answer, never a change of it.
+scenario "symlink sinks are resolved without forking realpath (and a file link still goes through it)"
+RPSTUB="$(mktemp -d)"; RPREAL="$(command -v realpath)"
+printf '#!/bin/sh\necho x >> "$RPSTUB_LOG"\nexec "$RPSTUB_REAL" "$@"\n' > "$RPSTUB/realpath"; chmod +x "$RPSTUB/realpath"
+ROOT="$(mktemp -d)"; make_fixture "$ROOT"; write_manifest "$ROOT/city"
+: > "$ROOT/rp.log"
+OUT="$(PATH="$RPSTUB:$PATH" RPSTUB_REAL="$RPREAL" RPSTUB_LOG="$ROOT/rp.log" run_audit "$ROOT/city" "$ROOT/wa" "$ROOT/city/.gc/state/skill-manifest.json" "$SKILLS_JSON")"
+n="$(wc -l < "$ROOT/rp.log" | tr -d ' ')"
+[[ "$(json_field "$OUT" drift_count)" == "0" ]] && ok "control: the clean fixture is clean through the stub" || bad "control: drift_count != 0: $OUT"
+[[ "$n" == "0" ]] && ok "3 directory links resolved with 0 realpath processes" || bad "realpath was started $n times for 3 directory links (was 6 before ga-6gdsknp)"
+# a sink that is a link to a FILE: cd -P cannot answer, realpath_of must, and the link is still drift
+rm -f "$ROOT/city/.gc/agents/a1/.claude/skills/demo"; printf 'x\n' > "$ROOT/elsewhere"; ln -s "$ROOT/elsewhere" "$ROOT/city/.gc/agents/a1/.claude/skills/demo"
+: > "$ROOT/rp.log"
+OUT="$(PATH="$RPSTUB:$PATH" RPSTUB_REAL="$RPREAL" RPSTUB_LOG="$ROOT/rp.log" run_audit "$ROOT/city" "$ROOT/wa" "$ROOT/city/.gc/state/skill-manifest.json" "$SKILLS_JSON")"
+n="$(wc -l < "$ROOT/rp.log" | tr -d ' ')"
+[[ "$(json_field "$OUT" drift_count)" == "1" ]] && ok "a link to a file is still reported as drift" || bad "link to a file: drift_count=$(json_field "$OUT" drift_count) json=$OUT"
+[[ "$n" -ge 1 ]] && ok "and it took the realpath fallback ($n call)" || bad "link to a file never reached realpath_of (n=$n)"
+rm -rf "$ROOT" "$RPSTUB"
+
 # ── Summary ───────────────────────────────────────────────────────────────────
 echo
 echo "════════════════════════════════════════════"

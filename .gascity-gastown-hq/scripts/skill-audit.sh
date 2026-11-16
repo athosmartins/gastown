@@ -264,18 +264,51 @@ PY
 # These are the dirs AGENTS actually load skills from. city-local is authoring
 # staging (agents consume via the HQ symlink, not city-local), so it is reported
 # separately as informational, not as drift.
+#
+# The provider dirs ("<agent>/.claude/skills") are the SAME for every skill, so the
+# two recursive `find` walks (the city's .gc/agents tree and the WA crew tree) run
+# ONCE per audit, in main, into SINK_PARENTS — not once per skill (ga-6gdsknp: with
+# 11 skills that was 22 tree walks per run, every 300 s, and one run took > 2 min
+# on the loaded mini). One audit is a snapshot, so reading the trees once cannot
+# change a verdict. SINK_PARENTS must be filled in the PARENT shell (the callers
+# read consumer_sinks through `< <(...)`, whose subshell would lose a lazy cache).
+SINK_PARENTS=""
+load_sink_parents() {
+    # vazio → no provider dir found: only the HQ sink is audited (as before);
+    # falhou → `find` prints what it could read and its errors go to /dev/null, so
+    # an unreadable tree is "no sink there" — inert (flags nothing), same as before.
+    SINK_PARENTS="$(
+        find "$CITY/.gc/agents" -type d -path "*/.claude/skills" 2>/dev/null
+        find "$WA/crew" -type d -path "*/.claude/skills" 2>/dev/null
+    )"
+}
+
 consumer_sinks() {
-    local name="$1"
+    local name="$1" d
     # HQ vendor sink
     echo "$CITY/.claude/skills/$name"
-    # Every agent provider dir under the city
-    find "$CITY/.gc/agents" -type d -path "*/.claude/skills" 2>/dev/null | while IFS= read -r d; do
+    # Every agent provider dir under the city, then the WA crew member provider dirs
+    # (both already collected by load_sink_parents, in that order).
+    while IFS= read -r d; do
+        [[ -z "$d" ]] && continue
         echo "$d/$name"
-    done
-    # WA crew member provider dirs
-    find "$WA/crew" -type d -path "*/.claude/skills" 2>/dev/null | while IFS= read -r d; do
-        echo "$d/$name"
-    done
+    done <<< "$SINK_PARENTS"
+}
+
+# phys_dir <path> — set PHYS to the physical (symlink-free) path of <path> when it is,
+# or links to, a directory this shell can enter; return 1 otherwise. Same answer as
+# realpath_of for a directory, but with `cd -P` in THIS shell: no fork, no exec.
+# (ga-6gdsknp: the audit used to spawn two `realpath` processes per symlink sink —
+# 924 sinks, ~1850 processes per run, every 300 s.) The caller falls back to
+# realpath_of when this returns 1 (a symlink to a file, or a dir without x permission),
+# so the verdict never depends on the fast path being able to answer.
+phys_dir() {
+    PHYS=""
+    local here="$PWD"
+    cd -P -- "$1" 2>/dev/null || return 1
+    PHYS="$PWD"
+    cd -- "$here" 2>/dev/null || cd / || return 1
+    return 0
 }
 
 # ── Audit one skill ───────────────────────────────────────────────────────────
@@ -314,18 +347,28 @@ audit_skill() {
     fi
 
     # --- drift check across consumer sinks ---
-    local sink
+    local sink canon_real
+    # The canonical's physical path is the same for every sink: resolve it once.
+    # vazio → realpath_of printed nothing: canon_real stays "" and no symlink can match
+    # it, so every symlink sink is reported (loud, as before) — never silently "ok".
+    if phys_dir "$canon"; then canon_real="$PHYS"; else canon_real="$(realpath_of "$canon")"; fi
     while IFS= read -r sink; do
         [[ -z "$sink" ]] && continue
         # Does the consumer have this skill at all?
         if [[ -L "$sink" ]]; then
             # symlink — must resolve to canonical
             local target
-            target="$(realpath_of "$sink")"
+            if [[ ! -e "$sink" ]]; then
+                target=""                    # dangling: nothing to resolve
+            elif phys_dir "$sink"; then
+                target="$PHYS"               # fork-free answer for a directory
+            else
+                target="$(realpath_of "$sink")"   # file link / unenterable dir: the old path
+            fi
             if [[ -z "$target" || ! -e "$sink" ]]; then
                 add_divergence "$name" "$sink" "dangling symlink -> $(readlink "$sink" 2>/dev/null)"
-            elif [[ "$target" != "$(realpath_of "$canon")" ]]; then
-                add_divergence "$name" "$sink" "symlink resolves to $target, not canonical $(realpath_of "$canon")"
+            elif [[ "$target" != "$canon_real" ]]; then
+                add_divergence "$name" "$sink" "symlink resolves to $target, not canonical $canon_real"
             fi
             # symlink to canonical => identical by construction; no hash needed.
         elif [[ -e "$sink" ]]; then
@@ -347,6 +390,7 @@ info "manifest: $MANIFEST"
 
 skills="$(list_city_skills)"
 if [[ -n "$skills" ]]; then
+    load_sink_parents   # once per audit, in THIS shell (see consumer_sinks)
     while IFS=$'\t' read -r name canon; do
         [[ -z "$name" ]] && continue
         audit_skill "$name" "$canon"
