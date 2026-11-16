@@ -20,15 +20,19 @@ next-action:*, blocked*, ...). A label the caller names with `--labels` is never
 ## Who copies the labels (proof)
 
 It is `bd` itself, not a janitor, hook or reconciler: `bd create --help` lists `--no-inherit-labels`
-("Don't inherit labels from parent issue"), the store has no `.beads/hooks`, and the copy happens in four places
+("Don't inherit labels from parent issue"), the store has no `.beads/hooks`, and the copy happens in three places
 of the bd source (all fixed here): `cmd/bd/create.go` `mergeCreateLabels` (also used by `create --form`, `q` and
 the `--dry-run` previews), `internal/storage/domain/issue.go` (`InheritedLabels`) and
-`internal/storage/issueops/execution.go` `ExecuteCreate` (the proxied/API route).
+`internal/storage/issueops/execution.go` `ExecuteCreate` (the proxied/API route). A fourth copier,
+`labelUseCaseImpl.inherit` (`internal/storage/domain/label.go`, `InheritFromParent` / `InheritFromWispParent`),
+still copies every parent label UNFILTERED and is NOT touched here: it has no production caller on `861fd98b9`
+or `403e27c6d` (only the `recordingLabelUC` wrapper in `uow/notifying.go`), so there is no live effect today, but
+a future caller would bring the bug back. Filter it or delete it in the next bd change.
 
 **Why this kept happening although ga-2svou8 (07/10) already wrote a filter:** that patch was landed in the ENGINE
 tree (`consolidated/engine-window-20261023`, linked into `gc`) but the `bd` binary agents actually run for
 `bd create --parent` is built from a different repo (`/Users/athos/gt/beads`) and never got it. Measured 31/10:
-`strings <gc> | grep -c IsInheritableLabel` = 2, `strings <bd> | grep -c IsInheritableLabel` = 0 (live `bd 1.1.0`,
+`strings <gc> | grep -c IsInheritableLabel` = 1 on `gc-1.1.1-engwin1023` (the gate re-measured; 31/10 said 2), `strings <bd> | grep -c IsInheritableLabel` = 0 (live `bd 1.1.0`,
 source `861fd98b9`). Merged is not live.
 
 ## Which file goes where
@@ -47,7 +51,7 @@ Single source: `internal/types/label_inherit.go` (`IsInheritableLabel`, `FilterI
 case-sensitive prefixes, not substrings (`gates:review`, `mygate:x`, a bare `pilot` stay inherited).
 
 - Never inherited, by prefix: `gate:` `gate-` `pilot:` `pool:` `lifecycle:` `delivery:` `next-action:` `blocked:`
-  `blocked-` `audit:` `auto-refino:` `refino:` `impacto:`.
+  `blocked-` `audit:` `auto-refino:` `refino:` `refino-gate:` `impacto:`.
 - Never inherited, exact: `exec:manual` `needs-human` `needs-human-decision` `ctx:thin` `scope:needs-review`.
 - `story:` is blocked as a NAMESPACE; only `story:approved`, `story:unrefined`, `story:needs-refino`,
   `story:needs-device` are inherited. A story state added later is therefore not inherited until someone lists
@@ -67,6 +71,10 @@ with the Go file inside the `.bd-repo.diff`, so they cannot drift.
 
 - Verified: both diffs apply clean to the bases above; `gofmt -e -l` clean on every touched file; no identifier
   collision in package `types` / `cmd/bd`; the expected output of every new test was hand-traced against the policy.
+- 16/11 (gate non-blocking findings, ga-gweig12): added the `refino-gate:` prefix (the refino gate's claim/verdict state: neither
+  `refino:` nor `gate-` matched it, so it was still inherited) to the policy, both patches, the sweep mirror and the test rows; fixed the conformance
+  comment (the seeded parent is open, not closed). Both diffs re-checked with `git apply --check` on their bases. `go test`
+  was tried again and the MBP was unreachable (`ssh rc=255`), so it is STILL not run.
 - **NOT run: `go test` / `go vet`.** The MBP preflight refused (rc 98, `swap 8790..9022 MB >= 8192 MB`, stable for
   over 30 min while `Modo: LIVRE`) and the mini is below the 13 GB Go disk floor, so by doctrine nothing was run
   on the mini. Run, from the bd worktree (`/Users/athos/gt/.gc-worktrees/bd-ga-y5z6hzh`, diff staged, not

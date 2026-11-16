@@ -76,7 +76,7 @@ SAFE_TOKEN = re.compile(r"[A-Za-z0-9][A-Za-z0-9:._@+=/-]*")
 # ── policy mirror of internal/types/label_inherit.go (bd patch ga-y5z6hzh) ──────────────────────────────
 NON_INHERITABLE_PREFIXES = (
     "gate:", "gate-", "pilot:", "pool:", "lifecycle:", "delivery:", "next-action:",
-    "blocked:", "blocked-", "audit:", "auto-refino:", "refino:", "impacto:",
+    "blocked:", "blocked-", "audit:", "auto-refino:", "refino:", "refino-gate:", "impacto:",
 )
 NON_INHERITABLE_EXACT = frozenset({
     "exec:manual", "needs-human", "needs-human-decision", "ctx:thin", "scope:needs-review",

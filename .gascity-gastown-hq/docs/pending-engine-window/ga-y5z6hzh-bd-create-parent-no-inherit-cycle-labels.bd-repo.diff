@@ -1,5 +1,5 @@
 diff --git a/backend/conformance/lifecycle_create_contract.go b/backend/conformance/lifecycle_create_contract.go
-index 831974df7..266fe17b0 100644
+index 831974df7..906f791ff 100644
 --- a/backend/conformance/lifecycle_create_contract.go
 +++ b/backend/conformance/lifecycle_create_contract.go
 @@ -348,7 +348,18 @@ func RunLifecycleCreateInheritsParentLabels(t *testing.T, ctx context.Context, f
@@ -7,8 +7,8 @@ index 831974df7..266fe17b0 100644
  
  	parent := fixture.IssuePrefix + "-lcc-inherit-parent"
 -	seedLifecycleCreateIssue(t, ctx, fixture, lifecycleCreateIssue(parent, "lcc-shared", "lcc-from-parent"))
-+	// The parent is a CLOSED, gated one: besides the two classification labels
-+	// it carries the cycle state of the process it already went through. A child
++	// The parent carries the cycle state of a gated bead: besides the two
++	// classification labels it holds the state of the process it went through. A child
 +	// born under it is new work and must not inherit any of that state
 +	// (ga-y5z6hzh: slices of closed parents were born gate:passed/story:done and
 +	// the dispatcher skipped them in silence).
@@ -17,7 +17,7 @@ index 831974df7..266fe17b0 100644
 +		"gate:passed", "story:done", "story:gate", "story:in-flight", "story:epic-split",
 +		"gate-approved:0123456789abcdef0123456789abcdef01234567",
 +		"exec:manual", "pilot:no-auto-dispatch", "pilot:reclaim-count:1",
-+		"delivery:tested", "next-action:mayor",
++		"delivery:tested", "next-action:mayor", "refino-gate:reviewing",
 +	))
  
  	inherited, err := fixture.Lifecycle.Create(ctx, publicops.CreateRequest{
@@ -163,10 +163,10 @@ index ed29ed820..554e90fea 100644
  	if issue.ID == "" && attempt.ParentID != "" {
 diff --git a/internal/types/label_inherit.go b/internal/types/label_inherit.go
 new file mode 100644
-index 000000000..67221b19e
+index 000000000..2b49ad920
 --- /dev/null
 +++ b/internal/types/label_inherit.go
-@@ -0,0 +1,91 @@
+@@ -0,0 +1,92 @@
 +package types
 +
 +import "strings"
@@ -201,6 +201,7 @@ index 000000000..67221b19e
 +	"audit:",       // post-merge audit state
 +	"auto-refino:", // refiner progress on this bead
 +	"refino:",      // refiner verdicts on this bead
++	"refino-gate:", // refino gate claim/verdict: reviewing, escalated, inconsistent-verdict
 +	"impacto:",     // live-damage mark, backed by evidence about one specific bead
 +}
 +
@@ -260,10 +261,10 @@ index 000000000..67221b19e
 +}
 diff --git a/internal/types/label_inherit_test.go b/internal/types/label_inherit_test.go
 new file mode 100644
-index 000000000..19bd33e3e
+index 000000000..616505dfd
 --- /dev/null
 +++ b/internal/types/label_inherit_test.go
-@@ -0,0 +1,123 @@
+@@ -0,0 +1,126 @@
 +package types
 +
 +import (
@@ -314,6 +315,9 @@ index 000000000..19bd33e3e
 +		{"audit:pending", false},
 +		{"auto-refino:refining", false},
 +		{"refino:info-gap", false},
++		{"refino-gate:reviewing", false},
++		{"refino-gate:escalated", false},
++		{"refino-gate:inconsistent-verdict", false},
 +		{"impacto:dano-ao-vivo", false},
 +		{"needs-human", false},
 +		{"needs-human-decision", false},

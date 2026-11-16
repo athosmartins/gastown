@@ -7,8 +7,8 @@ index 831974df7..266fe17b0 100644
  
  	parent := fixture.IssuePrefix + "-lcc-inherit-parent"
 -	seedLifecycleCreateIssue(t, ctx, fixture, lifecycleCreateIssue(parent, "lcc-shared", "lcc-from-parent"))
-+	// The parent is a CLOSED, gated one: besides the two classification labels
-+	// it carries the cycle state of the process it already went through. A child
++	// The parent carries the cycle state of a gated bead: besides the two
++	// classification labels it holds the state of the process it went through. A child
 +	// born under it is new work and must not inherit any of that state
 +	// (ga-y5z6hzh: slices of closed parents were born gate:passed/story:done and
 +	// the dispatcher skipped them in silence).
@@ -17,7 +17,7 @@ index 831974df7..266fe17b0 100644
 +		"gate:passed", "story:done", "story:gate", "story:in-flight", "story:epic-split",
 +		"gate-approved:0123456789abcdef0123456789abcdef01234567",
 +		"exec:manual", "pilot:no-auto-dispatch", "pilot:reclaim-count:1",
-+		"delivery:tested", "next-action:mayor",
++		"delivery:tested", "next-action:mayor", "refino-gate:reviewing",
 +	))
  
  	inherited, err := fixture.Lifecycle.Create(ctx, publicops.CreateRequest{
@@ -116,7 +116,7 @@ diff --git a/third_party/beads/internal/types/label_inherit.go b/third_party/bea
 index 2f40ebabf..67221b19e 100644
 --- a/third_party/beads/internal/types/label_inherit.go
 +++ b/third_party/beads/internal/types/label_inherit.go
-@@ -2,38 +2,74 @@ package types
+@@ -2,38 +2,75 @@ package types
  
  import "strings"
  
@@ -165,6 +165,7 @@ index 2f40ebabf..67221b19e 100644
 +	"audit:",       // post-merge audit state
 +	"auto-refino:", // refiner progress on this bead
 +	"refino:",      // refiner verdicts on this bead
++	"refino-gate:", // refino gate claim/verdict: reviewing, escalated, inconsistent-verdict
 +	"impacto:",     // live-damage mark, backed by evidence about one specific bead
  }
  
@@ -213,7 +214,7 @@ diff --git a/third_party/beads/internal/types/label_inherit_test.go b/third_part
 index 7bdf79ffe..19bd33e3e 100644
 --- a/third_party/beads/internal/types/label_inherit_test.go
 +++ b/third_party/beads/internal/types/label_inherit_test.go
-@@ -10,28 +10,90 @@ func TestIsInheritableLabel(t *testing.T) {
+@@ -10,28 +10,93 @@ func TestIsInheritableLabel(t *testing.T) {
  		label string
  		want  bool
  	}{
@@ -259,6 +260,9 @@ index 7bdf79ffe..19bd33e3e 100644
 +		{"audit:pending", false},
 +		{"auto-refino:refining", false},
 +		{"refino:info-gap", false},
++		{"refino-gate:reviewing", false},
++		{"refino-gate:escalated", false},
++		{"refino-gate:inconsistent-verdict", false},
 +		{"impacto:dano-ao-vivo", false},
 +		{"needs-human", false},
 +		{"needs-human-decision", false},
@@ -310,7 +314,7 @@ index 7bdf79ffe..19bd33e3e 100644
  		{"", true},
  	}
  	for _, tc := range cases {
-@@ -42,17 +104,17 @@ func TestIsInheritableLabel(t *testing.T) {
+@@ -42,17 +107,17 @@ func TestIsInheritableLabel(t *testing.T) {
  }
  
  func TestFilterInheritableLabels(t *testing.T) {
