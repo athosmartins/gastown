@@ -1,5 +1,9 @@
 max_active_sessions = 1
-min_active_sessions = 1
+# ga-esorlre.8: min 0 como as outras 9 crews. Com min=1 o motor trata o oracle como sessao de POOL (bead efemera);
+# no boot o start fica deferred_by_wake_budget, a bead sem trabalho e varrida (gc_swept) e o piso cria OUTRA, com
+# session_key novo: a conversa e o arm do live-conversation-capture se perdem em todo reboot. "Sempre de pe" agora e
+# do crew-no-session-alarm (CREWS_ALWAYS_UP=oracle-wa) + pin_awake da sessao manual, nao do piso do config.
+min_active_sessions = 0
 work_dir = "/Users/athos/gt/whatsapp_automation/crew/oracle"
 provider = "claude-rc-oracle"
 

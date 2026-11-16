@@ -240,11 +240,26 @@ sc_unrecordable() { [ "$(id -u)" != 0 ] || return 2          # root can write th
                   baseline; pass1; chmod a-w "$SD"; pass2; chmod u+w "$SD"; [ "$(mails)" = 0 ]; }
 sc_unsafe()     { baseline; cfg_agent "evil name;x" "" 1; episode; [ "$(mails)" = 1 ] && ! grep -q 'evil' "$T/fake/mail.1.subject" && logged 'skipped_unknown=1'; }
 sc_dry()        { baseline; pass1; pass2 DRY_RUN=1; [ "$(mails)" = 0 ] && logged 'DRY_RUN would MAIL' && [ "$(awk '{print $3}' "$OF")" = 0 ]; }
+# ga-esorlre.8: oracle-wa as it is committed now — min_active_sessions = 0 (manual session bead); only CREWS_ALWAYS_UP says "must be up".
+# Each helper checks that its edit landed: a fixture that silently stayed at min = 1 would make every L scenario vacuous.
+oracle_floor0() { perl -0pi -e 's/(name = "oracle-wa"\nprovider[^\n]*\nmax_active_sessions = 1\nmin_active_sessions = )1/${1}0/' "$T/fake/config.toml"
+                  perl -0ne 'exit(/name = "oracle-wa"\nprovider[^\n]*\nmax_active_sessions = 1\nmin_active_sessions = 0\n/ ? 0 : 1)' "$T/fake/config.toml"; }
+oracle_suspend() { perl -0pi -e 's/name = "oracle-wa"\n/name = "oracle-wa"\nsuspended = true\n/' "$T/fake/config.toml"
+                   grep -q '^suspended = true' "$T/fake/config.toml"; }
+sc_list_floor0()  { baseline; oracle_floor0 || return 1; episode
+                    [ "$(mails)" = 1 ] && grep -q 'oracle-wa' "$T/fake/mail.1.subject" && grep -q 'min_active_sessions = 0; sempre de pé por CREWS_ALWAYS_UP' "$T/fake/mail.1.body"; }
+sc_list_off()     { baseline; oracle_floor0 || return 1; episode CREWS_ALWAYS_UP=; [ "$(mails)" = 0 ] && [ ! -f "$OF" ] && logged "CREWS_ALWAYS_UP='', not suspended): 0"; }
+sc_list_live()    { baseline; oracle_floor0 || return 1; sess oracle-wa active; episode; [ "$(mails)" = 0 ] && [ ! -f "$OF" ]; }
+sc_list_susp()    { baseline; oracle_floor0 || return 1; oracle_suspend || return 1; episode; [ "$(mails)" = 0 ] && [ ! -f "$OF" ]; }
+sc_list_unknown() { baseline; oracle_floor0 || return 1; episode "CREWS_ALWAYS_UP=oracle-wa ghost-wa"
+                    [ "$(mails)" = 1 ] && logged 'skip:always-up-unknown:ghost-wa' && logged 'skipped_unknown=1'; }
+sc_list_two()     { baseline; oracle_floor0 || return 1; episode "CREWS_ALWAYS_UP=oracle-wa,digo-wa"
+                    [ "$(mails)" = 1 ] && grep -q 'oracle-wa' "$T/fake/mail.1.subject" && grep -q 'digo-wa' "$T/fake/mail.1.subject"; }
 
 echo "A. baseline: the 10/10 incident — oracle-wa (min_active_sessions = 1), no session at all for 11 min"
 baseline; pass1;                                                                        expect "first sighting only starts the absence clock (no mail yet)" 0
 said "...logged as an observation, not an alarm" 'clock started'
-said "...and the log counts the crews that must be up" 'must be up (min_active_sessions >= 1, not suspended): 1'
+said "...and the log counts the crews that must be up" "crews that must be up (min_active_sessions >= 1 or in CREWS_ALWAYS_UP='oracle-wa', not suspended): 1"
 [ "$(cat "$OF" 2>/dev/null)" = "$NOW0 $NOW0 0" ] && ok "absence clock recorded: '<first> <last> <alarmed=0>'" || bad "state file: [$(cat "$OF" 2>/dev/null)]"
 pass2;                                                                                  expect "11 min later, still no live session => ONE mail to the Mayor" 1
 [ "$(cat "$T/fake/mail.1.to" 2>/dev/null)" = "mayor" ] && ok "mail addressed to mayor" || bad "mail addressed to '$(cat "$T/fake/mail.1.to" 2>/dev/null)'"
@@ -345,6 +360,16 @@ if [ "$BASH_RUN" != bash ] && command -v bash >/dev/null 2>&1; then
 else ok "(only one bash in play — skipped)"; fi
 
 # ---- X: mutants — each load-bearing line broken; the matching scenario MUST fail ---------------------------
+echo "L. CREWS_ALWAYS_UP (ga-esorlre.8): oracle-wa is min_active_sessions = 0 now, the list is what says 'must be up'"
+check "oracle-wa min=0 + default list: no session for 11 min => ONE mail, body says why" sc_list_floor0
+check "oracle-wa min=0 + EMPTY list (set but empty = no list): never checked"            sc_list_off
+check "oracle-wa min=0 + list, live session: no mail and no clock kept"                   sc_list_live
+check "a SUSPENDED crew named in the list is not checked"                                 sc_list_susp
+check "a name in the list that is no [[agent]]: counted and named as UNKNOWN, rest still alarms" sc_list_unknown
+check "comma-separated list covers two crews (oracle-wa min 0, digo-wa min 0): ONE mail naming both" sc_list_two
+baseline; oracle_floor0 || bad "fixture: oracle-wa min=0 edit did not land"; sess oracle-wa active; cfg_agent crewx gastown 0; episode "CREWS_ALWAYS_UP=gastown/crewx"; expect "a rig crew is listed as 'dir/name' (gastown/crewx min 0 missing => mails)" 1
+baseline; oracle_floor0 || bad "fixture: oracle-wa min=0 edit did not land"; episode;        expect "UNSET list = the default (oracle-wa): same 11 min absence mails" 1
+
 echo "X. mutants: the scenario that guards each line must FAIL when the line is broken"
 cat > "$T/mutate.py" <<'PY'
 import sys
@@ -374,7 +399,7 @@ mutant other_template_counts 's.get("template") == tmpl and' '' sc_other_tmpl "a
 mutant live_keeps_clock '    forget "$stf"
     continue' '    continue' sc_recovery "a returning session leaves the old clock (a flap reads as one long outage)"
 mutant no_gap_restart 'if [ $((NOW - ST_LAST)) -gt "$GAP_SEC" ]; then' 'if false; then' sc_gap "an unobserved gap counted as proven absence"
-mutant floor0_checked 'if floor < 1 or ' 'if ' sc_floor0 "a crew with min_active_sessions = 0 is checked"
+mutant floor0_checked '(floor < 1 and not listed) or ' '' sc_floor0 "a crew with min_active_sessions = 0 that is not in the list is checked"
 mutant suspended_checked ' or a.get("suspended") or ' ' or ' sc_suspended "a suspended agent is checked"
 mutant rig_susp_checked ' or (d and d in susp_rigs)' '' sc_rig_susp "an agent in a suspended rig is checked"
 mutant cfg_rc_ignored 'if [ "$rc" -ne 0 ] || [ ! -s "$CFG_FILE" ]; then log "WARN: gc config show' 'if [ ! -s "$CFG_FILE" ]; then log "WARN: gc config show' sc_cfg_fail "a failed config read is trusted"
@@ -391,6 +416,10 @@ mutant unsafe_accepted 'if not name or not re.fullmatch' 'if not name or False a
 mutant dry_run_sends 'if [ "$DRY_RUN" = "1" ]; then
     log "DRY_RUN would MAIL' 'if false; then
     log "DRY_RUN would MAIL' sc_dry "DRY_RUN mails and writes marks"
+mutant list_ignored 'listed = tmpl in always' 'listed = False' sc_list_floor0 "CREWS_ALWAYS_UP read but never applied (oracle-wa min=0 is not watched: the ga-esorlre.8 blind spot)"
+mutant list_beats_suspended 'or a.get("suspended") or' 'or (a.get("suspended") and not listed) or' sc_list_susp "a suspended crew in the list is alarmed (Athos parked it on purpose)"
+mutant empty_list_is_default 'CREWS_ALWAYS_UP="${CREWS_ALWAYS_UP-oracle-wa}"' 'CREWS_ALWAYS_UP="${CREWS_ALWAYS_UP:-oracle-wa}"' sc_list_off "an explicitly empty list turns back into the default"
+mutant always_unknown_silent 'sys.stderr.write("skip:always-up-unknown:%s\n" % n)' 'pass' sc_list_unknown "a listed crew that is not in the config is dropped without a word"
 
 echo
 echo "crew-no-session-alarm selftest: $PASS passed, $FAIL failed"

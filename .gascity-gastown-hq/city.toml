@@ -452,7 +452,7 @@ max_active_sessions = 6
 [[patches.agent]]
 dir = ""
 name = "oracle-wa"
-min_active_sessions = 1
+min_active_sessions = 0
 # END ga-23z6a eval-window-concurrency-guard
 
 # ga-hnn7l: pool sessions (dog/wa-worker/ps-worker) get zero scoped

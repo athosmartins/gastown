@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # crew-no-session-alarm.sh — ga-4ytmas (item 3): ALARM the Mayor when a crew the config says must always be up
-# (an [[agent]] with min_active_sessions >= 1, not suspended) has NO live session for >= MISSING_SEC (10 min).
+# (an [[agent]] with min_active_sessions >= 1, OR named in CREWS_ALWAYS_UP; not suspended) has NO live session for
+# >= MISSING_SEC (10 min).
 # DETECTION ONLY: one mail per episode and nothing else — it never starts, wakes, nudges, closes or kills a
 # session (selftest K fails if it ever calls anything but `gc config show|session list|mail send`).
 #
@@ -17,8 +18,15 @@
 # This is the missing inverse: desired by config, absent in `gc session list`.
 #
 # WHAT "DESIRED" MEANS HERE. `gc config show` (the resolved city config) lists every [[agent]]; the always-on
-# floor is min_active_sessions. A crew is checked when that floor is >= 1, the agent is not `suspended`, and
-# its rig (if any) is not suspended. Today that is exactly oracle-wa. [[named_session]] mode = "always" is NOT
+# floor is min_active_sessions. A crew is checked when that floor is >= 1 OR its template is in CREWS_ALWAYS_UP
+# (default "oracle-wa"; comma/space separated; set it to "" to turn the list off), the agent is not `suspended`,
+# and its rig (if any) is not suspended.
+# WHY THE LIST (ga-esorlre.8): oracle-wa used to be the only agent with min_active_sessions = 1, and that floor
+# is what made the engine treat it as a POOL session (ephemeral bead, swept at every boot, conversation lost).
+# It is now min = 0 with a MANUAL session bead like the other crews, so the floor no longer says "must be up";
+# the list does. A name in the list that is not an [[agent]] in the config is reported as skip:always-up-unknown
+# (counted and named, never dropped): a crew we were told to watch but cannot find is UNKNOWN, not fine.
+# [[named_session]] mode = "always" is NOT
 # read on purpose: in this town the always-mode witnesses (and the suspended deacon/boot) sit `asleep` by
 # design — MEASURED 10/10 in `gc session list --json` — so counting them would be a permanent false alarm.
 # A session is LIVE only in state `active`; creating / start-pending / draining / asleep / orphaned ... are
@@ -69,6 +77,9 @@ REALARM_SEC="${CREW_ALARM_REALARM_SEC:-21600}"      # a crew still missing is ma
 GAP_SEC="${CREW_ALARM_GAP_SEC:-1800}"               # observations further apart than this do not form one episode
 CALL_TIMEOUT="${CREW_ALARM_CALL_TIMEOUT:-120}"      # one `gc config show` / `gc session list` call (MEASURED 5-37 s at load 50-80)
 DRY_RUN="${DRY_RUN:-0}"
+# ga-esorlre.8: crews that must be up even though their floor is 0 (a manual session bead, like every crew).
+# `-` not `:-`: an explicitly EMPTY CREWS_ALWAYS_UP means "no list", only an UNSET one takes the default.
+CREWS_ALWAYS_UP="${CREWS_ALWAYS_UP-oracle-wa}"; export CREWS_ALWAYS_UP
 NOW="${CREW_ALARM_NOW:-$(date +%s)}"                # overridable so the selftest is deterministic
 
 mkdir -p "$(dirname "$LOG")" "$(dirname "$LOCK_FILE")" 2>/dev/null || true
@@ -106,7 +117,7 @@ if [ "$rc" -ne 0 ] || [ ! -s "$SESS_FILE" ]; then log "WARN: gc session list fai
 # Join, one line per desired crew:  template|floor|live(0/1)|best-state|sessions
 # (non-whitespace delimiter on purpose: `read` would collapse empty tab-separated fields)
 python3 - "$CFG_FILE" "$SESS_FILE" > "$JOIN_FILE" 2> "$SKIP_FILE" <<'PY'
-import json, re, sys
+import json, os, re, sys
 try:
     import tomllib
 except Exception:
@@ -124,6 +135,8 @@ try:
     assert isinstance(sessions, list)
 except Exception:
     sys.exit(4)                      # unparseable session list: NOT the same as "zero sessions"
+always = set(x for x in re.split(r"[,\s]+", os.environ.get("CREWS_ALWAYS_UP", "")) if x)
+seen_always = set()
 susp_rigs = set(r.get("name") for r in (cfg.get("rigs") or []) if isinstance(r, dict) and r.get("suspended"))
 RANK = ["active", "creating", "start-pending", "draining", "asleep"]
 for a in agents:
@@ -135,9 +148,12 @@ for a in agents:
         floor = int(a.get("min_active_sessions") or 0)
     except Exception:
         sys.stderr.write("skip:bad-min_active_sessions:%s\n" % (name or "?")); continue
-    if floor < 1 or a.get("suspended") or (d and d in susp_rigs):
-        continue
     tmpl = d + "/" + name if d else name
+    listed = tmpl in always
+    if listed:
+        seen_always.add(tmpl)
+    if (floor < 1 and not listed) or a.get("suspended") or (d and d in susp_rigs):
+        continue
     # a template we cannot safely serialise (or that would escape the state dir) is UNKNOWN => not checked,
     # but COUNTED and named (stderr -> $SKIP_FILE), never dropped silently
     if not name or not re.fullmatch(r"[A-Za-z0-9._-]+(/[A-Za-z0-9._-]+)?", tmpl):
@@ -153,6 +169,9 @@ for a in agents:
         if states:
             best = states[0]
     print("%s|%d|%d|%s|%d" % (tmpl, floor, live, best, len(mine)))
+# a listed crew that is not an [[agent]] at all: we were told to watch it and cannot => UNKNOWN, named, counted
+for n in sorted(always - seen_always):
+    sys.stderr.write("skip:always-up-unknown:%s\n" % n)
 PY
 PY_RC=$?
 case "$PY_RC" in
@@ -166,7 +185,7 @@ NDES="$(wc -l < "$JOIN_FILE" | tr -d ' ')"
 # grep -c: rc 0 = some, 1 = none, >=2 = could not read the report. The last must not read as "none skipped".
 NSKIP="$(grep -c '^skip:' "$SKIP_FILE" 2>/dev/null)"; SKIP_RC=$?
 case "$SKIP_RC" in 0|1) ;; *) NSKIP="?"; log "WARN: the skip report $SKIP_FILE could not be read (grep exit $SKIP_RC) — how many crews were skipped is UNKNOWN" ;; esac
-log "crews that must be up (min_active_sessions >= 1, not suspended): $NDES"
+log "crews that must be up (min_active_sessions >= 1 or in CREWS_ALWAYS_UP='$CREWS_ALWAYS_UP', not suspended): $NDES"
 case "$NSKIP" in ''|*[!0-9]*) ;; *)
   if [ "$NSKIP" -gt 0 ]; then
     log "WARN: $NSKIP crew(s) skipped as UNKNOWN (cannot be checked): $(grep '^skip:' "$SKIP_FILE" | tr '\n' ' ')"
@@ -223,7 +242,7 @@ state_label() {
     start-pending) echo "start-pending (criada, nunca chegou a subir)" ;;
     creating)      echo "creating (criação em andamento, não subiu)" ;;
     draining)      echo "draining (sessão sendo encerrada)" ;;
-    asleep)        echo "asleep (dormindo — com piso min_active_sessions >= 1 ela deveria estar acordada)" ;;
+    asleep)        echo "asleep (dormindo — crew de sempre-de-pé deveria estar acordada)" ;;
     *)             echo "$1 (não é 'active')" ;;
   esac
 }
@@ -295,14 +314,14 @@ if [ "$N_DUE" -gt 0 ]; then
         since="$(date -r "$first" '+%Y-%m-%d %H:%M:%S' 2>/dev/null || echo "epoch $first")"
         NAMES="${NAMES:+$NAMES, }$tmpl"
         LIST="$LIST
-  crew:           $tmpl  (min_active_sessions = $floor)
+  crew:           $tmpl  (min_active_sessions = $floor$([ "$floor" -lt 1 ] && echo "; sempre de pé por CREWS_ALWAYS_UP"))
   sem sessão viva há: ~${mins}min  (desde $since)
   melhor estado:  $(state_label "$best")  — sessões deste template: $nsess
 "
       done < "$SEND_FILE"
       subject="Crew SEM sessão viva há ${MAXMIN}min (desired >= 1): $NAMES"
       body="$(cat <<EOF
-Crew que o config manda manter sempre de pé (min_active_sessions >= 1, não suspenso) está SEM sessão 'active' há >= $((MISSING_SEC / 60))min.
+Crew que o config manda manter sempre de pé (min_active_sessions >= 1 ou listado em CREWS_ALWAYS_UP, não suspenso) está SEM sessão 'active' há >= $((MISSING_SEC / 60))min.
 $LIST
 Por que isto chegou até você: em 10/10 (~14:06-14:40) o supervisor ficou cego sob carga (snapshot de processos do tmux
 morto a cada ~3 s) e o oracle-wa ficou ~20min fora; as sessões de reposição foram 'deferred_by_wake_budget' e depois

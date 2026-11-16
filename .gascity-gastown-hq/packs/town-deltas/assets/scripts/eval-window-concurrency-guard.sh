@@ -21,10 +21,11 @@
 #
 # ── WHAT GETS CAPPED (3 levers, 5 concrete values — see PROFILE VALUES) ────────
 #   dog-pool      gastown.dog max_active_sessions   3 -> 1   (city.toml patch)
-#   crew min_active  oracle-wa min_active_sessions  1 -> 0   (city.toml patch)
-#     (oracle-wa is the ONLY agent in this city with min_active_sessions>0 as
-#     of this writing — confirmed live via `gc config explain`; every other
-#     crew/pool agent is already min=0, on-demand, nothing to reduce further)
+#   crew min_active  oracle-wa min_active_sessions  0 -> 0   (city.toml patch; NOT a lever any more)
+#     (since ga-esorlre.8 oracle-wa is min=0 like every other crew/pool agent, so
+#     normal == throttled == 0 and this guard never rewrites the value; the patch
+#     block stays because get_oracle_min/apply_profile and the selftest still read
+#     it, and the selftest pins it to agents/oracle-wa/agent.toml so the two cannot drift)
 #   Dolt poll     3 town-deltas order intervals widened ~2.5x (see orders/*.toml)
 # Deliberately OUT OF SCOPE (do not extend this script to cover these):
 #   - job scheduling/stagger (ga-7xne1's territory)
@@ -119,10 +120,15 @@ QGE_BUFFER_SEC=1200      # ±20min around the predicted fire (drift + advisory-o
 DOG_MAX_NORMAL="${DOG_MAX_NORMAL:-3}"; DOG_MAX_THROTTLED=1
 GATE_FOCUS_DOG_MAX="${GATE_FOCUS_DOG_MAX:-2}"   # ga-kqa08j: dog cap while the gate is the bottleneck
 GATE_FOCUS_LIB="${GATE_FOCUS_LIB:-$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)/gate-focus-lib.sh}"
-# Mayor 12/10/2026: throttled stays 1. Dropping oracle-wa to 0 made the reconciler RETIRE the live crew
+# Mayor 12/10/2026: throttled stayed 1. Dropping oracle-wa to 0 made the reconciler RETIRE the live crew
 # session on the next config soft-reload (09:12 window=whatsapp -> 09:18 "pool slot retired by reconciler"),
 # killing an in-progress conversation with Athos. Crew sessions are Athos's decision, never a load lever.
-ORACLE_MIN_NORMAL=1;   ORACLE_MIN_THROTTLED=1
+# ga-esorlre.8 (Mayor 16/11, approved): oracle-wa is now min=0 in BOTH profiles. That is safe ONLY because its
+# live session bead is session_origin=manual (a manual bead is never swept and never retired by the pool floor);
+# with the bead still ephemeral/pool_managed, min=0 is exactly the 12/10 incident. Never set 0 here (or in
+# agents/oracle-wa/agent.toml / the city.toml patch) before `bd show <oracle session bead>` says manual. The old
+# "always up" guarantee moved to crew-no-session-alarm.sh (CREWS_ALWAYS_UP=oracle-wa).
+ORACLE_MIN_NORMAL=0;   ORACLE_MIN_THROTTLED=0
 BEADS_HEALTH_NORMAL="120s";     BEADS_HEALTH_THROTTLED="300s"
 GATE_SWEEP_NORMAL="60s";        GATE_SWEEP_THROTTLED="150s"
 ORDER_TRACKING_NORMAL="5m";     ORDER_TRACKING_THROTTLED="12m"

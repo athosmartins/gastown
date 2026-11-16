@@ -6,7 +6,8 @@
 # in_progress beads, pool-stuck-prompt-alarm at bead-less POOL sessions.
 #
 # DETECTION ONLY. This order mails the Mayor, once per episode, when a crew the resolved config says must
-# always be up (`gc config show`: [[agent]] with min_active_sessions >= 1, not suspended, rig not suspended)
+# always be up (`gc config show`: [[agent]] with min_active_sessions >= 1 OR named in CREWS_ALWAYS_UP — default
+# "oracle-wa", which is min 0 with a manual session bead since ga-esorlre.8 —, not suspended, rig not suspended)
 # has no session in state `active` in `gc session list --json` for 10 min on this script's own clock. It never
 # starts, wakes, nudges, closes or kills anything (selftest K). "Could not tell" (either read failed, timed out
 # or did not parse) is UNKNOWN: no clock moves and nothing is mailed. A gc order (fresh exec each tick,
@@ -18,7 +19,7 @@
 # drops under 2 x 120 + 45 + 60). A run the timeout cuts short is harmless: the "alarmed" mark is written
 # BEFORE the mail is sent, and the script's flock keeps the next tick from stacking on a straggler.
 [order]
-description = "Mail the Mayor when a crew with min_active_sessions >= 1 has had no live (active) session for >= 10 min (detection only)"
+description = "Mail the Mayor when a crew that must be up (min_active_sessions >= 1 or CREWS_ALWAYS_UP) has had no live (active) session for >= 10 min (detection only)"
 trigger = "cooldown"
 interval = "5m"
 timeout = "600s"

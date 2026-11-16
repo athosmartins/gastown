@@ -112,7 +112,15 @@ eq "profile when window=empty" "$(desired_profile "")" "normal"
 # ── 4. reading current on-disk values (against the REAL committed files) ──────
 echo "── 4. get_dog_max / get_oracle_min / get_order_interval read the real files ──"
 eq "gastown.dog max_active_sessions (normal, as committed)" "$(get_dog_max)" "$COMMITTED_DOG_MAX"
-eq "oracle-wa min_active_sessions (normal, as committed)" "$(get_oracle_min)" "1"
+eq "oracle-wa min_active_sessions (normal, as committed)" "$(get_oracle_min)" "0"
+# ga-esorlre.8: the three places that carry oracle-wa's floor must agree. city.toml patches agents/oracle-wa/agent.toml
+# at load time, so a drift here silently wins at runtime; and normal/throttled must both be the same value, because the
+# oracle crew is not a load lever (Mayor 12/10). Read the agent.toml with an awk of its own (not the guard's reader).
+ORACLE_AGENT_MIN="$(awk '/^min_active_sessions = [0-9]+$/ { print $3; exit }' "$SELF_DIR/../../../agents/oracle-wa/agent.toml")"
+case "$ORACLE_AGENT_MIN" in ''|*[!0-9]*) bad "could not read min_active_sessions from agents/oracle-wa/agent.toml (got [$ORACLE_AGENT_MIN])" ;; *)
+  eq "agents/oracle-wa/agent.toml min_active_sessions == city.toml patch" "$ORACLE_AGENT_MIN" "$(get_oracle_min)" ;; esac
+eq "ORACLE_MIN_NORMAL == city.toml patch (committed)" "$ORACLE_MIN_NORMAL" "$(get_oracle_min)"
+eq "ORACLE_MIN_THROTTLED == ORACLE_MIN_NORMAL (oracle is never a load lever)" "$ORACLE_MIN_THROTTLED" "$ORACLE_MIN_NORMAL"
 eq "beads-health interval (normal, as committed)" "$(get_order_interval "$BEADS_HEALTH_TOML")" "120s"
 eq "gate-sweep interval (normal, as committed)" "$(get_order_interval "$GATE_SWEEP_TOML")" "60s"
 eq "order-tracking-sweep interval (normal, as committed)" "$(get_order_interval "$ORDER_TRACKING_TOML")" "5m"
@@ -132,8 +140,8 @@ case "$LOG_6" in
   *) bad "expected the unqualified 'is now live' success line on a clean full apply, got: $LOG_6" ;;
 esac
 eq "gastown.dog max_active_sessions -> throttled" "$(get_dog_max)" "1"
-# Mayor 12/10: the throttled floor of the oracle crew stays 1 (a 0 retired the live session on 12/10)
-eq "oracle-wa min_active_sessions stays 1 when throttled (crew never a load lever)" "$(get_oracle_min)" "1"
+# ga-esorlre.8: oracle-wa is min=0 (manual session bead) in both profiles; the guard must not move it
+eq "oracle-wa min_active_sessions stays 0 when throttled (crew never a load lever)" "$(get_oracle_min)" "0"
 eq "beads-health interval -> throttled" "$(get_order_interval "$BEADS_HEALTH_TOML")" "300s"
 eq "gate-sweep interval -> throttled" "$(get_order_interval "$GATE_SWEEP_TOML")" "150s"
 eq "order-tracking-sweep interval -> throttled" "$(get_order_interval "$ORDER_TRACKING_TOML")" "12m"
@@ -157,7 +165,7 @@ eq "re-applying throttled profile is a byte-identical no-op" "$SUM_THROTTLED_AGA
 echo "── 8. apply_profile(normal) restores the original values ──"
 apply_profile "normal" >/dev/null
 eq "gastown.dog max_active_sessions restored" "$(get_dog_max)" "$COMMITTED_DOG_MAX"
-eq "oracle-wa min_active_sessions restored" "$(get_oracle_min)" "1"
+eq "oracle-wa min_active_sessions restored" "$(get_oracle_min)" "0"
 eq "beads-health interval restored" "$(get_order_interval "$BEADS_HEALTH_TOML")" "120s"
 eq "gate-sweep interval restored" "$(get_order_interval "$GATE_SWEEP_TOML")" "60s"
 eq "order-tracking-sweep interval restored" "$(get_order_interval "$ORDER_TRACKING_TOML")" "5m"
