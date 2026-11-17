@@ -5,12 +5,12 @@
 #   Simulado · Seções · Como rodar
 #
 # SIMULADO  o swap (DR_SWAP_MB_FILE), o relógio (DR_NOW_FILE), o arquivo do amostrador (JSONL escrito pelo teste, com swap subindo), o amostrador (script de mentira que acrescenta o registro que o teste mandou, ou falha),
-#   o roster `gc session list --json` (arquivo; o `gc` de mentira muda o estado dele em suspend e DIMINUI o swap a cada suspend, como se a memória voltasse), as transcrições (arquivos com mtime escolhido), o `bd`
+#   o roster `gc session list --json` (arquivo; o `gc` de mentira muda o estado dele em suspend/wake e DIMINUI o swap a cada suspend, como se a memória voltasse), as transcrições (arquivos com mtime escolhido), o `bd`
 #   (in_progress por identidade e por store; falha por modo; aviso no stderr; anexa/escreve na sessão DURANTE a leitura). Nada real é suspenso, lido ou gravado fora de $W.
 # SEÇÕES    gatilho (crescimento · absoluto · histórico curto · sem gatilho) · o corte (só candidata permitida; ordem; teto; nunca dolt/daemon/crew/dog/anexada/in_progress/transcrição recente ou desconhecida/estado) ·
 #   o log (quem foi cortado, quanto de swap voltou) · a pausa do Pilot (arquivo, validade, leitura de volta, renovação) · TERCEIRO ESTADO (amostrador ausente/velho/corrompido/sem atribuição/roster ilegível: NÃO corta, NÃO
 #   pausa, rc 30, avisa) · sem candidata (rc 11) · suspend com rc != 0 e a sessão ativa (rc 20) · suspend NÃO CONFIRMADO (atraso do reconciler, nunca muda, some da lista) · registro no disco antes do settle · releitura
-#   imediatamente antes do suspend (anexada, transcrição) · stderr do bd/gc · loja do rig · uma linha, um \n · pausa (validade absurda, mantida) · carência · dry-run · interruptor · trava · variáveis · estática (sem kill -9/pkill -f/Appium)
+#   imediatamente antes do suspend (anexada, transcrição) · stderr do bd/gc · loja do rig · uma linha, um \n · pausa (validade absurda, mantida) · carência · dry-run · interruptor · trava · retomada (--resume: calmo, não calmo, ilegível, estado ilegível, marca `u`, wake que falha, sessão que sumiu) · variáveis · estática (sem kill -9/pkill -f/Appium)
 # COMO RODAR  bash scripts/disk-recovery-swap-cut.selftest.sh   ·   outro executável: SWC_ST_SUT=<arquivo>   ·   SWC_ST_FAILFAST=1 sai no 1º FAIL
 set -uo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
@@ -33,7 +33,7 @@ C="$W/city"; GCD="$C/.gc"
 SWAPF="$W/swap"; NOWF="$W/now"; SAMPLES="$GCD/ram-owner-samples.jsonl"; NEXT="$W/next-rec"; ROSTER="$W/roster.json"; CALLS="$W/gc.calls"; SCALLS="$W/sampler.calls"
 LOGF="$GCD/logs/disk-recovery-swap-cut.log"; PAUSEF="$GCD/swap-spawn-pause"; STATEF="$GCD/disk-recovery-swap-cut.state"; PROJ="$W/projects"
 
-# gc de mentira: suspend → roster ganha state=asleep e o swap CAI (W_SWAP_DROP, padrão 300); list → o roster. Modos em $W/mode: suspend.fail, suspend.noop, suspend.lag, suspend.gone, list.fail, list.slow (trava 30 s)
+# gc de mentira: suspend → roster ganha state=asleep e o swap CAI (W_SWAP_DROP, padrão 300); wake → active; list → o roster. Modos em $W/mode: suspend.fail, suspend.noop, suspend.lag, suspend.gone, wake.fail, list.fail, list.slow (trava 30 s)
 cat > "$W/bin/gc" <<'STUB'
 #!/bin/bash
 echo "$*" >> "$W_CALLS"
@@ -59,6 +59,8 @@ json.dump(d, open(p, "w"))
 ' "$W_ROSTER" "$3"; exit 0; }
                      setstate "$3" asleep
                      v=$(cat "$W_SWAP"); echo $((v - ${W_SWAP_DROP:-300})) > "$W_SWAP"; exit 0 ;;
+  "session wake")    [ -e "$W_MODE/wake.fail" ] && { echo "wake: boom" >&2; exit 1; }
+                     setstate "$3" active; exit 0 ;;
   "session list")    [ -e "$W_MODE/list.fail" ] && exit 1
                      [ -e "$W_MODE/list.slow" ] && sleep 30
                      [ -e "$W_MODE/gc.warn" ] && echo "warning: builtin pack differs from the embedded copy" >&2
@@ -215,7 +217,7 @@ eq "$(cat "$PAUSEF" 2>/dev/null | sed -n 2p)" "$NOW" "pausa: epoch da gravacao"
 eq "$(cat "$PAUSEF" 2>/dev/null | sed -n 3p)" "$((NOW+900))" "pausa: validade = agora + 900"
 has "$(cat "$PAUSEF" 2>/dev/null | sed -n 4p)" "+1700MB em 300s" "pausa: o motivo"
 has "$OUT" "pausou o spawn novo do Pilot ate" "a linha diz da pausa"
-has "$(cat "$STATEF")" "s=id-1|wa-worker-1|wa-worker|878|$NOW" "registro: o que SUSPENDI (para a retomada, fatia ga-yh41v0e.3)"
+has "$(cat "$STATEF")" "s=id-1|wa-worker-1|wa-worker|878|$NOW" "registro: o que SUSPENDI (para o --resume)"
 has "$(cat "$STATEF")" "s=id-2|gate-reviewer-remote-1|" "registro: o segundo"
 eq "$(grep -c '^s=' "$STATEF")" 2 "registro so tem as 2 cortadas"
 
@@ -562,6 +564,169 @@ eq "$RC" 0 "lixo em MAX_CUT/GROW_MB: usa o padrao e age"
 has "$(logtxt)" "variavel de configuracao invalida" "log: diz que usou o padrao"
 scenario; DR_SWC_MAX_CUT=1 run --run
 eq "$(calls | grep -c 'session suspend')" 1 "DR_SWC_MAX_CUT=1: so 1"
+
+section "retomada (--resume)"
+resume_at() {  # $1 = epoch; acrescenta um registro calmo de 5 s antes e roda --resume
+  echo "$1" > "$NOWF"; rec "$SAMPLES" $(($1-5)) 2000 false "wa-worker-9:100000:session"; run --resume
+}
+scenario; run --run; : > "$CALLS"
+echo 2000 > "$SWAPF"; rec "$SAMPLES" $((NOW+300)) 2000 false "wa-worker-9:100000:session"
+T=$((NOW+400)); resume_at "$T"
+eq "$RC" 10 "1o --resume calmo: marca o inicio da calma, ainda nao age (rc 10)"
+[ -e "$PAUSEF" ] && ok "1o --resume: a pausa fica" || nope "1o --resume: a pausa fica"
+eq "$(calls | grep -c 'session wake')" 0 "1o --resume: nao religa"
+resume_at $((T+150)); eq "$RC" 10 "calma de 150s: ainda espera"
+resume_at $((T+300)); eq "$RC" 0 "calma de 300s: apaga a pausa (rc 0)"
+[ ! -e "$PAUSEF" ] && ok "pausa apagada" || nope "pausa apagada"
+has "$OUT" "pausa do spawn do Pilot apagada" "a linha diz"
+eq "$(calls | grep -c 'session wake')" 0 "com 300s ainda nao religa as sessoes"
+resume_at $((T+600)); eq "$(calls | grep -c 'session wake')" 0 "com 600s ainda nao religa"
+resume_at $((T+900)); eq "$RC" 0 "calma de 900s: religa (rc 0)"
+has "$(calls)" "session wake id-1" "religou wa-worker-1 (a que EU suspendi)"
+has "$(calls)" "session wake id-2" "religou gate-reviewer-remote-1"
+eq "$(calls | grep -c 'session wake')" 2 "so as 2 do registro"
+hasnt "$(calls)" "wake id-3" "nao religa o que nao suspendi"
+has "$(logtxt)" "RELIGOU wa-worker-1" "log: quem foi religado"
+eq "$(grep -c '^s=' "$STATEF")" 0 "registro esvaziado"
+resume_at $((T+1000)); eq "$RC" 10 "depois de tudo: nada a retomar (rc 10)"
+has "$OUT" "nada a retomar" "a linha diz"
+scenario; run --run; : > "$CALLS"; echo 4800 > "$SWAPF"
+hi_at() {  # $1 = epoch; swap alto e ESTAVEL: base de 290 s atras (4750) e amostra de 5 s atras (4800) => crescimento LIDO = +50, sem gatilho (4800 < 5120)
+  echo "$1" > "$NOWF"; rec "$SAMPLES" $(($1-290)) 4750 false "wa-worker-9:100000:session"; rec "$SAMPLES" $(($1-5)) 4800 false "wa-worker-9:100000:session"; run --resume
+}
+hi_at $((NOW+400)); eq "$RC" 10 "swap alto (4800 > 5120-1024) e estavel (+50): NAO calmo (1a)"
+hi_at $((NOW+1500)); hi_at $((NOW+1900))
+eq "$RC" 10 "swap alto (4800 > 5120-1024) e estavel (+50): NAO calmo, mesmo depois de 1500 s"
+has "$OUT" "ainda nao esta calmo" "swap alto: a linha diz que nao esta calmo"
+[ -e "$PAUSEF" ] && ok "swap alto: a pausa fica" || nope "swap alto: a pausa fica"
+eq "$(calls | grep -c 'session wake')" 0 "swap alto: nao religa"
+scenario; run --run; : > "$CALLS"; echo 2000 > "$SWAPF"; rm -f "$SAMPLES"
+echo $((NOW+1500)) > "$NOWF"; run --resume
+eq "$RC" 30 "--resume com amostrador sem leitura: rc 30"
+[ -e "$PAUSEF" ] && ok "sem leitura: a pausa fica (a validade vence sozinha)" || nope "sem leitura: a pausa fica"
+eq "$(calls | grep -c 'session wake')" 0 "sem leitura: nao religa"
+scenario; run --run; : > "$CALLS"; echo 2000 > "$SWAPF"
+rec "$SAMPLES" $((NOW+300)) 2000 false "wa-worker-9:100000:session"; T=$((NOW+400))
+resume_at "$T"; resume_at $((T+300)); resume_at $((T+600)); : > "$W/mode/wake.fail"; resume_at $((T+900))
+eq "$RC" 20 "wake que falha: rc 20"
+eq "$(grep -c '^s=' "$STATEF")" 2 "wake falhou: o registro CONTINUA com as 2 (tenta de novo na proxima)"
+rm -f "$W/mode/wake.fail"; DR_SWC_MAX_WAKE=1 resume_at $((T+1000))
+eq "$(calls | grep -c 'session wake id-1')" 2 "tentou de novo na rodada seguinte (1 por rodada com MAX_WAKE=1)"
+eq "$(grep -c '^s=' "$STATEF")" 1 "MAX_WAKE=1: sobrou 1 no registro"
+scenario; run --run; : > "$CALLS"; echo 2000 > "$SWAPF"; rec "$SAMPLES" $((NOW+395)) 2000 false "wa-worker-9:100000:session"
+echo $((NOW+400)) > "$NOWF"; rm -f "$SAMPLES"; rec "$SAMPLES" $((NOW+398)) 2000 false "wa-worker-9:100000:session"
+run --resume
+eq "$RC" 10 "historico curto (sem base de crescimento): NAO e calma"
+[ -e "$PAUSEF" ] && ok "historico curto: a pausa fica" || nope "historico curto: a pausa fica"
+echo $((NOW+720)) > "$NOWF"; rm -f "$SAMPLES"; rec "$SAMPLES" $((NOW+718)) 2000 false "wa-worker-9:100000:session"
+run --resume
+eq "$RC" 10 "historico curto 320 s depois (ainda sem base): continua sem calma (rc 10)"
+[ -e "$PAUSEF" ] && ok "historico curto 320 s depois: a pausa continua (calma = os DOIS lidos)" || nope "historico curto 320 s depois: a pausa continua"
+eq "$(calls | grep -c 'session wake')" 0 "historico curto: nao religa"
+
+section "retomada: marca u, sessao que sumiu, ja ativa, roster ilegivel, estado ilegivel, pausa ilegivel, contagem velha, gravacao que falha"
+calm_to_wake() {  # depois de scenario + run --run: acende a calma e chega em T+600 (o teste faz o --resume de T+900)
+  echo 2000 > "$SWAPF"; rec "$SAMPLES" $((NOW+300)) 2000 false "wa-worker-9:100000:session"
+  T=$((NOW+400)); resume_at "$T"; resume_at $((T+300)); resume_at $((T+600))
+}
+rost_del() { python3 -I -c 'import json, sys
+p, i = sys.argv[1:3]
+d = json.load(open(p)); d["sessions"] = [s for s in d["sessions"] if s["id"] != i]; json.dump(d, open(p, "w"))' "$ROSTER" "$1"; }
+rost_set() { python3 -I -c 'import json, sys
+p, i, st = sys.argv[1:4]
+d = json.load(open(p))
+for s in d["sessions"]:
+    if s["id"] == i: s["state"] = st
+json.dump(d, open(p, "w"))' "$ROSTER" "$1" "$2"; }
+# marca u: o registro tem uma suspensa nao confirmada; religa igual, e a marca VOLTA no registro quando o wake falha
+scenario; run --run; : > "$CALLS"
+awk '/^s=id-1\|/ { print $0 "|u"; next } { print }' "$STATEF" > "$W/st.new" && mv "$W/st.new" "$STATEF"
+calm_to_wake; : > "$W/mode/wake.fail"; resume_at $((T+900))
+eq "$RC" 20 "marca u + wake que falha: rc 20"
+has "$(cat "$STATEF")" "s=id-1|wa-worker-1|wa-worker|878|$NOW|u" "wake falhou: a marca u volta no registro (nao vira confirmada)"
+has "$(calls)" "session wake id-1" "religou tambem a marcada u"
+rm -f "$W/mode/wake.fail"; resume_at $((T+1000))
+eq "$RC" 0 "marca u: na rodada seguinte o wake passa (rc 0)"
+eq "$(grep -c '^s=' "$STATEF")" 0 "marca u: registro esvaziado"
+# sessao que sumiu do roster (leitura POSITIVA: o id nao esta na lista): sai do registro sem wake, nao fica rc 20 para sempre
+scenario; run --run; : > "$CALLS"; rost_del id-1
+calm_to_wake; resume_at $((T+900))
+eq "$RC" 0 "sessao que sumiu: rc 0"
+hasnt "$(calls)" "session wake id-1" "sumiu: nao tenta o wake dela"
+has "$(calls)" "session wake id-2" "sumiu: a outra e religada"
+has "$OUT" "wa-worker-1 ja nao existe" "sumiu: a linha diz"
+has "$(logtxt)" "nao esta mais no roster" "sumiu: o log diz"
+eq "$(grep -c '^s=' "$STATEF")" 0 "sumiu: saiu do registro"
+# alguem ja religou (ativa): tambem sai sem wake
+scenario; run --run; : > "$CALLS"; rost_set id-1 active
+calm_to_wake; resume_at $((T+900))
+eq "$RC" 0 "ja ativa: rc 0"
+hasnt "$(calls)" "session wake id-1" "ja ativa: nao repete o wake"
+has "$(calls)" "session wake id-2" "ja ativa: a outra e religada"
+has "$OUT" "wa-worker-1 ja estava ativa" "ja ativa: a linha diz"
+eq "$(grep -c '^s=' "$STATEF")" 0 "ja ativa: saiu do registro"
+# roster ILEGIVEL e terceiro estado: nao e "sumiu" — nao tira ninguem do registro, tenta o wake (a direcao que devolve a sessao)
+scenario; run --run; : > "$CALLS"
+calm_to_wake; echo 'lixo' > "$ROSTER"; resume_at $((T+900))
+has "$(calls)" "session wake id-1" "roster ilegivel: tenta o wake da 1a (nao a tira do registro por nao ler)"
+has "$(calls)" "session wake id-2" "roster ilegivel: tenta o wake da 2a"
+hasnt "$OUT" "ja nao existe" "roster ilegivel: NAO diz que sumiu"
+# ESTADO com linha que nao entendo: o registro pode estar la e eu nao o leio -> rc 30, nao religa, nao grava, a pausa fica
+scenario; run --run; : > "$CALLS"; echo 'lixo=1' >> "$STATEF"; cp "$STATEF" "$W/st.before"
+calm_to_wake; resume_at $((T+900))
+eq "$RC" 30 "estado com linha desconhecida: --resume rc 30"
+has "$OUT" "[ESTADO com linha que nao entendo]" "estado ruim: a linha diz"
+eq "$(calls | grep -c 'session wake')" 0 "estado ruim: nao religa"
+cmp -s "$STATEF" "$W/st.before" && ok "estado ruim: o arquivo NAO foi regravado" || nope "estado ruim: o arquivo NAO foi regravado"
+[ -e "$PAUSEF" ] && ok "estado ruim: a pausa fica (a validade vence sozinha)" || nope "estado ruim: a pausa fica"
+# estado ILEGIVEL (e um diretorio: ilegivel ate para root) com o registro dentro: "nao li" NAO e "nada a retomar"
+scenario; mkdir -p "$STATEF"; echo "s=old-1|wa-worker-9|wa-worker|700|$((NOW-4000))" > "$STATEF/dentro"; echo $((NOW+400)) > "$NOWF"; run --resume
+eq "$RC" 30 "estado ilegivel: --resume rc 30 (e nao 'nada a retomar')"
+hasnt "$OUT" "nada a retomar" "estado ilegivel: a linha NAO diz 'nada a retomar'"
+has "$OUT" "ESTADO ILEGIVEL" "estado ilegivel: a linha diz"
+[ -f "$STATEF/dentro" ] && ok "estado ilegivel: nada foi movido nem apagado" || nope "estado ilegivel: nada foi movido nem apagado"
+# pausa ilegivel (o Pilot a ignora): depois da calma e limpa, nao fica para sempre
+scenario; run --run; : > "$CALLS"; printf 'lixo\n' > "$PAUSEF"
+echo 2000 > "$SWAPF"; rec "$SAMPLES" $((NOW+300)) 2000 false "wa-worker-9:100000:session"; T=$((NOW+400)); resume_at "$T"; resume_at $((T+300))
+eq "$RC" 0 "pausa ilegivel: apagada depois de 300 s de calma (rc 0)"
+[ ! -e "$PAUSEF" ] && ok "pausa ilegivel: o arquivo sumiu" || nope "pausa ilegivel: o arquivo sumiu"
+# o gatilho zera a contagem da retomada (calm_since), com corte e sem corte (carencia)
+scenario; printf 'v=1\nlast_cut_ts=0\nlast_after_swap=0\ncalm_since=123\n' > "$STATEF"; run --run
+has "$(cat "$STATEF")" "calm_since=0" "o gatilho (com corte) zera a contagem da retomada"
+scenario; printf 'v=1\nlast_cut_ts=%s\nlast_after_swap=9000\ncalm_since=123\n' "$((NOW-10))" > "$STATEF"; run --run
+# cenario novo = nao ha pausa vigente: a carencia a grava (rc 0 = pausa renovada; rc 10 so quando ja ha pausa vigente, testado na secao da carencia)
+eq "$RC" 0 "carencia sem pausa vigente: grava a pausa (rc 0)"
+has "$OUT" "em carencia" "carencia: a linha diz carencia"
+eq "$(calls | grep -c 'session suspend')" 0 "carencia: nenhum corte"
+has "$(cat "$STATEF")" "calm_since=0" "o gatilho (so carencia, sem corte) zera a contagem tambem"
+has "$(cat "$STATEF")" "last_cut_ts=$((NOW-10))" "e preserva o resto do estado"
+# contagem velha (anterior ao ultimo corte) recomeca: o corte encerra o calmo anterior
+scenario; run --run; : > "$CALLS"
+awk '/^calm_since=/ { print "calm_since=1"; next } { print }' "$STATEF" > "$W/st.new" && mv "$W/st.new" "$STATEF"
+echo 2000 > "$SWAPF"; rec "$SAMPLES" $((NOW+800)) 2000 false "wa-worker-9:100000:session"; resume_at $((NOW+1000))
+eq "$RC" 10 "contagem anterior ao corte: recomeca (rc 10), nao religa de imediato"
+eq "$(calls | grep -c 'session wake')" 0 "contagem velha: nao religa"
+has "$(cat "$STATEF")" "calm_since=$((NOW+1000))" "contagem velha: recomecou agora"
+[ -e "$PAUSEF" ] && ok "contagem velha: a pausa fica" || nope "contagem velha: a pausa fica"
+# a zeragem / o inicio da contagem que NAO gravam: rc 20 e a linha diz (nunca silencio)
+if [ "$(id -u)" != 0 ]; then
+  scenario; run --run; : > "$CALLS"; mkdir -p "$W/ro2"; cp "$STATEF" "$W/ro2/state"
+  awk '/^calm_since=/ { print "calm_since=777"; next } { print }' "$W/ro2/state" > "$W/ro2/s.n" && mv "$W/ro2/s.n" "$W/ro2/state"; chmod 555 "$W/ro2"
+  echo 4800 > "$SWAPF"; DR_SWC_STATE="$W/ro2/state" hi_at $((NOW+1000))
+  chmod 755 "$W/ro2"
+  eq "$RC" 20 "nao calmo e a zeragem nao grava: rc 20"
+  has "$OUT" "nao consegui zerar a contagem" "zeragem que nao grava: a linha diz"
+  has "$(cat "$W/ro2/state")" "calm_since=777" "zeragem que nao grava: o arquivo segue como estava"
+  scenario; run --run; : > "$CALLS"; mkdir -p "$W/ro3"; cp "$STATEF" "$W/ro3/state"; chmod 555 "$W/ro3"
+  echo 2000 > "$SWAPF"; rec "$SAMPLES" $((NOW+800)) 2000 false "wa-worker-9:100000:session"; DR_SWC_STATE="$W/ro3/state" resume_at $((NOW+1000))
+  chmod 755 "$W/ro3"
+  eq "$RC" 20 "calmo e o inicio da contagem nao grava: rc 20"
+  has "$OUT" "nao consegui gravar o inicio da contagem" "inicio que nao grava: a linha diz"
+  eq "$(calls | grep -c 'session wake')" 0 "inicio que nao grava: nao religa"
+  chmod -R u+rwx "$W/ro2" "$W/ro3"
+else
+  printf 'pulado - zeragem/inicio de contagem que nao gravam (rodando como root: a permissao nao barra)\n'
+fi
 
 section "estatica: o que o degrau nunca faz"
 [ -x "$SUT" ] && ok "o degrau tem permissao de execucao (o maestro PULA e avisa o que nao executa)" || nope "o degrau tem permissao de execucao (o maestro PULA e avisa o que nao executa)"

@@ -2,7 +2,7 @@
 # disk-recovery-swap-cut.sh (ga-yh41v0e, P0) — degrau de SWAP da escada de recuperação de disco do mini: corta memória quando o swap CRESCE, ANTES de o disco cair.
 #
 # ## Contents
-#   Por que existe · O que faz · Ordem do corte · Nunca · Três estados · Pausa do Pilot · Contrato com o maestro · Variáveis (teste) · Teste
+#   Por que existe · O que faz · Ordem do corte · Nunca · Três estados · Pausa do Pilot · Retomada · Contrato com o maestro · Variáveis (teste) · Teste
 #
 # POR QUE EXISTE  16/11, a escada de disco (D2/D3/D3.5/D4) só reage ao DISCO e as 12 fatias da missão ga-1p1i5jr não bastaram duas vezes. 14:35: o swap saltou de 2,8 para 6 GB em ~5 min, o disco foi a 1 GB e o kernel
 #   entrou em pânico (watchdogd sem resposta por 94 s). 19:20: o disco caiu de 7,7 para 4,9 GB (abaixo do piso de 5120 MB do Pilot) e o Mayor cortou logs à mão. Quem enche o disco nesses casos é o SWAP (ele mora no mesmo
@@ -34,18 +34,20 @@
 # PAUSA DO PILOT  .gc/swap-spawn-pause: 4 linhas `PAUSE` · epoch da gravação · epoch da validade · motivo. A validade é o freio: se este degrau morrer, a pausa vence sozinha em PAUSE_TTL_S (900 s) e o Pilot volta a despachar
 #   (pausa vencida, ilegível ou com validade absurda — mais de 1 h à frente — NÃO pausa: fail-open VISÍVEL no log do Pilot, nunca um Pilot parado por um arquivo que ninguém renova). Enquanto o gatilho vale, cada rodada renova
 #   (só quando restam menos de metade da validade). Gravada num temporário, trocada com mv e LIDA DE VOLTA (tentado ≠ gravado).
-# CONTRATO        `--run` (real) · `--dry-run` (lê tudo, diz o que faria; não colhe amostra nova, não suspende, não grava pausa, estado nem log). stdout = UMA linha ASCII (o maestro filtra para imprimíveis) e NADA
+# RETOMADA        `--resume` (o maestro chama toda rodada, depois do --run): com o swap calmo (<= ABS_MB - HYST_MB e crescimento < GROW_MB/2, os dois LIDOS, e sem gatilho) por PAUSE_CALM_S (300 s) apaga a pausa; por CALM_S (900 s) religa (`gc session wake`)
+#   as sessões que ESTE degrau suspendeu (registro em .gc/disk-recovery-swap-cut.state, inclusive as marcadas `u`: religar quem não dormiu é inerte), no máximo MAX_WAKE (2) por rodada. Só religa o que ele mesmo suspendeu. Leitura que falha
+#   (amostrador cego/parado, estado ilegível ou com valor inválido) = não religa, não apaga a pausa (ela vence sozinha), não grava o estado: rc 30, nunca "calmo" por suposição. Perdeu o calmo (swap subiu) = zera a contagem.
+# CONTRATO        `--run` (real) · `--dry-run` (lê tudo, diz o que faria; não colhe amostra nova, não suspende, não grava pausa, estado nem log) · `--resume`. stdout = UMA linha ASCII (o maestro filtra para imprimíveis) e NADA
 #   antes dela; o detalhe vai para $LOG. Saída 0 = agiu (suspendeu, pediu suspend ainda sem confirmação e/ou pausou) · 10 = nada a fazer (sem gatilho, carência, pausa vigente) · 11 = gatilho ativo e NÃO há candidata permitida (pausa posta/mantida; precisa de humano) ·
-#   20 = falhou (suspend com rc != 0 e a sessão ainda ativa, pausa que não gravou) · 30 = não consegui ler (não cortei, não pausei) · 2 = uso. Falha e sucesso na mesma rodada = 20 (a linha diz os dois).
+#   20 = falhou (suspend com rc != 0 e a sessão ainda ativa, pausa que não gravou, wake que falhou, pausa que não apagou) · 30 = não consegui ler (não cortei, não pausei) · 2 = uso. Falha e sucesso na mesma rodada = 20 (a linha diz os dois).
 #   Carência: depois de uma rodada que CORTOU (ou pediu suspend ainda sem confirmação), COOLDOWN_S (300 s = a janela) sem cortar de novo, a não ser que o swap tenha voltado a subir >= GROW_MB/2 desde o corte (a base do crescimento ainda enxerga o salto de ANTES do corte).
 #   Rodada em que TODO suspend falhou (rc 20, nada mudou) NÃO arma a carência nem grava estado: a rodada seguinte tenta suspender de novo.
 # VARIÁVEIS (teste) DR_CITY · DR_OFF_FILE · DR_NOW_FILE · DR_SWAP_MB_FILE (os do maestro) · DR_GC_BIN · DR_SWC_LOG · DR_SWC_LOCK · DR_SWC_STATE · DR_SWC_PAUSE_FILE · DR_SWC_SAMPLES (o JSONL) · DR_SWC_SAMPLER_CMD (no lugar de
-#   `python3 ram-owner-sampler.py`) · DR_SWC_SESSIONS_FILE (JSON no lugar de `gc session list --json`) · DR_SWC_BD_BIN · DR_SWC_PROJECTS_DIR · DR_SWC_<NOME> numérico: GROW_MB GROW_WINDOW_S GROW_SLACK_S ABS_MB
-#   SAMPLE_MAX_AGE_S SAMPLER_DEAD_S IDLE_MIN MAX_CUT MIN_RSS_MB SETTLE_S VERIFY_S COOLDOWN_S PAUSE_TTL_S CMD_S SAMPLER_S BUDGET_S LOG_MAX_KB (lixo cai no padrão e é dito no log).
+#   `python3 ram-owner-sampler.py`) · DR_SWC_SESSIONS_FILE (JSON no lugar de `gc session list --json`) · DR_SWC_BD_BIN · DR_SWC_PROJECTS_DIR · DR_SWC_<NOME> numérico: GROW_MB GROW_WINDOW_S GROW_SLACK_S ABS_MB HYST_MB
+#   SAMPLE_MAX_AGE_S SAMPLER_DEAD_S IDLE_MIN MAX_CUT MAX_WAKE MIN_RSS_MB SETTLE_S VERIFY_S COOLDOWN_S PAUSE_TTL_S PAUSE_CALM_S CALM_S CMD_S SAMPLER_S BUDGET_S LOG_MAX_KB (lixo cai no padrão e é dito no log).
 # TESTE           bash scripts/disk-recovery-swap-cut.selftest.sh   (hermético: swap, amostrador, roster, bd, gc, relógio simulados; nada real é suspenso)
-# ESTADO DA ENTREGA (fatia 2/5, ga-yh41v0e.2)  Este arquivo é só o NÚCLEO (--run / --dry-run) e roda à mão: o maestro (disk-recovery-ladder.sh) AINDA NÃO o chama (fatia 4, ga-yh41v0e.4) e o `--resume` (religar o que
-#   foi suspenso e apagar a pausa) é a fatia 3 (ga-yh41v0e.3). A leitura da pausa pelo Pilot (fatia 1, ga-yh41v0e.1) já está em main: a pausa que este núcleo grava segura o despacho. As frases acima
-#   sobre "toda rodada do maestro" e "o maestro chama um humano" descrevem o conjunto final, não o que esta fatia sozinha faz.
+# ESTADO DA ENTREGA (fatia 3/5, ga-yh41v0e.3)  Este arquivo roda à mão (--run / --dry-run / --resume): o maestro (disk-recovery-ladder.sh) AINDA NÃO o chama (fatia 4, ga-yh41v0e.4). A leitura da pausa pelo Pilot (fatia 1,
+#   ga-yh41v0e.1) já está em main: a pausa que este degrau grava segura o despacho. As frases acima sobre "toda rodada do maestro" e "o maestro chama um humano" descrevem o conjunto final, não o que esta fatia sozinha faz.
 set -uo pipefail
 
 D=$(cd "$(dirname "$0")" && pwd)
@@ -81,9 +83,9 @@ cfg() {  # $1=nome $2=padrão [$3=mínimo] → define $1 com DR_SWC_$1 (só díg
   esac
   eval "$1=\$v"
 }
-cfg GROW_MB 1536 1; cfg GROW_WINDOW_S 300 60; cfg GROW_SLACK_S 330; cfg ABS_MB 5120 1
-cfg SAMPLE_MAX_AGE_S 120 1; cfg SAMPLER_DEAD_S 900 1; cfg IDLE_MIN 15 1; cfg MAX_CUT 3 1; cfg MIN_RSS_MB 50
-cfg SETTLE_S 20; cfg VERIFY_S 3; cfg COOLDOWN_S 300; cfg PAUSE_TTL_S 900 60
+cfg GROW_MB 1536 1; cfg GROW_WINDOW_S 300 60; cfg GROW_SLACK_S 330; cfg ABS_MB 5120 1; cfg HYST_MB 1024
+cfg SAMPLE_MAX_AGE_S 120 1; cfg SAMPLER_DEAD_S 900 1; cfg IDLE_MIN 15 1; cfg MAX_CUT 3 1; cfg MAX_WAKE 2 1; cfg MIN_RSS_MB 50
+cfg SETTLE_S 20; cfg VERIFY_S 3; cfg COOLDOWN_S 300; cfg PAUSE_TTL_S 900 60; cfg PAUSE_CALM_S 300; cfg CALM_S 900
 cfg CMD_S 30 1; cfg SAMPLER_S 60 1; cfg BUDGET_S 90 1; cfg LOG_MAX_KB 1024 1
 
 isnum() { case "$1" in ''|*[!0-9]*) return 1 ;; esac; [ "${#1}" -le 12 ]; }
@@ -95,7 +97,7 @@ log() {
   printf '[%s] %s\n' "$(date '+%F %T')" "$*" >> "$LOG" 2>/dev/null || true
 }
 say() { local l; l=$(printf '%s' "$*" | LC_ALL=C tr -cd '[:print:]' | cut -c1-300); printf '%s\n' "$l"; }   # a ÚNICA linha de stdout, com UM \n; imprimíveis ASCII
-usage() { echo "uso: $0 --run | --dry-run" >&2; exit 2; }
+usage() { echo "uso: $0 --run | --dry-run | --resume" >&2; exit 2; }
 
 now() {  # epoch; vazio/ilegível → rc 1 (sem hora não decido nada)
   local t
@@ -269,20 +271,20 @@ PYEOF
 
 py() { python3 -I -c "$PY" "$@" 2>/dev/null; }
 
-# ── estado: chave=valor, escrito inteiro e trocado com mv. Chaves: last_cut_ts last_after_swap + 1 linha `s=<id>|<nome>|<template>|<rss>|<ts>[|u]` por sessão suspensa por MIM (`u` = pedi o suspend e o estado não confirmou; a retomada religa as duas, religar quem não dormiu é inerte) ──────────────────────────────
-LAST_CUT_TS=0; LAST_AFTER_SWAP=0; REG=""; STATE_NOTE=""; STATE_BAD=0
+# ── estado: chave=valor, escrito inteiro e trocado com mv. Chaves: last_cut_ts last_after_swap calm_since + 1 linha `s=<id>|<nome>|<template>|<rss>|<ts>[|u]` por sessão suspensa por MIM (`u` = pedi o suspend e o estado não confirmou; a retomada religa as duas, religar quem não dormiu é inerte) ──────────────────────────────
+LAST_CUT_TS=0; LAST_AFTER_SWAP=0; CALM_SINCE=0; REG=""; STATE_NOTE=""; STATE_BAD=0
 load_state() {  # vazio (arquivo ausente) → zerado, sem aviso e sem STATE_BAD; falhou/ilegível/valor inválido/linha que não entendo → usa o que entendeu, STATE_BAD=1 e STATE_NOTE (NÃO é "sem estado": o registro de sessões suspensas pode ter se perdido). STATE_NOTE sai no log do GATILHO e na linha; save_state guarda o arquivo antigo antes de gravar por cima
   local line k v content
-  LAST_CUT_TS=0; LAST_AFTER_SWAP=0; REG=""; STATE_NOTE=""; STATE_BAD=0
+  LAST_CUT_TS=0; LAST_AFTER_SWAP=0; CALM_SINCE=0; REG=""; STATE_NOTE=""; STATE_BAD=0
   [ -e "$STATE" ] || return 0
   # vazio (arquivo sem bytes) → nenhuma linha → zerado; falhou (sem permissão, é um diretório, erro de leitura) → rc != 0 → ilegível, que é "não sei" e não "sem estado"
   content=$(cat "$STATE" 2>/dev/null) || { STATE_BAD=1; STATE_NOTE=" [ESTADO ILEGIVEL: registro de suspensas pode ter se perdido]"; return 0; }
   while IFS= read -r line; do
     case "$line" in
       v=1|'') ;;
-      last_cut_ts=*|last_after_swap=*)
+      last_cut_ts=*|last_after_swap=*|calm_since=*)
         k=${line%%=*}; v=${line#*=}
-        if isnum "$v"; then case "$k" in last_cut_ts) LAST_CUT_TS=$v ;; last_after_swap) LAST_AFTER_SWAP=$v ;; esac
+        if isnum "$v"; then case "$k" in last_cut_ts) LAST_CUT_TS=$v ;; last_after_swap) LAST_AFTER_SWAP=$v ;; calm_since) CALM_SINCE=$v ;; esac
         else STATE_BAD=1; STATE_NOTE="${STATE_NOTE:- [ESTADO com valor invalido em $k]}"; fi ;;
       s=*) REG="$REG${line#s=}
 " ;;
@@ -321,7 +323,7 @@ save_state() {  # rc 0 gravou; rc 1 não gravou (o chamador diz). Estado que exi
     fi
   fi
   {
-    printf 'v=1\nlast_cut_ts=%s\nlast_after_swap=%s\n' "$LAST_CUT_TS" "$LAST_AFTER_SWAP"
+    printf 'v=1\nlast_cut_ts=%s\nlast_after_swap=%s\ncalm_since=%s\n' "$LAST_CUT_TS" "$LAST_AFTER_SWAP" "$CALM_SINCE"
     printf '%s' "$REG" | while IFS= read -r l; do [ -n "$l" ] && printf 's=%s\n' "$l"; done
   } > "$tmp" 2>/dev/null && mv -f "$tmp" "$STATE" 2>/dev/null && return 0
   rm -f "$tmp" 2>/dev/null
@@ -474,6 +476,8 @@ do_run() {
   # vazio (sem arquivo de estado) → STATE_NOTE vazio, nada a dizer; ilegível/valor inválido/linha desconhecida → STATE_NOTE diz, no log do gatilho e em TODA linha de saída abaixo (o "sem gatilho" acima não lê nem grava o estado)
   load_state
   log "GATILHO: $WHY_TRIG ($sw_txt)$GROWTH_NOTE$SW_NOTE$STATE_NOTE"
+  # o gatilho encerra o "calmo" da retomada: zera a contagem (calm_since). Estado ilegível (STATE_BAD) não é regravado só por isso. Se a gravação falhar, a retomada ainda exige que a contagem tenha começado depois do último corte
+  if [ "$MODE" = run ] && [ "$STATE_BAD" = 0 ] && [ "$CALM_SINCE" != 0 ]; then CALM_SINCE=0; save_state || log "WARN: nao consegui zerar a contagem de calma em $STATE"; fi
 
   # carência: acabei de cortar e o swap não voltou a subir desde então → a base de crescimento ainda enxerga o salto de antes do corte; só mantém a pausa
   if [ "$LAST_CUT_TS" -gt 0 ] && [ $((NOW - LAST_CUT_TS)) -lt "$COOLDOWN_S" ] && [ "$SW_REF" -lt $((LAST_AFTER_SWAP + GROW_MB / 2)) ]; then
@@ -648,8 +652,74 @@ keep_pause() {
   return 0
 }
 
+# ── --resume ──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+do_resume() {
+  local calm=0 waked=0 failed=0 left="" id name tpl rss ts mk rcw wl="" has_reg=0 has_pause=0 age pst
+  # vazio (sem arquivo de estado) → nada registrado, segue; falhou/ilegível/valor inválido/linha que não entendo → rc 30: o registro das suspensas pode estar lá e eu não o leio. Não religo, não apago a pausa (vence sozinha), NÃO gravo
+  load_state
+  if [ "$STATE_BAD" = 1 ]; then
+    log "RETOMADA: estado nao lido inteiro$STATE_NOTE — nao religo, nao apago a pausa (a validade dela vence sozinha), nao gravo"
+    say "SEM LEITURA na retomada:$STATE_NOTE; nao religuei nada"; return 30
+  fi
+  [ -n "$REG" ] && has_reg=1
+  # vazio (sem arquivo) → sem pausa; ilegível ou vencida → também conta, para limpar (o Pilot já a ignora, apagar é inerte)
+  [ -e "$PAUSE" ] && has_pause=1
+  if [ "$has_reg" = 0 ] && [ "$has_pause" = 0 ]; then
+    if [ "$CALM_SINCE" != 0 ]; then CALM_SINCE=0; save_state || log "WARN: nao consegui gravar $STATE"; fi
+    say "nada a retomar"; return 10
+  fi
+  read_history || { log "RETOMADA: $BLIND — nao religo, nao apago a pausa (a validade dela vence sozinha)"; say "SEM LEITURA na retomada: $BLIND; nao religuei nada"; return 30; }
+  # calmo = os DOIS lidos: nível baixo E crescimento conhecido e pequeno, e nenhum gatilho. Crescimento sem base (histórico curto) não é "calmo"
+  if [ "$SW_REF" -le $((ABS_MB - HYST_MB)) ] && [ -n "$GROWTH" ] && [ "$GROWTH" -lt $((GROW_MB / 2)) ] && ! triggered; then calm=1; fi
+  if [ "$calm" = 0 ]; then
+    if [ "$CALM_SINCE" != 0 ]; then
+      CALM_SINCE=0
+      save_state || { log "FALHOU: nao consegui zerar a contagem de calma em $STATE (swap ${SW_REF}MB nao esta calmo)"; say "FALHOU na retomada: swap ${SW_REF}MB nao esta calmo e nao consegui zerar a contagem de calma; mantenho pausa e sessoes suspensas"; return 20; }
+    fi
+    say "swap ${SW_REF}MB${GROWTH:+ (${GROWTH}MB em ${GROW_WINDOW_S}s)} ainda nao esta calmo: mantenho pausa e sessoes suspensas"; return 10
+  fi
+  # a contagem só vale se começou DEPOIS do último corte (o corte encerra o calmo anterior): uma contagem velha que sobrou (zeragem que não gravou) recomeça agora
+  if [ "$CALM_SINCE" = 0 ] || [ "$CALM_SINCE" -gt "$NOW" ] || [ "$CALM_SINCE" -lt "$LAST_CUT_TS" ]; then
+    CALM_SINCE=$NOW
+    save_state || { log "FALHOU: nao consegui gravar o inicio da contagem de calma em $STATE"; say "FALHOU na retomada: swap calmo (${SW_REF}MB) mas nao consegui gravar o inicio da contagem; nao religo nada"; return 20; }
+  fi
+  age=$((NOW - CALM_SINCE))
+  if [ "$has_pause" = 1 ] && [ "$age" -ge "$PAUSE_CALM_S" ]; then
+    if rm -f "$PAUSE" 2>/dev/null && [ ! -e "$PAUSE" ]; then log "RETOMADA: pausa do spawn do Pilot apagada (calmo ha ${age}s, swap ${SW_REF}MB)"; has_pause=0; wl="pausa do spawn do Pilot apagada"
+    else log "FALHOU: nao consegui apagar $PAUSE"; failed=$((failed + 1)); fi
+  fi
+  if [ "$has_reg" = 1 ] && [ "$age" -ge "$CALM_S" ]; then
+    # `mk` = marca `u` (suspend pedido e nunca confirmado): religa igual, religar quem não dormiu é inerte, e a marca volta no registro se o wake falhar
+    while IFS='|' read -r id name tpl rss ts mk; do
+      [ -n "$id" ] || continue
+      if [ "$waked" -ge "$MAX_WAKE" ] || over_budget; then left="$left$id|$name|$tpl|$rss|$ts${mk:+|$mk}
+"; continue; fi
+      # só a leitura POSITIVA tira do registro: "gone" (o id não está mais na lista) ou já ativa (alguém religou). "?" (não li) → tenta o wake, que é a direção que devolve a sessão
+      pst=$(session_state "$id")
+      case "$pst" in
+        gone) log "RETOMADA: $name ($tpl) nao esta mais no roster; tirei do registro sem religar"; wl="${wl}${wl:+; }$name ja nao existe (tirada do registro)"; continue ;;
+        active|start-pending|creating) log "RETOMADA: $name ($tpl) ja esta '$pst' (alguem a religou); tirei do registro"; wl="${wl}${wl:+; }$name ja estava ativa (tirada do registro)"; continue ;;
+      esac
+      bounded "$CMD_S" "$GCBIN" session wake "$id"; rcw=$?; rb_clean
+      if [ "$rcw" = 0 ]; then
+        waked=$((waked + 1)); wl="${wl}${wl:+; }religou $name"; log "RELIGOU $name ($tpl) [suspensa por mim em $ts, ${rss}MB${mk:+, marca $mk}]: gc session wake rc=0"
+      else
+        failed=$((failed + 1)); left="$left$id|$name|$tpl|$rss|$ts${mk:+|$mk}
+"; log "FALHOU ao religar $name ($tpl): gc session wake rc=$rcw"
+      fi
+    done <<EOF
+$REG
+EOF
+    REG=$left
+    save_state || { log "WARN: nao consegui gravar $STATE: as religadas seguem no registro (a proxima rodada as tira, sao ativas)"; failed=$((failed + 1)); }
+  fi
+  if [ "$failed" -gt 0 ]; then say "FALHOU na retomada: ${wl:-nada feito}; $failed passo(s) sem efeito"; return 20; fi
+  if [ -n "$wl" ]; then say "swap calmo ha ${age}s (${SW_REF}MB): $wl"; return 0; fi
+  say "swap calmo ha ${age}s (${SW_REF}MB): aguardando ${CALM_S}s para religar"; return 10
+}
+
 main() {
-  case "${1:-}" in --run) MODE=run ;; --dry-run) MODE=dry ;; *) usage ;; esac
+  case "${1:-}" in --run) MODE=run ;; --dry-run) MODE=dry ;; --resume) MODE=resume ;; *) usage ;; esac
   [ "$#" -eq 1 ] || usage
   [ -z "$CFG_WARN" ] || log "WARN: variavel de configuracao invalida, usei o padrao:$CFG_WARN"
   # interruptor do maestro: existe → desligado (sai 10 sem ler nem agir), também quando alguém chama este degrau à mão
@@ -665,7 +735,10 @@ main() {
     esac
     trap release_lock EXIT
   fi
-  do_run; exit $?
+  case "$MODE" in
+    resume) do_resume; exit $? ;;
+    *) do_run; exit $? ;;
+  esac
 }
 
 main "$@"
