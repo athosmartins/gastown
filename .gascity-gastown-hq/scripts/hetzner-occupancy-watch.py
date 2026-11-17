@@ -20,6 +20,8 @@ AVISO    ao Mayor por `gc mail send` (não nudge: o nudge ao Mayor trava com a s
            cooldown de 3 h. Só olha a CPU: NÃO depende de fila, de sessão nem do foco do gate. Athos, 20/10: "o que nao pode é ficar menos do que 100% ocupado"; na madrugada de 20/10 a CPU ficou em
            0-15 % por 7 h e nenhum aviso saiu, porque toda leitura era "ocupado" (havia sessão segurando bead)
   cego     nenhuma leitura decidiu o estado há >= 1 h (sessões, CPU ou fila ilegíveis), OU a CPU não é lida há >= 1 h (com a CPU cega o aviso de CPU baixa está mudo, mesmo que a sessão prove "ocupado"); cooldown de 6 h
+  disco    o disco da raiz do nó acima de 90 % (HETZNER_OCC_DF_DISK_PCT) OU os inodes acima de 80 % (HETZNER_OCC_DF_INODE_PCT), lidos por `df -P` na MESMA ssh (ga-d4iob2s: em 16/11 o nó chegou a 98 % e ninguém viu);
+           cooldown de 6 h (HETZNER_OCC_DF_COOLDOWN_S). Seção ausente ou ilegível: sem aviso e `disco.lido` false (nunca "folgado"). O mail traz a última linha do reaper.log do nó (docs/runbooks/hetzner-tmp-reaper.md)
   foco     o foco do gate (gate-focus.state, mesma regra de 3 estados da gate-focus-lib.sh) liga: só conserto é despachado, então o aviso de ocioso se cala
   chave    o aviso só sai com <cidade>/.gc/hetzner-occupancy-alarm.on presente (e sem HETZNER_OCC_ALARM=0): sem ela é o modo só-medir, INERTE de propósito (mede e grava, nunca manda mail)
 CAUSA, DEGRAUS E NÚMERO DO DIA  (ga-2hd02v.5.10; 04/11, das 10h às 14h: CPU em 24-47 % em 18 leituras seguidas (4 h36 abaixo da régua) e o vigia só avisava, não dizia por quê nem agia; pedido do Athos: monitorar de perto e agir)
@@ -73,7 +75,7 @@ LIVE = frozenset({"active", "awake"})  # = bead_state.LIVE_SESSION_STATES
 DEAD = frozenset({"asleep", "drained", "closed", "archived", "quarantined", "failed-create"})  # = bead_state.DEAD_SESSION_STATES
 WARMUP = frozenset({"sem-leitura-anterior", "leitura-anterior-velha", "contador-recuou", "relogio-recuou"})  # a CPU só semeou o baseline: não é "cego"
 BEGIN, END = "@@OCC-BEGIN@@", "@@OCC-END@@"
-S_CG, S_MEM, S_TMUX, S_NOW = "@@OCC-CG@@", "@@OCC-MEM@@", "@@OCC-TMUX@@", "@@OCC-NOW@@"
+S_CG, S_MEM, S_TMUX, S_NOW, S_DF, S_RP = "@@OCC-CG@@", "@@OCC-MEM@@", "@@OCC-TMUX@@", "@@OCC-NOW@@", "@@OCC-DF@@", "@@OCC-RP@@"
 # A MESMA ssh traz o /proc/stat e o resto (ga-2hd02v.5.10): cada parte tem o seu marcador e a falha de uma não derruba as outras. `u` = cpu.stat do user-<uid>.slice, `l` = o do ballast.slice (some quando nada do lastro roda),
 # `m 1` = o gerenciador de usuário existe (sem ele a ausência do `l` não quer dizer "lastro parado"). O tmux diz o rc antes da lista: "sem servidor" (rc 1) é lista vazia, qualquer outra falha NÃO é.
 # A lista é por JANELA (list-windows -a) com as DUAS atividades: o session_activity só anda com input (start/nudge) e a saída do claude anda o window_activity (o precedente do ga-2hd02v.11, scripts/gc-session-ssh). Medido no nó
@@ -84,6 +86,7 @@ REMOTE_CMD = (
     "for p in \"u:$B\" \"l:$B/user@$U.service/ballast.slice\"; do awk -v k=\"${p%%:*}\" '/^usage_usec/{print k, $2}' \"${p#*:}/cpu.stat\" 2>/dev/null; done; "
     "echo " + S_MEM + "; grep -E '^(MemAvailable|MemTotal):' /proc/meminfo; "
     "echo " + S_TMUX + "; o=$(tmux -L gc-remote list-windows -a -F '#{session_name}|#{session_activity}|#{window_activity}' 2>&1); echo \"rc=$?\"; echo \"$o\"; "
+    "echo " + S_DF + "; df -Pk / | tail -n 1; df -Pi / | tail -n 1; echo " + S_RP + "; tail -n 1 \"$HOME/gt-remote/tmp-reaper/reaper.log\" 2>/dev/null; "
     "echo " + S_NOW + "; date +%s; echo " + END
 )
 RUNGS = ("d1", "d2", "d3")  # a ordem da escada; o D4 (esgotou) é o aviso, não um degrau que age
@@ -132,6 +135,7 @@ def load_config(env):
         blind_cooldown_s=_num(env, "HETZNER_OCC_BLIND_COOLDOWN_S", 21600, int, 0),
         low_pct=_num(env, "HETZNER_OCC_LOW_PCT", 85, float, 0),  # 0 = nenhuma janela é baixa = aviso de CPU baixa desligado
         low_after_s=_num(env, "HETZNER_OCC_LOW_AFTER_S", 1800, int, 60), low_cooldown_s=_num(env, "HETZNER_OCC_LOW_COOLDOWN_S", 10800, int, 0),
+        df_disk_pct=_num(env, "HETZNER_OCC_DF_DISK_PCT", 90, float, 0), df_inode_pct=_num(env, "HETZNER_OCC_DF_INODE_PCT", 80, float, 0), df_cooldown_s=_num(env, "HETZNER_OCC_DF_COOLDOWN_S", 21600, int, 0),
         min_window_s=120, max_window_s=3 * interval, future_tol_s=60,
         ssh_timeout_s=_num(env, "HETZNER_OCC_SSH_TIMEOUT_S", 30, int, 1),
         gc_timeout_s=_num(env, "HETZNER_OCC_GC_TIMEOUT_S", 60, int, 1), bd_timeout_s=_num(env, "HETZNER_OCC_BD_TIMEOUT_S", 60, int, 1),
@@ -466,7 +470,8 @@ def _section(lines, mark):
 
 def parse_extra(out):
     """O que a ssh traz além do /proc/stat. Cada parte é lida sozinha e a que falta fica None/lido=False, NUNCA zero: o que não li não é "nada rodando"."""
-    ex = {"iow": None, "u": None, "l": None, "m": False, "cg": False, "ram_mb": None, "node_now": None, "tmux": {"lido": False, "sessoes": [], "motivo": "sem-secao"}}
+    ex = {"iow": None, "u": None, "l": None, "m": False, "cg": False, "ram_mb": None, "node_now": None, "tmux": {"lido": False, "sessoes": [], "motivo": "sem-secao"},
+          "df": {"lido": False, "disco_pct": None, "inodes_pct": None, "motivo": "sem-secao"}, "reaper": None}
     lines = [ln.strip() for ln in (out or "").splitlines()]
     if BEGIN not in lines or END not in lines[lines.index(BEGIN) + 1:]:
         return ex
@@ -511,6 +516,15 @@ def parse_extra(out):
                 t.update(lido=True, sessoes=[], motivo=None)  # sem servidor tmux no nó = nenhuma sessão (leu); qualquer outra falha do tmux NÃO é lista vazia
             else:
                 t["motivo"] = "tmux-rc-%d" % rc
+    # vazio (sem a seção) → lido=False, motivo sem-secao; falhou/ilegível (menos de 2 linhas de 6 campos numéricos) → lido=False, linha-ilegivel: nunca "disco folgado" (% = usado/(usado+livre), como o df)
+    df = _section(lines, S_DF)
+    if df is not None:
+        got = [round(100.0 * int(f[2]) / (int(f[2]) + int(f[3])), 1) for f in (ln.split() for ln in df)
+               if len(f) == 6 and all(re.fullmatch(r"[0-9]+", x) for x in f[1:4]) and int(f[2]) + int(f[3]) > 0]
+        ex["df"] = {"lido": len(got) == 2, "disco_pct": got[0] if len(got) == 2 else None, "inodes_pct": got[1] if len(got) == 2 else None, "motivo": None if len(got) == 2 else "linha-ilegivel"}
+    # vazio (sem reaper.log no nó) → None, e o mail diz "sem registro"; falhou/ilegível → o mesmo None: é só contexto do mail, não entra na decisão
+    rp = _section(lines, S_RP)
+    ex["reaper"] = rp[0][:300] if rp else None
     nw = _section(lines, S_NOW)
     if nw and re.fullmatch(r"[0-9]+", nw[0]):
         ex["node_now"] = int(nw[0])
@@ -808,6 +822,19 @@ def low_mail(c, rd, low):
         "Este aviso NÃO depende de fila nem de sessão: com sessão segurando bead e a CPU parada ele sai do mesmo jeito (foi o que faltou na madrugada de 20/10, 7 h com 0 a 15% de CPU e zero aviso). "
         "A fila, quando lida, é a do Pilot ANTES dos vetos de pool e do freio de top-up: é um teto, não uma promessa.",
         "O vigia não atribui nem despacha bead nenhuma; mede, avisa e, só nos degraus cuja chave .on existe, age (mata sessão sem dono, pede lastro, reclassifica a fila de WA). Próximo aviso deste tipo em no mínimo %d h. Voltar a só-medir: rm %s" % (c.low_cooldown_s // 3600, c.alarm_key),
+    ])
+    return subj, body
+
+
+def disco_mail(c, rd, reaper):
+    d = rd["disco"]
+    subj = "Hetzner: disco do nó a %s%% e inodes a %s%% (aviso acima de %g%% e %g%%)" % (d["disco_pct"], d["inodes_pct"], c.df_disk_pct, c.df_inode_pct)
+    body = "\n".join([
+        "Estado do mundo: a raiz do nó Hetzner (%s) está com o disco a %s%% (aviso acima de %g%%) e os inodes a %s%% (aviso acima de %g%%). Sem espaço ou inode livre nenhum teste, build ou noturno grava "
+        "(16/11: 98%% e o noturno do Traço BIM pulou, ga-z4zvx4q)." % (c.ssh_host, d["disco_pct"], c.df_disk_pct, d["inodes_pct"], c.df_inode_pct),
+        "• última rodada do reaper de /tmp do nó (ga-d4iob2s): %s" % (reaper or "sem registro (não instalado ou nunca rodou: ~/gt-remote/tmp-reaper/reaper.log)"),
+        "• onde olhar: ~/gt-remote/tmp-reaper/status.json no nó (`top` = os prefixos que mais vazaram) e docs/runbooks/hetzner-tmp-reaper.md; os maiores consumidores de inodes são /tmp/claude-* (scratchpads) e os testes em /tmp.",
+        "O vigia só avisa. Próximo aviso deste tipo em no mínimo %d h. Voltar a só-medir: rm %s" % (c.df_cooldown_s // 3600, c.alarm_key),
     ])
     return subj, body
 
@@ -1150,7 +1177,7 @@ def run(args, env):
     c = load_config(env)
     if args.print_config:
         keys = ("city", "interval_s", "busy_cores", "stores", "other_hosts", "ssh_host", "alarm", "alarm_key", "idle_after_s", "blind_after_s", "slack_s",
-                "idle_cooldown_s", "blind_cooldown_s", "low_pct", "low_after_s", "low_cooldown_s", "min_window_s", "max_window_s", "ssh_timeout_s", "gc_timeout_s", "bd_timeout_s", "pilot_file",
+                "idle_cooldown_s", "blind_cooldown_s", "low_pct", "low_after_s", "low_cooldown_s", "df_disk_pct", "df_inode_pct", "df_cooldown_s", "min_window_s", "max_window_s", "ssh_timeout_s", "gc_timeout_s", "bd_timeout_s", "pilot_file",
                 "d1_idle_s", "d1_max", "act_cooldown_s", "act_tries", "d4_after_s", "notify_retry_s", "notify_timeout_s", "ram_start_mb", "ram_slot_mb", "min_free_cores", "day_min_windows", "ballast_home", "wa_memo",
                 "memo_unknown_ttl_s", "keys", "on")
         print(json.dumps({k: getattr(c, k) for k in keys}, ensure_ascii=False, indent=2))
@@ -1193,7 +1220,7 @@ def run(args, env):
 
     rd = {"ts": time.strftime("%Y-%m-%dT%H:%M:%S%z", time.localtime(now)), "epoch": now, "regra": RULE, "estado": est, "sessoes": sess, "cpu": cpu, "fila": fila, "foco": foco,
           "ociosas_seguidas": ocio, "cegas_seguidas": cegas, "baixas_seguidas": low["n"], "cpu_cegas_seguidas": cpu_cegas,
-          "nucleos": nuc, "ram_mb": ex["ram_mb"], "lixo": {k: v for k, v in lixo.items() if not k.startswith("_")}, "memo_unknown": memo_n, "causa": cause}
+          "nucleos": nuc, "ram_mb": ex["ram_mb"], "lixo": {k: v for k, v in lixo.items() if not k.startswith("_")}, "memo_unknown": memo_n, "causa": cause, "disco": ex["df"]}
     idle_due = est == "ocioso" and fila["lido"] and fila["n"] > 0 and now - ocio_desde >= c.idle_after_s - c.slack_s
     blind_state_due = cegas > 0 and now - decidida_em >= c.blind_after_s - c.slack_s
     blind_cpu_due = cpu_cegas > 0 and now - cpu_lida_em >= c.blind_after_s - c.slack_s
@@ -1203,7 +1230,9 @@ def run(args, env):
     a_idle = _plan(c, idle_due, last_idle, c.idle_cooldown_s, now, dry, "foco" if foco == "ligado" else None)
     a_blind = _plan(c, blind_due, last_blind, c.blind_cooldown_s, now, dry)
     a_low = _plan(c, low_due, last_low, c.low_cooldown_s, now, dry)
-    rd["alarme"] = {"ocioso": a_idle, "cego": a_blind, "cpu_baixa": a_low}
+    dfx, last_df = ex["df"], _int(st.get("alarme_disco_em"))  # disco do nó (ga-d4iob2s): só avisa com a leitura LIDA e acima do limite; sem leitura não há aviso nem "tudo bem"
+    a_df = _plan(c, dfx["lido"] and (dfx["disco_pct"] > c.df_disk_pct or dfx["inodes_pct"] > c.df_inode_pct), last_df, c.df_cooldown_s, now, dry)
+    rd["alarme"] = {"ocioso": a_idle, "cego": a_blind, "cpu_baixa": a_low, "disco": a_df}
     if dry:
         rd["dry_run"] = True
 
@@ -1225,7 +1254,7 @@ def run(args, env):
     new_st = {"versao": 1, "cpu": new_base or (st.get("cpu") if _baseline_ok(st.get("cpu")) else None), "ociosas_seguidas": ocio, "ocioso_desde": ocio_desde,
               "cegas_seguidas": cegas, "decidida_em": decidida_em, "alarme_ocioso_em": last_idle, "alarme_cego_em": last_blind, "atualizado_em": now,
               "cpu_cegas_seguidas": cpu_cegas, "cpu_lida_em": cpu_lida_em, "baixas_seguidas": low["n"], "baixa_desde": low["desde"],
-              "baixa_nucleos_s": None if low["n"] == 0 else round(low["nucleos_s"], 2), "baixa_capacidade_s": None if low["n"] == 0 else low["cap_s"], "alarme_baixa_em": last_low,
+              "baixa_nucleos_s": None if low["n"] == 0 else round(low["nucleos_s"], 2), "baixa_capacidade_s": None if low["n"] == 0 else low["cap_s"], "alarme_baixa_em": last_low, "alarme_disco_em": last_df,
               "cpu_extra": new_xbase or (st.get("cpu_extra") if _extra_base_ok(st.get("cpu_extra")) else None), "degraus": deg, "pendentes": pendentes,
               "ultima_acao_em": _int(st.get("ultima_acao_em")), "d4_dia": st.get("d4_dia"), "d4_bead": st.get("d4_bead") if low["n"] > 0 else None, "d4_falha_em": _int(st.get("d4_falha_em")),
               "d4_falha_ep": _int(st.get("d4_falha_ep")), "dia_avaliado": st.get("dia_avaliado"), "dia_falha_em": _int(st.get("dia_falha_em")),
@@ -1255,6 +1284,8 @@ def run(args, env):
         sends.append(("alarme_cego_em", last_blind, ("cego",)) + blind_mail(c, rd, now - decidida_em if blind_state_due else None, now - cpu_lida_em if blind_cpu_due else None))
     if a_low == "enviar":
         sends.append(("alarme_baixa_em", last_low, ("cpu_baixa",)) + low_mail(c, rd, low))
+    if a_df == "enviar":
+        sends.append(("alarme_disco_em", last_df, ("disco",)) + disco_mail(c, rd, ex["reaper"]))
     if not dry:
         if verdict in ("na-meta", "sem-numero", "sem-dia-anterior"):
             new_st["dia_avaliado"] = today  # avaliou de verdade e não há o que avisar: não reavalia o dia todo

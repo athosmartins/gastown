@@ -195,7 +195,7 @@ fresh() {   # cidade, HOME, stubs e relógio novos; sessões = nenhuma remota; f
   STUB_GC_RC=0; STUB_GC_SLEEP=""; STUB_SSH_RC=0; STUB_SSH_SLEEP=""; STUB_MAIL_RC=0; STUB_SSH_FILE=""; STUB_OUTFAIL=""; STUB_BD_RC=0; STUB_BD_SLEEP=""
   # a escada (ga-2hd02v.5.10): o que as ações, o notify, o bd create e o "nó" de mentira devolvem, e os contadores/menu da leitura completa (xtick)
   STUB_ACT_RC=0; STUB_ACT_SLEEP=""; STUB_ACT_OUT=""; STUB_TMUX_ACT_BAD=""; STUB_TMUX_KILL_FAIL=""; STUB_BD_CREATE_ID=""; STUB_BD_CREATE_RC=0; STUB_NOTIFY_RC=0; STUB_NOTIFY_SLEEP=""
-  XU=0; XL=0; CW=0; X_OMIT=""; X_RAM_MB=20000; X_TMUX=lista
+  XU=0; XL=0; CW=0; X_OMIT=""; X_RAM_MB=20000; X_TMUX=lista; X_DF_D=400; X_DF_I=100; X_DF_RAW=""; X_RP=""   # disco (ga-d4iob2s): % em décimos (400 = 40,0 %), df cru para a linha ruim, última linha do reaper.log do nó
   PILOT_HQ=3; PILOT_WA=0; FOCUS=off; WOUT="$T/out.json"; WERR="$T/err"
   # o aviso de CPU baixa (ga-2hd02v.6) nasce DESLIGADO aqui (régua 0 = nenhuma janela é baixa): os grupos antigos usam CPU de 0,3 % como "ocioso" e contam mails, e o de CPU baixa viria junto em todos.
   # Quem testa o aviso novo (grupo baixa) e a configuração padrão (cfg) pede o padrão de verdade com fresh_lp.
@@ -287,6 +287,9 @@ xwrite() {   # xwrite <arquivo>: a saída COMPLETA da ssh de leitura (/proc/stat
         lixo) echo "rc=0"; echo "linha sem barra" ;;
         semrc) cat "$T/stub/node.tmux" ;;
       esac ;; esac
+    case "$o" in *" df "*) ;; *) echo "@@OCC-DF@@"
+      if [ -n "$X_DF_RAW" ]; then printf '%s\n' "$X_DF_RAW"; else echo "/dev/sda1 1000 $X_DF_D $((1000 - X_DF_D)) $((X_DF_D / 10))% /"; echo "/dev/sda1 1000 $X_DF_I $((1000 - X_DF_I)) $((X_DF_I / 10))% /"; fi
+      [ -z "$X_RP" ] || { echo "@@OCC-RP@@"; echo "$X_RP"; } ;; esac
     case "$o" in *" now "*) ;; *) echo "@@OCC-NOW@@"; echo "$NOW" ;; esac
     echo "@@OCC-END@@"; } > "$1"
 }
@@ -1802,7 +1805,40 @@ g_replay() {
 }
 
 # ============================================================================================================================================================================
-# ---- CONTROLE NEGATIVO -----------------------------------------------------------------------------------------------------------------------------------------------------------
+g_disco() {
+  local HIW="1000 300 100 0"   # 14 de 16 núcleos (87,5 %): acima da régua de 85 %, para o aviso de CPU baixa não entrar na conta dos mails
+  dfresh() { xfresh; : > "$C/.gc/hetzner-occupancy-alarm.on"; }
+  echo "--- disco: disco do nó > 90 % ou inodes > 80 % avisa o Mayor (16/11: 98 % e 91 %, ninguém viu); leitura que falha NÃO é disco folgado (ga-d4iob2s)"
+  dfresh; xtick 900 $HIW >/dev/null
+  eq "disco 40 % e inodes 10 %: sem mail" 0 "$(mails)"; eq "... alarme.disco = nao" nao "$(reading alarme.disco)"; eq "... a leitura traz os dois números" "40.0/10.0" "$(reading disco.disco_pct)/$(reading disco.inodes_pct)"
+  has "... a ssh de leitura pede o df da raiz" "df -Pk / | tail -n 1; df -Pi /" "$(cat "$T/stub/ssh.calls")"
+  X_DF_D=981; X_DF_I=913; X_RP="2026-11-17T02:20:00Z LIMPO reaped=3 scanned=9 top=wa-parear-*:2"; xtick 900 $HIW
+  eq "disco 98,1 % e inodes 91,3 %: 1 mail ao Mayor" 1 "$(mails)"; eq "... destinatário" mayor "$(mailfield 1 to)"; eq "... alarme.disco = enviado" enviado "$(reading alarme.disco)"
+  has "... assunto: os dois números" "disco do nó a 98.1% e inodes a 91.3%" "$(mailfield 1 subj)"; has "... corpo: a última linha do reaper" "LIMPO reaped=3 scanned=9 top=wa-parear-*:2" "$(mailfield 1 body)"
+  eq "... o cooldown já estava GRAVADO quando o mail saiu" "$NOW" "$(jv "$T/stub/mail.1.state" alarme_disco_em)"
+  xtick 900 $HIW; eq "15 min depois, ainda alto: cooldown, sem mail repetido" 1 "$(mails)"; eq "... alarme.disco = cooldown" cooldown "$(reading alarme.disco)"
+  dfresh; TENV=(HETZNER_OCC_DF_COOLDOWN_S=1800); X_DF_D=981; xtick 900 $HIW >/dev/null; xtick 900 $HIW >/dev/null; xtick 900 $HIW
+  eq "cooldown vencido (HETZNER_OCC_DF_COOLDOWN_S): o 2º aviso sai" 2 "$(mails)"
+  echo "--- disco: os limites são estritos (> e não >=) e cada um avisa sozinho"
+  dfresh; X_DF_D=900; X_DF_I=800; xtick 900 $HIW >/dev/null; eq "exatamente 90,0 % e 80,0 %: não avisa" 0 "$(mails)"
+  dfresh; X_DF_D=901; xtick 900 $HIW >/dev/null; eq "disco 90,1 %: avisa" 1 "$(mails)"; has "... sem reaper.log no nó o corpo diz" "sem registro" "$(mailfield 1 body)"
+  dfresh; X_DF_I=801; xtick 900 $HIW >/dev/null; eq "inodes 80,1 % (disco 40 %): avisa" 1 "$(mails)"
+  echo "--- disco: leitura que falta ou não confere NUNCA é disco folgado e nunca avisa; chave, ALARM=0 e mail que falha"
+  dfresh; X_OMIT=" df "; xtick 900 $HIW >/dev/null
+  eq "seção do df ausente: lido false, motivo sem-secao, sem mail" "false/sem-secao/0" "$(reading disco.lido)/$(reading disco.motivo)/$(mails)"
+  dfresh; X_DF_RAW="/dev/sda1 abc def ghi 98% /"; xtick 900 $HIW >/dev/null
+  eq "linha do df que não confere: lido false, motivo linha-ilegivel, sem mail" "false/linha-ilegivel/0" "$(reading disco.lido)/$(reading disco.motivo)/$(mails)"
+  xfresh; X_DF_D=981; xtick 900 $HIW >/dev/null
+  eq "sem a chave .on: nenhum mail e alarme.disco = desligado" "0/desligado" "$(mails)/$(reading alarme.disco)"
+  dfresh; X_DF_D=981; TENV=(HETZNER_OCC_ALARM=0); xtick 900 $HIW >/dev/null
+  eq "HETZNER_OCC_ALARM=0: o mesmo" "0/desligado" "$(mails)/$(reading alarme.disco)"
+  dfresh; X_DF_D=981; STUB_MAIL_RC=1; xtick 900 $HIW >/dev/null
+  eq "mail que falha: alarme.disco = falhou e o cooldown NÃO é gasto" "falhou/null" "$(reading alarme.disco)/$(state_f alarme_disco_em)"
+  STUB_MAIL_RC=0; xtick 900 $HIW; eq "... a próxima rodada tenta de novo e envia" enviado "$(reading alarme.disco)"
+}
+
+# ============================================================================================================================================================================
+# ---- CONTROLE NEGATIVO-----------------------------------------------------------------------------------------------------------------------------------------------------------
 # mutante <nome> <grupos> <trecho> <troca>: troca UM trecho literal do script (tem de aparecer exatamente 1 vez), roda só os grupos que deveriam pegar e exige reprovação. Padrão que não existe = erro.
 # O padrão é conferido aqui, em série; a suíte do mutante roda num subshell em segundo plano (no máximo HOCC_JOBS) e o resultado vai para um arquivo, lido em ordem por mutantes_wait
 # (nada de `wait <pid>` depois de `jobs`: o que o bash lembra de um filho já colhido muda entre versões, e o mini pode estar no 3.2 do macOS).
@@ -2055,10 +2091,16 @@ g_mutantes() {
   mutante dia-sem-chave-avalia "aviso" $'    if not c.on["dia"]:\n        verdict = "desligado"' $'    if False:\n        verdict = "desligado"'
   mutante dia-avisa-duas-vezes "aviso" $'    elif st.get("dia_avaliado") == today:\n        verdict = "ja-avaliado"' $'    elif False:\n        verdict = "ja-avaliado"'
   mutante dia-causa-cega-conta "aviso" $'cnt = {k: t[k] for k in CAUSAS if k != "cego" and' $'cnt = {k: t[k] for k in CAUSAS if'
+  # o disco do nó (ga-d4iob2s): limite estrito, cada limite sozinho, cooldown, leitura que falta não avisa, e o df entra na MESMA ssh
+  mutante disco-limite-do-disco-maior-ou-igual "disco" $'dfx["disco_pct"] > c.df_disk_pct' $'dfx["disco_pct"] >= c.df_disk_pct'
+  mutante disco-ignora-os-inodes "disco" $' or dfx["inodes_pct"] > c.df_inode_pct' $''
+  mutante disco-sem-cooldown "disco" $'last_df, c.df_cooldown_s, now, dry)' $'None, c.df_cooldown_s, now, dry)'
+  mutante disco-leitura-ausente-avisa "disco" $'a_df = _plan(c, dfx["lido"] and (' $'a_df = _plan(c, True and ('
+  mutante disco-ssh-sem-df "disco" $'df -Pk / | tail -n 1; ' $''
   mutantes_wait
 }
 
-GROUPS_ALL="cfg sess bead cpu fila estado alarme baixa saida lastro causa escada aviso replay"
+GROUPS_ALL="cfg sess bead cpu fila estado alarme baixa saida lastro causa escada aviso replay disco"
 run_groups() { local g; for g in "$@"; do "g_$g"; done; }
 
 DEFAULT="$GROUPS_ALL mutantes"; [ -z "${HOCC_NO_MUTANTS:-}" ] || DEFAULT="$GROUPS_ALL"

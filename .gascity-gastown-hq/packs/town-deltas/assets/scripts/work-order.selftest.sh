@@ -13,7 +13,8 @@
 # Env: WO_LIB_UNDER_TEST / WO_PY_UNDER_TEST / WO_REGISTRY_UNDER_TEST point the checks at another copy
 # (the mutation controls use them); WO_SKIP_MUTATION=1 skips (j) and (R) (the library mutants' own runs);
 # WO_ONLY=R runs only the registry lint (the lint mutants' own runs). Temp files go under $TMPDIR and are
-# removed with safe-clean when it approves the path (never rm -rf).
+# removed with safe-clean when it approves the path; without safe-clean (the Hetzner node has none: 20k leaked
+# wo-selftest.* there, ga-d4iob2s) the directory THIS run made is removed by a name-checked `find -delete`.
 set -uo pipefail
 
 SELF="${BASH_SOURCE[0]}"
@@ -42,7 +43,11 @@ if [ ! -r "$LIB" ]; then
 fi
 
 TMP="$(mktemp -d "${TMPDIR:-/tmp}/wo-selftest.XXXXXX")" || { echo "FATAL: mktemp"; exit 1; }
-cleanup() { if command -v safe-clean >/dev/null 2>&1 && safe-clean --check "$TMP" >/dev/null 2>&1; then safe-clean "$TMP" >/dev/null 2>&1; fi; }
+cleanup() {
+  if command -v safe-clean >/dev/null 2>&1 && safe-clean --check "$TMP" >/dev/null 2>&1; then safe-clean "$TMP" >/dev/null 2>&1; return; fi
+  # vazio → nada a apagar; falhou/ilegível → a pasta fica para o reaper do nó (hetzner-tmp-reaper.py); nunca apaga o que não é a mktemp desta rodada (nome e link conferidos)
+  case "$TMP" in */wo-selftest.??????) [ -d "$TMP" ] && [ ! -L "$TMP" ] && find "$TMP" -depth -delete 2>/dev/null ;; esac
+}
 trap cleanup EXIT
 
 # ── fixtures ────────────────────────────────────────────────────────────────────────────────────
