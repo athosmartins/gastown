@@ -5,7 +5,7 @@
 #   Casos · Controle negativo · Como rodar
 #
 # CASOS  igual · diferente (mail, cooldown, IP novo, mail que falha) · não sei (fonte cai, discorda, resposta que não é IP, IP privado, timeout) · cegueira (N falhas seguidas, cooldown, zera com leitura boa)
-#   · episódio (voltou ao liberado e desviou de novo avisa na hora) · --ack · --dry-run · estado corrompido · instância única · aviso desligado · configuração inválida · plist
+#   · episódio (voltou ao liberado e desviou de novo avisa na hora) · --ack · --dry-run · estado corrompido (texto torto, não-UTF-8, JSON fundo, campo de tipo errado, chave extra; --print e --ack herdam) · estado que não grava depois do mail · instância única · aviso desligado · configuração inválida · plist
 # CONTROLE NEGATIVO  cada mutante (um trecho literal do script trocado, que tem de existir UMA vez) TEM de reprovar a suíte; mutante que passa = teste que não pega o bug.
 #   Cada um roda sob `ulimit -f` (teto de escrita por arquivo, ga-e6ug8gq) e a suíte dele pula os casos lentos (HFW_FAST=1).
 # COMO RODAR  hetzner-fw-ip-watch.selftest.sh   (HFW_UNDER_TEST=<script> roda a suíte contra outra cópia · HFW_NO_MUTANTS=1 pula o controle negativo · HFW_FAST=1 pula timeout e instância única)
@@ -147,12 +147,45 @@ echo '{"v": 1, "allowed_ip": "10.1.1.1", "fails": 0}' > "$T/city/.gc/hetzner-fw-
 echo '{"v": 1, "allowed_ip": "'"$LIBERADO"'", "fails": 0, "seen_epoch": "ontem"}' > "$T/city/.gc/hetzner-fw-ip.state.json"; run; has "epoch que não é inteiro: corrompido" "corrompido" "$err"
 echo '[1,2]' > "$T/city/.gc/hetzner-fw-ip.state.json"; run; has "JSON que não é objeto: corrompido" "corrompido" "$err"
 
+# estado que NÃO é texto / JSON fundo / tipo errado (ga-jhjnvqe): formato errado = corrompido (cópia guardada, recomeça da semente), nunca traceback (rc 1 a cada rodada, calado para sempre)
+corrupt_case() {  # corrupt_case <rótulo>: o arquivo de estado já está escrito; a rodada (fontes caídas) tem de recomeçar da semente e guardar os bytes antigos
+  local lbl="$1" st="$T/city/.gc/hetzner-fw-ip.state.json"
+  cp "$st" "$T/orig.state"
+  src "$H1" "rc 6"; src "$H2" "rc 6"; NOW_OVERRIDE=$((NOW+600)) run
+  eq "$lbl: rc 0" 0 "$rc"; has "$lbl: recomeçou da semente (falhas=1)" "falhas=1" "$out"; has "$lbl: avisa no stderr" "corrompido" "$err"; hasnt "$lbl: sem traceback" "Traceback" "$err"
+  if cmp -s "$T/orig.state" "$st.corrupt-$((NOW+600))"; then ok "$lbl: a cópia guarda os bytes antigos"; else bad "$lbl: a cópia não guarda os bytes antigos"; fi
+}
+reset; printf '\xff\xfe\x00garbage' > "$T/city/.gc/hetzner-fw-ip.state.json"; corrupt_case "estado não-UTF-8"
+reset; python3 -B -c 'import sys; sys.stdout.write("["*200000)' > "$T/city/.gc/hetzner-fw-ip.state.json"; corrupt_case "estado JSON fundo (RecursionError)"
+reset; echo '{"v": 1, "allowed_ip": 5, "fails": 0}' > "$T/city/.gc/hetzner-fw-ip.state.json"; corrupt_case "allowed_ip que não é texto (número)"
+reset; echo '{"v": 1, "allowed_ip": ["1.2.3.4"], "fails": 0}' > "$T/city/.gc/hetzner-fw-ip.state.json"; corrupt_case "allowed_ip que não é texto (lista)"
+reset; echo '{"v": 1, "allowed_ip": "'"$LIBERADO"'", "fails": 0, "seen_ip": 7}' > "$T/city/.gc/hetzner-fw-ip.state.json"; corrupt_case "seen_ip que não é texto"
+reset; echo '{"v": 1, "allowed_ip": "'"$LIBERADO"'", "fails": true}' > "$T/city/.gc/hetzner-fw-ip.state.json"; corrupt_case "fails booleano"
+reset; echo '{"v": true, "allowed_ip": "'"$LIBERADO"'", "fails": 0}' > "$T/city/.gc/hetzner-fw-ip.state.json"; corrupt_case "versão booleana"
+# chave a mais com texto que não grava de volta (surrogate solto): o estado vale, a chave extra não passa para o arquivo novo
+reset; echo '{"v": 1, "allowed_ip": "'"$LIBERADO"'", "fails": 0, "x": "\ud800"}' > "$T/city/.gc/hetzner-fw-ip.state.json"; both "$LIBERADO"; WARGS=""; run
+eq "chave extra ilegível de gravar: rc 0" 0 "$rc"; has "chave extra: rodada normal" "estado=igual" "$out"; hasnt "chave extra: sem traceback" "Traceback" "$err"
+ls "$T/city/.gc" | grep -q '\.tmp\.' && bad "chave extra: sobrou arquivo .tmp" || ok "chave extra: nenhum .tmp sobrando"
+python3 -B -c 'import json,sys; sys.exit(0 if "x" not in json.load(open(sys.argv[1])) else 1)' "$T/city/.gc/hetzner-fw-ip.state.json" && ok "chave extra: não foi copiada para o estado novo" || bad "chave extra: foi copiada para o estado novo"
+# --print e --ack herdam o conserto de load_state
+reset; printf '\xff\xfe\x00garbage' > "$T/city/.gc/hetzner-fw-ip.state.json"; WARGS="--print"; run
+eq "print com estado não-UTF-8: rc 0" 0 "$rc"; has "print com estado não-UTF-8: mostra a semente" "\"allowed_ip\": \"$LIBERADO\"" "$out"; hasnt "print: sem traceback" "Traceback" "$err"
+reset; printf '\xff\xfe\x00garbage' > "$T/city/.gc/hetzner-fw-ip.state.json"; WARGS="--ack $NOVO"; run
+eq "ack com estado não-UTF-8: rc 0" 0 "$rc"; eq "ack com estado não-UTF-8: grava o IP" "$NOVO" "$(sget allowed_ip)"
+WARGS=""
+
 # estado ilegível (sem permissão de leitura) = não sei: não decide, não manda mail, não mexe no arquivo, sai com rc 3
 reset; both "$NOVO"; WARGS=""; run; before=$(cat "$T/city/.gc/hetzner-fw-ip.state.json")
 chmod 000 "$T/city/.gc/hetzner-fw-ip.state.json"; NOW_OVERRIDE=$((NOW+600)) run; chmod 600 "$T/city/.gc/hetzner-fw-ip.state.json"
 eq "estado ilegível: rc 3" 3 "$rc"; has "estado ilegível: diz o que não conseguiu" "não consegui ler" "$err"; eq "estado ilegível: nenhum mail novo (o 1 é da 1ª rodada)" 1 "$(calls)"
 [ "$before" = "$(cat "$T/city/.gc/hetzner-fw-ip.state.json")" ] && ok "estado ilegível: o arquivo não foi tocado" || bad "estado ilegível: o arquivo foi alterado"; hasnt "estado ilegível: não vira estado de semente" "estado=" "$out"
 ls "$T/city/.gc" | grep -q 'state.json.corrupt-' && bad "estado ilegível: não guarda cópia de corrompido" || ok "estado ilegível: não guarda cópia de corrompido"
+
+# mail enviado mas estado que não grava (ga-jhjnvqe): rc 3 e o stderr diz que o mail saiu, para o mail repetido da rodada seguinte ter explicação no log
+reset; both "$NOVO"; WARGS=""; run; both "$NOVO2"; chmod 555 "$T/city/.gc"; NOW_OVERRIDE=$((NOW+600)) run; chmod 755 "$T/city/.gc"
+eq "mail enviado, estado não gravado: rc 3" 3 "$rc"; has "mail enviado, estado não gravado: o stderr diz que o mail saiu" "mail enviado, estado não gravado" "$err"; has "mail enviado, estado não gravado: e por que não gravou" "não consegui gravar" "$err"; eq "mail enviado, estado não gravado: o mail de fato saiu" 2 "$(calls)"
+reset; both "$NOVO"; run; chmod 555 "$T/city/.gc"; NOW_OVERRIDE=$((NOW+600)) run; chmod 755 "$T/city/.gc"
+eq "estado não grava sem mail na rodada: rc 3" 3 "$rc"; hasnt "estado não grava sem mail na rodada: NÃO afirma mail enviado" "mail enviado" "$err"; eq "estado não grava sem mail na rodada: ainda 1 mail" 1 "$(calls)"
 
 # ---- aviso desligado e configuração --------------------------------------------------------------------------------------------------------------------
 reset; both "$NOVO"; WARGS=""; run HETZNER_FW_IP_ALARM=0
@@ -214,6 +247,14 @@ if [ -z "${HFW_UNDER_TEST:-}" ] && [ "${HFW_NO_MUTANTS:-0}" != 1 ]; then
                 alarme = "dry-run"' 'elif False:
                 alarme = "dry-run"'
   mutant M13-estado-ilegivel 'raise Fail("não consegui ler %s: %s" % (path, e))' 'return new_state(c)'
+  mutant M14-estado-nao-utf8 'except UnicodeDecodeError:' 'except ZeroDivisionError:'
+  mutant M15-json-fundo 'except (ValueError, RecursionError):' 'except ValueError:'
+  mutant M16-ip-tipo-errado 'if not isinstance(text, str):' 'if False:'
+  mutant M17-grava-ValueError 'except (OSError, ValueError) as e:  # ValueError' 'except OSError as e:  # ValueError'
+  mutant M18-mail-sem-estado 'if mail_saiu:' 'if False:'
+  mutant M19-chave-extra 'base.update({k: st[k] for k in base if k in st})' 'base.update(st)'
+  mutant M20-versao-bool ' and not isinstance(st.get("v"), bool)' ''
+  mutant M21-fails-bool ' and not isinstance(st.get("fails"), bool)' ''
   mutant M12-liberado-sozinho 'st["seen_ip"], st["seen_epoch"] = ip, now' 'st["seen_ip"], st["seen_epoch"], st["allowed_ip"] = ip, now, ip'
 fi
 

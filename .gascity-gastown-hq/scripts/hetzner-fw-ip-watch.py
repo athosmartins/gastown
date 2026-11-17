@@ -15,7 +15,7 @@ REGRA  cada leitura tem TRÊS estados (igual ao liberado / diferente / não cons
   O vigia só LÊ e AVISA. Não muda o firewall: não há o item 'hcloud' (token da API de firewall) no cofre (17/11), e o firewall da nuvem não tem desfazer. Com o token, a atualização pela API
   (PUT /v1/firewalls/11795835/actions/set_rules) fica para uma fatia própria, com chave .on e prova de que o ssh volta.
 ARQUIVOS (só em <cidade>/.gc)  hetzner-fw-ip.state.json (liberado, visto, falhas seguidas, últimos avisos) · hetzner-fw-ip.lock (instância única: o launchd não empilha rodadas).
-  Estado corrompido não some: a cópia fica em <arquivo>.corrupt-<epoch> e o vigia recomeça da semente (caso comum: um aviso a mais; se o IP voltar justo ao da semente com o firewall em outro, lê 'igual' até o --ack).
+  Estado corrompido (não é UTF-8, não é JSON, JSON fundo demais, campo de tipo errado) não some: a cópia fica em <arquivo>.corrupt-<epoch> e o vigia recomeça da semente (caso comum: um aviso a mais; se o IP voltar justo ao da semente com o firewall em outro, lê 'igual' até o --ack).
 USO  hetzner-fw-ip-watch.py [--dry-run] [--print] [--ack [IP]]
   (sem argumento) uma rodada: lê, compara, avisa se for o caso, grava o estado, imprime UMA linha.   --dry-run  não grava nem manda mail.   --print  imprime o estado e sai.
   --ack [IP]  o firewall já foi atualizado: grava IP (ou, sem argumento, o IP que as duas fontes dizem agora) como liberado.
@@ -54,7 +54,9 @@ class Fail(Exception):
 # ---- configuração ------------------------------------------------------------------------------------------------------------------------------------
 def parse_ip(text):
     """IPv4 público válido (str normalizada) ou None. Privado, loopback, link-local, reservado, v6 e lixo = None."""
-    s = (text or "").strip()
+    if not isinstance(text, str):  # número, lista, None, bool... não é um IP (e não tem .strip())
+        return None
+    s = text.strip()
     if not s or len(s) > 15:
         return None
     try:
@@ -119,7 +121,7 @@ def write_atomic(path, text):
         with open(tmp, "w", encoding="utf-8") as f:
             f.write(text)
         os.replace(tmp, path)
-    except OSError as e:
+    except (OSError, ValueError) as e:  # ValueError: UnicodeEncodeError (texto com surrogate solto não grava em UTF-8)
         try:
             os.unlink(tmp)
         except OSError:
@@ -150,29 +152,35 @@ def new_state(c):
 
 
 def load_state(c, now, dry):
-    """O estado gravado, ou um estado de semente. Ausente = semente (1ª rodada); corrompido = a cópia fica em <arquivo>.corrupt-<epoch> (menos no --dry-run) e recomeça da semente."""
+    """O estado gravado, ou um estado de semente. Ausente = semente (1ª rodada); corrompido (não é texto UTF-8, não é JSON, JSON fundo demais, campo de tipo errado) = a cópia fica em <arquivo>.corrupt-<epoch> (menos no --dry-run) e recomeça da semente."""
     path = os.path.join(c.gc_dir, STATE_NAME)
-    # vazio → arquivo ausente = semente (liberado = o IP padrão); não consegui ler → Fail (rc 3, nada é decidido); formato errado → guarda a cópia e recomeça da semente. A semente pode estar velha (um --ack depois dela):
+    # vazio → arquivo ausente = semente (liberado = o IP padrão); não consegui ler (OSError) → Fail (rc 3, nada é decidido); formato errado (bytes que não são UTF-8, JSON ilegível ou fundo demais, campo de tipo errado) → guarda a cópia e recomeça da semente. A semente pode estar velha (um --ack depois dela):
     # o caso comum é UM aviso a mais; o contrário (o IP voltar justo ao da semente com o firewall já em outro) o vigia lê como 'igual' até o próximo --ack
+    raw = None
     try:
         with open(path, encoding="utf-8") as f:
             raw = f.read()
     except FileNotFoundError:
         return new_state(c)
+    except UnicodeDecodeError:
+        pass  # os bytes lidos não são texto UTF-8: formato errado (raw fica None), não "não consegui ler"
     except OSError as e:
         raise Fail("não consegui ler %s: %s" % (path, e))
-    try:
-        st = json.loads(raw)
-        ok = isinstance(st, dict) and st.get("v") == 1 and parse_ip(st.get("allowed_ip")) is not None and isinstance(st.get("fails"), int) and st["fails"] >= 0
-        for k in ("seen_epoch", "alarm_epoch", "blind_alarm_epoch"):
-            ok = ok and (st.get(k) is None or (isinstance(st[k], int) and not isinstance(st[k], bool)))
-        for k in ("seen_ip", "alarm_ip"):
-            ok = ok and (st.get(k) is None or parse_ip(st[k]) is not None)
-    except ValueError:
-        ok = False
+    ok, st = False, None
+    if raw is not None:
+        try:
+            st = json.loads(raw)
+            ok = isinstance(st, dict) and st.get("v") == 1 and not isinstance(st.get("v"), bool) and parse_ip(st.get("allowed_ip")) is not None
+            ok = ok and isinstance(st.get("fails"), int) and not isinstance(st.get("fails"), bool) and st["fails"] >= 0
+            for k in ("seen_epoch", "alarm_epoch", "blind_alarm_epoch"):
+                ok = ok and (st.get(k) is None or (isinstance(st[k], int) and not isinstance(st[k], bool)))
+            for k in ("seen_ip", "alarm_ip"):
+                ok = ok and (st.get(k) is None or parse_ip(st[k]) is not None)
+        except (ValueError, RecursionError):  # JSON ilegível (ValueError) ou fundo demais para o parser (RecursionError, que não é ValueError)
+            ok = False
     if ok:
         base = new_state(c)
-        base.update(st)
+        base.update({k: st[k] for k in base if k in st})  # só as chaves conhecidas: lixo a mais no arquivo não passa para o estado novo (e não trava a gravação)
         return base
     dest = "%s.corrupt-%d" % (path, now)
     if not dry:
@@ -256,7 +264,7 @@ def due(last, now, cooldown):
 
 
 def run_once(c, now, dry):
-    """(linha_para_imprimir, estado_novo). Muda o estado em memória; quem chama grava."""
+    """(linha_para_imprimir, estado_novo, mail_saiu). Muda o estado em memória; quem chama grava."""
     st = load_state(c, now, dry)
     ip, why = read_public_ip(c)
     alarme = "-"
@@ -297,7 +305,7 @@ def run_once(c, now, dry):
                     alarme = "mail-falhou"  # não grava alarm_*: a rodada seguinte tenta de novo
     line = "hetzner-fw-ip-watch: %s ip=%s liberado=%s estado=%s falhas=%d alarme=%s%s" % (
         time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now)), ip or "?", st["allowed_ip"], estado, st["fails"], alarme, (" motivo=" + why) if why else "")
-    return line, st
+    return line, st, alarme in ("enviado", "cego-enviado")
 
 
 def do_ack(c, arg, now, dry):
@@ -344,9 +352,15 @@ def main(argv, env):
         if a.ack is not None:
             do_ack(c, a.ack, now, a.dry_run)
             return 0
-        line, st = run_once(c, now, a.dry_run)
+        line, st, mail_saiu = run_once(c, now, a.dry_run)
         if not a.dry_run:
-            save(c, st)
+            try:
+                save(c, st)
+            except Fail:
+                if mail_saiu:  # o mail não se desfaz: sem esta linha o mail repetido da rodada seguinte não teria explicação no log
+                    print("hetzner-fw-ip-watch: mail enviado, estado não gravado (o aviso se repete na rodada seguinte)", file=sys.stderr)
+                    print(line)
+                raise
         print(line)
         return 0
     finally:
