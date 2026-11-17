@@ -38,7 +38,7 @@ COMO DECIDE (a 1ª regra que casa vale; tudo é lido da bead, nada é gravado ne
      linhas de comentário (mais largo). EVIDÊNCIA: (credencial) chamada ou argv do cofre (`secret`, `bw`), módulo do cofre, arquivo de credencial (.env, credentials*.json, token.json...); (banco-de-dados) caminho de produção fixado
      (`shared/data/x.db`, `md:`, `~/`/`/Users/…/x.db`) e, fora de teste, nome de banco solto (`"queue.db"`); (host-mac) osascript/launchctl/security/adb, perfil do Chrome do Mac. NÃO são evidência: variável de ambiente com nome de token,
      `sqlite3.connect(variavel)`, `import secrets` (stdlib), `/Users/…` sozinho, nome de banco solto num TESTE (ele cria o seu em tmp). TRÊS ESTADOS: leu e achou -> `moles:<slug>` -> mini (mesmo sem palavra); leu e não achou -> a palavra só
-     vai em `info` (`mole-so-em-prosa:<slug>`); NÃO consegui ler (git, arquivo > 1 MB: `mole-ilegivel:<motivo>`) ou nada que exista em origin/main para ler (tudo novo: `mole-sem-arquivo-lido`) -> volta a palavra e ela bloqueia, como antes.
+     vai em `info` (`mole-so-em-prosa:<slug>`); NÃO consegui ler (git, arquivo > 1 MB: `mole-ilegivel:<motivo>`) ou nada que exista em origin/main para ler (tudo novo: `mole-sem-arquivo-lido`) -> volta a palavra e ela bloqueia, como antes, EXCETO a de credencial (ga-2hd02v.15): token/secret em prosa é a palavra mais comum e o nó não tem cofre, então ela só vai em `info` (`mole-credencial-so-palavra`) e só barra com evidência de cofre/arquivo de credencial já lida.
      Arquivo NOVO (ainda não está em origin/main) não soma evidência e não bloqueia, se ao menos UM existente foi lido (`mole-arquivo-novo:N`). Código que só as IRMÃS tocaram (regra 7b) é palpite: é lido e a evidência dele só INFORMA
      (`mole-evidencia-irma:`), e se não der para lê-lo é só a nota `mole-irma-ilegivel`. Sem prova nenhuma o veredito é `unknown` (antes a palavra o fazia `mini`) e a palavra vai em `info` (`palavra-mole:<slug>`).
      BANCO COM SCHEMA NO NÓ (ga-kzwlkhh): se TODA evidência de banco da prova é o caminho fixado `shared/data/x.db` ou o nome solto `x.db` de um banco do recibo do wa-schema-dbs.py (cópia só-schema, sem linha, que o nó
@@ -1218,19 +1218,27 @@ def scan_evidence(path, text, is_test):
     return out
 
 
+def fallback_words(prose, ev):
+    """(motivos duros, info) quando o código da prova NÃO pôde ser lido por inteiro (ilegível ou tudo novo): a palavra escrita volta a barrar (`moles:<slug>`), menos a de CREDENCIAL (ga-2hd02v.15). Palavra como
+    token/secret é a mais comum em prosa (comentário, mensagem, doc): medido 0/9 divergências no nó (ga-q0nlcer), e o nó não tem cofre nem credencial, então o teste que de fato os usasse fica vermelho lá e a bead volta
+    (só custa tempo). Credencial só barra aqui com EVIDÊNCIA já lida (`ev`: chamada/argv do cofre, arquivo de credencial); a palavra sozinha vai em `info` (`mole-credencial-so-palavra`), sem fingir que o código foi lido.
+    banco-de-dados e host-mac seguem como antes: a palavra barra."""
+    hard = ["moles:" + s for s in prose if s != "credencial" or "credencial" in ev]
+    return hard, (["mole-credencial-so-palavra"] if "credencial" in prose and "credencial" not in ev else [])
+
+
 def mole_gate(proof, prose, soft_files=()):
     """(motivos duros, info) das moles de uma bead que JÁ tem prova de código+teste (regra 4, ga-qkc02kk). As moles procuram EVIDÊNCIA no código dos arquivos de prova (citados e derivados), lidos em REPO_REF; a palavra
     escrita na bead (`prose`) só informa quando a leitura deu certo. TRÊS ESTADOS: (1) leu e achou evidência -> `moles:<slug>` (mini), mesmo sem palavra; (2) leu e NÃO achou -> sem motivo, a palavra vai em `info`
     (`mole-so-em-prosa:<slug>`); (3) NÃO consegui ler (git, arquivo grande demais) ou não havia arquivo nenhum que existisse em REPO_REF (tudo novo) -> volta a regra antiga, a palavra bloqueia
-    (`moles:<slug>` das palavras), e `info` diz por quê (`mole-ilegivel:<motivo>`, sempre, mesmo sem palavra; `mole-sem-arquivo-lido` quando tudo é novo e há palavra). "Não li" nunca vira "li e não achei". Arquivo NOVO (não está em REPO_REF) não tem o que ler: não soma evidência e não bloqueia, desde que ao menos UM arquivo
+    (`moles:<slug>` das palavras; a de CREDENCIAL só com evidência já lida, `fallback_words`), e `info` diz por quê (`mole-ilegivel:<motivo>`, sempre, mesmo sem palavra; `mole-sem-arquivo-lido` quando tudo é novo e há palavra). "Não li" nunca vira "li e não achei". Arquivo NOVO (não está em REPO_REF) não tem o que ler: não soma evidência e não bloqueia, desde que ao menos UM arquivo
     existente tenha sido lido (o nó só precisa construir e testar o arquivo novo contra fixtures; o que ele faria em produção é do mini, depois do merge)."""
     files = sorted(f for f in proof if f.rsplit(".", 1)[-1] in SCAN_EXT)
-    fallback = ["moles:" + s for s in prose]
+    ev, novos, nread = {}, [], 0   # fora do `try`: a evidência já lida antes de um `Unreadable` não se perde (decide o fallback da credencial)
     evsoft, softbad = {}, []
     # vazio (nenhum arquivo de prova com extensão lida) -> sem base para dizer "não achei": volta a palavra; falhou/ilegível (árvore, git show, arquivo grande) -> volta a palavra + nota, nunca "sem evidência"
     try:
         tree = set(repo_tree())
-        ev, novos, nread = {}, [], 0
         for f in files:
             if f not in tree:
                 novos.append(f)
@@ -1249,9 +1257,11 @@ def mole_gate(proof, prose, soft_files=()):
             for slug, whats in scan_evidence(f, soft_text, bool(TEST_RE.search(f))).items():
                 evsoft.setdefault(slug, []).extend((f, w) for w in whats)
     except Unreadable as e:
-        return fallback, ["mole-ilegivel:" + str(e)]   # `-ilegivel` é o que o Pilot soma em `leitura` (a leitura que FALHOU): sai MESMO sem palavra, porque "não consegui varrer" não pode parecer "varri e não achei"
+        fallback, nota = fallback_words(prose, ev)
+        return fallback, ["mole-ilegivel:" + str(e)] + nota   # `-ilegivel` é o que o Pilot soma em `leitura` (a leitura que FALHOU): sai MESMO sem palavra, porque "não consegui varrer" não pode parecer "varri e não achei"
     if nread == 0:
-        return fallback, (["mole-sem-arquivo-lido"] if prose else [])
+        fallback, nota = fallback_words(prose, ev)
+        return fallback, (["mole-sem-arquivo-lido"] if prose else []) + nota
     ev_all, sch = ev, []
     if "banco-de-dados" in ev:   # banco COM SCHEMA NO NÓ (ga-kzwlkhh): só se TODA evidência de banco é de um banco do recibo; uma só que não é (md:, .duckdb, /Users, banco sem cópia) mantém `moles:banco-de-dados`
         dbs, nota = schema_receipt()
