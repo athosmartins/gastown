@@ -545,6 +545,9 @@ rc1 subject_impl_scopes_bead "fix(ga-2hd02v.3.28): MBP livre não recusa por swa
 
 # ── 3. merge-evidence helpers — real git, no network ────────────────────────
 echo "── 3. scan_commit_for_bead + branch_merged (real repo) ──"
+# ga-1m99gpb: the sweeps below stub bd with ONE canned answer for any `type:quality-gate-marker` query, which is the
+# per-bead query they were written for. The bulk marker index has its own section and its own stub; here it is off.
+export JANITOR_MARKER_INDEX_TTL=0
 export GIT_AUTHOR_NAME=selftest  GIT_AUTHOR_EMAIL=selftest@local
 export GIT_COMMITTER_NAME=selftest GIT_COMMITTER_EMAIL=selftest@local
 T="$(mktemp -d 2>/dev/null || mktemp -d -t gatijv5)"
@@ -2306,6 +2309,194 @@ if lim_closed; then ok "the 51st in_progress bead (merged) is closed"; else bad 
 eq "...and only that one was closed" "$(lim_closes)" "1"
 
 # ═════════════════════════════════════════════════════════════════════════════
+# ga-1m99gpb — the sweep-wide marker index (leftover 1 of ga-xvbini1)
+# ═════════════════════════════════════════════════════════════════════════════
+echo ""
+echo "── ga-1m99gpb: ONE bulk marker read per sweep instead of one bd query per bead (three states kept apart) ──"
+# The janitor asked `bd list -l source-bead:<id>` once per bead (~130 a sweep, ≈ 9 s and ≈ 0,4 CPU-s in Dolt each). It
+# now reads every marker once and answers each bead from a directory of files. The contract this proves: the index
+# answers EXACTLY what the per-bead query answers; whatever it cannot answer (off, load failed, empty or garbled
+# bulk read, id outside [a-z0-9._-], generation gone, file unreadable) is NOT "no marker": the per-bead query
+# answers, or the strict read says rc 1 ("could not know"). Everything below runs against a stub bd that serves
+# both queries from one marker list and counts the calls.
+MI_FIX="$T/mkidx-fix"; mkdir -p "$MI_FIX/bin"
+cat > "$MI_FIX/markers.json" <<'JSON'
+[
+ {"id":"gm-a1","status":"closed","labels":["type:quality-gate-marker","source-bead:ga-aaa","gate-status:passed"]},
+ {"id":"gm-a2","status":"open","labels":["type:quality-gate-marker","gate-status:open","source-bead:ga-aaa"]},
+ {"id":"gm-b1","status":"closed","labels":["type:quality-gate-marker","source-bead:ga-bbb.1"]},
+ {"id":"gm-c1","status":"open","labels":["type:quality-gate-marker","source-bead:GA-Upper"]},
+ {"id":"gm-d1","status":"open","labels":["type:quality-gate-marker"]},
+ {"id":"gm-f1","status":"open","labels":["type:quality-gate-marker","source-bead:ga-f1","source-bead:ga-f2"]}
+]
+JSON
+# The stub's two modes live in files so a scenario can change them between lookups:
+#   bulk: ok | fail (rc 1, nothing) | partial (a valid array, rc 1) | envelope ({"error":…}) | empty ([]) | garbage
+#   per : ok | fail (rc 1, nothing)
+cat > "$MI_FIX/bin/bd" <<'STUB'
+#!/usr/bin/env bash
+S="${MI_STATE:?}"
+printf '%s\n' "$*" >> "$S/calls.log"
+[ "${1:-}" = "-C" ] && shift 2
+[ "${1:-}" = "list" ] || exit 0
+case " $* " in
+  *" --limit 0 "*)
+    case "$(cat "$S/bulk" 2>/dev/null)" in
+      fail)     echo "Error: database is unavailable" >&2; exit 1 ;;
+      partial)  cat "$S/markers.json"; exit 1 ;;
+      envelope) printf '{"error":"x"}'; exit 0 ;;
+      empty)    printf '[]'; exit 0 ;;
+      garbage)  printf 'not json at all'; exit 0 ;;
+    esac
+    cat "$S/markers.json"; exit 0 ;;
+esac
+[ "$(cat "$S/per" 2>/dev/null)" = "fail" ] && { echo "Error: database is unavailable" >&2; exit 1; }
+id=""; prev=""
+for a in "$@"; do
+  if [ "$prev" = "-l" ]; then case "$a" in source-bead:*) id="${a#source-bead:}" ;; esac; fi
+  prev="$a"
+done
+jq -c --arg l "source-bead:$id" '[.[] | select((.labels // []) | index($l) != null)]' "$S/markers.json"
+STUB
+chmod +x "$MI_FIX/bin/bd"
+MI_N=0
+# mi_setup <bulk> <per> [ttl] — a fresh scenario: its own state dir, its own private index root, a fresh call log
+mi_setup() {
+  MI_N=$((MI_N+1)); MI_S="$MI_BASE/s$MI_N"; mkdir -p "$MI_S"
+  cp "$MI_FIX/markers.json" "$MI_S/markers.json"
+  printf '%s' "$1" > "$MI_S/bulk"; printf '%s' "$2" > "$MI_S/per"; : > "$MI_S/calls.log"
+  MK_IDX_ROOT=$(mktemp -d "$MI_S/root.XXXXXX"); MARKER_INDEX_TTL_SECONDS="${3:-90}"; export MI_STATE="$MI_S"
+}
+mi_bulk_n() { grep -c -e '--limit 0' "$MI_S/calls.log" || true; }
+mi_per_n()  { grep -c -e 'source-bead:' "$MI_S/calls.log" || true; }
+mi_get()    { MI_OUT=$(markers_for_bead_strict "$1" 2>/dev/null); MI_RC=$?; }
+mi_ids()    { printf '%s' "$MI_OUT" | jq -c 'map(.id)' 2>/dev/null || printf 'NOT-JSON'; }
+mi_gen()    { local g=""; { read -r g < "$MK_IDX_ROOT/current"; } 2>/dev/null; printf '%s' "$g"; }
+# mi_expect <label> <id> <expected ids json> — rc 0 and exactly these marker ids, in this order
+mi_expect() { mi_get "$2"; eq "$1: rc" "$MI_RC" "0"; eq "$1: markers" "$(mi_ids)" "$3"; }
+
+mi_checks() {   # <scratch base dir> — reruns unchanged against every mutant of the index
+  MI_BASE="$1"; mkdir -p "$MI_BASE"
+  local _p="$PATH" _c="$GC_CITY" _t="$MARKER_INDEX_TTL_SECONDS" _r="$MK_IDX_ROOT" _l="${LOG:-}" _ld="${LOG_DIR:-}"
+  PATH="$MI_FIX/bin:$PATH"; GC_CITY="$MI_BASE/city"; LOG="$MI_BASE/janitor.log"; LOG_DIR="$MI_BASE"
+  local id m g old now
+
+  # (a) the index answers, and answers what the per-bead query answers
+  mi_setup ok ok
+  mi_expect "(a) a bead with two markers keeps bd's order" ga-aaa '["gm-a1","gm-a2"]'
+  mi_expect "(a) a dotted id" ga-bbb.1 '["gm-b1"]'
+  mi_expect "(a) a bead with NO marker is [] (read from a generation that loaded in full)" ga-zzz '[]'
+  mi_expect "(a) a marker under two source-bead labels shows under the first" ga-f1 '["gm-f1"]'
+  mi_expect "(a) ...and under the second" ga-f2 '["gm-f1"]'
+  mi_expect "(a) an uppercase id is not keyable: the per-bead query answers (exact label match)" GA-Upper '["gm-c1"]'
+  mi_expect "(a) the same bead again" ga-aaa '["gm-a1","gm-a2"]'
+  eq "(a) ONE bulk read for the whole run" "$(mi_bulk_n)" "1"
+  eq "(a) per-bead queries: only the id the index cannot key" "$(mi_per_n)" "1"
+  for id in ga-aaa ga-bbb.1 ga-zzz ga-f1 GA-Upper; do   # the same answer, byte for byte, with the index off
+    mi_get "$id"; m="$MI_OUT"
+    MARKER_INDEX_TTL_SECONDS=0; mi_get "$id"; MARKER_INDEX_TTL_SECONDS=90
+    eq "(a) $id: index answer == per-bead answer" "$(printf '%s' "$m" | jq -S -c . 2>/dev/null)" "$(printf '%s' "$MI_OUT" | jq -S -c . 2>/dev/null)"
+  done
+
+  # (b) TTL 0 = off: no bulk read at all, every lookup is a per-bead query
+  mi_setup ok ok 0
+  mi_expect "(b) index off" ga-aaa '["gm-a1","gm-a2"]'; mi_get ga-zzz; mi_get ga-aaa
+  eq "(b) index off: no bulk read" "$(mi_bulk_n)" "0"
+  eq "(b) index off: one per-bead query per lookup" "$(mi_per_n)" "3"
+
+  # (c) the bulk read cannot be used → the per-bead path answers, and the bulk read is not retried for a TTL
+  for m in fail partial envelope empty garbage; do
+    mi_setup "$m" ok
+    mi_expect "(c/$m) bulk unusable: the per-bead query still answers" ga-aaa '["gm-a1","gm-a2"]'
+    mi_expect "(c/$m) ...a bead without marker too" ga-zzz '[]'; mi_get ga-aaa
+    eq "(c/$m) the failed bulk read is tried once, not once per bead" "$(mi_bulk_n)" "1"
+    eq "(c/$m) every lookup went to the per-bead query" "$(mi_per_n)" "3"
+    eq "(c/$m) no half-built generation is left behind" "$(find "$MK_IDX_ROOT" -maxdepth 1 -name 'gen.*' | wc -l | tr -d ' ')" "0"
+  done
+
+  # (d) THE point of the three states: bulk unusable AND the per-bead read fails → "could not know" (rc 1), never []
+  for m in fail partial envelope empty garbage; do
+    mi_setup "$m" fail
+    mi_get ga-aaa; eq "(d/$m) nothing can be read: rc 1, not 'no marker'" "$MI_RC" "1"; eq "(d/$m) ...and nothing printed" "$MI_OUT" ""
+    eq "(d/$m) the lenient read turns that into []" "$(markers_for_bead ga-aaa 2>/dev/null)" "[]"
+  done
+
+  # (e) the lifetime: a generation older than the TTL (or stamped in the future) is not trusted
+  mi_setup ok ok
+  mi_get ga-aaa; g=$(mi_gen); now=$(date +%s)
+  printf '%s\n' "$((now - 1000))" > "$g/.at"; mi_get ga-aaa
+  eq "(e) a generation older than the TTL is reloaded" "$(mi_bulk_n)" "2"
+  if [ -n "$g" ] && [ ! -e "$g" ]; then ok "(e) ...and the old generation is removed"; else bad "(e) the old generation was not removed ($g)"; fi
+  mi_expect "(e) ...and the answer after the reload is right" ga-aaa '["gm-a1","gm-a2"]'
+  g=$(mi_gen); printf '%s\n' "$((now + 5000))" > "$g/.at"; mi_get ga-aaa
+  eq "(e) a stamp from the future (clock moved back) is reloaded too" "$(mi_bulk_n)" "3"
+
+  # (f) a lookup the index cannot honour is "could not know", never "no marker"
+  mi_setup ok ok
+  mi_get ga-aaa; g=$(mi_gen)
+  printf 'garbage' > "$g/ga-aaa"; mi_get ga-aaa;  eq "(f) an indexed file that is not an array: rc 1" "$MI_RC" "1"
+  printf '[]' > "$g/ga-bbb.1"; mi_get ga-bbb.1;   eq "(f) an indexed file holding [] (it never should): rc 1" "$MI_RC" "1"
+  : > "$g/ga-f1"; mi_get ga-f1;                   eq "(f) an empty indexed file: rc 1" "$MI_RC" "1"
+  m=$( marker_index_dir() { printf '%s' "$MI_BASE/gone"; }; markers_for_bead_strict ga-zzz 2>/dev/null; echo "rc=$?" )
+  eq "(f) the generation vanished under a lookup with no file: rc 1, not []" "$m" "rc=1"
+  m=$( marker_index_dir() { printf '%s' "$MI_BASE/gone"; }; markers_for_bead_strict ga-aaa 2>/dev/null; echo "rc=$?" )
+  eq "(f) ...with a file name that does not exist either: rc 1" "$m" "rc=1"
+
+  # (g) ids that are not safe file names never touch the index (no path walk, no hidden files, no empty name)
+  mi_setup ok ok
+  mi_get ga-aaa
+  for id in .at .raw.json -x a/b ../current ga-aaa/../ga-bbb.1 GA-Upper ''; do
+    old=$(mi_per_n); mi_get "$id"
+    eq "(g) id [$id] goes to the per-bead query" "$(( $(mi_per_n) - old ))" "1"
+  done
+  mi_expect "(g) [.at] reads [] (the stamp file is not a bead)" .at '[]'
+  eq "(g) the bulk read stayed at one" "$(mi_bulk_n)" "1"
+
+  PATH="$_p"; GC_CITY="$_c"; MARKER_INDEX_TTL_SECONDS="$_t"; MK_IDX_ROOT="$_r"; LOG="$_l"; LOG_DIR="$_ld"
+}
+
+# The REAL sweep: a wrapper in front of the fixture's stub bd serves the marker queries (and logs them), the rest goes to the stub.
+mi_e2e() {
+  local ttl n
+  for ttl in 90 0; do
+    lim_fixture inflight 5 3; LIM_LOG="$LIM_D/bd.log"; LIM_OUT="$LIM_D/out.log"
+    mv "$LIM_D/bin/bd" "$LIM_D/bin/bd.real"; mkdir -p "$LIM_D/tmp"; : > "$LIM_D/mk.log"
+    printf '[{"id":"gm-x1","status":"closed","labels":["type:quality-gate-marker","source-bead:ga-elsewhere-1","gate-status:passed"]}]' > "$LIM_D/markers.json"
+    cat > "$LIM_D/bin/bd" <<'STUB'
+#!/usr/bin/env bash
+D="$(cd "$(dirname "$0")/.." && pwd)"
+case " $* " in
+  *" type:quality-gate-marker "*)
+    printf '%s\n' "$*" >> "$D/mk.log"
+    case " $* " in *" --limit 0 "*) cat "$D/markers.json" ;; *) printf '[]' ;; esac
+    exit 0 ;;
+esac
+exec "$D/bin/bd.real" "$@"
+STUB
+    chmod +x "$LIM_D/bin/bd"; : > "$LIM_LOG"
+    env GC_CITY_PATH="$LIM_D/city" JANITOR_LOG_STDOUT=1 JANITOR_DRY_RUN=0 JANITOR_MARKER_INDEX_TTL="$ttl" TMPDIR="$LIM_D/tmp" \
+        PATH="$LIM_D/bin:$PATH" bash "$JANITOR" > "$LIM_OUT" 2>&1
+    if lim_closed; then ok "(e2e ttl=$ttl) the sweep still closes the merged bead (#3)"; else bad "(e2e ttl=$ttl) the sweep no longer closes its merged bead: $(tail -3 "$LIM_OUT" | tr '\n' ';')"; fi
+    n=$(grep -c -e '--limit 0' "$LIM_D/mk.log" || true)
+    if [ "$ttl" = "0" ]; then
+      eq "(e2e ttl=0) no bulk read" "$n" "0"
+      if [ "$(grep -c -e 'source-bead:' "$LIM_D/mk.log" || true)" -ge 5 ]; then ok "(e2e ttl=0) the per-bead query runs for each bead (what the index replaces)"; else bad "(e2e ttl=0) fewer than 5 per-bead marker queries: the harness measures nothing"; fi
+    else
+      eq "(e2e ttl=90) ONE bulk marker read in the whole sweep" "$n" "1"
+      eq "(e2e ttl=90) ZERO per-bead marker queries" "$(grep -c -e 'source-bead:' "$LIM_D/mk.log" || true)" "0"
+      grep -qF 'marker-index: loaded generation' "$LIM_OUT" && ok "(e2e ttl=90) the sweep says it loaded the index" || bad "(e2e ttl=90) no 'marker-index: loaded generation' line in the log"
+    fi
+    eq "(e2e ttl=$ttl) the sweep leaves no index directory behind" "$(find "$LIM_D/tmp" -maxdepth 1 -name 'merged-bead-janitor-mkidx.*' | wc -l | tr -d ' ')" "0"
+  done
+}
+mi_checks "$T/mkidx-main"
+mi_e2e
+grep -q 'JANITOR_MARKER_INDEX_TTL' "$JANITOR" && grep -q 'merged-bead-janitor-mkidx' "$JANITOR" \
+  && ok "the index is wired: TTL knob and a private per-sweep directory" || bad "marker index wiring (JANITOR_MARKER_INDEX_TTL / per-sweep directory) is missing"
+grep -qF 'trap '"'"'rm -rf "$MK_IDX_ROOT"'"'"' EXIT' "$JANITOR" \
+  && ok "the sweep removes its index directory on exit" || bad "no EXIT trap removes the index directory"
+
+# ═════════════════════════════════════════════════════════════════════════════
 # ga-6m6iocf — the orphan-close branch closes ONLY on a commit that cites the bead's OWN id
 # ═════════════════════════════════════════════════════════════════════════════
 echo ""
@@ -2672,7 +2863,7 @@ oc_mutant_ok() {
   if cmp -s "$JANITOR" "$f"; then bad "mutant $1: identical to the janitor, the mutation changed nothing"; return 1; fi
   bash -n "$f" 2>/dev/null || { bad "mutant $1: does not parse — it would die for the wrong reason"; return 1; }
 }
-# oc_trial <name> <unit|e2e|gf|both> — the SAME checks, muted, against $OC_MUT/<name>.sh in a subshell with a
+# oc_trial <name> <unit|e2e|gf|both|mi|mie2e> — the SAME checks, muted, against $OC_MUT/<name>.sh in a subshell with a
 # write cap. OC_TRIAL_RC: 0 = some check failed (killed), 1 = every check held (survived), else harness error.
 oc_trial() {
   local name="$1" what="$2" f="$OC_MUT/$1.sh"
@@ -2687,6 +2878,8 @@ oc_trial() {
     case "$what" in unit|both) oc_unit_checks ;; esac
     case "$what" in e2e|both)  oc_e2e_core ;; esac
     case "$what" in gf|both)   oc_e2e_gatefix ;; esac
+    case "$what" in mi)        mi_checks "$BV/mi" ;; esac
+    case "$what" in mie2e)     mi_e2e ;; esac
     [ "$MUT_N" -gt 0 ] && exit 0
     exit 1
   ) >/dev/null 2>&1
@@ -2752,6 +2945,33 @@ oc_mutate_file "$JANITOR" "$OC_MUT/m17.sh" - 'elif [ "$O_FOREIGN" = "1" ] && fet
 oc_expect_dead m17 gf "a foreign story's HQ repo may be stale and still decide a strip"
 oc_mutate_file "$JANITOR" "$OC_MUT/m18.sh" - '|| warn "could not post the explanation comment on' '|| : "could not post the explanation comment on'
 oc_expect_dead m18 gf "a comment that failed to post is swallowed (the bead is stripped with no note and no trace in the log)"
+# — ga-1m99gpb: the marker index. One mutant per guard; every one must die —
+# control: the index checks on the unmutated janitor are clean (a kill below is the mutation's doing)
+oc_trial control mi
+if [ "$OC_TRIAL_RC" = "1" ]; then ok "control: the index checks pass on the unmutated janitor"
+else bad "control: the index checks are not clean on the unmutated janitor (rc=$OC_TRIAL_RC): $(head -c 200 "$OC_MUT/control.first")"; fi
+oc_mutate_file "$JANITOR" "$OC_MUT/mi1.sh" markers_for_bead_strict '[ -r "$gen/.at" ] || return 1' ':'
+oc_expect_dead mi1 mi "no file = [] even when the generation is gone (a vanished index reads as 'no marker')"
+oc_mutate_file "$JANITOR" "$OC_MUT/mi2.sh" marker_index_load "jq -e 'type == \"array\" and length > 0' \"\$raw\"" "jq -e 'type == \"array\"' \"\$raw\""
+oc_expect_dead mi2 mi "an EMPTY bulk read is accepted (a store that returned nothing reads as 'no bead has a marker')"
+# the stub for this one: bd's exit code is dropped on the bulk read (a bd that failed after printing a valid array)
+bd_ignore_rc() { bd "$@"; return 0; }
+oc_mutate_file "$JANITOR" "$OC_MUT/mi3.sh" marker_index_load 'if ! bd -C "$GC_CITY" list' 'if ! bd_ignore_rc -C "$GC_CITY" list'
+oc_expect_dead mi3 mi "the bulk read's exit code is ignored (a partial answer from a failed bd becomes the index)"
+oc_mutate_file "$JANITOR" "$OC_MUT/mi4.sh" marker_index_dir '[ "$now" -ge "$at" ] && [ $((now - at)) -lt "$ttl" ]' 'true'
+oc_expect_dead mi4 mi "a generation never expires (a marker written later is missed for the whole run)"
+oc_mutate_file "$JANITOR" "$OC_MUT/mi5.sh" marker_index_dir 'if [ "$now" -ge "$failed" ] && [ $((now - failed)) -lt "$ttl" ]; then return 1; fi' ':'
+oc_expect_dead mi5 mi "a failed bulk read is retried for every bead (~12 s of Dolt each, the cost the index removes)"
+oc_mutate_file "$JANITOR" "$OC_MUT/mi6.sh" markers_for_bead_strict "case \"\$id\" in ''|[!a-z0-9]*|*[!a-z0-9._-]*) ;; *)" "case \"\$id\" in '') ;; *)"
+oc_expect_dead mi6 mi "an id that is not a safe file name reaches the index (hidden files, paths, ids the bulk read skipped)"
+oc_mutate_file "$JANITOR" "$OC_MUT/mi7.sh" markers_for_bead_strict "printf '%s' \"\$out\" | jq -e 'type == \"array\" and length > 0' >/dev/null 2>&1 || return 1" ':'
+oc_expect_dead mi7 mi "an indexed file that is not a marker array is passed on as data"
+oc_mutate_file "$JANITOR" "$OC_MUT/mi8.sh" marker_index_dir '[ "$ttl" -gt 0 ] || return 1' ':'
+oc_expect_dead mi8 mi "TTL 0 no longer switches the index off"
+oc_mutate_file "$JANITOR" "$OC_MUT/mi9.sh" - 'MK_IDX_ROOT=$(mktemp -d "${TMPDIR:-/tmp}/merged-bead-janitor-mkidx.XXXXXX" 2>/dev/null) || MK_IDX_ROOT=""' 'MK_IDX_ROOT=""'
+oc_expect_dead mi9 mie2e "the sweep never makes its index directory (the whole sweep silently stays on the per-bead query)"
+oc_mutate_file "$JANITOR" "$OC_MUT/mi10.sh" - "trap 'rm -rf \"\$MK_IDX_ROOT\"' EXIT" ':'
+oc_expect_dead mi10 mie2e "the sweep leaves its index directory in TMPDIR"
 unset GIT_CEILING_DIRECTORIES
 
 echo ""

@@ -7,7 +7,7 @@
 • Guards (zero false-positive is the paramount constraint)
 • Durable prevention — commit convention (fixes the sibling root cause)
 • Joint/split beads — the stale-comment guard (ga-2zp4h)
-• Gate-passed stories wait for delivery (ga-botvu2) · Operating
+• Gate-passed stories wait for delivery (ga-botvu2) · Marker index (ga-1m99gpb) · Operating
 
 Closes beads that are stuck `in_progress` ("em voo" on the Kanban) even though
 their code is already merged to `origin/main`. Runs as a launchd sweep
@@ -194,6 +194,30 @@ story rather than closing it. Proven by `gate-passed-confirm.selftest.sh`.
 The VM-hold write in `gate_merged_path_vm_gate` (ga-buac0o) also sets `gate:passed`, but on a bead that carries
 `delivery:pending-vm`, which the janitor already treats as delivery-owned; it does not stamp, and if the hold is
 later released the janitor stamps it at first sight.
+
+## Marker index — one bulk read per sweep (ga-1m99gpb)
+
+The sweep used to ask `bd list -l source-bead:<id>` once per bead (~130 a sweep; each ≈ 9 s of wall clock and
+≈ 0,4 CPU-s in the shared Dolt, measured 17/11 in ga-xvbini1). It now reads every gate marker once
+(`bd list --all --include-infra --json --limit 0 -l type:quality-gate-marker`, ≈ 7 000 markers, ≈ 12 s,
+≈ 0,4 CPU-s) into a private directory (`$TMPDIR/merged-bead-janitor-mkidx.*`, one file per source-bead id, removed
+on exit) and answers every bead from it.
+
+The index keeps the three states of a read apart:
+
+| state | what the janitor does |
+|---|---|
+| bead **has** markers | the file exists: same array, same order as the per-bead query |
+| bead **has none** | no file, in a generation that loaded in full: `[]` |
+| **could not know** | the per-bead query answers (the pre-change behaviour); if that fails too, `markers_for_bead_strict` returns rc 1 and the orphan-close strip holds |
+
+"Could not know" is: the bulk read failed, printed no array, or printed an **empty** array (a store with thousands of
+markers does not suddenly have none); the id is not a safe file name (`[a-z0-9][a-z0-9._-]*`, e.g. uppercase); the
+generation vanished; an indexed file is not a marker array. A failed bulk read is not retried until the TTL passes.
+
+`JANITOR_MARKER_INDEX_TTL` (seconds, default `90`; `0` = index off, one query per bead as before) is the age after
+which a snapshot is not trusted: a marker a gate writes while the sweep runs is missed for at most that long, about
+the window the git scans between the read and the act already leave open.
 
 ## Operating
 

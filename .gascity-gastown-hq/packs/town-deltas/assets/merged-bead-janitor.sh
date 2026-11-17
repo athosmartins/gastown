@@ -1020,13 +1020,108 @@ EOF
 # BEAD / MARKER HELPERS (live Dolt; only used in the sweep, not the pure tests).
 # ═════════════════════════════════════════════════════════════════════════════
 
+# ── Sweep-wide marker index (ga-1m99gpb, leftover 1 of ga-xvbini1) ──────────────────────────────────────────
+# The sweep reads the markers of ONE bead at a time (~130 beads a sweep): each `bd list -l source-bead:<id>` is
+# ≈ 9 s of wall clock and ≈ 0,4 CPU-s in the shared Dolt (measured 17/11, ga-xvbini1). ONE `bd list -l
+# type:quality-gate-marker --limit 0` (≈ 7 000 markers, 13 MB, ≈ 12 s, ≈ 0,4 CPU-s) answers all of them. The index
+# is a directory of files, one per source-bead id, each holding that bead's marker array in bd's own order — on
+# disk, not in shell variables, because the callers run markers_for_bead_strict inside `$(...)` and a variable set
+# there would die with the subshell (every bead would then re-load the index).
+#
+# THREE states, kept apart on purpose:
+#   • has markers      → the file exists: its content is the same array `bd list -l source-bead:<id>` prints.
+#   • has none         → no file, in a generation that loaded in full: `[]`.
+#   • could not know   → the index is off / failed / stale / the id cannot be a file name: NOT answered from the
+#                        index; the caller goes to the per-bead query below, which has its own rc 1 for a failed read.
+# A bulk read that FAILED, printed no array, or printed an EMPTY array is never "no bead has a marker": it refuses
+# the index and the per-bead path (the behaviour before this change) takes over. The index also has a lifetime
+# (JANITOR_MARKER_INDEX_TTL, default 90 s; 0 = off): a decision never rests on a snapshot older than that, so a
+# marker a gate writes while the sweep runs is missed for at most that long — about the window the git scans
+# between the read and the act already open today.
+MARKER_INDEX_TTL_SECONDS="${JANITOR_MARKER_INDEX_TTL:-90}"
+MK_IDX_ROOT=""   # a private dir made at the start of the sweep; "" (lib-only, or mktemp failed) = index off
+
+# marker_index_load <now_epoch> — build a new generation and publish it. rc 0 only when every file is written, the
+# `.at` stamp is written LAST and `current` points at the finished generation; any failure removes the half-built
+# directory and returns 1 (the old generation, if any, stays the one `current` names).
+marker_index_load() {
+  local now="$1" gen raw old=""
+  gen=$(mktemp -d "$MK_IDX_ROOT/gen.XXXXXX" 2>/dev/null) || return 1
+  raw="$gen/.raw.json"
+  # vazio ([] — no marker at all in a store that has thousands) → refuse the index, per-bead path decides;
+  # falhou/ilegível (bd rc≠0, not an array) → refuse the index too and retry only after the TTL.
+  if ! bd -C "$GC_CITY" list --all --include-infra --json --limit 0 -l type:quality-gate-marker >"$raw" 2>/dev/null \
+     || ! jq -e 'type == "array" and length > 0' "$raw" >/dev/null 2>&1; then
+    rm -rf "$gen"; return 1
+  fi
+  # One line per source-bead id (only ids that are safe file names: [a-z0-9][a-z0-9._-]*; the lookup applies the
+  # same test, so an id this skips can never be answered from the index): "<id>\t<compact JSON array>".
+  if ! jq -r 'reduce .[] as $m ({};
+                reduce (($m.labels // [])[] | select(startswith("source-bead:")) | ltrimstr("source-bead:")
+                        | select(test("^[a-z0-9][a-z0-9._-]*$"))) as $id (.; .[$id] += [$m]))
+              | to_entries[] | "\(.key)\t\(.value | tojson)"' "$raw" \
+     | awk -F'\t' -v d="$gen" '{ f = d "/" $1; print $2 > f; close(f) }'; then
+    rm -rf "$gen"; return 1
+  fi
+  rm -f "$raw"
+  printf '%s\n' "$now" > "$gen/.at" || { rm -rf "$gen"; return 1; }
+  { read -r old < "$MK_IDX_ROOT/current"; } 2>/dev/null || old=""
+  { printf '%s\n' "$gen" > "$MK_IDX_ROOT/current.tmp" && mv -f "$MK_IDX_ROOT/current.tmp" "$MK_IDX_ROOT/current"; } \
+    || { rm -rf "$gen"; return 1; }
+  case "$old" in "$MK_IDX_ROOT"/gen.*) rm -rf "$old" ;; esac
+  log "marker-index: loaded generation $(basename "$gen") ($(find "$gen" -type f ! -name '.*' | wc -l | tr -d ' ') beads with markers)" >&2
+  return 0
+}
+
+# marker_index_dir — echo the directory of a generation younger than the TTL (loading one when needed) and
+# return 0; return 1 when the index cannot answer right now (off, unusable, load failed recently).
+marker_index_dir() {
+  local ttl="$MARKER_INDEX_TTL_SECONDS" now gen="" at="" failed=""
+  case "$ttl" in ''|*[!0-9]*) return 1 ;; esac
+  [ "$ttl" -gt 0 ] || return 1
+  [ -n "$MK_IDX_ROOT" ] && [ -d "$MK_IDX_ROOT" ] || return 1
+  now=$(date +%s)
+  if { read -r gen < "$MK_IDX_ROOT/current"; } 2>/dev/null && [ -n "$gen" ] && { read -r at < "$gen/.at"; } 2>/dev/null; then
+    case "$at" in ''|*[!0-9]*) ;; *)
+      if [ "$now" -ge "$at" ] && [ $((now - at)) -lt "$ttl" ]; then printf '%s' "$gen"; return 0; fi ;;
+    esac
+  fi
+  # a load that failed less than one TTL ago is not retried per bead (each try is ~12 s of Dolt)
+  if { read -r failed < "$MK_IDX_ROOT/failed-at"; } 2>/dev/null; then
+    case "$failed" in ''|*[!0-9]*) ;; *) if [ "$now" -ge "$failed" ] && [ $((now - failed)) -lt "$ttl" ]; then return 1; fi ;; esac
+  fi
+  if ! marker_index_load "$now"; then
+    printf '%s\n' "$now" > "$MK_IDX_ROOT/failed-at" 2>/dev/null || true
+    warn "marker-index: could not load the marker list — the per-bead query answers until $ttl s pass" >&2
+    return 1
+  fi
+  rm -f "$MK_IDX_ROOT/failed-at"
+  { read -r gen < "$MK_IDX_ROOT/current"; } 2>/dev/null && [ -n "$gen" ] && [ -r "$gen/.at" ] || return 1
+  printf '%s' "$gen"
+}
+
 # markers_for_bead_strict <bead_id> — the HQ quality-gate markers whose source-bead label is this bead, with a
 # read that FAILED kept apart from one that found NOTHING (ga-6m6iocf gate-fix 1). Echoes the JSON array and
-# returns 0 only when `bd list` exited 0 AND printed a JSON array: `[]` is a real "this bead has no marker".
+# returns 0 only when the read succeeded and produced a JSON array: `[]` is a real "this bead has no marker".
 # rc 1 = could not read — bd failed, or its stdout was empty / not an array (an error envelope such as
-# "Error: database is unavailable" is not data). What "could not read" means is the caller's decision.
+# "Error: database is unavailable" is not data), or an indexed file is unreadable. What "could not read" means
+# is the caller's decision. The sweep-wide index above answers first when it can; everything it cannot answer
+# (off, stale-and-failed, an id outside [a-z0-9._-]) falls through to the per-bead query, unchanged.
 markers_for_bead_strict() {
-  local id="$1" out
+  local id="$1" out gen f
+  case "$id" in ''|[!a-z0-9]*|*[!a-z0-9._-]*) ;; *)
+    if gen=$(marker_index_dir) && [ -n "$gen" ]; then
+      f="$gen/$id"
+      if [ -e "$f" ]; then
+        out=$(cat "$f" 2>/dev/null) || return 1
+        printf '%s' "$out" | jq -e 'type == "array" and length > 0' >/dev/null 2>&1 || return 1
+        printf '%s' "$out"; return 0
+      fi
+      # no file = "no marker" only while the generation is still there to say so (a vanished directory is "could not read")
+      [ -r "$gen/.at" ] || return 1
+      printf '[]'; return 0
+    fi ;;
+  esac
   # --include-infra (ga-vm20x, Mayor 07/08): bd 1.1.0 classifies --ephemeral
   # beads as INFRA and hides them from `bd list` by default; gate markers are
   # born ephemeral, so this janitor could not find the very markers it exists
@@ -1341,6 +1436,18 @@ resolve_bead_state() {
 # SWEEP
 # ═════════════════════════════════════════════════════════════════════════════
 log "=== merged-bead-janitor sweep start (dry_run=$DRY_RUN, source=$SOURCE_BEAD) ==="
+
+# ga-1m99gpb: the private directory of the marker index (see marker_index_load). A mktemp that fails leaves
+# MK_IDX_ROOT empty = index off = the per-bead query, exactly as before. The trap removes only a path that is
+# the one this run made.
+MK_IDX_ROOT=""
+if [ "${MARKER_INDEX_TTL_SECONDS:-0}" != "0" ]; then
+  MK_IDX_ROOT=$(mktemp -d "${TMPDIR:-/tmp}/merged-bead-janitor-mkidx.XXXXXX" 2>/dev/null) || MK_IDX_ROOT=""
+  case "$MK_IDX_ROOT" in
+    */merged-bead-janitor-mkidx.*) trap 'rm -rf "$MK_IDX_ROOT"' EXIT ;;
+    *) MK_IDX_ROOT="" ;;
+  esac
+fi
 
 RIG_LIST_JSON=$(gc --city "$GC_CITY" rig list --json 2>/dev/null || echo '{}')
 HQ_GITDIR_PAIR=$(rig_gitdir "$GC_CITY"); HQ_GITDIR="${HQ_GITDIR_PAIR%$'\t'*}"; HQ_CONTAINER="${HQ_GITDIR_PAIR#*$'\t'}"
