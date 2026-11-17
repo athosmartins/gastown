@@ -147,6 +147,13 @@ echo '{"v": 1, "allowed_ip": "10.1.1.1", "fails": 0}' > "$T/city/.gc/hetzner-fw-
 echo '{"v": 1, "allowed_ip": "'"$LIBERADO"'", "fails": 0, "seen_epoch": "ontem"}' > "$T/city/.gc/hetzner-fw-ip.state.json"; run; has "epoch que não é inteiro: corrompido" "corrompido" "$err"
 echo '[1,2]' > "$T/city/.gc/hetzner-fw-ip.state.json"; run; has "JSON que não é objeto: corrompido" "corrompido" "$err"
 
+# estado ilegível (sem permissão de leitura) = não sei: não decide, não manda mail, não mexe no arquivo, sai com rc 3
+reset; both "$NOVO"; WARGS=""; run; before=$(cat "$T/city/.gc/hetzner-fw-ip.state.json")
+chmod 000 "$T/city/.gc/hetzner-fw-ip.state.json"; NOW_OVERRIDE=$((NOW+600)) run; chmod 600 "$T/city/.gc/hetzner-fw-ip.state.json"
+eq "estado ilegível: rc 3" 3 "$rc"; has "estado ilegível: diz o que não conseguiu" "não consegui ler" "$err"; eq "estado ilegível: nenhum mail novo (o 1 é da 1ª rodada)" 1 "$(calls)"
+[ "$before" = "$(cat "$T/city/.gc/hetzner-fw-ip.state.json")" ] && ok "estado ilegível: o arquivo não foi tocado" || bad "estado ilegível: o arquivo foi alterado"; hasnt "estado ilegível: não vira estado de semente" "estado=" "$out"
+ls "$T/city/.gc" | grep -q 'state.json.corrupt-' && bad "estado ilegível: não guarda cópia de corrompido" || ok "estado ilegível: não guarda cópia de corrompido"
+
 # ---- aviso desligado e configuração --------------------------------------------------------------------------------------------------------------------
 reset; both "$NOVO"; WARGS=""; run HETZNER_FW_IP_ALARM=0
 has "aviso desligado: mede e diz" "alarme=desligado" "$out"; eq "aviso desligado: nenhum mail" 0 "$(calls)"
@@ -206,6 +213,7 @@ if [ -z "${HFW_UNDER_TEST:-}" ] && [ "${HFW_NO_MUTANTS:-0}" != 1 ]; then
   mutant M11-dry-run 'elif dry:
                 alarme = "dry-run"' 'elif False:
                 alarme = "dry-run"'
+  mutant M13-estado-ilegivel 'raise Fail("não consegui ler %s: %s" % (path, e))' 'return new_state(c)'
   mutant M12-liberado-sozinho 'st["seen_ip"], st["seen_epoch"] = ip, now' 'st["seen_ip"], st["seen_epoch"], st["allowed_ip"] = ip, now, ip'
 fi
 

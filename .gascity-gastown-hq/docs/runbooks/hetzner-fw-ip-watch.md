@@ -52,11 +52,11 @@ Configuração por ambiente (no plist): `HETZNER_FW_IP_ALLOWED` (semente do IP l
 ## Provar
 
 ```bash
-bash scripts/hetzner-fw-ip-watch.selftest.sh          # suíte + controle negativo (12 mutantes)
+bash scripts/hetzner-fw-ip-watch.selftest.sh          # suíte + controle negativo (13 mutantes)
 HFW_NO_MUTANTS=1 bash scripts/hetzner-fw-ip-watch.selftest.sh
 ```
 
-Hermético: `curl` e `gc` são stubs. Cobre igual, diferente (mail, cooldown e a borda dele, IP novo, mail que falha), não-sei (fonte cai, discorda, não é IP, privado, loopback, IPv6, vazio, enorme, trava), cegueira, episódio, `--ack`, `--dry-run`, estado corrompido, instância única, aviso desligado, configuração inválida e o plist.
+Hermético: `curl` e `gc` são stubs. Cobre igual, diferente (mail, cooldown e a borda dele, IP novo, mail que falha), não-sei (fonte cai, discorda, não é IP, privado, loopback, IPv6, vazio, enorme, trava), cegueira, episódio, `--ack`, `--dry-run`, estado corrompido e estado ilegível (rc 3, nada decidido), instância única, aviso desligado, configuração inválida e o plist.
 
 ## Medido, inferido, não testado
 
