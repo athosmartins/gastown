@@ -9,6 +9,12 @@
 # branch that introduce integration branch content are blocked unless
 # GT_INTEGRATION_LAND=1 is set (only gt mq integration land sets this).
 #
+# Also refuses a push to the default branch from a POOL session (dog, wa-worker,
+# ps-worker, ...) unless every file the push changes is under
+# docs/pending-engine-window/ (staging an engine patch). Code goes by work branch +
+# /gate-done. Mayor, the gate dispatcher (launchd) and terminals are not affected.
+# A pool push whose range or identity cannot be read is refused too. See ga-nmxtzzu.
+#
 # Also blocks new/modified files under two outer-root (repo root) trees that
 # shadow a canonical .gascity-gastown-hq/<path> equivalent, on ANY branch:
 #   - packs/town-deltas/ — an orphan no launchd plist executes (only
@@ -59,6 +65,60 @@ fi
 #                                    auto-rebases and pushes as fix/* etc.
 #   crew/*                        - Named-crew branches (crew/<name>/<bead>)
 
+# Pool sessions (dog, wa-worker, ps-worker, ...) do not push code to the default
+# branch (ga-nmxtzzu). Their only direct-to-main path is staging an engine patch
+# under docs/pending-engine-window/ (the town-deltas recipe); everything else goes
+# by work branch + /gate-done so the gate reviews it. Twice on 16-17/11 a dog took
+# that patch recipe for ordinary code (b96097445, 6772ada10) and pushed unreviewed.
+# Who is pushing comes from the session env (GC_AGENT/GC_ALIAS/GC_TEMPLATE/TD_ROLE
+# and GC_SESSION_ORIGIN). The gate dispatcher runs from launchd with none of them
+# and the Mayor is a named session, so both keep passing. It is a guard against a
+# well-meaning agent following the wrong recipe, not against one that scrubs its env.
+#
+# pool_push_identity prints one of three states:
+#   pool       -- some identity var names a pool template, or the session is ephemeral
+#   other      -- no session at all (launchd, a human terminal) or a named one (Mayor, crew)
+#   unreadable -- inside a gc session (GC_SESSION_NAME/GC_SESSION_ORIGIN set) yet every
+#                 identity var is empty: who is pushing cannot be told
+# Any one var saying "pool" wins over the others, so a conflict lands on the inert side.
+pool_push_identity() {
+  local v n base saw_name=0 in_session=0
+  [[ -n "${GC_SESSION_NAME:-}" || -n "${GC_SESSION_ORIGIN:-}" ]] && in_session=1
+  [[ "${GC_SESSION_ORIGIN:-}" == "ephemeral" ]] && { echo pool; return 0; }
+  for v in "${GC_AGENT:-}" "${GC_ALIAS:-}" "${GC_TEMPLATE:-}" "${TD_ROLE:-}"; do
+    [[ -n "$v" ]] || continue
+    saw_name=1
+    n=$(printf '%s' "$v" | tr 'A-Z' 'a-z')
+    base="${n##*/}"          # whatsapp_automation/wa-worker-3 -> wa-worker-3
+    base="${base#gastown.}"  # gastown.dog-5 -> dog-5
+    case "$base" in
+      dog|dog-*|wa-worker|wa-worker-*|ps-worker|ps-worker-*|kimi-worker*|gemini-worker*|\
+      gate-reviewer*|refino-gate-reviewer*|context-check-reviewer*|auto-refiner*)
+        echo pool; return 0 ;;
+    esac
+  done
+  if [[ "$in_session" == "1" && "$saw_name" == "0" ]]; then
+    echo unreadable
+  else
+    echo other
+  fi
+}
+
+# pool_range_files <remote_sha> <local_sha>: prints every path the push changes, one per
+# line (sorted, unique). Reads the tree diff AND each commit's own changes (-m also opens
+# merge commits), so a file added by one commit and removed by the next still shows up.
+# rc 0 = read fine (empty output = the range changes no file); rc 1 = could not read it
+# (a zero sha, an object this clone lacks, a git error) -- the caller must not read that
+# as "no files".
+pool_range_files() {
+  local rsha="$1" lsha="$2" tree_files commit_files
+  local zero="0000000000000000000000000000000000000000"
+  [[ "$rsha" != "$zero" && "$lsha" != "$zero" ]] || return 1
+  tree_files=$(git diff --name-only --no-renames "$rsha..$lsha" 2>/dev/null) || return 1
+  commit_files=$(git log -m --name-only --no-renames --format= "$rsha..$lsha" 2>/dev/null) || return 1
+  printf '%s\n%s\n' "$tree_files" "$commit_files" | awk 'NF' | sort -u
+}
+
 while read local_ref local_sha remote_ref remote_sha; do
   # Skip tags - they're allowed for releases
   if [[ "$remote_ref" == refs/tags/* ]]; then
@@ -93,6 +153,46 @@ while read local_ref local_sha remote_ref remote_sha; do
       fi
       ;;
   esac
+
+  # Pool-session guard for the default branch (ga-nmxtzzu): see pool_push_identity above.
+  # Who is pushing: pool -> judged by the range below; unreadable -> refused (inert);
+  # other (Mayor, the gate dispatcher, a terminal) -> not this guard's business.
+  if [[ "$branch" == "$default_branch" ]]; then
+    pool_state=$(pool_push_identity)
+    if [[ "$pool_state" == "unreadable" ]]; then
+      echo "BLOCKED: this push goes to $default_branch from inside a gc session, but no identity"
+      echo "variable (GC_AGENT, GC_ALIAS, GC_TEMPLATE, TD_ROLE) is set, so the hook cannot tell"
+      echo "whether a pool session is pushing. Refused to stay on the safe side."
+      echo "Work branch + /gate-done is always allowed: git push origin HEAD:refs/heads/fix/<bead>-<slug>"
+      exit 1
+    elif [[ "$pool_state" == "pool" ]]; then
+      # vazio (range sem arquivo) -> passa: nada a revisar; falhou/ilegivel -> recusa: nao da pra provar que so ha .patch
+      if ! pool_files=$(pool_range_files "$remote_sha" "$local_sha"); then
+        echo "BLOCKED: a pool session pushes to $default_branch, and the hook could not read what the"
+        echo "push changes (range ${remote_sha:0:12}..${local_sha:0:12}: a branch delete, a new default branch,"
+        echo "or a commit this clone does not have -- try 'git fetch origin' and push again)."
+        echo "Refused to stay on the safe side. Code goes by work branch + /gate-done."
+        exit 1
+      fi
+      pool_bad=""
+      while IFS= read -r pool_f; do
+        [[ -n "$pool_f" ]] || continue
+        case "$pool_f" in
+          .gascity-gastown-hq/docs/pending-engine-window/?*|docs/pending-engine-window/?*) ;;
+          *) pool_bad="${pool_bad}  ${pool_f}"$'\n' ;;
+        esac
+      done <<< "$pool_files"
+      if [[ -n "$pool_bad" ]]; then
+        echo "BLOCKED: a pool session (dog, wa-worker, ps-worker, ...) may push straight to $default_branch"
+        echo "only files under docs/pending-engine-window/ (staging an engine patch). This push also changes:"
+        printf '%s' "$pool_bad"
+        echo ""
+        echo "Use branch + /gate-done: git push origin HEAD:refs/heads/fix/<bead>-<slug>, then run /gate-done."
+        echo "The gate reviews and merges it; nobody merges code to $default_branch from a pool session (ga-nmxtzzu)."
+        exit 1
+      fi
+    fi
+  fi
 
   # Orphaned outer-root tree guard: reject new/modified files under any
   # outer-root (repo root) path that shadows a canonical

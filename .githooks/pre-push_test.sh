@@ -7,6 +7,11 @@
 
 set -euo pipefail
 
+# The pool-session guard (ga-nmxtzzu) reads who is pushing from the session env. This
+# suite runs from dog / worker sessions too, so start from a clean identity: every case
+# below that needs one sets it explicitly (run_hook_as).
+unset GC_AGENT GC_ALIAS GC_TEMPLATE GC_SESSION_NAME GC_SESSION_ORIGIN TD_ROLE
+
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 HOOK="$SCRIPT_DIR/pre-push"
 PASS=0
@@ -616,6 +621,189 @@ git add scripts/zz.md && git commit -m "adds scripts/zz.md" >/dev/null 2>&1
 local_sha=$(get_sha HEAD)
 git update-ref -d "refs/remotes/origin/$DEFAULT_BRANCH"
 assert_block "Fallback range still blocks scripts/zz.md" run_hook "refs/heads/fix/ga-99999-no-base" "$local_sha" "refs/heads/fix/ga-99999-no-base" "$remote_sha"
+cleanup
+
+# --- ga-nmxtzzu: pool sessions do not push code straight to the default branch ---------
+# A pool session (dog, wa-worker, ps-worker, ...) may push to the default branch only
+# files under docs/pending-engine-window/ (engine-patch staging). Mayor, the gate
+# dispatcher (launchd: no identity vars) and terminals are untouched. A range or an
+# identity the hook cannot read is refused. Tests 36, 38-40, 44-49 and 51 fail on the
+# hook before ga-nmxtzzu; 37, 41-43, 50 are controls that must hold before and after.
+
+run_hook_as() {
+  # run_hook_as "<VAR=val ...>" local_ref local_sha remote_ref remote_sha
+  local envs=$1; shift
+  local local_ref=$1 local_sha=$2 remote_ref=$3 remote_sha=$4
+  echo "$local_ref $local_sha $remote_ref $remote_sha" | env $envs bash "$HOOK" "origin" 2>&1
+}
+
+assert_block_says() {
+  # assert_block_says <name> <needle> <cmd...>: the hook refuses AND its output has <needle>
+  local test_name=$1 needle=$2; shift 2
+  local out rc=0
+  out=$("$@" 2>&1) || rc=$?
+  if [[ $rc -eq 0 ]]; then
+    echo "  FAIL: $test_name (expected block, got pass)"; FAIL=$((FAIL + 1))
+  elif [[ "$out" != *"$needle"* ]]; then
+    echo "  FAIL: $test_name (blocked, but the output lacks: $needle)"; FAIL=$((FAIL + 1))
+  else
+    echo "  PASS: $test_name"; PASS=$((PASS + 1))
+  fi
+}
+
+commit_file() {
+  # commit_file <path> <content> <message>
+  mkdir -p "$(dirname "$1")"
+  echo "$2" > "$1"
+  git add "$1" && git commit -m "$3" >/dev/null 2>&1
+}
+
+POOL_DOG="GC_AGENT=gastown.dog-5 GC_ALIAS=gastown.dog-5 GC_TEMPLATE=gastown.dog GC_SESSION_ORIGIN=ephemeral TD_ROLE=dog"
+PEW=".gascity-gastown-hq/docs/pending-engine-window"
+
+echo "Test 36: Pool session pushes only a .patch under .gascity-gastown-hq/docs/pending-engine-window/ to the default branch — allowed"
+setup_repos; cd "$TMPDIR/local"
+remote_sha=$(get_sha HEAD)
+commit_file "$PEW/ga-1-x.patch" "diff" "stage patch"
+local_sha=$(get_sha HEAD)
+assert_pass "Pool engine-patch staging allowed" run_hook_as "$POOL_DOG" "refs/heads/$DEFAULT_BRANCH" "$local_sha" "refs/heads/$DEFAULT_BRANCH" "$remote_sha"
+cleanup
+
+echo "Test 37: Pool session, same shape, but the repo-root docs/pending-engine-window/ — allowed (misplacement has its own alarm)"
+setup_repos; cd "$TMPDIR/local"
+remote_sha=$(get_sha HEAD)
+commit_file "docs/pending-engine-window/ga-1-x.patch" "diff" "stage patch"
+local_sha=$(get_sha HEAD)
+assert_pass "Pool root-level staging allowed" run_hook_as "$POOL_DOG" "refs/heads/$DEFAULT_BRANCH" "$local_sha" "refs/heads/$DEFAULT_BRANCH" "$remote_sha"
+cleanup
+
+echo "Test 38: Pool session pushes a .py to the default branch — blocked, names the file, points to branch + /gate-done"
+setup_repos; cd "$TMPDIR/local"
+remote_sha=$(get_sha HEAD)
+commit_file ".gascity-gastown-hq/scripts/hetzner-fw-ip-watch.py" "print(1)" "code straight to main"
+local_sha=$(get_sha HEAD)
+assert_block_says "Pool code push refused, file named" "hetzner-fw-ip-watch.py" run_hook_as "$POOL_DOG" "refs/heads/$DEFAULT_BRANCH" "$local_sha" "refs/heads/$DEFAULT_BRANCH" "$remote_sha"
+assert_block_says "Pool code push refused, tells where to go" "gate-done" run_hook_as "$POOL_DOG" "refs/heads/$DEFAULT_BRANCH" "$local_sha" "refs/heads/$DEFAULT_BRANCH" "$remote_sha"
+cleanup
+
+echo "Test 39: Pool session pushes a .patch AND a .py in one range — blocked; only the .py is named"
+setup_repos; cd "$TMPDIR/local"
+remote_sha=$(get_sha HEAD)
+commit_file "$PEW/ga-1-x.patch" "diff" "stage patch"
+commit_file "tools/sneaky.py" "print(1)" "and some code"
+local_sha=$(get_sha HEAD)
+out=$(run_hook_as "$POOL_DOG" "refs/heads/$DEFAULT_BRANCH" "$local_sha" "refs/heads/$DEFAULT_BRANCH" "$remote_sha" || true)
+if [[ "$out" == *"tools/sneaky.py"* && "$out" != *"ga-1-x.patch"* ]]; then
+  echo "  PASS: mixed range blocked, only the offending file named"; PASS=$((PASS + 1))
+else
+  echo "  FAIL: mixed range — output was: $out"; FAIL=$((FAIL + 1))
+fi
+cleanup
+
+echo "Test 40: Pool session, lookalike paths (pending-engine-window-x/, pending-engine-window.patch) — blocked"
+setup_repos; cd "$TMPDIR/local"
+remote_sha=$(get_sha HEAD)
+commit_file "docs/pending-engine-window-x/a.py" "print(1)" "lookalike dir"
+local_sha=$(get_sha HEAD)
+assert_block "Lookalike directory blocked" run_hook_as "$POOL_DOG" "refs/heads/$DEFAULT_BRANCH" "$local_sha" "refs/heads/$DEFAULT_BRANCH" "$remote_sha"
+cleanup
+setup_repos; cd "$TMPDIR/local"
+remote_sha=$(get_sha HEAD)
+commit_file "docs/pending-engine-window.patch" "diff" "a file, not the dir"
+local_sha=$(get_sha HEAD)
+assert_block "File named like the directory blocked" run_hook_as "$POOL_DOG" "refs/heads/$DEFAULT_BRANCH" "$local_sha" "refs/heads/$DEFAULT_BRANCH" "$remote_sha"
+cleanup
+
+echo "Test 41: Mayor (named session) pushes code to the default branch — allowed"
+setup_repos; cd "$TMPDIR/local"
+remote_sha=$(get_sha HEAD)
+commit_file "tools/mayor-fix.py" "print(1)" "mayor lands a fix"
+local_sha=$(get_sha HEAD)
+assert_pass "Mayor code push allowed" run_hook_as "GC_AGENT=gastown.mayor GC_ALIAS=gastown.mayor GC_TEMPLATE=gastown.mayor GC_SESSION_ORIGIN=named GC_SESSION_NAME=gastown--mayor" "refs/heads/$DEFAULT_BRANCH" "$local_sha" "refs/heads/$DEFAULT_BRANCH" "$remote_sha"
+cleanup
+
+echo "Test 42: The gate dispatcher (launchd, no identity vars at all) pushes code to the default branch — allowed"
+setup_repos; cd "$TMPDIR/local"
+remote_sha=$(get_sha HEAD)
+commit_file "tools/gated.py" "print(1)" "gate merges reviewed work"
+local_sha=$(get_sha HEAD)
+assert_pass "Gate-shaped push (no identity) allowed" run_hook "refs/heads/$DEFAULT_BRANCH" "$local_sha" "refs/heads/$DEFAULT_BRANCH" "$remote_sha"
+cleanup
+
+echo "Test 43: Pool session pushes code to a fix/* work branch — allowed (the guard is for the default branch only)"
+setup_repos; cd "$TMPDIR/local"
+git checkout -b fix/ga-nmxtzzu-x >/dev/null 2>&1
+commit_file "tools/work.py" "print(1)" "work on a branch"
+local_sha=$(get_sha HEAD)
+assert_pass "Pool work-branch push allowed" run_hook_as "$POOL_DOG" "refs/heads/fix/ga-nmxtzzu-x" "$local_sha" "refs/heads/fix/ga-nmxtzzu-x" "0000000000000000000000000000000000000000"
+cleanup
+
+echo "Test 44: Other pool templates (wa-worker rig-qualified, ps-worker, dog-remote, kimi) — blocked"
+setup_repos; cd "$TMPDIR/local"
+remote_sha=$(get_sha HEAD)
+commit_file "tools/x.py" "print(1)" "code"
+local_sha=$(get_sha HEAD)
+for ident in \
+  "GC_AGENT=whatsapp_automation/wa-worker-3 GC_TEMPLATE=whatsapp_automation/wa-worker" \
+  "GC_AGENT=ps-worker-2 GC_ALIAS=ps-worker-2" \
+  "GC_AGENT=dog-1 GC_TEMPLATE=dog-remote" \
+  "GC_TEMPLATE=kimi-worker-wa-remote"; do
+  assert_block "Pool identity [$ident] blocked" run_hook_as "$ident" "refs/heads/$DEFAULT_BRANCH" "$local_sha" "refs/heads/$DEFAULT_BRANCH" "$remote_sha"
+done
+cleanup
+
+echo "Test 45: Ephemeral session with a template name the hook does not know — blocked (ephemeral = pool)"
+setup_repos; cd "$TMPDIR/local"
+remote_sha=$(get_sha HEAD)
+commit_file "tools/x.py" "print(1)" "code"
+local_sha=$(get_sha HEAD)
+assert_block "Unknown ephemeral template blocked" run_hook_as "GC_AGENT=mystery-bot-9 GC_SESSION_ORIGIN=ephemeral" "refs/heads/$DEFAULT_BRANCH" "$local_sha" "refs/heads/$DEFAULT_BRANCH" "$remote_sha"
+cleanup
+
+echo "Test 46: Inside a gc session but every identity var empty — blocked (cannot tell who pushes)"
+setup_repos; cd "$TMPDIR/local"
+remote_sha=$(get_sha HEAD)
+commit_file "tools/x.py" "print(1)" "code"
+local_sha=$(get_sha HEAD)
+assert_block_says "Unreadable identity refused, says why" "cannot tell" run_hook_as "GC_SESSION_NAME=dog-abc123" "refs/heads/$DEFAULT_BRANCH" "$local_sha" "refs/heads/$DEFAULT_BRANCH" "$remote_sha"
+cleanup
+
+echo "Test 47: Pool session, remote sha unknown to this clone (range unreadable) — blocked, even for a .patch-only push"
+setup_repos; cd "$TMPDIR/local"
+commit_file "$PEW/ga-1-x.patch" "diff" "stage patch"
+local_sha=$(get_sha HEAD)
+assert_block_says "Unreadable range refused, says why" "could not read" run_hook_as "$POOL_DOG" "refs/heads/$DEFAULT_BRANCH" "$local_sha" "refs/heads/$DEFAULT_BRANCH" "1111111111111111111111111111111111111111"
+cleanup
+
+echo "Test 48: Pool session deletes the default branch (zero local sha) — blocked"
+setup_repos; cd "$TMPDIR/local"
+remote_sha=$(get_sha HEAD)
+assert_block "Pool delete of the default branch blocked" run_hook_as "$POOL_DOG" "(delete)" "0000000000000000000000000000000000000000" "refs/heads/$DEFAULT_BRANCH" "$remote_sha"
+cleanup
+
+echo "Test 49: Pool session adds a .py in one commit and removes it in the next (tree diff is empty) — blocked"
+setup_repos; cd "$TMPDIR/local"
+remote_sha=$(get_sha HEAD)
+commit_file "tools/flash.py" "print(1)" "add"
+git rm -q tools/flash.py && git commit -m "remove" >/dev/null 2>&1
+local_sha=$(get_sha HEAD)
+assert_block "Add-then-remove still seen through the per-commit read" run_hook_as "$POOL_DOG" "refs/heads/$DEFAULT_BRANCH" "$local_sha" "refs/heads/$DEFAULT_BRANCH" "$remote_sha"
+cleanup
+
+echo "Test 50: Pool session pushes an empty commit (range readable, no file changes) — allowed: empty is not unreadable"
+setup_repos; cd "$TMPDIR/local"
+remote_sha=$(get_sha HEAD)
+git commit --allow-empty -m "empty" >/dev/null 2>&1
+local_sha=$(get_sha HEAD)
+assert_pass "Readable empty range allowed" run_hook_as "$POOL_DOG" "refs/heads/$DEFAULT_BRANCH" "$local_sha" "refs/heads/$DEFAULT_BRANCH" "$remote_sha"
+cleanup
+
+echo "Test 51: Conflicting identity (GC_AGENT says Mayor, GC_TEMPLATE says dog) — blocked: pool wins"
+setup_repos; cd "$TMPDIR/local"
+remote_sha=$(get_sha HEAD)
+commit_file "tools/x.py" "print(1)" "code"
+local_sha=$(get_sha HEAD)
+assert_block "Conflicting identity lands on the inert side" run_hook_as "GC_AGENT=gastown.mayor GC_TEMPLATE=gastown.dog" "refs/heads/$DEFAULT_BRANCH" "$local_sha" "refs/heads/$DEFAULT_BRANCH" "$remote_sha"
 cleanup
 
 echo ""

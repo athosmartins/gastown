@@ -698,7 +698,13 @@ toda confusão de repo/tree checando o binário que roda de verdade.
    roda um nível acima de `in/`; `--push` de caminho inexistente sai com rc 98,
    igual a "MBP fora"). rc 96..99 = MBP indisponível: espere, não volte pro
    mini. Receita e armadilhas: `docs/runbooks/mbp-offload.md`, "Go no MBP".
-2. **Gere o patch num rascunho e entregue-o no MESMO ato: commit + push de um
+2. **SÓ para `.patch` em `docs/pending-engine-window/`; código vai por branch +
+   `/gate-done`.** Esta receita empurra direto para `main`, sem gate, e existe
+   apenas para o patch do engine: com qualquer outro arquivo no push (script,
+   selftest, plist, runbook) o hook pre-push RECUSA quando quem empurra é sessão
+   de pool (dog, wa-worker, ps-worker), e o gate nunca viu esse código (ga-nmxtzzu:
+   dois dogs empurraram código assim em 16-17/11, b96097445 e 6772ada10).
+   **Gere o patch num rascunho e entregue-o no MESMO ato: commit + push de um
    worktree SEU, nunca um commit só local na raiz `~/gt` (ga-1bao0qs).** O
    rascunho é `git -C <src> diff > <rascunho>` (caminho ABSOLUTO, fora de
    `$GC_CITY_PATH`); o patch vai para
