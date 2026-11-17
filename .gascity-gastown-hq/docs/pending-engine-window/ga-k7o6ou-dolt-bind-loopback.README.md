@@ -75,8 +75,8 @@ until that line aged out of the log. An unreadable line that mentions
 `nonloopback` stops the verdict from being `LIMPO`, because it cannot be dated and so cannot be
 shown to lie outside the window.
 
-* It runs from `packs/town-deltas/assets/com.gascity.dolt-remote-peer-audit.plist` (60 s,
-  ~0.17 s CPU per sample). The deploy installer loads new `com.gascity.*` plists from that
+* It runs from `packs/town-deltas/assets/com.gascity.dolt-remote-peer-audit.plist` (240 s since
+  ga-xvbini1.1, was 60 s; ~0.13 s CPU per sample). The deploy installer loads new `com.gascity.*` plists from that
   directory on the first deploy after merge. Merged is not alive: confirm with
   `launchctl list | grep dolt-remote-peer-audit` and a growing
   `.gc/logs/dolt-remote-peers.jsonl`.
@@ -86,7 +86,7 @@ shown to lie outside the window.
   stretch of more than 15 min made only of `unknown`, more than 1% unreadable lines, or any
   unreadable line that mentions `nonloopback`). A `BLOQUEADO` answer restarts the clock: deal
   with that client, then wait for 48 h of clean samples.
-* Limit: it is a snapshot every 60 s. A client that connects for milliseconds once a day can
+* Limit: it is a snapshot every 240 s. A client that connects for milliseconds once a day can
   slip past it. `LIMPO` means "no client outside the IPv4 loopback in N valid readings (+M
   unknown) over H hours".
 * A sampler that hangs holds the lock and sampling stops (`dolt-pid-lib` runs one `lsof` with

@@ -35,7 +35,7 @@
 #                127.0.0.1 deixaria de atender (o nome vem da pergunta "chega pelo IPv4 loopback?")
 #   unknown      sem PID do Dolt, sem porta de LISTEN, lsof falhou ou estourou o tempo
 #
-# LIMITE HONESTO: é um retrato a cada ~60 s. Cliente remoto que conecta por centenas de
+# LIMITE HONESTO: é um retrato a cada ~240 s (era 60 s até ga-xvbini1.1). Cliente remoto que conecta por centenas de
 # milissegundos uma vez por dia pode passar sem ser visto. O veredito LIMPO diz "nenhuma
 # conexão não-loopback em N amostras ao longo de H horas", não "nunca existiu". A rede de
 # segurança do bind é que o erro de um cliente esquecido é ALTO (conexão recusada), e a volta
@@ -108,7 +108,7 @@ emit() {
     "$lead" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$(date +%s)" "$state" "$pid" "$ports" \
     "$total" "$loop" "$loop6" "$selflan" "$remote" "$peers" "$why" >>"$LOG" 2>/dev/null || {
       echo "dolt-remote-peer-audit: não consegui gravar $LOG" >&2; return 1; }
-  # Teto do log: ~230 KB/dia a 60 s (linha de ~165 bytes), 20000 linhas ≈ 14 dias; só corta
+  # Teto do log: ~59 KB/dia a 240 s (linha de ~165 bytes), 20000 linhas ≈ 56 dias; só corta
   # quando passa do limite, mantendo o fim.
   local n
   n="$(wc -l <"$LOG" 2>/dev/null | tr -d ' ')"
