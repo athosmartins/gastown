@@ -10,6 +10,7 @@
 - Três estados: o que o maestro faz quando não consegue ler
 - Teto de 6 h do reinício (D4)
 - D3.5: corte de carga (ga-1p1i5jr.8)
+- Degrau de swap: corte de memória por CRESCIMENTO do swap (ga-yh41v0e)
 - D1: temporários do pytest e do GoogleUpdater, e a trava do Chrome (ga-1p1i5jr.9)
 - Como testar
 - Prova ponta a ponta e canário de 24 h (D5)
@@ -256,6 +257,29 @@ em 24 h, 6 h de cooldown) a escada só avisava, e o restart do D3 devolve a mesm
 - **Mão.** `scripts/disk-recovery-d35-load-shed.sh --dry-run` diz o que pararia. Religar um serviço à mão: `launchctl enable gui/$(id -u)/<label> && launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/<label>.plist`.
   Desligar tudo: `touch .gc/disk-recovery.off` (o mesmo interruptor do maestro).
 - **Não provado do nó (só o mini prova):** o formato real de `launchctl print` / `print-disabled`, o efeito da parada na RAM e no swap, e o `ps` do macOS na conferência da trava.
+
+## Degrau de swap: corte de memória por CRESCIMENTO do swap (ga-yh41v0e)
+
+16/11 14:35: o swap saltou de 2,8 para 6 GB em ~5 min, o disco foi a 1 GB e o kernel entrou em pânico; às 19:20 o disco caiu de 7,7 para 4,9 GB (abaixo do piso do Pilot) e o Mayor cortou logs à mão.
+O swap mora no mesmo volume do Dolt e os degraus de disco só reagem ao DISCO (D2 espera 900 s, D3 1800 s, D4 3600 s). `scripts/disk-recovery-swap-cut.sh` age pelo swap, **com o disco ainda alto**:
+o maestro o chama TODA rodada (120 s), ANTES dos degraus de disco, e `--resume` depois do `--resume` do D3.5.
+
+| Quando | O que acontece |
+|---|---|
+| swap cresceu ≥ 1536 MB em ~300 s (base = o registro do amostrador `ram-owner-samples.jsonl` mais próximo de 300 s, entre 150 e 630 s) OU swap em uso > 5120 MB | colhe UMA amostra nova do amostrador, suspende (`gc session suspend`, reversível) até 3 sessões de pool/reviewer OCIOSAS por rodada, a de maior RSS primeiro, e **pausa o spawn do Pilot** |
+| nenhuma candidata e o swap segue alto | rc 11: o maestro avisa (`notify -p 4` + mail ao Mayor, no máx. 1 por hora) com os maiores donos de RAM |
+| amostrador ausente, parado há > 900 s, sem amostra de ≤ 120 s, sem atribuição de sessão, roster ou relógio ilegíveis | **rc 30, NÃO corta e NÃO pausa**; o maestro avisa o Mayor (1 por hora) e a escada de disco SEGUE |
+| swap calmo (≤ 4096 MB e crescimento < 768 MB, os dois lidos) por 300 s | `--resume` apaga a pausa; 900 s depois religa as sessões suspensas (`gc session wake`, até 2 por rodada) |
+
+- **Nunca corta:** Dolt, daemon de WhatsApp, crew (`*-wa *-ma *-ps *-lx`, oracle*), witness/mayor/deacon/control-dispatcher/boot, dogs, sessão anexada, sessão com bead `in_progress` (sob qualquer nome do roster, no store do rig e no HQ),
+  sessão com transcrição parada há < 15 min ou desconhecida. Sem `kill -9`, sem `pkill -f`, nada que toque Appium. Só `gc session suspend`; o log diz quem foi cortado e quanto de swap voltou (o número LIDO, que pode ser 0 ou negativo).
+- **A pausa do Pilot** é o arquivo `.gc/swap-spawn-pause` (4 linhas: `PAUSE`, época da gravação, época da VALIDADE, motivo; TTL 900 s, renovado a cada rodada em que o gatilho vale). O Pilot o lê na varredura, logo depois do gate de pressão de RAM e
+  antes do disk floor (`_pilot_swap_spawn_pause`): válido e dentro da validade = varredura INTEIRA pausada (`swap-spawn-pause` no painel; nada em voo é tocado). **A validade é o freio:** se o degrau morrer a pausa vence sozinha;
+  arquivo vencido, corrompido, ilegível ou com validade a mais de 1 h (`PILOT_SWAP_PAUSE_MAX_AHEAD_S`) NÃO pausa (fail-open) e o Pilot DIZ isso no log; arquivo ausente é silêncio. Liberar à mão: `rm .gc/swap-spawn-pause`.
+- **Mão.** `scripts/disk-recovery-swap-cut.sh --dry-run` diz o que cortaria sem tocar em nada. Desligar tudo: `touch .gc/disk-recovery.off` (o mesmo interruptor do maestro). Log: `.gc/logs/disk-recovery-swap-cut.log`.
+- **Prova.** `scripts/disk-recovery-swap-cut.selftest.sh` (hermético: swap, amostrador, roster, bd, gc e relógio simulados; swap subindo → corte; mutantes), `scripts/disk-recovery-swap-cut.mutants.selftest.sh --run` (no nó; cada guarda desligada tem de reprovar o selftest; **chega com a fatia 5/5, ga-yh41v0e.5 — ainda não está no main**),
+  `packs/town-deltas/assets/pilot-dispatcher.swap-spawn-pause.selftest.sh` (o lado do Pilot, com os próprios mutantes) e o `disk-recovery-ladder.selftest.sh` (a chamada em toda rodada e o terceiro estado do maestro).
+- **Não provado do nó (só o mini prova):** o `vm.swapusage` real sob o launchd (pt_BR), o efeito de `gc session suspend` no RSS real e o tempo que o macOS leva para devolver o swap.
 
 ## D1: temporários do pytest e do GoogleUpdater, e a trava do Chrome (ga-1p1i5jr.9)
 

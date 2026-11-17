@@ -50,12 +50,13 @@ hasnt() { case "$1" in *"$2"*) nope "$3 (não devia ter: $2)" ;; *) ok "$3" ;; e
 section() { printf '\n== %s\n' "$1"; }
 
 # ── stubs ───────────────────────────────────────────────────────────────────────────────────────────────────
-for n in d2 d3 d4 d35; do
+for n in d2 d3 d4 d35 swapcut; do
   cp /dev/null "$W/stubs/$n"
   cat > "$W/stubs/$n" <<'STUB'
 #!/bin/bash
 # degrau simulado. Modo em $STUB_DIR/mode.<nome>: linhas rc=N msg=... setfree=N setswap=MISSING (apaga o arquivo do swap: o swap só fica ilegível na re-medição que vem depois do degrau) slp=N killp=1 waitfor=ARQUIVO (espera o arquivo existir, no máx. 30 s: segura o degrau sem depender da velocidade da máquina)
 n=$(basename "$0"); rc=0; msg="stub $n"; setfree=""; setswap=""; slp=0; killp=0; waitfor=""
+[ "$n" = swapcut ] && { rc=10; msg="sem gatilho (stub)"; }   # o degrau de swap roda TODA rodada (ga-yh41v0e): o padrão é o rc 10 calado
 # --resume (só o D2 tem): o maestro chama a CADA rodada, então o padrão é o rc 10 calado ("nada a retomar"); o teste manda outro em mode.<nome>.resume (rrc= rmsg='...' rslp=N, lido como shell: mensagem entre aspas).
 # Não mexe em state_at_call.* nem em pid.* (são do --run) e só anota a chamada em `calls`.
 if [ "${1:-}" = "--resume" ]; then
@@ -155,7 +156,7 @@ chmod 755 "$W/rssbin/ps"
 BASE=( "PATH=$W/rssbin:$PATH" "HOME=$W/home" "TMPDIR=$W/tmp" "STUB_DIR=$SD"
   "DR_CITY=$CITY" "DR_STATE=$STATE" "DR_LOG=$LOG" "DR_RSS_LOG=$RSSLOG" "DR_OFF_FILE=$OFF" "DR_LOCK=$LOCK"
   "DR_FREE_MB_FILE=$W/free" "DR_SWAP_MB_FILE=$W/swap" "DR_NOW_FILE=$W/now"
-  "DR_D2_CMD=$W/stubs/d2" "DR_D3_CMD=$W/stubs/d3" "DR_D4_CMD=$W/stubs/d4" "DR_D35_CMD=$W/stubs/d35"
+  "DR_D2_CMD=$W/stubs/d2" "DR_D3_CMD=$W/stubs/d3" "DR_D4_CMD=$W/stubs/d4" "DR_D35_CMD=$W/stubs/d35" "DR_SWAPCUT_CMD=$W/stubs/swapcut"
   "DR_NOTIFY_BIN=$W/stubs/notify" "DR_GC_BIN=$W/stubs/gc" "DR_SETTLE_S=0" )
 XENV=()
 
@@ -166,7 +167,7 @@ setfree() { if [ "$1" = MISSING ]; then rm -f "$W/free"; else printf '%s' "$1" >
 setswap() { if [ "$1" = MISSING ]; then rm -f "$W/swap"; else printf '%s' "$1" > "$W/swap"; fi; }
 tick() { setfree "$1"; setswap "$2"; printf '%s' "$3" > "$W/now"; runl --run; }   # livre swap agora
 ncall()  { local n; n=$(grep -c -x -F "$1 $2" "$SD/calls" 2>/dev/null); echo "${n:-0}"; }
-ncallall() { local n; n=$(grep -v -x -F -e 'd2 --resume' -e 'd4 --resume' -e 'd35 --resume' -e 'd35 --run' -e 'd35 --dry-run' "$SD/calls" 2>/dev/null | grep -c .); echo "${n:-0}"; }   # chamadas de --run/--dry-run; o --resume (toda rodada) conta à parte em nresume / nresume4
+ncallall() { local n; n=$(grep -v -x -F -e 'd2 --resume' -e 'd4 --resume' -e 'd35 --resume' -e 'd35 --run' -e 'd35 --dry-run' -e 'swapcut --resume' -e 'swapcut --run' -e 'swapcut --dry-run' "$SD/calls" 2>/dev/null | grep -c .); echo "${n:-0}"; }   # chamadas de --run/--dry-run; o --resume (toda rodada) conta à parte em nresume / nresume4
 nresume() { local n; n=$(grep -c -x -F 'd2 --resume' "$SD/calls" 2>/dev/null); echo "${n:-0}"; }
 nresume4() { local n; n=$(grep -c -x -F 'd4 --resume' "$SD/calls" 2>/dev/null); echo "${n:-0}"; }
 rmode() { printf '%s\n' "$@" > "$SD/mode.d2.resume"; }   # o que o D2 --resume devolve: rmode rrc=20 "rmsg='...'"
@@ -251,7 +252,8 @@ nres35() { local n; n=$(grep -c -x -F 'd35 --resume' "$SD/calls" 2>/dev/null); e
 rmode35() { printf '%s\n' "$@" > "$SD/mode.d35.resume"; }
 reset; tick 20000 0 "$T0"; tick 20000 0 $((T0 + 120))
 eq "$RC,$(nres35),$(nnotify p=),$(nmail to=)" "0,2,0,0" "rc 10 (nada a retomar): chamado a CADA rodada, silêncio total"
-eq "$(tail -n 3 "$SD/calls" | tr '\n' ',')" "d2 --resume,d4 --resume,d35 --resume," "o resume do D3.5 vem DEPOIS dos do D2 e do D4, na mesma rodada"
+eq "$(grep -v '^swapcut' "$SD/calls" | tail -n 3 | tr '\n' ',')" "d2 --resume,d4 --resume,d35 --resume," "o resume do D3.5 vem DEPOIS dos do D2 e do D4, na mesma rodada"
+eq "$(tail -n 4 "$SD/calls" | tr '\n' ',')" "d2 --resume,d4 --resume,d35 --resume,swapcut --resume," "o resume do degrau de swap (ga-yh41v0e) fecha a rodada, depois do D3.5"
 reset; rmode35 rrc=0 "rmsg='D3.5 resume: religou [com.t.b] (pid 1001 -> 5000); restam 1'"; tick 20000 0 "$T0"
 eq "$RC,$(nnotify "$D35R0"),$(nmail to=)" "0,1,0" "rc 0 (religou): notify -p 3 sem push forçado, sem mail, saída 0"; has "$(cat "$SD/notify.log")" "pid 1001 -> 5000" "…com a linha dele"
 reset; rmode35 rrc=20 "rmsg='FALHOU ao religar [com.t.b]: sem pid novo'"; tick 20000 0 "$T0"
@@ -263,6 +265,61 @@ reset; rmode35 rrc=99 "rmsg='???'"; tick 20000 0 "$T0"; eq "$RC,$(nnotify "$D35R
 reset; rmode35 rrc=0 rslp=5; XENV=("DR_RESUME_TIMEOUT_S=1"); tick 20000 0 "$T0"; eq "$RC,$(nnotify "$D35RB")" "20,1" "estourou o prazo da retomada (124): alerta de falha da chamada"
 reset; XENV=("DR_D35_CMD=$W/stubs/nao-existe"); tick 20000 0 "$T0"; eq "$RC,$(nnotify p=)" "0,0" "D3.5 ausente na retomada: calado (nada foi parado por ele; o corte é que avisa)"
 reset; setfree 20000; printf '%s' "$T0" > "$W/now"; runl --dry-run; eq "$(nres35)" 0 "dry-run não chama o --resume do D3.5"
+
+section "degrau de swap (ga-yh41v0e.4): chamado TODA rodada, ANTES do D3.5 e do degrau da vez; só o rc 10 é silêncio; rc 30 (cego) avisa e a escada SEGUE; falha da CHAMADA é alerta"
+SWN0='p=4 force=1 t=Swap: cortei memória antes do disco cair'; SWN11='p=4 force=1 t=Swap sobe e não há o que cortar sozinho'; SWN20='p=4 force=1 t=Disco: o degrau de swap FALHOU'
+SWN30='p=4 force=1 t=Swap: o degrau não consegue ler o amostrador de RAM'; SWNB='p=4 force=1 t=Disco: o degrau de swap falhou na chamada'; SWNA='p=4 force=1 t=Disco: o degrau de swap não executa'
+SWR0='p=3 force= t=Swap: calmo, retomei o que cortei'; SWR20='p=4 force=1 t=Disco: o degrau de swap NÃO retomou'; SWR30='p=4 force=1 t=Swap: o degrau não leu o amostrador na retomada'; SWRB='p=4 force=1 t=Disco: a retomada do degrau de swap falhou na chamada'
+nsw() { local n; n=$(grep -c -x -F "swapcut $1" "$SD/calls" 2>/dev/null); echo "${n:-0}"; }
+rmodesw() { printf '%s\n' "$@" > "$SD/mode.swapcut.resume"; }
+reset; tick 20000 0 "$T0"; tick 20000 0 $((T0 + 120))
+eq "$RC,$(nsw --run),$(nsw --resume),$(nnotify p=),$(nmail to=)" "0,2,2,0,0" "rc 10 (sem gatilho): chamado a CADA rodada (--run e --resume), silêncio total"
+hasnt "$(logtxt)" "swap:" "rc 10 'sem gatilho': nem o log enche a cada 120 s"
+reset; mode swapcut rc=10 "msg='gatilho em carencia (stub)'"; tick 20000 0 "$T0"; has "$(logtxt)" "swap: rc=10: gatilho em carencia" "rc 10 que NÃO é 'sem gatilho': vai ao log (só o caso normal é calado; o maestro só guarda os bytes ASCII da linha)"
+eq "$(nnotify p=)" 0 "…e continua sem aviso"
+reset; mode d2 rc=10; mode d35 rc=10; mkstate "$STATE" 0 0 $((T0 - 3700)) $((T0 - 1000)); tick 2900 0 $((T0 + 120))
+eq "$(grep -n -x -F 'swapcut --run' "$SD/calls" | head -n 1 | cut -d: -f1),$(grep -n -x -F 'd35 --run' "$SD/calls" | head -n 1 | cut -d: -f1)" "1,2" "o degrau de swap vem ANTES do D3.5 na mesma rodada"
+reset; mode d2 rc=10; mode swapcut rc=10; walk 4000 0 "$T0" $((T0 + 900)) 300
+eq "$WFIRST2,$(nsw --run)" "$((T0 + 900)),4" "o degrau de swap não muda o relógio do D2: D2 aos 900 s e o swap chamado nas 4 rodadas"
+reset; mode swapcut rc=0 "msg='cortei 2: Alfa 800MB, Beta 400MB; swap 6000 -> 4800 MB'"; tick 20000 6000 "$T0"
+eq "$RC,$(nnotify "$SWN0"),$(nmail 'Swap: cortei memória'),$(cat "$CITY/.gc/disk-recovery.resume-swapcutmail" 2>/dev/null)" "0,1,1,$T0" "rc 0 (cortou): notify -p 4 forçado + mail ao Mayor, marca do mail, saída 0"
+has "$(cat "$SD/notify.log")" "Alfa 800MB, Beta 400MB" "rc 0: a LISTA do que foi suspenso vai no aviso"
+tick 20000 6000 $((T0 + 120)); eq "$(nnotify "$SWN0"),$(nmail 'Swap: cortei memória')" "2,1" "rc 0 de novo 2 min depois: o notify repete (cada corte é fato novo), o mail só 1 por hora"
+reset; mode swapcut rc=11 "msg='gatilho ativo; 0 candidatas; maiores donos: X 3000MB'"; tick 20000 6000 "$T0"
+eq "$RC,$(nnotify "$SWN11"),$(nmail 'Swap sobe e o degrau não tem o que cortar'),$(cat "$CITY/.gc/disk-recovery.resume-swapcutrc11" 2>/dev/null)" "0,1,1,$T0" "rc 11 (gatilho sem candidata): alerta -p 4 forçado + mail, marca de 1 h, saída 0 (precisa de humano, mas a escada de disco segue)"
+tick 20000 6000 $((T0 + 120)); eq "$(nnotify "$SWN11"),$(nmail 'Swap sobe e o degrau não tem o que cortar')" "1,1" "rc 11 de novo 2 min depois: no máx. 1 alerta por hora"
+reset; mode swapcut rc=20 "msg='suspend falhou em 2 sessões'"; tick 20000 0 "$T0"
+eq "$RC,$(nnotify "$SWN20"),$(cat "$CITY/.gc/disk-recovery.resume-swapcutrc20" 2>/dev/null)" "20,1,$T0" "rc 20 (falhou): saída 20, alerta -p 4 forçado e marca de 1 h"
+tick 20000 0 $((T0 + 120)); eq "$(nnotify "$SWN20")" 1 "rc 20 de novo 2 min depois: no máx. 1 alerta por hora"
+reset; mode swapcut rc=30 "msg='amostrador parado há 2400 s'"; tick 20000 6000 "$T0"
+eq "$RC,$(nnotify "$SWN30"),$(nmail 'Swap: o degrau de memória está CEGO'),$(cat "$CITY/.gc/disk-recovery.resume-swapcutrc30" 2>/dev/null)" "0,1,1,$T0" "rc 30 (amostrador cego): saída 0 (o DISCO foi lido e tratado), alerta -p 4 forçado + mail, marca de 1 h"
+reset; mode d2 rc=10; mode swapcut rc=30 "msg='amostrador parado (stub)'"; walk 4000 0 "$T0" $((T0 + 900)) 300
+eq "$WFIRST2,$(nsw --run)" "$((T0 + 900)),4" "rc 30 NÃO trava a escada de disco: o D2 sai aos 900 s do mesmo jeito, com o degrau de swap cego em todas as rodadas"
+reset; mode swapcut rc=99 "msg='???'"; tick 20000 0 "$T0"; eq "$RC,$(nnotify "$SWNB")" "20,1" "rc fora do contrato: alerta de falha da chamada, saída 20"
+reset; mode swapcut rc=0 slp=5; XENV=("DR_SWAPCUT_TIMEOUT_S=1"); tick 20000 0 "$T0"
+eq "$RC,$(nnotify "$SWNB")" "20,1" "estourou o prazo (124): alerta de falha da chamada, saída 20 (não sei se suspendeu algo)"
+has "$(cat "$SD/notify.log")" "estourou 1s" "…e o alerta diz que foi o prazo"
+reset; XENV=("DR_SWAPCUT_CMD=$W/stubs/nao-existe"); tick 20000 0 "$T0"
+eq "$RC,$(nnotify "$SWNA"),$(nnotify p=)" "0,1,1" "degrau de swap AUSENTE: um alerta (nunca o silêncio do rc 10), a escada segue, e a retomada fica calada (nada foi suspenso por ele)"
+reset; cp "$W/stubs/swapcut" "$W/stubs/swapcut-sem-x"; chmod 644 "$W/stubs/swapcut-sem-x"; XENV=("DR_SWAPCUT_CMD=$W/stubs/swapcut-sem-x"); tick 20000 0 "$T0"
+eq "$RC,$(nnotify "$SWNA")" "0,1" "degrau de swap SEM permissão de execução: o mesmo alerta"
+reset; setfree MISSING; printf '%s' "$T0" > "$W/now"; runl --run
+eq "$RC,$(nsw --run),$(nsw --resume)" "30,1,1" "df ilegível: o degrau de swap roda do mesmo jeito (não depende do disco) e a saída continua 30"
+reset; mode swapcut rc=30 "msg='amostrador parado (stub)'"; tick MISSING 6000 "$T0"
+eq "$RC,$(nnotify "$SWN30")" "30,1" "df ilegível E amostrador cego: o aviso de swap sai e a saída é 30 (a leitura que faltou é a do disco)"
+reset; setfree 20000; printf '%s' "$T0" > "$W/now"; runl --dry-run
+eq "$RC,$(nsw --dry-run),$(nsw --run),$(nsw --resume),$(nnotify p=),$(nmail to=)" "0,1,0,0,0,0" "dry-run: o degrau recebe --dry-run (nunca --run), a retomada não é chamada e nada é avisado"
+reset; XENV=("DR_SWAPCUT_CMD=$W/stubs/nao-existe"); setfree 20000; printf '%s' "$T0" > "$W/now"; runl --dry-run
+eq "$RC,$(nnotify p=)" "0,0" "dry-run com o degrau ausente: calado (dry-run não avisa)"
+reset; rmodesw rrc=0 "rmsg='retomei 1: Alfa'"; tick 20000 0 "$T0"
+eq "$RC,$(nnotify "$SWR0"),$(nmail to=)" "0,1,0" "retomada rc 0 (religou): notify -p 3 sem push forçado, sem mail, saída 0"
+reset; rmodesw rrc=20 "rmsg='wake falhou'"; tick 20000 0 "$T0"
+eq "$RC,$(nnotify "$SWR20"),$(cat "$CITY/.gc/disk-recovery.resume-swapcutrrc20" 2>/dev/null)" "20,1,$T0" "retomada rc 20 (não religou): saída 20, alerta -p 4 forçado e marca de 1 h"
+has "$(cat "$SD/notify.log")" "gc session wake" "…e o alerta ensina a religar à mão"
+tick 20000 0 $((T0 + 120)); eq "$(nnotify "$SWR20")" 1 "retomada rc 20 de novo 2 min depois: no máx. 1 alerta por hora"
+reset; rmodesw rrc=30 "rmsg='amostrador ilegível'"; tick 20000 0 "$T0"; eq "$RC,$(nnotify "$SWR30")" "0,1" "retomada rc 30 (não li): alerta -p 4 forçado, a saída não muda (a pausa do Pilot vence sozinha)"
+reset; rmodesw rrc=99 "rmsg='???'"; tick 20000 0 "$T0"; eq "$RC,$(nnotify "$SWRB")" "20,1" "retomada com rc fora do contrato: alerta de falha da chamada, saída 20"
+reset; rmodesw rrc=0 rslp=5; XENV=("DR_RESUME_TIMEOUT_S=1"); tick 20000 0 "$T0"; eq "$RC,$(nnotify "$SWRB")" "20,1" "estourou o prazo da retomada (124): alerta de falha da chamada"
 
 section "uso e rodada sem episódio"
 reset
@@ -293,7 +350,7 @@ eq "$(nnotify p=),$(nmail to=),$(nmarks)" "0,0,0" "rc 10 (nada a retomar): silê
 hasnt "$(logtxt)" "retomada do D2" "rc 10: nem uma linha no log do maestro (rodada a cada 2 min)"
 tick 20000 0 $((T0 + 120)); eq "$(nresume)" 2 "…e de novo na rodada seguinte"
 reset; tick 5000 0 "$T0"; tick 5000 0 $((T0 + 450)); tick 5000 0 $((T0 + 900))
-eq "$(tail -n 4 "$SD/calls" | tr '\n' ',')" "d2 --run,d2 --resume,d4 --resume,d35 --resume," "escada em degrau: o --run vai primeiro e os três --resume (D2, D4 e D3.5, nessa ordem) depois, na MESMA rodada"
+eq "$(grep -v '^swapcut' "$SD/calls" | tail -n 4 | tr '\n' ',')" "d2 --run,d2 --resume,d4 --resume,d35 --resume," "escada em degrau: o --run vai primeiro e os três --resume (D2, D4 e D3.5, nessa ordem) depois, na MESMA rodada"
 reset; rmode rrc=0 "rmsg='retomou rfb --resume-run 1700000000-4242: de pé depois de 25s'"
 tick 20000 0 "$T0"
 eq "$RC,$(nnotify "$RN0"),$(nmail to=)" "0,1,0" "rc 0 (retomou): saída 0, 1 notify -p 3 'retomou' sem push forçado, sem mail"
@@ -414,7 +471,7 @@ reset; tick 20000 0 "$T0"; tick 20000 0 $((T0 + 120))
 eq "$RC,$(nresume4),$(nnotify p=),$(nmail to=)" "0,2,0,0" "rc 10 (nada a retomar): chamado a CADA rodada, silêncio total (nenhum aviso nem mail)"
 hasnt "$(logtxt)" "retomada do D4" "rc 10: nem uma linha no log do maestro"
 reset; rmode rrc=0 "rmsg='o D2 diz algo'"; tick 20000 0 "$T0"
-eq "$(tail -n 3 "$SD/calls" | tr '\n' ',')" "d2 --resume,d4 --resume,d35 --resume," "o resume do D4 vem DEPOIS do resume do D2 (e antes do D3.5), na mesma rodada"
+eq "$(grep -v '^swapcut' "$SD/calls" | tail -n 3 | tr '\n' ',')" "d2 --resume,d4 --resume,d35 --resume," "o resume do D4 vem DEPOIS do resume do D2 (e antes do D3.5), na mesma rodada"
 reset; rmode4 rrc=0 "rmsg='marca da pausa de envio de 08:01 solta: pausa de envio nossa solta e conferida'"; tick 20000 0 "$T0"
 eq "$RC,$(nnotify "$D4N0"),$(nmail to=)" "0,1,0" "rc 0 (soltou): notify -p 3 'soltou' sem push forçado, sem mail, saída 0"
 has "$(cat "$SD/notify.log")" "pausa de envio nossa solta e conferida" "rc 0: a linha do D4 vai na mensagem"
@@ -625,7 +682,7 @@ section "leitor real: df do volume Data (nunca o /) e swap, com LC_ALL=C e com a
 BASE_FULL=("${BASE[@]}")
 BASE=( "PATH=$W/bin:/usr/bin:/bin:/usr/sbin:/sbin" "HOME=$W/home" "TMPDIR=$W/tmp" "STUB_DIR=$SD"
   "DR_CITY=$CITY" "DR_STATE=$STATE" "DR_LOG=$LOG" "DR_OFF_FILE=$OFF" "DR_LOCK=$LOCK" "DR_NOW_FILE=$W/now"
-  "DR_D2_CMD=$W/stubs/d2" "DR_D3_CMD=$W/stubs/d3" "DR_D4_CMD=$W/stubs/d4" "DR_D35_CMD=$W/stubs/d35" "DR_NOTIFY_BIN=$W/stubs/notify" "DR_GC_BIN=$W/stubs/gc" )
+  "DR_D2_CMD=$W/stubs/d2" "DR_D3_CMD=$W/stubs/d3" "DR_D4_CMD=$W/stubs/d4" "DR_D35_CMD=$W/stubs/d35" "DR_SWAPCUT_CMD=$W/stubs/swapcut" "DR_NOTIFY_BIN=$W/stubs/notify" "DR_GC_BIN=$W/stubs/gc" )
 rm -f "$W/df.all" "$W/sysctl.all"
 real() {  # df-modo sysctl-modo [VAR=valor extra]: dry-run com os shims; acumula o que df/sysctl receberam (o reset apaga $SD)
   [ -f "$SD/df.args" ] && cat "$SD/df.args" >> "$W/df.all"; [ -f "$SD/sysctl.env" ] && cat "$SD/sysctl.env" >> "$W/sysctl.all"

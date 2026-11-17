@@ -63,6 +63,13 @@
 #   Reinício em laço: o `acted4_ts` é gravado ANTES de chamar o D4 (um reinício que mata este processo no meio não perde a marca; se a gravação falha, o D4 não é chamado) e o maestro não chama
 #   `d4 --run` de novo por 6 h depois de um rc 0; nesse caso, com o disco ainda < 3 GB, escala (notify -p 5 + mail, UMA vez por episódio, entregue: ver ENTREGA) em vez de reiniciar. A marca também vale quando o estado salvo some pela metade (ver TRÊS ESTADOS: acted4_ts = agora).
 #   Só se perde com o arquivo de estado AUSENTE (apagado à mão). O contrato pede que o D4 tenha cooldown próprio também (defesa em profundidade, ga-1p1i5jr.4); este maestro não depende disso.
+# DEGRAU DE SWAP (ga-yh41v0e, P0)  16/11 14:35: o swap saltou de 2,8 para 6 GB em ~5 min, o disco foi a 1 GB e o kernel entrou em pânico; todos os degraus acima reagem ao DISCO e o D2 só entra 15 min depois dos 5 GB.
+#   O `disk-recovery-swap-cut.sh` age pelo CRESCIMENTO do swap (>= 1,5 GB em 5 min, ou swap em uso > 5 GB) com o disco ainda ALTO: por isso o maestro o chama TODA rodada, ANTES do D3.5 e do degrau da vez, SEM olhar o livre
+#   (e também na rodada em que o df não leu: o degrau não depende do disco). Ele suspende (reversível) sessões de pool/reviewer ociosas, as maiores primeiro, e pausa o spawn novo do Pilot (`.gc/swap-spawn-pause`, com validade);
+#   nunca toca Dolt, daemon de WhatsApp, crew com trabalho, sessão anexada ou com bead in_progress. rc: 0 cortou (notify -p 4 + mail ao Mayor, 1/h) · 10 nada (CALADO; "sem gatilho" nem vai ao log) ·
+#   11 gatilho e NENHUMA candidata permitida (precisa de um humano: notify -p 4 + mail, 1/h por classe) · 20 falhou (RC_FINAL=20) · 30 AMOSTRADOR SEM LEITURA (arquivo ausente/velho/sem atribuição: o degrau NÃO corta às cegas;
+#   o maestro AVISA o Mayor, 1/h, e a escada de disco SEGUE; RC_FINAL não muda: o disco foi lido e tratado). O `--resume` roda toda rodada depois dos demais (apaga a pausa e religa o que o degrau suspendeu, com o swap calmo).
+#   Prazo do degrau: SWAPCUT_TIMEOUT_S (240 s; ele próprio se limita a 90 s de bd/gc: o maestro espera por ele).
 # CONTRATO DOS DEGRAUS  scripts/disk-recovery-d2-heavy-jobs.sh · -d3-ram-daemons.sh · -d4-guarded-reboot.sh, chamados `<script> --run` (real) ou `--dry-run` (só diz o que faria);
 #   stdout = UMA linha; saída 0 = agiu e terminou · 10 = nada a fazer ou guarda adiou · 20 = falhou · 30 = não consegui ler o estado (não age). Passou de 900 s = TERM e conta como 20.
 #   Degrau ausente (ou sem permissão de execução): loga, avisa uma vez por episódio (notify -p 4; a cada rodada até o notify confirmar) e PULA para o próximo. 10/20/30 repetem em 5 min; 0 não repete esse degrau por 30 min.
@@ -71,7 +78,7 @@
 # MODOS           --run (launchd) · --dry-run (lê o estado salvo, aplica a leitura de agora numa cópia, chama os degraus com --dry-run, não grava estado/log, não avisa, não manda mail, não chama o `--resume` do D2).
 #   Sai: 0 rodada feita · 10 interruptor ligado ou outra instância VIVA rodando · 20 um degrau falhou · 30 não consegui ler o disco, o relógio ou gravar o estado, ou não consegui tomar a trava (não agiu) · 2 uso.
 # VARIÁVEIS (teste) DR_CITY · DR_STATE · DR_LOG · DR_RSS_LOG · DR_OFF_FILE · DR_LOCK · DR_FREE_MB_FILE / DR_SWAP_MB_FILE (arquivo com o livre / o swap em MB, no lugar de df / sysctl) · DR_NOW_FILE (epoch)
-#   · DR_D2_CMD/DR_D3_CMD/DR_D4_CMD · DR_NOTIFY_BIN · DR_GC_BIN · DR_<NOME> numérico = os nomes da lista `cfg` abaixo (valor que não é número, ou que fica abaixo do mínimo da regra, cai no padrão e é dito no log).
+#   · DR_D2_CMD/DR_D3_CMD/DR_D4_CMD/DR_D35_CMD/DR_SWAPCUT_CMD · DR_NOTIFY_BIN · DR_GC_BIN · DR_<NOME> numérico = os nomes da lista `cfg` abaixo (valor que não é número, ou que fica abaixo do mínimo da regra, cai no padrão e é dito no log).
 # TESTE           bash scripts/disk-recovery-ladder.selftest.sh   (hermético: df, swap, relógio, degraus, notify e mail simulados; nada real é parado nem reiniciado)
 set -uo pipefail
 
@@ -89,6 +96,7 @@ D2_CMD="${DR_D2_CMD:-$D/disk-recovery-d2-heavy-jobs.sh}"
 D3_CMD="${DR_D3_CMD:-$D/disk-recovery-d3-ram-daemons.sh}"
 D4_CMD="${DR_D4_CMD:-$D/disk-recovery-d4-guarded-reboot.sh}"
 D35_CMD="${DR_D35_CMD:-$D/disk-recovery-d35-load-shed.sh}"
+SWAPCUT_CMD="${DR_SWAPCUT_CMD:-$D/disk-recovery-swap-cut.sh}"
 VOLUME="/System/Volumes/Data"
 
 DRY=""
@@ -121,7 +129,7 @@ cfg D4_HARD_MB 1536; cfg D4_HARD_N 2 1; cfg D4_HARD_SPACE_S 100
 cfg HYST_MB 512; cfg GAP_S 600; cfg RETRY_S 300; cfg ACTED_REPEAT_S 1800; cfg D4_COOLDOWN_S 21600
 cfg RUNG_TIMEOUT_S 900; cfg SETTLE_S 15; cfg WARN_EVERY_S 3600; cfg HEARTBEAT_S 3600; cfg LOG_MAX_KB 5120
 cfg NOTIFY_TIMEOUT_S 30; cfg MAIL_TIMEOUT_S 60; cfg LOCK_MAX_MIN 60 1; cfg RESUME_TIMEOUT_S 120 1
-cfg RSS_TIMEOUT_S 15 1; cfg RSS_LOG_MAX_KB 1024; cfg D35_HOLD_S 2700
+cfg RSS_TIMEOUT_S 15 1; cfg RSS_LOG_MAX_KB 1024; cfg D35_HOLD_S 2700; cfg SWAPCUT_TIMEOUT_S 240 1
 
 log()  { if [ "$DRY" = 1 ]; then printf '[dry-run] %s\n' "$*"; else printf '[%s] %s\n' "$(date '+%F %T')" "$*" >> "$LOG" 2>/dev/null || true; fi; }
 note() { log "$*"; [ "$DRY" = 1 ] || printf '%s\n' "$*"; }
@@ -747,6 +755,68 @@ resume_d35() {  # toda rodada, DEPOIS do resume do D4: o D3.5 --resume religa, u
   return 0
 }
 
+# ── corte de memória por swap (ga-yh41v0e) ─────────────────────────────────────────────────────────────────────────────────────
+swap_cut() {  # TODA rodada, ANTES do D3.5 e do pick_and_run, com o disco alto ou baixo (o degrau não lê o df). rc do degrau: 0 cortou · 10 nada (silêncio) · 11 gatilho sem candidata · 20 falhou · 30 amostrador sem leitura (NÃO cortou)
+  local cmd="$SWAPCUT_CMD" rc line t why
+  t=$(now) || t=$NOW
+  # vazio (degrau ausente ou sem execução) → AVISA, nunca o silêncio do rc 10: sem ele a escada fica sem o único degrau que age ANTES do disco cair; falhou/ilegível → idem
+  if [ ! -f "$cmd" ] || [ ! -x "$cmd" ]; then
+    [ "$DRY" = 1 ] && return 0
+    note "WARN: degrau de swap ausente ou sem permissão de execução ($cmd): sem corte de memória antes do disco cair"
+    resume_alert swapcutbroken "$t" 4 "Disco: o degrau de swap não executa" "$cmd não existe ou não executa: nada corta memória quando o swap sobe. (aviso no máximo 1 por hora)"
+    return 0
+  fi
+  if [ "$DRY" = 1 ]; then run_bounded "$SWAPCUT_TIMEOUT_S" "$cmd" --dry-run; rc=$?; line=$(out_line); rb_clean; log "swap --dry-run: rc=$rc: $line"; return 0; fi
+  run_bounded "$SWAPCUT_TIMEOUT_S" "$cmd" --run; rc=$?
+  line=$(out_line); rb_clean
+  case "$rc" in
+    0)  note "swap: cortou memória: $line"
+        send_notify 4 "Swap: cortei memória antes do disco cair" "$line (livre ${FREE:-?} MB, swap ${SWAP:-?} MB)"
+        if resume_mark_due swapcutmail "$t"; then send_mail "Swap: cortei memória (swap ${SWAP:-?} MB, livre ${FREE:-?} MB)" "Escada de recuperação de disco, degrau de swap (ga-yh41v0e).
+O swap subiu e o degrau agiu COM O DISCO AINDA ACIMA do piso: $line
+Reversível: as sessões foram SUSPENSAS (gc session suspend), não encerradas; o --resume as religa (gc session wake) quando o swap fica calmo; registro em $CITY/.gc/disk-recovery-swap-cut.state · pausa do spawn do Pilot: $CITY/.gc/swap-spawn-pause (vence sozinha) · log do degrau: $CITY/.gc/logs/disk-recovery-swap-cut.log · desligar a escada toda: touch $OFF" && resume_mark_set swapcutmail "$t"; fi ;;
+    10) case "$line" in "sem gatilho"*) ;; *) log "swap: rc=10: $line" ;; esac ;;   # o caso normal (sem gatilho) não enche o log a cada 120 s
+    11) note "WARN: swap: gatilho ativo e NÃO há sessão de pool ociosa para cortar: $line"
+        resume_alert swapcutrc11 "$t" 4 "Swap sobe e não há o que cortar sozinho" "$line (livre ${FREE:-?} MB, swap ${SWAP:-?} MB). Precisa de um humano. (aviso no máximo 1 por hora)" \
+          "Swap sobe e o degrau não tem o que cortar (livre ${FREE:-?} MB, swap ${SWAP:-?} MB)" "Escada de recuperação de disco, degrau de swap (ga-yh41v0e).
+O gatilho de swap está ativo mas nenhuma sessão de pool/reviewer ociosa e sem trabalho pôde ser suspensa: $line
+O degrau também tenta pausar o spawn novo do Pilot (vence sozinha; o log do degrau diz se gravou). Crew, Dolt e daemons de WhatsApp o degrau NUNCA corta: decisão humana. Log: $CITY/.gc/logs/disk-recovery-swap-cut.log" ;;
+    20) note "ERROR: swap: o degrau FALHOU: rc=20: $line"; RC_FINAL=20
+        resume_alert swapcutrc20 "$t" 4 "Disco: o degrau de swap FALHOU" "$line (aviso no máximo 1 por hora)" ;;
+    30) note "WARN: swap: amostrador de RAM sem leitura; NÃO cortei nada e a escada de disco segue: $line"
+        resume_alert swapcutrc30 "$t" 4 "Swap: o degrau não consegue ler o amostrador de RAM" "$line (livre ${FREE:-?} MB, swap ${SWAP:-?} MB). Sem leitura o degrau não corta às cegas; a escada de disco segue. (aviso no máximo 1 por hora)" \
+          "Swap: o degrau de memória está CEGO (amostrador de RAM sem leitura)" "Escada de recuperação de disco, degrau de swap (ga-yh41v0e).
+O degrau não conseguiu ler o amostrador de RAM (.gc/ram-owner-samples.jsonl ausente, velho ou sem atribuição de donos): $line
+Ele NÃO corta às cegas e NÃO pausa o Pilot enquanto estiver cego; a escada de disco (D2/D3/D3.5/D4) segue normal. Veja o job com.gascity.ram-owner-sampler (launchd, 300 s) e $CITY/.gc/logs/disk-recovery-swap-cut.log" ;;
+    *)  case "$rc" in 124) why="estourou ${SWAPCUT_TIMEOUT_S}s e foi encerrado (TERM)" ;; 125) why="não consegui lançar (mktemp falhou?)" ;; *) why="rc inesperado $rc" ;; esac
+        note "WARN: swap: falha na chamada: $why: $line"; [ "$rc" = 125 ] || RC_FINAL=20
+        resume_alert swapcutbroken "$t" 4 "Disco: o degrau de swap falhou na chamada" "$cmd --run: $why: $line. Não sei se suspendeu algo. (aviso no máximo 1 por hora)" ;;
+  esac
+  return 0
+}
+
+resume_swap_cut() {  # toda rodada, DEPOIS do resume do D3.5: o degrau de swap --resume apaga a pausa do Pilot e religa o que ELE suspendeu, com o swap calmo (o relógio é dele). rc: 0 retomou · 10 nada/espera (o ÚNICO silêncio) · 20 não retomou · 30 não li
+  local cmd="$SWAPCUT_CMD" rc line t why
+  [ "$DRY" = 1 ] && return 0
+  # vazio (degrau ausente ou sem execução) → calado: sem o script nada foi suspenso por ele (o swap_cut avisa); falhou/ilegível → alerta
+  [ -f "$cmd" ] && [ -x "$cmd" ] || return 0
+  t=$(now) || t=$NOW
+  run_bounded "$RESUME_TIMEOUT_S" "$cmd" --resume; rc=$?
+  line=$(out_line); rb_clean
+  case "$rc" in
+    10) return 0 ;;
+    0)  note "retomada do degrau de swap: rc=0: $line"; send_notify 3 "Swap: calmo, retomei o que cortei" "$line" ;;
+    20) note "ERROR: retomada do degrau de swap FALHOU: rc=20: $line"; RC_FINAL=20
+        resume_alert swapcutrrc20 "$t" 4 "Disco: o degrau de swap NÃO retomou" "$line. Sessão suspensa pelo degrau segue suspensa: religue com gc session wake <id> (registro em $CITY/.gc/disk-recovery-swap-cut.state) se isto durar. (aviso no máximo 1 por hora)" ;;
+    30) note "WARN: retomada do degrau de swap: rc=30 (não consegui ler): $line"
+        resume_alert swapcutrrc30 "$t" 4 "Swap: o degrau não leu o amostrador na retomada" "$line. Sessão suspensa pode estar esperando; a pausa do Pilot vence sozinha. (aviso no máximo 1 por hora)" ;;
+    *)  case "$rc" in 124) why="estourou ${RESUME_TIMEOUT_S}s e foi encerrado (TERM)" ;; 125) why="não consegui lançar (mktemp falhou?)" ;; *) why="rc inesperado $rc" ;; esac
+        note "WARN: retomada do degrau de swap com falha na chamada: $why: $line"; [ "$rc" = 125 ] || RC_FINAL=20
+        resume_alert swapcutrbroken "$t" 4 "Disco: a retomada do degrau de swap falhou na chamada" "$cmd --resume: $why: $line. Não sei se há sessão suspensa esperando. (aviso no máximo 1 por hora)" ;;
+  esac
+  return 0
+}
+
 log_rss() {  # rodada com livre <= D2_MB: foto dos 10 maiores RSS num log PRÓPRIO que gira (RSS_LOG_MAX_KB). Só diagnóstico: nunca decide nada nem muda a saída. 10/11 não havia como saber QUEM inchou a RAM
   [ "$DRY" = 1 ] && return 0
   local rc kb
@@ -799,6 +869,9 @@ main() {
       # o carimbo de 1 h só vale com o notify CONFIRMADO: sem entrega a rodada seguinte (2 min) avisa de novo
       send_notify 4 "Disco: a escada não consegue ler o disco" "Não consegui ler: $M_WHY. A escada de recuperação NÃO está agindo enquanto isso. (aviso no máximo 1 por hora)" && WARN_TS=$NOW
     fi
+    # o degrau de swap NÃO depende do disco (lê o swap e o amostrador): com o df ilegível ele roda do mesmo jeito, e o exit continua 30 (a leitura que faltou é a do disco)
+    FREE="?"; SWAP=${M_SWAP:-?}
+    swap_cut; resume_swap_cut
     save_state
     exit 30
   fi
@@ -823,12 +896,14 @@ main() {
 
   [ "$FREE" -le "$D2_MB" ] && log_rss   # ANTES de chamar um degrau: se o D4 reiniciar a máquina, a foto desta rodada já está no disco
   save_state
+  swap_cut   # ANTES de tudo que é de disco, TODA rodada e sem olhar o livre: age pelo crescimento do swap com o disco ainda alto (ga-yh41v0e); rc 30 = amostrador cego: avisa e a escada SEGUE
   shed_d35   # ANTES do degrau da vez: o D3.5 corta carga e diz se o corte está em curso (SHED_WORKING), que o teto do D4 lê para adiar o "precisa de um humano"
   pick_and_run "$NOW"
   save_state
   resume_d2   # sempre DEPOIS do --run: o --resume lê o registro do D2 já com o que o --run acabou de parar; quem decide se o livre voltou é o próprio D2 (resume_above_mb > stop_below_mb: histerese dele, não minha)
   resume_d4   # idem: o D4 --resume solta a pausa de envio que ele pôs (depois do boot, ou quando o pedido de reinício pendente vence)
   resume_d35  # idem: o D3.5 --resume religa o que o corte de carga parou
+  resume_swap_cut  # idem: o degrau de swap --resume apaga a pausa do spawn do Pilot e religa as sessões que ELE suspendeu (swap calmo)
   if [ "$SAVE_FAIL" = 1 ]; then [ "$RC_FINAL" = 0 ] && RC_FINAL=30; nosave_warn; fi
   exit "$RC_FINAL"
 }

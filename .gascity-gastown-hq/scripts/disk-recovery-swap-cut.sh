@@ -46,8 +46,6 @@
 #   `python3 ram-owner-sampler.py`) · DR_SWC_SESSIONS_FILE (JSON no lugar de `gc session list --json`) · DR_SWC_BD_BIN · DR_SWC_PROJECTS_DIR · DR_SWC_<NOME> numérico: GROW_MB GROW_WINDOW_S GROW_SLACK_S ABS_MB HYST_MB
 #   SAMPLE_MAX_AGE_S SAMPLER_DEAD_S IDLE_MIN MAX_CUT MAX_WAKE MIN_RSS_MB SETTLE_S VERIFY_S COOLDOWN_S PAUSE_TTL_S PAUSE_CALM_S CALM_S CMD_S SAMPLER_S BUDGET_S LOG_MAX_KB (lixo cai no padrão e é dito no log).
 # TESTE           bash scripts/disk-recovery-swap-cut.selftest.sh   (hermético: swap, amostrador, roster, bd, gc, relógio simulados; nada real é suspenso)
-# ESTADO DA ENTREGA (fatia 3/5, ga-yh41v0e.3)  Este arquivo roda à mão (--run / --dry-run / --resume): o maestro (disk-recovery-ladder.sh) AINDA NÃO o chama (fatia 4, ga-yh41v0e.4). A leitura da pausa pelo Pilot (fatia 1,
-#   ga-yh41v0e.1) já está em main: a pausa que este degrau grava segura o despacho. As frases acima sobre "toda rodada do maestro" e "o maestro chama um humano" descrevem o conjunto final, não o que esta fatia sozinha faz.
 set -uo pipefail
 
 D=$(cd "$(dirname "$0")" && pwd)
