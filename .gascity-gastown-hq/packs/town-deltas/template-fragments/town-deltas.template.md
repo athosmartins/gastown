@@ -699,7 +699,7 @@ toda confusão de repo/tree checando o binário que roda de verdade.
    igual a "MBP fora"). rc 96..99 = MBP indisponível: espere, não volte pro
    mini. Receita e armadilhas: `docs/runbooks/mbp-offload.md`, "Go no MBP".
 2. **SÓ para `.patch` em `docs/pending-engine-window/`; código vai por branch +
-   `/gate-done`.** Esta receita empurra direto para `main`, sem gate, e existe
+   o skill `gate-done`.** Esta receita empurra direto para `main`, sem gate, e existe
    apenas para o patch do engine: com qualquer outro arquivo no push (script,
    selftest, plist, runbook) o hook pre-push RECUSA quando quem empurra é sessão
    de pool (dog, wa-worker, ps-worker), e o gate nunca viu esse código (ga-nmxtzzu:
