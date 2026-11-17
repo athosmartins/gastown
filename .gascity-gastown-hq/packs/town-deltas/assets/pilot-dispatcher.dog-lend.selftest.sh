@@ -137,7 +137,7 @@ reset() {
   rm -rf "$WORK/db" "$WORK"/*.log "$WORK"/sling.* "$WORK"/nudge.fail "$WORK"/cands.ndjson "$WORK"/bd.fail.* "$WORK"/bd.lost.* "$WORK"/verdict.calls "$WORK"/disk.calls
   mkdir -p "$WORK/db"; : > "$WORK/cands.ndjson"
   T_WA_LIVE=4; T_PS_LIVE=2; T_DOG_LIVE=1; T_DISK=ok; T_MEM=ok; T_VERDICT=mini; T_REFUSAL=""; T_REFUSAL_FAIL=0; T_STOP=0
-  unset T_NODE_ONLY T_MODE T_MAX T_DRY T_DOG_MAX T_SMALL_RAW T_BIG_RAW
+  unset T_NODE_ONLY T_MODE T_MAX T_DRY T_DOG_MAX T_SMALL_RAW T_BIG_RAW T_JQ_FAIL
 }
 logged() { grep -qF -- "$1" "$WORK/log.txt" 2>/dev/null; }
 slings() { [ -f "$WORK/sling.count" ] && cat "$WORK/sling.count" || echo 0; }
@@ -207,6 +207,8 @@ run_pass() {
     SMALL_CANDIDATES=$(jq -cs '.' "$WORK/cands.ndjson"); BIG_CANDIDATES="[]"
     [ -z "${T_SMALL_RAW:-}" ] || SMALL_CANDIDATES="$T_SMALL_RAW"
     [ -z "${T_BIG_RAW:-}" ] || BIG_CANDIDATES="$T_BIG_RAW"
+    # T_JQ_FAIL=1: o jq que lê as listas desta varredura sai ≠ 0 (o programa de contagem da passada); qualquer outro jq segue real
+    if [ "${T_JQ_FAIL:-0}" = 1 ]; then jq() { case "$*" in *"candidate list is not an array"*) return 1 ;; esac; command jq "$@"; }; fi
     eval "$FUNCS"
     _pilot_dog_lend_pass
     echo "$_PCAP_LIVE_WA|$_PCAP_LIVE_PS" > "$WORK/pcap.after"
@@ -472,6 +474,11 @@ echo "(o4b) lista que é JSON válido mas NÃO é lista (objeto) → também avi
 reset; mk wa-o4b 0; T_BIG_RAW='{"id":"wa-o4b","priority":0}'
 sweep
 [ "$(slings)" = 0 ] && grep -q '^warn.*dog-lend: .*not readable JSON' "$WORK/log.txt" && ! logged "no P0/P1 story:approved candidate" && ok "o4b: lista-objeto → aviso, 0 empréstimos, sem a linha de «vazio»" || bad "o4b: slings=$(slings) log=$(cat "$WORK/log.txt" | tr '\n' '|')"
+
+echo "(o4c) o jq da leitura das listas sai com código ≠ 0 (command exits non-zero) → aviso, nada emprestado, sem a linha de «vazio»"
+reset; mk wa-o4c 0; T_JQ_FAIL=1
+sweep
+[ "$(slings)" = 0 ] && grep -q '^warn.*dog-lend: .*not readable JSON' "$WORK/log.txt" && ! logged "no P0/P1 story:approved candidate" && ok "o4c: jq falhou → aviso, 0 empréstimos, sem «vazio»" || bad "o4c: slings=$(slings) log=$(cat "$WORK/log.txt" | tr '\n' '|')"
 
 echo "(o5) desligada (off) — uma linha OFF, para «não rodou» não se confundir com «rodou e não achou»"
 reset; mk wa-o5 0; T_MODE=off
