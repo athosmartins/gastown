@@ -148,6 +148,7 @@ HQ="${DPW_HQ:-/Users/athos/gt/.gascity-gastown-hq}"
 # A metade que lê o plist e o script (limite > 2x o StartInterval; arquivo do heartbeat = StandardOutPath no upload, = o log do próprio script no
 # exporter) mora em daemon-presence-watchdog.selftest.sh.
 DPW_HEARTBEAT="${DPW_HEARTBEAT:-com.gascity.pilot|$HQ/.gc/logs/pilot-dispatcher.log|1500
+com.gascity.hetzner-fw-ip-watch|$HQ/.gc/logs/hetzner-fw-ip-watch.out|1800
 com.gascity.inflight-reclaim-guard|$HQ/.gc/logs/inflight-reclaim-guard-launchd.out|1500
 com.gascity.context-check-dispatcher|$HQ/.gc/logs/context-check-dispatcher.log|3000
 com.gascity.quality-gate-dispatcher|$HQ/.gc/logs/quality-gate-dispatcher.heartbeat|600
