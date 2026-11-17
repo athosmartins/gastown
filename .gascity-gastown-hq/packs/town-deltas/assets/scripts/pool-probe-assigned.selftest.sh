@@ -10,7 +10,7 @@
 # tell" must not read as "no work" (the point of the bead) — and there the expected rc and stderr are pinned (WANT_RC/WANT_ERR).
 # The acceptance case of ga-ica007 is section 7: ONE raw 0x08 byte in a description makes the engine's text answer `[]`
 # (rc 0, silent) in 1a, 1b — the script answers `[]` + stderr + rc 3.
-# Needs bash, jq, python3, sh. Exit 0 iff every check holds.
+# Needs bash, jq, python3, sh. Runs under bash 3.2 (the mini's /bin/bash) as well as 5.x. Exit 0 iff every check holds.
 #   --live   also compares the goldens with what `gc prime` renders NOW (drift check; run after an engine window).
 #            Not in the default run: it needs a live gc and a dog-shaped environment. A gc that cannot be read is a FAIL
 #            in this mode, never a pass — "could not compare" is not "equal".
@@ -78,11 +78,13 @@ reset_fix() { rm -f "$FIX"/*; }
 export_ids() { ID1="${1-ga-x1}"; ID2="${2-dog-x2}"; ID3="${3-gastown.dog-x3}"; }
 export_ids
 
-# run_both <step> <name> <expected-ids-or-"-">   (WANT_RC / WANT_ERR as in pool-probe.selftest.sh; ARG = the script's argument, default = step)
-WANT_RC=""; WANT_ERR=""; ARG=""
+# run_both <step> <name> <expected-ids-or-"-">   (WANT_RC / WANT_ERR as in pool-probe.selftest.sh; ARG = the script's argument, default = step;
+# WANT_OUT = the script's stdout when the ENGINE's answer is the very hazard - it hands out a bead cut from a non-array answer, or stops on
+# garbage - so neither its stdout nor its bd calls are the reference there; the engine's answer is still pinned by <expected-ids>)
+WANT_RC=""; WANT_ERR=""; ARG=""; WANT_OUT=""
 run_both() {
   local step="$1" name="$2" want="$3"
-  local want_rc="$WANT_RC" want_err="$WANT_ERR" arg="${ARG:-$step}"; WANT_RC=""; WANT_ERR=""; ARG=""
+  local want_rc="$WANT_RC" want_err="$WANT_ERR" arg="${ARG:-$step}" want_out="$WANT_OUT"; WANT_RC=""; WANT_ERR=""; ARG=""; WANT_OUT=""
   local body; if [ "$step" = 1a ]; then body="$body_1a"; else body="$body_1b"; fi
   : > "$TMP/gold.log"; : > "$TMP/mine.log"
   local g m g_rc m_rc
@@ -93,9 +95,13 @@ run_both() {
   [ -z "$g" ] && gids="(no output)"
   [ "$gids" = "" ] && gids="-"
   eq "[$step] $name: the engine's probe answers" "$gids" "$want"
-  if [ "$g" = "$m" ]; then ok "[$step] $name: stdout identical"; else bad "[$step] $name: stdout differs — engine [$g] vs script [$m]"; fi
-  if cmp -s "$TMP/gold.log" "$TMP/mine.log"; then ok "[$step] $name: bd calls identical ($(wc -l < "$TMP/gold.log" | tr -d ' ') call(s), same flags, same order)"
-  else bad "[$step] $name: bd calls differ"; diff <(tr '\037' ' ' < "$TMP/gold.log") <(tr '\037' ' ' < "$TMP/mine.log") | sed 's/^/      /' | head -12; fi
+  if [ -n "$want_out" ]; then
+    eq "[$step] $name: the script's stdout (deliberately not the engine's [$g])" "$m" "$want_out"
+  else
+    if [ "$g" = "$m" ]; then ok "[$step] $name: stdout identical"; else bad "[$step] $name: stdout differs — engine [$g] vs script [$m]"; fi
+    if cmp -s "$TMP/gold.log" "$TMP/mine.log"; then ok "[$step] $name: bd calls identical ($(wc -l < "$TMP/gold.log" | tr -d ' ') call(s), same flags, same order)"
+    else bad "[$step] $name: bd calls differ"; diff <(tr '\037' ' ' < "$TMP/gold.log") <(tr '\037' ' ' < "$TMP/mine.log") | sed 's/^/      /' | head -12; fi
+  fi
   if [ -z "$want_rc" ]; then
     if [ "$g_rc" = "$m_rc" ]; then ok "[$step] $name: exit code identical (=$m_rc)"; else bad "[$step] $name: exit code differs — engine $g_rc vs script $m_rc"; fi
   else
@@ -112,7 +118,9 @@ FUT=4102444800   # 2100-01-01
 PAST=1000000000  # 2001
 
 # bead <id> <assignee> <priority> <created_at> [labels-json] [extra-json-object-merged-in]
-bead() { jq -nc --arg id "$1" --arg as "$2" --argjson p "$3" --arg c "$4" --argjson l "${5:-[]}" --argjson x "${6:-{\}}" \
+# EMPTY_OBJ, not "${6:-{\}}": bash 3.2 (the mini's /bin/bash) keeps the backslash there, jq refuses the "{\}" it gets, and every bead comes out EMPTY
+EMPTY_OBJ='{}'
+bead() { jq -nc --arg id "$1" --arg as "$2" --argjson p "$3" --arg c "$4" --argjson l "${5:-[]}" --argjson x "${6:-$EMPTY_OBJ}" \
   '{id:$id, title:("t "+$id), status:"open", assignee:$as, priority:$p, created_at:$c, updated_at:$c, issue_type:"task", labels:$l} + $x'; }
 arr() { local first=1; printf '['; for b in "$@"; do [ $first = 1 ] || printf ','; printf '%s' "$b"; first=0; done; printf ']'; }
 
@@ -210,6 +218,20 @@ run_both $STEP "real empty arrays stay a clean []" "-"
 # 7h. only ONE identity can be read and it is empty; the others fail: still unreadable
 reset_fix; : > "$FIX/durable.$ID2.fail"
 WANT_RC=3 WANT_ERR="could not read: durable@$ID2" run_both $STEP "one identity's durable read fails -> rc 3" "-"
+# 7i. bd answers VALID JSON that is not ONE array of objects (ga-df22sac). 7d's {"error":"x"} is only caught because jq happens to fail on
+#     the string; an answer jq can walk is taken for a queue. The engine reads {} / null as `[]` rc 0, hands out [null], hands out the bead
+#     inside {"a":<bead>} (an error envelope), and stops on two documents. The script reads none of them as a queue: `[]` + stderr + rc 3.
+reset_fix; printf '{}' > "$FIX/durable.raw"; printf '{}' > "$FIX/ephemeral.raw"
+WANT_RC=3 WANT_ERR='could not read:' run_both $STEP "bd answers {} (valid JSON, no array) -> rc 3" "-"
+reset_fix; printf 'null' > "$FIX/durable.raw"; printf 'null' > "$FIX/ephemeral.raw"
+WANT_RC=3 WANT_ERR='could not read:' run_both $STEP "bd answers null -> rc 3" "-"
+reset_fix; printf '[null]' > "$FIX/durable.raw"; printf '[null]' > "$FIX/ephemeral.raw"
+WANT_OUT='[]' WANT_RC=3 WANT_ERR='could not read:' run_both $STEP "bd answers an array of non-objects ([null]) -> rc 3, nothing handed out" "-"
+reset_fix; printf '[] []' > "$FIX/durable.raw"; printf '[] []' > "$FIX/ephemeral.raw"
+WANT_OUT='[]' WANT_RC=3 WANT_ERR='could not read:' run_both $STEP "bd answers two documents -> rc 3, one clean []" "-"
+reset_fix; printf '{"a":%s}' "$(bead ga-env "$ID1" 2 2026-01-01T00:00:00Z)" > "$FIX/durable.raw"; cp "$FIX/durable.raw" "$FIX/ephemeral.raw"
+WANT_OUT='[]' WANT_RC=3 WANT_ERR='could not read:' run_both $STEP "bd answers an object whose value is a bead -> not handed out, rc 3" "ga-env"
+eq "[$STEP] ...and the script kept looking through every tier (6 bd calls)" "$(wc -l < "$TMP/mine.log" | tr -d ' ')" "6"
 done
 
 echo "== 8. nothing to probe with (deliberate: the engine answers [] rc 0, the script says it did not look)"

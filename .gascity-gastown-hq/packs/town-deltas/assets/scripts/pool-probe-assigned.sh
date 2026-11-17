@@ -19,8 +19,9 @@
 # case (one JSON array of at most one bead, or `[]`) - except what is said below. The proof is
 # pool-probe-assigned.selftest.sh, which runs the engine's text and this file against the same fixtures and
 # compares stdout and the argv of every bd call. What it adds, without touching stdout:
-#   * nothing found, and a tier whose bd call failed / whose answer was not JSON / whose answer got lost
-#     between two stages                    -> `[]`, a line on stderr naming the tier(s), exit 3
+#   * nothing found, and a tier whose bd call failed / whose answer was not JSON, or was JSON but not exactly ONE
+#     array of objects ({}, null, an error envelope, two documents) / whose answer got lost between two stages
+#                                           -> `[]`, a line on stderr naming the tier(s), exit 3
 #   * something found after an earlier tier could not be read
 #                                           -> the answer, a line on stderr (the head may be hidden), exit 0
 #   * none of GC_SESSION_ID / GC_SESSION_NAME / GC_ALIAS set, or a bad <step>
@@ -70,10 +71,12 @@ jq_stage() {
 # take_head <label>: the veto filter, wo_pick and the head, on the raw bd answer in $raw. Sets r. rc 1 = could not tell
 # (the tier is marked); rc 0 with r="[]" = a real empty tier; rc 0 with r=[bead] = found.
 # $pre is an optional jq stage that runs before the veto filter (the ephemeral tiers' assignee select; it sees $id).
-# vazio/falhou/ilegível -> vazio ("[]") = empty tier, passes; falhou or empty stdout = marked unreadable, never the empty verdict
+# vazio ("[]") -> empty tier, passes; falhou/ilegível (the shape guard below, or any jq stage that fails or prints nothing) -> tier marked, never the empty verdict
 take_head() {
   th_label="$1"; r=""
   th_in="$raw"
+  # vazio ([] = ONE array, no element) -> real empty tier, passes; falhou/ilegível (not exactly ONE JSON array of objects: {}, null, an object of objects, two documents, [null], prose) -> tier marked, never the empty verdict nor a "bead" cut from an error envelope
+  printf "%s" "$th_in" | jq -es 'length == 1 and (.[0] | type == "array" and all(.[]; type == "object"))' >/dev/null 2>&1 || { mark "$th_label"; return 1; }
   if [ -n "$pre" ]; then
     th_in=$(printf "%s" "$th_in" | jq_stage --arg id "$id" "$pre") || { mark "$th_label"; return 1; }
   fi
@@ -129,7 +132,7 @@ done
 
 printf "[]"
 if [ -n "$unreadable" ]; then
-  echo "pool-probe-assigned[$step]: could not read:$unreadable (bd failed, or its answer was not JSON) - [] here does NOT mean there is no assigned work: do not drain, tell the Mayor" >&2
+  echo "pool-probe-assigned[$step]: could not read:$unreadable (bd failed, its answer was not exactly one JSON array of objects, or a bead in it could not be filtered) - [] here does NOT mean there is no assigned work: do not drain, tell the Mayor" >&2
   exit 3
 fi
 exit 0
