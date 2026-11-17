@@ -13,8 +13,9 @@
 # Env: WO_LIB_UNDER_TEST / WO_PY_UNDER_TEST / WO_REGISTRY_UNDER_TEST point the checks at another copy
 # (the mutation controls use them); WO_SKIP_MUTATION=1 skips (j) and (R) (the library mutants' own runs);
 # WO_ONLY=R runs only the registry lint (the lint mutants' own runs). Temp files go under $TMPDIR and are
-# removed with safe-clean when it approves the path; without safe-clean (the Hetzner node has none: 20k leaked
-# wo-selftest.* there, ga-d4iob2s) the directory THIS run made is removed by a name-checked `find -delete`.
+# removed with safe-clean when it approves the path; where safe-clean does not exist (the Hetzner node has none: 20k
+# leaked wo-selftest.* there, ga-d4iob2s) the directory THIS run made is removed by a name-checked `find -delete`.
+# Where safe-clean exists and refuses (or fails), the directory stays: its refusal is never overridden (case C).
 set -uo pipefail
 
 SELF="${BASH_SOURCE[0]}"
@@ -44,9 +45,14 @@ fi
 
 TMP="$(mktemp -d "${TMPDIR:-/tmp}/wo-selftest.XXXXXX")" || { echo "FATAL: mktemp"; exit 1; }
 cleanup() {
-  if command -v safe-clean >/dev/null 2>&1 && safe-clean --check "$TMP" >/dev/null 2>&1; then safe-clean "$TMP" >/dev/null 2>&1; return; fi
-  # vazio → nada a apagar; falhou/ilegível → a pasta fica para o reaper do nó (hetzner-tmp-reaper.py); nunca apaga o que não é a mktemp desta rodada (nome e link conferidos)
+  if command -v safe-clean >/dev/null 2>&1; then
+    # recusou/falhou → a pasta fica (o reaper do nó a leva depois); a recusa do safe-clean não é passada por cima
+    safe-clean --check "$TMP" >/dev/null 2>&1 && safe-clean "$TMP" >/dev/null 2>&1
+    return 0
+  fi
+  # sem safe-clean (o nó Hetzner não tem): só a mktemp desta rodada, pelo nome e sem ser link; vazio → nada a apagar; find que falha → a pasta fica para o reaper
   case "$TMP" in */wo-selftest.??????) [ -d "$TMP" ] && [ ! -L "$TMP" ] && find "$TMP" -depth -delete 2>/dev/null ;; esac
+  return 0
 }
 trap cleanup EXIT
 
@@ -1080,6 +1086,19 @@ must_fail() {
   elif ! grep -q '^  ✗' "$TMP/mut.out"; then bad "mutant $name crashed the selftest without failing a check (a broken mutant proves nothing): $(tail -2 "$TMP/mut.out" | tr '\n' ' ' | cut -c1-160)"
   else ok "mutant $name is killed by: $(grep -m1 '^  ✗' "$TMP/mut.out" | sed 's/^  ✗ //' | cut -c1-110)"; fi
 }
+if want C && [ "${WO_SKIP_MUTATION:-0}" != "1" ]; then
+echo "== (C) cleanup of the temp dir: safe-clean approves → it removes; safe-clean refuses → the dir stays; no safe-clean → name-checked find -delete"
+# cada filho é este arquivo com WO_ONLY=Z (nenhuma seção casa): sobe, cria a sua mktemp, sai pelo finish e o trap EXIT roda o cleanup
+cdir() { WO_C="$TMP/c-$1"; mkdir -p "$WO_C/bin" "$WO_C/tmp"; }
+cleanup_child() { env -u WO_ONLY PATH="$WO_C/bin:$PATH" TMPDIR="$WO_C/tmp" WO_ONLY=Z bash "$SELF" >"$WO_C/out" 2>&1; echo "$?"; }
+left() { find "$WO_C/tmp" -mindepth 1 -maxdepth 1 -name 'wo-selftest.*' | wc -l | tr -d ' '; }
+cdir ok; printf '#!/bin/sh\n[ "$1" = --check ] && exit 0\necho "$@" >> "%s/calls"; rm -rf "$1"\n' "$WO_C" > "$WO_C/bin/safe-clean"; chmod +x "$WO_C/bin/safe-clean"
+eq "safe-clean aprova: o filho sai 0" "$(cleanup_child)" 0; eq "... a pasta da rodada foi removida por ele" "$(left)" 0; eq "... e ele foi chamado uma vez" "$(wc -l < "$WO_C/calls" | tr -d ' ')" 1
+cdir recusa; printf '#!/bin/sh\n[ "$1" = --check ] && exit 1\necho "$@" >> "%s/calls"\n' "$WO_C" > "$WO_C/bin/safe-clean"; chmod +x "$WO_C/bin/safe-clean"
+eq "safe-clean recusa: o filho sai 0" "$(cleanup_child)" 0; eq "... a pasta FICA (a recusa não é passada por cima)" "$(left)" 1; eq "... e nada foi apagado por ele" "$(ls "$WO_C/calls" 2>/dev/null | wc -l | tr -d ' ')" 0
+if command -v safe-clean >/dev/null 2>&1; then skip "sem safe-clean: este ambiente tem um (o ramo vale no nó Hetzner, que não tem)"
+else cdir sem; eq "sem safe-clean: o filho sai 0" "$(cleanup_child)" 0; eq "... a pasta da rodada foi removida por find -delete" "$(left)" 0; fi
+fi
 if want j && [ "${WO_SKIP_MUTATION:-0}" != "1" ]; then
 echo "== (j) mutation controls: each mutant of the library / lint must make this selftest fail"
 KEY='[wo_prio_class, wo_dano_class, wo_type_class($o), ($e // 9999999999), (.id // "")]'

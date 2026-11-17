@@ -6,16 +6,16 @@ Contents
 
 O QUE FAZ  Apaga de /tmp a UNIDADE do dono cuja ÁRVORE INTEIRA (ela e tudo abaixo) está parada há mais de N horas (padrão 6, --max-age-hours). Por idade e dono,
   nunca por lista de nomes: a lista do Mayor (7 padrões) casava 15 % do que sobrou em 17/11. Unidade = cada entrada de 1º nível e, dentro de um CONTÊINER (claude-<uid>, os
-  scratchpads das sessões), cada filho: o contêiner está sempre fresco (sessão viva) e sozinho nunca seria limpo; medido em 17/11: 2.687 de 2.758 projetos parados, ~4-13 M de inodes.
+  scratchpads das sessões), cada filho (CONTAINERS: claude-<uid> e pytest-of-<usuário>): o contêiner está sempre fresco (sessão viva, teste rodando) e sozinho nunca seria limpo; medido em 17/11: 2.687 de 2.758 projetos parados, ~4-13 M de inodes, e 18 GB em pytest-of-runner.
 COMO JULGA  Na ordem: dono (st_uid != o meu = alheio: nunca toco /tmp de outro usuário, o `dados` da trava 1) · exceção (tmux-*, .X11-unix..., mais as linhas do keep.txt) ·
   montagem (outro dispositivo, ou ponto de montagem em /proc/mounts dentro da unidade: o bind do MESMO disco passa pelo st_dev e apagar por ele apaga o original = mantém) · EM USO (cwd, exe, fd e argv de processo vivo, e socket unix ligado em /proc/net/unix: o socket do tmux dos agentes fica quieto por
   dias e a pasta dele pareceria velha) · idade da ÁRVORE (maior mtime/ctime de tudo abaixo; o ctime vale porque tar -x e chmod deixam mtime velho em coisa nova). Link simbólico:
   apaga o link, nunca segue. Antes de apagar reconfere dispositivo, inode e carimbos da hora do julgamento (mudou → mantém).
 OS 3 ESTADOS  O que decide a apagar e não respondeu NÃO vira "nada a limpar": df (statvfs), /proc, a varredura da raiz, o keep.txt (linha fora do alfabeto de nome = incerteza) ou
-  uma raiz que não é um /tmp (sticky + gravável por todos) → NAO-CONSEGUI (rc 2), nada é apagado, o motivo vai ao status. Falhar em gravar o status/log DEPOIS de apagar também é
-  NAO-CONSEGUI/escrever, nunca LIMPO. Entrada que sumiu no meio da varredura (o runner cria e apaga em /tmp o tempo todo) não é erro.
-SAÍDA  Uma linha JSON na stdout; fora do --dry-run também <state>/status.json (troca atômica) e uma linha em <state>/reaper.log (teto de 1 MB, vira reaper.log.1).
-  result: LIMPO | PARCIAL (acabou o --max-seconds; a próxima rodada continua) | ERROS (algo não apagou) | PULADO (outra instância tem o lock) | NAO-CONSEGUI. rc: 0 | 0 | 1 | 0 | 2 (64 = root ou idade <= 0).
+  uma raiz que não é um /tmp (sticky + gravável por todos) → NAO-CONSEGUI (rc 2), nada é apagado, o motivo vai ao status. Árvore com um filho cujo carimbo não se lê (pasta legível sem busca) → mantida (kept.ilegivel).
+  Falhar em gravar o status/log DEPOIS de apagar também é NAO-CONSEGUI/escrever (no log e no status, melhor esforço, e rc 2), nunca LIMPO. Entrada que sumiu no meio da varredura (o runner cria e apaga em /tmp o tempo todo) não é erro.
+SAÍDA  Uma linha JSON na stdout; fora do --dry-run também <state>/status.json (troca atômica; gravado ANTES do log) e uma linha em <state>/reaper.log (teto de 1 MB, vira reaper.log.1; traz erros=N e result/motivo).
+  result: LIMPO | PARCIAL (acabou o --max-seconds; a próxima rodada continua pelas unidades que sobraram, e a que estava no meio fica "recente" por N h) | ERROS (algo não apagou) | PULADO (outra instância tem o lock) | NAO-CONSEGUI. rc: 0 | 0 | 1 | 0 | 2 (64 = root, idade que não é número finito > 0 ou teto de tempo que não é finito >= 0; 70 = crash).
   disk_pct/inode_pct (como o df) são os de DEPOIS; alerta lista disco (> --disk-pct, 90) e/ou inodes (> --inode-pct, 80): é o que o vigia do mini lê.
 SEMENTES DE TESTE  --now (relógio), --proc (/proc de mentira), TMP_REAPER_FAKE_DF=<disco,inodes>|fail, TMP_REAPER_UID (dono de mentira, SÓ com --dry-run) e
   TMP_REAPER_PRETEND_ROOT=1 (finge ser root: só aumenta a recusa).
@@ -24,6 +24,7 @@ import argparse
 import fcntl
 import fnmatch
 import json
+import math
 import os
 import re
 import stat
@@ -31,7 +32,7 @@ import sys
 import time
 
 KEEP = ("tmux-*", ".X11-unix", ".ICE-unix", ".font-unix", ".XIM-unix", "hsperfdata_*", "systemd-private-*", "snap-private-tmp")  # exceções de fábrica
-CONTAINERS = ("claude-[0-9]*",)
+CONTAINERS = ("claude-[0-9]*", "pytest-of-*")  # scratchpads de sessão e o /tmp/pytest-of-<usuário> (18 GB em 17/11): sempre frescos, então só os filhos são unidades
 NAME_OK = re.compile(r"[A-Za-z0-9._*?\[\]-]+")
 LOG_MAX = 1 << 20
 
@@ -41,7 +42,7 @@ class Inert(Exception):
 
 
 class Budget(Exception):
-    """O teto de tempo acabou."""
+    """O teto de tempo acabou (args[0], quando há: quantas entradas a unidade em curso já apagou antes de parar)."""
 
 
 def check_root(root):
@@ -139,7 +140,8 @@ def read_mounts(proc, root):
             cols = [ln.split(" ") for ln in f.read().splitlines()]
     except OSError as e:
         raise Inert("proc", "%s/mounts: %s" % (proc, e))
-    return [c[1].replace("\\040", " ") for c in cols if len(c) >= 2 and c[1].startswith(root + "/")]
+    unesc = lambda s: re.sub(r"\\([0-7]{3})", lambda m: chr(int(m.group(1), 8)), s)  # o kernel escreve espaço, tab, newline e barra invertida como \040 \011 \012 \134
+    return [unesc(c[1]) for c in cols if len(c) >= 2 and unesc(c[1]).startswith(root + "/")]
 
 
 def tree_state(top, st0, dev, cut, deadline):
@@ -156,10 +158,11 @@ def tree_state(top, st0, dev, cut, deadline):
                     n += 1
                     if n % 512 == 0 and time.monotonic() > deadline:
                         raise Budget()
-                    try:
+                    try:  # sumiu → não conta; falhou por outro motivo (pasta legível sem busca: o nome aparece e o carimbo do filho não) → 'ilegivel': a frescura é desconhecida, mantém
                         s = e.stat(follow_symlinks=False)
                     except FileNotFoundError:
-                        continue  # sumiu no meio da varredura: não conta
+                        continue
+                    except OSError: return "ilegivel"
                     if newer(s):
                         return "recente"
                     if stat.S_ISDIR(s.st_mode):
@@ -180,7 +183,7 @@ def rm_tree(top, dev, me, deadline):
     while stack:
         d = stack.pop()
         if time.monotonic() > deadline:
-            raise Budget()
+            raise Budget(n)
         try:
             s = os.lstat(d)
             if not stat.S_ISDIR(s.st_mode) or s.st_dev != dev:
@@ -191,13 +194,16 @@ def rm_tree(top, dev, me, deadline):
             with os.scandir(d) as it:
                 ents = list(it)
             for k, e in enumerate(ents):
-                if e.is_dir(follow_symlinks=False):
-                    stack.append(e.path)
-                else:
-                    os.unlink(e.path)
-                    n += 1
+                try:  # a entrada que sumiu entre o scandir e o unlink (outro apagador anda no mesmo /tmp) já está como se quer: segue com as irmãs, e a pasta ainda vai para o rmdir
+                    if e.is_dir(follow_symlinks=False):
+                        stack.append(e.path)
+                    else:
+                        os.unlink(e.path)
+                        n += 1
+                except FileNotFoundError: pass
+                except OSError: bad += 1  # esta não apagou: conta o erro e segue com as outras; o rmdir da pasta vai falhar de novo (ENOTEMPTY) e o resultado sai ERROS
                 if k % 4096 == 4095 and time.monotonic() > deadline:
-                    raise Budget()
+                    raise Budget(n)
             order.append(d)
         except FileNotFoundError:
             continue
@@ -242,25 +248,45 @@ def prefix(rel):
     return m.group(1) + "*" if m else rel
 
 
-def publish(state, res):
-    # falhou (disco cheio, pasta sem permissão) → devolve o erro: o resultado vira NAO-CONSEGUI/escrever, nunca LIMPO
-    line = "%s %s reaped=%d scanned=%d secs=%s disco=%s%% inodes=%s%% alerta=%s top=%s" % (
-        res["iso"], res["result"], res["reaped"], res["scanned"], res["secs"], res["disk_pct"], res["inode_pct"], ",".join(res["alerta"]) or "-",
+def _log_line(res):
+    return "%s %s reaped=%d scanned=%d erros=%d secs=%s disco=%s%% inodes=%s%% alerta=%s top=%s" % (
+        res["iso"], res["result"] + ("/" + res["motivo"] if res["motivo"] else ""), res["reaped"], res["scanned"], res["errors"], res["secs"], res["disk_pct"], res["inode_pct"], ",".join(res["alerta"]) or "-",
         ",".join("%s:%d" % (k, n) for k, n in res["top"][:3]) or "-")
+
+
+def _write_status(state, res):
+    os.makedirs(state, exist_ok=True)
+    tmp = os.path.join(state, "status.json.tmp")
+    with open(tmp, "w") as f:
+        f.write(json.dumps(res, sort_keys=True) + "\n")
+    os.replace(tmp, os.path.join(state, "status.json"))
+
+
+def _append_log(state, line):
+    os.makedirs(state, exist_ok=True)
+    log = os.path.join(state, "reaper.log")
+    if os.path.exists(log) and os.path.getsize(log) > LOG_MAX:
+        os.replace(log, log + ".1")
+    with open(log, "a") as f:
+        f.write(line + "\n")
+
+
+def publish(state, res):
+    # falhou (disco cheio, pasta sem permissão) → devolve o erro E o que ficou gravado diz NAO-CONSEGUI/escrever (melhor esforço), nunca LIMPO: o cron manda a stdout para /dev/null e não guarda o rc, então só o log e o status.json ficam
+    err = None
     try:
-        os.makedirs(state, exist_ok=True)
-        log = os.path.join(state, "reaper.log")
-        if os.path.exists(log) and os.path.getsize(log) > LOG_MAX:
-            os.replace(log, log + ".1")
-        with open(log, "a") as f:
-            f.write(line + "\n")
-        tmp = os.path.join(state, "status.json.tmp")
-        with open(tmp, "w") as f:
-            f.write(json.dumps(res, sort_keys=True) + "\n")
-        os.replace(tmp, os.path.join(state, "status.json"))
+        _write_status(state, res)  # o status vem primeiro: a linha LIMPO do log só existe se o status que o vigia lê também foi gravado
+        _append_log(state, _log_line(res))
     except OSError as e:
-        return str(e)
-    return None
+        err = str(e)
+    if err is not None:
+        flipped = dict(res, result="NAO-CONSEGUI", motivo="escrever", detalhe=err)
+        for step in (lambda: _append_log(state, _log_line(flipped)), lambda: _write_status(state, flipped)):
+            try:
+                step()
+            except OSError:
+                pass  # o disco que falhou provavelmente falha de novo: o que não coube é o que o rc 2 e a stdout já dizem a quem rodou na mão
+    return err
 
 
 def main(argv):
@@ -275,8 +301,8 @@ def main(argv):
     ap.add_argument("--now", type=float)
     ap.add_argument("--proc", default="/proc")
     a = ap.parse_args(argv)
-    if os.geteuid() == 0 or os.environ.get("TMP_REAPER_PRETEND_ROOT") or a.max_age_hours <= 0:
-        print("hetzner-tmp-reaper: não rodo como root e a idade tem de ser > 0 (só apago o que é do usuário do lastro)", file=sys.stderr)
+    if os.geteuid() == 0 or os.environ.get("TMP_REAPER_PRETEND_ROOT") or not (0 < a.max_age_hours < math.inf) or not (0 <= a.max_seconds < math.inf):  # `<= 0` deixava o nan passar: com nan todo carimbo é "mais velho que o corte" e a rodada apagaria até o fresco
+        print("hetzner-tmp-reaper: não rodo como root, a idade tem de ser um número finito > 0 e o teto de tempo um número finito >= 0 (só apago o que é do usuário do lastro)", file=sys.stderr)
         return 64
     try:
         os.nice(19)
@@ -354,7 +380,11 @@ def main(argv):
                     res["reapable"] += 1
                     census[prefix(rel)] = census.get(prefix(rel), 0) + 1
                 else:
-                    n, bad, why2 = reap(path, st, rs.st_dev, me, deadline)
+                    try:
+                        n, bad, why2 = reap(path, st, rs.st_dev, me, deadline)
+                    except Budget as e:  # parou no meio da unidade: o que ela já apagou conta. O resto dela fica "recente" por N horas (apagar mexe no mtime) e só a rodada seguinte a essa janela o termina
+                        res["inodes_apagados"] += e.args[0] if e.args and isinstance(e.args[0], int) else 0
+                        raise
                     res["inodes_apagados"] += n
                     if why2:
                         kept[why2] = kept.get(why2, 0) + 1

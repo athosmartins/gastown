@@ -21,7 +21,7 @@ AVISO    ao Mayor por `gc mail send` (não nudge: o nudge ao Mayor trava com a s
            0-15 % por 7 h e nenhum aviso saiu, porque toda leitura era "ocupado" (havia sessão segurando bead)
   cego     nenhuma leitura decidiu o estado há >= 1 h (sessões, CPU ou fila ilegíveis), OU a CPU não é lida há >= 1 h (com a CPU cega o aviso de CPU baixa está mudo, mesmo que a sessão prove "ocupado"); cooldown de 6 h
   disco    o disco da raiz do nó acima de 90 % (HETZNER_OCC_DF_DISK_PCT) OU os inodes acima de 80 % (HETZNER_OCC_DF_INODE_PCT), lidos por `df -P` na MESMA ssh (ga-d4iob2s: em 16/11 o nó chegou a 98 % e ninguém viu);
-           cooldown de 6 h (HETZNER_OCC_DF_COOLDOWN_S). Seção ausente ou ilegível: sem aviso e `disco.lido` false (nunca "folgado"). O mail traz a última linha do reaper.log do nó (docs/runbooks/hetzner-tmp-reaper.md)
+           cooldown de 6 h (HETZNER_OCC_DF_COOLDOWN_S). Seção ausente ou ilegível: sem aviso e `disco.lido` false (nunca "folgado"); disco e inodes são lidos cada um por si (inodes ilegíveis não calam o aviso do disco, nem o contrário). O mail traz a última linha do reaper.log do nó (docs/runbooks/hetzner-tmp-reaper.md)
   foco     o foco do gate (gate-focus.state, mesma regra de 3 estados da gate-focus-lib.sh) liga: só conserto é despachado, então o aviso de ocioso se cala
   chave    o aviso só sai com <cidade>/.gc/hetzner-occupancy-alarm.on presente (e sem HETZNER_OCC_ALARM=0): sem ela é o modo só-medir, INERTE de propósito (mede e grava, nunca manda mail)
 CAUSA, DEGRAUS E NÚMERO DO DIA  (ga-2hd02v.5.10; 04/11, das 10h às 14h: CPU em 24-47 % em 18 leituras seguidas (4 h36 abaixo da régua) e o vigia só avisava, não dizia por quê nem agia; pedido do Athos: monitorar de perto e agir)
@@ -86,7 +86,7 @@ REMOTE_CMD = (
     "for p in \"u:$B\" \"l:$B/user@$U.service/ballast.slice\"; do awk -v k=\"${p%%:*}\" '/^usage_usec/{print k, $2}' \"${p#*:}/cpu.stat\" 2>/dev/null; done; "
     "echo " + S_MEM + "; grep -E '^(MemAvailable|MemTotal):' /proc/meminfo; "
     "echo " + S_TMUX + "; o=$(tmux -L gc-remote list-windows -a -F '#{session_name}|#{session_activity}|#{window_activity}' 2>&1); echo \"rc=$?\"; echo \"$o\"; "
-    "echo " + S_DF + "; df -Pk / | tail -n 1; df -Pi / | tail -n 1; echo " + S_RP + "; tail -n 1 \"$HOME/gt-remote/tmp-reaper/reaper.log\" 2>/dev/null; "
+    "echo " + S_DF + "; df -Pk / | tail -n 1 | sed 's/^/K /'; df -Pi / | tail -n 1 | sed 's/^/I /'; echo " + S_RP + "; tail -n 1 \"$HOME/gt-remote/tmp-reaper/reaper.log\" 2>/dev/null; "
     "echo " + S_NOW + "; date +%s; echo " + END
 )
 RUNGS = ("d1", "d2", "d3")  # a ordem da escada; o D4 (esgotou) é o aviso, não um degrau que age
@@ -516,12 +516,15 @@ def parse_extra(out):
                 t.update(lido=True, sessoes=[], motivo=None)  # sem servidor tmux no nó = nenhuma sessão (leu); qualquer outra falha do tmux NÃO é lista vazia
             else:
                 t["motivo"] = "tmux-rc-%d" % rc
-    # vazio (sem a seção) → lido=False, motivo sem-secao; falhou/ilegível (menos de 2 linhas de 6 campos numéricos) → lido=False, linha-ilegivel: nunca "disco folgado" (% = usado/(usado+livre), como o df)
+    # vazio (sem a seção) → lido=False, motivo sem-secao; falhou/ilegível → esse número fica None (nunca "folgado") e o outro continua valendo: K = disco (df -Pk), I = inodes (df -Pi), cada linha lida sozinha,
+    # então um sistema de arquivos que imprime "-" nos inodes não cala o aviso do disco; `lido` só é true com os DOIS números (% = usado/(usado+livre), como o df)
     df = _section(lines, S_DF)
     if df is not None:
-        got = [round(100.0 * int(f[2]) / (int(f[2]) + int(f[3])), 1) for f in (ln.split() for ln in df)
-               if len(f) == 6 and all(re.fullmatch(r"[0-9]+", x) for x in f[1:4]) and int(f[2]) + int(f[3]) > 0]
-        ex["df"] = {"lido": len(got) == 2, "disco_pct": got[0] if len(got) == 2 else None, "inodes_pct": got[1] if len(got) == 2 else None, "motivo": None if len(got) == 2 else "linha-ilegivel"}
+        def pct(tag):
+            rows = [f for f in (ln.split() for ln in df) if len(f) == 7 and f[0] == tag and all(re.fullmatch(r"[0-9]+", x) for x in f[2:5]) and int(f[3]) + int(f[4]) > 0]
+            return round(100.0 * int(rows[0][3]) / (int(rows[0][3]) + int(rows[0][4])), 1) if len(rows) == 1 else None
+        dp, ip = pct("K"), pct("I")
+        ex["df"] = {"lido": dp is not None and ip is not None, "disco_pct": dp, "inodes_pct": ip, "motivo": None if dp is not None and ip is not None else "linha-ilegivel"}
     # vazio (sem reaper.log no nó) → None, e o mail diz "sem registro"; falhou/ilegível → o mesmo None: é só contexto do mail, não entra na decisão
     rp = _section(lines, S_RP)
     ex["reaper"] = rp[0][:300] if rp else None
@@ -827,7 +830,7 @@ def low_mail(c, rd, low):
 
 
 def disco_mail(c, rd, reaper):
-    d = rd["disco"]
+    d = {k: "?" if rd["disco"][k] is None else rd["disco"][k] for k in ("disco_pct", "inodes_pct")}  # um dos dois ilegível ("?"): o outro, acima do limite, é o que fez o aviso sair
     subj = "Hetzner: disco do nó a %s%% e inodes a %s%% (aviso acima de %g%% e %g%%)" % (d["disco_pct"], d["inodes_pct"], c.df_disk_pct, c.df_inode_pct)
     body = "\n".join([
         "Estado do mundo: a raiz do nó Hetzner (%s) está com o disco a %s%% (aviso acima de %g%%) e os inodes a %s%% (aviso acima de %g%%). Sem espaço ou inode livre nenhum teste, build ou noturno grava "
@@ -1231,7 +1234,7 @@ def run(args, env):
     a_blind = _plan(c, blind_due, last_blind, c.blind_cooldown_s, now, dry)
     a_low = _plan(c, low_due, last_low, c.low_cooldown_s, now, dry)
     dfx, last_df = ex["df"], _int(st.get("alarme_disco_em"))  # disco do nó (ga-d4iob2s): só avisa com a leitura LIDA e acima do limite; sem leitura não há aviso nem "tudo bem"
-    a_df = _plan(c, dfx["lido"] and (dfx["disco_pct"] > c.df_disk_pct or dfx["inodes_pct"] > c.df_inode_pct), last_df, c.df_cooldown_s, now, dry)
+    a_df = _plan(c, (dfx["disco_pct"] is not None and dfx["disco_pct"] > c.df_disk_pct) or (dfx["inodes_pct"] is not None and dfx["inodes_pct"] > c.df_inode_pct), last_df, c.df_cooldown_s, now, dry)
     rd["alarme"] = {"ocioso": a_idle, "cego": a_blind, "cpu_baixa": a_low, "disco": a_df}
     if dry:
         rd["dry_run"] = True

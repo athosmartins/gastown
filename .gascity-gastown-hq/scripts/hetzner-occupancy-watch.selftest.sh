@@ -288,7 +288,7 @@ xwrite() {   # xwrite <arquivo>: a saída COMPLETA da ssh de leitura (/proc/stat
         semrc) cat "$T/stub/node.tmux" ;;
       esac ;; esac
     case "$o" in *" df "*) ;; *) echo "@@OCC-DF@@"
-      if [ -n "$X_DF_RAW" ]; then printf '%s\n' "$X_DF_RAW"; else echo "/dev/sda1 1000 $X_DF_D $((1000 - X_DF_D)) $((X_DF_D / 10))% /"; echo "/dev/sda1 1000 $X_DF_I $((1000 - X_DF_I)) $((X_DF_I / 10))% /"; fi
+      if [ -n "$X_DF_RAW" ]; then printf '%s\n' "$X_DF_RAW"; else echo "K /dev/sda1 1000 $X_DF_D $((1000 - X_DF_D)) $((X_DF_D / 10))% /"; echo "I /dev/sda1 1000 $X_DF_I $((1000 - X_DF_I)) $((X_DF_I / 10))% /"; fi
       [ -z "$X_RP" ] || { echo "@@OCC-RP@@"; echo "$X_RP"; } ;; esac
     case "$o" in *" now "*) ;; *) echo "@@OCC-NOW@@"; echo "$NOW" ;; esac
     echo "@@OCC-END@@"; } > "$1"
@@ -1811,7 +1811,7 @@ g_disco() {
   echo "--- disco: disco do nó > 90 % ou inodes > 80 % avisa o Mayor (16/11: 98 % e 91 %, ninguém viu); leitura que falha NÃO é disco folgado (ga-d4iob2s)"
   dfresh; xtick 900 $HIW >/dev/null
   eq "disco 40 % e inodes 10 %: sem mail" 0 "$(mails)"; eq "... alarme.disco = nao" nao "$(reading alarme.disco)"; eq "... a leitura traz os dois números" "40.0/10.0" "$(reading disco.disco_pct)/$(reading disco.inodes_pct)"
-  has "... a ssh de leitura pede o df da raiz" "df -Pk / | tail -n 1; df -Pi /" "$(cat "$T/stub/ssh.calls")"
+  has "... a ssh de leitura pede o df da raiz (cada linha com a sua letra: K disco, I inodes)" "df -Pk / | tail -n 1 | sed 's/^/K /'; df -Pi / | tail -n 1 | sed 's/^/I /'" "$(cat "$T/stub/ssh.calls")"
   X_DF_D=981; X_DF_I=913; X_RP="2026-11-17T02:20:00Z LIMPO reaped=3 scanned=9 top=wa-parear-*:2"; xtick 900 $HIW
   eq "disco 98,1 % e inodes 91,3 %: 1 mail ao Mayor" 1 "$(mails)"; eq "... destinatário" mayor "$(mailfield 1 to)"; eq "... alarme.disco = enviado" enviado "$(reading alarme.disco)"
   has "... assunto: os dois números" "disco do nó a 98.1% e inodes a 91.3%" "$(mailfield 1 subj)"; has "... corpo: a última linha do reaper" "LIMPO reaped=3 scanned=9 top=wa-parear-*:2" "$(mailfield 1 body)"
@@ -1826,8 +1826,17 @@ g_disco() {
   echo "--- disco: leitura que falta ou não confere NUNCA é disco folgado e nunca avisa; chave, ALARM=0 e mail que falha"
   dfresh; X_OMIT=" df "; xtick 900 $HIW >/dev/null
   eq "seção do df ausente: lido false, motivo sem-secao, sem mail" "false/sem-secao/0" "$(reading disco.lido)/$(reading disco.motivo)/$(mails)"
-  dfresh; X_DF_RAW="/dev/sda1 abc def ghi 98% /"; xtick 900 $HIW >/dev/null
+  dfresh; X_DF_RAW="K /dev/sda1 abc def ghi 98% /"; xtick 900 $HIW >/dev/null
   eq "linha do df que não confere: lido false, motivo linha-ilegivel, sem mail" "false/linha-ilegivel/0" "$(reading disco.lido)/$(reading disco.motivo)/$(mails)"
+  echo "--- disco: um dos dois ilegível não cala o outro (sistema de arquivos que imprime '-' nos inodes)"
+  dfresh; X_DF_RAW=$'K /dev/sda1 1000 981 19 98% /\nI overlay - - - - /'; xtick 900 $HIW >/dev/null
+  eq "inodes '-', disco 98,1 %: o aviso do disco sai" "1/enviado" "$(mails)/$(reading alarme.disco)"
+  eq "... lido false (só um dos dois), o disco lido e os inodes null" "false/98.1/null" "$(reading disco.lido)/$(reading disco.disco_pct)/$(reading disco.inodes_pct)"
+  has "... o assunto marca o que não leu com ?" "disco do nó a 98.1% e inodes a ?%" "$(mailfield 1 subj)"
+  dfresh; X_DF_RAW=$'K /dev/sda1 abc def ghi 98% /\nI /dev/sda1 1000 913 87 91% /'; xtick 900 $HIW >/dev/null
+  eq "disco ilegível, inodes 91,3 %: o aviso dos inodes sai" "1/enviado" "$(mails)/$(reading alarme.disco)"
+  dfresh; X_DF_RAW=$'K /dev/sda1 1000 400 600 40% /\nI overlay - - - - /'; xtick 900 $HIW >/dev/null
+  eq "inodes '-', disco 40 %: sem mail (o que se leu está folgado, o resto não é lido como folgado nem como cheio)" "0/nao" "$(mails)/$(reading alarme.disco)"
   xfresh; X_DF_D=981; xtick 900 $HIW >/dev/null
   eq "sem a chave .on: nenhum mail e alarme.disco = desligado" "0/desligado" "$(mails)/$(reading alarme.disco)"
   dfresh; X_DF_D=981; TENV=(HETZNER_OCC_ALARM=0); xtick 900 $HIW >/dev/null
@@ -2093,10 +2102,11 @@ g_mutantes() {
   mutante dia-causa-cega-conta "aviso" $'cnt = {k: t[k] for k in CAUSAS if k != "cego" and' $'cnt = {k: t[k] for k in CAUSAS if'
   # o disco do nó (ga-d4iob2s): limite estrito, cada limite sozinho, cooldown, leitura que falta não avisa, e o df entra na MESMA ssh
   mutante disco-limite-do-disco-maior-ou-igual "disco" $'dfx["disco_pct"] > c.df_disk_pct' $'dfx["disco_pct"] >= c.df_disk_pct'
-  mutante disco-ignora-os-inodes "disco" $' or dfx["inodes_pct"] > c.df_inode_pct' $''
+  mutante disco-ignora-os-inodes "disco" $' or (dfx["inodes_pct"] is not None and dfx["inodes_pct"] > c.df_inode_pct)' $''
   mutante disco-sem-cooldown "disco" $'last_df, c.df_cooldown_s, now, dry)' $'None, c.df_cooldown_s, now, dry)'
-  mutante disco-leitura-ausente-avisa "disco" $'a_df = _plan(c, dfx["lido"] and (' $'a_df = _plan(c, True and ('
-  mutante disco-ssh-sem-df "disco" $'df -Pk / | tail -n 1; ' $''
+  mutante disco-leitura-ausente-avisa "disco" $'(dfx["disco_pct"] is not None and dfx["disco_pct"] > c.df_disk_pct)' $'((dfx["disco_pct"] or 100) > c.df_disk_pct)'
+  mutante disco-leitura-parcial-silencia "disco" $'a_df = _plan(c, (' $'a_df = _plan(c, dfx["lido"] and ('
+  mutante disco-ssh-sem-df "disco" $'df -Pk / | tail -n 1 | sed \'s/^/K /\'; ' $''
   mutantes_wait
 }
 
