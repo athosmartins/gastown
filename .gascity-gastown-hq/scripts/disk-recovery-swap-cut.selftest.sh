@@ -33,7 +33,7 @@ C="$W/city"; GCD="$C/.gc"
 SWAPF="$W/swap"; NOWF="$W/now"; SAMPLES="$GCD/ram-owner-samples.jsonl"; NEXT="$W/next-rec"; ROSTER="$W/roster.json"; CALLS="$W/gc.calls"; SCALLS="$W/sampler.calls"
 LOGF="$GCD/logs/disk-recovery-swap-cut.log"; PAUSEF="$GCD/swap-spawn-pause"; STATEF="$GCD/disk-recovery-swap-cut.state"; PROJ="$W/projects"
 
-# gc de mentira: suspend → roster ganha state=asleep e o swap CAI (W_SWAP_DROP, padrão 300); list → o roster. Modos em $W/mode: suspend.fail, suspend.noop, list.fail
+# gc de mentira: suspend → roster ganha state=asleep e o swap CAI (W_SWAP_DROP, padrão 300); list → o roster. Modos em $W/mode: suspend.fail, suspend.noop, suspend.lag, suspend.gone, list.fail, list.slow (trava 30 s)
 cat > "$W/bin/gc" <<'STUB'
 #!/bin/bash
 echo "$*" >> "$W_CALLS"
@@ -60,12 +60,13 @@ json.dump(d, open(p, "w"))
                      setstate "$3" asleep
                      v=$(cat "$W_SWAP"); echo $((v - ${W_SWAP_DROP:-300})) > "$W_SWAP"; exit 0 ;;
   "session list")    [ -e "$W_MODE/list.fail" ] && exit 1
+                     [ -e "$W_MODE/list.slow" ] && sleep 30
                      [ -e "$W_MODE/gc.warn" ] && echo "warning: builtin pack differs from the embedded copy" >&2
                      cat "$W_ROSTER" ;;
   *) exit 0 ;;
 esac
 STUB
-# bd de mentira: `bd -C <store> list --status in_progress --assignee <ident> --json --limit 0` → $W/bd/<basename do store>/<ident> (JSON) ou []. Modos: bd.fail (tudo), bd.fail.<ident>, bd.warn (aviso no stderr com rc 0),
+# bd de mentira: `bd -C <store> list --status in_progress --assignee <ident> --json --limit 0` → $W/bd/<basename do store>/<ident> (JSON) ou []. Modos: bd.fail (tudo), bd.fail.<ident>, bd.warn (aviso no stderr com rc 0), bd.sleep (cada leitura leva 2 s),
 # bd.attach.<ident> (o arquivo diz o id da sessão: ela fica ANEXADA durante esta leitura), bd.touch.<ident> (o arquivo diz a transcrição que passa a ter escrita agora). Cada chamada vai para $W_BDCALLS
 cat > "$W/bin/bd" <<'STUB'
 #!/bin/bash
@@ -75,6 +76,7 @@ echo "$(basename "$store") $ident" >> "$W_BDCALLS"
 [ -e "$W_MODE/bd.fail" ] && { echo "bd: boom" >&2; exit 1; }
 [ -e "$W_MODE/bd.fail.$ident" ] && { echo "bd: boom" >&2; exit 1; }
 [ -e "$W_MODE/bd.warn" ] && echo "warning: builtin pack differs from the embedded copy" >&2
+[ -e "$W_MODE/bd.sleep" ] && sleep 2
 [ -e "$W_MODE/bd.touch.$ident" ] && touch "$(cat "$W_MODE/bd.touch.$ident")"
 [ -e "$W_MODE/bd.attach.$ident" ] && python3 -I -c '
 import json, sys
@@ -323,7 +325,7 @@ scenario; : > "$W/mode/suspend.fail"; run --run
 eq "$RC" 20 "gc session suspend com rc 1 e a sessao ainda ativa: FALHOU, rc 20"
 has "$OUT" "FALHOU" "a linha diz FALHOU"
 has "$(logtxt)" "FALHOU wa-worker-1" "log: qual falhou"
-eq "$(grep -c '^s=' "$STATEF" 2>/dev/null)" 0 "suspend que falhou NAO entra no registro"
+eq "$(cat "$STATEF" 2>/dev/null | grep -c '^s=')" 0 "suspend que falhou NAO entra no registro (e a rodada so com falha nem grava estado: o arquivo pode nem existir)"
 hasnt "$(logtxt)" "NAO CONFIRMADO" "rc != 0 com a sessao ainda ativa nao e 'nao confirmado'"
 scenario; : > "$W/mode/suspend.lag"; DR_SWC_SETTLE_S=4 run --run
 eq "$RC" 0 "reconciler atrasado (rc 0, ativa na hora, dorme 1 s depois): rc 0"
@@ -431,6 +433,104 @@ run --run
 eq "$RC" 11 "500 s depois, swap 6000, as 2 cortadas dormem e nao ha outra: rc 11"
 eq "$(logtxt | grep -c 'PAUSA do spawn do Pilot ate')" 2 "passou da metade da validade: renova a pausa (log: gravou 2 vezes)"
 eq "$(cat "$PAUSEF" | sed -n 3p)" "$((NOW+500+900))" "pausa renovada: validade nova = agora + 900"
+
+section "carencia: rodada em que TODO suspend falhou NAO arma a carencia (a seguinte tenta de novo)"
+scenario; : > "$W/mode/suspend.fail"; run --run
+eq "$RC" 20 "R1: todo suspend falha, nada cortado: rc 20 (segue sendo dito)"
+has "$OUT" "cortou 0" "R1: a linha nao diz que cortou"
+hasnt "$(cat "$STATEF" 2>/dev/null)" "last_cut_ts=$NOW" "R1: NAO grava last_cut_ts (nao houve corte: nao ha o que esperar)"
+rm -f "$W/mode/suspend.fail"; echo $((NOW+60)) > "$NOWF"; echo 4600 > "$SWAPF"; : > "$CALLS"
+run --run
+eq "$RC" 0 "R2 (60 s depois, swap 4600, suspend voltou): corta, NAO fica em carencia (rc 0, nao 10)"
+hasnt "$OUT" "em carencia" "R2: a linha nao diz carencia"
+eq "$(calls | grep -c '^session suspend ')" 2 "R2: tentou suspender de novo e suspendeu as 2"
+has "$OUT" "cortou 2 sessao" "R2: a linha diz que cortou"
+has "$(cat "$STATEF" 2>/dev/null)" "last_cut_ts=$((NOW+60))" "R2: agora SIM a carencia arma (houve corte)"
+echo $((NOW+90)) > "$NOWF"; echo 4600 > "$SWAPF"; : > "$CALLS"; run --run   # o corte de R2 fez o swap cair para 4000; de volta a 4600 o gatilho vale e a carencia (4600 < 4000+768) segura
+eq "$RC" 10 "R3 (30 s depois do corte de R2, gatilho valendo): ai sim, em carencia (rc 10)"
+eq "$(calls | grep -c 'session suspend')" 0 "R3: em carencia nao suspende"
+has "$OUT" "em carencia" "R3: a linha diz carencia"
+
+section "ESTADO ilegivel / valor invalido / linha desconhecida: nao e 'sem estado' (a linha diz; o arquivo antigo e guardado, nunca sobrescrito)"
+# seed_state <linha extra ou vazio>: um estado antigo com o registro de 1 sessao suspensa por mim (s=old-1)
+seed_state() { printf 'v=1\nlast_cut_ts=%s\nlast_after_swap=3900\ns=old-1|wa-worker-9|wa-worker|700|%s\n%s' "$((NOW-4000))" "$((NOW-4000))" "${1:+$1
+}" > "$STATEF"; }
+KEPT="$STATEF.ilegivel.$NOW"
+scenario; seed_state; run --run
+eq "$RC" 0 "controle: estado valido, sem nota: rc 0"
+hasnt "$OUT" "ESTADO" "controle: estado valido NAO gera nota na linha"
+hasnt "$(logtxt)" "ESTADO" "controle: nem no log"
+[ ! -e "$KEPT" ] && ok "controle: estado valido nao e guardado/movido" || nope "controle: estado valido nao e guardado/movido"
+has "$(cat "$STATEF")" "s=old-1|wa-worker-9|wa-worker|700|" "controle: o registro antigo segue no estado novo"
+has "$(cat "$STATEF")" "s=id-1|wa-worker-1|" "controle: e o registro novo tambem"
+scenario; seed_state "last_cut_ts=abc"; run --run
+eq "$RC" 0 "valor invalido em last_cut_ts: corta mesmo assim (rc 0)"
+eq "$(lines "$OUT")" 1 "valor invalido: stdout = UMA linha"
+has "$OUT" "[ESTADO com valor invalido em last_cut_ts]" "valor invalido: a LINHA diz"
+has "$(logtxt | grep 'GATILHO:')" "[ESTADO com valor invalido em last_cut_ts]" "valor invalido: o log do GATILHO diz"
+has "$OUT" "estado antigo guardado em disk-recovery-swap-cut.state.ilegivel.$NOW" "valor invalido: a linha diz ONDE guardou o antigo"
+has "$(cat "$KEPT" 2>/dev/null)" "last_cut_ts=abc" "valor invalido: o arquivo ORIGINAL esta guardado, byte a byte"
+has "$(cat "$KEPT" 2>/dev/null)" "s=old-1|wa-worker-9|wa-worker|700|" "valor invalido: com o registro das sessoes suspensas"
+has "$(cat "$STATEF")" "s=old-1|wa-worker-9|wa-worker|700|" "valor invalido: o que da para entender (o registro) segue no estado novo"
+has "$(cat "$STATEF")" "s=id-1|wa-worker-1|" "valor invalido: o corte desta rodada foi registrado"
+hasnt "$(cat "$STATEF")" "last_cut_ts=abc" "valor invalido: o estado novo esta limpo"
+has "$(logtxt)" "guardei o original em $KEPT" "valor invalido: o log diz que guardou"
+scenario; seed_state "futuro=1"; run --run
+eq "$RC" 0 "linha desconhecida: corta (rc 0)"
+has "$OUT" "[ESTADO com linha que nao entendo]" "linha desconhecida: a LINHA diz"
+has "$(logtxt | grep 'GATILHO:')" "[ESTADO com linha que nao entendo]" "linha desconhecida: o log do GATILHO diz"
+has "$(cat "$KEPT" 2>/dev/null)" "futuro=1" "linha desconhecida: o original (com a linha que nao entendi) esta guardado"
+hasnt "$(cat "$STATEF")" "futuro=1" "linha desconhecida: o estado novo so tem o que o degrau entende"
+scenario; mkdir -p "$STATEF"; echo "s=old-1|wa-worker-9|wa-worker|700|$((NOW-4000))" > "$STATEF/dentro"; run --run
+eq "$RC" 0 "estado ilegivel (e um diretorio: ilegivel ate para root): corta (rc 0)"
+has "$OUT" "[ESTADO ILEGIVEL: registro de suspensas pode ter se perdido]" "ilegivel: a LINHA diz"
+has "$(logtxt | grep 'GATILHO:')" "[ESTADO ILEGIVEL" "ilegivel: o log do GATILHO diz"
+has "$(cat "$KEPT/dentro" 2>/dev/null)" "s=old-1|" "ilegivel: o original (com o registro) esta guardado, nao apagado"
+[ -f "$STATEF" ] && ok "ilegivel: o estado novo e um arquivo normal" || nope "ilegivel: o estado novo e um arquivo normal"
+has "$(cat "$STATEF" 2>/dev/null)" "s=id-1|wa-worker-1|" "ilegivel: o corte desta rodada foi registrado"
+if [ "$(id -u)" != 0 ]; then
+  scenario; seed_state; chmod 000 "$STATEF"; run --run
+  eq "$RC" 0 "estado ilegivel (chmod 000): corta (rc 0)"
+  has "$OUT" "[ESTADO ILEGIVEL: registro de suspensas pode ter se perdido]" "chmod 000: a LINHA diz"
+  has "$OUT" "estado antigo guardado em disk-recovery-swap-cut.state.ilegivel.$NOW" "chmod 000: a linha diz onde guardou"
+  chmod u+r "$KEPT" 2>/dev/null
+  has "$(cat "$KEPT" 2>/dev/null)" "s=old-1|wa-worker-9|wa-worker|700|" "chmod 000: o registro antigo esta no arquivo guardado (rename funciona sem ler)"
+  scenario; mkdir -p "$W/ro"; printf 'v=1\ns=old-1|wa-worker-9|wa-worker|700|%s\n' "$((NOW-4000))" > "$W/ro/state"; chmod 000 "$W/ro/state"; chmod 555 "$W/ro"
+  DR_SWC_STATE="$W/ro/state" run --run
+  chmod 755 "$W/ro"; chmod 600 "$W/ro/state"
+  eq "$RC" 20 "estado ilegivel e NAO consigo guarda-lo: rc 20, nao grava por cima"
+  has "$OUT" "FALHOU em parte" "sem como guardar: a linha diz FALHOU"
+  has "$OUT" "NAO gravei o estado: nao consegui guardar o antigo" "sem como guardar: a linha diz que NAO sobrescreveu"
+  has "$OUT" "NAO gravei o registro das sessoes suspensas" "sem como guardar: o FALHOU diz que e o registro, nao o suspend"
+  hasnt "$OUT" "0 suspend(s) com rc" "sem como guardar: nao finge que foi suspend com rc != 0"
+  has "$(cat "$W/ro/state" 2>/dev/null)" "s=old-1|wa-worker-9|wa-worker|700|" "sem como guardar: o arquivo antigo segue INTACTO"
+  chmod -R u+rwx "$W/ro"   # o trap do fim apaga $W inteiro
+else
+  printf 'pulado - estado ilegivel por chmod 000 e por diretorio sem escrita (rodando como root: a permissao nao barra)\n'
+fi
+scenario; cat "$NEXT" >> "$SAMPLES"; rm -f "$NEXT"; seed_state "last_cut_ts=abc"; run --dry-run
+eq "$RC" 10 "dry-run com estado invalido: rc 10"
+has "$OUT" "[ESTADO com valor invalido em last_cut_ts]" "dry-run: a linha tambem diz"
+[ ! -e "$KEPT" ] && ok "dry-run: o estado NAO e movido" || nope "dry-run: o estado NAO e movido"
+has "$(cat "$STATEF")" "last_cut_ts=abc" "dry-run: nem tocado (segue com o valor invalido de antes)"
+scenario; seed_state "last_cut_ts=abc"; : > "$W/mode/suspend.fail"; run --run
+eq "$RC" 20 "estado invalido numa rodada em que todo suspend falha: rc 20"
+has "$OUT" "[ESTADO com valor invalido em last_cut_ts]" "falha total: a linha diz do estado tambem"
+has "$(cat "$STATEF")" "last_cut_ts=abc" "falha total: sem corte nao ha gravacao: o estado antigo nem e mexido"
+[ ! -e "$KEPT" ] && ok "falha total: e nao e movido (nada foi gravado)" || nope "falha total: e nao e movido (nada foi gravado)"
+
+section "bd/gc travado: o cronometro (bounded) e o orcamento nao seguram a escada"
+scenario; unset DR_SWC_SESSIONS_FILE; : > "$W/mode/list.slow"; _t=$SECONDS; DR_SWC_CMD_S=1 run --run; _el=$((SECONDS - _t))
+eq "$RC" 30 "gc session list trava (estoura CMD_S=1): SEM LEITURA, rc 30"
+has "$OUT" "SEM LEITURA" "list travado: a linha diz SEM LEITURA"
+[ "$_el" -le 15 ] && ok "list travado: a rodada terminou em ${_el}s (o gc de mentira dorme 30 s)" || nope "list travado: a rodada terminou em ${_el}s (o gc de mentira dorme 30 s)"
+eq "$(calls | grep -c 'session suspend')" 0 "list travado: nenhum suspend"
+[ ! -e "$PAUSEF" ] && ok "list travado: nenhuma pausa" || nope "list travado: nenhuma pausa"
+scenario; : > "$W/mode/bd.sleep"; DR_SWC_BUDGET_S=1 run --run
+eq "$RC" 11 "orcamento de 1 s esgotado pelas leituras de bd (2 s cada): ninguem e verificada, rc 11"
+eq "$(calls | grep -c 'session suspend')" 0 "orcamento esgotado: nenhum suspend (nao verificou = nao corta)"
+has "$OUT" "por leitura impossivel" "orcamento esgotado: a linha diz que foi por NAO LER"
+has "$(logtxt)" "orcamento de 1s esgotado" "orcamento esgotado: o log diz"
 
 section "dry-run, interruptor, trava"
 scenario; cat "$NEXT" >> "$SAMPLES"; rm -f "$NEXT"

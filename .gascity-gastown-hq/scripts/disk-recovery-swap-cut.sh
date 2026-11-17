@@ -29,13 +29,16 @@
 #   SUSPEND NÃO CONFIRMADO é o terceiro estado do próprio corte: no caminho gerenciado `gc session suspend` só põe o hold e cutuca o reconciler, então rc 0 com a sessão ainda `active` (ou `?`/`gone`) 3 s depois pode ser atraso OU
 #   falta de efeito. Não é FALHOU (nada de rc 20 nem "sem efeito"), não é CORTOU: entra no registro marcado `u`, conta à parte, e UMA releitura depois do SETTLE_S resolve (dormindo → CORTOU; ainda não → fica `u` e a linha diz).
 #   FALHOU só com rc != 0 E a sessão ainda ativa. Imediatamente antes do suspend o estado, o `attached` e a transcrição são relidos (o Athos pode ter anexado durante as leituras de bd).
+#   ARQUIVO DE ESTADO ilegível (existe e não leio), com valor inválido ou com linha que não entendo = "não sei", NÃO "sem estado": a nota `[ESTADO ...]` sai no log do GATILHO e na linha de stdout, e o arquivo antigo nunca é sobrescrito
+#   às cegas: antes de gravar o novo ele é guardado como <estado>.ilegivel.<epoch> (rename, funciona sem ler; é onde fica o registro das sessões suspensas que a retomada, fatia 3, precisa); se nem o rename der, NÃO grava e diz (rc 20).
 # PAUSA DO PILOT  .gc/swap-spawn-pause: 4 linhas `PAUSE` · epoch da gravação · epoch da validade · motivo. A validade é o freio: se este degrau morrer, a pausa vence sozinha em PAUSE_TTL_S (900 s) e o Pilot volta a despachar
 #   (pausa vencida, ilegível ou com validade absurda — mais de 1 h à frente — NÃO pausa: fail-open VISÍVEL no log do Pilot, nunca um Pilot parado por um arquivo que ninguém renova). Enquanto o gatilho vale, cada rodada renova
 #   (só quando restam menos de metade da validade). Gravada num temporário, trocada com mv e LIDA DE VOLTA (tentado ≠ gravado).
 # CONTRATO        `--run` (real) · `--dry-run` (lê tudo, diz o que faria; não colhe amostra nova, não suspende, não grava pausa, estado nem log). stdout = UMA linha ASCII (o maestro filtra para imprimíveis) e NADA
 #   antes dela; o detalhe vai para $LOG. Saída 0 = agiu (suspendeu, pediu suspend ainda sem confirmação e/ou pausou) · 10 = nada a fazer (sem gatilho, carência, pausa vigente) · 11 = gatilho ativo e NÃO há candidata permitida (pausa posta/mantida; precisa de humano) ·
 #   20 = falhou (suspend com rc != 0 e a sessão ainda ativa, pausa que não gravou) · 30 = não consegui ler (não cortei, não pausei) · 2 = uso. Falha e sucesso na mesma rodada = 20 (a linha diz os dois).
-#   Carência: depois de uma rodada que cortou, COOLDOWN_S (300 s = a janela) sem cortar de novo, a não ser que o swap tenha voltado a subir >= GROW_MB/2 desde o corte (a base do crescimento ainda enxerga o salto de ANTES do corte).
+#   Carência: depois de uma rodada que CORTOU (ou pediu suspend ainda sem confirmação), COOLDOWN_S (300 s = a janela) sem cortar de novo, a não ser que o swap tenha voltado a subir >= GROW_MB/2 desde o corte (a base do crescimento ainda enxerga o salto de ANTES do corte).
+#   Rodada em que TODO suspend falhou (rc 20, nada mudou) NÃO arma a carência nem grava estado: a rodada seguinte tenta suspender de novo.
 # VARIÁVEIS (teste) DR_CITY · DR_OFF_FILE · DR_NOW_FILE · DR_SWAP_MB_FILE (os do maestro) · DR_GC_BIN · DR_SWC_LOG · DR_SWC_LOCK · DR_SWC_STATE · DR_SWC_PAUSE_FILE · DR_SWC_SAMPLES (o JSONL) · DR_SWC_SAMPLER_CMD (no lugar de
 #   `python3 ram-owner-sampler.py`) · DR_SWC_SESSIONS_FILE (JSON no lugar de `gc session list --json`) · DR_SWC_BD_BIN · DR_SWC_PROJECTS_DIR · DR_SWC_<NOME> numérico: GROW_MB GROW_WINDOW_S GROW_SLACK_S ABS_MB
 #   SAMPLE_MAX_AGE_S SAMPLER_DEAD_S IDLE_MIN MAX_CUT MIN_RSS_MB SETTLE_S VERIFY_S COOLDOWN_S PAUSE_TTL_S CMD_S SAMPLER_S BUDGET_S LOG_MAX_KB (lixo cai no padrão e é dito no log).
@@ -267,24 +270,27 @@ PYEOF
 py() { python3 -I -c "$PY" "$@" 2>/dev/null; }
 
 # ── estado: chave=valor, escrito inteiro e trocado com mv. Chaves: last_cut_ts last_after_swap + 1 linha `s=<id>|<nome>|<template>|<rss>|<ts>[|u]` por sessão suspensa por MIM (`u` = pedi o suspend e o estado não confirmou; a retomada religa as duas, religar quem não dormiu é inerte) ──────────────────────────────
-LAST_CUT_TS=0; LAST_AFTER_SWAP=0; REG=""; STATE_NOTE=""
-load_state() {  # vazio (arquivo ausente) → zerado, sem aviso; falhou/ilegível/linha que não entendo → zerado E STATE_NOTE (o registro pode ter se perdido: a linha diz)
-  local line k v
-  LAST_CUT_TS=0; LAST_AFTER_SWAP=0; REG=""; STATE_NOTE=""
+LAST_CUT_TS=0; LAST_AFTER_SWAP=0; REG=""; STATE_NOTE=""; STATE_BAD=0
+load_state() {  # vazio (arquivo ausente) → zerado, sem aviso e sem STATE_BAD; falhou/ilegível/valor inválido/linha que não entendo → usa o que entendeu, STATE_BAD=1 e STATE_NOTE (NÃO é "sem estado": o registro de sessões suspensas pode ter se perdido). STATE_NOTE sai no log do GATILHO e na linha; save_state guarda o arquivo antigo antes de gravar por cima
+  local line k v content
+  LAST_CUT_TS=0; LAST_AFTER_SWAP=0; REG=""; STATE_NOTE=""; STATE_BAD=0
   [ -e "$STATE" ] || return 0
-  [ -r "$STATE" ] || { STATE_NOTE=" [estado ilegivel: o registro de sessoes suspensas pode ter se perdido]"; return 0; }
-  while IFS= read -r line || [ -n "$line" ]; do
+  # vazio (arquivo sem bytes) → nenhuma linha → zerado; falhou (sem permissão, é um diretório, erro de leitura) → rc != 0 → ilegível, que é "não sei" e não "sem estado"
+  content=$(cat "$STATE" 2>/dev/null) || { STATE_BAD=1; STATE_NOTE=" [ESTADO ILEGIVEL: registro de suspensas pode ter se perdido]"; return 0; }
+  while IFS= read -r line; do
     case "$line" in
       v=1|'') ;;
       last_cut_ts=*|last_after_swap=*)
         k=${line%%=*}; v=${line#*=}
         if isnum "$v"; then case "$k" in last_cut_ts) LAST_CUT_TS=$v ;; last_after_swap) LAST_AFTER_SWAP=$v ;; esac
-        else STATE_NOTE=" [estado com valor invalido em $k]"; fi ;;
+        else STATE_BAD=1; STATE_NOTE="${STATE_NOTE:- [ESTADO com valor invalido em $k]}"; fi ;;
       s=*) REG="$REG${line#s=}
 " ;;
-      *) STATE_NOTE=" [estado com linha que nao entendo]" ;;
+      *) STATE_BAD=1; STATE_NOTE="${STATE_NOTE:- [ESTADO com linha que nao entendo]}" ;;
     esac
-  done < "$STATE"
+  done <<EOF
+$content
+EOF
   return 0
 }
 reg_put() {  # $1=id $2=nome $3=template $4=rss $5=marca (vazio ou u): põe a sessão no registro, trocando a linha dela se já estava (uma sessão que segue ativa é candidata de novo na rodada seguinte)
@@ -299,9 +305,21 @@ EOF
   REG="$new$1|$2|$3|$4|$NOW${5:+|$5}
 "
 }
-save_state() {  # rc 0 gravou; rc 1 não gravou (o chamador diz)
-  local tmp="$STATE.tmp.$$" l
+save_state() {  # rc 0 gravou; rc 1 não gravou (o chamador diz). Estado que existe e que não li inteiro (STATE_BAD) é "não sei": o arquivo antigo é GUARDADO (rename, que funciona sem ler) antes de qualquer gravação; se nem isso der, NÃO grava e diz
+  local tmp="$STATE.tmp.$$" l kept
   mkdir -p "$(dirname "$STATE")" 2>/dev/null
+  # vazio (o arquivo sumiu desde a leitura: nada a guardar) → segue e grava; falhou o rename → rc 1 sem tocar no arquivo antigo
+  if [ "$STATE_BAD" = 1 ] && [ -e "$STATE" ]; then
+    kept="$STATE.ilegivel.$NOW"; [ -e "$kept" ] && kept="$kept.$$"
+    if mv "$STATE" "$kept" 2>/dev/null; then
+      STATE_BAD=0; STATE_NOTE="$STATE_NOTE [estado antigo guardado em ${kept##*/}]"
+      log "ESTADO: o arquivo de estado nao foi lido inteiro; guardei o original em $kept antes de gravar o novo (o registro de sessoes suspensas, se havia, esta la)"
+    else
+      case "$STATE_NOTE" in *"NAO gravei o estado"*) ;; *) STATE_NOTE="$STATE_NOTE [NAO gravei o estado: nao consegui guardar o antigo]" ;; esac   # uma vez só: cada sessão cortada tenta gravar de novo
+      log "FALHOU: o arquivo de estado $STATE nao foi lido inteiro e nao consegui guarda-lo (rename para $kept falhou): NAO gravei por cima"
+      return 1
+    fi
+  fi
   {
     printf 'v=1\nlast_cut_ts=%s\nlast_after_swap=%s\n' "$LAST_CUT_TS" "$LAST_AFTER_SWAP"
     printf '%s' "$REG" | while IFS= read -r l; do [ -n "$l" ] && printf 's=%s\n' "$l"; done
@@ -446,21 +464,22 @@ triggered() {  # rc 0 se algum gatilho vale. Preenche WHY_TRIG
 
 # ── --run ─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
 do_run() {
-  local sw_txt out_tmp roster_tmp cut_n=0 fail_n=0 unc_n=0 unk_n=0 unc_list="" unk_txt="" unc_txt="" pr idle2 still skipped="" cutlist="" tops="" cand_n=0 pause_msg="" pause_ok=-1 exp rem sw_after back rcs st
+  local sw_txt out_tmp roster_tmp cut_n=0 fail_n=0 save_fail=0 fail_txt="" unc_n=0 unk_n=0 unc_list="" unk_txt="" unc_txt="" pr idle2 still skipped="" cutlist="" tops="" cand_n=0 pause_msg="" pause_ok=-1 exp rem sw_after back rcs st
   local id name alias template session_name agent_name wd skey rss idle ident store tried blocked nl src
   nl=$'\n'
 
   read_history || { log "SEM LEITURA: $BLIND — nao corto, nao pauso"; say "SEM LEITURA: $BLIND; nao cortei nada"; return 30; }
   sw_txt="swap ${SW_REF}MB${GROWTH:+ (${GROWTH}MB em ${GROW_WINDOW_S}s)}"
   triggered || { log "sem gatilho: $sw_txt$GROWTH_NOTE$SW_NOTE"; say "sem gatilho: $sw_txt$GROWTH_NOTE (limites: +${GROW_MB}MB/${GROW_WINDOW_S}s, ${ABS_MB}MB)"; return 10; }
-  log "GATILHO: $WHY_TRIG ($sw_txt)$GROWTH_NOTE$SW_NOTE"
+  # vazio (sem arquivo de estado) → STATE_NOTE vazio, nada a dizer; ilegível/valor inválido/linha desconhecida → STATE_NOTE diz, no log do gatilho e em TODA linha de saída abaixo (o "sem gatilho" acima não lê nem grava o estado)
   load_state
+  log "GATILHO: $WHY_TRIG ($sw_txt)$GROWTH_NOTE$SW_NOTE$STATE_NOTE"
 
   # carência: acabei de cortar e o swap não voltou a subir desde então → a base de crescimento ainda enxerga o salto de antes do corte; só mantém a pausa
   if [ "$LAST_CUT_TS" -gt 0 ] && [ $((NOW - LAST_CUT_TS)) -lt "$COOLDOWN_S" ] && [ "$SW_REF" -lt $((LAST_AFTER_SWAP + GROW_MB / 2)) ]; then
     if [ "$MODE" = run ]; then keep_pause "carencia: $WHY_TRIG"; fi
     log "carencia: cortei ha $((NOW - LAST_CUT_TS))s (swap depois do corte ${LAST_AFTER_SWAP}MB, agora ${SW_REF}MB)$PAUSE_NOTE"
-    say "em carencia ($((NOW - LAST_CUT_TS))s < ${COOLDOWN_S}s desde o corte): $sw_txt$PAUSE_NOTE"
+    say "em carencia ($((NOW - LAST_CUT_TS))s < ${COOLDOWN_S}s desde o corte)$STATE_NOTE: $sw_txt$PAUSE_NOTE"
     return ${PAUSE_RC:-10}
   fi
 
@@ -559,7 +578,9 @@ EOF
   fi
 
   sw_after=""
-  if [ "$MODE" = run ] && { [ "$cut_n" -gt 0 ] || [ "$fail_n" -gt 0 ] || [ "$unc_n" -gt 0 ]; }; then
+  # a carência (LAST_CUT_TS) só arma depois de uma rodada que CORTOU ou pediu suspend ainda sem confirmação (cut_n+unc_n > 0). Rodada em que TODO suspend falhou (cut_n=0, unc_n=0, fail_n>0) não mudou nada:
+  # não arma a carência, não grava estado, e a rodada seguinte tenta suspender de novo (o rc 20 e a linha FALHOU seguem sendo ditos abaixo). Cortar de verdade em uma sessão e falhar em outra arma, porque houve corte
+  if [ "$MODE" = run ] && [ $((cut_n + unc_n)) -gt 0 ]; then
     LAST_CUT_TS=$NOW
     sleep "$SETTLE_S"
     if [ "$unc_n" -gt 0 ]; then   # UMA releitura dos não confirmados, agora que o reconciler teve o SETTLE_S: dormindo → CORTOU; ainda não → continua `u` e a linha diz
@@ -579,14 +600,15 @@ EOF
     fi
     sw_after=$(read_swap_mb) || sw_after=""
     isnum "$sw_after" && LAST_AFTER_SWAP=$sw_after || LAST_AFTER_SWAP=$SW_REF
-    save_state || { log "WARN: nao consegui gravar $STATE: o registro das sessoes suspensas fica so no log"; fail_n=$((fail_n + 1)); }
+    # falhou a gravação → save_fail (rc 20), contado à parte: não é "suspend com rc != 0", e a linha não pode dizer que foi
+    save_state || { log "WARN: nao consegui gravar $STATE: o registro das sessoes suspensas fica so no log"; save_fail=1; }
   fi
 
   # a linha. "mantida por leitura impossivel" != "mantida porque estava ocupada": a linha diz quantas foram por não conseguir ler (bd/gc/transcricao/orcamento)
   [ "$unk_n" -gt 0 ] && unk_txt="; $unk_n delas mantida(s) por leitura impossivel (bd/gc/transcricao/orcamento), nao por estarem ocupadas"
   if [ "$MODE" = dry ]; then
-    if [ "$cut_n" -gt 0 ]; then say "(dry-run) $WHY_TRIG: cortaria $cut_n sessao(oes) ociosa(s): $cutlist; pausaria o spawn do Pilot por ${PAUSE_TTL_S}s"; return 10; fi
-    say "(dry-run) $WHY_TRIG: sem candidata permitida ($cand_n candidata(s) no roster, todas mantidas:$skipped$unk_txt); pausaria o spawn do Pilot por ${PAUSE_TTL_S}s; maiores donos: $tops"; return 10
+    if [ "$cut_n" -gt 0 ]; then say "(dry-run) $WHY_TRIG$STATE_NOTE: cortaria $cut_n sessao(oes) ociosa(s): $cutlist; pausaria o spawn do Pilot por ${PAUSE_TTL_S}s"; return 10; fi
+    say "(dry-run) $WHY_TRIG$STATE_NOTE: sem candidata permitida ($cand_n candidata(s) no roster, todas mantidas:$skipped$unk_txt); pausaria o spawn do Pilot por ${PAUSE_TTL_S}s; maiores donos: $tops"; return 10
   fi
   rem=""
   if [ "$pause_ok" = 1 ]; then rem="; pausou o spawn novo do Pilot ate $(hhmm "$PAUSE_UNTIL")"; elif [ "$pause_ok" = 0 ]; then rem="; NAO gravou a pausa do spawn do Pilot"; fi
@@ -594,14 +616,17 @@ EOF
     if [ -n "$sw_after" ]; then rem="$rem; swap ${SW_REF}->${sw_after}MB (voltou $((SW_REF - sw_after))MB)"; else rem="$rem; swap depois do corte ilegivel"; fi
   fi
   [ "$unc_n" -gt 0 ] && unc_txt="; $unc_n suspend(s) pedido(s) SEM confirmacao de estado apos ${SETTLE_S}s (hold posto; no registro como nao confirmados)"
-  if [ "$fail_n" -gt 0 ] || [ "$pause_ok" = 0 ]; then
-    say "FALHOU em parte: $WHY_TRIG: cortou $cut_n${cutlist:+ ($cutlist)}, $fail_n suspend(s) com rc != 0 e a sessao ainda ativa$unc_txt$rem"
+  # a linha diz O QUE falhou: suspend (rc != 0 e a sessão ativa), registro que não gravou, pausa que não gravou. Falha só da pausa não diz "0 suspend(s) com rc != 0"
+  if [ "$fail_n" -gt 0 ] || [ "$save_fail" = 1 ] || [ "$pause_ok" = 0 ]; then
+    [ "$fail_n" -gt 0 ] && fail_txt=", $fail_n suspend(s) com rc != 0 e a sessao ainda ativa"
+    [ "$save_fail" = 1 ] && fail_txt="$fail_txt, NAO gravei o registro das sessoes suspensas"
+    say "FALHOU em parte: $WHY_TRIG$STATE_NOTE: cortou $cut_n${cutlist:+ ($cutlist)}$fail_txt$unc_txt$rem"
     return 20
   fi
-  if [ "$cut_n" -gt 0 ] || [ "$unc_n" -gt 0 ]; then say "$WHY_TRIG: cortou $cut_n sessao(oes) ociosa(s)${cutlist:+: $cutlist}$unc_txt$rem"; return 0; fi
+  if [ "$cut_n" -gt 0 ] || [ "$unc_n" -gt 0 ]; then say "$WHY_TRIG$STATE_NOTE: cortou $cut_n sessao(oes) ociosa(s)${cutlist:+: $cutlist}$unc_txt$rem"; return 0; fi
   # gatilho ativo e ninguém para cortar
   log "SEM CANDIDATA: $cand_n candidata(s) no roster, todas mantidas:$skipped"
-  say "$WHY_TRIG e NAO ha sessao de pool ociosa para cortar ($cand_n candidata(s) mantida(s))$unk_txt; maiores donos: $tops$rem"
+  say "$WHY_TRIG$STATE_NOTE e NAO ha sessao de pool ociosa para cortar ($cand_n candidata(s) mantida(s))$unk_txt; maiores donos: $tops$rem"
   return 11
 }
 
