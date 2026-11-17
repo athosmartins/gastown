@@ -1,8 +1,10 @@
+# D4 — reinício guardado do mini (ga-1p1i5jr.4)
+
 ## Contents
 
-- O que é · Como ver o que ele decidiu · Como desligar · As guardas · Cooldown e laço · O que ele NÃO faz · Pedido pendente · Estado terminal · Limites conhecidos · O que ainda não foi provado · Testar
-
-# D4 — reinício guardado do mini (ga-1p1i5jr.4)
+• O que é · Como ver o que ele decidiu · Como desligar · As guardas · Cooldown e laço
+• O que ele NÃO faz · Pedido pendente · Estado terminal (ga-1p1i5jr.10) · Limites conhecidos
+• O que ainda não foi provado · Testar
 
 ## O que é
 
