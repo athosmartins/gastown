@@ -16,6 +16,9 @@
 #   reserva do aviso falhar SEMPRE no mini, com o push no teto global o D4 nunca reiniciava (ga-hp9pwtr). `n_mail` conta o mail que o engine ACEITARIA, `n_mail_try` as tentativas.
 #   ga-1p1i5jr.10 (estado terminal): replay de 10/11 (guarda de envio estoura o prazo com 185 MB livres → leitura barata de reserva); envio ilegível no estado terminal → pausa REAL (outreach_config de mentira, SQL de verdade
 #   no sqlite3 de verdade; o `sqlite3` do cenário delega a ele e tem modos de falha), esvaziamento, reinício; a pausa é solta pelo emit ou pelo `--resume` (pós-boot, pedido pendente, outro dono); nada disso fora do estado terminal.
+#   ga-tklekcn (guarda da ronda noturna do WA): a ronda em curso ADIA o reinício — rodada aberta no health.db (finished_at IS NULL, iniciada nas últimas 3 h; as bordas) OU o flock da ronda
+#   segurado (um flock EX de verdade, num processo à parte, lido pelo F_GETLK do D4 sem adquirir); as duas leituras têm os 3 estados (em curso = adia · sem ronda = segue · ilegível = rc 30) e
+#   só o estado TERMINAL do disco faz a ronda ceder. As seções `ronda_*` reprovam no D4 anterior à guarda (rodar com DR4_ST_SUT apontando a cópia antiga).
 # COMO NÃO REINICIA: o D4 só chama DR4_REBOOT_CMD (um stub que anota e, no cenário "o mini cai", mata o próprio D4 como o desligamento mata) ou
 #   DR4_OSASCRIPT_BIN (outro stub); DR4_NO_REAL_REBOOT=1 vale em TODOS os cenários: se uma costura sumir, o comando de verdade é recusado.
 # FILTRO: D4_ST_ONLY='^cool$|^cap$' roda só esses cenários; DR4_ST_SUT aponta outra cópia do D4 (a bateria de mutantes usa os dois).
@@ -27,7 +30,8 @@ NIGHTLY_REAL="${DR4_ST_NIGHTLY:-$D/nightly-reboot.sh}"
 ONLY="${D4_ST_ONLY:-}"
 SKIP=0
 T=$(mktemp -d "${TMPDIR:-/tmp}/d4-selftest.XXXXXX") || { echo "FAIL: sem diretório temporário"; exit 1; }
-trap 'rm -rf "$T" 2>/dev/null' EXIT
+HOLD_PID=""   # o processo que segura o flock da ronda de mentira (ga-tklekcn); o trap o mata, senão ele sobra por 2 min
+trap '[ -z "$HOLD_PID" ] || kill "$HOLD_PID" 2>/dev/null; rm -rf "$T" 2>/dev/null' EXIT
 
 PASS=0; FAIL=0
 check() {  # $1=descrição; resto = comando de teste (palavras, sem && nem !)
@@ -100,10 +104,42 @@ case "$last" in
     case "$m" in *race=pause*) /usr/bin/sqlite3 "$C/assign.db" "UPDATE outreach_config SET value='1', updated_at='2000-01-01 00:00:00' WHERE key='system_paused'; UPDATE outreach_config SET value='thies-wa: corrida' WHERE key='system_paused_by';" ;; esac
     case "$m" in *write=fail*) echo "Error: attempt to write a readonly database" >&2; exit 8 ;; esac ;;
   *"SELECT 'p='"*) case "$m" in *read=fail*) echo "Error: no such table: outreach_config" >&2; exit 1 ;; esac ;;
+  *nightly_audit_rodada*)   # a leitura da ronda no health.db (ga-tklekcn): ronda=hang|fail|junk|empty
+    case "$m" in
+      *ronda=hang*) sleep 30; exit 0 ;;
+      *ronda=fail*) echo "Error: no such table: nightly_audit_rodada" >&2; exit 1 ;;
+      *ronda=junk*) echo "abc"; exit 0 ;;
+      *ronda=empty*) exit 0 ;;
+    esac ;;
 esac
 exec /usr/bin/sqlite3 "$@"
 EOS
 }
+mk_health() {  # health.db de mentira com a tabela da ronda (o DDL é o do WA: lib/nightly_audit_findings_store.py, _CREATE_SQL), VAZIA = nenhuma rodada. Todo cenário nasce com ele: a guarda da ronda lê (ga-tklekcn) e "sem banco" não é "sem ronda"
+  [ "$SKIP" = 1 ] && return 0
+  rm -f "$C/health.db"; /usr/bin/sqlite3 "$C/health.db" "CREATE TABLE nightly_audit_rodada (rodada_id TEXT PRIMARY KEY, started_at TEXT NOT NULL, finished_at TEXT, status TEXT NOT NULL DEFAULT 'em_andamento', devices_no_roster INTEGER NOT NULL DEFAULT 0, diagnostico_status TEXT, diagnostico_bead_id TEXT, diagnosticado_at TEXT);"
+}
+add_rodada() {  # $1=idade em segundos (relativa ao DR4_NOW do cenário: o started_at fica em hora LOCAL, 'YYYY-MM-DD HH:MM:SS', como o WA grava) · $2=aberta|fechada
+  [ "$SKIP" = 1 ] && return 0
+  local s; s=$(date -r $((NOW - $1)) '+%Y-%m-%d %H:%M:%S')
+  if [ "$2" = aberta ]; then /usr/bin/sqlite3 "$C/health.db" "INSERT OR IGNORE INTO nightly_audit_rodada (rodada_id, started_at, status) VALUES ('r$1-$2', '$s', 'em_andamento');"
+  else /usr/bin/sqlite3 "$C/health.db" "INSERT OR IGNORE INTO nightly_audit_rodada (rodada_id, started_at, finished_at, status) VALUES ('r$1-$2', '$s', '$s', 'concluida');"; fi
+}
+cat > "$T/hold.py" <<'PYEOF'
+import fcntl, os, sys, time
+# o MESMO gesto do cdp_driver_lock do WA: flock EX não bloqueante num fd com O_CLOEXEC; segura até morrer
+fd = os.open(sys.argv[1], os.O_RDWR | os.O_CREAT | os.O_CLOEXEC, 0o600)
+fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+print("held", flush=True)
+time.sleep(120)
+PYEOF
+hold_ronda_lock() {  # $1=arquivo → um processo à parte segura um flock EX de VERDADE nele (HOLD_PID) e só volta quando ele disse "held"
+  [ "$SKIP" = 1 ] && return 0
+  : > "$T/hold.out"; /usr/bin/python3 -I "$T/hold.py" "$1" > "$T/hold.out" 2>&1 & HOLD_PID=$!
+  local i=0; while ! grep -q '^held' "$T/hold.out" 2>/dev/null && [ "$i" -lt 100 ]; do sleep 0.1; i=$((i + 1)); done
+  grep -q '^held' "$T/hold.out" || { echo "FAIL: o processo que segura o flock da ronda não subiu ($(cat "$T/hold.out"))"; FAIL=$((FAIL + 1)); }
+}
+release_ronda_lock() { [ -z "$HOLD_PID" ] || { kill "$HOLD_PID" 2>/dev/null; wait "$HOLD_PID" 2>/dev/null; }; HOLD_PID=""; }
 mk_case() {  # $1=nome → C=$T/<nome> com stubs "tudo ok" e o vetor ENVV
   SKIP=0
   if [ -n "$ONLY" ] && ! printf '%s' "$1" | grep -Eq "$ONLY"; then
@@ -136,7 +172,9 @@ exit \$(cat $C/reboot.rc)"
   # captura da conversa viva (ga-esorlre.2): anota "<args>|marca=<1 se a marca do reinício JÁ estava no estado>"; capture.hang = pendura; capture.rc = o rc
   echo 0 > "$C/capture.rc"; : > "$C/capture.calls"
   printf 'import os, sys, time\nC = "%s"\nm = os.path.exists(C + "/state") and "reboots=%s" in open(C + "/state").read()\nopen(C + "/capture.calls", "a").write(" ".join(sys.argv[1:]) + "|marca=" + str(int(m)) + "\\n")\nif os.path.exists(C + "/capture.hang"):\n  time.sleep(60)\nsys.exit(int(open(C + "/capture.rc").read()))\n' "$C" "$NOW" > "$C/capture_stub.py"
+  mk_health
   ENVV=(
+    "DR4_HEALTH_DB=$C/health.db" "DR4_RONDA_LOCK=$C/ronda.lock"   # ga-tklekcn: banco da ronda com a tabela vazia e um caminho de trava que NÃO existe = sem ronda
     "DR_CITY=$C/city" "DR4_STATE=$C/state" "DR4_LOG=$C/log" "DR_OFF_FILE=$C/off"
     "DR_NOTIFY_BIN=$C/bin/notify" "DR_GC_BIN=$C/bin/gc"
     "DR4_NOW=$NOW" "DR4_BOOT_EPOCH=$BOOT" "DR4_FREE_MB_OVERRIDE=2000" "DR4_CONSOLE_USER=athos"
@@ -220,7 +258,7 @@ run_sut --dry-run
 check "dry-run: rc 0 (veio $RC: $OUT)" [ "$RC" = 0 ]
 check "dry-run: uma linha" one_line
 check "dry-run: reiniciaria" contains "reiniciaria agora"
-check "dry-run: as 4 guardas leram ok" contains "calls=ok · sender=ok · dolt=ok · scraper=ok"
+check "dry-run: as 5 guardas leram ok (a 5ª, ronda, é a ga-tklekcn)" contains "calls=ok · sender=ok · dolt=ok · scraper=ok · ronda=ok"
 chk "dry-run: não reiniciou, não escreveu estado, não avisou, não deixou trava" 'no_reboot && [ ! -e "$C/state" ] && [ "$(n_notify)" = 0 ] && [ "$(n_mail)" = 0 ] && [ ! -e "$C/state.lock.d" ]'
 
 section "run feliz: o mini 'cai' (o stub mata o D4 como o desligamento)"
@@ -874,6 +912,118 @@ mk_case rs_bad2; printf 'v=1\nreboots=\nsp_mark=abc\n' > "$C/state"; run_sut --r
 chk "o --run também recusa o sp_mark ilegível (rc 30, sem reinício; veio $RC: $OUT)" '[ "$RC" = 30 ] && contains "sp_mark" && no_reboot'
 mk_case rs_uso; run_sut --resume --run
 check "--resume com outro modo: rc 2" [ "$RC" = 2 ]
+
+# ═══ ga-tklekcn — a ronda noturna do WA é guarda que ADIA o reinício ═══════════════════════════════════════════════════════════════════
+# Replay: 09/11 21:36:08 (9 de 13 pares) e 12/11 21:27:50 (2 de 13): o D4 reiniciou o mini no MEIO da ronda e a rodada morreu. Duas leituras, qualquer uma "em curso" adia: (1) rodada aberta no
+# health.db (finished_at IS NULL, iniciada nas últimas 3 h); (2) o flock da ronda (/tmp/wa_nightly_audit/run.lock) segurado. Cada uma tem os 3 estados; ilegível = rc 30 (inerte, como as outras guardas).
+section "ronda: rodada ABERTA no health.db adia o reinício (replay de 09/11 e 12/11)"
+mk_case ronda_open; add_rodada 1800 aberta
+run_sut --run
+expect_no_reboot "rodada aberta há 30 min" 10 "ronda"
+chk "rodada aberta: diz de onde veio, segura 10 min e AVISA o adiamento (veio: $OUT)" 'contains "rodada(s) aberta(s)" && state_has "defer_until=$((NOW + 600))" && grep -q "reinício adiado (ronda)" "$C/notify.log" && grep -q "ronda=" "$C/log"'
+mk_case ronda_dry; add_rodada 1800 aberta
+run_sut --dry-run
+chk "dry-run com a ronda aberta: rc 10, uma linha, nada escrito, ninguém avisado (veio $RC: $OUT)" '[ "$RC" = 10 ] && one_line && contains "ronda" && no_reboot && [ ! -e "$C/state" ] && [ "$(n_notify)" = 0 ]'
+
+section "ronda: as bordas da janela de 3 h, a rodada fechada e o relógio"
+mk_case ronda_b0; add_rodada 10800 aberta;   run_sut --dry-run
+chk "iniciada há EXATAMENTE 3 h e ainda aberta: conta (borda inclusiva; veio $RC: $OUT)" '[ "$RC" = 10 ] && contains "ronda"'
+mk_case ronda_b1; add_rodada 10801 aberta;   run_sut --dry-run
+chk "iniciada há 3 h e 1 s: não conta mais, o D4 reiniciaria (veio $RC: $OUT)" '[ "$RC" = 0 ] && contains "ronda=ok"'
+mk_case ronda_old; add_rodada 14400 aberta;  run_sut --dry-run
+chk "aberta há 4 h (rodada que morreu sem fechar): não segura o reinício para sempre (veio $RC: $OUT)" '[ "$RC" = 0 ] && contains "ronda=ok"'
+mk_case ronda_closed; add_rodada 60 fechada; run_sut --dry-run
+chk "rodada FECHADA há 1 min (finished_at preenchido): não é ronda em curso (veio $RC: $OUT)" '[ "$RC" = 0 ] && contains "ronda=ok"'
+mk_case ronda_mix; add_rodada 60 fechada; add_rodada 14400 aberta; run_sut --dry-run
+chk "uma fechada recente + uma aberta velha demais: nenhuma conta (veio $RC: $OUT)" '[ "$RC" = 0 ] && contains "ronda=ok"'
+mk_case ronda_mix2; add_rodada 60 fechada; add_rodada 7200 aberta; run_sut --dry-run
+chk "uma fechada recente + uma aberta há 2 h: a aberta conta (veio $RC: $OUT)" '[ "$RC" = 10 ] && contains "ronda"'
+mk_case ronda_fut; add_rodada -600 aberta;   run_sut --dry-run
+chk "aberta com started_at no FUTURO (o relógio voltou): conta como em curso, o lado inerte (veio $RC: $OUT)" '[ "$RC" = 10 ] && contains "ronda"'
+mk_case ronda_win; add_rodada 7200 aberta; setenv "DR4_RONDA_WINDOW_S=3600"; run_sut --dry-run
+chk "DR4_RONDA_WINDOW_S chega à guarda: com janela de 1 h a aberta há 2 h não conta (veio $RC: $OUT)" '[ "$RC" = 0 ] && contains "ronda=ok"'
+mk_case ronda_win_bad; add_rodada 7200 aberta; setenv "DR4_RONDA_WINDOW_S=abc"; run_sut --dry-run
+chk "janela ilegível cai nos 3 h do padrão (a aberta há 2 h conta) e o log diz (veio $RC: $OUT)" '[ "$RC" = 10 ] && contains "ronda" && grep -q "DR4_RONDA_WINDOW_S=.abc.->10800" "$C/log"'
+
+section "ronda: o FLOCK da ronda segurado adia, mesmo sem linha no banco; livre ou ausente = segue"
+mk_case ronda_lk; hold_ronda_lock "$C/ronda.lock"
+run_sut --run
+expect_no_reboot "flock da ronda segurado por outro processo" 10 "ronda"
+chk "flock segurado: diz que foi o flock, segura 10 min e a trava continua com o dono (o D4 só pergunta, não adquire; veio: $OUT)" 'contains "flock da ronda segurado" && state_has "defer_until=$((NOW + 600))" && kill -0 "$HOLD_PID" 2>/dev/null'
+release_ronda_lock
+run_sut --dry-run
+chk "controle: o MESMO arquivo de trava, agora sem dono, deixa o D4 seguir (o teste acima não passou por acaso; veio $RC: $OUT)" '[ -e "$C/ronda.lock" ] && [ "$RC" = 0 ] && contains "ronda=ok"'
+mk_case ronda_lk_none; run_sut --dry-run
+chk "arquivo de trava AUSENTE (ninguém a segurou nesta boot): segue (veio $RC: $OUT)" '[ ! -e "$C/ronda.lock" ] && [ "$RC" = 0 ] && contains "ronda=ok"'
+mk_case ronda_lk_perm; : > "$C/ronda.lock"; chmod 000 "$C/ronda.lock"
+run_sut --run
+chk "trava que existe e eu NÃO consigo abrir: não sei → rc 30, não reinicia (veio $RC: $OUT)" '[ "$RC" = 30 ] && no_reboot && contains "ronda" && contains "open"'
+chmod 600 "$C/ronda.lock" 2>/dev/null
+
+section "ronda: o banco ilegível NÃO é 'sem ronda' (3º estado: rc 30, não reinicia)"
+mk_case ronda_dbfail; echo "ronda=fail" > "$C/sqlite.mode"; run_sut --run
+chk "sqlite3 falha (tabela sumiu/banco travado): rc 30, sem reinício, a linha cita a ronda (veio $RC: $OUT)" '[ "$RC" = 30 ] && no_reboot && contains "ronda" && contains "sqlite3 rc="'
+mk_case ronda_dbhang; echo "ronda=hang" > "$C/sqlite.mode"; setenv "DR4_CHEAP_S=1"; run_sut --run
+chk "sqlite3 PENDURA além do prazo: rc 30, nunca 'sem ronda' (veio $RC: $OUT)" '[ "$RC" = 30 ] && no_reboot && contains "ronda" && contains "rc=124"'
+mk_case ronda_dbjunk; echo "ronda=junk" > "$C/sqlite.mode"; run_sut --run
+chk "resposta que não é número: rc 30 (veio $RC: $OUT)" '[ "$RC" = 30 ] && no_reboot && contains "ronda" && contains "não é um número"'
+mk_case ronda_dbempty; echo "ronda=empty" > "$C/sqlite.mode"; run_sut --run
+chk "resposta VAZIA com rc 0: não é '0 rodadas', é 'não respondeu' → rc 30 (veio $RC: $OUT)" '[ "$RC" = 30 ] && no_reboot && contains "ronda"'
+mk_case ronda_nodb; rm -f "$C/health.db"; run_sut --run
+chk "health.db inexistente: rc 30 (veio $RC: $OUT)" '[ "$RC" = 30 ] && no_reboot && contains "ronda" && contains "não existe"'
+mk_case ronda_notab; rm -f "$C/health.db"; /usr/bin/sqlite3 "$C/health.db" "CREATE TABLE outra (a INTEGER);"; run_sut --run
+chk "banco SEM a tabela da ronda (sqlite3 de verdade erra): rc 30 (veio $RC: $OUT)" '[ "$RC" = 30 ] && no_reboot && contains "ronda"'
+mk_case ronda_unk_aviso; echo "ronda=fail" > "$C/sqlite.mode"; run_sut --run
+chk "ilegível avisa que NÃO reinicia por não conseguir ler (o mesmo aviso das outras guardas; veio: $(cat "$C/notify.log"))" 'grep -q "o D4 não consegue ler uma guarda" "$C/notify.log" && grep -q "ronda" "$C/notify.log"'
+
+section "ronda: leitura positiva vence a ilegível (um lado diz 'em curso', o outro 'não sei')"
+mk_case ronda_win1; hold_ronda_lock "$C/ronda.lock"; echo "ronda=fail" > "$C/sqlite.mode"; run_sut --run
+chk "flock segurado + banco ilegível: ADIA (rc 10), não rc 30 (veio $RC: $OUT)" '[ "$RC" = 10 ] && no_reboot && contains "flock da ronda segurado"'
+release_ronda_lock
+mk_case ronda_win2; add_rodada 60 aberta; : > "$C/ronda.lock"; chmod 000 "$C/ronda.lock"; run_sut --run
+chk "rodada aberta + trava ilegível: ADIA (rc 10), não rc 30 (veio $RC: $OUT)" '[ "$RC" = 10 ] && no_reboot && contains "rodada(s) aberta(s)"'
+chmod 600 "$C/ronda.lock" 2>/dev/null
+
+section "ronda: só o estado TERMINAL do disco faz a ronda ceder (o adiamento não pode deixar o disco chegar a zero)"
+mk_case ronda_t1; setenv "DR4_FREE_MB_OVERRIDE=185"; add_rodada 1800 aberta; touch "$C/reboot.dies"
+run_sut --run
+chk "terminal (185 MB) + rodada aberta: REINICIA (kill 143; veio $RC: $OUT)" '[ "$RC" = 143 ] && [ "$(n_reboot)" = 1 ]'
+chk "…e o aviso (-p 5, ANTES do pedido) diz que a ronda noturna do WA será cortada, para quem decide abortar" 'grep -q "ronda noturna do WA" "$C/notify.at-reboot" && grep -q "ATENÇÃO" "$C/notify.at-reboot"'
+mk_case ronda_t2; setenv "DR4_FREE_MB_OVERRIDE=185"; hold_ronda_lock "$C/ronda.lock"; touch "$C/reboot.dies"
+run_sut --run
+chk "terminal + flock segurado: REINICIA (kill 143; veio $RC: $OUT)" '[ "$RC" = 143 ] && grep -q "ronda noturna do WA" "$C/notify.at-reboot"'
+release_ronda_lock
+mk_case ronda_t3; setenv "DR4_FREE_MB_OVERRIDE=185"; echo "ronda=fail" > "$C/sqlite.mode"; touch "$C/reboot.dies"
+run_sut --run
+chk "terminal + banco da ronda ilegível: REINICIA (a ronda ilegível não segura o disco que vai travar; kill 143; veio $RC: $OUT)" '[ "$RC" = 143 ] && grep -q "ronda noturna do WA" "$C/notify.at-reboot"'
+mk_case ronda_t4; setenv "DR4_FREE_MB_OVERRIDE=185"; add_rodada 1800 aberta
+run_sut --dry-run
+chk "dry-run terminal + rodada aberta: rc 0 'reiniciaria', cita a ronda que será cortada, e NÃO escreve (veio $RC: $OUT)" '[ "$RC" = 0 ] && contains "reiniciaria agora" && contains "ronda noturna do WA" && contains "ronda=cede" && [ ! -e "$C/state" ] && [ "$(n_notify)" = 0 ]'
+mk_case ronda_t5; setenv "DR4_FREE_MB_OVERRIDE=1000"; add_rodada 1800 aberta
+run_sut --run
+chk "crítico (1000 MB, < 1,5 GB) mas SEM sequência do maestro: ainda NÃO é terminal, a ronda adia (rc 10; veio $RC: $OUT)" '[ "$RC" = 10 ] && no_reboot && contains "ronda"'
+mk_case ronda_t6; setenv "DR4_FREE_MB_OVERRIDE=1000"; setenv "DR4_HARD_STREAK=2"; add_rodada 1800 aberta; touch "$C/reboot.dies"
+run_sut --run
+chk "1000 MB com DR4_HARD_STREAK=2 (terminal pela sequência do maestro): a ronda cede e reinicia (kill 143; veio $RC: $OUT)" '[ "$RC" = 143 ]'
+mk_case ronda_t7; setenv "DR4_FREE_MB_OVERRIDE=500"; add_rodada 1800 aberta
+run_sut --run
+chk "500 MB (borda: terminal é < 500): a ronda ainda adia (rc 10; veio $RC: $OUT)" '[ "$RC" = 10 ] && no_reboot'
+mk_case ronda_t8; setenv "DR4_FREE_MB_OVERRIDE=499"; add_rodada 1800 aberta; touch "$C/reboot.dies"
+run_sut --run
+chk "499 MB: terminal, a ronda cede e reinicia (kill 143; veio $RC: $OUT)" '[ "$RC" = 143 ]'
+mk_case ronda_t9; setenv "DR4_FREE_MB_OVERRIDE=185"; add_rodada 1800 aberta; echo 1 > "$C/sender.rc"; echo "central_sender_restart_safe: 1 envio(s) em voo" > "$C/sender.out"
+run_sut --run
+chk "terminal: a ronda cede só por ELA — envio em voo (lido) segue bloqueando (rc 10, cita sender; veio $RC: $OUT)" '[ "$RC" = 10 ] && no_reboot && contains "sender" && ! contains "ronda"'
+mk_case ronda_t10; setenv "DR4_FREE_MB_OVERRIDE=2000"; add_rodada 1800 aberta; touch "$C/reboot.dies"
+run_sut --run
+chk "controle: o aviso do reinício FORA do estado terminal não existe com ronda aberta (nada reiniciou; veio $RC: $OUT)" '[ "$RC" = 10 ] && no_reboot && ! grep -q "ronda noturna do WA" "$C/notify.log"'
+
+section "ronda: a ronda que NASCE durante a carência cancela o reinício (a releitura vale; mesma regra das outras guardas)"
+mk_case ronda_re
+printf '/usr/bin/sqlite3 "%s/health.db" "INSERT OR IGNORE INTO nightly_audit_rodada (rodada_id, started_at, status) VALUES ('"'"'nasceu'"'"', '"'"'%s'"'"', '"'"'em_andamento'"'"');"\n' "$C" "$(date -r $NOW '+%Y-%m-%d %H:%M:%S')" > "$C/notify.hook"
+run_sut --run
+chk "a ronda abriu depois do aviso: rc 10, NÃO reiniciou, diz 'releitura final' e a ronda (veio $RC: $OUT)" '[ "$RC" = 10 ] && no_reboot && contains "releitura final" && contains "ronda"'
+chk "…e o cancelamento foi avisado (-p 5) com a ronda no assunto" 'grep -q "reinício cancelado na última checagem (ronda)" "$C/notify.log"'
 
 echo
 echo "disk-recovery-d4-guarded-reboot.selftest: PASS=$PASS FAIL=$FAIL"

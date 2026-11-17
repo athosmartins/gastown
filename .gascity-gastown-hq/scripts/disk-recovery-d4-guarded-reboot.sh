@@ -34,6 +34,13 @@
 #   Não usa o `nightly-reboot.sh --check-guards` inteiro: o guard3 (beads hq em andamento) bloquearia para sempre (sempre há agente trabalhando; o
 #   próprio noturno em modo dreno decide só pelas guardas de segurança) e ele não tem timeout — Dolt doente é o cenário de disco cheio.
 #
+# RONDA NOTURNA DO WA (ga-tklekcn; quinta guarda, `ronda`). 09/11 21:36 (9 de 13 pares) e 12/11 21:27 (2 de 13): o D4 reiniciou o mini no MEIO da ronda das 21:00 e a rodada morreu. Ronda em curso = (1) rodada aberta no health.db
+#   (nightly_audit_rodada: finished_at IS NULL e started_at nas últimas RONDA_WINDOW_S = 3 h; a ronda dura ~28 min, o resto da janela cobre rodada longa sem segurar o reinício para sempre uma rodada que morreu sem fechar) OU (2) o flock da
+#   ronda (/tmp/wa_nightly_audit/run.lock, lib/nightly_audit_run_lock.py do WA) segurado: lido por F_GETLK, que só PERGUNTA (um flock de teste poderia fazer a ronda real, que tenta LOCK_EX|LOCK_NB uma vez, ler "já em curso" e desistir). As duas
+#   leituras têm os 3 estados: em curso = adia (10) · sem ronda = segue · ilegível (banco ausente/sem a tabela/travado, trava que não abro, python sem resposta, plataforma que não medi) = rc 30, NÃO reinicia; "em curso" de um lado vence
+#   "não sei" do outro. Trava AUSENTE = ninguém a segura (quem segura a criou antes). É a única guarda que CEDE: com o disco em estado TERMINAL (abaixo) a ronda não adia nem ilegível trava — o disco que chega a zero derruba tudo, não só a ronda —,
+#   e o aviso (-p 5) e o log dizem que a ronda será cortada. Fora do terminal, ronda aberta adia como as outras guardas.
+#
 # ESTADO TERMINAL (ga-1p1i5jr.10). 10/11 o mini travou por pânico (watchdog) com 185 MB livres: a guarda de envio estourou os 60 s sob thrash de swap → "não sei" → rc 30 → o D4 ficou inerte justamente no estado em que a
 #   máquina cai sozinha, sem dreno. TERMINAL = livre < TERMINAL_MB (500) OU livre < HARD_MB com DR4_HARD_STREAK >= 2 (as leituras seguidas que o maestro contou; sem a variável vale 0). Duas mudanças: (1) a guarda de envio ganhou uma
 #   leitura BARATA de reserva (sqlite3 direto no queue.db: sem python, sem import, sem rede) quando o python não dá resposta, em QUALQUER estado do disco: ela conta TODA linha 'sending' (nunca menos que o python, que ainda descarta a
@@ -49,7 +56,7 @@
 #   mesmo assim, então ela não serve de preditor). Falha vira rc 20 e desfaz a marca; a prova real é o canário do D5.
 #
 # COSTURAS (DR4_*; o selftest NUNCA reinicia de verdade): DR4_REBOOT_CMD · DR4_NO_REAL_REBOOT=1 (recusa o comando de verdade) · DR4_FREE_MB_OVERRIDE ·
-#   DR4_NOW · DR4_BOOT_EPOCH · DR4_CONSOLE_USER · DR4_*_BIN (DR4_SQLITE_BIN inclusive) · DR4_CALLS_PY · DR4_SENDER_SAFE_PY · DR4_QUEUE_DB · DR4_ASSIGN_DB · DR4_HARD_STREAK · DR4_NIGHTLY · DR4_STATE/LOG/LOCKD · limites numéricos
+#   DR4_NOW · DR4_BOOT_EPOCH · DR4_CONSOLE_USER · DR4_*_BIN (DR4_SQLITE_BIN inclusive) · DR4_CALLS_PY · DR4_SENDER_SAFE_PY · DR4_QUEUE_DB · DR4_ASSIGN_DB · DR4_HEALTH_DB · DR4_RONDA_LOCK · DR4_RONDA_WINDOW_S · DR4_HARD_STREAK · DR4_NIGHTLY · DR4_STATE/LOG/LOCKD · limites numéricos
 #   (número ilegível cai no padrão e é dito no log). Compartilhados com o orquestrador DE PROPÓSITO: DR_OFF_FILE, DR_NOTIFY_BIN, DR_GC_BIN. Bash 3.2.
 
 set -uo pipefail
@@ -81,6 +88,8 @@ OSASCRIPT="${DR4_OSASCRIPT_BIN:-/usr/bin/osascript}"
 SQLITE="${DR4_SQLITE_BIN:-/usr/bin/sqlite3}"
 QUEUE_DB="${DR4_QUEUE_DB:-/Users/athos/shared/data/queue.db}"                  # o mesmo padrão do central_sender_restart_safe.py (DEFAULT_DB): duas fontes do caminho; se o WA o mover, a leitura barata lê um arquivo velho
 ASSIGN_DB="${DR4_ASSIGN_DB:-/Users/athos/shared/data/demand_assignments.db}"   # onde mora outreach_config (system_paused): o mesmo diretório do queue.db
+HEALTH_DB="${DR4_HEALTH_DB:-/Users/athos/shared/data/health.db}"               # onde mora nightly_audit_rodada: o MESMO padrão do WA (nightly_audit_findings_store._DEFAULT_DB, e o do nightly_audit_deadman.sh); três fontes do caminho — se o WA o mover, a guarda lê um arquivo velho
+RONDA_LOCK="${DR4_RONDA_LOCK:-/tmp/wa_nightly_audit/run.lock}"                  # o DEFAULT_LOCK_PATH de lib/nightly_audit_run_lock.py. O WA aceita trocá-lo por NIGHTLY_AUDIT_RUN_LOCK; o D4 não vê o ambiente da ronda, então só este padrão (e a leitura do banco cobre a ronda que usar outro)
 SP_ID="disk-recovery-d4:"                                                       # prefixo do system_paused_by: é assim que reconheço uma pausa NOSSA (o D3 usa "disk-recovery-d3:")
 
 DRY=0
@@ -123,6 +132,7 @@ cfg HARD_STREAK_N 2    # com livre < HARD_MB e HARD_STREAK >= isto, também é t
 cfg CHEAP_S 25         # prazo de cada chamada do sqlite3 (leitura barata do envio, leitura e escrita da pausa)
 cfg DRAIN_S 150        # com o envio pausado, espera isto para esvaziar (um envio on-device leva ~2 min)
 cfg DRAIN_POLL_S 10    # intervalo entre as leituras baratas durante o esvaziamento
+cfg RONDA_WINDOW_S 10800  # rodada aberta (sem finished_at) só conta se começou nas últimas 3 h: a ronda dura ~28 min; mais velha que isto é rodada que morreu sem fechar (ga-tklekcn)
 cfg CAPTURE_TIMEOUT_S 30  # prazo da captura da conversa viva (--final) antes do reinício (ga-esorlre.2); estourou/falhou = só o log avisa
 
 now() { case "${DR4_NOW:-}" in ''|*[!0-9]*) date +%s ;; *) printf '%s' "$DR4_NOW" ;; esac; }
@@ -500,12 +510,94 @@ guard_scraper() {  # rodada do property_scrapers em curso (a função do noturno
   return 0
 }
 
-GUARDS_SUMMARY=""; BLOCK_NAMES=""; BLOCK_WHY=""; UNK_NAMES=""; UNK_WHY=""; UNK_LIST=" "
+R_STATE=""; R_WHY=""
+# F_GETLK pergunta "alguém segura este arquivo?" SEM adquirir nada (medido no mini em 17/11, Darwin 25.6: com um flock EX de outro processo devolve l_type=F_WRLCK e l_pid=-1; sem dono, F_UNLCK — ou seja, no macOS o F_GETLK enxerga um flock(); no Linux os dois
+# mecanismos são separados e o layout do struct também muda, por isso qualquer plataforma que não seja darwin sai "não sei"). Um flock de teste (LOCK_SH|LOCK_NB) também
+# responderia, mas por um instante TOMA a trava: a ronda real tenta LOCK_EX|LOCK_NB UMA vez (timeout=0 no cdp_driver_lock: uma tentativa e o prazo já passou) e leria "já em curso", abortando uma rodada que não tinha concorrente.
+# Só vale o PAR (rc, palavra): 0+livre · 0+ausente · 1+segurado; qualquer outra coisa (inclusive o rc 1 de um traceback) é "não sei".
+read -r -d '' RONDA_LOCK_PY <<'PYEOF' || true
+import fcntl, os, struct, sys
+if sys.platform != "darwin":
+    print("plataforma %s: o F_GETLK de um flock so foi medido no macOS" % sys.platform); sys.exit(2)
+try:
+    fd = os.open(sys.argv[1], os.O_RDONLY | os.O_CLOEXEC)
+except FileNotFoundError:
+    print("ausente"); sys.exit(0)
+except OSError as e:
+    print("open: %s" % e); sys.exit(2)
+try:
+    fmt = "@qqihh"   # struct flock do macOS: l_start, l_len, l_pid, l_type, l_whence
+    t = struct.unpack(fmt, fcntl.fcntl(fd, fcntl.F_GETLK, struct.pack(fmt, 0, 0, 0, fcntl.F_WRLCK, 0)))[3]
+except Exception as e:
+    print("F_GETLK: %s" % e); sys.exit(2)
+if t == fcntl.F_UNLCK:
+    print("livre"); sys.exit(0)
+if t in (fcntl.F_RDLCK, fcntl.F_WRLCK):
+    print("segurado"); sys.exit(1)
+print("F_GETLK devolveu l_type=%s, que nao reconheco" % t); sys.exit(2)
+PYEOF
+ronda_db() {  # rodada aberta no health.db → R_STATE ok|block|unknown (R_WHY). Aberta = finished_at IS NULL e started_at (hora LOCAL 'YYYY-MM-DD HH:MM:SS', como o WA grava) nas últimas RONDA_WINDOW_S; started_at no futuro (relógio voltou) conta
+  R_STATE="unknown"; R_WHY=""
+  local rc v cut
+  # vazio (tabela sem rodada aberta) → COUNT 0 → ok; falhou/ilegível (banco ausente, sem a tabela, travado, rc≠0, prazo estourado, sem saída, saída que não é um número, corte da janela que não montei) → unknown, NUNCA "0 rodadas"
+  if [ ! -f "$HEALTH_DB" ]; then R_WHY="$HEALTH_DB não existe"; return 0; fi
+  cut=$(date -r $(( NOW - RONDA_WINDOW_S )) '+%Y-%m-%d %H:%M:%S' 2>/dev/null)
+  case "$cut" in [0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]' '[0-9][0-9]:[0-9][0-9]:[0-9][0-9]) ;; *) R_WHY="não montei o corte da janela de ${RONDA_WINDOW_S}s ('${cut:-vazio}')"; return 0 ;; esac
+  run_bounded "$CHEAP_S" "$SQLITE" -batch -cmd ".timeout 3000" -cmd "PRAGMA query_only=ON" "$HEALTH_DB" "SELECT COUNT(*) FROM nightly_audit_rodada WHERE finished_at IS NULL AND started_at >= '$cut';"; rc=$?
+  v=$(out_raw | tr -d ' \r')
+  if [ "$rc" -ne 0 ]; then R_WHY="sqlite3 rc=$rc: $(out_line)"
+  elif ! isnum "$v"; then R_WHY="resposta que não é um número: '$(out_line)'"
+  elif [ "$v" -eq 0 ]; then R_STATE="ok"; R_WHY="nenhuma rodada aberta desde $cut"
+  else R_STATE="block"; R_WHY="$v rodada(s) aberta(s) em nightly_audit_rodada (finished_at IS NULL, iniciada desde $cut)"; fi
+  rb_clean; return 0
+}
+ronda_lock() {  # flock da ronda segurado → R_STATE ok|block|unknown (R_WHY). Só o par (rc, palavra) que o python imprime vale: rc 1 também é o que um traceback devolve
+  R_STATE="unknown"; R_WHY=""
+  local rc line
+  # vazio (arquivo de trava ausente) → ok: quem segura a trava a criou antes (O_CREAT); falhou/ilegível (não abro, F_GETLK erra, plataforma que não medi, python sem resposta no prazo, saída fora do par) → unknown, NUNCA "livre"
+  run_bounded "$GUARD_TIMEOUT_S" "$PY" -I -c "$RONDA_LOCK_PY" "$RONDA_LOCK"; rc=$?
+  line=$(out_line)
+  case "$rc:$line" in
+    0:livre) R_STATE="ok"; R_WHY="flock da ronda livre ($RONDA_LOCK)" ;;
+    0:ausente) R_STATE="ok"; R_WHY="sem arquivo de trava da ronda ($RONDA_LOCK): ninguém a segura" ;;
+    1:segurado) R_STATE="block"; R_WHY="flock da ronda segurado ($RONDA_LOCK): a ronda noturna está rodando" ;;
+    *) R_WHY="rc=$rc: $line" ;;
+  esac
+  rb_clean; return 0
+}
+guard_ronda() {  # as duas leituras, 3 estados cada: "em curso" de QUALQUER uma adia (positivo vence "não sei"); as duas livres = ok; o resto = não sei
+  G_STATE="unknown"; G_WHY=""
+  local ds dw ls lw
+  ronda_db;   ds=$R_STATE; dw=$R_WHY
+  ronda_lock; ls=$R_STATE; lw=$R_WHY
+  if [ "$ds" = block ] || [ "$ls" = block ]; then
+    G_STATE="block"
+    [ "$ds" = block ] && G_WHY="$dw"
+    [ "$ls" = block ] && G_WHY="${G_WHY:+$G_WHY; }$lw"
+    [ "$ds" = unknown ] && G_WHY="$G_WHY | banco da ronda ilegível: $dw"
+    [ "$ls" = unknown ] && G_WHY="$G_WHY | trava da ronda ilegível: $lw"
+  elif [ "$ds" = ok ] && [ "$ls" = ok ]; then
+    G_STATE="ok"; G_WHY="$dw; $lw"
+  else
+    [ "$ds" = unknown ] && G_WHY="banco da ronda: $dw"
+    [ "$ls" = unknown ] && G_WHY="${G_WHY:+$G_WHY; }trava da ronda: $lw"
+  fi
+  return 0
+}
+
+GUARDS_SUMMARY=""; BLOCK_NAMES=""; BLOCK_WHY=""; UNK_NAMES=""; UNK_WHY=""; UNK_LIST=" "; RONDA_NOTE=""
 run_guards() {  # avalia TODAS (mesmo depois de uma bloquear: uma linha mostra tudo o que está no caminho). rc 0 = todas ok · 1 = alguma bloqueia · 2 = nenhuma bloqueia mas alguma não deu pra ler (UNK_LIST = " calls sender ")
-  GUARDS_SUMMARY=""; BLOCK_NAMES=""; BLOCK_WHY=""; UNK_NAMES=""; UNK_WHY=""; UNK_LIST=" "
+  GUARDS_SUMMARY=""; BLOCK_NAMES=""; BLOCK_WHY=""; UNK_NAMES=""; UNK_WHY=""; UNK_LIST=" "; RONDA_NOTE=""
   local g
-  for g in calls sender dolt scraper; do
+  for g in calls sender dolt scraper ronda; do
     "guard_$g"
+    # a ronda é a única guarda que CEDE (ga-tklekcn): com o disco em estado terminal ela não adia nem trava por ilegível. Registra o que cedeu: o aviso e o log dizem que a ronda será cortada
+    if [ "$g" = ronda ] && [ "$G_STATE" != ok ] && is_terminal; then
+      RONDA_NOTE="a ronda noturna do WA ($G_STATE: $G_WHY) NÃO adia o reinício porque o disco está em estado terminal (livre ${FREE_MB} MB); se ela está rodando, este reinício a corta"
+      GUARDS_SUMMARY="$GUARDS_SUMMARY${GUARDS_SUMMARY:+ · }ronda=cede($G_STATE)"
+      log "guarda ronda cede ao estado terminal (livre=${FREE_MB}MB): $G_STATE — $G_WHY"
+      continue
+    fi
     GUARDS_SUMMARY="$GUARDS_SUMMARY${GUARDS_SUMMARY:+ · }$g=$G_STATE"
     case "$G_STATE" in
       ok) ;;
@@ -801,14 +893,14 @@ esac
 
 SWAP=$(swap_used)
 if [ "$DRY" = 1 ]; then
-  emit 0 "reiniciaria agora (livre=${FREE_MB}MB ${TIER}, swap=${SWAP}; ${GUARDS_SUMMARY})${TERM_NOTE:+ [estado terminal: $TERM_NOTE]}${HOLD_NOTE}"
+  emit 0 "reiniciaria agora (livre=${FREE_MB}MB ${TIER}, swap=${SWAP}; ${GUARDS_SUMMARY})${TERM_NOTE:+ [estado terminal: $TERM_NOTE]}${RONDA_NOTE:+ [$RONDA_NOTE]}${HOLD_NOTE}"
 fi
 
 # 8 — o reinício de verdade: aviso → carência → releitura → grava e confere → pede
 # O aviso é CONDIÇÃO do reinício, não cortesia (decisão do Athos: "e AVISA"): sem ninguém avisado a carência para abortar é teatro. Não entregou (notify rc≠0 ou prazo
 # estourado = "não sei") → 2º canal, o mail ao Mayor; os dois falharam → não reinicia (inerte), espera e tenta de novo. Nunca "aviso enviado" sem confirmação.
 SP_TXT=""; [ "$SP_HOLD" = 1 ] && SP_TXT=" O envio de primeiro contato só volta depois do boot (o D4 o solta sozinho)."
-WARN_TXT="Livre ${FREE_MB} MB (${TIER}), swap ${SWAP}. Guardas ok: ${GUARDS_SUMMARY}.${TERM_NOTE:+ ATENÇÃO, disco em estado terminal: $TERM_NOTE.}${SP_TXT} Volto em ~2 min (auto-login + postcheck). Para ABORTAR agora: touch ${OFF}"
+WARN_TXT="Livre ${FREE_MB} MB (${TIER}), swap ${SWAP}. Guardas: ${GUARDS_SUMMARY}.${TERM_NOTE:+ ATENÇÃO, disco em estado terminal: $TERM_NOTE.}${RONDA_NOTE:+ ATENÇÃO: $RONDA_NOTE.}${SP_TXT} Volto em ~2 min (auto-login + postcheck). Para ABORTAR agora: touch ${OFF}"
 WARN_VIA="notify"
 if ! send_notify 5 "Disco: reiniciando o mini em ${GRACE_S}s" "$WARN_TXT"; then
   if send_mail "Disco: reiniciando o mini em ${GRACE_S}s (o push NÃO foi confirmado)" "$WARN_TXT"; then WARN_VIA="mail ao Mayor (o push NÃO foi confirmado)"
@@ -887,7 +979,7 @@ case ",$S_REBOOTS," in
   *",$MARK,"*) ;;
   *) emit 20 "gravei o estado mas a marca $MARK não está nele quando releio — NÃO reinicio" ;;
 esac
-log "REINÍCIO AUTOMÁTICO (D4, decisão do Athos 01/11) marca=$MARK livre=${FREE_MB}MB ${TIER} swap=${SWAP} no ar há $(( (MARK - BOOT_EPOCH) / 60 )) min; guardas: ${GUARDS_SUMMARY}${TERM_NOTE:+; estado terminal: $TERM_NOTE}. Marca gravada e conferida; pedindo o reinício"
+log "REINÍCIO AUTOMÁTICO (D4, decisão do Athos 01/11) marca=$MARK livre=${FREE_MB}MB ${TIER} swap=${SWAP} no ar há $(( (MARK - BOOT_EPOCH) / 60 )) min; guardas: ${GUARDS_SUMMARY}${TERM_NOTE:+; estado terminal: $TERM_NOTE}${RONDA_NOTE:+; $RONDA_NOTE}. Marca gravada e conferida; pedindo o reinício"
 
 if [ -n "${DR4_REBOOT_CMD:-}" ]; then
   run_bounded "$REBOOT_TIMEOUT_S" env LANG=en_US.UTF-8 LC_ALL=en_US.UTF-8 bash -c "$DR4_REBOOT_CMD"; rrc=$?
