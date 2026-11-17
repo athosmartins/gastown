@@ -7,7 +7,8 @@
 • Guards (zero false-positive is the paramount constraint)
 • Durable prevention — commit convention (fixes the sibling root cause)
 • Joint/split beads — the stale-comment guard (ga-2zp4h)
-• Gate-passed stories wait for delivery (ga-botvu2) · Marker index (ga-1m99gpb) · Operating
+• Gate-passed stories wait for delivery (ga-botvu2)
+• Marker index — one bulk read per sweep (ga-1m99gpb) · Operating
 
 Closes beads that are stuck `in_progress` ("em voo" on the Kanban) even though
 their code is already merged to `origin/main`. Runs as a launchd sweep
