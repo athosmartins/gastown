@@ -1040,6 +1040,19 @@ já na chamada seguinte. **Uma linha `pool-probe: …` no stderr, ou saída ≠ 
 PRÓPRIO script for negado, avise o Mayor e espere (não divida o script pra contornar):
 `gc session nudge mayor/ "dog sem sonda: <comando negado>"`
 
+**Os Steps 1a e 1b do dog (trabalho já atribuído a você) rodam pelo script, UM por chamada (ga-ica007):**
+`sh "$GC_CITY_PATH/packs/town-deltas/assets/scripts/pool-probe-assigned.sh" 1a`
+`sh "$GC_CITY_PATH/packs/town-deltas/assets/scripts/pool-probe-assigned.sh" 1b`
+Cada estágio do `sh -c` do engine termina em `2>/dev/null`: `bd` falhando ou resposta ilegível (ex.: um
+byte 0x08 cru numa descrição — o jq 1.8 recusa o documento inteiro) sai como `[]` com exit 0, IGUAL a
+"sem trabalho". O script é a MESMA sonda (mesmos `bd`, mesmos filtros, mesma ordenação, mesma saída:
+array JSON com no máximo 1 bead, ou `[]`; `pool-probe-assigned.selftest.sh` prova contra o texto do
+engine) e acrescenta só o que o engine cala. **Uma linha `pool-probe-assigned…` no stderr, ou saída ≠ 0,
+quer dizer que `[]` NÃO é "sem trabalho"**: exit 3 = um tier não pôde ser lido (não drene, avise o
+Mayor); exit 2 = nada foi sondado (sem identidade, ou argumento errado); exit 0 com bead + linha no
+stderr = achou, mas um tier anterior estava ilegível (pode haver bead de prioridade maior escondida —
+trate a bead, e avise o Mayor). O `sh -c` longo de 1a/1b do prompt só vale se o script não puder rodar.
+
 {{ if or (not .TD_ROLE) (eq .TD_ROLE "dog") (eq .TD_ROLE "ps-worker") (eq .TD_ROLE "wa-worker") -}}{{/* td:next-action-mayor-waiting */ -}}
 **Vai PARAR esperando decisão de outro agente (Mayor, tipicamente)? Grave na
 BEAD antes de parar — nudge sozinho te deixa INVISÍVEL (ga-1ygf6o).** MEDIDO
