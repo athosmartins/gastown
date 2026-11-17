@@ -15,7 +15,7 @@ REGRA  cada leitura tem TRÊS estados (igual ao liberado / diferente / não cons
   O vigia só LÊ e AVISA. Não muda o firewall: não há o item 'hcloud' (token da API de firewall) no cofre (17/11), e o firewall da nuvem não tem desfazer. Com o token, a atualização pela API
   (PUT /v1/firewalls/11795835/actions/set_rules) fica para uma fatia própria, com chave .on e prova de que o ssh volta.
 ARQUIVOS (só em <cidade>/.gc)  hetzner-fw-ip.state.json (liberado, visto, falhas seguidas, últimos avisos) · hetzner-fw-ip.lock (instância única: o launchd não empilha rodadas).
-  Estado corrompido (não é UTF-8, não é JSON, JSON fundo demais, campo de tipo errado) não some: a cópia fica em <arquivo>.corrupt-<epoch> e o vigia recomeça da semente (caso comum: um aviso a mais; se o IP voltar justo ao da semente com o firewall em outro, lê 'igual' até o --ack).
+  Estado corrompido (não é UTF-8, não é JSON, JSON fundo demais, campo de tipo errado ou texto que não grava) não some: a cópia fica em <arquivo>.corrupt-<epoch> e o vigia recomeça da semente (caso comum: um aviso a mais; se o IP voltar justo ao da semente com o firewall em outro, lê 'igual' até o --ack).
 USO  hetzner-fw-ip-watch.py [--dry-run] [--print] [--ack [IP]]
   (sem argumento) uma rodada: lê, compara, avisa se for o caso, grava o estado, imprime UMA linha.   --dry-run  não grava nem manda mail.   --print  imprime o estado e sai.
   --ack [IP]  o firewall já foi atualizado: grava IP (ou, sem argumento, o IP que as duas fontes dizem agora) como liberado.
@@ -64,6 +64,17 @@ def parse_ip(text):
     except ValueError:
         return None
     return str(ip) if ip.is_global else None
+
+
+def writable_text(x):
+    """True se x é texto que grava em UTF-8 (str sem surrogate solto). Número, lista, None e str com U+D800 = False."""
+    if not isinstance(x, str):
+        return False
+    try:
+        x.encode("utf-8")
+    except UnicodeEncodeError:
+        return False
+    return True
 
 
 def _int(env, key, default, lo):
@@ -152,7 +163,7 @@ def new_state(c):
 
 
 def load_state(c, now, dry):
-    """O estado gravado, ou um estado de semente. Ausente = semente (1ª rodada); corrompido (não é texto UTF-8, não é JSON, JSON fundo demais, campo de tipo errado) = a cópia fica em <arquivo>.corrupt-<epoch> (menos no --dry-run) e recomeça da semente."""
+    """O estado gravado, ou um estado de semente. Ausente = semente (1ª rodada); corrompido (não é texto UTF-8, não é JSON, JSON fundo demais, campo de tipo errado — inclusive fail_reason que não grava de volta e v que não é o inteiro 1) = a cópia fica em <arquivo>.corrupt-<epoch> (menos no --dry-run) e recomeça da semente."""
     path = os.path.join(c.gc_dir, STATE_NAME)
     # vazio → arquivo ausente = semente (liberado = o IP padrão); não consegui ler (OSError) → Fail (rc 3, nada é decidido); formato errado (bytes que não são UTF-8, JSON ilegível ou fundo demais, campo de tipo errado) → guarda a cópia e recomeça da semente. A semente pode estar velha (um --ack depois dela):
     # o caso comum é UM aviso a mais; o contrário (o IP voltar justo ao da semente com o firewall já em outro) o vigia lê como 'igual' até o próximo --ack
@@ -170,17 +181,21 @@ def load_state(c, now, dry):
     if raw is not None:
         try:
             st = json.loads(raw)
-            ok = isinstance(st, dict) and st.get("v") == 1 and not isinstance(st.get("v"), bool) and parse_ip(st.get("allowed_ip")) is not None
+            ok = isinstance(st, dict) and isinstance(st.get("v"), int) and not isinstance(st.get("v"), bool) and st["v"] == 1 and parse_ip(st.get("allowed_ip")) is not None
             ok = ok and isinstance(st.get("fails"), int) and not isinstance(st.get("fails"), bool) and st["fails"] >= 0
             for k in ("seen_epoch", "alarm_epoch", "blind_alarm_epoch"):
                 ok = ok and (st.get(k) is None or (isinstance(st[k], int) and not isinstance(st[k], bool)))
             for k in ("seen_ip", "alarm_ip"):
                 ok = ok and (st.get(k) is None or parse_ip(st[k]) is not None)
+            ok = ok and (st.get("fail_reason") is None or writable_text(st["fail_reason"]))  # a única chave de texto livre: com surrogate solto ela quebraria --print e a gravação seguinte
         except (ValueError, RecursionError):  # JSON ilegível (ValueError) ou fundo demais para o parser (RecursionError, que não é ValueError)
             ok = False
     if ok:
         base = new_state(c)
-        base.update({k: st[k] for k in base if k in st})  # só as chaves conhecidas: lixo a mais no arquivo não passa para o estado novo (e não trava a gravação)
+        base.update({k: st[k] for k in base if k in st})  # só as chaves conhecidas (todas validadas acima): lixo a mais no arquivo não passa para o estado novo (e não trava a gravação)
+        for k in ("allowed_ip", "seen_ip", "alarm_ip"):
+            if base[k] is not None:
+                base[k] = parse_ip(base[k])  # guarda a forma NORMALIZADA (sem espaços): o que foi validado é o que é comparado e gravado
         return base
     dest = "%s.corrupt-%d" % (path, now)
     if not dry:

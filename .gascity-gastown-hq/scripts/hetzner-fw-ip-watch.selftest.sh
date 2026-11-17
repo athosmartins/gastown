@@ -5,7 +5,7 @@
 #   Casos · Controle negativo · Como rodar
 #
 # CASOS  igual · diferente (mail, cooldown, IP novo, mail que falha) · não sei (fonte cai, discorda, resposta que não é IP, IP privado, timeout) · cegueira (N falhas seguidas, cooldown, zera com leitura boa)
-#   · episódio (voltou ao liberado e desviou de novo avisa na hora) · --ack · --dry-run · estado corrompido (texto torto, não-UTF-8, JSON fundo, campo de tipo errado, chave extra; --print e --ack herdam) · estado que não grava depois do mail · instância única · aviso desligado · configuração inválida · plist
+#   · episódio (voltou ao liberado e desviou de novo avisa na hora) · --ack · --dry-run · estado corrompido (texto torto, não-UTF-8, JSON fundo, campo de tipo errado, fail_reason que não grava, v float, chave extra, allowed_ip com espaço guardado normalizado; --print e --ack herdam) · write_atomic com texto que não grava (chamada direta) · estado que não grava depois do mail · instância única · aviso desligado · configuração inválida · plist
 # CONTROLE NEGATIVO  cada mutante (um trecho literal do script trocado, que tem de existir UMA vez) TEM de reprovar a suíte; mutante que passa = teste que não pega o bug.
 #   Cada um roda sob `ulimit -f` (teto de escrita por arquivo, ga-e6ug8gq) e a suíte dele pula os casos lentos (HFW_FAST=1).
 # COMO RODAR  hetzner-fw-ip-watch.selftest.sh   (HFW_UNDER_TEST=<script> roda a suíte contra outra cópia · HFW_NO_MUTANTS=1 pula o controle negativo · HFW_FAST=1 pula timeout e instância única)
@@ -162,17 +162,44 @@ reset; echo '{"v": 1, "allowed_ip": ["1.2.3.4"], "fails": 0}' > "$T/city/.gc/het
 reset; echo '{"v": 1, "allowed_ip": "'"$LIBERADO"'", "fails": 0, "seen_ip": 7}' > "$T/city/.gc/hetzner-fw-ip.state.json"; corrupt_case "seen_ip que não é texto"
 reset; echo '{"v": 1, "allowed_ip": "'"$LIBERADO"'", "fails": true}' > "$T/city/.gc/hetzner-fw-ip.state.json"; corrupt_case "fails booleano"
 reset; echo '{"v": true, "allowed_ip": "'"$LIBERADO"'", "fails": 0}' > "$T/city/.gc/hetzner-fw-ip.state.json"; corrupt_case "versão booleana"
-# chave a mais com texto que não grava de volta (surrogate solto): o estado vale, a chave extra não passa para o arquivo novo
+reset; echo '{"v": 1.0, "allowed_ip": "'"$LIBERADO"'", "fails": 0}' > "$T/city/.gc/hetzner-fw-ip.state.json"; corrupt_case "versão float (1.0)"
+reset; echo '{"v": 1, "allowed_ip": "'"$LIBERADO"'", "fails": 0, "fail_reason": "\ud800"}' > "$T/city/.gc/hetzner-fw-ip.state.json"; corrupt_case "fail_reason com surrogate solto"
+reset; echo '{"v": 1, "allowed_ip": "'"$LIBERADO"'", "fails": 0, "fail_reason": 7}' > "$T/city/.gc/hetzner-fw-ip.state.json"; corrupt_case "fail_reason que não é texto"
+# chave a mais com texto que não grava de volta (surrogate solto): o estado vale, a chave extra não passa para o arquivo novo (quem pega a falha de gravação em si é o caso direto de write_atomic mais abaixo; aqui o "nenhum .tmp" só prova que nada tentou gravar a chave)
 reset; echo '{"v": 1, "allowed_ip": "'"$LIBERADO"'", "fails": 0, "x": "\ud800"}' > "$T/city/.gc/hetzner-fw-ip.state.json"; both "$LIBERADO"; WARGS=""; run
 eq "chave extra ilegível de gravar: rc 0" 0 "$rc"; has "chave extra: rodada normal" "estado=igual" "$out"; hasnt "chave extra: sem traceback" "Traceback" "$err"
 ls "$T/city/.gc" | grep -q '\.tmp\.' && bad "chave extra: sobrou arquivo .tmp" || ok "chave extra: nenhum .tmp sobrando"
 python3 -B -c 'import json,sys; sys.exit(0 if "x" not in json.load(open(sys.argv[1])) else 1)' "$T/city/.gc/hetzner-fw-ip.state.json" && ok "chave extra: não foi copiada para o estado novo" || bad "chave extra: foi copiada para o estado novo"
+# allowed_ip com espaço na frente: o que foi validado (normalizado) é o que se compara e se grava; senão 2 fontes iguais ao liberado dariam "diferente" e 1 mail "( X → X)"
+reset; echo '{"v": 1, "allowed_ip": " '"$LIBERADO"'", "fails": 0}' > "$T/city/.gc/hetzner-fw-ip.state.json"; both "$LIBERADO"; WARGS=""; run
+eq "allowed_ip com espaço: rc 0" 0 "$rc"; has "allowed_ip com espaço: estado=igual" "estado=igual" "$out"; eq "allowed_ip com espaço: nenhum mail" 0 "$(calls)"; eq "allowed_ip com espaço: gravado normalizado" "$LIBERADO" "$(sget allowed_ip)"
 # --print e --ack herdam o conserto de load_state
 reset; printf '\xff\xfe\x00garbage' > "$T/city/.gc/hetzner-fw-ip.state.json"; WARGS="--print"; run
 eq "print com estado não-UTF-8: rc 0" 0 "$rc"; has "print com estado não-UTF-8: mostra a semente" "\"allowed_ip\": \"$LIBERADO\"" "$out"; hasnt "print: sem traceback" "Traceback" "$err"
 reset; printf '\xff\xfe\x00garbage' > "$T/city/.gc/hetzner-fw-ip.state.json"; WARGS="--ack $NOVO"; run
 eq "ack com estado não-UTF-8: rc 0" 0 "$rc"; eq "ack com estado não-UTF-8: grava o IP" "$NOVO" "$(sget allowed_ip)"
+reset; echo '{"v": 1, "allowed_ip": "'"$LIBERADO"'", "fails": 0, "fail_reason": "\ud800"}' > "$T/city/.gc/hetzner-fw-ip.state.json"; WARGS="--print"; run
+eq "print com fail_reason que não imprime: rc 0" 0 "$rc"; hasnt "print com fail_reason que não imprime: sem traceback" "Traceback" "$err"; has "print com fail_reason que não imprime: recomeça da semente" "\"fails\": 0" "$out"
 WARGS=""
+
+# write_atomic direto (ga-jhjnvqe, gate-fix 1): nenhuma entrada do estado chega até aqui com texto que não grava (load_state valida tudo), então só uma chamada direta exercita o `except ValueError`:
+# texto com surrogate solto tem de virar Fail (rc 3 no main), o arquivo antigo fica intacto e nenhum .tmp sobra
+mkdir -p "$T/wa"; echo antigo > "$T/wa/x.json"
+wa=$(python3 -B -c '
+import importlib.util, os, sys
+spec = importlib.util.spec_from_file_location("hfw_under_test", sys.argv[1]); m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
+p = os.path.join(sys.argv[2], "x.json")
+try:
+    m.write_atomic(p, "\ud800")
+    print("SEM-ERRO")
+except m.Fail as e:
+    print("Fail")
+except BaseException as e:
+    print("OUTRA:" + type(e).__name__)
+print("tmp=" + ",".join(sorted(f for f in os.listdir(sys.argv[2]) if ".tmp." in f)))
+print("conteudo=" + open(p).read().strip())
+' "$WATCH" "$T/wa" 2>&1)
+has "write_atomic com texto que não grava: vira Fail" "Fail" "$(printf '%s\n' "$wa" | sed -n 1p)"; eq "write_atomic com texto que não grava: nenhum .tmp sobra" "tmp=" "$(printf '%s\n' "$wa" | sed -n 2p)"; eq "write_atomic com texto que não grava: o arquivo antigo fica intacto" "conteudo=antigo" "$(printf '%s\n' "$wa" | sed -n 3p)"
 
 # estado ilegível (sem permissão de leitura) = não sei: não decide, não manda mail, não mexe no arquivo, sai com rc 3
 reset; both "$NOVO"; WARGS=""; run; before=$(cat "$T/city/.gc/hetzner-fw-ip.state.json")
@@ -255,6 +282,10 @@ if [ -z "${HFW_UNDER_TEST:-}" ] && [ "${HFW_NO_MUTANTS:-0}" != 1 ]; then
   mutant M19-chave-extra 'base.update({k: st[k] for k in base if k in st})' 'base.update(st)'
   mutant M20-versao-bool ' and not isinstance(st.get("v"), bool)' ''
   mutant M21-fails-bool ' and not isinstance(st.get("fails"), bool)' ''
+  mutant M22-fail-reason-nao-grava 'ok = ok and (st.get("fail_reason") is None or writable_text(st["fail_reason"]))' 'ok = ok and True'
+  mutant M23-ip-normalizado 'base[k] = parse_ip(base[k])  #' 'pass  #'
+  mutant M24-versao-float 'isinstance(st.get("v"), int) and not isinstance(st.get("v"), bool) and st["v"] == 1' 'st.get("v") == 1 and not isinstance(st.get("v"), bool)'
+  mutant M25-texto-sem-encode 'x.encode("utf-8")' 'pass'
   mutant M12-liberado-sozinho 'st["seen_ip"], st["seen_epoch"] = ip, now' 'st["seen_ip"], st["seen_epoch"], st["allowed_ip"] = ip, now, ip'
 fi
 
