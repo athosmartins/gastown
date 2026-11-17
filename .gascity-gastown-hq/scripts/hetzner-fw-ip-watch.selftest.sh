@@ -6,9 +6,11 @@
 #
 # CASOS  igual · diferente (mail, cooldown, IP novo, mail que falha) · não sei (fonte cai, discorda, resposta que não é IP, IP privado, timeout) · cegueira (N falhas seguidas, cooldown, zera com leitura boa)
 #   · episódio (voltou ao liberado e desviou de novo avisa na hora) · --ack · --dry-run · estado corrompido (texto torto, não-UTF-8, JSON fundo, campo de tipo errado, fail_reason que não grava, v float, chave extra, allowed_ip com espaço guardado normalizado; --print e --ack herdam) · write_atomic com texto que não grava (chamada direta) · estado que não grava depois do mail · instância única · aviso desligado · configuração inválida · plist
+#   · o arquivo de estado e o --print em texto exato · --print só lê · fail_reason em UTF-8 (--ack grava, --print mostra) · queda inesperada (rc 1) · unidade em processo único (limites da configuração, borda do cooldown, tamanho da resposta, texto dos avisos, grupo de processos)
 # CONTROLE NEGATIVO  cada mutante (um trecho literal do script trocado, que tem de existir UMA vez) TEM de reprovar a suíte; mutante que passa = teste que não pega o bug.
 #   Cada um roda sob `ulimit -f` (teto de escrita por arquivo, ga-e6ug8gq) e a suíte dele pula os casos lentos (HFW_FAST=1).
 # COMO RODAR  hetzner-fw-ip-watch.selftest.sh   (HFW_UNDER_TEST=<script> roda a suíte contra outra cópia · HFW_NO_MUTANTS=1 pula o controle negativo · HFW_FAST=1 pula timeout e instância única)
+#   HFW_FAST=1 também pula o bloco "limites, codificação e processo" (os mutantes embutidos rodam com ele e não precisam desses casos: cada um custaria ×13)
 #   exit 0 = tudo verde · 1 = algum caso ou mutante reprovou
 set -u
 HERE="$(cd "$(dirname "$0")" && pwd)"
@@ -80,6 +82,11 @@ reset; both "$NOVO"; run
 has "diferente: estado" "estado=diferente" "$out"; has "diferente: alarme enviado" "alarme=enviado" "$out"; eq "diferente: 1 mail" 1 "$(calls)"
 has "diferente: vai ao mayor por mail send" "mail send mayor" "$(cat "$STUB/gc.log")"; has "diferente: assunto traz o IP novo" "$NOVO" "$(cat "$STUB/gc.log")"
 eq "diferente: liberado NÃO muda sozinho" "$LIBERADO" "$(sget allowed_ip)"; eq "diferente: alarm_ip gravado" "$NOVO" "$(sget alarm_ip)"
+has "diferente: a linha impressa traz o IP lido e o liberado" "ip=$NOVO liberado=$LIBERADO" "$out"
+# vazio → arquivo ausente: o texto lido não bate e reprova; falhou/ilegível → idem (nunca passa por igual)
+hfw_exp=$(printf '{\n "alarm_epoch": %s,\n "alarm_ip": "%s",\n "allowed_ip": "%s",\n "blind_alarm_epoch": null,\n "fail_reason": null,\n "fails": 0,\n "seen_epoch": %s,\n "seen_ip": "%s",\n "v": 1\n}' "$NOW" "$NOVO" "$LIBERADO" "$NOW" "$NOVO")
+hfw_got=$(cat "$T/city/.gc/hetzner-fw-ip.state.json" 2>&1)
+[ "$hfw_got" = "$hfw_exp" ] && ok "diferente: o arquivo de estado, texto exato (chaves em ordem alfabética, recuo de 1 espaço)" || bad "diferente: o arquivo de estado difere do esperado: $(printf '%s' "$hfw_got" | tr '\n' ' ' | head -c 300)"
 NOW_OVERRIDE=$((NOW+600)) run; has "cooldown: 10 min depois não repete" "alarme=cooldown" "$out"; eq "cooldown: ainda 1 mail" 1 "$(calls)"
 NOW_OVERRIDE=$((NOW+10799)) run; has "cooldown: 1 s antes do fim não repete" "alarme=cooldown" "$out"; eq "cooldown: ainda 1 mail (borda)" 1 "$(calls)"
 NOW_OVERRIDE=$((NOW+10800)) run; has "cooldown: no fim repete" "alarme=enviado" "$out"; eq "cooldown: 2 mails" 2 "$(calls)"
@@ -138,6 +145,10 @@ reset; src "$H1" "rc 6"; src "$H2" "rc 6"; WARGS="--ack"; run; eq "ack sem IP e 
 reset; both "$NOVO"; WARGS="--dry-run"; run
 has "dry-run: diz que avisaria" "alarme=dry-run" "$out"; eq "dry-run: nenhum mail" 0 "$(calls)"; [ -f "$T/city/.gc/hetzner-fw-ip.state.json" ] && bad "dry-run: não grava estado" || ok "dry-run: não grava estado"
 WARGS=""; run; WARGS="--print"; run; has "print: mostra o estado" "\"allowed_ip\": \"$LIBERADO\"" "$out"
+eq "print: rc 0" 0 "$rc"
+# vazio → arquivo ausente: o texto lido não bate e reprova; falhou/ilegível → idem
+hfw_got=$(cat "$T/city/.gc/hetzner-fw-ip.state.json" 2>&1)
+[ "$out" = "$hfw_got" ] && ok "print: é o estado gravado, texto exato (chaves em ordem alfabética, recuo de 1 espaço)" || bad "print: o texto difere do arquivo gravado: $(printf '%s' "$out" | tr '\n' ' ' | head -c 300)"
 
 # ---- estado corrompido ---------------------------------------------------------------------------------------------------------------------------------
 reset; both "$LIBERADO"; echo '{"v": 1, "allowed_ip": "banana"' > "$T/city/.gc/hetzner-fw-ip.state.json"; WARGS=""; run
@@ -223,6 +234,148 @@ run HETZNER_FW_IP_BLIND_AFTER=0; eq "BLIND_AFTER=0: rc 3" 3 "$rc"
 reset; both "$NOVO"; run HETZNER_FW_IP_ALLOWED=$NOVO; has "liberado por ambiente (semente, 1ª rodada)" "estado=igual" "$out"
 run HETZNER_FW_IP_ALLOWED=9.9.9.9; has "semente do ambiente não vale depois da 1ª rodada (manda o estado)" "estado=igual" "$out"
 reset; both "$LIBERADO"; run HETZNER_FW_IP_COOLDOWN_S=60 HETZNER_FW_IP_ALLOWED=9.9.9.9; has "semente 9.9.9.9 ≠ IP lido: diferente" "estado=diferente" "$out"
+
+# ---- limites, codificação e processo -------------------------------------------------------------------------------------------------------------------
+# Só na rodada principal (HFW_FAST=1 pula): os mutantes embutidos rodam com ele e já têm o que precisam. A unidade importa o script uma vez e confere o que o fluxo inteiro não alcança.
+# EQUIVALENT 08c73e33ec 4e1996742d: parse_ip's `len(s) > 15` guard (and the `not s or` before it) only repeats what ipaddress.IPv4Address already refuses: an IPv4 literal is at most 4 x 3 digits + 3 dots = 15 characters, so `15 -> 16` lets one more length reach the library, which raises the ValueError the next lines turn into the same None, and `or -> and` makes the guard never fire (empty and long strings reach that same ValueError); MEASURED on 350653 inputs (every 4-octet combination of 15 octet spellings, random strings, non-str values) under python 3.9 and 3.12: same value or same exception class, with a control (`> 14`) that diverges
+# EQUIVALENT 637b7290d6: `return ips[0]` -> `ips[1]` in read_public_ip: load_config refuses fewer than 2 sources, the `if motivos` return above leaves one answer per source, and `len(set(ips)) != 1` returns unless all of them are equal, so ips[1] IS ips[0]; MEASURED on 775 scenarios (2-4 sources x agree/disagree/fail) with a control (discord not refused) that diverges; a 1-source config would raise IndexError, which load_config makes unreachable
+# EQUIVALENT 13b9789598: run_cmd's `universal_newlines=True` -> False: the same call passes errors="replace", and CPython opens the pipes in text mode when encoding, errors, text or universal_newlines is set, so the flag adds nothing; MEASURED on 8 commands (CR, CRLF, invalid UTF-8, empty, 70 KB, missing binary) under python 3.9 and 3.12: same (rc, out, err, why) including the types, with a control (no text flag at all) that diverges
+PYU='import importlib.machinery, importlib.util, os, signal, subprocess, sys, tempfile, time
+from types import SimpleNamespace
+sys.dont_write_bytecode = True
+ld = importlib.machinery.SourceFileLoader("hfw", sys.argv[1])
+m = importlib.util.module_from_spec(importlib.util.spec_from_loader("hfw", ld))
+ld.exec_module(m)
+bad = []
+nchk = [0]
+def chk(name, got, want):
+    nchk[0] += 1
+    try:
+        g = got()
+    except Exception as e:
+        g = "raised " + type(e).__name__
+    if g != want:
+        bad.append(name)
+        print("FAIL %s: esperado %r, veio %r" % (name, want, g))
+def raises(f, cls):
+    try:
+        f()
+    except cls:
+        return True
+    except Exception as e:
+        return "outra excecao " + type(e).__name__
+    return False
+def cfg(**kw):
+    env = {"GC_CITY_PATH": "/cidade"}
+    env.update(kw)
+    return m.load_config(env)
+# configuracao: os padroes e os limites (cooldown 0 vale; timeout do curl abaixo de 1 nao)
+c = cfg()
+chk("config: padroes", lambda: (c.blind_after, c.cooldown_s, c.blind_cooldown_s, c.curl_timeout_s, c.alarm_on), (3, 10800, 21600, 10, True))
+chk("config: COOLDOWN_S=0 vale", lambda: cfg(HETZNER_FW_IP_COOLDOWN_S="0").cooldown_s, 0)
+chk("config: BLIND_COOLDOWN_S=0 vale", lambda: cfg(HETZNER_FW_IP_BLIND_COOLDOWN_S="0").blind_cooldown_s, 0)
+chk("config: CURL_TIMEOUT_S=1 vale", lambda: cfg(HETZNER_FW_IP_CURL_TIMEOUT_S="1").curl_timeout_s, 1)
+chk("config: CURL_TIMEOUT_S=0 e recusado", lambda: raises(lambda: cfg(HETZNER_FW_IP_CURL_TIMEOUT_S="0"), ValueError), True)
+# borda do cooldown: no mesmo instante do aviso ele ainda nao acabou
+chk("due: nunca avisou", lambda: m.due(None, 100, 10800), True)
+chk("due: no mesmo instante do aviso", lambda: m.due(1000, 1000, 10800), False)
+chk("due: 1 s antes do fim", lambda: m.due(1000, 1000 + 10799, 10800), False)
+chk("due: no fim", lambda: m.due(1000, 1000 + 10800, 10800), True)
+chk("due: relogio que recuou avisa", lambda: m.due(1000, 999, 10800), True)
+chk("due: cooldown 0 avisa sempre", lambda: m.due(1000, 1000, 0), True)
+# o IPv4 publico mais longo tem 15 caracteres e vale; com 16 nao e IP
+chk("parse_ip: IPv4 publico de 15 caracteres", lambda: m.parse_ip("123.123.123.123"), "123.123.123.123")
+chk("parse_ip: 16 caracteres nao e IP", lambda: m.parse_ip("1234.123.123.123"), None)
+# leitura de uma fonte e envio do mail com o processo trocado por um gravador: argv e limite de tempo sao o comportamento
+real_run = m.run_cmd
+rec = []
+resp = []
+def fake_run(argv, timeout):
+    rec.append((list(argv), timeout))
+    return resp.pop(0)
+m.run_cmd = fake_run
+try:
+    cc = SimpleNamespace(curl_bin="CURL", curl_timeout_s=7)
+    resp[:] = [(0, "179.197.107.78\n", "", None)]
+    chk("read_source: resposta boa", lambda: m.read_source(cc, "https://h/ip"), ("179.197.107.78", None))
+    chk("read_source: argv do curl e teto de fora (max-time + 5)", lambda: rec[-1], (["CURL", "-4", "-fsS", "--max-time", "7", "https://h/ip"], 12))
+    for size, want in ((64, "resposta-invalida"), (65, "resposta-grande")):
+        resp[:] = [(0, "9" * size, "", None)]
+        chk("read_source: corpo de %d caracteres" % size, lambda: m.read_source(cc, "u"), (None, want))
+    cm = SimpleNamespace(gc_bin="GC", city="/cidade")
+    resp[:] = [(0, "", "", None)]
+    chk("send_mail: enviou", lambda: m.send_mail(cm, "S", "B"), True)
+    chk("send_mail: argv do mail ao mayor e limite de 45 s", lambda: rec[-1], (["GC", "--city", "/cidade", "mail", "send", "mayor", "-s", "S", "-m", "B"], 45))
+finally:
+    m.run_cmd = real_run
+# o texto dos avisos
+cmsg = SimpleNamespace(city="/cidade", sources=["https://api.ipify.org", "https://ifconfig.me/ip"], cooldown_s=10800, blind_cooldown_s=21600)
+stc = {"fails": 3, "fail_reason": "fonte-sem-resposta(timeout)", "allowed_ip": "1.2.3.4"}
+chk("changed_message: cita as fontes pelo host", lambda: "(as 2 fontes api.ipify.org e ifconfig.me concordam)" in m.changed_message(cmsg, "1.2.3.4", "5.6.7.8")[1], True)
+chk("changed_message: diz que repete a cada 3 h", lambda: "Repete a cada 3 h enquanto" in m.changed_message(cmsg, "1.2.3.4", "5.6.7.8")[1], True)
+chk("blind_message: proximo aviso em no minimo 6 h", lambda: "em no m\xednimo 6 h;" in m.blind_message(cmsg, stc)[1], True)
+# processo de verdade: um comando que trava vira timeout e leva o grupo de processos inteiro (o neto tambem)
+def vivo(p):
+    out = subprocess.run(["ps", "-o", "stat=", "-p", str(p)], stdout=subprocess.PIPE, universal_newlines=True).stdout.strip()
+    return bool(out) and not out.startswith("Z")
+pf = os.path.join(tempfile.mkdtemp(), "pid")
+chk("run_cmd: comando que trava termina como timeout", lambda: m.run_cmd(["sh", "-c", "sleep 60 & echo $! > " + pf + "; wait"], 2), (None, "", "", "timeout"))
+# vazio -> sem arquivo de pid (o sh nem rodou): vira pid 0 e o teste do grupo abaixo reprova com "sem pid"; arquivo ilegivel ou vazio -> o int() levanta e o bloco todo cai com traceback (o shell reprova a unidade, nunca passa)
+pid = int(open(pf).read().strip()) if os.path.exists(pf) else 0
+for _ in range(50):
+    if not pid or not vivo(pid):
+        break
+    time.sleep(0.1)
+chk("run_cmd: o grupo inteiro morre no timeout (o neto tambem)", lambda: vivo(pid) if pid else "sem pid", False)
+if pid and vivo(pid):
+    os.kill(pid, signal.SIGKILL)
+# o mesmo caminho do timeout com o Popen trocado: quem recebe SIGKILL e quanto se espera pelos canos depois dele
+class FP(object):
+    last = None
+    def __init__(self, argv, **kw):
+        self.pid = 424242
+        self.returncode = None
+        self.waits = []
+        FP.last = self
+    def communicate(self, timeout=None):
+        self.waits.append(timeout)
+        if len(self.waits) == 1:
+            raise subprocess.TimeoutExpired("falso", timeout)
+        return ("", "")
+real_popen, real_killpg = subprocess.Popen, os.killpg
+sent = []
+subprocess.Popen = FP
+os.killpg = lambda pid, sig: sent.append((pid, sig))
+try:
+    got_fp = m.run_cmd(["x"], 3)
+finally:
+    subprocess.Popen, os.killpg = real_popen, real_killpg
+chk("run_cmd (Popen falso): devolve timeout", lambda: got_fp, (None, "", "", "timeout"))
+chk("run_cmd (Popen falso): SIGKILL no grupo do filho", lambda: sent, [(424242, signal.SIGKILL)])
+chk("run_cmd (Popen falso): espera no maximo 5 s pelos canos depois do kill", lambda: FP.last.waits, [3, 5])
+print("CHECKS %d" % nchk[0])
+print("DONE %d" % len(bad))'
+if [ "${HFW_FAST:-0}" != 1 ]; then
+  # vazio → sem a linha DONE o bloco não terminou e reprova; falhou/ilegível (traceback, python ausente) → idem, com o começo da saída na mensagem
+  hfw_unit=$(python3 -B -c "$PYU" "$WATCH" 2>&1)
+  case "$hfw_unit" in
+    *"DONE 0") ok "unidade: $(printf '%s\n' "$hfw_unit" | sed -n 's/^CHECKS //p') checagens em um processo só (configuração, borda do cooldown, corpo da resposta, texto dos avisos, grupo de processos)" ;;
+    *) bad "unidade: $(printf '%s' "$hfw_unit" | head -c 700)" ;;
+  esac
+  # fail_reason (a única chave de texto livre que o estado aceita; chave extra não passa) com texto fora do ASCII: o --ack a regrava em UTF-8 (não como \u), e o --print o mostra inteiro
+  reset; printf '{"v": 1, "allowed_ip": "%s", "fails": 0, "fail_reason": "ação"}\n' "$LIBERADO" > "$T/city/.gc/hetzner-fw-ip.state.json"; WARGS="--ack $NOVO"; run
+  # vazio → arquivo ausente: o grep não acha e reprova; falhou/ilegível → idem
+  grep -q '"fail_reason": "ação"' "$T/city/.gc/hetzner-fw-ip.state.json" 2>/dev/null && ok "estado: o fail_reason volta gravado em UTF-8" || bad "estado: o fail_reason perdeu o UTF-8 (ou o arquivo sumiu)"
+  WARGS="--print"; run; has "print: mostra o UTF-8 inteiro" '"fail_reason": "ação"' "$out"
+  # --print só lê: o estado corrompido é dito, a cópia que uma rodada normal guardaria não é feita
+  reset; echo '{"v": 1, "allowed_ip": "banana"' > "$T/city/.gc/hetzner-fw-ip.state.json"; WARGS="--print"; run
+  has "print: estado corrompido só é dito" "a cópia iria para" "$err"
+  [ -f "$T/city/.gc/hetzner-fw-ip.state.json" ] && ok "print: o arquivo corrompido continua no lugar" || bad "print: o arquivo corrompido foi movido"
+  ls "$T/city/.gc" | grep -q 'state.json.corrupt-' && bad "print: não cria cópia de corrompido" || ok "print: não cria cópia de corrompido"
+  # queda inesperada (um relógio que o gmtime não aguenta): traceback no stderr e rc 1, nunca rc 0
+  reset; both "$LIBERADO"; WARGS=""; NOW_OVERRIDE=99999999999999999999 run
+  eq "queda inesperada: rc 1" 1 "$rc"; has "queda inesperada: traceback no stderr" "Traceback" "$err"
+fi
 
 # ---- timeout e instância única (lentos) ----------------------------------------------------------------------------------------------------------------
 if [ "${HFW_FAST:-0}" != 1 ]; then
