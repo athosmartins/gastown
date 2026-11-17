@@ -11,7 +11,7 @@
 #   3. no agent.toml is left on the Opus provider claude-rc (that one is the Mayor's, set by the pack);
 #   4. each claude-rc-<name> is exactly --remote-control <name> --model opus; claude-rc-crew (the unnamed
 #      fallback) pins --model opus with --remote-control; claude-rc keeps --model opus;
-#   5. the Mayor's effort patch in city.toml is "high".
+#   5. the Mayor's effort patch in city.toml is "medium".
 # The model comes from the provider's own --model alias (latest Sonnet / latest Opus), NOT from
 # option_defaults.model — the engine's builtin "opus" choice maps to claude-opus-4-8 (a downgrade).
 set -euo pipefail
@@ -28,7 +28,7 @@ bad() { echo "  ✗ $*"; FAIL=$((FAIL+1)); }
 [ -f "$CITY_TOML" ] || { echo "FATAL: city.toml not found at $CITY_TOML"; exit 1; }
 [ -d "$AGENTS_DIR" ] || { echo "FATAL: agents dir not found at $AGENTS_DIR"; exit 1; }
 
-EXPECTED_EFFORT="high"
+EXPECTED_EFFORT="medium"
 # ga-ift2yeq: crew agent dir -> its provider key (claude-rc-<key>) -> the Remote Control name the Claude
 # app shows. Athos 12/11: the shown name is Proper Case ("Batista", not "batista"); "_" stands for a space.
 CREW_RC_NAMES="batista-lx:batista-lx:Batista_LX batista-ps:batista-ps:Batista_PS batista-wa:batista:Batista digo-wa:digo:Digo mila-ma:mila-ma:Mila_MA mila-wa:mila:Mila oracle-wa:oracle:Oracle peter-wa:peter:Peter thies-ps:thies-ps:Thies_PS thies-wa:thies:Thies"
@@ -73,10 +73,10 @@ rc_args="$(awk '$0=="[providers.claude-rc]"{f=1; next} /^\[/{f=0} f' "$CITY_TOML
 echo "$rc_args" | grep -q '"--model", "opus"' \
   && ok "claude-rc (Mayor) pins --model opus" || bad "claude-rc does not pin --model opus: ${rc_args:-<no args_append>}"
 
-echo "── 5. the Mayor's effort is high ──"
+echo "── 5. the Mayor's effort is medium ──"
 mayor_eff="$(awk '/^\[\[patches.agent\]\]/{blk=""} {blk=blk"\n"$0} /^option_defaults/ && blk ~ /name = "gastown.mayor"/ {print; exit}' "$CITY_TOML")"
-echo "$mayor_eff" | grep -q 'effort = "high"' \
-  && ok "gastown.mayor effort = high" || bad "gastown.mayor effort is not high: ${mayor_eff:-<no patch found>}"
+echo "$mayor_eff" | grep -q 'effort = "medium"' \
+  && ok "gastown.mayor effort = medium" || bad "gastown.mayor effort is not medium: ${mayor_eff:-<no patch found>}"
 
 echo ""
 echo "$PASS passed, $FAIL failed"

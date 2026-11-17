@@ -3,4 +3,4 @@ suspended = true
 work_dir = "/Users/athos/gt/lexbh/crew/batista"
 provider = "claude-rc-batista-lx"
 
-option_defaults = { effort = "high" }  # Athos 2026-10-05: crews em Sonnet + effort high (substitui ga-n56ase medium)
+option_defaults = { effort = "medium" }  # Athos 2026-11-17 13:2x: crews em Opus 5.5 + effort medium (supersede high de 05/10)
