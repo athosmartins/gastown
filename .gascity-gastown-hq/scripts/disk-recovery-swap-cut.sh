@@ -16,7 +16,7 @@
 #   Depois de cortar espera SETTLE_S, lê o swap de novo e LOGA quem foi cortado e quanto de swap voltou (pode ser 0 ou negativo: o macOS devolve o swap devagar; o log diz o número lido, nunca "voltou" por suposição).
 # ORDEM DO CORTE  (menos crítico primeiro) sessão de pool/reviewer ociosa, a de maior RSS primeiro; depois a pausa do spawn. O degrau NÃO sobe para nada mais crítico: se o swap segue subindo e não sobra candidato, sai 11 e o
 #   maestro chama um humano (notify -p 4 + mail ao Mayor, no máximo 1 por hora) com a lista dos maiores donos de RAM e o que cada um é.
-#   Candidata = TODAS: (a) dona de RSS >= MIN_RSS_MB na amostra nova, de tipo `session` (nunca daemon, nunca Dolt); (b) template na lista fixa POOL_TEMPLATES (wa-worker ps-worker gate-reviewer refino-gate-reviewer context-check-reviewer, as variantes -remote e a faixa kimi-worker*; o roster real as tem);
+#   Candidata = TODAS: (a) dona de RSS >= MIN_RSS_MB na amostra nova, de tipo `session` (nunca daemon, nunca Dolt); (b) template na lista fixa POOL_TEMPLATES (wa-worker ps-worker gate-reviewer refino-gate-reviewer context-check-reviewer, as variantes -remote e as 2 kimi-worker-remote / kimi-worker-wa-remote, por nome exato; o roster real as tem);
 #   (c) nenhum nome dela casa com a deny-list; (d) estado `active` e NÃO anexada (anexada = o Athos está olhando); (e) zero bead in_progress atribuído a ela, sob QUALQUER dos nomes que o roster dá (id, session_name, name, alias,
 #   agent_name, template) no store do rig E no HQ (mesma regra do idle-crew-suspender: a bead de um worker pode estar sob o session_name); (f) a transcrição dela parada há >= IDLE_MIN (15) min
 #   (~/.claude/projects/<slug do work_dir>/<session_key>.jsonl; sem a transcrição = não sei = não corta). Qualquer leitura que falha deixa a sessão quieta (o contrário de "ociosa").
@@ -26,15 +26,18 @@
 # TRÊS ESTADOS    tem / não-tem / não-consegui-saber. AMOSTRADOR SEM LEITURA = arquivo ausente, ilegível, sem registro válido, parado há mais de SAMPLER_DEAD_S (900 s = 3 intervalos), ou sem amostra nova de <= SAMPLE_MAX_AGE_S (120 s)
 #   depois de colher uma, ou com `sessions_lookup_failed` (os donos de sessão viram rótulo genérico) ou roster `gc session list` ilegível: o degrau NÃO corta às cegas, NÃO pausa o Pilot, sai 30 e o maestro avisa o Mayor
 #   (notify -p 4 + mail, 1 por hora) e SEGUE a escada de disco. `vm.swapusage` ilegível não é 0: o degrau cai no swap da última amostra e diz isso; sem nenhum dos dois = 30. Relógio ilegível = 30.
+#   SUSPEND NÃO CONFIRMADO é o terceiro estado do próprio corte: no caminho gerenciado `gc session suspend` só põe o hold e cutuca o reconciler, então rc 0 com a sessão ainda `active` (ou `?`/`gone`) 3 s depois pode ser atraso OU
+#   falta de efeito. Não é FALHOU (nada de rc 20 nem "sem efeito"), não é CORTOU: entra no registro marcado `u`, conta à parte, e UMA releitura depois do SETTLE_S resolve (dormindo → CORTOU; ainda não → fica `u` e a linha diz).
+#   FALHOU só com rc != 0 E a sessão ainda ativa. Imediatamente antes do suspend o estado, o `attached` e a transcrição são relidos (o Athos pode ter anexado durante as leituras de bd).
 # PAUSA DO PILOT  .gc/swap-spawn-pause: 4 linhas `PAUSE` · epoch da gravação · epoch da validade · motivo. A validade é o freio: se este degrau morrer, a pausa vence sozinha em PAUSE_TTL_S (900 s) e o Pilot volta a despachar
 #   (pausa vencida, ilegível ou com validade absurda — mais de 1 h à frente — NÃO pausa: fail-open VISÍVEL no log do Pilot, nunca um Pilot parado por um arquivo que ninguém renova). Enquanto o gatilho vale, cada rodada renova
 #   (só quando restam menos de metade da validade). Gravada num temporário, trocada com mv e LIDA DE VOLTA (tentado ≠ gravado).
 # CONTRATO        `--run` (real) · `--dry-run` (lê tudo, diz o que faria; não colhe amostra nova, não suspende, não grava pausa, estado nem log). stdout = UMA linha ASCII (o maestro filtra para imprimíveis) e NADA
-#   antes dela; o detalhe vai para $LOG. Saída 0 = agiu (suspendeu e/ou pausou) · 10 = nada a fazer (sem gatilho, carência, pausa vigente) · 11 = gatilho ativo e NÃO há candidata permitida (pausa posta/mantida; precisa de humano) ·
-#   20 = falhou (suspend sem efeito, pausa que não gravou) · 30 = não consegui ler (não cortei, não pausei) · 2 = uso. Falha e sucesso na mesma rodada = 20 (a linha diz os dois).
+#   antes dela; o detalhe vai para $LOG. Saída 0 = agiu (suspendeu, pediu suspend ainda sem confirmação e/ou pausou) · 10 = nada a fazer (sem gatilho, carência, pausa vigente) · 11 = gatilho ativo e NÃO há candidata permitida (pausa posta/mantida; precisa de humano) ·
+#   20 = falhou (suspend com rc != 0 e a sessão ainda ativa, pausa que não gravou) · 30 = não consegui ler (não cortei, não pausei) · 2 = uso. Falha e sucesso na mesma rodada = 20 (a linha diz os dois).
 #   Carência: depois de uma rodada que cortou, COOLDOWN_S (300 s = a janela) sem cortar de novo, a não ser que o swap tenha voltado a subir >= GROW_MB/2 desde o corte (a base do crescimento ainda enxerga o salto de ANTES do corte).
 # VARIÁVEIS (teste) DR_CITY · DR_OFF_FILE · DR_NOW_FILE · DR_SWAP_MB_FILE (os do maestro) · DR_GC_BIN · DR_SWC_LOG · DR_SWC_LOCK · DR_SWC_STATE · DR_SWC_PAUSE_FILE · DR_SWC_SAMPLES (o JSONL) · DR_SWC_SAMPLER_CMD (no lugar de
-#   `python3 ram-owner-sampler.py`) · DR_SWC_SESSIONS_FILE (JSON no lugar de `gc session list --json`) · DR_SWC_BD_BIN · DR_SWC_PROJECTS_DIR · DR_SWC_<NOME> numérico: GROW_MB GROW_WINDOW_S GROW_SLACK_S ABS_MB HYST_MB
+#   `python3 ram-owner-sampler.py`) · DR_SWC_SESSIONS_FILE (JSON no lugar de `gc session list --json`) · DR_SWC_BD_BIN · DR_SWC_PROJECTS_DIR · DR_SWC_<NOME> numérico: GROW_MB GROW_WINDOW_S GROW_SLACK_S ABS_MB
 #   SAMPLE_MAX_AGE_S SAMPLER_DEAD_S IDLE_MIN MAX_CUT MIN_RSS_MB SETTLE_S VERIFY_S COOLDOWN_S PAUSE_TTL_S CMD_S SAMPLER_S BUDGET_S LOG_MAX_KB (lixo cai no padrão e é dito no log).
 # TESTE           bash scripts/disk-recovery-swap-cut.selftest.sh   (hermético: swap, amostrador, roster, bd, gc, relógio simulados; nada real é suspenso)
 # ESTADO DA ENTREGA (fatia 2/5, ga-yh41v0e.2)  Este arquivo é só o NÚCLEO (--run / --dry-run) e roda à mão: o maestro (disk-recovery-ladder.sh) AINDA NÃO o chama (fatia 4, ga-yh41v0e.4) e o `--resume` (religar o que
@@ -75,7 +78,7 @@ cfg() {  # $1=nome $2=padrão [$3=mínimo] → define $1 com DR_SWC_$1 (só díg
   esac
   eval "$1=\$v"
 }
-cfg GROW_MB 1536 1; cfg GROW_WINDOW_S 300 60; cfg GROW_SLACK_S 330; cfg ABS_MB 5120 1; cfg HYST_MB 1024
+cfg GROW_MB 1536 1; cfg GROW_WINDOW_S 300 60; cfg GROW_SLACK_S 330; cfg ABS_MB 5120 1
 cfg SAMPLE_MAX_AGE_S 120 1; cfg SAMPLER_DEAD_S 900 1; cfg IDLE_MIN 15 1; cfg MAX_CUT 3 1; cfg MIN_RSS_MB 50
 cfg SETTLE_S 20; cfg VERIFY_S 3; cfg COOLDOWN_S 300; cfg PAUSE_TTL_S 900 60
 cfg CMD_S 30 1; cfg SAMPLER_S 60 1; cfg BUDGET_S 90 1; cfg LOG_MAX_KB 1024 1
@@ -88,7 +91,7 @@ log() {
   if [ "$MODE" = dry ]; then printf '[dry-run] %s\n' "$*" >&2; return 0; fi
   printf '[%s] %s\n' "$(date '+%F %T')" "$*" >> "$LOG" 2>/dev/null || true
 }
-say() { printf '%s\n' "$*" | LC_ALL=C tr -cd '[:print:]' | cut -c1-300; echo; }   # a ÚNICA linha de stdout; imprimíveis ASCII
+say() { local l; l=$(printf '%s' "$*" | LC_ALL=C tr -cd '[:print:]' | cut -c1-300); printf '%s\n' "$l"; }   # a ÚNICA linha de stdout, com UM \n; imprimíveis ASCII
 usage() { echo "uso: $0 --run | --dry-run" >&2; exit 2; }
 
 now() {  # epoch; vazio/ilegível → rc 1 (sem hora não decido nada)
@@ -110,12 +113,12 @@ read_swap_mb() {  # MB de swap EM USO. vazio → rc 1; falhou/ilegível/unidade 
   printf '%s' "$v"
 }
 
-bounded() {  # $1=segundos, resto=comando. Saída (stdout+stderr) em $RB_OUT. rc do comando; 124 = estourou (TERM e depois KILL, filhos primeiro); 125 = não consegui lançar. Sem `timeout` (o PATH do launchd não o garante)
+bounded() {  # $1=segundos, resto=comando. stdout em $RB_OUT e stderr em $RB_OUT.err (separados: um aviso do bd/gc com rc 0 não pode invalidar o JSON que se lê). rc do comando; 124 = estourou (TERM e depois KILL, filhos primeiro); 125 = não consegui lançar. Sem `timeout` (o PATH do launchd não o garante)
   local secs=$1 pid ticks=0 limit
   shift
   RB_OUT=$(mktemp "${TMPDIR:-/tmp}/swap-cut.XXXXXX" 2>/dev/null) || { RB_OUT=""; return 125; }
   limit=$((secs * 5))
-  "$@" > "$RB_OUT" 2>&1 < /dev/null &
+  "$@" > "$RB_OUT" 2> "$RB_OUT.err" < /dev/null &
   pid=$!
   while kill -0 "$pid" 2>/dev/null; do
     if [ "$ticks" -ge "$limit" ]; then
@@ -129,7 +132,7 @@ bounded() {  # $1=segundos, resto=comando. Saída (stdout+stderr) em $RB_OUT. rc
   done
   wait "$pid"
 }
-rb_clean() { [ -n "$RB_OUT" ] && rm -f "$RB_OUT" 2>/dev/null; RB_OUT=""; return 0; }
+rb_clean() { [ -n "$RB_OUT" ] && rm -f "$RB_OUT" "$RB_OUT.err" 2>/dev/null; RB_OUT=""; return 0; }
 
 # ── o lado Python: lê o fim do JSONL do amostrador (o arquivo chega a 16 MB: só o último MB) ───────────────────────────────────────────────────────────
 read -r -d '' PY <<'PYEOF'
@@ -263,7 +266,7 @@ PYEOF
 
 py() { python3 -I -c "$PY" "$@" 2>/dev/null; }
 
-# ── estado: chave=valor, escrito inteiro e trocado com mv. Chaves: last_cut_ts last_after_swap + 1 linha `s=<id>|<nome>|<template>|<rss>|<ts>` por sessão suspensa por MIM ──────────────────────────────
+# ── estado: chave=valor, escrito inteiro e trocado com mv. Chaves: last_cut_ts last_after_swap + 1 linha `s=<id>|<nome>|<template>|<rss>|<ts>[|u]` por sessão suspensa por MIM (`u` = pedi o suspend e o estado não confirmou; a retomada religa as duas, religar quem não dormiu é inerte) ──────────────────────────────
 LAST_CUT_TS=0; LAST_AFTER_SWAP=0; REG=""; STATE_NOTE=""
 load_state() {  # vazio (arquivo ausente) → zerado, sem aviso; falhou/ilegível/linha que não entendo → zerado E STATE_NOTE (o registro pode ter se perdido: a linha diz)
   local line k v
@@ -283,6 +286,18 @@ load_state() {  # vazio (arquivo ausente) → zerado, sem aviso; falhou/ilegíve
     esac
   done < "$STATE"
   return 0
+}
+reg_put() {  # $1=id $2=nome $3=template $4=rss $5=marca (vazio ou u): põe a sessão no registro, trocando a linha dela se já estava (uma sessão que segue ativa é candidata de novo na rodada seguinte)
+  local l new=""
+  while IFS= read -r l; do
+    [ -n "$l" ] || continue
+    case "$l" in "$1|"*) ;; *) new="$new$l
+" ;; esac
+  done <<EOF
+$REG
+EOF
+  REG="$new$1|$2|$3|$4|$NOW${5:+|$5}
+"
 }
 save_state() {  # rc 0 gravou; rc 1 não gravou (o chamador diz)
   local tmp="$STATE.tmp.$$" l
@@ -374,36 +389,27 @@ transcript_idle_min() {  # $1=work_dir $2=session_key → minutos inteiros desde
 rig_of() {  # work_dir de crew/worker → raiz do rig; senão vazio (só o HQ)
   case "$1" in */crew/*) printf '%s' "${1%/crew/*}" ;; *) printf '' ;; esac
 }
-session_state() {  # $1=id → estado atual, "gone" ou "?"
-  local st
-  if [ -n "${DR_SWC_SESSIONS_FILE:-}" ]; then
-    st=$(ID="$1" python3 -I -c '
-import json, os, sys
-try:
-    rows = json.load(open(sys.argv[1]))["sessions"]
-except Exception:
-    print("?"); sys.exit(0)
-for s in rows:
-    if isinstance(s, dict) and s.get("id") == os.environ["ID"]:
-        print(s.get("state") or "?"); sys.exit(0)
-print("gone")
-' "$DR_SWC_SESSIONS_FILE" 2>/dev/null)
-  else
-    bounded "$CMD_S" "$GCBIN" session list --json --state all || { rb_clean; printf '?'; return 0; }
-    st=$(ID="$1" python3 -I -c '
+read -r -d '' PYS <<'PYEOF'
 import json, os, sys
 try:
     rows = json.load(sys.stdin)["sessions"]
 except Exception:
-    print("?"); sys.exit(0)
+    print("?|?"); sys.exit(0)
 for s in rows:
     if isinstance(s, dict) and s.get("id") == os.environ["ID"]:
-        print(s.get("state") or "?"); sys.exit(0)
-print("gone")
-' < "$RB_OUT" 2>/dev/null); rb_clean
+        print("%s|%s" % (s.get("state") or "?", {True: "true", False: "false"}.get(s.get("attached"), "?"))); sys.exit(0)
+print("gone|-")
+PYEOF
+session_probe() {  # $1=id → "estado|anexada" (anexada true/false/?; estado "gone" = o id não está na lista; "?|?" = não consegui ler: nunca "ativa e solta")
+  local st
+  if [ -n "${DR_SWC_SESSIONS_FILE:-}" ]; then st=$(ID="$1" python3 -I -c "$PYS" 2>/dev/null < "$DR_SWC_SESSIONS_FILE")
+  else
+    bounded "$CMD_S" "$GCBIN" session list --json --state all || { rb_clean; printf '?|?'; return 0; }
+    st=$(ID="$1" python3 -I -c "$PYS" 2>/dev/null < "$RB_OUT"); rb_clean
   fi
-  printf '%s' "${st:-?}"
+  printf '%s' "${st:-?|?}"
 }
+session_state() { local p; p=$(session_probe "$1"); printf '%s' "${p%%|*}"; }   # $1=id → estado atual, "gone" ou "?"
 
 # ── leitura comum: swap agora + histórico do amostrador. Preenche SW_NOW SW_REF SW_NOTE NEW_TS NEW_SWAP BASE_TS BASE_SWAP GROWTH BLIND ────────────────────────────────────────────────────────────────
 SW_NOW=""; SW_REF=""; SW_NOTE=""; NEW_TS=""; NEW_SWAP=""; BASE_TS=""; BASE_SWAP=""; GROWTH=""; GROWTH_NOTE=""; BLIND=""
@@ -440,13 +446,13 @@ triggered() {  # rc 0 se algum gatilho vale. Preenche WHY_TRIG
 
 # ── --run ─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
 do_run() {
-  local sw_txt out_tmp roster_tmp cut_n=0 fail_n=0 skipped="" cutlist="" tops="" cand_n=0 pause_msg="" pause_ok=-1 exp rem sw_after back rcs st
+  local sw_txt out_tmp roster_tmp cut_n=0 fail_n=0 unc_n=0 unk_n=0 unc_list="" unk_txt="" unc_txt="" pr idle2 still skipped="" cutlist="" tops="" cand_n=0 pause_msg="" pause_ok=-1 exp rem sw_after back rcs st
   local id name alias template session_name agent_name wd skey rss idle ident store tried blocked nl src
   nl=$'\n'
 
   read_history || { log "SEM LEITURA: $BLIND — nao corto, nao pauso"; say "SEM LEITURA: $BLIND; nao cortei nada"; return 30; }
   sw_txt="swap ${SW_REF}MB${GROWTH:+ (${GROWTH}MB em ${GROW_WINDOW_S}s)}"
-  triggered || { log "sem gatilho: $sw_txt$GROWTH_NOTE$SW_NOTE"; say "sem gatilho: $sw_txt (limites: +${GROW_MB}MB/${GROW_WINDOW_S}s, ${ABS_MB}MB)"; return 10; }
+  triggered || { log "sem gatilho: $sw_txt$GROWTH_NOTE$SW_NOTE"; say "sem gatilho: $sw_txt$GROWTH_NOTE (limites: +${GROW_MB}MB/${GROW_WINDOW_S}s, ${ABS_MB}MB)"; return 10; }
   log "GATILHO: $WHY_TRIG ($sw_txt)$GROWTH_NOTE$SW_NOTE"
   load_state
 
@@ -461,7 +467,7 @@ do_run() {
   # amostra nova: o degrau exige dono de RAM de <= SAMPLE_MAX_AGE_S; o launchd do amostrador roda a cada 300 s, então a colho agora (dry-run não colhe: lê o que tem)
   if [ "$MODE" = run ]; then
     bounded "$SAMPLER_S" env RAM_OWNER_OUT="$SAMPLES" $SAMPLER_CMD; rcs=$?
-    [ "$rcs" = 0 ] || log "amostra nova: o amostrador saiu rc=$rcs: $(head -c 200 "$RB_OUT" 2>/dev/null | tr '\n' ' ')"
+    [ "$rcs" = 0 ] || log "amostra nova: o amostrador saiu rc=$rcs: $(cat "$RB_OUT.err" "$RB_OUT" 2>/dev/null | head -c 200 | tr '\n' ' ')"
     rb_clean
     read_history || { log "SEM LEITURA depois da amostra nova: $BLIND — nao corto, nao pauso"; say "SEM LEITURA: $BLIND; nao cortei nada"; return 30; }
     if [ $((NOW - NEW_TS)) -gt "$SAMPLE_MAX_AGE_S" ]; then
@@ -490,8 +496,9 @@ do_run() {
   while IFS="$US" read -r _tag rss id name alias template session_name agent_name wd skey; do
     [ "$_tag" = CAND ] || continue
     cand_n=$((cand_n + 1))
-    if over_budget; then skipped="$skipped $name:orcamento"; log "MANTEM $name ($template, ${rss}MB): orcamento de ${BUDGET_S}s esgotado (bd/gc lentos): nao verifiquei"; continue; fi
-    idle=$(transcript_idle_min "$wd" "$skey") || { skipped="$skipped $name:transcricao-desconhecida"; log "MANTEM $name ($template, ${rss}MB): transcricao desconhecida"; continue; }
+    if over_budget; then skipped="$skipped $name:orcamento"; unk_n=$((unk_n + 1)); log "MANTEM $name ($template, ${rss}MB): orcamento de ${BUDGET_S}s esgotado (bd/gc lentos): nao verifiquei"; continue; fi
+    if [ $((cut_n + unc_n)) -ge "$MAX_CUT" ]; then skipped="$skipped $name:teto-por-rodada"; log "MANTEM $name ($template, ${rss}MB): teto de $MAX_CUT por rodada"; continue; fi
+    idle=$(transcript_idle_min "$wd" "$skey") || { skipped="$skipped $name:transcricao-desconhecida"; unk_n=$((unk_n + 1)); log "MANTEM $name ($template, ${rss}MB): transcricao desconhecida"; continue; }
     if [ "$idle" -lt "$IDLE_MIN" ]; then skipped="$skipped $name:transcricao-recente(${idle}min)"; log "MANTEM $name ($template, ${rss}MB): transcricao parada ha ${idle}min (< ${IDLE_MIN})"; continue; fi
     blocked=""; tried="$nl"
     for ident in "$alias" "$session_name" "$id" "$name" "$agent_name" "$template"; do
@@ -505,22 +512,42 @@ do_run() {
         if [ "$st" != 0 ]; then blocked="in_progress=$st como=$ident store=${store##*/}"; break 2; fi
       done
     done
-    if [ -n "$blocked" ]; then skipped="$skipped $name:bead($blocked)"; log "MANTEM $name ($template, ${rss}MB): $blocked"; continue; fi
-    if [ "$cut_n" -ge "$MAX_CUT" ]; then skipped="$skipped $name:teto-por-rodada"; log "MANTEM $name ($template, ${rss}MB): teto de $MAX_CUT por rodada"; continue; fi
+    if [ -n "$blocked" ]; then
+      case "$blocked" in in_progress=\?*|orcamento*) unk_n=$((unk_n + 1)) ;; esac
+      skipped="$skipped $name:bead($blocked)"; log "MANTEM $name ($template, ${rss}MB): $blocked"; continue
+    fi
     if [ "$MODE" = dry ]; then cutlist="$cutlist${cutlist:+, }$name ${rss}MB"; cut_n=$((cut_n + 1)); log "CORTARIA $name ($template, ${rss}MB, transcricao parada ha ${idle}min)"; continue; fi
+    # as leituras de bd acima levam até ${BUDGET_S}s: o Athos pode ter anexado, a sessão pode ter voltado a escrever ou mudado de estado. Releio estado, anexada e transcrição AGORA; o que não consigo ler (ou o orçamento esgotado) mantém
+    # vazio → "?|?" (mantém); falhou/ilegível/orçamento esgotado → "?|?" (mantém): só "active|false" deixa suspender
+    if over_budget; then pr="?|?"; else pr=$(session_probe "$id"); fi
+    # vazio → rc 2 → idle2=0 (mantém); falhou/ilegível → o mesmo: sem a transcrição não sei, e não saber é "escreveu agora"
+    idle2=$(transcript_idle_min "$wd" "$skey") || idle2=0
+    if [ "$pr" != "active|false" ] || [ "$idle2" -lt "$IDLE_MIN" ]; then
+      case "$pr" in *\?*) unk_n=$((unk_n + 1)) ;; esac
+      skipped="$skipped $name:mudou-antes-do-suspend"; log "MANTEM $name ($template, ${rss}MB): logo antes do suspend leu estado|anexada='$pr' e transcricao parada ha ${idle2}min (precisa de active|false e >= ${IDLE_MIN}min)"; continue
+    fi
     bounded "$CMD_S" "$GCBIN" session suspend "$id"; src=$?; rb_clean
     sleep "$VERIFY_S"
     st=$(session_state "$id")
-    # no caminho gerenciado o `gc session suspend` só põe o hold e cutuca o reconciler: o rc sozinho não diz nada, o estado lido sim. Sem confirmação NÃO conta como cortada
+    # no caminho gerenciado o `gc session suspend` só põe o hold e cutuca o reconciler: o rc e o estado de 3 s depois não distinguem ATRASO de FALTA DE EFEITO. Três desfechos, como o idle-crew-suspender:
+    # dormindo (qualquer outro estado) = CORTOU · rc != 0 e a sessão ainda ativa = FALHOU (nada mudou) · o resto (rc 0 e ainda ativa, ou estado `?`/`gone`) = NAO CONFIRMADO (entra no registro marcado `u`; uma releitura depois do settle resolve)
     case "$st" in
-      active|start-pending|creating|"?")
-        fail_n=$((fail_n + 1)); skipped="$skipped $name:suspend-sem-efeito"; log "FALHOU $name ($template, ${rss}MB): gc session suspend rc=$src e a sessao segue '$st'" ;;
+      active|start-pending|creating) [ "$src" = 0 ] && st="$st:unc" || st="$st:fail" ;;
+      "?"|gone) st="$st:unc" ;;
+    esac
+    case "$st" in
+      *:fail)
+        fail_n=$((fail_n + 1)); skipped="$skipped $name:suspend-sem-efeito"; log "FALHOU $name ($template, ${rss}MB): gc session suspend rc=$src e a sessao segue '${st%:fail}'" ;;
+      *:unc)
+        unc_n=$((unc_n + 1)); unc_list="$unc_list$id|$name|$template|$rss
+"; reg_put "$id" "$name" "$template" "$rss" u
+        log "NAO CONFIRMADO $name ($template, ${rss}MB): gc session suspend rc=$src, estado '${st%:unc}' ${VERIFY_S}s depois (hold posto, o reconciler pode estar atrasado); registrado como nao confirmado, releio depois de ${SETTLE_S}s" ;;
       *)
-        cut_n=$((cut_n + 1)); cutlist="$cutlist${cutlist:+, }$name ${rss}MB"
-        REG="$REG$id|$name|$template|$rss|$NOW
-"
+        cut_n=$((cut_n + 1)); cutlist="$cutlist${cutlist:+, }$name ${rss}MB"; reg_put "$id" "$name" "$template" "$rss" ""
         log "CORTOU $name ($template, ${rss}MB, transcricao parada ha ${idle}min): gc session suspend rc=$src, estado depois: $st" ;;
     esac
+    # o registro vai para o disco AGORA, antes do settle: um kill do maestro (ou um pânico como o de 16/11) na janela do settle não pode perder o que já foi posto para dormir
+    case "$st" in *:fail) ;; *) LAST_CUT_TS=$NOW; LAST_AFTER_SWAP=$SW_REF; save_state || log "WARN: nao consegui gravar $STATE depois de suspender $name" ;; esac
   done <<EOF
 $out_tmp
 EOF
@@ -532,44 +559,62 @@ EOF
   fi
 
   sw_after=""
-  if [ "$MODE" = run ] && { [ "$cut_n" -gt 0 ] || [ "$fail_n" -gt 0 ]; }; then
+  if [ "$MODE" = run ] && { [ "$cut_n" -gt 0 ] || [ "$fail_n" -gt 0 ] || [ "$unc_n" -gt 0 ]; }; then
     LAST_CUT_TS=$NOW
     sleep "$SETTLE_S"
+    if [ "$unc_n" -gt 0 ]; then   # UMA releitura dos não confirmados, agora que o reconciler teve o SETTLE_S: dormindo → CORTOU; ainda não → continua `u` e a linha diz
+      still=0
+      while IFS='|' read -r id name template rss; do
+        [ -n "$id" ] || continue
+        # vazio → "gone" (segue não confirmado); falhou/ilegível → "?" (segue não confirmado): nunca vira CORTOU sem ler um estado de sessão parada
+        st=$(session_state "$id")
+        case "$st" in
+          active|start-pending|creating|"?"|gone) still=$((still + 1)); log "NAO CONFIRMADO apos ${SETTLE_S}s: $name segue '$st' (suspend pedido, hold posto, no registro como u)" ;;
+          *) cut_n=$((cut_n + 1)); cutlist="$cutlist${cutlist:+, }$name ${rss}MB"; reg_put "$id" "$name" "$template" "$rss" ""; log "CONFIRMADO $name: estado '$st' depois de ${SETTLE_S}s" ;;
+        esac
+      done <<EOF
+$unc_list
+EOF
+      unc_n=$still
+    fi
     sw_after=$(read_swap_mb) || sw_after=""
     isnum "$sw_after" && LAST_AFTER_SWAP=$sw_after || LAST_AFTER_SWAP=$SW_REF
     save_state || { log "WARN: nao consegui gravar $STATE: o registro das sessoes suspensas fica so no log"; fail_n=$((fail_n + 1)); }
   fi
 
-  # a linha
+  # a linha. "mantida por leitura impossivel" != "mantida porque estava ocupada": a linha diz quantas foram por não conseguir ler (bd/gc/transcricao/orcamento)
+  [ "$unk_n" -gt 0 ] && unk_txt="; $unk_n delas mantida(s) por leitura impossivel (bd/gc/transcricao/orcamento), nao por estarem ocupadas"
   if [ "$MODE" = dry ]; then
     if [ "$cut_n" -gt 0 ]; then say "(dry-run) $WHY_TRIG: cortaria $cut_n sessao(oes) ociosa(s): $cutlist; pausaria o spawn do Pilot por ${PAUSE_TTL_S}s"; return 10; fi
-    say "(dry-run) $WHY_TRIG: sem candidata permitida ($cand_n candidata(s) no roster, todas mantidas:$skipped); pausaria o spawn do Pilot por ${PAUSE_TTL_S}s; maiores donos: $tops"; return 10
+    say "(dry-run) $WHY_TRIG: sem candidata permitida ($cand_n candidata(s) no roster, todas mantidas:$skipped$unk_txt); pausaria o spawn do Pilot por ${PAUSE_TTL_S}s; maiores donos: $tops"; return 10
   fi
   rem=""
-  if [ "$pause_ok" = 1 ]; then rem="; pausou o spawn novo do Pilot ate $(hhmm $((NOW + PAUSE_TTL_S)))"; elif [ "$pause_ok" = 0 ]; then rem="; NAO gravou a pausa do spawn do Pilot"; fi
-  if [ "$cut_n" -gt 0 ]; then
+  if [ "$pause_ok" = 1 ]; then rem="; pausou o spawn novo do Pilot ate $(hhmm "$PAUSE_UNTIL")"; elif [ "$pause_ok" = 0 ]; then rem="; NAO gravou a pausa do spawn do Pilot"; fi
+  if [ $((cut_n + unc_n)) -gt 0 ]; then
     if [ -n "$sw_after" ]; then rem="$rem; swap ${SW_REF}->${sw_after}MB (voltou $((SW_REF - sw_after))MB)"; else rem="$rem; swap depois do corte ilegivel"; fi
   fi
+  [ "$unc_n" -gt 0 ] && unc_txt="; $unc_n suspend(s) pedido(s) SEM confirmacao de estado apos ${SETTLE_S}s (hold posto; no registro como nao confirmados)"
   if [ "$fail_n" -gt 0 ] || [ "$pause_ok" = 0 ]; then
-    say "FALHOU em parte: $WHY_TRIG: cortou $cut_n${cutlist:+ ($cutlist)}, $fail_n suspend(s) sem efeito$rem"
+    say "FALHOU em parte: $WHY_TRIG: cortou $cut_n${cutlist:+ ($cutlist)}, $fail_n suspend(s) com rc != 0 e a sessao ainda ativa$unc_txt$rem"
     return 20
   fi
-  if [ "$cut_n" -gt 0 ]; then say "$WHY_TRIG: cortou $cut_n sessao(oes) ociosa(s): $cutlist$rem"; return 0; fi
+  if [ "$cut_n" -gt 0 ] || [ "$unc_n" -gt 0 ]; then say "$WHY_TRIG: cortou $cut_n sessao(oes) ociosa(s)${cutlist:+: $cutlist}$unc_txt$rem"; return 0; fi
   # gatilho ativo e ninguém para cortar
   log "SEM CANDIDATA: $cand_n candidata(s) no roster, todas mantidas:$skipped"
-  say "$WHY_TRIG e NAO ha sessao de pool ociosa para cortar ($cand_n candidata(s) mantida(s)); maiores donos: $tops$rem"
+  say "$WHY_TRIG e NAO ha sessao de pool ociosa para cortar ($cand_n candidata(s) mantida(s))$unk_txt; maiores donos: $tops$rem"
   return 11
 }
 
 # keep_pause <motivo>: grava ou renova a pausa quando restam menos de metade da validade. Preenche PAUSE_OK (1 gravou/vigente · 0 não gravou), PAUSE_NOTE e PAUSE_RC (0 gravou/renovou · 10 vigente · 20 falhou)
-PAUSE_OK=-1; PAUSE_NOTE=""; PAUSE_RC=10
+PAUSE_OK=-1; PAUSE_NOTE=""; PAUSE_RC=10; PAUSE_UNTIL=0
 keep_pause() {
   local exp rem
   PAUSE_NOTE=""; PAUSE_RC=10; PAUSE_OK=1
   exp=$(pause_expiry) || exp=""
-  if isnum "$exp" && [ $((exp - NOW)) -ge $((PAUSE_TTL_S / 2)) ]; then PAUSE_NOTE="; pausa do Pilot vigente ate $(hhmm "$exp")"; return 0; fi
+  # vigente = restam >= metade da validade E <= 3600 s: o Pilot ignora validade mais longe que isso (PILOT_SWAP_PAUSE_MAX_AHEAD_S, fail-open), então um arquivo assim não pausa nada e é regravado
+  if isnum "$exp" && [ $((exp - NOW)) -ge $((PAUSE_TTL_S / 2)) ] && [ $((exp - NOW)) -le 3600 ]; then PAUSE_UNTIL=$exp; PAUSE_NOTE="; pausa do Pilot vigente ate $(hhmm "$exp")"; return 0; fi
   if write_pause "$NOW" "$1"; then
-    PAUSE_NOTE="; pausa do spawn do Pilot renovada ate $(hhmm $((NOW + PAUSE_TTL_S)))"; PAUSE_RC=0
+    PAUSE_UNTIL=$((NOW + PAUSE_TTL_S)); PAUSE_NOTE="; pausa do spawn do Pilot renovada ate $(hhmm $PAUSE_UNTIL)"; PAUSE_RC=0
     log "PAUSA do spawn do Pilot ate $(hhmm $((NOW + PAUSE_TTL_S))) ($PAUSE): $1"
   else
     PAUSE_OK=0; PAUSE_RC=20; PAUSE_NOTE="; NAO gravei a pausa do spawn do Pilot ($PAUSE)"
