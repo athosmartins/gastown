@@ -7,7 +7,7 @@
 # O QUE PROVA   Os selftests de cada peça (maestro .1, D2, D3, D4) trocam os vizinhos por stubs. Aqui NENHUM script da escada é trocado: o maestro REAL chama o D2, o D3 e o D4 REAIS, do jeito que o plist manda
 #   (`/bin/bash disk-recovery-ladder.sh --run`, env mínimo, a cada 120 s), contra UM mundo simulado onde o df, o swap e os processos são os mesmos para os quatro. O que só aparece na composição: contrato de saída
 #   (rc + UMA linha) de cada degrau lido pelo maestro de verdade, o efeito de cada degrau na re-medição do maestro, a ordem D2 → D3 → D4 e os cronômetros com os limiares de produção, o reinício que mata o próprio maestro
-#   (a marca do D4 já está no disco), o teto de 6 h e a escalada, a guarda de ligação que segura o D4 e o D3 com o MESMO banco, e o relatório (disk-recovery-report.py) lendo o log que o maestro real escreveu.
+#   (a marca do D4 já está no disco), o teto de 6 h e a escalada, a guarda de ligação que segura o D4 e o D3 com o MESMO banco, e o relatório (disk-recovery-report.py) lendo o log que o maestro real escreveu. A ronda noturna do WA (ga-tklekcn): a cena S-G abre uma rodada no health.db DO TESTE e prova que o D4 real, chamado pelo maestro real, adia o reinício e que ele sai (uma vez) depois que a rodada fecha.
 # O QUE NÃO PROVA   (1) o reinício de verdade: o AppleEvent do osascript sob o launchd (o D4 diz que só o canário real mostra) e o boot que volta sozinho; (2) o job carregado e vivo no launchd (`launchctl print`) e o que ele
 #   escreveu em 24 h (isso é o canário (b) e o relatório (c): scripts/disk-recovery-report.py lê o log real); (3) o `--resume` do D2 (ga-1p1i5jr.6: hoje o maestro não o chama) e o Safari/bw-serve do D3 (ga-1p1i5jr.7: o `ps`
 #   simulado não lista Safari e o bw-serve não está carregado); (4) rodadas de 120 s só no cenário S-A: os outros usam 300 s (o maestro tolera até 600 s entre leituras e trata o launchd atrasado, mas com 300 s = RETRY_S
@@ -18,7 +18,9 @@
 # SEGURANÇA     nada real é parado, reiniciado ou enviado: os binários do D4 são shims, DR4_NO_REAL_REBOOT=1 vale em todo cenário, `reboot`/`shutdown`/`sudo` e `df /` são armadilhas que gravam em $W/forbidden (o teste
 #   falha se algo cair nelas). O único processo real que morre é o rfb de brinquedo deste teste: o D2 só ENXERGA os processos dele (ps filtrado pelo diretório de trabalho), então o rfb de PRODUÇÃO nunca é visto nem tocado
 #   se estiver rodando na máquina do teste, e várias execuções em paralelo não se enxergam.
-# COMO RODAR    bash scripts/disk-recovery-e2e.selftest.sh        (~80 s no nó Linux, bash 5.2 e 3.2.57, a partir de um worktree; o mbp-run.sh NÃO o leva ao nó: está em hetzner-mac-only.hq.txt, pois usa o disk-recovery-d2-allowlist.tsv, que o filtro do nó não carrega, e o macOS é a prova que vale). ST_FAILFAST=1 sai no 1º FAIL; E2E_KEEP=1 mantém o diretório de trabalho (logs, estado, rastro). Cópias modificadas (mutantes): E2E_LADDER / E2E_D2 / E2E_D3 / E2E_D4 / E2E_REPORT=/caminho/...
+#   As duas leituras novas do D4 (ga-tklekcn) também ficam DENTRO do mundo: DR4_HEALTH_DB e DR4_RONDA_LOCK apontam para $W (mkenv), então o teste nunca lê o health.db nem o /tmp/wa_nightly_audit/run.lock REAIS da máquina (a cena S-G confere isso no log do maestro); a sonda do flock
+#   roda por DR4_PYTHON=$BIN/python-d4, um shim que só põe a plataforma "darwin" na frente do `python3 -I -c` da sonda (fora do macOS ela responde "não sei", de propósito), e a trava do teste é sempre ausente.
+# COMO RODAR    bash scripts/disk-recovery-e2e.selftest.sh        (~80 s no nó Linux antes da ga-tklekcn e não remedido depois dela; < 10 min no mini a load alto com a S-G, medido em 17/11; bash 5.2 e 3.2.57, a partir de um worktree; o mbp-run.sh NÃO o leva ao nó: está em hetzner-mac-only.hq.txt, pois usa o disk-recovery-d2-allowlist.tsv, que o filtro do nó não carrega, e o macOS é a prova que vale). ST_FAILFAST=1 sai no 1º FAIL; E2E_KEEP=1 mantém o diretório de trabalho (logs, estado, rastro). Cópias modificadas (mutantes): E2E_LADDER / E2E_D2 / E2E_D3 / E2E_D4 / E2E_REPORT=/caminho/...
 #   (o arquivo da cópia TEM de manter disk-recovery-ladder / disk-recovery-d2 no nome: as travas de instância única conferem a linha de comando). E2E_BASH=/caminho/bash roda o maestro com outro bash (o plist usa /bin/bash).
 set -uo pipefail
 
@@ -169,6 +171,15 @@ echo 'echo "gui/501/x = { state = not running }"' >> "$BIN/launchctl-d4"
 printf '#!/bin/bash\necho "D3.5 (stub do e2e): nada a cortar"\nexit 10\n' > "$BIN/d35-idle"   # o D3.5 (ga-1p1i5jr.8) tem selftest próprio: aqui ele é ocioso, porque o real leria o df e o launchctl DE VERDADE do mini (nunca toca na máquina)
 for n in reboot shutdown sudo top secret; do printf '#!/bin/bash\necho "%s $*" >> "$E2E_W/forbidden"; exit 1\n' "$n" > "$BIN/$n"; done
 printf 'import sys\nsys.stdout.write("central_sender_restart_safe: fila sem envio em voo — pode reiniciar\\n")\n' > "$W/sender_stub.py"
+cat > "$BIN/python-d4" <<'SH'
+#!/bin/bash
+# DR4_PYTHON do e2e (ga-tklekcn, gate-fix 1): a sonda da trava da ronda do D4 (`python3 -I -c <F_GETLK> <trava>`) responde "não sei" fora do macOS, de propósito (o F_GETLK de um flock só foi medido lá), e o e2e roda no nó Linux também. Só essa chamada
+# ganha a plataforma "darwin" na frente; no macOS isso não muda nada. Com a trava AUSENTE ($W/ronda.lock, a única que este teste cria) a sonda responde antes do F_GETLK, então o e2e prova a composição (o maestro lendo o rc do D4), não o F_GETLK: quem o prova é o
+# selftest do D4, no macOS. Toda outra chamada do D4 ao python (calls-in-flight, sender, capture) passa direto.
+if [ "${1:-}" = -I ] && [ "${2:-}" = -c ]; then c=$3; shift 3; exec /usr/bin/python3 -I -c "import sys; sys.platform = 'darwin'
+$c" "$@"; fi
+exec /usr/bin/python3 "$@"
+SH
 chmod 755 "$BIN"/*
 [ "$RBASH" = /bin/bash ] || for _s in "$BIN"/*; do sed "1s|.*|#!$RBASH|" "$_s" > "$_s.new" && mv "$_s.new" "$_s" && chmod 755 "$_s"; done   # os shims rodam no MESMO bash que o plist manda (o teste sob o bash 3.2 do mini)
 cat > "$W/mkdb.py" <<'PY'
@@ -220,7 +231,20 @@ rfb_start() {  # $1=diretório, $2=arquivo do pid do filho. O job do rfb de brin
   [ -n "$kid" ] && { echo "$kid" > "$2"; BG="$BG $kid"; }
   [ -n "$kid" ]
 }
-calls_set() { /usr/bin/python3 -I "$W/mkdb.py" "$W/pix.db" "$W/vb.db" "$@"; }   # sem argumento = nenhuma ligação; `pix dialing 3` = uma ligação pix em curso há 3 min
+calls_set() { /usr/bin/python3 -I "$W/mkdb.py" "$W/pix.db" "$W/vb.db" "$@"; }
+ronda_set() {  # a ronda noturna do WA do D4 (ga-tklekcn): health.db de mentira com a tabela da ronda VAZIA (o DDL é o do WA, nightly_audit_findings_store._CREATE_SQL) e a trava AUSENTE ($W/ronda.lock) = nenhuma ronda. `ronda_set aberta` = uma rodada aberta há 30 min da hora simulada
+  rm -f "$W/health.db" "$W/health.db-wal" "$W/health.db-shm" "$W/ronda.lock"
+  /usr/bin/python3 -I - "$W/health.db" "${1:-}" "$NOW_S" <<'PY' || nope "o health.db da ronda não saiu"
+import sqlite3, sys, time
+path, estado, agora = sys.argv[1], sys.argv[2], int(sys.argv[3])
+con = sqlite3.connect(path)
+con.execute("CREATE TABLE nightly_audit_rodada (rodada_id TEXT PRIMARY KEY, started_at TEXT NOT NULL, finished_at TEXT, status TEXT NOT NULL DEFAULT 'em_andamento', devices_no_roster INTEGER NOT NULL DEFAULT 0, diagnostico_status TEXT, diagnostico_bead_id TEXT, diagnosticado_at TEXT)")
+if estado == "aberta":   # started_at em hora LOCAL 'YYYY-MM-DD HH:MM:SS', como o WA grava, na hora SIMULADA do mundo
+    con.execute("INSERT INTO nightly_audit_rodada (rodada_id, started_at) VALUES ('e2e', ?)", (time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(agora - 1800)),))
+con.commit(); con.close()
+PY
+}
+ronda_fecha() { /usr/bin/sqlite3 "$W/health.db" "UPDATE nightly_audit_rodada SET finished_at = started_at, status = 'concluida' WHERE finished_at IS NULL;"; }   # a ronda acabou   # sem argumento = nenhuma ligação; `pix dialing 3` = uma ligação pix em curso há 3 min
 world_new() {  # $1=base (MB sem nenhum consumidor), $2=vazamento (MB/min): cidade, mundo, bancos e rfb NOVOS; relógio em T0
   local p; for p in $BG; do kill "$p" 2>/dev/null; done; BG=""
   rm -rf "$CITY" "$WD" "$SD" "$W/tmp" "$W/home" "$W/rodadas" "$W/rfb" "$W/reboot.calls" "$W/launchctl.log" "$W/state.at-reboot"
@@ -228,7 +252,7 @@ world_new() {  # $1=base (MB sem nenhum consumidor), $2=vazamento (MB/min): cida
   : > "$SD/notify.log"; : > "$SD/mail.log"; : > "$W/reboot.calls"; : > "$W/launchctl.log"; : > "$W/trace"; touch "$W/forbidden"; T_D2=""; T_D3=""; T_D4=""; SEEN_IDLE=" "
   printf '%s' "$1" > "$WD/base"; LEAK=$2; echo 2200 > "$WD/rfb.mb"; echo 9000 > "$WD/counter"; NOW_S=$T0; echo $((T0 - 90000)) > "$WD/boot"
   printf '%s\n' "com.whatsapp.demand-dashboard 4001 1-02:00:00 1300" "com.whatsapp.map-viewer 4002 1-02:00:00 800" "com.whatsapp.ficha360 4003 1-02:00:00 400" "com.whatsapp.clientes-dashboard 4004 1-02:00:00 300" > "$WD/procs"
-  calls_set; rfb_start "$W/rfb" "$WD/rfb.pid" || nope "o rfb de brinquedo não subiu"
+  ronda_set; calls_set; rfb_start "$W/rfb" "$WD/rfb.pid" || nope "o rfb de brinquedo não subiu"
 }
 world_boot() {  # o mini volta do reinício simulado: $1=base saudável, daemons NOVOS e pequenos, sem rfb (o launchd só o sobe às 00:15), hora de boot nova; o estado e o log da escada ficam (o disco persiste)
   NOW_S=$((NOW_S + 240)); echo $((NOW_S - 60)) > "$WD/boot"; printf '%s' "$1" > "$WD/base"; procs_boot; rm -f "$WD/rfb.pid"
@@ -241,6 +265,7 @@ mkenv() {  # ENVV = o env do plist (PATH, HOME, GC_CITY_PATH, BD_ACTOR) + só as
     "DR4_NOW=$NOW_S" "DR4_BOOT_EPOCH=$(cat "$WD/boot")" "DR4_FDESETUP_BIN=$BIN/fdesetup" "DR4_DEFAULTS_BIN=$BIN/defaults" "DR4_LAUNCHCTL_BIN=$BIN/launchctl-d4"
     "DR4_PGREP_BIN=$BIN/pgrep" "DR4_SYSCTL_BIN=$BIN/sysctl" "DR4_DF_BIN=$BIN/df" "DR4_OSASCRIPT_BIN=$BIN/osascript" "DR4_CONSOLE_USER=athos"
     "DR4_SENDER_SAFE_PY=$W/sender_stub.py" "DR4_CALLS_PY=$HERE/disk-recovery-d4-calls-in-flight.py" "DR4_NIGHTLY=$HERE/nightly-reboot.sh"
+    "DR4_PYTHON=$BIN/python-d4" "DR4_HEALTH_DB=$W/health.db" "DR4_RONDA_LOCK=$W/ronda.lock"   # a ronda do WA (ga-tklekcn): nunca o health.db nem o /tmp/wa_nightly_audit/run.lock REAIS da máquina
     "PIX_CALL_QUEUE_DEMAND_DB=$W/pix.db" "VOICEBOT_COST_DB=$W/vb.db" "SCRAPER_RODADA_DIR=$W/rodadas" "SCRAPER_BOOT_EPOCH=$(( $(date +%s) - 100000 ))"
     "DR4_REBOOT_CMD=$BIN/reboot-stub" "DR4_NO_REAL_REBOOT=1" "DR4_GRACE_S=0" "DR4_WAIT_S=1" "DR4_REBOOT_TIMEOUT_S=15" "DR4_GUARD_TIMEOUT_S=30" ${OVR[@]+"${OVR[@]}"} )
 }
@@ -341,6 +366,16 @@ STEP=300; world_new 3940 0; nothing_left; printf '%s\n' "com.whatsapp.demand-das
 calls_set pix dialing 3; i=0; while [ "$i" -lt 8 ]; do tick "$STEP"; i=$((i + 1)); done
 has "$(cat "$LOG")" "D3 adiado, nada reiniciado: ligacao em curso (pix=1 voicebot=0) antes de map-viewer" "S-C2: o D3 adiou com a ligação em curso (livre $FB MB, o map-viewer de 800 MB estava elegível)"
 eq "$(cat "$W/launchctl.log")" "" "S-C2: nenhum daemon foi reiniciado com a ligação em curso"
+
+section "S-G: ronda noturna do WA aberta segura o D4 real (ga-tklekcn); o reinício sai depois que ela fecha (rodadas de 300 s)"
+STEP=300; world_new 3200 0; nothing_left; ronda_set aberta
+i=0; while [ "$i" -lt 20 ]; do tick "$STEP"; show; i=$((i + 1)); [ "$(( (NOW_S - T0) / 60 ))" -ge 95 ] && break; done
+eq "$(cat "$W/reboot.calls" | wc -l | tr -d ' ')" 0 "S-G: com a rodada da ronda aberta no health.db do TESTE (DR4_HEALTH_DB) NÃO houve reinício (D4 chamado e adiado a partir de +65 min)"
+eq "$(cnt "$SD/notify.log" 'reinício adiado (ronda)')" 1 "S-G: um aviso -p 5 de reinício adiado pela ronda (no máximo 1 por hora)"
+has "$(cat "$LOG")" "rodada(s) aberta(s) em nightly_audit_rodada" "S-G: a linha do D4 no log do maestro diz que a rodada aberta é a do banco do teste"
+hasnt "$(cat "$LOG")" "/Users/athos/shared/data/health.db" "S-G: o D4 não leu o health.db REAL da máquina"
+ronda_fecha; i=0; while [ "$i" -lt 8 ]; do tick "$STEP"; show; i=$((i + 1)); [ "$RC" = 143 ] && break; done
+eq "$RC $(cat "$W/reboot.calls" | wc -l | tr -d ' ')" "143 1" "S-G: a ronda fechou e o D4 reiniciou (uma vez)"
 
 section "S-D: hora saudável e depois um pico isolado < 1,5 GB: UMA leitura não reinicia (rodadas de 120 s)"
 STEP=120; world_new "$HEALTHY" 0

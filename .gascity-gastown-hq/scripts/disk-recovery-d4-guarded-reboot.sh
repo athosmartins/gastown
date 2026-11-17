@@ -541,7 +541,7 @@ ronda_db() {  # rodada aberta no health.db → R_STATE ok|block|unknown (R_WHY).
   local rc v cut
   # vazio (tabela sem rodada aberta) → COUNT 0 → ok; falhou/ilegível (banco ausente, sem a tabela, travado, rc≠0, prazo estourado, sem saída, saída que não é um número, corte da janela que não montei) → unknown, NUNCA "0 rodadas"
   if [ ! -f "$HEALTH_DB" ]; then R_WHY="$HEALTH_DB não existe"; return 0; fi
-  cut=$(date -r $(( NOW - RONDA_WINDOW_S )) '+%Y-%m-%d %H:%M:%S' 2>/dev/null)
+  cut=$(date -r $(( NOW - RONDA_WINDOW_S )) '+%Y-%m-%d %H:%M:%S' 2>/dev/null || date -d "@$(( NOW - RONDA_WINDOW_S ))" '+%Y-%m-%d %H:%M:%S' 2>/dev/null)   # -r é a forma do BSD/macOS, -d @N a do GNU (nessa ordem: o `date -d` do macOS mexe no DST do kernel); nenhuma das duas = corte vazio = abaixo, "não sei"
   case "$cut" in [0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]' '[0-9][0-9]:[0-9][0-9]:[0-9][0-9]) ;; *) R_WHY="não montei o corte da janela de ${RONDA_WINDOW_S}s ('${cut:-vazio}')"; return 0 ;; esac
   run_bounded "$CHEAP_S" "$SQLITE" -batch -cmd ".timeout 3000" -cmd "PRAGMA query_only=ON" "$HEALTH_DB" "SELECT COUNT(*) FROM nightly_audit_rodada WHERE finished_at IS NULL AND started_at >= '$cut';"; rc=$?
   v=$(out_raw | tr -d ' \r')

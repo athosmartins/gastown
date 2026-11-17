@@ -19,6 +19,9 @@
 #   ga-tklekcn (guarda da ronda noturna do WA): a ronda em curso ADIA o reinício — rodada aberta no health.db (finished_at IS NULL, iniciada nas últimas 3 h; as bordas) OU o flock da ronda
 #   segurado (um flock EX de verdade, num processo à parte, lido pelo F_GETLK do D4 sem adquirir); as duas leituras têm os 3 estados (em curso = adia · sem ronda = segue · ilegível = rc 30) e
 #   só o estado TERMINAL do disco faz a ronda ceder. As seções `ronda_*` reprovam no D4 anterior à guarda (rodar com DR4_ST_SUT apontando a cópia antiga).
+# ONDE RODA: no macOS (o mini). A sonda da trava da ronda (F_GETLK de um flock) só foi medida no Darwin e o D4 responde "não sei" (rc 30) em qualquer outra plataforma, de propósito; no nó Linux toda cena que chega às guardas
+#   vira rc 30 e a bateria reprova (medido pelo revisor do gate em 17/11: PASS=0 FAIL=7 na cena run_ok). Por isso ela está em scripts/hetzner-mac-only.hq.txt (o mbp-run.sh a devolve com rc 97 = rode local). Quem precisar rodá-la no
+#   Linux troca a sonda por um DR4_PYTHON que emule o CONTRATO dela (rc 0+livre · 0+ausente · 1+segurado · 2+qualquer outra coisa); as cenas ronda_lk / ronda_win1 / ronda_t2 só provam o F_GETLK de verdade no macOS.
 # COMO NÃO REINICIA: o D4 só chama DR4_REBOOT_CMD (um stub que anota e, no cenário "o mini cai", mata o próprio D4 como o desligamento mata) ou
 #   DR4_OSASCRIPT_BIN (outro stub); DR4_NO_REAL_REBOOT=1 vale em TODOS os cenários: se uma costura sumir, o comando de verdade é recusado.
 # FILTRO: D4_ST_ONLY='^cool$|^cap$' roda só esses cenários; DR4_ST_SUT aponta outra cópia do D4 (a bateria de mutantes usa os dois).
@@ -121,7 +124,7 @@ mk_health() {  # health.db de mentira com a tabela da ronda (o DDL é o do WA: l
 }
 add_rodada() {  # $1=idade em segundos (relativa ao DR4_NOW do cenário: o started_at fica em hora LOCAL, 'YYYY-MM-DD HH:MM:SS', como o WA grava) · $2=aberta|fechada
   [ "$SKIP" = 1 ] && return 0
-  local s; s=$(date -r $((NOW - $1)) '+%Y-%m-%d %H:%M:%S')
+  local s; s=$(date -r $((NOW - $1)) '+%Y-%m-%d %H:%M:%S' 2>/dev/null || date -d "@$((NOW - $1))" '+%Y-%m-%d %H:%M:%S')   # -r = BSD/macOS, -d @N = GNU
   if [ "$2" = aberta ]; then /usr/bin/sqlite3 "$C/health.db" "INSERT OR IGNORE INTO nightly_audit_rodada (rodada_id, started_at, status) VALUES ('r$1-$2', '$s', 'em_andamento');"
   else /usr/bin/sqlite3 "$C/health.db" "INSERT OR IGNORE INTO nightly_audit_rodada (rodada_id, started_at, finished_at, status) VALUES ('r$1-$2', '$s', '$s', 'concluida');"; fi
 }
