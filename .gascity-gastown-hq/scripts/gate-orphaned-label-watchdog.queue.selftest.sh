@@ -9,7 +9,7 @@
 # ga-twb32km adds what the sweep still found alive once the wrapper was in the family (the in-file block never leaves GOLW_TEST_MODE and never fails a tool): a bd or jq that is
 # not on PATH, a bd comment that fails, a re-check that prints a closed bead and exits non-zero, a local clock that fails, prints garbage or prints a stamp and still exits 1, the mail's
 # delta sections (+N already reported, RESOLVED), the Jev seam (off: never called; suppressing: still commented, nothing sent, state saved), the state rewrite of a cooldown-only sweep
-# and the lock's edges (a heartbeat with no process reads as ALIVE, the recovery sentinel at exactly its TTL, a holder that turns live under the sentinel, the moved-aside sentinel removed).
+# and the lock's edges (a heartbeat with no process reads as ALIVE, the recovery sentinel at exactly its TTL, a holder that turns live under the sentinel, the moved-aside sentinel removed, a heartbeat emptied between the dead-check and the empty-heartbeat check, a takeover whose heartbeat write cannot fill an emptied heartbeat).
 # The EQUIVALENT lines below say, per id, whether the claim was MEASURED (original vs mutant, with a control mutant that diverges) or only READ from the code.
 # Stubs only: no bd, gc, notify or Pilot is touched. GOLW_SCRIPT_UNDER_TEST=<other copy> proves the selftest fails on older code.
 # Mutants of gate-orphaned-label-watchdog.sh that no run of the family (this file + gate-orphaned-label-watchdog.selftest.sh) can tell from the original,
@@ -32,8 +32,6 @@
 # EQUIVALENT cc6e6f8834 d4729d3c53: the clamp `[ "$_golw_eff_age_sec" -lt 0 ] && _golw_eff_age_sec=0` -> `-le 0` / `-lt 1`: at 0 it assigns 0 to 0, below 0 it assigns 0 either way, above 0 it assigns nothing (integers only: the value is $(( )) arithmetic)
 # EQUIVALENT dd73e5fa9a: `[ -z "$_arts" ] || [ "$_arts" = "null" ]` -> `&&` in _gate_artifact_probe: an empty answer falls through to the jq classification, which prints nothing for empty input, and the `[ -z "$_out" ]` branch prints the same `0 none 0` line the early return printed; the literal null cannot reach the test (the jq before it wraps it into [null]); MEASURED with an empty, a null and an open-marker answer: exit status, log, comments, notify, mail and state identical, with a control that diverges
 # EQUIVALENT 88d2e8e6db a0c704c15e 6f5824ceaa 9b9232c632: the lock helpers: `|| echo ""` -> `&& echo ""` after the stat fallbacks (the extra empty line is stripped by $( ): same value), `|| true` -> `&& true` after the pid read (same value) and after the heartbeat write (that status is read by nobody: its two callers are statements, each followed by a `-s` check), and `return 0` -> `1` of _release_golw_lock (only used as the EXIT trap, whose status the shell drops: checked on bash 5.2 and 3.2.57); MEASURED at function level on bash 5.2 and 3.2.57 over missing, empty, directory, dead-pid, live-pid and malformed heartbeat shapes: identical outputs, only the two statuses described differ
-# EQUIVALENT ab858725f9: `return 1` -> `0` on the empty-heartbeat check after the dead-holder test in _acquire_golw_lock: an empty or absent heartbeat reads as an empty pid, which _golw_lock_holder_dead treats as ALIVE, so the function has already returned 1 at the first liveness check; only a heartbeat emptied between two reads would reach it (READ from the code)
-# EQUIVALENT eba58dae1b: `return 1` -> `0` after a heartbeat write that failed under the recovery sentinel in _acquire_golw_lock (a dead holder's lock taken over in place): reachable only when the write TRUNCATES the heartbeat and then fails (or a peer empties it in that instant), because the empty-heartbeat check a few lines above already sent an empty one back as ALIVE (READ from the code); no env seam and no PATH shim of the script produces that, and an fsize limit would turn it into a test of the OS: NOT killable here, left alive on purpose. Its sibling right after the lock's own mkdir (d4cc8682cb) was killable and is killed by run 24: a mkdir shim makes that directory mode 000, so the heartbeat cannot be written
 set -uo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SCRIPT="${GOLW_SCRIPT_UNDER_TEST:-$HERE/gate-orphaned-label-watchdog.sh}"
@@ -397,6 +395,36 @@ if [ "$(id -u)" = 0 ]; then ok "run 24: (root writes into a mode 000 directory, 
   else
     bad "run 24: the mkdir shim did not make an unwritable lock directory (no real mkdir, or -m 000 refused): the case cannot run"
   fi
+fi
+
+echo "run 25: the dead holder is read dead AGAIN under the recovery sentinel, but the heartbeat write then cannot fill the heartbeat (a cut shim empties it and makes it read-only once the sentinel exists) -> the sentinel is released and the run backs off: nothing swept, exit 0 (the same takeover with the shim idle does sweep)"
+if [ "$(id -u)" = 0 ]; then ok "run 25: (root writes into a read-only file, runs 25 and 25b skipped)"; else
+  printf '[{"id":"wa-a2iz7b.1","status":"open","updated_at":"%s","metadata":{"gc.routed_to":"wa-worker"},"labels":["gate:needs-fix","gate:fix-attempt:1"]}]\n' "$OLD_TS" > "$T/candidates.json"
+  # vazio → no real cut to build the shim on: the control and the probe below say bad and the case reaches no verdict; falhou/ilegível → the same (a shim that runs no cut makes the dead-check read an empty pid, the run backs off as if the holder were ALIVE and the back-off check would pass for THAT reason)
+  cut_real="$(PATH="$P0" command -v cut)"; mkdir -p "$T/cuthb"
+  # QS_HB_LD=<lock dir>: fire once the recovery sentinel exists (empty AND read-only); QS_HB_PRE=<lock dir>: fire once, while NO sentinel exists (empty only); neither set: the shim is a plain cut
+  printf '%s\n' '#!/bin/sh' "$cut_real \"\$@\"; rc=\$?" 'if [ -n "${QS_HB_LD:-}" ] && [ -d "$QS_HB_LD.reaping" ]; then : > "$QS_HB_LD/heartbeat"; chmod 444 "$QS_HB_LD/heartbeat"; fi' \
+    'if [ -n "${QS_HB_PRE:-}" ] && [ -s "$QS_HB_PRE/heartbeat" ] && [ ! -d "$QS_HB_PRE.reaping" ]; then : > "$QS_HB_PRE/heartbeat"; fi' 'exit $rc' > "$T/cuthb/cut"; chmod +x "$T/cuthb/cut"
+  mkdir -p "$LD"; printf '%s:tok\n' "$dp" > "$LD/heartbeat"
+  run GOLW_QUEUE_EVIDENCE_MIN=5 PATH="$T/cuthb:$P0"
+  { grep -q "Recovered STALE/DEAD lock" "$T/golw.log" && grep -q "comment:wa-a2iz7b.1" "$T/comments"; } && ok "run 25: with the cut shim idle the dead holder's lock is taken over and the sweep runs (so the back-off below is the lock's)" || bad "run 25: the control takeover (cut shim idle) did not recover the lock and sweep"
+  find "$LD" "$LD.reaping" -depth -delete 2>/dev/null
+  mkdir -p "$LD"; printf '%s:tok\n' "$dp" > "$LD/heartbeat"
+  run GOLW_QUEUE_EVIDENCE_MIN=5 PATH="$T/cuthb:$P0" QS_HB_LD="$LD"
+  rc=$?
+  { [ -e "$LD/heartbeat" ] && [ ! -s "$LD/heartbeat" ] && [ ! -w "$LD/heartbeat" ]; } && ok "run 25: the shim fired under the sentinel (the heartbeat is empty and read-only)" || bad "run 25: the heartbeat was not emptied under the sentinel: the case cannot show the back-off"
+  { grep -q "backing off (single-instance guard" "$T/golw.log" && [ ! -s "$T/comments" ] && [ ! -e "$LD.reaping" ] && ! grep -q "Recovered STALE/DEAD lock" "$T/golw.log"; } && ok "run 25: a takeover whose heartbeat could not be filled is not held: the run backed off, swept nothing and released the sentinel" || bad "run 25: the run went on to sweep with a lock it could not stamp (or did not release the sentinel)"
+  [ "$rc" -eq 0 ] && ok "run 25: backing off from an emptied heartbeat exits 0" || bad "run 25: backing off from an emptied heartbeat exited $rc"
+  chmod 700 "$LD/heartbeat" 2>/dev/null; find "$LD" "$LD.reaping" -depth -delete 2>/dev/null   # a read-only empty heartbeat the back-off left in place would make every later run back off too
+
+  echo "run 25b: the dead holder is read dead, then its heartbeat is emptied BEFORE any sentinel exists (the cut shim fires while there is none) -> the empty heartbeat reads as a holder caught mid-write: the run backs off, nothing swept, exit 0"
+  mkdir -p "$LD"; printf '%s:tok\n' "$dp" > "$LD/heartbeat"
+  run GOLW_QUEUE_EVIDENCE_MIN=5 PATH="$T/cuthb:$P0" QS_HB_PRE="$LD"
+  rc=$?
+  { [ -e "$LD/heartbeat" ] && [ ! -s "$LD/heartbeat" ]; } && ok "run 25b: the shim fired before the sentinel (the heartbeat is empty)" || bad "run 25b: the heartbeat was not emptied: the case cannot show the back-off"
+  { grep -q "backing off (single-instance guard" "$T/golw.log" && [ ! -s "$T/comments" ] && [ ! -e "$LD.reaping" ] && ! grep -q "Recovered STALE/DEAD lock" "$T/golw.log"; } && ok "run 25b: a heartbeat emptied between the dead-check and the empty-heartbeat check is not reclaimed: the run backed off and swept nothing" || bad "run 25b: the run went on to take over (or sweep) a lock whose heartbeat had just been emptied"
+  [ "$rc" -eq 0 ] && ok "run 25b: backing off from an emptied heartbeat exits 0" || bad "run 25b: backing off from an emptied heartbeat exited $rc"
+  find "$LD" "$LD.reaping" -depth -delete 2>/dev/null
 fi
 
 echo ""
