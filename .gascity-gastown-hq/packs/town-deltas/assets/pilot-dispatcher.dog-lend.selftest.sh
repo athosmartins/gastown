@@ -137,7 +137,7 @@ reset() {
   rm -rf "$WORK/db" "$WORK"/*.log "$WORK"/sling.* "$WORK"/nudge.fail "$WORK"/cands.ndjson "$WORK"/bd.fail.* "$WORK"/bd.lost.* "$WORK"/verdict.calls "$WORK"/disk.calls
   mkdir -p "$WORK/db"; : > "$WORK/cands.ndjson"
   T_WA_LIVE=4; T_PS_LIVE=2; T_DOG_LIVE=1; T_DISK=ok; T_MEM=ok; T_VERDICT=mini; T_REFUSAL=""; T_REFUSAL_FAIL=0; T_STOP=0
-  unset T_NODE_ONLY T_MODE T_MAX T_DRY T_DOG_MAX
+  unset T_NODE_ONLY T_MODE T_MAX T_DRY T_DOG_MAX T_SMALL_RAW T_BIG_RAW
 }
 logged() { grep -qF -- "$1" "$WORK/log.txt" 2>/dev/null; }
 slings() { [ -f "$WORK/sling.count" ] && cat "$WORK/sling.count" || echo 0; }
@@ -205,6 +205,8 @@ run_pass() {
     _pilot_suppress_reused_sling() { echo "suppress $2" >> "$WORK/suppress.log"; }
     _pilot_unsuppress_sling() { echo "unsuppress $2" >> "$WORK/suppress.log"; }
     SMALL_CANDIDATES=$(jq -cs '.' "$WORK/cands.ndjson"); BIG_CANDIDATES="[]"
+    [ -z "${T_SMALL_RAW:-}" ] || SMALL_CANDIDATES="$T_SMALL_RAW"
+    [ -z "${T_BIG_RAW:-}" ] || BIG_CANDIDATES="$T_BIG_RAW"
     eval "$FUNCS"
     _pilot_dog_lend_pass
     echo "$_PCAP_LIVE_WA|$_PCAP_LIVE_PS" > "$WORK/pcap.after"
@@ -434,6 +436,71 @@ reset; mk wa-ng 0; : > "$WORK/nudge.fail"
 sweep
 has_label wa-ng story:in-flight && ok "m4: bead do rig in-flight mesmo com o nudge falho" || bad "m4: perdeu o in-flight por causa do nudge"
 
+# ── (o) NUNCA SILÊNCIO (ga-xja7uyv) ───────────────────────────────────────────────────────────────────────────────────────────────
+# Medido em 17/11: das 02:16 às 09:37 a passada não deixou NENHUMA linha enquanto o Pilot logava POOL-SATURATED com 100 candidatas. A única saída calada era «nenhum P0/P1
+# story:approved nas listas» (return 0 sem log) — e isso é indistinguível de «não vi as listas». Agora: vazio → UMA linha com as contagens e a origem; ilegível → aviso.
+echo "(o) só P2/P3 nas listas — a passada roda e DIZ que não havia P0/P1 aprovada (contagens + origem), nunca silêncio"
+reset; mk wa-o2 2; mk wa-o3 3
+sweep
+[ "$(slings)" = 0 ] && ok "o: 0 empréstimos (só P2/P3)" || bad "o: emprestou P2/P3"
+logged "dog-lend: pass done mode=on seen=0 lent=0" && ok "o: a linha «pass done … seen=0 lent=0» existe" || bad "o: SILÊNCIO — sem linha «pass done» numa varredura sem P0/P1 ($(cat "$WORK/log.txt" | tr '\n' '|'))"
+logged "no P0/P1 story:approved candidate" && ok "o: diz o motivo (nenhum P0/P1 story:approved)" || bad "o: sem o motivo"
+logged "source=SMALL_CANDIDATES+BIG_CANDIDATES" && ok "o: diz a ORIGEM da lista" || bad "o: sem a origem da lista"
+logged "small=2 big=0 p01=0" && ok "o: traz as contagens (small=2 big=0 p01=0)" || bad "o: sem as contagens: $(grep 'pass done' "$WORK/log.txt")"
+[ "$(grep -c 'dog-lend: pass done' "$WORK/log.txt")" = 1 ] && ok "o: UMA linha por varredura" || bad "o: $(grep -c 'dog-lend: pass done' "$WORK/log.txt") linhas «pass done»"
+
+echo "(o2) P1 SEM story:approved nas listas — o ponto cego fica VISÍVEL (contagem + id), e não é emprestada"
+reset; mk wa-na 1 "ctx:ready,exec:auto"
+sweep
+[ "$(slings)" = 0 ] && ok "o2: P1 sem story:approved não é emprestada (a ordem do Athos é «em aprovadas»)" || bad "o2: emprestou P1 sem story:approved"
+logged "p01=1" && ok "o2: conta o P0/P1 que viu (p01=1)" || bad "o2: não contou o P1: $(grep 'pass done' "$WORK/log.txt")"
+logged "p01-without-story:approved=wa-na" && ok "o2: nomeia o P1 que ficou de fora por falta do label" || bad "o2: não nomeou: $(grep 'pass done' "$WORK/log.txt")"
+
+echo "(o3) as DUAS listas vazias — também uma linha (sem lista ≠ sem passada)"
+reset
+sweep
+logged "dog-lend: pass done mode=on seen=0 lent=0" && logged "small=0 big=0 p01=0" && ok "o3: listas vazias → linha com small=0 big=0 p01=0" || bad "o3: silêncio com as listas vazias ($(cat "$WORK/log.txt" | tr '\n' '|'))"
+
+echo "(o4) lista que não é JSON — AVISO e NADA emprestado; nunca a linha de «vazio» (ilegível ≠ vazio)"
+reset; mk wa-o4 0; T_SMALL_RAW='isso não é json'
+sweep
+[ "$(slings)" = 0 ] && ok "o4: lista ilegível → 0 empréstimos" || bad "o4: emprestou com a lista ilegível"
+grep -q '^warn.*dog-lend: .*not readable JSON' "$WORK/log.txt" && ok "o4: AVISA (warn) que a lista não é legível" || bad "o4: sem aviso: $(cat "$WORK/log.txt" | tr '\n' '|')"
+logged "no P0/P1 story:approved candidate" && bad "o4: a lista ilegível saiu como «nenhum P0/P1» (terceiro estado colapsado em vazio)" || ok "o4: ilegível NÃO vira «nenhum P0/P1»"
+
+echo "(o5) desligada (off) — uma linha OFF, para «não rodou» não se confundir com «rodou e não achou»"
+reset; mk wa-o5 0; T_MODE=off
+sweep
+logged "dog-lend: OFF" && ok "o5: off deixa a linha «dog-lend: OFF»" || bad "o5: off silencioso"
+[ "$(slings)" = 0 ] && ok "o5: off não empresta" || bad "o5: off emprestou"
+
+echo "(o6) pool do rig COM vaga — a linha final conta (pool-with-room=1), não só seen=1 lent=0"
+reset; mk wa-o6 0; T_WA_LIVE=3
+sweep
+logged "pool-with-room=1" && ok "o6: «pool-with-room=1» na linha final" || bad "o6: a linha final não diz por que não emprestou: $(grep 'pass done' "$WORK/log.txt")"
+
+echo "(o7) emprestou — continua UMA linha «pass done» por varredura"
+reset; mk wa-o7 0
+sweep
+[ "$(grep -c 'dog-lend: pass done' "$WORK/log.txt")" = 1 ] && ok "o7: uma linha «pass done» também quando empresta" || bad "o7: $(grep -c 'dog-lend: pass done' "$WORK/log.txt") linhas"
+
+# ── (p) o aceite de ga-xja7uyv, ponta a ponta no log: pool do WA cheio + P0 aprovada elegível + dog livre ──────────────────────────────────
+echo "(p) pool do WA cheio + P0 aprovada elegível + dog livre + mini ok → LENT (e a linha final fecha a varredura)"
+reset; mk wa-p0a 0
+sweep
+logged "dog-lend: LENT wa-p0a → gastown.dog" && ok "p: linha LENT wa-p0a" || bad "p: sem a linha LENT: $(cat "$WORK/log.txt" | tr '\n' '|')"
+logged "dog-lend: pass done mode=on seen=1 lent=1" && ok "p: linha final seen=1 lent=1" || bad "p: sem a linha final"
+echo "(p2) o mesmo, com o disco do mini baixo → «SKIP-REST mini not ok», 0 empréstimos"
+reset; mk wa-p0b 0; T_DISK=low
+sweep
+logged "dog-lend: SKIP-REST mini not ok" && ok "p2: linha «SKIP-REST mini not ok»" || bad "p2: sem a linha: $(cat "$WORK/log.txt" | tr '\n' '|')"
+[ "$(slings)" = 0 ] && ok "p2: 0 empréstimos com o disco baixo" || bad "p2: emprestou com o disco baixo"
+logged "dog-lend: pass done mode=on seen=1 lent=0" && ok "p2: a varredura fecha com a linha final" || bad "p2: sem a linha final"
+echo "(p3) o mesmo, com a memória do mini apertada → «SKIP-REST mini not ok»"
+reset; mk wa-p0c 0; T_MEM=tight
+sweep
+logged "dog-lend: SKIP-REST mini not ok" && [ "$(slings)" = 0 ] && ok "p3: memória apertada → SKIP-REST mini not ok, 0 empréstimos" || bad "p3: slings=$(slings) log=$(cat "$WORK/log.txt" | tr '\n' '|')"
+
 # ── fiação (o que só o texto do despachante prova) ──────────────────────────────────────────────────────────────────────────────────────────────────────────────
 echo "(n) fiação no despachante"
 has() { grep -qE -- "$1" "$DISPATCHER"; }
@@ -449,6 +516,9 @@ printf '%s' "$SRC_NODE" | grep -q '_pilot_wa_node_pass_check' && ok "n: o veredi
 printf '%s' "$SRC_PASS" | grep -q '_pilot_priority_refusal_of\|_pilot_dog_lend_veto' && ok "n: vetos aplicados" || bad "n: sem vetos"
 printf '%s' "$SRC_ONE$SRC_PASS" | grep -qE 'PILOT_WA_WORKER_MAX' && bad "n: mexe em PILOT_WA_WORKER_MAX (não deve gastar vaga do pool)" || ok "n: não toca PILOT_WA_WORKER_MAX na decisão de empréstimo"
 printf '%s' "$(fn_src _pilot_dog_lend_pool_full)" | grep -q 'PILOT_WA_WORKER_MAX' && ok "n: só LÊ o teto do pool, para saber se está cheio" || bad "n: não lê o teto do pool"
+SRC_LANE="$(fn_src dispatch_lane)"
+[ -n "$SRC_LANE" ] && ok "n: dispatch_lane() localizada" || bad "n: dispatch_lane() não encontrada"
+printf '%s' "$SRC_LANE" | grep -qE '(SMALL|BIG)_CANDIDATES[=+]|unset (SMALL|BIG)_CANDIDATES' && bad "n: dispatch_lane reescreve SMALL_/BIG_CANDIDATES (a passada leria listas já consumidas pela pista)" || ok "n: dispatch_lane NÃO reescreve as listas que a passada lê (medido 17/11: a varredura POOL-SATURATED chega à passada com as 100 candidatas)"
 # a fiação do vigia (cenários 65-78: gc.routed_to=gastown.dog em P0/P1 aprovada do HQ) é provada pelo --selftest do próprio vigia — fatia 1/2 de ga-hfx1kou, outro commit; aqui só o despachante
 
 echo

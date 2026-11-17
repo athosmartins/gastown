@@ -18833,10 +18833,11 @@ _PDL_WRAP=""
 # Ordem por bead: loja do rig → veto (com o JSON do varrimento, barato) → pool cheio → vaga de dog → mini → releitura + veto de novo (os candidatos são do início da varredura e as pistas acabaram de
 # despachar) → veredito de nó (WA) → empresta. Corta quando acaba o teto da varredura. Dog sem vaga, contagem ilegível e mini apertado valem para TODAS as seguintes: cortam o laço.
 _pilot_dog_lend_pass() {
-  local _mode _cands _ordered _row _id _v _fresh _rc _considered=0 _seen=0 _max _maxc _skipped_other=0
+  local _mode _cands _stats _lists _ordered _row _id _v _fresh _rc _considered=0 _seen=0 _max _maxc _skipped_other=0 _room=0
   _mode=$(_pilot_dog_lend_mode)
   case "${PILOT_DOG_LEND:-}" in ''|on|1|shadow|off|0) ;; *) warn "dog-lend: PILOT_DOG_LEND='${PILOT_DOG_LEND}' is not on/shadow/off — the pass stays OFF (only an explicit on, or nothing, turns it on)" ;; esac
-  [ "$_mode" != off ] || return 0
+  # ga-xja7uyv: desligada TAMBÉM deixa uma linha por varredura — «não rodou» (off) precisa ser distinguível de «rodou e não achou»
+  if [ "$_mode" = off ]; then log "dog-lend: OFF (PILOT_DOG_LEND='${PILOT_DOG_LEND:-}' — the pass does not run this sweep)"; return 0; fi
   _PDL_LENT=0; _PDL_WHY=""; _PDL_DOG_LIVE=""; _PDL_WRAP=""
   if [ "${_PILOT_NODE_ONLY:-0}" = "1" ]; then log "dog-lend: SKIP-ALL node-only sweep (the mini is short on disk/memory)"; return 0; fi
   if [ "${PILOT_GATE_FOCUS:-0}" = "1" ]; then log "dog-lend: SKIP-ALL gate focus mode is ON (the pools are clamped on purpose; new work is not lent either)"; return 0; fi
@@ -18844,13 +18845,22 @@ _pilot_dog_lend_pass() {
   if _pilot_dispatch_should_stop; then log "dog-lend: SKIP-ALL the dispatch phase was halted this sweep"; return 0; fi
   _max="${PILOT_DOG_LEND_MAX_PER_SWEEP:-2}"; case "$_max" in ''|*[!0-9]*) _max=2 ;; esac
   _maxc="${PILOT_DOG_LEND_MAX_CONSIDER:-6}"; case "$_maxc" in ''|*[!0-9]*) _maxc=6 ;; esac
-  # vazio ([] — nenhum candidato P0/P1 aprovado) → nada a fazer, em silêncio; falhou/ilegível (candidatos que não são JSON, ordenação que falha) → avisa e NÃO empresta
-  if ! _cands=$(jq -cn --argjson a "${SMALL_CANDIDATES:-[]}" --argjson b "${BIG_CANDIDATES:-[]}" '
+  # vazio ([] — nenhum candidato P0/P1 aprovado) → UMA linha «pass done … seen=0» com as contagens e a ORIGEM da lista (ga-xja7uyv: o silêncio de 17/11 02:16→09:47, com o pool cheio e ~100 candidatas, não se distinguia de «não olhou»); os P0/P1 SEM story:approved são contados e nomeados — a ordem do Athos é «em aprovadas», e o que fica de fora por falta do label tem de aparecer; falhou/ilegível (candidatos que não são JSON nem lista, ordenação que falha) → avisa e NÃO empresta, nunca a linha de «vazio»
+  if ! _stats=$(jq -cn --argjson a "${SMALL_CANDIDATES:-[]}" --argjson b "${BIG_CANDIDATES:-[]}" '
       def pri: (.priority | if type == "number" then . elif type == "string" then (sub("^[Pp]"; "") | (try tonumber catch 99)) else 99 end);
-      ($a + $b) | map(select(type == "object" and pri <= 1 and ((.labels // []) | any(.[]; . == "story:approved")))) | unique_by(.id)' 2>/dev/null); then
+      def appr: ((.labels // []) | any(.[]; . == "story:approved"));
+      if ($a | type) != "array" or ($b | type) != "array" then error("candidate list is not an array") else . end
+      | ($a + $b) as $all
+      | ($all | map(select(type == "object" and pri <= 1))) as $p01
+      | ($p01 | map(select(appr | not)) | unique_by(.id) | map(.id // "?")) as $noappr
+      | {cands: ($p01 | map(select(appr)) | unique_by(.id)),
+         lists: ("small=\($a | length) big=\($b | length) p01=\($p01 | unique_by(.id) | length) p01-without-story:approved=" + (if ($noappr | length) == 0 then "-" else (($noappr[:5] | join(",")) + (if ($noappr | length) > 5 then ",+\($noappr | length - 5) more" else "" end)) end))}' 2>/dev/null) \
+     || ! _cands=$(printf '%s' "$_stats" | jq -c '.cands' 2>/dev/null) || ! _lists=$(printf '%s' "$_stats" | jq -r '.lists' 2>/dev/null) || [ -z "$_lists" ]; then
     warn "dog-lend: the sweep's candidate lists are not readable JSON — nothing lent this sweep"; return 0
   fi
-  [ "$_cands" != "[]" ] || return 0
+  if [ "$_cands" = "[]" ]; then
+    log "dog-lend: pass done mode=$_mode seen=0 lent=0 — no P0/P1 story:approved candidate in this sweep's lists (source=SMALL_CANDIDATES+BIG_CANDIDATES $_lists)"; return 0
+  fi
   if ! _ordered=$(_pilot_order_pool "$_cands") || [ -z "$_ordered" ]; then warn "dog-lend: could not order the P0/P1 candidates (work-order unreadable) — nothing lent this sweep"; return 0; fi
   while IFS= read -r _row; do
     [ -n "$_row" ] || continue
@@ -18863,7 +18873,7 @@ _pilot_dog_lend_pass() {
     if [ "$_v" != ok ]; then log "dog-lend: SKIP $_id veto $_v"; continue; fi
     _rc=0; _pilot_dog_lend_pool_full "$_PDL_POOL" || _rc=$?
     if [ "$_rc" = 2 ]; then log "dog-lend: SKIP $_id ${_PDL_WHY} (pool $_PDL_POOL)"; continue; fi
-    [ "$_rc" = 0 ] || continue
+    if [ "$_rc" != 0 ]; then _room=$((_room + 1)); continue; fi      # vaga no pool do rig: a passada NÃO empresta (o caminho normal serve); só conta, para a linha final
     _rc=0; _pilot_dog_lend_dog_free || _rc=$?
     if [ "$_rc" != 0 ]; then log "dog-lend: SKIP-REST ${_PDL_WHY/no-free-dog/no free dog} (dogs live=${_PDL_DOG_LIVE:-?} lent=$_PDL_LENT max=${PILOT_DOG_LEND_DOG_MAX:-3})"; break; fi
     if ! _pilot_dog_lend_mini_ok; then log "dog-lend: SKIP-REST mini not ok — $_PDL_WHY"; break; fi
@@ -18885,7 +18895,7 @@ _pilot_dog_lend_pass() {
       log "dog-lend: FAILED $_id ${_PDL_WHY:-?} (nothing left half-done except what the reason says)"
     fi
   done < <(printf '%s' "$_ordered" | jq -c '.[]' 2>/dev/null)
-  log "dog-lend: pass done mode=$_mode seen=$_seen lent=$_PDL_LENT not-in-a-pool-rig=$_skipped_other"
+  log "dog-lend: pass done mode=$_mode seen=$_seen lent=$_PDL_LENT not-in-a-pool-rig=$_skipped_other pool-with-room=$_room (source=SMALL_CANDIDATES+BIG_CANDIDATES $_lists)"
   return 0
 }
 
