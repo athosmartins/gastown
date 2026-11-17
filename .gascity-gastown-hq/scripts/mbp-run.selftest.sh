@@ -1046,19 +1046,30 @@ echo code > "$WTD/processo_lookup/pdpj_token.py"; echo code > "$WTD/tests/test_p
 for lk in $LEAKS; do mkdir -p "$WTD/$(dirname "$lk")"; echo secret > "$WTD/$lk"; done
 for lk in $NEUTRAL; do mkdir -p "$WTD/$(dirname "$lk")"; echo '[{"phone": "+5531987654321", "cpf": "123.456.789-09"}]' > "$WTD/$lk"; done
 for lk in $OKCFG; do mkdir -p "$WTD/$(dirname "$lk")"; echo ok > "$WTD/$lk"; done
+# ga-2hd02v.16 — executável SEM extensão que um teste executa ou lê (Seção 3c do filtro do wa): chega por caminho EXATO e com o bit de execução. Os PARECIDOS não chegam: prefixo (notify-rich, notify2), extensão desconhecida (.bak, .sample), o mesmo nome em outra pasta ou na raiz (sem âncora, `+ scripts/notify` vaza docs/scripts/notify; só pelo nome, `+ notify` vaza também lib/notify, notify, scripts/sub/notify e tools/wa_call_bridge/servidor/notify), e o irmão real que nenhum teste cita (tools/wa_call_bridge/servidor/notify)
+NOEXT_OK="scripts/notify scripts/hooks/pre-commit scripts/hooks/pre-push"
+NOEXT_LEAK="scripts/notify-rich scripts/notify2 scripts/notify.bak scripts/sub/notify docs/scripts/notify lib/notify notify tools/wa_call_bridge/servidor/notify scripts/hooks/pre-rebase scripts/hooks/sub/pre-push scripts/hooks/pre-commit.sample"
+for lk in $NOEXT_OK $NOEXT_LEAK; do mkdir -p "$WTD/$(dirname "$lk")"; printf '#!/bin/bash\nexit 0\n' > "$WTD/$lk"; chmod +x "$WTD/$lk"; done
 phones() { awk -v n="$1" 'BEGIN { for (i = 1; i <= n; i++) printf "\"+55319%08d\",\n", (i * 7654321) % 100000000 }'; }
 phones 25 > "$WTD/lib/leads_list.py"; phones 25 > "$WTD/lib/changelog.d/dump.json"; phones 3 > "$WTD/lib/few.py"
 awk 'BEGIN { for (i = 1; i <= 4; i++) printf "\"%03d.456.789-%02d\",\n", i, i }' > "$WTD/tests/fixtures/cpfs.json"
 awk 'BEGIN { for (i = 0; i < 32; i++) printf "\"+55319999%d%d%d%d%d\",\n", int(i/16)%2, int(i/8)%2, int(i/4)%2, int(i/2)%2, i%2 }' > "$WTD/lib/synthetic.py"
 DEST="$T/home/gt-remote/mirror/wa-1"
 leakcheck() { # imprime os arquivos plantados que chegaram ao destino (vazio = nada vazou)
-  local lk got=""; for lk in $LEAKS $NEUTRAL $HELDF; do [ -e "$DEST/$lk" ] && got="$got $lk"; done; printf '%s' "${got# }"; }
+  local lk got=""; for lk in $LEAKS $NEUTRAL $HELDF $NOEXT_LEAK; do [ -e "$DEST/$lk" ] && got="$got $lk"; done; printf '%s' "${got# }"; }
 reset; date > "$NODEFLAG"; find "$DEST" -mindepth 1 -delete 2>/dev/null; mkdir -p "$DEST/processo_lookup" "$DEST/shared/logs.backup"; echo old > "$DEST/processo_lookup/.env.pdpj"; echo old > "$DEST/shared/logs.backup/x.out"
 STUB_RSYNC_REAL=1 "$RUN" --repo wa --dir "$WTD" -- tests/test_x.py >"$T/out" 2>"$T/err"; rc=$?; expect "rsync real: a bateria roda no nó" 0 "$rc"; has "…no nó" "$J" '"host":"hetzner"'
 eq "NADA de dado ou segredo plantado chegou ao nó, nem arquivo de nome neutro, nem lista de telefones/CPFs (a lista abaixo tem de ser vazia)" "" "$(leakcheck)"
 has "o node_guard avisa quantos reteve" "$T/err" 'NOTE: 3 arquivo\(s\) com lista de telefones/CPFs ficam no mini e NÃO vão ao nó Linux'; hasnt "…e o aviso nunca traz o VALOR" "$T/err" '5531[0-9]{8}'
-for okf in lib/a.py tests/test_x.py tests/ok.json tests/data/fixture.json tests/fixtures/win.jsonl contacts_auth/server.py processo_lookup/pdpj_token.py tests/test_pdpj_token_refresh.py lib/rules.yaml $OKCFG $PASSF; do n=$((n+1)); if [ -f "$DEST/$okf" ]; then echo "ok   chegou (é código/config listado/abaixo do limite): $okf"; else echo "FAIL não chegou: $okf"; fails=$((fails+1)); fi; done
+for okf in lib/a.py tests/test_x.py tests/ok.json tests/data/fixture.json tests/fixtures/win.jsonl contacts_auth/server.py processo_lookup/pdpj_token.py tests/test_pdpj_token_refresh.py lib/rules.yaml $OKCFG $PASSF $NOEXT_OK; do n=$((n+1)); if [ -f "$DEST/$okf" ]; then echo "ok   chegou (é código/config listado/abaixo do limite): $okf"; else echo "FAIL não chegou: $okf"; fails=$((fails+1)); fi; done
 n=$((n+1)); if [ ! -e "$DEST/processo_lookup/.env.pdpj" ] && [ ! -e "$DEST/shared/logs.backup/x.out" ]; then echo "ok   --delete-excluded limpa o que uma semeadura antiga deixou (.env.pdpj e shared/logs.backup/x.out)"; else echo "FAIL o destino manteve segredo/log antigo"; fails=$((fails+1)); fi
+for f in $NOEXT_OK; do n=$((n+1)); if [ -x "$DEST/$f" ]; then echo "ok   executável sem extensão chega EXECUTÁVEL (Seção 3c): $f"; else echo "FAIL executável sem extensão não chegou executável (Seção 3c): $f"; fails=$((fails+1)); fi; done
+# controle (ga-2hd02v.16): o filtro SEM a 3c — o que valia antes do conserto — não leva nenhum dos 3. Prova que a chegada acima vem da 3c e de nenhuma outra regra; lib/a.py chegando prova que o rsync RODOU com esse filtro (sem essa prova, "nenhum chegou" poderia ser só o nó não usado). Se as linhas da 3c mudarem de forma e o grep não as tirar, o filtro fica igual ao real e o controle reprova alto
+# vazio/ilegível → o filtro derivado sai vazio, o filter_sane o recusa, o nó não é usado e a prova de vida (lib/a.py) reprova; o grep que não tira as 3 linhas (elas mudaram de forma) deixa o filtro igual ao real e o eq reprova — nunca um "nenhum chegou" verde por acidente
+grep -v -F -x -e '+ /scripts/notify' -e '+ /scripts/hooks/pre-commit' -e '+ /scripts/hooks/pre-push' "$HERE/hetzner-rsync-filter.wa.txt" > "$T/wa-filter-sem-3c"
+reset; date > "$NODEFLAG"; find "$DEST" -mindepth 1 -delete 2>/dev/null; HETZNER_RSYNC_FILTER="$T/wa-filter-sem-3c" STUB_RSYNC_REAL=1 "$RUN" --repo wa --dir "$WTD" -- tests/test_x.py >/dev/null 2>&1
+got=""; for f in $NOEXT_OK; do [ -e "$DEST/$f" ] && got="$got $f"; done; eq "controle: o filtro SEM a 3c não leva nenhum executável sem extensão (o defeito do ga-2hd02v.16)" "" "${got# }"
+[ -f "$DEST/lib/a.py" ] && ok "controle: …e o rsync rodou com esse filtro (lib/a.py chegou)" || bad "controle: o rsync não rodou com o filtro sem a 3c (lib/a.py ausente): o controle acima passaria vazio"
 MUT="$T/mutdir"; mkdir -p "$MUT"; for mf in mbp-presence.sh mbp-controle.sh hetzner-rsync-filter.wa.txt hetzner-pii-scan.py hetzner-mac-only.txt hetzner-rsync-filter.hq.txt hetzner-mac-only.hq.txt; do ln -sf "$HERE/$mf" "$MUT/$mf"; done   # o pii-scan TEM de estar aqui: sem ele o node_guard do mutante falha fechado e nada vaza, e o controle diria que o teste não enxerga o defeito; a lista mac-only idem (ilegível = o nó não é usado)
 # HETZNER_ISOLATE=1 (ga-9p6pte, a bateria noturna): o pytest do nó só roda dentro do wrapper de isolamento; fora do nó ou sem o wrapper → 97 e NADA roda.
 # iso_obs R: roda o mbp-run R (o real ou um mutante) nos 4 cenários e deixa as observações em ISO_OBS (uma palavra por observação que se confirmou).
