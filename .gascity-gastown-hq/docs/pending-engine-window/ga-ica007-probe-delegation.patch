@@ -1,0 +1,509 @@
+diff --git a/internal/config/city_probe_delegation_test.go b/internal/config/city_probe_delegation_test.go
+new file mode 100644
+index 0000000000..ccc5ddff9b
+--- /dev/null
++++ b/internal/config/city_probe_delegation_test.go
+@@ -0,0 +1,360 @@
++package config
++
++import (
++	"os"
++	"os/exec"
++	"path/filepath"
++	"strings"
++	"testing"
++)
++
++// ga-ica007: the rendered 1a / 1b / 1c texts delegate to the city's probe scripts
++// (packs/town-deltas/assets/scripts/pool-probe-assigned.sh <1a|1b> and pool-probe.sh
++// <target>) when they are readable, so "could not read" (`[]` + stderr + exit 3) is
++// never flattened into "no work" (`[]`, exit 0, silence) by the engine's
++// `2>/dev/null |` stages. The scripts live in the city repo and have their own
++// selftests; here STAND-INS with the same contract (argv in, stdout/stderr/rc out)
++// pin the engine's plumbing: that the right script is called with the right
++// argument, that stdout / stderr / exit status pass through, that a tier that could
++// not be read is not forgotten by the tiers after it, and that with no script the
++// old text runs unchanged (the fake bd is called).
++//
++// Each case reports through files in the fake city, never through the exit status
++// alone, so a query that exits 3 for the wrong reason cannot pass.
++
++type cityProbeFixture struct {
++	t       *testing.T
++	root    string // GC_CITY_PATH
++	bin     string // dir with the fake bd, first on PATH
++	callLog string // one line per stub / bd call
++}
++
++// newCityProbeFixture builds a fake city. assigned / pool are the stub bodies for
++// pool-probe-assigned.sh and pool-probe.sh ("" = do not create that script). A stub
++// logs "<name> <argv>" and then runs its body, where $STEP_RC_1A, $STEP_OUT_1B ...
++// come from the test's env so one body serves every case.
++func newCityProbeFixture(t *testing.T, assigned, pool string) *cityProbeFixture {
++	t.Helper()
++	tmp := t.TempDir()
++	f := &cityProbeFixture{t: t, root: filepath.Join(tmp, "city"), bin: filepath.Join(tmp, "bin"), callLog: filepath.Join(tmp, "calls.log")}
++	scripts := filepath.Join(f.root, "packs", "town-deltas", "assets", "scripts")
++	for _, d := range []string{scripts, f.bin} {
++		if err := os.MkdirAll(d, 0o755); err != nil {
++			t.Fatal(err)
++		}
++	}
++	write := func(path, body string) {
++		if err := os.WriteFile(path, []byte(body), 0o755); err != nil {
++			t.Fatal(err)
++		}
++	}
++	// The fake bd must never be called when a script answers: it records the call
++	// and prints an empty list.
++	write(filepath.Join(f.bin, "bd"), "#!/bin/sh\necho \"bd $*\" >> \"$CALL_LOG\"\nprintf '[]'\n")
++	if assigned != "" {
++		write(filepath.Join(scripts, "pool-probe-assigned.sh"), assigned)
++	}
++	if pool != "" {
++		write(filepath.Join(scripts, "pool-probe.sh"), pool)
++	}
++	return f
++}
++
++// Stub bodies. `$1` is the step (1a|1b) or the target; the answer for that call comes from
++// OUT_<key> / RC_<key> / ERR_<key> in the environment (key = 1A, 1B, POOL).
++const (
++	stubAssigned = `#!/bin/sh
++k=$(printf '%s' "$1" | tr a-z A-Z)
++echo "assigned $*" >> "$CALL_LOG"
++eval "out=\${OUT_$k:-[]}; rc=\${RC_$k:-0}; err=\${ERR_$k:-}"
++[ -n "$err" ] && echo "$err" >&2
++printf '%s' "$out"
++exit "$rc"
++`
++	stubPool = `#!/bin/sh
++echo "pool $*" >> "$CALL_LOG"
++[ -n "$ERR_POOL" ] && echo "$ERR_POOL" >&2
++printf '%s' "${OUT_POOL:-[]}"
++exit "${RC_POOL:-0}"
++`
++)
++
++type cityProbeRun struct {
++	stdout, stderr string
++	rc             int
++	calls          []string
++}
++
++func (f *cityProbeFixture) run(query string, env map[string]string) cityProbeRun {
++	f.t.Helper()
++	cmd := exec.Command("sh", "-c", query)
++	cmd.Env = []string{"PATH=" + f.bin + ":" + os.Getenv("PATH"), "CALL_LOG=" + f.callLog}
++	// Never let the ordering lib of the machine running the test leak in.
++	cmd.Env = append(cmd.Env, "WORK_ORDER_LIB="+filepath.Join(f.bin, "no-such-work-order.sh"))
++	for k, v := range env {
++		cmd.Env = append(cmd.Env, k+"="+v)
++	}
++	var so, se strings.Builder
++	cmd.Stdout, cmd.Stderr = &so, &se
++	rc := 0
++	if err := cmd.Run(); err != nil {
++		ee, ok := err.(*exec.ExitError)
++		if !ok {
++			f.t.Fatalf("run query: %v", err)
++		}
++		rc = ee.ExitCode()
++	}
++	var calls []string
++	if b, err := os.ReadFile(f.callLog); err == nil {
++		calls = strings.Split(strings.TrimSpace(string(b)), "\n")
++		if len(calls) == 1 && calls[0] == "" {
++			calls = nil
++		}
++	}
++	return cityProbeRun{stdout: so.String(), stderr: se.String(), rc: rc, calls: calls}
++}
++
++func (r cityProbeRun) callsJoined() string { return strings.Join(r.calls, "|") }
++
++func standardAgent() *Agent { return &Agent{Name: "dog", Dir: ""} }
++
++const sessionEnv = "GC_SESSION_NAME"
++
++func TestCityProbeDelegation_AssignedQueriesCallTheScriptAndPassItsAnswerThrough(t *testing.T) {
++	cases := []struct {
++		name  string
++		query func(a *Agent) string
++		step  string
++		key   string
++	}{
++		{"1a", func(a *Agent) string { return a.EffectiveAssignedInProgressQuery() }, "1a", "1A"},
++		{"1b", func(a *Agent) string { return a.EffectiveAssignedReadyQuery() }, "1b", "1B"},
++	}
++	for _, tc := range cases {
++		t.Run(tc.name+"/could-not-read-is-not-no-work", func(t *testing.T) {
++			f := newCityProbeFixture(t, stubAssigned, stubPool)
++			got := f.run(tc.query(standardAgent()), map[string]string{
++				"GC_CITY_PATH": f.root, sessionEnv: "dog-1",
++				"RC_" + tc.key: "3", "ERR_" + tc.key: "pool-probe-assigned: could not read: ephemeral@dog-1",
++			})
++			if got.rc != 3 {
++				t.Fatalf("exit = %d, want 3 (the script's 'could not read'); stdout=%q stderr=%q", got.rc, got.stdout, got.stderr)
++			}
++			if !strings.Contains(got.stderr, "could not read: ephemeral@dog-1") {
++				t.Errorf("the script's stderr line did not reach the caller: %q", got.stderr)
++			}
++			if got.stdout != "[]" {
++				t.Errorf("stdout = %q, want []", got.stdout)
++			}
++			if want := "assigned " + tc.step; got.callsJoined() != want {
++				t.Errorf("calls = %q, want exactly %q (and the fake bd must not run)", got.callsJoined(), want)
++			}
++		})
++		t.Run(tc.name+"/a-bead-passes-through", func(t *testing.T) {
++			f := newCityProbeFixture(t, stubAssigned, stubPool)
++			got := f.run(tc.query(standardAgent()), map[string]string{
++				"GC_CITY_PATH": f.root, sessionEnv: "dog-1", "OUT_" + tc.key: `[{"id":"ga-1"}]`,
++			})
++			if got.rc != 0 || got.stdout != `[{"id":"ga-1"}]` {
++				t.Errorf("rc=%d stdout=%q, want 0 and the bead", got.rc, got.stdout)
++			}
++		})
++		t.Run(tc.name+"/falls-back-to-the-old-text-without-the-script", func(t *testing.T) {
++			f := newCityProbeFixture(t, "", "")
++			got := f.run(tc.query(standardAgent()), map[string]string{"GC_CITY_PATH": f.root, sessionEnv: "dog-1"})
++			if got.rc != 0 || got.stdout != "[]" {
++				t.Errorf("rc=%d stdout=%q, want the old text's [] / 0", got.rc, got.stdout)
++			}
++			if len(got.calls) == 0 || !strings.HasPrefix(got.calls[0], "bd ") {
++				t.Errorf("calls = %q, want the fake bd to run (the old text)", got.callsJoined())
++			}
++		})
++		t.Run(tc.name+"/no-city-env-falls-back", func(t *testing.T) {
++			f := newCityProbeFixture(t, stubAssigned, stubPool)
++			got := f.run(tc.query(standardAgent()), map[string]string{sessionEnv: "dog-1"})
++			for _, c := range got.calls {
++				if strings.HasPrefix(c, "assigned ") || strings.HasPrefix(c, "pool ") {
++					t.Fatalf("a script ran with neither GC_CITY_PATH nor GC_CITY set: %q", got.callsJoined())
++				}
++			}
++		})
++		t.Run(tc.name+"/GC_CITY-is-the-second-choice", func(t *testing.T) {
++			f := newCityProbeFixture(t, stubAssigned, stubPool)
++			got := f.run(tc.query(standardAgent()), map[string]string{"GC_CITY": f.root, sessionEnv: "dog-1"})
++			if want := "assigned " + tc.step; got.callsJoined() != want {
++				t.Errorf("calls = %q, want %q", got.callsJoined(), want)
++			}
++		})
++	}
++}
++
++func TestCityProbeDelegation_PoolQueryCallsPoolProbeWithTheTarget(t *testing.T) {
++	f := newCityProbeFixture(t, stubAssigned, stubPool)
++	a := standardAgent()
++	got := f.run(a.EffectiveRoutedPoolQuery(), map[string]string{
++		"GC_CITY_PATH": f.root, "RC_POOL": "3", "ERR_POOL": "pool-probe: tier(s) 1 unreadable",
++	})
++	if got.rc != 3 || got.stdout != "[]" || !strings.Contains(got.stderr, "tier(s) 1 unreadable") {
++		t.Fatalf("rc=%d stdout=%q stderr=%q, want 3 / [] / the script's line", got.rc, got.stdout, got.stderr)
++	}
++	if want := "pool " + a.poolDemandTarget(); got.callsJoined() != want {
++		t.Errorf("calls = %q, want %q", got.callsJoined(), want)
++	}
++}
++
++// The full work query runs 1a, 1b, 1c in that order, the first bead wins, and a tier
++// that could not be read is remembered: with nothing found anywhere the query ends in
++// the script's non-zero status (stdout []), never in the 0 the old text gave.
++func TestCityProbeDelegation_FullQueryKeepsAnUnreadableTierInMind(t *testing.T) {
++	a := standardAgent()
++	target := a.poolDemandTarget()
++	base := func(f *cityProbeFixture) map[string]string {
++		return map[string]string{"GC_CITY_PATH": f.root, sessionEnv: "dog-1"}
++	}
++	type tc struct {
++		name       string
++		env        map[string]string
++		wantRC     int
++		wantStdout string
++		wantCalls  string
++	}
++	cases := []tc{
++		{"all-empty", map[string]string{}, 0, "[]", "assigned 1a|assigned 1b|pool " + target},
++		{"1a-found-stops-there", map[string]string{"OUT_1A": `[{"id":"a"}]`}, 0, `[{"id":"a"}]`, "assigned 1a"},
++		{"1b-found-after-1a-empty", map[string]string{"OUT_1B": `[{"id":"b"}]`}, 0, `[{"id":"b"}]`, "assigned 1a|assigned 1b"},
++		{"1c-found", map[string]string{"OUT_POOL": `[{"id":"c"}]`}, 0, `[{"id":"c"}]`, "assigned 1a|assigned 1b|pool " + target},
++		{"1a-unreadable-nothing-else-found", map[string]string{"RC_1A": "3", "ERR_1A": "1a unreadable"}, 3, "[]", "assigned 1a|assigned 1b|pool " + target},
++		{"1b-unreadable-nothing-else-found", map[string]string{"RC_1B": "3", "ERR_1B": "1b unreadable"}, 3, "[]", "assigned 1a|assigned 1b|pool " + target},
++		{"1c-unreadable", map[string]string{"RC_POOL": "3", "ERR_POOL": "1c unreadable"}, 3, "[]", "assigned 1a|assigned 1b|pool " + target},
++		{"1a-unreadable-but-1c-finds", map[string]string{"RC_1A": "3", "OUT_POOL": `[{"id":"c"}]`}, 0, `[{"id":"c"}]`, "assigned 1a|assigned 1b|pool " + target},
++		{"no-identity-skips-1a-1b-like-the-text", map[string]string{sessionEnv: ""}, 0, "[]", "pool " + target},
++		{"non-ephemeral-origin-stops-before-1c-but-keeps-the-error", map[string]string{"GC_SESSION_ORIGIN": "named", "RC_1A": "3"}, 3, "", "assigned 1a|assigned 1b"},
++		{"non-ephemeral-origin-clean-is-silent-0", map[string]string{"GC_SESSION_ORIGIN": "named"}, 0, "", "assigned 1a|assigned 1b"},
++	}
++	for _, c := range cases {
++		t.Run(c.name, func(t *testing.T) {
++			f := newCityProbeFixture(t, stubAssigned, stubPool)
++			env := base(f)
++			for k, v := range c.env {
++				env[k] = v
++			}
++			got := f.run(a.EffectiveWorkQuery(), env)
++			if got.rc != c.wantRC || got.stdout != c.wantStdout || got.callsJoined() != c.wantCalls {
++				t.Errorf("rc=%d stdout=%q calls=%q; want rc=%d stdout=%q calls=%q (stderr=%q)",
++					got.rc, got.stdout, got.callsJoined(), c.wantRC, c.wantStdout, c.wantCalls, got.stderr)
++			}
++			if strings.Contains(got.callsJoined(), "bd ") {
++				t.Errorf("the fake bd ran although the scripts answered: %q", got.callsJoined())
++			}
++		})
++	}
++}
++
++func TestCityProbeDelegation_FullQueryNeedsBothScripts(t *testing.T) {
++	// Only one of the two present: the whole query is the old text, never a half-delegated mix.
++	for _, only := range []string{"assigned", "pool"} {
++		a, p := stubAssigned, stubPool
++		if only == "assigned" {
++			p = ""
++		} else {
++			a = ""
++		}
++		f := newCityProbeFixture(t, a, p)
++		got := f.run(standardAgent().EffectiveWorkQuery(), map[string]string{"GC_CITY_PATH": f.root, sessionEnv: "dog-1"})
++		for _, c := range got.calls {
++			if strings.HasPrefix(c, "assigned ") || strings.HasPrefix(c, "pool ") {
++				t.Errorf("only %s present, but a script ran: %q", only, got.callsJoined())
++			}
++		}
++		if len(got.calls) == 0 {
++			t.Errorf("only %s present: the old text should have run the fake bd", only)
++		}
++	}
++}
++
++// Cases that must keep the old text on purpose (see the block comment in config.go):
++// the legacy control-dispatcher branch (two targets) and bd 1.0.5 ready semantics.
++func TestCityProbeDelegation_DoesNotDelegateWhereTheScriptsDoNotFit(t *testing.T) {
++	control := &Agent{Name: ControlDispatcherAgentName}
++	queries := map[string]string{
++		"control-dispatcher/work":        control.effectiveWorkQuery(false),
++		"control-dispatcher/in-progress": control.effectiveAssignedInProgressQuery(false),
++		"control-dispatcher/ready":       control.effectiveAssignedReadyQuery(false),
++		"control-dispatcher/pool":        control.effectiveRoutedPoolQuery(false),
++	}
++	for name, q := range queries {
++		if strings.Contains(q, "pool-probe") {
++			t.Errorf("%s: delegates to a city script; the legacy control branch must keep the old text", name)
++		}
++	}
++}
++
++func TestCityProbeDelegation_Bd105SemanticsKeepTheOldText(t *testing.T) {
++	a := standardAgent()
++	for name, q := range map[string]string{
++		"work":        a.effectiveWorkQuery(true),
++		"in-progress": a.effectiveAssignedInProgressQuery(true),
++		"ready":       a.effectiveAssignedReadyQuery(true),
++		"pool":        a.effectiveRoutedPoolQuery(true),
++	} {
++		if strings.Contains(q, "pool-probe") {
++			t.Errorf("%s: delegates to a city script under includeEphemeralReady; the scripts carry the ephemeral tier it drops", name)
++		}
++	}
++	for name, q := range map[string]string{
++		"work":        a.effectiveWorkQuery(false),
++		"in-progress": a.effectiveAssignedInProgressQuery(false),
++		"ready":       a.effectiveAssignedReadyQuery(false),
++		"pool":        a.effectiveRoutedPoolQuery(false),
++	} {
++		if !strings.Contains(q, "pool-probe") {
++			t.Errorf("%s: default semantics should delegate", name)
++		}
++	}
++}
++
++// The scripts are the dog pool's probes (their own filters, selftested against the dog's
++// texts only), so every other agent keeps the old text: a crew, a reviewer, a polecat, the
++// wa/ps workers, dog-remote, and a "dog" that lives inside a rig.
++func TestCityProbeDelegation_OnlyTheDogDelegates(t *testing.T) {
++	others := []*Agent{
++		{Name: "wa-worker"}, {Name: "ps-worker"}, {Name: "claude"}, {Name: "gate-reviewer"},
++		{Name: "dog-remote"}, {Name: "mayor"}, {Name: "polecat", Dir: "rig"}, {Name: "refinery", Dir: "rig"},
++		{Name: "dog", Dir: "rig"},
++	}
++	for _, a := range others {
++		for name, q := range map[string]string{
++			"work":        a.effectiveWorkQuery(false),
++			"in-progress": a.effectiveAssignedInProgressQuery(false),
++			"ready":       a.effectiveAssignedReadyQuery(false),
++			"pool":        a.effectiveRoutedPoolQuery(false),
++		} {
++			if strings.Contains(q, "pool-probe") || strings.Contains(q, "ga_root=") {
++				t.Errorf("%s/%s: delegates to the dog's city script; only the city-scope dog may", a.QualifiedName(), name)
++			}
++		}
++	}
++	dog := standardAgent()
++	for name, q := range map[string]string{
++		"work":        dog.effectiveWorkQuery(false),
++		"in-progress": dog.effectiveAssignedInProgressQuery(false),
++		"ready":       dog.effectiveAssignedReadyQuery(false),
++		"pool":        dog.effectiveRoutedPoolQuery(false),
++	} {
++		if !strings.Contains(q, "pool-probe") {
++			t.Errorf("dog/%s: should delegate", name)
++		}
++	}
++}
++
++func TestCityProbeDelegation_CustomWorkQueryIsReturnedUnchanged(t *testing.T) {
++	a := &Agent{Name: "x", WorkQuery: "echo custom"}
++	for name, q := range map[string]string{
++		"work": a.EffectiveWorkQuery(), "in-progress": a.EffectiveAssignedInProgressQuery(),
++		"ready": a.EffectiveAssignedReadyQuery(), "pool": a.EffectiveRoutedPoolQuery(),
++	} {
++		if q != "echo custom" {
++			t.Errorf("%s = %q, want the custom query untouched", name, q)
++		}
++	}
++}
+diff --git a/internal/config/config.go b/internal/config/config.go
+index 54612a2759..25e1504049 100644
+--- a/internal/config/config.go
++++ b/internal/config/config.go
+@@ -4203,6 +4203,99 @@ func poolDemandOriginGateScript() string {
+ 		`esac; `
+ }
+ 
++// ga-ica007: the rendered 1a/1b/1c texts run `bd ... 2>/dev/null | jq ... 2>/dev/null`
++// at every stage, so a bd that fails, or an answer jq refuses (ONE raw 0x08 byte in a
++// string is enough: jq 1.8 rejects the whole document), comes out as `[]` with exit 0
++// and nothing on stderr — "could not read" and "queue is empty" are the same answer, and
++// a worker that reads `[]` as "no work" drains while a bead waits. The city versions the
++// same probes as scripts that keep the three states apart (answer / `[]` / could not
++// read = `[]` + a line on stderr + exit 3): packs/town-deltas/assets/scripts/
++// pool-probe-assigned.sh (<1a|1b>, ga-ica007) and pool-probe.sh (<target>, ga-witezg).
++// The rendered text now DELEGATES to them when they are readable, and falls back to the
++// old text when they are not (no city, an older checkout), so the engine keeps working
++// on any tree. Three cases keep the old text: the legacy control-dispatcher branch (two
++// targets, the scripts take one), includeEphemeralReady (bd 1.0.5 ready semantics drops
++// the ephemeral tier the scripts carry), and every agent but the dog (see
++// cityProbeDelegationAgent).
++//
++// The lookup is the one wo_pick uses for work-order.sh: $GC_CITY_PATH, else $GC_CITY,
++// plus packs/town-deltas/assets/scripts; first one set wins, no cascade.
++const cityProbeScriptsRel = "packs/town-deltas/assets/scripts"
++
++func cityProbeScriptsLookupShell() string {
++	return `ga_root="${GC_CITY_PATH:-}"; [ -n "$ga_root" ] || ga_root="${GC_CITY:-}"; ` +
++		`ga_dir="$ga_root/` + cityProbeScriptsRel + `"; `
++}
++
++// cityAssignedProbeDelegationScript is the prefix of the assigned-in-progress (step
++// "1a") and assigned-ready (step "1b") queries: `exec` hands stdout, stderr and the
++// exit status to the script untouched (exit 3 = could not read; never `[]`/0).
++func cityAssignedProbeDelegationScript(step string) string {
++	return cityProbeScriptsLookupShell() +
++		`if [ -n "$ga_root" ] && [ -r "$ga_dir/pool-probe-assigned.sh" ]; then ` +
++		`exec sh "$ga_dir/pool-probe-assigned.sh" ` + step + `; fi; `
++}
++
++// cityPoolProbeDelegationScript is the prefix of the routed-pool-only query (Step 1c,
++// $1 = the pool target): the script's stdout, stderr and exit status pass through.
++func cityPoolProbeDelegationScript() string {
++	return cityProbeScriptsLookupShell() +
++		`if [ -n "$ga_root" ] && [ -r "$ga_dir/pool-probe.sh" ]; then ` +
++		`exec sh "$ga_dir/pool-probe.sh" "$1"; fi; `
++}
++
++// cityWorkQueryDelegationScript is the prefix of the full work query (1a, then 1b,
++// then 1c with $1 = the pool target), same order and same first-answer-wins as the
++// text it fronts. A tier that could not be read is remembered, not forgotten: if no
++// later tier finds a bead the query ends with the SCRIPT's non-zero status (stdout
++// `[]` where the text prints it), so the caller sees an error, not "no work". 1a/1b
++// run only when a session identity exists, as in the text (its loop skips empty ids).
++func cityWorkQueryDelegationScript() string {
++	return cityProbeScriptsLookupShell() +
++		`if [ -n "$ga_root" ] && [ -r "$ga_dir/pool-probe-assigned.sh" ] && [ -r "$ga_dir/pool-probe.sh" ]; then ` +
++		`ga_bad=0; ` +
++		`if [ -n "$GC_SESSION_ID$GC_SESSION_NAME$GC_ALIAS" ]; then ` +
++		`for ga_st in 1a 1b; do ` +
++		`ga_r=$(sh "$ga_dir/pool-probe-assigned.sh" "$ga_st"); ga_rc=$?; ` +
++		`if [ -n "$ga_r" ] && [ "$ga_r" != "[]" ]; then printf "%s" "$ga_r"; exit 0; fi; ` +
++		`[ "$ga_rc" -eq 0 ] || ga_bad=$ga_rc; ` +
++		`done; ` +
++		`fi; ` +
++		poolDemandOriginGateScriptExiting(`"$ga_bad"`) +
++		`ga_r=$(sh "$ga_dir/pool-probe.sh" "$1"); ga_rc=$?; ` +
++		`if [ -n "$ga_r" ] && [ "$ga_r" != "[]" ]; then printf "%s" "$ga_r"; exit 0; fi; ` +
++		`[ "$ga_rc" -eq 0 ] || ga_bad=$ga_rc; ` +
++		`printf "[]"; exit "$ga_bad"; ` +
++		`fi; `
++}
++
++// cityProbeDelegationAgent is the ONE agent whose rendered texts delegate. The scripts are
++// the dog pool's probes: pool-probe.sh carries the dog pool's own filters (gate focus mode,
++// disk hold, delivered-awaiting-gate drop) and both scripts are selftested against the dog's
++// texts only. Delegating for every agent would hand those filters to crews, reviewers,
++// polecats and the wa/ps workers; widening it is a follow-up, pool by pool, after a measure.
++const cityProbeDelegationAgent = "dog"
++
++// workQueryCityDelegation returns the delegation prefix, or "" when the old text must
++// run alone: any agent but the dog (see cityProbeDelegationAgent), or bd 1.0.5 ready
++// semantics (the scripts are the includeEphemeralReady=false probe, see the block comment
++// above).
++func workQueryCityDelegation(a *Agent, includeEphemeralReady bool, prefix string) string {
++	if includeEphemeralReady || a.Name != cityProbeDelegationAgent || a.Dir != "" {
++		return ""
++	}
++	return prefix
++}
++
++// poolDemandOriginGateScriptExiting is poolDemandOriginGateScript with a chosen exit
++// status, so a tier that could not be read before the gate is not turned into 0.
++func poolDemandOriginGateScriptExiting(status string) string {
++	return `case "$GC_SESSION_ORIGIN" in ` +
++		`ephemeral|"") ;; ` +
++		`*) exit ` + status + ` ;; ` +
++		`esac; `
++}
++
+ func routedPoolWorkQueryProbeScript(includeEphemeralReady bool, targetCount int) string {
+ 	script := workOrderPickFunctionScript() + poolDemandOriginGateScript() + poolDemandFirstRowFunctionScript(includeEphemeralReady)
+ 	for i := 1; i <= targetCount; i++ {
+@@ -4270,7 +4363,8 @@ func (a *Agent) effectiveWorkQuery(includeEphemeralReady bool) string {
+ 	target := a.poolDemandTarget()
+ 	legacyTarget := legacyWorkflowControlQualifiedName(target)
+ 	if legacyTarget == "" {
+-		script := workOrderPickFunctionScript() +
++		script := workQueryCityDelegation(a, includeEphemeralReady, cityWorkQueryDelegationScript()) +
++			workOrderPickFunctionScript() +
+ 			standardAssignedWorkQueryScript(includeEphemeralReady) +
+ 			poolDemandOriginGateScript() +
+ 			poolDemandFirstRowFunctionScript(includeEphemeralReady) +
+@@ -4310,7 +4404,7 @@ func (a *Agent) effectiveAssignedInProgressQuery(includeEphemeralReady bool) str
+ 	if legacyWorkflowControlQualifiedName(target) != "" {
+ 		return shellquote.Join([]string{"sh", "-c", workOrderPickFunctionScript() + legacyControlAssignedInProgressWorkQueryScript(includeEphemeralReady) + `printf "[]"`})
+ 	}
+-	return shellquote.Join([]string{"sh", "-c", workOrderPickFunctionScript() + standardAssignedInProgressWorkQueryScript(includeEphemeralReady) + `printf "[]"`})
++	return shellquote.Join([]string{"sh", "-c", workQueryCityDelegation(a, includeEphemeralReady, cityAssignedProbeDelegationScript("1a")) + workOrderPickFunctionScript() + standardAssignedInProgressWorkQueryScript(includeEphemeralReady) + `printf "[]"`})
+ }
+ 
+ // EffectiveAssignedReadyQuery returns the assigned-ready-only command for
+@@ -4335,7 +4429,7 @@ func (a *Agent) effectiveAssignedReadyQuery(includeEphemeralReady bool) string {
+ 	if legacyWorkflowControlQualifiedName(target) != "" {
+ 		return shellquote.Join([]string{"sh", "-c", workOrderPickFunctionScript() + legacyControlAssignedReadyWorkQueryScript(includeEphemeralReady) + `printf "[]"`})
+ 	}
+-	return shellquote.Join([]string{"sh", "-c", workOrderPickFunctionScript() + standardAssignedReadyWorkQueryScript(includeEphemeralReady) + `printf "[]"`})
++	return shellquote.Join([]string{"sh", "-c", workQueryCityDelegation(a, includeEphemeralReady, cityAssignedProbeDelegationScript("1b")) + workOrderPickFunctionScript() + standardAssignedReadyWorkQueryScript(includeEphemeralReady) + `printf "[]"`})
+ }
+ 
+ // EffectiveRoutedPoolQuery returns the routed-pool-only command for prompt
+@@ -4358,7 +4452,9 @@ func (a *Agent) effectiveRoutedPoolQuery(includeEphemeralReady bool) string {
+ 	target := a.poolDemandTarget()
+ 	legacyTarget := legacyWorkflowControlQualifiedName(target)
+ 	if legacyTarget == "" {
+-		return routedPoolWorkQueryCommand(includeEphemeralReady, target)
++		// ga-ica007: the prompt-side Step 1c delegates to the city's pool-probe.sh too.
++		prefix := workQueryCityDelegation(a, includeEphemeralReady, cityPoolProbeDelegationScript())
++		return shellquote.Join([]string{"sh", "-c", prefix + routedPoolWorkQueryProbeScript(includeEphemeralReady, 1), "--", target})
+ 	}
+ 	return routedPoolWorkQueryCommand(includeEphemeralReady, target, legacyTarget)
+ }
