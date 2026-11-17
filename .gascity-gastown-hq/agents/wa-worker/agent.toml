@@ -122,6 +122,10 @@
 #
 # Back 3 -> 2 on 2026-10-05 14:0x BRT (Mayor, revert rule): swap used 6.87 GB > 6 (disk 9.3 GB).
 #
+# Up 2 -> 3 on 2026-11-17 00:1x BRT (Mayor, Athos rule of 03/10 + mission ga-v8p1tx.1, 8 reviewed/h): after the
+# nightly reboot and compacting processos.db, disk free 14.0 GB >= 9, swap 0 GB <= 6. Revert to 2 if swap > 6 GB
+# or disk < 6 GB (hourly mission check).
+#
 # MODEL: Sonnet. Build work is well within Sonnet's capabilities. Keeps wa-worker
 # off the scarce weekly Opus budget (which is reserved for Mayor / named crew).
 #
@@ -130,7 +134,7 @@
 
 work_dir = "/Users/athos/gt/whatsapp_automation/crew/worker"
 min_active_sessions = 0
-max_active_sessions = 2
+max_active_sessions = 3
 idle_timeout = "2h"
 wake_mode = "fresh"
 model = "sonnet"
