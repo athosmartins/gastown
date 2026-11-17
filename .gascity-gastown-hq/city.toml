@@ -660,7 +660,7 @@ overlay_dir = "packs/town-deltas/assets/claude-overlays/longlived-cdp-firecrawl"
 [[patches.agent]]
 dir = ""
 name = "gastown.mayor"
-option_defaults = { effort = "high" }  # Athos 2026-10-05: "pro mayor, opus com effort high"
+option_defaults = { effort = "medium" }  # Athos 2026-11-17 13:2x: "o default é modelo Opus 5.5, effort medium" (crews e Mayor; antes high de 05/10)
 
 [[patches.agent]]
 dir = ""
