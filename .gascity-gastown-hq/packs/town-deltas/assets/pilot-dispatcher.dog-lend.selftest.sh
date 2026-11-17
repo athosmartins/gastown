@@ -461,12 +461,17 @@ reset
 sweep
 logged "dog-lend: pass done mode=on seen=0 lent=0" && logged "small=0 big=0 p01=0" && ok "o3: listas vazias → linha com small=0 big=0 p01=0" || bad "o3: silêncio com as listas vazias ($(cat "$WORK/log.txt" | tr '\n' '|'))"
 
-echo "(o4) lista que não é JSON — AVISO e NADA emprestado; nunca a linha de «vazio» (ilegível ≠ vazio)"
-reset; mk wa-o4 0; T_SMALL_RAW='isso não é json'
+echo "(o4) JSON corrompido na lista (corrupt JSON) — AVISO e NADA emprestado; nunca a linha de «vazio» (ilegível ≠ vazio)"
+reset; mk wa-o4 0; T_SMALL_RAW='[{"id":"wa-o4","priority":0,'
 sweep
 [ "$(slings)" = 0 ] && ok "o4: lista ilegível → 0 empréstimos" || bad "o4: emprestou com a lista ilegível"
 grep -q '^warn.*dog-lend: .*not readable JSON' "$WORK/log.txt" && ok "o4: AVISA (warn) que a lista não é legível" || bad "o4: sem aviso: $(cat "$WORK/log.txt" | tr '\n' '|')"
 logged "no P0/P1 story:approved candidate" && bad "o4: a lista ilegível saiu como «nenhum P0/P1» (terceiro estado colapsado em vazio)" || ok "o4: ilegível NÃO vira «nenhum P0/P1»"
+
+echo "(o4b) lista que é JSON válido mas NÃO é lista (objeto) → também aviso, nada emprestado"
+reset; mk wa-o4b 0; T_BIG_RAW='{"id":"wa-o4b","priority":0}'
+sweep
+[ "$(slings)" = 0 ] && grep -q '^warn.*dog-lend: .*not readable JSON' "$WORK/log.txt" && ! logged "no P0/P1 story:approved candidate" && ok "o4b: lista-objeto → aviso, 0 empréstimos, sem a linha de «vazio»" || bad "o4b: slings=$(slings) log=$(cat "$WORK/log.txt" | tr '\n' '|')"
 
 echo "(o5) desligada (off) — uma linha OFF, para «não rodou» não se confundir com «rodou e não achou»"
 reset; mk wa-o5 0; T_MODE=off
