@@ -79,6 +79,8 @@ notify() { :; }
 _pilot_write_sweep_pause_state() { echo "PAUSE_STATE $*" >> "$WORK/pause.calls"; }
 _PILOT_QUOTA_STATE="${GT_QUOTA:-ok}"; _pilot_quota_eta() { echo ""; }
 _pilot_ram_pressure_blocks() { echo "${GT_RAM:-0}"; }; _pilot_ram_pressure_level() { echo WARN; }; _pilot_ram_pressure_unreadable() { echo 0; }
+# ga-yh41v0e: o gate de pausa por swap (depois da RAM, antes do disco) é só um leitor falso aqui; a prova do leitor e da cadeia real mora em pilot-dispatcher.swap-spawn-pause.selftest.sh
+_pilot_swap_spawn_pause() { PILOT_SWAP_PAUSE_DETAIL="swap (leitor falso)"; case "${GT_SWAP:-0}" in 1) PILOT_SWAP_PAUSE_STATE=paused; return 0 ;; *) PILOT_SWAP_PAUSE_STATE=absent; return 1 ;; esac; }
 _pilot_disk_floor() {
   PILOT_DISK_FLOOR_NOTE=""; PILOT_DISK_FLOOR_DETAIL="disk_free=3000MB floor=5120MB"
   case "${GT_DISK:-ok}" in low) PILOT_DISK_FLOOR_STATE=low; return 0 ;; unknown) PILOT_DISK_FLOOR_STATE=unknown; return 1 ;; *) PILOT_DISK_FLOOR_STATE=ok; return 1 ;; esac

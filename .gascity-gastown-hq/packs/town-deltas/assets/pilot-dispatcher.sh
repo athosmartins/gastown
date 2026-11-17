@@ -286,6 +286,20 @@ PILOT_RAM_LEVEL_FILE="${PILOT_RAM_LEVEL_FILE:-${HOME}/.gastown/run/ram-pressure-
 PILOT_RAM_MAX_AGE_SECS="${PILOT_RAM_MAX_AGE_SECS:-1800}"
 PILOT_RAM_PRESSURE_OVERRIDE="${PILOT_RAM_PRESSURE_OVERRIDE:-}"
 
+# ── ga-yh41v0e (P0, 16/11): SWAP SPAWN PAUSE — a HARD pause on NEW dispatch while the swap step of the disk ladder holds it ─
+# 16/11 14:35 the swap jumped 2.8 → 6 GB in ~5 min, the disk went to 1 GB and the kernel panicked; every rung of the disk ladder
+# reacts to the DISK, and the swap lives on the same volume as Dolt. scripts/disk-recovery-swap-cut.sh (the ladder's swap step, slice ga-yh41v0e.2) reacts to the
+# GROWTH of the swap and, besides suspending idle pool sessions, writes <city>/.gc/swap-spawn-pause: 4 lines — PAUSE · write epoch ·
+# EXPIRY epoch · reason. This gate is the reader: while the file is valid, the sweep dispatches nothing (same full-PAUSE shape as the
+# RAM-pressure gate above: nothing is mutated, candidates are re-picked by a later sweep). In-flight builders are untouched.
+# The EXPIRY is the brake: the writer renews it only while the trigger holds, so if the swap step dies the pause lapses by itself and the
+# Pilot goes back to dispatching. FAIL-OPEN, never silent: an expired, malformed or absurd file (expiry more than
+# PILOT_SWAP_PAUSE_MAX_AHEAD_S ahead of now) does NOT pause and says so on the log — a pause file nobody renews must never hold the Pilot.
+# Absent file = the normal case, silent. Emergency release by hand: rm <city>/.gc/swap-spawn-pause. PILOT_SWAP_PAUSE_FILE is the test seam.
+PILOT_SWAP_PAUSE_FILE="${PILOT_SWAP_PAUSE_FILE:-${PILOT_CITY_OVERRIDE:-/Users/athos/gt/.gascity-gastown-hq}/.gc/swap-spawn-pause}"
+PILOT_SWAP_PAUSE_MAX_AHEAD_S="${PILOT_SWAP_PAUSE_MAX_AHEAD_S:-3600}"
+case "$PILOT_SWAP_PAUSE_MAX_AHEAD_S" in ''|*[!0-9]*) PILOT_SWAP_PAUSE_MAX_AHEAD_S=3600 ;; esac
+
 # ga-dxyvxr: quiet-hours admission gate (00h-08h, Athos 2026-08-16) — shared
 # read-side helper, see quiet-hours-check.sh's own header for the full
 # rationale. Same directory, same sibling-source convention this file already
@@ -2191,6 +2205,50 @@ _pilot_ram_pressure_unreadable() {
   _now=$(date +%s)
   if [ $(( _now - _ts )) -gt "$PILOT_RAM_MAX_AGE_SECS" ]; then printf '1'; return 0; fi
   printf '0'
+}
+
+# ── ga-yh41v0e: the SWAP SPAWN PAUSE gate's reader (see the config header above PILOT_SWAP_PAUSE_FILE) ──────────────────────────────
+# _pilot_swap_spawn_pause — return 0 (a VALID, unexpired pause file: pause dispatch) / 1 (anything else).
+# Sets PILOT_SWAP_PAUSE_STATE ("paused" | "absent" | "expired" | "unreadable") and PILOT_SWAP_PAUSE_DETAIL (for the log).
+# Called DIRECTLY, never in $(...), so the globals survive — the shape of _pilot_disk_floor.
+# THREE states and only a file that PROVES itself returns 0: absent (the normal case) is silent; expired/unreadable (wrong first line, no
+# numeric expiry, a clock that cannot be read, an expiry absurdly far ahead, a file that exists but cannot be read) return 1 — fail-open —
+# with the state named so the caller logs it apart from "absent".
+_pilot_swap_spawn_pause() {
+  PILOT_SWAP_PAUSE_STATE="absent"
+  PILOT_SWAP_PAUSE_DETAIL=""
+  local _f="$PILOT_SWAP_PAUSE_FILE" _l1 _l3 _l4 _now _left
+  # vazio (no file) → "absent", silent, no pause; falhou/ilegível (exists but is not a readable regular file) → "unreadable", no pause, said on the log
+  [ -e "$_f" ] || return 1
+  if [ ! -f "$_f" ] || [ ! -r "$_f" ]; then
+    PILOT_SWAP_PAUSE_STATE="unreadable"
+    PILOT_SWAP_PAUSE_DETAIL="exists but is not a readable regular file: ${_f}"
+    return 1
+  fi
+  # vazio (empty file / missing line) → the checks below call it unreadable; falhou (sed cannot read) → same: never "paused" by default
+  _l1=$(sed -n '1p' "$_f" 2>/dev/null | tr -d '[:space:]')
+  _l3=$(sed -n '3p' "$_f" 2>/dev/null | tr -d '[:space:]')
+  _l4=$(sed -n '4p' "$_f" 2>/dev/null | tr -d '\r' | cut -c1-200)
+  PILOT_SWAP_PAUSE_STATE="unreadable"
+  if [ "$_l1" != "PAUSE" ]; then PILOT_SWAP_PAUSE_DETAIL="first line is not PAUSE: ${_f}"; return 1; fi
+  case "$_l3" in ''|*[!0-9]*) PILOT_SWAP_PAUSE_DETAIL="expiry (line 3) is not a number: ${_f}"; return 1 ;; esac
+  if [ "${#_l3}" -gt 12 ]; then PILOT_SWAP_PAUSE_DETAIL="expiry (line 3) is absurdly large: ${_f}"; return 1; fi
+  # falhou/ilegível (date prints nothing or a non-number) → the clock cannot be read: unreadable, not "expired" and not "paused"
+  _now=$(date +%s 2>/dev/null) || _now=""
+  case "$_now" in ''|*[!0-9]*) PILOT_SWAP_PAUSE_DETAIL="clock unreadable (date +%s gave '${_now}'): ${_f}"; return 1 ;; esac
+  _left=$(( 10#$_l3 - 10#$_now ))   # 10#: a malformed "0900" must not read as octal and abort the sweep under set -e
+  if [ "$_left" -le 0 ]; then
+    PILOT_SWAP_PAUSE_STATE="expired"
+    PILOT_SWAP_PAUSE_DETAIL="expired $(( 0 - _left ))s ago (${_f})"
+    return 1
+  fi
+  if [ "$_left" -gt "$PILOT_SWAP_PAUSE_MAX_AHEAD_S" ]; then
+    PILOT_SWAP_PAUSE_DETAIL="expiry is ${_left}s ahead, more than ${PILOT_SWAP_PAUSE_MAX_AHEAD_S}s: a pause nobody can renew is not trusted (${_f})"
+    return 1
+  fi
+  PILOT_SWAP_PAUSE_STATE="paused"
+  PILOT_SWAP_PAUSE_DETAIL="expires in ${_left}s: ${_l4:-no reason given}"
+  return 0
 }
 
 # gc_variable_session_count — LIVE count of the elastic-pool session types the
@@ -5965,6 +6023,24 @@ elif [ "$(_pilot_ram_pressure_unreadable)" = "1" ]; then
   # header above) but "couldn't tell" must stay VISIBLE, not collapse silently
   # into the same log-silence as "confirmed clear" on a state-mutating path.
   log "RAM-pressure signal UNREADABLE (stale/corrupt ${PILOT_RAM_LEVEL_FILE}) — fail-open, dispatch proceeding normally this sweep (ga-m2gqb)."
+fi
+
+# ── ga-yh41v0e: SWAP SPAWN PAUSE — PAUSE dispatch while the disk ladder's swap step holds the pause file ───────────────────────────
+# See the config header (PILOT_SWAP_PAUSE_FILE) for the why. Same full-PAUSE shape as the RAM-pressure gate right above: nothing is
+# mutated, the candidates are re-picked by a later sweep once the file is gone or has lapsed. No push per sweep: the swap step already
+# notified the Mayor when it cut. `|| rc=$?`: the reader answers 1 for "no pause", and the dispatcher runs under set -e.
+_swap_pause_rc=0
+_pilot_swap_spawn_pause || _swap_pause_rc=$?
+if [ "$_swap_pause_rc" -eq 0 ]; then
+  warn "Swap spawn pause (${PILOT_SWAP_PAUSE_DETAIL}) — PAUSING all dispatch this sweep: the swap is growing and it lives on the Dolt volume (16/11: swap 2.8 → 6 GB in ~5 min, disk 1 GB, kernel panic). In-flight builders are untouched; dispatch resumes on its own once the file is removed or lapses (ga-yh41v0e)."
+  # The state-file reason ("swap-spawn-pause") and the "(paused: swap spawn pause)" text of the sweep-complete line below stay CONSTANT on purpose: approved-state-reconciler.py
+  # counts that line as a whole-sweep pause in its history (_PILOT_SWEEP_PAUSED_RE) and, from the state file, explains starving beads by it. Only the DETAIL (seconds left, the writer's reason) varies.
+  _pilot_write_sweep_pause_state 1 "swap-spawn-pause" "Swap spawn pause: ${PILOT_SWAP_PAUSE_DETAIL}"
+  log "=== Pilot sweep complete: dispatched=0 (paused: swap spawn pause) ==="
+  exit 0
+elif [ "$PILOT_SWAP_PAUSE_STATE" = "expired" ] || [ "$PILOT_SWAP_PAUSE_STATE" = "unreadable" ]; then
+  # Third state kept VISIBLE: a pause file that cannot be trusted is not "no pause" — dispatch proceeds (fail-open) but says why (ga-yh41v0e).
+  log "Swap spawn pause file ${PILOT_SWAP_PAUSE_STATE} (${PILOT_SWAP_PAUSE_DETAIL}) — fail-open, dispatch proceeding normally this sweep; this is NOT a confirmation that the swap is calm (ga-yh41v0e)."
 fi
 
 # ── ga-vln2py: DISK FLOOR — PAUSE dispatch when the free disk is under the new-work floor ───────────
