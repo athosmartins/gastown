@@ -374,13 +374,13 @@ done
 
 # ══ 14. what the hq-mutants sweep found loose (ga-hq1qc5y): the exit codes, the stderr switches, git failing in each way ═══
 # EQUIVALENT, documented: b7c9d8d8cd (`info`'s `return 0` -> `1`: nobody reads info's status and there is no set -e), 0eee0688b9 (`list_city_skills`'s `return 0` -> `1`: it is only
-# ever the command of an assignment), 6c338436aa and 9a09ceee49 (`$ok && exit 0 || exit 1` is the last
+# ever the command of an assignment), 5f0dc5369f and 6ef7fc53ac (`$ok && exit 0 || exit 1` is the last
 # command: falling off the end exits with the status of `$ok`, which is 1 exactly when the explicit exit would have been).
 # 20adc40c2f (`if command -v realpath` -> `if ! command -v realpath`) is equivalent on any PATH that HAS realpath (both branches print the physical path) and is killed by the scenario
 # "realpath missing from PATH", which audits a link to a FILE on a PATH without realpath and checks the resolved path in the reason (ga-r8nsaot; since ga-6gdsknp a directory link no longer reaches realpath_of).
 # EQUIVALENT b7c9d8d8cd: `info`'s `return 0` -> `1`: nobody reads info's status and there is no set -e
 # EQUIVALENT 0eee0688b9: `list_city_skills`'s `return 0` -> `1`: it is only ever the command of an assignment
-# EQUIVALENT 6c338436aa 9a09ceee49: `$ok && exit 0 || exit 1` is the last command: falling off the end exits with the status of `$ok`, which is 1 exactly when the explicit exit would have been
+# EQUIVALENT 5f0dc5369f 6ef7fc53ac: `$ok && exit 0 || exit 1` is the last command: falling off the end exits with the status of `$ok`, which is 1 exactly when the explicit exit would have been
 scenario "exit codes and the stderr switches"
 rc=0; "$AUDIT" --help >/dev/null 2>&1 || rc=$?
 [[ "$rc" == 0 ]] && ok "--help exits 0" || bad "--help exited $rc"
@@ -451,7 +451,7 @@ rm -rf "$ROOT" "$NORP"
 # realpath path and still be flagged — the fast path is a shortcut for the answer, never a change of it.
 scenario "symlink sinks are resolved without forking realpath (and a file link still goes through it)"
 RPSTUB="$(mktemp -d)"; RPREAL="$(command -v realpath)"
-printf '#!/bin/sh\necho x >> "$RPSTUB_LOG"\nexec "$RPSTUB_REAL" "$@"\n' > "$RPSTUB/realpath"; chmod +x "$RPSTUB/realpath"
+printf '#!/bin/sh\necho x >> "$RPSTUB_LOG"\n[ -z "${RPSTUB_EMPTY:-}" ] || exit 1\nexec "$RPSTUB_REAL" "$@"\n' > "$RPSTUB/realpath"; chmod +x "$RPSTUB/realpath"
 ROOT="$(mktemp -d)"; make_fixture "$ROOT"; write_manifest "$ROOT/city"
 : > "$ROOT/rp.log"
 OUT="$(PATH="$RPSTUB:$PATH" RPSTUB_REAL="$RPREAL" RPSTUB_LOG="$ROOT/rp.log" run_audit "$ROOT/city" "$ROOT/wa" "$ROOT/city/.gc/state/skill-manifest.json" "$SKILLS_JSON")"
@@ -467,6 +467,14 @@ n="$(wc -l < "$ROOT/rp.log" | tr -d ' ')"
 [[ "$(json_field "$OUT" drift_count)" == "1" ]] && ok "a link to a file is still reported as drift" || bad "link to a file: drift_count=$(json_field "$OUT" drift_count) json=$OUT"
 [[ "$n" -ge 1 ]] && ok "and it took the realpath fallback ($n call)" || bad "link to a file never reached realpath_of (n=$n)"
 [[ "$(reasons_of "$OUT")" == "symlink resolves to $RROOT/elsewhere, not canonical "* ]] && ok "and realpath_of answered the physical path ($RROOT/elsewhere), not nothing (dangling) and not the link itself" || bad "realpath_of gave the wrong answer: reasons=[$(reasons_of "$OUT")] (want: symlink resolves to $RROOT/elsewhere, not canonical ...)"
+# the third state: realpath ran and FAILED (printed nothing) for a link that exists. cd -P cannot take a link to a file, so realpath_of is the only answer here, and "no answer" is not a path:
+# the sink is reported as dangling, naming where the link points — never as "resolves to <empty>", which would read as a resolution that merely differs from canonical.
+: > "$ROOT/rp.log"
+OUT="$(PATH="$RPSTUB:$PATH" RPSTUB_REAL="$RPREAL" RPSTUB_EMPTY=1 RPSTUB_LOG="$ROOT/rp.log" run_audit "$ROOT/city" "$ROOT/wa" "$ROOT/city/.gc/state/skill-manifest.json" "$SKILLS_JSON")"
+n="$(wc -l < "$ROOT/rp.log" | tr -d ' ')"
+[[ "$n" -ge 1 ]] && ok "control: the failing realpath was asked about the file link ($n call)" || bad "control: the failing realpath was never asked (n=$n): the case below proves nothing"
+[[ "$(json_field "$OUT" drift_count)" == "1" ]] && ok "a link that realpath could not resolve is still drift" || bad "realpath failing: drift_count=$(json_field "$OUT" drift_count) json=$OUT"
+[[ "$(reasons_of "$OUT")" == "dangling symlink -> $ROOT/elsewhere" ]] && ok "and it is reported as dangling, naming where the link points" || bad "realpath failing: reasons=[$(reasons_of "$OUT")] (want: dangling symlink -> $ROOT/elsewhere)"
 rm -rf "$ROOT" "$RPSTUB"
 
 # cd -P resolves a relative path through an exported CDPATH and prints what it found; phys_dir runs in the audit's own shell, so that line would land in the JSON stream (gate review of ga-6gdsknp).
@@ -475,7 +483,35 @@ scenario "CDPATH exported + relative city: stdout is still a single JSON object"
 ROOT="$(mktemp -d)"; make_fixture "$ROOT"; write_manifest "$ROOT/city"; RROOT="$(phys_of "$ROOT")"
 OUT="$(cd "$RROOT" && CDPATH="$RROOT" SKILL_AUDIT_CITY="city" SKILL_AUDIT_WA="wa" SKILL_AUDIT_MANIFEST="city/.gc/state/skill-manifest.json" SKILL_AUDIT_SKILLS_JSON="$SKILLS_JSON" "$AUDIT" --json-only --quiet 2>/dev/null)"
 printf '%s' "$OUT" | python3 -c 'import json,sys; json.load(sys.stdin)' 2>/dev/null && ok "stdout parses as one JSON document" || bad "stdout is not a single JSON document: [$OUT]"
+# the same relative setup with a REAL drift (a consumer link to nowhere) must still be drift: a phys_dir that leaves the shell in / makes every relative sink look absent, and absent is not drift,
+# so the audit would report a drifted city as clean (measured: ok=true, drift_count=0 with the shell left in /; the absolute city never showed it)
+ln -sfn "$RROOT/nowhere" "$ROOT/city/.gc/agents/a1/.claude/skills/demo"
+OUT="$(cd "$RROOT" && CDPATH="$RROOT" SKILL_AUDIT_CITY="city" SKILL_AUDIT_WA="wa" SKILL_AUDIT_MANIFEST="city/.gc/state/skill-manifest.json" SKILL_AUDIT_SKILLS_JSON="$SKILLS_JSON" "$AUDIT" --json-only --quiet 2>/dev/null)"
+[[ "$(json_field "$OUT" drift_count)" == "1" ]] && ok "relative city: a link to nowhere is still drift (the audit's shell was not left in /)" || bad "relative city lost the drift: drift_count=$(json_field "$OUT" drift_count) json=$OUT"
 rm -rf "$ROOT"
+
+# phys_dir is the audit's fork-free answer for a directory (`cd -P` in the audit's own shell). Its promises matter in setups that a healthy run on absolute paths never reaches: it hands the shell
+# back where it found it (a relative path the audit uses later would break otherwise), it prints nothing (stdout is the JSON stream), and it says rc 1 — so the caller asks realpath_of
+# instead — whenever it cannot answer OR cannot put the shell back anywhere. Run here as the function text cut out of the script (sourcing the script would run an audit).
+scenario "phys_dir: answers a directory link, leaves the shell where it was, and says no when it cannot"
+PDD="$(mktemp -d)"; PRD="$(phys_of "$PDD")"
+mkdir "$PDD/real" "$PDD/work"; ln -s "$PDD/real" "$PDD/dlink"; printf 'x\n' > "$PDD/file"; ln -s "$PDD/file" "$PDD/flink"
+# vazio (the function is not in the script) → the control below fails and so does every case after it (phys_dir: command not found, rc 127; the first case dies on the unset PHYS under set -u); falhou/ilegível → the same
+PDFN="$(sed -n '/^phys_dir() {/,/^}/p' "$AUDIT")"
+[[ "$PDFN" == "phys_dir() {"*$'\n'"}" ]] && ok "control: phys_dir was cut out of the script whole" || bad "control: phys_dir was not cut out whole: [$PDFN]"
+got="$( eval "$PDFN"; builtin cd "$PDD/work" && phys_dir "$PDD/dlink" > "$PDD/stdout"; echo "rc=$? PHYS=$PHYS PWD=$PWD" )"
+[[ "$got" == "rc=0 PHYS=$PRD/real PWD=$PDD/work" ]] && ok "a directory link: rc 0, PHYS is the physical path, the shell is back where it was" || bad "directory link: got [$got] (want rc=0 PHYS=$PRD/real PWD=$PDD/work)"
+[[ "$got" == "rc=0 "* && ! -s "$PDD/stdout" ]] && ok "and nothing was printed on stdout" || bad "phys_dir printed on stdout (or never ran): got=[$got] stdout=[$(cat "$PDD/stdout")]"
+got="$( eval "$PDFN"; builtin cd "$PDD/work" && phys_dir "$PDD/flink"; echo "rc=$? PWD=$PWD" )"
+[[ "$got" == "rc=1 PWD=$PDD/work" ]] && ok "a link to a file: rc 1 (the caller falls back to realpath_of) and the shell has not moved" || bad "file link: got [$got] (want rc=1 PWD=$PDD/work)"
+# a `cd` that works for its first call only: the shell sits inside the target and can be taken neither back to where it was nor to /. The answer must be rc 1 (a fast path that has lost
+# the shell is not trusted), not a success that leaves the audit standing inside the skill. Limit 99 is the control: the same wrapper lets every call through.
+for lim in 99 1; do
+    got="$( eval "$PDFN"; N=0; cd() { N=$((N+1)); [[ "$N" -le "$lim" ]] || return 1; builtin cd "$@"; }; phys_dir "$PDD/dlink"; echo "rc=$?" )"
+    [[ "$lim" == 99 ]] && want="rc=0" || want="rc=1"
+    [[ "$got" == "$want" ]] && ok "cd allowed $lim call(s): $want" || bad "cd allowed $lim call(s): got [$got] (want $want)"
+done
+rm -rf "$PDD"
 
 # ── Summary ───────────────────────────────────────────────────────────────────
 echo

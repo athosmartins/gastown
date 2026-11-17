@@ -238,15 +238,15 @@ ROOT="$_saved_ROOT"; REMOTE="$_saved_REMOTE"; BRANCH="$_saved_BRANCH"
 # date e git de mentira definidos como funcoes deste shell, como gc e notify acima.
 # EQUIVALENTES (lastro): 3bf5a69c5c 3ec1b3ce09 18e2ca9f08 8c15fc648f (`cmd || true` -> `cmd && true`:
 # ninguem le o status e nao ha set -e); 4dd84a5bcb (o `|| true` que fecha a cadeia de cp do backup: ninguem le o status);
-# d0372d9f4c 2a4dfbfe9d c3efbaf3cc 7990ceb751 d1fe4548ab 86e745f1c8 (`$(git ... || echo "")` -> `&&`: quando o git
-# falha nao imprime nada e quando acerta a linha vazia a mais some no $(...)).
+# d0372d9f4c 2a4dfbfe9d c3efbaf3cc 7990ceb751 d1fe4548ab 86e745f1c8 (`$(git ... || echo "")` -> `&&`: o `echo ""` so
+# acrescenta uma quebra de linha, que o $(...) tira de qualquer jeito; o valor nao muda, so o status da atribuicao).
 # NAO e' equivalente: 033544c743, o `rm -f` que fecha o clear_escalation, muda o status do PROPRIO ajudante; o caso do
 # carimbo-diretorio no cenario 22 le esse status. Tambem nao e': 24909e7bf1 (o `||` entre os dois cp do backup virando `&&`): o 2o cp, depois de um `cp -p` que deu certo, troca o mtime do
 # backup pela hora de agora (os bytes sao os mesmos); o cenario 21 le o mtime e, sem /tmp gravavel (a jaula do gate, onde ele ficava vivo), conta as chamadas de um `cp` de mentira (ga-0co26ac).
 # date devolve $FAKE_NOW para `date +%s` quando ele esta definido; git falha quando "<subcomando> <1o arg>" comeca por $GITFAIL.
 # EQUIVALENT 3bf5a69c5c 3ec1b3ce09 18e2ca9f08 8c15fc648f: `cmd || true` -> `cmd && true`: ninguem le o status e nao ha set -e
 # EQUIVALENT 4dd84a5bcb: o `|| true` que fecha a cadeia de cp do backup: ninguem le o status
-# EQUIVALENT 2a4dfbfe9d 7990ceb751 86e745f1c8 d0372d9f4c c3efbaf3cc d1fe4548ab: `$(git ... || echo "")` -> `&&`: quando o git falha nao imprime nada e quando acerta a linha vazia a mais some no $(...)
+# EQUIVALENT 2a4dfbfe9d 7990ceb751 86e745f1c8 d0372d9f4c c3efbaf3cc d1fe4548ab: `$(git ... || echo "")` -> `&&`: o `echo ""` so acrescenta uma quebra de linha e o $(...) a tira de qualquer jeito, entao o valor e o mesmo quando o git acerta (a sha) e quando falha (o rev-parse sem --verify imprime o nome da ref que nao achou); so muda o STATUS da atribuicao (128 no mutante), que ninguem le (sem set -e nem trap ERR)
 date() { if [ "${1-}" = "+%s" ] && [ -n "${FAKE_NOW:-}" ]; then echo "$FAKE_NOW"; else command date "$@"; fi; }
 git() { if [ -n "${GITFAIL:-}" ]; then case "${3-} ${4-}" in "$GITFAIL"*) return 1 ;; esac; fi; command git "$@"; }
 fresh_stamps() { rm -f "$ESCALATE_STAMP" "$NTFY_STAMP"; }
