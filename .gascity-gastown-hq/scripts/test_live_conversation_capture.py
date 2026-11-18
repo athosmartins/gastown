@@ -473,6 +473,66 @@ class Pass(unittest.TestCase):
         self.assertEqual((self.w.main("--final")[0], self.w.stored()), (0, U1))
         fh.close()
 
+    def test_final_outwaits_a_periodic_pass_that_holds_the_lock_longer_than_10_s_and_still_captures(self):
+        """17/11 23:41 (ga-esorlre.9): a periodic pass held the lock for ~11+ s at load 50, `--final` gave up after the old 10 s, armed nothing, and the reboot went on."""
+        import fcntl
+        fh = open(self.w.p(".gc", "live-conversation-capture.lock"), "w")
+        self.addCleanup(fh.close)
+        fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        t0 = self.w.io.t
+
+        def pass_ends():  # the periodic pass lets go 15 s after `--final` started waiting
+            if self.w.io.t - t0 >= 15:
+                fcntl.flock(fh, fcntl.LOCK_UN)
+        self.w.io.on_sleep = pass_ends
+        rc, out = self.w.main("--final")
+        self.assertEqual((rc, self.w.stored()), (0, U1), out)
+        self.assertIn("armou=", out)
+        self.assertTrue(15 <= self.w.io.t - t0 < 20)  # it did not wait a second more than the pass needed
+        self.assertEqual(L.Cfg({}).lock_wait_s, 60)  # the default: longer than a pass that is stuck in `gc session list` (45 s) plus the target it is on
+
+    def test_a_waiting_final_raises_the_flag_for_the_whole_wait_and_takes_it_down_on_every_way_out(self):
+        import fcntl
+        flag = self.w.p(".gc", "live-conversation-capture.final-wanted")
+        fh = open(self.w.p(".gc", "live-conversation-capture.lock"), "w")
+        self.addCleanup(fh.close)
+        fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        seen = []
+        self.w.io.on_sleep = lambda: seen.append((os.path.exists(flag), L.final_wanted(L.Cfg(self.w.env), self.w.io)))
+        self.assertEqual(self.w.main("--final", LCC_LOCK_WAIT_S="3")[0], 4)  # gave up: the flag goes too, or the periodic passes would yield to nobody
+        self.assertTrue(seen and all(x == (True, True) for x in seen), seen)  # up the whole time it waited, and fresh by the pass's own clock
+        self.assertFalse(os.path.exists(flag))
+        self.w.io.on_sleep = lambda: fcntl.flock(fh, fcntl.LOCK_UN)
+        self.assertEqual(self.w.main("--final")[0], 0)  # got the lock and ran the pass
+        self.assertFalse(os.path.exists(flag))
+        fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        self.w.io.on_sleep = lambda: seen.append("dry slept")
+        seen.clear()
+        self.assertEqual(self.w.main("--final", "--dry-run", LCC_LOCK_WAIT_S="1")[0], 4)  # a dry run writes nothing, and a flag is a write
+        self.assertEqual(seen[:1], ["dry slept"])
+        self.assertFalse(os.path.exists(flag))
+
+    def test_a_periodic_pass_yields_to_a_fresh_flag_and_ignores_a_stale_or_unreadable_one(self):
+        w = self.w
+        w.crew("batista-wa", "ga-wisp-bbb", base=300, sid=U2)
+        flag = w.p(".gc", "live-conversation-capture.final-wanted")
+        open(flag, "w").close()
+        os.utime(flag, (w.io.t - 5, w.io.t - 5))
+        code, c = w.go()
+        self.assertEqual((code, c["wrote"], w.io.n("bd", "update")), (0, 0, 0))  # stopped before the first target: nothing written, nothing armed
+        self.assertIn("YIELD:", rd(w.p(".gc", "logs", "live-conversation-capture.log")))
+        self.assertEqual(w.go(final=True)[1]["wrote"], 2)  # the `--final` pass itself never yields to its own flag
+        os.remove(w.p(".gc", "live-conversation-capture.state.json"))  # forget what was written, so a pass that is not stopped has two targets to write
+        w.io.meta.clear()
+        os.utime(flag, (w.io.t - 200, w.io.t - 200))  # a `--final` that died: its flag no longer counts
+        self.assertEqual(w.go()[1]["wrote"], 2)
+        os.utime(flag, (w.io.t - 5, w.io.t - 5))
+        real_stat = os.stat
+        with mock.patch("os.stat", side_effect=lambda p, *a, **k: (_ for _ in ()).throw(PermissionError(errno.EACCES, "no")) if p == flag else real_stat(p, *a, **k)):
+            self.assertFalse(L.final_wanted(L.Cfg(w.env), w.io))  # cannot read it = the old behaviour, never a stop on a doubt
+        os.remove(flag)
+        self.assertFalse(L.final_wanted(L.Cfg(w.env), w.io))
+
     def test_the_budget_clamps_every_call_and_leaves_the_targets_it_cannot_reach_unknown(self):
         w = self.w
         w.go(LCC_BUDGET_S="30")

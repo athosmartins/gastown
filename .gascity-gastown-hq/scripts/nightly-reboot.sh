@@ -1344,8 +1344,10 @@ done
 # root-owned files next to them would break the user later: see guard_sender_in_flight), bounded, and NEVER a veto: the safety re-check is behind us (no skip decision is left, only the
 # shutdown call itself can fail); if the capture fails or times out, the last value of the periodic capture (launchd, every 2 min) stands.
 CAPTURE_PY="${NIGHTLY_REBOOT_CAPTURE_PY:-${CITY}/scripts/live-conversation-capture.py}"
-CAPTURE_TIMEOUT="${NIGHTLY_REBOOT_CAPTURE_TIMEOUT_SECS:-30}"
-case "${CAPTURE_TIMEOUT}" in ''|*[!0-9]*|0) CAPTURE_TIMEOUT=30 ;; esac
+# 90 s = the lock wait of `--final` (LCC_LOCK_WAIT_S, 60) + its own pass (20) + margin (ga-esorlre.9). At 30 s the wait itself was cut short: on 17/11 a periodic pass held the lock, `--final` gave up
+# after 10 s, nothing was armed and 5 of 5 crews came back on a NEW conversation. The wait is only that long when a periodic pass is in the way; `--final` makes that pass let go of the lock.
+CAPTURE_TIMEOUT="${NIGHTLY_REBOOT_CAPTURE_TIMEOUT_SECS:-90}"
+case "${CAPTURE_TIMEOUT}" in ''|*[!0-9]*|0) CAPTURE_TIMEOUT=90 ;; esac
 capture_live_conversations() {
     sudo -u "${NOTIFY_AS_USER}" /usr/bin/env HOME="/Users/${NOTIFY_AS_USER}" GC_CITY_PATH="${CITY}" LCC_GC="${GC}" LCC_BD="${BD}" LCC_TMUX="${NIGHTLY_REBOOT_TMUX:-/opt/homebrew/bin/tmux}" "${PYTHON3_BIN}" "${CAPTURE_PY}" --final
 }
@@ -1388,7 +1390,7 @@ log "swapfiles before: $(ls /System/Volumes/VM/ 2>/dev/null | grep -c swapfile)"
 # possible; a send that started in the gap holds the reboot like one that was there at
 # 23:40. The streak is reset only after this, so a night that ends here as a SKIP keeps
 # counting. What is left between this read and the shutdown is the live-conversation
-# capture below (bounded by NIGHTLY_REBOOT_CAPTURE_TIMEOUT_SECS, 30 s by default, and never
+# capture below (bounded by NIGHTLY_REBOOT_CAPTURE_TIMEOUT_SECS, 90 s by default, and never
 # a veto), the routine note after it (notify: not bounded here, see the header), the
 # counters' bookkeeping (two local files; the scraper-cut alarm mail is NOT sent from here,
 # it rides in the pending file), the pending file itself and `sync` — seconds, not minutes.
@@ -1402,6 +1404,13 @@ CAP_OUT="$(mktemp -t nightly-reboot-capture.XXXXXX)"; run_bounded "${CAPTURE_TIM
 CAP_NOTE=""; [ "${CAP_RC}" -eq 124 ] && CAP_NOTE=" (TIMED OUT)"
 log "capture: live conversations rc=${CAP_RC}${CAP_NOTE}: $(head -1 "${CAP_OUT}" 2>/dev/null | cut -c1-200) — the reboot proceeds"
 rm -f "${CAP_OUT}" "${CAP_OUT}.deadline"
+# rc 0 = the pass ran (whether each crew was armed or deliberately refused is in the capture's own log). Anything else (4 = the lock never freed, 124 = timed out, 3 = could not evaluate) means
+# NOTHING was armed: the crews and the Mayor will come back on a new conversation. That used to be one log line; now the log says it loudly AND the note Athos gets carries it (ga-esorlre.9).
+CAP_WARN=""
+if [ "${CAP_RC}" -ne 0 ]; then
+    CAP_WARN=" ATENÇÃO: não consegui guardar a conversa das crews antes de reiniciar (captura rc=${CAP_RC}${CAP_NOTE}): elas devem voltar em conversa NOVA."
+    log "WARN: reboot WITHOUT arming the live conversations (capture rc=${CAP_RC}${CAP_NOTE}) — the crews and the Mayor come back on a NEW conversation"
+fi
 
 # The routine "Reiniciando" note is sent AFTER the re-check (gate FAIL 3/3): the re-check
 # can still turn the night into a SKIP — up to ~16 min later — and a "reiniciando às HH:MM"
@@ -1409,7 +1418,7 @@ rm -f "${CAP_OUT}" "${CAP_OUT}.deadline"
 # price is that notify's own time now sits between the re-check and the shutdown: notify is
 # one of the calls this script does not bound (see the header), and that time was not
 # measured here — it is a routine note on the digest route, not an alarm push.
-notify_athos "Reboot noturno" "Reiniciando às $(date '+%H:%M') pra liberar swap acumulado. Volto em ~2min (auto-login)." 3
+notify_athos "Reboot noturno" "Reiniciando às $(date '+%H:%M') pra liberar swap acumulado. Volto em ~2min (auto-login).${CAP_WARN}" 3
 
 # The night's bookkeeping — the skip streak back to 0, the scraper-cut counter — is written
 # HERE, right before the shutdown call and not earlier, so nothing slow sits between it and
