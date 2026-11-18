@@ -133,7 +133,7 @@ cfg CHEAP_S 25         # prazo de cada chamada do sqlite3 (leitura barata do env
 cfg DRAIN_S 150        # com o envio pausado, espera isto para esvaziar (um envio on-device leva ~2 min)
 cfg DRAIN_POLL_S 10    # intervalo entre as leituras baratas durante o esvaziamento
 cfg RONDA_WINDOW_S 10800  # rodada aberta (sem finished_at) só conta se começou nas últimas 3 h: a ronda dura ~28 min; mais velha que isto é rodada que morreu sem fechar (ga-tklekcn)
-cfg CAPTURE_TIMEOUT_S 30  # prazo da captura da conversa viva (--final) antes do reinício (ga-esorlre.2); estourou/falhou = só o log avisa
+cfg CAPTURE_TIMEOUT_S 90  # prazo da captura da conversa viva (--final) antes do reinício (ga-esorlre.2): 60 s de espera pela trava + 20 s da passada + folga (ga-esorlre.9: a 30 s a espera era cortada e nada era armado); estourou/falhou = o log avisa
 
 now() { case "${DR4_NOW:-}" in ''|*[!0-9]*) date +%s ;; *) printf '%s' "$DR4_NOW" ;; esac; }
 hhmm() { date -r "$1" '+%H:%M' 2>/dev/null || printf '%s' "$1"; }
@@ -962,7 +962,7 @@ esac
 # captura da conversa viva (ga-esorlre.2): guardas e cancelamentos ficaram para trás (só a marca e o pedido ainda podem falhar), então a conversa que cada crew e o Mayor usam AGORA vai para a
 # bead de sessão, o último ato antes da marca. NUNCA barra o reinício (o D4 existe para salvar o mini; vale o último valor da rodada periódica). vazio → n/a (só o rc importa); falhou/estourou o prazo → só o log avisa
 run_bounded "$CAPTURE_TIMEOUT_S" env GC_CITY_PATH="$CITY" "$PY" "$CAPTURE_PY" --final; crc=$?
-if [ "$crc" -eq 0 ]; then log "captura da conversa viva (--final): $(out_line)"; else log "WARN: captura da conversa viva (--final) rc=$crc ($(out_line)) — o reinício segue"; fi
+if [ "$crc" -eq 0 ]; then log "captura da conversa viva (--final): $(out_line)"; else log "WARN: captura da conversa viva (--final) rc=$crc ($(out_line)) — o reinício segue SEM armar: as crews e o Mayor devem voltar em conversa NOVA"; fi
 rb_clean
 
 # a marca vai para o disco ANTES do pedido e é CONFERIDA: o pedido derruba este processo (nada escrito depois conta), e reinício sem marca

@@ -630,6 +630,8 @@ mk_case cap_ok; touch "$C/reboot.dies"; run_sut --run
 chk "chamada UMA vez, com --final, ANTES da marca; o reinício veio depois (143; veio $RC)" '[ "$RC" = 143 ] && [ "$(cat "$C/capture.calls")" = "--final|marca=0" ] && [ "$(n_reboot)" = 1 ]'
 mk_case cap_fail; touch "$C/reboot.dies"; echo 1 > "$C/capture.rc"; run_sut --run
 chk "captura com rc 1: o reinício segue (143) e o log avisa" '[ "$RC" = 143 ] && grep -q "WARN: captura.*rc=1" "$C/log"'
+chk "...e o aviso diz o que isso custa: sem armar, as crews voltam em conversa NOVA (ga-esorlre.9)" 'grep -q "WARN: captura.*rc=1.*SEM armar.*conversa NOVA" "$C/log"'
+chk "o prazo PADRÃO da captura cobre a espera pela trava (60 s) + a passada (20 s): 90 s, não os 30 s que cortavam a espera (ga-esorlre.9)" 'grep -q "^cfg CAPTURE_TIMEOUT_S 90 " "$SUT"'
 mk_case cap_hang; touch "$C/reboot.dies" "$C/capture.hang"; setenv "DR4_CAPTURE_TIMEOUT_S=1"; run_sut --run
 chk "captura que pendura: o prazo a mata e o reinício segue (143; log com rc=124)" '[ "$RC" = 143 ] && grep -q "WARN: captura.*rc=124" "$C/log"'
 mk_case cap_dry; run_sut --dry-run

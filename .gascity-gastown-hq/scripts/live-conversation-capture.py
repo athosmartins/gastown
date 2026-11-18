@@ -10,8 +10,11 @@ HOW  Targets: active gastown.mayor + named crews (Layer-1 rule of crew-idle-chec
   ~/.claude/sessions/<pid>.json of a process in it; a file older than its process is a leftover of an earlier holder of the pid (reboots leave them) and is ignored.
 THREE STATES  live (one conversation, with a transcript: written) / absent (no claude in the pane, no transcript yet, no tmux session) / unknown (two conversations in one pane, unreadable
   file, tmux/ps/gc failed, budget spent). Absent and unknown never write and never erase: the last good value stays and the reason is logged.
-RUN  launchd every 120 s (instance lock, budget LCC_BUDGET_S 90) + `--final` (lock wait, budget 20 s) from the D4 and nightly reboot scripts; `--dry-run` writes nothing. stdout = ONE summary line;
+RUN  launchd every 120 s (instance lock, budget LCC_BUDGET_S 90) + `--final` (lock wait LCC_LOCK_WAIT_S 60, then its own budget 20 s) from the D4 and nightly reboot scripts; `--dry-run` writes nothing. stdout = ONE summary line;
   events go to .gc/logs/live-conversation-capture.log; last written (bead -> id, at) in .gc/live-conversation-capture.state.json (unreadable = one more harmless write).
+WAIT (ga-esorlre.9)  A periodic pass can hold the lock for its whole 90 s budget, and at load 50 it does (17/11 23:41: `--final` gave up after 10 s, armed nothing, and 5 of 5 crews came back on a NEW conversation).
+  So `--final` (not --dry-run) first touches .gc/live-conversation-capture.final-wanted; a periodic pass that finds it fresh (< 120s old) stops before its next target and lets go of the lock (the next pass
+  resumes, the last good values stand); the flag is removed when `--final` is done. A flag that cannot be written or read only costs the old behaviour: the wait runs its full length.
 ARM (ga-esorlre.3, only in --final)  After the capture, each live target is ARMED so the next boot RESUMES that conversation instead of starting a fresh one. Why: at boot the engine finds the session bead `active` with
   no runtime and no deliberate sleep_reason, calls it an unexpected death, wipes session_key and starts `--session-id <new>` (measured 12/11 23:47: Mayor + every crew came back on a new id; internal/session/
   lifecycle_projection.go shouldResetContinuation + cmd/gc/session_reconcile.go healState). The same engine keeps the key when sleep_reason is deliberate (what `gc stop` writes: city-stop). So ONE `bd update`:
@@ -23,7 +26,7 @@ ARM (ga-esorlre.3, only in --final)  After the capture, each live target is ARME
   AFTER BOOT (normal passes): armed + last_woke_at later than the arming -> session.resume_result=ok (same id) or fresh (other id; the session gets ONE nudge naming the old id); armed and no restart for
   LCC_DISARM_AFTER_S (900) -> sleep_reason=city-stop is removed again (the reboot did not happen). A restart onto another id that was never armed (guard said no, crash) gets the same nudge.
 KNOBS  LCC_ENABLED=0 or .gc/live-conversation-capture.off · LCC_HOME · LCC_CLAUDE_DIR · LCC_GC · LCC_BD · LCC_TMUX · LCC_TMUX_SOCKET · LCC_REFRESH_S · LCC_BUDGET_S · LCC_FINAL_BUDGET_S ·
-  LCC_LOCK_WAIT_S · LCC_GC_TIMEOUT_S/LCC_BD_TIMEOUT_S/LCC_SYS_TIMEOUT_S · LCC_ARM=0 (capture only) · LCC_MAX_RESUME_TOKENS · LCC_REFUSE_DANGLING · LCC_DISARM_AFTER_S · LCC_ARM_WORKERS.  EXIT 0 evaluated · 2 usage · 3 could not evaluate · 4 another instance runs.
+  LCC_LOCK_WAIT_S (60) · LCC_GC_TIMEOUT_S/LCC_BD_TIMEOUT_S/LCC_SYS_TIMEOUT_S · LCC_ARM=0 (capture only) · LCC_MAX_RESUME_TOKENS · LCC_REFUSE_DANGLING · LCC_DISARM_AFTER_S · LCC_ARM_WORKERS.  EXIT 0 evaluated · 2 usage · 3 could not evaluate · 4 another instance runs.
 """
 import concurrent.futures
 import fcntl
@@ -46,6 +49,7 @@ TAIL_BYTES = 4 << 20  # how much of a transcript's end the guards read
 NUDGE_TRIES = 3  # a nudge that keeps failing is given up after this many tries
 START_SLACK_S = 3  # ps etime has 1 s resolution: a registry file may look this much older than its process and still be its own
 MAX_DEPTH = 8
+FINAL_FLAG_TTL_S = 120  # a `--final` that died leaves its flag behind: older than this it no longer makes the periodic pass yield
 
 
 def num(v, default):
@@ -66,12 +70,13 @@ class Cfg:
         self.bd = [g("LCC_BD") or g("BD_BIN") or "bd", "-C", self.city]
         self.tmux = [g("LCC_TMUX") or "tmux", "-L", g("LCC_TMUX_SOCKET") or "gascity"]
         self.refresh_s, self.budget_s, self.final_budget_s = num(g("LCC_REFRESH_S"), 1800), num(g("LCC_BUDGET_S"), 90), num(g("LCC_FINAL_BUDGET_S"), 20)
-        self.lock_wait_s, self.gc_t, self.bd_t, self.sys_t = num(g("LCC_LOCK_WAIT_S"), 10), num(g("LCC_GC_TIMEOUT_S"), 45), num(g("LCC_BD_TIMEOUT_S"), 30), num(g("LCC_SYS_TIMEOUT_S"), 10)
+        self.lock_wait_s, self.gc_t, self.bd_t, self.sys_t = num(g("LCC_LOCK_WAIT_S"), 60), num(g("LCC_GC_TIMEOUT_S"), 45), num(g("LCC_BD_TIMEOUT_S"), 30), num(g("LCC_SYS_TIMEOUT_S"), 10)
         self.refuse_dangling = g("LCC_REFUSE_DANGLING", "0") == "1"
         self.arm, self.max_tokens, self.disarm_s, self.workers = g("LCC_ARM", "1") != "0", num(g("LCC_MAX_RESUME_TOKENS"), 700000), num(g("LCC_DISARM_AFTER_S"), 900), num(g("LCC_ARM_WORKERS"), 6)
         gc_dir = os.path.join(self.city, ".gc")
         self.agents, self.state = os.path.join(self.city, "agents"), os.path.join(gc_dir, "live-conversation-capture.state.json")
         self.lock, self.log = os.path.join(gc_dir, "live-conversation-capture.lock"), os.path.join(gc_dir, "logs", "live-conversation-capture.log")
+        self.final_flag = os.path.join(gc_dir, "live-conversation-capture.final-wanted")
         self.enabled = g("LCC_ENABLED", "1") != "0" and not os.path.exists(os.path.join(gc_dir, "live-conversation-capture.off"))
 
 
@@ -499,6 +504,29 @@ def check_boot(io, cfg, log, bead, tname, sid, ent, tmo, dry):
         log("FAILED %s (%s): could not record resume_result (retried next pass)" % (bead, tname))
 
 
+def raise_final_flag(cfg, io, up):
+    """`--final` tells the periodic pass that holds the lock to let go of it (ga-esorlre.9). Only a hint: a flag that cannot be written or removed costs the old behaviour (the wait runs its full length), never a failure."""
+    try:
+        if up:
+            open(cfg.final_flag, "a").close()
+            os.utime(cfg.final_flag, (io.now(), io.now()))  # the clock of the pass, so a faked clock and the real one agree on how old the flag is
+        else:
+            os.remove(cfg.final_flag)
+    except FileNotFoundError:
+        pass  # nothing to take down
+    except OSError:
+        pass  # vazio/falhou → segue sem a dica: a espera pela trava é a de sempre
+
+
+def final_wanted(cfg, io):
+    """True only when a `--final` raised its flag a moment ago. absent → False; unreadable → False (the periodic pass keeps its old behaviour, it never stops on a doubt); older than FINAL_FLAG_TTL_S → False (a `--final` that died)."""
+    try:
+        age = io.now() - os.stat(cfg.final_flag).st_mtime
+    except OSError:
+        return False
+    return age < FINAL_FLAG_TTL_S
+
+
 def run_pass(cfg, io, final=False, dry=False):
     """-> (exit code, counts). 0 evaluated · 3 could not evaluate (crew list or roster unreadable: nothing written)."""
     log = Log(cfg.log, dry)
@@ -526,6 +554,9 @@ def run_pass(cfg, io, final=False, dry=False):
     before = json.dumps(state, sort_keys=True)
     for tgt in targets:
         bead, tname = tgt["bead"], tgt["tname"]
+        if not final and final_wanted(cfg, io):
+            log("YIELD: a --final pass is waiting for the lock — this pass stops before %s (%s); the next one resumes, the last good values stand" % (bead, tname))
+            break
         ent = state.setdefault(bead, {})
         if io.now() >= end:
             st, val = "unknown", "time budget of the pass spent before this target"
@@ -636,6 +667,8 @@ def main(argv=None, env=None, io=None):
         print("%s NÃO consegui abrir a trava %s: %s" % (tag, cfg.lock, ex))
         return 3
     try:
+        if final and not dry:
+            raise_final_flag(cfg, io, True)
         end = io.now() + (cfg.lock_wait_s if final else 0)
         while True:
             try:
@@ -651,6 +684,8 @@ def main(argv=None, env=None, io=None):
                 return 3
         code, c = run_pass(cfg, io, final, dry)
     finally:
+        if final and not dry:
+            raise_final_flag(cfg, io, False)
         fh.close()
     if code != 0:
         print("%s NÃO consegui avaliar (ver %s)" % (tag, cfg.log))
