@@ -6,13 +6,16 @@
 #
 # CASOS: recusas antes de tocar em qualquer coisa (não é root, chave com opções/2 linhas/ilegível, entrypoint e tamanho inválidos, código sem sha limpo, runner no grupo, grupos extras) · instalação feliz (usuário, sudoers sem curinga,
 #   chave de root com restrict, drop-in, fstab sem perder as outras linhas, árvore, timer) e `--check` com os 20 itens ok · idempotência · sshd reprovado desfaz o drop-in (-t, dados fora do arquivo de root, runner afetado) e restaura o anterior ·
-#   visudo reprovado não troca o sudoers · fstab ilegível não é reescrito · link para fora da árvore · `--check` que FALHA / não consegue (cada item adulterado, e cada leitura que falha: id do runner, swapon, árvore, sudoers, sshd -T) · opção sem valor (com prazo: nunca gira) · chave com linha em branco · sshd -T do runner que falha desfaz o drop-in · `--code-dir` com repo de verdade (git archive do COMMIT: arquivo ignorado e edição assume-unchanged não entram, árvore antiga some, extração com modo inseguro e git archive que morre no meio → 98 com a árvore antiga intacta) · chave de root com grupo errado.
+#   visudo reprovado não troca o sudoers · fstab ilegível não é reescrito · link para fora da árvore · `--check` que FALHA / não consegue (cada item adulterado, e cada leitura que falha: id do runner, swapon, árvore, sudoers, sshd -T) · opção sem valor (com prazo: nunca gira) · chave com linha em branco · sshd -T do runner que falha desfaz o drop-in · `--code-dir` com repo de verdade (git archive do COMMIT: arquivo ignorado e edição assume-unchanged não entram, árvore antiga some, extração com modo inseguro e git archive que morre no meio → 98 com a árvore antiga intacta) · chave de root com grupo errado · LISTA BRANCA do código (wa-4p38ls, P0): o commit do teste tem dado de lead (hawkey_outbound_messages_48h.csv, contacts_auth/, docs/investigations/, *.db/*.sqlite/*.jsonl) e o nó recebe SÓ o fechamento da lista (nenhum byte de dado, nem lib/other.py);
+#   recusas 98 com o código certo e a árvore antiga intacta: lista ilegível/linha inválida/entrypoint sem linha/lista vazia, arquivo fora do commit, pasta na lista (o archive leva mais que a lista), arquivo de dado na lista sem `@fixture` (todas as extensões e pastas, em maiúscula também), `@fixture` isenta só o arquivo dele; linha de outro entrypoint não entra.
 # O QUE NÃO PROVA: que useradd/sshd/sudo/mount se comportam assim no Ubuntu 24.04 do nó. Isso é o `--check` + `hetzner-dados-prove.sh` rodados no nó depois da instalação.
 set -u
 HERE="$(cd "$(dirname "$0")" && pwd)"
 T=$(mktemp -d "${TMPDIR:-/tmp}/hzdados-inst-selftest.XXXXXX"); R="$T/r"; LOG="$T/log"; OUT="$T/out"; ERR="$T/err"; ME=$(id -un)
 trap 'chmod -R u+rwx "$T" 2>/dev/null; find "$T" -mindepth 1 -delete 2>/dev/null; rmdir "$T" 2>/dev/null' EXIT
 mkdir -p "$T/stubs" "$T/own"
+# a lista branca do código (wa-4p38ls): o instalador copiado lê $T/allow.txt (mkcopy), não a lista de produção; o entrypoint de teste é o build-x
+ALLOW_BASE=("build-x bin/build-x" "build-x lib/x.py"); setallow() { printf '%s\n' "$@" > "$T/allow.txt"; }; setallow "${ALLOW_BASE[@]}"
 mk() { printf '%s\n' "$2" > "$T/stubs/$1"; chmod +x "$T/stubs/$1"; }
 mk id '#!/usr/bin/env bash
 case "$*" in "-u") echo "${ID_U:-0}" ;; "-u dados"|"-g dados") echo 1234 ;; "-nG dados") echo "${ID_G_DADOS:-dados}" ;; "-nG runner") [ -z "${ID_RUNNER_FAIL:-}" ] || exit 1; echo "${ID_G_RUNNER:-runner}" ;; *) exec /usr/bin/id "$@" ;; esac'
@@ -25,6 +28,8 @@ mk sshd 'echo "sshd $*" >> "$LOG"
 case "$1" in -t) [ -z "${SSHD_T_FAIL:-}" ] ;; -T) case "$3" in user=dados,*) [ -n "${SSHD_DADOS_WRONG:-}" ] && echo "authorizedkeysfile .ssh/authorized_keys" || { [ -f "$R/etc/ssh/sshd_config.d/50-gt-dados.conf" ] && sed -n "s#^ *AuthorizedKeysFile \(.*\)#authorizedkeysfile \1#p" "$R/etc/ssh/sshd_config.d/50-gt-dados.conf"; } ;; *) [ -z "${SSHD_RUNNER_FAIL:-}" ] || exit 1; echo "authorizedkeysfile ${SSHD_RUNNER_LEAK:-.ssh/authorized_keys}" ;; esac ;; esac'
 mk systemctl 'echo "systemctl $*" >> "$LOG"; [ "${SWEEP_FAIL:-}" = 1 ] && [ "$1 $2" = "start gt-dados-sweep.service" ] && exit 1; exit 0'
 mk visudo 'echo "visudo $*" >> "$LOG"; [ -z "${VISUDO_MISSING:-}" ] || exit 127; [ -z "${VISUDO_FAIL:-}" ]'
+# `timeout` (GNU) não existe no PATH hermético do macOS (/usr/bin:/bin): sem o stub a 1ª varredura "falhava" aqui por `command not found`, não pelo que o caso prova (SWEEP_FAIL é do systemctl)
+mk timeout 'shift; exec "$@"'
 mk mountpoint '[ -f "$T/mounted" ]'
 mk mount 'echo "mount $*" >> "$LOG"; touch "$T/mounted"; echo "dados dados 700" > "$T/own/$(echo "$R/srv/gtdados" | tr / _)"'
 mk findmnt 'echo "${FS:-tmpfs} rw,nosuid,nodev,noexec,relatime"'
@@ -47,12 +52,12 @@ mk mv '/bin/mv "$@"; f="$T/own/$(echo "$1" | tr / _)"; [ -f "$f" ] && /bin/mv "$
 mk stat '[ "$1" = -c ] || exit 2; f="$T/own/$(echo "$3" | tr / _)"; [ -e "$3" ] || exit 1; read -r u g m < "$f" 2>/dev/null || { u=root g=root m=644; }; case "$2" in "%U:%G %a") echo "$u:$g $m" ;; "%U %a") echo "$u $m" ;; esac'
 export LOG T R
 mkcopy() { sed -e "s#^PATH=/usr/sbin:/usr/bin:/sbin:/bin\$#PATH=$T/stubs:/usr/bin:/bin#" -e "s#^DU=dados; SBIN=/usr/local/sbin; ETC=/etc/gt-dados; OPT=/opt/gt-dados; STAGE=/srv/gtdados; DHOME=/home/dados; SSHD_D=/etc/ssh/sshd_config.d; AKDIR=/etc/ssh/authorized_keys.d\$#DU=dados; SBIN=$R/usr/local/sbin; ETC=$R/etc/gt-dados; OPT=$R/opt/gt-dados; STAGE=$R/srv/gtdados; DHOME=$R/home/dados; SSHD_D=$R/etc/ssh/sshd_config.d; AKDIR=$R/etc/ssh/authorized_keys.d#" \
-  -e "s#^SUDOERS=/etc/sudoers.d/gt-dados-run; FSTAB=/etc/fstab; UNITS=/etc/systemd/system; LOGF=/var/log/gt-dados-sweep.log\$#SUDOERS=$R/etc/sudoers.d/gt-dados-run; FSTAB=$R/etc/fstab; UNITS=$R/etc/systemd/system; LOGF=$R/var/log/gt-dados-sweep.log#" -e "s#^SRC=.*; RUNNER=runner\$#SRC=$HERE; RUNNER=runner#" -e 's#-user root#-user '"$ME"'#g' ${2:+-e "$2"} "$1" > "$3"; chmod +x "$3"; }
+  -e "s#^SUDOERS=/etc/sudoers.d/gt-dados-run; FSTAB=/etc/fstab; UNITS=/etc/systemd/system; LOGF=/var/log/gt-dados-sweep.log\$#SUDOERS=$R/etc/sudoers.d/gt-dados-run; FSTAB=$R/etc/fstab; UNITS=$R/etc/systemd/system; LOGF=$R/var/log/gt-dados-sweep.log#" -e "s#^SRC=.*; RUNNER=runner\$#SRC=$HERE; RUNNER=runner#" -e "s#^ALLOW=.*\$#ALLOW=$T/allow.txt#" -e 's#-user root#-user '"$ME"'#g' ${2:+-e "$2"} "$1" > "$3"; chmod +x "$3"; }
 mkcopy "$HERE/hetzner-dados-install.sh" "" "$T/inst.sh" 2>/dev/null; mkcopy "$HERE/hetzner-dados-install.sh" "" "$T/inst.sh"
 n=0; fails=0; BAD=0; QUIET=0
 ck() { local l=$1; shift; [ "$QUIET" = 1 ] || n=$((n+1)); if "$@"; then [ "$QUIET" = 1 ] || echo "ok   $l"; else [ "$QUIET" = 1 ] || { echo "FAIL $l"; fails=$((fails+1)); }; BAD=1; fi; }
 rcis() { [ "$RC" = "$1" ]; }; has() { grep -q -E -- "$2" "$1"; }; hasnt() { ! grep -q -E -- "$2" "$1"; }
-ck "a cópia testada só troca caminhos, PATH e -user" test "$(diff "$HERE/hetzner-dados-install.sh" "$T/inst.sh" | grep '^<' | grep -v -c -e 'PATH=' -e '^< DU=dados' -e '^< SUDOERS=' -e '^< SRC=' -e '-user root')" = 0
+ck "a cópia testada só troca caminhos, PATH e -user" test "$(diff "$HERE/hetzner-dados-install.sh" "$T/inst.sh" | grep '^<' | grep -v -c -e 'PATH=' -e '^< DU=dados' -e '^< SUDOERS=' -e '^< SRC=' -e '^< ALLOW=' -e '-user root')" = 0
 echo "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAItestkey mini@gt" > "$T/mini.pub"
 world() { chmod -R u+rwx "$T/r" 2>/dev/null; find "$T/r" "$T/own" -mindepth 1 -delete 2>/dev/null; rm -f "$T/user" "$T/mounted"
   mkdir -p "$R/etc/ssh/sshd_config.d" "$R/etc/sudoers.d" "$R/etc/systemd/system" "$R/var/log" "$R/opt/gt-dados/app/bin" "$R/srv" "$R/usr/local/sbin"; printf 'UUID=1 / ext4 defaults 0 1\n' > "$R/etc/fstab"; : > "$LOG"
@@ -98,9 +103,13 @@ case_rollback() { local s=$1
   world; echo "# SUDOERS ANTIGO" > "$R/etc/sudoers.d/gt-dados-run"; VISUDO_FAIL=1 ap "$s"; ck "visudo reprova → 98, sudoers ANTIGO intacto, sem .new" bash -c "[ $RC = 98 ] && grep -q 'SUDOERS ANTIGO' '$R/etc/sudoers.d/gt-dados-run' && [ ! -e '$R/etc/sudoers.d/gt-dados-run.new' ]"
   world; rm -f "$R/etc/fstab"; ap "$s"; ck "fstab ilegível → 98 fstab-leitura e NÃO cria fstab só com a nossa linha" bash -c "[ $RC = 98 ] && grep -q 'fstab-leitura' '$ERR' && [ ! -s '$R/etc/fstab' ]"; }
 # o código de --code-dir é o do COMMIT: repo de verdade (GIT_REAL=1) com um arquivo ignorado, uma edição escondida por assume-unchanged (nenhum dos dois aparece em `status --porcelain`) e tar.umask=0 (diretórios 0777 no archive)
-mkrepo() { rm -rf "$T/repo" "$T/partial"; mkdir -p "$T/repo/bin" "$T/repo/lib" "$T/partial/bin"; echo partial > "$T/partial/bin/build-x"
+# wa-4p38ls: o commit TAMBÉM tem o que não pode ir ao nó — dado de lead/conversa (todo conteúdo "LEAD-DATA"), um csv na raiz com o nome do vazamento real, contacts_auth/, docs/investigations/ — e código que nenhuma lista autoriza (lib/other.py).
+# O `partial` (o que o git archive que morre entrega) é EXATAMENTE a lista base: só o pipefail o reprova
+mkrepo() { rm -rf "$T/repo" "$T/partial"; mkdir -p "$T/repo/bin" "$T/repo/lib" "$T/repo/data" "$T/repo/contacts_auth" "$T/repo/docs/investigations" "$T/partial/bin" "$T/partial/lib"; echo partial > "$T/partial/bin/build-x"; echo partial > "$T/partial/lib/x.py"
   ( cd "$T/repo" && /usr/bin/git init -q . && /usr/bin/git config user.email t@t && /usr/bin/git config user.name t && /usr/bin/git config commit.gpgsign false && /usr/bin/git config tar.umask 0 \
-    && printf '#!/bin/sh\n' > bin/build-x && chmod 755 bin/build-x && echo good > lib/x.py && echo junk > .gitignore && /usr/bin/git add -A && /usr/bin/git commit -q -m c \
+    && printf '#!/bin/sh\n' > bin/build-x && chmod 755 bin/build-x && echo good > lib/x.py && echo other > lib/other.py && echo junk > .gitignore \
+    && for f in hawkey_outbound_messages_48h.csv lib/tabela.csv lib/outra.csv lib/PLANILHA.CSV lib/t.sqlite lib/t.jsonl data/contatos.db contacts_auth/helper.py contacts_auth/cookies.json docs/investigations/nota.py; do echo LEAD-DATA > "$f"; done \
+    && /usr/bin/git add -A && /usr/bin/git commit -q -m c \
     && echo evil > lib/x.py && /usr/bin/git update-index --assume-unchanged lib/x.py && echo secret > junk ) > /dev/null 2>&1; }
 case_code() { local s=$1 sha app="$R/opt/gt-dados/app"
   mkrepo; sha=$(/usr/bin/git -C "$T/repo" rev-parse HEAD); ck "code-dir (preparo): o repo de teste é 'limpo' para o git (o que o instalador confere) e tem a edição escondida" bash -c "[ -z \"\$(/usr/bin/git -C '$T/repo' status --porcelain)\" ] && [ \"\$(cat '$T/repo/lib/x.py')\" = evil ]"
@@ -110,6 +119,9 @@ case_code() { local s=$1 sha app="$R/opt/gt-dados/app"
   ck "code-dir: o arquivo IGNORADO pelo .gitignore não é copiado" test ! -e "$app/junk"
   ck "code-dir: a edição escondida (assume-unchanged) não entra: o instalado é o conteúdo do COMMIT" bash -c "[ \"\$(cat '$app/lib/x.py')\" = good ]"
   ck "code-dir: o que havia na árvore e não está no commit some (como o --delete do rsync)" test ! -e "$app/stale"
+  # wa-4p38ls (P0): o commit inteiro NÃO vai. A árvore do nó é exatamente o fechamento da lista (+ o synth do próprio instalador); nenhum byte de dado de lead, nem o csv do vazamento real
+  ck "code-dir: o nó recebe SÓ a lista branca (bin/build-x, lib/x.py + o synth do instalador): nada de lib/other.py nem dos dados" bash -c "[ \"\$(cd '$app' && find . ! -type d | sed 's#^\./##' | sort | tr '\n' ' ')\" = 'bin/build-x bin/synth lib/x.py ' ]"
+  ck "code-dir: hawkey_outbound_messages_48h.csv (o vazamento do wa-4p38ls) e todo dado de lead ficam FORA do nó" bash -c "[ ! -e '$app/hawkey_outbound_messages_48h.csv' ] && [ ! -e '$app/contacts_auth' ] && [ ! -e '$app/docs' ] && [ ! -e '$app/data' ] && [ -z \"\$(grep -rl LEAD-DATA '$app' 2> /dev/null)\" ]"
   ck "code-dir: sem .git na árvore de root e sem app.new/app.old de sobra" bash -c "[ ! -e '$app/.git' ] && [ ! -e '$R/opt/gt-dados/app.new' ] && [ ! -e '$R/opt/gt-dados/app.old' ]"
   ck "code-dir: nada gravável por grupo/outros nem setuid/setgid (o archive tinha diretórios 0777: tar.umask=0)" bash -c "[ -z \"\$(find '$app' ! -type l -perm /6022)\" ]"
   world; echo old > "$app/stale"; TAR_LOOSE=1 GIT_REAL=1 ap "$s" --entrypoint build-x --code-dir "$T/repo" --code-sha "$sha"
@@ -117,6 +129,31 @@ case_code() { local s=$1 sha app="$R/opt/gt-dados/app"
   world; echo old > "$app/stale"; GIT_ARCHIVE_FAIL=1 GIT_REAL=1 ap "$s" --entrypoint build-x --code-dir "$T/repo" --code-sha "$sha"
   ck "code-dir: git archive que sai 1 depois de entregar um tar válido → 98 code-archive (pipefail), árvore antiga INTACTA, sem app.new" bash -c "[ $RC = 98 ] && grep -q 'falhou:code-archive' '$ERR' && [ -f '$app/stale' ] && [ ! -e '$R/opt/gt-dados/app.new' ]"
   world; GIT_REAL=1 ap "$s" --entrypoint build-x --code-dir "$T/repo" --code-sha 0000000000000000000000000000000000000000; ck "code-dir: sha que não é o HEAD → 98 e nada trocado" bash -c "[ $RC = 98 ] && grep -q 'code-dir-nao-e-o-sha-limpo' '$ERR' && [ -f '$app/bin/build-x' ] && [ ! -e '$app/lib' ]"; }
+# wa-4p38ls: a lista branca e a recusa por padrão de dado. Cada recusa → 98 com o código certo (não basta o rc: outra guarda poderia ter reprovado), árvore antiga INTACTA e sem app.new.
+# refuse_code enxerga $s/$sha/$app do caso que a chama (escopo dinâmico do bash) e devolve a lista base ao fim
+refuse_code() { local rot=$1 msg=$2; shift 2; setallow "$@"; world; echo old > "$app/stale"; GIT_REAL=1 ap "$s" --entrypoint build-x --code-dir "$T/repo" --code-sha "$sha"
+  ck "lista: $rot → 98 $msg, árvore antiga INTACTA, sem app.new" bash -c "[ $RC = 98 ] && grep -q 'falhou:$msg' '$ERR' && [ -f '$app/stale' ] && [ ! -e '$R/opt/gt-dados/app.new' ]"; setallow "${ALLOW_BASE[@]}"; }
+case_code_dado() { local s=$1 sha app="$R/opt/gt-dados/app" d
+  mkrepo; sha=$(/usr/bin/git -C "$T/repo" rev-parse HEAD)
+  # (a lista autoriza o arquivo de dado de PROPÓSITO: é o que a recusa tem de pegar; a maiúscula prova que o padrão não depende da caixa)
+  for d in hawkey_outbound_messages_48h.csv lib/tabela.csv lib/PLANILHA.CSV data/contatos.db lib/t.sqlite lib/t.jsonl contacts_auth/helper.py docs/investigations/nota.py; do
+    refuse_code "arquivo de dado na lista, sem @fixture ($d)" "code-dado-no-export:$d" "${ALLOW_BASE[@]}" "build-x $d"; done
+  refuse_code "@fixture isenta só o arquivo dela (lib/outra.csv segue recusado)" 'code-dado-no-export:lib/outra.csv' "${ALLOW_BASE[@]}" "@fixture lib/tabela.csv" "build-x lib/tabela.csv" "build-x lib/outra.csv"
+  setallow "# fixture 100 % fictícia" "" "${ALLOW_BASE[@]}" "@fixture lib/tabela.csv" "build-x lib/tabela.csv"; world; GIT_REAL=1 ap "$s" --entrypoint build-x --code-dir "$T/repo" --code-sha "$sha"
+  ck "lista: @fixture + linha do entrypoint (com comentário e linha em branco na lista) → instala, e o arquivo isento está lá" bash -c "[ $RC = 0 ] && [ -f '$app/lib/tabela.csv' ] && [ ! -e '$app/hawkey_outbound_messages_48h.csv' ]"; setallow "${ALLOW_BASE[@]}"; }
+case_code_lista() { local s=$1 sha app="$R/opt/gt-dados/app" bad
+  mkrepo; sha=$(/usr/bin/git -C "$T/repo" rev-parse HEAD)
+  refuse_code "entrypoint sem linha na lista (só há linha de outro entrypoint)" 'code-allow-sem-linha:build-x' "other-ep lib/other.py"
+  rm -f "$T/allow.txt"; world; echo old > "$app/stale"; GIT_REAL=1 ap "$s" --entrypoint build-x --code-dir "$T/repo" --code-sha "$sha"
+  ck "lista: arquivo da lista ilegível/ausente → 98 code-allow-ilegivel (nunca 'sem lista = exporta tudo'), árvore antiga INTACTA" bash -c "[ $RC = 98 ] && grep -q 'falhou:code-allow-ilegivel' '$ERR' && [ -f '$app/stale' ] && [ ! -e '$R/opt/gt-dados/app.new' ]"; setallow "${ALLOW_BASE[@]}"
+  for bad in "build-x lib/" "build-x ../lib/x.py" 'build-x lib/*' "build-x" "build-x lib/x.py extra" "build-x /etc/passwd" "build-x lib/../bin/build-x"; do
+    refuse_code "linha inválida na lista ('$bad')" 'code-allow-linha-invalida:build-x' "${ALLOW_BASE[@]}" "$bad"; done
+  refuse_code "pasta na lista (bin: o archive leva mais do que a lista diz)" 'code-fora-da-lista' "build-x bin"
+  refuse_code "arquivo da lista que não está no commit" 'code-archive' "${ALLOW_BASE[@]}" "build-x lib/nao-existe.py"
+  world; echo old > "$app/stale"; GIT_REAL=1 ap "$s" --code-dir "$T/repo" --code-sha "$sha"
+  ck "lista: --code-dir sem nenhum entrypoint de código (só o synth) → 98 code-allow-vazia, nada trocado" bash -c "[ $RC = 98 ] && grep -q 'falhou:code-allow-vazia' '$ERR' && [ -f '$app/stale' ]"
+  setallow "${ALLOW_BASE[@]}" "other-ep lib/other.py"; world; GIT_REAL=1 ap "$s" --entrypoint build-x --code-dir "$T/repo" --code-sha "$sha"
+  ck "lista: a linha de OUTRO entrypoint (other-ep) não entra: só o fechamento do entrypoint pedido" bash -c "[ $RC = 0 ] && [ -f '$app/lib/x.py' ] && [ ! -e '$app/lib/other.py' ]"; setallow "${ALLOW_BASE[@]}"; }
 adult() { # <rótulo> <item esperado FALHOU/nao-consegui> <comando de adulteração>
   world; ap "$s_" --entrypoint build-x > /dev/null 2>&1; eval "$3"; inst "$s_" --check; ck "check: $1 → $2 e rc≠0" bash -c "[ $RC != 0 ] && grep -q '^GTD-CHECK: $2' '$OUT'"; }
 case_check() { s_=$1; world; ap "$s_" > /dev/null 2>&1; inst "$s_" --check; ck "check: mundo recém-instalado → rc 0, 20 ok" bash -c "[ $RC = 0 ] && [ \"$(okc)\" = 20 ]"
@@ -135,7 +172,7 @@ case_check() { s_=$1; world; ap "$s_" > /dev/null 2>&1; inst "$s_" --check; ck "
   # link simbólico DENTRO da árvore de root (o guarda do instalador aceita os que ficam na árvore): o modo 0777 do próprio link (Linux sempre) não é "arquivo gravável por outros" → arvore-de-root segue ok (o mundo adulterado acima prova que o teste ainda reprova de verdade)
   world; ap "$s_" --entrypoint build-x > /dev/null 2>&1; ln -s bin/synth "$R/opt/gt-dados/app/elo"; chmod -h 777 "$R/opt/gt-dados/app/elo" 2> /dev/null; inst "$s_" --check
   ck "check: link simbólico dentro da árvore de root (modo 0777 do link) → arvore-de-root ok, rc 0" bash -c "[ $RC = 0 ] && grep -q '^GTD-CHECK: arvore-de-root ok' '$OUT'"; }
-case_refuse "$T/inst.sh"; case_happy "$T/inst.sh"; case_rollback "$T/inst.sh"; case_check "$T/inst.sh"; case_code "$T/inst.sh"
+case_refuse "$T/inst.sh"; case_happy "$T/inst.sh"; case_rollback "$T/inst.sh"; case_check "$T/inst.sh"; case_code "$T/inst.sh"; case_code_dado "$T/inst.sh"; case_code_lista "$T/inst.sh"
 mut() { local name=$1 expr=$2 fn=$3 mc="$T/mut-$1.sh"; mkcopy "$HERE/hetzner-dados-install.sh" "$expr" "$mc"; cmp -s "$mc" "$T/inst.sh" && { echo "FAIL mutante $name não alterou nada"; fails=$((fails+1)); return; }
   QUIET=1; BAD=0; "$fn" "$mc" > /dev/null 2>&1; QUIET=0; n=$((n+1)); if [ "$BAD" = 1 ]; then echo "ok   mutante $name reprovado"; else echo "FAIL mutante $name SOBREVIVEU"; fails=$((fails+1)); fi; }
 mut I26-tree-reprova-link 's#! -type l ##' case_check
@@ -164,10 +201,27 @@ mut I22-check-sudoers-ilegivel-vira-ok 's#t_sudo_strict() { \[ -r "\$SUDOERS" \]
 mut I23-sshd-runner-ilegivel-vira-intacto 's#RO=\$(sshd_for "\$RUNNER") || undo sshd-runner-ilegivel#RO=$(sshd_for "$RUNNER")#' case_rollback
 mut I24-check-sshd-runner-127-vira-ok 's#o=\$(sshd_for "\$RUNNER") || return 127; #o=$(sshd_for "$RUNNER"); #' case_check
 mut I25-chave-com-linha-em-branco 's#KEYLINE=\$(grep -m1 \. "\$PUB")#KEYLINE=$(cat "$PUB")#' case_happy
-mut I27-code-da-arvore-de-trabalho 's#git -C "\$CODE" archive --format=tar "\$SHA" | tar -x#tar -c -C "$CODE" --exclude=.git . | tar -x#' case_code
+mut I27-code-da-arvore-de-trabalho 's#git -C "\$CODE" archive --format=tar "\$SHA" -- "\${PSPEC\[@\]}" | tar -x#tar -c -C "$CODE" -- "${PSPEC[@]}" | tar -x#' case_code
 mut I28-code-sem-guarda-de-modo 's#\[ -z "\$bad" \] || {#true || {#' case_code
 mut I29-code-sem-pipefail 's#set -o pipefail; ##' case_code
 mut I30-chave-sem-grupo 's#owned "\$AKDIR/\$DU" "root:\$DU 640"#[ "$(stat -c "%U %a" "$AKDIR/$DU")" = "root 640" ]#' case_check
 mut I31-code-modo-inseguro-deixa-app-new 's#\[ -z "\$bad" \] || { rm -rf -- "\$NEW"; die#[ -z "$bad" ] || { die#' case_code
 mut I32-code-archive-deixa-app-new 's#|| { rm -rf -- "\$NEW"; die code-archive; }#|| die code-archive#' case_code
+# wa-4p38ls: cada guarda da lista branca tem o seu mutante (desligada sozinha, o caso que a prova reprova)
+mut I33-code-exporta-o-commit-inteiro 's#"\$SHA" -- "\${PSPEC\[@\]}" | tar#"$SHA" | tar#' case_code
+mut I34-code-sem-conferir-o-export-com-a-lista 's#\[ "\$GOT" = "\$WLS" \] || {#true || {#' case_code_lista
+mut I35-code-sem-recusa-de-dado 's#! data_path "\$f" || printf#true || printf#' case_code_dado
+mut I36-code-fixture-isenta-tudo 's#grep -qxF -- "\$f"#test -n "$FX"#' case_code_dado
+mut I37-code-padrao-de-dado-so-minusculo 's#tr "\[:upper:\]" "\[:lower:\]"#cat#' case_code_dado
+mut I38-code-sem-padrao-csv 's#\*\.csv | ##' case_code_dado
+mut I39-code-sem-padrao-db 's#\*\.db | ##' case_code_dado
+mut I40-code-sem-padrao-sqlite 's#\*\.sqlite | ##' case_code_dado
+mut I41-code-sem-padrao-jsonl 's#\*\.jsonl | ##' case_code_dado
+mut I42-code-sem-padrao-contacts-auth 's# | contacts_auth/\* | \*/contacts_auth/\*##' case_code_dado
+mut I43-code-sem-padrao-investigations 's# | docs/investigations/\* | \*/docs/investigations/\*##' case_code_dado
+mut I44-code-lista-ilegivel-vira-vazia 's#\[ -f "\$ALLOW" \] && \[ -r "\$ALLOW" \] || die code-allow-ilegivel#true#' case_code_lista
+mut I45-code-entrypoint-sem-linha-passa 's#\*) die "code-allow-sem-linha:\$e" ;; esac; done#*) ;; esac; done#' case_code_lista
+mut I46-code-linha-invalida-aceita 's#|| die "code-allow-linha-invalida:\$k"#|| true#' case_code_lista
+mut I47-code-lista-de-todos-os-entrypoints 's#\[ "\$k" != "\$e" \] || WL=#WL=#' case_code_lista
+mut I48-code-lista-vazia-exporta 's#\[ -n "\$WLS" \] || die code-allow-vazia#true#' case_code_lista
 echo "---"; echo "casos: $n, reprovados: $fails"; [ "$fails" -eq 0 ]

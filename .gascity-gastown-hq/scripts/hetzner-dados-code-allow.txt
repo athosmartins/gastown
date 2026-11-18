@@ -1,0 +1,36 @@
+# hetzner-dados-code-allow.txt — LISTA BRANCA do código que `hetzner-dados-install.sh apply --code-dir` leva ao nó Hetzner (wa-4p38ls, P0).
+#
+# POR QUÊ: o nó recebe só o fechamento de cada entrypoint, nunca o commit inteiro. O `git archive` do commit inteiro levava a pasta de dado do repo
+# (ex.: hawkey_outbound_messages_48h.csv, contacts_auth/, docs/investigations/) para uma máquina onde NÃO pode haver dado de lead/conversa (regra do Athos).
+# O instalador (de ROOT, rodando a partir DESTE repo) exporta SÓ os caminhos listados aqui para o entrypoint pedido e RECUSA (98) se: a lista não tem linha para
+# o entrypoint, o arquivo não está no commit, o que saiu do archive difere da lista, ou algum arquivo exportado casa padrão de dado (veja `@fixture`).
+#
+# FORMATO (um por linha; só ARQUIVOS — pasta, glob, `..` e barra no fim são recusados; `#` comenta):
+#   <entrypoint> <caminho relativo à raiz do repo>     o arquivo entra na árvore do nó quando o entrypoint é instalado
+#   @fixture <caminho>                                   isenta UM arquivo da recusa por padrão de dado (*.csv *.db *.sqlite *.jsonl ..., contacts_auth/, docs/investigations/);
+#                                                        só vale para um arquivo que algum entrypoint já lista. Use só para fixture 100 % FICTÍCIA.
+#
+# COMO MANTER: entrypoint novo ou import novo no lado do nó = linha nova AQUI (revisada), nunca "exportar a pasta". O fechamento é o do CAMINHO DO NÓ
+# (`main_no`/`_main_no`), não o import estático do módulo (esse inclui imports preguiçosos que só o mini executa). Prove cada mudança montando uma árvore só com
+# estes arquivos e rodando `python3 -I <modulo>.py no --stage <pasta>`: tem de falhar por falta de pedido, nunca por ImportError.
+# `synth` não precisa de linha: o instalador o copia deste repo (hetzner-dados-synth.sh), não do código do rig.
+
+# lotes-tiles (wa-u5xxcf.2): só stdlib; tippecanoe/tile-join são de ROOT em /usr/local/bin
+lotes-tiles bin/lotes-tiles
+lotes-tiles scripts/map_viewer/lotes_tiles_no.py
+
+# lotes-adjacencia (lot_adjacency_no): lê o pedido do stage; `build_lot_adjacency` e `lib.dados_no` são os únicos imports do lado do nó
+lotes-adjacencia bin/lotes-adjacencia
+lotes-adjacencia scripts/map_viewer/lot_adjacency_no.py
+lotes-adjacencia scripts/map_viewer/build_lot_adjacency.py
+lotes-adjacencia lib/dados_no.py
+
+# spe-alert-build (spe_alert_dados): casa pontos nos lotes com duckdb (lib do nó em /opt/gt-dados/pylib); o geojson dos lotes vem do stage, não do repo
+spe-alert-build bin/spe-alert-build
+spe-alert-build scripts/map_viewer/spe_alert_dados.py
+spe-alert-build scripts/map_viewer/build_lot_ficha_extra.py
+spe-alert-build scripts/map_viewer/lot_ficha_extra_helpers.py
+spe-alert-build lib/lot_key.py
+spe-alert-build lib/drive_materialize.py
+spe-alert-build lib/gdrive_reader.py
+spe-alert-build lib/shared_data_path.py

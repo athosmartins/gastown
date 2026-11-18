@@ -8,7 +8,8 @@
 #   hetzner-dados-install.sh apply --pubkey-file <mini.pub> [--entrypoint <nome>]... [--code-dir <dir> --code-sha <sha>] [--runner runner] [--stage-size 8g]
 #   hetzner-dados-install.sh --check      confere o contrato inteiro como root e imprime `GTD-CHECK: <item> ok|FALHOU|nao-consegui` (rc 0 só com tudo ok)
 # O QUE INSTALA: usuário `dados` (senha travada, shell real, home 0700, grupo próprio, runner FORA dele) · /srv/gtdados tmpfs (fstab: size=, 0700 dados, noexec,nosuid,nodev) · /usr/local/sbin/gt-dados-{run,ingest,sweep}
-#   · /opt/gt-dados/app/bin/<entrypoint> (árvore de ROOT, ninguém mais escreve; a de `--code-dir` só entra com o HEAD igual a `--code-sha` e árvore limpa, e é o conteúdo do COMMIT (`git archive`), não o da árvore de trabalho) + /etc/gt-dados/entrypoints
+#   · /opt/gt-dados/app/bin/<entrypoint> (árvore de ROOT, ninguém mais escreve; a de `--code-dir` só entra com o HEAD igual a `--code-sha` e árvore limpa, e é SÓ o fechamento dos entrypoints pedidos — os caminhos de hetzner-dados-code-allow.txt, lista branca
+#     deste repo — no conteúdo do COMMIT (`git archive -- <caminhos>`), nunca a árvore de trabalho nem o commit inteiro: o nó não pode receber dado de lead/conversa, então o apply RECUSA (98) entrypoint sem linha na lista e arquivo exportado que case padrão de dado) + /etc/gt-dados/entrypoints
 #   · /etc/ssh/authorized_keys.d/dados (de ROOT: `restrict,command="gt-dados-ingest"`) + drop-in sshd `Match User dados` · /etc/sudoers.d/gt-dados-run (UMA linha por entrypoint, sem curinga) · gt-dados-sweep.timer diário.
 #   sshd só recarrega DEPOIS de `sshd -t` e de `sshd -T -C` provar que `dados` usa o arquivo de ROOT e o runner NÃO; qualquer reprovação desfaz o drop-in. sudoers só entra depois de `visudo -cf`.
 # CÓDIGOS: 0 · 64 uso/não é root · 98 um passo falhou (`GTD-INSTALL: falhou:<passo>`; o que já estava no nó não é apagado, exceto o drop-in do sshd reprovado)
@@ -17,6 +18,7 @@ PATH=/usr/sbin:/usr/bin:/sbin:/bin
 DU=dados; SBIN=/usr/local/sbin; ETC=/etc/gt-dados; OPT=/opt/gt-dados; STAGE=/srv/gtdados; DHOME=/home/dados; SSHD_D=/etc/ssh/sshd_config.d; AKDIR=/etc/ssh/authorized_keys.d
 SUDOERS=/etc/sudoers.d/gt-dados-run; FSTAB=/etc/fstab; UNITS=/etc/systemd/system; LOGF=/var/log/gt-dados-sweep.log
 SRC=$(cd "$(dirname "$0")" && pwd); RUNNER=runner
+ALLOW=$SRC/hetzner-dados-code-allow.txt
 die() { echo "GTD-INSTALL: falhou:$1" >&2; exit 98; }
 chk() { local n=$1 rc; shift; "$@" > /dev/null 2>&1; rc=$?; case $rc in 0) echo "GTD-CHECK: $n ok" ;; 127) echo "GTD-CHECK: $n nao-consegui"; [ "$CH" = 1 ] || CH=2 ;; *) echo "GTD-CHECK: $n FALHOU"; CH=1 ;; esac; }
 owned() { [ "$(stat -c '%U:%G %a' "$1" 2> /dev/null)" = "$2" ]; }
@@ -75,10 +77,30 @@ install -d -o root -g root -m 0755 "$OPT" "$OPT/app" "$OPT/app/bin" "$ETC" || di
 # o código de --code-dir vem do COMMIT (`git archive $SHA`), nunca da árvore de trabalho: o rsync copiava o que estivesse no disco, e `status --porcelain` não vê arquivo ignorado (.gitignore) nem edição escondida por `update-index --assume-unchanged`/`skip-worktree`:
 # o HEAD==sha e a "árvore limpa" conferidos acima não descreviam o que ia para uma árvore que roda como `dados`. Extrai numa pasta nova (dono root, sem escrita de grupo/outros), confere os modos e só então troca a árvore de uma vez (falhou → a antiga fica)
 # falhou (git archive, tar ou find) → recusa, nunca instala o que sobrou: pipefail faz um git que morre no meio da saída reprovar mesmo com um tar que aceita o que chegou
+# wa-4p38ls: o COMMIT inteiro também não vai (levava hawkey_outbound_messages_48h.csv, contacts_auth/, docs/investigations/ para um nó sem dado de lead): só os caminhos da lista branca dos entrypoints pedidos
+# (hetzner-dados-code-allow.txt, deste repo de ROOT, não do commit exportado: um manifesto dentro do commit seria o próprio exportado se autorizando). Três estados em cada leitura (E12): lista ilegível/linha inválida/entrypoint sem linha →
+# recusa, nunca "sem lista = exporta tudo"; o que saiu do archive tem de ser EXATAMENTE a lista (pasta na lista, arquivo ausente do commit ou export-ignore reprovam); e nenhum arquivo exportado pode casar padrão de dado, salvo `@fixture` explícito.
+data_path() { local p; p=$(printf %s "$1" | tr "[:upper:]" "[:lower:]"); case $p in *.csv | *.db | *.sqlite | *.sqlite3 | *.jsonl | *.parquet | *.duckdb | *.xlsx | *.xls | *.vcf | contacts_auth/* | */contacts_auth/* | docs/investigations/* | */docs/investigations/*) return 0 ;; esac; return 1; }
 if [ -n "$CODE" ]; then
+  [ -f "$ALLOW" ] && [ -r "$ALLOW" ] || die code-allow-ilegivel
+  WL=""; FX=""; HAVE=""; allow_re='^[A-Za-z0-9_][A-Za-z0-9_./-]*$'
+  while read -r k p x || [ -n "${k:-}" ]; do
+    case ${k:-} in '' | '#'*) continue ;; esac
+    [[ -n ${p:-} && -z ${x:-} && $p =~ $allow_re && $p != */ && $p != *..* && $p != *//* ]] || die "code-allow-linha-invalida:$k"
+    if [ "$k" = @fixture ]; then FX="$FX$p"$'\n'; else HAVE="$HAVE $k"; for e in $ENTS; do [ "$k" != "$e" ] || WL="$WL$p"$'\n'; done; fi
+  done < "$ALLOW"
+  for e in $ENTS; do [ "$e" = synth ] || case " $HAVE " in *" $e "*) ;; *) die "code-allow-sem-linha:$e" ;; esac; done
+  WLS=$(printf '%s' "$WL" | LC_ALL=C sort -u); [ -n "$WLS" ] || die code-allow-vazia
+  PSPEC=(); while IFS= read -r p; do PSPEC+=("$p"); done <<< "$WLS"
   NEW="$OPT/app.new"; OLD="$OPT/app.old"
   rm -rf -- "$NEW" "$OLD" && mkdir -m 0755 "$NEW" || die code-new
-  ( set -o pipefail; umask 022; git -C "$CODE" archive --format=tar "$SHA" | tar -x --no-same-owner --no-same-permissions -C "$NEW" ) || { rm -rf -- "$NEW"; die code-archive; }
+  ( set -o pipefail; umask 022; git -C "$CODE" archive --format=tar "$SHA" -- "${PSPEC[@]}" | tar -x --no-same-owner --no-same-permissions -C "$NEW" ) || { rm -rf -- "$NEW"; die code-archive; }
+  GOT=$(cd "$NEW" && find . ! -type d -print) || { rm -rf -- "$NEW"; die code-find; }
+  GOT=$(printf '%s\n' "$GOT" | sed 's#^\./##' | LC_ALL=C sort)
+  [ "$GOT" = "$WLS" ] || { rm -rf -- "$NEW"; die code-fora-da-lista; }
+  while IFS= read -r f; do
+    ! data_path "$f" || printf '%s' "$FX" | grep -qxF -- "$f" || { rm -rf -- "$NEW"; die "code-dado-no-export:$f"; }
+  done <<< "$GOT"
   bad=$(find "$NEW" ! -type l -perm /6022 -print -quit) || { rm -rf -- "$NEW"; die code-find; }
   [ -z "$bad" ] || { rm -rf -- "$NEW"; die "code-modo-inseguro:$bad"; }
   mv "$OPT/app" "$OLD" && mv "$NEW" "$OPT/app" || { [ -d "$OPT/app" ] || mv "$OLD" "$OPT/app"; rm -rf -- "$NEW"; die code-troca; }
