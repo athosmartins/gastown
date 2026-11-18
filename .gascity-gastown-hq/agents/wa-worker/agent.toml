@@ -134,7 +134,8 @@
 
 work_dir = "/Users/athos/gt/whatsapp_automation/crew/worker"
 min_active_sessions = 0
-max_active_sessions = 3
+# Mayor 2026-11-18 07:0x: 3 -> 2 (disco 3816 MB < 6000, swap 4,8 GB; regra da missao ga-v8p1tx.1). Volta a 3 com disco >= 9000 MB e swap <= 6 GB.
+max_active_sessions = 2
 idle_timeout = "2h"
 wake_mode = "fresh"
 model = "sonnet"
