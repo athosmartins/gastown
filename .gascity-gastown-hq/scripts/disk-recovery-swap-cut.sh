@@ -14,9 +14,9 @@
 #     1) sessões de POOL/REVIEWER OCIOSAS (suspende com `gc session suspend`: o runtime para, a sessão e a conversa ficam; `gc session wake` volta);
 #     2) PAUSA o spawn novo do Pilot (arquivo .gc/swap-spawn-pause com validade; o Pilot lê no começo da varredura, no mesmo ponto da pausa por pressão de RAM, e não despacha nada novo enquanto valer).
 #   Depois de cortar espera SETTLE_S, lê o swap de novo e LOGA quem foi cortado e quanto de swap voltou (pode ser 0 ou negativo: o macOS devolve o swap devagar; o log diz o número lido, nunca "voltou" por suposição).
-# ORDEM DO CORTE  (menos crítico primeiro) sessão de pool/reviewer ociosa, a de maior RSS primeiro; depois a pausa do spawn. O degrau NÃO sobe para nada mais crítico: se o swap segue subindo e não sobra candidato, sai 11 e o
+# ORDEM DO CORTE  (menos crítico primeiro) sessão de pool/reviewer ociosa, a de maior PEGADA primeiro (o MEM do `top`, que já inclui o comprimido e o RSS esconde; só quando o amostrador não leu o top vale o RSS, e o log diz qual base valeu); depois a pausa do spawn. O degrau NÃO sobe para nada mais crítico: se o swap segue subindo e não sobra candidato, sai 11 e o
 #   maestro chama um humano (notify -p 4 + mail ao Mayor, no máximo 1 por hora) com a lista dos maiores donos de RAM e o que cada um é.
-#   Candidata = TODAS: (a) dona de RSS >= MIN_RSS_MB na amostra nova, de tipo `session` (nunca daemon, nunca Dolt); (b) template na lista fixa POOL_TEMPLATES (wa-worker ps-worker gate-reviewer refino-gate-reviewer context-check-reviewer, as variantes -remote e as 2 kimi-worker-remote / kimi-worker-wa-remote, por nome exato; o roster real as tem);
+#   Candidata = TODAS: (a) dona de pegada (MEM do top; RSS se o top não foi lido) >= MIN_RSS_MB (em MB) na amostra nova, de tipo `session` (nunca daemon, nunca Dolt); (b) template na lista fixa POOL_TEMPLATES (wa-worker ps-worker gate-reviewer refino-gate-reviewer context-check-reviewer, as variantes -remote e as 2 kimi-worker-remote / kimi-worker-wa-remote, por nome exato; o roster real as tem);
 #   (c) nenhum nome dela casa com a deny-list; (d) estado `active` e NÃO anexada (anexada = o Athos está olhando); (e) zero bead in_progress atribuído a ela, sob QUALQUER dos nomes que o roster dá (id, session_name, name, alias,
 #   agent_name, template) no store do rig E no HQ (mesma regra do idle-crew-suspender: a bead de um worker pode estar sob o session_name); (f) a transcrição dela parada há >= IDLE_MIN (15) min
 #   (~/.claude/projects/<slug do work_dir>/<session_key>.jsonl; sem a transcrição = não sei = não corta). Qualquer leitura que falha deixa a sessão quieta (o contrário de "ociosa").
@@ -227,10 +227,15 @@ def cmd_owners(a):
             for k in ("name", "alias"):
                 if s.get(k):
                     idx.setdefault(s[k], s)
-    rows = []
-    for owner, kb in best["by_owner"].items():
-        if isnum(kb):
-            rows.append((kb, owner))
+    # a pegada: o MEM do top por dono (inclui o comprimido, que o RSS esconde), quando o amostrador o leu; sem ele (ausente, null, lixo) o RSS de sempre, e a base vai na saida. O CMPRS vem ao lado, nunca somado
+    rows, cmprs = [], {}
+    tm = best.get("top_mem")
+    for e in tm if isinstance(tm, list) else []:
+        if isinstance(e, list) and len(e) == 3 and isinstance(e[0], str) and isnum(e[1]) and isnum(e[2]):
+            rows.append((e[1], e[0])); cmprs[e[0]] = e[2]
+    basis = "mem" if rows else "rss"
+    if not rows:
+        rows = [(kb, owner) for owner, kb in best["by_owner"].items() if isnum(kb)]
     rows.sort(key=lambda x: (-x[0], x[1]))
     def verdict(owner):
         kind = best["owner_kind"].get(owner, "?")
@@ -254,11 +259,12 @@ def cmd_owners(a):
             return "fora:anexada-ou-desconhecido", None
         return "candidata", s
     print("ts|%d" % int(best["ts"]))
+    print("basis|%s" % basis)
     shown = 0
     for kb, owner in rows:
         v, s = verdict(owner)
         if shown < 6:
-            print("TOP|%d|%s|%s" % (kb // 1024, clean(owner), v)); shown += 1
+            print("TOP|%d|%s|%s|%s" % (kb // 1024, clean(owner), v, cmprs[owner] // 1024 if owner in cmprs else "-")); shown += 1
         if s is not None and kb // 1024 >= min_rss_mb:
             f = lambda k: re.sub(r"[\x00-\x1f\x7f]", " ", str(s.get(k) or ""))
             print("\x1f".join(["CAND", str(kb // 1024), f("id"), f("name"), f("alias"), f("template"), f("session_name"), f("agent_name"), f("work_dir"), f("session_key")]))
@@ -510,8 +516,9 @@ do_run() {
   case "$out_tmp" in
     err\|*) log "SEM LEITURA dos donos de RAM: ${out_tmp#err|} — nao corto, nao pauso"; say "SEM LEITURA dos donos de RAM (${out_tmp#err|}); nao cortei nada"; return 30 ;;
   esac
-  tops=$(printf '%s\n' "$out_tmp" | awk -F'|' '$1=="TOP" {printf "%s%s %sMB (%s)", (n++ ? ", " : ""), $3, $2, $4}')
+  tops=$(printf '%s\n' "$out_tmp" | awk -F'|' '$1=="TOP" {printf "%s%s %sMB (%s%s)", (n++ ? ", " : ""), $3, $2, $4, ($5 != "-" ? ", comprimido " $5 "MB" : "")}')
   log "maiores donos de RAM: $tops"
+  if printf '%s\n' "$out_tmp" | grep -q '^basis|mem$'; then log "ordem do corte por MEM (o top: pegada que ja inclui o comprimido)"; else log "ordem do corte por RSS: o amostrador nao leu o top nesta amostra (top_mem ausente ou ilegivel)"; fi
 
   # candidatas, em ordem de RSS desc (o Python já ordenou)
   while IFS="$US" read -r _tag rss id name alias template session_name agent_name wd skey; do

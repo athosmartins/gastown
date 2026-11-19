@@ -741,5 +741,58 @@ hasnt "$SRC" "session kill" "nao mata sessao"
 hasnt "$SRC" "session close" "nao fecha sessao"
 hasnt "$SRC" "dolt stop" "nao para o Dolt"
 
+section "a pegada (ga-1p1i5jr.14): o MEM do top (inclui o comprimido) manda na ordem do corte; RSS so quando o top nao foi lido, e o log diz"
+# addtop <arquivo> <nome:mem_kb:cmprs_kb...|null|junk> — poe top_mem no ULTIMO registro do arquivo (o que o amostrador acrescentaria)
+addtop() {
+  python3 -I - "$@" <<'PY'
+import json, sys
+p, args = sys.argv[1], sys.argv[2:]
+lines = open(p).read().splitlines()
+r = json.loads(lines[-1])
+if args == ["null"]:
+    r["top_mem"] = None
+elif args == ["junk"]:
+    r["top_mem"] = ["x", [1], ["y", "z", "w"], [7, 1, 1], "wa-worker-1", {"a": 1, "b": 2, "c": 3}, ["wa-worker-2", 5], ["wa-worker-2", 5, 5, 5], ["wa-worker-2", "x", 5], ["wa-worker-2", 5, "x"]]
+else:
+    r["top_mem"] = [[n, int(m), int(c)] for n, m, c in (a.rsplit(":", 2) for a in args)]
+lines[-1] = json.dumps(r)
+open(p, "w").write("\n".join(lines) + "\n")
+PY
+}
+# wa-worker-1: o maior RSS (878 MB), pegada pequena. wa-worker-2: RSS 97 MB e a maior pegada (quase tudo comprimido). wa-worker-3: RSS 781 MB, pegada 19 MB (abaixo do minimo)
+foot() {
+  reset
+  export DR_SWC_MAX_CUT=1
+  rec "$SAMPLES" $((NOW-290)) 2800 false "wa-worker-1:900000:session" "dolt:3000000:dolt"
+  rec "$SAMPLES" $((NOW-130)) 4000 false "wa-worker-1:900000:session" "dolt:3000000:dolt"
+  rec "$NEXT" $((NOW-5)) 4500 false "wa-worker-1:900000:session" "wa-worker-2:100000:session" "wa-worker-3:800000:session" "dolt:3000000:dolt"
+  sess id-1 wa-worker-1 wa-worker active false false 60
+  sess id-2 wa-worker-2 wa-worker active false false 60
+  sess id-3 wa-worker-3 wa-worker active false false 60
+  mkroster
+}
+foot; addtop "$NEXT" wa-worker-1:300000:10000 wa-worker-2:1500000:1400000 wa-worker-3:20000:0 dolt:2400000:1400000
+run --run
+eq "$RC" 0 "com top_mem: agiu"
+eq "$(calls | sed -n '/session suspend/p')" "session suspend id-2" "corta a maior PEGADA (wa-worker-2, RSS pequeno), nao o maior RSS"
+has "$OUT" "wa-worker-2 1464MB" "a linha nomeia a sessao com a pegada em MB (1500000 KB), nao o RSS"
+has "$(logtxt)" "maiores donos de RAM: dolt 2343MB (nunca:dolt, comprimido 1367MB), wa-worker-2 1464MB (candidata, comprimido 1367MB)" "log: ordenado por pegada, com o comprimido AO LADO (nao somado)"
+has "$(logtxt)" "ordem do corte por MEM" "log: diz a base da ordem"
+hasnt "$(logtxt)" "MANTEM wa-worker-3" "wa-worker-3 (RSS 781 MB, pegada 19 MB) nem e candidata: o minimo vale para a pegada"
+hasnt "$(logtxt)" "wa-worker-3 (wa-worker" "wa-worker-3 nao aparece como candidata"
+for how in sem-campo null junk; do
+  foot
+  case "$how" in null|junk) addtop "$NEXT" "$how" ;; esac
+  run --run
+  eq "$(calls | sed -n '/session suspend/p')" "session suspend id-1" "top_mem $how: cai no RSS (corta wa-worker-1, o maior RSS)"
+  has "$(logtxt)" "ordem do corte por RSS" "top_mem $how: o log diz que a base foi o RSS"
+  has "$(logtxt)" "top" "top_mem $how: o log diz que o top nao foi lido"
+  has "$(logtxt)" "maiores donos de RAM: dolt 2929MB (nunca:dolt), wa-worker-1 878MB (candidata)" "top_mem $how: a lista de maiores donos tem o formato de sempre (RSS, sem comprimido)"
+done
+foot; addtop "$NEXT" wa-worker-2:1500000:1400000 wa-worker-1:300000:10000 wa-worker-3:20000:0 dolt:2400000:1400000
+export DR_SWC_MAX_CUT=3; run --run
+eq "$(calls | sed -n '/session suspend/p' | tr '\n' ' ')" "session suspend id-2 session suspend id-1 " "teto 3: corta as duas candidatas pela ordem da pegada (a entrada em qualquer ordem no registro)"
+unset DR_SWC_MAX_CUT
+
 printf '\n%s ok, %s FAIL\n' "$PASS" "$FAIL"
 [ "$FAIL" = 0 ]

@@ -51,6 +51,7 @@ ROTATE_KEEP_BYTES = int(os.environ.get("RAM_OWNER_ROTATE_KEEP_BYTES", str(8 * 10
 NOW = int(os.environ.get("RAM_OWNER_NOW_EPOCH", str(int(time.time()))))
 PS_FIXTURE = os.environ.get("RAM_OWNER_PS_FIXTURE")
 SESSIONS_FIXTURE = os.environ.get("RAM_OWNER_SESSIONS_FIXTURE")
+TOP_FIXTURE = os.environ.get("RAM_OWNER_TOP_FIXTURE")
 
 
 def notify_fail(msg):
@@ -110,7 +111,7 @@ def rotate_if_needed(path, max_days, now):
 
 def main():
     try:
-        rec = lib.sample(now=NOW, ps_fixture=PS_FIXTURE, sessions_fixture=SESSIONS_FIXTURE)
+        rec = lib.sample(now=NOW, ps_fixture=PS_FIXTURE, sessions_fixture=SESSIONS_FIXTURE, top_fixture=TOP_FIXTURE)
         if rec.get("error"):
             # A failed ps read is a measurement gap, not a real zero-RSS
             # sample — writing it to the JSONL would poison every downstream

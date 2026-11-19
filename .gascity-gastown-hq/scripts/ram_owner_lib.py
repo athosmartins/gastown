@@ -42,6 +42,7 @@ import re
 import subprocess
 import time
 
+MEM_TOP_N = 40          # owners whose footprint is kept per sample: a record is already ~26KB (ga-mswg06s) and the swap step only ever cuts one of the big ones
 ARGS_HEAD_CHARS = 500  # --session-id / script path / gc|bd verb all live well within this
 MAX_CLIMB = 30          # cycle/runaway guard, mirrors dolt-load-attributor's `seen` set intent
 RIG_RESOLVE_TOP_N = 20  # bound on lsof calls for rig attribution — see sample()
@@ -105,6 +106,50 @@ def ps_snapshot(fixture_path=None):
         comm, args = parts[3], parts[4]
         tbl[pid] = {"ppid": ppid, "rss_kb": rss, "comm": comm, "args_head": args[:ARGS_HEAD_CHARS]}
     return tbl
+
+
+def _top_kb(tok):
+    """A `top` size ("123M", "12K", "1G", "0B", with a trailing + or - when top saw it move) in KB, or None when it is not a size."""
+    m = re.fullmatch(r"(\d+(?:\.\d+)?)([BKMG])[+-]?", tok)
+    return int(float(m.group(1)) * {"B": 1 / 1024, "K": 1, "M": 1024, "G": 1024 * 1024}[m.group(2)]) if m else None
+
+
+def top_mem_snapshot(fixture_path=None):
+    """(pid -> (mem_kb, cmprs_kb), bad_rows) from ONE `top -l 1 -stats pid,mem,cmprs`, or (None, 0) when the read is unusable.
+
+    MEM is the process FOOTPRINT and already includes its compressed memory, which `ps` RSS and vm.swapusage do not show (ga-1p1i5jr.14: the 19/11 swapfiles were invisible to both; city.toml ga-e87w1f measured
+    top MEM == footprint(1)). CMPRS is a subset of MEM: kept beside it, NEVER added. Three states: no table (top fails, prints nothing, has no PID/MEM/CMPRS header or no row after it) -> None, never an
+    empty dict, which would read as "nothing uses memory"; a row that is not `pid size size` is COUNTED in bad_rows and left out, since an unknown size is never 0.
+    fixture_path (test seam): a file with what `top` printed."""
+    if fixture_path:
+        try:
+            with open(fixture_path) as f:
+                out = f.read()
+        except Exception:
+            return None, 0
+    else:
+        got, out = _sh_checked(["top", "-l", "1", "-stats", "pid,mem,cmprs"], timeout=60)
+        if not got:
+            return None, 0
+    cols, tbl, bad = None, {}, 0
+    for ln in out.splitlines():
+        f = ln.split()
+        if cols is None:
+            if sorted(f) == ["CMPRS", "MEM", "PID"]:
+                cols = (f.index("PID"), f.index("MEM"), f.index("CMPRS"))
+            continue
+        if not f:
+            continue
+        try:
+            pid = int(f[cols[0]])
+            mem, cmprs = _top_kb(f[cols[1]]), _top_kb(f[cols[2]])
+        except (ValueError, IndexError):
+            mem = cmprs = None
+        if len(f) != 3 or mem is None or cmprs is None:
+            bad += 1
+            continue
+        tbl[pid] = (mem, cmprs)
+    return (tbl, bad) if tbl else (None, 0)
 
 
 def sessions_by_key(fixture_path=None):
@@ -274,7 +319,7 @@ def cwd_of_pid(pid, timeout=5):
     return fields[-1] if fields else None
 
 
-def sample(now=None, ps_fixture=None, sessions_fixture=None, compute_rig=True):
+def sample(now=None, ps_fixture=None, sessions_fixture=None, compute_rig=True, top_fixture=None):
     """One full attributed snapshot: RSS aggregated by owner (and, unless
     compute_rig=False, by rig too), plus swap/free context. Pure aside from
     the (fixture-swappable) subprocess calls in ps_snapshot()/
@@ -301,8 +346,11 @@ def sample(now=None, ps_fixture=None, sessions_fixture=None, compute_rig=True):
         return {"ts": now, "error": "ps_snapshot_empty", "total_rss_kb": None,
                 "unresolved_kb": None, "n_procs": 0, "swap_used_mb": None,
                 "swap_total_mb": None, "free_pct": None, "by_owner": {},
-                "owner_kind": {}, "by_rig": {}, "sessions_lookup_failed": None}
+                "owner_kind": {}, "by_rig": {}, "sessions_lookup_failed": None,
+                "top_mem": None, "top_mem_other_kb": None, "top_mem_unmatched_kb": None, "top_mem_bad_rows": None}
     sess, sess_ok = sessions_by_key(sessions_fixture)
+    top, top_bad = top_mem_snapshot(top_fixture)
+    mem_by, cmprs_by, mem_unmatched = {}, {}, 0
 
     by_owner = {}
     owner_kind = {}
@@ -314,6 +362,12 @@ def sample(now=None, ps_fixture=None, sessions_fixture=None, compute_rig=True):
         rss = node["rss_kb"]
         total_rss += rss
         name, kind, _wd = owner_of(pid, tbl, sess)
+        if top is not None and pid in top:
+            if kind == "?":
+                mem_unmatched += top[pid][0]
+            else:
+                mem_by[name] = mem_by.get(name, 0) + top[pid][0]
+                cmprs_by[name] = cmprs_by.get(name, 0) + top[pid][1]
         if kind == "?":
             unresolved_kb += rss
             continue
@@ -356,6 +410,16 @@ def sample(now=None, ps_fixture=None, sessions_fixture=None, compute_rig=True):
     swap_used_mb, swap_total_mb = swap_usage()
     free_pct = mem_free_pct()
 
+    # footprint (top MEM) per owner: the MEM_TOP_N biggest, plus what is NOT in that list as numbers (the rest, what top showed for a pid with no owner or not in ps, the rows it could not read);
+    # None for all four = top could not be read, never {} or 0
+    top_mem = top_other = top_unmatched = top_bad_rows = None
+    if top is not None:
+        mem_unmatched += sum(v[0] for p, v in top.items() if p not in tbl)
+        ranked = sorted(mem_by, key=lambda n: (-mem_by[n], n))
+        top_mem = [[n, mem_by[n], cmprs_by[n]] for n in ranked[:MEM_TOP_N]]
+        top_other = sum(mem_by[n] for n in ranked[MEM_TOP_N:])
+        top_unmatched, top_bad_rows = mem_unmatched, top_bad
+
     return {
         "ts": now,
         "total_rss_kb": total_rss,
@@ -368,6 +432,10 @@ def sample(now=None, ps_fixture=None, sessions_fixture=None, compute_rig=True):
         "owner_kind": owner_kind,
         "by_rig": by_rig,
         "sessions_lookup_failed": not sess_ok,
+        "top_mem": top_mem,
+        "top_mem_other_kb": top_other,
+        "top_mem_unmatched_kb": top_unmatched,
+        "top_mem_bad_rows": top_bad_rows,
     }
 
 

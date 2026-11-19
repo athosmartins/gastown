@@ -34,10 +34,11 @@ EOF
 run_sampler() {
   RAM_OWNER_PS_FIXTURE="$TMP/ps.txt" \
   RAM_OWNER_SESSIONS_FIXTURE="$TMP/sessions.json" \
+  RAM_OWNER_TOP_FIXTURE="${TOP_FIX-$TMP/top.txt}" \
   RAM_OWNER_OUT="$1" \
   RAM_OWNER_NOW_EPOCH="${2:-1787700000}" \
   RAM_OWNER_NOTIFY="$TMP/notify" \
-  PATH="/usr/bin:/bin:/usr/sbin:/sbin:$PATH" \
+  PATH="${PATH_FIRST:+$PATH_FIRST:}/usr/bin:/bin:/usr/sbin:/sbin:$PATH" \
     python3 "$SAMPLER" "${@:3}"
 }
 
@@ -272,6 +273,75 @@ PATH="/usr/bin:/bin:/usr/sbin:/sbin:$PATH" \
 CHROME_REC=$(tail -1 "$TMP/chrome.jsonl" 2>/dev/null)
 chrome_get() { python3 -c "import json,sys; d=json.loads(sys.argv[1]); print(d$1)" "$CHROME_REC" 2>/dev/null; }
 [ "$(chrome_get '["by_owner"]["Google Chrome"]')" = "400000" ] && ok "app-bundle path labeled by its full name 'Google Chrome', not truncated to 'Google'" || bad "chrome label wrong: $(chrome_get '["by_owner"]')"
+
+echo ""
+echo "── Scenario: footprint per owner from top MEM (ga-1p1i5jr.14) — MEM already includes the compressed memory: CMPRS sits beside it, never added ──"
+cat > "$TMP/top.txt" <<'EOF'
+Processes: 521 total, 3 running, 518 sleeping, 2530 threads
+2026/11/19 13:05:11
+Load Avg: 3.12, 3.45, 3.60
+CPU usage: 6.25% user, 9.37% sys, 84.37% idle
+PhysMem: 15G used (2204M wired, 6347M compressor), 296M unused.
+VM: 232T vsize, 4125M framework vsize, 0(0) swapins, 0(0) swapouts.
+PID file: /var/run/top.pid
+
+PID    MEM    CMPRS
+100    2433M  1433M
+200    345M+  210M-
+201    1G     0B
+202    12288B 0B
+300    20M    4M
+600    3000K  0B
+1      100K   0B
+50000  500K   0B
+999    0.5M   0B
+abc    1M     1M
+77     12X    1M
+88     1M     1M     1M
+EOF
+run_sampler "$TMP/top.jsonl" >/dev/null 2>"$TMP/stderr_top"
+cat > "$TMP/check-top.py" <<'EOF'
+import json, sys
+r = json.loads(open(sys.argv[1]).read().splitlines()[-1])
+tm = {n: (m, c) for n, m, c in r["top_mem"]}
+assert r["top_mem"][0] == ["dolt", 2491392, 1467392], r["top_mem"][0]          # 2433M, not 2433M + 1433M
+assert tm["gastown.dog-2"] == (353280, 215040) and tm["wa-worker-x"] == (1048576, 0) and tm["claude (no session-id match)"] == (12, 0), tm
+assert r["top_mem_unmatched_kb"] == 3512 and r["top_mem_bad_rows"] == 3 and r["top_mem_other_kb"] == 0, r   # pid 600 (no owner) + pid 999 (not in ps, a decimal size: 0.5M); `abc`, `12X` and a row with a 4th field
+assert sum(m for _, m, _ in r["top_mem"]) + r["top_mem_other_kb"] + r["top_mem_unmatched_kb"] == 3917852   # every readable row is somewhere
+assert r["by_owner"]["dolt"] == 1012304                                          # RSS stays as it was
+EOF
+python3 -I "$TMP/check-top.py" "$TMP/top.jsonl" && ok "top_mem: sorted by MEM, +/- and K/M/G read, CMPRS beside MEM (never added), unmatched and bad rows COUNTED, nothing lost" || bad "top_mem record wrong: $(tail -1 "$TMP/top.jsonl" | cut -c1-300)"
+cat > "$TMP/check-cap.py" <<'EOF'
+import sys
+sys.path.insert(0, sys.argv[1])
+import ram_owner_lib as lib
+assert lib.MEM_TOP_N == 40                        # the record-size contract (a record is ~26KB already, ga-mswg06s)
+lib.MEM_TOP_N = 2
+r = lib.sample(now=1, ps_fixture=sys.argv[2] + "/ps.txt", sessions_fixture=sys.argv[2] + "/sessions.json", top_fixture=sys.argv[2] + "/top.txt", compute_rig=False)
+assert [n for n, _, _ in r["top_mem"]] == ["dolt", "wa-worker-x"], r["top_mem"]
+assert sum(m for _, m, _ in r["top_mem"]) + r["top_mem_other_kb"] + r["top_mem_unmatched_kb"] == 3917852
+EOF
+python3 -I "$TMP/check-cap.py" "$SELF_DIR" "$TMP" && ok "only the MEM_TOP_N biggest owners are listed and the rest is COUNTED in top_mem_other_kb" || bad "MEM_TOP_N cap lost memory or listed too many"
+echo "── Scenario: top unreadable -> top_mem is null, never [] and never 0; the RSS sample is still written ──"
+printf 'Processes: 1 total\nsome banner\n' > "$TMP/top-no-header.txt"; printf 'PID    MEM    CMPRS \n' > "$TMP/top-no-rows.txt"
+cat > "$TMP/check-null.py" <<'EOF'
+import json, sys
+r = json.loads(open(sys.argv[1]).read().splitlines()[-1])
+assert r["top_mem"] is None and r["top_mem_unmatched_kb"] is None and r["top_mem_bad_rows"] is None and r["top_mem_other_kb"] is None and r["by_owner"]["dolt"] == 1012304
+EOF
+for how in no-such-top.txt top-no-header.txt top-no-rows.txt; do
+  TOP_FIX="$TMP/$how" run_sampler "$TMP/topfail.jsonl" >/dev/null 2>&1
+  python3 -I "$TMP/check-null.py" "$TMP/topfail.jsonl" && ok "unreadable top ($how): top_mem and its counters null, by_owner intact" || bad "unreadable top ($how) did not yield null fields: $(tail -1 "$TMP/topfail.jsonl" | cut -c1-200)"
+done
+echo "── Scenario: the real command line is top -l 1 -stats pid,mem,cmprs (a fake top on PATH records its argv; one that fails gives null) ──"
+mkdir -p "$TMP/fakebin"
+printf '%s\n' '#!/bin/sh' 'echo "$*" > "$TOPARGV"' 'cat "$TOPOUT"' > "$TMP/fakebin/top"; chmod +x "$TMP/fakebin/top"
+TOP_FIX= TOPARGV="$TMP/top.argv" TOPOUT="$TMP/top.txt" PATH_FIRST="$TMP/fakebin" run_sampler "$TMP/topcmd.jsonl" >/dev/null 2>&1
+[ "$(cat "$TMP/top.argv" 2>/dev/null)" = "-l 1 -stats pid,mem,cmprs" ] && ok "top is called as -l 1 -stats pid,mem,cmprs" || bad "top argv: '$(cat "$TMP/top.argv" 2>/dev/null)'"
+tail -1 "$TMP/topcmd.jsonl" | grep -q '"top_mem": \[\["dolt", 2491392' && ok "the live path parses what top prints" || bad "live-path record lacks top_mem"
+mkdir -p "$TMP/failbin"; printf '%s\n' '#!/bin/sh' 'cat "$TOPOUT"' 'exit 1' > "$TMP/failbin/top"; chmod +x "$TMP/failbin/top"
+TOP_FIX= TOPOUT="$TMP/top.txt" PATH_FIRST="$TMP/failbin" run_sampler "$TMP/topbad.jsonl" >/dev/null 2>&1
+python3 -I "$TMP/check-null.py" "$TMP/topbad.jsonl" && ok "a top that prints a good table and exits 1 is unreadable: null, not the table" || bad "failing top still produced top_mem"
 
 echo ""
 echo "ram-owner-sampler selftest: PASS=$PASS FAIL=$FAIL"
