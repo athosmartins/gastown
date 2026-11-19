@@ -7800,6 +7800,8 @@ run_capq_dispatch() {
     PILOT_POOL_CAP_PRECLAIM_SKIP="${6:-1}" \
     PILOT_SPAWN_WA_WORKER="${7:-1}" \
     GC_VARIABLE_SESSION_COUNT_OVERRIDE="${8:-}" \
+    PILOT_LOCAL_BUILDER_MAX="${PILOT_LOCAL_BUILDER_MAX:-}" \
+    PILOT_TEST_LOCAL_BUILDER_COUNT="${PILOT_TEST_LOCAL_BUILDER_COUNT:-}" \
     PILOT_TEST_WA_WORKER_LIVE_COUNT="${2-0}" \
     PILOT_TEST_PS_WORKER_LIVE_COUNT="${3-0}" \
     bash "$DISPATCHER" >/dev/null 2>&1 || true
@@ -8293,6 +8295,80 @@ sweep_expect '.dispatched' '0'          "SWEEP-C: dispatched=0"
 sweep_expect '.pool_saturated' '1'      "SWEEP-C: a global-cap sweep is saturation too (same predicate as the per-pool cap)"
 sweep_expect '.results' '{"rig_native_global_session_cap_queued":2}' "SWEEP-C: results carries the global-cap name"
 sweep_expect "$SWEEP_CLOSES" 'true'     "SWEEP-C: the buckets add up to candidates"
+
+# ── Scenario LBC (ga-2hd02v.17): o teto de construtores LOCAIS — wa-worker+ps-worker+gastown.dog no mini (PILOT_LOCAL_BUILDER_MAX) ──────────────────────────
+# "Construtores todos no Hetzner" (Athos 19/11): no mini fica UMA vaga de construtor. O pool pode ter vaga e o mini não: a bead que o Pilot ia abrir no mini vira FILA de capacidade (claim liberada, story:approved,
+# nada "em execução" sem worker), com o nome local_builder_cap_queued no evento da varredura. A contagem vem da semente PILOT_TEST_LOCAL_BUILDER_COUNT (a leitura de verdade do gc é provada em
+# pilot-dispatcher.local-builder-cap.selftest.sh). As funções puras, o top-up, o empréstimo e os mutantes vivem lá; aqui só a cadeia real dispatch_one → dispatch_lane → evento, na harness CAPQ.
+echo "Scenario LBC-A (ga-2hd02v.17): wa-worker 1ª vez, pool COM vaga mas o teto LOCAL cheio → FILA: claim liberada, nada em execução, nenhuma sessão, resultado local_builder_cap_queued"
+PILOT_LOCAL_BUILDER_MAX=1; PILOT_TEST_LOCAL_BUILDER_COUNT=1
+LOG_LBA="$(run_capq_dispatch "$CAPQ_WA_FX" 0 0)"
+PILOT_LOCAL_BUILDER_MAX=""; PILOT_TEST_LOCAL_BUILDER_COUNT=""
+grep -q "ga-2hd02v.17: local builder cap hit (1/1" <<< "$LOG_LBA" \
+  && ok "LBC-A: a harness chegou ao braço do teto local de verdade (não é um passe vazio)" \
+  || bad "LBC-A: o braço do teto local NUNCA foi alcançado — as asserções abaixo não provam nada"
+[ "$(capq_n 'label add wa-capq1 story:in-flight')" = "0" ] && [ "$(capq_n 'label add wa-capq1 pilot:dispatched')" = "0" ] && [ "$(capq_n 'Pilot dispatched builder')" = "0" ] \
+  && ok "LBC-A: nenhum story:in-flight, pilot:dispatched nem comentário de despacho para uma bead sem worker" \
+  || bad "LBC-A: a bead foi marcada em execução com o teto local cheio (falso 'em execução')"
+[ ! -f "$STATE/wa-capq1.dispatching" ] && grep -q 'released wa-capq1' "$STATE/releases.log" 2>/dev/null \
+  && ok "LBC-A: a claim (pilot:dispatching) foi liberada" \
+  || bad "LBC-A: a claim NÃO foi liberada — a bead ficaria presa até o TTL"
+[ "$(capq_n 'set-metadata gc.routed_to=wa-worker')" -ge 1 ] \
+  && ok "LBC-A: gc.routed_to=wa-worker carimbado (a bead fica visível ao top-up e ao pulo pré-claim da próxima varredura)" \
+  || bad "LBC-A: gc.routed_to NÃO carimbado — a próxima varredura pagaria claim+soltura de novo"
+[ ! -s "$STATE/session_new.log" ] && ok "LBC-A: nenhuma sessão de wa-worker aberta acima do teto local" || bad "LBC-A: uma sessão foi aberta com o teto local cheio"
+sweep_expect '.results' '{"local_builder_cap_queued":1}' "LBC-A: o evento da varredura traz o nome local_builder_cap_queued"
+sweep_expect '.queued_global_cap' '1'  "LBC-A: conta em queued_global_cap (teto COMBINADO, apartado do teto por pool)"
+sweep_expect '.queued_pool_cap' '0'    "LBC-A: e não em queued_pool_cap — a causa é outra"
+sweep_expect '.failed_other' '0'       "LBC-A: fila de capacidade não é falha do Pilot (failed_other=0)"
+sweep_expect '.pool_saturated' '1'     "LBC-A: a varredura é SATURAÇÃO, não parada (não alimenta o alarme de estagnação)"
+[ ! -f "$FIXCITY/.gc/pilot-dispatcher-stall.count" ] && ok "LBC-A: o contador de estagnação não andou" || bad "LBC-A: o teto local contou como estagnação do Pilot"
+sweep_expect "$SWEEP_CLOSES" 'true'    "LBC-A: os baldes fecham com os candidatos"
+
+echo "Scenario LBC-B (ga-2hd02v.17, controle): o mesmo, com VAGA no teto local (0 de 1) → abre a sessão e marca em execução (a harness chega ao spawn)"
+PILOT_LOCAL_BUILDER_MAX=1; PILOT_TEST_LOCAL_BUILDER_COUNT=0
+LOG_LBB="$(run_capq_dispatch "$CAPQ_WA_FX" 0 0)"
+PILOT_LOCAL_BUILDER_MAX=""; PILOT_TEST_LOCAL_BUILDER_COUNT=""
+[ -s "$STATE/session_new.log" ] && [ "$(capq_n 'label add wa-capq1 story:in-flight')" -ge 1 ] \
+  && ok "LBC-B: com vaga local a sessão abre e a bead vai em execução" || bad "LBC-B: o controle não abriu a sessão com vaga no teto local (o teto está barrando demais)"
+grep -q "local builder cap hit" <<< "$LOG_LBB" && bad "LBC-B: o teto local barrou com vaga" || ok "LBC-B: nenhuma linha de teto local cheio"
+
+echo "Scenario LBC-C (ga-2hd02v.17, controle): SEM PILOT_LOCAL_BUILDER_MAX o Pilot é o de antes — a contagem local nem entra (semente 1, e abre)"
+PILOT_TEST_LOCAL_BUILDER_COUNT=1
+LOG_LBC="$(run_capq_dispatch "$CAPQ_WA_FX" 0 0)"
+PILOT_TEST_LOCAL_BUILDER_COUNT=""
+[ -s "$STATE/session_new.log" ] && ! grep -q "local builder cap" <<< "$LOG_LBC" \
+  && ok "LBC-C: sem o botão a sessão abre e nada fala de teto local (compatibilidade byte a byte com o Pilot de antes)" || bad "LBC-C: o teto local agiu com o botão desligado"
+
+echo "Scenario LBC-D (ga-2hd02v.17): a MESMA bead na varredura seguinte (já carimbada wa-worker) é PULADA ANTES da claim, sem escrever nada"
+PILOT_LOCAL_BUILDER_MAX=1; PILOT_TEST_LOCAL_BUILDER_COUNT=1
+LOG_LBD="$(run_capq_dispatch "$CAPQ_WA_ROUTED_FX" 0 0)"
+PILOT_LOCAL_BUILDER_MAX=""; PILOT_TEST_LOCAL_BUILDER_COUNT=""
+grep -q "ga-2hd02v.17: wa-capq2 QUEUED — local builder cap full (1/1" <<< "$LOG_LBD" \
+  && ok "LBC-D: a harness chegou ao pulo pré-claim do teto local" || bad "LBC-D: o pulo pré-claim do teto local NUNCA foi alcançado"
+[ "$(capq_n 'label add wa-capq2 pilot:dispatching')" = "0" ] && [ "$(capq_n 'update wa-capq2')" = "0" ] \
+  && ok "LBC-D: zero escrita na bead (nem claim nem soltura): é isso que o ga-in9ebr tirou do teto por pool" || bad "LBC-D: o pulo pré-claim ESCREVEU na bead (claim→soltura a cada varredura)"
+sweep_expect '.results' '{"local_builder_cap_queued":1}' "LBC-D: o pulo pré-claim vai ao evento com o mesmo nome do braço"
+sweep_expect '.pool_saturated' '1'     "LBC-D: e conta como saturação"
+
+echo "Scenario LBC-E (ga-2hd02v.17): o espelho no ps-worker — 1ª vez com o teto local cheio → FILA"
+PILOT_LOCAL_BUILDER_MAX=1; PILOT_TEST_LOCAL_BUILDER_COUNT=1
+LOG_LBE="$(run_capq_dispatch "$CAPQ_PS_FX" 0 0)"
+PILOT_LOCAL_BUILDER_MAX=""; PILOT_TEST_LOCAL_BUILDER_COUNT=""
+grep -q "ga-2hd02v.17: local builder cap hit (1/1" <<< "$LOG_LBE" && [ ! -s "$STATE/session_new.log" ] && [ "$(capq_n 'label add ps-capq1 story:in-flight')" = "0" ] \
+  && ok "LBC-E: ps-worker no teto local: fila, sem sessão, sem em execução" || bad "LBC-E: o braço do ps-worker não respeitou o teto local"
+sweep_expect '.results' '{"local_builder_cap_queued":1}' "LBC-E: resultado local_builder_cap_queued"
+
+echo "Scenario LBC-F (ga-2hd02v.17): contagem que NÃO se lê → FALHA fechada (nada abre), com o nome que para a fase de despacho — nunca 'cabe'"
+PILOT_LOCAL_BUILDER_MAX=1
+LOG_LBF="$(run_capq_dispatch "$CAPQ_WA_FX" 0 0 "isto não é JSON" 0 1 1 0)"
+PILOT_LOCAL_BUILDER_MAX=""
+grep -q "ga-2hd02v.17: cannot read the local-builder session count" <<< "$LOG_LBF" \
+  && ok "LBC-F: a harness chegou ao ramo da contagem ilegível do teto local" || bad "LBC-F: o ramo da contagem ilegível NUNCA foi alcançado"
+[ ! -s "$STATE/session_new.log" ] && [ "$(capq_n 'label add wa-capq1 story:in-flight')" = "0" ] \
+  && ok "LBC-F: nenhuma sessão aberta e nada em execução sem a contagem" || bad "LBC-F: abriu sessão sem ler a contagem (fail-open)"
+sweep_expect '.results' '{"rig_native_pool_count_unreadable":1}' "LBC-F: resultado rig_native_pool_count_unreadable (FALHA, o nome que o dispatch_lane já trata)"
+sweep_expect '.queued_global_cap' '0'  "LBC-F: NÃO é fila de capacidade — leitura que falha nunca vira saturação"
 
 echo "Scenario SWEEP-D (ga-ov3gow): a sweep with NO candidates exits before the dispatch loops and writes NO line — so a missing pilot_sweep is NOT a liveness signal (pinned: the header block above dispatch_lane() says so)"
 LOG_SWD="$(run_capq_dispatch "[]" 0 0)"
