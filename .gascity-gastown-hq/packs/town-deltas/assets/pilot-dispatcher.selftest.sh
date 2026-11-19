@@ -8370,6 +8370,85 @@ grep -q "ga-2hd02v.17: cannot read the local-builder session count" <<< "$LOG_LB
 sweep_expect '.results' '{"rig_native_pool_count_unreadable":1}' "LBC-F: resultado rig_native_pool_count_unreadable (FALHA, o nome que o dispatch_lane já trata)"
 sweep_expect '.queued_global_cap' '0'  "LBC-F: NÃO é fila de capacidade — leitura que falha nunca vira saturação"
 
+# O braço do sling ao dog (bead do HQ, DRY_RUN=0): a harness do run_sling_retry com as beads do HQ por parâmetro e os dois botões do teto local.
+run_lbc_hq() { # $1 = FAKE_BUGS_JSON (as beads do HQ desta varredura)
+  : > "$FIXCITY/.gc/logs/pilot-dispatcher.log"
+  rm -f "$FIXCITY/.gc/pilot-dispatcher.jsonl"
+  reset_state
+  env -i \
+    DRAIN_WINDOW_OVERRIDE="OPEN" \
+    PATH="$SHIMBIN:/usr/bin:/bin:/usr/local/bin" \
+    HOME="$HOME" \
+    PILOT_RAM_LEVEL_FILE="/nonexistent-hermetic-ram-level-for-tests" \
+    DISK_FREE_OVERRIDE_MB="${PILOT_TEST_DISK_FREE_MB:-100000}" \
+    DRY_RUN=0 \
+    PILOT_CITY_OVERRIDE="$FIXCITY" \
+    PILOT_TEST_STATE="$STATE" \
+    PILOT_DISPATCHABLE_FILE="$FIXCITY/.gc/pilot-dispatchable.json" \
+    PILOT_SLING_RETRIES=3 \
+    PILOT_SLING_SLEEP=0 \
+    PILOT_INFLIGHT_RETRIES=3 \
+    PILOT_INFLIGHT_SLEEP=0 \
+    FAKE_BLOCKED_IDS="" \
+    FAKE_SUPPRESS_INFLIGHT=0 \
+    FAKE_SLING_FAIL_TIMES=0 \
+    FAKE_SLING_ALWAYS_FAIL=0 \
+    FAKE_SLING_ORPHAN_JSON="" \
+    PILOT_DOLT_LATENCY_OVERRIDE_MS=100 \
+    PILOT_DOLT_CPU_OVERRIDE=10 \
+    DISPATCH_TO_CAPACITY=1 \
+    PILOT_LOCAL_BUILDER_MAX="${PILOT_LOCAL_BUILDER_MAX:-}" \
+    PILOT_TEST_LOCAL_BUILDER_COUNT="${PILOT_TEST_LOCAL_BUILDER_COUNT:-}" \
+    FAKE_BUGS_JSON="$1" \
+    bash "$DISPATCHER" >/dev/null 2>&1 || true
+  cat "$FIXCITY/.gc/logs/pilot-dispatcher.log"
+}
+lbc_hq_bead() { printf '{"id":"%s","title":"HQ generico %s","priority":0,"issue_type":"bug","description":"fixture body - ajuste de infraestrutura","status":"open","labels":[],"assignee":null,"created_at":"2026-06-%sT00:00:00Z","metadata":{}}' "$1" "$1" "$2"; }
+
+echo "Scenario LBC-G (ga-2hd02v.17): bead do HQ no braço do sling ao dog com o teto LOCAL cheio → FILA: nenhum gc sling, claim liberada, resultado local_builder_cap_queued"
+PILOT_LOCAL_BUILDER_MAX=1; PILOT_TEST_LOCAL_BUILDER_COUNT=1
+LOG_LBG="$(run_lbc_hq "[$(lbc_hq_bead ga-lbc1 01)]")"
+PILOT_LOCAL_BUILDER_MAX=""; PILOT_TEST_LOCAL_BUILDER_COUNT=""
+grep -q "ga-2hd02v.17: local builder cap hit (1/1: wa-worker+ps-worker+gastown.dog on the mini) — QUEUED ga-lbc1 for a gastown.dog session" <<< "$LOG_LBG" \
+  && ok "LBC-G: a harness chegou ao braço do sling ao dog de verdade (não é um passe vazio)" \
+  || bad "LBC-G: o braço do sling ao dog NUNCA foi alcançado — as asserções abaixo não provam nada"
+[ ! -s "$STATE/sling_n" ] && ok "LBC-G: nenhum gc sling — a bead não foi slingada a um pool cheio" || bad "LBC-G: houve gc sling com o teto local cheio ($(cat "$STATE/sling_n" 2>/dev/null))"
+grep -q 'released ga-lbc1' "$STATE/releases.log" 2>/dev/null && [ ! -f "$STATE/ga-lbc1.dispatching" ] \
+  && ok "LBC-G: a claim foi liberada" || bad "LBC-G: a claim NÃO foi liberada"
+[ ! -f "$STATE/ga-lbc1.inflight" ] && ok "LBC-G: a bead não ficou em execução" || bad "LBC-G: a bead ficou em execução sem worker"
+sweep_expect '.results' '{"local_builder_cap_queued":1}' "LBC-G: o evento da varredura traz local_builder_cap_queued"
+sweep_expect '.queued_global_cap' '1'   "LBC-G: conta em queued_global_cap"
+sweep_expect '.failed_other' '0'        "LBC-G: e não é falha do Pilot"
+sweep_expect '.pool_saturated' '1'      "LBC-G: a varredura é saturação, não estagnação"
+
+echo "Scenario LBC-H (ga-2hd02v.17, controle): o mesmo com VAGA no teto local (0 de 1) → o gc sling sai e a bead é despachada"
+PILOT_LOCAL_BUILDER_MAX=1; PILOT_TEST_LOCAL_BUILDER_COUNT=0
+LOG_LBH="$(run_lbc_hq "[$(lbc_hq_bead ga-lbc1 01)]")"
+PILOT_LOCAL_BUILDER_MAX=""; PILOT_TEST_LOCAL_BUILDER_COUNT=""
+[ "$(cat "$STATE/sling_n" 2>/dev/null || echo 0)" -ge 1 ] && ! grep -q "local builder cap" <<< "$LOG_LBH" \
+  && ok "LBC-H: com vaga local o sling sai e nada fala de teto cheio (a harness chega ao sling)" || bad "LBC-H: o controle não slingou com vaga no teto local"
+sweep_expect '.dispatched' '1'          "LBC-H: dispatched=1"
+
+echo "Scenario LBC-I (ga-2hd02v.17, controle): SEM PILOT_LOCAL_BUILDER_MAX o Pilot é o de antes (a contagem local nem entra)"
+PILOT_TEST_LOCAL_BUILDER_COUNT=1
+LOG_LBI="$(run_lbc_hq "[$(lbc_hq_bead ga-lbc1 01)]")"
+PILOT_TEST_LOCAL_BUILDER_COUNT=""
+[ "$(cat "$STATE/sling_n" 2>/dev/null || echo 0)" -ge 1 ] && ! grep -q "local builder cap" <<< "$LOG_LBI" \
+  && ok "LBC-I: sem o botão o sling sai e nada fala de teto local" || bad "LBC-I: o teto local agiu com o botão desligado"
+
+echo "Scenario LBC-J (ga-2hd02v.17): DUAS genéricas do HQ, teto cheio — a 1ª paga a claim e prova a classe no braço do dog; a 2ª é PULADA antes da claim, sem escrever"
+PILOT_LOCAL_BUILDER_MAX=1; PILOT_TEST_LOCAL_BUILDER_COUNT=1
+LOG_LBJ="$(run_lbc_hq "[$(lbc_hq_bead ga-lbc1 01),$(lbc_hq_bead ga-lbc2 02)]")"
+PILOT_LOCAL_BUILDER_MAX=""; PILOT_TEST_LOCAL_BUILDER_COUNT=""
+grep -q "QUEUED ga-lbc1 for a gastown.dog session" <<< "$LOG_LBJ" && grep -q "ga-2hd02v.17: ga-lbc2 QUEUED — local builder cap full (1/1" <<< "$LOG_LBJ" \
+  && ok "LBC-J: a 1ª parou no braço do dog e a 2ª no pulo pré-claim (a harness chegou aos dois)" || bad "LBC-J: não chegou aos dois caminhos — as asserções abaixo não provam nada"
+grep -q 'released ga-lbc1' "$STATE/releases.log" 2>/dev/null && ! grep -q 'released ga-lbc2' "$STATE/releases.log" 2>/dev/null && [ ! -f "$STATE/ga-lbc2.dispatching" ] \
+  && ok "LBC-J: só a 1ª teve claim e soltura; a 2ª não foi nem claimada (zero escrita: o que o ga-in9ebr tirou do teto por pool)" || bad "LBC-J: a 2ª genérica pagou claim+soltura — a classe não foi pulada"
+[ ! -s "$STATE/sling_n" ] && ok "LBC-J: nenhum gc sling" || bad "LBC-J: houve gc sling com o teto cheio"
+sweep_expect '.results' '{"local_builder_cap_queued":2}' "LBC-J: as duas contam como local_builder_cap_queued no evento"
+sweep_expect '.candidates' '2'          "LBC-J: as duas foram avaliadas"
+sweep_expect "$SWEEP_CLOSES" 'true'     "LBC-J: os baldes fecham com os candidatos"
+
 echo "Scenario SWEEP-D (ga-ov3gow): a sweep with NO candidates exits before the dispatch loops and writes NO line — so a missing pilot_sweep is NOT a liveness signal (pinned: the header block above dispatch_lane() says so)"
 LOG_SWD="$(run_capq_dispatch "[]" 0 0)"
 grep -q "No dispatchable candidates (Tier 1 or Tier 2). Exiting." <<< "$LOG_SWD" \
