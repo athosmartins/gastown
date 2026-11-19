@@ -2,18 +2,21 @@
 #
 # POR QUÊ: o nó recebe só o fechamento de cada entrypoint, nunca o commit inteiro. O `git archive` do commit inteiro levava a pasta de dado do repo
 # (ex.: hawkey_outbound_messages_48h.csv, contacts_auth/, docs/investigations/) para uma máquina onde NÃO pode haver dado de lead/conversa (regra do Athos).
-# O instalador (de ROOT, rodando a partir DESTE repo) exporta SÓ os caminhos listados aqui para o entrypoint pedido e RECUSA (98) se: a lista não tem linha para
-# o entrypoint, o arquivo não está no commit, o que saiu do archive difere da lista, ou algum arquivo exportado casa padrão de dado (veja `@fixture`).
+# O instalador (de ROOT) lê ESTA lista AO LADO dele e exporta SÓ os caminhos listados aqui para o entrypoint pedido. RECUSA (98) se: a lista não está ao lado dele, não tem linha para
+# o entrypoint (nem a do próprio bin/<entrypoint>) — tudo isso ANTES de mexer no nó —, o arquivo não está no commit, o que saiu do archive difere da lista, ou algum arquivo exportado casa padrão de dado (veja `@fixture`).
+#
+# ENTREGA: no nó o instalador roda de /root/gt-dados-src, e a lista TEM de estar nessa mesma pasta: o scp do runbook (docs/runbooks/hetzner-dados.md, passo 2) leva este arquivo junto com os scripts
+# (o selftest do instalador lê a linha do scp do runbook e instala a partir de uma pasta com SÓ o que ela entrega). "Neste repo" é onde a lista é REVISADA e versionada; quem a lê é a cópia ao lado do instalador, não o commit exportado.
 #
 # FORMATO (um por linha; só ARQUIVOS — pasta, glob, `..` e barra no fim são recusados; `#` comenta):
-#   <entrypoint> <caminho relativo à raiz do repo>     o arquivo entra na árvore do nó quando o entrypoint é instalado
+#   <entrypoint> <caminho relativo à raiz do repo>     o arquivo entra na árvore do nó quando o entrypoint é instalado; todo entrypoint de código precisa da linha `<entrypoint> bin/<entrypoint>`
 #   @fixture <caminho>                                   isenta UM arquivo da recusa por padrão de dado (*.csv *.db *.sqlite *.jsonl ..., contacts_auth/, docs/investigations/);
 #                                                        só vale para um arquivo que algum entrypoint já lista. Use só para fixture 100 % FICTÍCIA.
 #
 # COMO MANTER: entrypoint novo ou import novo no lado do nó = linha nova AQUI (revisada), nunca "exportar a pasta". O fechamento é o do CAMINHO DO NÓ
 # (`main_no`/`_main_no`), não o import estático do módulo (esse inclui imports preguiçosos que só o mini executa). Prove cada mudança montando uma árvore só com
 # estes arquivos e rodando `python3 -I <modulo>.py no --stage <pasta>`: tem de falhar por falta de pedido, nunca por ImportError.
-# `synth` não precisa de linha: o instalador o copia deste repo (hetzner-dados-synth.sh), não do código do rig.
+# `synth` não precisa de linha: o instalador o copia da pasta dele (hetzner-dados-synth.sh, entregue pelo mesmo scp), não do código do rig.
 
 # lotes-tiles (wa-u5xxcf.2): só stdlib; tippecanoe/tile-join são de ROOT em /usr/local/bin
 lotes-tiles bin/lotes-tiles

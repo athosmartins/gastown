@@ -9,7 +9,7 @@
 #   hetzner-dados-install.sh --check      confere o contrato inteiro como root e imprime `GTD-CHECK: <item> ok|FALHOU|nao-consegui` (rc 0 só com tudo ok)
 # O QUE INSTALA: usuário `dados` (senha travada, shell real, home 0700, grupo próprio, runner FORA dele) · /srv/gtdados tmpfs (fstab: size=, 0700 dados, noexec,nosuid,nodev) · /usr/local/sbin/gt-dados-{run,ingest,sweep}
 #   · /opt/gt-dados/app/bin/<entrypoint> (árvore de ROOT, ninguém mais escreve; a de `--code-dir` só entra com o HEAD igual a `--code-sha` e árvore limpa, e é SÓ o fechamento dos entrypoints pedidos — os caminhos de hetzner-dados-code-allow.txt, lista branca
-#     deste repo — no conteúdo do COMMIT (`git archive -- <caminhos>`), nunca a árvore de trabalho nem o commit inteiro: o nó não pode receber dado de lead/conversa, então o apply RECUSA (98) entrypoint sem linha na lista e arquivo exportado que case padrão de dado) + /etc/gt-dados/entrypoints
+#     que fica AO LADO deste instalador (no nó, /root/gt-dados-src: o scp do runbook, passo 2, a entrega junto) — no conteúdo do COMMIT (`git archive -- <caminhos>`), nunca a árvore de trabalho nem o commit inteiro: o nó não pode receber dado de lead/conversa, então o apply RECUSA (98), antes de mexer no nó, lista ausente, entrypoint sem linha ou sem o próprio bin/<ep>, e depois do export o arquivo que case padrão de dado) + /etc/gt-dados/entrypoints
 #   · /etc/ssh/authorized_keys.d/dados (de ROOT: `restrict,command="gt-dados-ingest"`) + drop-in sshd `Match User dados` · /etc/sudoers.d/gt-dados-run (UMA linha por entrypoint, sem curinga) · gt-dados-sweep.timer diário.
 #   sshd só recarrega DEPOIS de `sshd -t` e de `sshd -T -C` provar que `dados` usa o arquivo de ROOT e o runner NÃO; qualquer reprovação desfaz o drop-in. sudoers só entra depois de `visudo -cf`.
 # CÓDIGOS: 0 · 64 uso/não é root · 98 um passo falhou (`GTD-INSTALL: falhou:<passo>`; o que já estava no nó não é apagado, exceto o drop-in do sshd reprovado)
@@ -64,6 +64,24 @@ KEYLINE=$(grep -m1 . "$PUB") || die pubkey
 for e in $ENTS; do [[ $e =~ ^[a-z0-9][a-z0-9_.-]{0,63}$ ]] || die "entrypoint-invalido:$e"; done
 [[ $SIZE =~ ^[1-9][0-9]*[mg]$ ]] || die stage-size
 [ -z "$CODE" ] || { [ -n "$SHA" ] && [ "$(git -C "$CODE" rev-parse HEAD 2> /dev/null)" = "$SHA" ] && [ -z "$(git -C "$CODE" status --porcelain 2> /dev/null || echo ?)" ]; } || die code-dir-nao-e-o-sha-limpo
+# wa-4p38ls: o COMMIT inteiro não vai ao nó (levava hawkey_outbound_messages_48h.csv, contacts_auth/, docs/investigations/ para um nó sem dado de lead): só os caminhos da lista branca dos entrypoints pedidos.
+# A lista (hetzner-dados-code-allow.txt) é lida AO LADO deste instalador — no nó, /root/gt-dados-src, entregue pelo scp do runbook (passo 2) — e nunca do commit exportado: um manifesto dentro do commit seria o próprio exportado se autorizando.
+# Ela é lida e validada AQUI, antes de qualquer mudança no nó (usuário, árvore, sshd): lista ausente/ilegível, linha inválida, entrypoint sem linha ou sem o próprio bin/<ep> → recusa 98 sem tocar em nada. Três estados em cada leitura (E12).
+if [ -n "$CODE" ]; then
+  # vazio/falhou: lista ausente ou ilegível → recusa 98 (nunca "sem lista = exporta tudo"); a dica diz onde ela tem de estar (o 1º envio esqueceu de entregá-la: gate de 19/11)
+  [ -f "$ALLOW" ] && [ -r "$ALLOW" ] || { echo "GTD-INSTALL: lista branca ausente: $ALLOW (tem de estar AO LADO do instalador; runbook hetzner-dados.md, passo 2: o scp leva hetzner-dados-code-allow.txt junto, para /root/gt-dados-src)" >&2; die code-allow-ilegivel; }
+  WL=""; FX=""; HAVE=""; BINS=""; allow_re='^[A-Za-z0-9_][A-Za-z0-9_./-]*$'
+  while read -r k p x || [ -n "${k:-}" ]; do
+    case ${k:-} in '' | '#'*) continue ;; esac
+    [[ -n ${p:-} && -z ${x:-} && $p =~ $allow_re && $p != */ && $p != *..* && $p != *//* ]] || die "code-allow-linha-invalida:$k"
+    if [ "$k" = @fixture ]; then FX="$FX$p"$'\n'; else HAVE="$HAVE $k"; [ "$p" != "bin/$k" ] || BINS="$BINS $k"; for e in $ENTS; do [ "$k" != "$e" ] || WL="$WL$p"$'\n'; done; fi
+  done < "$ALLOW"
+  for e in $ENTS; do [ "$e" = synth ] || case " $HAVE " in *" $e "*) ;; *) die "code-allow-sem-linha:$e" ;; esac; done
+  # o entrypoint instalado é o bin/<ep> da árvore exportada: sem essa linha o export não o leva e o instalador só o notaria DEPOIS da troca (entrypoint-ausente, com a árvore antiga já removida)
+  for e in $ENTS; do [ "$e" = synth ] || case " $BINS " in *" $e "*) ;; *) die "code-allow-sem-bin:$e" ;; esac; done
+  WLS=$(printf '%s' "$WL" | LC_ALL=C sort -u); [ -n "$WLS" ] || die code-allow-vazia
+  PSPEC=(); while IFS= read -r p; do PSPEC+=("$p"); done <<< "$WLS"
+fi
 # 1. usuário: sem skel (-M), senha travada, shell REAL (nologin quebraria o forced command: o sshd roda o command= pelo shell), home 0700, grupo próprio
 getent passwd "$DU" > /dev/null || useradd -M -d "$DHOME" -s /bin/bash -U -c "gt dados (trava 1)" "$DU" || die useradd
 usermod -L "$DU" || die passwd-lock
@@ -77,21 +95,11 @@ install -d -o root -g root -m 0755 "$OPT" "$OPT/app" "$OPT/app/bin" "$ETC" || di
 # o código de --code-dir vem do COMMIT (`git archive $SHA`), nunca da árvore de trabalho: o rsync copiava o que estivesse no disco, e `status --porcelain` não vê arquivo ignorado (.gitignore) nem edição escondida por `update-index --assume-unchanged`/`skip-worktree`:
 # o HEAD==sha e a "árvore limpa" conferidos acima não descreviam o que ia para uma árvore que roda como `dados`. Extrai numa pasta nova (dono root, sem escrita de grupo/outros), confere os modos e só então troca a árvore de uma vez (falhou → a antiga fica)
 # falhou (git archive, tar ou find) → recusa, nunca instala o que sobrou: pipefail faz um git que morre no meio da saída reprovar mesmo com um tar que aceita o que chegou
-# wa-4p38ls: o COMMIT inteiro também não vai (levava hawkey_outbound_messages_48h.csv, contacts_auth/, docs/investigations/ para um nó sem dado de lead): só os caminhos da lista branca dos entrypoints pedidos
-# (hetzner-dados-code-allow.txt, deste repo de ROOT, não do commit exportado: um manifesto dentro do commit seria o próprio exportado se autorizando). Três estados em cada leitura (E12): lista ilegível/linha inválida/entrypoint sem linha →
-# recusa, nunca "sem lista = exporta tudo"; o que saiu do archive tem de ser EXATAMENTE a lista (pasta na lista, arquivo ausente do commit ou export-ignore reprovam); e nenhum arquivo exportado pode casar padrão de dado, salvo `@fixture` explícito.
-data_path() { local p; p=$(printf %s "$1" | tr "[:upper:]" "[:lower:]"); case $p in *.csv | *.db | *.sqlite | *.sqlite3 | *.jsonl | *.parquet | *.duckdb | *.xlsx | *.xls | *.vcf | contacts_auth/* | */contacts_auth/* | docs/investigations/* | */docs/investigations/*) return 0 ;; esac; return 1; }
+# wa-4p38ls: a lista branca já foi lida e validada lá em cima (PSPEC); aqui o que saiu do archive tem de ser EXATAMENTE a lista (pasta na lista, arquivo ausente do commit ou export-ignore reprovam),
+# e nenhum arquivo exportado pode casar padrão de dado, salvo `@fixture` explícito.
+# vazio/falhou: o `tr` que falha deixa `p` vazio, e vazio não casa nenhum padrão ("não é dado"): falhou → o arquivo conta como DADO (return 0, recusa), nunca como "não é dado"
+data_path() { local p; p=$(printf %s "$1" | tr "[:upper:]" "[:lower:]") || return 0; case $p in *.csv | *.db | *.sqlite | *.sqlite3 | *.jsonl | *.parquet | *.duckdb | *.xlsx | *.xls | *.vcf | contacts_auth/* | */contacts_auth/* | docs/investigations/* | */docs/investigations/*) return 0 ;; esac; return 1; }
 if [ -n "$CODE" ]; then
-  [ -f "$ALLOW" ] && [ -r "$ALLOW" ] || die code-allow-ilegivel
-  WL=""; FX=""; HAVE=""; allow_re='^[A-Za-z0-9_][A-Za-z0-9_./-]*$'
-  while read -r k p x || [ -n "${k:-}" ]; do
-    case ${k:-} in '' | '#'*) continue ;; esac
-    [[ -n ${p:-} && -z ${x:-} && $p =~ $allow_re && $p != */ && $p != *..* && $p != *//* ]] || die "code-allow-linha-invalida:$k"
-    if [ "$k" = @fixture ]; then FX="$FX$p"$'\n'; else HAVE="$HAVE $k"; for e in $ENTS; do [ "$k" != "$e" ] || WL="$WL$p"$'\n'; done; fi
-  done < "$ALLOW"
-  for e in $ENTS; do [ "$e" = synth ] || case " $HAVE " in *" $e "*) ;; *) die "code-allow-sem-linha:$e" ;; esac; done
-  WLS=$(printf '%s' "$WL" | LC_ALL=C sort -u); [ -n "$WLS" ] || die code-allow-vazia
-  PSPEC=(); while IFS= read -r p; do PSPEC+=("$p"); done <<< "$WLS"
   NEW="$OPT/app.new"; OLD="$OPT/app.old"
   rm -rf -- "$NEW" "$OLD" && mkdir -m 0755 "$NEW" || die code-new
   ( set -o pipefail; umask 022; git -C "$CODE" archive --format=tar "$SHA" -- "${PSPEC[@]}" | tar -x --no-same-owner --no-same-permissions -C "$NEW" ) || { rm -rf -- "$NEW"; die code-archive; }
