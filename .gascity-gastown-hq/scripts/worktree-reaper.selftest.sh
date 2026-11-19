@@ -86,6 +86,8 @@ export WORKTREE_REAPER_ACTIVITY_SCAN=0
 export WORKTREE_REAPER_IGNORED_DATA_GUARD=0
 NO_LSOF="$TMP/no_lsof.txt"; : > "$NO_LSOF"
 export WORKTREE_REAPER_FAKE_LSOF="$NO_LSOF"
+# ga-1p1i5jr.15: the audit of the worker trees a pass leaves behind asks `bd` once more per tree, and some of the older scenarios count the bd calls they provoke exactly (ga-yw18yk (o)): pinned OFF here, ON per call in the ga-1p1i5jr.15 section
+export WORKTREE_REAPER_WORKER_AUDIT=0
 
 # ga-yw18yk: the same hermeticity, for the BEAD lookup. An unparseable lock whose tree is clean/aged/unused
 # now asks `bd` whether the worktree's bead is closed; without a seam every scenario below that keeps such a
@@ -3284,6 +3286,372 @@ crt_town cz_z4 "" 14; git -C "$TMP/cz_z4" worktree lock --reason "claude agent a
 run_dg cz_z4 "$CT_CLOSED10" $CZ_ENV WORKTREE_REAPER_FAKE_PS="$GF_PS"
 crt_twt cz_z4 && bad "ga-zgqssr7 gate-fix (z4): control — the same dead-holder lock on a 14 h town tree was NOT reaped by the lock contract" \
   || ok "ga-zgqssr7 gate-fix (z4): control — the same dead-holder lock on a 14 h town tree IS reaped by the lock contract (the holder really is a zombie)"
+
+
+# ══ ga-1p1i5jr.15: a pool WORKER tree of a CLOSED bead is not held for ever by what its session left behind ══
+# Incident (19/11): 22 trees crew/worker-wa-<bead> (4.1 GB, the oldest from 16/09) sat on the mini's disk with their beads closed: the ignored-data guard (ga-xpoj67) kept every one, because a worker leaves logs/, .gc/, .runtime/,
+# CLAUDE.md... that .gitignore hides and no junk rule named (the sweep logged kept_ignored_data, every pass, and nobody read it). Two rules, for POOL WORKER trees only (<rig>/crew/worker-*, $GT/worker-*): WORKER_JUNK_RE names what a
+# worker session leaves by itself (so a tree holding only that is reaped as soon as the other proofs allow), and a CLEAN tree whose beads are ALL closed for 12 h releases the REST of its ignored data when it was measured entry by entry and
+# fits the cap (ignored_data_released says what went). Then audit_pool_workers reads what is LEFT: a worker tree whose beads were all closed for 24 h or more is a worker_tree_overdue (reason + size), counted on the sweep line and written to
+# the report beside the log. Against the pre-fix reaper the scenarios that use a new rule or a new field fail
+# (61 of the section's 96 assertions, run on the node 19/11: (a)(a2)(a5)(a6)(d)(d2)(d3)(e2)(e4)(gt1)(j3)(l)(m1)(nw2)(sc_c)(sc_e)(sc_h) and every audit scenario); the others pin what must NOT change: the guard still holds data
+# it cannot prove is over (a dirty tree, an open or unreadable bead, a bead closed too recently, data over the cap or not measured, a process inside) and a tree that is not a pool worker tree keeps the ga-xpoj67 rule as it was.
+echo "── ga-1p1i5jr.15: pool worker trees of closed beads (derived junk, release of the rest, audit of what is left) ──"
+# the excludes of the rig's .gitignore these scenarios need, added from INSIDE the tree (the common git dir's info/exclude), so the files the tree is given are ignored, not dirt
+WK_X="printf '%s\n' logs/ /logs .logs/ .gc/ .runtime/ CLAUDE.md CLAUDE.local.md .crew-active-pid .gemini/ coverage/ htmlcov/ .vitest-cache/ .playwright-mcp/ .superpowers/ '.coverage*' '*.log' '*.db-shm' '*.db-wal' pesquisa/ '*.q' mylogs/ CLAUDE.md.bak '*.logx' >> \"\$(git rev-parse --git-common-dir)/info/exclude\""
+WK_JUNK='mkdir -p logs .logs .gc/system .runtime .gemini/skills coverage htmlcov .vitest-cache .playwright-mcp .superpowers && echo x > logs/run.log && echo x > .logs/l && echo x > .gc/system/a && echo x > .runtime/r && echo x > CLAUDE.md && echo x > CLAUDE.local.md && echo x > .crew-active-pid && echo x > .gemini/skills/s && echo x > coverage/c && echo x > htmlcov/i && echo x > .vitest-cache/v && echo x > .playwright-mcp/p && echo x > .superpowers/s && echo x > .coverage && echo x > .coverage.host.1 && echo x > run.log && echo x > a.db-shm && echo x > a.db-wal'
+WK_DATA='mkdir -p pesquisa/out && echo r1 > pesquisa/out/battery.csv'
+WK_UNSHIPPED='echo unshipped > unshipped.txt && git add unshipped.txt && git commit -qm unshipped'
+# wk_mk <name> [<setup run inside the tree>] [<age in hours, default 30>] — kz_mk's rebased worker tree (crew/worker-kz on crew/kz/wa-kz1xyz, its patch already in main) plus the excludes above
+wk_mk() { kz_mk "$1" "$WK_X; ${2:-true}" "${3:-30}"; }
+# wk_run <name> <beads-json | @missing> [ENV=val ...] — run_kz with the ga-xpoj67 guard ON (the suite pins it off for the older scenarios)
+wk_run() { local t="$1" b="$2"; shift 2; run_kz "$t" "$b" WORKTREE_REAPER_IGNORED_DATA_GUARD=1 WORKTREE_REAPER_WORKER_AUDIT=1 "$@"; }
+WK_C10="$KZ_CLOSED"; WK_C14="[$(bc_bead "$KZ_ID" closed 14)]"; WK_C25="[$(bc_bead "$KZ_ID" closed 25)]"; WK_C30="[$(bc_bead "$KZ_ID" closed 30)]"; WK_C23="[$(bc_bead "$KZ_ID" closed 23)]"
+wk_gone() {   # wk_gone <name> <label> [<event that must be logged once>] — the tree is gone through the ordinary pool reap
+  if ! kz_wt "$1" && [ "$(events "$1" reaped_pool)" = "1" ] && { [ -z "${3:-}" ] || [ "$(events "$1" "$3")" = "1" ]; }; then ok "ga-1p1i5jr.15 $2 → REAPED${3:+, $3 logged once}"
+  else bad "ga-1p1i5jr.15 $2 → NOT reaped (wt=$(kz_wt "$1" && echo y || echo n) reaped_pool=$(events "$1" reaped_pool) kept_ignored_data=$(events "$1" kept_ignored_data) ${3:-event}=$([ -n "${3:-}" ] && events "$1" "$3" || echo -))"; fi
+}
+wk_kept() {   # wk_kept <name> <label> — the tree is there, nothing was reaped, the guard kept it once and released nothing
+  if kz_wt "$1" && [ "$(events "$1" reaped_pool)" = "0" ] && [ "$(events "$1" kept_ignored_data)" = "1" ] && [ "$(events "$1" ignored_data_released)" = "0" ]; then ok "ga-1p1i5jr.15 $2 → KEPT (kept_ignored_data once, nothing released)"
+  else bad "ga-1p1i5jr.15 $2 → not kept as expected (wt=$(kz_wt "$1" && echo y || echo n) reaped_pool=$(events "$1" reaped_pool) kept_ignored_data=$(events "$1" kept_ignored_data) released=$(events "$1" ignored_data_released))"; fi
+}
+wk_sweep() { jq -s -r "map(select(.event==\"sweep\"))[0].$2" "$TMP/$1.jsonl" 2>/dev/null; }   # wk_sweep <name> <field> — a field of the pass's sweep line
+
+# ── (a)(a2) derived junk alone: logs/, .gc/, .runtime/, CLAUDE.md, .gemini/, coverage/, .coverage, *.log never hold a worker tree (the measured shape, rebased + closed 10 h)
+wk_mk wk_a "$WK_JUNK"; wk_run wk_a "$WK_C10"
+wk_gone wk_a "(a): rebased worker tree, bead closed 10 h, holding only what a worker session leaves (logs/ .logs/ .gc/ .runtime/ CLAUDE.md CLAUDE.local.md .crew-active-pid .gemini/ coverage/ htmlcov/ .vitest-cache/ .playwright-mcp/ .superpowers/ .coverage* *.log *.db-shm *.db-wal)"
+[ "$(events wk_a kept_ignored_data)" = "0" ] && [ "$(events wk_a ignored_data_released)" = "0" ] \
+  && ok "ga-1p1i5jr.15 (a): nothing was kept for it and nothing had to be released — the junk list alone cleared it" || bad "ga-1p1i5jr.15 (a): kept_ignored_data=$(events wk_a kept_ignored_data) released=$(events wk_a ignored_data_released)"
+wk_mk wk_a2 "$WK_JUNK"; wk_run wk_a2 "$WK_C10" "$PRESS"
+wk_gone wk_a2 "(a2): the same tree under DISK PRESSURE"
+# (a3) the junk list is the knob that does it: narrowed to match nothing, the same tree is DATA again (the closed hours are below the release grace)
+wk_mk wk_a3 "$WK_JUNK"; wk_run wk_a3 "$WK_C10" WORKTREE_REAPER_WORKER_JUNK_RE='^nothing-matches$'
+wk_kept wk_a3 "(a3): WORKTREE_REAPER_WORKER_JUNK_RE narrowed to match nothing, bead closed 10 h (< the 12 h release grace)"
+
+# (a4) look-alikes are DATA: names that only resemble the worker junk (mylogs/, CLAUDE.md.bak, a.logx) are not skipped by it — the regex is anchored, not a substring match
+WK_LOOK='mkdir -p mylogs && echo x > mylogs/a && echo x > CLAUDE.md.bak && echo x > a.logx'
+wk_mk wk_a4 "$WK_LOOK" 30; wk_run wk_a4 "$WK_C10"
+wk_kept wk_a4 "(a4): mylogs/, CLAUDE.md.bak and a.logx (look like worker junk, are not), bead closed 10 h"
+grep '"event":"kept_ignored_data"' "$TMP/wk_a4.jsonl" | grep -q 'mylogs/' && grep '"event":"kept_ignored_data"' "$TMP/wk_a4.jsonl" | grep -q 'CLAUDE\.md\.bak' && grep '"event":"kept_ignored_data"' "$TMP/wk_a4.jsonl" | grep -q 'a\.logx' \
+  && ok "ga-1p1i5jr.15 (a4): the kept_ignored_data event names all three look-alikes" || bad "ga-1p1i5jr.15 (a4): event: $(grep kept_ignored_data "$TMP/wk_a4.jsonl" | head -1 | cut -c1-300)"
+
+# (a5) NESTED junk: daemons/logs/ and daemons/s.log under a directory that has TRACKED files (git lists them one by one) are junk too — the by-name list is anchored at any depth
+# (a directory that exists only because of ignored files is ONE entry, its topmost name, and a by-name list cannot see inside it: that is the .claude/ case of ga-1bfcda7, and it stays data here)
+wk_mk2() {   # <name> [<setup run inside the tree>] [<age h>] — kz_mk's rebased worker tree, but main's base commit also tracks daemons/keep.txt
+  local name="$1" extra="${2:-}" root="$TMP/$1"; mkdir -p "$root"
+  git init -q --bare "$root/remote.git"; git init -q -b main "$root/rig"
+  ( cd "$root/rig" || exit 1
+    git remote add origin "$root/remote.git"
+    mkdir -p daemons && echo base > base.txt && echo keep > daemons/keep.txt && git add base.txt daemons/keep.txt && git commit -qm base
+    git push -q origin main; git fetch -q origin; git remote set-head origin main 2>/dev/null || true
+    mkdir -p crew
+    git worktree add -q crew/worker-kz -b "crew/kz/$KZ_ID" main
+    ( cd crew/worker-kz && echo shipped > shipped.txt && git add shipped.txt && git commit -qm shipped )
+    git cherry-pick -x "crew/kz/$KZ_ID" && git push -q origin main && git fetch -q origin
+    ( cd crew/worker-kz && eval "$WK_X; $extra" )
+  ) >/dev/null 2>&1
+  pe_age "$root/rig/crew/worker-kz" "${3:-30}"
+}
+wk_mk2 wk_a5 'mkdir -p daemons/logs && echo x > daemons/logs/n.log && echo x > daemons/s.log'
+[ "$(git -C "$TMP/wk_a5/rig/crew/worker-kz" ls-files -z -o -i --exclude-standard --directory --no-empty-directory | tr '\0' '\n' | sort | tr '\n' ' ')" = "daemons/logs/ daemons/s.log " ] \
+  && ok "ga-1p1i5jr.15 (a5): fixture — git lists the nested junk one by one (daemons/logs/ and daemons/s.log)" || bad "ga-1p1i5jr.15 (a5): fixture lists: $(git -C "$TMP/wk_a5/rig/crew/worker-kz" ls-files -z -o -i --exclude-standard --directory --no-empty-directory | tr '\0' ' ')"
+wk_run wk_a5 "$WK_C10"
+wk_gone wk_a5 "(a5): nested daemons/logs/ and daemons/s.log (a tracked daemons/ around them), bead closed 10 h"
+[ "$(events wk_a5 kept_ignored_data)" = "0" ] && ok "ga-1p1i5jr.15 (a5): nothing was kept for it" || bad "ga-1p1i5jr.15 (a5): kept_ignored_data=$(events wk_a5 kept_ignored_data)"
+
+# (a6) an ignored entry named like the junk but listed WITHOUT a trailing slash (a file or a symlink named logs, which the WA .gitignore also covers with /logs): a name that ends the path is junk too, not only a directory.
+# A non-empty file, because a zero-size entry (a dangling symlink) never holds a tree anyway (du 0 < IGNORED_MIN_KB)
+wk_mk wk_a6 'echo x > logs'
+[ "$(git -C "$TMP/wk_a6/rig/crew/worker-kz" ls-files -z -o -i --exclude-standard --directory --no-empty-directory | tr '\0' '\n' | tr '\n' ' ')" = "logs " ] \
+  && ok "ga-1p1i5jr.15 (a6): fixture — git lists the file as 'logs' (no trailing slash)" || bad "ga-1p1i5jr.15 (a6): fixture lists: $(git -C "$TMP/wk_a6/rig/crew/worker-kz" ls-files -z -o -i --exclude-standard --directory --no-empty-directory | tr '\0' ' ')"
+wk_run wk_a6 "$WK_C10"
+wk_gone wk_a6 "(a6): a root FILE named logs (ignored by /logs), bead closed 10 h"
+
+# ── (nw) control: the same files in a tree that is NOT a pool worker tree (crew/w) stay DATA — the extension is for worker trees only
+xp_nw() { m5_mk "$1"; local r="$TMP/$1/rig"; printf '%s\n' logs/ .gc/ >> "$r/.git/info/exclude"
+  ( cd "$r" && git worktree add -q "$r/crew/w" -b crew/m5/w main && cd "$r/crew/w" && mkdir -p logs .gc && echo x > logs/a.log && echo x > .gc/b ) >/dev/null 2>&1; m5_age "$r/crew/w" 14; }
+xp_nw wk_nw; xp_run wk_nw
+xp_kept wk_nw "(nw): a MERGED tree crew/w (not a pool worker tree) holding logs/ and .gc/ → KEPT, kept_ignored_data — the worker junk list does not reach it" kept_ignored_data
+# (ow) a directory named worker-* that is neither under crew/ nor under $GT is not a pool worker tree either
+xp_ow() { m5_mk "$1"; local r="$TMP/$1/rig"; printf '%s\n' logs/ >> "$r/.git/info/exclude"; mkdir -p "$TMP/$1/other"
+  ( cd "$r" && git worktree add -q "$TMP/$1/other/worker-x" -b crew/m5/x main && cd "$TMP/$1/other/worker-x" && mkdir -p logs && echo x > logs/a.log ) >/dev/null 2>&1; m5_age "$TMP/$1/other/worker-x" 14; }
+xp_ow wk_ow; xp_run wk_ow
+{ git -C "$TMP/wk_ow/rig" worktree list --porcelain | grep -q 'other/worker-x$' && [ "$(events wk_ow kept_ignored_data)" = "1" ]; } \
+  && ok "ga-1p1i5jr.15 (ow): worker-x under other/ (not crew/, not \$GT) holding logs/ → KEPT, kept_ignored_data" || bad "ga-1p1i5jr.15 (ow): present=$(git -C "$TMP/wk_ow/rig" worktree list --porcelain | grep -c 'other/worker-x$') kept_ignored_data=$(events wk_ow kept_ignored_data)"
+
+# ── (gt1) a worker tree directly under $GT ($GT/worker-<bead>, owned by the rig) is a pool worker tree too
+wk_gt() { kz_mk "$1" "$WK_X" 30 && ( cd "$TMP/$1/rig" && git worktree add -q "$TMP/$1/worker-wa-gt1xyz" -b crew/gt/wa-gt1xyz main && cd "$TMP/$1/worker-wa-gt1xyz" && eval "$WK_JUNK" ) >/dev/null 2>&1; pe_age "$TMP/$1/worker-wa-gt1xyz" 30; }
+wk_gt wk_gt1; wk_run wk_gt1 "[$(bc_bead wa-gt1xyz closed 14),$(bc_bead "$KZ_ID" closed 14)]"
+git -C "$TMP/wk_gt1/rig" worktree list --porcelain | grep -q 'worker-wa-gt1xyz$' && bad "ga-1p1i5jr.15 (gt1): worker-wa-gt1xyz directly under \$GT, holding only worker junk, bead closed 14 h → NOT reaped" \
+  || ok "ga-1p1i5jr.15 (gt1): worker-wa-gt1xyz directly under \$GT, holding only worker junk, bead closed 14 h → REAPED"
+
+# ── (c)(d) the rest of the ignored data: a CLEAN tree whose bead is closed for 12 h or more releases it; younger than that it stays (the grace)
+wk_mk wk_c "$WK_DATA"; wk_run wk_c "$WK_C10"
+wk_kept wk_c "(c): ignored pesquisa/ data, bead closed 10 h (< 12 h)"
+wk_mk wk_d "$WK_DATA"; wk_run wk_d "$WK_C14"
+wk_gone wk_d "(d): the same tree, bead closed 14 h (>= 12 h)" ignored_data_released
+grep '"event":"ignored_data_released"' "$TMP/wk_d.jsonl" | grep -Eq "\"beads\":\"$KZ_ID\",\"closed_hours\":12,\"size_kb\":[1-9][0-9]*,\"top\":\[\{\"path\":\"pesquisa/\",\"kb\":[1-9][0-9]*\}\]" \
+  && ok "ga-1p1i5jr.15 (d): the event names the bead, the grace, the size and the ignored path that went" || bad "ga-1p1i5jr.15 (d): event lacks the fields: $(grep ignored_data_released "$TMP/wk_d.jsonl" | head -1)"
+[ ! -e "$TMP/wk_d/rig/crew/worker-kz/pesquisa" ] && ok "ga-1p1i5jr.15 (d): the ignored data is gone with the tree" || bad "ga-1p1i5jr.15 (d): the tree directory is still on disk"
+# (d2) an UNMERGED tree (a commit main lacks) under pressure: reaped on the closed-bead proof, its branch kept
+wk_mk wk_d2 "$WK_DATA; $WK_UNSHIPPED"; wk_run wk_d2 "$WK_C14" "$PRESS"
+if ! kz_wt wk_d2 && kz_br wk_d2 && [ "$(events wk_d2 ignored_data_released)" = "1" ] && [ "$(events wk_d2 reaped_pool)" = "1" ]; then ok "ga-1p1i5jr.15 (d2): UNMERGED tree, pressure, bead closed 14 h → reaped, data released, the branch with the unshipped commit KEPT"
+else bad "ga-1p1i5jr.15 (d2): wt=$(kz_wt wk_d2 && echo y || echo n) br=$(kz_br wk_d2 && echo y || echo n) released=$(events wk_d2 ignored_data_released) reaped_pool=$(events wk_d2 reaped_pool)"; fi
+# (d3) the grace is a knob (hours) and a value that is not a number is the default, never fewer hours
+wk_mk wk_d3 "$WK_DATA"; wk_run wk_d3 "$WK_C10" WORKTREE_REAPER_CLOSED_WORKER_IGNORED_HOURS=8
+wk_gone wk_d3 "(d3): WORKTREE_REAPER_CLOSED_WORKER_IGNORED_HOURS=8, bead closed 10 h" ignored_data_released
+wk_mk wk_d4 "$WK_DATA"; wk_run wk_d4 "$WK_C10" WORKTREE_REAPER_CLOSED_WORKER_IGNORED_HOURS=abc
+wk_kept wk_d4 "(d4): WORKTREE_REAPER_CLOSED_WORKER_IGNORED_HOURS=abc (not a number → 12), bead closed 10 h"
+
+# ── (e) the size cap: inclusive, a knob, and a value that is not a number is the default
+wk_mk wk_e1 "$WK_DATA"; wk_run wk_e1 "$WK_C14" WORKTREE_REAPER_CLOSED_WORKER_IGNORED_MAX_KB=1
+wk_kept wk_e1 "(e1): ignored data above the cap (MAX_KB=1), bead closed 14 h"
+WK_KB="$(grep '"event":"kept_ignored_data"' "$TMP/wk_e1.jsonl" | head -1 | sed -n 's/.*"size_kb":\([0-9][0-9]*\).*/\1/p')"
+case "$WK_KB" in ''|*[!0-9]*) bad "ga-1p1i5jr.15 (e): could not read the measured size from the kept_ignored_data event" ; WK_KB=999999 ;; *) ok "ga-1p1i5jr.15 (e): the measured size of the fixture is $WK_KB KiB" ;; esac
+wk_mk wk_e2 "$WK_DATA"; wk_run wk_e2 "$WK_C14" WORKTREE_REAPER_CLOSED_WORKER_IGNORED_MAX_KB="$WK_KB"
+wk_gone wk_e2 "(e2): the cap equals the measured size (inclusive)" ignored_data_released
+wk_mk wk_e3 "$WK_DATA"; wk_run wk_e3 "$WK_C14" WORKTREE_REAPER_CLOSED_WORKER_IGNORED_MAX_KB=$((WK_KB-1))
+wk_kept wk_e3 "(e3): the cap is one KiB below the measured size"
+wk_mk wk_e4 "$WK_DATA"; wk_run wk_e4 "$WK_C14" WORKTREE_REAPER_CLOSED_WORKER_IGNORED_MAX_KB=big
+wk_gone wk_e4 "(e4): MAX_KB=big (not a number → the 64 MiB default)" ignored_data_released
+
+# ── (f) a DIRTY worker tree never releases its data: an untracked file, an edited tracked file
+wk_mk wk_f1 "$WK_DATA; echo wip > wip.txt"; wk_run wk_f1 "$WK_C14"
+wk_kept wk_f1 "(f1): an untracked file in the tree, bead closed 14 h"
+wk_mk wk_f2 "$WK_DATA; echo edit >> shipped.txt"; wk_run wk_f2 "$WK_C14"
+wk_kept wk_f2 "(f2): an edited tracked file in the tree, bead closed 14 h"
+wk_mk wk_f3 "$WK_DATA"; wk_run wk_f3 "$WK_C14" PE_STATUS=fail
+wk_kept wk_f3 "(f3): git status FAILS (an empty listing from a failed status is not 'clean')"
+
+# ── (g) the bead says the work may not be over, or says nothing: KEPT
+wk_mk wk_g1 "$WK_DATA"; wk_run wk_g1 "[$(bc_bead "$KZ_ID" open)]";        wk_kept wk_g1 "(g1): bead OPEN"
+wk_mk wk_g2 "$WK_DATA"; wk_run wk_g2 "[$(bc_bead "$KZ_ID" in_progress)]"; wk_kept wk_g2 "(g2): bead IN_PROGRESS"
+wk_mk wk_g3 "$WK_DATA"; wk_run wk_g3 "[$(bc_bead "$KZ_ID" closed)]";      wk_kept wk_g3 "(g3): bead closed but its closed_at is unknown"
+wk_mk wk_g4 "$WK_DATA"; wk_run wk_g4 @missing;                            wk_kept wk_g4 "(g4): the bead lookup FAILED"
+wk_mk wk_g5 "$WK_DATA"; wk_run wk_g5 'this is not json';                  wk_kept wk_g5 "(g5): the bead lookup printed JUNK"
+wk_mk wk_g6 "$WK_DATA"; wk_run wk_g6 '[]';                                wk_kept wk_g6 "(g6): the bead was NOT FOUND"
+# (g7) a worker still using it: the in-use check comes first, nothing is released
+wk_mk wk_g7 "$WK_DATA"; ( cd "$TMP/wk_g7/rig/crew/worker-kz" && pwd -P ) > "$TMP/wk_g7.lsof"; wk_run wk_g7 "$WK_C14" WORKTREE_REAPER_FAKE_LSOF="$TMP/wk_g7.lsof"
+if kz_wt wk_g7 && [ "$(events wk_g7 reaped_pool)" = "0" ] && [ "$(events wk_g7 ignored_data_released)" = "0" ] && [ "$(events wk_g7 kept_in_use)$(events wk_g7 kept_merged_in_use)" != "00" ]; then ok "ga-1p1i5jr.15 (g7): a process has its cwd in the tree → KEPT (kept_in_use), nothing released"
+else bad "ga-1p1i5jr.15 (g7): wt=$(kz_wt wk_g7 && echo y || echo n) reaped_pool=$(events wk_g7 reaped_pool) released=$(events wk_g7 ignored_data_released) in_use=$(events wk_g7 kept_in_use)/$(events wk_g7 kept_merged_in_use)"; fi
+
+# ── (i) the kill switch is the ga-xpoj67 rule again; (l) a dry run says what would go and removes nothing
+wk_mk wk_i "$WK_DATA"; wk_run wk_i "$WK_C14" WORKTREE_REAPER_CLOSED_WORKER_IGNORED_RELEASE=0
+wk_kept wk_i "(i): WORKTREE_REAPER_CLOSED_WORKER_IGNORED_RELEASE=0, bead closed 14 h"
+wk_mk wk_l "$WK_DATA"; wk_run wk_l "$WK_C14" WORKTREE_REAPER_ENABLED=0
+if kz_wt wk_l && [ "$(events wk_l would_release_ignored_data)" = "1" ] && [ "$(events wk_l ignored_data_released)" = "0" ] && [ "$(events wk_l would_reap_pool)" = "1" ] && [ "$(events wk_l reaped_pool)" = "0" ]; then ok "ga-1p1i5jr.15 (l): dry run → would_release_ignored_data + would_reap_pool, the tree is still there"
+else bad "ga-1p1i5jr.15 (l): wt=$(kz_wt wk_l && echo y || echo n) would_release=$(events wk_l would_release_ignored_data) released=$(events wk_l ignored_data_released) would_reap_pool=$(events wk_l would_reap_pool)"; fi
+
+# ── (j) the data must have been MEASURED: a du that fails, or more entries than the 200 that get a du, is a floor and not a size → KEPT
+wk_mk wk_j1 "$WK_DATA"; wk_run wk_j1 "$WK_C14" PE_DU=fail
+wk_kept wk_j1 "(j1): du FAILS for the ignored entry (counted 1 KiB: a floor, not a size)"
+wk_mk wk_j2 "i=0; while [ \$i -lt 201 ]; do echo x > f\$i.q; i=\$((i+1)); done"; wk_run wk_j2 "$WK_C14"
+wk_kept wk_j2 "(j2): 201 ignored entries (the 201st has no du)"
+wk_mk wk_j3 "i=0; while [ \$i -lt 5 ]; do echo x > f\$i.q; i=\$((i+1)); done"; wk_run wk_j3 "$WK_C14"
+wk_gone wk_j3 "(j3): control — 5 ignored entries, all measured" ignored_data_released
+
+# ── (m) a worker tree LOCKED with free text ("<bead> active build") and carrying a commit main lacks (so the ancestor and patch proofs fail): the lock contract's bead-closed proof (6 h) reaps it, the guard asks for 12 h
+WK_LOCK="git worktree lock --reason 'wa-kz1xyz active build' \"\$PWD\""
+wk_mk wk_m1 "$WK_DATA; $WK_UNSHIPPED; $WK_LOCK"; wk_run wk_m1 "$WK_C14"
+if ! kz_wt wk_m1 && [ "$(events wk_m1 reaped_locked_unparseable_bead_closed)" = "1" ] && [ "$(events wk_m1 ignored_data_released)" = "1" ] && grep '"event":"reaped_locked_unparseable_bead_closed"' "$TMP/wk_m1.jsonl" | grep -q "\"verdict\":\"bead_closed $KZ_ID\""; then ok "ga-1p1i5jr.15 (m1): locked with free text, bead closed 14 h, ignored data → reaped by the lock contract, data released, the event names the bead"
+else bad "ga-1p1i5jr.15 (m1): wt=$(kz_wt wk_m1 && echo y || echo n) reaped=$(events wk_m1 reaped_locked_unparseable_bead_closed) released=$(events wk_m1 ignored_data_released)"; fi
+wk_mk wk_m2 "$WK_DATA; $WK_UNSHIPPED; $WK_LOCK"; wk_run wk_m2 "$WK_C10"
+if kz_wt wk_m2 && [ "$(events wk_m2 reaped_locked_unparseable_bead_closed)" = "0" ] && [ "$(events wk_m2 kept_ignored_data)" = "1" ] && [ "$(git -C "$TMP/wk_m2/rig" worktree list --porcelain | grep -c '^locked')" = "1" ]; then ok "ga-1p1i5jr.15 (m2): the same lock, bead closed 10 h (6 h <= 10 < 12) → KEPT with its lock, kept_ignored_data"
+else bad "ga-1p1i5jr.15 (m2): wt=$(kz_wt wk_m2 && echo y || echo n) reaped=$(events wk_m2 reaped_locked_unparseable_bead_closed) kept_ignored_data=$(events wk_m2 kept_ignored_data)"; fi
+
+# ── (sc) the dial of the "end of the delivery" release: a tree DELIVERED to main (every commit there as an equivalent patch) goes when its beads have been closed for SHIPPED_CLOSED_HOURS — by default the 6 h of BEAD_CLOSED_HOURS
+# (unchanged), WORKTREE_REAPER_SHIPPED_CLOSED_HOURS=1 for a faster release. The tree is 14 h old (inside the 24 h age gate), so only the delivery proof can take it.
+wk_young() {   # wk_young <name> <label> — the tree is still there and nothing was reaped
+  if kz_wt "$1" && [ "$(events "$1" reaped_pool)" = "0" ]; then ok "ga-1p1i5jr.15 $2 → KEPT"; else bad "ga-1p1i5jr.15 $2 → not kept (wt=$(kz_wt "$1" && echo y || echo n) reaped_pool=$(events "$1" reaped_pool))"; fi
+}
+wk_mk sc_a "" 14; wk_run sc_a "[$(bc_bead "$KZ_ID" closed 5)]";  wk_young sc_a "(sc_a): delivered tree, bead closed 5 h, default grace (6 h)"
+wk_mk sc_b "" 14; wk_run sc_b "[$(bc_bead "$KZ_ID" closed 7)]"
+{ ! kz_wt sc_b && grep '"event":"reaped_pool"' "$TMP/sc_b.jsonl" | grep -q '"proof":"patch_equivalent bead_closed"'; } && ok "ga-1p1i5jr.15 (sc_b): delivered tree, bead closed 7 h, default grace → REAPED on the patch-equivalent + bead-closed proof" || bad "ga-1p1i5jr.15 (sc_b): wt=$(kz_wt sc_b && echo y || echo n) reaped_pool=$(events sc_b reaped_pool)"
+wk_mk sc_c "" 14; wk_run sc_c "[$(bc_bead "$KZ_ID" closed 2)]" WORKTREE_REAPER_SHIPPED_CLOSED_HOURS=1
+{ ! kz_wt sc_c && [ "$(events sc_c reaped_pool)" = "1" ]; } && ok "ga-1p1i5jr.15 (sc_c): SHIPPED_CLOSED_HOURS=1, bead closed 2 h → REAPED (the faster release)" || bad "ga-1p1i5jr.15 (sc_c): wt=$(kz_wt sc_c && echo y || echo n) reaped_pool=$(events sc_c reaped_pool)"
+wk_mk sc_d "" 14; wk_run sc_d "[$(bc_bead "$KZ_ID" closed 2)]" WORKTREE_REAPER_SHIPPED_CLOSED_HOURS=3; wk_young sc_d "(sc_d): SHIPPED_CLOSED_HOURS=3, bead closed 2 h"
+wk_mk sc_e "" 14; wk_run sc_e "[$(bc_bead "$KZ_ID" closed 4)]" WORKTREE_REAPER_SHIPPED_CLOSED_HOURS=3
+{ ! kz_wt sc_e && [ "$(events sc_e reaped_pool)" = "1" ]; } && ok "ga-1p1i5jr.15 (sc_e): SHIPPED_CLOSED_HOURS=3, bead closed 4 h → REAPED (the knob moves the line, it does not just lower it)" || bad "ga-1p1i5jr.15 (sc_e): wt=$(kz_wt sc_e && echo y || echo n) reaped_pool=$(events sc_e reaped_pool)"
+wk_mk sc_f "" 14; wk_run sc_f "[$(bc_bead "$KZ_ID" closed 5)]" WORKTREE_REAPER_SHIPPED_CLOSED_HOURS=abc; wk_young sc_f "(sc_f): SHIPPED_CLOSED_HOURS=abc (not a number → BEAD_CLOSED_HOURS, 6), bead closed 5 h"
+wk_mk sc_g "" 14; wk_run sc_g "[$(bc_bead "$KZ_ID" closed 5)]" WORKTREE_REAPER_CLOSED_BEAD_HOURS=2
+{ ! kz_wt sc_g && [ "$(events sc_g reaped_pool)" = "1" ]; } && ok "ga-1p1i5jr.15 (sc_g): the dial's DEFAULT is BEAD_CLOSED_HOURS: with that at 2 h and the bead closed 5 h → REAPED" || bad "ga-1p1i5jr.15 (sc_g): wt=$(kz_wt sc_g && echo y || echo n) reaped_pool=$(events sc_g reaped_pool)"
+# (sc_h) the dial is for the delivery proof alone: it does not shorten the 12 h the guard asks before it lets ignored data go
+wk_mk sc_h "$WK_DATA" 14; wk_run sc_h "[$(bc_bead "$KZ_ID" closed 2)]" WORKTREE_REAPER_SHIPPED_CLOSED_HOURS=0
+wk_kept sc_h "(sc_h): SHIPPED_CLOSED_HOURS=0 on a delivered tree holding ignored data, bead closed 2 h (< the 12 h release grace)"
+
+# ── the AUDIT: what is left on disk after the pass, bead closed for more than 24 h
+echo "── ga-1p1i5jr.15: audit_pool_workers (worker_tree_overdue, the report, the sweep counters) ──"
+au_n() { grep -c '"event":"worker_tree_overdue"' "$TMP/$1.jsonl" 2>/dev/null || true; }
+au_field() { grep '"event":"worker_tree_overdue"' "$TMP/$1.jsonl" 2>/dev/null | head -1 | jq -r ".$2" 2>/dev/null; }   # au_field <name> <field> of the first overdue event
+au_rep() { cat "$TMP/$1.workers.jsonl" 2>/dev/null; }
+au_ok() { [ "$(au_n "$1")" = "1" ] && [ "$(au_field "$1" reason)" = "$2" ] && [ "$(wk_sweep "$1" worker_overdue)" = "1" ] && [ "$(au_rep "$1" | wc -l | tr -d ' ')" = "1" ]; }
+wk_mk au_a "$WK_DATA" 30; wk_run au_a "$WK_C30" WORKTREE_REAPER_CLOSED_WORKER_IGNORED_MAX_KB=1
+if kz_wt au_a && au_ok au_a ignored_data && [ "$(au_field au_a beads)" = "$KZ_ID" ] && [ "$(au_field au_a closed_h)" = "30" ] && [ "$(au_field au_a locked)" = "false" ] && [ "$(au_field au_a repo)" = "rig" ] && [ "$(au_field au_a dry_run)" = "false" ] \
+   && [ "$(au_field au_a wt)" = "worker-kz" ] && [ "$(au_field au_a branch)" = "crew/kz/$KZ_ID" ]; then ok "ga-1p1i5jr.15 (au_a): clean worker tree, bead closed 30 h, data above the cap → worker_tree_overdue (reason ignored_data, bead, closed_h 30, repo, wt, branch)"
+else bad "ga-1p1i5jr.15 (au_a): wt=$(kz_wt au_a && echo y || echo n) n=$(au_n au_a) reason=$(au_field au_a reason) beads=$(au_field au_a beads) closed_h=$(au_field au_a closed_h) sweep=$(wk_sweep au_a worker_overdue)"; fi
+KB_A="$(au_field au_a size_kb)"
+case "$KB_A" in ''|null|*[!0-9]*) bad "ga-1p1i5jr.15 (au_a): size_kb is not a number: $KB_A" ;; *) { [ "$(wk_sweep au_a worker_overdue_kb)" = "$KB_A" ] && [ "$(wk_sweep au_a worker_trees)" = "1" ] && [ "$(wk_sweep au_a worker_audit_unknown)" = "0" ]; } \
+   && ok "ga-1p1i5jr.15 (au_a): the sweep line counts worker_trees 1, worker_overdue 1, worker_overdue_kb == the event's size_kb ($KB_A), worker_audit_unknown 0" || bad "ga-1p1i5jr.15 (au_a): sweep trees=$(wk_sweep au_a worker_trees) kb=$(wk_sweep au_a worker_overdue_kb) unknown=$(wk_sweep au_a worker_audit_unknown) event kb=$KB_A" ;; esac
+[ "$(au_rep au_a)" = "$(grep '"event":"worker_tree_overdue"' "$TMP/au_a.jsonl")" ] && ok "ga-1p1i5jr.15 (au_a): the report file holds exactly the log's worker_tree_overdue line" || bad "ga-1p1i5jr.15 (au_a): report=$(au_rep au_a | head -c 300)"
+detail_a="$(au_field au_a detail)"; DATA_A="$(grep '"event":"kept_ignored_data"' "$TMP/au_a.jsonl" | head -1 | sed -n 's/.*"size_kb":\([0-9][0-9]*\).*/\1/p')"
+{ [ -n "$DATA_A" ] && [ "$detail_a" = "$DATA_A KiB" ] && [ "$DATA_A" != "$KB_A" ]; } && ok "ga-1p1i5jr.15 (au_a): the detail carries the size of the IGNORED DATA that keeps the tree ($DATA_A KiB, what kept_ignored_data measured), not the tree's size ($KB_A KiB)" || bad "ga-1p1i5jr.15 (au_a): detail=$detail_a data=$DATA_A tree=$KB_A"
+
+# (au_b) an OPEN bead is the normal life of a tree: counted as a worker tree, never overdue; the report is an empty file
+wk_mk au_b "$WK_DATA" 30; wk_run au_b "[$(bc_bead "$KZ_ID" open)]"
+if kz_wt au_b && [ "$(au_n au_b)" = "0" ] && [ "$(wk_sweep au_b worker_trees)" = "1" ] && [ "$(wk_sweep au_b worker_overdue)" = "0" ] && [ -f "$TMP/au_b.workers.jsonl" ] && [ ! -s "$TMP/au_b.workers.jsonl" ]; then ok "ga-1p1i5jr.15 (au_b): bead open → worker_trees 1, worker_overdue 0, an EMPTY report file"
+else bad "ga-1p1i5jr.15 (au_b): n=$(au_n au_b) trees=$(wk_sweep au_b worker_trees) overdue=$(wk_sweep au_b worker_overdue) report=$([ -f "$TMP/au_b.workers.jsonl" ] && wc -c < "$TMP/au_b.workers.jsonl" || echo missing)"; fi
+# (au_c) the line is 24 h: closed 23 h ago is not overdue, 25 h ago is
+wk_mk au_c1 "$WK_DATA" 30; wk_run au_c1 "$WK_C23" WORKTREE_REAPER_CLOSED_WORKER_IGNORED_MAX_KB=1
+{ kz_wt au_c1 && [ "$(au_n au_c1)" = "0" ] && [ "$(wk_sweep au_c1 worker_overdue)" = "0" ]; } && ok "ga-1p1i5jr.15 (au_c1): bead closed 23 h ago, tree kept by its data → not overdue yet" || bad "ga-1p1i5jr.15 (au_c1): n=$(au_n au_c1) overdue=$(wk_sweep au_c1 worker_overdue)"
+wk_mk au_c2 "$WK_DATA" 30; wk_run au_c2 "$WK_C25" WORKTREE_REAPER_CLOSED_WORKER_IGNORED_MAX_KB=1
+au_ok au_c2 ignored_data && ok "ga-1p1i5jr.15 (au_c2): bead closed 25 h ago, tree kept by its data → overdue" || bad "ga-1p1i5jr.15 (au_c2): n=$(au_n au_c2) overdue=$(wk_sweep au_c2 worker_overdue)"
+wk_mk au_c3 "$WK_DATA" 30; wk_run au_c3 "$WK_C25" WORKTREE_REAPER_CLOSED_WORKER_IGNORED_MAX_KB=1 WORKTREE_REAPER_WORKER_OVERDUE_HOURS=30
+{ [ "$(au_n au_c3)" = "0" ]; } && ok "ga-1p1i5jr.15 (au_c3): WORKTREE_REAPER_WORKER_OVERDUE_HOURS=30 moves the line (closed 25 h → not overdue)" || bad "ga-1p1i5jr.15 (au_c3): n=$(au_n au_c3)"
+wk_mk au_c4 "$WK_DATA" 30; wk_run au_c4 "$WK_C25" WORKTREE_REAPER_CLOSED_WORKER_IGNORED_MAX_KB=1 WORKTREE_REAPER_WORKER_OVERDUE_HOURS=soon
+au_ok au_c4 ignored_data && ok "ga-1p1i5jr.15 (au_c4): WORKTREE_REAPER_WORKER_OVERDUE_HOURS=soon (not a number → 24)" || bad "ga-1p1i5jr.15 (au_c4): n=$(au_n au_c4)"
+wk_mk au_c5 "$WK_DATA" 30; wk_run au_c5 "$WK_C23" WORKTREE_REAPER_CLOSED_WORKER_IGNORED_MAX_KB=1 WORKTREE_REAPER_WORKER_OVERDUE_HOURS=soon
+{ kz_wt au_c5 && [ "$(au_n au_c5)" = "0" ]; } && ok "ga-1p1i5jr.15 (au_c5): WORKTREE_REAPER_WORKER_OVERDUE_HOURS=soon with the bead closed 23 h → NOT overdue (the fallback is 24, not 0)" || bad "ga-1p1i5jr.15 (au_c5): n=$(au_n au_c5)"
+
+# (au_d) the first thing that keeps it, in order: dirty (pressure keeps an unmerged dirty tree), locked (a lock wins over dirt), in use, op in progress, unreadable status
+wk_mk au_d "echo wip > wip.txt" 30; wk_run au_d "$WK_C30" "$PRESS"
+{ kz_wt au_d && au_ok au_d dirty && [ "$(au_field au_d detail)" = "1 path(s) changed" ]; } && ok "ga-1p1i5jr.15 (au_d): an untracked file, bead closed 30 h, pressure → overdue, reason dirty (1 path(s) changed)" || bad "ga-1p1i5jr.15 (au_d): n=$(au_n au_d) reason=$(au_field au_d reason) detail=$(au_field au_d detail)"
+wk_mk au_e "echo wip > wip.txt; git worktree lock --reason 'fix \"x\" \\ y' \"\$PWD\"" 30; wk_run au_e "$WK_C30"
+{ kz_wt au_e && au_ok au_e locked && [ "$(au_field au_e locked)" = "true" ] && au_field au_e detail | grep -q 'fix'; } && ok "ga-1p1i5jr.15 (au_e): locked AND dirty → reason locked (a lock is named first), locked true, the lock reason (a quote and a backslash in it) arrives as the detail" || bad "ga-1p1i5jr.15 (au_e): n=$(au_n au_e) reason=$(au_field au_e reason) detail=$(au_field au_e detail)"
+jq -e . "$TMP/au_e.jsonl" >/dev/null 2>&1 && [ "$(jq -c . "$TMP/au_e.workers.jsonl" 2>/dev/null | wc -l | tr -d ' ')" = "1" ] && ok "ga-1p1i5jr.15 (au_e): every log line and the report line are valid JSON" || bad "ga-1p1i5jr.15 (au_e): the log or the report is not valid JSON"
+wk_mk au_f "echo wip > wip.txt" 30; ( cd "$TMP/au_f/rig/crew/worker-kz" && pwd -P ) > "$TMP/au_f.lsof"; wk_run au_f "$WK_C30" "$PRESS" WORKTREE_REAPER_FAKE_LSOF="$TMP/au_f.lsof"
+{ kz_wt au_f && au_ok au_f in_use; } && ok "ga-1p1i5jr.15 (au_f): a process has its cwd in the tree → reason in_use (before dirty)" || bad "ga-1p1i5jr.15 (au_f): n=$(au_n au_f) reason=$(au_field au_f reason)"
+wk_mk au_g "echo wip > wip.txt; mkdir -p \"\$(git rev-parse --git-dir)/rebase-merge\"" 30; wk_run au_g "$WK_C30" "$PRESS"
+{ kz_wt au_g && au_ok au_g op_in_progress; } && ok "ga-1p1i5jr.15 (au_g): a rebase under way, bead closed 30 h → reason op_in_progress (the proof refuses it before asking the bead; the idle tree is still said)" || bad "ga-1p1i5jr.15 (au_g): n=$(au_n au_g) reason=$(au_field au_g reason)"
+wk_mk au_h "$WK_DATA" 30; wk_run au_h "$WK_C30" WORKTREE_REAPER_CLOSED_WORKER_IGNORED_MAX_KB=1 PE_DU=fail
+{ kz_wt au_h && au_ok au_h ignored_data && [ "$(au_field au_h size_kb)" = "null" ]; } && ok "ga-1p1i5jr.15 (au_h): du fails for the size → the overdue line says size_kb null (a log field), the tree is still reported" || bad "ga-1p1i5jr.15 (au_h): n=$(au_n au_h) size=$(au_field au_h size_kb) reason=$(au_field au_h reason)"
+
+# (au_i) the bead state could not be read: NOT overdue, counted apart — never read as 'fine' without a trace, never as overdue
+wk_mk au_i "$WK_DATA" 30; wk_run au_i @missing
+{ kz_wt au_i && [ "$(au_n au_i)" = "0" ] && [ "$(wk_sweep au_i worker_audit_unknown)" = "1" ] && [ "$(wk_sweep au_i worker_overdue)" = "0" ] && [ "$(wk_sweep au_i worker_trees)" = "1" ]; } \
+  && ok "ga-1p1i5jr.15 (au_i): bead lookup FAILED → no worker_tree_overdue, worker_audit_unknown 1, worker_overdue 0" || bad "ga-1p1i5jr.15 (au_i): n=$(au_n au_i) unknown=$(wk_sweep au_i worker_audit_unknown) overdue=$(wk_sweep au_i worker_overdue)"
+wk_mk au_i2 "$WK_DATA" 30; wk_run au_i2 'this is not json'
+{ [ "$(au_n au_i2)" = "0" ] && [ "$(wk_sweep au_i2 worker_audit_unknown)" = "1" ]; } && ok "ga-1p1i5jr.15 (au_i2): the lookup printed JUNK → worker_audit_unknown 1" || bad "ga-1p1i5jr.15 (au_i2): n=$(au_n au_i2) unknown=$(wk_sweep au_i2 worker_audit_unknown)"
+# (au_j) one failed lookup is not asked again for the repo's other trees: 3 young unmerged worker trees, a bd that always fails → ONE call
+mkdir -p "$TMP/au_j-bin"; printf '#!/bin/sh\necho "$*" >> "%s"\nexit 1\n' "$TMP/au_j.calls" > "$TMP/au_j-bin/bd"; chmod +x "$TMP/au_j-bin/bd"
+wk_mk au_j "$WK_UNSHIPPED" 1
+( cd "$TMP/au_j/rig" && for n in 2 3; do git worktree add -q "crew/worker-kz$n" -b "crew/kz/wa-kz${n}xyz" main && ( cd "crew/worker-kz$n" && echo u$n > u$n.txt && git add u$n.txt && git commit -qm u$n ); done ) >/dev/null 2>&1
+pe_age "$TMP/au_j/rig/crew/worker-kz2" 1; pe_age "$TMP/au_j/rig/crew/worker-kz3" 1
+: > "$TMP/au_j.calls"; wk_run au_j '[]' PATH="$TMP/au_j-bin:$PE_BIN:$PATH" WORKTREE_REAPER_FAKE_BEADS=
+{ [ "$(wk_sweep au_j worker_trees)" = "3" ] && [ "$(wk_sweep au_j worker_audit_unknown)" = "3" ] && [ "$(wc -l < "$TMP/au_j.calls" | tr -d ' ')" = "1" ]; } \
+  && ok "ga-1p1i5jr.15 (au_j): 3 worker trees, the bead lookup fails on the first → worker_audit_unknown 3 and exactly ONE bd call (the others are not asked)" || bad "ga-1p1i5jr.15 (au_j): trees=$(wk_sweep au_j worker_trees) unknown=$(wk_sweep au_j worker_audit_unknown) bd calls=$(wc -l < "$TMP/au_j.calls" | tr -d ' ')"
+
+# (au_k) no bead found: overdue only once the tree has been idle for 24 h; and then it says so
+wk_mk au_k1 "" 30; wk_run au_k1 '[]' "$PRESS"
+{ kz_wt au_k1 && au_ok au_k1 bead_not_found && [ "$(au_field au_k1 beads)" = "" ] && [ "$(au_field au_k1 closed_h)" = "null" ]; } && ok "ga-1p1i5jr.15 (au_k1): no bead found, tree idle 30 h, pressure keeps it → overdue, reason bead_not_found (no beads, closed_h null)" || bad "ga-1p1i5jr.15 (au_k1): n=$(au_n au_k1) reason=$(au_field au_k1 reason) closed_h=$(au_field au_k1 closed_h)"
+wk_mk au_k2 "" 14; wk_run au_k2 '[]' "$PRESS"
+{ kz_wt au_k2 && [ "$(au_n au_k2)" = "0" ] && [ "$(wk_sweep au_k2 worker_trees)" = "1" ]; } && ok "ga-1p1i5jr.15 (au_k2): no bead found, tree idle 14 h (< 24) → not overdue" || bad "ga-1p1i5jr.15 (au_k2): n=$(au_n au_k2)"
+# (au_l) activity inside the age gate: a tree whose bead closed 30 h ago but that something touched a minute ago is young, not abandoned (ACTIVITY_SCAN on: the freshest file and the index count)
+wk_mk au_l "" 30; touch "$TMP/au_l/rig/crew/worker-kz/shipped.txt"
+wk_run au_l "$WK_C30" WORKTREE_REAPER_ACTIVITY_SCAN=1
+{ kz_wt au_l && au_ok au_l young; } && ok "ga-1p1i5jr.15 (au_l): bead closed 30 h, a file inside written just now → overdue, reason young (it is still being touched)" || bad "ga-1p1i5jr.15 (au_l): wt=$(kz_wt au_l && echo y || echo n) n=$(au_n au_l) reason=$(au_field au_l reason)"
+# (au_m) nothing keeps it that the audit can see (and it is not a missing bead): unknown — here the pass never reached the tree: a cap of 0 reaps per sweep... use the per-sweep cap
+wk_mk au_m "" 30; wk_run au_m "$WK_C30" WORKTREE_REAPER_MAX_PER_SWEEP=0
+{ kz_wt au_m && au_ok au_m unknown; } && ok "ga-1p1i5jr.15 (au_m): the sweep cap stopped the pass before this clean tree, bead closed 30 h → overdue, reason unknown (nothing the audit sees keeps it)" || bad "ga-1p1i5jr.15 (au_m): wt=$(kz_wt au_m && echo y || echo n) n=$(au_n au_m) reason=$(au_field au_m reason) cap=$(events au_m pool_cap_hit)"
+
+# (au_z) a clean tree with no ignored data and a closed bead is not left behind at all: nothing to report (the report is empty), the tree is reaped
+wk_mk au_z "" 30; wk_run au_z "$WK_C30"
+{ ! kz_wt au_z && [ "$(au_n au_z)" = "0" ] && [ "$(wk_sweep au_z worker_trees)" = "0" ] && [ -f "$TMP/au_z.workers.jsonl" ] && [ ! -s "$TMP/au_z.workers.jsonl" ]; } && ok "ga-1p1i5jr.15 (au_z): the tree was reaped → worker_trees 0, nothing overdue, an empty report" || bad "ga-1p1i5jr.15 (au_z): wt=$(kz_wt au_z && echo y || echo n) n=$(au_n au_z) trees=$(wk_sweep au_z worker_trees)"
+# (au_o) the report is REPLACED each pass: the second pass finds the bead reopened → an empty report; no temp file is left behind
+wk_mk au_o "$WK_DATA" 30; wk_run au_o "$WK_C30" WORKTREE_REAPER_CLOSED_WORKER_IGNORED_MAX_KB=1
+[ "$(au_rep au_o | wc -l | tr -d ' ')" = "1" ] || bad "ga-1p1i5jr.15 (au_o): the first pass left $(au_rep au_o | wc -l | tr -d ' ') report lines (want 1)"
+run_kz au_o "[$(bc_bead "$KZ_ID" open)]" WORKTREE_REAPER_IGNORED_DATA_GUARD=1 WORKTREE_REAPER_WORKER_AUDIT=1 WORKTREE_REAPER_CLOSED_WORKER_IGNORED_MAX_KB=1
+{ [ -f "$TMP/au_o.workers.jsonl" ] && [ ! -s "$TMP/au_o.workers.jsonl" ] && [ "$(au_n au_o)" = "1" ] && ! ls "$TMP"/au_o.workers.jsonl.tmp.* >/dev/null 2>&1; } && ok "ga-1p1i5jr.15 (au_o): the second pass REPLACED the report (now empty), the log keeps the first pass's line, no temp file is left" || bad "ga-1p1i5jr.15 (au_o): report bytes=$(wc -c < "$TMP/au_o.workers.jsonl" 2>/dev/null) log lines=$(au_n au_o) tmp=$(ls "$TMP"/au_o.workers.jsonl.tmp.* 2>/dev/null | wc -l | tr -d ' ')"
+# (au_p) a report that cannot be moved into place is not a failed pass: the old report stays, the log lines are the record, no temp file is left
+wk_mk au_p "$WK_DATA" 30; mkdir -p "$TMP/au_p-bin"; printf 'OLD REPORT\n' > "$TMP/au_p.workers.jsonl"
+printf '#!/bin/sh\nfor a; do last="$a"; done\ncase "$last" in *.workers.jsonl) echo "mv: injected failure" >&2; exit 1 ;; esac\nexec "$PE_REAL_MV" "$@"\n' > "$TMP/au_p-bin/mv"; chmod +x "$TMP/au_p-bin/mv"
+wk_run au_p "$WK_C30" WORKTREE_REAPER_CLOSED_WORKER_IGNORED_MAX_KB=1 PATH="$TMP/au_p-bin:$PE_BIN:$PATH"
+{ [ "$(au_n au_p)" = "1" ] && [ "$(wk_sweep au_p worker_overdue)" = "1" ] && [ "$(cat "$TMP/au_p.workers.jsonl")" = "OLD REPORT" ] && ! ls "$TMP"/au_p.workers.jsonl.tmp.* >/dev/null 2>&1; } && ok "ga-1p1i5jr.15 (au_p): the report cannot be moved into place (mv fails) → the old report stays, the pass still logs the overdue tree and the sweep line, no temp file is left" || bad "ga-1p1i5jr.15 (au_p): n=$(au_n au_p) sweep=$(wk_sweep au_p worker_overdue) report=$(head -c 60 "$TMP/au_p.workers.jsonl") tmp=$(ls "$TMP"/au_p.workers.jsonl.tmp.* 2>/dev/null | wc -l | tr -d ' ')"
+# (au_q) the worktree list cannot be read: the pool loop logs skip_repo_unresolvable, the audit has nothing to say and does not fail the pass
+wk_mk au_q "$WK_DATA" 30; wk_run au_q "$WK_C30" PE_WTLIST=fail
+{ [ "$(events au_q skip_repo_unresolvable)" -ge "1" ] && [ "$(au_n au_q)" = "0" ] && [ "$(wk_sweep au_q worker_trees)" = "0" ]; } && ok "ga-1p1i5jr.15 (au_q): git worktree list FAILS → skip_repo_unresolvable from the pool loop, no audit line, worker_trees 0, the sweep line is still written" || bad "ga-1p1i5jr.15 (au_q): skip=$(events au_q skip_repo_unresolvable) n=$(au_n au_q) trees=$(wk_sweep au_q worker_trees)"
+# (au_r) the audit removes nothing and changes nothing: the overdue tree and its branch are exactly as the pass left them (dry run included: the line is read-only)
+wk_mk au_r "$WK_DATA" 30; printf 'OLD REPORT\n' > "$TMP/au_r.workers.jsonl"; wk_run au_r "$WK_C30" WORKTREE_REAPER_CLOSED_WORKER_IGNORED_MAX_KB=1 WORKTREE_REAPER_ENABLED=0
+{ kz_wt au_r && kz_br au_r && [ "$(au_n au_r)" = "1" ] && [ "$(au_field au_r reason)" = "ignored_data" ] && [ "$(au_field au_r dry_run)" = "true" ] && [ "$(events au_r reaped_pool)" = "0" ] && [ "$(cat "$TMP/au_r.workers.jsonl")" = "OLD REPORT" ] && ! ls "$TMP"/au_r.workers.jsonl.tmp.* >/dev/null 2>&1; } \
+  && ok "ga-1p1i5jr.15 (au_r): dry run — the overdue tree is reported (dry_run true) and left exactly as it was, and the previous REAL report is not replaced" || bad "ga-1p1i5jr.15 (au_r): wt=$(kz_wt au_r && echo y || echo n) n=$(au_n au_r) dry_run=$(au_field au_r dry_run) report=$(head -c 40 "$TMP/au_r.workers.jsonl")"
+
+# (au_s) the audit has a kill switch, and the sweep line says it is off: no lookup, no overdue line, the old report is left alone, worker_audit 0 (so its zero counters are not read as "none overdue")
+wk_mk au_s "$WK_DATA" 30; printf 'OLD REPORT\n' > "$TMP/au_s.workers.jsonl"; wk_run au_s "$WK_C30" WORKTREE_REAPER_CLOSED_WORKER_IGNORED_MAX_KB=1 WORKTREE_REAPER_WORKER_AUDIT=0
+{ kz_wt au_s && [ "$(au_n au_s)" = "0" ] && [ "$(wk_sweep au_s worker_audit)" = "0" ] && [ "$(wk_sweep au_s worker_trees)" = "0" ] && [ "$(cat "$TMP/au_s.workers.jsonl")" = "OLD REPORT" ] && ! ls "$TMP"/au_s.workers.jsonl.tmp.* >/dev/null 2>&1; } \
+  && ok "ga-1p1i5jr.15 (au_s): WORKTREE_REAPER_WORKER_AUDIT=0 → no overdue line, worker_audit 0 on the sweep line, the previous report untouched, no temp file" || bad "ga-1p1i5jr.15 (au_s): n=$(au_n au_s) audit=$(wk_sweep au_s worker_audit) trees=$(wk_sweep au_s worker_trees) report=$(head -c 40 "$TMP/au_s.workers.jsonl")"
+[ "$(wk_sweep au_a worker_audit)" = "1" ] && ok "ga-1p1i5jr.15 (au_s): control — a pass with the audit on says worker_audit 1" || bad "ga-1p1i5jr.15 (au_s): au_a worker_audit=$(wk_sweep au_a worker_audit)"
+# (au_t) last_event: the last thing the PASS logged for the tree is what the overdue line quotes; a tree the pass never reached has none
+[ "$(au_field au_a last_event)" = "kept_ignored_data" ] && ok "ga-1p1i5jr.15 (au_t): au_a — last_event is kept_ignored_data (what the pass logged for the tree)" || bad "ga-1p1i5jr.15 (au_t): au_a last_event=$(au_field au_a last_event)"
+[ "$(au_field au_m last_event)" = "" ] && ok "ga-1p1i5jr.15 (au_t): au_m — the sweep cap stopped the pass before the tree: last_event empty" || bad "ga-1p1i5jr.15 (au_t): au_m last_event=$(au_field au_m last_event)"
+[ "$(au_field au_d last_event)" = "kept_pressure_unmerged" ] && ok "ga-1p1i5jr.15 (au_t): au_d — last_event is kept_pressure_unmerged (the dirty tree under pressure)" || bad "ga-1p1i5jr.15 (au_t): au_d last_event=$(au_field au_d last_event)"
+# (au_u) a line the pass logged for ANOTHER tree is not this tree's: two worker trees, one reaped (no ignored data) and one kept by data — the overdue tree quotes ITS event
+au_two() { wk_mk "$1" "$WK_DATA" 30; ( cd "$TMP/$1/rig" && git worktree add -q crew/worker-kz9 -b crew/kz/wa-kz9xyz main ) >/dev/null 2>&1; pe_age "$TMP/$1/rig/crew/worker-kz9" 30; }
+au_two au_u
+wk_run au_u "[$(bc_bead "$KZ_ID" closed 30),$(bc_bead wa-kz9xyz closed 30)]" WORKTREE_REAPER_CLOSED_WORKER_IGNORED_MAX_KB=1
+{ [ "$(au_n au_u)" = "1" ] && [ "$(au_field au_u wt)" = "worker-kz" ] && [ "$(au_field au_u last_event)" = "kept_ignored_data" ] && [ "$(events au_u reaped_pool)" = "1" ]; } && ok "ga-1p1i5jr.15 (au_u): two worker trees, one reaped — the overdue tree quotes ITS event, not the other tree's reaped_pool" || bad "ga-1p1i5jr.15 (au_u): n=$(au_n au_u) wt=$(au_field au_u wt) last_event=$(au_field au_u last_event) reaped_pool=$(events au_u reaped_pool)"
+
+# (nw2) the release is for pool WORKER trees: a tree under crew/ that is not named worker-* (a crew member's own branch tree), clean, bead closed 30 h, holding ignored data → KEPT; and the audit does not count it
+xp_nw2() { m5_mk "$1"; local r="$TMP/$1/rig"
+  ( cd "$r" && git worktree add -q "$r/crew/notes-kz" -b "crew/kz/$KZ_ID" main && cd "$r/crew/notes-kz" && mkdir -p pesquisa/out && echo r1 > pesquisa/out/b.csv ) >/dev/null 2>&1; m5_age "$r/crew/notes-kz" 30; }
+xp_nw2 wk_nw2; wk_run wk_nw2 "$WK_C30"
+{ git -C "$TMP/wk_nw2/rig" worktree list --porcelain | grep -q 'crew/notes-kz$' && [ "$(events wk_nw2 kept_ignored_data)" = "1" ] && [ "$(events wk_nw2 ignored_data_released)" = "0" ] && [ "$(wk_sweep wk_nw2 worker_trees)" = "0" ] && [ "$(events wk_nw2 worker_tree_overdue)" = "0" ]; } \
+  && ok "ga-1p1i5jr.15 (nw2): crew/notes-kz (not worker-*), clean, bead closed 30 h, ignored data → KEPT (nothing released), and the audit counts no worker tree" || bad "ga-1p1i5jr.15 (nw2): present=$(git -C "$TMP/wk_nw2/rig" worktree list --porcelain | grep -c 'crew/notes-kz$') kept_ignored_data=$(events wk_nw2 kept_ignored_data) released=$(events wk_nw2 ignored_data_released) trees=$(wk_sweep wk_nw2 worker_trees)"
+
+# (au_v) closed_h is the age of the NEWEST closure among the beads the tree names (the tree has been idle since the last bead closed): two beads, closed 40 h and 26 h ago → 26
+wk_mk au_v "$WK_DATA; git branch -m crew/kz/wa-kz1xyz-wa-kz2xyz" 30
+wk_run au_v "[$(bc_bead "$KZ_ID" closed 40),$(bc_bead wa-kz2xyz closed 26)]" WORKTREE_REAPER_CLOSED_WORKER_IGNORED_MAX_KB=1
+{ au_ok au_v ignored_data && [ "$(au_field au_v closed_h)" = "26" ] && [ "$(au_field au_v beads)" = "$KZ_ID wa-kz2xyz" ]; } && ok "ga-1p1i5jr.15 (au_v): a tree naming two beads (closed 40 h and 26 h ago) → overdue with closed_h 26 (the newest closure) and both beads" || bad "ga-1p1i5jr.15 (au_v): n=$(au_n au_v) closed_h=$(au_field au_v closed_h) beads=$(au_field au_v beads) reason=$(au_field au_v reason)"
+# an open bead among them: not overdue
+wk_mk au_v2 "$WK_DATA; git branch -m crew/kz/wa-kz1xyz-wa-kz2xyz" 30
+wk_run au_v2 "[$(bc_bead "$KZ_ID" closed 40),$(bc_bead wa-kz2xyz open)]" WORKTREE_REAPER_CLOSED_WORKER_IGNORED_MAX_KB=1
+{ kz_wt au_v2 && [ "$(au_n au_v2)" = "0" ] && [ "$(wk_sweep au_v2 worker_trees)" = "1" ]; } && ok "ga-1p1i5jr.15 (au_v2): one of the two beads still open → not overdue (every bead must be closed)" || bad "ga-1p1i5jr.15 (au_v2): n=$(au_n au_v2)"
+
+# (au_w) a bead lookup that failed in one repo does not silence the audit of the NEXT repo: rig's bd fails, rig2's answers
+au_w_mk() { local t="$TMP/$1"
+  git init -q --bare "$t/remote2.git"; git init -q -b main "$t/rig2"
+  ( cd "$t/rig2" && git remote add origin "$t/remote2.git" && echo base > base.txt && git add base.txt && git commit -qm base && git push -q origin main && git fetch -q origin && git remote set-head origin main \
+    && mkdir -p crew && git worktree add -q crew/worker-kz -b "crew/kz/$KZ_ID" main && cd crew/worker-kz && echo u > u.txt && git add u.txt && git commit -qm u ) >/dev/null 2>&1
+  pe_age "$t/rig2/crew/worker-kz" 1; }
+mkdir -p "$TMP/au_w-bin"; : > "$TMP/au_w.calls"
+cat > "$TMP/au_w-bin/bd" <<EOF
+#!/bin/sh
+echo "\$*" >> "$TMP/au_w.calls"
+case "\$2" in */rig2) printf '[{"id":"$KZ_ID","status":"closed","closed_at":"$(bc_iso 30)"}]'; exit 0 ;; esac
+exit 1
+EOF
+chmod +x "$TMP/au_w-bin/bd"
+wk_mk au_w "$WK_UNSHIPPED" 1; au_w_mk au_w
+wk_run au_w '[]' PATH="$TMP/au_w-bin:$PE_BIN:$PATH" WORKTREE_REAPER_FAKE_BEADS=
+{ [ "$(wk_sweep au_w worker_trees)" = "2" ] && [ "$(wk_sweep au_w worker_audit_unknown)" = "1" ] && [ "$(wk_sweep au_w worker_overdue)" = "1" ] && [ "$(au_field au_w repo)" = "rig2" ]; } \
+  && ok "ga-1p1i5jr.15 (au_w): the lookup fails in rig, answers in rig2 → rig2's tree is still audited (overdue), rig's is counted unknown — the 'lookup down' state does not leak across repos" || bad "ga-1p1i5jr.15 (au_w): trees=$(wk_sweep au_w worker_trees) unknown=$(wk_sweep au_w worker_audit_unknown) overdue=$(wk_sweep au_w worker_overdue) repo=$(au_field au_w repo) calls=$(tr '\n' '|' < "$TMP/au_w.calls" | cut -c1-200)"
+
+# (au_x) git status cannot be read: the audit says status_unreadable, never 'clean' and never 'dirty'
+wk_mk au_x "$WK_DATA" 30; wk_run au_x "$WK_C30" WORKTREE_REAPER_CLOSED_WORKER_IGNORED_MAX_KB=1 PE_STATUS=fail
+{ kz_wt au_x && au_ok au_x status_unreadable; } && ok "ga-1p1i5jr.15 (au_x): git status FAILS → overdue, reason status_unreadable" || bad "ga-1p1i5jr.15 (au_x): n=$(au_n au_x) reason=$(au_field au_x reason)"
+# (au_y) the listing of ignored files cannot be read: ignored_data_unknown (the guard kept the tree as kept_ignored_data_unknown)
+mkdir -p "$TMP/au_y-bin"; printf '#!/bin/sh\ncase " $* " in *" ls-files "*) exit 1 ;; esac\nexec %s "$@"\n' "$(command -v git)" > "$TMP/au_y-bin/git"; chmod +x "$TMP/au_y-bin/git"
+wk_mk au_y "" 30; wk_run au_y "$WK_C30" PATH="$TMP/au_y-bin:$PE_BIN:$PATH"
+{ kz_wt au_y && au_ok au_y ignored_data_unknown && [ "$(events au_y kept_ignored_data_unknown)" = "1" ]; } && ok "ga-1p1i5jr.15 (au_y): the ignored listing FAILS → overdue, reason ignored_data_unknown (and the guard kept it as kept_ignored_data_unknown)" || bad "ga-1p1i5jr.15 (au_y): n=$(au_n au_y) reason=$(au_field au_y reason) unknown=$(events au_y kept_ignored_data_unknown)"
+# (au_dflt) the defaults: with no WORKER_AUDIT, no RELEASE, no HOURS and no cap in the environment (the suite pins the audit OFF; unset here) the audit runs and the release rules are on
+wk_mk au_dflt "$WK_DATA" 30; printf '%s' "$WK_C30" > "$TMP/au_dflt.beads.json"
+env -u WORKTREE_REAPER_WORKER_AUDIT -u WORKTREE_REAPER_CLOSED_WORKER_IGNORED_RELEASE -u WORKTREE_REAPER_CLOSED_WORKER_IGNORED_HOURS -u WORKTREE_REAPER_CLOSED_WORKER_IGNORED_MAX_KB -u WORKTREE_REAPER_WORKER_OVERDUE_HOURS \
+  PATH="$PE_BIN:$PATH" WORKTREE_REAPER_GT="$TMP/au_dflt" WORKTREE_REAPER_LOG="$TMP/au_dflt.jsonl" WORKTREE_REAPER_STALE_HOURS=24 WORKTREE_REAPER_ENABLED=1 WORKTREE_REAPER_IGNORED_DATA_GUARD=1 \
+  WORKTREE_REAPER_FAKE_LSOF="$TMP/bc_nolsof.txt" WORKTREE_REAPER_FAKE_BEADS="$TMP/au_dflt.beads.json" bash "$REAPER" >/dev/null 2>&1
+{ ! kz_wt au_dflt && [ "$(events au_dflt ignored_data_released)" = "1" ] && [ "$(wk_sweep au_dflt worker_audit)" = "1" ]; } && ok "ga-1p1i5jr.15 (au_dflt): defaults — the audit is on (worker_audit 1) and a clean tree of a bead closed 30 h with a small pile of ignored data is released and reaped" || bad "ga-1p1i5jr.15 (au_dflt): wt=$(kz_wt au_dflt && echo y || echo n) released=$(events au_dflt ignored_data_released) audit=$(wk_sweep au_dflt worker_audit)"
+wk_mk au_dflt2 "$WK_DATA" 30; printf '%s' "$WK_C30" > "$TMP/au_dflt2.beads.json"
+env -u WORKTREE_REAPER_WORKER_AUDIT -u WORKTREE_REAPER_CLOSED_WORKER_IGNORED_RELEASE -u WORKTREE_REAPER_CLOSED_WORKER_IGNORED_HOURS -u WORKTREE_REAPER_CLOSED_WORKER_IGNORED_MAX_KB -u WORKTREE_REAPER_WORKER_OVERDUE_HOURS \
+  PATH="$PE_BIN:$PATH" WORKTREE_REAPER_GT="$TMP/au_dflt2" WORKTREE_REAPER_LOG="$TMP/au_dflt2.jsonl" WORKTREE_REAPER_STALE_HOURS=24 WORKTREE_REAPER_ENABLED=1 WORKTREE_REAPER_IGNORED_DATA_GUARD=1 WORKTREE_REAPER_ENABLED=1 \
+  WORKTREE_REAPER_FAKE_LSOF="$TMP/bc_nolsof.txt" WORKTREE_REAPER_FAKE_BEADS="$TMP/au_dflt2.beads.json" WORKTREE_REAPER_PRESSURE_FREE_GB=0 WORKTREE_REAPER_MAX_PER_SWEEP=0 bash "$REAPER" >/dev/null 2>&1
+{ kz_wt au_dflt2 && [ "$(au_n au_dflt2)" = "1" ] && [ "$(au_field au_dflt2 closed_h)" = "30" ]; } && ok "ga-1p1i5jr.15 (au_dflt2): defaults — the overdue line is written with the 24 h line (bead closed 30 h, the sweep cap kept the tree where it was)" || bad "ga-1p1i5jr.15 (au_dflt2): wt=$(kz_wt au_dflt2 && echo y || echo n) n=$(au_n au_dflt2)"
+
+# (au_t2) last_event is what THIS pass logged: a second pass that never reaches the tree (sweep cap 0) quotes nothing, though the first pass logged kept_ignored_data for it in the same file
+wk_mk au_t2 "$WK_DATA" 30; wk_run au_t2 "$WK_C30" WORKTREE_REAPER_CLOSED_WORKER_IGNORED_MAX_KB=1
+run_kz au_t2 "$WK_C30" WORKTREE_REAPER_IGNORED_DATA_GUARD=1 WORKTREE_REAPER_WORKER_AUDIT=1 WORKTREE_REAPER_CLOSED_WORKER_IGNORED_MAX_KB=1 WORKTREE_REAPER_MAX_PER_SWEEP=0
+{ [ "$(au_n au_t2)" = "2" ] && [ "$(grep '"event":"worker_tree_overdue"' "$TMP/au_t2.jsonl" | sed -n 1p | jq -r .last_event)" = "kept_ignored_data" ] && [ "$(grep '"event":"worker_tree_overdue"' "$TMP/au_t2.jsonl" | sed -n 2p | jq -r .last_event)" = "" ]; } \
+  && ok "ga-1p1i5jr.15 (au_t2): pass 1 quotes kept_ignored_data, pass 2 (the cap stopped it before the tree) quotes nothing — only this pass's lines count" || bad "ga-1p1i5jr.15 (au_t2): n=$(au_n au_t2) last_events=$(grep '"event":"worker_tree_overdue"' "$TMP/au_t2.jsonl" | jq -r .last_event | tr '\n' '|')"
+# (au_r2) a dry run logs two lines for one tree (would_release_ignored_data, then would_reap_pool) and removes nothing: the tree is still there, overdue, and the LAST of them is what is quoted
+wk_mk au_r2 "$WK_DATA" 30; wk_run au_r2 "$WK_C30" WORKTREE_REAPER_ENABLED=0
+{ kz_wt au_r2 && [ "$(au_n au_r2)" = "1" ] && [ "$(au_field au_r2 reason)" = "ignored_data" ] && [ "$(events au_r2 would_release_ignored_data)" = "1" ] && [ "$(au_field au_r2 last_event)" = "would_reap_pool" ]; } \
+  && ok "ga-1p1i5jr.15 (au_r2): dry run — the tree stays, is overdue, and last_event is the LAST line of the pass for it (would_reap_pool, after would_release_ignored_data)" || bad "ga-1p1i5jr.15 (au_r2): wt=$(kz_wt au_r2 && echo y || echo n) n=$(au_n au_r2) last_event=$(au_field au_r2 last_event) reason=$(au_field au_r2 reason)"
 
 echo ""
 echo "── RESULTS: $PASS passed, $FAIL failed ──"

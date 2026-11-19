@@ -53,6 +53,13 @@
 # waits for it nor moves it; WORKTREE_REAPER_FORCE=1 ignores it; a df that gives no number, free_gb_unreadable on the sweep line, never skips) — so the normal rhythm stays ~2 h while pressure runs every tick. The sweep line
 # carries duration_s and interval_s, and a pass longer than the tick logs pass_exceeds_interval. scripts/com.gascity.worktree-reaper.plist is the template of the job; the installed plist is wrapped by wait-for-dolt, so
 # only its StartInterval is changed in place (see the comment in the plist), never a copy over it.
+# ga-1p1i5jr.15: 22 pool worker trees of CLOSED beads (4.1 GB, the oldest from 16/09) sat on the mini's disk. Read in the code and reproduced on a synthetic WA-like tree (NOT measured on the mini): the ignored-data guard (ga-xpoj67) keeps a
+# worker tree for anything .gitignore hides and no junk rule named, and a worker leaves logs/, .gc/, .runtime/, CLAUDE.md and the like. For POOL WORKER trees only (<rig>/crew/worker-*, $GT/worker-*; _is_pool_worker_tree): WORKER_JUNK_RE names what a worker session leaves by itself, and a CLEAN tree whose beads are ALL closed
+# for CLOSED_WORKER_IGNORED_HOURS (12) lets the rest of its ignored data go with it when that was measured entry by entry and adds up to at most CLOSED_WORKER_IGNORED_MAX_KB (ignored_data_released names it); a dirty tree, an open bead, an
+# unmeasured or bigger pile of data still keeps the tree. After the pool loop audit_pool_workers reads what is LEFT: a worker tree whose beads have all been closed for WORKER_OVERDUE_HOURS (24) or more is logged as worker_tree_overdue with
+# WHY it is still there (reason: locked, op_in_progress, in_use, status_unreadable, dirty, ignored_data, ignored_data_unknown, young, bead_not_found, unknown) and written to the report beside the log; the sweep line counts worker_trees,
+# worker_overdue and worker_audit_unknown (bead state not readable: said, never read as "not overdue" and never as "overdue"); last_event is the last event the pass itself logged for the tree (kept_ignored_data, kept_pressure_unmerged, ...). WORKTREE_REAPER_WORKER_AUDIT=0 switches the audit off (the sweep line then says worker_audit 0). A DRY RUN
+# audits too (a preview that touches nothing): its lines say dry_run true, a tree whose last_event is would_reap_* is one a real pass takes, and it never replaces the report.
 # The one exception to "WITHOUT --force" is a LOCKED worktree (`remove -f -f`); it is reaped only
 # under the LOCK CONTRACT stated at ZOMBIE-LOCK DETECTION below, never because of its age alone.
 # A second, narrower exception (ga-he2c1u, town .gc-worktrees roots only): an UNLOCKED tree dirty with nothing but generated
@@ -125,6 +132,21 @@ IGNORED_JUNK_RE='(^|/)(\.venv|venv|node_modules|__pycache__|\.pytest_cache|\.myp
 [ -z "${WORKTREE_REAPER_IGNORED_JUNK_RE:-}" ] || IGNORED_JUNK_RE="$WORKTREE_REAPER_IGNORED_JUNK_RE"
 # ga-1bfcda7: an ignored .claude/ FOLDER is ONE entry of the listing, and the junk list cannot see inside an entry: one named .claude/ is opened (_ignored_open_tool_dirs)
 IGNORED_TOOL_DIR_RE='(^|/)\.claude/$'
+# ga-1p1i5jr.15: the two rules for POOL WORKER trees (header; _is_pool_worker_tree). WORKER_JUNK_RE = what a worker session leaves behind by itself — logs, gc/gt runtime state, the role file, coverage and test caches, DB sidecars: junk
+# for these trees, like IGNORED_JUNK_RE (WORKTREE_REAPER_WORKER_JUNK_RE replaces it). The release: a CLEAN tree whose every named bead has been closed for CLOSED_WORKER_IGNORED_HOURS lets the REST of its ignored data go with it when
+# that was measured entry by entry and adds up to at most CLOSED_WORKER_IGNORED_MAX_KB (KiB). Only 0 on _RELEASE is the ga-xpoj67 rule (any ignored data holds the tree); an hours or size that is not a number is the default, never fewer.
+WORKER_JUNK_RE='(^|/)(logs|\.logs|\.gc|\.runtime|\.gemini|coverage|htmlcov|\.vitest-cache|\.playwright-mcp|\.superpowers)(/|$)|(^|/)CLAUDE(\.local)?\.md$|(^|/)\.crew-active-pid$|(^|/)\.coverage(\.[^/]*)?$|\.log$|\.db-(shm|wal)$'
+[ -z "${WORKTREE_REAPER_WORKER_JUNK_RE:-}" ] || WORKER_JUNK_RE="$WORKTREE_REAPER_WORKER_JUNK_RE"
+CLOSED_WORKER_IGNORED_RELEASE="${WORKTREE_REAPER_CLOSED_WORKER_IGNORED_RELEASE:-1}"
+CLOSED_WORKER_IGNORED_HOURS="${WORKTREE_REAPER_CLOSED_WORKER_IGNORED_HOURS:-12}"
+case "$CLOSED_WORKER_IGNORED_HOURS" in ''|*[!0-9]*) CLOSED_WORKER_IGNORED_HOURS=12 ;; esac
+CLOSED_WORKER_IGNORED_MAX_KB="${WORKTREE_REAPER_CLOSED_WORKER_IGNORED_MAX_KB:-65536}"
+case "$CLOSED_WORKER_IGNORED_MAX_KB" in ''|*[!0-9]*) CLOSED_WORKER_IGNORED_MAX_KB=65536 ;; esac
+# ga-1p1i5jr.15: a pool worker tree whose beads have all been closed for this many hours or more and is still on disk after a pass is OVERDUE (audit_pool_workers). 24 = the bead's acceptance ("only open beads, or closed < 24 h").
+WORKER_OVERDUE_HOURS="${WORKTREE_REAPER_WORKER_OVERDUE_HOURS:-24}"
+case "$WORKER_OVERDUE_HOURS" in ''|*[!0-9]*) WORKER_OVERDUE_HOURS=24 ;; esac
+# ga-1p1i5jr.15: the audit asks `bd` about every pool worker tree left after the pass (bounded, and given up for a repo after its first failed lookup). Only 0 switches it off; the sweep line says worker_audit 0 then, so its zero counters are not read as "none overdue".
+WORKER_AUDIT="${WORKTREE_REAPER_WORKER_AUDIT:-1}"
 # ── zombie-lock reaping (wa-8y45): a worktree LOCKED by a stuck/ancient agent ─────
 ZOMBIE_LOCK_ENABLED="${WORKTREE_REAPER_ZOMBIE_LOCK_ENABLED:-1}"  # 0 = old behavior (skip ALL locked)
 ZOMBIE_HOURS="${WORKTREE_REAPER_ZOMBIE_HOURS:-48}"               # alive holder must EXCEED this AND be idle
@@ -151,6 +173,10 @@ case "$SESSION_LIST_KILL_GRACE" in ''|*[!0-9]*) SESSION_LIST_KILL_GRACE=5 ;; esa
 # it first closes, and the worker that built it can still be finishing. 6 is the youngest tree in the measured leak.
 BEAD_CLOSED_HOURS="${WORKTREE_REAPER_CLOSED_BEAD_HOURS:-6}"
 case "$BEAD_CLOSED_HOURS" in ''|*[!0-9]*) BEAD_CLOSED_HOURS=6 ;; esac
+# ga-1p1i5jr.15: how long the bead(s) must have been closed before a tree DELIVERED to main (every commit there as an equivalent patch, _pool_shipped_and_closed) may go — the "end of the delivery" release. The default is BEAD_CLOSED_HOURS:
+# that margin was chosen on purpose (ga-yw18yk, ga-k0mose6) and is kept; WORKTREE_REAPER_SHIPPED_CLOSED_HOURS=1 (or 0) is the dial for a faster release. Not a number → BEAD_CLOSED_HOURS, never fewer on a guess.
+SHIPPED_CLOSED_HOURS="${WORKTREE_REAPER_SHIPPED_CLOSED_HOURS:-$BEAD_CLOSED_HOURS}"
+case "$SHIPPED_CLOSED_HOURS" in ''|*[!0-9]*) SHIPPED_CLOSED_HOURS="$BEAD_CLOSED_HOURS" ;; esac
 # ... and the bound (seconds) on each `bd list` that proof costs (TERM at N, KILL 5s later). A lookup that times out
 # is "could not tell", so the tree is KEPT — never reaped on a guess — and the sweep is held for at most this long.
 BEAD_LOOKUP_TIMEOUT="${WORKTREE_REAPER_BEAD_LOOKUP_TIMEOUT:-20}"
@@ -326,6 +352,10 @@ _CR_JSON=""; _CR_DEL=""           # ga-zgqssr7: _critical_shipped_and_closed's a
 _KU_PROOF_JSON=""                 # ga-ggj1wnv: _keep_unsafe's answer to its caller: the event fields of a tree it let through on the closed-bead proof ("" = it did not)
 repo_unresolvable=0               # ga-ryykl9l: repos the pool loop could not read (each skipped and logged as skip_repo_unresolvable); the sweep line carries the count
 _RR_ROOT=""                       # ga-ryykl9l: _resolve_repo_root's answer to its caller: the repo's own tree (a work tree's root, or the directory a bare container was found under)
+worker_trees=0; worker_overdue=0; worker_overdue_kb=0; worker_audit_unknown=0   # ga-1p1i5jr.15: audit_pool_workers' tallies — pool worker trees looked at, of them overdue (and their KiB), and those whose bead state could not be read
+_AUDIT_LOOKUP_DOWN=0              # ga-1p1i5jr.15: set when a bead lookup failed in this repo's audit: its remaining trees are counted as "could not tell" without asking again
+# ga-1p1i5jr.15: the byte where THIS pass's lines start in the log (the audit quotes the last event the pass logged for a tree). vazio/falhou (no log yet, not readable, not a number) → 0: the audit then reads the whole log, never less
+_LOG_START="$(wc -c < "$LOG" 2>/dev/null | tr -d ' ')"; case "$_LOG_START" in ''|*[!0-9]*) _LOG_START=0 ;; esac   # BSD wc pads the number with spaces
 # ga-pdrij: the rig-worktree backlog is LARGE (704 observed — the legacy loop used
 # `git -C $GT` and could never remove rig-owned worktrees, so they piled up). Bound the
 # per-sweep pool reaping so a single run is never a massive destructive operation; the
@@ -590,10 +620,11 @@ _ignored_open_tool_dirs() {
 # Sets _ID_KB (the total, KiB) and _ID_TOP (JSON: the 5 largest, largest first, {"path","kb"}). rc 0 = data worth keeping (total >= IGNORED_MIN_KB),
 # 1 = none (nothing ignored, only junk, or under the limit), 2 = could not tell (mktemp, git or the .claude/ opening failed): the caller KEEPS the tree. A size du cannot
 # read counts 1 KiB (an entry git listed is never "nothing"), and so does every entry past the 200th, which gets no du: the cost stays bounded
-# and the verdict can only grow.
+# and the verdict can only grow. ga-1p1i5jr.15: _ID_EXACT is 1 iff every entry was measured by du (0 = _ID_KB is a floor, not a size); a pool worker tree also skips WORKER_JUNK_RE.
 _ignored_data_scan() {
-  local wt="$1" tmp rc path kb n=0 total=0 rows="" sep="" tab=$'\t'
-  _ID_KB=0; _ID_TOP="[]"
+  local wt="$1" tmp rc path kb n=0 total=0 rows="" sep="" tab=$'\t' worker=0
+  _ID_KB=0; _ID_TOP="[]"; _ID_EXACT=1
+  _is_pool_worker_tree "$wt" && worker=1   # ga-1p1i5jr.15: a pool worker tree also skips WORKER_JUNK_RE
   tmp="$(mktemp 2>/dev/null)" || return 2
   # vazio → nothing is ignored (rc 1 below); falhou (rc != 0: git broke, not a work tree) → rc 2 and the caller KEEPS the tree
   git -C "$wt" ls-files -z -o -i --exclude-standard --directory --no-empty-directory >"$tmp" 2>/dev/null; rc=$?
@@ -602,10 +633,12 @@ _ignored_data_scan() {
   _ignored_open_tool_dirs "$wt" "$tmp" || { rm -f "$tmp"; return 2; }
   while IFS= read -r -d '' path; do
     [[ "$path" =~ $IGNORED_JUNK_RE ]] && continue
+    [ "$worker" = "1" ] && [[ "$path" =~ $WORKER_JUNK_RE ]] && continue
     kb=1
     if [ "$n" -lt 200 ]; then
-      # vazio/falhou → 1 KiB: git lists the entry, so it still holds the tree
-      kb="$(du -sk -- "$wt/${path%/}" 2>/dev/null | awk '{print $1; exit}')"; case "$kb" in ''|*[!0-9]*) kb=1 ;; esac
+      # vazio/falhou → 1 KiB: git lists the entry, so it still holds the tree; ga-1p1i5jr.15: and the total is then a floor, not a size (_ID_EXACT=0)
+      kb="$(du -sk -- "$wt/${path%/}" 2>/dev/null | awk '{print $1; exit}')"; case "$kb" in ''|*[!0-9]*) kb=1; _ID_EXACT=0 ;; esac
+    else _ID_EXACT=0   # past the 200th entry nothing is measured (1 KiB each): ga-1p1i5jr.15 reads the total as a floor
     fi
     n=$((n+1)); total=$((total+kb)); rows="$rows$kb$tab$path"$'\n'
   done <"$tmp"   # third-state-waiver: $tmp exists (checked above) and was written by a command whose exit code was checked; an empty file is git's answer "nothing is ignored"
@@ -620,6 +653,38 @@ _ignored_data_scan() {
   return 0
 }
 
+# ── _is_pool_worker_tree <wt> — ga-1p1i5jr.15: 0 iff <wt> is an EPHEMERAL pool worker tree: a directory named worker-* directly under a crew/ directory (<rig>/crew/worker-<bead>) or directly under $GT ($GT/worker-<bead>), by the path git
+# printed. Not a crew member's own tree (crew/oracle), not a gate-review tree, not a <rig>-wt/<bead> tree: those keep the ga-xpoj67 rule as it was.
+_is_pool_worker_tree() {
+  local b p gt_p
+  b="$(basename "$1")"; p="$(dirname "$1")"
+  case "$b" in worker-*) : ;; *) return 1 ;; esac
+  [ "$(basename "$p")" = "crew" ] && return 0
+  # vazio/falhou (GT cannot be entered, pwd prints nothing) → gt_p is empty and no directory equals it: not a $GT/worker-* tree
+  gt_p="$(cd "$GT" 2>/dev/null && pwd -P)"
+  [ "$p" = "$gt_p" ]
+}
+
+# ── _release_closed_worker_ignored <repo> <wt> <br> <age_h> — ga-1p1i5jr.15: 0 = the ignored data of this tree does NOT hold it (_keep_ignored_data goes on and the caller removes it), 1 = it does. Only for a POOL WORKER tree that is CLEAN,
+# whose every named bead is CLOSED for CLOSED_WORKER_IGNORED_HOURS (_bead_closed_proof: it also refuses a rebase/merge under way and a lookup that fails) and whose ignored data (the _ignored_data_scan that just ran) was measured entry by
+# entry (_ID_EXACT) and adds up to at most CLOSED_WORKER_IGNORED_MAX_KB. Every answer that cannot be had (status failed, lookup failed, an entry that was not measured) is "no": the tree stays, and the
+# audit reports it once it is overdue. The data goes with the tree, so the event says WHAT (size_kb, top) and for which beads: ignored_data_released (would_release_ignored_data in a dry run), logged before the remove is tried.
+_release_closed_worker_ignored() {
+  local repo="$1" wt="$2" br="$3" age="$4" st ev
+  [ "$CLOSED_WORKER_IGNORED_RELEASE" = "1" ] || return 1
+  _is_pool_worker_tree "$wt" || return 1
+  [ "$_ID_EXACT" = "1" ] || return 1
+  [ "$_ID_KB" -le "$CLOSED_WORKER_IGNORED_MAX_KB" ] || return 1
+  # vazio → clean, the proof goes on; falhou (status could not run) → NOT clean: the tree stays
+  st="$(git -C "$wt" status --porcelain 2>/dev/null)" || return 1
+  [ -z "$st" ] || return 1
+  _bead_closed_proof "$repo" "$wt" "$br" "$CLOSED_WORKER_IGNORED_HOURS" || return 1
+  ev="ignored_data_released"; [ "$ENABLED" = "1" ] || ev="would_release_ignored_data"
+  printf '{"ts":"%s","event":"%s","repo":"%s","wt":"%s","branch":"%s","age_h":%s,"beads":"%s","closed_hours":%s,"size_kb":%s,"top":%s}\n' \
+    "$(ts)" "$ev" "$(_json_esc "$(basename "$repo")")" "$(_json_esc "$(basename "$wt")")" "$(_json_esc "$br")" "$age" "$(_json_esc "$_BC_PROOF_IDS")" "$CLOSED_WORKER_IGNORED_HOURS" "$_ID_KB" "$_ID_TOP" >> "$LOG" 2>/dev/null
+  return 0
+}
+
 # ── _keep_ignored_data <repo> <wt> <br> <age_h> — ga-xpoj67: 0 = KEEP the tree (the event is logged here), 1 = go on. kept_ignored_data
 # carries the total size and the 5 largest ignored paths; kept_ignored_data_unknown (size null) is a listing that could not be read — a tree whose
 # ignored files cannot be listed is not a tree without any. "locked" is git's own answer for the tree (_wt_lock_reason), whichever caller got here
@@ -630,7 +695,8 @@ _keep_ignored_data() {
   _ignored_data_scan "$wt"; rc=$?
   case "$rc" in
     1) return 1 ;;
-    0) ev="kept_ignored_data" ;;
+    0) _release_closed_worker_ignored "$repo" "$wt" "$br" "$age" && return 1   # ga-1p1i5jr.15: a clean worker tree of closed beads does not stay for this data
+       ev="kept_ignored_data" ;;
     *) ev="kept_ignored_data_unknown"; _ID_KB=null ;;
   esac
   # vazio → not locked; falhou (git broke) → the same: it only labels the event, the tree is kept either way
@@ -1526,8 +1592,8 @@ _reap_dirty_generated_only() {
 #   (3) `git status` ran and printed nothing (no uncommitted or untracked file). The remove is the plain, non --force
 #       `worktree remove`: a tree that turns dirty after this check is refused by git and takes the existing preserve-then-reap
 #       path (WIP pushed first), it is not lost;
-#   (4) every bead the tree is named for is CLOSED for BEAD_CLOSED_HOURS (_bead_closed_proof; a bd that fails, times out or
-#       prints junk is "could not tell").
+#   (4) every bead the tree is named for is CLOSED for SHIPPED_CLOSED_HOURS (BEAD_CLOSED_HOURS unless ga-1p1i5jr.15's dial says
+#       otherwise; _bead_closed_proof; a bd that fails, times out or prints junk is "could not tell").
 # The cheap git checks run first, so the bounded `bd list` waits are only paid by a tree that is otherwise safe to go. Main
 # shell only: on 0, $_BC_PROOF_IDS holds the closed bead ids the proof relied on (the caller logs them).
 # Not applied to LOCKED trees: a lock has its own contract (zombie holder, unparseable-lock safety net) further down.
@@ -1542,7 +1608,7 @@ _pool_shipped_and_closed() {
   # vazio → clean, the proof goes on; falhou (status could not run) → NOT clean: the tree stays
   st="$(git -C "$wt" status --porcelain 2>/dev/null)" || return 1
   [ -z "$st" ] || return 1
-  _bead_closed_proof "$repo" "$wt" "$br"
+  _bead_closed_proof "$repo" "$wt" "$br" "$SHIPPED_CLOSED_HOURS"
 }
 
 # ── _critical_shipped_and_closed <repo> <wt> <br> — ga-zgqssr7: the CRITICAL tier's proof (free < CRITICAL_FREE_GB, see the knob). The same four facts as _pool_shipped_and_closed — and the same rule that any
@@ -1766,6 +1832,83 @@ reap_pool_worktrees() {
   [ "$ENABLED" = "1" ] && git -C "$repo" worktree prune 2>/dev/null
 }
 
+# ── _audit_one_worker <repo> <wt> <br> <lock> — ga-1p1i5jr.15: ONE pool worker tree the pass left on disk. Main shell only (it counts). Read-only: nothing is removed or changed here.
+# Three answers about the bead(s) the tree is named for, never collapsed into one: all CLOSED for WORKER_OVERDUE_HOURS or more → the tree is OVERDUE (logged and reported with the first thing that keeps it, below); open, in progress or closed
+# too recently → the normal life of a tree, nothing said; the lookup could not be answered → worker_audit_unknown, nothing said about the tree (and the repo's other trees are not asked again). A tree whose name finds no bead is said only once it
+# has been idle that long (bead_not_found when nothing else explains it): nothing then says its work is over, and nothing ever will.
+# WHY it is still here = the first of: locked (detail: the lock reason), op_in_progress, in_use, status_unreadable, dirty, ignored_data (detail: KiB), ignored_data_unknown, young (activity inside the age gate), bead_not_found, unknown.
+_audit_one_worker() {
+  local repo="$1" wt="$2" br="$3" lock="$4" failed0 now_s fresh age_h closed_h=null reason="" detail="" kb st src ids="" nf=0 line last
+  worker_trees=$((worker_trees+1))
+  if [ "$_AUDIT_LOOKUP_DOWN" = "1" ]; then worker_audit_unknown=$((worker_audit_unknown+1)); return 0; fi
+  failed0="$bead_lookup_failed"; now_s=$(date +%s)
+  if _bead_closed_proof "$repo" "$wt" "$br" "$WORKER_OVERDUE_HOURS"; then
+    ids="$_BC_PROOF_IDS"
+    # vazio/falhou (no row, or a closed_at awk cannot read) → closed_h stays null: a log field only, the tree is overdue either way
+    closed_h="$(printf '%s\n' "$_BC_ROWS" | awk -F'\t' -v now="$now_s" 'NF>=3 && $3 ~ /^[0-9]+$/ { h=int((now-$3)/3600); if (m=="" || h<m) m=h } END { if (m!="") print m }')"
+    case "$closed_h" in ''|*[!0-9]*) closed_h=null ;; esac
+  elif [ "$bead_lookup_failed" -gt "$failed0" ]; then
+    worker_audit_unknown=$((worker_audit_unknown+1)); _AUDIT_LOOKUP_DOWN=1; return 0
+  elif [ -z "$_BC_ROWS" ]; then
+    # no bead found (or an operation under way, which the proof refuses before asking): overdue only when the tree has been idle that long. falhou (its activity cannot be read) → could not tell, counted
+    fresh="$(_wt_fresh_epoch "$wt" "$now_s")" || { worker_audit_unknown=$((worker_audit_unknown+1)); return 0; }
+    age_h=$(( (now_s - fresh) / 3600 ))
+    [ "$age_h" -ge "$WORKER_OVERDUE_HOURS" ] || return 0
+    nf=1
+  else
+    return 0
+  fi
+  if [ -n "$lock" ]; then reason=locked; detail="$lock"
+  elif _worktree_op_in_progress "$wt"; then reason=op_in_progress
+  elif _worktree_in_use "$wt"; then reason=in_use
+  else
+    # vazio → clean; falhou (status could not run) → status_unreadable, never "clean"
+    st="$(git -C "$wt" status --porcelain 2>/dev/null)"; src=$?
+    if [ "$src" -ne 0 ]; then reason=status_unreadable
+    elif [ -n "$st" ]; then reason=dirty; detail="$(printf '%s\n' "$st" | wc -l | tr -d ' ') path(s) changed"
+    else
+      # rc 1 = nothing that holds the tree; 0 = data (detail: its size); 2 = the listing could not be read
+      _ignored_data_scan "$wt"; src=$?
+      if [ "$src" = "0" ]; then reason=ignored_data; detail="$_ID_KB KiB"
+      elif [ "$src" = "2" ]; then reason=ignored_data_unknown
+      # vazio/falhou (its activity cannot be read) → not "young": the next reason explains the tree, and a tree is never called young on a guess
+      elif fresh="$(_wt_fresh_epoch "$wt" "$now_s")" && [ $(( (now_s - fresh) / 3600 )) -le "$gate_hours" ]; then reason=young; detail="active inside the ${gate_hours} h age gate"
+      elif [ "$nf" = "1" ]; then reason=bead_not_found
+      else reason=unknown; detail="nothing keeps it that this audit can see: the pass did not reach it (cap, a lookup that failed there), or a proof it did not log failed"
+      fi
+    fi
+  fi
+  # vazio/falhou → size_kb null: a log field only
+  kb="$(du -sk "$wt" 2>/dev/null | awk '{print $1; exit}')"; case "$kb" in ''|*[!0-9]*) kb=null ;; esac
+  # vazio (no line of this pass names the tree: the pass did not reach it) / falhou (log unreadable, jq missing) → last_event "": a log field only. fromjson? skips a line that is not JSON instead of ending the read
+  last="$(tail -c +"$((_LOG_START+1))" "$LOG" 2>/dev/null | jq -rR --arg r "$(basename "$repo")" --arg w "$(basename "$wt")" 'fromjson? | select(type=="object" and .repo==$r and .wt==$w) | .event' 2>/dev/null | tail -n 1)"
+  line="$(printf '{"ts":"%s","event":"worker_tree_overdue","repo":"%s","wt":"%s","branch":"%s","beads":"%s","closed_h":%s,"size_kb":%s,"reason":"%s","detail":"%s","locked":%s,"last_event":"%s","dry_run":%s}' \
+    "$(ts)" "$(_json_esc "$(basename "$repo")")" "$(_json_esc "$(basename "$wt")")" "$(_json_esc "$br")" "$(_json_esc "$ids")" "$closed_h" "$kb" "$reason" "$(_json_esc "$detail")" "$([ -n "$lock" ] && echo true || echo false)" "$(_json_esc "$last")" "$([ "$ENABLED" = "1" ] && echo false || echo true)")"
+  printf '%s\n' "$line" >> "$LOG" 2>/dev/null
+  printf '%s\n' "$line" >> "$_WORKERS_REPORT_TMP" 2>/dev/null
+  worker_overdue=$((worker_overdue+1))
+  case "$kb" in null) : ;; *) worker_overdue_kb=$((worker_overdue_kb+kb)) ;; esac
+}
+
+# ── audit_pool_workers <repo> — ga-1p1i5jr.15: the pool worker trees <repo> lists AFTER the pass, each through _audit_one_worker. A repo whose worktree list cannot be read was already logged (skip_repo_unresolvable) by the pool loop.
+audit_pool_workers() {
+  local repo="$1" list line wt="" br="" lock=""
+  [ -d "$repo/.git" ] || [ -f "$repo/.git" ] || return 0
+  _AUDIT_LOOKUP_DOWN=0
+  # vazio → no worktree to look at; falhou (rc != 0) → nothing to audit here: the pool loop logged the failure for this repo, and the tally says nothing about it
+  list="$(git -C "$repo" worktree list --porcelain 2>/dev/null)" || return 0
+  while IFS= read -r line; do
+    case "$line" in
+      "worktree "*) wt="${line#worktree }"; br=""; lock="" ;;
+      "branch "*)   br="${line#branch refs/heads/}" ;;
+      "locked "*)   lock="${line#locked }" ;;
+      "locked")     lock="(no reason)" ;;
+      "")  [ -n "$wt" ] && [ -d "$wt" ] && _is_pool_worker_tree "$wt" && _audit_one_worker "$repo" "$wt" "$br" "$lock"
+           wt=""; br=""; lock="" ;;
+    esac
+  done <<< "$list"$'\n'
+}
+
 # ── 1. legacy path-glob scan of known .gc-worktrees roots (town repo) ─────────────
 # ga-t14of: a branch already merged into origin/main bypasses the age gate below (the
 # work is durably in main — waiting out STALE_HOURS buys nothing) but must still clear
@@ -1871,11 +2014,15 @@ done
 # under .claude/worktrees / .gc-worktrees, OR directly under the rig's <rig>-wt/ — ga-ggj1wnv)
 # keeps it to ephemeral FRAMEWORK worktrees and never touches durable feature trees.
 # Best-effort; a missing/garbage repo is skipped.
+# ga-1p1i5jr.15: this pass's overdue worker trees are collected in a temp file and replace the last pass's report when the loop ends (an empty report = none overdue)
+WORKERS_REPORT="${WORKTREE_REAPER_WORKERS_REPORT:-${LOG%.jsonl}.workers.jsonl}"
+_WORKERS_REPORT_TMP="$WORKERS_REPORT.tmp.$$"; : > "$_WORKERS_REPORT_TMP" 2>/dev/null
 for _repo in "$GT"/*/; do
   _repo="${_repo%/}"
   [ -d "$_repo/.git" ] || [ -f "$_repo/.git" ] || continue
   case "$(basename "$_repo")" in .gc-worktrees|.git|.claude|.worktrees) continue ;; esac
   reap_pool_worktrees "$_repo"
+  [ "$WORKER_AUDIT" = "0" ] || audit_pool_workers "$_repo"
   # wa-bptki (2026-08-02): a named crew member's clone (<rig>/crew/oracle, crew/mila, …)
   # is its OWN independent repo — a real `git clone` with its own .git DIRECTORY and its
   # own `origin` remote — not a linked worktree of $_repo. `git -C $_repo worktree list`
@@ -1896,6 +2043,10 @@ for _repo in "$GT"/*/; do
     done
   fi
 done
+# falhou (the report cannot be moved into place: no room, read-only) → the previous report stays and the temp file is dropped; the worker_tree_overdue lines in the log are the record either way. Audit off, or a DRY RUN (it removed
+# nothing, so its overdue list holds trees a real pass takes: dry_run true on the lines, last_event would_reap_*) → the report is left alone (an empty one would say "none overdue", a dry run's would say what a real pass has not left)
+if [ "$WORKER_AUDIT" = "0" ] || [ "$ENABLED" != "1" ]; then rm -f "$_WORKERS_REPORT_TMP" 2>/dev/null
+else mv -f "$_WORKERS_REPORT_TMP" "$WORKERS_REPORT" 2>/dev/null || rm -f "$_WORKERS_REPORT_TMP" 2>/dev/null; fi
 
 # ga-zgqssr7: how long THIS pass took, and the tick it must fit in. A pass that outlasts CADENCE_S is logged by itself (pass_exceeds_interval): the next tick(s) found the lock held and did nothing, so the cadence is longer than the
 # plist says — the line is what tells the Mayor to raise the interval or cut the work, instead of that going unseen.
@@ -1903,6 +2054,6 @@ duration_s=$(( $(date +%s) - START_S ))
 if [ "$duration_s" -ge "$CADENCE_S" ] && [ "$CADENCE_S" -gt 0 ]; then
   printf '{"ts":"%s","event":"pass_exceeds_interval","duration_s":%s,"interval_s":%s,"note":"ticks that fell inside this pass found the lock held and did nothing"}\n' "$(ts)" "$duration_s" "$CADENCE_S" >> "$LOG" 2>/dev/null
 fi
-printf '{"ts":"%s","event":"sweep","mode":"%s","free_gb":%s,"gate_hours":%s,"reaped":%s,"pool_reaped":%s,"zombie_reaped":%s,"preserved_dirty":%s,"branches_deleted":%s,"skipped_dirty":%s,"kept":%s,"session_list":"%s","kept_session_list_unavailable":%s,"bead_lookup_failed":%s,"repo_unresolvable":%s,"critical":%s,"critical_free_gb":%s,"critical_reaped":%s,"critical_kept":%s,"free_gb_unreadable":%s,"lock_unavailable":%s,"duration_s":%s,"interval_s":%s}\n' \
-  "$(ts)" "$mode" "$free_gb" "$gate_hours" "$reaped" "$pool_reaped" "$zombie_reaped" "$preserved_dirty" "$branches_deleted" "$skipped_dirty" "$kept" "${_WT_REAPER_SESSION_STATE:-unused}" "$kept_session_list_unavailable" "$bead_lookup_failed" "$repo_unresolvable" "$critical" "$CRITICAL_FREE_GB" "$critical_reaped" "$critical_kept" "$free_gb_unreadable" "$lock_unavailable" "$duration_s" "$CADENCE_S" >> "$LOG" 2>/dev/null
+printf '{"ts":"%s","event":"sweep","mode":"%s","free_gb":%s,"gate_hours":%s,"reaped":%s,"pool_reaped":%s,"zombie_reaped":%s,"preserved_dirty":%s,"branches_deleted":%s,"skipped_dirty":%s,"kept":%s,"session_list":"%s","kept_session_list_unavailable":%s,"bead_lookup_failed":%s,"repo_unresolvable":%s,"critical":%s,"critical_free_gb":%s,"critical_reaped":%s,"critical_kept":%s,"free_gb_unreadable":%s,"lock_unavailable":%s,"duration_s":%s,"interval_s":%s,"worker_audit":%s,"worker_trees":%s,"worker_overdue":%s,"worker_overdue_kb":%s,"worker_audit_unknown":%s}\n' \
+  "$(ts)" "$mode" "$free_gb" "$gate_hours" "$reaped" "$pool_reaped" "$zombie_reaped" "$preserved_dirty" "$branches_deleted" "$skipped_dirty" "$kept" "${_WT_REAPER_SESSION_STATE:-unused}" "$kept_session_list_unavailable" "$bead_lookup_failed" "$repo_unresolvable" "$critical" "$CRITICAL_FREE_GB" "$critical_reaped" "$critical_kept" "$free_gb_unreadable" "$lock_unavailable" "$duration_s" "$CADENCE_S" "$([ "$WORKER_AUDIT" = "0" ] && echo 0 || echo 1)" "$worker_trees" "$worker_overdue" "$worker_overdue_kb" "$worker_audit_unknown" >> "$LOG" 2>/dev/null
 exit 0
