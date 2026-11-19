@@ -320,7 +320,7 @@ def cwd_of_pid(pid, timeout=5):
     return fields[-1] if fields else None
 
 
-def sample(now=None, ps_fixture=None, sessions_fixture=None, compute_rig=True, top_fixture=None):
+def sample(now=None, ps_fixture=None, sessions_fixture=None, compute_rig=True, top_fixture=None, with_top=False):
     """One full attributed snapshot: RSS aggregated by owner (and, unless
     compute_rig=False, by rig too), plus swap/free context. Pure aside from
     the (fixture-swappable) subprocess calls in ps_snapshot()/
@@ -350,7 +350,8 @@ def sample(now=None, ps_fixture=None, sessions_fixture=None, compute_rig=True, t
                 "owner_kind": {}, "by_rig": {}, "sessions_lookup_failed": None,
                 "top_mem": None, "top_mem_other_kb": None, "top_mem_unmatched_kb": None, "top_mem_bad_rows": None}
     sess, sess_ok = sessions_by_key(sessions_fixture)
-    top, top_bad = top_mem_snapshot(top_fixture)
+    # the top read (footprint per owner) is OPT-IN: ram-owner-report.py --top runs this inline at RAM-alert time, and the machine is already short then. with_top (the sampler) or a fixture asks for it
+    top, top_bad = top_mem_snapshot(top_fixture) if (with_top or top_fixture) else (None, 0)
     mem_by, cmprs_by, mem_unmatched = {}, {}, 0
 
     by_owner = {}

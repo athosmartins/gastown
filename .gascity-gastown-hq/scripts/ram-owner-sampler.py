@@ -111,7 +111,7 @@ def rotate_if_needed(path, max_days, now):
 
 def main():
     try:
-        rec = lib.sample(now=NOW, ps_fixture=PS_FIXTURE, sessions_fixture=SESSIONS_FIXTURE, top_fixture=TOP_FIXTURE)
+        rec = lib.sample(now=NOW, ps_fixture=PS_FIXTURE, sessions_fixture=SESSIONS_FIXTURE, top_fixture=TOP_FIXTURE, with_top=True)
         if rec.get("error"):
             # A failed ps read is a measurement gap, not a real zero-RSS
             # sample — writing it to the JSONL would poison every downstream

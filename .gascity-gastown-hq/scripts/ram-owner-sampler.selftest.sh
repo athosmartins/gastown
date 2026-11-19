@@ -339,6 +339,16 @@ printf '%s\n' '#!/bin/sh' 'echo "$*" > "$TOPARGV"' 'cat "$TOPOUT"' > "$TMP/fakeb
 TOP_FIX= TOPARGV="$TMP/top.argv" TOPOUT="$TMP/top.txt" PATH_FIRST="$TMP/fakebin" run_sampler "$TMP/topcmd.jsonl" >/dev/null 2>&1
 [ "$(cat "$TMP/top.argv" 2>/dev/null)" = "-l 1 -stats pid,mem,cmprs" ] && ok "top is called as -l 1 -stats pid,mem,cmprs" || bad "top argv: '$(cat "$TMP/top.argv" 2>/dev/null)'"
 tail -1 "$TMP/topcmd.jsonl" | grep -q '"top_mem": \[\["dolt", 2491392' && ok "the live path parses what top prints" || bad "live-path record lacks top_mem"
+# the live --top mode of ram-owner-report.py runs INLINE at RAM-alert time and must not pay for a top: sample() reads it only when asked (with_top, or a fixture)
+rm -f "$TMP/top.argv"
+cat > "$TMP/check-notop.py" <<'EOF'
+import sys
+sys.path.insert(0, sys.argv[1])
+import ram_owner_lib as lib
+r = lib.sample(now=1, ps_fixture=sys.argv[2] + "/ps.txt", sessions_fixture=sys.argv[2] + "/sessions.json", compute_rig=False)
+assert r["top_mem"] is None and r["top_mem_other_kb"] is None and r["top_mem_unmatched_kb"] is None and r["top_mem_bad_rows"] is None and r["by_owner"]["dolt"] == 1012304, r
+EOF
+TOPARGV="$TMP/top.argv" TOPOUT="$TMP/top.txt" PATH="$TMP/fakebin:$PATH" python3 -I "$TMP/check-notop.py" "$SELF_DIR" "$TMP" && [ ! -e "$TMP/top.argv" ] && ok "sample() without with_top and without a fixture never calls top (the alert-time report path stays free of it)" || bad "sample() called top (or lost by_owner) without being asked: $(cat "$TMP/top.argv" 2>/dev/null)"
 mkdir -p "$TMP/failbin"; printf '%s\n' '#!/bin/sh' 'cat "$TOPOUT"' 'exit 1' > "$TMP/failbin/top"; chmod +x "$TMP/failbin/top"
 TOP_FIX= TOPOUT="$TMP/top.txt" PATH_FIRST="$TMP/failbin" run_sampler "$TMP/topbad.jsonl" >/dev/null 2>&1
 python3 -I "$TMP/check-null.py" "$TMP/topbad.jsonl" && ok "a top that prints a good table and exits 1 is unreadable: null, not the table" || bad "failing top still produced top_mem"
