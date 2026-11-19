@@ -25,11 +25,11 @@ jq -c 'select(.event=="sweep") | {ts,worker_audit,worker_trees,worker_overdue,wo
 cat ${LOG%.jsonl}.workers.jsonl      # um objeto por árvore atrasada da última passada; vazio = nenhuma
 ```
 
-Aceite atendido (`crew/worker-*` só com bead aberta ou fechada há menos de 24 h) = uma passada com `worker_audit` 1, `worker_overdue` 0 e `worker_audit_unknown` 0. `worker_audit` 0 ou `worker_audit_unknown` maior que 0 NÃO é "nenhuma atrasada": o primeiro é auditoria desligada, o segundo é bead que não deu para ler (o `bd` falhou ou estourou o prazo; o reaper desiste de perguntar naquele repo depois da primeira falha).
+Aceite atendido (`crew/worker-*` só com bead aberta ou fechada há menos de 24 h) = uma passada com `worker_audit` 1, `worker_overdue` 0 e `worker_audit_unknown` 0. `worker_audit` 0 ou `worker_audit_unknown` maior que 0 NÃO é "nenhuma atrasada": o primeiro é auditoria desligada, o segundo é "não deu para ler", e cada caso vem com um evento `worker_audit_unknown` (`repo`, `wt`, `why`) dizendo qual: o `bd` falhou ou estourou o prazo (o reaper desiste de perguntar naquele repo depois da primeira falha; o evento é o `bead_lookup_failed`), uma bead da árvore voltou sem status ou fechada sem `closed_at` legível (`why` = `bead_row_unreadable`: não se sabe há quanto tempo fechou), a atividade da árvore não pôde ser lida (`activity_unreadable`), ou a própria lista de worktrees do repo falhou na auditoria (`worktree_list_failed`, sem `wt`: as árvores do repo não foram olhadas e `worker_trees` não as conta). `worker_overdue` conta toda árvore dita atrasada, qualquer que seja o motivo: a coluna `beads` diz quais beads foram lidas e fechadas (vazia = nenhuma foi lida; é o caso de `op_in_progress` e de `bead_not_found`).
 
 ## O que cada motivo de `worker_tree_overdue` pede
 
-Cada linha traz `repo`, `wt`, `branch`, `beads`, `closed_h`, `size_kb`, `reason`, `detail`, `locked` e `last_event` (o último evento que a passada registrou para a árvore). O `reason` é o primeiro que vale, nesta ordem:
+Cada linha traz `repo`, `wt`, `branch`, `beads`, `closed_h`, `size_kb`, `reason`, `detail`, `locked` e `last_event` (o último evento que a passada registrou para a árvore). O `reason` é o primeiro que vale, na ordem em que a própria passada decide (o portão de idade vem antes do guarda de dado ignorado):
 
 | reason | quer dizer | o que fazer |
 |---|---|---|
@@ -38,16 +38,16 @@ Cada linha traz `repo`, `wt`, `branch`, `beads`, `closed_h`, `size_kb`, `reason`
 | `in_use` | um processo tem a árvore como cwd ou arquivo aberto | achar o processo (`lsof +D <árvore>`) |
 | `status_unreadable` | `git status` falhou | olhar o repo (disco cheio, índice corrompido) |
 | `dirty` | mudança não commitada (`detail` = quantos caminhos) | decisão humana; o que o reaper faz com árvore suja não mudou (abaixo) |
-| `ignored_data` / `ignored_data_unknown` | dado ignorado fora da lista, maior que o teto ou não medido (`detail` = KiB) | ler `top` no evento `kept_ignored_data` da árvore; se for lixo regenerável, acrescentar o nome a `WORKTREE_REAPER_WORKER_JUNK_RE`; se for dado, decisão humana |
 | `young` | algo tocou a árvore dentro do portão de idade | normal por algumas horas; se persistir, achar quem escreve nela |
+| `ignored_data` / `ignored_data_unknown` | dado ignorado fora da lista que a regra de liberação NÃO solta: maior que o teto, não medido, ou liberação desligada (`detail` = KiB). Dado pequeno e medido numa árvore de bead fechada há 12 h ou mais não é motivo: a passada o solta, e a árvore cai em `unknown` se ainda está lá | ler `top` no evento `kept_ignored_data` da árvore; se for lixo regenerável, acrescentar o nome a `WORKTREE_REAPER_WORKER_JUNK_RE`; se for dado, decisão humana |
 | `bead_not_found` | o nome da árvore não acha bead e ela está parada há 24 h ou mais | árvore órfã: conferir e remover à mão com `git worktree remove` (nunca `rm -rf`) |
-| `unknown` | nada do que a auditoria enxerga a segura | ler `last_event`: vazio = a passada não chegou nela (teto por passada, `bead_lookup_failed`); senão o nome do evento diz a prova que falhou |
+| `unknown` | nada do que a auditoria enxerga a segura | ler `last_event`: vazio = a passada não chegou nela (teto por passada, `bead_lookup_failed`); senão o nome do evento diz a prova que falhou; em simulação (`dry_run` true) ela está ali porque a simulação não remove nada |
 
 ## Interruptores
 
-Todos por ambiente do job (`WORKTREE_REAPER_…`); só o valor `0` desliga os interruptores, número inválido vale o padrão, nunca menos horas.
+Todos por ambiente do job (`WORKTREE_REAPER_…`). `WORKER_AUDIT`: só o valor `0` desliga a auditoria. `CLOSED_WORKER_IGNORED_RELEASE`: só o valor `1` deixa a liberação ligada, qualquer outro (`0`, `off`, `true`, `2`) a desliga (o lado seguro: o dado ignorado volta a segurar a árvore). Número inválido de horas ou de KiB vale o padrão, nunca menos.
 
-- `CLOSED_WORKER_IGNORED_RELEASE` (1; 0 = só a lista de lixo, a regra do ga-xpoj67 para o resto), `CLOSED_WORKER_IGNORED_HOURS` (12), `CLOSED_WORKER_IGNORED_MAX_KB` (65536).
+- `CLOSED_WORKER_IGNORED_RELEASE` (1; qualquer outro valor = só a lista de lixo, a regra do ga-xpoj67 para o resto), `CLOSED_WORKER_IGNORED_HOURS` (12), `CLOSED_WORKER_IGNORED_MAX_KB` (65536).
 - `SHIPPED_CLOSED_HOURS`: quanto tempo a bead fica fechada antes de a árvore ENTREGUE ao `main` por patch (todo commit dela lá, `git cherry`) poder sair. Padrão = `CLOSED_BEAD_HOURS` (6), o mesmo de antes; `WORKTREE_REAPER_SHIPPED_CLOSED_HOURS=1` (ou 0) é o botão do "fim da entrega".
 - `WORKER_JUNK_RE` (substitui a lista de lixo de worker), `WORKER_OVERDUE_HOURS` (24), `WORKER_AUDIT` (1; 0 desliga a auditoria e a linha `sweep` passa a dizer `worker_audit` 0).
 - `WORKERS_REPORT` (caminho do relatório; padrão: o log trocando `.jsonl` por `.workers.jsonl`).

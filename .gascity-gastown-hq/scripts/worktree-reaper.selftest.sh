@@ -1312,6 +1312,11 @@ for a in "$@"; do
   fi
   if [ "$a" = "list" ] && [ "$wk" = "1" ] && [ -n "${PE_WTLIST_SLEEP:-}" ]; then sleep "$PE_WTLIST_SLEEP"; fi   # ga-zgqssr7: PE_WTLIST_SLEEP=<s> makes every `worktree list` slow, so a pass takes a measurable time
   if [ "$a" = "list" ] && [ "$wk" = "1" ] && [ "${PE_WTLIST:-}" = "fail" ]; then echo "fatal: injected worktree list failure" >&2; exit 128; fi
+  # ga-1p1i5jr.15 gate-fix: PE_WTLIST_CNT=<file> counts every `worktree list` call of the pass in that file; PE_WTLIST_NTH=<n> fails exactly the n-th (PE_WTLIST above is all-or-nothing and cannot tell the pool loop's read from the audit's)
+  if [ "$a" = "list" ] && [ "$wk" = "1" ] && [ -n "${PE_WTLIST_CNT:-}" ]; then
+    pe_n=$(( $(cat "$PE_WTLIST_CNT" 2>/dev/null || echo 0) + 1 )); echo "$pe_n" > "$PE_WTLIST_CNT"
+    if [ "$pe_n" = "${PE_WTLIST_NTH:-0}" ]; then echo "fatal: injected worktree list failure (call $pe_n)" >&2; exit 128; fi
+  fi
   if [ "$a" = "HEAD" ] && [ "$rp" = "1" ] && [ "${PE_REVPARSE:-}" = "fail" ]; then exit 128; fi
   if [ "$a" = "status" ] && [ "${PE_STATUS:-}" = "fail" ]; then exit 128; fi
   if [ "$a" = "remote" ] && [ "${PE_REMOTE:-}" = "fail" ]; then exit 128; fi
@@ -3566,9 +3571,9 @@ wk_mk au_p "$WK_DATA" 30; mkdir -p "$TMP/au_p-bin"; printf 'OLD REPORT\n' > "$TM
 printf '#!/bin/sh\nfor a; do last="$a"; done\ncase "$last" in *.workers.jsonl) echo "mv: injected failure" >&2; exit 1 ;; esac\nexec "$PE_REAL_MV" "$@"\n' > "$TMP/au_p-bin/mv"; chmod +x "$TMP/au_p-bin/mv"
 wk_run au_p "$WK_C30" WORKTREE_REAPER_CLOSED_WORKER_IGNORED_MAX_KB=1 PATH="$TMP/au_p-bin:$PE_BIN:$PATH"
 { [ "$(au_n au_p)" = "1" ] && [ "$(wk_sweep au_p worker_overdue)" = "1" ] && [ "$(cat "$TMP/au_p.workers.jsonl")" = "OLD REPORT" ] && ! ls "$TMP"/au_p.workers.jsonl.tmp.* >/dev/null 2>&1; } && ok "ga-1p1i5jr.15 (au_p): the report cannot be moved into place (mv fails) → the old report stays, the pass still logs the overdue tree and the sweep line, no temp file is left" || bad "ga-1p1i5jr.15 (au_p): n=$(au_n au_p) sweep=$(wk_sweep au_p worker_overdue) report=$(head -c 60 "$TMP/au_p.workers.jsonl") tmp=$(ls "$TMP"/au_p.workers.jsonl.tmp.* 2>/dev/null | wc -l | tr -d ' ')"
-# (au_q) the worktree list cannot be read: the pool loop logs skip_repo_unresolvable, the audit has nothing to say and does not fail the pass
+# (au_q) the worktree list cannot be read at all: the pool loop logs skip_repo_unresolvable AND the audit's own read fails too, which the audit counts and says (worker_audit_unknown + an event naming the repo): it never reads as "no worker trees here"
 wk_mk au_q "$WK_DATA" 30; wk_run au_q "$WK_C30" PE_WTLIST=fail
-{ [ "$(events au_q skip_repo_unresolvable)" -ge "1" ] && [ "$(au_n au_q)" = "0" ] && [ "$(wk_sweep au_q worker_trees)" = "0" ]; } && ok "ga-1p1i5jr.15 (au_q): git worktree list FAILS → skip_repo_unresolvable from the pool loop, no audit line, worker_trees 0, the sweep line is still written" || bad "ga-1p1i5jr.15 (au_q): skip=$(events au_q skip_repo_unresolvable) n=$(au_n au_q) trees=$(wk_sweep au_q worker_trees)"
+{ [ "$(events au_q skip_repo_unresolvable)" -ge "1" ] && [ "$(au_n au_q)" = "0" ] && [ "$(wk_sweep au_q worker_trees)" = "0" ] && [ "$(wk_sweep au_q worker_audit_unknown)" = "1" ] && [ "$(events au_q worker_audit_unknown)" = "1" ]; } && ok "ga-1p1i5jr.15 (au_q): git worktree list FAILS → skip_repo_unresolvable from the pool loop, no overdue line, worker_trees 0, worker_audit_unknown 1 + its event, the sweep line is still written" || bad "ga-1p1i5jr.15 (au_q): skip=$(events au_q skip_repo_unresolvable) n=$(au_n au_q) trees=$(wk_sweep au_q worker_trees) unknown=$(wk_sweep au_q worker_audit_unknown) unknown_ev=$(events au_q worker_audit_unknown)"
 # (au_r) the audit removes nothing and changes nothing: the overdue tree and its branch are exactly as the pass left them (dry run included: the line is read-only)
 wk_mk au_r "$WK_DATA" 30; printf 'OLD REPORT\n' > "$TMP/au_r.workers.jsonl"; wk_run au_r "$WK_C30" WORKTREE_REAPER_CLOSED_WORKER_IGNORED_MAX_KB=1 WORKTREE_REAPER_ENABLED=0
 { kz_wt au_r && kz_br au_r && [ "$(au_n au_r)" = "1" ] && [ "$(au_field au_r reason)" = "ignored_data" ] && [ "$(au_field au_r dry_run)" = "true" ] && [ "$(events au_r reaped_pool)" = "0" ] && [ "$(cat "$TMP/au_r.workers.jsonl")" = "OLD REPORT" ] && ! ls "$TMP"/au_r.workers.jsonl.tmp.* >/dev/null 2>&1; } \
@@ -3650,8 +3655,62 @@ run_kz au_t2 "$WK_C30" WORKTREE_REAPER_IGNORED_DATA_GUARD=1 WORKTREE_REAPER_WORK
   && ok "ga-1p1i5jr.15 (au_t2): pass 1 quotes kept_ignored_data, pass 2 (the cap stopped it before the tree) quotes nothing — only this pass's lines count" || bad "ga-1p1i5jr.15 (au_t2): n=$(au_n au_t2) last_events=$(grep '"event":"worker_tree_overdue"' "$TMP/au_t2.jsonl" | jq -r .last_event | tr '\n' '|')"
 # (au_r2) a dry run logs two lines for one tree (would_release_ignored_data, then would_reap_pool) and removes nothing: the tree is still there, overdue, and the LAST of them is what is quoted
 wk_mk au_r2 "$WK_DATA" 30; wk_run au_r2 "$WK_C30" WORKTREE_REAPER_ENABLED=0
-{ kz_wt au_r2 && [ "$(au_n au_r2)" = "1" ] && [ "$(au_field au_r2 reason)" = "ignored_data" ] && [ "$(events au_r2 would_release_ignored_data)" = "1" ] && [ "$(au_field au_r2 last_event)" = "would_reap_pool" ]; } \
+{ kz_wt au_r2 && [ "$(au_n au_r2)" = "1" ] && [ "$(au_field au_r2 reason)" = "unknown" ] && [ "$(au_field au_r2 detail | grep -c dry)" = "1" ] && [ "$(events au_r2 would_release_ignored_data)" = "1" ] && [ "$(au_field au_r2 last_event)" = "would_reap_pool" ]; } \
   && ok "ga-1p1i5jr.15 (au_r2): dry run — the tree stays, is overdue, and last_event is the LAST line of the pass for it (would_reap_pool, after would_release_ignored_data)" || bad "ga-1p1i5jr.15 (au_r2): wt=$(kz_wt au_r2 && echo y || echo n) n=$(au_n au_r2) last_event=$(au_field au_r2 last_event) reason=$(au_field au_r2 reason)"
+
+# ══ ga-1p1i5jr.15 gate-fix 1/3: the audit's third states — a bead row it cannot use, its OWN worktree list — and a reason that follows the pass ══
+# Gate finding 1: a CLOSED bead whose closed_at is missing/null made _bead_closed_proof fail, the audit read "failed, rows present" as the normal life of a tree and said nothing: the tree of the 19/11 incident stayed for ever with
+# worker_overdue 0 and worker_audit_unknown 0. Finding 2: `list=$(git worktree list) || return 0` in audit_pool_workers was a second, independent git read that turned a failure into "nothing to audit". Finding 3 (medium): reason
+# ignored_data was inferred from a fresh scan, before the age gate and without the release rule the pass applied.
+echo "── ga-1p1i5jr.15 gate-fix: unusable bead rows, the audit's own worktree list, reason in the pass's order ──"
+gf_uf() { grep '"event":"worker_audit_unknown"' "$TMP/$1.jsonl" 2>/dev/null | head -1 | jq -r ".$2" 2>/dev/null; }   # gf_uf <name> <field> of the first worker_audit_unknown event
+gf_unk() {   # gf_unk <name> <label> — counted once on the sweep line, said once as an event naming the tree, no overdue line, no report line, the tree is still there
+  if kz_wt "$1" && [ "$(wk_sweep "$1" worker_audit_unknown)" = "1" ] && [ "$(events "$1" worker_audit_unknown)" = "1" ] && [ "$(au_n "$1")" = "0" ] && [ "$(wk_sweep "$1" worker_overdue)" = "0" ] && [ "$(wk_sweep "$1" worker_trees)" = "1" ] \
+     && [ -z "$(au_rep "$1")" ] && [ "$(gf_uf "$1" wt)" = "worker-kz" ] && [ "$(gf_uf "$1" repo)" = "rig" ] && case "$(gf_uf "$1" why)" in bead_row_unreadable*) true ;; *) false ;; esac; then ok "ga-1p1i5jr.15 $2 → worker_audit_unknown 1 (sweep line + event naming rig/worker-kz), no overdue line, no report line"
+  else bad "ga-1p1i5jr.15 $2 → wt=$(kz_wt "$1" && echo y || echo n) unknown=$(wk_sweep "$1" worker_audit_unknown) event=$(events "$1" worker_audit_unknown) overdue_lines=$(au_n "$1") overdue=$(wk_sweep "$1" worker_overdue) trees=$(wk_sweep "$1" worker_trees) why=$(gf_uf "$1" why)"; fi
+}
+gf_quiet() {   # gf_quiet <name> <label> — a tree in its normal life: audited (worker_trees 1), nothing said, nothing counted unknown
+  if kz_wt "$1" && [ "$(wk_sweep "$1" worker_trees)" = "1" ] && [ "$(wk_sweep "$1" worker_audit_unknown)" = "0" ] && [ "$(events "$1" worker_audit_unknown)" = "0" ] && [ "$(au_n "$1")" = "0" ] && [ "$(wk_sweep "$1" worker_overdue)" = "0" ]; then ok "ga-1p1i5jr.15 $2 → normal life: audited, nothing said, worker_audit_unknown 0"
+  else bad "ga-1p1i5jr.15 $2 → wt=$(kz_wt "$1" && echo y || echo n) trees=$(wk_sweep "$1" worker_trees) unknown=$(wk_sweep "$1" worker_audit_unknown) event=$(events "$1" worker_audit_unknown) overdue_lines=$(au_n "$1")"; fi
+}
+# (gf_a) THE BLOCKING SHAPE: the bead is closed, closed_at is null; a clean worker tree idle 30 h holds data above the cap (the 19/11 incident) → counted unknown and said, never the normal life of a tree. Control: au_a is the same tree with closed_at 30 h ago → overdue
+wk_mk gf_a "$WK_DATA" 30; wk_run gf_a "[{\"id\":\"$KZ_ID\",\"status\":\"closed\",\"closed_at\":null}]" WORKTREE_REAPER_CLOSED_WORKER_IGNORED_MAX_KB=1
+gf_unk gf_a "(gf_a): bead closed with closed_at null, clean tree idle 30 h, data over the cap"
+# (gf_b) closed_at is not a date at all
+wk_mk gf_b "$WK_DATA" 30; wk_run gf_b "[{\"id\":\"$KZ_ID\",\"status\":\"closed\",\"closed_at\":\"not a date\"}]" WORKTREE_REAPER_CLOSED_WORKER_IGNORED_MAX_KB=1
+gf_unk gf_b "(gf_b): closed_at is not a date"
+# (gf_c) the row has NO status (absent) / an EMPTY status: the bead's state is unknown, not "live"
+wk_mk gf_c "$WK_DATA" 30; wk_run gf_c "[{\"id\":\"$KZ_ID\",\"closed_at\":\"$(bc_iso 30)\"}]" WORKTREE_REAPER_CLOSED_WORKER_IGNORED_MAX_KB=1
+gf_unk gf_c "(gf_c): a row with no status key"
+wk_mk gf_c2 "$WK_DATA" 30; wk_run gf_c2 "[{\"id\":\"$KZ_ID\",\"status\":\"\",\"closed_at\":\"$(bc_iso 30)\"}]" WORKTREE_REAPER_CLOSED_WORKER_IGNORED_MAX_KB=1
+gf_unk gf_c2 "(gf_c2): a row with an empty status"
+# (gf_d) two beads, priority live > recent > unreadable: an open bead with a closed-no-date one is live (normal life); a bead closed 1 h ago with a closed-no-date one is recent (the newest closure is under the line whatever the other says);
+# closed 40 h ago with a closed-no-date one is unreadable (the undated one may be the newest closure)
+GF_NODATE="{\"id\":\"$KZ_ID\",\"status\":\"closed\",\"closed_at\":null}"
+wk_mk gf_d1 "$WK_DATA; git branch -m crew/kz/wa-kz1xyz-wa-kz2xyz" 30; wk_run gf_d1 "[$GF_NODATE,$(bc_bead wa-kz2xyz open)]" WORKTREE_REAPER_CLOSED_WORKER_IGNORED_MAX_KB=1
+gf_quiet gf_d1 "(gf_d1): one bead OPEN, the other closed with no closed_at"
+wk_mk gf_d2 "$WK_DATA; git branch -m crew/kz/wa-kz1xyz-wa-kz2xyz" 30; wk_run gf_d2 "[$GF_NODATE,$(bc_bead wa-kz2xyz closed 1)]" WORKTREE_REAPER_CLOSED_WORKER_IGNORED_MAX_KB=1
+gf_quiet gf_d2 "(gf_d2): one bead closed 1 h ago, the other closed with no closed_at"
+wk_mk gf_d3 "$WK_DATA; git branch -m crew/kz/wa-kz1xyz-wa-kz2xyz" 30; wk_run gf_d3 "[$GF_NODATE,$(bc_bead wa-kz2xyz closed 40)]" WORKTREE_REAPER_CLOSED_WORKER_IGNORED_MAX_KB=1
+gf_unk gf_d3 "(gf_d3): one bead closed 40 h ago, the other closed with no closed_at"
+# (gf_e) the audit's OWN worktree list fails while the pool loop's read works: probe pass counts the `worktree list` calls (the audit's is the LAST of a one-repo pass), the second pass fails exactly that one on the same kind of tree (overdue: bead closed 30 h, data over the cap)
+wk_mk gf_ep "$WK_DATA" 30; : > "$TMP/gf_ep.cnt"; wk_run gf_ep "$WK_C30" WORKTREE_REAPER_CLOSED_WORKER_IGNORED_MAX_KB=1 PE_WTLIST_CNT="$TMP/gf_ep.cnt"
+GF_NL="$(tr -d ' \n' < "$TMP/gf_ep.cnt")"
+wk_mk gf_e "$WK_DATA" 30; : > "$TMP/gf_e.cnt"; wk_run gf_e "$WK_C30" WORKTREE_REAPER_CLOSED_WORKER_IGNORED_MAX_KB=1 PE_WTLIST_CNT="$TMP/gf_e.cnt" PE_WTLIST_NTH="$GF_NL"
+{ [ "${GF_NL:-0}" -ge 2 ] && [ "$(au_n gf_ep)" = "1" ] && kz_wt gf_e && [ "$(events gf_e skip_repo_unresolvable)" = "0" ] && [ "$(wk_sweep gf_e repo_unresolvable)" = "0" ] && [ "$(events gf_e worker_audit_unknown)" = "1" ] && [ "$(wk_sweep gf_e worker_audit_unknown)" = "1" ] \
+  && [ "$(au_n gf_e)" = "0" ] && [ "$(wk_sweep gf_e worker_audit)" = "1" ] && [ "$(wk_sweep gf_e worker_trees)" = "0" ] && [ "$(gf_uf gf_e repo)" = "rig" ] && [ "$(gf_uf gf_e wt)" = "" ] && case "$(gf_uf gf_e why)" in worktree_list_failed*) true ;; *) false ;; esac; } \
+  && ok "ga-1p1i5jr.15 (gf_e): ONLY the audit's worktree list fails (the pool loop's read worked, $GF_NL calls in the probe pass) → worker_audit_unknown 1 + an event naming rig (no wt), repo_unresolvable 0, no overdue line" || bad "ga-1p1i5jr.15 (gf_e): calls=$GF_NL probe_overdue=$(au_n gf_ep) skip=$(events gf_e skip_repo_unresolvable) repo_unres=$(wk_sweep gf_e repo_unresolvable) unknown_ev=$(events gf_e worker_audit_unknown) unknown=$(wk_sweep gf_e worker_audit_unknown) overdue=$(au_n gf_e) why=$(gf_uf gf_e why)"
+# (gf_f) the reason follows the pass: a tree younger than the age gate was never given to the ignored-data guard (no kept_ignored_data) → young, even when it holds data. Unmerged clean tree, bead closed 30 h, a little data (under the cap), directory touched 1 h ago (gate 24 h)
+wk_mk gf_f "$WK_DATA; $WK_UNSHIPPED" 1; wk_run gf_f "$WK_C30"
+{ kz_wt gf_f && [ "$(au_n gf_f)" = "1" ] && [ "$(au_field gf_f reason)" = "young" ] && [ "$(events gf_f kept_ignored_data)" = "0" ]; } && ok "ga-1p1i5jr.15 (gf_f): tree inside the age gate that holds data (under the cap) → reason young, not ignored_data (the pass never logged kept_ignored_data for it)" || bad "ga-1p1i5jr.15 (gf_f): n=$(au_n gf_f) reason=$(au_field gf_f reason) kept_ignored_data=$(events gf_f kept_ignored_data)"
+# (gf_g) data the release rule would let go (measured, under the cap, beads closed 30 h) is not what holds the tree: an unmerged OLD tree the pass leaves alone → reason unknown, not ignored_data. Control: the same tree with the cap at 1 KiB → ignored_data
+wk_mk gf_g "$WK_DATA; $WK_UNSHIPPED" 30; wk_run gf_g "$WK_C30"
+{ kz_wt gf_g && [ "$(au_n gf_g)" = "1" ] && [ "$(au_field gf_g reason)" = "unknown" ] && [ "$(events gf_g kept_ignored_data)" = "0" ]; } && ok "ga-1p1i5jr.15 (gf_g): data under the cap the release rule lets go, tree still there for another reason → reason unknown, not ignored_data" || bad "ga-1p1i5jr.15 (gf_g): n=$(au_n gf_g) reason=$(au_field gf_g reason) kept_ignored_data=$(events gf_g kept_ignored_data)"
+wk_mk gf_g2 "$WK_DATA; $WK_UNSHIPPED" 30; wk_run gf_g2 "$WK_C30" WORKTREE_REAPER_CLOSED_WORKER_IGNORED_MAX_KB=1
+{ kz_wt gf_g2 && [ "$(au_n gf_g2)" = "1" ] && [ "$(au_field gf_g2 reason)" = "ignored_data" ] && [ "$(events gf_g2 kept_ignored_data)" = "1" ]; } && ok "ga-1p1i5jr.15 (gf_g2): control — the same tree, data over the cap → reason ignored_data (kept_ignored_data once)" || bad "ga-1p1i5jr.15 (gf_g2): n=$(au_n gf_g2) reason=$(au_field gf_g2 reason) kept_ignored_data=$(events gf_g2 kept_ignored_data)"
+# (gf_h) the release switched off (any value but 1): the data DOES hold the tree and the reason says so
+wk_mk gf_h "$WK_DATA; $WK_UNSHIPPED" 30; wk_run gf_h "$WK_C30" WORKTREE_REAPER_CLOSED_WORKER_IGNORED_RELEASE=off
+{ kz_wt gf_h && [ "$(au_field gf_h reason)" = "ignored_data" ] && [ "$(events gf_h kept_ignored_data)" = "1" ]; } && ok "ga-1p1i5jr.15 (gf_h): CLOSED_WORKER_IGNORED_RELEASE=off (not 1) → the release is off, the data holds the tree, reason ignored_data" || bad "ga-1p1i5jr.15 (gf_h): reason=$(au_field gf_h reason) kept_ignored_data=$(events gf_h kept_ignored_data)"
 
 echo ""
 echo "── RESULTS: $PASS passed, $FAIL failed ──"

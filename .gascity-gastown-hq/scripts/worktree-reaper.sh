@@ -57,8 +57,8 @@
 # worker tree for anything .gitignore hides and no junk rule named, and a worker leaves logs/, .gc/, .runtime/, CLAUDE.md and the like. For POOL WORKER trees only (<rig>/crew/worker-*, $GT/worker-*; _is_pool_worker_tree): WORKER_JUNK_RE names what a worker session leaves by itself, and a CLEAN tree whose beads are ALL closed
 # for CLOSED_WORKER_IGNORED_HOURS (12) lets the rest of its ignored data go with it when that was measured entry by entry and adds up to at most CLOSED_WORKER_IGNORED_MAX_KB (ignored_data_released names it); a dirty tree, an open bead, an
 # unmeasured or bigger pile of data still keeps the tree. After the pool loop audit_pool_workers reads what is LEFT: a worker tree whose beads have all been closed for WORKER_OVERDUE_HOURS (24) or more is logged as worker_tree_overdue with
-# WHY it is still there (reason: locked, op_in_progress, in_use, status_unreadable, dirty, ignored_data, ignored_data_unknown, young, bead_not_found, unknown) and written to the report beside the log; the sweep line counts worker_trees,
-# worker_overdue and worker_audit_unknown (bead state not readable: said, never read as "not overdue" and never as "overdue"); last_event is the last event the pass itself logged for the tree (kept_ignored_data, kept_pressure_unmerged, ...). WORKTREE_REAPER_WORKER_AUDIT=0 switches the audit off (the sweep line then says worker_audit 0). A DRY RUN
+# WHY it is still there (reason, in the pass's own order: locked, op_in_progress, in_use, status_unreadable, dirty, young, ignored_data, ignored_data_unknown, bead_not_found, unknown) and written to the report beside the log; the sweep line counts worker_trees,
+# worker_overdue and worker_audit_unknown (bead state or the worktree list not readable, or a closed bead with no closed_at: counted and said with a worker_audit_unknown event, never read as "not overdue" and never as "overdue"); last_event is the last event the pass itself logged for the tree (kept_ignored_data, kept_pressure_unmerged, ...). WORKTREE_REAPER_WORKER_AUDIT=0 switches the audit off (the sweep line then says worker_audit 0). A DRY RUN
 # audits too (a preview that touches nothing): its lines say dry_run true, a tree whose last_event is would_reap_* is one a real pass takes, and it never replaces the report.
 # The one exception to "WITHOUT --force" is a LOCKED worktree (`remove -f -f`); it is reaped only
 # under the LOCK CONTRACT stated at ZOMBIE-LOCK DETECTION below, never because of its age alone.
@@ -134,7 +134,7 @@ IGNORED_JUNK_RE='(^|/)(\.venv|venv|node_modules|__pycache__|\.pytest_cache|\.myp
 IGNORED_TOOL_DIR_RE='(^|/)\.claude/$'
 # ga-1p1i5jr.15: the two rules for POOL WORKER trees (header; _is_pool_worker_tree). WORKER_JUNK_RE = what a worker session leaves behind by itself — logs, gc/gt runtime state, the role file, coverage and test caches, DB sidecars: junk
 # for these trees, like IGNORED_JUNK_RE (WORKTREE_REAPER_WORKER_JUNK_RE replaces it). The release: a CLEAN tree whose every named bead has been closed for CLOSED_WORKER_IGNORED_HOURS lets the REST of its ignored data go with it when
-# that was measured entry by entry and adds up to at most CLOSED_WORKER_IGNORED_MAX_KB (KiB). Only 0 on _RELEASE is the ga-xpoj67 rule (any ignored data holds the tree); an hours or size that is not a number is the default, never fewer.
+# that was measured entry by entry and adds up to at most CLOSED_WORKER_IGNORED_MAX_KB (KiB). Only the value 1 on _RELEASE leaves the release ON; any other value (0, off, true, 2) is the ga-xpoj67 rule (any ignored data holds the tree), the safe direction; an hours or size that is not a number is the default, never fewer.
 WORKER_JUNK_RE='(^|/)(logs|\.logs|\.gc|\.runtime|\.gemini|coverage|htmlcov|\.vitest-cache|\.playwright-mcp|\.superpowers)(/|$)|(^|/)CLAUDE(\.local)?\.md$|(^|/)\.crew-active-pid$|(^|/)\.coverage(\.[^/]*)?$|\.log$|\.db-(shm|wal)$'
 [ -z "${WORKTREE_REAPER_WORKER_JUNK_RE:-}" ] || WORKER_JUNK_RE="$WORKTREE_REAPER_WORKER_JUNK_RE"
 CLOSED_WORKER_IGNORED_RELEASE="${WORKTREE_REAPER_CLOSED_WORKER_IGNORED_RELEASE:-1}"
@@ -1832,14 +1832,27 @@ reap_pool_worktrees() {
   [ "$ENABLED" = "1" ] && git -C "$repo" worktree prune 2>/dev/null
 }
 
+# ── _audit_unknown <repo> <wt> <why> — ga-1p1i5jr.15 gate-fix: the audit could not tell about ONE tree (<wt>) or a whole repo (<wt> empty): ONE count on the sweep line (worker_audit_unknown) and ONE worker_audit_unknown event that names it and says
+# why. Never "nothing to say": a tree or a repo the audit could not read looks, without this line, like one with nothing overdue. Main shell only: it counts.
+_audit_unknown() {
+  local wtn=""
+  [ -z "$2" ] || wtn="$(basename "$2")"
+  worker_audit_unknown=$((worker_audit_unknown+1))
+  printf '{"ts":"%s","event":"worker_audit_unknown","repo":"%s","wt":"%s","why":"%s"}\n' \
+    "$(ts)" "$(_json_esc "$(basename "$1")")" "$(_json_esc "$wtn")" "$(_json_esc "$3")" >> "$LOG" 2>/dev/null
+}
+
 # ── _audit_one_worker <repo> <wt> <br> <lock> — ga-1p1i5jr.15: ONE pool worker tree the pass left on disk. Main shell only (it counts). Read-only: nothing is removed or changed here.
-# Three answers about the bead(s) the tree is named for, never collapsed into one: all CLOSED for WORKER_OVERDUE_HOURS or more → the tree is OVERDUE (logged and reported with the first thing that keeps it, below); open, in progress or closed
-# too recently → the normal life of a tree, nothing said; the lookup could not be answered → worker_audit_unknown, nothing said about the tree (and the repo's other trees are not asked again). A tree whose name finds no bead is said only once it
-# has been idle that long (bead_not_found when nothing else explains it): nothing then says its work is over, and nothing ever will.
-# WHY it is still here = the first of: locked (detail: the lock reason), op_in_progress, in_use, status_unreadable, dirty, ignored_data (detail: KiB), ignored_data_unknown, young (activity inside the age gate), bead_not_found, unknown.
+# Four answers about the bead(s) the tree is named for, never collapsed into one: all CLOSED for WORKER_OVERDUE_HOURS or more → the tree is OVERDUE (logged and reported with the first thing that keeps it, below); open or in progress, or closed
+# too recently → the normal life of a tree, nothing said; the bead state could not be read — the lookup failed, or a row came back without a status or a closed_at (a closed bead whose closure date is unknown may be one that closed an hour ago or a month ago)
+# → worker_audit_unknown and a worker_audit_unknown event, nothing said about the tree (and after a failed lookup the repo's other trees are not asked again). A tree whose name finds no bead is said only once it has been idle that long
+# (bead_not_found when nothing else explains it): nothing then says its work is over, and nothing ever will.
+# WHY it is still here = the first of, in the order the PASS itself decides (age gate before the ignored-data guard): locked (detail: the lock reason), op_in_progress, in_use, status_unreadable, dirty, young (activity inside the age gate),
+# ignored_data (detail: KiB; only data the release rule would NOT let go), ignored_data_unknown, bead_not_found, unknown. worker_overdue counts every tree said here, whatever the reason: the beads field says which closed (empty = none was read).
 _audit_one_worker() {
-  local repo="$1" wt="$2" br="$3" lock="$4" failed0 now_s fresh age_h closed_h=null reason="" detail="" kb st src ids="" nf=0 line last
+  local repo="$1" wt="$2" br="$3" lock="$4" failed0 now_s fresh age_h rows_v closed_h=null reason="" detail="" kb st src ids="" nf=0 line last
   worker_trees=$((worker_trees+1))
+  # a lookup of this repo already failed (_bead_lookup_failed logged it): this tree is counted as "could not tell", the bead is not asked again
   if [ "$_AUDIT_LOOKUP_DOWN" = "1" ]; then worker_audit_unknown=$((worker_audit_unknown+1)); return 0; fi
   failed0="$bead_lookup_failed"; now_s=$(date +%s)
   if _bead_closed_proof "$repo" "$wt" "$br" "$WORKER_OVERDUE_HOURS"; then
@@ -1850,13 +1863,20 @@ _audit_one_worker() {
   elif [ "$bead_lookup_failed" -gt "$failed0" ]; then
     worker_audit_unknown=$((worker_audit_unknown+1)); _AUDIT_LOOKUP_DOWN=1; return 0
   elif [ -z "$_BC_ROWS" ]; then
-    # no bead found (or an operation under way, which the proof refuses before asking): overdue only when the tree has been idle that long. falhou (its activity cannot be read) → could not tell, counted
-    fresh="$(_wt_fresh_epoch "$wt" "$now_s")" || { worker_audit_unknown=$((worker_audit_unknown+1)); return 0; }
+    # no bead found (or an operation under way, which the proof refuses before asking): overdue only when the tree has been idle that long. falhou (its activity cannot be read) → could not tell, counted and said
+    fresh="$(_wt_fresh_epoch "$wt" "$now_s")" || { _audit_unknown "$repo" "$wt" "activity_unreadable"; return 0; }
     age_h=$(( (now_s - fresh) / 3600 ))
     [ "$age_h" -ge "$WORKER_OVERDUE_HOURS" ] || return 0
     nf=1
   else
-    return 0
+    # The proof failed with rows present and no lookup failure: a row that is not closed (the tree is live), a closed row too recent (the tree is in its normal life), or a row the proof could not use — no status, or closed with no
+    # readable closed_at. Priority: live, then recent (the newest closure is then under the line whatever the unreadable row says), then unreadable. vazio (no usable row) / anything else → unreadable: could not tell, counted and said,
+    # NEVER the normal life of a tree (a bead closed with no closed_at is the shape of a tree that stays on disk for ever)
+    rows_v="$(printf '%s\n' "$_BC_ROWS" | awk -F'\t' 'NF>=3 && $1!="" { if ($2=="closed") { if ($3 ~ /^[0-9]+$/) rec=1; else unk=1 } else if ($2=="-") unk=1; else live=1 } END { if (live) print "live"; else if (rec) print "recent"; else print "unreadable" }' 2>/dev/null)"
+    case "$rows_v" in
+      live|recent) return 0 ;;
+      *) _audit_unknown "$repo" "$wt" "bead_row_unreadable: a bead the tree names has no status or no closed_at (beads: $(printf '%s\n' "$_BC_ROWS" | cut -f1 | tr '\n' ' ' | sed 's/ $//'))"; return 0 ;;
+    esac
   fi
   if [ -n "$lock" ]; then reason=locked; detail="$lock"
   elif _worktree_op_in_progress "$wt"; then reason=op_in_progress
@@ -1866,15 +1886,20 @@ _audit_one_worker() {
     st="$(git -C "$wt" status --porcelain 2>/dev/null)"; src=$?
     if [ "$src" -ne 0 ]; then reason=status_unreadable
     elif [ -n "$st" ]; then reason=dirty; detail="$(printf '%s\n' "$st" | wc -l | tr -d ' ') path(s) changed"
+    # the PASS's order: its age gate comes before the ignored-data guard, so a tree inside the gate never reached the guard (no kept_ignored_data for it) and is "young", whatever it holds.
+    # vazio/falhou (its activity cannot be read) → not "young": the next reason explains the tree, and a tree is never called young on a guess
+    elif fresh="$(_wt_fresh_epoch "$wt" "$now_s")" && [ $(( (now_s - fresh) / 3600 )) -le "$gate_hours" ]; then reason=young; detail="active inside the ${gate_hours} h age gate"
     else
-      # rc 1 = nothing that holds the tree; 0 = data (detail: its size); 2 = the listing could not be read
+      # rc 1 = nothing that holds the tree; 0 = data; 2 = the listing could not be read. Data is the reason only when the release rule would NOT have let it go (exactly measured, within the cap, beads closed that long: the
+      # same test _release_closed_worker_ignored applies, without asking bd again): a tree whose data the rule releases is held by something else, and the reasons below say what (or "unknown": the pass did not reach it)
       _ignored_data_scan "$wt"; src=$?
-      if [ "$src" = "0" ]; then reason=ignored_data; detail="$_ID_KB KiB"
+      if [ "$src" = "0" ] && { [ "$nf" = "1" ] || [ "$CLOSED_WORKER_IGNORED_RELEASE" != "1" ] || [ "$_ID_EXACT" != "1" ] || [ "$_ID_KB" -gt "$CLOSED_WORKER_IGNORED_MAX_KB" ] || [ "$WORKER_OVERDUE_HOURS" -lt "$CLOSED_WORKER_IGNORED_HOURS" ]; }; then
+        reason=ignored_data; detail="$_ID_KB KiB"
       elif [ "$src" = "2" ]; then reason=ignored_data_unknown
-      # vazio/falhou (its activity cannot be read) → not "young": the next reason explains the tree, and a tree is never called young on a guess
-      elif fresh="$(_wt_fresh_epoch "$wt" "$now_s")" && [ $(( (now_s - fresh) / 3600 )) -le "$gate_hours" ]; then reason=young; detail="active inside the ${gate_hours} h age gate"
       elif [ "$nf" = "1" ]; then reason=bead_not_found
-      else reason=unknown; detail="nothing keeps it that this audit can see: the pass did not reach it (cap, a lookup that failed there), or a proof it did not log failed"
+      else
+        reason=unknown; detail="nothing keeps it that this audit can see: the pass did not reach it (cap, a lookup that failed there), or a proof it did not log failed"
+        [ "$ENABLED" = "1" ] || detail="nothing keeps it that this audit can see; this is a dry run (it removes nothing): last_event says what a real pass would do"
       fi
     fi
   fi
@@ -1890,13 +1915,15 @@ _audit_one_worker() {
   case "$kb" in null) : ;; *) worker_overdue_kb=$((worker_overdue_kb+kb)) ;; esac
 }
 
-# ── audit_pool_workers <repo> — ga-1p1i5jr.15: the pool worker trees <repo> lists AFTER the pass, each through _audit_one_worker. A repo whose worktree list cannot be read was already logged (skip_repo_unresolvable) by the pool loop.
+# ── audit_pool_workers <repo> — ga-1p1i5jr.15: the pool worker trees <repo> lists AFTER the pass, each through _audit_one_worker. The list is the audit's OWN read, a git call apart from the pool loop's: when it fails (the pool loop's read
+# may have worked) the repo is counted and said (_audit_unknown, no wt), never "no worker trees here".
 audit_pool_workers() {
-  local repo="$1" list line wt="" br="" lock=""
+  local repo="$1" list line wt="" br="" lock="" lrc
   [ -d "$repo/.git" ] || [ -f "$repo/.git" ] || return 0
   _AUDIT_LOOKUP_DOWN=0
-  # vazio → no worktree to look at; falhou (rc != 0) → nothing to audit here: the pool loop logged the failure for this repo, and the tally says nothing about it
-  list="$(git -C "$repo" worktree list --porcelain 2>/dev/null)" || return 0
+  # vazio → no worktree to look at; falhou (rc != 0) → counted as "could not tell" with an event naming the repo: the trees it holds were not looked at, and worker_trees does not count them
+  list="$(git -C "$repo" worktree list --porcelain 2>/dev/null)"; lrc=$?
+  if [ "$lrc" -ne 0 ]; then _audit_unknown "$repo" "" "worktree_list_failed rc=$lrc"; return 0; fi
   while IFS= read -r line; do
     case "$line" in
       "worktree "*) wt="${line#worktree }"; br=""; lock="" ;;
