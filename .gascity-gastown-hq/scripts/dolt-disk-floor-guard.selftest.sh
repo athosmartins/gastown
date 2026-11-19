@@ -2184,6 +2184,11 @@ for junk in STAT_JUNK STAT_JUNK1 STAT_JUNK2 STAT_ONE; do
   sw_out="$(eval "$junk=swapfile1 GROWTH_VM_DIR=\"$SWD\" _growth_swapfiles")"
   [ "$(printf '%s\n' "$sw_out" | sed -n 3p)" = "$(printf 'SWAPFILE\t?\t?\tswapfile1')" ] && ok "swapfiles: a stat that prints $junk (not 'size mtime') is '?', never a number" || bad "swapfiles: $junk mishandled: $(printf '%s' "$sw_out" | tr '\n' '|')"
 done
+# commands that FAIL on a directory/photo that exist: stubs that exit 1 (an unreadable read is "unmeasured", never an empty list or a zero)
+mkdir -p "$GROW_TMP/faills" "$GROW_TMP/failawk"; printf '%s\n' '#!/bin/sh' 'exit 1' > "$GROW_TMP/faills/ls"; printf '%s\n' '#!/bin/sh' 'exit 1' > "$GROW_TMP/failawk/awk"; chmod +x "$GROW_TMP/faills/ls" "$GROW_TMP/failawk/awk"
+[ "$(PATH="$GROW_TMP/faills:$PATH" GROWTH_VM_DIR="$SWD" _growth_swapfiles)" = "$(printf 'SWAPFILES\tunmeasured')" ] && ok "swapfiles: an ls that exits 1 on a directory that EXISTS is unmeasured, not ok 0" || bad "swapfiles: failing ls mishandled"
+vr="$(PATH="$GROW_TMP/failawk:$PATH" _growth_vm_report "$GROW_TMP/vr-base.txt" "$GROW_TMP/vr-now.txt")"
+case "$vr" in *"swapfiles of /System/Volumes/VM NOT measured in this photo"*"top memory footprint NOT measured in this photo"*) ok "report: an awk that exits 1 leaves both blocks UNMEASURED (never 0 swapfiles, never an empty top)" ;; *) bad "report: failing awk mishandled: $vr" ;; esac
 [ "$GROWTH_TOPMEM_N" = 10 ] && ok "photo: records the 10 biggest footprints by default" || bad "photo: GROWTH_TOPMEM_N is '$GROWTH_TOPMEM_N', expected 10"
 top() {
   cat <<'TOPFIX'

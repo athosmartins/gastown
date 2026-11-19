@@ -329,9 +329,9 @@ import json, sys
 r = json.loads(open(sys.argv[1]).read().splitlines()[-1])
 assert r["top_mem"] is None and r["top_mem_unmatched_kb"] is None and r["top_mem_bad_rows"] is None and r["top_mem_other_kb"] is None and r["by_owner"]["dolt"] == 1012304
 EOF
-for how in no-such-top.txt top-no-header.txt top-no-rows.txt; do
-  TOP_FIX="$TMP/$how" run_sampler "$TMP/topfail.jsonl" >/dev/null 2>&1
-  python3 -I "$TMP/check-null.py" "$TMP/topfail.jsonl" && ok "unreadable top ($how): top_mem and its counters null, by_owner intact" || bad "unreadable top ($how) did not yield null fields: $(tail -1 "$TMP/topfail.jsonl" | cut -c1-200)"
+for how in "$TMP/nonexistent/top.txt" "$TMP/top-no-header.txt" "$TMP/top-no-rows.txt"; do
+  TOP_FIX="$how" run_sampler "$TMP/topfail.jsonl" >/dev/null 2>&1
+  python3 -I "$TMP/check-null.py" "$TMP/topfail.jsonl" && ok "unreadable top ($(basename "$how")): top_mem and its counters null, by_owner intact" || bad "unreadable top ($(basename "$how")) did not yield null fields: $(tail -1 "$TMP/topfail.jsonl" | cut -c1-200)"
 done
 echo "── Scenario: the real command line is top -l 1 -stats pid,mem,cmprs (a fake top on PATH records its argv; one that fails gives null) ──"
 mkdir -p "$TMP/fakebin"
