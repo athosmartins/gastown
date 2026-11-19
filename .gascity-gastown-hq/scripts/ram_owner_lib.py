@@ -128,7 +128,8 @@ def top_mem_snapshot(fixture_path=None):
         except Exception:
             return None, 0
     else:
-        got, out = _sh_checked(["top", "-l", "1", "-stats", "pid,mem,cmprs"], timeout=60)
+        # bounded like the ps read: disk-recovery-swap-cut.sh waits SAMPLER_S (60 s) for the WHOLE sampler, and a top that is slow under load must end as "unreadable" (RSS fallback), not as a sampler that missed the deadline
+        got, out = _sh_checked(["top", "-l", "1", "-stats", "pid,mem,cmprs"], timeout=20)
         if not got:
             return None, 0
     cols, tbl, bad = None, {}, 0
