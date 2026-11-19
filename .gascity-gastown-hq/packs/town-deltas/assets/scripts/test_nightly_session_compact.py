@@ -25,6 +25,16 @@ nsc = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(nsc)
 T0 = calendar.timegm((2026, 11, 12, 23, 0, 0))  # 23:00 local (TZ=UTC here)
 IDLE = "✻ Cooked for 3m 1s · done 8:55 PM\n──────\n❯ \n──────\n  ⏵⏵ bypass permissions on (shift+tab to cycle)\n"
+RULE = "─" * 80
+
+
+def real_pane(footer):
+    """The chrome of claude 2.1.310 on the mini, in the shape captured from live panes (scripts/test_claude_crew_account.py REAL_BOX, gate-nudge-receipt.selftest.sh): two status lines
+    between the prompt box and the footer, and `← 1 agent` on every pane captured there. IDLE above is the old synthetic stand-in: it never had the hint, so it never saw the veto."""
+    return "✻ Cooked for 3m 1s · done 8:55 PM\n\n%s\n❯ \n%s\n  👥 0 workers · 🚦 running 2/3 6c179cf040677bf559f74e\n  [Opus 5.5] ctx: 38.0%% (380k/1000k)\n%s\n" % (RULE, RULE, footer)
+
+
+REAL_IDLE = real_pane("  ⏵⏵ bypass permissions on (shift+tab to cycle) · ← 1 agent")
 TS = "2026-11-12T22:00:00Z"
 TMUX = ["tmux", "-L", "gascity", "send-keys", "-t", "=c1:"]
 
@@ -387,13 +397,77 @@ class T(unittest.TestCase):
             self.assertEqual(run(["gc"], 1), (None, ""))
         self.assertEqual(run([sys.executable, "-c", "print('hi'); raise SystemExit(3)"], 20), (3, "hi\n"))
 
-    def test_order_file_fires_at_23h_local_in_utc(self):
+    def test_the_agent_hint_of_the_real_footer_is_not_background_work(self):
+        self.assertTrue(all(s in REAL_IDLE for s in ("← 1 agent", "👥 0 workers", "ctx: 38.0%", "bypass permissions on")))  # the fixture has the captured shape, not the old stand-in's
+        self.assertEqual(nsc.read_pane(REAL_IDLE), ("idle", ""))
+        self.assertEqual(nsc.read_pane(real_pane("  ⏵⏵ bypass permissions on · 2 local agents · ← 1 agent"))[0], "idle")  # a subagent in the background does not veto either
+        for foot, seen in (("3 shells, 1 monitor", "3 shells"), ("1 monitor", "1 monitor")):  # shells and monitors still veto: only the agent hint went
+            state, why = nsc.read_pane(real_pane("  ⏵⏵ bypass permissions on · %s · ← 1 agent" % foot))
+            self.assertEqual(state, "busy", foot)
+            self.assertIn(seen, why)
+        w = self.w()
+        w.add("c1", pane=REAL_IDLE)
+        w.go()
+        self.assertEqual((len(w.nudges()), w.res()["c1"]["result"]), (1, "compacted"))
+
+    def test_order_file_is_a_cooldown_the_dispatcher_can_not_starve(self):
         with open(os.path.join(HERE, "..", "..", "orders", "nightly-session-compact.toml")) as fh:
             txt = fh.read()
-        self.assertEqual(re.search(r'^schedule\s*=\s*"([^"]+)"', txt, re.M).group(1), "0 2 * * *")
-        self.assertIn('trigger = "cron"', txt)
-        self.assertGreaterEqual(int(re.search(r'^timeout\s*=\s*"(\d+)s"', txt, re.M).group(1)), 2400)
-        self.assertTrue(os.path.exists(os.path.join(HERE, re.search(r"assets/scripts/(\S+?\.py)", txt).group(1))))
+        key = lambda k: re.search(r'^%s\s*=\s*"([^"]+)"' % k, txt, re.M).group(1)
+        # a cron order that never ran fires only in its exact minute and the engine looks at an order once per ~35 min (4 dispatches a tick): ~3% a night. A cooldown is due the first time it is looked at.
+        self.assertEqual((key("trigger"), re.search(r"^schedule\s*=", txt, re.M)), ("cooldown", None))
+        self.assertLessEqual(int(key("interval").rstrip("m")), 30)
+        c = nsc.Cfg({})
+        longest = c.early_s + int(nsc.day_epoch(T0, c.win_end) - nsc.day_epoch(T0, c.win_start)) + c.grace_s  # the wait for the window + the window + the grace of the last compaction
+        self.assertGreaterEqual(int(key("timeout").rstrip("s")), longest)
+        self.assertTrue(os.path.exists(os.path.join(HERE, re.search(r"assets/scripts/(\S+?\.py)", key("exec")).group(1))))  # the exec key, not the first mention (a comment)
+
+    def test_a_visit_that_comes_early_waits_for_the_window_and_compacts_inside_it(self):
+        for clock in (T0 - 110 * 60, T0 - 120 * 60):  # 21:10, and 21:00 sharp: the reach of an early visit (NSC_EARLY_S before 22:30) is inclusive
+            w, sent = self.w(), []
+            w.add("c1", idle=3 * 3600)  # idle since before the window opens at 22:30
+            w.t = clock  # the dispatcher visits an order every ~35 min and sometimes only after hours: a visit at 21:10 must not be wasted
+            w.on_nudge = lambda n, w=w, sent=sent: (sent.append(w.t), w.boundary(n))
+            self.assertEqual(w.go(), 0)
+            self.assertEqual(len(sent), 1, w.out)
+            self.assertEqual(w.res()["c1"]["result"], "compacted")
+            self.assertGreaterEqual(sent[0], T0 - 30 * 60)  # nothing is typed before 22:30
+            self.assertIn("early", w.out)
+
+    def test_a_visit_out_of_reach_or_a_dry_run_does_not_wait_and_the_log_says_when(self):
+        for name, env, clock in (("20:00", {}, T0 - 180 * 60), ("23:26", {}, T0 + 26 * 60), ("dry-run at 22:00", {"NSC_DRY_RUN": "1"}, T0 - 60 * 60), ("reach cut to 1 min", {"NSC_EARLY_S": "60"}, T0 - 110 * 60)):
+            w = self.w(**env)
+            w.add("c1", idle=3 * 3600)
+            w.t = clock
+            w.go()
+            self.assertEqual((w.nudges(), w.t, "outside the window" in w.out), ([], clock, True), name)
+            self.assertRegex(w.out, r"now \d\d:\d\d [+-]\d{4}", name)  # every visit leaves its local time: the next night nothing happens, the log shows whether the order was looked at at all
+
+    def test_switching_off_while_waiting_stops_the_wait_and_a_second_run_gives_way(self):
+        w = self.w()
+        w.add("c1", idle=3 * 3600)
+        w.t = T0 - 100 * 60
+        w.events.append((w.t + 20 * 60, lambda: put(os.path.join(w.city, ".gc/nightly-session-compact.off"), "")))
+        w.go()
+        self.assertEqual(w.nudges(), [])
+        self.assertIn("off", w.out)
+        self.assertLess(w.t, T0 - 60 * 60)  # it stopped waiting when the switch appeared
+        w = self.w()
+        w.add("c1", idle=3 * 3600)
+        w.t = T0 - 100 * 60
+        os.makedirs(os.path.join(w.city, ".gc/state"))
+        fd = os.open(os.path.join(w.city, ".gc/state/nightly-session-compact.lock"), os.O_CREAT | os.O_RDWR)
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        self.assertEqual(w.go(), 0)  # the engine's tracking sweep may close an open tracking after 10 min and look again: the second run must not wait too
+        self.assertEqual((w.nudges(), w.t, "in flight" in w.out), ([], T0 - 100 * 60, True))
+        os.close(fd)
+
+    def test_a_switch_that_cannot_be_read_is_off_not_on(self):
+        w = self.w()
+        w.add("c1")
+        os.symlink("nightly-session-compact.off", os.path.join(w.city, ".gc/nightly-session-compact.off"))  # points at itself: stat fails with ELOOP, which is not "absent"
+        self.assertEqual(w.go(), 0)
+        self.assertEqual((w.nudges(), "off (" in w.out), ([], True))
 
     def test_cli_dry_run_end_to_end_on_the_real_clock(self):
         w = self.w()

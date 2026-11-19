@@ -3,20 +3,21 @@
 
 WHY  Athos 12/11: a crew resumes after the 23:40 reboot in its own conversation; if that conversation is huge the resume costs a fortune. So at night every
   big conversation is compacted, finished or not, never cleared. This script edits nothing: it types `/compact` and checks the transcript.
-WHAT  The `gc order` fires at 02:00 UTC (= 23:00 local; order crons are UTC). Targets: gastown.mayor + the named crews of agents/*/agent.toml (the Layer-1 rule
+WHAT  The `gc order` is a cooldown (orders/nightly-session-compact.toml says why not a cron: ga-esorlre.10) that the engine looks at only every ~35 min or worse; the window is
+  HERE (NSC_WINDOW_START/END, local) and a visit up to NSC_EARLY_S (90 min) before it waits for it. Targets: gastown.mayor + the named crews of agents/*/agent.toml (the Layer-1 rule
   of crew-idle-check.sh) read from `gc session list --json`. Each target maps to its live Claude process in ~/.claude/sessions/<pid>.json (tmux session
   name, else the crew's work_dir) and to ~/.claude/projects/*/<sessionId>.jsonl: context = the last assistant usage (input + cache creation + cache read),
   or postTokens of a newer compact_boundary. Context >= NSC_MIN_TOKENS (250000) AND idle => /compact. Nothing starts after NSC_WINDOW_END (23:25 local), at
   most NSC_MAX_PARALLEL (3) run at once, and every outcome (tokens before/after) is one line of .gc/logs/nightly-session-compact.jsonl.
 THREE STATES  Idle needs ALL of: registry status idle for >= NSC_IDLE_MIN_S (no status field: transcript quiet for twice that); the last turn finished
   (assistant end_turn, then turn_duration) and quiet; no background task opened since the process started (transcript pairing); and a pane
-  (`gc session peek`) that is a Claude prompt with nothing running, no dialog, an EMPTY input box (a human draft) and no shell/agent/monitor in the footer.
+  (`gc session peek`) that is a Claude prompt with nothing running, no dialog, an EMPTY input box (a human draft) and no shell/monitor in the footer (`← N agent` is not one).
   Busy is retried on the next pass; unreadable or ambiguous is "unknown": NOT compacted, with the reason in the log. Failure never looks like empty.
 DELIVERY  `gc session nudge <name> /compact --delivery immediate --json`. Proof is in the transcript: a compact_boundary after the offset taken at send
   time = compacted (preTokens/postTokens); a local_command "Error during compaction" = failed (a usage limit repeats: no retry). No sign of life for
   NSC_RETRY_AFTER_S (90, or 20 if the nudge did not type): a working pane counts as life; an idle pane with an empty input box gets ONE retry typed by tmux.
 KNOBS  NSC_ENABLED=0 or $CITY/.gc/nightly-session-compact.off · NSC_DRY_RUN=1 / --dry-run · --force (outside the window) · NSC_MIN_TOKENS · NSC_IDLE_MIN_S ·
-  NSC_WINDOW_START/END (HH:MM local) · NSC_MAX_PARALLEL · NSC_CONFIRM_TIMEOUT_S · NSC_RETRY_AFTER_S · NSC_POLL_S · NSC_PASS_INTERVAL_S · NSC_GRACE_S ·
+  NSC_WINDOW_START/END (HH:MM local) · NSC_EARLY_S (5400) · NSC_MAX_PARALLEL · NSC_CONFIRM_TIMEOUT_S · NSC_RETRY_AFTER_S · NSC_POLL_S · NSC_PASS_INTERVAL_S · NSC_GRACE_S ·
   NSC_GC / NSC_TMUX / NSC_TMUX_SOCKET (gascity) · NSC_HOME · GC_CITY_PATH.  EXIT 0 ran · 2 usage · 3 could not evaluate (roster never readable, lock).
 """
 import argparse
@@ -37,7 +38,9 @@ GLYPH = r"(✻|✽|✳|✶|✢|✺|✹|·|\*)"
 DIALOG_RE = re.compile(r"Do you want to proceed\?|requires confirmation|Enter to select|Esc to cancel")
 BUSY_RE = re.compile(r"(…|\.\.\.)[^(]*\(" + DUR + "|esc to interrupt")
 SPIN_RE = re.compile(r"^\s*" + GLYPH + r"\s+\S+(…|\.\.\.)", re.M)
-FOOT_RE = re.compile(r"\b\d+ (?:shells?|bash(?:es)?|(?:local |remote |background )?agents?|tasks?|monitors?)\b")
+# NOT agents (ga-esorlre.10): the mini's claude draws `· ← 1 agent` on every pane captured there (03/10 and 25/10 fixtures of other scripts, claude 2.1.310), idle, busy and even a crew stopped at
+# its weekly limit with `0 workers`, so it is no sign of work: the dry run of 19/11 vetoed digo-wa, oracle-wa and the Mayor with it. A subagent in the background would not stop a compaction either.
+FOOT_RE = re.compile(r"\b\d+ (?:shells?|bash(?:es)?|tasks?|monitors?)\b")
 START_RE = re.compile(r"\s*(?:Command running in background with ID: |Monitor started \(task )(\w+)")
 DONE_RE, STATUS_RE = re.compile(r"<task-id>(\w+)</task-id>"), re.compile(r"<status>(\w+)</status>")
 ACTIVE_TYPES = ("user", "assistant", "system", "attachment")
@@ -65,6 +68,7 @@ class Cfg:
         self.max_parallel, self.confirm_s = num(g("NSC_MAX_PARALLEL"), 3), num(g("NSC_CONFIRM_TIMEOUT_S"), 900)
         self.retry_s, self.poll_s, self.pass_s = num(g("NSC_RETRY_AFTER_S"), 90), num(g("NSC_POLL_S"), 10), num(g("NSC_PASS_INTERVAL_S"), 120)
         self.grace_s, self.gc_timeout = num(g("NSC_GRACE_S"), 600), num(g("NSC_GC_TIMEOUT_S"), 120)
+        self.early_s = num(g("NSC_EARLY_S"), 5400)  # a visit up to this long BEFORE the window waits for it; the order's timeout must cover it (a test pins that)
         self.enabled, self.dry = g("NSC_ENABLED", "1") != "0", g("NSC_DRY_RUN") == "1"
 
 class RealIO:
@@ -458,27 +462,49 @@ def start(io, cfg, t, info):
             "activity": False, "retried": False, "typed_at": None, "retry_at": now + (cfg.retry_s if oc == "delivered" else 20), "via": "nudge",
             "notes": ["nudge %s %s" % (oc, detail)]}
 
+def is_off(cfg):
+    # vazio (sem o arquivo .off) → ligado; falhou/ilegível (stat com erro que não é «não existe»: permissão, laço de symlink, EIO) → desligado: os.path.exists leria isso como «ausente» e digitaria
+    if not cfg.enabled:
+        return True
+    try:
+        os.stat(os.path.join(cfg.city, ".gc", "nightly-session-compact.off"))
+    except FileNotFoundError:
+        return False
+    except OSError:
+        return True
+    return True
+
 def run(cfg, io, log, force=False):
     now = io.now()
-    if not cfg.enabled or os.path.exists(os.path.join(cfg.city, ".gc", "nightly-session-compact.off")):
+    if is_off(cfg):
         log("off (NSC_ENABLED=0 or the .off file): nothing done")
         return 0
     first, end = day_epoch(now, cfg.win_start), day_epoch(now, cfg.win_end)
     if force:
         first, end = now, now + 1200
-    if not first <= now <= end:
-        log("outside the window %02d:%02d-%02d:%02d local: nothing done (--force overrides)" % (cfg.win_start + cfg.win_end))
+    lead = first - now  # > 0: the window is not open yet
+    # the engine looks at an order about every 35 min (sometimes hours) and a lost visit is a lost night: a visit up to NSC_EARLY_S before the window waits for it. A dry run never waits.
+    if now > end or (lead > 0 and (cfg.dry or lead > cfg.early_s)):
+        at = lambda t, f="%H:%M": time.strftime(f, time.localtime(t))  # a visit outside the window leaves its LOCAL time and UTC offset: the log shows whether the order was looked at at all, and in which zone
+        log("outside the window %02d:%02d-%02d:%02d local (visits from %s; now %s): nothing done (--force overrides)" % (cfg.win_start + cfg.win_end + (at(first - cfg.early_s), at(now, "%H:%M %z"))))
         return 0
     try:
         os.makedirs(os.path.join(cfg.city, ".gc", "state"), exist_ok=True)
         lock = os.open(os.path.join(cfg.city, ".gc", "state", "nightly-session-compact.lock"), os.O_CREAT | os.O_RDWR, 0o644)
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except BlockingIOError:
-        log("another run holds the lock: in flight, nothing done")
+        log("another run holds the lock: in flight, nothing done")  # the lock comes BEFORE the wait: the engine's tracking sweep may close an open tracking after 10 min and look again, that run must not wait too
         return 0
     except OSError as ex:
         log("ERROR: cannot take the instance lock (%s): nothing done" % ex)
         return 3
+    if lead > 0:
+        log("early by %d min: waiting for the window to open at %s" % (lead // 60, time.strftime("%H:%M", time.localtime(first))))
+        while io.now() < first and not is_off(cfg):
+            io.sleep(min(60.0, first - io.now()))
+        if is_off(cfg):
+            log("off (NSC_ENABLED=0 or the .off file): stopped waiting, nothing done")
+            return 0
     log("start: window ends %s, min_tokens=%d idle>=%ds parallel<=%d%s" % (time.strftime("%H:%M", time.localtime(end)), cfg.min_tokens, cfg.idle_s, cfg.max_parallel, " DRY-RUN" if cfg.dry else ""))
     crews = crew_templates(os.path.join(cfg.city, "agents"))
     if crews is None:

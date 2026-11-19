@@ -1,13 +1,18 @@
-# ga-esorlre.4: antes do reboot das 23:40, toda crew nomeada e o Mayor com conversa grande E ociosa recebe `/compact` (nunca /clear) para a retomada
-# depois do boot ser barata (Athos, 12/11: compactar sempre, terminou ou não). ARMADILHA DO CRON (ver engine-window-reboot-noon.toml): cron de order é
-# UTC; 23:00 local (-03) = 02:00 UTC. O script só roda em 22:30-23:25 locais (--force à mão) e a última compactação ainda tem 10 min: acaba antes das 23:40.
-# Só LÊ roster, registros ~/.claude/sessions e transcripts e digita `/compact` em sessão provada ociosa; tokens antes/depois por alvo em
-# .gc/logs/nightly-session-compact.jsonl. Desligar: touch $GC_CITY_PATH/.gc/nightly-session-compact.off. Teste a seco no mini, sem enviar nada, antes da 1ª noite:
-#   python3 -I $GC_CITY_PATH/packs/town-deltas/assets/scripts/nightly-session-compact.py --force --dry-run
-# Mergeado não é vivo: `gc order show nightly-session-compact` e leia o log na manhã seguinte.
+# ga-esorlre.4 / .10: antes do reboot das 23:40, toda crew nomeada e o Mayor com conversa grande E ociosa recebe `/compact` (nunca /clear) para a retomada depois do boot ser
+# barata (Athos, 12/11: compactar sempre, terminou ou não). Só LÊ roster, registros ~/.claude/sessions e transcripts e digita `/compact` em sessão provada ociosa; tokens
+# antes/depois por alvo em .gc/logs/nightly-session-compact.jsonl. Desligar: touch $GC_CITY_PATH/.gc/nightly-session-compact.off.
+#
+# POR QUE COOLDOWN E NÃO CRON (ga-esorlre.10: a versão cron `0 2 * * *` = 23:00 local nunca rodou, sem histórico em 19/11): o despachante do motor inicia no máximo 4 orders
+# por tick e olha cada order uma vez por rotação do cursor (~35 min de mediana, p90 67 min; city.toml ga-ki02nmt e docs/pending-engine-window/ga-ieo0wz1-order-dispatch-cap.README.md).
+# Um cron só dispara no minuto exato quando a order NUNCA rodou (o catch-up de ocorrência perdida precisa de um último run: checkCron em internal/orders/triggers.go, lido na janela 14/11): ~60 s / ~2130 s = ~3 % por noite.
+# O cooldown de uma order que nunca rodou fica devido no primeiro olhar. O horário de verdade é do SCRIPT (NSC_WINDOW_START/END, hora local, 22:30-23:25): fora dele o run só registra a
+# hora local e sai; um olhar até NSC_EARLY_S (90 min) ANTES da janela espera por ela dentro do run. timeout = espera 5400 + janela 3300 + graça da última compactação 600 = 9300 -> 9600 s
+# (um teste amarra isto aos padrões do script). O order-tracking-sweep (--stale-after 10m) pode fechar o rastreio aberto e o motor olhar de novo: o 2º run acha o flock do 1º e sai ("in flight").
+# Teste a seco no mini, sem enviar nada: python3 -I $GC_CITY_PATH/packs/town-deltas/assets/scripts/nightly-session-compact.py --dry-run --force
+# Mergeado não é vivo: `gc order show nightly-session-compact` e leia .gc/logs/nightly-session-compact.log na manhã seguinte (uma linha por visita, com a hora local).
 [order]
-description = "23:00 local: compactar (nunca limpar) a conversa grande e ociosa de cada crew nomeada e do Mayor antes do reboot das 23:40 (ga-esorlre.4)"
-trigger = "cron"
-schedule = "0 2 * * *"
-timeout = "2400s"
+description = "Noite (22:30-23:25 local, olhares a partir das 21:00): compactar (nunca limpar) a conversa grande e ociosa de cada crew nomeada e do Mayor antes do reboot das 23:40 (ga-esorlre.4, .10)"
+trigger = "cooldown"
+interval = "15m"
+timeout = "9600s"
 exec = "python3 -I $PACK_DIR/assets/scripts/nightly-session-compact.py"
