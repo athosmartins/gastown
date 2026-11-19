@@ -469,7 +469,7 @@ PILOT_DISK_LIB="${PILOT_DISK_LIB:-$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/n
 # PILOT_NODE_FIRST=on the sweep goes on as the NODE-ONLY pass (the disk floor's), otherwise it pauses; what already runs is never touched. FAIL-OPEN but not silent (an unreadable RAM dispatches as before and says so;
 # heavy-guard.sh fails CLOSED, per step). The reading is taken once per sweep, so a sweep that starts just over the floor can still open its few sessions.
 # BORN OFF, like the other Pilot switches that change who gets work (PILOT_NODE_FIRST, the WA node route): PILOT_RAM_FLOOR_ENABLED = 0 (the default; empty and any unknown word too) | shadow (reads, and writes the reading on the
-# log every sweep, never acts: the way to compare it with `memory_pressure` by hand) | 1 (acts). Who flips it is a person, in the plist (docs/runbooks/hetzner-capacity.md, "Teto de RAM do mini"). Off, it is also what keeps
+# log every sweep, never acts: the way to compare it with `memory_pressure` by hand) | 1 (acts). Who flips it is a person, in the plist (docs/runbooks/teto-ram-mini.md). Off, it is also what keeps
 # every selftest that runs the dispatcher from depending on how much RAM its host has (the class selftest-disk-pin-class.selftest.sh closes for the disk). The reading is pinned in selftests with
 # PILOT_RAM_AVAIL_OVERRIDE_MB (or RAM_AVAIL_OVERRIDE_MB); RAM_NEW_WORK_MIN_MB tunes the floor.
 PILOT_RAM_FLOOR_ENABLED="${PILOT_RAM_FLOOR_ENABLED:-0}"
