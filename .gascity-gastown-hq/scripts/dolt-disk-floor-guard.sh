@@ -585,6 +585,8 @@ GROWTH_KEEP_PHOTOS="${DOLT_DISK_FLOOR_GROWTH_KEEP_PHOTOS:-20}"
 # Smallest regular file (MB) that _top_open_write_files reports as "held open
 # for write".
 GROWTH_WRITER_MIN_MB="${DOLT_DISK_FLOOR_GROWTH_WRITER_MIN_MB:-100}"
+# How many of the biggest memory footprints (top MEM) the photo records (ga-1p1i5jr.14).
+GROWTH_TOPMEM_N="${DOLT_DISK_FLOOR_GROWTH_TOPMEM_N:-10}"
 
 ts()  { date '+%Y-%m-%d %H:%M:%S'; }
 log() { echo "[$(ts)] $*" >> "$LOG" 2>/dev/null || true; }
@@ -1237,6 +1239,8 @@ _top_disk_consumers() {
 #                                 or garbled is unknown, never a measured 0.
 #   ENT <kb> <path>             — immediate child of the ROOT line above it
 #   WRITERS <ok|unmeasured>     WRITER <mb> <pid> <command> <path>
+#   SWAPFILES <ok N|unmeasured> SWAPFILE <bytes|?> <mtime epoch|?> <name>   — the swapfile<N> files of /System/Volumes/VM (ga-1p1i5jr.14)
+#   TOPMEM <ok|unmeasured>      TOPMEM_ROW <pid> <MEM> <CMPRS> <launchd label|-> <command, cut at 200>   — the GROWTH_TOPMEM_N biggest footprints
 # "Unmeasured" is always a STATUS, a count that is not 0, or an absent line, never a
 # 0: a root that timed out keeps the rows that finished and says PARTIAL; one the
 # budget never reached says SKIPPED; the diff refuses to call an entry "new" when
@@ -1444,6 +1448,35 @@ _top_open_write_files() {
   return 0
 }
 
+# _growth_swapfiles → the swapfile<N> files of /System/Volumes/VM (GROWTH_VM_DIR is the test seam) for the photo: `SWAPFILES\tok\t<n>`, then `SWAPFILE\t<bytes>\t<mtime epoch>\t<name>` per file
+# (BSD `stat -f '%z %m'`: this guard runs on the mini). Each 1 GB of swap is one file there and macOS gives them back only at reboot, so the count and the mtimes say WHEN the swap grew (the
+# du total of VM_DIR_KB cannot). Three states: a directory with none is a MEASURED zero; a directory that cannot be listed → `SWAPFILES\tunmeasured`, never ok 0; a file whose stat fails
+# keeps its row with `?` for size and mtime, never 0.
+_growth_swapfiles() {
+  local dir="${GROWTH_VM_DIR:-/System/Volumes/VM}" names n f st
+  names="$(ls -1 "$dir" 2>/dev/null)" || { printf 'SWAPFILES\tunmeasured\n'; return 0; }
+  names="$(printf '%s\n' "$names" | awk '/^swapfile[0-9]+$/')"
+  n="$(printf '%s\n' "$names" | grep -c .)"
+  printf 'SWAPFILES\tok\t%s\n' "$n"
+  if [ "$n" = 0 ]; then return 0; fi
+  printf '%s\n' "$names" | while IFS= read -r f; do
+    st="$(stat -f '%z %m' "$dir/$f" 2>/dev/null)" || st=""
+    set -- $st
+    if [ "$#" = 2 ] && [ -z "${1//[0-9]/}" ] && [ -z "${2//[0-9]/}" ]; then printf 'SWAPFILE\t%s\t%s\t%s\n' "$1" "$2" "$f"
+    else printf 'SWAPFILE\t?\t?\t%s\n' "$f"; fi
+  done
+}
+
+# _growth_topmem → the biggest footprints for the photo: `TOPMEM\tok` then `TOPMEM_ROW\t<pid>\t<MEM>\t<CMPRS>\t<label>\t<command>` (command cut at 200: a claude argv carries its whole prompt, ~45 KB),
+# or `TOPMEM\tunmeasured` when _top_mem_processes printed nothing (top failed or was not its table): never "ok" with no rows. MEM already includes the compressed memory, CMPRS sits beside it.
+_growth_topmem() {
+  local rows
+  rows="$(_top_mem_processes "$GROWTH_TOPMEM_N")"
+  if [ -z "$rows" ]; then printf 'TOPMEM\tunmeasured\n'; return 0; fi
+  printf 'TOPMEM\tok\n'
+  printf '%s\n' "$rows" | awk '{ pid = $1; mem = $3; cmprs = $4; lab = $5; $1 = $2 = $3 = $4 = $5 = ""; sub(/^ +/, ""); printf "TOPMEM_ROW\t%s\t%s\t%s\t%s\t%s\n", pid, mem, cmprs, lab, substr($0, 1, 200) }'
+}
+
 # _disk_growth_photo <outfile> [writers] [budget_secs] → reads the roots (one per
 # line) from STDIN and writes the photo (format above) to <outfile>, atomically
 # (tmp + mv, so a reader never sees half a photo). Pass "writers" to also record
@@ -1467,6 +1500,8 @@ _disk_growth_photo() {
     printf 'AVAIL_GB\t%s\n' "$(_avail_gb "$DOLTDIR")"
     printf 'VM_SWAP\t%s\n' "$(sysctl -n vm.swapusage 2>/dev/null | tr '\t\n' '  ')"
     printf 'VM_DIR_KB\t%s\n' "$vm_kb"
+    _growth_swapfiles
+    _growth_topmem
     while IFS= read -r root; do
       [ -z "$root" ] && continue
       left=$(( budget - (SECONDS - start) ))
@@ -1596,6 +1631,31 @@ _growth_delta() {
   printf '%s\n' "$rows" | awk -F'\t' '$1 == "V" || $1 == "U" || $1 == "E"'
 }
 
+# _growth_vm_report <baseline|""> <now> → the swapfile count (now vs the baseline, and how long before the photo the newest was written) and the biggest memory footprints of ONE photo, as report lines.
+# An unmeasured block is SAID, never shown as 0 or as an empty list. No date command: the age comes from the photo's own TS (BSD and GNU `date` disagree).
+_growth_vm_report() {
+  local base="$1" now="$2" nts nn bn newest age=""
+  nts="$(awk -F'\t' '$1 == "TS" { print $2; exit }' "$now" 2>/dev/null)"
+  nn="$(awk -F'\t' '$1 == "SWAPFILES" { print ($2 == "ok" ? $3 : "?"); exit }' "$now" 2>/dev/null)"
+  bn="$([ -s "$base" ] && awk -F'\t' '$1 == "SWAPFILES" { print ($2 == "ok" ? $3 : "?"); exit }' "$base" 2>/dev/null)"
+  case "$nn" in
+    ''|'?') echo "  (swapfiles of /System/Volumes/VM NOT measured in this photo — the count is unknown, not zero)" ;;
+    *)
+      newest="$(awk -F'\t' '$1 == "SWAPFILE" && $3 ~ /^[0-9]+$/ && $3 + 0 > m { m = $3 + 0 } END { if (m) print m }' "$now" 2>/dev/null)"
+      case "$nts:$newest" in *[!0-9:]*|:*|*:) ;; *) age="; the newest was written $(( (nts - newest) / 60 )) min before this photo" ;; esac
+      case "$bn" in
+        ''|'?') echo "  swapfiles of /System/Volumes/VM: ${nn} now (the baseline did not measure them)$age" ;;
+        *) echo "  swapfiles of /System/Volumes/VM: ${nn} now, ${bn} at the baseline ($(printf '%+d' $(( nn - bn ))))$age" ;;
+      esac ;;
+  esac
+  if [ "$(awk -F'\t' '$1 == "TOPMEM" { print $2; exit }' "$now" 2>/dev/null)" = ok ]; then
+    echo "  top memory footprint now (MEM already includes the compressed memory; CMPRS beside it, never added):"
+    awk -F'\t' '$1 == "TOPMEM_ROW" { printf "    %s (%s compressed)  pid %s  %s\n", $3, $4, $2, $6 }' "$now"
+  else
+    echo "  (top memory footprint NOT measured in this photo)"
+  fi
+}
+
 # _growth_report <baseline> <now> → the human text for a finished photo. With a
 # baseline: the growers (or an explicit "nothing >= N MB grew in the comparable
 # roots"), the VM delta, and every root that could not be compared. Without one
@@ -1618,6 +1678,7 @@ _growth_report() {
       echo "That list is INCOMPLETE — this photo did not measure everything:"
       printf '%s\n' "$u"
     fi
+    _growth_vm_report "" "$now"
     return 0
   fi
   bts="$(awk -F'\t' '$1 == "TS" { print $2; exit }' "$base" 2>/dev/null)"
@@ -1647,6 +1708,7 @@ _growth_report() {
   fi
   v="$(printf '%s\n' "$delta" | awk -F'\t' '$1 == "V" { printf "  /System/Volumes/VM: %sMB now, %+dMB vs baseline (%sMB)\n", $3, $2, $4 }')"
   if [ -n "$v" ]; then printf '%s\n' "$v"; fi
+  _growth_vm_report "$base" "$now"
   # A comparison that could not be made says so: its ABSENCE from this report must
   # never read as "that did not grow". The delta stays silent on both (it only emits
   # what it could compare), so they are read straight from the two photos here.

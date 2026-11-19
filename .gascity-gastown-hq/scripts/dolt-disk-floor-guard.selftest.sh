@@ -2165,6 +2165,67 @@ grep -q "^VM_DIR_KB${TAB}" "$PH" && grep -q "^VM_SWAP${TAB}" "$PH" \
   && ok "_disk_growth_photo: records VM_SWAP and VM_DIR_KB (the vm.swapusage + /System/Volumes/VM half of the bead)" \
   || bad "_disk_growth_photo: VM lines missing"
 
+# ── ga-1p1i5jr.14: the photo also records the swapfiles of /System/Volumes/VM (count, size, mtime: macOS gives each 1 GB file back only at reboot, so the mtimes say WHEN the swap grew) and the
+#    10 biggest footprints (top MEM, which already includes the compressed memory; CMPRS beside it). `stat` here is the node's shim for BSD `stat -f '%z %m'` (the mini has the real one) ──
+SWD="$GROW_TMP/vm"; mkdir -p "$SWD" "$GROW_TMP/vm-empty"
+for i in 0 1 2; do head -c 1024 /dev/zero > "$SWD/swapfile$i"; done; echo x > "$SWD/notaswapfile"; : > "$SWD/swapfile.bak"
+touch -d @1795100000 "$SWD/swapfile0"; touch -d @1795103000 "$SWD/swapfile1"; touch -d @1795104000 "$SWD/swapfile2"
+stat() { if [ "${1:-}" = -f ]; then [ "${STAT_FAIL:-}" = "$(basename "$3")" ] && return 1; [ "${STAT_JUNK:-}" = "$(basename "$3")" ] && { echo "abc def"; return 0; }; [ "${STAT_JUNK1:-}" = "$(basename "$3")" ] && { echo "abc 123"; return 0; }; [ "${STAT_JUNK2:-}" = "$(basename "$3")" ] && { echo "123 def"; return 0; }; [ "${STAT_ONE:-}" = "$(basename "$3")" ] && { echo 1024; return 0; }; command stat -c '%s %Y' "$3"; else command stat "$@"; fi; }
+sw_out="$(GROWTH_VM_DIR="$SWD" _growth_swapfiles)"
+[ "$sw_out" = "$(printf 'SWAPFILES\tok\t3\nSWAPFILE\t1024\t1795100000\tswapfile0\nSWAPFILE\t1024\t1795103000\tswapfile1\nSWAPFILE\t1024\t1795104000\tswapfile2')" ] \
+  && ok "swapfiles: count + size + mtime per swapfile<N>, in order; a README and swapfile.bak in the same directory are not swapfiles" \
+  || bad "swapfiles: wrong rows: $(printf '%s' "$sw_out" | tr '\n' '|')"
+[ "$(GROWTH_VM_DIR="$GROW_TMP/vm-empty" _growth_swapfiles)" = "$(printf 'SWAPFILES\tok\t0')" ] && ok "swapfiles: a directory with none is a MEASURED zero" || bad "swapfiles: empty directory should be ok 0"
+[ "$(GROWTH_VM_DIR="$GROW_TMP/no-such-vm" _growth_swapfiles)" = "$(printf 'SWAPFILES\tunmeasured')" ] && ok "swapfiles: a directory that cannot be listed is UNMEASURED, never ok 0" || bad "swapfiles: missing directory must be unmeasured"
+sw_out="$(STAT_FAIL=swapfile1 GROWTH_VM_DIR="$SWD" _growth_swapfiles)"
+[ "$(printf '%s\n' "$sw_out" | sed -n 1p)" = "$(printf 'SWAPFILES\tok\t3')" ] && [ "$(printf '%s\n' "$sw_out" | sed -n 3p)" = "$(printf 'SWAPFILE\t?\t?\tswapfile1')" ] \
+  && ok "swapfiles: a file whose stat fails keeps its place and its size/mtime are '?', never 0" || bad "swapfiles: stat failure mishandled: $(printf '%s' "$sw_out" | tr '\n' '|')"
+for junk in STAT_JUNK STAT_JUNK1 STAT_JUNK2 STAT_ONE; do
+  sw_out="$(eval "$junk=swapfile1 GROWTH_VM_DIR=\"$SWD\" _growth_swapfiles")"
+  [ "$(printf '%s\n' "$sw_out" | sed -n 3p)" = "$(printf 'SWAPFILE\t?\t?\tswapfile1')" ] && ok "swapfiles: a stat that prints $junk (not 'size mtime') is '?', never a number" || bad "swapfiles: $junk mishandled: $(printf '%s' "$sw_out" | tr '\n' '|')"
+done
+[ "$GROWTH_TOPMEM_N" = 10 ] && ok "photo: records the 10 biggest footprints by default" || bad "photo: GROWTH_TOPMEM_N is '$GROWTH_TOPMEM_N', expected 10"
+top() {
+  cat <<'TOPFIX'
+Processes: 400 total, 3 running, 397 sleeping, 2000 threads
+PhysMem: 16G used, 200M unused.
+
+PID    PPID  COMMAND      MEM   CMPRS
+89690  1     Python       22G   20G
+51664  1     dolt         584M  12M
+11357  1     claude       253M  4M
+TOPFIX
+}
+PHM="$GROW_TMP/photo-mem.txt"; printf '%s\n' "$GR" | GROWTH_VM_DIR="$SWD" _disk_growth_photo "$PHM"
+[ "$(awk -F'\t' '$1 == "SWAPFILES" { print $2 "/" $3 }' "$PHM")" = "ok/3" ] && [ "$(grep -c '^SWAPFILE'"$TAB" "$PHM")" = 3 ] && ok "photo: carries the SWAPFILES block" || bad "photo: SWAPFILES block missing: $(grep '^SWAPFILE' "$PHM" | tr '\n' '|')"
+[ "$(awk -F'\t' '$1 == "TOPMEM" { print $2 }' "$PHM")" = ok ] && [ "$(awk -F'\t' '$1 == "TOPMEM_ROW" { n++ } END { print n }' "$PHM")" = 3 ] \
+  && [ "$(awk -F'\t' '$1 == "TOPMEM_ROW" && $2 == 89690 { print $3 "/" $4 }' "$PHM")" = "22G/20G" ] && ok "photo: TOPMEM rows carry pid, MEM and CMPRS (the compressed beside the footprint, not added)" || bad "photo: TOPMEM block wrong: $(grep '^TOPMEM' "$PHM" | tr '\n' '|')"
+ps() { [ "$*" = "-o command= -p 89690" ] && head -c 5000 /dev/zero | tr '\0' x; }
+printf '%s\n' "$GR" | GROWTH_VM_DIR="$SWD" _disk_growth_photo "$PHM"
+[ "$(awk -F'\t' '$1 == "TOPMEM_ROW" && $2 == 89690 { print length($6) }' "$PHM")" = 200 ] && ok "photo: a command line (a claude argv can be 45 KB) is cut at 200 characters in TOPMEM_ROW" || bad "photo: TOPMEM_ROW command not cut at 200: $(awk -F'\t' '$1 == "TOPMEM_ROW" { print length($6) }' "$PHM" | tr '\n' ' ')"
+unset -f ps
+top() { echo "not top output"; }
+printf '%s\n' "$GR" | GROWTH_VM_DIR="$SWD" _disk_growth_photo "$PHM"
+[ "$(awk -F'\t' '$1 == "TOPMEM" { print $2 }' "$PHM")" = unmeasured ] && ! grep -q "^TOPMEM_ROW" "$PHM" && ok "photo: a top that fails is UNMEASURED (no rows), the rest of the photo still written" || bad "photo: top failure mishandled"
+unset -f top
+# the report: both photos measured, the baseline without the block, and a photo that did not measure either
+printf 'TS\t1000\nSWAPFILES\tok\t2\nSWAPFILE\t1\t900\tswapfile0\n' > "$GROW_TMP/vr-base.txt"
+printf 'TS\t4200\nSWAPFILES\tok\t5\nSWAPFILE\t1\t900\tswapfile0\nSWAPFILE\t1\t4020\tswapfile4\nTOPMEM\tok\nTOPMEM_ROW\t89690\t22G\t20G\t-\t/usr/bin/python3 build.py\n' > "$GROW_TMP/vr-now.txt"
+vr="$(_growth_vm_report "$GROW_TMP/vr-base.txt" "$GROW_TMP/vr-now.txt")"
+case "$vr" in *"swapfiles of /System/Volumes/VM: 5 now, 2 at the baseline (+3); the newest was written 3 min before this photo"*) ok "report: swapfile count now vs baseline, and how long ago the newest was written" ;; *) bad "report: swapfile line wrong: $vr" ;; esac
+case "$vr" in *"22G (20G compressed)  pid 89690  /usr/bin/python3 build.py"*) ok "report: the top footprint rows, CMPRS beside MEM" ;; *) bad "report: top rows wrong: $vr" ;; esac
+vr="$(_growth_vm_report "" "$GROW_TMP/vr-now.txt")"
+case "$vr" in *"5 now (the baseline did not measure them)"*) ok "report: no baseline photo -> says the baseline did not measure them" ;; *) bad "report: no-baseline line wrong: $vr" ;; esac
+printf 'TS\t4200\nSWAPFILES\tunmeasured\nTOPMEM\tunmeasured\n' > "$GROW_TMP/vr-none.txt"
+vr="$(_growth_vm_report "$GROW_TMP/vr-base.txt" "$GROW_TMP/vr-none.txt")"
+case "$vr" in *"swapfiles of /System/Volumes/VM NOT measured in this photo — the count is unknown, not zero"*"top memory footprint NOT measured in this photo"*) ok "report: unmeasured is said, never shown as 0 or as an empty list" ;; *) bad "report: unmeasured lines wrong: $vr" ;; esac
+rep="$(_growth_report "$GROW_TMP/vr-base.txt" "$GROW_TMP/vr-now.txt")"
+case "$rep" in *"swapfiles of /System/Volumes/VM: 5 now"*) ok "_growth_report with a baseline includes the swapfile/top block" ;; *) bad "_growth_report (baseline) lacks the swapfile/top block" ;; esac
+rep="$(_growth_report "$GROW_TMP/missing-base.txt" "$GROW_TMP/vr-now.txt")"
+case "$rep" in *"swapfiles of /System/Volumes/VM: 5 now (the baseline did not measure them)"*) ok "_growth_report without a baseline includes it too" ;; *) bad "_growth_report (no baseline) lacks the swapfile/top block" ;; esac
+unset -f stat
+
+
 printf '%s\n' "$GR" | _disk_growth_photo "$GROW_TMP/photo-budget.txt" "" 0
 if grep -q "^ROOT${TAB}SKIPPED${TAB}$GR" "$GROW_TMP/photo-budget.txt" && [ "$(grep -c '^ENT' "$GROW_TMP/photo-budget.txt")" = "0" ]; then
   ok "_disk_growth_photo: a spent budget records every remaining root SKIPPED — explicit 'not measured', no ENT rows, never a silent zero"
