@@ -258,7 +258,9 @@ run_topup() { # $1 = teto local (vazio = sem teto) · $2 = max do pool · $3.. =
     log()  { echo "LOG $*" >> "$WORK/lines.txt"; }
     warn() { echo "WARN $*" >> "$WORK/lines.txt"; }
     eval "$PLB_INIT"
-    for _f in "$FUNC_JSON" "$FUNC_LIVE" "$FUNC_MAX" "$FUNC_GATE" "$FUNC_NOTE" "$FUNC_VSC" "$FUNC_GVSC" "$FUNC_SLOW" "$FUNC_TIMING" "$FUNC_TOPSPAWN" "$FUNC_TOPUP"; do eval "$_f"; done
+    for _f in "$FUNC_JSON" "$FUNC_LIVE" "$FUNC_VSC" "$FUNC_GVSC" "$FUNC_SLOW" "$FUNC_TIMING" "$FUNC_TOPSPAWN" "$FUNC_TOPUP"; do eval "$_f"; done
+    # as funções do teto local ficam de fora num harness "antigo" (TOPUP_NO_LB_FUNCS=1): é como os selftests antigos extraem o top-up
+    [ -n "${TOPUP_NO_LB_FUNCS:-}" ] || { eval "$FUNC_MAX"; eval "$FUNC_GATE"; eval "$FUNC_NOTE"; }
     # o bind real tira a bead claimada da consulta: a próxima "pendente" é OUTRA bead (sem isto o freio ga-qnarixf de "uma sessão por bead por passada" para o laço sozinho)
     _PN=1
     _topup_bind_after_spawn() { _PN=$((_PN + 1)); PILOT_TEST_WA_WORKER_TOPUP_PENDING="wa-pend$_PN"; PILOT_TEST_PS_WORKER_TOPUP_PENDING="ps-pend$_PN"; return 0; }
@@ -285,6 +287,9 @@ run_topup 1 3 wa-worker
 reset; roster
 run_topup 3 3 wa-worker
 [ "$(spawns)" = 3 ] && ok "controle: o mesmo pool com teto local 3 abre as 3 (a bead pendente muda a cada spawn, o laço roda)" || bad "controle do laço do top-up: esperava 3 spawns com teto 3, deu $(spawns)"
+reset; roster
+TOPUP_NO_LB_FUNCS=1 run_topup 1 3 wa-worker
+[ "$(spawns)" = 3 ] && ok "harness antigo (as funções do teto local NÃO estão definidas: é o caso dos selftests que extraem só _pilot_pool_topup): o laço segue como sempre — rc 127 não é 'cheio'" || bad "função ausente parou o laço do top-up ($(spawns) spawns, esperava 3)"
 reset; roster gastown.dog:active
 run_topup "" 2 wa-worker
 [ "$(spawns)" = 2 ] && ok "sem PILOT_LOCAL_BUILDER_MAX: o top-up é o de antes (enche o pool de 2 mesmo com um dog vivo)" || bad "sem teto o top-up barrou ($(spawns) spawns, esperava 2)"
@@ -380,7 +385,7 @@ open(sys.argv[4],"w",encoding="utf-8").write(s.replace(sys.argv[2],sys.argv[3]))
   mutant "braço: cheio não conta como fila de capacidade" '       _pilot_release_pool_cap_queued "$_id" "$_city" "$_bt"' '       _pilot_release_count_unreadable "$_id" "$_city" "$_bt"'
   mutant "braço: cheio deixa abrir" $'       case "$_bt" in gastown.dog|gastown.dog-*) _PLB_DOG_FULL=1 ;; esac\n       return 1 ;;\n  esac' $'       case "$_bt" in gastown.dog|gastown.dog-*) _PLB_DOG_FULL=1 ;; esac\n       return 0 ;;\n  esac'
   mutant "top-up ignora o teto antes do laço" '  elif [ "$_PLB_RC" = 1 ]; then' '  elif false; then'
-  mutant "top-up não para quando o spawn enche o teto" '      [ "$_PLB_RC" = 0 ] || break' '      :'
+  mutant "top-up não para quando o spawn enche o teto" '      case "$_PLB_RC" in 1|2) break ;; esac' '      :'
   mutant "empréstimo ignora o teto local" '    if [ -z "${_PLB_MAX:-}" ] || [ $(( _PLB_N + ${_PDL_LENT:-0} )) -lt "$_PLB_MAX" ]; then return 0; fi' '    return 0'
   mutant "empréstimo não conta o que a varredura emprestou" '[ $(( _PLB_N + ${_PDL_LENT:-0} )) -lt "$_PLB_MAX" ]; then return 0; fi' '[ "$_PLB_N" -lt "$_PLB_MAX" ]; then return 0; fi'
   mutant "sem o pulo pré-claim em dispatch_lane" 'if [ "$_mbp_pass" != 1 ] && _pilot_local_builder_full_pre "$pick"; then' 'if false; then'

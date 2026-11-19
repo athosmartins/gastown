@@ -182,7 +182,8 @@ need() { # need <fn>... — echoes the sources; records (does not abort on) a mi
 prelude_for() { # sets PRELUDE and TOPUP_VARS from $DISP
   MISSING=""
   PRELUDE="$(need rig_to_builders wa_worker_template _pilot_rig_builds_pool _topup_rig_serves_pool _topup_exclude_braked \
-                  _topup_validate_input _topup_pick_first _topup_rig_pending _pilot_pool_topup)
+                  _topup_validate_input _topup_pick_first _topup_rig_pending _pilot_pool_topup \
+                  _pilot_local_builder_max _pilot_local_builder_gate _pilot_local_builder_note_spawn)
 # ga-vp2zr0: the HQ query is gated by _topup_hq_serves_pool (does this pool read the HQ store?), and wa-worker / ps-worker
 # do NOT, which is the fix. This selftest is about the ORDER of the candidates the HQ query returns (the pick, the window,
 # the epic filter), so its sandbox pools are given HQ-reading workers. The gate itself, real, with the pool -> rig -> store

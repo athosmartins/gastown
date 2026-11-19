@@ -11868,7 +11868,8 @@ _pilot_pool_topup() {
       _topup_bind_after_spawn "$_pool" "$_pending" || true
       _live=$((_live + 1))
       _global=$((_global + 1))
-      # ga-2hd02v.17: o spawn sobe o número da varredura; com o teto local agora cheio (ou sem leitura) o laço para — o próximo pool também fecha no portão acima
+      # ga-2hd02v.17: o spawn sobe o número da varredura; com o teto local agora cheio (rc 1) ou sem leitura (rc 2) o laço para — o próximo pool também fecha no portão acima. Só 1 e 2 param: sem teto (rc 0) ou com
+      # a função ausente (rc 127: os selftests que extraem _pilot_pool_topup sozinhos) o laço segue como sempre.
       _pilot_local_builder_note_spawn
       _PLB_RC=0; _pilot_local_builder_gate cached || _PLB_RC=$?
       # ga-5fn5p3: the dispatch lanes later in this sweep read the per-pool live count from the cache the scan above warmed
@@ -11877,7 +11878,7 @@ _pilot_pool_topup() {
         wa-worker) if [ -n "${_PCAP_LIVE_WA:-}" ]; then _PCAP_LIVE_WA=$(( _PCAP_LIVE_WA + 1 )); fi ;;
         ps-worker) if [ -n "${_PCAP_LIVE_PS:-}" ]; then _PCAP_LIVE_PS=$(( _PCAP_LIVE_PS + 1 )); fi ;;
       esac
-      [ "$_PLB_RC" = 0 ] || break
+      case "$_PLB_RC" in 1|2) break ;; esac
     else
       break
     fi

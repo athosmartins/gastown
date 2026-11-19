@@ -55,7 +55,8 @@ need() { # need <fn>... — the sources; a missing function is recorded, not fat
 }
 FUNCS="$(need _pilot_pool_topup _pilot_topup_spawn _pilot_slow_spawn_budget_spent _pilot_note_spawn_timing \
               _topup_bind_after_spawn _topup_bind_claim _topup_session_for _topup_pending_store _topup_note_spawn \
-              _topup_worker_probe_migrated _topup_exclude_braked _topup_validate_input _topup_rig_pending)"
+              _topup_worker_probe_migrated _topup_exclude_braked _topup_validate_input _topup_rig_pending \
+              _pilot_local_builder_max _pilot_local_builder_gate _pilot_local_builder_note_spawn)"
 if [ -n "$MISSING" ]; then
   echo "FATAL: not found in $DISPATCHER:$MISSING (extraction pattern drifted?)" >&2
   exit 2
