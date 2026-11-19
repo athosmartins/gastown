@@ -2,7 +2,7 @@
 # heavy-guard.sh (ga-vln2py, P0) — keep a HEAVY step from starting on the mini while the disk is near the floor.
 #
 # ## Contents
-#   Why · Usage · Exit codes · What counts as heavy · Go class · Push class · File-cap class · Disk-watch class · Where it is wired · Lib lookup · Not covered
+#   Why · Usage · Exit codes · What counts as heavy · Go class · Push class · File-cap class · Disk-watch class · RAM class · Where it is wired · Lib lookup · Not covered
 #
 # WHY. 17/10 12:40-12:56 three agent steps (a git repack, a selftest copying hq.jsonl, `go build` + golangci-lint of
 # the beads repo) ran with the disk already low and filled it: Dolt took ENOSPC writing its journal and the data
@@ -10,7 +10,7 @@
 # mattered, so this is a command, not a paragraph: it checks `df` and either runs the step or says no.
 #
 # USAGE
-#   heavy-guard.sh [--min-free-mb N] [--wait-secs S] [--max-file-mb M] [--max-disk-drop-mb D] [--what LABEL] -- <command> [args...]
+#   heavy-guard.sh [--min-free-mb N] [--wait-secs S] [--max-file-mb M] [--max-disk-drop-mb D] [--ram-mb R] [--what LABEL] -- <command> [args...]
 #       free >= N  -> runs the command (exec) and returns its exit code.
 #       free <  N  -> waits up to S seconds (default 0) for the disk to recover, then refuses WITHOUT running it.
 #   heavy-guard.sh --check [--min-free-mb N] [--wait-secs S] [--what LABEL]
@@ -27,14 +27,14 @@
 # EXIT CODES (deliberately OUTSIDE mbp-run.sh's 96..99, which mean "run it locally" — a refusal here must never be
 # read as that):
 #   <command's own>  0..74, 77, 80.. (propagated) when it ran (78 and 79 are the push class's own, below)
-#   75  LOW      the disk is below the floor and stayed there for the whole wait. NOT a failure of the step: do not
+#   75  LOW      the disk is below the floor and stayed there for the whole wait (or, RAM class: the RAM is short / the job is too big for the mini). NOT a failure of the step: do not
 #                run it here by another route. Send it to the Linux node when it can go there
 #                (scripts/mbp-run.sh --repo hq --dir <worktree> -- scripts/X.selftest.sh), send a Go build/test to the
 #                MacBook (scripts/mbp-run.sh --exec --go ..., see "GO CLASS"; golangci-lint has no remote today), or
 #                wait for the disk and try again; tell the Mayor if it stays low.
 #   76  UNKNOWN  no usable reading of the disk. The step is refused too — fail CLOSED, because the command this
 #                guards fails by ENOSPC on the database — and the line says so. Also: the file-size cap (below) was asked for
-#                and could not be set, or could not be read back.
+#                and could not be set, or could not be read back. RAM class: the free RAM, the RAM lib or the host could not be read.
 #   64  usage    bad flag / no command and no --check.
 #   78  INTERRUPTED (push class, and the selftest/mutant class) the disk fell UNDER DISK_PUSH_STOP_MB while the step ran (the selftest/mutant
 #                class: or fell by more than the drop limit since it started, see "DISK-WATCH CLASS") and the guard stopped it. This is not "try
@@ -145,6 +145,16 @@
 #   - limits: the fall is read on the whole volume, so another process writing at the same time counts against the step; the step runs in the background of the
 #     guard, so it cannot read the terminal; a guard that is KILLed (not TERMed: no trap runs) leaves its step running, and the watch stays with it and goes on
 #     reading the disk until the step ends. --check runs nothing, so it has nothing to watch: it accepts the option and only judges the disk.
+#
+# RAM CLASS (ga-1p1i5jr.14). 19/11 the mini grew permanent 1 GB swapfiles in /System/Volumes/VM (macOS gives them back only at reboot; ~1 GB/h of disk) from a hand-run
+# 2.1 GB build and from the sum of sessions; RSS and vm.swapusage hide it. A step is in the class when it declares --ram-mb R (R > 0), or by itself when it runs python, node or
+# duckdb (a WORD of the command, a path before it counts, also inside `sh -c '…'`; a git command or a selftest/mutant step is never in it by itself). A Go step and a push never are:
+# they have their own routes. It is refused with rc 75 and "run it on the Hetzner node" when it declares R >= RAM_JOB_MAX_MB (1024: a build/backfill that big never runs on the mini)
+# or when the free RAM (ram-headroom-lib.sh: memory_pressure x hw.memsize) is under RAM_NEW_WORK_MIN_MB (2048) + R. No waiting: the answer is the node, not a later retry. Three states:
+# a reading, a lib or a host (uname) it cannot get is rc 76 for a step IN the class, and changes nothing for any other. Only a Darwin host is checked (on Linux, the node, there is nothing to refuse).
+# --ram-mb 0 is the explicit opt-out for a false match; RAM_HEADROOM_ENABLED=0 is the visible kill switch (selftests only). --check judges only a declared --ram-mb (no command to read).
+# The RAM lib is the sibling of the disk lib (same directory; HEAVY_GUARD_RAM_LIB pins it) and is read only by a step in the class. A python/node/duckdb step the matcher cannot see
+# (`uv run`, `npm run build`, a script that starts one inside) is marked with --ram-mb R, and a step that is not run under this guard is not covered.
 #
 # WHERE IT IS WIRED. jsonl-archive-compact.selftest.sh (--check at the top); the doctrine paragraph in
 # packs/town-deltas/template-fragments/town-deltas.template.md and the HQ SELFTESTS text of the gate
@@ -305,6 +315,19 @@ hg_selftest_step() {
   return 1
 }
 
+# hg_ram_step <command...> — rc 0 when the command runs python, node or duckdb (see "RAM CLASS"), else rc 1. Pure bash like the other matchers: ; & | ( ) ` " ' become spaces, then one of the
+# three as a WORD (a path before it counts). A git command is never in the class. A miss only leaves a step unchecked, as before this class (mark it --ram-mb); a false match only refuses
+# it on a short RAM (--ram-mb 0 lifts it). vazio (no command words) → rc 1; falhou cannot happen (nothing is read from a file, the disk or an outside command)
+hg_ram_step() {
+  local norm seps cre
+  case "${1:-}" in git|*/git) return 1 ;; esac
+  seps=$';&|()`"\''
+  norm=" $* "
+  norm="${norm//[$seps]/ }"
+  cre='[[:space:]/](python[0-9.]*|nodejs|node|duckdb)[[:space:]]'
+  [[ $norm =~ $cre ]]
+}
+
 # hg_apply_fcap <MB> — ulimit -f for this shell, which becomes the command. Returns 0 when the cap in force is at most <MB> (set now, or a
 # tighter HARD limit that ulimit would not let go; a tighter soft-only limit is raised to <MB> with the hard one), else rc 1. The caller refuses with 76 on rc 1: a cap that was asked for is never silently absent.
 # bash counts ulimit -f in 1024-byte blocks (512 in POSIX mode: then both the set and the read-back are in 512s, and the cap is tighter, never looser)
@@ -321,6 +344,52 @@ hg_log() {
   # best effort by design: the verdict was already reached, a full disk is exactly when this write fails
   mkdir -p "$(dirname "$HG_LOG")" 2>/dev/null || return 0
   printf '%s heavy-guard: %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$*" >> "$HG_LOG" 2>/dev/null || true
+}
+
+HG_RAM_WHERE="Run it on the Hetzner node, not here: hand it to the node pool as a bead (dog-remote / wa-worker-remote, docs/runbooks/hetzner-wa-node.md), or scripts/mbp-run.sh --repo <wa|ps|hq> --dir <worktree> -- <test args> for a test run. Do NOT run it on this machine by another route; if it cannot go to the node, tell the Mayor."
+HG_RAM_WHY="19/11 batch jobs and the sum of sessions made the mini grow permanent 1 GB swapfiles in /System/Volumes/VM, which macOS gives back only at reboot (~1 GB/h of disk)"
+
+# hg_ram_gate — the decision of the RAM class (see "RAM CLASS"): returns 0 to go on, or exits 75 (RAM short / job too big) or 76 (cannot tell). Reads $what and $ram_mb (0 = nothing declared).
+hg_ram_gate() {
+  local lib="${HEAVY_GUARD_RAM_LIB:-$(dirname "$HG_LIB")/ram-headroom-lib.sh}" free need
+  # vazio/falhou/ilegível (the lib is absent, cannot be sourced or lacks a function) → 76: a step in the class never runs without its check
+  if [ ! -r "$lib" ] || ! . "$lib" 2>/dev/null || ! type ram_host_kind ram_avail_mb ram_state_of >/dev/null 2>&1; then
+    echo "heavy-guard: cannot load $lib — no way to read the free RAM, so '$what' is refused (rc 76). Deploy fault: tell the Mayor." >&2
+    hg_log "REFUSED what='$what' class=ram lib_unloadable=$lib rc=76"
+    exit 76
+  fi
+  if [ "${RAM_HEADROOM_ENABLED:-1}" = "0" ]; then
+    echo "heavy-guard: NOTE: '$what' goes ahead with the RAM check bypassed (RAM_HEADROOM_ENABLED=0 in this environment) — meant for selftests only" >&2
+    hg_log "BYPASS what='$what' class=ram RAM_HEADROOM_ENABLED=0"
+    return 0
+  fi
+  # darwin → checked; other (Linux, the node) → nothing to refuse; unknown (uname gave nothing) → 76, never "other"
+  case "$(ram_host_kind)" in
+    darwin) ;;
+    other) return 0 ;;
+    *) echo "heavy-guard: REFUSED '$what': cannot tell which host this is (uname gave nothing), so the RAM check cannot be applied (rc 76). Retry; if it persists, tell the Mayor." >&2
+       hg_log "REFUSED what='$what' class=ram host=unknown rc=76"
+       exit 76 ;;
+  esac
+  if [ "$ram_mb" -ge "$RAM_JOB_MAX_MB" ]; then
+    echo "heavy-guard: REFUSED '$what': it declares ${ram_mb} MB of RAM and the mini does not run a job of ${RAM_JOB_MAX_MB} MB or more (ga-1p1i5jr.14: $HG_RAM_WHY). $HG_RAM_WHERE (rc 75)" >&2
+    hg_log "REFUSED what='$what' class=ram declared_mb=$ram_mb max_mb=$RAM_JOB_MAX_MB rc=75"
+    exit 75
+  fi
+  # vazio/falhou/ilegível → free="" → ram_state_of says unknown → 76 below, never a guess
+  free="$(ram_avail_mb 2>/dev/null)" || free=""
+  need=$(( RAM_NEW_WORK_MIN_MB + ram_mb ))
+  case "$(ram_state_of "$free" "$need")" in
+    ok) return 0 ;;
+    low)
+      echo "heavy-guard: REFUSED '$what': ${free} MB of free RAM < ${need} MB needed (${RAM_NEW_WORK_MIN_MB} MB floor + ${ram_mb} MB declared) — starting it would make the mini swap (ga-1p1i5jr.14: $HG_RAM_WHY). $HG_RAM_WHERE (rc 75)" >&2
+      hg_log "REFUSED what='$what' class=ram free_mb=$free need_mb=$need rc=75"
+      exit 75 ;;
+    *)
+      echo "heavy-guard: REFUSED '$what': the free RAM could not be read (memory_pressure or sysctl hw.memsize failed or printed something unexpected), so the step is not started. Retry; if it persists, tell the Mayor. (rc 76)" >&2
+      hg_log "REFUSED what='$what' class=ram free_mb=unreadable need_mb=$need rc=76"
+      exit 76 ;;
+  esac
 }
 
 # ── push class (ga-pwd2h6): the lock and the watch ──────────────────────────────────────────────────────────
@@ -562,7 +631,7 @@ if [ ! -r "$HG_LIB" ] || ! . "$HG_LIB" 2>/dev/null || ! type disk_headroom_state
   exit 76
 fi
 
-min=""; wait_s=0; what="heavy step"; mode=run; fcap=""; fcap_given=0; drop=""; drop_given=0
+min=""; wait_s=0; what="heavy step"; mode=run; fcap=""; fcap_given=0; drop=""; drop_given=0; ram=""; ram_given=0
 while [ $# -gt 0 ]; do
   case "$1" in
     --min-free-mb) min="${2:-}"; shift 2 || { echo "heavy-guard: --min-free-mb needs a number" >&2; exit 64; } ;;
@@ -570,6 +639,7 @@ while [ $# -gt 0 ]; do
     --what)        what="${2:-}"; shift 2 || { echo "heavy-guard: --what needs a label" >&2; exit 64; } ;;
     --max-file-mb) fcap="${2:-}"; fcap_given=1; shift 2 || { echo "heavy-guard: --max-file-mb needs a number" >&2; exit 64; } ;;
     --max-disk-drop-mb) drop="${2:-}"; drop_given=1; shift 2 || { echo "heavy-guard: --max-disk-drop-mb needs a number" >&2; exit 64; } ;;
+    --ram-mb)      ram="${2:-}"; ram_given=1; shift 2 || { echo "heavy-guard: --ram-mb needs a number" >&2; exit 64; } ;;
     --check)       mode=check; shift ;;
     --)            shift; break ;;
     -h|--help)     sed -n '2,/^HG_HERE=/p' "$0" | sed '$d' | sed 's/^# \{0,1\}//'; exit 0 ;;
@@ -595,6 +665,12 @@ if [ "$drop_given" = 1 ]; then
   case "$drop" in ''|*[!0-9]*) echo "heavy-guard: --max-disk-drop-mb must be a whole number of MB, 0 for no drop limit (got '$drop')" >&2; exit 64 ;; esac
   [ "${#drop}" -le 9 ] || { echo "heavy-guard: --max-disk-drop-mb takes at most 9 digits (got '$drop')" >&2; exit 64; }
   drop=$(( 10#$drop ))
+fi
+ram_mb=0
+if [ "$ram_given" = 1 ]; then
+  case "$ram" in ''|*[!0-9]*) echo "heavy-guard: --ram-mb must be a whole number of MB, 0 for 'not RAM-heavy' (got '$ram')" >&2; exit 64 ;; esac
+  [ "${#ram}" -le 9 ] || { echo "heavy-guard: --ram-mb takes at most 9 digits (got '$ram')" >&2; exit 64; }
+  ram_mb=$(( 10#$ram ))
 fi
 if [ "$mode" = run ] && [ $# -eq 0 ]; then
   echo "heavy-guard: no command given (usage: heavy-guard.sh [opts] -- <command> [args...], or --check)" >&2
@@ -657,6 +733,16 @@ if [ "$mode" = run ] && [ "$push_class" = 0 ]; then
     watch_kind=step
   fi
 fi
+
+# RAM CLASS (ga-1p1i5jr.14): never a Go step or a push (own routes); --ram-mb R > 0 marks any other step; a python/node/duckdb command is in it by itself unless it is a selftest/mutant step
+# (own caps) — --ram-mb 0 lifts it. Decided before the disk wait and without waiting. vazio (no marker, no match) → not in the class, as before.
+ram_class=0
+if [ "$go_class" = 0 ] && [ "$push_class" = 0 ]; then
+  if [ "$ram_mb" -gt 0 ]; then ram_class=1
+  elif [ "$ram_given" = 0 ] && ! hg_selftest_step "$what" "$@" && hg_ram_step "$@"; then ram_class=1
+  fi
+fi
+[ "$ram_class" = 0 ] || hg_ram_gate
 
 # a push that RUNS under the guard goes one at a time, but the lock is held only while the push runs (ga-r2u6sv0): the disk is judged FIRST, with its
 # wait, OUTSIDE the lock; the lock is taken on an "ok" reading and the disk is judged once more INSIDE it (taking it can take a while, and the disk moves);
