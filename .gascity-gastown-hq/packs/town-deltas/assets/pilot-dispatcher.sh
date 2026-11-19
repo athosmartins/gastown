@@ -2402,6 +2402,7 @@ _PLB_N=""        # saída de _pilot_local_builder_gate: construtores locais vivo
 _PLB_MAX=""      # saída: o teto efetivo ("" = sem teto)
 _PLB_LIVE=""     # o número da varredura: lido uma vez e subido a cada spawn ("" = ainda não lido)
 _PLB_RC=0        # rc do último gate, para os pontos de chamada
+_PLB_DOG_FULL=0  # 1 depois que o braço do sling ao dog disse "cheio" NESTA varredura (libera o pulo pré-claim da bead genérica do HQ, abaixo)
 
 # _pilot_local_builder_max — imprime o teto efetivo, ou nada quando não há teto. Sempre devolve 0.
 _pilot_local_builder_max() {
@@ -2444,13 +2445,32 @@ _pilot_local_builder_note_spawn() {
   return 0
 }
 
+# _pilot_local_builder_hq_generic <bead-json> — exit 0 iff é uma bead do HQ (`ga-*`) SEM rota e SEM story.rig que o texto também não manda a uma crew de domínio (bead_content_rig vazio): o destino dela é o dog do
+# mini (dispatch_one infere o rig gascity pelo prefixo). Puro: só jq e bead_content_rig, nenhuma leitura de bd. 1 em tudo o mais, inclusive JSON que não se lê e bead sem id: o pulo nunca nasce de um palpite.
+# Medido em 19/11 (bd list --status open --label story:approved): 9 das 13 beads aprovadas do HQ não tinham rota nem story.rig (o texto delas não foi lido); o pulo pré-claim de beads presas a pool (rota ou story.rig) não as pega.
+_pilot_local_builder_hq_generic() {
+  local _b="${1:-}" _rec="" _id="" _rt="" _rig=""
+  # vazio (sem id: o bd omite a chave) → "" → 1; falhou/ilegível (JSON que o jq não lê) → 1
+  _rec=$(printf '%s' "$_b" | jq -r '[(.id // ""), (.metadata["gc.routed_to"] // ""), (.metadata["story.rig"] // "")] | join("|")' 2>/dev/null) || return 1
+  IFS='|' read -r _id _rt _rig <<EOF_PLB
+$_rec
+EOF_PLB
+  case "$_id" in ga-?*) ;; *) return 1 ;; esac
+  [ -z "$_rt" ] && [ -z "$_rig" ] || return 1
+  [ -z "$(bead_content_rig "$_b")" ]
+}
+
 # _pilot_local_builder_full_pre <bead-json> — exit 0 = PULA a bead antes da claim, sem escrever: ela é CONHECIDA, antes da claim, por abrir uma sessão local (_pilot_priority_pool_bound_pre: rota de pool ou
-# rig→dog sem crew), o teto local está POSITIVAMENTE cheio e o nó NÃO a quer (_pilot_priority_node_exempt_pre: oráculo node com vaga). 1 em tudo o mais: sem teto, bead que talvez vá a uma crew, teto com vaga,
-# contagem que não se leu (os braços de dispatch_one são fail-closed; um pulo nunca nasce de um palpite) e bead que o nó leva.
+# rig→dog sem crew; ou, depois que o braço do dog já disse "cheio" NESTA varredura, a bead genérica do HQ sem rota e sem story.rig: a 1ª paga a claim e prova a classe, as outras não), o teto local está
+# POSITIVAMENTE cheio e o nó NÃO a quer (_pilot_priority_node_exempt_pre: oráculo node com vaga). 1 em tudo o mais: sem teto, bead que talvez vá a uma crew, teto com vaga, contagem que não se leu
+# (os braços de dispatch_one são fail-closed; um pulo nunca nasce de um palpite) e bead que o nó leva.
 _pilot_local_builder_full_pre() {
   local _b="${1:-}" _rc=0
   [ -n "$(_pilot_local_builder_max)" ] || return 1
-  _pilot_priority_pool_bound_pre "$_b" || return 1
+  if ! _pilot_priority_pool_bound_pre "$_b"; then
+    [ "${_PLB_DOG_FULL:-0}" = 1 ] || return 1
+    _pilot_local_builder_hq_generic "$_b" || return 1
+  fi
   _pilot_local_builder_gate cached || _rc=$?
   [ "$_rc" = 1 ] || return 1
   if _pilot_priority_node_exempt_pre "$_b"; then return 1; fi
@@ -2472,6 +2492,7 @@ _pilot_local_builder_arm() {
     *) log "  ga-2hd02v.17: local builder cap hit (${_PLB_N:-?}/${_PLB_MAX:-?}: wa-worker+ps-worker+gastown.dog on the mini) — QUEUED $_id for $_what (claim released, story:approved retained; the node takes what it can, the next sweep re-checks)."
        _pilot_release_pool_cap_queued "$_id" "$_city" "$_bt"
        DISPATCH_RESULT="local_builder_cap_queued"
+       case "$_bt" in gastown.dog|gastown.dog-*) _PLB_DOG_FULL=1 ;; esac
        return 1 ;;
   esac
 }

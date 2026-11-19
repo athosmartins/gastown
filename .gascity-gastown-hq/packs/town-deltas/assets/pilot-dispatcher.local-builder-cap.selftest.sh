@@ -34,6 +34,8 @@ FUNC_MAX="$(need_fn _pilot_local_builder_max)"
 FUNC_GATE="$(need_fn _pilot_local_builder_gate)"
 FUNC_NOTE="$(need_fn _pilot_local_builder_note_spawn)"
 FUNC_PRE="$(need_fn _pilot_local_builder_full_pre)"
+FUNC_HQG="$(need_fn _pilot_local_builder_hq_generic)"
+FUNC_CRIG="$(need_fn bead_content_rig)"
 FUNC_ARM="$(need_fn _pilot_local_builder_arm)"
 FUNC_LEND="$(need_fn _pilot_dog_lend_dog_free)"
 FUNC_VSC="$(need_fn _pilot_variable_session_count)"
@@ -42,8 +44,8 @@ FUNC_SLOW="$(need_fn _pilot_slow_spawn_budget_spent)"
 FUNC_TIMING="$(need_fn _pilot_note_spawn_timing)"
 FUNC_TOPSPAWN="$(need_fn _pilot_topup_spawn)"
 FUNC_TOPUP="$(need_fn _pilot_pool_topup)"
-PLB_INIT="$(grep -E '^_PLB_(N|MAX|LIVE|RC)=' "$DISPATCHER")"
-[ "$(printf '%s\n' "$PLB_INIT" | grep -c .)" = 4 ] || { echo "FATAL: _PLB_* initialisers (N, MAX, LIVE, RC) not found in $DISPATCHER" >&2; exit 2; }
+PLB_INIT="$(grep -E '^_PLB_(N|MAX|LIVE|RC|DOG_FULL)=' "$DISPATCHER")"
+[ "$(printf '%s\n' "$PLB_INIT" | grep -c .)" = 5 ] || { echo "FATAL: _PLB_* initialisers (N, MAX, LIVE, RC, DOG_FULL) not found in $DISPATCHER" >&2; exit 2; }
 
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/pilot-lbc-selftest.XXXXXX")"
 trap 'chmod -R u+rwX "$WORK" 2>/dev/null; rm -rf "$WORK"' EXIT
@@ -63,7 +65,7 @@ esac
 exit 0
 EOF
 chmod +x "$WORK/bin/gc"
-sandbox_path_init "$WORK" jq timeout mkdir dirname cat date || exit 2
+sandbox_path_init "$WORK" jq timeout mkdir dirname cat date grep sed || exit 2
 
 reset() { rm -f "$WORK"/list.calls "$WORK"/new.log "$WORK"/sl.* "$WORK"/lines.txt "$WORK"/bound.yes "$WORK"/node.yes; }
 roster() { # roster template:state ... -> $WORK/sl.json
@@ -94,7 +96,7 @@ run_lb() {
     if [ "${LBC_MAX+x}" = x ]; then PILOT_LOCAL_BUILDER_MAX="$LBC_MAX"; export PILOT_LOCAL_BUILDER_MAX; fi
     if [ -n "${LBC_COUNT:-}" ]; then PILOT_TEST_LOCAL_BUILDER_COUNT="$LBC_COUNT"; export PILOT_TEST_LOCAL_BUILDER_COUNT; fi
     eval "$PLB_INIT"
-    eval "$FUNC_JSON"; eval "$FUNC_LIVE"; eval "$FUNC_MAX"; eval "$FUNC_GATE"; eval "$FUNC_NOTE"; eval "$FUNC_PRE"; eval "$FUNC_ARM"; eval "$FUNC_LEND"
+    eval "$FUNC_JSON"; eval "$FUNC_LIVE"; eval "$FUNC_MAX"; eval "$FUNC_GATE"; eval "$FUNC_NOTE"; eval "$FUNC_PRE"; eval "$FUNC_HQG"; eval "$FUNC_CRIG"; eval "$FUNC_ARM"; eval "$FUNC_LEND"
     # o resto do que _pilot_local_builder_full_pre e _pilot_local_builder_arm chamam: só os pontos de decisão, controlados por arquivo
     _pilot_priority_pool_bound_pre() { [ -f "$WORK/bound.yes" ]; }
     _pilot_priority_node_exempt_pre() { [ -f "$WORK/node.yes" ]; }
@@ -189,6 +191,38 @@ r=$(run_lb 'x=0; _pilot_local_builder_full_pre "{}" || x=$?; echo "skip=$x"')
 reset; : > "$WORK/sl.fail"; touch "$WORK/bound.yes"
 r=$(LBC_MAX=1 run_lb 'x=0; _pilot_local_builder_full_pre "{}" || x=$?; echo "skip=$x"')
 [ "$r" = "skip=1" ] && ok "contagem que não leu: NÃO pula por palpite (o gate dos braços é que fecha, fail-closed)" || bad "pulou sem leitura positiva: $r"
+
+echo "── bead genérica do HQ (sem rota, sem story.rig): só entra no pulo pré-claim depois de o braço do dog dizer 'cheio' nesta varredura"
+hqg() { # $1 = JSON da bead -> rc de _pilot_local_builder_hq_generic
+  run_lb 'x=0; _pilot_local_builder_hq_generic '"$(printf '%q' "$1")"' || x=$?; echo "hqg=$x"'
+}
+J_GEN='{"id":"ga-g1","title":"Ajustar o reconciliador de filas","description":"detalhe de infraestrutura","labels":["story:approved"],"metadata":{}}'
+[ "$(hqg "$J_GEN")" = "hqg=0" ] && ok "ga-* sem rota, sem story.rig e texto sem domínio: é a genérica do HQ (vai ao dog)" || bad "a bead genérica do HQ não foi reconhecida"
+[ "$(hqg '{"id":"ga-g2","title":"x","metadata":{"gc.routed_to":"gastown.dog"}}')" = "hqg=1" ] && ok "com rota: já é de quem a pré-claim de pool pega, não desta classe" || bad "bead com rota entrou na classe genérica"
+[ "$(hqg '{"id":"ga-g3","title":"x","metadata":{"story.rig":"gascity"}}')" = "hqg=1" ] && ok "com story.rig: idem" || bad "bead com story.rig entrou na classe genérica"
+[ "$(hqg '{"id":"wa-g4","title":"x","metadata":{}}')" = "hqg=1" ] && ok "prefixo que não é do HQ (wa-): fora" || bad "bead de outro store entrou na classe genérica"
+[ "$(hqg '{"id":"ga-","title":"x","metadata":{}}')" = "hqg=1" ] && ok "id 'ga-' sem nada depois: fora" || bad "id vazio depois do prefixo entrou"
+[ "$(hqg '{"id":"ga-g5","title":"Ajustar o painel do pipedrive","description":"kanban de leads","metadata":{}}')" = "hqg=1" ] && ok "o texto aponta o domínio do WA (painel, pipedrive): vai a crew, não ao dog — fora" || bad "bead de domínio entrou na classe genérica"
+[ "$(hqg '{"title":"sem id","metadata":{}}')" = "hqg=1" ] && ok "sem id: fora" || bad "bead sem id entrou"
+[ "$(hqg 'isto não é json')" = "hqg=1" ] && ok "JSON que o jq não lê: fora — nunca nasce de um palpite" || bad "JSON ilegível entrou na classe genérica"
+reset; roster gastown.dog:active
+r=$(LBC_MAX=1 run_lb 'x=0; _pilot_local_builder_full_pre '"$(printf '%q' "$J_GEN")"' || x=$?; echo "skip=$x"')
+[ "$r" = "skip=1" ] && ok "genérica do HQ com o teto cheio, mas NENHUM braço de dog disse 'cheio' ainda: NÃO pula (a classe ainda não foi provada)" || bad "pulou a genérica antes de o braço provar a classe: $r"
+reset; roster gastown.dog:active
+r=$(LBC_MAX=1 run_lb '_PLB_DOG_FULL=1; x=0; _pilot_local_builder_full_pre '"$(printf '%q' "$J_GEN")"' || x=$?; echo "skip=$x"')
+[ "$r" = "skip=0" ] && ok "depois de o braço do dog dizer 'cheio': a genérica do HQ é PULADA antes da claim (a 1ª pagou a claim, as outras não)" || bad "não pulou a genérica depois da prova do braço: $r"
+reset; roster gastown.dog:active; touch "$WORK/node.yes"
+r=$(LBC_MAX=1 run_lb '_PLB_DOG_FULL=1; x=0; _pilot_local_builder_full_pre '"$(printf '%q' "$J_GEN")"' || x=$?; echo "skip=$x"')
+[ "$r" = "skip=1" ] && ok "...mas a que o nó quer continua indo à claim" || bad "pulou genérica que o nó levaria: $r"
+reset; roster
+r=$(LBC_MAX=1 run_lb '_PLB_DOG_FULL=1; x=0; _pilot_local_builder_full_pre '"$(printf '%q' "$J_GEN")"' || x=$?; echo "skip=$x"')
+[ "$r" = "skip=1" ] && ok "...e com vaga no teto local não pula, mesmo com a bandeira" || bad "pulou a genérica com vaga no teto: $r"
+reset; roster gastown.dog:active
+r=$(LBC_MAX=1 run_lb '_PLB_DOG_FULL=0; DISPATCH_RESULT=""; _pilot_local_builder_arm ga-1 /city gastown.dog "a gastown.dog session" || true; echo "flag=$_PLB_DOG_FULL"')
+[ "$r" = "flag=1" ] && ok "o braço do dog cheio levanta a bandeira da varredura" || bad "o braço do dog não levantou a bandeira: $r"
+reset; roster gastown.dog:active
+r=$(LBC_MAX=1 run_lb '_PLB_DOG_FULL=0; DISPATCH_RESULT=""; _pilot_local_builder_arm wa-1 /rig wa-worker-2 "a wa-worker session" || true; echo "flag=$_PLB_DOG_FULL"')
+[ "$r" = "flag=0" ] && ok "o braço do wa-worker cheio NÃO levanta a bandeira do dog (a classe provada é a do sling ao dog)" || bad "o braço do wa-worker levantou a bandeira do dog: $r"
 
 echo "── braço de dispatch_one (wa-worker, ps-worker, sling ao dog): fecha, enfileira ou não abre"
 reset; roster
@@ -339,12 +373,12 @@ open(sys.argv[4],"w",encoding="utf-8").write(s.replace(sys.argv[2],sys.argv[3]))
   mutant "cheio só com contagem maior que o teto" '  [ "$_n" -lt "$_PLB_MAX" ] && return 0' '  [ "$_n" -le "$_PLB_MAX" ] && return 0'
   mutant "cached não usa o número da varredura" '  elif [ "$_mode" = "cached" ] && [ -n "${_PLB_LIVE:-}" ]; then' '  elif false; then'
   mutant "o spawn não sobe o número da varredura" '  case "${_PLB_LIVE:-}" in '"''"'|*[!0-9]*) ;; *) _PLB_LIVE=$(( _PLB_LIVE + 1 )) ;; esac' '  :'
-  mutant "pré-claim pula bead que talvez vá a uma crew" '  _pilot_priority_pool_bound_pre "$_b" || return 1' '  :'
+  mutant "pré-claim pula bead que talvez vá a uma crew" $'  if ! _pilot_priority_pool_bound_pre "$_b"; then\n    [ "${_PLB_DOG_FULL:-0}" = 1 ] || return 1\n    _pilot_local_builder_hq_generic "$_b" || return 1\n  fi' '  :'
   mutant "pré-claim ignora o nó" '  if _pilot_priority_node_exempt_pre "$_b"; then return 1; fi' '  :'
   mutant "pré-claim pula por contagem que não leu" $'  [ "$_rc" = 1 ] || return 1\n  if _pilot_priority_node_exempt_pre' $'  [ "$_rc" != 0 ] || return 1\n  if _pilot_priority_node_exempt_pre'
   mutant "braço: contagem ilegível sai como fila" $'       _pilot_release_count_unreadable "$_id" "$_city" "$_bt"\n       DISPATCH_RESULT="rig_native_pool_count_unreadable"' $'       _pilot_release_count_unreadable "$_id" "$_city" "$_bt"\n       DISPATCH_RESULT="local_builder_cap_queued"'
   mutant "braço: cheio não conta como fila de capacidade" '       _pilot_release_pool_cap_queued "$_id" "$_city" "$_bt"' '       _pilot_release_count_unreadable "$_id" "$_city" "$_bt"'
-  mutant "braço: cheio deixa abrir" $'       DISPATCH_RESULT="local_builder_cap_queued"\n       return 1 ;;\n  esac' $'       DISPATCH_RESULT="local_builder_cap_queued"\n       return 0 ;;\n  esac'
+  mutant "braço: cheio deixa abrir" $'       case "$_bt" in gastown.dog|gastown.dog-*) _PLB_DOG_FULL=1 ;; esac\n       return 1 ;;\n  esac' $'       case "$_bt" in gastown.dog|gastown.dog-*) _PLB_DOG_FULL=1 ;; esac\n       return 0 ;;\n  esac'
   mutant "top-up ignora o teto antes do laço" '  elif [ "$_PLB_RC" = 1 ]; then' '  elif false; then'
   mutant "top-up não para quando o spawn enche o teto" '      [ "$_PLB_RC" = 0 ] || break' '      :'
   mutant "empréstimo ignora o teto local" '    if [ -z "${_PLB_MAX:-}" ] || [ $(( _PLB_N + ${_PDL_LENT:-0} )) -lt "$_PLB_MAX" ]; then return 0; fi' '    return 0'
@@ -352,6 +386,12 @@ open(sys.argv[4],"w",encoding="utf-8").write(s.replace(sys.argv[2],sys.argv[3]))
   mutant "sem o pulo pré-claim em dispatch_lane" 'if [ "$_mbp_pass" != 1 ] && _pilot_local_builder_full_pre "$pick"; then' 'if false; then'
   mutant "o braço do dog roda no DRY_RUN" $'      if [ "$DRY_RUN" != "1" ] && [ "$_IS_RIG_NATIVE" != "1" ] && [ "${_PNF_RESULT:-}" != "node" ] \\' $'      if [ "$_IS_RIG_NATIVE" != "1" ] && [ "${_PNF_RESULT:-}" != "node" ] \\'
   mutant "o sling ao dog não sobe o número da varredura" '    case "$_SLING_TARGET" in gastown.dog|gastown.dog-*) _pilot_local_builder_note_spawn ;; esac' '    :'
+  mutant "a genérica pula sem o braço do dog ter provado a classe" $'    [ "${_PLB_DOG_FULL:-0}" = 1 ] || return 1\n    _pilot_local_builder_hq_generic "$_b" || return 1' $'    _pilot_local_builder_hq_generic "$_b" || return 1'
+  mutant "a genérica aceita bead com rota ou story.rig" '  [ -z "$_rt" ] && [ -z "$_rig" ] || return 1' '  :'
+  mutant "a genérica ignora o domínio do texto" '  [ -z "$(bead_content_rig "$_b")" ]' '  true'
+  mutant "a genérica aceita qualquer prefixo" '  case "$_id" in ga-?*) ;; *) return 1 ;; esac' '  case "$_id" in *) ;; esac'
+  mutant "o braço do dog não levanta a bandeira" '       case "$_bt" in gastown.dog|gastown.dog-*) _PLB_DOG_FULL=1 ;; esac' '       :'
+  mutant "o braço do wa-worker levanta a bandeira do dog" '       case "$_bt" in gastown.dog|gastown.dog-*) _PLB_DOG_FULL=1 ;; esac' '       _PLB_DOG_FULL=1'
   mutant "a fila local cai em failed_other" 'elif $o.r == "rig_native_global_session_cap_queued" or $o.r == "local_builder_cap_queued" then "queued_global_cap"' 'elif $o.r == "rig_native_global_session_cap_queued" then "queued_global_cap"'
 fi
 echo "── $PASS ok, $FAIL falhas"
