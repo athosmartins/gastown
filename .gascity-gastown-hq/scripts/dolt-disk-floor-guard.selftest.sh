@@ -2165,8 +2165,7 @@ grep -q "^VM_DIR_KB${TAB}" "$PH" && grep -q "^VM_SWAP${TAB}" "$PH" \
   && ok "_disk_growth_photo: records VM_SWAP and VM_DIR_KB (the vm.swapusage + /System/Volumes/VM half of the bead)" \
   || bad "_disk_growth_photo: VM lines missing"
 
-# ── ga-1p1i5jr.14: the photo also records the swapfiles of /System/Volumes/VM (count, size, mtime: macOS gives each 1 GB file back only at reboot, so the mtimes say WHEN the swap grew) and the
-#    10 biggest footprints (top MEM, which already includes the compressed memory; CMPRS beside it). `stat` here is the node's shim for BSD `stat -f '%z %m'` (the mini has the real one) ──
+# ── ga-1p1i5jr.14: the photo also records the swapfiles of /System/Volumes/VM (count, size, mtime: they say WHEN the swap grew) and the 10 biggest footprints (top MEM, CMPRS beside it); `stat` is the node's BSD shim ──
 SWD="$GROW_TMP/vm"; mkdir -p "$SWD" "$GROW_TMP/vm-empty"
 for i in 0 1 2; do head -c 1024 /dev/zero > "$SWD/swapfile$i"; done; echo x > "$SWD/notaswapfile"; : > "$SWD/swapfile.bak"
 touch -d @1795100000 "$SWD/swapfile0"; touch -d @1795103000 "$SWD/swapfile1"; touch -d @1795104000 "$SWD/swapfile2"
@@ -2212,7 +2211,6 @@ GROWTH_EXTRA_TIMEOUT_SECS=10
 top() {
   cat <<'TOPFIX'
 Processes: 400 total, 3 running, 397 sleeping, 2000 threads
-PhysMem: 16G used, 200M unused.
 
 PID    PPID  COMMAND      MEM   CMPRS
 89690  1     Python       22G   20G

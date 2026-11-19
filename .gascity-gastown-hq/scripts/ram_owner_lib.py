@@ -117,10 +117,9 @@ def _top_kb(tok):
 def top_mem_snapshot(fixture_path=None):
     """(pid -> (mem_kb, cmprs_kb), bad_rows) from ONE `top -l 1 -stats pid,mem,cmprs`, or (None, 0) when the read is unusable.
 
-    MEM is the process FOOTPRINT and already includes its compressed memory, which `ps` RSS and vm.swapusage do not show (ga-1p1i5jr.14: the 19/11 swapfiles were invisible to both; city.toml ga-e87w1f measured
-    top MEM == footprint(1)). CMPRS is a subset of MEM: kept beside it, NEVER added. Three states: no table (top fails, prints nothing, has no PID/MEM/CMPRS header or no row after it) -> None, never an
-    empty dict, which would read as "nothing uses memory"; a row that is not `pid size size` is COUNTED in bad_rows and left out, since an unknown size is never 0.
-    fixture_path (test seam): a file with what `top` printed."""
+    MEM is the process FOOTPRINT and already includes its compressed memory, which `ps` RSS and vm.swapusage do not show (ga-1p1i5jr.14; city.toml ga-e87w1f measured top MEM == footprint(1)). CMPRS is a subset
+    of MEM: kept beside it, NEVER added. Three states: no table (top fails, prints nothing, no PID/MEM/CMPRS header or no row after it) -> None, never {} (which would read "nothing uses memory"); a row that is not
+    `pid size size` is COUNTED in bad_rows and left out (an unknown size is never 0). fixture_path (test seam): a file with what `top` printed."""
     if fixture_path:
         try:
             with open(fixture_path) as f:

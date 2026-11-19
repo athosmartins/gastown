@@ -2,7 +2,7 @@
 
 ## Contents
 
-• O que entrega · Ligar o teto do Pilot (sombra primeiro) · Afinar o piso · Desligar · O guarda de passo (`--ram-mb`) · O que NÃO cobre · Prova e o que só o mini prova
+• O que entrega · Ligar o teto do Pilot (sombra primeiro) · Afinar e desligar · O guarda de passo (`--ram-mb`) · O que NÃO cobre · Prova e o que só o mini prova
 
 ## O que entrega
 
@@ -27,13 +27,9 @@ Nasce **desligado** (como `PILOT_NODE_FIRST`): mergeado ≠ vivo. O plist do rep
 
 O piso inicial é uma estimativa sem dado do mini. Depois de ~24 h em `shadow`, veja quantas varreduras teriam agido: `grep -o 'RAM floor (sombra): [a-z]*' "$GC_CITY_PATH/.gc/logs/pilot-dispatcher.log" | sort | uniq -c` (`low` = a varredura teria ido só-nó).
 
-## Afinar o piso
+## Afinar e desligar
 
-`RAM_NEW_WORK_MIN_MB` (padrão 2048) e `RAM_JOB_MAX_MB` (padrão 1024), no plist do Pilot e no ambiente de quem chama o guarda. Número que não é inteiro, vazio, `0`, `08` ou com 10+ dígitos = o padrão. O histórico para decidir: `free_pct` em `.gc/ram-owner-samples.jsonl`, nos horários em que um swapfile novo apareceu (mtime em `SWAPFILE` da foto). Piso alto demais manda tudo ao nó; baixo demais não segura nada.
-
-## Desligar
-
-Tire a chave do plist (ou `0`) e `bootout`/`bootstrap`. Valor desconhecido = desligado. `RAM_HEADROOM_ENABLED=0` desliga a lib inteira (só para teste; vira aviso no log).
+`RAM_NEW_WORK_MIN_MB` (padrão 2048) e `RAM_JOB_MAX_MB` (padrão 1024), no plist do Pilot e no ambiente de quem chama o guarda; valor que não é inteiro >= 1 de até 9 dígitos = o padrão. Para decidir: `free_pct` em `.gc/ram-owner-samples.jsonl` nos horários em que apareceu swapfile novo (mtime em `SWAPFILE` da foto); piso alto manda tudo ao nó, baixo não segura nada. Desligar: tire a chave do plist (ou `0`) e `bootout`/`bootstrap`; valor desconhecido = desligado. `RAM_HEADROOM_ENABLED=0` desliga a lib inteira (só teste; vira aviso).
 
 ## O guarda de passo (`--ram-mb`)
 
@@ -41,12 +37,11 @@ Tire a chave do plist (ou `0`) e `bootout`/`bootstrap`. Valor desconhecido = des
 
 ## O que NÃO cobre
 
-- A RAM é lida UMA vez por varredura (10 min): uma varredura que começa logo acima do piso ainda abre as sessões dela.
-- Sessão que já roda não é tocada pelo teto; quem corta é o degrau de swap (só pool/reviewer ocioso).
+- A RAM é lida UMA vez por varredura (10 min): uma varredura que começa logo acima do piso ainda abre as sessões dela. Sessão que já roda não é tocada (quem corta é o degrau de swap, só pool/reviewer ocioso).
 - O reconciliador (`approved-state-reconciler.py`) conta a passada só-nó por RAM como varredura normal (como já contava a do yield por memória, ga-2hd02v.13): o histórico de pausa não a mostra.
 - O D3 (`disk-recovery-d3-ram-daemons.sh`, `mem_of`) SOMA MEM + CMPRS; o MEM já inclui o comprimido, então ele conta o comprimido em dobro (fora desta bead).
 
 ## Prova e o que só o mini prova
 
-Selftests: `ram-headroom-lib.selftest.sh`, `heavy-guard-ram.selftest.sh`, `pilot-dispatcher.ram-floor.selftest.sh`, `ram-owner-sampler.selftest.sh`, `disk-recovery-swap-cut.selftest.sh` (seção "a pegada") e `dolt-disk-floor-guard.selftest.sh` (`SWAPFILES`/`TOPMEM`); fixtures na forma que o código já lê em produção (`memory_pressure`, `vm_stat`, `top -stats pid,ppid,command,mem,cmprs`).
-**Não provado do nó:** `memory_pressure`/`hw.memsize`/`top -l 1 -stats pid,mem,cmprs` rodando de verdade no macOS do mini, o formato real do `stat -f '%z %m'` em `/System/Volumes/VM` e o aceite da bead (24 h sem swapfile novo criado por job de lote). Primeira conferência: o passo 2 acima.
+Selftests: `ram-headroom-lib`, `heavy-guard-ram`, `pilot-dispatcher.ram-floor`, `ram-owner-sampler`, `disk-recovery-swap-cut` (seção "a pegada") e `dolt-disk-floor-guard` (`SWAPFILES`/`TOPMEM`), com fixtures na forma que o código já lê em produção.
+**Não provado do nó:** `memory_pressure`, `hw.memsize`, `top -l 1 -stats pid,mem,cmprs` e `stat -f '%z %m'` rodando de verdade no macOS do mini, e o aceite da bead (24 h sem swapfile novo criado por job de lote). Primeira conferência: o passo 2 acima.

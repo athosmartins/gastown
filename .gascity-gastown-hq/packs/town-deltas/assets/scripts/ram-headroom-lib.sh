@@ -16,15 +16,14 @@
 #                              step (rc 75), the Pilot opens no new local session. A step that DECLARES its size (--ram-mb N) needs floor + N.
 #   RAM_JOB_MAX_MB       1024  the biggest job the mini runs: a step that declares this much or more goes to the node whatever the free RAM
 #                              (a build/backfill > 1 GB is what turned into permanent swapfiles).
-#   Both are first estimates, tunable from the free_pct history of ram-owner-samples.jsonl; junk, empty, 0, 08 or 10+ digits = the default.
+#   First estimates, tunable from the free_pct history of ram-owner-samples.jsonl; junk, empty, 0, 08 or 10+ digits = the default.
 #
 # THREE STATES, never two: ram_state_of prints ok | low | unknown. unknown = no reading, a floor that is not a number, or one `[` could
 # not compare; it is NEVER ok. What a caller does with it is its own decision: heavy-guard.sh fails CLOSED (the step is refused, rc 76);
 # the Pilot fails OPEN and says so on its log. ram_host_kind: darwin | other (Linux: the swapfile problem is macOS's, nothing to read) |
 # unknown (uname gave nothing: NOT "other", so a broken uname cannot switch a guard off).
 #
-# SEAMS. RAM_AVAIL_OVERRIDE_MB pins the reading in selftests (a number = that many MB, any other non-empty value = unreadable).
-# RAM_HEADROOM_ENABLED=0 makes every state ok (kill switch; never set in prod).
+# SEAMS. RAM_AVAIL_OVERRIDE_MB pins the reading in selftests (a number = that many MB, any other non-empty value = unreadable); RAM_HEADROOM_ENABLED=0 makes every state ok (kill switch; never in prod).
 
 RAM_NEW_WORK_MIN_MB="${RAM_NEW_WORK_MIN_MB:-2048}"
 RAM_JOB_MAX_MB="${RAM_JOB_MAX_MB:-1024}"

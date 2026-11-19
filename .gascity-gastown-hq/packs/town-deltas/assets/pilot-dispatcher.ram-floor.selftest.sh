@@ -1,16 +1,13 @@
 #!/usr/bin/env bash
-# pilot-dispatcher.ram-floor.selftest.sh — ga-1p1i5jr.14 (o teto de RAM do Pilot: o mini não abre sessão nova com a RAM livre real abaixo do piso)
+# pilot-dispatcher.ram-floor.selftest.sh — ga-1p1i5jr.14: o teto de RAM do Pilot (o mini não abre sessão nova com a RAM livre real abaixo do piso)
 #
 # Contents
 #   O que prova · Como roda
 #
-# O QUE PROVA: (1) o LEITOR `_pilot_ram_floor` (verbatim do dispatcher), nos três estados que nunca se confundem: abaixo do piso → rc 0 só com a chave ligada (`1`); `shadow` lê e nomeia o estado mas NUNCA age (rc 1);
-#   ok → rc 1; ilegível (leitura, biblioteca que não carrega, host sem nome) → "unknown", rc 1 (fail-open, o estado nomeado); desligada (padrão, `0`, vazio, palavra desconhecida) e host que não é macOS → "off", sem ler nada.
-#   (2) a região do gate (verbatim, com o leitor real, `set -euo pipefail`): RAM baixa + PILOT_NODE_FIRST=on fora do DRY_RUN segue na passada SÓ-NÓ e grava a pausa "ram-floor" uma vez (sem sobrescrever a razão de uma passada
-#   só-nó que o disco já ligou); sem o `on` ou no DRY_RUN pausa a varredura inteira e sai (exit 0) com o texto "memory floor" (a tabela do reconciler arquiva qualquer texto com a palavra ram como pressão de RAM); `shadow` só escreve a leitura no log; ok segue calado; ilegível segue e DIZ. (3) a ORDEM: depois do disk floor, antes do drain window.
-# COMO RODA: leitor e região extraídos VERBATIM do dispatcher (awk) e executados em shells filhos; a biblioteca é a REAL, `uname`/`sysctl`/`memory_pressure` são fakes no PATH de sandbox (a forma que o macOS imprime),
-#   a leitura também se fixa com PILOT_RAM_AVAIL_OVERRIDE_MB. Sem rede, sem gc/bd. Contra o dispatcher sem o teto: FATAL logo no início (a função e a região não existem).
-# Variáveis: PILOT_DISPATCHER_PATH
+# O QUE PROVA: (1) o leitor `_pilot_ram_floor` (verbatim do dispatcher): rc 0 só abaixo do piso com a chave `1`; `shadow` lê e nomeia o estado mas nunca age; ilegível (leitura, lib, host) = "unknown" (fail-open, nomeado);
+#   chave desligada (padrão, `0`, vazio, palavra desconhecida) e host que não é macOS = "off". (2) a região do gate (verbatim, `set -euo pipefail`): RAM baixa + PILOT_NODE_FIRST=on fora do DRY_RUN = passada SÓ-NÓ (pausa "ram-floor"
+#   gravada uma vez, sem sobrescrever a de uma só-nó do disco); senão pausa a varredura e sai com "memory floor" (a tabela do reconciler arquiva qualquer texto com a palavra ram como pressão de RAM); shadow só loga; ok é calado.
+#   (3) a ordem no dispatcher. COMO RODA: awk extrai verbatim, a lib é a REAL, uname/sysctl/memory_pressure são fakes no PATH de sandbox. Variáveis: PILOT_DISPATCHER_PATH
 set -uo pipefail
 SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DISPATCHER="${PILOT_DISPATCHER_PATH:-$SELF_DIR/pilot-dispatcher.sh}"

@@ -278,11 +278,7 @@ echo ""
 echo "── Scenario: footprint per owner from top MEM (ga-1p1i5jr.14) — MEM already includes the compressed memory: CMPRS sits beside it, never added ──"
 cat > "$TMP/top.txt" <<'EOF'
 Processes: 521 total, 3 running, 518 sleeping, 2530 threads
-2026/11/19 13:05:11
-Load Avg: 3.12, 3.45, 3.60
-CPU usage: 6.25% user, 9.37% sys, 84.37% idle
 PhysMem: 15G used (2204M wired, 6347M compressor), 296M unused.
-VM: 232T vsize, 4125M framework vsize, 0(0) swapins, 0(0) swapouts.
 PID file: /var/run/top.pid
 
 PID    MEM    CMPRS

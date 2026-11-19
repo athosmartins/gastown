@@ -146,15 +146,13 @@
 #     guard, so it cannot read the terminal; a guard that is KILLed (not TERMed: no trap runs) leaves its step running, and the watch stays with it and goes on
 #     reading the disk until the step ends. --check runs nothing, so it has nothing to watch: it accepts the option and only judges the disk.
 #
-# RAM CLASS (ga-1p1i5jr.14). 19/11 the mini grew permanent 1 GB swapfiles in /System/Volumes/VM (macOS gives them back only at reboot; ~1 GB/h of disk) from a hand-run
-# 2.1 GB build and from the sum of sessions; RSS and vm.swapusage hide it. A step is in the class when it declares --ram-mb R (R > 0), or by itself when it runs python, node or
-# duckdb (a WORD of the command, a path before it counts, also inside `sh -c '…'`; a git command or a selftest/mutant step is never in it by itself). A Go step and a push never are:
-# they have their own routes. It is refused with rc 75 and "run it on the Hetzner node" when it declares R >= RAM_JOB_MAX_MB (1024: a build/backfill that big never runs on the mini)
-# or when the free RAM (ram-headroom-lib.sh: memory_pressure x hw.memsize) is under RAM_NEW_WORK_MIN_MB (2048) + R. No waiting: the answer is the node, not a later retry. Three states:
-# a reading, a lib or a host (uname) it cannot get is rc 76 for a step IN the class, and changes nothing for any other. Only a Darwin host is checked (on Linux, the node, there is nothing to refuse).
-# --ram-mb 0 is the explicit opt-out for a false match; RAM_HEADROOM_ENABLED=0 is the visible kill switch (selftests only). --check judges only a declared --ram-mb (no command to read).
-# The RAM lib is the sibling of the disk lib (same directory; HEAVY_GUARD_RAM_LIB pins it) and is read only by a step in the class. A python/node/duckdb step the matcher cannot see
-# (`uv run`, `npm run build`, a script that starts one inside) is marked with --ram-mb R, and a step that is not run under this guard is not covered.
+# RAM CLASS (ga-1p1i5jr.14). 19/11 the mini grew permanent 1 GB swapfiles in /System/Volumes/VM (macOS gives them back only at reboot; ~1 GB/h of disk) from a hand-run 2.1 GB build and from the sum of sessions;
+# RSS and vm.swapusage hide it. A step is in the class when it declares --ram-mb R (R > 0), or by itself when it runs python, node or duckdb (a WORD of the command, a path before it counts, also inside `sh -c '…'`; a git
+# command or a selftest/mutant step is never in it by itself); a Go step and a push never are (own routes). Refused with rc 75 and "run it on the Hetzner node" when it declares R >= RAM_JOB_MAX_MB (1024) or the free RAM
+# (ram-headroom-lib.sh: memory_pressure x hw.memsize) is under RAM_NEW_WORK_MIN_MB (2048) + R; no waiting (the answer is the node, not a later retry). Three states: a reading, lib or host (uname) it cannot get is rc 76 for a
+# step IN the class and changes nothing for any other. Only a Darwin host is checked (Linux, the node, has nothing to refuse). --ram-mb 0 opts a false match out; RAM_HEADROOM_ENABLED=0 is the visible kill switch (selftests
+# only); --check judges only a declared --ram-mb. The RAM lib sits beside the disk lib (HEAVY_GUARD_RAM_LIB pins it) and only a step in the class reads it. A python/node/duckdb step the matcher cannot see (`uv run`, `npm run
+# build`, a script that starts one inside) is marked with --ram-mb R; a step not run under this guard is not covered.
 #
 # WHERE IT IS WIRED. jsonl-archive-compact.selftest.sh (--check at the top); the doctrine paragraph in
 # packs/town-deltas/template-fragments/town-deltas.template.md and the HQ SELFTESTS text of the gate
@@ -315,9 +313,8 @@ hg_selftest_step() {
   return 1
 }
 
-# hg_ram_step <command...> — rc 0 when the command runs python, node or duckdb (see "RAM CLASS"), else rc 1. Pure bash like the other matchers: ; & | ( ) ` " ' become spaces, then one of the
-# three as a WORD (a path before it counts). A git command is never in the class. A miss only leaves a step unchecked, as before this class (mark it --ram-mb); a false match only refuses
-# it on a short RAM (--ram-mb 0 lifts it). vazio (no command words) → rc 1; falhou cannot happen (nothing is read from a file, the disk or an outside command)
+# hg_ram_step <command...> — rc 0 when the command runs python, node or duckdb (see "RAM CLASS"), else rc 1. Pure bash like the other matchers: ; & | ( ) ` " ' become spaces, then one of the three as a WORD (a path
+# before it counts); a git command never. A miss leaves a step unchecked as before (mark it --ram-mb); a false match only refuses it on a short RAM (--ram-mb 0 lifts it). vazio (no command words) → rc 1; falhou cannot happen
 hg_ram_step() {
   local norm seps cre
   case "${1:-}" in git|*/git) return 1 ;; esac

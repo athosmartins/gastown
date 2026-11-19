@@ -464,14 +464,12 @@ PILOT_DISK_FLOOR_ENABLED="${PILOT_DISK_FLOOR_ENABLED:-1}"
 PILOT_DISK_LIB="${PILOT_DISK_LIB:-$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd || true)/scripts/disk-headroom-lib.sh}"
 
 # ── ga-1p1i5jr.14 (P0, 19/11): RAM FLOOR — the mini opens no NEW session when its real free RAM is under the floor ─────────────────────
-# 19/11 11:37-11:46 three swapfiles appeared in /System/Volumes/VM with NO heavy job — macOS gives each 1 GB file back only at the next reboot: the SUM of 16 Claude sessions (~350 MB each) + Dolt 2.4 GB + Chrome on
-# a 16 GB mini, which RSS and swapusage hide (compressed memory). The free RAM the kernel reports (ram-headroom-lib.sh: memory_pressure x hw.memsize) under RAM_NEW_WORK_MIN_MB (2048) → the MINI starts nothing: with
-# PILOT_NODE_FIRST=on the sweep goes on as the NODE-ONLY pass (the disk floor's), otherwise it pauses; what already runs is never touched. FAIL-OPEN but not silent (an unreadable RAM dispatches as before and says so;
-# heavy-guard.sh fails CLOSED, per step). The reading is taken once per sweep, so a sweep that starts just over the floor can still open its few sessions.
-# BORN OFF, like the other Pilot switches that change who gets work (PILOT_NODE_FIRST, the WA node route): PILOT_RAM_FLOOR_ENABLED = 0 (the default; empty and any unknown word too) | shadow (reads, and writes the reading on the
-# log every sweep, never acts: the way to compare it with `memory_pressure` by hand) | 1 (acts). Who flips it is a person, in the plist (docs/runbooks/teto-ram-mini.md). Off, it is also what keeps
-# every selftest that runs the dispatcher from depending on how much RAM its host has (the class selftest-disk-pin-class.selftest.sh closes for the disk). The reading is pinned in selftests with
-# PILOT_RAM_AVAIL_OVERRIDE_MB (or RAM_AVAIL_OVERRIDE_MB); RAM_NEW_WORK_MIN_MB tunes the floor.
+# 19/11 11:37-11:46 three swapfiles appeared in /System/Volumes/VM with NO heavy job (macOS gives each 1 GB file back only at reboot): the SUM of 16 Claude sessions + Dolt 2.4 GB + Chrome on a 16 GB mini,
+# which RSS and swapusage hide (compressed memory). Free RAM (ram-headroom-lib.sh: memory_pressure x hw.memsize) under RAM_NEW_WORK_MIN_MB (2048) → the MINI starts nothing: PILOT_NODE_FIRST=on makes the sweep the
+# NODE-ONLY pass (the disk floor's), else it pauses; what already runs is never touched. FAIL-OPEN but not silent (heavy-guard.sh fails CLOSED, per step). Read once per sweep: a sweep starting just over the floor still opens its few sessions.
+# BORN OFF like the other Pilot switches that change who gets work (PILOT_NODE_FIRST, the WA node route): PILOT_RAM_FLOOR_ENABLED = 0 (default; empty and any unknown word too) | shadow (reads and logs the reading every
+# sweep, never acts: compare it with `memory_pressure` by hand) | 1 (acts). A person flips it, in the plist (docs/runbooks/teto-ram-mini.md); off is also what keeps every selftest that runs the dispatcher from depending on
+# its host's RAM (the class selftest-disk-pin-class.selftest.sh closes for the disk). Selftests pin the reading with PILOT_RAM_AVAIL_OVERRIDE_MB (or RAM_AVAIL_OVERRIDE_MB).
 PILOT_RAM_FLOOR_ENABLED="${PILOT_RAM_FLOOR_ENABLED:-0}"
 PILOT_RAM_LIB="${PILOT_RAM_LIB:-$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd || true)/scripts/ram-headroom-lib.sh}"
 
@@ -6129,8 +6127,8 @@ elif [ "$PILOT_DISK_FLOOR_STATE" = "unknown" ]; then
 fi
 
 # ── ga-1p1i5jr.14: RAM FLOOR — the mini opens no new session when its free RAM is under the floor ─────────────────────────────────
-# See the config header (PILOT_RAM_FLOOR_ENABLED) for the why. Same two shapes as the disk floor right above: the NODE-ONLY pass with PILOT_NODE_FIRST=on outside DRY_RUN (the node's sessions do not spend the mini's
-# RAM), else the whole sweep pauses; a sweep the disk floor already made node-only keeps ITS pause reason. `|| rc=$?`: the reader answers 1 for "no action", and the dispatcher runs under set -e.
+# See the config header (PILOT_RAM_FLOOR_ENABLED). Same two shapes as the disk floor above: the NODE-ONLY pass with PILOT_NODE_FIRST=on outside DRY_RUN (the node's sessions do not spend the mini's RAM), else the whole sweep
+# pauses; a sweep the disk floor already made node-only keeps ITS pause reason. `|| rc=$?`: the reader answers 1 for "no action", and the dispatcher runs under set -e.
 _ram_floor_rc=0
 _pilot_ram_floor || _ram_floor_rc=$?
 if [ -n "${PILOT_RAM_FLOOR_NOTE:-}" ]; then

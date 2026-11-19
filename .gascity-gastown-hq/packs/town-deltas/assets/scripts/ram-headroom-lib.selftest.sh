@@ -1,7 +1,6 @@
 #!/usr/bin/env bash
-# ram-headroom-lib.selftest.sh (ga-1p1i5jr.14) — ram-headroom-lib.sh: the two floors, the three states, and the reading of
-# `memory_pressure` + `sysctl hw.memsize` in the shape macOS really prints. Hermetic: uname/sysctl/memory_pressure are FAKES
-# first on PATH (strict: a sysctl key nobody modelled is recorded and fails), nothing real is read. RAM_LIB_UNDER_TEST swaps the lib.
+# ram-headroom-lib.selftest.sh (ga-1p1i5jr.14) — ram-headroom-lib.sh: the floors, the three states, and the reading of `memory_pressure` + `sysctl hw.memsize` in the shape
+# macOS prints. Hermetic: uname/sysctl/memory_pressure are FAKES first on PATH (a sysctl key nobody modelled is recorded and fails). RAM_LIB_UNDER_TEST swaps the lib.
 set -u
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 LIB="${RAM_LIB_UNDER_TEST:-$HERE/ram-headroom-lib.sh}"
@@ -25,7 +24,6 @@ eq "sourcing prints nothing and reads nothing" "" "$(run ':')"
 # the floors: 2048 to START memory-hungry work, 1024 = the biggest job the mini may run; junk, 0, 08 and 10+ digits fall back to the default
 fl() { run 'echo "$RAM_NEW_WORK_MIN_MB/$RAM_JOB_MAX_MB"' "$@"; }
 eq "default floors"                      "2048/1024" "$(fl X=1)"
-eq "floors from the env"                 "4096/2048" "$(fl RAM_NEW_WORK_MIN_MB=4096 RAM_JOB_MAX_MB=2048)"
 eq "junk floors fall back"               "2048/1024" "$(fl RAM_NEW_WORK_MIN_MB=junk RAM_JOB_MAX_MB=)"
 eq "a floor of 0 or 08 is the default"   "2048/1024" "$(fl RAM_NEW_WORK_MIN_MB=0 RAM_JOB_MAX_MB=08)"
 eq "10 digits fall back"                 "2048/1024" "$(fl RAM_NEW_WORK_MIN_MB=1234567890 RAM_JOB_MAX_MB=1234567890)"

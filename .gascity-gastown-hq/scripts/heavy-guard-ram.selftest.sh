@@ -62,8 +62,7 @@ g RAM_AVAIL_OVERRIDE_MB=3048 -- --ram-mb 1000 -- true;  want "1000 declared need
 g "$LOW" -- --ram-mb 0 -- python3 x.py;           want "--ram-mb 0 is the explicit opt-out" 0 yes
 g RAM_AVAIL_OVERRIDE_MB=2057 -- --ram-mb 010 -- true;   want "--ram-mb 010 is ten, not octal eight (needs 2058)" 75 no
 g "$PLENTY" -- --ram-mb 08 -- true;                want "--ram-mb 08 is a number, not an octal error" 0 no
-g "$PLENTY" -- --ram-mb abc -- true;              want "--ram-mb abc is a usage error" 64 no
-g "$PLENTY" -- --ram-mb 1234567890 -- true;       want "--ram-mb past 9 digits is a usage error" 64 no
+for bad in abc 1234567890; do g "$PLENTY" -- --ram-mb "$bad" -- true; want "--ram-mb $bad is a usage error" 64 no; done
 g RAM_AVAIL_OVERRIDE_MB=3000 -- --check --ram-mb 500;   want "--check with a declared size and room" 0 no
 g RAM_AVAIL_OVERRIDE_MB=2000 -- --check --ram-mb 500;   want "--check with a declared size and no room" 75 no
 g "$LOW" -- --check --what python3;               want "--check without --ram-mb has no command to classify" 0 no

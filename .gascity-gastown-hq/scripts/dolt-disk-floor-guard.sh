@@ -1453,9 +1453,8 @@ _top_open_write_files() {
 }
 
 # _growth_swapfiles → the swapfile<N> files of /System/Volumes/VM (GROWTH_VM_DIR is the test seam) for the photo: `SWAPFILES\tok\t<n>`, then `SWAPFILE\t<bytes>\t<mtime epoch>\t<name>` per file
-# (BSD `stat -f '%z %m'`: this guard runs on the mini). Each 1 GB of swap is one file there and macOS gives them back only at reboot, so the count and the mtimes say WHEN the swap grew (the
-# du total of VM_DIR_KB cannot). Three states: a directory with none is a MEASURED zero; a directory that cannot be listed → `SWAPFILES\tunmeasured`, never ok 0; a file whose stat fails
-# keeps its row with `?` for size and mtime, never 0.
+# (BSD `stat -f '%z %m'`: this guard runs on the mini). Each 1 GB of swap is one file there and macOS gives them back only at reboot, so the count and the mtimes say WHEN the swap grew (the du total of VM_DIR_KB
+# cannot). Three states: none = a MEASURED zero; a directory that cannot be listed → `SWAPFILES\tunmeasured`, never ok 0; a file whose stat fails keeps its row with `?`, never 0.
 _growth_swapfiles() {
   local dir="${GROWTH_VM_DIR:-/System/Volumes/VM}" names n f st
   names="$(timeout "$GROWTH_EXTRA_TIMEOUT_SECS" ls -1 "$dir" 2>/dev/null)" || { printf 'SWAPFILES\tunmeasured\n'; return 0; }
