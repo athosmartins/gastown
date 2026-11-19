@@ -2,7 +2,7 @@
 
 ## Contents
 
-• O que faz (a cada 60 s, sob flock) · A tela do limite e o Escape (ga-ci3uao) · A mensagem de limite sem o modal e o último degrau (ga-yqzedv) · Ninguém fica sem aviso: sem login completo, login queimado, login a vencer (ga-xoe5ao.4) · Duas lojas para o login default: item e arquivo (ga-i4t0lzx) · Garantias · Liga/desliga · Riscos abertos (não medidos)
+• O que faz (a cada 60 s, sob flock) · A tela do limite e o Escape (ga-ci3uao) · A mensagem de limite sem o modal e o último degrau (ga-yqzedv) · Ninguém fica sem aviso: sem login completo, login queimado, login a vencer (ga-xoe5ao.4) · Duas lojas para o login default: item e arquivo (ga-i4t0lzx) · De quem é o login de cada item, quando ele nasce (ga-8pxmcrb) · Garantias · Liga/desliga · Riscos abertos (não medidos)
 
 Fase 2 da ga-xoe5ao. O pool headless (ga-8hcnvb.1, `claude-pool-account.py`) decide a conta; este script **segue** a decisão
 para quem usa Remote Control (Mayor + crews), reescrevendo o item DEFAULT do Keychain `Claude Code-credentials`.
@@ -223,6 +223,38 @@ de login **Background** do launchd, onde a leitura do Keychain falha (rc 36), en
 
 **NÃO medido:** quem reescreveu o item default sem o access token às 13:55:52Z; por que o login `d0aeaa6c` morreu; a mudança de sessão Aqua→Background depois do boot. O que a correção garante não depende disso: a troca escreve as duas lojas com leitura de volta, e a cura iguala a que ficou atrás — exceto no instante em que uma sessão rotaciona o arquivo no meio de uma troca que falhou no item (aí as lojas ficam diferentes até a próxima rodada, e o push diz isso).
 
+## De quem é o login de cada item, quando ele nasce (ga-8pxmcrb)
+**O que aconteceu (19/11 11:29, print do alerta):** o pool foi para throw.away.amb@ e as crews ficaram no athosmartins@. O alerta `no-login:throw.away.amb@gmail.com` dizia que o item do diretório dela
+(`Claude Code-credentials-d0aeaa6c`, derivado de `/Users/athos/.gastown/claude-accounts/throw.away.amb`; o teste `test_item_names_...` fixa o nome) estava em **quarentena** («it turned out to hold athosmartins@'s login») e que a
+reserva `...CREW-RESERVE-throw.away.amb@gmail.com` não existia. Quarentena só nasce no `resolve_unverified`: o job JÁ tinha levado as crews para esse login (troca às cegas, token guardado vencido, perfil mudo), o CLI renovou, o perfil
+respondeu «athosmartins@» e as crews ficaram na conta errada. O teste `test_a_crossed_item_is_not_switched_onto_a_day_later...` reproduz isso no script da base (a troca às cegas acontece).
+
+**Causa, lida no código (o Keychain, o estado e o log do mini NÃO são lidos deste nó):**
+1. Nenhum caminho do job grava o login de uma conta no item de outra (ga-xoe5ao.2 leu os pontos de escrita; `sync_back` só grava no item da conta que o perfil confirmou). O login errado entra por FORA: um `claude auth login` no diretório
+   da conta com o navegador entrado em OUTRA conta no claude.ai, feito à mão ou pelo `claude-login-renew` (que MANTÉM um login novo cujo dono o perfil não soube dizer, `owner unverified`). Medido: a ajuda do `claude auth login` (2.1.302)
+   diz que `--email` só «pré-preenche o e-mail na página de login». Hipótese, NÃO medida: um navegador já entrado em outra conta autoriza ESSA. É a 3ª vez (15-16/10, 27/10, 19/11): as duas primeiras sem causa achada.
+2. O dono só era descoberto na 1ª TROCA, às cegas. O perfil responde só por token vivo; a cópia guardada tem o token vencido há mais de um dia, mas na hora em que o login nasce o token vive (~8 h): era o momento de perguntar.
+3. O renew somava o fim do login alheio como fim do login da conta: com esse login a mais de 7 dias do fim (o fim real não foi lido daqui; a fixture usa 25) a conta cruzada parecia saudável, nunca ficava devida, e nenhum relogin
+   automático era tentado: as crews não iam para ela. (Se o fim real era < 7 dias, a previsão teria disparado e o relogin teria sido tentado: não sei dizer daqui qual dos dois foi o caso.)
+4. O aviso trazia o «Fix: log X in» no FIM de um texto longo (o push é cortado no celular) e sem dizer que o navegador tem de estar entrado COMO a conta.
+
+**O que o job faz agora**
+- `audit_stored` (a cada `AUDIT_EVERY_S` = 5 min, dentro de `LOOK_BUDGET_S`, DEPOIS da troca: keychain lento não atrasa a troca): para cada item PRÓPRIO de cada conta com login completo e token com mais de `LIVE_TOKEN_MIN_S` de vida, pergunta ao perfil
+  de quem é. Cópia com token vencido não é perguntada e nada se diz dela; leitura que não responde (keychain travado) encerra a auditoria sem veredito. **Outra conta**: quarentena (`bad_sources`, pela impressão do refresh token), `owners` atualizado e
+  UM push `item-mismatch:<conta>` que abre com a ação. As crews nunca são levadas por esse login, nem às cegas um dia depois: o `load_source` o recusa e tenta a reserva.
+- `keep_reserve`: o login que o perfil confirma como da conta também fica na reserva dela (criada se falta). Um login COMPLETO já lá só é trocado por um estritamente mais novo da MESMA conta e só quando o perfil já tinha dado o velho a ela (`owners`);
+  o que o job não sabe situar não é sobrescrito. Cópia segura contra um item próprio cruzado ou perdido; a reserva só acompanha o login enquanto ele é visto vivo (a auditoria), então pode ficar um pouco atrás.
+- `relogin_how`: todo push que manda alguém logar uma conta (`no-login`, `heal-no-source`, o episódio sem login, a previsão de vencimento, `item-mismatch`, as paredes do renew) traz QUAL conta e COMO («sign in to claude.ai AS <conta> first
+  (private window: the browser's account decides, not --email), then run: <comando>»); `no-login`, `heal-no-source` e `item-mismatch` ABREM com isso, antes do diagnóstico, e o de `no-login` cabe inteiro nos ~360 caracteres em que o
+  print de 19/11 foi cortado (o teste mede com o caminho do mini).
+- `claude-login-renew`: o fim de um login que o job recusa por ser de OUTRA conta (`foreign_login`: quarentena ou `owners`) não conta como fim da conta (`best_left`); conta só com logins alheios fica «unusable» e é renovada como uma sem login, a escolha do
+  pool primeiro (`docs/claude-login-renew.md`).
+
+**NÃO medido, e o que fica para o mini:** (a) QUAL escritor pôs o login do athosmartins@ no `d0aeaa6c` (a prova está nos logs do mini: `claude-login-renew.log` com `renewing throw.away.amb@`, `owner unverified`, `wrong_account`; e o `claude-crew-account.log`
+com `unverified switch`/`owner-mismatch` para a throw.away; só linhas, nunca o conteúdo do item); (b) que o claude.ai deixa a conta do navegador mandar mais que o `--email` (é o que o incidente sugere, não foi medido); (c) o item vivo CONTINUA cruzado até
+alguém logar a throw.away de verdade: nenhum código inventa login, o renew tenta e, se o Chrome de automação não tem a sessão Google dela (02/11: só athoscrypto@ e athosmartins@), a parede `no_google_session` manda UM push com o passo; (d) se o servidor invalida um
+refresh token antigo quando outra cópia é usada: a reserva só é lida quando o item próprio é recusado, e uma cópia velha que não renova cai nas guardas de sempre (`held`, `burn`/`dead`).
+
 ## Garantias
 - Nunca chama `claude`; custo de crédito zero (só o perfil, grátis). Nunca escreve no item hasheado do pool. O único arquivo que escreve fora dos itens é `~/.claude/.credentials.json` (0600, atômico, lido de volta).
 - Token nunca em argv, ambiente, log, estado ou notificação.
@@ -296,7 +328,7 @@ de login **Background** do launchd, onde a leitura do Keychain falha (rc 36), en
 - (ga-xoe5ao.2) A trava só vale para a troca NÃO verificada. Um `SWITCH` verificado (o perfil respondeu pela cópia guardada) que se repita a
   cada ciclo não é cortado por ela; não foi visto em produção e o mecanismo que esvazia o default (acima) não deveria agir sobre um token vivo.
 
-Testes: `scripts/test_claude_crew_account.py` (251 testes, shim de `security`, servidor de perfil em loopback, `tmux` falso que registra cada argv e cada tecla, `gc` falso que registra cada chamada e aceita `mail send`, `notify` falso que registra o ambiente (STRICT/FORCE) e devolve o rc pedido). O harness é
+Testes: `scripts/test_claude_crew_account.py` (306 testes, shim de `security`, servidor de perfil em loopback, `tmux` falso que registra cada argv e cada tecla, `gc` falso que registra cada chamada e aceita `mail send`, `notify` falso que registra o ambiente (STRICT/FORCE) e devolve o rc pedido). O harness é
 selado: todo teste roda com `CLAUDE_CREW_NOTIFY`, `CLAUDE_CREW_SECURITY` e `GC_CITY_PATH` fixados em stubs/tmp e `PATH`
 sem o `notify` real; no fim da sessão afirma que o log/estado/lock reais não mudaram e que nenhum sentinela foi executado;
 e o script roda de verdade sob `env -i`, com `python3` do pytest e com `/usr/bin/python3` (3.9, o do plist).

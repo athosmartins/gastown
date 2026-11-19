@@ -97,6 +97,11 @@ What it does, every run (launchd StartInterval, single instance via flock):
      (d) A FULL login a write would destroy - one this job did not write itself (`wrote`), that the profile cannot place as an older login of the same
      account - is PARKED first in an item nothing reads ("...CREW-RESERVE-PARKED-<fingerprint>"); a park that fails stops the write. (e) notify's push
      cap answers exit 12 to the forced push: an urgent alert is asked again, once, as a decision that waits for Athos (the route the cap exempts).
+  9. WHOSE IS THE LOGIN IN EACH ITEM - WHEN IT IS MADE (ga-8pxmcrb, 19/11): the profile answers for a LIVE token only, and a stored copy's is a day old by the time a
+     switch wants it, so the owner was first learned blind: the crews moved onto athosmartins@'s login that sat in throw.away.amb@'s item. audit_stored() asks, every
+     AUDIT_EVERY_S, about the own items whose token still lives: another account's login is quarantined and said at once (`item-mismatch:<account>`, with the action);
+     one the profile vouches for is kept in the account's reserve item too (keep_reserve), so a crossed or lost own item leaves the follow another login of that account.
+     Every push that sends a person to log an account in leads with WHICH account and HOW (relogin_how): the browser's signed-in account decides whose login it is.
 
 Secrets: held in memory; the only place they leave is `security -i` STDIN (hex). Never argv, env, log, state or alert.
 Accounts are named by e-mail + sha256[:8] fingerprints.
@@ -159,6 +164,8 @@ BURN_LIMIT = 2                  # ... twice = that refresh token is dead; it is 
 EXPIRY_WARN_S = 7 * 86400       # a refresh token has an ABSOLUTE life (~30 days from the login, ga-yyltfk): said this long ahead ...
 EXPIRY_EVERY_S = 86400          # ... once a day per account ...
 EXPIRY_CHECK_S = 3600           # ... reading the items at most this often
+AUDIT_EVERY_S = 300             # ga-8pxmcrb: whose is the login in each account's own item? asked at most this often (a login just made lives ~8 h: plenty) ...
+LIVE_TOKEN_MIN_S = 60           # ... and the profile is asked only about an access token with more life than this left: an expired copy is never asked
 # ga-ci3uao - which screen is each Remote Control session on, and the (opt-in) Escape for one on claude's limit screen
 DEFAULT_TMUX_SOCKET = "gascity"  # the city's tmux server (`tmux -L gascity`): every gc session, Mayor and crews included, lives in it
 LIMIT_WATCH_S = 900              # a session found on the limit screen is watched this long, then the watch is dropped (the push stands)
@@ -1027,6 +1034,15 @@ def relogin_cmd(email: str) -> str:
     return f"mkdir -p {p} && CLAUDE_CONFIG_DIR={p} claude auth login --email {email}"
 
 
+def relogin_how(email: str) -> str:
+    """ga-8pxmcrb: the hand step WHOLE, what every push that sends a person to log an account in leads with. The command alone is not enough: `--email` only pre-fills the login
+    page (the CLI's own help), and a browser already signed in to claude.ai as ANOTHER account is expected to authorize that one - the login would land in this account's item with the other
+    account's name on it, which is what throw.away.amb@'s item held on 19/11 (that this is how it got there was not measured). An account with no config dir has nothing to run: relogin_cmd says so."""
+    if not (accounts().get(email) or {}).get("dir"):
+        return relogin_cmd(email)
+    return f"sign in to claude.ai AS {email} first (private window: the browser's account decides, not --email), then run: {relogin_cmd(email)}"
+
+
 def no_login_text(ep: dict, dec, t: float) -> str:
     want = login_pick(str((dec or {}).get("current") or "").strip().lower()) or next(iter(accounts()), "")
     # vazio (no count, no list: the job did not record a try) → it says NOTHING about tries, "not recorded" is not "none was tried"; falhou/ilegível (not an int / not a text) → the same
@@ -1041,7 +1057,7 @@ def no_login_text(ep: dict, dec, t: float) -> str:
         fix = (f"This job heals only a default item that exists and holds a login object, so it will NOT put one back by itself. Fix: log "
                f"{want or 'an account'} in by hand, in the default config dir - claude auth login" + (f" --email {want}" if want else "") + ".")
     else:
-        fix = f"Fix: log ONE account in, the pool's pick first - {relogin_cmd(want)} - and this job writes it to the default item within a minute."
+        fix = f"Fix: log ONE account in, the pool's pick first - {relogin_how(want)} - and this job writes it to the default item within a minute."
     return (f"the Mayor and the crews have had NO full Claude login for {int((t - _num(ep.get('since'))) // 60)} min - Remote Control is down "
             f"({ep.get('why')}).{did} {fix} The automatic relogin is the separate job claude-login-renew (launchd, every 15 min): it tries one account per run, the "
             "pool's pick first, in the mini's own browser, and sends its own push when only a person can finish it - if this outage outlives a few of its "
@@ -1945,17 +1961,29 @@ def exhausted(dec: dict, email: str, t: float) -> bool:
     return isinstance(r, (int, float)) and r > t
 
 
-def source_refusal(st: Optional[dict], email: str, svc: str, blob: dict, t: float) -> Optional[str]:
-    """Why the login in `svc` (read, a login object in it) is NOT one this job would write as `email`'s (None = it would). One question, one answer: load_source
-    asks it to pick a source, and claude-login-renew (from ga-i4t0lzx.1 on) asks it to know whether an account HAS a usable login - two judges of 'usable' disagreed on 04/11
-    (the renew job called a held login usable and never launched, while this job refused it)."""
+def foreign_login(st: Optional[dict], email: str, svc: str, blob: dict, t: float) -> Optional[str]:
+    """Why the login in `svc` is NOT `email`'s at all (None = nothing says it is not): this job quarantined that very login, or the profile already gave it to another account.
+    The NAME of an item is not its owner. Its own function (ga-8pxmcrb) because claude-login-renew must tell 'a login that is not this account's' (its end says nothing about
+    when THIS account's ends) from 'a login of this account that is only not usable now' (held, dead, expiring)."""
     rfp = fp(blob["claudeAiOauth"].get("refreshToken"))
+    # vazio (no table, no entry for this item) → None: nothing says it is quarantined; falhou/ilegível (a table or an entry that is no dict) → None too: a damaged table loses knowledge, it never invents any
     q = ((st or {}).get("bad_sources") or {}).get(svc)
     if isinstance(q, dict) and q.get("rfp") == rfp:
         return f"quarantined (it turned out to hold {q.get('owner')}'s login, not {email}'s)"
     k = known_owner(st, rfp, t)               # the NAME of an item is not its owner: a login the profile already gave to someone else is not this one's
     if k and k[0] != email:
         return f"holds {k[0]}'s login, not {email}'s (the profile said so on {_iso(k[1])}) - not written as {email}'s"
+    return None
+
+
+def source_refusal(st: Optional[dict], email: str, svc: str, blob: dict, t: float) -> Optional[str]:
+    """Why the login in `svc` (read, a login object in it) is NOT one this job would write as `email`'s (None = it would). One question, one answer: load_source
+    asks it to pick a source, and claude-login-renew (from ga-i4t0lzx.1 on) asks it to know whether an account HAS a usable login - two judges of 'usable' disagreed on 04/11
+    (the renew job called a held login usable and never launched, while this job refused it)."""
+    rfp = fp(blob["claudeAiOauth"].get("refreshToken"))
+    foreign = foreign_login(st, email, svc, blob, t)
+    if foreign is not None:
+        return foreign
     ok, reason = full_login(blob, t)
     if not ok:
         return reason
@@ -2074,8 +2102,9 @@ def choose(st: dict, dec: dict, ident: str, t: float) -> Choice:
         return None, None, "wanted account could not be read", None
     msg = f"the pool is on {want} but there is no usable full login for it ({'; '.join(why)}) - the crews stay on {ident}"
     if not exhausted(dec, ident, t):
-        fix = f"log {want} in (claude auth login with its CLAUDE_CONFIG_DIR)" if login_pick(want) else f"take {want} out of the pool's list"
-        alert(st, f"no-login:{want}", f"{msg}. Fix: {fix} - a human step", t)
+        # the 19/11 push was cut at ~360 characters of its text, inside the diagnosis: which account to log in, and how, come FIRST and fit in them (ga-8pxmcrb)
+        fix = relogin_how(want) if login_pick(want) else f"take {want} out of the pool's list"
+        alert(st, f"no-login:{want}", f"ACTION: {fix} - {msg}", t)
         return None, None, "wanted account has no full login; current one still has balance", None
     unread_others = []
     for other in accounts():
@@ -2107,9 +2136,8 @@ def heal_choice(st: dict, dec: dict, ident: Optional[str], want: str, t: float) 
             return cand, src, "heal" if cand == want else "heal-fallback", note
         whys.append(f"{cand}: {'; '.join(why)}")
         short.append(f"{cand}: " + ", ".join(sorted({r.split(": ", 1)[-1].split(" - ")[0].split(" (")[0] for r in why})))   # 'held', 'dead', 'missing', 'no access token' ...
-    alert(st, "heal-no-source", f"cannot heal the default item: no account has a usable full login ({' | '.join(whys)}). "
-                                f"Fix: log {login_pick(want) or 'one of the accounts'} in (claude auth login with its CLAUDE_CONFIG_DIR) - a human "
-                                "step", t)
+    fix = relogin_how(login_pick(want)) if login_pick(want) else "log one of the accounts in (claude auth login with its CLAUDE_CONFIG_DIR)"
+    alert(st, "heal-no-source", f"ACTION: {fix} - cannot heal the default item: no account has a usable full login ({' | '.join(whys)}) - a human step", t)
     ep = st.get("no_login")
     if isinstance(ep, dict):                                   # ga-xoe5ao.4: the episode notice (what reaches the Mayor) says which account failed and why
         ep["accounts"] = ("Not usable: " + " | ".join(short))[:700]
@@ -2190,7 +2218,69 @@ def warn_expiring(st: dict, t: float) -> None:
     for email, left in sorted(best.items()):
         if email not in unread and 0 < left <= EXPIRY_WARN_S:
             alert(st, f"expiring:{email}", f"the best login of {email} ends in {left / 86400:.1f} days (a refresh token lives ~30 days from the "
-                  f"login): log it in again before then - {relogin_cmd(email)}", t, every=EXPIRY_EVERY_S, urgent=False)
+                  f"login): log it in again before then - {relogin_how(email)}", t, every=EXPIRY_EVERY_S, urgent=False)
+
+
+def keep_reserve(st: dict, email: str, login: dict, t: float) -> None:
+    """ga-8pxmcrb: a login the PROFILE just vouched for as `email`'s is kept whole in `email`'s reserve item too (the last place source_services looks): when the account's own item is
+    later crossed, quarantined or lost, the follow still has a login of that account. Written when the reserve is missing or holds no full login; a FULL login already there is replaced
+    only by a strictly NEWER login of the SAME account (the profile once placed the old one as `email`'s - `owners`): anything else may be the only copy of a login this job cannot
+    place, and 'cannot place' is not 'safe to overwrite'. Verified write, and the same login is never written twice. `login` is a FULL login (audit_stored checked it)."""
+    svc = reserve_service(email)
+    # vazio (no reserve yet) → it is created; falhou/ilegível (locked keychain, an item with no login object: 'unknown') → nothing is written over what cannot be looked at
+    s, acct, held = kc_read(svc)
+    if s == "unknown":
+        return
+    if s == "ok" and full_login(held, t)[0]:
+        placed, newer = known_owner(st, fp(held["claudeAiOauth"].get("refreshToken")), t), recency(login, held)       # newer 0 = the very same login: not written twice
+        if placed is None or placed[0] != email or newer is None or newer <= 0:
+            return
+    if DRY:
+        log("INFO", f"DRY-RUN would keep {email}'s login in {svc}")
+        return
+    if verified_write(svc, acct or login_name(), with_login(held, login)):
+        log("INFO", f"reserve: {email}'s login (refresh fp {fp(login['claudeAiOauth'].get('refreshToken'))}) is kept in {svc} too")
+    else:
+        log("WARN", f"reserve: {email}'s login could not be written to {svc}")
+
+
+def audit_stored(st: dict, t: float) -> None:
+    """ga-8pxmcrb: whose is the login in each account's OWN item? Asked while the answer can be known: right after a login its access token lives (~8 h) and the profile says whose it is;
+    a day later the stored copy's token is expired and nobody can say, so the first answer came from a BLIND switch (19/11: the crews moved onto athosmartins@'s login that sat in
+    throw.away.amb@'s item). A login the profile gives to ANOTHER account is quarantined and said at once, with the action (`item-mismatch:<account>`); one it vouches for is kept in the
+    reserve too. Every AUDIT_EVERY_S, after the switch (a slow keychain must never delay it) and no new item is started after LOOK_BUDGET_S; an expired copy is never asked about, and a
+    read that cannot tell stops the audit: no verdict, nothing written, nothing said."""
+    if t - _num(st.get("audit_checked")) < AUDIT_EVERY_S:         # vazio / ilegível → _num() says 0: looked at now
+        return
+    st["audit_checked"] = t
+    deadline = time.monotonic() + LOOK_BUDGET_S
+    for email in accounts():
+        for svc in source_services(email)[:-1]:                   # its own item(s); the reserve, last, is where a vouched-for login is kept - not a place a login is made
+            if time.monotonic() > deadline:
+                return                                            # no time: what was not looked at waits for the next audit
+            # vazio (no item, no login object) → nothing to judge here; falhou/ilegível (locked keychain, crashed security: 'unknown' with no blob) → the audit stops: no verdict
+            s, _, b = kc_read(svc)
+            if s == "unknown" and b is None:
+                return
+            if s != "ok" or not full_login(b, t)[0]:
+                continue
+            o = b["claudeAiOauth"]
+            left = _ms_left(o, "expiresAt", t)
+            # vazio (no expiry) / falhou (expired token, profile silent) → no owner: not judged now - "cannot tell" is no verdict, and an expired copy is never asked about
+            owner = profile_email(o["accessToken"]) if left is not None and left > LIVE_TOKEN_MIN_S else None
+            if owner is None:
+                continue
+            rfp = fp(o.get("refreshToken"))
+            note_owner(st, rfp, owner, t)
+            if owner == email:
+                keep_reserve(st, email, b, t)
+                continue
+            # vazio (no table yet) → a new one; falhou/ilegível (not a table) → a new one too: the quarantines are lost, none is invented, and the next audit finds the mismatch again
+            bad = st.get("bad_sources")
+            bad = st["bad_sources"] = bad if isinstance(bad, dict) else {}
+            bad[svc] = {"rfp": rfp, "owner": owner, "at": t}
+            alert(st, f"item-mismatch:{email}", f"ACTION: {relogin_how(email)} - the login stored for {email} (item {svc}) belongs to {owner}, not {email}: it is quarantined and is "
+                  f"never written as {email}'s, so the crews cannot follow the pool to {email} until it is logged in properly", t)
 
 
 def _follow(st: dict, dec: dict, user: str, t: float, dry: bool) -> int:
@@ -2344,7 +2434,8 @@ def run_once(dry: bool = False) -> int:
         # 06/10: 75 min old while the daemon ran every minute), so age says nothing about whether the daemon is alive. Following
         # an old-but-unchanged decision is correct (the crews are already on it); the pool daemon's liveness is ga-8hcnvb.3's.
         rc = _follow(st, dec, user, t, dry)
-    for what, fn in (("no-login notice", lambda: tell_no_login(st, dec, t)), ("expiry forecast", lambda: warn_expiring(st, t))):
+    for what, fn in (("no-login notice", lambda: tell_no_login(st, dec, t)), ("expiry forecast", lambda: warn_expiring(st, t)),
+                     ("stored-login audit", lambda: audit_stored(st, t))):
         try:
             fn()
         except Exception as e:  # noqa: BLE001 - the news is an addition: a bug in it must not cost the switch that has already been made

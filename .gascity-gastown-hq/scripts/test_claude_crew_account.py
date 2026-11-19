@@ -380,12 +380,14 @@ class World:
         self.d = tmp / "world"
         self.d.mkdir()
         self.tokens = {}                                    # access token -> e-mail, what the profile server answers
+        self.asked = []                                     # every token the profile was asked about, in order (ga-8pxmcrb: an expired copy must not be asked)
         self.profile_status = 200
         w = self
 
         class H(http.server.BaseHTTPRequestHandler):
             def do_GET(self):
                 tok = (self.headers.get("Authorization") or "").replace("Bearer ", "")
+                w.asked.append(tok)
                 email = w.tokens.get(tok)
                 if w.profile_status != 200 or not email:
                     self.send_response(w.profile_status if w.profile_status != 200 else 401)
@@ -572,6 +574,159 @@ def test_item_names_are_derived_from_the_absolute_path_and_match_the_measured_on
     assert crew.dir_service("/Users/athos/.gastown/claude-pool-cred") == "Claude Code-credentials-50adeaf1"
 
 
+# ══ ga-8pxmcrb: the login of ANOTHER account in an account's own item is caught when it is made, and an alert says which account to log in and how ═══
+# 19/11: the pool went to throw.away.amb@, whose own item (…-d0aeaa6c) held athosmartins@'s login; the crews had already been moved onto it blind (a quarantine is only born after an
+# unverified switch: the profile could not say whose the stored login was) and the push put the fix after a long diagnosis, where the phone cut it. First in the file on purpose: the
+# gate runs a test file on the pre-fix tree with failfast.
+def _crossed(w, key, owner, tag, *, live=True, **kw):
+    """`key`'s own item holds a full login that the profile says is `owner`'s - what `claude auth login` leaves when the browser was signed in as `owner`.
+    live: the access token is fresh (the minutes after the login), so the profile can say whose it is; not live: a stored copy a day later, which it cannot."""
+    b = blob(tag, **kw)
+    if live:
+        w.tokens[b["claudeAiOauth"]["accessToken"]] = EMAIL[owner]
+    else:
+        b["claudeAiOauth"]["expiresAt"] = int((T0 - 30 * 3600) * 1000)
+    w.put(w.src_service(key), b)
+    return b
+
+
+def _crew_on_crypto(w):
+    w.default("crypto", blob("crypto"))
+    w.account("crypto", blob("crypto"))
+
+
+def test_a_login_of_another_account_in_an_accounts_own_item_is_said_at_once_with_the_action_while_its_token_lives(w):
+    """Breaks if nothing looks at the stored items until a switch wants them: the profile answers only for a LIVE token, and by the time the pool picks the account it is a day old."""
+    _crew_on_crypto(w)
+    _crossed(w, "amb", "martins", "martins-in-amb")
+    w.decide("crypto")                                            # the pool is not on amb: no switch is wanted, only the audit looks
+    w.run()
+    told = [n for n in w.notified() if f"item-mismatch:{EMAIL['amb']}" in n]
+    assert len(told) == 1 and EMAIL["martins"] in told[0] and "sk-ant" not in told[0]
+    assert f"sign in to claude.ai AS {EMAIL['amb']}" in told[0] and crew.relogin_cmd(EMAIL["amb"]) in told[0]
+    assert w.writes() == []
+
+
+def test_a_crossed_item_is_not_switched_onto_a_day_later_when_the_profile_cannot_answer_any_more(w):
+    """The 19/11 incident end to end. Breaks if the audit does not remember what it saw: a day on, the stored token is expired, the job switches BLIND and the
+    crews land on athosmartins@ with throw.away.amb@'s name on the push."""
+    _crew_on_crypto(w)
+    b = _crossed(w, "amb", "martins", "martins-in-amb")
+    w.put(crew.reserve_service(EMAIL["amb"]), {**b, "claudeAiOauth": {**b["claudeAiOauth"], "expiresAt": int((T0 - 30 * 3600) * 1000)}})      # the same login was copied to the reserve too
+    w.decide("crypto")
+    w.run()                                                       # the audit sees it while the token lives
+    del w.tokens[b["claudeAiOauth"]["accessToken"]]               # a day later the profile is silent for that token
+    w.decide("amb")
+    w.run(at=w.now + 30 * 3600)
+    assert crew.DEFAULT_SERVICE not in w.writes() and w.state()["current"] == EMAIL["crypto"]      # neither copy is written as amb's: the item is quarantined, the login is known to be martins'
+    said = [n for n in w.notified() if f"no-login:{EMAIL['amb']}" in n]
+    assert len(said) == 1 and "quarantined" in said[0] and f"holds {EMAIL['martins']}'s login" in said[0]
+
+
+def test_with_the_own_item_crossed_the_crews_follow_the_pool_from_the_reserve(w):
+    """The Mayor's acceptance: the next switch of the pool takes the crews along. Breaks if a login the job refuses stops the search instead of letting the next place be tried."""
+    _crew_on_crypto(w)
+    w.put(crew.reserve_service(EMAIL["amb"]), blob("amb-real", acc_hours=-30))        # kept there when amb was last logged in; its token is long expired
+    _crossed(w, "amb", "martins", "martins-in-amb")
+    w.decide("amb")
+    w.run()                                                       # the live token says martins: nothing is written; the audit quarantines the item
+    assert crew.DEFAULT_SERVICE not in w.writes()
+    w.run(at=w.now + 60)
+    assert _rt(w.get(crew.DEFAULT_SERVICE)) == "sk-ant-ort01-amb-real-ref" and w.state()["current"] == EMAIL["amb"]
+
+
+def test_the_no_login_alert_leads_with_the_account_to_log_in_and_how_before_any_diagnosis(w):
+    """Breaks if the fix goes last: the push is cut after ~200 characters on the phone, and on 19/11 the cut fell inside the diagnosis."""
+    _crew_on_crypto(w)
+    w.decide("amb")                                               # the pool is on amb, which has no login anywhere
+    w.run()
+    said = [n for n in w.notified() if f"no-login:{EMAIL['amb']}" in n]
+    assert len(said) == 1
+    diagnosis = said[0].index("no usable full login")
+    assert said[0].index(f"sign in to claude.ai AS {EMAIL['amb']}") < diagnosis and said[0].index(crew.relogin_cmd(EMAIL["amb"])) < diagnosis
+    w.mp.setenv("CLAUDE_CREW_ACCOUNTS_DIR", "/Users/athos/.gastown/claude-accounts")             # the mini's own path: what the action measures in production
+    assert len("job falhou: claude-crew-account — ACTION: " + crew.relogin_how(EMAIL["amb"])) <= 360       # the 19/11 print was cut at ~360 characters: the whole action fits in them
+
+
+def test_a_login_the_profile_vouches_for_in_an_accounts_own_item_is_kept_in_its_reserve_too_and_only_once(w):
+    """Breaks if the reserve is not made when an account is logged in (the 19/11 reserve was 'missing'), or is rewritten every run, or the profile is asked every minute."""
+    _crew_on_crypto(w)
+    b = blob("amb")
+    w.account("amb", b, fresh=True)                               # a login just made: its token lives, the profile says it is amb's
+    tok, reserve = b["claudeAiOauth"]["accessToken"], crew.reserve_service(EMAIL["amb"])
+    w.decide("crypto")
+    w.run()
+    assert w.get(reserve) == w.get(w.src_service("amb")) and w.writes() == [reserve] and w.asked.count(tok) == 1
+    w.run(at=w.now + 60)
+    assert w.asked.count(tok) == 1                                # looked at every 5 minutes, not every minute
+    w.run(at=w.now + 600)
+    assert w.asked.count(tok) == 2 and w.writes() == [reserve]    # looked again, the same login is not written again
+
+
+@pytest.mark.parametrize("old_is, old_days, renewed", [("amb", 10, True), (None, 10, False), ("martins", 10, False), ("amb", 40, False)],
+                         ids=["the-profile-placed-the-old-one-as-amb", "the-old-one-is-unplaced", "the-profile-placed-the-old-one-as-another", "the-old-one-is-the-newer"])
+def test_a_reserve_with_an_older_login_is_renewed_only_when_the_profile_once_placed_it_as_the_same_accounts(w, old_is, old_days, renewed):
+    """Breaks if the reserve is never renewed (a stale copy is a dead login when it is needed), or if a full login this job cannot place, that is another account's, or that is the
+    NEWER one is overwritten."""
+    _crew_on_crypto(w)
+    old = blob("amb-old", rexp_days=old_days, acc_hours=-30)
+    w.put(crew.reserve_service(EMAIL["amb"]), old)
+    if old_is:
+        (w.d / "crew_state.json").write_text(json.dumps({"owners": {crew.fp(old["claudeAiOauth"]["refreshToken"]): {"email": EMAIL[old_is], "at": w.now - 3600}}}))
+    w.account("amb", blob("amb-new", rexp_days=29), fresh=True)
+    w.decide("crypto")
+    w.run()
+    assert (_rt(w.get(crew.reserve_service(EMAIL["amb"]))) == "sk-ant-ort01-amb-new-ref") is renewed
+
+
+def test_a_reserve_that_holds_no_full_login_is_replaced_by_the_one_the_profile_vouches_for(w):
+    _crew_on_crypto(w)
+    w.put(crew.reserve_service(EMAIL["amb"]), blob("amb-setup", refresh=False, acc_hours=-30))      # a setup-token: nothing worth keeping
+    w.account("amb", blob("amb"), fresh=True)
+    w.decide("crypto")
+    w.run()
+    assert _rt(w.get(crew.reserve_service(EMAIL["amb"]))) == "sk-ant-ort01-amb-ref"
+
+
+@pytest.mark.parametrize("how", ["unreadable", "no-login-object", "dry-run"])
+def test_a_reserve_that_cannot_be_looked_at_or_that_a_dry_run_must_not_touch_is_not_written(w, how, capsys):
+    """Breaks if the reserve is written over an item that cannot be read or that holds no login object (only the machine's MCP logins), or by a --dry-run."""
+    _crew_on_crypto(w)
+    reserve = crew.reserve_service(EMAIL["amb"])
+    if how == "unreadable":
+        w.mp.setenv("FAKE_SEC_FAIL", reserve)
+    elif how == "no-login-object":
+        w.put(reserve, {"mcpOAuth": {"some-server": {"token": "x"}}})
+    w.account("amb", blob("amb"), fresh=True)
+    w.decide("crypto")
+    w.run(dry=(how == "dry-run"))
+    assert reserve not in w.writes()
+    assert how != "dry-run" or (w.get(reserve) is None and f"would keep {EMAIL['amb']}'s login in {reserve}" in capsys.readouterr().err)       # the dry run SAID it (the guard is not just absent)
+
+
+@pytest.mark.parametrize("how", ["expired-copy", "dry-run", "keychain-locked", "not-a-full-login"])
+def test_the_audit_that_cannot_look_or_must_not_act_asks_nothing_says_nothing_and_writes_nothing(w, how):
+    _crew_on_crypto(w)
+    plain = how == "not-a-full-login"                                  # amb's OWN login, vouched for by the profile, but a setup-token: nothing worth keeping in the reserve
+    b = _crossed(w, "amb", "amb" if plain else "martins", "martins-in-amb", live=(how != "expired-copy"), **({"refresh": False} if plain else {}))
+    if how == "keychain-locked":
+        _crossed(w, "b85", "martins", "martins-in-b85")                # looked at AFTER amb: a keychain that does not answer ends the audit, it does not skip one item and go on
+        w.mp.setenv("FAKE_SEC_FAIL", w.src_service("amb"))
+    w.decide("crypto")
+    w.run(dry=(how == "dry-run"))
+    assert w.notified() == [] and w.writes() == [] and "bad_sources" not in w.state()
+    assert how != "expired-copy" or b["claudeAiOauth"]["accessToken"] not in w.asked      # an expired copy is not even asked about
+
+
+def test_the_heal_alert_too_leads_with_the_action_and_an_account_with_no_config_dir_is_not_told_to_sign_in_and_run(w):
+    w.put(crew.DEFAULT_SERVICE, blob("old", refresh=False))      # the default holds no full login: the heal looks for one, and nobody has one
+    w.decide("amb")
+    w.run()
+    said = [n for n in w.notified() if "heal-no-source" in n]
+    assert len(said) == 1 and said[0].index(f"sign in to claude.ai AS {EMAIL['amb']}") < said[0].index("cannot heal")
+    assert crew.relogin_how(EMAIL["martins"]) == crew.relogin_cmd(EMAIL["martins"]) and "sign in" not in crew.relogin_how(EMAIL["martins"])      # athosmartins@ has an item, no dir: nothing to run
+
+
 # ══ ga-oo94pgo: athosb85@ was cancelled by Athos on 11/11 - no switch, heal or renewal may land on it ═══════════════════════════
 # Production no longer lists it (the World's five accounts are the fixtures', TEST_ACCOUNTS): every test here runs on the script's own list.
 # First in the file on purpose: the gate runs a test file on the pre-fix tree with failfast and a time limit, and the ~270 tests below would use it up.
@@ -699,7 +854,8 @@ def test_follows_the_pool_decision_and_syncs_the_leaving_account_back(w):
     assert now_default["claudeAiOauth"]["refreshToken"] == amb["claudeAiOauth"]["refreshToken"]
     # the leaving account's login was copied back BEFORE the default item was overwritten (a refresh token lives in one place)
     assert w.get(w.src_service("crypto"))["claudeAiOauth"]["refreshToken"] == "sk-ant-ort01-crypto-rotated-ref"
-    assert w.writes() == [w.src_service("crypto"), crew.DEFAULT_SERVICE]
+    # ga-8pxmcrb: after the switch the audit finds crypto's own item holding a login the profile vouches for (the copy-back just wrote it, its token lives): it is kept in the reserve too
+    assert w.writes() == [w.src_service("crypto"), crew.DEFAULT_SERVICE, crew.reserve_service(EMAIL["crypto"])]
     s = w.state()
     assert s["current"] == EMAIL["amb"] and s["last_switch"]["from"] == EMAIL["crypto"]
     assert "SWITCH crews" in w.log()
@@ -2595,6 +2751,7 @@ def test_the_outage_is_told_after_ten_minutes_by_push_and_mail_again_when_it_end
     subject, body = mail[mail.index("-s") + 1], mail[mail.index("-m") + 1]
     assert mail[4:7] == ["mayor/", "--from", "controller"] and "SEM login completo" in subject
     assert "Not usable:" in body and EMAIL["b85"] in body and f"claude auth login --email {EMAIL['terr']}" in body
+    assert f"sign in to claude.ai AS {EMAIL['terr']}" in body                # ga-8pxmcrb: which account the BROWSER must be signed in as comes before the command
     assert "NOT wired" not in body and "claude-login-renew" in body        # ga-i4t0lzx: the automatic relogin IS wired (its own launchd job) - the stale sentence told the Mayor it was not
     _run_dead(w, 21600 + 600, 21600 + 660, 21600 + 720, 21600 + 780, 21600 + 840)     # 6 h on: every hold has lapsed, each login gets its one more try
     _run_dead(w, 43200 + 600, 64800 + 600)
@@ -2760,7 +2917,8 @@ def test_logins_ending_within_a_week_are_said_once_a_day_and_the_best_login_of_t
     w.run()
     said = lambda: [n for n in w.notified() if "ends in" in n]    # noqa: E731
     assert len(said()) == 1 and EMAIL["amb"] in said()[0] and "ends in 5.0 days" in said()[0] and f"claude auth login --email {EMAIL['amb']}" in said()[0]
-    assert w.notify_envs() == ["1/1"]                             # strict AND forced like every other push: FORCE_PUSH keeps it out of the digest, it never pierced the quiet hours (rc 10 = held until 07:00 = told)
+    assert f"sign in to claude.ai AS {EMAIL['amb']}" in said()[0]            # ga-8pxmcrb
+    assert w.notify_envs() == ["1/1"]                            # strict AND forced like every other push: FORCE_PUSH keeps it out of the digest, it never pierced the quiet hours (rc 10 = held until 07:00 = told)
     w.run(at=w.now + 7200)                                        # read again, but said less than a day ago
     assert len(said()) == 1
     w.run(at=w.now + 90000)

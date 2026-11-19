@@ -286,6 +286,87 @@ def w(tmp_path, monkeypatch):
     return World(tmp_path, monkeypatch)
 
 
+# ── ga-8pxmcrb: a login that is another account's is no login of THIS account - its end must not make the account look healthy ──────────────────
+# 19/11: throw.away.amb@'s own item held athosmartins@'s login (25 days of life, quarantined by the crew job). The survey counted that end as amb's, so amb was never due, no
+# relogin was ever tried and the crews stayed on the wrong account for ever. First in the file on purpose: the gate runs a test file on the pre-fix tree with failfast.
+def _crossed_login(w, how="quarantined", key="amb", **state):
+    """`key`'s own item holds martins@'s login and the crew job knows it is not `key`'s: it moved onto it and found out (quarantined), or the profile placed it earlier (owners).
+    `state`: more of the crew job's state (the crew state file is written whole)."""
+    b = blob(f"martins-in-{key}", rexp_days=25.0)
+    w.own(key, b)
+    rfp = crew.fp(b["claudeAiOauth"]["refreshToken"])
+    w.crew_state(**{**({"bad_sources": {w.svc(key): {"rfp": rfp, "owner": EMAIL["martins"], "at": T0 - 3600}}} if how == "quarantined"
+                       else {"owners": {rfp: {"email": EMAIL["martins"], "at": T0 - 3600}}}), **state})
+
+
+@pytest.mark.parametrize("how", ["quarantined", "the-profile-placed-it"])
+def test_an_account_whose_only_login_is_another_accounts_is_due_and_gets_launched(w, how):
+    """Breaks if the other account's 25 days count as amb's: no forecast, no outage (the default is fine) - 'nothing launched' for ever."""
+    healthy(w, 29.0, "crypto", "b85", "terr")
+    _crossed_login(w, how)
+    w.decide("amb")
+    seen = record(w)
+    assert renew.housekeeping() == 0
+    assert seen == [(EMAIL["amb"], "unusable")]
+
+
+def test_the_forecast_goes_before_an_account_that_is_only_unusable_and_one_account_goes_per_run(w):
+    healthy(w, 29.0, "crypto", "terr")
+    w.own("b85", blob("b85-x", rexp_days=3.0))
+    _crossed_login(w)
+    seen = record(w)
+    renew.housekeeping()
+    w.own("b85", blob("b85-new"))
+    renew.housekeeping()
+    assert seen == [(EMAIL["b85"], "forecast"), (EMAIL["amb"], "unusable")]
+
+
+@pytest.mark.parametrize("days, held, due", [(3.0, False, [("amb", "forecast")]), (20.0, False, []), (None, False, []), (20.0, True, [])],
+                         ids=["real-login-ending", "real-login-fine", "real-login-with-no-recorded-end", "real-login-held-for-a-while"])
+def test_a_real_login_of_the_account_elsewhere_decides_not_the_crossed_one(w, days, held, due):
+    """Breaks if the crossed login hides the real one's end (its 25 days win the max), or if having a real login - even one with no recorded end, or one held back for a few
+    hours after an unverified switch (it comes back by itself) - still counts the account as unusable."""
+    healthy(w, 29.0, "crypto", "b85", "terr")
+    real = blob("amb-real", rexp_days=days or 29.0)
+    if days is None:
+        del real["claudeAiOauth"]["refreshTokenExpiresAt"]
+    _crossed_login(w, **({"unverified_logins": {crew.fp(real["claudeAiOauth"]["refreshToken"]): {"svc": "x", "target": EMAIL["amb"], "at": T0 - 60}}} if held else {}))
+    w.put(crew.reserve_service(EMAIL["amb"]), real)
+    seen = record(w)
+    renew.housekeeping()
+    assert seen == [(EMAIL[k], why) for k, why in due]
+
+
+def test_the_pool_pick_goes_first_among_the_unusable_accounts(w):
+    """b85 comes first by name; the pool's pick (amb) must go first anyway: it is the one the crews are failing to follow."""
+    healthy(w, 29.0, "crypto", "terr")
+    _crossed_login(w, key="b85")
+    _crossed_login(w, key="amb", bad_sources={w.svc(k): {"rfp": crew.fp(f"sk-ant-ort01-martins-in-{k}-ref"), "owner": EMAIL["martins"], "at": T0 - 3600} for k in ("amb", "b85")})
+    w.decide("amb")
+    seen = record(w)
+    renew.housekeeping()
+    w.own("amb", blob("amb-new"))                                                               # it was renewed: a login of its own now
+    renew.housekeeping()
+    assert seen == [(EMAIL["amb"], "unusable"), (EMAIL["b85"], "unusable")]
+
+
+def test_a_mark_is_not_lifted_by_another_accounts_login_that_has_more_life(w):
+    """The mark was made when amb's own login ended in 2 days. Breaks if martins@'s 25 days in the same item count as 'logged in by hand'."""
+    healthy(w, 29.0, "crypto", "b85", "terr")
+    _crossed_login(w)
+    (w.d / "renew_state.json").write_text(json.dumps({"accounts": {EMAIL["amb"]: {"infeasible": {"verdict": "needs_device", "step": "s", "at": T0 - 60, "left": 2 * DAY, "pushed": T0 - 60}}}}))
+    seen = record(w)
+    renew.housekeeping()
+    assert w.mark("amb") is not None and "logged in by hand" not in w.log() and seen == []
+
+
+@pytest.mark.parametrize("verdict", ["wrong_account", "puzzle", "needs_device", "failed_3_times"])
+def test_the_hand_step_in_a_wall_push_says_which_account_to_sign_in_as_before_the_command(verdict):
+    """Breaks if the push hands over `claude auth login --email` alone: a browser signed in as another account authorizes THAT one, whatever --email says."""
+    text = renew.step_text(EMAIL["amb"], {"verdict": verdict, "step": "x", "left": None, "at": T0})
+    assert f"sign in to claude.ai AS {EMAIL['amb']}" in text and text.index("sign in to claude.ai AS") < text.index(crew.relogin_cmd(EMAIL["amb"]))
+
+
 # ── ga-oo94pgo: athosb85@ was cancelled by Athos on 11/11 - the renewal no longer serves it (these run on the crew script's own list) ──
 # First in the file on purpose: the gate runs a test file on the pre-fix tree with failfast and a time limit, and the ~190 tests below would use it up.
 def _ran(w):

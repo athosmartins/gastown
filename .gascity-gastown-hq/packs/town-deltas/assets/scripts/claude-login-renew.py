@@ -16,6 +16,9 @@ When the scheduled run acts (one account per run, the forecast first by nearest 
     the crew job's own judge (its source_refusal): a login it holds back after an unverified switch, quarantined, knows to be another account's, or has burned is NOT usable.
     On 04/11 this job called such logins usable, saw no outage, and stayed silent for the whole of it. The credentials file counts like the default item (a full login in it is
     a login the sessions have); an item or the file that cannot be READ means "unknown": no outage is judged.
+  * UNUSABLE (ga-8pxmcrb): an item of the account holds a login that is ANOTHER account's (the crew job quarantined it, or the profile placed it) and the account has no usable login of its own
+    (none the crew job would write, no end of its own recorded): renewed like an account with no login, the pool's pick first, after the forecast and the outage. The end of such a login is never
+    counted as the account's own: on 19/11 throw.away.amb@'s item held athosmartins@'s login, and while an alien login is more than 7 days from its end the account was never due.
   EVERY scheduled run leaves one `scheduled run:` line in the log (accounts looked at, the verdict on the outage, what was launched, who was passed over and why): silence
   means the job did not run, never "nothing to say".
   An account whose mark says "wait" (`recheck_at`, `next_at`) is not touched before that time. Off switch: GC_LOGIN_RENEW=0 or <city>/.gc/no-login-renew.
@@ -348,8 +351,8 @@ def survey(email: str, crew: dict, t: float, file: Optional[dict] = None) -> dic
     WRITE - its own judge, source_refusal, so the two jobs cannot disagree on 'usable' as they did on 04/11 - or, for the holder of the default, the default item or the
     credentials file holds a full login that is not dead), default_full (the holder's default item or file holds such a login), unread (an item - or, for the holder, the file - that
     could not be read: the account is not judged), no_object (its OWN item parses but holds no login object: it says nothing about a login, yet attempt() will not launch for it -
-    what cannot be put back is not touched), refused (the logins that exist but the crew job would not write, with its reason: what the log says when an outage is not fixed by them)."""
-    best, full, default_full, unread, no_object, refused = None, False, False, False, False, []
+    what cannot be put back is not touched), refused (the logins that exist but the crew job would not write, with its reason: what the log says when an outage is not fixed by them), alien (how many of its items hold a login that is ANOTHER account's: they count in nobody's best_left)."""
+    best, full, default_full, unread, no_object, refused, alien = None, False, False, False, False, [], 0
     holder = email == holder_of(crew)
     d = acct_dir(email)
     own = C.dir_service(str(d)) if d else None
@@ -360,8 +363,12 @@ def survey(email: str, crew: dict, t: float, file: Optional[dict] = None) -> dic
             unread = True
         elif s == "ok" and b:
             o = b["claudeAiOauth"]
+            # ga-8pxmcrb: a login that is ANOTHER account's (quarantined, or the profile placed it) says nothing about when THIS account's ends: it is counted in nobody's best_left (that is how a crossed
+            # item like throw.away.amb@'s on 19/11 can look healthy: its end is far). `alien` counts them: an account with only those is not 'ending', it HAS no login of its own.
+            is_alien = C.foreign_login(crew, email, svc, b, t) is not None
+            alien += is_alien
             left = C._ms_left(o, "refreshTokenExpiresAt", t)
-            if left is not None:
+            if left is not None and not is_alien:
                 best = left if best is None else max(best, left)
             if svc == C.DEFAULT_SERVICE:                       # the LIVE login of the holder, not a source: the crew job's rule for it is full and not dead
                 why = None if C.full_login(b, t)[0] and not C.dead_login(crew, C.fp(o.get("refreshToken"))) else "not a usable full login"
@@ -379,7 +386,7 @@ def survey(email: str, crew: dict, t: float, file: Optional[dict] = None) -> dic
             only_file, unread = not unread, True
         elif file["full"]:
             full = default_full = True
-    return {"best_left": best, "full": full, "default_full": default_full, "unread": unread, "no_object": no_object, "refused": refused, "unread_file": only_file}
+    return {"best_left": best, "full": full, "default_full": default_full, "unread": unread, "no_object": no_object, "refused": refused, "unread_file": only_file, "alien": alien}
 
 
 def retired(st: dict) -> List[str]:
@@ -419,7 +426,7 @@ def step_text(email: str, mark: dict) -> str:
     verdict, step, left, at = str(mark.get("verdict") or ""), str(mark.get("step") or ""), mark.get("left"), mark.get("at")
     chrome = ("sign this Google account in ONCE in the automation Chrome on the mini (profile ~/.chrome-cdp, `cdp status`; password and 2-step by you, "
               "nothing passes through an agent). Once it is done the job notices within about a day and the renewal is automatic again")
-    hand = C.relogin_cmd(email)
+    hand = C.relogin_how(email)                                                   # ga-8pxmcrb: the account the browser is signed in as decides whose login it is, not --email
     why = {
         "puzzle": f"Anthropic asked a human-verification puzzle at 'Authorize' (not circumvented). Log {email} in by hand, once, in the mini's Terminal: {hand}",
         "no_google_session": f"the Google account {email} is not signed in in the automation Chrome, so the job cannot pick it. Step: {chrome}.",
@@ -518,7 +525,7 @@ def candidates(st: dict, crew: dict, dec, t: float, facts: Optional[dict] = None
     cf = cred_view(crew, t)                                    # read ONCE: the file is the holder's second store (the sessions read and rotate in it), not an account's
     surveys = {e: survey(e, crew, t, cf) for e in C.accounts()}      # ALL of them: an account with no config dir (a backup or reserve item) is a login the crew job heals from
     facts["accounts"] = len(surveys)
-    forecast, outage = [], []
+    forecast, outage, unusable = [], [], []
     ep = crew.get("no_login")
     since = ep.get("since") if isinstance(ep, dict) and isinstance(ep.get("since"), (int, float)) and not isinstance(ep.get("since"), bool) else None
     in_outage = since is not None and not ep.get("ending") and t - since >= C.NO_LOGIN_WARN_S
@@ -543,7 +550,11 @@ def candidates(st: dict, crew: dict, dec, t: float, facts: Optional[dict] = None
     pick = str((dec or {}).get("current") or "").strip().lower() if isinstance(dec, dict) else ""
     for email, v in surveys.items():
         a = (st.get("accounts") or {}).get(email) or {}
-        due = "forecast" if v["best_left"] is not None and v["best_left"] <= C.EXPIRY_WARN_S else "outage" if none_usable else None
+        # ga-8pxmcrb: "unusable" = an item holds a login that is another account's and the account has no login of its own the crew job would write (no end of its OWN is recorded either): the
+        # pool can pick it and the crews cannot follow. Before, the alien login's end counted as its own, so while that end was more than 7 days off it was never due; a mislabeled item is as good
+        # as no login, so it is renewed like one.
+        due = ("forecast" if v["best_left"] is not None and v["best_left"] <= C.EXPIRY_WARN_S else "outage" if none_usable
+               else "unusable" if v["alien"] and not v["full"] and v["best_left"] is None else None)
         if v["unread"]:
             what = "the credentials file" if v["unread_file"] else "an item"
             rlog("WARN", f"{email}: {what} could not be read - the account is not judged this run" + ("" if acct_dir(email) else " (and whether any account has a login is unknown, so no outage is judged)"))
@@ -592,7 +603,9 @@ def candidates(st: dict, crew: dict, dec, t: float, facts: Optional[dict] = None
             forecast.append((v["best_left"], email))
         elif due == "outage":
             outage.append((0 if email == pick else 1, email))
-    return [(e, "forecast") for _, e in sorted(forecast)] + [(e, "outage") for _, e in sorted(outage)]
+        elif due == "unusable":
+            unusable.append((0 if email == pick else 1, email))
+    return [(e, "forecast") for _, e in sorted(forecast)] + [(e, "outage") for _, e in sorted(outage)] + [(e, "unusable") for _, e in sorted(unusable)]
 
 
 def run_once(email: str) -> int:
