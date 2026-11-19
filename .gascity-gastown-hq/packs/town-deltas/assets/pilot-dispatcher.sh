@@ -2376,6 +2376,96 @@ _pilot_variable_session_count() {
   _pilot_live_session_count wa-worker ps-worker gate-reviewer
 }
 
+# ── ga-2hd02v.17: TETO DE CONSTRUTORES LOCAIS — "Construtores todos no Hetzner" (Athos, 19/11 ~12:10, AskUserQuestion na sessão do Mayor) ──
+# O mini (16 GB) não comporta ~16 sessões Claude (~350 MB cada) + Dolt (2,4 GB) + Chrome + painéis: cada GB acima vira swapfile permanente no disco e o piso de disco pausa o mini (gate a 0,3/h às 12:00 de
+# 19/11; ga-1p1i5jr.13/.14). Os construtores (dog, wa-worker, ps-worker) rodam no nó Hetzner; no mini fica UMA vaga, para o que só o mini faz (celular/ADB, Chrome logado, dado local) e para o transbordo do nó.
+# O teto é COMBINADO: a SOMA das sessões vivas dos três templates do mini (wa-worker, ps-worker, gastown.dog). Um teto por pool não serve: 1 wa-worker + 1 ps-worker + 1 dog são 3 sessões e nenhum pool vê as outras.
+# dog-remote, wa-worker-remote e ps-worker-remote são templates do NÓ e não entram na conta.
+# PILOT_LOCAL_BUILDER_MAX: vazio/ausente → sem teto (o Pilot de antes; o plist versionado põe 1) · inteiro de 0 a 999 → esse teto (0 = o mini não abre construtor) · qualquer outra coisa (letra, sinal, ponto,
+# espaço, 4+ dígitos) → 1, o valor da decisão do Athos: erro de digitação cai do lado que protege o mini, nunca em "sem teto".
+# Três estados na contagem, como no teto global (ga-oa004t): cabe (0) · cheio (1) · não consegui ler (2: quem vai abrir sessão NÃO abre; só uma leitura POSITIVA de "cheio" pula uma bead antes da claim).
+# A leitura é a de _pilot_live_session_count (active + creating + start-pending, fail-closed, com o sinalizador sticky da varredura). `fresh` lê de novo (o empréstimo ao dog); `cached` usa o número da varredura,
+# lido uma vez e SUBIDO por cada spawn que este script faz (_pilot_local_builder_note_spawn): o dog de um `gc sling` só nasce depois que o controller o cria, então uma releitura no meio da varredura não o
+# veria e um 2º sling passaria o teto. Sessão aberta por outro no meio da varredura entra na varredura seguinte; o teto de cada pool no engine (agent.toml, city.toml) é o cinto.
+# PILOT_TEST_LOCAL_BUILDER_COUNT é a semente de teste (inteiro; nunca definida em produção).
+_PLB_N=""        # saída de _pilot_local_builder_gate: construtores locais vivos ("" = não lido)
+_PLB_MAX=""      # saída: o teto efetivo ("" = sem teto)
+_PLB_LIVE=""     # o número da varredura: lido uma vez e subido a cada spawn ("" = ainda não lido)
+_PLB_RC=0        # rc do último gate, para os pontos de chamada
+
+# _pilot_local_builder_max — imprime o teto efetivo, ou nada quando não há teto. Sempre devolve 0.
+_pilot_local_builder_max() {
+  local _v="${PILOT_LOCAL_BUILDER_MAX:-}"
+  # vazio (variável ausente ou vazia) → nada: sem teto; falhou/ilegível (não é inteiro de 1 a 3 dígitos) → 1, o lado que protege o mini
+  [ -n "$_v" ] || return 0
+  case "$_v" in
+    *[!0-9]*|????*) printf '1' ;;
+    *) printf '%s' "$((10#$_v))" ;;
+  esac
+  return 0
+}
+
+# _pilot_local_builder_gate <fresh|cached> — 0 = cabe (ou sem teto) · 1 = cheio · 2 = não consegui ler a contagem. Deixa _PLB_N e _PLB_MAX.
+# NUNCA via $(...): o número da varredura e o sinalizador sticky de _pilot_live_session_count são do shell de quem chama.
+_pilot_local_builder_gate() {
+  local _mode="${1:-fresh}" _n=""
+  _PLB_N=""
+  _PLB_MAX=$(_pilot_local_builder_max)
+  [ -n "$_PLB_MAX" ] || return 0
+  # vazio (sem semente e sem número da varredura) → lê o gc; falhou/ilegível (gc, JSON ou .sessions que não se leem; semente que não é inteiro) → 2, nunca "0 vivos"
+  if [ -n "${PILOT_TEST_LOCAL_BUILDER_COUNT:-}" ]; then
+    _n="$PILOT_TEST_LOCAL_BUILDER_COUNT"
+  elif [ "$_mode" = "cached" ] && [ -n "${_PLB_LIVE:-}" ]; then
+    _n="$_PLB_LIVE"
+  elif _pilot_live_session_count wa-worker ps-worker gastown.dog; then
+    _n="$_PLSC_N"
+  else
+    return 2
+  fi
+  case "$_n" in ''|*[!0-9]*) return 2 ;; esac
+  _PLB_N="$_n"; _PLB_LIVE="$_n"
+  [ "$_n" -lt "$_PLB_MAX" ] && return 0
+  return 1
+}
+
+# _pilot_local_builder_note_spawn — um spawn deste script sobe o número da varredura (só sobe, e só se ele já foi lido: sem número não há o que subir, e a primeira leitura vem antes de qualquer spawn).
+_pilot_local_builder_note_spawn() {
+  case "${_PLB_LIVE:-}" in ''|*[!0-9]*) ;; *) _PLB_LIVE=$(( _PLB_LIVE + 1 )) ;; esac
+  return 0
+}
+
+# _pilot_local_builder_full_pre <bead-json> — exit 0 = PULA a bead antes da claim, sem escrever: ela é CONHECIDA, antes da claim, por abrir uma sessão local (_pilot_priority_pool_bound_pre: rota de pool ou
+# rig→dog sem crew), o teto local está POSITIVAMENTE cheio e o nó NÃO a quer (_pilot_priority_node_exempt_pre: oráculo node com vaga). 1 em tudo o mais: sem teto, bead que talvez vá a uma crew, teto com vaga,
+# contagem que não se leu (os braços de dispatch_one são fail-closed; um pulo nunca nasce de um palpite) e bead que o nó leva.
+_pilot_local_builder_full_pre() {
+  local _b="${1:-}" _rc=0
+  [ -n "$(_pilot_local_builder_max)" ] || return 1
+  _pilot_priority_pool_bound_pre "$_b" || return 1
+  _pilot_local_builder_gate cached || _rc=$?
+  [ "$_rc" = 1 ] || return 1
+  if _pilot_priority_node_exempt_pre "$_b"; then return 1; fi
+  return 0
+}
+
+# _pilot_local_builder_arm <bead_id> <bead_city> <builder> <o-que-abriria> — o portão de dispatch_one logo antes de abrir sessão no mini (spawn do wa-worker, do ps-worker, `gc sling` ao gastown.dog).
+# 0 = pode abrir. 1 = a claim foi liberada e DISPATCH_RESULT dito, e o chamador só faz `return 1`: local_builder_cap_queued (cheio: fila de capacidade, a bead segue story:approved, sem falso "em execução")
+# ou rig_native_pool_count_unreadable (contagem ilegível: FALHA, não fila, e o dispatch_lane para a fase de despacho — o mesmo nome e o mesmo tratamento do teto global).
+_pilot_local_builder_arm() {
+  local _id="$1" _city="$2" _bt="${3:-}" _what="${4:-a builder session}" _rc=0
+  _pilot_local_builder_gate cached || _rc=$?
+  case "$_rc" in
+    0) return 0 ;;
+    2) log "  ga-2hd02v.17: cannot read the local-builder session count (session list unreadable/timed out) — NOT opening $_what for $_id (fail-closed: claim released; the next sweep re-probes)."
+       _pilot_release_count_unreadable "$_id" "$_city" "$_bt"
+       DISPATCH_RESULT="rig_native_pool_count_unreadable"
+       return 1 ;;
+    *) log "  ga-2hd02v.17: local builder cap hit (${_PLB_N:-?}/${_PLB_MAX:-?}: wa-worker+ps-worker+gastown.dog on the mini) — QUEUED $_id for $_what (claim released, story:approved retained; the node takes what it can, the next sweep re-checks)."
+       _pilot_release_pool_cap_queued "$_id" "$_city" "$_bt"
+       DISPATCH_RESULT="local_builder_cap_queued"
+       return 1 ;;
+  esac
+}
+
 # ── ga-5je3zv: an unreadable session count HALTS the dispatch phase — it is not a per-candidate event ──
 # ga-oa004t made an unreadable count fail CLOSED, and that stays right: never open a worker without knowing
 # the count. The defect was what happened AFTER. _PLSC_UNREADABLE is sticky for the sweep, so once ONE
@@ -11558,6 +11648,16 @@ _pilot_pool_topup() {
   fi
   _global="$_PLSC_N"
   case "$_global" in ''|*[!0-9]*) _global=0 ;; esac
+  # ga-2hd02v.17: teto de construtores LOCAIS (wa-worker+ps-worker+gastown.dog no mini; PILOT_LOCAL_BUILDER_MAX, vazio = sem teto). O pool pode ter vaga e o mini não: sem vaga local não abre sessão.
+  # vazio (sem teto) → segue como sempre; falhou/ilegível (contagem que não se leu) → não abre, dito no log (o mesmo fail-closed do teto global acima).
+  _PLB_RC=0; _pilot_local_builder_gate cached || _PLB_RC=$?
+  if [ "$_PLB_RC" = 2 ]; then
+    log "  ga-2hd02v.17: top-up gate — cannot read the local builder session count (session list unreadable/timed out) — NOT spawning $_pool this sweep (fail-closed; the next sweep re-probes)."
+    return 0
+  elif [ "$_PLB_RC" = 1 ]; then
+    log "  ga-2hd02v.17: top-up gate — local builder cap full (${_PLB_N:-?}/${_PLB_MAX:-?}: wa-worker+ps-worker+gastown.dog on the mini) — NOT spawning $_pool this sweep (the node takes what it can)."
+    return 0
+  fi
 
   while [ "$_live" -lt "$_max" ] && [ "$_global" -lt "$GC_VARIABLE_SESSION_MAX" ]; do
     # Test seam mirrors PILOT_TEST_WA_WORKER_LIVE_COUNT above: set to (even an
@@ -11671,12 +11771,16 @@ _pilot_pool_topup() {
       _topup_bind_after_spawn "$_pool" "$_pending" || true
       _live=$((_live + 1))
       _global=$((_global + 1))
+      # ga-2hd02v.17: o spawn sobe o número da varredura; com o teto local agora cheio (ou sem leitura) o laço para — o próximo pool também fecha no portão acima
+      _pilot_local_builder_note_spawn
+      _PLB_RC=0; _pilot_local_builder_gate cached || _PLB_RC=$?
       # ga-5fn5p3: the dispatch lanes later in this sweep read the per-pool live count from the cache the scan above warmed
       # (_PCAP_LIVE_*); a top-up spawn only ever raises it, so keep the cache as honest as dispatch_one()'s own spawn sites do.
       case "$_pool" in
         wa-worker) if [ -n "${_PCAP_LIVE_WA:-}" ]; then _PCAP_LIVE_WA=$(( _PCAP_LIVE_WA + 1 )); fi ;;
         ps-worker) if [ -n "${_PCAP_LIVE_PS:-}" ]; then _PCAP_LIVE_PS=$(( _PCAP_LIVE_PS + 1 )); fi ;;
       esac
+      [ "$_PLB_RC" = 0 ] || break
     else
       break
     fi
@@ -17026,6 +17130,17 @@ TASK
     return 1
   fi
 
+  # ── ga-2hd02v.17: o sling ao dog do MINI só sai com vaga no teto de construtores locais ──────────────────────────────────────────────────────────────────────────────────
+  # O dog do `gc sling` nasce depois, no controller: sem este portão a bead seria slingada a um pool cheio (max do gastown.dog) e esperaria na fila do engine como "em execução" sem worker (a classe do
+  # ga-in9ebr). Só a bead do HQ que o nó NÃO levou (nem em DRY_RUN, que não escreve); crew nomeada e rig-native seguem como antes. Cheio = a claim é liberada como fila e a bead segue story:approved.
+  case "$_SLING_TARGET" in
+    gastown.dog|gastown.dog-*)
+      if [ "$DRY_RUN" != "1" ] && [ "$_IS_RIG_NATIVE" != "1" ] && [ "${_PNF_RESULT:-}" != "node" ] \
+         && ! _pilot_local_builder_arm "$STORY_ID" "$STORY_BEAD_CITY" "$BUILDER_TARGET" "a gastown.dog session"; then
+        return 1
+      fi ;;
+  esac
+
   # ── Dispatch via gc sling (HQ beads) or bd assign (rig-native beads) ─────────
   # ga-ov3gow: DISPATCH_RESULT is NOT local (it used to be): every `DISPATCH_RESULT=...; return 1` below
   # is a reason the caller never saw, so a queue / failed spawn / guard refusal left no trace anywhere.
@@ -17413,6 +17528,8 @@ TASK
             DISPATCH_RESULT="rig_native_global_session_cap_queued"
             return 1
           fi
+          # ── ga-2hd02v.17: teto de construtores LOCAIS (wa-worker+ps-worker+gastown.dog no mini; PILOT_LOCAL_BUILDER_MAX, vazio = sem teto) — ver _pilot_local_builder_arm ──
+          if ! _pilot_local_builder_arm "$STORY_ID" "$STORY_BEAD_CITY" "$BUILDER_TARGET" "a wa-worker session"; then return 1; fi
           # ── ga-v3o6i: max-cap guard — count live sessions before spawning ──────
           # Each sweep dispatches a bead then spawns a session. Without a cap check,
           # rapid re-sweeps (or slow session startup) spawn N sessions for M beads
@@ -17479,6 +17596,7 @@ TASK
               log "  ga-mfeip: wa-worker session spawned for $STORY_ID (slot=$BUILDER_TARGET). [ga-oa004t path=dispatch_one pool_live_before=$_live_wa_count max=${PILOT_WA_WORKER_MAX:-4}]"
               # ga-in9ebr: keep the per-sweep pre-claim count honest (a spawn only ever raises it).
               if [ -n "${_PCAP_LIVE_WA:-}" ]; then _PCAP_LIVE_WA=$(( _PCAP_LIVE_WA + 1 )); fi
+              _pilot_local_builder_note_spawn
             else
               warn "ga-mfeip: Could not spawn wa-worker for $STORY_ID — gc.routed_to=wa-worker set; ga-93yxc pool top-up retries on a later sweep [ga-6hr8p7 exit=$_spawn_rc after $(( SECONDS - _spawn_t0 ))s of ${PILOT_SPAWN_TIMEOUT_SECS:-150}s$([ "$_spawn_rc" = "124" ] && printf ' -- TIMED OUT: the session may still have been created, the next sweep live count decides')]"
               # ga-d20od: the spawn genuinely failed/timed out — no worker was
@@ -17533,6 +17651,8 @@ TASK
             DISPATCH_RESULT="rig_native_global_session_cap_queued"
             return 1
           fi
+          # ── ga-2hd02v.17: teto de construtores LOCAIS (o mesmo do braço do wa-worker) ──
+          if ! _pilot_local_builder_arm "$STORY_ID" "$STORY_BEAD_CITY" "$BUILDER_TARGET" "a ps-worker session"; then return 1; fi
           if [ -n "${PILOT_TEST_PS_WORKER_LIVE_COUNT:-}" ]; then
             _live_ps_count="$PILOT_TEST_PS_WORKER_LIVE_COUNT"
           elif _pilot_live_session_count ps-worker; then
@@ -17575,6 +17695,7 @@ TASK
               log "  ga-mfeip: ps-worker session spawned for $STORY_ID. [ga-oa004t path=dispatch_one pool_live_before=$_live_ps_count max=${PILOT_PS_WORKER_MAX:-2}]"
               # ga-in9ebr: keep the per-sweep pre-claim count honest (a spawn only ever raises it).
               if [ -n "${_PCAP_LIVE_PS:-}" ]; then _PCAP_LIVE_PS=$(( _PCAP_LIVE_PS + 1 )); fi
+              _pilot_local_builder_note_spawn
             else
               warn "ga-mfeip: Could not spawn ps-worker for $STORY_ID — gc.routed_to=ps-worker set; ga-93yxc pool top-up retries on a later sweep [ga-6hr8p7 exit=$_spawn_rc after $(( SECONDS - _spawn_t0 ))s of ${PILOT_SPAWN_TIMEOUT_SECS:-150}s$([ "$_spawn_rc" = "124" ] && printf ' -- TIMED OUT: the session may still have been created, the next sweep live count decides')]"
               # ga-d20od: mirrors the wa-worker spawn-failure rollback above —
@@ -17851,6 +17972,8 @@ TASK
     fi
 
     log "Dispatch complete: sling_bead=$SLING_BEAD_ID target=$_SLING_TARGET slot=$BUILDER_TARGET reuse=${_DISPATCH_REUSE} session_state=${_DISPATCH_SESS_STATE}"
+    # ga-2hd02v.17: o dog slingado nasce depois, no controller: o número da varredura sobe já, senão um 2º sling desta varredura passaria o teto local.
+    case "$_SLING_TARGET" in gastown.dog|gastown.dog-*) _pilot_local_builder_note_spawn ;; esac
   fi
 
   # ── Transition bead: DURABLE lane tag + DURABLE story:in-flight (ga-2azzj fix 1,
@@ -18208,7 +18331,7 @@ _pilot_sweep_emit() {
     def cls($o):
       if $o.rc == "0" then "dispatched"
       elif $o.r == "rig_native_pool_session_cap_queued" then "queued_pool_cap"
-      elif $o.r == "rig_native_global_session_cap_queued" then "queued_global_cap"
+      elif $o.r == "rig_native_global_session_cap_queued" or $o.r == "local_builder_cap_queued" then "queued_global_cap"
       elif $o.r == "rig_native_spawn_failed" then "spawn_failed"
       elif $o.r == "priority_yield" then "yielded_priority"
       elif ["pool_ownership_refuse", "rig_native_dog_store_blind", "rig_native_dog_store_migrated", "rig_native_pool_store_blind", "rig_native_pool_store_migrated", "hq_pool_store_blind", "rig_native_pool_target_only", "rig_dedup_skip", "rig_native_spawn_deferred_slow", "disk_floor_node_only", "node_owned_skip", "wa_node_pass_released", "kimi_lane_released", "kimi_lane_wait", "kimi_lane_demoted"]
@@ -18380,6 +18503,17 @@ dispatch_lane() {
       # ga-ov3gow: this bead never reaches dispatch_one(), so nothing else would record it — and it is the
       # commonest queue path. Same name dispatch_one() gives the in-arm cap: one kind of queue, one bucket.
       _pilot_sweep_note "$pick_id" 1 "rig_native_pool_session_cap_queued"
+      continue
+    fi
+
+    # ── ga-2hd02v.17: teto de construtores LOCAIS — a bead que o Pilot SABE que abriria sessão no mini, com o teto cheio e sem o nó querê-la, é PULADA antes da claim ──
+    # Mesma forma e mesma razão do pulo do teto por pool logo acima (claim → carimbo → soltura a cada varredura, em cada candidata, é o que o ga-in9ebr tirou): zero escrita, só a nota em memória, e conta como FILA de
+    # capacidade (saturação, não parada: nem NONQUEUE_FAILS nem PRIORITY_YIELDED). A bead de primeira vista que o Pilot ainda não sabe presa a um pool é decidida no braço de dispatch_one (_pilot_local_builder_arm).
+    if [ "$_mbp_pass" != 1 ] && _pilot_local_builder_full_pre "$pick"; then
+      if _pilot_note_pool_cap_queued "$pick_id"; then
+        log "ga-2hd02v.17: $pick_id QUEUED — local builder cap full (${_PLB_N:-?}/${_PLB_MAX:-?}: wa-worker+ps-worker+gastown.dog on the mini; the node takes what it can); not claimed, no writes this sweep."
+      fi
+      _pilot_sweep_note "$pick_id" 1 "local_builder_cap_queued"
       continue
     fi
 
@@ -18603,7 +18737,15 @@ _pilot_dog_lend_dog_free() {
   if ! _pilot_live_session_count gastown.dog; then _PDL_WHY="dog-count-unreadable"; return 2; fi
   case "${_PLSC_N:-}" in ''|*[!0-9]*) _PDL_WHY="dog-count-unreadable"; return 2 ;; esac
   _PDL_DOG_LIVE="$_PLSC_N"
-  if [ $(( _PLSC_N + ${_PDL_LENT:-0} )) -lt "$_max" ]; then return 0; fi
+  if [ $(( _PLSC_N + ${_PDL_LENT:-0} )) -lt "$_max" ]; then
+    # ga-2hd02v.17: o dog emprestado é um construtor LOCAL: também precisa de vaga no teto combinado (wa-worker+ps-worker+gastown.dog; PILOT_LOCAL_BUILDER_MAX, vazio = sem teto), contando o que esta varredura já emprestou.
+    # vazio (sem teto) → vaga; falhou/ilegível (contagem que não se leu) → rc 2, sem vaga por palpite
+    _PLB_RC=0; _pilot_local_builder_gate fresh || _PLB_RC=$?
+    if [ "$_PLB_RC" = 2 ]; then _PDL_WHY="local-builder-count-unreadable"; return 2; fi
+    if [ -z "${_PLB_MAX:-}" ] || [ $(( _PLB_N + ${_PDL_LENT:-0} )) -lt "$_PLB_MAX" ]; then return 0; fi
+    _PDL_WHY="no-free-local-builder (${_PLB_N}+${_PDL_LENT:-0} >= ${_PLB_MAX}: wa-worker+ps-worker+gastown.dog on the mini)"
+    return 1
+  fi
   _PDL_WHY="no-free-dog"
   return 1
 }
