@@ -463,6 +463,18 @@ PILOT_WA_NODE_EXEMPT="${PILOT_WA_NODE_EXEMPT:-off}"
 PILOT_DISK_FLOOR_ENABLED="${PILOT_DISK_FLOOR_ENABLED:-1}"
 PILOT_DISK_LIB="${PILOT_DISK_LIB:-$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd || true)/scripts/disk-headroom-lib.sh}"
 
+# ── ga-1p1i5jr.14 (P0, 19/11): RAM FLOOR — the mini opens no NEW session when its real free RAM is under the floor ─────────────────────
+# 19/11 11:37-11:46 three swapfiles appeared in /System/Volumes/VM with NO heavy job — macOS gives each 1 GB file back only at the next reboot: the SUM of 16 Claude sessions (~350 MB each) + Dolt 2.4 GB + Chrome on
+# a 16 GB mini, which RSS and swapusage hide (compressed memory). The free RAM the kernel reports (ram-headroom-lib.sh: memory_pressure x hw.memsize) under RAM_NEW_WORK_MIN_MB (2048) → the MINI starts nothing: with
+# PILOT_NODE_FIRST=on the sweep goes on as the NODE-ONLY pass (the disk floor's), otherwise it pauses; what already runs is never touched. FAIL-OPEN but not silent (an unreadable RAM dispatches as before and says so;
+# heavy-guard.sh fails CLOSED, per step). The reading is taken once per sweep, so a sweep that starts just over the floor can still open its few sessions.
+# BORN OFF, like the other Pilot switches that change who gets work (PILOT_NODE_FIRST, the WA node route): PILOT_RAM_FLOOR_ENABLED = 0 (the default; empty and any unknown word too) | shadow (reads, and writes the reading on the
+# log every sweep, never acts: the way to compare it with `memory_pressure` by hand) | 1 (acts). Who flips it is a person, in the plist (docs/runbooks/hetzner-capacity.md, "Teto de RAM do mini"). Off, it is also what keeps
+# every selftest that runs the dispatcher from depending on how much RAM its host has (the class selftest-disk-pin-class.selftest.sh closes for the disk). The reading is pinned in selftests with
+# PILOT_RAM_AVAIL_OVERRIDE_MB (or RAM_AVAIL_OVERRIDE_MB); RAM_NEW_WORK_MIN_MB tunes the floor.
+PILOT_RAM_FLOOR_ENABLED="${PILOT_RAM_FLOOR_ENABLED:-0}"
+PILOT_RAM_LIB="${PILOT_RAM_LIB:-$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd || true)/scripts/ram-headroom-lib.sh}"
+
 # ── Stale in-flight slot correction (ga-rk5va adversarial constraint c) ────────
 # A story:in-flight bead normally occupies a builder slot. But a session can hang
 # (the 16h-stuck-session bug) — zero state-transitions for hours while the bead
@@ -2664,6 +2676,44 @@ _pilot_disk_floor() {
   PILOT_DISK_FLOOR_STATE="$_st"
   PILOT_DISK_FLOOR_DETAIL="disk_free=${_free:-?}MB floor=${DISK_NEW_WORK_MIN_MB}MB"
   [ "$_st" = "low" ] && return 0
+  return 1
+}
+
+# ── ga-1p1i5jr.14: the RAM FLOOR gate's reader (see the config header above) ──────────────────────────────────────────────────────
+# _pilot_ram_floor — return 0 (ACT: the free RAM is BELOW the new-work floor and the gate is ON) / 1 (anything else, shadow included). Sets PILOT_RAM_FLOOR_STATE ("ok" | "low" | "unknown" | "off": what the reading
+# says, also in shadow), PILOT_RAM_FLOOR_DETAIL (the reading, for the log) and PILOT_RAM_FLOOR_NOTE (what the ENVIRONMENT did to the gate, "" in a default run; the caller logs it).
+# Called DIRECTLY, never in $(...), so the globals survive. THREE states, and only a real reading under the floor of a gate that is ON returns 0: "unknown" (the library does not load, the host or the reading cannot
+# be had) returns 1 — fail-open — with the state named so the caller can log it apart from "ok"; "off" = the key is not 1 or shadow, or the host is not macOS (the swapfile problem is macOS's).
+_pilot_ram_floor() {
+  PILOT_RAM_FLOOR_STATE="off"
+  PILOT_RAM_FLOOR_DETAIL=""
+  PILOT_RAM_FLOOR_NOTE=""
+  # vazio/falhou/ilegível (the key is empty, 0 or any word that is not 1 or shadow) → off, silent: born OFF, and a typo keeps it off
+  case "$PILOT_RAM_FLOOR_ENABLED" in 1|shadow) ;; *) return 1 ;; esac
+  [ "${RAM_HEADROOM_ENABLED:-1}" != "0" ] || PILOT_RAM_FLOOR_NOTE="RAM_HEADROOM_ENABLED=0 is set in the environment, so every RAM reading counts as ok and this gate can never fire"
+  PILOT_RAM_FLOOR_STATE="unknown"
+  # vazio/falhou/ilegível (the library file is absent, does not load, or loads without a reader) → "unknown", fail-open and on the log, never "low". The first `.` is a PROBE in a subshell: on /bin/bash 3.2
+  # (what launchd runs) a syntax error in a sourced file ends the whole shell, `2>/dev/null` and `if !` notwithstanding — in a subshell it ends only the probe, and a corrupt library becomes this state, not a dead Pilot.
+  if ! ( . "$PILOT_RAM_LIB" ) >/dev/null 2>&1 || ! . "$PILOT_RAM_LIB" 2>/dev/null || ! type ram_host_kind >/dev/null 2>&1 || ! type ram_avail_mb >/dev/null 2>&1 || ! type ram_state_of >/dev/null 2>&1; then
+    PILOT_RAM_FLOOR_DETAIL="library unreadable or does not load: ${PILOT_RAM_LIB}"
+    return 1
+  fi
+  # darwin → read it; other (Linux) → off; unknown (uname gave nothing) → unknown, never "other"
+  case "$(ram_host_kind)" in
+    darwin) ;;
+    other) PILOT_RAM_FLOOR_STATE="off"; return 1 ;;
+    *) PILOT_RAM_FLOOR_DETAIL="host unreadable (uname gave nothing)"; return 1 ;;
+  esac
+  local _ov="${PILOT_RAM_AVAIL_OVERRIDE_MB:-${RAM_AVAIL_OVERRIDE_MB:-}}" _st _free=""
+  # ONE read feeds the verdict AND the log line. vazio/falhou/ilegível → _free stays "" and ram_state_of answers "unknown" for it; a reading under the floor → "low"
+  _free="$(RAM_AVAIL_OVERRIDE_MB="$_ov" ram_avail_mb)" || _free=""
+  # a lib that does not define the floor (older than this reader) fails this substitution under set -u, and `|| unknown` takes it: the sweep is never killed
+  _st="$(ram_state_of "$_free" "$RAM_NEW_WORK_MIN_MB")" || _st="unknown"
+  case "$_st" in ok|low) ;; *) _st="unknown" ;; esac
+  PILOT_RAM_FLOOR_STATE="$_st"
+  PILOT_RAM_FLOOR_DETAIL="ram_free=${_free:-?}MB floor=${RAM_NEW_WORK_MIN_MB:-?}MB"
+  # shadow reads and names the state but never acts
+  [ "$_st" = "low" ] && [ "$PILOT_RAM_FLOOR_ENABLED" = "1" ] && return 0
   return 1
 }
 
@@ -6076,6 +6126,34 @@ elif [ "$_disk_floor_rc" -eq 0 ]; then
 elif [ "$PILOT_DISK_FLOOR_STATE" = "unknown" ]; then
   # Third state kept VISIBLE: "could not read the disk" is not "the disk is fine" (ga-vln2py).
   log "Disk free UNREADABLE (${PILOT_DISK_FLOOR_DETAIL:-df gave no usable number}) — fail-open, dispatch proceeding normally this sweep; this is NOT a confirmation that the disk is fine (ga-vln2py)."
+fi
+
+# ── ga-1p1i5jr.14: RAM FLOOR — the mini opens no new session when its free RAM is under the floor ─────────────────────────────────
+# See the config header (PILOT_RAM_FLOOR_ENABLED) for the why. Same two shapes as the disk floor right above: the NODE-ONLY pass with PILOT_NODE_FIRST=on outside DRY_RUN (the node's sessions do not spend the mini's
+# RAM), else the whole sweep pauses; a sweep the disk floor already made node-only keeps ITS pause reason. `|| rc=$?`: the reader answers 1 for "no action", and the dispatcher runs under set -e.
+_ram_floor_rc=0
+_pilot_ram_floor || _ram_floor_rc=$?
+if [ -n "${PILOT_RAM_FLOOR_NOTE:-}" ]; then
+  warn "RAM floor gate bent by the environment — ${PILOT_RAM_FLOOR_NOTE} (never in production; ga-1p1i5jr.14)."
+fi
+if [ "$_ram_floor_rc" -eq 0 ] && [ "${PILOT_NODE_FIRST:-off}" = "on" ] && [ "${DRY_RUN:-0}" != "1" ]; then
+  warn "RAM floor (${PILOT_RAM_FLOOR_DETAIL}) — the MINI opens no new session, but PILOT_NODE_FIRST=on: this sweep still runs the NODE-ONLY pass (ga-1p1i5jr.14)."
+  [ "${_PILOT_NODE_ONLY:-0}" = "1" ] || _pilot_write_sweep_pause_state 1 "ram-floor" "RAM floor: ${PILOT_RAM_FLOOR_DETAIL}"
+  _PILOT_NODE_ONLY=1
+  log "RAM floor: passada só-nó — só bead de dog do HQ com veredito node e vaga vai adiante; nada vai ao mini (ga-1p1i5jr.14)."
+elif [ "$_ram_floor_rc" -eq 0 ]; then
+  warn "RAM floor (${PILOT_RAM_FLOOR_DETAIL}) — PAUSING all dispatch this sweep: a new session on a mini this short of RAM is what grew permanent swapfiles on 19/11. Stories stay queued; dispatch resumes on its own once a later sweep reads the free RAM above the floor (ga-1p1i5jr.14)."
+  _pilot_write_sweep_pause_state 1 "ram-floor" "RAM floor: ${PILOT_RAM_FLOOR_DETAIL}"
+  # The reason text inside the parens stays CONSTANT on purpose: approved-state-reconciler.py files an unknown pause reason under its own text, and a changing number would be a new "reason" every sweep.
+  # And it says "memory floor", not "RAM floor": that table files any text with the word ram under the RAM-pressure monitor's reason (_PILOT_PAUSE_REASONS), a different gate.
+  log "=== Pilot sweep complete: dispatched=0 (paused: memory floor) ==="
+  exit 0
+elif [ "${PILOT_RAM_FLOOR_ENABLED:-}" = "shadow" ] && [ "${PILOT_RAM_FLOOR_STATE:-off}" != "off" ]; then
+  # SHADOW: nothing is held back; the reading lands on the log every sweep, "ok" ones too — that is what is compared with `memory_pressure` by hand before the key goes to 1
+  log "RAM floor (sombra): ${PILOT_RAM_FLOOR_STATE} ${PILOT_RAM_FLOOR_DETAIL} — nothing held back; with PILOT_RAM_FLOOR_ENABLED=1 a low reading makes the mini open no session (ga-1p1i5jr.14)."
+elif [ "${PILOT_RAM_FLOOR_STATE:-off}" = "unknown" ]; then
+  # Third state kept VISIBLE: "could not read the RAM" is not "the RAM is fine" (ga-1p1i5jr.14).
+  log "Free RAM UNREADABLE (${PILOT_RAM_FLOOR_DETAIL:-no usable reading}) — fail-open, dispatch proceeding normally this sweep; this is NOT a confirmation that the RAM is fine (ga-1p1i5jr.14)."
 fi
 
 # ── ga-a2v0bz: drain window — no NEW dispatch admitted from 23:00 until the nightly reboot ─

@@ -30,6 +30,8 @@
 		<string>shadow</string>
 		<key>PILOT_PS_WORKER_MAX</key>
 		<string>1</string>
+		<key>PILOT_RAM_FLOOR_ENABLED</key>
+		<string>shadow</string>
 		<key>PILOT_SPAWN_PS_WORKER</key>
 		<string>1</string>
 		<key>PILOT_SPAWN_WA_WORKER</key>
