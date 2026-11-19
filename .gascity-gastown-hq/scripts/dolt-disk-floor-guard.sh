@@ -566,8 +566,9 @@ GROWTH_BASELINE_INTERVAL_SECS="${DOLT_DISK_FLOOR_GROWTH_BASELINE_INTERVAL_SECS:-
 # very things that grew), so the budget bounds the ROOT SCAN's share of any delay to
 # them. (_reap_growing_logs is not one of them: it runs every cycle at the top of
 # main(), before the photo.) It is not the whole delay: the /System/Volumes/VM du
-# (<=20s) and the writers lsof (<=30s) sit outside it, so the worst case is budget +
-# ~50s (see _disk_growth_photo).
+# (<=20s), the swapfile ls and the top read (<=10s each, GROWTH_EXTRA_TIMEOUT_SECS) and
+# the writers lsof (<=30s) sit outside it, so the worst case is budget + ~70s (see
+# _disk_growth_photo).
 GROWTH_ROOT_TIMEOUT_SECS="${DOLT_DISK_FLOOR_GROWTH_ROOT_TIMEOUT_SECS:-60}"
 GROWTH_TOTAL_BUDGET_SECS="${DOLT_DISK_FLOOR_GROWTH_TOTAL_BUDGET_SECS:-150}"
 # Tighter budget for the photo taken on a CRITICAL cycle: it runs before the
@@ -585,8 +586,11 @@ GROWTH_KEEP_PHOTOS="${DOLT_DISK_FLOOR_GROWTH_KEEP_PHOTOS:-20}"
 # Smallest regular file (MB) that _top_open_write_files reports as "held open
 # for write".
 GROWTH_WRITER_MIN_MB="${DOLT_DISK_FLOOR_GROWTH_WRITER_MIN_MB:-100}"
-# How many of the biggest memory footprints (top MEM) the photo records (ga-1p1i5jr.14).
+# How many of the biggest memory footprints (top MEM) the photo records (ga-1p1i5jr.14), and the bound (s) of each EXTRA read the photo makes for it (the swapfile ls, the top + ps loop): the
+# photo is taken BEFORE the reclaim levers, so a hung read must end as "unmeasured" in seconds. An integer >= 1: text makes timeout refuse to run and `timeout 0` means NO limit.
 GROWTH_TOPMEM_N="${DOLT_DISK_FLOOR_GROWTH_TOPMEM_N:-10}"
+GROWTH_EXTRA_TIMEOUT_SECS="${DOLT_DISK_FLOOR_GROWTH_EXTRA_TIMEOUT_SECS:-10}"
+case "$GROWTH_EXTRA_TIMEOUT_SECS" in ''|*[!0-9]*|0) GROWTH_EXTRA_TIMEOUT_SECS=10 ;; esac
 
 ts()  { date '+%Y-%m-%d %H:%M:%S'; }
 log() { echo "[$(ts)] $*" >> "$LOG" 2>/dev/null || true; }
@@ -1454,7 +1458,7 @@ _top_open_write_files() {
 # keeps its row with `?` for size and mtime, never 0.
 _growth_swapfiles() {
   local dir="${GROWTH_VM_DIR:-/System/Volumes/VM}" names n f st
-  names="$(ls -1 "$dir" 2>/dev/null)" || { printf 'SWAPFILES\tunmeasured\n'; return 0; }
+  names="$(timeout "$GROWTH_EXTRA_TIMEOUT_SECS" ls -1 "$dir" 2>/dev/null)" || { printf 'SWAPFILES\tunmeasured\n'; return 0; }
   names="$(printf '%s\n' "$names" | awk '/^swapfile[0-9]+$/')"
   n="$(printf '%s\n' "$names" | grep -c .)"
   printf 'SWAPFILES\tok\t%s\n' "$n"
@@ -1470,9 +1474,11 @@ _growth_swapfiles() {
 # _growth_topmem → the biggest footprints for the photo: `TOPMEM\tok` then `TOPMEM_ROW\t<pid>\t<MEM>\t<CMPRS>\t<label>\t<command>` (command cut at 200: a claude argv carries its whole prompt, ~45 KB),
 # or `TOPMEM\tunmeasured` when _top_mem_processes printed nothing (top failed or was not its table): never "ok" with no rows. MEM already includes the compressed memory, CMPRS sits beside it.
 _growth_topmem() {
-  local rows
-  rows="$(_top_mem_processes "$GROWTH_TOPMEM_N")"
-  if [ -z "$rows" ]; then printf 'TOPMEM\tunmeasured\n'; return 0; fi
+  local rows rc
+  # _top_mem_processes (top, then a ps per row) has no bound of its own, and the photo runs BEFORE the reclaim levers: a child bash (with the function, and any shadow of top/ps/launchctl a selftest
+  # declares) lets `timeout` cut it. Cut or failed → unmeasured, never the rows it had printed so far.
+  rows="$(timeout "$GROWTH_EXTRA_TIMEOUT_SECS" bash -c "$(declare -f _top_mem_processes top ps launchctl 2>/dev/null); _top_mem_processes \"\$1\"" _ "$GROWTH_TOPMEM_N" 2>/dev/null)"; rc=$?
+  if [ "$rc" != 0 ] || [ -z "$rows" ]; then printf 'TOPMEM\tunmeasured\n'; return 0; fi
   printf 'TOPMEM\tok\n'
   printf '%s\n' "$rows" | awk '{ pid = $1; mem = $3; cmprs = $4; lab = $5; $1 = $2 = $3 = $4 = $5 = ""; sub(/^ +/, ""); printf "TOPMEM_ROW\t%s\t%s\t%s\t%s\t%s\n", pid, mem, cmprs, lab, substr($0, 1, 200) }'
 }

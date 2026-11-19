@@ -2189,6 +2189,25 @@ mkdir -p "$GROW_TMP/faills" "$GROW_TMP/failawk"; printf '%s\n' '#!/bin/sh' 'exit
 [ "$(PATH="$GROW_TMP/faills:$PATH" GROWTH_VM_DIR="$SWD" _growth_swapfiles)" = "$(printf 'SWAPFILES\tunmeasured')" ] && ok "swapfiles: an ls that exits 1 on a directory that EXISTS is unmeasured, not ok 0" || bad "swapfiles: failing ls mishandled"
 vr="$(PATH="$GROW_TMP/failawk:$PATH" _growth_vm_report "$GROW_TMP/vr-base.txt" "$GROW_TMP/vr-now.txt")"
 case "$vr" in *"swapfiles of /System/Volumes/VM NOT measured in this photo"*"top memory footprint NOT measured in this photo"*) ok "report: an awk that exits 1 leaves both blocks UNMEASURED (never 0 swapfiles, never an empty top)" ;; *) bad "report: failing awk mishandled: $vr" ;; esac
+# the photo is taken BEFORE the reclaim levers: its extra reads are bounded (a hung top or ls must end as UNMEASURED in seconds, never delay the levers)
+GROWTH_EXTRA_TIMEOUT_SECS_DEFAULT="${GROWTH_EXTRA_TIMEOUT_SECS:-unset}"; GROWTH_EXTRA_TIMEOUT_SECS=1
+top() { sleep 5; echo "PID PPID COMMAND MEM CMPRS"; }
+t0=$SECONDS; tm_out="$(_growth_topmem)"; tm_el=$((SECONDS - t0))
+[ "$tm_out" = "$(printf 'TOPMEM\tunmeasured')" ] && [ "$tm_el" -le 3 ] && ok "photo: a top that hangs is cut at the bound ($tm_el s) and the block is UNMEASURED, never partial" || bad "photo: hung top not bounded (out='$tm_out', ${tm_el}s)"
+unset -f top
+mkdir -p "$GROW_TMP/slowls"; printf '%s\n' '#!/bin/sh' 'sleep 5' 'echo swapfile0' > "$GROW_TMP/slowls/ls"; chmod +x "$GROW_TMP/slowls/ls"
+t0=$SECONDS; sw_out="$(PATH="$GROW_TMP/slowls:$PATH" GROWTH_VM_DIR="$SWD" _growth_swapfiles)"; sw_el=$((SECONDS - t0))
+[ "$sw_out" = "$(printf 'SWAPFILES\tunmeasured')" ] && [ "$sw_el" -le 3 ] && ok "swapfiles: an ls that hangs is cut at the bound ($sw_el s): unmeasured" || bad "swapfiles: hung ls not bounded (out='$sw_out', ${sw_el}s)"
+top() { printf 'PID PPID COMMAND MEM CMPRS\n89690 1 Python 22G 20G\n51664 1 dolt 584M 12M\n'; }
+ps() { if [ "$4" = 89690 ]; then echo first-row-command; else sleep 5; fi; }   # ps -o command= -p <pid>
+t0=$SECONDS; tm_out="$(_growth_topmem)"; tm_el=$((SECONDS - t0))
+[ "$tm_out" = "$(printf 'TOPMEM\tunmeasured')" ] && [ "$tm_el" -le 3 ] && ok "photo: a ps that hangs on the 2nd row cuts the whole block (unmeasured, NOT the 1 row printed so far)" || bad "photo: partial rows leaked (out='$tm_out', ${tm_el}s)"
+unset -f top ps
+for v in 0 abc 3; do
+  [ "$(env DOLT_DISK_FLOOR_GUARD_LOG=/dev/null DOLT_DISK_FLOOR_GUARD_LIB=1 DOLT_DISK_FLOOR_GROWTH_EXTRA_TIMEOUT_SECS="$v" bash -c '. "$1"; echo "$GROWTH_EXTRA_TIMEOUT_SECS"' _ "$SCRIPT")" = "$([ "$v" = 3 ] && echo 3 || echo 10)" ] && ok "photo: bound from the environment '$v' -> $([ "$v" = 3 ] && echo 3 || echo '10 (0 and text would make timeout refuse or never end)')" || bad "photo: bound '$v' not normalised"
+done
+GROWTH_EXTRA_TIMEOUT_SECS=10
+[ "$GROWTH_EXTRA_TIMEOUT_SECS_DEFAULT" = 10 ] && ok "photo: the extra reads are bounded at 10 s by default" || bad "photo: default bound is '$GROWTH_EXTRA_TIMEOUT_SECS_DEFAULT', expected 10"
 [ "$GROWTH_TOPMEM_N" = 10 ] && ok "photo: records the 10 biggest footprints by default" || bad "photo: GROWTH_TOPMEM_N is '$GROWTH_TOPMEM_N', expected 10"
 top() {
   cat <<'TOPFIX'
