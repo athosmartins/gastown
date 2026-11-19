@@ -3703,13 +3703,13 @@ wk_mk gf_e "$WK_DATA" 30; : > "$TMP/gf_e.cnt"; wk_run gf_e "$WK_C30" WORKTREE_RE
 # (gf_f) the reason follows the pass: a tree younger than the age gate was never given to the ignored-data guard (no kept_ignored_data) → young, even when it holds data. Unmerged clean tree, bead closed 30 h, a little data (under the cap), directory touched 1 h ago (gate 24 h)
 wk_mk gf_f "$WK_DATA; $WK_UNSHIPPED" 1; wk_run gf_f "$WK_C30"
 { kz_wt gf_f && [ "$(au_n gf_f)" = "1" ] && [ "$(au_field gf_f reason)" = "young" ] && [ "$(events gf_f kept_ignored_data)" = "0" ]; } && ok "ga-1p1i5jr.15 (gf_f): tree inside the age gate that holds data (under the cap) → reason young, not ignored_data (the pass never logged kept_ignored_data for it)" || bad "ga-1p1i5jr.15 (gf_f): n=$(au_n gf_f) reason=$(au_field gf_f reason) kept_ignored_data=$(events gf_f kept_ignored_data)"
-# (gf_g) data the release rule would let go (measured, under the cap, beads closed 30 h) is not what holds the tree: an unmerged OLD tree the pass leaves alone → reason unknown, not ignored_data. Control: the same tree with the cap at 1 KiB → ignored_data
-wk_mk gf_g "$WK_DATA; $WK_UNSHIPPED" 30; wk_run gf_g "$WK_C30"
-{ kz_wt gf_g && [ "$(au_n gf_g)" = "1" ] && [ "$(au_field gf_g reason)" = "unknown" ] && [ "$(events gf_g kept_ignored_data)" = "0" ]; } && ok "ga-1p1i5jr.15 (gf_g): data under the cap the release rule lets go, tree still there for another reason → reason unknown, not ignored_data" || bad "ga-1p1i5jr.15 (gf_g): n=$(au_n gf_g) reason=$(au_field gf_g reason) kept_ignored_data=$(events gf_g kept_ignored_data)"
-wk_mk gf_g2 "$WK_DATA; $WK_UNSHIPPED" 30; wk_run gf_g2 "$WK_C30" WORKTREE_REAPER_CLOSED_WORKER_IGNORED_MAX_KB=1
+# (gf_g) data the release rule would let go (measured, under the cap, beads closed 30 h) is not what holds the tree: a clean idle tree the pass never reached (sweep cap 0) → reason unknown, not ignored_data. Control gf_g2: the same tree with the cap at 1 KiB → ignored_data
+wk_mk gf_g "$WK_DATA" 30; wk_run gf_g "$WK_C30" WORKTREE_REAPER_MAX_PER_SWEEP=0
+{ kz_wt gf_g && [ "$(au_n gf_g)" = "1" ] && [ "$(au_field gf_g reason)" = "unknown" ] && [ "$(events gf_g kept_ignored_data)" = "0" ]; } && ok "ga-1p1i5jr.15 (gf_g): data under the cap the release rule lets go, tree still there (the pass never reached it) → reason unknown, not ignored_data" || bad "ga-1p1i5jr.15 (gf_g): n=$(au_n gf_g) reason=$(au_field gf_g reason) kept_ignored_data=$(events gf_g kept_ignored_data)"
+wk_mk gf_g2 "$WK_DATA" 30; wk_run gf_g2 "$WK_C30" WORKTREE_REAPER_CLOSED_WORKER_IGNORED_MAX_KB=1
 { kz_wt gf_g2 && [ "$(au_n gf_g2)" = "1" ] && [ "$(au_field gf_g2 reason)" = "ignored_data" ] && [ "$(events gf_g2 kept_ignored_data)" = "1" ]; } && ok "ga-1p1i5jr.15 (gf_g2): control — the same tree, data over the cap → reason ignored_data (kept_ignored_data once)" || bad "ga-1p1i5jr.15 (gf_g2): n=$(au_n gf_g2) reason=$(au_field gf_g2 reason) kept_ignored_data=$(events gf_g2 kept_ignored_data)"
 # (gf_h) the release switched off (any value but 1): the data DOES hold the tree and the reason says so
-wk_mk gf_h "$WK_DATA; $WK_UNSHIPPED" 30; wk_run gf_h "$WK_C30" WORKTREE_REAPER_CLOSED_WORKER_IGNORED_RELEASE=off
+wk_mk gf_h "$WK_DATA" 30; wk_run gf_h "$WK_C30" WORKTREE_REAPER_CLOSED_WORKER_IGNORED_RELEASE=off
 { kz_wt gf_h && [ "$(au_field gf_h reason)" = "ignored_data" ] && [ "$(events gf_h kept_ignored_data)" = "1" ]; } && ok "ga-1p1i5jr.15 (gf_h): CLOSED_WORKER_IGNORED_RELEASE=off (not 1) → the release is off, the data holds the tree, reason ignored_data" || bad "ga-1p1i5jr.15 (gf_h): reason=$(au_field gf_h reason) kept_ignored_data=$(events gf_h kept_ignored_data)"
 
 echo ""

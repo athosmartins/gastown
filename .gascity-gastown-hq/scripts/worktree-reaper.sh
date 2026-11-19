@@ -1870,9 +1870,9 @@ _audit_one_worker() {
     nf=1
   else
     # The proof failed with rows present and no lookup failure: a row that is not closed (the tree is live), a closed row too recent (the tree is in its normal life), or a row the proof could not use — no status, or closed with no
-    # readable closed_at. Priority: live, then recent (the newest closure is then under the line whatever the unreadable row says), then unreadable. vazio (no usable row) / anything else → unreadable: could not tell, counted and said,
+    # readable closed_at. Priority: live, then recent (closed less than WORKER_OVERDUE_HOURS ago: the newest closure is then under the line whatever the unreadable row says; a closed row that is OLD enough proves nothing alone), then unreadable. vazio (no usable row) / anything else → unreadable: could not tell, counted and said,
     # NEVER the normal life of a tree (a bead closed with no closed_at is the shape of a tree that stays on disk for ever)
-    rows_v="$(printf '%s\n' "$_BC_ROWS" | awk -F'\t' 'NF>=3 && $1!="" { if ($2=="closed") { if ($3 ~ /^[0-9]+$/) rec=1; else unk=1 } else if ($2=="-") unk=1; else live=1 } END { if (live) print "live"; else if (rec) print "recent"; else print "unreadable" }' 2>/dev/null)"
+    rows_v="$(printf '%s\n' "$_BC_ROWS" | awk -F'\t' -v now="$now_s" -v need="$((WORKER_OVERDUE_HOURS * 3600))" 'NF>=3 && $1!="" { if ($2=="closed") { if ($3 ~ /^[0-9]+$/) { if (now - $3 < need) rec=1 } else unk=1 } else if ($2=="-") unk=1; else live=1 } END { if (live) print "live"; else if (rec) print "recent"; else print "unreadable" }' 2>/dev/null)"
     case "$rows_v" in
       live|recent) return 0 ;;
       *) _audit_unknown "$repo" "$wt" "bead_row_unreadable: a bead the tree names has no status or no closed_at (beads: $(printf '%s\n' "$_BC_ROWS" | cut -f1 | tr '\n' ' ' | sed 's/ $//'))"; return 0 ;;
