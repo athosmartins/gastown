@@ -2,7 +2,7 @@
 
 ## Contents
 
-• O que esta fatia é — e o que não é · Estado: o que está vivo · Como usar (comandos) · Os degraus e os limites (e por quê) · Encher o nó: relógio próprio, CPU e carga externa (ga-2hd02v.2) · O veredito · Sessão ocupada × sessão viva (ga-2hd02v.1.22) · Como ligar a sombra do Pilot · Como ler a sombra · Ligar e desligar o nó primeiro (`on`) · Subir os tetos fixos · O que falta para o "nó primeiro" de verdade · Medido, inferido, não testado · Limites
+• O que esta fatia é — e o que não é · Estado: o que está vivo · Como usar (comandos) · Os degraus e os limites (e por quê) · Encher o nó: relógio próprio, CPU e carga externa (ga-2hd02v.2) · O veredito · Sessão ocupada × sessão viva (ga-2hd02v.1.22) · Como ligar a sombra do Pilot · Como ler a sombra · Ligar e desligar o nó primeiro (`on`) · Teto de construtores locais no mini (ga-2hd02v.17) · Subir os tetos fixos · O que falta para o "nó primeiro" de verdade · Medido, inferido, não testado · Limites
 
 Bead ga-2hd02v.1.11 (fatia da ga-2hd02v.1; objetivo do Athos: o mini para de entrar em swap, o Hetzner pago trabalha 24/7). **Entrega duas peças, em duas fatias** (a ga-2hd02v.1.11 foi recusada 3x pelo teto de tamanho do gate): (1) `scripts/hetzner-capacity.py` — fatia A, ga-5yp4n1, **tem que estar no main antes desta** — que mede o nó e responde "quantas sessões ele aguenta agora" (um teto que sobe em degraus 1→3→6→10 só com evidência, e desce sozinho) e "esta bead vai ao nó ou fica no mini" (`verdict`); (2) o **modo sombra** do Pilot (`PILOT_NODE_FIRST=shadow`) — fatia B, ga-elvr8e, esta —, que consulta o veredito para cada bead de dog do HQ e **registra** o que faria, sem mudar o despacho.
 
@@ -175,6 +175,33 @@ Se `node_rollback_unconfirmed` aparecer, olhe a bead (`bd show <id>`): se ainda 
 **Desligar** (na hora, sem perder nada): tire `PILOT_NODE_FIRST` do plist (volta a `off`) ou ponha `shadow`, e `launchctl bootout` + `bootstrap`. Beads já no nó **terminam lá** ou voltam pelo reclaim no TTL; o Pilot não puxa de volta bead em andamento. Para travar só o envio sem reiniciar o Pilot: `scripts/hetzner-capacity.py pause --reason <texto>` (próximo veredito já diz `mini paused`).
 
 **`DRY_RUN=1`** com `on` não consulta o nó (a consulta mede e grava estado) e imprime o plano de 4 passos por bead de dog (ou o veto que a deixa no mini); nada é escrito.
+
+## Teto de construtores locais no mini (ga-2hd02v.17)
+
+Decisão do Athos (19/11 ~12:10, AskUserQuestion na sessão do Mayor): **«Construtores todos no Hetzner»**. Dogs e construtores do WA rodam no nó; no mini ficam as crews, os painéis e o banco, e **UMA vaga de construtor** para o que só o mini faz (celular/ADB, Chrome logado, dado local) e para o transbordo do nó. Causa (ga-1p1i5jr.13/.14): 16 GB não comportam ~16 sessões Claude (~350 MB cada) + Dolt (2,4 GB) + Chrome + painéis; cada GB acima vira swapfile permanente e o piso de disco pausa o mini (gate a 0,3/h às 12:00 de 19/11).
+
+**O teto é COMBINADO.** A vaga é a soma das sessões vivas (active, creating, start-pending) dos três templates que rodam no mini: `wa-worker`, `ps-worker` e `gastown.dog`. `dog-remote`, `wa-worker-remote` e `ps-worker-remote` são do nó e não contam. Um teto por pool não bastava: 1 wa-worker + 1 ps-worker + 1 dog são 3 sessões e nenhum pool vê as outras. O botão é `PILOT_LOCAL_BUILDER_MAX` no plist do Pilot: vazio ou ausente = sem teto (o Pilot de antes); inteiro de 0 a 999 = esse teto (0 = o mini não abre construtor); qualquer outra coisa (letra, sinal, ponto, espaço, 4+ dígitos) = 1, o valor da decisão: erro de digitação cai do lado que protege o mini.
+
+**Onde o Pilot o respeita** (todo ponto em que ele abre sessão local): o spawn do wa-worker e do ps-worker em `dispatch_one`, o top-up de pool, o `gc sling` ao `gastown.dog`, o empréstimo ao dog (`PILOT_DOG_LEND`) e o pulo pré-claim das beads já carimbadas (`dispatch_lane`: zero escrita, sem claim nem soltura a cada varredura). A bead que não cabe fica `story:approved`, sem falso «em execução»: o log diz `local builder cap hit (N/M …) — QUEUED <bead>` (ou `QUEUED — local builder cap full` no pulo pré-claim) e o evento `pilot_sweep` conta o resultado `local_builder_cap_queued` em `results` e em `queued_global_cap` (fila de capacidade, não falha; a varredura vale como saturação, não como estagnação). Contagem que não se lê = não abre (`rig_native_pool_count_unreadable`, como no teto global). A bead que o oráculo quer no nó **não** é pulada: vai à claim e ao nó. O número da varredura é lido uma vez e sobe a cada spawn do Pilot (o dog de um `gc sling` só nasce depois, no controller); sessão aberta por outro no meio da varredura entra na seguinte, e o teto de cada pool no engine é o cinto.
+
+**Onde os números moram** (tudo versionado; o mini instala):
+
+| O quê | Valor | Onde |
+|---|---|---|
+| Teto local combinado | 1 | `PILOT_LOCAL_BUILDER_MAX` em `scripts/com.gascity.pilot.plist` |
+| wa-worker do mini | 1 | `PILOT_WA_WORKER_MAX` (mesmo plist) e `max_active_sessions` em `agents/wa-worker/agent.toml` (o Pilot segue o do engine sozinho) |
+| dog do mini | 1 | `max_active_sessions` do `gastown.dog` em `city.toml` **e** `DOG_MAX_NORMAL` em `packs/town-deltas/assets/eval-window-concurrency-guard.plist` (o guard reescreve a linha do `city.toml` a partir dele; o selftest dele exige os dois iguais) |
+| nó: wa-worker-remote | 8 (era 5) | `max_active_sessions` em `agents/wa-worker-remote/agent.toml` e `PILOT_WA_NODE_SLOTS=8` no plist do Pilot |
+| nó: dog-remote | 5 (era 3) | `max_active_sessions` em `agents/dog-remote/agent.toml` |
+| pistas do Pilot | `MAX_SMALL` 12 (era 8), `MAX_BIG` 2 | plist do Pilot: as pistas 8+2 travariam o nó abaixo dos 13 slots novos |
+
+Os tetos do nó são só o **teto do engine**: quantas sessões abrem quem decide é o oráculo (escada por RAM e CPU) e o `cap` do host em `.gc/session-ssh.json`, dividido com `dog-remote`, `wa-worker-remote` e `gate-reviewer`. Medido no nó em 19/11: 16 núcleos, **30 GiB de RAM** (a bead falava em 64 GB), 15 GiB disponíveis com 6 sessões e o lastro, sem swap (OOM mata a sessão). Subir o `cap` e a escada acima de 10 é medir antes.
+
+**Só o mini faz, depois do merge** (nada disto é do nó): (1) copiar `scripts/com.gascity.pilot.plist` e `eval-window-concurrency-guard.plist` para `~/Library/LaunchAgents`, `launchctl bootout` e `bootstrap` os dois jobs — sem recarregar o guard, a próxima passada dele reescreve `max_active_sessions = 6` no `city.toml` (o plist vivo ainda diz 6); (2) `gc reload --soft` para o engine ler `agents/` e `city.toml`; (3) se `.gc/pool-ceiling-engine.on` existir, o motor pode **subir** o wa-worker a 3 sobre o commitado (regra de 03/10): prenda com `POOL_CEILING_ENGINE_WA_WORKER_CEIL=1` no ambiente do job dele; (4) o `cap` do host e a escada do oráculo (`status` mostra) só depois de confirmar a RAM do nó. Desligar na hora: tirar `PILOT_LOCAL_BUILDER_MAX` do plist e recarregar (o teto por pool continua valendo).
+
+**Como medir as 24 h do aceite** (no mini): construtores locais vivos, a cada 5 min — `gc session list --json | jq '[.sessions[] | select(.template=="wa-worker" or .template=="ps-worker" or .template=="gastown.dog") | select(.state=="active" or .state=="creating" or .state=="start-pending")] | length'` (esperado ≤ 1); filas pelo teto — `grep -c 'local builder cap' .gc/logs/pilot-dispatcher.log`; swapfiles novos — os arquivos `swapfile*` de `/private/var/vm`; CPU do nó por hora — `python3 scripts/hetzner-capacity.py hourly` (exit 0 = toda hora com leitura e média ≥ 85 %); revisadas por hora — a checagem horária da missão ga-v8p1tx.1 (meta ≥ 8/h).
+
+**Efeitos a vigiar.** Um dog parado conta e segura a vaga do wa-worker. A vaga local é única: um build longo de dog atrasa as tarefas curtas de rotina (`mol-dog-*`) que usam o mesmo pool, e o `pool-autoscale-watchdog` pode avisar `[STUCK]` com demanda na fila e sem capacidade. Com a maioria das beads de WA classificadas `mini` (ga-24lvl1c, 19/11: só 5 de 98 despacháveis com veredito `node`), a fila do WA passa a esperar essa vaga única: a vazão depende de o nó absorver o resto e de a classificação deixar mais beads irem a ele.
 
 ## Subir os tetos fixos
 
