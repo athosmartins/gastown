@@ -178,6 +178,9 @@ eq "restored state is byte-identical to the original committed files" "$SUM_REST
 # the canonical PRODUCTION path (mirrors crew-hang-detector.plist's own
 # convention), so an absolute-path comparison would false-fail under a worktree.
 echo "── 8b. gate focus mode (ga-kqa08j): ON clamps the dog cap, UNKNOWN never moves it ──"
+# ga-2hd02v.17: the committed normal dog cap is 1 now (below GATE_FOCUS_DOG_MAX=2), so the clamp is only observable on a normal profile ABOVE it. The clamp cases below run with
+# DOG_MAX_NORMAL=6 (the value the committed profile had before that story); the committed value is pinned again right after them.
+DOG_MAX_NORMAL=6
 GATE_FOCUS_ACTIVE_OVERRIDE=1 apply_profile "normal" >/dev/null 2>&1
 eq "focus ON + normal profile -> dog cap clamped to GATE_FOCUS_DOG_MAX" "$(get_dog_max)" "2"
 GATE_FOCUS_ACTIVE_OVERRIDE=1 apply_profile "throttled" >/dev/null 2>&1
@@ -187,6 +190,11 @@ eq "focus UNKNOWN -> dog cap left exactly as it was (no flip, no reload)" "$(get
 GATE_FOCUS_ACTIVE_OVERRIDE=1 apply_profile "normal" >/dev/null 2>&1
 GATE_FOCUS_ACTIVE_OVERRIDE=unknown apply_profile "throttled" >/dev/null 2>&1
 eq "focus UNKNOWN + throttled profile -> the throttle can still LOWER the cap (2 -> 1)" "$(get_dog_max)" "1"
+GATE_FOCUS_ACTIVE_OVERRIDE=0 apply_profile "normal" >/dev/null 2>&1
+eq "focus OFF -> back to the normal cap" "$(get_dog_max)" "6"
+DOG_MAX_NORMAL="$COMMITTED_DOG_MAX"
+GATE_FOCUS_ACTIVE_OVERRIDE=1 apply_profile "normal" >/dev/null 2>&1
+eq "focus ON + the COMMITTED normal cap (at or below GATE_FOCUS_DOG_MAX) -> the clamp never RAISES it" "$(get_dog_max)" "$COMMITTED_DOG_MAX"
 GATE_FOCUS_ACTIVE_OVERRIDE=0 apply_profile "normal" >/dev/null 2>&1
 eq "focus OFF -> back to the committed normal cap" "$(get_dog_max)" "$COMMITTED_DOG_MAX"
 
