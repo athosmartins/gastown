@@ -167,8 +167,8 @@ case_manifest() { local s=$1 app="$R/opt/gt-dados/app" idb idx z up
   { echo "gt-dados-code-manifest 1"; echo "commit $sA"; printf '100755\t%s\tbin/build-x\n' "$idb"; echo "100644 $idx lib/x.py"; } > "$T/m.man"; mtry; refused "tabulação no lugar de espaço na linha 3" 'code-manifesto-invalido:3' 1
   man_with "100755 $idb bin/build-x" "" "100644 $idx lib/x.py"; mtry; refused "linha em branco no meio" 'code-manifesto-invalido:4' 1
   awk '{ printf "%s\r\n", $0 }' "$T/A.man" > "$T/m.man"; mtry; refused "manifesto com CRLF" 'code-manifesto-invalido:1' 1
-  man_with "100755 $idb bin/build-x" "100644 $idx lib/x.py" "100644 $idx lib/other.py"; mtry; refused "arquivo a mais no manifesto (lib/other.py não está na lista)" 'code-manifesto-fora-da-lista' 1
-  man_with "100755 $idb bin/build-x"; mtry; refused "arquivo da lista ausente do manifesto" 'code-manifesto-fora-da-lista' 1
+  man_with "100755 $idb bin/build-x" "100644 $idx lib/x.py" "100644 $idx lib/other.py"; mtry; refused "arquivo a mais no manifesto (lib/other.py não está na lista): a recusa nomeia o caminho" 'code-manifesto-fora-da-lista:lib/other.py' 1
+  man_with "100755 $idb bin/build-x"; mtry; refused "arquivo da lista ausente do manifesto (export de MENOS entrypoints que o apply): a recusa nomeia o que falta" 'code-manifesto-fora-da-lista:lib/x.py' 1
   man_with "100755 $idb bin/build-x" "100644 $idx lib/x.py" "100644 $idx lib/x.py"; mtry; refused "linha duplicada" 'code-manifesto-fora-da-lista' 1
   man_with "100644 $idb bin/build-x" "100644 $idx lib/x.py"; mtry; refused "bin/build-x sem o bit de execução NO COMMIT" 'code-bin-sem-exec:build-x' 1
   : > "$T/m.man"; mtry; refused "manifesto vazio" 'code-manifesto-vazio' 1
@@ -306,7 +306,7 @@ mut T13-commit-do-manifesto-livre 's#\[ "\$ml" = "commit \$SHA" \] || die code-m
 mut T14-sem-forma-da-linha-de-arquivo 's#\[\[ \$ml =~ \$man_re \]\] || die "code-manifesto-invalido:\$mn"#true#' case_manifest
 mut T15-caminho-do-manifesto-sem-guarda 's#\[\[ \$mp != \*/ && \$mp != \*\.\.\* && \$mp != \*//\* \]\] || die "code-manifesto-invalido:\$mn"#true#' case_manifest
 mut T16-manifesto-sem-arquivo-passa 's#\[ "\$MN" -ge 1 \] || die code-manifesto-vazio#true#' case_manifest
-mut T17-manifesto-fora-da-lista-passa 's#\[ "\$MANS" = "\$WLS" \] || die code-manifesto-fora-da-lista#true#' case_manifest
+mut T17-manifesto-fora-da-lista-passa 's#\[ "\$MANS" = "\$WLS" \] ||#true ||#' case_manifest
 mut T18-bin-sem-exec-passa 's#\*) die "code-bin-sem-exec:\$e" ;; esac; done#*) ;; esac; done#' case_manifest
 # tar (antes de extrair)
 mut T07-tar-que-nao-e-arquivo-trava 's#\[ -f "\$CTAR" \] || die code-tar-ilegivel#true#' case_tarfile

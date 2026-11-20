@@ -119,7 +119,7 @@ code_tree_check() {
 # ── código por TAR + MANIFESTO (ga-kwk6fcl): o mini exporta, o nó só verifica, sem repo ───────────────────────────────────────────────────────────────────────────────
 # Tudo o que dá para recusar SEM extrair nada, e antes de mexer no nó. Deixa nos globais: MLINES (uma linha `<modo> <blob-id> <caminho>` por arquivo, já validada), MN (quantos), MPATHS, MDIRS (pastas-pai) e MEXEC (os 100755)
 code_tar_prepare() {
-  local MAN ml mn=0 mp mm mr d e tn TT TN MANS odd man_re='^(100644|100755) [0-9a-f]{40} [A-Za-z0-9_][A-Za-z0-9_./-]*$' commit_re='^commit [0-9a-f]{40}$'
+  local MAN ml mn=0 mp mm mr d e h tn TT TN MANS odd man_re='^(100644|100755) [0-9a-f]{40} [A-Za-z0-9_][A-Za-z0-9_./-]*$' commit_re='^commit [0-9a-f]{40}$'
   # o id de commit é o de 40 hex minúsculos (o que `git ls-tree` e `git rev-parse` imprimem): nome de ref, abreviação ou maiúsculas não identificam um commit
   [[ $SHA =~ ^[0-9a-f]{40}$ ]] || die code-sha-invalido
   # vazio/falhou: tar ou manifesto ausente ou que não é arquivo comum (pasta, FIFO, dispositivo: a leitura travaria ou não teria fim) → recusa 98 antes de mexer no nó (nunca "sem manifesto = nada a conferir")
@@ -146,7 +146,9 @@ code_tar_prepare() {
   MN=$((mn - 2)); [ "$MN" -ge 1 ] || die code-manifesto-vazio
   # vazio/falhou: um sort que falha deixa MANS vazio, que nunca é igual à lista (há ≥ 1 arquivo nela) → recusa. O conjunto do manifesto (com a linha duplicada, se houver) tem de ser IGUAL ao que a lista branca autoriza para os entrypoints pedidos
   MANS=$(printf '%s' "$MPATHS" | LC_ALL=C sort)
-  [ "$MANS" = "$WLS" ] || die code-manifesto-fora-da-lista
+  # a dica (o 1º caminho que está só de um lado) é cosmética: o `apply` REESCREVE a lista de entrypoints, então o tar tem de ser do conjunto INTEIRO (os já instalados + o novo), e a causa comum é um export com menos entrypoints; sem dica a recusa é a mesma
+  h=$(printf '%s\n%s\n' "$MANS" "$WLS" | LC_ALL=C sort | uniq -u | head -n 1)
+  [ "$MANS" = "$WLS" ] || die "code-manifesto-fora-da-lista${h:+:$h}"
   # o bin/<ep> de cada entrypoint de código é executável NO COMMIT (modo 100755 do manifesto): o `gt-dados-run` o executa
   for e in $ENTS; do [ "$e" = synth ] || case " $MEXEC " in *" bin/$e "*) ;; *) die "code-bin-sem-exec:$e" ;; esac; done
   # o 1º caractere do `tar -tv` é o tipo do membro: `-` arquivo · `d` pasta · `l` elo simbólico · `h` elo duro · outros (dispositivo, fifo). vazio → tar sem membro nenhum: recusa (nunca "nada a extrair = ok"); falhou/ilegível (tar que não lê, arquivo cortado) → recusa

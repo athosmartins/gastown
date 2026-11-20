@@ -62,7 +62,7 @@ has "$INST" 'git hash-object --no-filters'                         || fail "inst
 has "$INST" 'die "code-hash:'                                      || fail "instalador: blob-id diferente do manifesto não recusa"
 has "$INST" 'die "code-tar-fora-do-manifesto:'                     || fail "instalador: membro do tar que o manifesto não lista seria gravado no nó"
 has "$INST" 'die "code-tar-tipo:'                                  || fail "instalador: membro do tar que é elo/dispositivo passaria"
-has "$INST" 'die code-manifesto-fora-da-lista'                     || fail "instalador: manifesto fora da lista branca passaria"
+has "$INST" 'die "code-manifesto-fora-da-lista'                    || fail "instalador: manifesto fora da lista branca passaria"
 has "$INST" 'code_tree_check "\$NEW"'                              || fail "instalador: a cauda comum (lista exata, dado, modo) não roda sobre a árvore extraída"
 has "$INST" 'verify-code'                                          || fail "instalador: sem o verify-code (a conferência que o mini roda antes de exportar)"
 EXP="$SC/hetzner-dados-code-export.sh"
