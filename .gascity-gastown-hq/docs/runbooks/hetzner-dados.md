@@ -59,12 +59,12 @@ bash $CITY/scripts/hetzner-dados-code-export.sh --repo /Users/athos/gt/whatsapp_
   --entrypoint lotes-tiles --entrypoint lotes-adjacencia --entrypoint spe-alert-build --out "$HOME/gt-dados-export/<sha12>"
 X="$HOME/gt-dados-export/<sha12>"
 scp -i $KEY $X/code.tar $X/code.manifest $NODE:/root/gt-dados-src/
-# no NÓ, como root (os wrappers do rig fazem isto): o MESMO sha e os MESMOS entrypoints (o apply REESCREVE a lista de entrypoints)
+# no NÓ, como root (direto, até os wrappers do rig migrarem para --code-tar): o MESMO sha e os MESMOS entrypoints (o apply REESCREVE a lista de entrypoints)
 bash /root/gt-dados-src/hetzner-dados-install.sh apply --pubkey-file /root/gt-dados-src/hetzner_dados_ingest.pub \
   --code-tar /root/gt-dados-src/code.tar --code-manifest /root/gt-dados-src/code.manifest --code-sha <sha> \
   --entrypoint lotes-tiles --entrypoint lotes-adjacencia --entrypoint spe-alert-build
 ```
-**O tar é do conjunto INTEIRO de entrypoints do apply.** O `apply` reescreve `/opt/gt-dados/app` e a lista de entrypoints (`/etc/gt-dados/entrypoints`) com o que recebe, então ao instalar um entrypoint novo exporte de novo com os já instalados (`cat /etc/gt-dados/entrypoints` no nó) MAIS o novo. É isso que os wrappers do rig fazem com a lista (cada um passa os existentes + o seu), e é a causa comum de `code-manifesto-fora-da-lista:<caminho>`: o caminho nomeado é de um entrypoint que o export não incluiu.
+**O tar é do conjunto INTEIRO de entrypoints do apply.** O `apply` reescreve `/opt/gt-dados/app` e a lista de entrypoints (`/etc/gt-dados/entrypoints`) com o que recebe, então ao instalar um entrypoint novo exporte de novo com os já instalados (`cat /etc/gt-dados/entrypoints` no nó) MAIS o novo. Os wrappers do rig já passam a lista assim (cada um os existentes + o seu), e é a causa comum de `code-manifesto-fora-da-lista:<caminho>`: o caminho nomeado é de um entrypoint que o export não incluiu.
 
 **Manifesto** (`code.manifest`, texto): `gt-dados-code-manifest 1`, `commit <sha>` e uma linha `<modo 100644|100755> <blob-id> <caminho>` por arquivo, que é o `git ls-tree -r <sha>` dos caminhos da lista branca. O blob-id é a identidade do arquivo no git (`git hash-object`): o nó confere cada arquivo contra ele sem precisar do repo.
 

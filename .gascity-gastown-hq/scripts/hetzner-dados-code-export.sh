@@ -7,7 +7,7 @@
 # USO (no mini, com o repo do rig):
 #   hetzner-dados-code-export.sh --repo <repo git> --sha <id de 40 hex> --entrypoint <nome> [--entrypoint <nome>]... --out <pasta NOVA> [--main-ref origin/main]
 #   → <pasta>/code.tar e <pasta>/code.manifest. Os dois vão ao nó (scp para /root/gt-dados-src, docs/runbooks/hetzner-dados.md) e entram no instalador:
-#   hetzner-dados-install.sh apply ... --code-tar <tar> --code-manifest <manifesto> --code-sha <o MESMO sha> (os wrappers do rig passam essas três opções no lugar de --code-dir).
+#   hetzner-dados-install.sh apply ... --code-tar <tar> --code-manifest <manifesto> --code-sha <o MESMO sha> (os wrappers do rig ainda passam --code-dir: devem passar essas três opções no lugar, migração pendente no rig WA).
 # POR QUÊ: o `apply --code-dir` roda `git archive` NO NÓ e o `git archive` pede ao repo TODO blob do commit (medido: um pathspec de 2 arquivos num clone parcial buscou os 8 blobs do commit, dado de lead incluso);
 #   um clone com todos os blobs no nó é o que a wa-4p38ls proíbe. Aqui o `git archive` e o `git ls-tree` do COMMIT rodam no mini, só com os caminhos da lista branca (hetzner-dados-code-allow.txt, AO LADO deste script),
 #   e o nó só confere cada arquivo contra o blob-id do manifesto (`git hash-object`), sem repo.
