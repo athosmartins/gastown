@@ -2576,6 +2576,37 @@ def _branch_segment_matches_bead(segment, bead_id):
             or segment.startswith(bead_id + "."))
 
 
+# ga-vpan6h8: o ref de resgate mora FORA do vocabulário de entrega. delivery-branch-patterns.sh (fix feat feature refactor docs chore test + crew/*/<id>) é o que os probes "já construída?" do Pilot, os
+# reconciliadores GAP-1/GAP-2 do gate e o resto dos leitores daquele arquivo tomam por "esta bead tem entrega": o trabalho pela metade de um builder morto, empurrado para crew/<pool>/<bead>, leu como construído
+# e a bead não foi re-despachada por PILOT_ORPHAN_BRANCH_STALE_HOURS (wa-4qu2n6.1, 19/11, relato do witness: 48 recusas em ~13 h). inflight-reclaim-guard.salvage-ref.selftest.sh (G1b/G9d) lê o ref com o oráculo REAL, então um
+# prefixo "salvage" que entrasse naquela lista reprova o teste em vez de voltar ao incidente.
+SALVAGE_REF_PREFIX = "salvage/"
+
+
+def _salvage_branch_name(bead_id, branch):
+    """salvage/<bead>-<dono> para o ramo local `branch` de `bead_id`: crew/wa-worker/<bead> → salvage/<bead>-wa-worker; fix/<bead>-<slug> → salvage/<bead>-fix-<slug>; feat/<bead> → salvage/<bead>-feat. O prefixo
+    de origem e o que vem depois do id no último segmento distinguem dois ramos da mesma bead (cada um tem o seu resgate); só [A-Za-z0-9._-] sobrevive, sem ".." nem ".lock" no fim: ref válido para o git."""
+    parts = branch.split("/")
+    lead = parts[:-1]
+    if lead and lead[0] == "crew":
+        lead = lead[1:]   # "crew/" é o prefixo de entrega; quem constrói é o que vem depois
+    seg = parts[-1]
+    tail = seg[len(bead_id):].strip("-_.") if seg.startswith(bead_id) else ""
+    token = "-".join(p for p in ("-".join(lead), tail) if p) or "branch"
+    rest = re.sub(r"[^A-Za-z0-9._-]+", "-", f"{bead_id}-{token}")
+    rest = re.sub(r"\.{2,}", ".", rest).strip("-.")
+    return SALVAGE_REF_PREFIX + re.sub(r"\.lock$", "-lock", rest)
+
+
+class _PreserveResult(list):
+    """O que preserve_unpushed_branch devolve: as linhas legíveis de sempre (o que os chamadores e os testes leem) mais `.records` — um {"branch","ref","sha"} por commit salvo, para o do_reclaim gravar na bead
+    (ga-vpan6h8). Uma lista simples, como a de um stub de teste, não tem `.records`: getattr(..., "records", ()) é vazio = nada a gravar."""
+
+    def __init__(self, *args):
+        super().__init__(*args)
+        self.records = []
+
+
 def _commits_unique_to(repo, tip, base, timeout=30):
     """Commit shas reachable from `tip` but not from `base` (`git rev-list
     base..tip`). `tip`/`base` may be a sha or a ref name. None on any git
@@ -2688,17 +2719,21 @@ def preserve_unpushed_branch(bead_id):
     bead_id (via the shared _branch_segment_matches_bead() predicate) and that
     carries a commit not already reachable from any origin ref (by sha, or by
     patch-id — ga-2uyvc, see _already_landed_by_patch_id):
-      1. Try `git push --no-verify origin <sha>:refs/heads/<branch>` —
-         recoverable under its own familiar name, immediately resumable by a
-         human or the next builder.
+      1. Try `git push --no-verify origin <sha>:refs/heads/salvage/<bead>-<owner>`
+         (_salvage_branch_name) — recoverable under a name a human or the next
+         builder finds by the bead id, and OUTSIDE the delivery vocabulary (ga-vpan6h8:
+         under the builder's own crew/<pool>/<bead> the unfinished work read as a
+         delivery and the Pilot would not re-dispatch the bead).
       2. If that is rejected (a same-named origin branch already diverged),
          fall back to `git push --no-verify origin <sha>:refs/reclaimed/<bead_id>/<sha>`
          — a ref whose name embeds the sha, so it can never collide and the
          push always succeeds if the remote is reachable at all.
+    A commit that an earlier reclaim already saved on origin/salvage/<bead>-<owner> is
+    reported again (without pushing) so its record on the bead can be rewritten.
 
     --no-verify (ga-2uyvc) skips the target repo's local pre-push hook. These
-    pushes only ever target rescue refs (a `refs/heads/<branch>` under the
-    bead's own name, or `refs/reclaimed/*`), never `main` — so a hook's
+    pushes only ever target rescue refs (`refs/heads/salvage/*`, or
+    `refs/reclaimed/*`), never `main` — so a hook's
     main-protection/atlas/test guards don't apply here, and running them is
     pure risk: whatsapp_automation's pre-push hook computes its "which files
     changed" diff against origin/main unconditionally, regardless of which
@@ -2717,9 +2752,10 @@ def preserve_unpushed_branch(bead_id):
 
     Returns a list of human-readable "what was preserved" strings (possibly
     empty — most reclaims have no local unpushed branch at all, e.g. a builder
-    that never got as far as committing).
+    that never got as far as committing); its `.records` (_PreserveResult) carries
+    the {"branch","ref","sha"} of each saved commit for do_reclaim to write on the bead.
     """
-    preserved = []
+    preserved = _PreserveResult()
     for repo in REPOS:
         # Refresh remote-tracking refs so the "already on origin?" check below
         # isn't working off a stale fetch. Fail-safe: a fetch error here just
@@ -2758,12 +2794,18 @@ def preserve_unpushed_branch(bead_id):
             if not _branch_segment_matches_bead(segment, bead_id):
                 continue
 
+            salvage = _salvage_branch_name(bead_id, branch)
+
             # Already reachable from some origin ref (pushed earlier, or merged)?
             try:
                 chk = subprocess.run(
                     ["git", "-C", repo, "branch", "-r", "--contains", sha],
                     capture_output=True, text=True, timeout=30)
                 if chk.returncode == 0 and chk.stdout.strip():
+                    # ga-vpan6h8: our OWN rescue ref among the refs that hold it = an earlier reclaim saved it; say so again (no push) so the record on the bead is rewritten if that write failed then
+                    if f"origin/{salvage}" in {ln.strip() for ln in chk.stdout.splitlines()}:
+                        preserved.append(f"{branch}@{sha[:8]} already saved on origin/{salvage}")
+                        preserved.records.append({"branch": branch, "ref": salvage, "sha": sha})
                     continue  # already safe on origin — nothing to preserve
             except Exception:
                 pass  # can't confirm safety → fall through and attempt the push anyway
@@ -2780,15 +2822,17 @@ def preserve_unpushed_branch(bead_id):
             except Exception:
                 pass  # can't confirm safety → fall through and attempt the push anyway
 
+            # vazio → n/a (só o rc importa); falhou (rc≠0: nome já divergido em origin, origin fora; exceção/prazo) → cai no refs/reclaimed abaixo, e se este também falha nada é registrado: "falhou" nunca vira "salvo"
             pushed = False
             try:
                 p = subprocess.run(
                     ["git", "-C", repo, "push", "--no-verify", "origin",
-                     f"{sha}:refs/heads/{branch}"],
+                     f"{sha}:refs/heads/{salvage}"],
                     capture_output=True, text=True, timeout=30)
                 if p.returncode == 0:
                     pushed = True
-                    preserved.append(f"{branch}@{sha[:8]} pushed to origin/{branch}")
+                    preserved.append(f"{branch}@{sha[:8]} saved to origin/{salvage}")
+                    preserved.records.append({"branch": branch, "ref": salvage, "sha": sha})
             except Exception as exc:
                 print(f"[INFLIGHT-RECLAIM] preserve-branch: push {branch} failed: {exc}",
                       flush=True)
@@ -2802,6 +2846,7 @@ def preserve_unpushed_branch(bead_id):
                         capture_output=True, text=True, timeout=30)
                     if p2.returncode == 0:
                         preserved.append(f"{branch}@{sha[:8]} tagged {tag_ref}")
+                        preserved.records.append({"branch": branch, "ref": tag_ref, "sha": sha})
                     else:
                         print(f"[INFLIGHT-RECLAIM] preserve-branch: FAILED to preserve "
                               f"{branch}@{sha[:8]} in {repo}: {p2.stderr.strip()[:300]}",
@@ -3625,6 +3670,33 @@ def _restore_approved_verified(bd_prefix, bead_id, attempts=3, delay_secs=1.0):
     return False
 
 
+def _record_salvage_metadata(bd_prefix, bead_id, records):
+    """Grava na bead ONDE o trabalho de um builder morto ficou salvo (ga-vpan6h8): pilot.salvage_ref (os refs de origin) e pilot.salvage_sha (os commits, separados por espaço). O Pilot lê o sha: um ramo ainda
+    nessa ponta não teve commit desde que o builder se foi, então não é "entrega"; quem pegar a bead depois pode retomá-lo (o worktree que ficou, ou o ref em origin). Devolve o trecho do comentário de
+    auditoria ("" sem registro). Melhor esforço, como o resto do passo 0 do do_reclaim: uma gravação que falha não trava o reclaim — o comentário diz que ficou sem registro e o Pilot segue lendo o ramo
+    local como "construído" (o veto de antes, só que dito), nunca solta por palpite."""
+    # vazio (nada salvo nesta passada: sem commit local solto, ou tudo já está em origin em outro ref) → nada a gravar e nenhuma chamada ao bd; falhou (rc≠0, exceção, prazo do bd) → aviso + nota "NOT recorded" no comentário
+    if not records:
+        return ""
+    refs = " ".join(r["ref"] for r in records)
+    shas = " ".join(r["sha"] for r in records)
+    where = records[0]["ref"] if records[0]["ref"].startswith("refs/") else "origin/" + records[0]["ref"]   # refs/reclaimed/... já é o nome inteiro; salvage/... é um ramo de origin
+    try:
+        r = subprocess.run(
+            bd_prefix + ["update", bead_id, "--set-metadata", f"pilot.salvage_ref={refs}",
+                         "--set-metadata", f"pilot.salvage_sha={shas}", "-q"],
+            capture_output=True, text=True, timeout=15)
+        if r.returncode == 0:
+            return (f" Saved work recorded on the bead (pilot.salvage_ref={refs}, pilot.salvage_sha={shas}): a branch still at that commit has had no commit "
+                    f"since the builder went, so the Pilot does not read it as a delivery (ga-vpan6h8); whoever takes the bead next can resume from the leftover worktree, if it is still there, or from {where}.")
+        why = f"rc={r.returncode}: {(r.stderr or '').strip()[:200]}"
+    except Exception as exc:
+        why = str(exc)
+    print(f"[INFLIGHT-RECLAIM] warn: could not record salvage metadata on {bead_id} ({why}) — the Pilot keeps reading its leftover builder branch as built (ga-vpan6h8)", flush=True)
+    return (f" WARNING: salvage metadata NOT recorded on the bead (bd update failed: {why}) — the Pilot will keep reading the leftover builder branch as built until it ages out "
+            f"(PILOT_ORPHAN_BRANCH_STALE_HOURS); the work is saved on origin at {refs}.")
+
+
 def do_reclaim(bead_id, bead_title, reclaim_count, idle_min, labels, rig_root=None,
                 has_explicit_refusal=False, refusal_count=0, bridge_sources=None,
                 sling_bead_id=None, never_had_owner=False, unset_metadata=()):
@@ -3715,6 +3787,11 @@ def do_reclaim(bead_id, bead_title, reclaim_count, idle_min, labels, rig_root=No
 
     # Build the bd prefix: rig-native beads route to their own store.
     _bd = ["bd", "-C", rig_root] if rig_root else ["bd"]
+
+    # 0a. ga-vpan6h8: write WHERE the work was saved on the bead BEFORE it stops being the builder's (steps 1-2b below), so the proof that the leftover builder branch is a frozen rescue and not a delivery is
+    #     already there when the Pilot first sees the bead open and unowned. Best-effort (see _record_salvage_metadata): a write that fails leaves the bead without it, and the audit comment says so.
+    #     A stub's plain list has no .records → nothing recorded.
+    _salvage_note = _record_salvage_metadata(_bd, bead_id, getattr(_preserved, "records", ()))
 
     # 0b. ga-w6a9xps: a STORY goes back to the pool WITH its story:approved. The builder's claim dropped it; stripping story:in-flight below would leave the
     #     story with no story:* label, and auto-refino's RAW sweep would take it for a new idea (wa-tvrs41.5). Restored first and read back; not confirmed →
@@ -3952,7 +4029,7 @@ def do_reclaim(bead_id, bead_title, reclaim_count, idle_min, labels, rig_root=No
     _sling_note = (f" Its dispatch sling {sling_bead_id} was also closed "
                    f"(superseded-by-reclaim-hold, ga-xlnkf)."
                    if _sling_closed else "")
-    _preserve_note = (" Preserved unpushed work (ga-ufr7): " + "; ".join(_preserved) + "."
+    _preserve_note = (" Preserved unpushed work (ga-ufr7): " + "; ".join(_preserved) + "." + _salvage_note
                        if _preserved else "")
     _refusal_note = (
         f" ga-be4x: this reclaim was an EXPLICIT worker refusal (reason(s): "
@@ -7194,7 +7271,8 @@ def _selftest():
     # (exit 2 = LIMITED); reclaim_decision(account_rate_limited=...) must defer
     # (noop) a confirmed-limited cycle even when every other rail says reclaim
     # or escalate. PB-*: preserve_unpushed_branch() must push a local branch's
-    # unpushed commit to origin under its own name, fall back to a
+    # unpushed commit to origin under salvage/<bead>-<owner> (never under the
+    # builder's own delivery-shaped name, ga-vpan6h8), fall back to a
     # refs/reclaimed/<bead>/<sha> tag on rejection, and touch nothing when the
     # commit is already reachable from origin or no branch matches. All stub
     # subprocess.run — no real git/bd calls.
@@ -7284,19 +7362,20 @@ def _selftest():
         return _run
 
     try:
-        # PB-1: matching local branch, not on origin, own-name push succeeds.
+        # PB-1: matching local branch, not on origin, salvage push succeeds (ga-vpan6h8: the rescue is salvage/<bead>-<owner>, not the builder's own name).
         subprocess.run = _stub_preserve(
             branches=[("fix/ga-fakebead-my-fix", _FAKE_SHA)])
         res = preserve_unpushed_branch("ga-fakebead")
-        check("PB-1: unpushed branch, own-name push succeeds → preserved via origin push",
-              len(res) == 1 and "pushed to origin/fix/ga-fakebead-my-fix" in res[0],
-              f"got={res!r}")
+        check("PB-1: unpushed branch, salvage push succeeds → preserved via origin push",
+              len(res) == 1 and "saved to origin/salvage/ga-fakebead-fix-my-fix" in res[0]
+              and res.records == [{"branch": "fix/ga-fakebead-my-fix", "ref": "salvage/ga-fakebead-fix-my-fix", "sha": _FAKE_SHA}],
+              f"got={res!r} records={getattr(res, 'records', None)!r}")
 
-        # PB-2: own-name push rejected (diverged same-named branch) → falls back to tag.
+        # PB-2: salvage push rejected (diverged same-named branch) → falls back to tag.
         subprocess.run = _stub_preserve(
             branches=[("fix/ga-fakebead-my-fix", _FAKE_SHA)], own_push_ok=False, tag_push_ok=True)
         res = preserve_unpushed_branch("ga-fakebead")
-        check("PB-2: own-name push rejected → falls back to refs/reclaimed/<bead>/<sha> tag",
+        check("PB-2: salvage push rejected → falls back to refs/reclaimed/<bead>/<sha> tag",
               len(res) == 1 and f"tagged refs/reclaimed/ga-fakebead/{_FAKE_SHA}" in res[0],
               f"got={res!r}")
 
@@ -7314,7 +7393,7 @@ def _selftest():
         check("PB-4: no matching branch segment → preserved list empty",
               res == [], f"got={res!r}")
 
-        # PB-5: both own-name and tag push fail → best-effort, empty result, no raise.
+        # PB-5: both salvage and tag push fail → best-effort, empty result, no raise.
         subprocess.run = _stub_preserve(
             branches=[("fix/ga-fakebead-my-fix", _FAKE_SHA)], own_push_ok=False, tag_push_ok=False)
         try:
@@ -7335,7 +7414,7 @@ def _selftest():
                 return inner(cmd, **kw)
             return _run, calls
 
-        # PB-6: own-name push must carry --no-verify. whatsapp_automation's
+        # PB-6: the salvage push must carry --no-verify. whatsapp_automation's
         # pre-push hook computes its "files changed" diff against origin/main
         # UNCONDITIONALLY, regardless of which ref is actually being pushed
         # to (confirmed by reading .git/hooks/pre-push Guard 2) — so a push
@@ -7346,13 +7425,17 @@ def _selftest():
             branches=[("fix/ga-fakebead-my-fix", _FAKE_SHA)]))
         res = preserve_unpushed_branch("ga-fakebead")
         push_cmds = [c for c in _calls6 if "push" in c]
-        check("PB-6: own-name push carries --no-verify (bypasses a slow/expensive "
+        check("PB-6: salvage push carries --no-verify (bypasses a slow/expensive "
               "local pre-push hook on a rescue ref) — ga-2uyvc",
-              len(res) == 1 and "pushed to origin/fix/ga-fakebead-my-fix" in res[0]
+              len(res) == 1 and "saved to origin/salvage/ga-fakebead-fix-my-fix" in res[0]
               and len(push_cmds) == 1 and "--no-verify" in push_cmds[0],
               f"res={res!r} push_cmds={push_cmds!r}")
+        # PB-6b (ga-vpan6h8): the refspec TARGET is the salvage ref — pushing the sha to the builder's own fix/<bead>-… name (what this function did before) would make the rescue read as a delivery.
+        check("PB-6b: the rescue push never targets the builder's own delivery-shaped branch name",
+              len(push_cmds) == 1 and push_cmds[0][-1].split(":", 1)[1] == "refs/heads/salvage/ga-fakebead-fix-my-fix",
+              f"push_cmds={push_cmds!r}")
 
-        # PB-7: fallback tag-push (own-name push rejected) also carries --no-verify.
+        # PB-7: fallback tag-push (salvage push rejected) also carries --no-verify.
         subprocess.run, _calls7 = _capturing(_stub_preserve(
             branches=[("fix/ga-fakebead-my-fix", _FAKE_SHA)],
             own_push_ok=False, tag_push_ok=True))
@@ -7426,7 +7509,7 @@ def _selftest():
         res = preserve_unpushed_branch("ga-fakebead")
         push_calls9 = [c for c in _calls9 if "push" in c]
         check("PB-9: different patch-id → NOT skipped, push still attempted and preserved",
-              len(res) == 1 and "pushed to origin/fix/ga-fakebead-my-fix" in res[0]
+              len(res) == 1 and "saved to origin/salvage/ga-fakebead-fix-my-fix" in res[0]
               and len(push_calls9) == 1, f"res={res!r} push_calls={push_calls9!r}")
     finally:
         subprocess.run = _orig_run_pb

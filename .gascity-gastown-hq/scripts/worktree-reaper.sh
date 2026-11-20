@@ -789,8 +789,10 @@ _keep_unsafe() {
 # (5.9G), and disk hit 95%, breaking the ITBI pipeline's SQLite. Snapshot the WIP
 # into a commit object via a SCRATCH index (GIT_INDEX_FILE) — the real working tree
 # and index are never touched — push it durable to origin (own branch name if free,
-# else refs/reclaimed/<label>/<sha> — same convention as inflight-reclaim-guard.py's
-# preserve_unpushed_branch), and ONLY THEN force-remove.
+# else refs/reclaimed/<label>/<sha> — the convention inflight-reclaim-guard.py's
+# preserve_unpushed_branch followed until ga-vpan6h8, which moved that rescue to
+# salvage/<bead>-<owner> so it no longer reads as a delivery; this function still pushes
+# under the branch's own name, the same gap, left as it was), and ONLY THEN force-remove.
 #
 # gate-feedback (fix-attempt 1): the first version did a real `git commit` BEFORE
 # either push was attempted. When both pushes failed, the function correctly

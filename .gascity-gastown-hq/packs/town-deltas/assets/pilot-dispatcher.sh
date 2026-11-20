@@ -5642,6 +5642,11 @@ _filter_built() {
               # handed to the next builder to resume (resume_directive_for). Not a "built" reason, so the EXCLUÍDO trace
               # below never names this branch.
               log "[pilot] _filter_built: $id has branch $_matched_ref but no commit of its own (its tip is in origin/main and no commit there names the bead) — not counted as built (ga-qcrgi9k)" >&2
+            elif [ "${_bf_signal%%$'\t'*}" = "salvage" ]; then
+              # ga-vpan6h8: the branch is still AT a commit the in-flight reclaim guard saved (the bead's metadata pilot.salvage_sha) — its builder died and nobody committed since, so it is neither in flight nor a
+              # delivery. Kept like an empty branch: a gate marker or gate:* label (ingate_ids, computed at the top) still drops it in the combine step, and dispatch_one()'s ownership guard still judges it. Whoever takes the bead
+              # next may resume the leftover worktree, or origin's salvage/<bead>-<owner> copy. Not a "built" reason, so the EXCLUÍDO trace below never names this branch.
+              log "[pilot] _filter_built: $id has branch $_matched_ref still at the commit the in-flight reclaim guard saved (pilot.salvage_sha): its builder died and nobody committed since — not counted as built (ga-vpan6h8)" >&2
             else
               built_ids="${built_ids:+$built_ids }$id"
               built_reasons="${built_reasons}${id}"$'\t'"branch $_matched_ref exists"$'\n'
@@ -7756,6 +7761,24 @@ _beadid_matched_crew_branch_ref() {
 #                                           ($_json — the candidate query
 #                                           already required it empty) is empty
 #                                           → abandoned, not active.
+#   salvage \t <ref>                     — ga-vpan6h8: unmerged, the bead has no
+#                                           owner, and the ref's tip is one of the
+#                                           commits in the bead's metadata
+#                                           pilot.salvage_sha (space-separated) —
+#                                           what inflight-reclaim-guard saved when it
+#                                           reclaimed a DEAD builder's unpushed work.
+#                                           Nobody has committed since: nothing is in
+#                                           flight and nothing was delivered (whoever
+#                                           takes the bead next may resume it). One
+#                                           commit on top and the tip no longer matches
+#                                           → block again. Checked BEFORE the age rule:
+#                                           without it the leftover crew/<pool>/<bead>
+#                                           (wa-4qu2n6.1, 19/11, witness report: 48
+#                                           refusals in ~13 h) blocked until
+#                                           PILOT_ORPHAN_BRANCH_STALE_HOURS after the
+#                                           builder's last commit. Anything this cannot
+#                                           read — metadata, ref — falls through to the
+#                                           age rule below, exactly as before.
 # Test seams (space-lists of bead ids, hermetic — consulted only when the
 # underlying branch match already succeeded via PILOT_TEST_CREW_BRANCH_BEADS):
 #   PILOT_TEST_BRANCH_MERGED_BEADS  — force the "merged" classification.
@@ -7808,6 +7831,19 @@ _beadid_branch_signal() {
   if [ -n "$_asg_snapshot" ] && [ "$_asg_snapshot" != "null" ]; then
     printf 'block\t%s' "$_ref"
     return 0
+  fi
+  # ga-vpan6h8: the reclaim guard's proof that this branch is a dead builder's frozen work (see the `salvage` class above). Only a POSITIVE match frees it.
+  local _salv _tip
+  # vazio (bead sem pilot.salvage_sha, linha sem metadata) → "" e segue para a idade (o veto de antes); falhou/ilegível (jq não lê a linha; valor que não é texto: o test levanta erro e o `|| _salv=""` o pega; texto que não é lista de sha em hex) → "" idem: só prova positiva solta o veto
+  _salv=$(printf '%s' "$_json" | jq -r '(.metadata["pilot.salvage_sha"] // "") | if test("\\A[0-9a-f]{40,64}( [0-9a-f]{40,64})*\\z") then . else "" end' 2>/dev/null) || _salv=""
+  if [ -n "$_salv" ]; then
+    # vazio/falhou (git não resolve a ponta de $_ref) → "" → não casa com nenhum sha → segue para a idade: "não consegui ler" nunca vira "congelado"
+    _tip=$(git -C "$_repo" rev-parse --verify -q "${_ref}^{commit}" 2>/dev/null) || _tip=""
+    if [ -n "$_tip" ]; then
+      case " $_salv " in
+        *" $_tip "*) printf 'salvage\t%s' "$_ref"; return 0 ;;
+      esac
+    fi
   fi
   if [ -n "${PILOT_TEST_ORPHAN_BRANCH_BEADS+x}" ]; then
     case " $PILOT_TEST_ORPHAN_BRANCH_BEADS " in
@@ -8351,6 +8387,10 @@ _ownership_guard_should_refuse() {
           empty)
             : # ga-qcrgi9k — the branch never got a commit of its own (its builder died first): nothing in flight, nothing
               # shipped. Not a refusal; a live owner, an external claim, a gate artifact or an attached session still are.
+            ;;
+          salvage)
+            : # ga-vpan6h8 — the branch is still at the commit the reclaim guard saved when it took the bead from a dead builder: nothing in flight,
+              # nothing shipped. Not a refusal, same as `empty`; the other signals below (owner, external claim, gate artifact, attached session) still are.
             ;;
           orphan)
             # AC1b/AC3 — unmerged but abandoned (stale + unassigned): surface

@@ -27,6 +27,10 @@
 # see _beadid_needs_remerge_branch.
 # crew/*/<bead> is not listed — its glob has a different shape — and is always
 # appended last by gc_delivery_branch_globs.
+# salvage/ is deliberately NOT listed (ga-vpan6h8): inflight-reclaim-guard saves a dead builder's
+# unfinished work on origin as salvage/<bead>-<owner> and relies on that name being invisible here;
+# under crew/<pool>/<bead> it read as a delivery and kept the bead from being re-dispatched.
+# inflight-reclaim-guard.salvage-ref.selftest.sh reads that name through this file.
 GC_DELIVERY_BRANCH_PREFIXES="fix feat feature refactor docs chore test"
 
 # gc_delivery_branch_globs <bead_id>
