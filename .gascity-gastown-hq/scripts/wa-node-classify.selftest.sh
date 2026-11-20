@@ -26,6 +26,8 @@
 #   (6 casos com o texto de beads WA reais); tarefa, sem a palavra, frase cortada, negação colada («não reprova»), «passa em main», «main thread», sem teste citado e teste ausente de main (com a nota) = unknown; envio = mini; banco fixado no teste = mini (moles);
 #   as regras 5, 7 e 8 vencem a 9 e a leitura que falhou (regra 7 ou 8) a impede de rodar (nunca node).
 #   · ÂNCORA DO DADO (regra 3): a bead que cita só dado e NOMEIA o módulo é ancorada pelo código derivado (mesmos filtros); sem âncora/fora do nó/leitura que falha o dado segue duro; PII e item que não é evidência impedem a tentativa.
+#   · HOST-MAC: EXECUÇÃO, NÃO MENÇÃO (ga-fijap88): a marca de UA "Google Chrome", a mensagem que começa com "adb" (adb morreu) e o executável do Mac só numa MENSAGEM (assert/log/raise/print, em literal, f-string, `+`, `%`, `.format`, sys.stderr.write) NÃO são evidência;
+#   o caminho do build Mac do Chrome for Testing, o comando do adb (com subcomando ou flag), o `write(...)` solto e o argv escondido num raise SIM; o que só aparece no TESTE informa (`mole-evidencia-teste`, até 6 + `-mais`) e não barra, o do código barra.
 # CONTROLE NEGATIVO: cada mutante abaixo troca UMA linha do classificador numa cópia e o caso designado tem de reprovar; mutante que sobrevive reprova esta bateria. Um mutante só vale se o
 #   ORIGINAL passa o mesmo caso no mesmo ambiente e se ele não morre por causa do ambiente (ver as 3 regras acima de mk_mutant); caso e mutante de rsync usam stubs que só o mutante separa do original.
 # COMO RODAR: bash scripts/wa-node-classify.selftest.sh   (macOS /bin/bash 3.2 e Linux). Pesado o bastante para ir ao nó: scripts/mbp-run.sh --repo hq scripts/wa-node-classify.selftest.sh
@@ -360,6 +362,22 @@ wf lib/mole_hostpath.py $'import subprocess\nsubprocess.run(["/usr/bin/security"
 wf lib/mole_hostshell.py $'import os\nos.system("security find-generic-password -s x")'; wf tests/test_mole_hostshell.py $'from lib.mole_hostshell import os'
 wf lib/mole_dbf.py $'import sqlite3\ndef c(n):\n    return sqlite3.connect(f"shared/data/{n}.db")'; wf tests/test_mole_dbf.py $'from lib.mole_dbf import c'
 wf lib/mole_prose.py $'def f(n):\n    raise RuntimeError("the secret key is missing")\nX = "lib/security"\nY = "lib/secret"\nZ = "security headers are off"\nW = f"the {n} secret is missing"\nV = "setup httpfs/secret S3 falhou - leitura indisponivel"'; wf tests/test_mole_prose.py $'from lib.mole_prose import f'
+# host-mac: EXECUÇÃO, não menção (ga-fijap88, 20/11). Medido no nó: dos 255 arquivos de teste do WA com texto de host-mac, 226 passam sem falha no Linux (14 só pulam, 15 reprovam); as strings "adb morreu"/"adb offline", a marca de UA "Google Chrome" e o nome do
+# executável numa mensagem (assert/log/raise/print) eram a maior parte da evidência. mole_chromeua/mole_adbprosa/mole_hostmsg NÃO são evidência; mole_chromemac/mole_adbcmd/mole_hostmsgrun SIM (caminho do build Mac, comando do adb, argv dentro de
+# um raise); mole_thost tem o argv só no TESTE (informa, não barra); mole_hostboth tem no código E no teste (o código barra, o teste só aparece em info).
+wf lib/mole_chromeua.py $'UA = \'"Not:A-Brand";v="99", "Google Chrome";v="145", "Chromium";v="145"\''; wf tests/test_mole_chromeua.py $'from lib.mole_chromeua import UA'
+wf lib/mole_chromemac.py $'CHROME = "/Users/x/.cache/ms-playwright/chromium-1/chrome-mac-arm64/Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing"'; wf tests/test_mole_chromemac.py $'from lib.mole_chromemac import CHROME'
+wf lib/mole_adbprosa.py $'def estado(ok):\n    if not ok:\n        return "adb morreu no meio da leitura"\n    return "adb: device offline"'; wf tests/test_mole_adbprosa.py $'from lib.mole_adbprosa import estado'
+wf lib/mole_adbcmd.py $'import os\nos.system("adb logcat -d")'; wf tests/test_mole_adbcmd.py $'from lib.mole_adbcmd import os'
+wf lib/mole_hostmsg.py $'import logging\nimport sys\nlog = logging.getLogger("x")\ndef f(rc):\n    assert rc == 0, "launchctl kickstart falhou"\n    if rc:\n        log.warning("launchctl print rc=%s", rc)\n        log.error("launchctl list: %s" % rc)\n        log.error("falhou " + "launchctl")\n        log.info("launchctl {}".format(rc))\n        sys.stderr.write("pmset falhou")\n        raise RuntimeError(f"nao consegui executar launchctl: {rc}")\n    print("osascript indisponivel")'; wf tests/test_mole_hostmsg.py $'from lib.mole_hostmsg import f'
+wf lib/mole_hostmsgrun.py $'import subprocess\ndef f():\n    raise RuntimeError(subprocess.check_output(["launchctl", "list"]))'; wf tests/test_mole_hostmsgrun.py $'from lib.mole_hostmsgrun import f'
+wf lib/mole_thost.py $'X = 1'; wf tests/test_mole_thost.py $'import subprocess\nfrom lib.mole_thost import X\ndef test_x():\n    subprocess.run(["launchctl", "list"])'
+wf lib/mole_hostboth.py $'import subprocess\nsubprocess.run(["osascript", "-e", "x"])'; wf tests/test_mole_hostboth.py $'import subprocess\nfrom lib.mole_hostboth import subprocess as s\nsubprocess.run(["launchctl", "list"])'
+wf lib/mole_chromeapp.py $'APP = "/opt/x/Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing"'; wf tests/test_mole_chromeapp.py $'from lib.mole_chromeapp import APP'
+wf lib/mole_chromex64.py $'D = "/x/chrome-mac-x64/chrome"'; wf tests/test_mole_chromex64.py $'from lib.mole_chromex64 import D'
+wf lib/mole_adbflag.py $'import os\nos.system("adb -d wait-for-device")'; wf tests/test_mole_adbflag.py $'from lib.mole_adbflag import os'
+wf lib/mole_hostwrite.py $'def f(write):\n    write("launchctl load -w x.plist")'; wf tests/test_mole_hostwrite.py $'from lib.mole_hostwrite import f'   # write(...) SOLTO é uma função qualquer (aqui, quem grava o comando), não mensagem: só sys.…write é
+wf lib/mole_tmany.py $'X = 1'; wf tests/test_mole_tmany.py $'import subprocess\nfrom lib.mole_tmany import X\ndef test_x():\n    subprocess.run(["osascript", "-e", "x"])\n    subprocess.run(["launchctl", "list"])\n    subprocess.run(["plutil", "-p", "x"])\n    subprocess.run(["pmset", "-g"])\n    subprocess.run(["pbcopy"])\n    subprocess.run(["adb", "devices"])\n    subprocess.run(["security", "x"])'   # 7 evidências distintas SÓ no teste: 6 nomeadas, 1 contada
 wf lib/impt_macmod.py $'# impt_macmod'; wf tests/test_impt_mac_x.py $'from lib.impt_macmod import x'   # o único teste que importa impt_macmod é só-no-Mac (macs-impt.txt)
 wf lib/mole_sibdb.py $'P = "shared/data/y.db"'; wf tests/test_mole_sibdb.py $'mole_sibdb'
 gw add lib/mole_sibdb.py tests/test_mole_sibdb.py && gw commit -q -m "feat(wa-molp1.1): mole_sibdb" || bad "commit da irma do mole nao montado"
@@ -811,6 +829,22 @@ expect "mole: evidência - linha de shell \"security find-generic-password …\"
 expect "mole: evidência - banco montado em f-string (shared/data/{n}.db)" "$(DESC 'ajustar lib/mole_dbf.py')" 10 'moles:banco-de-dados.*mole_dbf\.py\[shared/data/_\.db\]'
 expect_not "mole: PROSA em string (\"the secret key is missing\", \"httpfs/secret S3 falhou\", \"lib/security\", \"lib/secret\", \"security headers are off\", f\"the {n} secret is missing\") NÃO é evidência" "$(DESC 'ajustar lib/mole_prose.py')" 0 'moles:|mole-evidencia'
 expect_not "mole: nome de banco solto num TESTE que não parseia (texto) também não conta" "$(DESC 'ajustar lib/mole_tbare2.py')" 0 'moles:|mole-evidencia'
+# host-mac: EXECUÇÃO, não menção (ga-fijap88). A marca de UA, a mensagem que começa com "adb" e o nome do executável numa mensagem NÃO são evidência; o caminho do build Mac do Chrome for Testing, o comando do adb com subcomando e o argv
+# escondido num raise SIM; e o que só aparece no TESTE informa (`mole-evidencia-teste:`) sem barrar: 226 dos 255 arquivos de teste com texto de host-mac passam sem falha no Linux; dos 15 que reprovam, 8 já estão na lista mac-only (regra 3) e o teste vermelho no nó devolve a bead nos outros.
+expect_not "host-mac: marca de UA \"Google Chrome\";v=... (Client Hint) NÃO é o navegador do Mac" "$(DESC 'ajustar lib/mole_chromeua.py')" 0 'moles:|mole-evidencia'
+expect "host-mac: evidência - caminho do build Mac do Chrome for Testing (chrome-mac-arm64) segue valendo" "$(DESC 'ajustar lib/mole_chromemac.py')" 10 'moles:host-mac.*mole_chromemac\.py\[chrome-mac-arm64\]'
+expect_not "host-mac: mensagem que COMEÇA com \"adb\" (adb morreu, adb: device offline) NÃO é comando" "$(DESC 'ajustar lib/mole_adbprosa.py')" 0 'moles:|mole-evidencia'
+expect "host-mac: evidência - linha de comando do adb com subcomando (adb logcat) segue valendo" "$(DESC 'ajustar lib/mole_adbcmd.py')" 10 'moles:host-mac.*mole_adbcmd\.py\[adb logcat\]'
+expect_not "host-mac: nome do executável do Mac só em MENSAGEM (assert, log, raise, print) NÃO é evidência" "$(DESC 'ajustar lib/mole_hostmsg.py')" 0 'moles:|mole-evidencia'
+expect "host-mac: o argv de um executável do Mac DENTRO de um raise continua sendo evidência (só o texto de mensagem é ignorado)" "$(DESC 'ajustar lib/mole_hostmsgrun.py')" 10 'moles:host-mac.*mole_hostmsgrun\.py\[argv:launchctl\]'
+expect "host-mac: evidência - Chrome for Testing.app (build Mac do Playwright/Puppeteer) segue valendo" "$(DESC 'ajustar lib/mole_chromeapp.py')" 10 'moles:host-mac.*mole_chromeapp\.py\[Chrome for Testing\.app\]'
+expect "host-mac: evidência - chrome-mac-x64 (Intel) vale como o chrome-mac-arm64" "$(DESC 'ajustar lib/mole_chromex64.py')" 10 'moles:host-mac.*mole_chromex64\.py\[chrome-mac-x64\]'
+expect "host-mac: evidência - adb com flag (adb -d …), sem subcomando logo depois" "$(DESC 'ajustar lib/mole_adbflag.py')" 10 'moles:host-mac.*mole_adbflag\.py\[adb -d\]'
+expect "host-mac: evidência - write(\"launchctl …\") SOLTO não é mensagem (só sys.…write é)" "$(DESC 'ajustar lib/mole_hostwrite.py')" 10 'moles:host-mac.*mole_hostwrite\.py\[launchctl\]'
+expect "host-mac: evidência SÓ no teste (argv launchctl) não barra: node, e o info diz o que foi ignorado (mole-evidencia-teste)" "$(DESC 'ajustar lib/mole_thost.py')" 0 '"verdict": "node".*"mole-evidencia-teste:host-mac=tests/test_mole_thost\.py\[argv:launchctl\]"'
+expect_not "host-mac: evidência SÓ no teste não vira motivo duro" "$(DESC 'ajustar lib/mole_thost.py')" 0 'moles:host-mac|"mole-evidencia:host-mac'
+expect "host-mac: mais de 6 evidências só no teste: 6 nomeadas e o resto contado (mole-evidencia-teste-mais)" "$(DESC 'ajustar lib/mole_tmany.py')" 0 '"mole-evidencia-teste:host-mac=tests/test_mole_tmany\.py\[argv:adb\]", "mole-evidencia-teste-mais:1"\]\}$'
+expect "host-mac: evidência no CÓDIGO e no teste: o código barra, o teste aparece à parte em info" "$(DESC 'ajustar lib/mole_hostboth.py')" 10 'moles:host-mac.*mole-evidencia:host-mac=lib/mole_hostboth\.py\[argv:osascript\].*mole-evidencia-teste:host-mac=tests/test_mole_hostboth\.py\[argv:launchctl\]'
 # três estados: não consegui ler / nada para ler -> a palavra volta a valer (como antes), e a resposta diz por quê
 export WA_NODE_REPO="$T/wa-repo-ausente"
 expect "mole: repo ilegível + palavra -> a palavra vale (mini) e a leitura que falhou é nomeada" "$(DESC 'lib/mole_clean.py abre um sqlite; tests/test_mole_clean.py')" 10 'moles:banco-de-dados.*"mole-ilegivel:repo-git-rc-128"'
@@ -1236,8 +1270,8 @@ mutant ev-info-sem-teto   'info += names[:MAX_EVIDENCE_INFO] +'            'info
 MD="WA_NODE_REPO=$RP WA_NODE_MIRROR=$T/mirror-ok"
 MR="WA_NODE_REPO=$T/wa-repo-ausente WA_NODE_MIRROR=$T/espelho-ausente"
 MCLEAN="$(DESC 'ajustar lib/mole_clean.py que abre um sqlite com o token e roda osascript')"
-mutant mole-sem-evidencia        'hard = ["moles:" + s for s in MOLE_SLUGS if s in ev]' 'hard = []'                                          "$(DESC 'ajustar lib/mole_db.py')" 10 'moles:banco-de-dados' "$MD"
-mutant mole-palavra-barra        'hard = ["moles:" + s for s in MOLE_SLUGS if s in ev]' 'hard = ["moles:" + s for s in MOLE_SLUGS if s in ev or s in prose]' "$MCLEAN" 0 'mole-so-em-prosa:banco-de-dados' "$MD"
+mutant mole-sem-evidencia        'hard = ["moles:" + s for s in MOLE_SLUGS if ev_blk.get(s)]' 'hard = []'                                          "$(DESC 'ajustar lib/mole_db.py')" 10 'moles:banco-de-dados' "$MD"
+mutant mole-palavra-barra        'hard = ["moles:" + s for s in MOLE_SLUGS if ev_blk.get(s)]' 'hard = ["moles:" + s for s in MOLE_SLUGS if ev_blk.get(s) or s in prose]' "$MCLEAN" 0 'mole-so-em-prosa:banco-de-dados' "$MD"
 mutant mole-falha-vira-sem-evid  'return fallback, ["mole-ilegivel:" + str(e)]'         'return [], ["mole-ilegivel:" + str(e)]'            "$(DESC 'lib/mole_clean.py abre um sqlite; tests/test_mole_clean.py')" 10 'moles:banco-de-dados.*mole-ilegivel' "$MR"
 mutant mole-falha-sem-nota       'fallback, ["mole-ilegivel:" + str(e)]'                'fallback, []'                                      "$(DESC 'lib/mole_clean.py e tests/test_mole_clean.py')" 0 'mole-ilegivel:repo-git-rc-128' "$MR"
 mutant mole-sem-base-vira-vazio  '    if nread == 0:'                                    '    if False:'                                     "$(DESC 'lib/novo_zz.py abre um sqlite; tests/test_novo_zz.py')" 10 'moles:banco-de-dados.*mole-sem-arquivo-lido' "$MD"
@@ -1260,7 +1294,7 @@ mutant mole-stdlib-secrets       '|_?secret(?:_bin|_cli)?)(?:\.|$)", re.I)'     
 mutant mole-cofre-argv-ignorado  '            if b in CRED_CLI:'                        '            if False:'                             "$(DESC 'ajustar lib/mole_cred.py')" 10 'moles:credencial' "$MD"
 mutant mole-cofre-chamada        '            if CRED_CALL_RE.match(c):'               '            if False:'                             "$(DESC 'ajustar lib/mole_credfn.py')" 10 'moles:credencial' "$MD"
 mutant mole-cofre-arquivo        '            elif CRED_FILE_RE.search(t):'            '            elif False:'                           "$(DESC 'ajustar lib/mole_credpem.py')" 10 'moles:credencial' "$MD"
-mutant mole-host-argv-ignorado   '            if b in HOST_ARGV:'                       '            if False:'                             "$(DESC 'ajustar lib/mole_secarg.py')" 10 'moles:host-mac' "$MD"
+mutant mole-host-argv-ignorado   '            elif b in HOST_ARGV:'                     '            elif False:'                             "$(DESC 'ajustar lib/mole_secarg.py')" 10 'moles:host-mac' "$MD"
 mutant mole-chrome-ignorado      '|Application Support/Google/Chrome'                   ''                                                  "$(DESC 'ajustar lib/mole_chrome.py')" 10 'moles:host-mac' "$MD"
 mutant mole-md-ignorado          '|(?<![\w])md:[\w\-]*'                              ''                                                  "$(DESC 'ajustar lib/mole_md.py e tests/test_mole_md.py')" 10 'moles:banco-de-dados' "$MD"
 mutant mole-users-conta          '|~/Library|remote-debugging-port'                    '|~/Library|/Users/[A-Za-z]|remote-debugging-port' "$(DESC 'ajustar lib/mole_users.py')" 0 '"verdict": "node"' "$MD"
@@ -1302,6 +1336,49 @@ mutant ancora-sem-filtro         '    if any(p not in dsent or any(fnmatch.fnmat
 mutant ancora-falha-sem-nota     '        info += anotes'                              '        pass'                                          "$(DESC 'Medido em queue.db; ajustar anchor_mod quando vem vazio')" 10 'ancora-derivada-ilegivel:repo-git-rc-128' "$MR"
 mutant ancora-ignora-pii         'if not has_code and blocked and not hard and all('    'if not has_code and blocked and all('              "$(DESC 'Medido em queue.db (31) 98876-5432; ajustar anchor_mod quando vem vazio')" 10 'caminho-fora-do-filtro:queue\.db.*dado-no-texto' "$MD"
 mutant ancora-sem-exigir-evid    'for _, p, _ in blocked):'                            'for _, p, _ in []):'                               "$(DESC 'Medido em queue.db e ~/Library/LaunchAgents/x.plist; ajustar anchor_mod quando vem vazio')" 10 'caminho-fora-do-filtro:queue\.db.*caminho-fora-do-formato' "$MD"
+# ---- controle negativo do host-mac (ga-fijap88): execução, não menção. Cada linha nova do classificador tem um mutante e um caso que só o original passa
+HUA="$(DESC 'ajustar lib/mole_chromeua.py')"; HMAC="$(DESC 'ajustar lib/mole_chromemac.py')"; HAPP="$(DESC 'ajustar lib/mole_chromeapp.py')"; HX64="$(DESC 'ajustar lib/mole_chromex64.py')"
+HPRO="$(DESC 'ajustar lib/mole_adbprosa.py')"; HCMD="$(DESC 'ajustar lib/mole_adbcmd.py')"; HFLAG="$(DESC 'ajustar lib/mole_adbflag.py')"
+HMSG="$(DESC 'ajustar lib/mole_hostmsg.py')"; HRUN="$(DESC 'ajustar lib/mole_hostmsgrun.py')"; HWR="$(DESC 'ajustar lib/mole_hostwrite.py')"
+HTH="$(DESC 'ajustar lib/mole_thost.py')"; HMANY="$(DESC 'ajustar lib/mole_tmany.py')"; HNODE='"verdict": "node"'
+# HOST_RE: a marca de UA volta a ser evidência / o caminho do build Mac some
+mutant host-chrome-ua-solto        '\b|Chrome\.app|Chrome for Testing\.app|'              '\b|Google Chrome|Chrome\.app|Chrome for Testing\.app|'  "$HUA" 0 "$HNODE" "$MD"
+mutant host-chrome-mac-ignorado    '|chrome-mac-(?:arm64|x64)|'                           '|'                                                      "$HMAC" 10 'moles:host-mac.*\[chrome-mac-arm64\]' "$MD"
+mutant host-chrome-app-ignorado    '|Chrome for Testing\.app|'                            '|'                                                      "$HAPP" 10 'moles:host-mac.*\[Chrome for Testing\.app\]' "$MD"
+mutant host-chrome-x64-ignorado    'chrome-mac-(?:arm64|x64)'                             'chrome-mac-(?:arm64)'                                   "$HX64" 10 'moles:host-mac.*\[chrome-mac-x64\]' "$MD"
+# HOST_SHELL_RE: o `adb` solto volta a ser evidência / o subcomando e a flag deixam de valer
+mutant host-adb-prosa-volta        '(?:(?:osascript|launchctl|pmset|plutil|pbcopy|pbpaste|caffeinate|screencapture)\b|adb\s+' '(?:(?:adb|osascript|launchctl|pmset|plutil|pbcopy|pbpaste|caffeinate|screencapture)\b|adb\s+' "$HPRO" 0 "$HNODE" "$MD"
+mutant host-adb-sem-subcomando     '|logcat|forward|'                                     '|forward|'                                              "$HCMD" 10 'moles:host-mac.*\[adb logcat\]' "$MD"
+mutant host-adb-sem-flag           'adb\s+(?:-[A-Za-z]\b|(?:shell|'                       'adb\s+(?:(?:shell|'                                     "$HFLAG" 10 'moles:host-mac.*\[adb -d\]' "$MD"
+# mensagem: o descarte inteiro, cada raiz, cada forma de texto, o dono e a função do log, e o que NÃO é mensagem
+mutant host-msg-ignorada           '            if is_msg:'                               '            if False:'                                   "$HMSG" 0 "$HNODE" "$MD"
+mutant host-msg-const-nao-marca    '            msgs.append(id(n) in mids)'               '            msgs.append(False)'                          "$HMSG" 0 "$HNODE" "$MD"
+mutant host-msg-fstring-nao-marca  '            msgs.append(any(id(v) in mids for v in n.values if isinstance(v, ast.Constant)))' '            msgs.append(False)' "$HMSG" 0 "$HNODE" "$MD"
+mutant host-msg-assert-fora        '            text(n.msg)'                              '            pass'                                        "$HMSG" 0 "$HNODE" "$MD"
+mutant host-msg-raise-fora         '            for a in n.exc.args:'                     '            for a in []:'                                "$HMSG" 0 "$HNODE" "$MD"
+mutant host-msg-log-fora           '            if nm in MSG_FUNCS and (not own or any(o in MSG_OWNERS for o in own)) and not (nm == "write" and "sys" not in own):' '            if False:' "$HMSG" 0 "$HNODE" "$MD"
+mutant host-msg-print-fora         '("print", "warn", "debug",'                           '("warn", "debug",'                                      "$HMSG" 0 "$HNODE" "$MD"
+mutant host-msg-info-fora          '"debug", "info", "warning",'                          '"debug", "warning",'                                    "$HMSG" 0 "$HNODE" "$MD"
+mutant host-msg-warning-fora       '"info", "warning", "error",'                          '"info", "error",'                                       "$HMSG" 0 "$HNODE" "$MD"
+mutant host-msg-dono-log-fora      '("logger", "log", "logging",'                         '("logger", "logging",'                                  "$HMSG" 0 "$HNODE" "$MD"
+mutant host-msg-solto-fora         '(not own or any(o in MSG_OWNERS for o in own))'       '(any(o in MSG_OWNERS for o in own))'                    "$HMSG" 0 "$HNODE" "$MD"
+mutant host-msg-write-sys-fora     'and not (nm == "write" and "sys" not in own)'         'and not (nm == "write")'                                "$HMSG" 0 "$HNODE" "$MD"
+mutant host-msg-write-qualquer     'and not (nm == "write" and "sys" not in own)'         ''                                                       "$HWR" 10 'moles:host-mac.*mole_hostwrite\.py\[launchctl\]' "$MD"
+mutant host-msg-fstring-fora       '        elif isinstance(e, ast.JoinedStr):'           '        elif False:'                                    "$HMSG" 0 "$HNODE" "$MD"
+mutant host-msg-binop-fora         '        elif isinstance(e, ast.BinOp) and isinstance(e.op, (ast.Add, ast.Mod)):' '        elif False:'      "$HMSG" 0 "$HNODE" "$MD"
+mutant host-msg-mod-fora           '(ast.Add, ast.Mod)'                                   '(ast.Add,)'                                             "$HMSG" 0 "$HNODE" "$MD"
+mutant host-msg-add-fora           '(ast.Add, ast.Mod)'                                   '(ast.Mod,)'                                             "$HMSG" 0 "$HNODE" "$MD"
+mutant host-msg-format-fora        '        elif isinstance(e, ast.Call) and isinstance(e.func, ast.Attribute) and e.func.attr == "format":' '        elif False:' "$HMSG" 0 "$HNODE" "$MD"
+mutant host-msg-desce-no-raise     '            for a in n.exc.args:'                     '            for a in ast.walk(n.exc):'                   "$HRUN" 10 'moles:host-mac.*\[argv:launchctl\]' "$MD"
+# teste: o que só aparece no teste informa e não barra
+mutant host-teste-barra            'if not is_t(f)] if s == "host-mac" else v)'          'if True] if s == "host-mac" else v)'                    "$HTH" 0 "$HNODE" "$MD"
+mutant host-teste-nao-reconhece    'is_t = lambda f: bool(TEST_RE.search(f))'             'is_t = lambda f: False'                                 "$HTH" 0 "$HNODE" "$MD"
+mutant host-teste-par-misturado    'if not (s == "host-mac" and is_t(f))]'               ']'                                                      "$HTH" 0 '"teste-derivado:lib/mole_thost\.py=tests/test_mole_thost\.py", "mole-evidencia-teste:host-mac=tests/test_mole_thost\.py' "$MD"
+mutant host-teste-par-ausente      'for f, w in ev_all.get("host-mac", []) if is_t(f)]'   'for f, w in ev_all.get("host-mac", []) if False]'        "$HTH" 0 'mole-evidencia-teste:host-mac=tests/test_mole_thost\.py' "$MD"
+mutant host-teste-mais-ausente     'if len(tpairs) > MOLE_INFO_MAX else [])'              'if False else [])'                                      "$HMANY" 0 '"mole-evidencia-teste-mais:1"' "$MD"
+mutant host-teste-sem-corte        'info += tpairs[:MOLE_INFO_MAX] +'                     'info += tpairs +'                                       "$HMANY" 0 '"mole-evidencia-teste:host-mac=tests/test_mole_tmany\.py\[argv:adb\]", "mole-evidencia-teste-mais:1"\]\}$' "$MD"
+# ---- fim do controle negativo do host-mac
+
 # ---- controle negativo do banco COM SCHEMA NO NÓ (ga-kzwlkhh): cada guarda do recibo e da cobertura tem um mutante e um caso que só o original passa
 SR="$MD WA_NODE_SCHEMA_RECEIPT=$T/rcpt-ok.json"; SOK="$(DESC 'ajustar lib/sch_ok.py')"
 mutant schema-velho-vale          'if age > SCHEMA_MAX_AGE:'                         'if False:'                                       "$SOK" 10 'schema-recibo-velho' "$MD WA_NODE_SCHEMA_RECEIPT=$T/rcpt-velho.json"
@@ -1324,7 +1401,7 @@ mutant schema-abs-sem-fronteira   $'(?:[^\\s\\"\']+/)?(shared/data/'            
 mutant schema-abs-sem-til         '(?:/Users/[\w.\-]+|~)/(?:'                         '(?:/Users/[\w.\-]+)/(?:'                         "$(DESC 'ajustar lib/sch_tilde.py')" 0 "$SA" "$SR"
 mutant schema-abs-sem-users       '(?:/Users/[\w.\-]+|~)/(?:'                         '(?:~)/(?:'                                       "$(DESC 'ajustar lib/sch_abs.py')" 0 "$SA" "$SR"
 mutant schema-evid-corta-48       'if slug == "banco-de-dados" else what[:EVID_CLIP]' 'if False else what[:EVID_CLIP]'          "$(DESC 'ajustar lib/sch_abs.py')" 0 "$SA" "$SR"
-mutant schema-info-sem-corte      'evid_clip(w)) for s in MOLE_SLUGS for f, w in ev_all.get(s, [])]' 'w) for s in MOLE_SLUGS for f, w in ev_all.get(s, [])]' "$(DESC 'ajustar lib/sch_abs.py')" 0 '\[/Users/athos/gt/whatsapp_automation/shared/data/\]", "mole-banco-com-schema:shared/data/queue\.db"\]\}$' "$SR"
+mutant schema-info-sem-corte      'evid_clip(w)) for s in MOLE_SLUGS for f, w in ev_all.get(s, []) if not (s == "host-mac" and is_t(f))]' 'w) for s in MOLE_SLUGS for f, w in ev_all.get(s, []) if not (s == "host-mac" and is_t(f))]' "$(DESC 'ajustar lib/sch_abs.py')" 0 '\[/Users/athos/gt/whatsapp_automation/shared/data/\]", "mole-banco-com-schema:shared/data/queue\.db"\]\}$' "$SR"
 mutant schema-irma-sem-corte      'evid_clip(w)) for s in MOLE_SLUGS for f, w in evsoft.get(s, [])]' 'w) for s in MOLE_SLUGS for f, w in evsoft.get(s, [])]' "$(DESCI wa-molp3.2 'corrigir o caso de borda')" 0 'mole-evidencia-irma:banco-de-dados=lib/mole_sibabs\.py\[/Users/athos/gt/whatsapp_automation/shared/data/\]' "$MD"
 mutant schema-evid-sem-marca     'what[:EVID_DB_KEEP] + "…")' 'what[:EVID_DB_KEEP])'  "$(DESC 'ajustar lib/sch_abs_long.py')" 10 "$SM" "$SR"
 mutant schema-evid-teto-299       'len(what) <= EVID_DB_KEEP' 'len(what) <= EVID_DB_KEEP - 1'  "$(DESC 'ajustar lib/sch_abs_300.py')" 0 "$SA" "$SR"

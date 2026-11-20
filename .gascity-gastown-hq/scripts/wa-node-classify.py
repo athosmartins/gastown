@@ -45,6 +45,10 @@ COMO DECIDE (a 1ª regra que casa vale; tudo é lido da bead, nada é gravado ne
      confirmou ter e o wt-add põe no worktree; recibo fresco, `WA_NODE_SCHEMA_MAX_AGE_H`), o banco deixa de ser mole e vai em `info` (`mole-banco-com-schema:<db>`); a prova de teste segue exigida. Vale também o caminho ABSOLUTO `/Users/<u>/…/shared/data/x.db` ou `~/…/shared/data/x.db`
      (ga-t00j8kf; decisão do Mayor, 06/11): o custo é só tempo — o teste que de fato abrir o caminho fica vermelho no nó e a bead volta —, nenhum dado muda e o filtro do espelho segue o mesmo; o caminho TEM de acabar em `shared/data/<banco do recibo>`
      (pasta que não é shared/data, `xshared/data/…` e `/Users/…/x.db` sem esse miolo seguem moles). `md:`, `.duckdb`, nome montado em f-string e banco sem cópia seguem `moles:banco-de-dados`; recibo ausente = como antes, sem nota; velho, do futuro, ilegível ou sem `placement: ok` = como antes, com a nota `schema-recibo-*` (a `-ilegivel` é a leitura que falhou, que o Pilot soma em `leitura`).
+     HOST-MAC: EXECUÇÃO, NÃO MENÇÃO (ga-fijap88). Conta: osascript/launchctl/security/adb (o `adb` só como comando: argv ou `adb <subcomando>`; a mensagem «adb morreu» não conta), perfil e build do Chrome do Mac (`/Applications/`, `Chrome.app`,
+     `chrome-mac-arm64`), LaunchAgents, e SÓ no código da prova: o que aparece só num TESTE vai em `info` (`mole-evidencia-teste:host-mac=<arquivo>[<o que>]`) e não barra (dos 255 arquivos de teste do WA com texto de host-mac, 226 passam sem falha no
+     Linux; o que é só-Mac mora na lista mac-only, regra 3). Não conta, em Python: texto de MENSAGEM (o `msg` de um assert, o argumento de um raise, de print/log/warn/pytest.fail: "launchctl kickstart falhou") e a marca de UA
+     `"Google Chrome";v="145"` (Client Hint sec-ch-ua). O argv de um executável do Mac escondido DENTRO de um raise segue sendo evidência. Medição e leitura bead a bead: runbook hetzner-wa-node.md, «Medido em 20/11».
      INFORMATIVAS (produção/deploy, tela, lead, cliente, terreno, envio...): vocabulário do produto e da entrega, NÃO bloqueiam; vão para `info`, que o Pilot grava no jsonl da sombra
      para medir o acerto antes de ligar. MEDIDO (19/10, 400 beads WA fechadas): bloqueando por elas, 0 de 400 passavam; sem bloquear, ~4% citam teste + código sem caminho duro.
      Quem segura o resíduo é o que não depende de palavra: caminho pelo filtro real, telefone/CPF no texto, e o gate depois.
@@ -252,11 +256,11 @@ CRED_CALL_RE = re.compile(r"^_*(?:get_|load_|read_|fetch_|resolve_)?secret(?:_bi
 CRED_MOD_RE = re.compile(r"(?:^|\.)(?:_?bitwarden\w*|keychain\w*|credentials?\w*|_?secret(?:_bin|_cli)?)(?:\.|$)", re.I)   # módulo do cofre/chaveiro; `secrets` (stdlib: números aleatórios) NÃO casa
 CRED_FILE_RE = re.compile(r"(?:^|[/\\])(?:\.env(?:\.[\w\-]+)?|credentials?[\w\-]*\.json|token\.json|client_secrets?[\w\-]*\.json|service[_\-]?account[\w\-]*\.json|[\w\-]+\.(?:pem|p12|pfx))$", re.I)   # abrir arquivo de credencial
 CRED_TEXT_RE = re.compile(r"\$\(\s*secret\s+\S|(?<![\w\-])secret\s+[\"'$\w][\w\-\"']*|\bbw\s+(?:get|unlock|login)\b|bitwarden|(?<![\w/])\.env\b|credentials?[\w\-]*\.json|token\.json|client_secrets?[\w\-]*\.json", re.I)   # texto de .sh/.js e de Python que não parseia
-HOST_RE = re.compile(r"\b(?:osascript|launchctl|plutil|pmset|pbcopy|pbpaste|caffeinate|screencapture)\b|Google Chrome|Chrome\.app|Application Support/Google/Chrome|/Applications/|LaunchAgents|LaunchDaemons|~/Library|remote-debugging-port|connect_over_cdp|\bbrew\s+(?:install|services|list)\b|\badb\s+(?:shell|devices|connect|push|pull|-s)\b")   # recurso do Mac do Athos que o nó não tem; `/Users/...` sozinho NÃO conta (é caminho-padrão, não recurso)
+HOST_RE = re.compile(r"\b(?:osascript|launchctl|plutil|pmset|pbcopy|pbpaste|caffeinate|screencapture)\b|Chrome\.app|Chrome for Testing\.app|chrome-mac-(?:arm64|x64)|Application Support/Google/Chrome|/Applications/|LaunchAgents|LaunchDaemons|~/Library|remote-debugging-port|connect_over_cdp|\bbrew\s+(?:install|services|list)\b|\badb\s+(?:shell|devices|connect|push|pull|-s)\b")   # recurso do Mac do Athos que o nó não tem; `/Users/...` sozinho NÃO conta (é caminho-padrão, não recurso). A frase solta `Google Chrome` saiu (ga-fijap88): é a marca do Client Hint sec-ch-ua ("Google Chrome";v="145") e rótulo de tela, não o app; o app do Mac é `Chrome.app`, `/Applications/`, o perfil e o build `chrome-mac-arm64`/`Chrome for Testing.app` do Playwright
 # o ramo `ast` do Python vê STRINGS soltas, não o texto: a mesma ideia escrita como linha de shell ("secret motherduck-token", "/Users/x/.local/bin/secret k") ou como caminho do executável
 # precisa dar o MESMO achado que o ramo de texto (ga-qkc02kk, gate-fix 1). O comando só vale no INÍCIO da string ou depois de operador de shell (`; | & ( \``): "the secret key is missing" é prosa e não conta.
 CRED_SHELL_RE = re.compile(r"(?:^\s*|[;|&(`]\s*)(?:\S*/)?(?:secret\s+(?:[\w\-\"'$][\w\-\"']*|$)|bws?\s+(?:get|list|unlock|login|logout|status|sync|secret|run)\b)|bitwarden|(?<![\w/])\.env\b|credentials?[\w\-]*\.json|token\.json|client_secrets?[\w\-]*\.json|\bCREATE\s+(?:OR\s+REPLACE\s+)?(?:PERSISTENT\s+|TEMPORARY\s+)?SECRET\b", re.I)   # texto de UMA string de Python que parseia; o último ramo é o DDL do DuckDB (`CREATE OR REPLACE SECRET s3_x (TYPE s3, PROVIDER credential_chain)`: lib/mds_s3.py, lib/rfb_s3.py), credencial AWS que o ramo de texto só vê por acaso
-HOST_SHELL_RE = re.compile(r"(?:^\s*|[;|&(`]\s*)(?:\S*/)?(?:(?:adb|osascript|launchctl|pmset|plutil|pbcopy|pbpaste|caffeinate|screencapture)\b|security\s+(?:find|add|delete|import|export|unlock|lock|list|dump|set|show|create)-[\w\-]+)")   # idem para o Mac: o executável do Mac no começo da linha
+HOST_SHELL_RE = re.compile(r"(?:^\s*|[;|&(`]\s*)(?:\S*/)?(?:(?:osascript|launchctl|pmset|plutil|pbcopy|pbpaste|caffeinate|screencapture)\b|adb\s+(?:-[A-Za-z]\b|(?:shell|devices|connect|disconnect|push|pull|install|uninstall|logcat|forward|reverse|kill-server|start-server|reboot|tcpip|usb|root|remount|exec-out|get-state|get-serialno|wait-for-device|bugreport|sideload|emu)\b)|security\s+(?:find|add|delete|import|export|unlock|lock|list|dump|set|show|create)-[\w\-]+)")   # idem para o Mac: o executável do Mac no começo da linha. O `adb` só vale COM subcomando ou flag (ga-fijap88): "adb morreu", "adb offline", "adb: device offline" são mensagens (247 achados no WA, nenhum comando) e a string que é só `adb` é o argv (HOST_ARGV)
 HOST_CALL_RE = re.compile(r"(?:^|_)(?:connect_over_cdp|osascript|launchctl|plutil|pmset|pbcopy|pbpaste|caffeinate|screencapture)(?:_|$)")   # NOME de chamada/módulo: `chromium.connect_over_cdp(...)`, `run_osascript(...)` (o HOST_RE de string não vê nome de função, e `\b` não separa `_`)
 HOST_ARGV = frozenset(("adb", "osascript", "launchctl", "security", "pmset", "plutil", "pbcopy"))   # string que é SÓ o executável (argv[0] de subprocess)
 DB_PINNED_RE = re.compile(r"shared/data/[^\s\"']*\.(?:db|sqlite3?|duckdb)\b|(?<![\w])md:[\w\-]*|/Users/[\w.\-]+/[^\s\"']*\.(?:db|sqlite3?|duckdb)\b|~/[^\s\"']*\.(?:db|sqlite3?|duckdb)\b|\.duckdb\b")   # caminho de banco de PRODUÇÃO fixado (vale em código e em teste)
@@ -1065,9 +1069,53 @@ def exec_base(t):
     return ""
 
 
+MSG_OWNERS = frozenset(("logger", "log", "logging", "LOG", "LOGGER", "_log", "_logger", "warnings", "pytest", "sys"))   # de quem é o `.warning(...)`/`.fail(...)`/`.write(...)` de MENSAGEM: o objeto de log, `warnings`, `pytest` e `sys` (sys.stderr.write); um `.info()` de outro objeto pode ser outra coisa
+MSG_FUNCS = frozenset(("print", "warn", "debug", "info", "warning", "error", "exception", "critical", "fail", "skip", "xfail", "write"))   # um nome daqui SOLTO (`print(...)`, `warn(...)`, `fail(...)`, `error(...)`) vale; com dono (`x.info(...)`), só se o dono está em MSG_OWNERS; `write` só em `sys.…` (`write(...)` solto ou de arquivo não é mensagem)
+
+
+def msg_text_ids(tree):
+    """ids dos Constant str que só MONTAM o texto de uma MENSAGEM (ga-fijap88): o `msg` de um assert, os argumentos de uma exceção levantada (`raise X("…")`) e os de print/log/warn/pytest.fail, em forma de literal, pedaço de f-string,
+    `+`/`%` e `.format`. Texto de mensagem não executa nada: "launchctl kickstart falhou" num assert não é o Mac. NÃO desce em argumento de chamada, lista nem tupla (nem no `{expr}` da f-string; no `.format` só o molde): um raise cujo argumento roda `launchctl list` por subprocess
+    segue com o argv, que é execução. vazio (nenhuma mensagem reconhecida) -> conjunto vazio e toda string conta como antes; qualquer forma que não reconheço fica de fora do conjunto (na dúvida a string vale, o lado do mini). Só marca ids: nada é lido nem executado."""
+    ids = set()
+
+    def text(e):
+        if isinstance(e, ast.Constant) and isinstance(e.value, str):
+            ids.add(id(e))
+        elif isinstance(e, ast.JoinedStr):
+            for v in e.values:
+                text(v)
+        elif isinstance(e, ast.BinOp) and isinstance(e.op, (ast.Add, ast.Mod)):
+            text(e.left)
+            text(e.right)
+        elif isinstance(e, ast.Call) and isinstance(e.func, ast.Attribute) and e.func.attr == "format":
+            text(e.func.value)
+
+    for n in ast.walk(tree):
+        if isinstance(n, ast.Assert) and n.msg is not None:
+            text(n.msg)
+        elif isinstance(n, ast.Raise) and isinstance(n.exc, ast.Call):
+            for a in n.exc.args:
+                text(a)
+        elif isinstance(n, ast.Call):
+            names, f = [], n.func
+            while isinstance(f, ast.Attribute):
+                names.append(f.attr)
+                f = f.value
+            if isinstance(f, ast.Name):
+                names.append(f.id)
+            names.reverse()
+            nm, own = (names[-1], names[:-1]) if names else ("", [])
+            if nm in MSG_FUNCS and (not own or any(o in MSG_OWNERS for o in own)) and not (nm == "write" and "sys" not in own):
+                for a in n.args:
+                    text(a)
+    return ids
+
+
 def py_exec_parts(src):
-    """(strings, calls, modules) do código EXECUTÁVEL de `src` (Python), sem docstring e sem comentário, por `ast.parse` (nada é executado). Não parseia -> None: quem chama cai no texto (mais largo)."""
-    # vazio (arquivo sem string nem chamada) -> três listas vazias, legítimo; falhou/ilegível (SyntaxError, ValueError, RecursionError, MemoryError) -> None, NUNCA listas vazias
+    """(strings, calls, modules, msgs) do código EXECUTÁVEL de `src` (Python), sem docstring e sem comentário, por `ast.parse` (nada é executado); `msgs` é paralela a `strings` (True = a string só monta texto de mensagem, msg_text_ids).
+    Não parseia -> None: quem chama cai no texto (mais largo)."""
+    # vazio (arquivo sem string nem chamada) -> quatro listas vazias, legítimo; falhou/ilegível (SyntaxError, ValueError, RecursionError, MemoryError) -> None, NUNCA listas vazias
     try:
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
@@ -1081,12 +1129,15 @@ def py_exec_parts(src):
             if isinstance(f, ast.Expr) and isinstance(f.value, ast.Constant) and isinstance(f.value.value, str):
                 docs.add(id(f.value))
     pieces = {id(v) for n in ast.walk(tree) if isinstance(n, ast.JoinedStr) for v in n.values if isinstance(v, ast.Constant)}   # pedaços de f-string: entram remontados (abaixo), não um a um
-    strs, calls, mods = [], [], []
+    strs, calls, mods, msgs = [], [], [], []
+    mids = msg_text_ids(tree)
     for n in ast.walk(tree):
         if isinstance(n, ast.Constant) and isinstance(n.value, str) and id(n) not in docs and id(n) not in pieces:
             strs.append(n.value[:MAX_STR_LEN])
+            msgs.append(id(n) in mids)
         elif isinstance(n, ast.JoinedStr):   # f"shared/data/{nome}.db", f"secret {chave}": o ast parte em pedaços; remonta com `_` no lugar de cada {…} (o pedaço dinâmico é palavra, como o regex espera)
             strs.append("".join(v.value if isinstance(v, ast.Constant) and isinstance(v.value, str) else "_" for v in n.values)[:MAX_STR_LEN])
+            msgs.append(any(id(v) in mids for v in n.values if isinstance(v, ast.Constant)))
         elif isinstance(n, ast.Call):
             f = n.func
             nm = f.id if isinstance(f, ast.Name) else (f.attr if isinstance(f, ast.Attribute) else "")
@@ -1096,7 +1147,7 @@ def py_exec_parts(src):
             mods += [a.name for a in n.names]
         elif isinstance(n, ast.ImportFrom):
             mods += [n.module or ""] + [(n.module or "") + "." + a.name for a in n.names]
-    return strs, calls, mods
+    return strs, calls, mods, msgs
 
 
 def strip_js_comments(src):
@@ -1178,7 +1229,7 @@ def scan_evidence(path, text, is_test):
 
     parts = py_exec_parts(text) if path.endswith(".py") else None
     if parts is not None:
-        strs, calls, mods = parts
+        strs, calls, mods, msgs = parts
         for c in calls:
             if CRED_CALL_RE.match(c):
                 hit("credencial", c + "()")
@@ -1189,7 +1240,7 @@ def scan_evidence(path, text, is_test):
                 hit("credencial", "import " + m)
             if any(HOST_CALL_RE.search(x) for x in m.split(".")):
                 hit("host-mac", "import " + m)
-        for t in strs:
+        for t, is_msg in zip(strs, msgs):
             b = exec_base(t)
             if b in CRED_CLI:
                 hit("credencial", "argv:" + b)
@@ -1199,7 +1250,9 @@ def scan_evidence(path, text, is_test):
                 m = CRED_SHELL_RE.search(t)
                 if m:
                     hit("credencial", "sh:" + m.group(0).strip(" ;|&(`"))
-            if b in HOST_ARGV:
+            if is_msg:
+                pass   # texto de MENSAGEM (assert/raise/print/log) não executa o Mac (ga-fijap88): só o host-mac o ignora; credencial e banco leem a string como sempre
+            elif b in HOST_ARGV:
                 hit("host-mac", "argv:" + b)
             else:
                 m = HOST_RE.search(t) or HOST_SHELL_RE.search(t)
@@ -1272,9 +1325,17 @@ def mole_gate(proof, prose, soft_files=()):
             ev = {s: v for s, v in ev.items() if s != "banco-de-dados"}
         elif nota:
             sch = [nota]
-    hard = ["moles:" + s for s in MOLE_SLUGS if s in ev]
-    pairs = ["mole-evidencia:%s=%s[%s]" % (s, f, evid_clip(w)) for s in MOLE_SLUGS for f, w in ev_all.get(s, [])]
+    # host-mac achado só em arquivo de TESTE informa e não barra (ga-fijap88). Medido no nó em 20/11 (os 255 arquivos de teste do WA com texto de host-mac, rodados no Linux dentro da jaula de rede): 226 sem falha e com teste que passou, 14 só pulam
+    # (Chrome, token e lxml ausentes, nenhum por ser Mac) e 15 reprovam, 8 deles já na lista mac-only; o texto em teste é fixture, mock e mensagem (nos testes, 204 dos 226 "adb"/"launchctl" soltos NÃO são o 1º elemento de um argv).
+    # Quem diz que um teste é só-Mac é a lista mac-only (regra 3, medida no nó) e o teste vermelho no nó, que devolve a bead; o CÓDIGO da prova barra como antes. vazio (sem evidência de host-mac) -> nada muda; falhou (arquivo
+    # ilegível) -> já caiu em `except Unreadable` acima, antes daqui: "não li" nunca vira "li e só achei em teste".
+    is_t = lambda f: bool(TEST_RE.search(f))
+    ev_blk = {s: ([(f, w) for f, w in v if not is_t(f)] if s == "host-mac" else v) for s, v in ev.items()}
+    hard = ["moles:" + s for s in MOLE_SLUGS if ev_blk.get(s)]
+    pairs = ["mole-evidencia:%s=%s[%s]" % (s, f, evid_clip(w)) for s in MOLE_SLUGS for f, w in ev_all.get(s, []) if not (s == "host-mac" and is_t(f))]
+    tpairs = ["mole-evidencia-teste:host-mac=%s[%s]" % (f, evid_clip(w)) for f, w in ev_all.get("host-mac", []) if is_t(f)]
     info = pairs[:MOLE_INFO_MAX] + (["mole-evidencia-mais:%d" % (len(pairs) - MOLE_INFO_MAX)] if len(pairs) > MOLE_INFO_MAX else [])
+    info += tpairs[:MOLE_INFO_MAX] + (["mole-evidencia-teste-mais:%d" % (len(tpairs) - MOLE_INFO_MAX)] if len(tpairs) > MOLE_INFO_MAX else [])
     info += ["mole-so-em-prosa:" + s for s in prose if s not in ev_all] + sch
     soft_pairs = ["mole-evidencia-irma:%s=%s[%s]" % (s, f, evid_clip(w)) for s in MOLE_SLUGS for f, w in evsoft.get(s, [])]
     info += soft_pairs[:MOLE_INFO_MAX] + (["mole-evidencia-irma-mais:%d" % (len(soft_pairs) - MOLE_INFO_MAX)] if len(soft_pairs) > MOLE_INFO_MAX else [])
