@@ -25,11 +25,18 @@
 # gc_delivery_branch_globs, whose own empty-id guard (section 1) returns 1 before
 # the pick reads stdin — same rc, same (empty) output, same stdin left unread. Two
 # guards in series: a test cannot tell which one fired, so dropping the
-# `|| return 1` from that line (hq-mutants id 780bf08a58) is an EQUIVALENT mutant
-# and no case here fails on it, by design.
+# `|| return 1` from that line is an EQUIVALENT mutant and no case here fails on
+# it, by design. Re-measured on the real function (lastro r18, ga-n6a2o3u): no
+# difference in rc, stdout, stderr or stdin left over, for an empty, missing,
+# ordinary and prefix-only id, a default, empty and unset prefix list, stdin with
+# and without refs, plain / if / && || / || / $( ) / ! calls, errexit and nounset
+# on or off, bash 5.2 and 3.2.57. The id of that mutant follows the line number:
+# it was 780bf08a58 until ga-vpan6h8 put four comment lines above the line, so the
+# id on the EQUIVALENT line below is the one to re-issue whenever a production edit
+# above the line moves it.
 #
 # Exit 0 iff every assertion holds.
-# EQUIVALENT 780bf08a58: the `|| return 1` of gc_delivery_branch_pick: gc_delivery_branch_globs has its own empty-id guard that returns 1 first (same rc, same empty output, same stdin left unread)
+# EQUIVALENT 1981bdb0d4: the `|| return 1` of gc_delivery_branch_pick: gc_delivery_branch_globs has its own empty-id guard that returns 1 first (same rc, same empty output, same stdin left unread, also under set -e / set -u and in plain, if, && ||, $( ) and ! calls)
 set -uo pipefail
 
 SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"

@@ -554,12 +554,10 @@ echo "== lock edges, the script as a program, unreadable gh / bd output =="
 # 2986485ef0, 6d485cfc2d, f59c4652e3, a859477f33, 75643e9927, 83c269f339); the same in log() after the append (c57a9845cf) is equivalent THROUGH run_sweep (log's status is
 # read only by its last statement, and a sweep cannot get that far with an unwritable log: every command in it redirects stderr into $LOG, and a failed redirection skips the
 # command, so the sweep stops at its first gh call and returns 0 there, measured) and is killed by calling log() itself with an unwritable LOG (the case after the heartbeat
-# write, ga-r8nsaot); the `.reaping` guard `return 1` -> `0` after `[ ! -s HB ]` (84b1276392):
-# _bupw_lock_holder_dead says "dead" only for a pid read from the heartbeat's first line, so a heartbeat that is empty at that point cannot be; the stat chain
+# write, ga-r8nsaot); the stat chain
 # `A || B || C` -> `A || B && C` (f33a615f4e): it prints the age of whichever of the BSD and GNU forms answers, and an empty line more, which $(...) drops
 # (`A && B || C`, 63d6ca95b6, does not: below).
 # EQUIVALENT 9122e0cab9 da12ce03da 02d2feffe8 8db6498b62 2986485ef0 6d485cfc2d f59c4652e3 a859477f33 75643e9927 83c269f339: `|| true` -> `&& true` after a command whose status nobody reads, under no `set -e`
-# EQUIVALENT 84b1276392: the `.reaping` guard `return 1` -> `0` after `[ ! -s HB ]`: _bupw_lock_holder_dead says "dead" only for a pid read from the heartbeat's first line, so a heartbeat that is empty at that point cannot be
 # EQUIVALENT f33a615f4e: the stat chain `A || B || C` -> `A || B && C`: it prints the age of whichever of the BSD and GNU forms answers, and an empty line more, which $(...) drops
 lk_reset() { rm -rf "$BUPW_LOCK_DIR" "${BUPW_LOCK_DIR}.reaping" "${BUPW_LOCK_DIR}".reaping.dead.* 2>/dev/null; }
 ( : ) & DPID=$!; wait "$DPID" 2>/dev/null   # a pid that was alive a moment ago and is not any more
@@ -592,6 +590,14 @@ eq "the holder turns out ALIVE on the second look: back off" "$rc" "1"
 lk_dead; rc=0; ( _bupw_lock_write_hb() { : > "$BUPW_LOCK_HB"; }; BUPW_LOCK_TOKEN="$$:r5" _acquire_bupw_lock ) || rc=$?
 eq "the takeover's heartbeat did not land: back off" "$rc" "1"
 [ ! -d "${BUPW_LOCK_DIR}.reaping" ] && ok "...and the .reaping claim is given back" || bad "...the .reaping claim was left behind"
+# The first `[ ! -s HB ]` after a "dead" verdict (84b1276392; declared equivalent until lastro r18, on the argument that a pid read from the heartbeat's first line means the heartbeat is
+# not empty) guards a race, not an input: another reclaimer's rewrite (`printf >` truncates, then writes) can leave it empty between the verdict and the guard, and `return 0` there would
+# claim a lock that run is recovering. The verdict is stubbed as dead-and-emptying, the way the cases above stub the second look and the write; the last case is the control.
+lk_dead; rc=0; ( _bupw_lock_holder_dead() { : > "$BUPW_LOCK_HB"; return 0; }; BUPW_LOCK_TOKEN="$$:r6" _acquire_bupw_lock ) || rc=$?
+eq "a holder read as dead whose heartbeat is empty by the time of the guard (another reclaimer is rewriting it): back off" "$rc" "1"
+[ ! -d "${BUPW_LOCK_DIR}.reaping" ] && ok "...and no .reaping claim was opened" || bad "...a .reaping claim was opened"
+lk_dead; rc=0; ( age_bsd; _bupw_lock_holder_dead() { return 0; }; MT=1000 BUPW_LOCK_TOKEN="$$:r7" _acquire_bupw_lock ) || rc=$?
+eq "...while the same dead verdict over an intact heartbeat reclaims (the stub alone does not refuse)" "$rc" "0"
 lk_reset; mkdir "$BUPW_LOCK_DIR"; echo "$$:rel" > "$BUPW_LOCK_HB"; rc=0; BUPW_LOCK_TOKEN="$$:rel" _release_bupw_lock || rc=$?
 eq "releasing a lock we own returns 0" "$rc" "0"
 echo "$$:other" > "$BUPW_LOCK_HB"; mkdir -p "$BUPW_LOCK_DIR"; rc=0; BUPW_LOCK_TOKEN="$$:rel" _release_bupw_lock || rc=$?
