@@ -1,9 +1,11 @@
-# hetzner-dados-code-allow.txt — LISTA BRANCA do código que `hetzner-dados-install.sh apply --code-dir` leva ao nó Hetzner (wa-4p38ls, P0).
+# hetzner-dados-code-allow.txt — LISTA BRANCA do código que `hetzner-dados-install.sh apply` leva ao nó Hetzner (wa-4p38ls, P0), por `--code-tar` (exportado no mini por hetzner-dados-code-export.sh) ou pelo `--code-dir` legado.
 #
 # POR QUÊ: o nó recebe só o fechamento de cada entrypoint, nunca o commit inteiro. O `git archive` do commit inteiro levava a pasta de dado do repo
 # (ex.: hawkey_outbound_messages_48h.csv, contacts_auth/, docs/investigations/) para uma máquina onde NÃO pode haver dado de lead/conversa (regra do Athos).
 # O instalador (de ROOT) lê ESTA lista AO LADO dele e exporta SÓ os caminhos listados aqui para o entrypoint pedido. RECUSA (98) se: a lista não está ao lado dele, não tem linha para
 # o entrypoint (nem a do próprio bin/<entrypoint>) — tudo isso ANTES de mexer no nó —, o arquivo não está no commit, o que saiu do archive difere da lista, ou algum arquivo exportado casa padrão de dado (veja `@fixture`).
+# O EXPORTADOR do mini (hetzner-dados-code-export.sh) lê esta mesma lista AO LADO dele para escolher os caminhos do `git archive`/`git ls-tree` do commit; quem a valida a sério (formato, bin/<ep>, dado) é o `verify-code` do instalador,
+# que ele roda no que exportou antes de mandar ao nó: um caminho que a lista autorize e o commit não tenha, ou que case padrão de dado, é recusado NO MINI.
 #
 # ENTREGA: no nó o instalador roda de /root/gt-dados-src, e a lista TEM de estar nessa mesma pasta: o scp do runbook (docs/runbooks/hetzner-dados.md, passo 2) leva este arquivo junto com os scripts
 # (o selftest do instalador lê a linha do scp do runbook e instala a partir de uma pasta com SÓ o que ela entrega). "Neste repo" é onde a lista é REVISADA e versionada; quem a lê é a cópia ao lado do instalador, não o commit exportado.

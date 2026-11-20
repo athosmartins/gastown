@@ -12,14 +12,15 @@ RUNBOOK="$CITY/docs/runbooks/hetzner-dados.md"
 log()  { echo "[prod-test:gascity ga-qg1dw5z.1] $*"; }
 fail() { echo "[prod-test:gascity ga-qg1dw5z.1] FAIL: $*" >&2; exit 1; }
 
-FILES=(install run ingest sweep synth prove)
+FILES=(install run ingest sweep synth prove code-export)
 for f in "${FILES[@]}"; do
   p="$SC/hetzner-dados-$f.sh"
   [[ -f "$p" ]] || fail "arquivo implantado ausente: $p"
   [[ -x "$p" ]] || fail "não é executável: $p"
   bash -n "$p" 2>/dev/null || fail "erro de sintaxe em $p"
 done
-for t in hetzner-dados.selftest.sh hetzner-dados-install.selftest.sh; do
+[[ -f "$SC/hetzner-dados-code-allow.txt" ]] || fail "lista branca do código ausente: $SC/hetzner-dados-code-allow.txt"
+for t in hetzner-dados.selftest.sh hetzner-dados-install.selftest.sh hetzner-dados-install-tar.selftest.sh hetzner-dados-code-export.selftest.sh; do
   [[ -f "$SC/$t" ]] || fail "bateria ausente: $t"
   bash -n "$SC/$t" 2>/dev/null || fail "erro de sintaxe em $t"
 done
@@ -55,6 +56,26 @@ nrs=$(grep -v '^#' "$INST" | grep -c 'rsync') || true
 has "$INST" 'owned "\$AKDIR/\$DU" "root:\$DU 640"'                  || fail "instalador: --check não confere o grupo do arquivo de chaves"
 log "instalador: shell real, senha travada, chave restrict, arquivo de root, sudoers por entrypoint e validado, tmpfs noexec/nosuid/nodev ✓"
 
+# ── código por tar + manifesto (ga-kwk6fcl): o nó só VERIFICA o que o mini exportou, sem repo e sem blob de dado
+has "$INST" 'code_tar_prepare\(\)'                                 || fail "instalador: sem a conferência do tar + manifesto (code_tar_prepare)"
+has "$INST" 'git hash-object --no-filters'                         || fail "instalador: o arquivo extraído não é conferido contra o blob-id do manifesto (sem filtro do git do operador)"
+has "$INST" 'die "code-hash:'                                      || fail "instalador: blob-id diferente do manifesto não recusa"
+has "$INST" 'die "code-tar-fora-do-manifesto:'                     || fail "instalador: membro do tar que o manifesto não lista seria gravado no nó"
+has "$INST" 'die "code-tar-tipo:'                                  || fail "instalador: membro do tar que é elo/dispositivo passaria"
+has "$INST" 'die code-manifesto-fora-da-lista'                     || fail "instalador: manifesto fora da lista branca passaria"
+has "$INST" 'code_tree_check "\$NEW"'                              || fail "instalador: a cauda comum (lista exata, dado, modo) não roda sobre a árvore extraída"
+has "$INST" 'verify-code'                                          || fail "instalador: sem o verify-code (a conferência que o mini roda antes de exportar)"
+EXP="$SC/hetzner-dados-code-export.sh"
+has "$EXP" 'merge-base --is-ancestor'                              || fail "exportador: não confere que o sha está em main"
+has "$EXP" 'die sha-fora-de-main'                                  || fail "exportador: sha fora de main passa"
+has "$EXP" 'die main-ilegivel'                                     || fail "exportador: ref de main ilegível vira 'está em main'"
+has "$EXP" 'entrypoint-sem-linha'                                  || fail "exportador: entrypoint sem linha exportaria o commit inteiro (git archive sem caminho)"
+has "$EXP" 'verify-code'                                           || fail "exportador: não roda o verify-code antes de entregar"
+# vazio (nenhum git no texto) ou falhou (ilegível) → o conjunto difere do esperado e reprova; o exportador só LÊ o repo: archive, ls-tree, merge-base e rev-parse (nenhum comando que escreva nele)
+subs=$(grep -v '^#' "$EXP" | grep -o -E 'git -C "\$REPO" [a-z-]+' | awk '{print $NF}' | sort -u | tr '\n' ' ') || subs="?"
+[[ "$subs" == "archive ls-tree merge-base rev-parse " ]] || fail "exportador: subcomandos de git inesperados: '$subs' (esperado: archive ls-tree merge-base rev-parse)"
+log "código por tar: o nó verifica (blob-id, lista, tipos, nomes), o exportador confere main e roda o verify-code ✓"
+
 # ── wrapper: recusa antes de rodar, sem rede, sem privilégio, apaga o dado
 has "$RUN" 'fail stage-nao-e-tmpfs'                                || fail "wrapper: roda com staging fora do tmpfs"
 has "$RUN" 'fail swap-ligada-ou-ilegivel'                          || fail "wrapper: roda com swap ligada"
@@ -89,7 +110,7 @@ has "$INST" 'timeout 900 systemctl start gt-dados-sweep.service \|\| die sweep-p
 log "ingest e varredura ✓"
 
 # ── runbook: contrato, instalação, prova, ordem com a trava 2
-for key in '## Contents' 'Contrato (o que a trava 3 confere)' 'Instalação (precisa de root, uma vez)' 'Prova (como runner)' 'Ordem com a trava 2' 'hetzner-dados-install.sh' 'hetzner-dados-prove.sh' 'GTD-CHECK' 'GTD-PROVE' 'NAO-CONSEGUI' '/srv/gtdados' 'gt-dados-run'; do
+for key in '## Contents' 'Contrato (o que a trava 3 confere)' 'Instalação (precisa de root, uma vez)' 'Prova (como runner)' 'Ordem com a trava 2' 'hetzner-dados-install.sh' 'hetzner-dados-prove.sh' 'GTD-CHECK' 'GTD-PROVE' 'NAO-CONSEGUI' '/srv/gtdados' 'gt-dados-run' 'Código do build: exportar no mini, verificar no nó' 'hetzner-dados-code-export.sh' '--code-tar' 'verify-code' 'GTD-EXPORT'; do
   grep -q -F -- "$key" "$RUNBOOK" || fail "runbook não descreve '$key'"
 done
 log "runbook ✓"
