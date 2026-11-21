@@ -52,8 +52,9 @@
 		<string>8</string>
 		<key>PILOT_WA_NODE_SPAWN</key>
 		<string>pilot</string>
+		<!-- Mayor 2026-11-21 14:1x (decisao do Athos «3 com freio automatico»): PILOT_WA_WORKER_MAX 1 -> 3; o teto por pool do Pilot tambem segurava o wa-worker em 1 depois de 6eac23dc9 -->
 		<key>PILOT_WA_WORKER_MAX</key>
-		<string>1</string>
+		<string>3</string>
 	</dict>
 	<key>Label</key>
 	<string>com.gascity.pilot</string>
