@@ -141,7 +141,10 @@ min_active_sessions = 0
 # (PILOT_LOCAL_BUILDER_MAX=1 no plist do Pilot); o resto vai ao no (wa-worker-remote). As regras de volta a 3 acima ficam sem efeito enquanto valer essa decisao: subir de novo e decisao do Athos.
 # O Pilot segue este valor sozinho (_pilot_clamp_to_engine_cap). Atencao: se .gc/pool-ceiling-engine.on existir no mini, o motor pode SUBIR o wa-worker a 3 sobre o commitado (o teto de subida dele, regra de 03/10);
 # nesse caso prenda o motor com POOL_CEILING_ENGINE_WA_WORKER_CEIL=1 no ambiente do job dele (docs/pool-ceiling-dynamic.md).
-max_active_sessions = 1
+# Mayor 2026-11-21 12:4x (decisao do Athos, AskUserQuestion na sessao do Mayor: «3 com freio automatico»): 1 -> 3. Gate seco (0 revisadas em 3h, 117 aprovadas na fila)
+# porque ~95% das beads do WA ficam no mini (banco/credencial/dado de lead). Freios: .gc/pool-ceiling-engine.on (teto dinamico aperta com disco/swap) + regra horaria da
+# missao ga-v8p1tx.1 (volta a 1 se disco < 6000 MB ou swap > 6 GB). Junto: PILOT_LOCAL_BUILDER_MAX 1 -> 3 no plist do Pilot.
+max_active_sessions = 3
 idle_timeout = "2h"
 wake_mode = "fresh"
 model = "sonnet"
