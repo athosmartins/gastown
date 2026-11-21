@@ -41,9 +41,14 @@ CAUSA, DEGRAUS E NÚMERO DO DIA  (ga-2hd02v.5.10; 04/11, das 10h às 14h: CPU em
                 dele: o vigia só pede com MemAvailable >= piso + 1 slot, e o pedido vence em 2 leituras (ate). Sem consumidor o efeito medido é zero e a escada segue.
     D3 fila     hetzner-occupancy-d3.on: tira da memória de vereditos do Pilot (<cidade>/.gc/wa-node-pass-memo.tsv) as linhas `unknown` ainda frescas, e a passada seguinte reclassifica essas beads de WA; o «Só no ocioso» (P2+ só ocupa o nó quando
                 nenhuma P0/P1 cabe lá, Athos 30/10; ga-2hd02v.3.18 e, na passada do disk floor, ga-2hd02v.3.26) já é do Pilot e vale para o que voltar `node`: o vigia não despacha nada.
-    D4 esgotou  hetzner-occupancy-d4.on: abaixo da régua há >= 6 h (HETZNER_OCC_D4_AFTER_S), sem nenhum degrau aplicável que ainda tenha tentativa (ou com a causa RAM, em que nada cabe) e o lixo LIDO (lixo ilegível nunca esgota) → UM `notify` ao Athos por dia (quanto, por quê, o que foi tentado) e
-                uma bead com a causa. O notify roda com NOTIFY_STRICT_EXIT=1 e o rc é conferido: 0 saiu, 10 segurado até as 7 h e 11 já tinha saído contam como entregue; 12 (digest/teto), 13, 14, timeout e qualquer outro NÃO saíram (04/11, ga-i4t0lzx:
+    D4 esgotou  hetzner-occupancy-d4.on: abaixo da régua há >= 6 h (HETZNER_OCC_D4_AFTER_S), sem nenhum degrau aplicável que ainda tenha tentativa (ou com a causa RAM, em que nada cabe), o lixo LIDO (lixo ilegível nunca esgota) e com OFERTA (abaixo) → UM `notify` ao Athos
+                por dia (quanto, por quê, o que foi tentado, quantas beads esperam) e uma bead de REGISTRO com a causa, com o veto pilot:no-auto-dispatch (sem ele o Pilot a despachou a um dog 7 min depois de criada, mesmo sem story:approved nem exec:auto: ga-eidrbo8, 21/11). O notify roda
+                com NOTIFY_STRICT_EXIT=1 e o rc é conferido: 0 saiu, 10 segurado até as 7 h e 11 já tinha saído contam como entregue; 12 (digest/teto), 13, 14, timeout e qualquer outro NÃO saíram (04/11, ga-i4t0lzx:
                 exit 12 e o aviso não chegou): o vigia manda o mesmo texto por `gc mail send mayor` uma vez POR EPISÓDIO (a sequência baixa; o dia julgado) e tenta o notify de novo a cada hora.
+    oferta      (ga-m2kef40, decisão do Mayor em 21/11; a média de 23 h foi 55 % por falta de trabalho para o nó, não por defeito, e o D4 saía todo dia) o D4 só avisa com trabalho ESPERANDO que o nó podia pegar: a fila do Pilot (a lida acima, lojas de HETZNER_OCC_STORES) com >= 1 bead
+                esperando há >= 30 min (HETZNER_OCC_D4_WAIT_S, com a folga de 2 min do launchd). O relógio é POR BEAD e fica em `fila_vistos` no estado: quem sai da fila e volta recomeça, e uma leitura ilegível zera todos (sem ler, não sei se ficaram esperando).
+                `sem-oferta` (fila lida e vazia) e `oferta-recente` (há bead, nenhuma esperou 30 min) só registram: `d4` e `oferta` no JSONL e uma linha no log, sem notify, mail nem bead; `nao-sei` (fila ilegível) AVISA mesmo assim, dizendo "não consegui saber":
+                leitura que falha nunca cala. A fila é a do Pilot ANTES dos vetos de pool: é um teto, parte pode ser trabalho do mini.
   número do dia  hetzner-occupancy-dia.on: na 1ª leitura de cada dia, se o dia anterior fechou com ocupacao_pct < régua (e >= 48 janelas de CPU lidas: dia cego não tem número), 1 notify ao Athos com o % e a causa principal do dia; dia na meta
            ou sem número não avisa (e não gasta o aviso).
 ARQUIVOS (só em <cidade>/.gc): hetzner-occupancy.jsonl (uma leitura por rodada) · hetzner-occupancy-daily.json (o número por dia: ocupado/ocioso/desconhecido;
@@ -146,6 +151,7 @@ def load_config(env):
         d1_idle_s=_num(env, "HETZNER_OCC_D1_IDLE_S", 1800, int, 60), d1_max=_num(env, "HETZNER_OCC_D1_MAX", 2, int, 1),
         act_cooldown_s=_num(env, "HETZNER_OCC_ACT_COOLDOWN_S", 1800, int, 0), act_tries=_num(env, "HETZNER_OCC_ACT_TRIES", 2, int, 1),
         d4_after_s=_num(env, "HETZNER_OCC_D4_AFTER_S", 21600, int, 60), notify_retry_s=_num(env, "HETZNER_OCC_NOTIFY_RETRY_S", 3600, int, 0), notify_timeout_s=_num(env, "HETZNER_OCC_NOTIFY_TIMEOUT_S", 60, int, 1),
+        d4_wait_s=_num(env, "HETZNER_OCC_D4_WAIT_S", 1800, int, 0),  # quanto uma bead elegível espera na fila do Pilot para o D4 contar com ela (ga-m2kef40); 0 = basta estar na fila
         ram_start_mb=_num(env, "HETZNER_OCC_RAM_START_MB", 14336, int, 0), ram_slot_mb=_num(env, "HETZNER_OCC_RAM_SLOT_MB", 1024, int, 1),
         min_free_cores=_num(env, "HETZNER_OCC_MIN_FREE_CORES", 2, float, 0.1), day_min_windows=_num(env, "HETZNER_OCC_DAY_MIN_WINDOWS", 48, int, 1),
         ballast_home=env.get("HETZNER_OCC_BALLAST_HOME", "~/gt-remote/ballast"),
@@ -698,8 +704,28 @@ def read_queue(c, now):
     if r["motivo"]:
         return r
     elig = [str(it.get("id", "?")) for it in items if it["store"] in c.stores]
-    r.update(lido=True, n=len(elig), ids=elig[:5])
+    r.update(lido=True, n=len(elig), ids=elig[:5], _todos=elig)  # `ids` é a amostra do JSONL; `_todos` (todos os ids) só serve ao queue_wait e o run() o tira da leitura
     return r
+
+
+def queue_wait(c, fila, st, now):
+    """(vistos, oferta): o que o D4 lê da fila elegível (ga-m2kef40). `vistos` = o relógio de espera, {id: epoch em que a bead entrou na fila e não saiu mais}: só as beads que estão na fila AGORA (quem saiu é esquecido e, se voltar, recomeça)
+    e fila NÃO lida zera tudo (sem ler, não sei se a bead ficou esperando). Relógio guardado que não confere (no futuro, não inteiro: estado editado à mão, relógio que recuou) conta como "visto agora": nunca soma uma espera que não dá para provar.
+    `oferta` = {estado, n, esperando, mais_antiga_s, ids, motivo}. estado: sem-oferta (fila lida e vazia) · esperando (alguma bead espera há >= d4_wait_s, menos a folga do launchd) · recente (há bead, nenhuma esperou o bastante) · nao-sei (fila não lida:
+    o motivo vai junto e n e esperando são null, nunca 0). `ids` = as que esperam, da mais antiga para a mais nova (empate: por id), no máximo 5."""
+    # vazio → relógio vazio (toda bead da fila recomeça agora, nenhuma conta como esperando); falhou/ilegível (não é objeto, ou o epoch de uma bead não confere) → o mesmo, bead a bead: o erro cai para NÃO avisar por espera, nunca para somar uma que não provei
+    old = st.get("fila_vistos")
+    old = old if isinstance(old, dict) else {}
+    if not fila["lido"]:
+        return {}, {"estado": "nao-sei", "n": None, "esperando": None, "mais_antiga_s": None, "ids": [], "motivo": fila["motivo"]}
+    vistos = {}
+    for i in fila["_todos"]:
+        since = _int(old.get(i))
+        vistos[i] = since if since is not None and since <= now else now
+    ordem = sorted(vistos, key=lambda i: (vistos[i], i))  # a mais antiga primeiro (menor epoch), empate por id
+    esperam = [i for i in ordem if now - vistos[i] >= c.d4_wait_s - c.slack_s]
+    estado = "esperando" if esperam else ("recente" if vistos else "sem-oferta")
+    return vistos, {"estado": estado, "n": fila["n"], "esperando": len(esperam), "mais_antiga_s": now - vistos[ordem[0]] if ordem else None, "ids": esperam[:5], "motivo": None}
 
 
 def read_focus(c, now):
@@ -1130,6 +1156,28 @@ def day_notice(c, day, key):
     return title, text
 
 
+D4_SEM_OFERTA = {"sem-oferta": "sem-oferta", "recente": "oferta-recente"}  # estado da oferta que CALA o D4 (só registro) -> o que o `d4` do JSONL passa a dizer; `esperando` e `nao-sei` seguem para o aviso
+
+
+def oferta_frase(c, oferta):
+    """A frase da oferta no texto do D4 (aviso e bead): quantas beads elegíveis esperam e há quanto tempo, ou que não consegui saber. Vazio para o que não tem o que dizer (a oferta que cala o D4 nem chega aqui)."""
+    if oferta["estado"] == "esperando":
+        mais = oferta["esperando"] - len(oferta["ids"])
+        return "Há %d bead(s) elegível(is) esperando na fila do Pilot há %d min ou mais (a mais antiga há %d min): %s%s. A fila é um teto: parte pode ser trabalho do mini." % (
+            oferta["esperando"], _mins(c.d4_wait_s), _mins(oferta["mais_antiga_s"]), ", ".join(oferta["ids"]), " e mais %d" % mais if mais > 0 else "")
+    if oferta["estado"] == "nao-sei":
+        return "Não consegui saber se há bead elegível esperando: a fila do Pilot não foi lida (%s)." % oferta["motivo"]
+    return ""
+
+
+def oferta_line(c, rd, low, oferta, d4):
+    """A linha de log (stdout do launchd) do D4 que a oferta calou: o que o JSONL já guarda, com a contagem, para quem lê só o .out."""
+    if d4 == "sem-oferta":
+        return "%s d4=sem-oferta: CPU abaixo de %g%% há %d h e a escada esgotou, mas a fila do Pilot tem %d bead(s) elegível(is): ocioso por falta de oferta (sem aviso, sem bead)" % (
+            rd["ts"], c.low_pct, (rd["epoch"] - low["desde"]) // 3600, oferta["n"])
+    return "%s d4=oferta-recente: %d bead(s) elegível(is) na fila do Pilot, a mais antiga há %d s (espero %d min antes de avisar)" % (rd["ts"], oferta["n"], oferta["mais_antiga_s"], _mins(c.d4_wait_s))
+
+
 def d4_notice(c, rd, low, st, cause):
     span, media = rd["epoch"] - low["desde"], _avg_pct(low["nucleos_s"], low["cap_s"])
     nuc = rd["nucleos"]
@@ -1141,14 +1189,16 @@ def d4_notice(c, rd, low, st, cause):
             tried.append("%s %dx%s" % (RUNG_NOME[k], n, "" if ganho is None else " (ganho medido: %+.2f núcleo)" % ganho))
     nums = "" if not nuc["lido"] else " Hoje: %s núcleos em sessões, %s no lastro, %s de sistema, %s esperando disco, %s livres." % (nuc["sessoes"], nuc["lastro"], nuc["sistema"], nuc["espera"], nuc["livres"])
     title = "Hetzner abaixo de %g%% há %d h: esgotei o que o vigia faz sozinho" % (c.low_pct, span // 3600)
-    text = "O Hetzner pago está com a CPU média em %s%% há %d h (meta %g%%). Causa: %s.%s Tentei: %s. Nada mais que o vigia possa fazer sozinho." % (
-        media, span // 3600, c.low_pct, CAUSA_FRASE.get(cause, "não identificada"), nums, "; ".join(tried) or "nada (a causa não tem degrau que caiba)")
+    ofe = oferta_frase(c, rd["oferta"])
+    text = "O Hetzner pago está com a CPU média em %s%% há %d h (meta %g%%). Causa: %s.%s%s Tentei: %s. Nada mais que o vigia possa fazer sozinho." % (
+        media, span // 3600, c.low_pct, CAUSA_FRASE.get(cause, "não identificada"), nums, " " + ofe if ofe else "", "; ".join(tried) or "nada (a causa não tem degrau que caiba)")
     return title, text
 
 
 def create_d4_bead(c, title, text):
-    """(id|None, rótulo). Bead SEM story:approved nem exec:auto: nada a despacha sozinho, é registro da causa (o aviso é o notify)."""
-    rc, out, err, why = run_cmd([c.bd_bin, "-C", c.city, "create", "--silent", "-t", "task", "-p", "2", "-l", "area:infra,hetzner-ocupacao", "--title", title, "-d", text], c.bd_timeout_s)
+    """(id|None, rótulo). Bead de REGISTRO da causa (o aviso é o notify), com o veto `pilot:no-auto-dispatch`: a ausência de story:approved e de exec:auto NÃO segurava uma `task` (ga-eidrbo8, 21/11: o Pilot a despachou a um dog 7 min depois de criada).
+    O veto é o que o filtro central do Pilot (_filter_candidates) honra, por qualquer caminho de candidato, e vai no MESMO `create` (-l), não num `bd label add` depois: não há uma 2ª chamada que possa falhar e deixar a bead sem ele."""
+    rc, out, err, why = run_cmd([c.bd_bin, "-C", c.city, "create", "--silent", "-t", "task", "-p", "2", "-l", "area:infra,hetzner-ocupacao,pilot:no-auto-dispatch", "--title", title, "-d", text], c.bd_timeout_s)
     motivo = _failed(rc, why, "bd")
     bid = out.strip().splitlines()[-1].strip() if out.strip() else ""
     if motivo or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", bid):
@@ -1181,7 +1231,7 @@ def run(args, env):
     if args.print_config:
         keys = ("city", "interval_s", "busy_cores", "stores", "other_hosts", "ssh_host", "alarm", "alarm_key", "idle_after_s", "blind_after_s", "slack_s",
                 "idle_cooldown_s", "blind_cooldown_s", "low_pct", "low_after_s", "low_cooldown_s", "df_disk_pct", "df_inode_pct", "df_cooldown_s", "min_window_s", "max_window_s", "ssh_timeout_s", "gc_timeout_s", "bd_timeout_s", "pilot_file",
-                "d1_idle_s", "d1_max", "act_cooldown_s", "act_tries", "d4_after_s", "notify_retry_s", "notify_timeout_s", "ram_start_mb", "ram_slot_mb", "min_free_cores", "day_min_windows", "ballast_home", "wa_memo",
+                "d1_idle_s", "d1_max", "act_cooldown_s", "act_tries", "d4_after_s", "d4_wait_s", "notify_retry_s", "notify_timeout_s", "ram_start_mb", "ram_slot_mb", "min_free_cores", "day_min_windows", "ballast_home", "wa_memo",
                 "memo_unknown_ttl_s", "keys", "on")
         print(json.dumps({k: getattr(c, k) for k in keys}, ensure_ascii=False, indent=2))
         return 0
@@ -1200,6 +1250,8 @@ def run(args, env):
     ex = parse_extra(raw.get("out"))
     nuc, new_xbase = read_nucleos(c, st.get("cpu_extra"), ex, raw, now)
     fila, foco = read_queue(c, now), read_focus(c, now)
+    vistos, oferta = queue_wait(c, fila, st, now)
+    fila.pop("_todos", None)  # só servia ao relógio da oferta: não vai ao JSONL
     est = decide(sess, cpu, cores, c.busy_cores)
     lixo = find_lixo(c, sess, ex)
     sess.pop("_reconhecidas", None)  # só serviam ao find_lixo: não vão ao JSONL
@@ -1223,7 +1275,7 @@ def run(args, env):
 
     rd = {"ts": time.strftime("%Y-%m-%dT%H:%M:%S%z", time.localtime(now)), "epoch": now, "regra": RULE, "estado": est, "sessoes": sess, "cpu": cpu, "fila": fila, "foco": foco,
           "ociosas_seguidas": ocio, "cegas_seguidas": cegas, "baixas_seguidas": low["n"], "cpu_cegas_seguidas": cpu_cegas,
-          "nucleos": nuc, "ram_mb": ex["ram_mb"], "lixo": {k: v for k, v in lixo.items() if not k.startswith("_")}, "memo_unknown": memo_n, "causa": cause, "disco": ex["df"]}
+          "nucleos": nuc, "ram_mb": ex["ram_mb"], "lixo": {k: v for k, v in lixo.items() if not k.startswith("_")}, "memo_unknown": memo_n, "causa": cause, "disco": ex["df"], "oferta": oferta}
     idle_due = est == "ocioso" and fila["lido"] and fila["n"] > 0 and now - ocio_desde >= c.idle_after_s - c.slack_s
     blind_state_due = cegas > 0 and now - decidida_em >= c.blind_after_s - c.slack_s
     blind_cpu_due = cpu_cegas > 0 and now - cpu_lida_em >= c.blind_after_s - c.slack_s
@@ -1260,11 +1312,16 @@ def run(args, env):
               "baixa_nucleos_s": None if low["n"] == 0 else round(low["nucleos_s"], 2), "baixa_capacidade_s": None if low["n"] == 0 else low["cap_s"], "alarme_baixa_em": last_low, "alarme_disco_em": last_df,
               "cpu_extra": new_xbase or (st.get("cpu_extra") if _extra_base_ok(st.get("cpu_extra")) else None), "degraus": deg, "pendentes": pendentes,
               "ultima_acao_em": _int(st.get("ultima_acao_em")), "d4_dia": st.get("d4_dia"), "d4_bead": st.get("d4_bead") if low["n"] > 0 else None, "d4_falha_em": _int(st.get("d4_falha_em")),
-              "d4_falha_ep": _int(st.get("d4_falha_ep")), "dia_avaliado": st.get("dia_avaliado"), "dia_falha_em": _int(st.get("dia_falha_em")),
+              "d4_falha_ep": _int(st.get("d4_falha_ep")), "fila_vistos": vistos, "dia_avaliado": st.get("dia_avaliado"), "dia_falha_em": _int(st.get("dia_falha_em")),
               "dia_falha_ep": st.get("dia_falha_ep") if isinstance(st.get("dia_falha_ep"), str) else None}
 
     # avisos ao Athos: o D4 (esgotou) e o número do dia
     d4_due = low["n"] > 0 and exhausted and now - low["desde"] >= c.d4_after_s - c.slack_s
+    # a oferta (ga-m2kef40): o D4 seria devido, mas não há bead elegível ESPERANDO há tempo bastante (fila lida e vazia, ou só beads recém-chegadas que o Pilot ainda pode despachar): não há trabalho que o nó tenha deixado de pegar, então só registro
+    # (`d4` no JSONL e a linha do log), sem notify, mail nem bead. `esperando` e `nao-sei` (fila ilegível) seguem para o aviso: leitura que falha nunca cala o D4
+    d4_calado = D4_SEM_OFERTA.get(oferta["estado"]) if d4_due else None
+    if d4_calado:
+        d4_due = False
     # a falha do notify é do EPISÓDIO que a causou (D4: a sequência baixa em curso; número do dia: o dia julgado): marcador de outro episódio não vale como "o mail de reserva deste já saiu"
     d4_ep = low["desde"] if low["n"] > 0 else None
     d4_falha = falha_do_episodio(new_st["d4_falha_em"], new_st["d4_falha_ep"], d4_ep)
@@ -1278,7 +1335,7 @@ def run(args, env):
         verdict, yday, ykey = judge_yesterday(c, daily, now)
     dia_falha = falha_do_episodio(new_st["dia_falha_em"], new_st["dia_falha_ep"], ykey)
     s_dia = plan_notice(c, "dia", True, False, dia_falha, now, dry) if verdict == "abaixo" else verdict
-    rd.update(d4=s_d4, numero_do_dia=s_dia)
+    rd.update(d4=d4_calado or s_d4, numero_do_dia=s_dia)
 
     sends = []  # (chave do estado, valor antigo, assunto, corpo)
     if a_idle == "enviar":
@@ -1381,6 +1438,8 @@ def run(args, env):
     else:
         print("%s estado=%s sessoes=%s cpu=%s fila=%s foco=%s ociosas=%d cegas=%d alarme=%s/%s/%s causa=%s" % (
             rd["ts"], est, sess["ativas"], cpu["nucleos"], fila["n"], foco, ocio, cegas, rd["alarme"]["ocioso"], rd["alarme"]["cego"], rd["alarme"]["cpu_baixa"], cause))
+        if d4_calado:  # a linha de log que a oferta pede (ga-m2kef40); só neste ramo: com --print a leitura inteira sai como UM JSON que já traz `d4` e `oferta`, e uma 2ª linha o quebraria
+            print(oferta_line(c, rd, low, oferta, d4_calado))
     return 0
 
 

@@ -112,11 +112,12 @@ EOF
 cat > "$T/bin/bd" <<'EOF'
 #!/usr/bin/env bash
 # bd de mentira: duas formas permitidas. (1) a leitura de quem segura bead (`-C <cidade> list --status in_progress --json --limit 0`): devolve $STUB_BD_FILE (ou falha com $STUB_BD_RC; com $STUB_OUTFAIL imprime o JSON COMPLETO antes de falhar;
-# com $STUB_BD_SLEEP trava esses segundos). (2) a bead do aviso D4 (`-C <cidade> create --silent -t task -p 2 -l area:infra,hetzner-ocupacao --title <t> -d <d>`, 14 argumentos, a forma EXATA): grava create.N.title/.desc, imprime
+# com $STUB_BD_SLEEP trava esses segundos). (2) a bead do aviso D4 (`-C <cidade> create --silent -t task -p 2 -l area:infra,hetzner-ocupacao,pilot:no-auto-dispatch --title <t> -d <d>`, 14 argumentos, a forma EXATA; o veto é o que a
+# impede de ir para um dog: ga-m2kef40): grava create.N.title/.desc, imprime
 # $STUB_BD_CREATE_ID (padrão ga-d4test; VAZIO = não imprime nada) e sai com $STUB_BD_CREATE_RC. Qualquer outra forma é PROIBIDA (rc 99, marcada).
 # A forma (1) com -C <cidade>/rigs/<rig> lê a loja de um RIG: devolve $STUB_DIR/bd.rig.<rig> (padrão: []), ou falha se $STUB_DIR/bd.rig.<rig>.rc existir.
 echo "bd $*" >> "$STUB_DIR/bd.calls"
-if [ "$#" -eq 14 ] && [ "$1" = "-C" ] && [ "$3 $4 $5 $6 $7 $8 $9 ${10} ${11}" = "create --silent -t task -p 2 -l area:infra,hetzner-ocupacao --title" ] && [ "${13}" = "-d" ]; then
+if [ "$#" -eq 14 ] && [ "$1" = "-C" ] && [ "$3 $4 $5 $6 $7 $8 $9 ${10} ${11}" = "create --silent -t task -p 2 -l area:infra,hetzner-ocupacao,pilot:no-auto-dispatch --title" ] && [ "${13}" = "-d" ]; then
   c=$(( $(cat "$STUB_DIR/create.count" 2>/dev/null || echo 0) + 1 )); echo "$c" > "$STUB_DIR/create.count"
   printf '%s' "${12}" > "$STUB_DIR/create.$c.title"; printf '%s' "${14}" > "$STUB_DIR/create.$c.desc"
   [ "${STUB_BD_CREATE_RC:-0}" != 0 ] && { echo "bd: erro injetado (create)" >&2; exit "$STUB_BD_CREATE_RC"; }
@@ -648,6 +649,25 @@ g_fila() {
   pilot 1800 1800 3 0; W -- --print; eq "exatamente no ttl: ainda vale (só passa do ttl é velho, como no reconciler)" true "$(reading fila.lido)"
   pilot -120 1800 3 0; W -- --print; eq "carimbado 2 min no futuro (relógio fora do lugar): NÃO lida" false "$(reading fila.lido)"; eq "... motivo" no-futuro "$(reading fila.motivo)"
   pilot -30 1800 3 0; W -- --print; eq "30 s no futuro cabe na tolerância (60 s)" true "$(reading fila.lido)"
+  # a oferta que o D4 lê (ga-m2kef40): a MESMA fila, com um relógio de espera por bead (id -> quando entrou e não saiu mais) guardado no estado
+  fresh; PILOT_HQ=3; PILOT_WA=2; tick 900 5
+  eq "oferta, 1ª leitura: as 3 elegíveis do hq (as 2 do wa não contam) acabaram de entrar: 'recente', nenhuma espera ainda, a mais antiga há 0 s" "recente/3/0/0" "$(reading oferta.estado)/$(reading oferta.n)/$(reading oferta.esperando)/$(reading oferta.mais_antiga_s)"
+  eq "... o relógio de cada uma fica no estado (o epoch da 1ª vez que apareceram)" "$NOW/$NOW/$NOW" "$(state_f fila_vistos.ga-hq0)/$(state_f fila_vistos.ga-hq1)/$(state_f fila_vistos.ga-hq2)"
+  eq "... e a leitura NÃO leva a lista toda de ids da fila (só a amostra de 5 em fila.ids)" null "$(reading fila._todos)"
+  tick 900 5 >/dev/null; tick 900 5
+  eq "3 leituras seguidas (1800 s medidos, a 2ª e a 3ª só mantêm o relógio): as 3 esperam, a mais antiga há 1800 s" "esperando/3/3/1800" "$(reading oferta.estado)/$(reading oferta.n)/$(reading oferta.esperando)/$(reading oferta.mais_antiga_s)"
+  eq "... e o relógio continua o da 1ª vez (não anda a cada leitura)" "$((NOW - 1800))" "$(state_f fila_vistos.ga-hq0)"
+  PILOT_HQ=0; tick 900 5
+  eq "a fila esvazia (lida, 0 elegíveis): 'sem-oferta', e o relógio das que saíram é APAGADO (se voltarem, recomeçam)" "sem-oferta/0/0/null/{}" "$(reading oferta.estado)/$(reading oferta.n)/$(reading oferta.esperando)/$(reading oferta.mais_antiga_s)/$(state_f fila_vistos)"
+  fresh; PILOT_HQ=7; PILOT_WA=0; tick 900 5 >/dev/null; tick 900 5 >/dev/null; tick 900 5
+  eq "7 elegíveis (mais que os 5 ids de amostra): o relógio vale para TODAS, as 7 esperam depois de 30 min" "esperando/7/7" "$(reading oferta.estado)/$(reading oferta.n)/$(reading oferta.esperando)"
+  eq "... e a amostra de fila.ids segue com 5" 5 "$(python3 -I -c 'import json,sys; print(len(json.load(open(sys.argv[1]))["fila"]["ids"]))' "$WOUT")"
+  fresh; PILOT_HQ=0; PILOT_WA=2; tick 900 5
+  eq "só itens de outra loja: para o hq a oferta é 'sem-oferta' (n = 0), não 'nao-sei'" "sem-oferta/0" "$(reading oferta.estado)/$(reading oferta.n)"
+  fresh; PILOT_HQ=none; tick 900 5
+  eq "fila NÃO lida (arquivo ausente): 'nao-sei' com o motivo, n = null (nunca 'sem-oferta', que seria 'li e não há nada')" "nao-sei/null/null/arquivo-ausente" "$(reading oferta.estado)/$(reading oferta.n)/$(reading oferta.esperando)/$(reading oferta.motivo)"
+  fresh; PILOT_HQ=3; PILOT_WA=0; tick 900 5 >/dev/null; pilot 1801 1800 3 0; W -- --print
+  eq "fila lida na 1ª leitura e VELHA na seguinte: 'nao-sei' (motivo 'velho') e o relógio das 3 é apagado (sem ler, não sei se ficaram esperando)" "nao-sei/velho/{}" "$(reading oferta.estado)/$(reading oferta.motivo)/$(state_f fila_vistos)"
 }
 
 # ============================================================================================================================================================================
@@ -1019,7 +1039,7 @@ spec = importlib.util.spec_from_file_location("hoc_watch", sys.argv[1])
 m = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(m)
 WORK = sys.argv[2]
-EXPECT = 53
+EXPECT = 66
 ran = [0]
 
 
@@ -1146,6 +1166,50 @@ os.makedirs(cf.gc_dir, exist_ok=True)
 with open(os.path.join(cf.gc_dir, "gate-focus.state"), "w") as fh:
     fh.write("active=1\nat=%d\nactive=0\nat=1\nsem igual\n" % T0)
 chk("read_focus: chave repetida vale a 1ª (ligado) e linha sem '=' não vira chave", lambda: m.read_focus(cf, T0), "ligado")
+
+# ---- a oferta que o D4 lê (ga-m2kef40): o relógio de espera por bead sobre a fila elegível ---------------------------------------------------------
+def qfila(ids, lido=True, motivo=None):   # a fila como o read_queue a devolve: lida (com todos os ids em _todos) ou não lida (sem _todos)
+    return {"lido": True, "n": len(ids), "ids": ids[:5], "motivo": None, "_todos": ids} if lido else {"lido": False, "n": None, "ids": [], "motivo": motivo}
+
+
+def oferta(ids, st=None, lido=True, motivo=None, **kw):
+    return m.queue_wait(cfg(**kw), qfila(ids, lido, motivo), st if st is not None else {}, T0)
+
+
+chk("queue_wait: fila lida e vazia é 'sem-oferta' (n = 0, ninguém esperando) e o relógio fica vazio, mesmo que o estado tivesse beads",
+    lambda: oferta([], {"fila_vistos": {"ga-1": T0 - 5000}}), ({}, {"estado": "sem-oferta", "n": 0, "esperando": 0, "mais_antiga_s": None, "ids": [], "motivo": None}))
+chk("queue_wait: fila NÃO lida é 'nao-sei' com o motivo (n e esperando null, nunca 0) e o relógio é zerado",
+    lambda: oferta([], {"fila_vistos": {"ga-1": T0 - 5000}}, lido=False, motivo="velho"), ({}, {"estado": "nao-sei", "n": None, "esperando": None, "mais_antiga_s": None, "ids": [], "motivo": "velho"}))
+chk("queue_wait: bead nova (sem relógio no estado) entra com 'agora': 'recente', a mais antiga há 0 s, nenhum id citado",
+    lambda: oferta(["ga-1", "ga-2"]), ({"ga-1": T0, "ga-2": T0}, {"estado": "recente", "n": 2, "esperando": 0, "mais_antiga_s": 0, "ids": [], "motivo": None}))
+chk("queue_wait: a espera conta a partir de d4_wait_s MENOS a folga de 120 s do launchd (1679 s ainda é recente, 1680 s já espera)",
+    lambda: [oferta(["a"], {"fila_vistos": {"a": T0 - s}})[1]["estado"] for s in (1679, 1680)], ["recente", "esperando"])
+chk("queue_wait: HETZNER_OCC_D4_WAIT_S move o corte (0: a recém-chegada já espera; 7200: 1 h na fila não basta)",
+    lambda: (oferta(["a"], HETZNER_OCC_D4_WAIT_S="0")[1]["estado"], oferta(["a"], {"fila_vistos": {"a": T0 - 3600}}, HETZNER_OCC_D4_WAIT_S="7200")[1]["estado"]), ("esperando", "recente"))
+chk("queue_wait: o N é só de quem ESPERA (3 de 4 na fila), a mais antiga é a de maior espera e os ids vêm da mais antiga para a mais nova (empate: por id)",
+    lambda: oferta(["d", "c", "b", "a"], {"fila_vistos": {"b": T0 - 2000, "a": T0 - 2000, "c": T0 - 1700, "d": T0 - 100}})[1],
+    {"estado": "esperando", "n": 4, "esperando": 3, "mais_antiga_s": 2000, "ids": ["a", "b", "c"], "motivo": None})
+muitas = ["i%d" % k for k in range(7)]
+chk("queue_wait: cita no máximo 5 ids (como a fila), mas conta todas as que esperam", lambda: [(r["esperando"], r["ids"]) for r in [oferta(muitas, {"fila_vistos": {i: T0 - 3000 for i in muitas}})[1]]][0], (7, ["i0", "i1", "i2", "i3", "i4"]))
+chk("queue_wait: o relógio guarda SÓ as beads que estão na fila agora, cada uma com a 1ª vez em que foi vista (quem saiu é esquecido; a nova entra com agora)",
+    lambda: oferta(["a", "n"], {"fila_vistos": {"a": T0 - 900, "saiu": T0 - 9000}})[0], {"a": T0 - 900, "n": T0})
+chk("queue_wait: relógio guardado que não confere (no futuro, texto, negativo, booleano, decimal) conta como 'visto agora'; o válido segue",
+    lambda: oferta(["fut", "txt", "neg", "bool", "dec", "ok"], {"fila_vistos": {"fut": T0 + 500, "txt": "x", "neg": -5, "bool": True, "dec": 2.5, "ok": T0 - 3600}})[0],
+    {"fut": T0, "txt": T0, "neg": T0, "bool": T0, "dec": T0, "ok": T0 - 3600})
+chk("queue_wait: fila_vistos que não é objeto (lista, texto, número, ausente) é relógio vazio", lambda: [oferta(["a"], {"fila_vistos": v})[0] for v in ([1, 2], "a", 7, None)], [{"a": T0}] * 4)
+
+
+def esperando(k, ids):
+    return {"estado": "esperando", "n": k + 2, "esperando": k, "mais_antiga_s": 3000, "ids": ids, "motivo": None}
+
+
+chk("oferta_frase: esperando cita quantas, o corte, a mais antiga e os ids; com mais ids do que a amostra diz 'e mais N'",
+    lambda: m.oferta_frase(cfg(), esperando(7, ["i0", "i1", "i2", "i3", "i4"])),
+    "Há 7 bead(s) elegível(is) esperando na fila do Pilot há 30 min ou mais (a mais antiga há 50 min): i0, i1, i2, i3, i4 e mais 2. A fila é um teto: parte pode ser trabalho do mini.")
+chk("oferta_frase: com todos os ids que esperam na amostra (5 de 5) não diz 'e mais'", lambda: "e mais" in m.oferta_frase(cfg(), esperando(5, ["i0", "i1", "i2", "i3", "i4"])), False)
+chk("oferta_frase: nao-sei diz que não consegui saber, com o motivo; o que não tem o que dizer (sem-oferta, recente) é vazio",
+    lambda: (m.oferta_frase(cfg(), {"estado": "nao-sei", "n": None, "esperando": None, "mais_antiga_s": None, "ids": [], "motivo": "velho"}), m.oferta_frase(cfg(), {"estado": "sem-oferta"}), m.oferta_frase(cfg(), {"estado": "recente"})),
+    ("Não consegui saber se há bead elegível esperando: a fila do Pilot não foi lida (velho).", "", ""))
 
 # ---- números do estado, sequência de CPU baixa e diário ---------------------------------------------------------------------------------------
 chk("_int: 0 vale (>= 0); negativo, bool, texto e decimal vão para o padrão", (m._int(0, 9), m._int(5), m._int(-1, 9), m._int(True, 9), m._int("3", 9), m._int(2.0, 9), m._int(None)), (0, 5, 9, 9, 9, 9, None))
@@ -1403,13 +1467,15 @@ g_escada() {
   W -- --print-config
   eq "padrão: lixo = parado há 30 min, no máximo 2 por leitura" "1800/2" "$(reading d1_idle_s)/$(reading d1_max)"; eq "padrão: 30 min entre ações, 2 tentativas por degrau" "1800/2" "$(reading act_cooldown_s)/$(reading act_tries)"
   eq "padrão: o D4 só depois de 6 h" 21600 "$(reading d4_after_s)"; eq "padrão: notify de novo a cada 1 h e 60 s de paciência" "3600/60" "$(reading notify_retry_s)/$(reading notify_timeout_s)"
+  eq "padrão: o D4 só conta a bead elegível que espera na fila do Pilot há 30 min (ga-m2kef40)" 1800 "$(reading d4_wait_s)"
+  W HETZNER_OCC_D4_WAIT_S=0 -- --print-config; eq "espera 0 é aceita (basta a bead estar na fila) e 7200 também" "0" "$(reading d4_wait_s)"; W HETZNER_OCC_D4_WAIT_S=7200 -- --print-config; eq "... 7200 vale como vem" 7200 "$(reading d4_wait_s)"; W -- --print-config
   eq "padrão: pisos de RAM do lastro (partida 14336 MB, slot 1024 MB) e 2 núcleos livres" "14336/1024/2.0" "$(reading ram_start_mb)/$(reading ram_slot_mb)/$(reading min_free_cores)"
   eq "padrão: o dia precisa de 48 janelas lidas para ter número; a pasta do lastro; a memória dos vereditos 'unknown' dura 1 h" "48/~/gt-remote/ballast/3600" "$(reading day_min_windows)/$(reading ballast_home)/$(reading memo_unknown_ttl_s)"
   eq "sem nenhuma chave: nenhum degrau liga (INERTE por padrão)" '{"d1": false, "d2": false, "d3": false, "d4": false, "dia": false}' "$(reading on)"
   keys_on d1 dia; W -- --print-config; eq "a chave .on liga só o degrau dela" '{"d1": true, "d2": false, "d3": false, "d4": false, "dia": true}' "$(reading on)"
   W HETZNER_OCC_ACT=0 -- --print-config; eq "HETZNER_OCC_ACT=0 desliga TODAS as chaves de uma vez" '{"d1": false, "d2": false, "d3": false, "d4": false, "dia": false}' "$(reading on)"
   : > "$C/.gc/hetzner-occupancy-alarm.on"; W HETZNER_OCC_ACT=0 -- --print-config; eq "... mas não mexe na chave do aviso antigo (alarm)" true "$(reading alarm)"; rm -f "$C/.gc/hetzner-occupancy-alarm.on"
-  for bad_h in 'HETZNER_OCC_D4_AFTER_S=30' 'HETZNER_OCC_D1_IDLE_S=30' 'HETZNER_OCC_D1_MAX=0' 'HETZNER_OCC_ACT_TRIES=0' 'HETZNER_OCC_NOTIFY_TIMEOUT_S=0' 'HETZNER_OCC_DAY_MIN_WINDOWS=0' 'HETZNER_OCC_MIN_FREE_CORES=0' 'HETZNER_OCC_BALLAST_HOME=/x;rm' 'HETZNER_OCC_BALLAST_HOME=../x' 'HETZNER_OCC_BALLAST_HOME=a b' "HETZNER_OCC_BALLAST_HOME=x'y"; do
+  for bad_h in 'HETZNER_OCC_D4_AFTER_S=30' 'HETZNER_OCC_D4_WAIT_S=-1' 'HETZNER_OCC_D4_WAIT_S=meia-hora' 'HETZNER_OCC_D1_IDLE_S=30' 'HETZNER_OCC_D1_MAX=0' 'HETZNER_OCC_ACT_TRIES=0' 'HETZNER_OCC_NOTIFY_TIMEOUT_S=0' 'HETZNER_OCC_DAY_MIN_WINDOWS=0' 'HETZNER_OCC_MIN_FREE_CORES=0' 'HETZNER_OCC_BALLAST_HOME=/x;rm' 'HETZNER_OCC_BALLAST_HOME=../x' 'HETZNER_OCC_BALLAST_HOME=a b' "HETZNER_OCC_BALLAST_HOME=x'y"; do
     W "$bad_h" -- --print-config; check "$bad_h: recusado (rc != 0), nunca vira um comando no nó" "$([ "$RC" -ne 0 ] && echo 1 || echo 0)"
   done
   W HETZNER_OCC_ACT_COOLDOWN_S=0 -- --print-config; eq "intervalo entre ações 0 é aceito" 0 "$(reading act_cooldown_s)"
@@ -1561,8 +1627,13 @@ g_aviso() {
   has "... e a bead onde a causa fica registrada" "Bead: ga-d4test." "$(cat "$T/stub/notify.1.text")"
   eq "a bead leva o MESMO texto do aviso (sem a linha da bead) e o título" "$(cat "$T/stub/notify.1.title")" "$(cat "$T/stub/create.1.title")"
   has "... e a descrição da bead tem a causa" "Causa: sobram núcleos livres e o lastro não os usa." "$(cat "$T/stub/create.1.desc")"
-  hasnt "... sem ids, caminhos de código nem jargão do vigia no texto ao Athos" "degrau" "$(cat "$T/stub/notify.1.text")"
-  check "a bead nasce SEM story:approved nem exec:auto (nada a despacha sozinho; só registra)" "$(grep -q 'story:approved\|exec:auto' "$T/stub/bd.calls" && echo 0 || echo 1)"
+  hasnt "... sem caminhos de código nem jargão do vigia ('degrau') no texto ao Athos" "degrau" "$(cat "$T/stub/notify.1.text")"
+  has "... e cita a oferta que decidiu (ga-m2kef40): as 3 beads elegíveis que esperam há 60 min na fila do Pilot, com os ids" "Há 3 bead(s) elegível(is) esperando na fila do Pilot há 30 min ou mais (a mais antiga há 60 min): ga-hq0, ga-hq1, ga-hq2." "$(cat "$T/stub/notify.1.text")"
+  has "... a frase da oferta entra entre os números de hoje e o que tentou, com um espaço de cada lado" "11.7 livres. Há 3 bead(s)" "$(cat "$T/stub/notify.1.text")"; has "... e o que tentou segue logo depois dela" "trabalho do mini. Tentei: pedir mais lastro 1x" "$(cat "$T/stub/notify.1.text")"
+  has "... a bead leva a MESMA frase (o registro da causa diz quantas esperam)" "Há 3 bead(s) elegível(is) esperando na fila do Pilot" "$(cat "$T/stub/create.1.desc")"
+  eq "... o JSONL guarda a oferta (esperando, 3 na fila, 3 esperando, a mais antiga há 3600 s)" "esperando/3/3/3600" "$(reading oferta.estado)/$(reading oferta.n)/$(reading oferta.esperando)/$(reading oferta.mais_antiga_s)"
+  check "a bead nasce SEM story:approved nem exec:auto" "$(grep -q 'story:approved\|exec:auto' "$T/stub/bd.calls" && echo 0 || echo 1)"
+  check "... e COM o veto pilot:no-auto-dispatch, que o filtro central do Pilot honra (sem story:approved nem exec:auto o Pilot a despachou a um dog 7 min depois de criada: ga-eidrbo8, 21/11)" "$(grep -q 'pilot:no-auto-dispatch' "$T/stub/bd.calls" && echo 1 || echo 0)"
   eq "o estado marca o dia do aviso (hoje) e não há falha pendente" "2026-10-19/null" "$(state_f d4_dia)/$(state_f d4_falha_em)"
   xtick 900 $LOWW; eq "a leitura seguinte, no mesmo dia: 'ja-avisou' (no máximo 1 por dia), nada novo sai" "ja-avisou/1/1" "$(reading d4)/$(notifies)/$(creates)"
   xrun 20 $LOWW; eq "... nem 5 h depois, no mesmo dia (e a bead é a mesma, não nasce outra)" "ja-avisou/1/1/ga-d4test" "$(reading d4)/$(notifies)/$(creates)/$(state_f d4_bead)"
@@ -1593,6 +1664,58 @@ g_aviso() {
   d4_setup; xrun 4 $LOWW >/dev/null; STUB_SSH_RC=1; xtick 900 $LOWW; eq "CPU não lida na hora do aviso: não há sequência baixa lida, o D4 não é devido" "nao/0" "$(reading d4)/$(notifies)"
   d4_setup; xrun 4 $LOWW >/dev/null; cp "$C/.gc/hetzner-occupancy.state.json" "$T/state.before"; XARGS="--print --dry-run" xtick 900 $LOWW; eq "--dry-run: diz 'enviaria', não manda, não cria bead e não grava o estado" "enviaria/0/0/1" "$(reading d4)/$(notifies)/$(creates)/$(cmp -s "$C/.gc/hetzner-occupancy.state.json" "$T/state.before" && echo 1 || echo 0)"
   d4_setup; xrun 5 $LOWW; eq "(controle) o mesmo cenário, sem nenhuma das portas fechadas, avisa" "enviado:entregue" "$(reading d4)"
+
+  # ---- a oferta (ga-m2kef40, decisão do Mayor em 21/11): o D4 só avisa com bead ELEGÍVEL esperando que o nó podia pegar; sem oferta é só registro; fila ilegível NUNCA cala ------------------
+  # a oferta = a fila do Pilot (hq), com um relógio por bead: espera quem está na fila há >= 30 min (HETZNER_OCC_D4_WAIT_S, com a folga de 2 min do launchd); quem sai da fila ou some numa leitura ruim recomeça
+  d4_setup; PILOT_HQ=0; xrun 4 $LOWW
+  eq "fila lida e vazia na 4ª leitura: o D4 ainda não é devido (falta o tempo) e diz 'nao': o registro de oferta só substitui o 'devido'" "nao/sem-oferta" "$(reading d4)/$(reading oferta.estado)"
+  XARGS= xtick 900 $LOWW; last_line "$C/.gc/hetzner-occupancy.jsonl"
+  eq "(a) 5ª leitura, fila LIDA e VAZIA (0 elegíveis): o D4 seria devido, mas o nó está parado por falta de trabalho, não por defeito: nenhum notify, mail nem bead" "sem-oferta/0/0/0" "$(jv "$T/last.json" d4)/$(notifies)/$(mails)/$(creates)"
+  eq "... a oferta fica no JSONL com a contagem (fila lida, 0 elegíveis, ninguém esperando)" "sem-oferta/0/0" "$(jv "$T/last.json" oferta.estado)/$(jv "$T/last.json" oferta.n)/$(jv "$T/last.json" oferta.esperando)"
+  has "... e a linha do log diz 'ocioso por falta de oferta'" "ocioso por falta de oferta" "$(cat "$WOUT")"; has "... com a contagem de elegíveis (0)" "0 bead(s) elegível(is)" "$(cat "$WOUT")"
+  has "... e há quanto tempo a CPU está abaixo da régua" "d4=sem-oferta: CPU abaixo de 85% há 1 h e a escada esgotou" "$(cat "$WOUT")"
+  eq "... o aviso do dia NÃO foi gasto e nenhuma bead foi guardada (se a oferta aparecer hoje, o D4 ainda avisa)" "null/null" "$(state_f d4_dia)/$(state_f d4_bead)"
+  PILOT_HQ=3; xtick 900 $LOWW
+  eq "a oferta aparece no mesmo dia (3 beads recém-chegadas): ainda não esperam 30 min, o D4 só registra 'oferta-recente'; sem aviso nem bead" "oferta-recente/recente/3/0/0/0" "$(reading d4)/$(reading oferta.estado)/$(reading oferta.n)/$(reading oferta.esperando)/$(notifies)/$(creates)"
+  XARGS= xtick 900 $LOWW; has "... a linha do log diz 'oferta-recente' com a contagem e há quanto a mais antiga espera" "d4=oferta-recente: 3 bead(s) elegível(is) na fila do Pilot, a mais antiga há 900 s" "$(cat "$WOUT")"
+  eq "... 15 min depois (900 s de espera, abaixo dos 1800 s menos a folga de 120 s): continua só registrando" "0/0" "$(notifies)/$(creates)"
+  xtick 900 $LOWW
+  eq "30 min depois de entrarem as 3 (1800 s): esperam o bastante, o D4 avisa UMA vez e cria UMA bead (o aviso do dia nunca foi gasto)" "enviado:entregue/esperando/3/3/1/1" "$(reading d4)/$(reading oferta.estado)/$(reading oferta.n)/$(reading oferta.esperando)/$(notifies)/$(creates)"
+  has "... e o texto cita as 3, quanto esperam e que a fila é um teto" "Há 3 bead(s) elegível(is) esperando na fila do Pilot há 30 min ou mais (a mais antiga há 30 min): ga-hq0, ga-hq1, ga-hq2. A fila é um teto: parte pode ser trabalho do mini." "$(cat "$T/stub/notify.1.text")"
+  # o relógio é por bead: o N que o aviso cita é o de quem ESPERA, não o da fila inteira
+  d4_setup; PILOT_HQ=1; xrun 4 $LOWW >/dev/null; PILOT_HQ=3; xtick 900 $LOWW
+  eq "1 bead na fila há 1 h (ga-hq0) e 2 recém-chegadas: avisa citando SÓ a que espera (1 das 3 na fila, a mais antiga há 3600 s)" "enviado:entregue/3/1/3600" "$(reading d4)/$(reading oferta.n)/$(reading oferta.esperando)/$(reading oferta.mais_antiga_s)"
+  has "... o texto cita só a que espera" "Há 1 bead(s) elegível(is) esperando na fila do Pilot há 30 min ou mais (a mais antiga há 60 min): ga-hq0. " "$(cat "$T/stub/notify.1.text")"
+  hasnt "... e não as 2 recém-chegadas" "ga-hq1" "$(cat "$T/stub/notify.1.text")"
+  d4_setup; xrun 3 $LOWW >/dev/null; PILOT_HQ=0; xtick 900 $LOWW >/dev/null; PILOT_HQ=3; xtick 900 $LOWW
+  eq "bead que SAIU da fila (uma leitura veio vazia) e voltou: o relógio recomeça, 'oferta-recente' (não herda a espera de 3600 s desde a 1ª vez)" "oferta-recente/recente/0/0" "$(reading d4)/$(reading oferta.estado)/$(notifies)/$(creates)"
+  d4_setup; xrun 3 $LOWW >/dev/null; PILOT_HQ=none; rm -f "$HM/.gc/pilot-dispatchable.json"; xtick 900 $LOWW >/dev/null; PILOT_HQ=3; xtick 900 $LOWW
+  eq "fila NÃO lida numa leitura (o arquivo sumiu) zera o relógio: ao voltar, as beads contam desde agora ('oferta-recente')" "oferta-recente/0" "$(reading d4)/$(notifies)"
+  # (c) fila ilegível: o 3º estado. Não sei se há oferta, então o aviso SAI (dizendo que não consegui saber): leitura que falha nunca cala
+  d4_setup; PILOT_HQ=none; xrun 5 $LOWW
+  eq "(c) fila NÃO lida (arquivo do Pilot ausente) na hora do D4: não sei se há oferta, então avisa mesmo assim e cria a bead" "enviado:entregue/nao-sei/arquivo-ausente/1/1" "$(reading d4)/$(reading oferta.estado)/$(reading oferta.motivo)/$(notifies)/$(creates)"
+  has "... e o texto diz 'não consegui saber' e por quê" "Não consegui saber se há bead elegível esperando: a fila do Pilot não foi lida (arquivo-ausente)." "$(cat "$T/stub/notify.1.text")"
+  has "... entre os números de hoje e o que tentou, com um espaço de cada lado" "11.7 livres. Não consegui saber" "$(cat "$T/stub/notify.1.text")"; has "... e o que tentou segue logo depois" "(arquivo-ausente). Tentei: pedir mais lastro 1x" "$(cat "$T/stub/notify.1.text")"
+  hasnt "... sem inventar contagem de beads" "bead(s) elegível(is)" "$(cat "$T/stub/notify.1.text")"
+  d4_setup; PILOT_HQ=none; pilot 5000 1800 3 0; xrun 5 $LOWW
+  eq "(c) arquivo da fila VELHO (o Pilot parado: 5000 s > o ttl de 1800 s): também NÃO lida, também avisa, com o motivo 'velho'" "enviado:entregue/nao-sei/velho" "$(reading d4)/$(reading oferta.estado)/$(reading oferta.motivo)"
+  # a espera é configurável
+  d4_setup; TENV+=(HETZNER_OCC_D4_WAIT_S=0); PILOT_HQ=0; xrun 4 $LOWW >/dev/null; PILOT_HQ=3; xtick 900 $LOWW
+  eq "HETZNER_OCC_D4_WAIT_S=0: basta a bead estar na fila (a que acabou de entrar já conta)" "enviado:entregue/esperando/3" "$(reading d4)/$(reading oferta.estado)/$(reading oferta.esperando)"
+  d4_setup; TENV+=(HETZNER_OCC_D4_WAIT_S=7200); xrun 5 $LOWW
+  eq "HETZNER_OCC_D4_WAIT_S=7200: 1 h na fila (3600 s) não basta (faltam 7200 s menos a folga de 120 s)" "oferta-recente/recente/0" "$(reading d4)/$(reading oferta.estado)/$(notifies)"
+  d4_setup; TENV+=(HETZNER_OCC_D4_WAIT_S=3000); xrun 5 $LOWW
+  eq "HETZNER_OCC_D4_WAIT_S=3000: 1 h na fila basta, e o texto diz o corte de verdade (50 min, não um 30 fixo)" "enviado:entregue/1" "$(reading d4)/$(notifies)"
+  has "... o texto leva o corte configurado" "esperando na fila do Pilot há 50 min ou mais (a mais antiga há 60 min)" "$(cat "$T/stub/notify.1.text")"
+  # a oferta é um fato do mundo, não uma permissão: vale com a chave do d4 desligada e no --dry-run; e não mexe no aviso do dia
+  d4_setup; rm -f "$C/.gc/hetzner-occupancy-d4.on"; keys_on d2; PILOT_HQ=0; xrun 5 $LOWW
+  eq "sem a chave do d4 e sem oferta: o registro vale do mesmo jeito ('sem-oferta', não 'desligado'), e nada sai" "sem-oferta/0/0" "$(reading d4)/$(notifies)/$(creates)"
+  d4_setup; PILOT_HQ=0; xrun 4 $LOWW >/dev/null; cp "$C/.gc/hetzner-occupancy.state.json" "$T/state.before"; XARGS="--print --dry-run" xtick 900 $LOWW
+  eq "--dry-run sem oferta: diz 'sem-oferta', não manda, não cria bead e não grava o estado" "sem-oferta/0/0/1" "$(reading d4)/$(notifies)/$(creates)/$(cmp -s "$C/.gc/hetzner-occupancy.state.json" "$T/state.before" && echo 1 || echo 0)"
+  d4_setup; xrun 5 $LOWW >/dev/null; PILOT_HQ=0; xtick 900 $LOWW
+  eq "avisou hoje e a fila esvazia (as beads foram despachadas): 'sem-oferta', nada novo sai e o aviso do dia e a bead ficam como estão" "sem-oferta/1/1/2026-10-19/ga-d4test" "$(reading d4)/$(notifies)/$(creates)/$(state_f d4_dia)/$(state_f d4_bead)"
+  PILOT_HQ=3; xtick 900 $LOWW >/dev/null; xtick 900 $LOWW >/dev/null; xtick 900 $LOWW
+  eq "... a oferta volta e espera 30 min: o aviso do dia já saiu, então 'ja-avisou' (1 por dia, mesmo com oferta nova)" "ja-avisou/1/1" "$(reading d4)/$(notifies)/$(creates)"
 
   # ---- o rc do notify: só 0, 10 e 11 são entregue; o resto NÃO saiu (04/11, ga-i4t0lzx: exit 12 e o Athos não soube) ------------------------------------------------------------
   for rc_ok in "0 entregue" "10 segurado-ate-7h" "11 ja-tinha-saido"; do
@@ -1646,7 +1769,7 @@ g_aviso() {
   xfresh; keys_on d3 d4; PILOT_HQ=0; mkdir -p "$C/.gc/wa-node-pass-memo.tsv"; TENV=(HETZNER_OCC_D4_AFTER_S=3600); xrun 5 600 30 50 800
   eq "memória do Pilot que não abre: o D3 é 'cego' e a escada NÃO esgotou, então 1 h abaixo da régua não avisa nem cria bead" "fila-sem-elegível/cego/nao/0/0" "$(reading causa)/$(reading degrau.d3)/$(reading d4)/$(notifies)/$(creates)"
   xfresh; keys_on d3 d4; PILOT_HQ=0; TENV=(HETZNER_OCC_D4_AFTER_S=3600); xrun 5 600 30 50 800
-  eq "... o controle: com a memória LIDA e sem 'unknown' (nada a reclassificar) a escada esgotou e o D4 avisa" "nao-aplica/enviado:entregue/1/1" "$(reading degrau.d3)/$(reading d4)/$(notifies)/$(creates)"
+  eq "... o controle: com a memória LIDA e sem 'unknown' (nada a reclassificar) a escada esgotou, mas a fila elegível está VAZIA (é a própria causa): o D4 NÃO avisa, é falta de oferta e não defeito (ga-m2kef40; era o aviso que saía todo dia)" "nao-aplica/sem-oferta/0/0" "$(reading degrau.d3)/$(reading d4)/$(notifies)/$(creates)"
 
   # ---- o número do dia -------------------------------------------------------------------------------------------------------------------------------------------------------------
   numdia() { python3 -I - "$(dj)" "$1" "$2" "$3" "$4" "$5" <<'PY'
@@ -2091,9 +2214,48 @@ g_mutantes() {
   # D4: só depois de 6 h, só esgotado, uma vez por dia, e a bead é registro (nunca despachável)
   mutante d4-sem-esgotar "aviso" $'d4_due = low["n"] > 0 and exhausted and' $'d4_due = low["n"] > 0 and'
   mutante d4-sem-esperar-6h "aviso" $'now - low["desde"] >= c.d4_after_s - c.slack_s' $'now - low["desde"] >= 0'
-  mutante d4-bead-despachavel "aviso" $'"area:infra,hetzner-ocupacao"' $'"area:infra,hetzner-ocupacao,story:approved,exec:auto"'
+  mutante d4-bead-despachavel "aviso" $'"area:infra,hetzner-ocupacao,pilot:no-auto-dispatch"' $'"area:infra,hetzner-ocupacao,pilot:no-auto-dispatch,story:approved,exec:auto"'
+  mutante d4-bead-sem-veto "aviso" $'"area:infra,hetzner-ocupacao,pilot:no-auto-dispatch"' $'"area:infra,hetzner-ocupacao"'
   mutante d4-bead-nao-guardada "aviso" $'                if bid:\n                    new_st["d4_bead"] = bid\n' $'                if bid:\n                    pass\n'
   mutante d4-dia-nao-gravado "aviso" $'            new_st["d4_dia"] = today\n            save()\n            ok4' $'            save()\n            ok4'
+  # a oferta do D4 (ga-m2kef40): sem oferta (ou só oferta recente) é registro e nunca aviso; fila ilegível NUNCA cala; o relógio é por bead, zera na leitura ruim e vale só para quem está na fila agora
+  mutante d4-sem-oferta-avisa "aviso" $'D4_SEM_OFERTA = {"sem-oferta": "sem-oferta", "recente": "oferta-recente"}' $'D4_SEM_OFERTA = {"recente": "oferta-recente"}'
+  mutante d4-oferta-recente-avisa "aviso" $'D4_SEM_OFERTA = {"sem-oferta": "sem-oferta", "recente": "oferta-recente"}' $'D4_SEM_OFERTA = {"sem-oferta": "sem-oferta"}'
+  mutante d4-fila-ilegivel-cala "aviso" $'D4_SEM_OFERTA = {"sem-oferta": "sem-oferta", "recente": "oferta-recente"}' $'D4_SEM_OFERTA = {"sem-oferta": "sem-oferta", "recente": "oferta-recente", "nao-sei": "sem-oferta"}'
+  mutante oferta-calada-fora-do-d4-devido "aviso" $'d4_calado = D4_SEM_OFERTA.get(oferta["estado"]) if d4_due else None' $'d4_calado = D4_SEM_OFERTA.get(oferta["estado"])'
+  mutante oferta-calada-nao-cala "aviso" $'    if d4_calado:\n        d4_due = False' $'    if d4_calado:\n        pass'
+  mutante oferta-calada-nao-registra "aviso" $'rd.update(d4=d4_calado or s_d4, numero_do_dia=s_dia)' $'rd.update(d4=s_d4, numero_do_dia=s_dia)'
+  mutante oferta-sem-linha-de-log "aviso" $'print(oferta_line(c, rd, low, oferta, d4_calado))' $'pass'
+  mutante oferta-linha-horas-erradas "aviso" $'(rd["epoch"] - low["desde"]) // 3600, oferta["n"])' $'(rd["epoch"] - low["desde"]) // 60, oferta["n"])'
+  mutante oferta-ilegivel-vira-vazia "lastro fila aviso" $'return {}, {"estado": "nao-sei", "n": None,' $'return {}, {"estado": "sem-oferta", "n": 0,'
+  mutante oferta-leitura-ruim-mantem-o-relogio "lastro fila aviso" $'    if not fila["lido"]:\n        return {}, {"estado": "nao-sei"' $'    if not fila["lido"]:\n        return old, {"estado": "nao-sei"'
+  mutante oferta-relogio-guarda-quem-saiu "lastro fila aviso" $'    vistos = {}\n    for i in fila["_todos"]:' $'    vistos = dict(old)\n    for i in fila["_todos"]:'
+  mutante oferta-relogio-anda-a-cada-leitura "lastro fila aviso" $'        vistos[i] = since if since is not None and since <= now else now' $'        vistos[i] = now'
+  mutante oferta-relogio-no-futuro-vale "lastro" $'vistos[i] = since if since is not None and since <= now else now' $'vistos[i] = since if since is not None else now'
+  mutante oferta-relogio-ilegivel-vale "lastro" $'        since = _int(old.get(i))' $'        since = old.get(i)'
+  mutante oferta-fila-vistos-nao-e-objeto-vale "lastro" $'    old = old if isinstance(old, dict) else {}' $'    old = old or {}'
+  mutante oferta-espera-sem-folga "lastro" $'now - vistos[i] >= c.d4_wait_s - c.slack_s' $'now - vistos[i] >= c.d4_wait_s'
+  mutante oferta-espera-estrita "lastro" $'now - vistos[i] >= c.d4_wait_s - c.slack_s' $'now - vistos[i] > c.d4_wait_s - c.slack_s'
+  mutante oferta-espera-fixa-em-30min "lastro" $'now - vistos[i] >= c.d4_wait_s - c.slack_s' $'now - vistos[i] >= 1800 - c.slack_s'
+  mutante oferta-conta-a-fila-inteira "lastro aviso" $'"esperando": len(esperam)' $'"esperando": len(vistos)'
+  mutante oferta-ids-sem-ordem "lastro" $'ordem = sorted(vistos, key=lambda i: (vistos[i], i))' $'ordem = list(vistos)'
+  mutante oferta-ids-sem-desempate "lastro" $'key=lambda i: (vistos[i], i))' $'key=lambda i: vistos[i])'
+  mutante oferta-ids-sem-teto "lastro" $'"ids": esperam[:5]' $'"ids": esperam'
+  mutante oferta-recente-vira-sem-oferta "lastro aviso" $'estado = "esperando" if esperam else ("recente" if vistos else "sem-oferta")' $'estado = "esperando" if esperam else "sem-oferta"'
+  mutante oferta-recente-vira-esperando "lastro aviso" $'estado = "esperando" if esperam else ("recente" if vistos else "sem-oferta")' $'estado = "esperando" if vistos else "sem-oferta"'
+  mutante oferta-fila-vistos-nao-gravado "fila aviso" $'"fila_vistos": vistos,' $'"fila_vistos": {},'
+  mutante oferta-todos-vaza-no-jsonl "fila" $'fila.pop("_todos", None)' $'None'
+  mutante oferta-todos-so-5 "fila aviso" $'ids=elig[:5], _todos=elig)' $'ids=elig[:5], _todos=elig[:5])'
+  mutante oferta-frase-sem-ids "lastro aviso" $'", ".join(oferta["ids"])' $'""'
+  mutante oferta-frase-sem-mais "lastro" $'" e mais %d" % mais if mais > 0 else ""' $'""'
+  mutante oferta-frase-sempre-mais "lastro" $'if mais > 0 else ""' $'if mais >= 0 else ""'
+  mutante oferta-frase-corte-fixo "lastro aviso" $'_mins(c.d4_wait_s), _mins(oferta["mais_antiga_s"])' $'30, _mins(oferta["mais_antiga_s"])'
+  mutante oferta-frase-nao-sei-sem-motivo "lastro aviso" $'a fila do Pilot não foi lida (%s)." % oferta["motivo"]' $'a fila do Pilot não foi lida." % ()'
+  mutante oferta-aviso-sem-frase "aviso" $'ofe = oferta_frase(c, rd["oferta"])' $'ofe = ""'
+  mutante oferta-aviso-sem-espaco "aviso" $'" " + ofe if ofe else ""' $'ofe if ofe else ""'
+  mutante d4-wait-padrao "escada" $'"HETZNER_OCC_D4_WAIT_S", 1800, int, 0)' $'"HETZNER_OCC_D4_WAIT_S", 900, int, 0)'
+  mutante d4-wait-piso "escada" $'"HETZNER_OCC_D4_WAIT_S", 1800, int, 0)' $'"HETZNER_OCC_D4_WAIT_S", 1800, int, 1)'
+  mutante d4-wait-fora-do-print-config "escada" $'"d4_after_s", "d4_wait_s", "notify_retry_s",' $'"d4_after_s", "notify_retry_s",'
   # o número do dia: só dia com número, só abaixo da meta
   mutante dia-cego-vira-abaixo "aviso" $'if pct is None or wins < c.day_min_windows:' $'if pct is None:'
   mutante dia-na-meta-avisa "aviso replay" $'return ("abaixo" if pct < c.low_pct else "na-meta"), day, key' $'return "abaixo", day, key'
