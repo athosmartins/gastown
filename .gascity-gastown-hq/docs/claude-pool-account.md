@@ -3,6 +3,7 @@
 ## Contents
 
 • How it works · What it costs, and what it never does (ga-8hcnvb.2.2)
+• The move to the account that resets first — when an account that answers is still the wrong one (ga-1yzovub)
 • The guard — divergence alert, per-version test, the daemon's liveness and no key leaks (ga-8hcnvb.3)
 • Activation — merged is not live · Kill switches (no config reload) · Files
 • The item holds a credential the daemon did not write (ga-xknkke)
@@ -11,12 +12,15 @@
 • Known limits · Exit codes (`launchctl list` → last exit status)
 
 The headless pool (dog, wa-worker, ps-worker, gate-reviewer, boot, deacon, auto-refiner — ~90% of the spend)
-follows ONE Claude account, which a script chooses. The script moves the pool away from the account in use only when that account
+follows ONE Claude account, which a script chooses. The script moves the pool away from the account in use when that account
 **says the limit is hit** (an HTTP 429, or a `rejected` status in the `anthropic-ratelimit-unified-*` headers) or **refuses its key**
-(401/403) — never on a utilization, a warning or the usage store's ranking ("What it costs, and what it never does"). It goes back to the
-account it left once that account has renewed **and a usage collection taken after the renewal confirms it ranks ahead** — so up to about
-one collector period (30 min) after the renewal, not at the instant of it (see "The way back waits for a fresh collection"). That return is
-the one move the pool makes away from an account that still answers, and it is by design.
+(401/403) — never on a utilization or a warning ("What it costs, and what it never does"). Two moves leave an account that still answers,
+and both are by design. (1) The way back to the account it left, once that account has renewed **and a usage collection taken after the
+renewal confirms it ranks ahead** — so up to about one collector period (30 min) after the renewal, not at the instant of it (see "The way
+back waits for a fresh collection"). (2) The move to an account the order of use ranks **ahead** of the one in use (the one whose balance is
+lost first — Athos 23/11: «todo consumo deve estar concentrado na próxima conta a resetar»), when that account is not registered exhausted, has a good
+usage reading of its own, has its key in the vault and answers a probe now ("The move to the account that resets first"). Without (2) a pool
+that a failover had put on the 4th of 4 accounts stayed there for three days, because (1) only returns to an account this daemon saw rejected.
 No restart and no login asked of Athos (the 5 setup-tokens are already in the vault as `claude-oauth-token-<email>`): a live session keeps
 its process and its conversation across a switch (measured at turn boundaries only — see Known limits). A session already sitting on
 claude's limit modal needs one Escape to notice the switch, and gets it only when the daemon can prove the pane is a pool one ("The Escape
@@ -36,10 +40,15 @@ exception"; boot and deacon follow the item like the rest but are not on that li
                         ranks ahead of the active one — no probe of it on the way back
                         (not to one whose KEY was refused, 401/403: see Known limits)
                         a reading from BEFORE the reset is no evidence: the entry is kept and the log says it waits
+                        PREFER (ga-1yzovub): else, to the first account the order of use ranks AHEAD of the active one that is NOT in
+                        the registry, whose OWN usage reading is good (not stale / failed), whose key came back from the vault and
+                        that answers a probe NOW; one move per run (a failback that moved the pool is the move); the active account
+                        missing from the order = its rank is unknown = no move. See "The move to the account that resets first"
      cannot tell     -> change nothing: every answer that is not a 2xx, a 429 / `rejected`, or a 401/403 — network, 5xx, a 404 from a
                         retired model ID, any other 4xx, a redirect: error is not exhaustion. For a failover CANDIDATE it means
                         "skip it, do not register it"
-   vault (Bitwarden) read lazily: the ACTIVE account's key every run, the other accounts' only when the pool moves
+   vault (Bitwarden) read lazily: the ACTIVE account's key every run, the other accounts' only when the pool moves - or when an account
+                             is ranked ahead of the active one and is not registered exhausted and has a good reading (PREFER)
    a key the vault does not return for the active account is NOT "its key is gone": the item is the second witness
    writes ONE Keychain item  "Claude Code-credentials-50adeaf1"   (the POOL's item only — never the plain
                              "Claude Code-credentials" of Mayor and the crews: a setup-token there kills their Remote
@@ -84,9 +93,11 @@ is B74/B74b: a `claude` on the daemon's PATH records any start, and none is reco
 
 Mayor 04/10 (comment on the bead) overrides the original wording: **no utilization threshold** (fail over only when
 the limit is actually hit) and **no confirmation probe on failback** (go back at the stored reset time; if it has not
-really renewed, its 429 sends the pool to the next account again). Both are pinned by tests that fail when they are broken: B73 (nothing
-short of a rejection moves the pool) and B75 (a failback sends no call as the account it returns to), each run again on a copy of the daemon
-with that one property broken (B78a–c, B78f).
+really renewed, its 429 sends the pool to the next account again). Both are pinned by tests that fail when they are broken: B73 (no header —
+a warning, a utilization — moves the pool while nothing is ranked ahead of the account in use) and B75 (a failback sends no call as the account
+it returns to), each run again on a copy of the daemon with that one property broken (B78a–b, B78f). Athos 23/11 (ga-1yzovub) added the one
+move B73 used to forbid - to an account the order ranks ahead of the one in use that answers a probe - and B79–B79h pin it, with B78j–B78q
+as the broken copies.
 
 ## What it costs, and what it never does (ga-8hcnvb.2.2)
 
@@ -95,26 +106,69 @@ selftest (B73–B78) and the live harness (P1f, P1g, P3.0b–P3.7) count — "10
 
 | Event | Calls to the API | Cost |
 |---|---|---|
-| a steady run (every 60 s, about 1440 a day) | 1: `POST /v1/messages` with `max_tokens=1`, as the account in use | an account that answers serves it (its short prompt in, one token out); a refused call (429, 401/403) costs nothing |
+| a steady run (every 60 s, about 1440 a day), the pool on the first account of the order | 1: `POST /v1/messages` with `max_tokens=1`, as the account in use | an account that answers serves it (its short prompt in, one token out); a refused call (429, 401/403) costs nothing |
+| a steady run with an account ranked ahead of the one in use that is not registered exhausted and has a good reading | the call above + one per such account, in order, until one answers (the pool moves there) | a candidate that answers serves one more such call and takes the pool, so this lasts one run; one that is refused is registered until its reset and not asked again; one that cannot be told (5xx, network) is asked again next run |
 | a failover | the call above (refused) + one per candidate tried, in order, until one answers | the candidate that answers serves one more such call; refused candidates cost nothing; a candidate that cannot be told (5xx, network) is skipped and not registered |
 | a failback | the call as the account in use, and **none** as the account it returns to | nothing more: it trusts the stored reset time and a usage reading taken after it; if the account has not really renewed, its 429 sends the pool on at the next run |
+| a move to the account that resets first (prefer) | the call as the account in use + one per candidate tried until one answers | the account it moves to has been asked (that is its evidence), unlike a failback's; candidates left out for want of evidence (registered, no good reading, no key) cost no call |
 | the Escape | none (a tmux `send-keys` to a pane) | nothing |
 
 So "no credit" is exact about what it excludes and not about the probe: no balance, usage or quota endpoint is called, no `claude` runs, no model
 is asked for anything but that 1-token probe; and the probe of an account that **answers** is a served call (the pool pays it about 1440 times a day, plus the candidate that
-a failover lands on). Making the daemon spend literally nothing would mean replacing that probe with a call that generates nothing; whether such a
+a failover or a prefer lands on). Making the daemon spend literally nothing would mean replacing that probe with a call that generates nothing; whether such a
 call carries the `anthropic-ratelimit-unified-*` headers the verdict reads was not measured here, so it is a decision for Athos, not a default.
 
 What it never does, each with the test that fails if it did:
 
-- start a `claude` on the switch path — failover, Escape and failback (B74b, B78d; live P1f, P3.7);
+- start a `claude` on the switch path — failover, Escape, failback and prefer (B74b, B78d; live P1f, P3.7);
 - call anything but `POST /v1/messages` (B75, B78e; live P3.2b, P3.4b);
-- leave an account that answers because of a warning, a utilization (95%, 99%, 100% without `rejected`) or the usage store's numbers, which only
-  *order* the candidates once the pool has to move and *gate* the way back (B73, B78a–c; live P3.1b) — the single exception is the failback;
+- leave an account that answers because of a warning or a utilization in the API's headers (95%, 99%, 100% without `rejected`: B73, B78a–b; live
+  P3.1b), or on the usage store's numbers alone: the store's order moves the pool only to an account that is not registered exhausted, has a good
+  reading of its own and answers a probe now (B79–B79h, B78j–B78q) — the two moves that leave an account that answers are the failback and that one;
 - call a refused key a "cannot tell" (B76, B78g), or a status it does not understand a limit (B77, B78h);
 - send a key to a pane that is not a pool pane sitting on the limit modal (the pane filters are B60–B72; B76/B78i run a pane on the modal and a pane
   on its prompt through the same 401/403 failover and look 60 s later — the first has its one Escape, the second none — and B78i makes the
   daemon read every screen as the modal to show that this check fails when a prompt pane is pressed).
+
+## The move to the account that resets first — when an account that answers is still the wrong one (ga-1yzovub)
+
+Athos 23/11, verbatim: «O que esta consumindo a conta throw away? Ela eh a ultima a resetar. Nao faz sentido algo estar conectado nela. Todo consumo
+deve estar concentrado na próxima conta a resetar consumo». The pool had sat on the 4th of 4 accounts (reset 27/11, 98% of the week) from 20/11 00:16
+to 23/11 08:50: a failover had put it there, and nothing took it back — the failback only returns to an account **this daemon saw rejected**, and the first
+account (reset 25/11, 21%) never was, so the registry was empty and "the active account answers" was reason enough to stay for ever.
+
+The rule (`prefer_ahead`, run when the active account answers and the failback did not move the pool): walk the accounts the order of use ranks
+**ahead** of the active one, best first, and move to the first that has all of this. Each line is a piece of evidence that can be *could not tell*,
+and then the account is **not a candidate this run** — nothing moves, nothing is registered, the next run asks again:
+
+| evidence | when it is missing or could not be told | what the daemon does |
+|---|---|---|
+| where the **active** account ranks | it is not in the order this run (the usage store lacks its row: B40) | no move at all — its position is unknown, which is not "last" (B79g) |
+| the candidate is **not in the exhausted registry** | it is there, expired or not | skipped in silence: coming back from a limit is the failback's rule, with its own evidence (B79f) |
+| a **good usage reading of the candidate itself** (`usage_readings`) | stale / failed collection (`ok=false`), no row, no usable `last_ok_at`, stamped ahead of the clock | skipped, **not probed**; one INFO line every 10th minute says why (B79d) |
+| its **key** | the vault gave nothing back this run (not registered, or unreadable — the library cannot tell which) | skipped; one INFO line every 10th minute (B79e) |
+| a **probe answers now** | `rejected` / 401 / 403 → registered like the candidate of a failover (and not asked again before its reset); anything else (5xx, network, redirect) → skipped, **not registered**, one INFO line | the next account ahead still gets its turn (B79c) |
+
+The first candidate that answers takes the pool (`SWITCH <active> -> <it> ... prefer: ...`; the decision file's `reason` starts with `prefer:`), so a run
+costs one probe per candidate tried and moves at most once; a run in which the failback moved the pool does not look for another, and the account ahead of
+the one it landed on waits for the next run (B79h). Nothing else changes: the failover (the active account rejected or refused) and the failback are exactly
+what they were, no utilization or warning moves the pool (B73), and the switch is still a script — no `claude`, no usage endpoint (B74, B75).
+
+To see why the pool is not on the first account of the order, read the log: `grep 'prefer:' <city>/.gc/logs/claude-pool-account.log` shows the switches and,
+every 10th minute, each account ranked ahead that was left out and why (a registered account is left out in silence). If the pool stays behind an account
+that is not in the registry and no `prefer:` line shows up over more than ten minutes, the rule is not reaching it: the active account is not in the order this
+run (see the `not in the order of use this run` line), the usage store gave no order at all, the daemon is stood down (kill switch, degraded marker) or could
+not read the pool item (locked Keychain: "the decision is left as it is"), or the active account's own probe did not answer (then the failover /
+cannot-tell rules above apply, not this one).
+
+Limits, said plainly. The reading gate is `usage_readings` (`stale`, `ok`, a zoned `last_ok_at` not ahead of the clock); it has no
+age bound, so a collector that stopped altogether leaves the last order frozen and this rule keeps acting on it — the probe is what keeps the move honest
+(an account that is exhausted answers 429 and is registered), and nothing here alerts on the collector. The rank follows `ordem_das_contas()`, so an
+account the store shows at 100% on a window is ranked **last** even while the API still answers it (a stale "esgotada" included, see "The way back
+waits for a fresh collection"): the pool then moves to the account ahead of it (B79b) and, once a collection ranks the first account first again, moves back
+by the same rule (B79). An
+account ranked ahead that is not registered, has a good reading and a key, but answers `cannot tell` every run, costs one probe per run for as long as
+it does.
 
 ## The guard — divergence alert, per-version test, the daemon's liveness and no key leaks (ga-8hcnvb.3)
 
@@ -286,7 +340,7 @@ first, delete last, and only when restarting the pool is acceptable.
 | `packs/town-deltas/assets/scripts/claude-pool-account.py` | the daemon (`run-once`) |
 | `packs/town-deltas/assets/scripts/claude-lowprio.sh` | wrapper: points a pool launch at the item (fail-open) |
 | `packs/town-deltas/assets/claude-pool-account.plist` | launchd job, not loaded by the merge |
-| `packs/town-deltas/assets/scripts/claude-pool-account.selftest.sh` | hermetic tests (fake security / vault / API / tmux / ps, real accounts lib; no real pane or process is ever looked at or pressed; runs under macOS bash 3.2); it also repoints every path it inherits (`GC_CITY_PATH`, `HOME`, the state / cred-dir / accounts-lib seams) at scratch, and D1 fails if a fixture line reached the log of the city it was launched from, D2 if the live pool credentials file changed during the run (metadata only: the file is never opened); it refuses to start (exit 2) without a scratch directory, or when `security` on its PATH is not the fake - otherwise B49b writes a fixture token into the REAL Keychain (found there 06/10: `Claude Code-credentials-0123abcd` holding `sk-ant-oat01-ALLOWED`). B73–B78 (ga-8hcnvb.2.2): no switch before the limit, no `claude` on the switch path, the request count of a steady run / failover / failback, a refused key on the active account, "cannot tell" is inert - and B78a–h run the same scenarios on a copy of the daemon with ONE property broken each, which must fail for the stated reason |
+| `packs/town-deltas/assets/scripts/claude-pool-account.selftest.sh` | hermetic tests (fake security / vault / API / tmux / ps, real accounts lib; no real pane or process is ever looked at or pressed; runs under macOS bash 3.2); it also repoints every path it inherits (`GC_CITY_PATH`, `HOME`, the state / cred-dir / accounts-lib seams) at scratch, and D1 fails if a fixture line reached the log of the city it was launched from, D2 if the live pool credentials file changed during the run (metadata only: the file is never opened); it refuses to start (exit 2) without a scratch directory, or when `security` on its PATH is not the fake - otherwise B49b writes a fixture token into the REAL Keychain (found there 06/10: `Claude Code-credentials-0123abcd` holding `sk-ant-oat01-ALLOWED`). B73–B78 (ga-8hcnvb.2.2): no switch on a header's warning or utilization, no `claude` on the switch path, the request count of a steady run / failover / failback, a refused key on the active account, "cannot tell" is inert; B79–B79h (ga-1yzovub): the move to the account that resets first (the incident's world, the store ranking the active account last, the candidate's own probe, a failed reading, no key, the registry, the active account missing from the order, one move per run) - and B78a–b and B78d–q (B78c is retired: its mutant became the feature) run the same scenarios on a copy of the daemon with ONE property broken each, which must fail for the stated reason |
 | `packs/town-deltas/assets/scripts/claude-pool-account.live-accept.sh` | acceptance on the real API + a live TUI session (+ the guard's real-claude self-test and the leakscan control); counts the daemon's requests and `claude` starts (P1f, P1g, P3.0b–P3.7). Needs an EXH account that is exhausted *now*: the default's weekly limit ran until 2026-10-07 ~22:00Z, so it is no longer known to be one |
 | `packs/town-deltas/assets/scripts/claude-pool-guard.py` | the guard (`run-once` / `status [--json]` / `selftest`) |
 | `packs/town-deltas/assets/claude-pool-guard.plist` | the guard's launchd job, not loaded by the merge |
@@ -375,7 +429,7 @@ modal waits for a key.
 ```
 
 The daemon sends that session **one key, Escape**, after the switch. The decision to switch is still the script's alone (Athos 04/10:
-only when the limit is hit, by a script, no `claude`/LLM in the path — what it costs is in "What it costs, and what it never does"); this only
+when the limit is hit - and, since Athos 23/11, to the account that resets first - by a script, no `claude`/LLM in the path; what it costs is in "What it costs, and what it never does"); this only
 finishes the switch for the sessions that cannot finish it themselves.
 
 **This is a scoped exception to the send-keys doctrine** (agents do not type into other agents' panes). It stands on the conditions
@@ -491,12 +545,15 @@ in the selftest ever touches a real pane.
 - A key the API **refuses** (401/403) is registered for an hour like a limit, but at that time it is **not** failed back
   to: the failback does not probe, and a key that is still refused would be written into the item and break every pool
   session until the next run — once an hour for as long as the key stays bad. It is dropped from the registry (with a
-  `dropped: its key was refused` log line) and probed the normal way when a later failover reaches it. Consequence: after such a key is fixed the pool does not return to
-  that account on its own; it moves there the next time the account in use is rejected.
+  `dropped: its key was refused` log line) and probed the normal way: by a later failover, or — since ga-1yzovub — on that very run by the
+  prefer rule, when the account ranks ahead of the one in use (one refused call, which costs nothing; while the key stays refused it is
+  registered again for another hour, which is also what a failover inside that hour finds: B32d, B32b). Consequence: once such a key is fixed the
+  pool goes back to that account on its own, at the next expiry of that hour, if it still ranks ahead.
   The same rule covers an `exhausted` entry that does not say why it was registered (`why` missing or not
   `rejected`/`invalid` — the daemon always records it, so only a state file edited by hand or written by something else
   lacks it): only an entry that says `rejected` is failed back to. The other is dropped at its time, with one `WARN`
-  (`does not say why it was registered`) and a `dropped:` line, and probed the normal way if a later failover reaches it.
+  (`does not say why it was registered`) and a `dropped:` line, and probed the normal way — by a later failover, or at once by the prefer rule
+  (B32c). The same goes for an entry whose reset time is garbage (`sanitize_state` drops it): the account is asked once, never moved to unasked (B22).
 - **The way back waits for a fresh collection.** The order of use comes from the usage store
   (`claude_usage.json`), which the collector rewrites every 30 min (`com.urblink.claude-usage-collector`,
   `StartInterval=1800`) while this daemon runs every 60 s: at the reset tick the order can be half an hour old, and a

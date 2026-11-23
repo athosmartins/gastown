@@ -768,14 +768,25 @@ EOF
   [ "$rc" = "1" ] && [ ! -e "$D/kc/items/$SVC" ] && [ ! -s "$D/probes.log" ] && ! grep -q "holds the lock" "$D/city/.gc/logs/claude-pool-account.log" \
     && ok "B21c a lock file that cannot be opened is an error (exit 1), not contention" || bad "B21c rc=$rc: $(cat "$D/city/.gc/logs/claude-pool-account.log" 2>/dev/null | head -c 200)"
 
-  # B22 a malformed exhausted entry is not 'recovered': no failback on a reset time nobody stored
+  # B22 a malformed exhausted entry is not 'recovered': no failback on a reset time nobody stored. sanitize_state drops the entry and says "it
+  # is probed again before any use"; since ga-1yzovub that is literally what happens - a ranks ahead of b and is no longer registered, so the prefer
+  # rule asks it (ONE probe). Here a still answers 429, so the pool stays on b and the answer registers a anew with a reset time the API gave
+  # (sane_reset: a number ahead of the clock and at most 31 days away - not the garbage that was stored).
+  sane_reset() { # sane_reset <account> <clock>
+    local r; r="$(jex "$1" reset_epoch)"; r="${r%%.*}"; case "$r" in ''|*[!0-9]*) return 1 ;; esac
+    [ "$r" -gt "${2%%.*}" ] && [ "$r" -le $(( ${2%%.*} + 31 * 86400 )) ]
+  }
   seeded; set_srv a@t.test 429 "$(hdr_rejected seven_day 2000000000)"; run_d -- run-once        # on b, a exhausted
-  edit_state 'st["exhausted"]["a@t.test"].pop("reset_epoch", None)'; pa0=$(probes_of a@t.test); run_d -- run-once
-  [ "$(jget "$STATE" current)" = "b@t.test" ] && [ "$(probes_of a@t.test)" = "$pa0" ] && [ -z "$(jex a@t.test why)" ] \
-    && ok "B22 exhausted entry without reset_epoch -> dropped, NOT a failback to a" || bad "B22 current='$(jget "$STATE" current)'"
+  edit_state 'st["exhausted"]["a@t.test"].pop("reset_epoch", None)'; pa0=$(probes_of a@t.test); w0=$(writes); run_d -- run-once
+  [ "$(jget "$STATE" current)" = "b@t.test" ] && [ "$(writes)" = "$w0" ] && [ "$(( $(probes_of a@t.test) - pa0 ))" = "1" ] && [ "$(jex a@t.test why)" = "rejected" ] \
+    && sane_reset a@t.test "$NOW_BASE" && grep -q "no usable reset_epoch - dropped" "$D/city/.gc/logs/claude-pool-account.log" \
+    && ok "B22 exhausted entry without reset_epoch -> dropped, NOT a failback to a: a is asked once (429), stays on b, registered anew with a believable reset" \
+    || bad "B22 current='$(jget "$STATE" current)' writes $w0 -> $(writes) a probed $pa0 -> $(probes_of a@t.test) a-entry='$(jex a@t.test why)' reset='$(jex a@t.test reset_epoch)'"
   seeded; set_srv a@t.test 429 "$(hdr_rejected seven_day 2000000000)"; run_d -- run-once
   edit_state 'st["exhausted"]["a@t.test"]["reset_epoch"] = "soon"'; run_d -- run-once
-  [ "$(jget "$STATE" current)" = "b@t.test" ] && [ "$(jex a@t.test why)" = "" ] && ok "B22b a non-numeric reset_epoch is dropped too (handled, not a crash)" || bad "B22b current='$(jget "$STATE" current)' a-entry='$(jex a@t.test why)'"
+  [ "$(jget "$STATE" current)" = "b@t.test" ] && [ "$(jex a@t.test why)" = "rejected" ] && sane_reset a@t.test "$NOW_BASE" \
+    && ok "B22b a non-numeric reset_epoch is dropped too (handled, not a crash): a is asked and registered anew" \
+    || bad "B22b current='$(jget "$STATE" current)' a-entry='$(jex a@t.test why)' reset='$(jex a@t.test reset_epoch)'"
   grep -q "unhandled" "$D/city/.gc/logs/claude-pool-account.log" 2>/dev/null && bad "B22b the daemon crashed on it instead of handling it"
   seeded; edit_state 'st["exhausted"]=["a@t.test"]'; w0=$(writes); run_d -- run-once; rc=$?
   [ "$rc" = "0" ] && [ "$(jget "$STATE" current)" = "a@t.test" ] && [ "$(writes)" = "$w0" ] && ok "B22c an 'exhausted' that is not an object -> dropped, run carries on, no rewrite" || bad "B22c rc=$rc current='$(jget "$STATE" current)'"
@@ -809,9 +820,10 @@ EOF
   for junk in 0 -5 1e30 '10**400' 4000000000 '2000000100 + 40*86400'; do
     seeded; set_srv a@t.test 429 "$(hdr_rejected seven_day 2000000000)"; run_d -- run-once          # on b, a exhausted
     edit_state "st[\"exhausted\"][\"a@t.test\"][\"reset_epoch\"]=$junk"; pa0=$(probes_of a@t.test); w0=$(writes); NOW_OVERRIDE=2000000100 run_d -- run-once
-    [ "$(jget "$STATE" current)" = "b@t.test" ] && [ "$(writes)" = "$w0" ] && [ "$(probes_of a@t.test)" = "$pa0" ] && [ -z "$(jex a@t.test why)" ] \
-      && ok "B22g reset_epoch=$junk -> dropped: no unprobed failback, no for-ever exclusion" \
-      || bad "B22g reset_epoch=$junk: current='$(jget "$STATE" current)' a-entry='$(jex a@t.test why)' writes $w0 -> $(writes)"
+    [ "$(jget "$STATE" current)" = "b@t.test" ] && [ "$(writes)" = "$w0" ] && [ "$(( $(probes_of a@t.test) - pa0 ))" = "1" ] && [ "$(jex a@t.test why)" = "rejected" ] \
+      && sane_reset a@t.test 2000000100 \
+      && ok "B22g reset_epoch=$junk -> dropped: no unprobed failback, no for-ever exclusion (a is asked once, still 429, and registered anew with a reset the clock can believe)" \
+      || bad "B22g reset_epoch=$junk: current='$(jget "$STATE" current)' a-entry='$(jex a@t.test why)' reset='$(jex a@t.test reset_epoch)' a probed $pa0 -> $(probes_of a@t.test) writes $w0 -> $(writes)"
   done
 
   # B23 a USER that is not a plain account name never reaches a security command line (exit 1: misconfigured, not 'idle')
@@ -905,18 +917,24 @@ print("OK" if n and n == pwd.getpwuid(os.getuid()).pw_name and m.valid_user(n) e
 
   # B32 an account whose KEY was refused (401/403) is not failed back to on its timer: the failback does not probe, so it would put a
   # key that is STILL refused into the item and break every pool session until the next run - once an hour, for as long as the key
-  # stays bad. It is probed again the normal way (pick_next, on a later failover).
+  # stays bad. It is probed again the normal way: by pick_next on a later failover, or - since ga-1yzovub - by the prefer rule on the very
+  # run that drops the entry, when the account ranks ahead of the one in use (B32d).
   seeded; set_srv a@t.test 401 '{}'; run_d -- run-once                                   # a's key refused -> on b, a registered 'invalid'
   [ "$(jget "$STATE" current)" = "b@t.test" ] && [ "$(jex a@t.test why)" = "invalid" ] || bad "B32 precondition: failover to b / a registered invalid (why='$(jex a@t.test why)')"
-  w0=$(writes); NOW_OVERRIDE=2000000000 run_d -- run-once                                 # an hour later; a still refused
+  w0=$(writes); pa0=$(probes_of a@t.test); NOW_OVERRIDE=2000000000 run_d -- run-once       # an hour later; a still refused
   [ "$(jget "$STATE" current)" = "b@t.test" ] && [ "$(item_token)" = "$TOKEN_b" ] && [ "$(writes)" = "$w0" ] \
     && ok "B32 invalid key past its cooldown -> NO unprobed failback (stays on b, item untouched)" \
     || bad "B32 current='$(jget "$STATE" current)' item=$(item_token | cut -c1-24) writes $w0 -> $(writes)"
-  [ -z "$(jex a@t.test why)" ] && grep -q "exhausted entry for a@t.test dropped: its key was refused" "$LOG" \
-    && ok "B32d the refused key's entry leaves the registry at its time WITH a line saying why (it used to go in silence)" \
-    || bad "B32d a-entry='$(jex a@t.test why)': $(grep -E 'dropped' "$LOG" | tail -n 1)"
-  set_srv b@t.test 429 "$(hdr_rejected five_hour 2000003600)"; set_srv a@t.test 200 "$HDR_OK"; NOW_OVERRIDE=2000000100 run_d -- run-once
-  [ "$(jget "$STATE" current)" = "a@t.test" ] && ok "B32b ...and once its key works again it is used the normal way: probed on the next failover (b rejected -> a)" \
+  # B32d the entry still leaves the registry at its time with a line saying why. Since ga-1yzovub the account is then ASKED once - a ranks ahead of
+  # b and is no longer registered - and while its key is still refused the 401 registers it again for another hour (what a failover's candidate gets, B76).
+  [ "$(( $(probes_of a@t.test) - pa0 ))" = "1" ] && [ "$(jex a@t.test why)" = "invalid" ] && sane_reset a@t.test 2000000000 \
+    && grep -q "exhausted entry for a@t.test dropped: its key was refused" "$LOG" \
+    && ok "B32d the refused key's entry leaves the registry at its time WITH a line saying why; a is asked once as a candidate (the failback did not probe it) and, still refused, registered again for an hour" \
+    || bad "B32d a-entry='$(jex a@t.test why)' a probed $pa0 -> $(probes_of a@t.test): $(grep -E 'dropped' "$LOG" | tail -n 1)"
+  # B32b ...and once its key works again it is used the normal way. B32d's probe registered a until 2000003600 and a failover inside that hour skips
+  # it like any candidate refused by a failover, so this one comes after it: b is rejected, a is no longer remembered, answers, and takes the pool.
+  set_srv b@t.test 429 "$(hdr_rejected five_hour 2000007200)"; set_srv a@t.test 200 "$HDR_OK"; NOW_OVERRIDE=2000003700 run_d -- run-once
+  [ "$(jget "$STATE" current)" = "a@t.test" ] && ok "B32b ...and once its key works again (and the hour is over) it is used the normal way: probed on the next failover (b rejected -> a)" \
     || bad "B32b current='$(jget "$STATE" current)'"
 
   # B32c the same for an exhausted entry that does not say WHY it was registered (this daemon always records `why`; a state file edited
@@ -927,11 +945,13 @@ print("OK" if n and n == pwd.getpwuid(os.getuid()).pw_name and m.valid_user(n) e
     seeded; set_srv a@t.test 429 "$(hdr_rejected seven_day 2000000000)"; run_d -- run-once        # on b, a registered 'rejected'
     [ "$(jget "$STATE" current)" = "b@t.test" ] && [ "$(jex a@t.test why)" = "rejected" ] || bad "B32c precondition: failover to b / a registered rejected (why='$(jex a@t.test why)')"
     edit_state "$edit"; pa0=$(probes_of a@t.test); w0=$(writes); NOW_OVERRIDE=2000000100 run_d -- run-once; rc=$?   # a's time has passed, a outranks b
+    # (a is then asked ONCE, as a candidate the order ranks ahead of b that is no longer registered - ga-1yzovub; it still answers 429, so the pool stays
+    # on b and that answer registers it anew with a reset time the clock can believe. What must not happen is a move on the stored entry without a probe.)
     [ "$rc" = "0" ] && [ "$(jget "$STATE" current)" = "b@t.test" ] && [ "$(item_token)" = "$TOKEN_b" ] && [ "$(writes)" = "$w0" ] \
-      && [ "$(probes_of a@t.test)" = "$pa0" ] && [ -z "$(jex a@t.test reset_epoch)" ] \
+      && [ "$(( $(probes_of a@t.test) - pa0 ))" = "1" ] && [ "$(jex a@t.test why)" = "rejected" ] && sane_reset a@t.test 2000000100 \
       && grep -q "exhausted entry for a@t.test does not say why it was registered" "$D/city/.gc/logs/claude-pool-account.log" \
-      && ok "B32c entry [$edit] -> NO unprobed failback (stays on b, item untouched), dropped, and a WARN says so" \
-      || bad "B32c [$edit]: rc=$rc current='$(jget "$STATE" current)' item=$(item_token | cut -c1-24) writes $w0 -> $(writes) a-entry='$(jex a@t.test reset_epoch)'"
+      && ok "B32c entry [$edit] -> NO unprobed failback (stays on b, item untouched), dropped with a WARN; a is asked once (429) and registered anew by that answer" \
+      || bad "B32c [$edit]: rc=$rc current='$(jget "$STATE" current)' item=$(item_token | cut -c1-24) writes $w0 -> $(writes) a probed $pa0 -> $(probes_of a@t.test) a-entry='$(jex a@t.test why)' reset='$(jex a@t.test reset_epoch)'"
   done
 
   # B33 what the active account just ANSWERED beats what was stored about it: if it is in the exhausted registry (all accounts had
@@ -1845,6 +1865,9 @@ EOF
   # FAIL. So each property has a scenario, and the scenario is run twice: on the real daemon (it must hold), and on a copy of the daemon
   # with that one property broken on purpose (it must NOT hold - B78). A scenario that passes on the broken copy proves nothing, and one
   # whose broken copy does not even run its world (`world:` in WHY) is reported as vacuous, not as caught.
+  # Athos 23/11 (ga-1yzovub) added ONE move the 04/10 rule did not have, and it is the only one besides the failback that leaves an account
+  # that answers: to an account the order of use ranks AHEAD of it that is not registered exhausted, has a good usage reading and answers a
+  # probe now (B79). "No claude, no usage endpoint, a script only" is unchanged and is still what B74 / B75 prove.
   REAL_D="$DAEMON"; REAL_SUM="$(shasum -a 256 < "$REAL_D" 2>/dev/null | cut -d' ' -f1)"      # B78z compares against this: empty = could not read it = the check fails
   n_reqs()      { [ -s "$D/probes.log.reqs" ] && wc -l < "$D/probes.log.reqs" | tr -d ' ' || echo 0; }
   n_served()     { awk '$3 >= 200 && $3 < 300' "$D/probes.log.reqs" 2>/dev/null | wc -l | tr -d ' '; }      # answered with a 2xx: the calls that cost something
@@ -1876,8 +1899,11 @@ EOF
     [ -z "$why" ] || WHY="$WHY [$1:$why]"
   }
 
-  # (c) NO switch before the limit is hit. The only thing that sends the pool away from an account that ANSWERS is the API saying
-  # "rejected" (a 429, or a rejected status in the unified headers). Not a utilization, not a warning, not the usage store's ranking.
+  # (c) NO switch before the limit is hit on what the API's HEADERS say. A utilization (95%, 99%, 100% without `rejected`) or a "warning" status never
+  # sends the pool away from an account that ANSWERS; what does is the API saying "rejected" (a 429, or a rejected status in the unified headers).
+  # Since ga-1yzovub (Athos 23/11) the usage store's RANKING moves the pool too - to an account the order puts AHEAD of the one in use that answers a
+  # probe now - but only through the evidence B79 pins (not registered exhausted, a good reading of that account, a probe that answers). So this
+  # scenario's worlds are the ones where nothing is ahead of a: the order cannot move the pool, and neither can a header.
   scn_no_early_switch() {
     local spec label st u5 u7 uw us w0
     for spec in "use-50|allowed|0.50|0.50" "warning-95|allowed_warning|0.95|0.60" "warning-99|allowed_warning|0.60|0.99" "use-100-but-not-rejected|allowed|1.0|1.0"; do
@@ -1887,7 +1913,10 @@ EOF
       run_d -- run-once; run_d -- run-once; run_d -- run-once
       still_a "$label" "$w0"
     done
-    for spec in "store-99|99|99" "store-100-and-the-API-answers|100|100" "store-weekly-100|100|0" "store-session-100|0|100"; do
+    # The store at 99% still ranks a FIRST (only 100% on a window ranks an account last), so nothing is ahead of a and nothing moves. The three
+    # worlds in which the store ranks a LAST while the API answers it are no longer in this list (ga-1yzovub): there an account ranked ahead that
+    # answers a probe now takes the pool, and they expect exactly that (scn_prefer_store, B79b).
+    for spec in "store-99|99|99"; do
       IFS='|' read -r label uw us <<< "$spec"
       seeded; world_ok || { WHY="world: the seed failed"; return; }
       w0=$(writes); store_use "$uw" "$us"
@@ -1896,8 +1925,8 @@ EOF
     done
   }
   WHY=""; scn_no_early_switch
-  [ -z "$WHY" ] && ok "B73 no switch before the limit: a answers 200 at 50% / warning at 95% and 99% / 100% but not rejected, and the usage store has a at 99% / 100% (weekly or session) - 3 runs each: stays on a, no item write, nothing registered, no candidate probed, no claude" \
-    || bad "B73 the pool moved (or probed, or started claude) with nothing rejected:$WHY"
+  [ -z "$WHY" ] && ok "B73 no switch before the limit on what the API's HEADERS say: a answers 200 at 50% / warning at 95% and 99% / 100% but not rejected, and the usage store has a at 99% (still ranked first) - 3 runs each: stays on a, no item write, nothing registered, no candidate probed, no claude" \
+    || bad "B73 the pool moved (or probed, or started claude) with nothing rejected and nothing ranked ahead of a:$WHY"
   # B73b the control: the same worlds CAN switch - the API rejecting is what does it (else B73 is a world in which nothing ever moves)
   seeded; world_ok && set_srv a@t.test 200 "$(hdr_use allowed_warning 0.99 0.99)" && run_d -- run-once && [ "$(jget "$STATE" current)" = "a@t.test" ] \
     && set_srv a@t.test 429 "$(hdr_rejected seven_day 2000000000)" && run_d -- run-once && on_b \
@@ -1989,6 +2018,191 @@ EOF
   WHY=""; scn_unknown
   [ -z "$WHY" ] && ok "B77 can't tell is inert: HTTP 400 / 404 / 408 / 500 / 502 / 503 / 529 on the active account change nothing and register nothing; a candidate that answers 500 is skipped without being marked exhausted" || bad "B77$WHY"
 
+  # ══ B79 (ga-1yzovub) the pool sits on the account the order of use ranks FIRST among those that can be used ═════════════════════════════
+  # Athos 23/11: "todo consumo deve estar concentrado na próxima conta a resetar consumo". The pool sat three days on the 4th of 4 accounts: a
+  # failover had put it there, the failback only returns to an account THIS daemon saw rejected, and the first account never was - so an
+  # account that merely answers was reason enough to stay for ever. Now, when the order of use ranks another account AHEAD of the active one,
+  # the pool moves to it, on pieces of evidence that can each be "could not tell" (and then NOTHING moves and nothing is registered):
+  #   0. the ACTIVE account is in the order this run (absent, where it ranks is unknown - not "last": B40, B79g);
+  #   1. the candidate is not in the exhausted registry (how an account comes back from a limit is the failback's rule, with its own evidence);
+  #   2. its OWN usage reading is good (not stale, not a failed collection): a rank built on a guess is no reason to leave an account that works;
+  #   3. its key came back from the vault this run;
+  #   4. a probe answers NOW (rejected / refused is registered like a failover candidate; a probe that cannot tell is skipped, not registered).
+  # The world of the incident: the pool is on c (a failover that was long forgotten, or a seed that found no key for a and b), a and b were
+  # never rejected, the registry is empty - so the failback has nothing to go back to. The failover rule itself is untouched (B75-B77).
+  R79=2000000000   # NOT the file's `R`: a pane test (B60+) reassigns R to a pane id such as %88, and $((R - 600)) then aborts the scenario
+  registry_empty() { case "$(jget "$STATE" exhausted)" in ""|"{}") return 0 ;; *) return 1 ;; esac; }
+  on_c() { [ "$(item_token)" = "$TOKEN_c" ] && [ "$(jget "$STATE" current)" = "c@t.test" ]; }
+  n_switches() { local n; n=$(grep -c ' SWITCH ' "$LOG" 2>/dev/null); echo "${n:-0}"; }
+  n_notes() { local n; n=$(grep -c 'is not a candidate this run' "$LOG" 2>/dev/null); echo "${n:-0}"; }   # the lines this rule says now and then about a candidate it left out
+  prefer_world() { # prefer_world <letters>...: seed the pool while those accounts have NO key in the vault (it lands on the first account that has one), then give the keys back
+    local l; new_d; for l in "$@"; do hide_key "$l@t.test"; done; run_d -- run-once; for l in "$@"; do show_key "$l@t.test"; done
+  }
+
+  scn_ok() { # scn_ok <id> <text>: a pass only if the scenario found nothing wrong AND ran to its last line (a command that fails inside a function can end it early, and an empty WHY then reads as 'nothing wrong')
+    if [ -z "$WHY" ] && [ "${SCN_END:-0}" = 1 ]; then ok "$1 $2"; else bad "$1${WHY:- the scenario stopped before its last line (a command in it failed)}"; fi
+  }
+
+  # the pool is on c; a and b rank ahead of it, were never rejected, and answer
+  scn_prefer() {
+    local r0 w0 s0 pb0
+    SCN_END=0
+    prefer_world a b
+    { on_c && registry_empty; } || { WHY="world: the pool was not seeded on c with nothing registered (current='$(jget "$STATE" current)')"; return; }
+    r0=$(n_reqs); w0=$(writes); s0=$(n_switches); pb0=$(probes_of b@t.test)
+    run_d -- run-once
+    { [ "$(jget "$STATE" current)" = "a@t.test" ] && [ "$(item_token)" = "$TOKEN_a" ]; } \
+      || WHY="$WHY [a ranks first, was never rejected and answers, but the pool stayed on '$(jget "$STATE" current)' (item $(item_token | cut -c1-24))];"
+    case "$(jget "$STATE" reason)" in prefer:*) ;; *) WHY="$WHY [the decision's reason is '$(jget "$STATE" reason)', want one that starts with prefer:];" ;; esac
+    [ "$(jget "$STATE" previous)" = "c@t.test" ] || WHY="$WHY [previous='$(jget "$STATE" previous)', want c@t.test];"
+    { [ "$(( $(n_switches) - s0 ))" = "1" ] && grep -q "SWITCH c@t.test -> a@t.test fp=.*: prefer: " "$LOG"; } \
+      || WHY="$WHY [the log does not show exactly one 'SWITCH c@t.test -> a@t.test ... prefer:' line];"
+    [ "$(( $(n_reqs) - r0 ))" = "2" ] || WHY="$WHY [the move made $(( $(n_reqs) - r0 )) requests, want 2 (the account in use, and the one it moves to)];"
+    [ "$(probes_of b@t.test)" = "$pb0" ] || WHY="$WHY [b was probed: the first account ahead that answers takes the pool, the rest are not asked];"
+    [ "$(( $(writes) - w0 ))" = "1" ] || WHY="$WHY [the item was written $(( $(writes) - w0 )) times, want 1];"
+    registry_empty || WHY="$WHY [an account was registered exhausted though nothing was rejected: $(jget "$STATE" exhausted)];"
+    # and then it stays: a is the first of the order, nothing is ahead of it, so a steady run is ONE request and writes nothing
+    r0=$(n_reqs); w0=$(writes); s0=$(n_switches); run_d -- run-once
+    { [ "$(jget "$STATE" current)" = "a@t.test" ] && [ "$(( $(n_reqs) - r0 ))" = "1" ] && [ "$(writes)" = "$w0" ] && [ "$(n_switches)" = "$s0" ]; } \
+      || WHY="$WHY [the run after the move was not steady: current='$(jget "$STATE" current)', $(( $(n_reqs) - r0 )) requests (want 1), writes $w0 -> $(writes)];"
+    [ "$(claude_calls)" = "0" ] || WHY="$WHY [started claude];"
+    SCN_END=1
+  }
+  # the three worlds in which the STORE ranks a last (100% on a window) while the API still answers it: b, ranked ahead and answering, takes the pool
+  scn_prefer_store() {
+    local spec label uw us r0
+    SCN_END=0
+    for spec in "store-100-and-the-API-answers|100|100" "store-weekly-100|100|0" "store-session-100|0|100"; do
+      IFS='|' read -r label uw us <<< "$spec"
+      seeded; world_ok || { WHY="world: the seed failed"; return; }
+      r0=$(n_reqs); store_use "$uw" "$us"
+      run_d -- run-once
+      on_b || WHY="$WHY [$label: the store ranks a last and b answers, but the pool is on '$(jget "$STATE" current)'];"
+      [ "$(( $(n_reqs) - r0 ))" = "2" ] || WHY="$WHY [$label: $(( $(n_reqs) - r0 )) requests, want 2 (a, then b)];"
+      registry_empty || WHY="$WHY [$label: nothing was rejected but the registry says $(jget "$STATE" exhausted)];"
+    done
+    SCN_END=1
+  }
+  # the candidate's OWN probe has the last word
+  scn_prefer_probe() {
+    local pa0 w0
+    SCN_END=0
+    # rejected: registered like the candidate of a failover, and the next account ahead still gets its turn
+    prefer_world a b; on_c || { WHY="world: the pool was not seeded on c"; return; }
+    set_srv a@t.test 429 "$(hdr_rejected seven_day 2000000000)"
+    run_d -- run-once
+    on_b || WHY="$WHY [a was rejected as a candidate: the pool is on '$(jget "$STATE" current)', want b (a skipped, b ahead of c and answering)];"
+    [ "$(jex a@t.test why)" = "rejected" ] || WHY="$WHY [a was rejected as a candidate but is registered as '$(jex a@t.test why)', want rejected];"
+    # registered means it is not asked again before its reset, whatever it answers meanwhile
+    set_srv a@t.test 200 "$HDR_OK"; pa0=$(probes_of a@t.test); w0=$(writes)
+    NOW_OVERRIDE=$((NOW_BASE + 60)) run_d -- run-once
+    { [ "$(probes_of a@t.test)" = "$pa0" ] && [ "$(writes)" = "$w0" ] && on_b; } \
+      || WHY="$WHY [a is registered rejected until its reset but was probed or moved to again (probes $pa0 -> $(probes_of a@t.test), current='$(jget "$STATE" current)')];"
+    # cannot tell (HTTP 500): skipped and NOT registered - the pool stays, and the next run asks again
+    prefer_world a; on_b || { WHY="$WHY world: the pool was not seeded on b"; return; }
+    set_srv a@t.test 500 '{}'; w0=$(writes)
+    run_d -- run-once
+    { on_b && [ "$(writes)" = "$w0" ]; } || WHY="$WHY [a answered 500 as a candidate: the pool moved or wrote (current='$(jget "$STATE" current)', writes $w0 -> $(writes))];"
+    { [ -z "$(jex a@t.test why)" ] && registry_empty; } || WHY="$WHY [a answered 500 as a candidate and was registered as '$(jex a@t.test why)': cannot-tell is not exhaustion];"
+    set_srv a@t.test 200 "$HDR_OK"; run_d -- run-once
+    [ "$(jget "$STATE" current)" = "a@t.test" ] || WHY="$WHY [a answers again and nothing was registered, but the pool stayed on '$(jget "$STATE" current)'];"
+    SCN_END=1
+  }
+  # the rank of a candidate is only worth ITS reading: a failed collection makes the order a guess
+  scn_prefer_reading() {
+    local pa0 pb0 w0 n0
+    SCN_END=0
+    prefer_world a b; on_c || { WHY="world: the pool was not seeded on c"; return; }
+    # c is ranked last by the store (its 5h window at 100%, while the API still answers it); the collections of a AND b both FAILED, so the
+    # order a, b, c is a guess for the two that are ahead of c
+    usage_store a:5:10:stale@$((R79 - 600)) b:5:10:stale@$((R79 - 600)) c:100:10:$((R79 - 600))
+    pa0=$(probes_of a@t.test); pb0=$(probes_of b@t.test); w0=$(writes); n0=$(n_notes)
+    NOW_OVERRIDE=$((R79 + 60)) run_d -- run-once                                    # not a minute on which the daemon says what it leaves out
+    { on_c && [ "$(writes)" = "$w0" ]; } || WHY="$WHY [a and b rank ahead of c on readings that FAILED, but the pool moved: current='$(jget "$STATE" current)', writes $w0 -> $(writes)];"
+    { [ "$(probes_of a@t.test)" = "$pa0" ] && [ "$(probes_of b@t.test)" = "$pb0" ]; } \
+      || WHY="$WHY [a candidate with a stale reading was probed (a $pa0 -> $(probes_of a@t.test), b $pb0 -> $(probes_of b@t.test))];"
+    [ "$(n_notes)" = "$n0" ] || WHY="$WHY [a candidate left out was logged on a run that is not due (the note is said every 10th minute, not every run)];"
+    NOW_OVERRIDE=$((R79 + 400)) run_d -- run-once                                   # a due minute: the silence is not silence
+    grep -q "prefer: a@t.test ranks ahead of c@t.test but is not a candidate this run - its last collection failed" "$LOG" \
+      || WHY="$WHY [on a due minute the log does not say why a is left out: $(tail -n 2 "$LOG" | cut -c1-160 | tr '\n' '|')];"
+    # the control, in the same world: a's collection did NOT fail. The only difference is the reading, and now a takes the pool
+    usage_store a:5:10:$((R79 - 600)) b:5:10:stale@$((R79 - 600)) c:100:10:$((R79 - 600))
+    NOW_OVERRIDE=$((R79 + 460)) run_d -- run-once
+    [ "$(jget "$STATE" current)" = "a@t.test" ] || WHY="$WHY [control: a has a good reading and ranks first, but the pool is on '$(jget "$STATE" current)'];"
+    SCN_END=1
+  }
+  # a key the vault does not give back this run is not a candidate - and is not "no such account": the next run asks again
+  scn_prefer_nokey() {
+    local pa0 w0 n0
+    SCN_END=0
+    prefer_world a; on_b || { WHY="world: the pool was not seeded on b"; return; }
+    hide_key a@t.test; pa0=$(probes_of a@t.test); w0=$(writes); n0=$(n_notes)
+    NOW_OVERRIDE=$((NOW_BASE + 60)) run_d -- run-once                             # not a due minute
+    { on_b && [ "$(writes)" = "$w0" ] && [ "$(probes_of a@t.test)" = "$pa0" ]; } \
+      || WHY="$WHY [a has no key this run: the pool must stay on b and a must not be probed (current='$(jget "$STATE" current)', a probed $pa0 -> $(probes_of a@t.test))];"
+    [ "$(n_notes)" = "$n0" ] || WHY="$WHY [a candidate without a key was logged on a run that is not due];"
+    NOW_OVERRIDE=$((NOW_BASE + 200)) run_d -- run-once                            # a due minute
+    grep -q "prefer: a@t.test ranks ahead of b@t.test but is not a candidate this run - no key came back from the vault" "$LOG" \
+      || WHY="$WHY [on a due minute the log does not say that a has no key: $(tail -n 2 "$LOG" | cut -c1-160 | tr '\n' '|')];"
+    show_key a@t.test; NOW_OVERRIDE=$((NOW_BASE + 260)) run_d -- run-once
+    [ "$(jget "$STATE" current)" = "a@t.test" ] || WHY="$WHY [the key is back and a ranks first, but the pool is on '$(jget "$STATE" current)'];"
+    SCN_END=1
+  }
+  # an account in the exhausted registry is the FAILBACK's business: not probed, not moved to, however well it answers
+  scn_prefer_registry() {
+    local pa0 w0
+    SCN_END=0
+    seeded; world_ok || { WHY="world: the seed failed"; return; }
+    fail_a; on_b || { WHY="world: the failover to b did not happen"; return; }
+    set_srv a@t.test 200 "$HDR_OK"; pa0=$(probes_of a@t.test); w0=$(writes)
+    NOW_OVERRIDE=$((NOW_BASE + 60)) run_d -- run-once                             # a's stored reset is ~11 days away: the entry stands
+    { on_b && [ "$(writes)" = "$w0" ] && [ "$(probes_of a@t.test)" = "$pa0" ] && [ "$(jex a@t.test why)" = "rejected" ]; } \
+      || WHY="$WHY [a is registered rejected until its reset, answers 200 and ranks first, yet the pool or the registry changed: current='$(jget "$STATE" current)', a probed $pa0 -> $(probes_of a@t.test), a's entry '$(jex a@t.test why)'];"
+    SCN_END=1
+  }
+  # the ACTIVE account is missing from the order (B40): where it ranks is unknown - not "last" - so the pool stays while it answers
+  scn_prefer_absent() {
+    local w0
+    SCN_END=0
+    seeded; world_ok || { WHY="world: the seed failed"; return; }
+    w0=$(writes)
+    "$PY3" - "$D/usage.json" <<'EOF'
+import json, sys
+d = json.load(open(sys.argv[1])); d["accounts"] = [a for a in d["accounts"] if a["email"] != "a@t.test"]; json.dump(d, open(sys.argv[1], "w"))
+EOF
+    run_d -- run-once
+    { world_ok && [ "$(writes)" = "$w0" ] && [ "$(probes_of b@t.test)" = "0" ] && [ "$(probes_of c@t.test)" = "0" ]; } \
+      || WHY="$WHY [a is missing from the order of use: the pool must stay on it and ask nobody (current='$(jget "$STATE" current)', writes $w0 -> $(writes), b/c probed $(probes_of b@t.test)/$(probes_of c@t.test))];"
+    SCN_END=1
+  }
+  # one move per run: a failback that took the pool IS the run's move, and the account ahead of the one it landed on waits for the next run
+  scn_prefer_onemove() {
+    local s0 pa0
+    SCN_END=0
+    new_d; hide_key a@t.test; run_d -- run-once                                    # the seed lands on b (a has no key yet)
+    on_b || { WHY="world: the pool was not seeded on b"; return; }
+    set_srv b@t.test 429 "$(hdr_rejected seven_day $R79)"; NOW_OVERRIDE=$((R79 - 3600)) run_d -- run-once      # b -> c (a still has no key); b registered until R79
+    on_c || { WHY="world: the failover b -> c did not happen (current='$(jget "$STATE" current)')"; return; }
+    show_key a@t.test; set_srv b@t.test 200 "$HDR_OK"
+    usage_store a:5:10:$((R79 + 30)) b:5:10:$((R79 + 30)) c:5:10:$((R79 + 30))          # collected AFTER b's reset: the order is a, b, c
+    s0=$(n_switches); pa0=$(probes_of a@t.test)
+    NOW_OVERRIDE=$((R79 + 60)) run_d -- run-once                                    # c answers: b has recovered and ranks ahead of c -> failback; a (ahead of b) must wait
+    { [ "$(jget "$STATE" current)" = "b@t.test" ] && [ "$(( $(n_switches) - s0 ))" = "1" ] && [ "$(probes_of a@t.test)" = "$pa0" ]; } \
+      || WHY="$WHY [the failback to b took the pool, but the run moved again or asked a: current='$(jget "$STATE" current)', switches +$(( $(n_switches) - s0 )), a probed $pa0 -> $(probes_of a@t.test)];"
+    NOW_OVERRIDE=$((R79 + 120)) run_d -- run-once                                   # the next run: b answers, a ranks ahead of it and was never rejected
+    [ "$(jget "$STATE" current)" = "a@t.test" ] || WHY="$WHY [the next run did not move on to a: current='$(jget "$STATE" current)'];"
+    SCN_END=1
+  }
+
+  WHY=""; scn_prefer; scn_ok B79 "the incident: the pool is on c, a and b rank ahead of it and were never rejected -> it moves to a, the first that answers (reason 'prefer:', 2 requests, b not even asked, nothing registered), then stays: one request a run, no more writes"
+  WHY=""; scn_prefer_store; scn_ok B79b "the store ranks a LAST (100% weekly / 5h / both) while the API still answers it -> b, ranked ahead and answering, takes the pool (2 requests, nothing registered)"
+  WHY=""; scn_prefer_probe; scn_ok B79c "the candidate's own probe has the last word: rejected -> registered, not asked again before its reset, and the next account ahead gets its turn; HTTP 500 -> skipped, NOT registered, the next run asks again"
+  WHY=""; scn_prefer_reading; scn_ok B79d "a candidate whose own reading FAILED is not asked and not moved to (said on a due minute, silent on the others); the same world with a good reading moves"
+  WHY=""; scn_prefer_nokey; scn_ok B79e "a candidate whose key does not come from the vault is not asked and not moved to (said on a due minute); once the key is back the pool moves"
+  WHY=""; scn_prefer_registry; scn_ok B79f "an account in the exhausted registry is the failback's: not probed and not moved to, however well it answers"
+  WHY=""; scn_prefer_absent; scn_ok B79g "the active account missing from the order of use: its rank is unknown, not last - the pool stays and asks nobody"
+  WHY=""; scn_prefer_onemove; scn_ok B79h "one move per run: a failback that took the pool is the run's move (a, ahead of it, is not asked); the next run moves on to a"
+
   # B78 the same scenarios on a daemon with ONE property broken each: every one must be caught
   mutant() { # mutant <name> <old text> <new text>: a copy of the daemon with exactly one occurrence of <old> replaced (prints its path; nothing if <old> is not there exactly once or the copy does not compile)
     local out="$W/mut/$1/claude-pool-account.py"; mkdir -p "$W/mut/$1"
@@ -2017,7 +2231,19 @@ EOF
   CL='rejected = status == 429 or overall == "rejected" or any(v == "rejected" for v in windows.values())'
   caught B78a "a warning (allowed_warning) read as a limit"      scn_no_early_switch "$(mutant warn "$CL" "$CL or overall == \"allowed_warning\" or any(v == \"allowed_warning\" for v in windows.values())")" "[warning-95: left a"
   caught B78b "a utilization of 95% read as a limit"              scn_no_early_switch "$(mutant util "$CL" "$CL or any(float(h.get(f\"{pre}{w}-utilization\", \"0\") or 0) >= 0.95 for w in (\"5h\", \"7d\"))")" "[warning-95: left a"
-  caught B78c "a switch to a better-ranked account while the active one answers" scn_no_early_switch "$(mutant rank '        # active account answers. What it just answered beats anything stored about it.' "        # active account answers. What it just answered beats anything stored about it.${NL}        _g = pick_next(st, order, keys, {cur}, t)${NL}        if _g and cur in order and order.index(_g[0]) < order.index(cur):${NL}            switch_to(st, user, _g[0], _g[1], 'mutant: ranked ahead', t)${NL}            return")" "[store-100-and-the-API-answers: left a"
+  # B78c used to break "never leave an account that answers because of where the store ranks it" and was caught by B73's three 100%-store
+  # worlds. That is now the DESIRED move (ga-1yzovub, B79), so there is no such mutant any more: B78j-B78q are the copies of the daemon that break
+  # the move itself (it never runs: the incident's code) and each piece of the evidence it rests on - a probe, the registry, a good reading, the
+  # active account's own position, one move per run, a candidate that cannot be told, and the note that is said now and then rather than every run.
+  PR='        cand = probe(tok)'
+  caught B78j "the prefer move never run (the daemon the bead was about)"   scn_prefer "$(mutant noprefer '            prefer_ahead(st, keys, order, readings, user, cur, t)' '            pass')" "[a ranks first, was never rejected and answers, but the pool stayed on"
+  caught B78k "the candidate moved to WITHOUT a probe (anything ahead taken as answering)" scn_prefer_probe "$(mutant noprobe "$PR" '        cand = Probe("allowed", None, "", "mutant: not asked")')" "[a was rejected as a candidate: the pool is on"
+  caught B78l "the exhausted registry ignored (a registered account is probed and moved to)" scn_prefer_registry "$(mutant noreg '        if e in ex:' '        if False:')" "[a is registered rejected until its reset"
+  caught B78m "the candidate's own reading ignored (a failed collection ranks it)" scn_prefer_reading "$(mutant noread '        if read_at is None:' '        if False:')" "[a and b rank ahead of c on readings that FAILED, but the pool moved"
+  caught B78n "the active account missing from the order ranked LAST (so anything is ahead of it)" scn_prefer_absent "$(mutant absent '    pos = order.index(cur) if cur in order else None' '    pos = order.index(cur) if cur in order else len(order)')" "[a is missing from the order of use"
+  caught B78o "a second move in the same run, after the failback already moved the pool" scn_prefer_onemove "$(mutant twice '        if st.get("current") == cur:' '        if True:')" "[the failback to b took the pool, but the run moved again"
+  caught B78p "a candidate that cannot be told registered as exhausted" scn_prefer_probe "$(mutant unreg '        if cand.verdict in ("rejected", "invalid"):' '        if True:')" "[a answered 500 as a candidate and was registered"
+  caught B78q "the note about a candidate left out said on EVERY run" scn_prefer_reading "$(mutant chatty "    if int(now() // 60) % SILENT_DROP_LOG_EVERY_MIN == 0:${NL}        log(\"INFO\", f\"prefer: {e} ranks" "    if True:${NL}        log(\"INFO\", f\"prefer: {e} ranks")" "[a candidate left out was logged on a run that is not due"
   caught B78d "claude started inside switch_to"                   scn_no_claude "$(mutant spawn "$SW" "$SW${NL}    subprocess.run(['claude', '--version'], capture_output=True, timeout=5, check=False)")" "[claude was started"
   caught B78e "a call to a usage / balance endpoint inside switch_to" scn_requests "$(mutant balance "$SW" "$SW${NL}    try:${NL}        urllib.request.urlopen(urllib.request.Request(probe_url().replace('/v1/messages', '/api/oauth/usage'), headers={'authorization': 'Bearer ' + token}), timeout=5).read()${NL}    except Exception:${NL}        pass")" "request(s) that are not POST /v1/messages"
   caught B78f "a confirmation probe of the account a failback returns to" scn_requests "$(mutant fbprobe '        key = keys.token(e)' "        key = keys.token(e)${NL}        probe(key) if key else None")" "the failback probed the account it returns to"

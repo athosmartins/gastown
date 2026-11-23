@@ -18,12 +18,16 @@ One run (launchd StartInterval, single instance via flock):
   * no usable decision yet            -> seed with the first account of the order that answers a probe.
   * the active account is REJECTED    -> failover: first account of the order that is not known-exhausted and
     (HTTP 429 / a *-status of "rejected")   answers a probe. The rejection's reset time is stored.
-  * the active account answers        -> stay. Failback only to an account that WE saw exhausted (rate-limited, not
-                                         key-refused), whose stored reset time has passed, whose usage reading in
-                                         the usage store was taken AFTER that reset, and which that fresh reading
-                                         ranks ahead of the active one — with NO probe of it (Mayor 04/10: no
-                                         balance probe on the way back; if it has not really renewed, its 429 simply
-                                         triggers the failover again).
+  * the active account answers        -> stay, with two exceptions - each on evidence that can be "could not tell", and then nothing moves:
+      - failback: to an account that WE saw exhausted (rate-limited, not key-refused), whose stored reset time has
+        passed, whose usage reading in the usage store was taken AFTER that reset, and which that fresh reading
+        ranks ahead of the active one — with NO probe of it (Mayor 04/10: no balance probe on the way back; if it
+        has not really renewed, its 429 simply triggers the failover again).
+      - prefer (ga-1yzovub; Athos 23/11: all consumption belongs on the next account to reset): to the first account
+        the order of use ranks AHEAD of the active one that is not in the exhausted registry, has a good usage
+        reading of its OWN, has its key in the vault and answers a probe NOW. Failback only goes back to an account we
+        saw exhausted, so without this a pool that a failover once put on the 4th account stayed there while it answered.
+    One move per run: a run in which the failback moved the pool does not look for another.
   * the probe could not tell (network, 5xx, anything not 2xx/429/401/403) -> no failover and no failback: the DECISION does
     not change. Error != exhausted. (The run still goes on to heal_item, which may put the item back to the decision
     already taken - the item following the decision, not the probe changing it.)
@@ -52,7 +56,8 @@ the probe and as the hex of a `security -i` command on STDIN. They are never in 
 accounts are named by e-mail + sha256[:8] fingerprint.
 
 The vault is read LAZILY (Keys): the key of the CURRENT account every run, the keys of the candidates only when the pool
-has to move (seed, failover, failback). `token_da_conta` returns None both for "no key registered" and for "vault
+has to move (seed, failover, failback) or when an account is ranked ahead of the active one (prefer: only one that is not
+registered exhausted and has a good reading of its own). `token_da_conta` returns None both for "no key registered" and for "vault
 unreadable just now", so a None for the current account is NOT "its key is gone": the Keychain item this daemon wrote
 (and the fingerprint in the state) is the second witness. Item holds the decision's credential -> keep the decision and
 probe THAT token; item cannot be read -> change nothing; item missing or holding something else -> choose again.
@@ -1404,6 +1409,60 @@ def failback(st: dict, keys: Keys, order: List[str], readings: Dict[str, Tuple[O
         break
 
 
+def note_not_a_candidate(e: str, cur: str, why: str) -> None:
+    """What prefer_ahead leaves out for want of evidence, said now and then (SILENT_DROP_LOG_EVERY_MIN) and not on every run: it can last for
+    hours (a collection that keeps failing, an account with no key yet) and this daemon runs every minute. Said never, a candidate left out
+    would look in the log like 'nothing ranks ahead of the active account' (the pool sat three days on the wrong account with no line to say why)."""
+    if int(now() // 60) % SILENT_DROP_LOG_EVERY_MIN == 0:
+        log("INFO", f"prefer: {e} ranks ahead of {cur} but is not a candidate this run - {why}")
+
+
+def prefer_ahead(st: dict, keys: Keys, order: List[str], readings: Dict[str, Tuple[Optional[float], str]], user: str, cur: str, t: float) -> None:
+    """The active account answers. Move the pool to the account the order of use ranks AHEAD of it. The order spends first what expires
+    first (lib/claude_account_pool.py), so an account that merely answers while a better ranked one is free is consumption in the wrong place
+    (Athos 23/11: three days on the 4th of 4 - a failover had put the pool there, and the failback only goes back to an account WE saw
+    rejected, which the first one never was). Each piece of evidence can be 'could not tell', and then nothing moves and nothing is registered:
+
+      1. where the active account ranks - it has to be in the order this run; absent, its position is unknown (B40: not 'last');
+      2. the candidate is not in the exhausted registry - the way back from a limit is failback's, and it has its own evidence;
+      3. the candidate has a good usage reading of its OWN (usage_readings): a rank built on a failed collection is a guess;
+      4. its key came back from the vault this run;
+      5. a probe of it answers NOW: 'rejected'/'invalid' is registered like the candidate of a failover, 'unknown' is skipped, not registered.
+
+    The first candidate that answers takes the pool: one probe per account tried, at most one move per run (decide does not get here when
+    the failback already moved it). No `claude`, no usage endpoint - the probe is the same 1-token call."""
+    # vazio → the active account is not in the order this run: where it ranks is unknown, so nothing is "ahead" of it and nothing moves; falhou/ilegível → the same (a lookup in a list)
+    pos = order.index(cur) if cur in order else None
+    if pos is None:
+        return
+    # vazio → no registry yet: nobody is left out; falhou/ilegível → n/a (sanitize_state already dropped a registry that is not an object)
+    ex = st.get("exhausted", {})
+    for e in dict.fromkeys(order[:pos]):
+        if e in ex:
+            continue
+        # vazio → no row for it (NO_ROW); falhou/ilegível → (None, why): either way its rank is a guess, so it is not a candidate this run
+        read_at, why_not = readings.get(e, (None, NO_ROW))
+        if read_at is None:
+            note_not_a_candidate(e, cur, why_not)
+            continue
+        # vazio → no key came back (Keys cannot tell 'no key registered' from 'vault unreadable'): not a candidate this run; falhou/ilegível → the same
+        tok = keys.token(e)
+        if not tok:
+            note_not_a_candidate(e, cur, "no key came back from the vault this run")
+            continue
+        # vazio → n/a (a probe always has a verdict); falhou/ilegível → verdict 'unknown': skipped this run and NOT registered
+        cand = probe(tok)
+        if cand.verdict == "allowed":
+            if not switch_to(st, user, e, tok, f"prefer: {e} ranks ahead of {cur} (resets first) and answers a probe", t):
+                # The write failed, so the move did NOT happen; a write that is refused is refused for the next account too: stop here.
+                log("WARN", f"prefer: move to {e} not done (the pool item could not be switched) - {cur} keeps the pool, the next run asks again")
+            return
+        if cand.verdict in ("rejected", "invalid"):
+            register_exhausted(st, e, cand, t)
+        else:
+            log("INFO", f"prefer: {e} fp={fingerprint(tok)} probe={cand.verdict} {cand.detail} - skipped this run, not registered")
+
+
 def decide(st: dict, keys: Keys, order: List[str], readings: Dict[str, Tuple[Optional[float], str]], user: str, t: float) -> None:
     sanitize_state(st, t)
     cur = st.get("current")
@@ -1431,6 +1490,8 @@ def decide(st: dict, keys: Keys, order: List[str], readings: Dict[str, Tuple[Opt
         if ex.pop(cur, None) is not None:
             log("INFO", f"exhausted entry for {cur} dropped: it answered the probe, which beats what was stored about it")
         failback(st, keys, order, readings, user, cur, t)
+        if st.get("current") == cur:   # the failback did not move the pool: a failback that did IS the run's one move
+            prefer_ahead(st, keys, order, readings, user, cur, t)
     now_cur = st.get("current")
     if kind == "item" and now_cur == cur:
         # the key of the decision never came from the vault and the item IS that key: nothing to heal the ITEM against - but that key is the
