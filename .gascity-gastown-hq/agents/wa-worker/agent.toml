@@ -146,7 +146,8 @@ min_active_sessions = 0
 # missao ga-v8p1tx.1 (volta a 1 se disco < 6000 MB ou swap > 6 GB). Junto: PILOT_LOCAL_BUILDER_MAX 1 -> 3 no plist do Pilot.
 # Mayor 2026-11-21 19:0x (freio da decisao «3 com freio»): 3 -> 2. Disco 6343 MB (piso 6000 chegando pelo swapfile), load 82/10 nucleos, gc mail estourando 120 s, gate 0 na ultima hora.
 # Mayor 2026-11-23 00:0x (regra horaria ga-v8p1tx.1): 2 -> 3. Disco 11925 MB, swap 0 (mini reiniciou 23:41), fila do gate 4; foco Joice SDR na madrugada.
-max_active_sessions = 3
+# Mayor 2026-11-23 10:1x (regra horaria ga-v8p1tx.1): freio 3 -> 2. Disco 5384 MB (< 6000), swap 2,4 GB, load 57; Dolt reiniciou 09:52.
+max_active_sessions = 2
 idle_timeout = "2h"
 wake_mode = "fresh"
 model = "sonnet"

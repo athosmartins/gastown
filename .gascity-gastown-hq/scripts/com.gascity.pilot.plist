@@ -4,8 +4,7 @@
 <dict>
 	<key>EnvironmentVariables</key>
 	<dict>
-		<key>BEADS_DOLT_SERVER_PORT</key>
-		<string>52756</string>
+		<!-- ga-3v2zt00 (Mayor 23/11): sem porta fixa do Dolt; bd acha a porta viva por .beads/dolt-server.port -->
 		<key>GC_CITY_PATH</key>
 		<string>/Users/athos/gt/.gascity-gastown-hq</string>
 		<key>GC_VARIABLE_SESSION_MAX</key>
@@ -28,8 +27,9 @@
 		<!-- Mayor 2026-11-21 (decisao do Athos «3 com freio automatico»): 1 -> 3; freio = pool-ceiling-engine + regra horaria da missao ga-v8p1tx.1 (volta a 1 se disco < 6000 MB ou swap > 6 GB) -->
 		<!-- Mayor 2026-11-21 19:0x: freio 3 -> 2 (disco 6343 MB, load 82) nos dois tetos do Pilot -->
 		<!-- Mayor 2026-11-23 00:0x: 2 -> 3 (disco 11925 MB, swap 0) pela regra horaria ga-v8p1tx.1 -->
+		<!-- Mayor 2026-11-23 10:1x: freio 3 -> 2 (disco 5384 MB) pela regra horaria ga-v8p1tx.1 -->
 		<key>PILOT_LOCAL_BUILDER_MAX</key>
-		<string>3</string>
+		<string>2</string>
 		<key>PILOT_NODE_FIRST</key>
 		<string>on</string>
 		<key>PILOT_PS_NODE_ROUTE</key>
@@ -56,7 +56,7 @@
 		<string>pilot</string>
 		<!-- Mayor 2026-11-21 14:1x (decisao do Athos «3 com freio automatico»): PILOT_WA_WORKER_MAX 1 -> 3; o teto por pool do Pilot tambem segurava o wa-worker em 1 depois de 6eac23dc9 -->
 		<key>PILOT_WA_WORKER_MAX</key>
-		<string>3</string>
+		<string>2</string>
 	</dict>
 	<key>Label</key>
 	<string>com.gascity.pilot</string>
