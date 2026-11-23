@@ -65,8 +65,8 @@ echo ""
 echo "── Scenario: the sampler's reading, world by world (ga-hq1qc5y, hq-mutants lastro) ──"
 # One in-process python run. Every external read (sh, bd_list, ps_count, dolt_ok) is a stub, so each case is a small world whose record is known by hand: every flag of the
 # record is read on both sides of its edge (a bead exactly BUILD_FRESH_SEC old, a marker exactly GATE_STALL_MIN old, the 3-column row of `gc session list`).
-# EQUIVALENT, documented: 304e0ebd20 (`a > gate_oldest_queued_min` -> `>=`: at equality it assigns the same number).
-# EQUIVALENT 304e0ebd20: `a > gate_oldest_queued_min` -> `>=`: at equality it assigns the same number
+# EQUIVALENT, documented: a7eedf5b30 (`a > gate_oldest_queued_min` -> `>=`: at equality it assigns the same number).
+# EQUIVALENT a7eedf5b30: `a > gate_oldest_queued_min` -> `>=`: at equality it assigns the same number (re-declared under the id the line has since moved to; the old id 304e0ebd20 is no longer generated)
 PYT='
 import contextlib, datetime, importlib.util, io, json, os, sys, tempfile, types
 for k in ("UTIL_OUT", "UTIL_NOTIFY", "UTIL_BUILD_FRESH_SEC", "UTIL_GATE_STALL_MIN"):
@@ -107,6 +107,20 @@ m.sh = fake_sh("ID TEMPLATE STATE AGE\ns1 gastown.dog active 5m\ns2 x active\ns3
 eq("active_sessions: header, short and asleep rows skipped, three columns are enough, 25 s", (m.active_sessions(), calls[-1][1]), ({"gastown.dog": 1, "x": 2}, 25))
 m.sh = fake_sh("1\n"); eq("dolt_ok: 10 s, true on a 1", (m.dolt_ok(), calls[-1][1]), (True, 10))
 m.sh = fake_sh(""); eq("dolt_ok: false on silence", m.dolt_ok(), False)
+def city_of(**env):
+    saved = {k: os.environ.pop(k, None) for k in ("GC_CITY", "GC_CITY_PATH")}
+    os.environ.update(env)
+    try:
+        m.sh = fake_sh("1\n"); m.dolt_ok()
+        return calls[-1][0][-1]
+    finally:
+        for k in ("GC_CITY", "GC_CITY_PATH"):
+            os.environ.pop(k, None)
+        os.environ.update({k: v for k, v in saved.items() if v is not None})
+eq("dolt_ok city: GC_CITY wins over GC_CITY_PATH", city_of(GC_CITY="/a", GC_CITY_PATH="/b"), "/a")
+eq("dolt_ok city: GC_CITY alone", city_of(GC_CITY="/a"), "/a")
+eq("dolt_ok city: GC_CITY_PATH when GC_CITY is unset or empty", (city_of(GC_CITY_PATH="/b"), city_of(GC_CITY="", GC_CITY_PATH="/b")), ("/b", "/b"))
+eq("dolt_ok city: neither set -> the default city", city_of(), "/Users/athos/gt/.gascity-gastown-hq")
 m.sh = fake_sh("196.94"); eq("dolt_cpu_pct: one decimal, 8 s", (m.dolt_cpu_pct(), calls[-1][1]), (196.9, 8))
 m.sh = fake_sh("x"); eq("dolt_cpu_pct: junk is None", m.dolt_cpu_pct(), None)
 m.dolt_ok = lambda: False; m.dolt_cpu_pct = lambda: 12.5

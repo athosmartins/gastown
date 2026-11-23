@@ -228,10 +228,10 @@ sc_porta_arquivo() {   # no live server, or one whose LISTEN line cannot be read
   local b="$SCRATCH/pt2/bin" c="$SCRATCH/pt2/city"
   mkportcity "$c"; printf '4444\n' > "$c/.beads/dolt-server.port"; mkport_stubs "$b" "" listen 3333
   run_port "$b" "$c" BEADS_DOLT_PORT=2222
-  assert_eq "no live server: the port file wins over the pin" 4444 "$GOT"
+  assert_eq "no live server: the port file wins over the pin" 4444 "$GOT"; assert_eq "port file as the answer: rc 0" 0 "$GOT_RC"
   mkport_stubs "$b" "$REAL_PID" nolisten 3333
   run_port "$b" "$c" BEADS_DOLT_PORT=2222
-  assert_eq "live server with unreadable LISTEN: falls to the port file, not to a default" 4444 "$GOT"
+  assert_eq "live server with unreadable LISTEN: falls to the port file, not to a default" 4444 "$GOT"; assert_eq "unreadable LISTEN falling to the port file: rc 0" 0 "$GOT_RC"
 }
 sc_porta_pin_ultimo() {   # the legacy pin is the LAST resort; a junk port file does not count as an answer
   local b="$SCRATCH/pt3/bin" c="$SCRATCH/pt3/city"
@@ -273,7 +273,7 @@ sc_porta_viva_estrita() {   # gate round 2 (ga-3v2zt00): the strict "live" answe
   run_live "$b" "$c" BEADS_DOLT_PORT=2222
   assert_eq "verified server: the LISTEN port" 3333 "$GOT"; assert_eq "verified server: rc 0" 0 "$GOT_RC"
   run_live "$b" "$c" GC_DOLT_PORT_OVERRIDE=1
-  assert_eq "the explicit override still answers" 1 "$GOT"
+  assert_eq "the explicit override still answers" 1 "$GOT"; assert_eq "the explicit override answers with rc 0 (the lib contract: a port printed comes with rc 0, empty comes with rc 1)" 0 "$GOT_RC"
   run_port "$b" "$c" BEADS_DOLT_PORT=2222   # the loose half still works for connect-only callers
   assert_eq "dolt_server_port is unchanged for a live server" 3333 "$GOT"
   mkport_stubs "$b" "" listen 3333
