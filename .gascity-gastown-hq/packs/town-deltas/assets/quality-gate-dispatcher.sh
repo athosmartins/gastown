@@ -13429,7 +13429,16 @@ gate_collect_verdicts() {
         # its reason. Parse .text (with .body kept as a defensive fallback for
         # any future schema drift), preferring the comment that starts with
         # "VERDICT:" (the reviewer convention), else the first non-empty one.
-        VB_COMMENTS_JSON=$(bd -C "$GC_CITY" comments "$VB" --json 2>/dev/null || echo "[]")
+        # ga-g8dmmyf: the PASS branch below already keeps a FAILED read apart from an empty one
+        # (ga-w7pm55, VB_COMMENTS_READ_OK); this FAIL branch still collapsed the two, so a `bd comments`
+        # that failed was reported to the builder as a reviewer who "left no parseable reason". The
+        # decision does not move (a verdict:FAIL label blocks the merge either way) — the sentence does.
+        # vazio (comments read fine, no parseable text) → the INCONCLUSIVE wording below; falhou/ilegível (bd comments rc != 0) → VB_COMMENTS_READ_OK=0, still a FAIL, but the warning and the builder text say the comments could not be read
+        VB_COMMENTS_READ_OK=1
+        if ! VB_COMMENTS_JSON=$(bd -C "$GC_CITY" comments "$VB" --json 2>/dev/null); then
+          VB_COMMENTS_JSON="[]"
+          VB_COMMENTS_READ_OK=0
+        fi
         FAIL_COMMENT=$(printf '%s' "$VB_COMMENTS_JSON" | jq -r '
             [ .[]? | (.text // .body // "") ]
             | ( map(select(test("^\\s*VERDICT:"; "i"))) | last )
@@ -13438,8 +13447,9 @@ gate_collect_verdicts() {
           ' 2>/dev/null || echo "")
         # FORENSICS (ga-kf0v #3): always log the raw comments + verdict labels
         # for a FAIL so any future schema/field drift is visible in the
-        # dispatcher log without re-deriving from beads.
-        log "  FAIL forensics reviewer $((j+1)) bead=$VB labels=[$VB_LABELS] raw_comments=$(printf '%s' "$VB_COMMENTS_JSON" | jq -c . 2>/dev/null | cut -c1-2000)"
+        # dispatcher log without re-deriving from beads. ga-g8dmmyf: a FAILED read prints UNREADABLE,
+        # not the "[]" it was swapped for above — that would read as "the reviewer wrote nothing".
+        log "  FAIL forensics reviewer $((j+1)) bead=$VB labels=[$VB_LABELS] raw_comments=$(if [ "$VB_COMMENTS_READ_OK" = "1" ]; then printf '%s' "$VB_COMMENTS_JSON" | jq -c . 2>/dev/null | cut -c1-2000; else printf 'UNREADABLE (bd comments failed)'; fi)"
         if [ -z "$FAIL_COMMENT" ]; then
           # Reviewer closed verdict:FAIL but left no parseable reason. Now rare
           # (the .text fix above resolves the common case). Fail-safe: PASS is
@@ -13450,8 +13460,13 @@ gate_collect_verdicts() {
           # a reviewer mid-collection is higher-risk than this lane:small fix
           # warrants; making the empty case visible addresses the intent without
           # destabilising the gate's verdict-collection loop.)
-          warn "Reviewer $((j+1)) (bead $VB) closed verdict:FAIL with no parseable reason — counting as INCONCLUSIVE FAIL (fail-safe)."
-          FAIL_COMMENT="INCONCLUSIVE — verdict:FAIL with empty/unparseable reason (raw bead $VB; see forensics log above)"
+          if [ "$VB_COMMENTS_READ_OK" = "0" ]; then
+            warn "Reviewer $((j+1)) (bead $VB) closed verdict:FAIL and its comments could NOT be read (bd comments failed) — the reason exists but is unread here; counting FAIL (fail-safe, root-class:error-vs-empty, ga-g8dmmyf)."
+            FAIL_COMMENT="verdict:FAIL — its reason could not be read this sweep (bd comments failed, NOT an empty reason); read it on verdict bead $VB"
+          else
+            warn "Reviewer $((j+1)) (bead $VB) closed verdict:FAIL with no parseable reason — counting as INCONCLUSIVE FAIL (fail-safe)."
+            FAIL_COMMENT="INCONCLUSIVE — verdict:FAIL with empty/unparseable reason (raw bead $VB; see forensics log above)"
+          fi
         fi
         FAIL_REASONS="${FAIL_REASONS}Reviewer $((j+1)) FAIL: $(gate_reasons_escape "$FAIL_COMMENT")\n"
         GATE_E5_FAIL_IDX+=("$((j+1))"); GATE_E5_FAIL_TXT+=("$FAIL_COMMENT")
@@ -14589,21 +14604,40 @@ DISPATCHING_TTL_MINUTES=30
 # the same marker that's been dispatching for 30 minutes.
 # ga-jnajhn: --limit 0 — a marker whose live run fell outside a default-50 cut
 # would look run-less and get reclaimed while its Phase B is still in progress.
-LIVE_RUN_MARKER_IDS_JSON=$(bash "$GC_CITY/scripts/bd-list-cached.sh" -C "$GC_CITY" list --json --include-infra --limit 0 \
+# SELFTEST-EXTRACT dispatching-ttl-reads: BEGIN
+# ga-g8dmmyf (root-class:error-vs-empty): the run list below used to end in `|| echo "[]"`, so a
+# read that FAILED looked like "no run is live" — and the recovery then re-queued a marker whose
+# Phase B was still running (a second dispatch of the same marker, one of MAX_RECLAIMS burned). A
+# run list that could not be read decides nothing: LIVE_RUN_READ_OK=0 skips the whole recovery this
+# sweep (inert — the next sweep reads again) and says why. The dispatching list below used to skip
+# in silence when it failed; it says so now.
+LIVE_RUN_READ_OK=1
+# vazio ([] read fine) → no run is live, a marker past the TTL is a real zombie and is re-queued below; falhou/ilegível (bd list rc != 0, nothing printed, junk) → LIVE_RUN_READ_OK=0, recovery skipped with a WARN — never "no live run"
+if ! LIVE_RUN_MARKER_IDS_JSON=$(bash "$GC_CITY/scripts/bd-list-cached.sh" -C "$GC_CITY" list --json --include-infra --limit 0 \
   -l type:quality-gate-run \
   -l gate-status:running \
-  2>/dev/null || echo "[]")
+  2>/dev/null) || ! jq -e 'type == "array"' <<<"$LIVE_RUN_MARKER_IDS_JSON" >/dev/null 2>&1; then
+  LIVE_RUN_MARKER_IDS_JSON="[]"
+  LIVE_RUN_READ_OK=0
+  warn "TTL recovery SKIPPED this sweep: the live gate-run list (type:quality-gate-run, gate-status:running) could not be read — an unreadable list is not \"no live run\": a marker whose Phase B is still running must not be re-queued as a zombie (root-class:error-vs-empty, ga-g8dmmyf)."
+fi
 
 # ga-h199q: routed through the read-cache shim — feeds the same 30-minute TTL
 # reclaim check as LIVE_RUN_MARKER_IDS_JSON just above; a ≤5s-stale read is
 # inconsequential against that threshold.
 # ga-jnajhn: --limit 0 — the TTL reclaim walks every dispatching marker; the
 # oldest are exactly the ones that have overstayed, and a default-50 cut drops them first.
-DISPATCHING_JSON=$(bash "$GC_CITY/scripts/bd-list-cached.sh" -C "$GC_CITY" list --json --include-infra --limit 0 \
+# vazio ([] read fine) → nothing is dispatching, nothing to reclaim; falhou/ilegível → the same empty list (nothing to reclaim is the inert side) plus a WARN that the recovery did not run
+if ! DISPATCHING_JSON=$(bash "$GC_CITY/scripts/bd-list-cached.sh" -C "$GC_CITY" list --json --include-infra --limit 0 \
   -l type:quality-gate-marker \
   -l gate-status:dispatching \
-  2>/dev/null || echo "[]")
+  2>/dev/null) || ! jq -e 'type == "array"' <<<"$DISPATCHING_JSON" >/dev/null 2>&1; then
+  DISPATCHING_JSON="[]"
+  warn "TTL recovery SKIPPED this sweep: the dispatching-marker list (type:quality-gate-marker, gate-status:dispatching) could not be read — an unreadable list is not \"nothing is dispatching\" (root-class:error-vs-empty, ga-g8dmmyf)."
+fi
 DISPATCHING_COUNT=$(printf '%s\n' "$DISPATCHING_JSON" | jq 'length' 2>/dev/null || echo "0")
+[ "$LIVE_RUN_READ_OK" = "1" ] || DISPATCHING_COUNT=0
+# SELFTEST-EXTRACT dispatching-ttl-reads: END
 
 # SELFTEST-EXTRACT dispatching-ttl-recovery: BEGIN
 if [ "$DISPATCHING_COUNT" -gt 0 ]; then
@@ -15175,10 +15209,18 @@ gate_midsweep_collect "step-0b" || true   # ga-bk5j8u.1
 # undocumented behaviour, not something to lean on.) Guarded by
 # gate-marker-fetch-limit.selftest.sh.
 # SELFTEST-EXTRACT marker-fetch: BEGIN
-MARKERS_JSON=$(bash "$GC_CITY/scripts/bd-list-cached.sh" -C "$GC_CITY" list --json --include-infra --limit 0 \
+# ga-g8dmmyf (root-class:error-vs-empty): a `bd list` that FAILED used to land here as `[]`, and the
+# sweep went on to log "Found 0 queued marker(s)" / "No queued markers. Exiting." — a statement about
+# the queue from a gate that had not seen it. An unreadable queue now ends the sweep inert, with its
+# own warning (the empty-queue exit below is the same exit, so nothing else is skipped).
+# vazio ([] read fine) → falls through, the sweep says "No queued markers" truthfully; falhou/ilegível (bd list rc != 0, junk, not a list) → WARN "could not be read ... NOT an empty queue", exit 0 before any count is logged
+if ! MARKERS_JSON=$(bash "$GC_CITY/scripts/bd-list-cached.sh" -C "$GC_CITY" list --json --include-infra --limit 0 \
   -l type:quality-gate-marker \
   -l gate-status:queued \
-  2>/dev/null || echo "[]")
+  2>/dev/null) || ! jq -e 'type == "array"' <<<"$MARKERS_JSON" >/dev/null 2>&1; then
+  warn "Queued-marker list could not be read this sweep (the read failed, or its answer is not a list) — NOT an empty queue; admitting nothing, the next sweep reads it again (root-class:error-vs-empty, ga-g8dmmyf)."
+  exit 0
+fi
 # SELFTEST-EXTRACT marker-fetch: END
 
 COUNT=$(printf '%s\n' "$MARKERS_JSON" | jq 'length' 2>/dev/null || echo "0")
@@ -16005,8 +16047,25 @@ gate_midsweep_collect "step-1" || true   # ga-bk5j8u.1
 # destructive — and the existing DISPATCHING_TTL_MINUTES self-heal (below,
 # ~L5774) already converges any marker stuck with two labels back to one via
 # set_gate_status, so this degraded state is not a dead end.
-VERIFY_JSON=$(bd -C "$GC_CITY" show "$MARKER_ID" --json 2>/dev/null || echo "[]")
-VERIFY_LABELS=$(echo "$VERIFY_JSON" | jq -r 'if type=="array" then .[0] else . end | (.labels // []) | join(",")' 2>/dev/null || echo "")
+# SELFTEST-EXTRACT claim-verify: BEGIN
+# ga-g8dmmyf: THREE answers, not two (root-class:error-vs-empty). This read used to end in
+# `|| echo "[]"`, so a `bd show` that FAILED (Dolt down or timing out under load) left VERIFY_LABELS
+# empty — the same value as "read the marker, it carries no gate-status:queued" — and the sweep
+# logged "raced away before claim" while the gate was blind. MEASURED 23/11, in a Dolt brown-out:
+# ga-ponlqgd was gate-status:queued throughout and every sweep logged "raced away" — nothing was
+# admitted for tens of minutes and the log read as a benign race (the counts are in the bead). Only
+# a bead that WAS read and is not queued is a race now; a failed or unreadable answer says so and
+# claims nothing (inert: the marker stays queued, the next sweep reads it again). $VERIFY_JSON is
+# reused below for the author (ga-tkvsa), so it keeps the raw answer.
+# vazio (marker read, no gate-status:queued) → "raced away", exit 0; falhou/ilegível (bd rc != 0, junk, or an answer that is not the marker) → WARN "claim read FAILED", exit 0, nothing claimed
+CLAIM_READ_OK=1
+VERIFY_JSON=$(bd -C "$GC_CITY" show "$MARKER_ID" --json 2>/dev/null) || CLAIM_READ_OK=0
+# rc 0 is not proof of a bead: an error envelope parses as JSON but carries no .id, and `-e` makes "nothing selected" a failure — the same test as the re-reads of this file (ga-n7hu2)
+VERIFY_LABELS=$(printf '%s' "$VERIFY_JSON" | jq -er 'if type=="array" then .[0] else . end | select((.id // "") != "") | (.labels // []) | join(",")' 2>/dev/null) || CLAIM_READ_OK=0
+if [ "$CLAIM_READ_OK" != "1" ]; then
+  warn "Marker $MARKER_ID claim read FAILED (bd show failed, or its answer is not the marker) — NOT a race: it may well still be queued; claiming nothing this sweep, the next sweep reads it again (root-class:error-vs-empty, ga-g8dmmyf)."
+  exit 0
+fi
 
 if echo "$VERIFY_LABELS" | grep "gate-status:dispatching" >/dev/null; then
   log "Marker $MARKER_ID already dispatching by another process. Skipping."
@@ -16016,6 +16075,7 @@ if ! echo "$VERIFY_LABELS" | grep "gate-status:queued" >/dev/null; then
   log "Marker $MARKER_ID no longer queued (raced away before claim). Skipping."
   exit 0
 fi
+# SELFTEST-EXTRACT claim-verify: END
 
 # ga-jmmcjn: stamp the entry into `dispatching` FIRST. This claim is label-only,
 # and bd bumps updated_at only on `bd update`, so without the stamp the guard's

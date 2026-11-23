@@ -8214,9 +8214,21 @@ log "Attempting to claim marker $MARKER_ID ..."
 # error and a genuinely-empty label set produced the SAME value (""), so a
 # permanent parse failure was indistinguishable from — and got reported as —
 # a transient race.
-VERIFY_JSON=$(bd -C "$GC_CITY" show "$MARKER_ID" --json 2>/dev/null \
-  | jq 'if type=="array" then .[0] else . end' 2>/dev/null || echo "{}")
-CURRENT_LABELS=$(echo "$VERIFY_JSON" | jq -r '(.labels // []) | join(",")' 2>/dev/null || echo "")
+# SELFTEST-EXTRACT claim-verify: BEGIN
+# ga-g8dmmyf: the paragraph above names this collapse, but the array normalisation below only removed
+# its PARSE cause: a `bd show` that FAILS (Dolt down or slow under load) still ended in `|| echo "{}"`
+# → CURRENT_LABELS "" → "raced away" — what the dispatcher's own claim did on 23/11 (ga-ponlqgd,
+# queued all along). Only a marker that WAS read and is not ready is a race; a failed or unreadable
+# answer says so and claims nothing (inert: the marker stays ready, the next sweep reads it again).
+# vazio (marker read, no gate-status:ready) → "raced away", exit 0; falhou/ilegível (bd rc != 0, junk, or an answer that is not the marker) → WARN "claim read FAILED", exit 0, nothing claimed
+CLAIM_READ_OK=1
+VERIFY_JSON=$(bd -C "$GC_CITY" show "$MARKER_ID" --json 2>/dev/null) || CLAIM_READ_OK=0
+# the array normalisation described above; rc 0 is not proof of a bead (an error envelope has no .id) and `-e` makes "nothing selected" a failure
+CURRENT_LABELS=$(printf '%s' "$VERIFY_JSON" | jq -er 'if type=="array" then .[0] else . end | select((.id // "") != "") | (.labels // []) | join(",")' 2>/dev/null) || CLAIM_READ_OK=0
+if [ "$CLAIM_READ_OK" != "1" ]; then
+  warn "Marker $MARKER_ID claim read FAILED (bd show failed, or its answer is not the marker) — NOT a race: it may well still be ready; claiming nothing this sweep, the next sweep reads it again (root-class:error-vs-empty, ga-g8dmmyf)."
+  exit 0
+fi
 
 if echo "$CURRENT_LABELS" | grep "gate-status:claimed" >/dev/null; then
   log "Marker $MARKER_ID already claimed by another sweep. Skipping."
@@ -8227,6 +8239,7 @@ if ! echo "$CURRENT_LABELS" | grep "gate-status:ready" >/dev/null; then
   log "Marker $MARKER_ID no longer ready (raced away before claim). Skipping."
   exit 0
 fi
+# SELFTEST-EXTRACT claim-verify: END
 
 # ga-jmmcjn: stamp the entry into `claimed` FIRST. This claim is label-only, and
 # bd bumps updated_at only on `bd update`, so without the stamp Vector A would
