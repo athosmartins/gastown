@@ -247,9 +247,18 @@ def host_block() -> dict:
             "shim": {"spool_dir": SPOOL, "wrapper_config": WRAPPER_CFG, "idle_exit_s": 90, "poll_s": 2}}
 
 
+# A identidade que o wrapper do mini aceita para o MBP (ga-gkm3hbn): a sessão de TESTE da prova (`remote-test-remote-mbp-<1-3 dígitos>`) e a sessão REAL do pool, o template
+# `wa-worker-remote-mbp` (e `wa-worker-remote-mbp-<1-3 dígitos | 3-12 alnum>`) — a mesma forma do IDENTITY_PATTERN do Hetzner (gc-session-ssh.md), com o papel e o sufixo -mbp do MBP.
+# O wrapper confere GC_ALIAS, GC_AGENT, GC_SESSION_NAME e GC_TEMPLATE contra ele (remote-shim-wrapper.py): os quatro têm de casar. Nada de dog/gate-reviewer/ps-worker aqui: o
+# MBP só recebe wa-worker (escopo do ga-gkm3hbn, decisão do Mayor em 23/11); outro papel que venha a ir para o MBP é decisão e bead próprias.
+MBP_IDENTITY_PATTERN = "^(remote-test-remote-mbp-[0-9]{1,3}|wa-worker-remote-mbp(-([0-9]{1,3}|[A-Za-z0-9]{3,12}))?)$"
+
+
 def wrapper_config() -> dict:
-    """A config do wrapper no MINI para o MBP: só a sessão de teste (a identidade da prova); sessões reais são da fatia 3."""
-    return {"city": CITY, "identity_pattern": "^remote-test-remote-mbp-[0-9]{1,3}$", "nudge_pattern": "gastown\\.(mayor|deacon)", "gate_done_bin": None,
+    """A config do wrapper no MINI para o MBP: a sessão de teste da prova e a sessão real do wa-worker (MBP_IDENTITY_PATTERN). `gate_done_bin` continua NULO (ga-gkm3hbn, opção b1 do
+    Mayor): o gate-done-remote.py lê o ref do ESPELHO do Hetzner e o MBP empurra direto ao origin, então o wrapper recusa o gate-done do MBP e quem entrega a bead ao gate é o Mayor,
+    à mão, com o ref+sha que o worker comenta (b2, ensinar o gate-done-remote a ler o origin, é bead à parte depois do canário)."""
+    return {"city": CITY, "identity_pattern": MBP_IDENTITY_PATTERN, "nudge_pattern": "gastown\\.(mayor|deacon)", "gate_done_bin": None,
             "log": os.path.join(MINI_HOME, ".gastown", "logs", "remote-shim-mbp.log")}
 
 
@@ -1485,7 +1494,7 @@ def cmd_install(a: argparse.Namespace) -> int:
     out = f"{CITY}/.gc/runtime/mbp-proof/bundle-out"
     stage_id = time.strftime("%Y%m%d%H%M%S", time.gmtime())
     role_dir = os.path.join(CITY, ".gc", "agents", "dogs", "gastown.dog-1")
-    plan = [f"construir o bundle com o builder (--remote-root {BUNDLE} --remote-home {BUNDLE}/home, sem --skills, --session-path {':'.join(SESSION_PATH)}: o zdot do bundle) em {out} e conferi-lo aqui",
+    plan = [f"construir o bundle com o builder (--remote-root {BUNDLE} --remote-home {BUNDLE}/home, sem --skills, --guard-layer session: nada vai para o ~/.claude do MBP, o guarda sai em guard/ e no --settings da sessão; --session-path {':'.join(SESSION_PATH)}: o zdot do bundle) em {out} e conferi-lo aqui",
             f"enviar por tar/ssh para {MGT}/bundle.new.{stage_id}, conferir LÁ (verify + bundle_hash) e trocar por {BUNDLE} (a pasta run/ do provider é preservada)",
             f"instalar o cliente do atalho em {SHIMBIN} (bd, gc, gate-done → remote-shim; dolt → remote-shim, que o RECUSA) e remote-shim.json = {json.dumps(client_config())}",
             f"criar o spool {SPOOL} (0700) e levar remote-bundle-build.py para {MBIN}", f"gravar {WRAPPER_CFG} no mini"]
@@ -1523,7 +1532,8 @@ def cmd_install(a: argparse.Namespace) -> int:
         pr.say(f"NAO INSTALEI: {WRAPPER_CFG} já existe e é diferente do que a prova grava; confira à mão (não sobrescrevo) antes de repetir")
         return 1
     steps = [[sys.executable, "-I", BUILDER, "build", "--city", CITY, "--claude-home", os.path.expanduser("~/.claude"), "--role", "dog", "--role-dir", role_dir,
-              "--remote-root", BUNDLE, "--remote-home", BUNDLE + "/home", "--session-path", ":".join(SESSION_PATH), "--out", out],
+              "--remote-root", BUNDLE, "--remote-home", BUNDLE + "/home", "--session-path", ":".join(SESSION_PATH),
+              "--guard-layer", "session", "--out", out],
              [sys.executable, "-I", BUILDER, "verify", out]]
     for st in steps:
         r = subprocess.run(st, capture_output=True, text=True)

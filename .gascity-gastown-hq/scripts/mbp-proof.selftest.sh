@@ -455,9 +455,26 @@ for sh in ("bash","zsh"):
     ok,why=M.resolution_verdict(go(sh,"/usr/bin:/bin"),run,d,"/nonexistent"); assert not ok and "bd resolve" in why, (sh,why)'; ok $? "unit: measure_cmd — o comando do passo 1 rodado de verdade (bash, e zsh quando existe) dá uma saída que o veredito entende: atalho + dolt recusado ou ausente passam, PATH sem o atalho reprova"; }
   c identity && { py 'import re
 rx=re.compile(M.wrapper_config()["identity_pattern"])
-assert rx.fullmatch("remote-test-remote-mbp-1") and rx.fullmatch("remote-test-remote-mbp-123")
-assert not any(rx.fullmatch(x) for x in ("remote-test-remote-mbp-1234","remote-e2e-1","gastown.dog-1","remote-test-remote-mbp-1; x","remote-mbp-1","gastown.mayor"))
-assert M.wrapper_config()["gate_done_bin"] is None'; ok $? "unit: a identidade do wrapper do MBP aceita SÓ a sessão de teste (sessão real é da fatia 3)"; }
+good=("remote-test-remote-mbp-1","remote-test-remote-mbp-123","wa-worker-remote-mbp","wa-worker-remote-mbp-1","wa-worker-remote-mbp-12","wa-worker-remote-mbp-123","wa-worker-remote-mbp-a2lb9b","wa-worker-remote-mbp-gawisp1x2y3z")
+assert all(rx.fullmatch(x) for x in good), [x for x in good if not rx.fullmatch(x)]
+bad=("remote-test-remote-mbp-1234","remote-e2e-1","gastown.dog-1","remote-test-remote-mbp-1; x","remote-mbp-1","gastown.mayor","wa-worker-remote","wa-worker-remote-1","wa-worker-remote-adhoc-abcdefghij","wa-worker-mbp","dog-remote-mbp","dog-remote-mbp-1","gate-reviewer-remote-mbp-1","ps-worker-remote-mbp-1","kimi-worker-remote-mbp-1","wa-worker-remote-mbp-","wa-worker-remote-mbp-ab","wa-worker-remote-mbp-abcdefghijklm","wa-worker-remote-mbp-a b","wa-worker-remote-mbp-1;x","wa-worker-remote-mbp-1/x","xwa-worker-remote-mbp","wa-worker-remote-mbpx","wa-worker-remote-mbp\n")
+assert not any(rx.fullmatch(x) for x in bad), [x for x in bad if rx.fullmatch(x)]
+assert M.wrapper_config()["gate_done_bin"] is None'; ok $? "unit: a identidade do wrapper do MBP aceita a sessão de teste e a REAL do wa-worker (template e <template>-<cauda>), e nada de outro papel, outro host ou sem a cauda -mbp (ga-gkm3hbn)"; }
+  # ga-gkm3hbn: quem confere é o wrapper de verdade (fullmatch em GC_ALIAS, GC_AGENT, GC_SESSION_NAME e GC_TEMPLATE): com a config que o install grava, os QUATRO têm de casar, e um só fora derruba o pedido
+  c identity-wrapper && { py 'import importlib.util,os
+sp=importlib.util.spec_from_file_location("rsw", os.path.join(os.path.dirname(os.path.abspath(M.__file__)), "remote-shim-wrapper.py")); W=importlib.util.module_from_spec(sp); sp.loader.exec_module(W)
+cfg=dict(M.wrapper_config()); cfg["identity_re"]=W.re.compile(cfg["identity_pattern"])
+def ident(env):
+    try: W.decide(cfg, "bd", ["ready"], env)
+    except W.Refused as e: return "identity_pattern" not in str(e), str(e)
+    return True, ""
+real={"GC_ALIAS":"wa-worker-remote-mbp-gawisp1","GC_AGENT":"wa-worker-remote-mbp-gawisp1","GC_SESSION_NAME":"wa-worker-remote-mbp-gawisp1","GC_TEMPLATE":"wa-worker-remote-mbp"}
+r,why=ident(real); assert r, ("sessão real recusada pela identidade", why)
+test={k:"remote-test-remote-mbp-7" for k in ("GC_ALIAS","GC_AGENT","GC_SESSION_NAME","GC_TEMPLATE")}
+r,why=ident(test); assert r, ("sessão de teste recusada pela identidade", why)
+for k in real:
+    for bad in ("gastown.dog-1","wa-worker-remote-gawisp1","dog-remote-mbp-1"):
+        r,why=ident(dict(real, **{k: bad})); assert not r, (k, bad, "passou pela identidade com um dos quatro fora")'; ok $? "unit: o wrapper de verdade aceita a sessão real do wa-worker com GC_ALIAS/AGENT/SESSION_NAME/TEMPLATE casando, e recusa quando QUALQUER um dos quatro não casa (ga-gkm3hbn)"; }
   c tmuxstate && { py 'T=lambda rc,out="",err="": {"tmux":{"rc":rc,"out":out,"err":err}}
 want={"livre":[T(1,"","no server running on /tmp/x"),T(1,"","error connecting to /tmp/x (No such file or directory)"),T(0,"")],
  "aberta":[T(0,"remote-test-remote-mbp-1")],
@@ -706,7 +723,9 @@ g_install() {
     sp="$SRV/gt-remote/shim-bin:/usr/bin:/bin"; z="$SRV/gt-remote/bundle/zdot"
     python3 -I -c 'import json,sys; d=json.load(open(sys.argv[1]+"/gt-remote/bundle/manifest.json")); assert d["session_path"]==sys.argv[2].split(":"), d.get("session_path")' "$SRV" "$sp" && has "$z/.zshenv" "export PATH='$sp'" && has "$z/.zprofile" "export PATH='$sp'" && has "$z/.zshrc" "export PATH='$sp'" && [ -f "$z/env.sh" ]; ok $? "install: o bundle leva o zdot (.zshenv, .zprofile, .zshrc e env.sh) com o PATH explícito da sessão, e o manifest registra session_path"
     python3 -I -c 'import json,sys,os; d=json.load(open(sys.argv[1]+"/gt-remote/shim-bin/remote-shim.json")); assert d=={"transport":"spool","spool_dir":sys.argv[1]+"/gt-remote/shim","timeout_s":330}, d; assert oct(os.stat(sys.argv[1]+"/gt-remote/shim").st_mode&0o777)=="0o700"' "$SRV"; ok $? "install: remote-shim.json é só a puxada (sem host nem chave) e o spool é 0700"
-    python3 -I -c 'import json,sys; d=json.load(open(sys.argv[1])); assert d["identity_pattern"]=="^remote-test-remote-mbp-[0-9]{1,3}$" and d["gate_done_bin"] is None and d["city"]==sys.argv[2], d' "$MINI/.gastown/remote-shim-mbp.json" "$CITY"; ok $? "install: a config do wrapper no mini só aceita a sessão de teste e não tem gate-done"
+    python3 -I -c 'import json,re,sys; d=json.load(open(sys.argv[1])); rx=re.compile(d["identity_pattern"]); assert d["identity_pattern"]=="^(remote-test-remote-mbp-[0-9]{1,3}|wa-worker-remote-mbp(-([0-9]{1,3}|[A-Za-z0-9]{3,12}))?)$" and d["gate_done_bin"] is None and d["city"]==sys.argv[2], d; assert rx.fullmatch("remote-test-remote-mbp-1") and rx.fullmatch("wa-worker-remote-mbp") and rx.fullmatch("wa-worker-remote-mbp-gawisp1") and not any(rx.fullmatch(x) for x in ("gastown.dog-1","wa-worker-remote-1","dog-remote-mbp-1"))' "$MINI/.gastown/remote-shim-mbp.json" "$CITY"; ok $? "install: a config do wrapper no mini aceita a sessão de teste e a REAL do wa-worker (nenhum outro papel) e continua SEM gate-done (entrega do canário manual, ga-gkm3hbn)"
+    # ga-gkm3hbn: o bundle sai na camada da SESSÃO — nada em {remote_home}/.claude (o ~/.claude do MBP é do Athos), o guarda em guard/ e no --settings da sessão (city/settings.json)
+    python3 -I -c 'import json,os,sys; b=sys.argv[1]+"/gt-remote/bundle"; m=json.load(open(b+"/manifest.json")); assert m.get("guard_layer")=="session", m.get("guard_layer"); assert os.path.isfile(b+"/guard/remote-clone-guard.py"), "sem guard/remote-clone-guard.py"; assert not os.path.exists(b+"/home/.claude"), "bundle na camada home: home/.claude existe"; s=json.load(open(b+"/city/settings.json")); assert s.get("disableAllHooks") is False, s.get("disableAllHooks"); assert "remote-clone-guard" in json.dumps(s["hooks"]["PreToolUse"]), "o --settings da sessão não leva o guarda"' "$SRV"; ok $? "install: o bundle instalado é da camada SESSÃO (manifest guard_layer=session, guard/remote-clone-guard.py, sem home/.claude, e o city/settings.json com o PreToolUse do guarda e disableAllHooks=false) (ga-gkm3hbn)"
     [ "$(dsig "$SRV/.claude" "$SRV/.ssh")" = "$own" ] && [ ! -e "$SRV/.config" ]; ok $? "install: nada em ~/.claude, ~/.ssh nem ~/.config do MBP"
     [ "$(sha "$SRV/gt-remote/bin/remote-bundle-build.py")" = "$(sha "$BUILDER")" ]; ok $? "install: o builder em gt-remote/bin é o do repositório"
     first=$(cat "$SRV/gt-remote/bundle/manifest.json"); proof install --apply > "$T/out" 2> "$T/err"; RC=$?
@@ -995,6 +1014,12 @@ open(sys.argv[4], "w").write(s.replace(old, new))' "$P" "$1" "$2" "$3"
   mutant install inst-gate-garbage "veredito ilegível vira livre" 'if not isinstance(v, dict):' 'if False:'
   mutant install inst-upload "envio do builder sem conferir o rc" '    if r.returncode != 0:  # senão um builder velho' '    if False:  # senão um builder velho'
   mutant install inst-tamper "verify no MBP ignorado" 'if v.returncode != 0 or got != want:' 'if False:'
+  # ga-gkm3hbn: o install constrói na camada SESSÃO; o padrão de identidade tem a sessão real do wa-worker e nenhum outro papel; o gate-done do MBP segue nulo (entrega manual)
+  mutant install inst-ok "o install constrói na camada home (sem --guard-layer session)" '"--guard-layer", "session", ' ''
+  mutant unit identity,identity-wrapper "a identidade perde a sessão real do wa-worker" '|wa-worker-remote-mbp(-([0-9]{1,3}|[A-Za-z0-9]{3,12}))?)$' ')$'
+  mutant unit identity,identity-wrapper "a identidade aceita também o dog no MBP" '|wa-worker-remote-mbp(' '|(wa-worker|dog)-remote-mbp('
+  mutant unit identity,identity-wrapper "a identidade aceita a sessão real sem a cauda -mbp (a do Hetzner)" '|wa-worker-remote-mbp(' '|wa-worker-remote(-mbp)?('
+  mutant unit,install identity,inst-ok "gate_done_bin deixa de ser nulo" '"gate_done_bin": None,' '"gate_done_bin": "/x/gate-done",'
   mutant install inst-ok "a troca perde run/" '[ ! -d "$B/run" ] || mv "$B/run" "$N/run"\n' ''
   mutant install inst-ok "o spool não vira 0700" ' && chmod 700 {q(SPOOL)}' ''
   mutant e2e athos "o gate do MBP é ignorado" 'return g.returncode == 0, v.get("reason") or self.out(g)[:160]' 'return True, "livre"'
