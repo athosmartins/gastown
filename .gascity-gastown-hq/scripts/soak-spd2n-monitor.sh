@@ -17,7 +17,8 @@ LOG="$CITY/.gc/logs/soak-spd2n.jsonl"
 START_F="$CITY/.gc/soak-spd2n.start"           # epoch of soak start
 STRIKES_F="/tmp/soak-spd2n.strikes"            # consecutive wedge checks
 # ga-3v2zt00: derived from the live server (dolt_server_port), never a number written here -- it flips on every Dolt start.
-# vazio/falhou (port unknown) → dolt_ok=0 below, the same "could not confirm serving" answer a refused connection gives.
+# vazio/falhou (port unknown) → dolt_ok=null below: a THIRD state ("could not ask"), not 0 ("asked, no answer"). It adds no
+# wedge strike (the page would say dolt=0 about a server nobody asked) and it does not reset the strikes either.
 DOLT_PORT="$(dolt_server_port || true)"
 SOAK_HOURS="${SOAK_HOURS:-24}"
 WEDGE_FAIL_STRIKES="${WEDGE_FAIL_STRIKES:-3}"  # 3 consecutive 30min checks = 90min sustained
@@ -36,8 +37,11 @@ elapsed_h=$(( (now - start) / 3600 ))
 fresh() { local f="$1"; [ -f "$f" ] || { echo 0; return; }; local m=$(( (now - $(stat -f %m "$f" 2>/dev/null || echo 0)) / 60 )); [ "$m" -le 15 ] && echo 1 || echo 0; }
 gate_alive=$(fresh "$GATE_LOG")
 pilot_alive=$(fresh "$PILOT_LOG")
-[ -n "$DOLT_PORT" ] || DOLT_PORT=0   # 0 is never a listening port: the connect below fails fast → dolt_ok=0
-dolt_ok=$(timeout 8 python3 -c "import pymysql;pymysql.connect(host='127.0.0.1',port=$DOLT_PORT,user='root',connect_timeout=6).cursor().execute('SELECT 1');print(1)" 2>/dev/null || echo 0)
+if [ -n "$DOLT_PORT" ]; then
+  dolt_ok=$(timeout 8 python3 -c "import pymysql;pymysql.connect(host='127.0.0.1',port=$DOLT_PORT,user='root',connect_timeout=6).cursor().execute('SELECT 1');print(1)" 2>/dev/null || echo 0)
+else
+  dolt_ok=null   # port unknown: no probe at a guessed port, and no 0 -- JSON null in the log line
+fi
 dolt_cpu=$(ps -p "$(dolt_server_pid)" -o %cpu= 2>/dev/null | tr -d ' ' || echo "?")
 refino_ok=$(launchctl list 2>/dev/null | grep -E 'com.gascity.(auto-refino|refino-gate)-dispatcher' >/dev/null && echo 1 || echo 0)
 # progress: merges in the whole soak window (monotonic non-decreasing health signal)
@@ -61,7 +65,8 @@ wedged=0
 
 # strike accounting (sustained wedge detection)
 strikes=$(cat "$STRIKES_F" 2>/dev/null || echo 0)
-if [ "$wedged" = "1" ]; then strikes=$((strikes+1)); else strikes=0; fi
+# the only evidence missing is the Dolt answer (dolt_ok=null) and nothing else is wedged -> keep the strikes as they were
+if [ "$wedged" = "1" ]; then strikes=$((strikes+1)); elif [ "$dolt_ok" = "null" ]; then :; else strikes=0; fi
 echo "$strikes" > "$STRIKES_F"
 
 printf '{"ts":"%s","elapsed_h":%s,"gate_alive":%s,"pilot_alive":%s,"dolt_ok":%s,"dolt_cpu":"%s","refino_ok":%s,"merges":%s,"wedged":%s,"strikes":%s}\n' \

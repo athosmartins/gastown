@@ -15,6 +15,14 @@ mkplist() { # mkplist <file> <key> <value>   (key empty -> a plist with no port 
     [ -n "$2" ] && echo "<key>$2</key><string>$3</string>"
     echo '</dict></dict></plist>'; } > "$1"
 }
+mkcomment_plist() { # mkcomment_plist <file> : names all three port variables ONLY inside XML comments (multi-line one included), carries no pin
+  { echo '<?xml version="1.0" encoding="UTF-8"?>'
+    echo '<!-- ga-3v2zt00: NO BEADS_DOLT_PORT here, on purpose;'
+    echo '     BEADS_DOLT_SERVER_PORT and GC_DOLT_PORT are not set either. -->'
+    echo '<plist version="1.0"><dict><key>Label</key><string>x</string><key>EnvironmentVariables</key><dict><key>HOME</key><string>/h</string>'
+    echo '<!-- SEM BEADS_DOLT_PORT: nao volte a escrever porta -->'
+    echo '</dict></dict></plist>'; } > "$1"
+}
 mkrig() { # mkrig <dir> <port> : a rig .beads with the three port sources
   mkdir -p "$1"; printf '%s\n' "$2" > "$1/dolt-server.port"; printf 'dolt.port: %s\nother: 1\n' "$2" > "$1/config.yaml"
   printf '{\n  "dolt_server_port": %s,\n  "x": 1\n}\n' "$2" > "$1/metadata.json"
@@ -108,7 +116,11 @@ scenarios() { # scenarios <script> -> prints "label=ok|bad" lines
   run "$S" PATH="$C/bin:$PATH"; grep -q "INCONCLUSIVE" "$C/log" && grep -q "grep over the plists failed" "$C/log" && r14d=1 || r14d=0   # grep itself fails
   case_dir s14e; mkplist "$C/plists/a.plist" "" ""; mkrig "$C/rig/r" 52756; printf '{\n  "dolt_server_port": null\n}\n' > "$C/rig/r/metadata.json"; BEADS_DIRS="$C/rig/r"; echo keep > "$C/state"
   run "$S"; grep -q "INCONCLUSIVE" "$C/log" && r14e=1 || r14e=0                                                          # metadata key present, no number
-  [ "$r14a$r14b$r14c$r14d$r14e" = 11111 ] && echo unjudgeable_not_clean=ok || echo "unjudgeable_not_clean=bad($r14a$r14b$r14c$r14d$r14e)"
+  case_dir s14f; mkcomment_plist "$C/plists/a.plist"; mkdir -p "$C/bin"; printf '#!/bin/sh\nexit 1\n' > "$C/bin/perl"; chmod +x "$C/bin/perl"; echo keep > "$C/state"
+  run "$S" PATH="$C/bin:$PATH"; grep -q "INCONCLUSIVE" "$C/log" && grep -q "could not strip its XML comments" "$C/log" && [ "$(cat "$C/state")" = keep ] && r14f=1 || r14f=0   # the comment stripper cannot run
+  case_dir s14g; mkcomment_plist "$C/plists/a.plist"; mkdir -p "$C/bin"; printf '#!/bin/sh\ncase "$*" in *-qE*) exit 2 ;; esac\nexec /usr/bin/grep "$@"\n' > "$C/bin/grep"; chmod +x "$C/bin/grep"; echo keep > "$C/state"
+  run "$S" PATH="$C/bin:$PATH"; grep -q "INCONCLUSIVE" "$C/log" && grep -q "comment-free text failed" "$C/log" && [ "$(cat "$C/state")" = keep ] && r14g=1 || r14g=0   # grep over the stripped text fails
+  [ "$r14a$r14b$r14c$r14d$r14e$r14f$r14g" = 1111111 ] && echo unjudgeable_not_clean=ok || echo "unjudgeable_not_clean=bad($r14a$r14b$r14c$r14d$r14e$r14f$r14g)"
   # 15 the other shapes of the same sources are READ: nested config.yaml `dolt:` + `port:`, a one-line metadata.json, a quoted value
   case_dir s15; mkrig "$C/rig/n" 52756; printf 'dolt:\n  disable-event-flush: true\n  port: 52757 # old\n' > "$C/rig/n/config.yaml"
   mkrig "$C/rig/m" 52756; printf '{"dolt_server_port": "52757", "x": 1}\n' > "$C/rig/m/metadata.json"; BEADS_DIRS="$C/rig/n $C/rig/m"
@@ -116,11 +128,30 @@ scenarios() { # scenarios <script> -> prints "label=ok|bad" lines
   # 15b a nested `dolt:` block with NO port key (what the real rigs have) is "no pin", not unreadable
   case_dir s15b; mkplist "$C/plists/a.plist" "" ""; mkrig "$C/rig/n" 52756; printf 'dolt:\n  disable-event-flush: true\nbackup.enabled: false\n' > "$C/rig/n/config.yaml"; BEADS_DIRS="$C/rig/n"
   run "$S"; grep -q "OK: live=52756" "$C/log" && echo nested_no_port_clean=ok || echo nested_no_port_clean=bad
+  # 16 (gate round 3) a plist that names a port variable ONLY in an XML comment was READ and holds no pin: clean, and the
+  # stale -> clean -> same-stale cycle must alert, say "limpos", then alert AGAIN (a muted second alert is the bug this pins)
+  case_dir s16; mkcomment_plist "$C/plists/c.plist"; mkrig "$C/rig/r" 52757; BEADS_DIRS="$C/rig/r"
+  run "$S"; n1="$(nnotify)"; mkrig "$C/rig/r" 52756; run "$S"; n2="$(nnotify)"; st2="$(cat "$C/state")"; mkrig "$C/rig/r" 52757; run "$S"; n3="$(nnotify)"
+  # "Z unreadable" = a log LINE reporting an unreadable source, not the "(unreadable=0)" counter the OK line carries
+  if [ "$n1$n2$n3" = 123 ] && [ "$st2" = none ] && ! grep -qE 'Z unreadable' "$C/log"; then echo comment_only_clean=ok; else echo "comment_only_clean=bad(n=$n1$n2$n3 state=$st2)"; fi
+  # 16b the strip must not hand out a free pass: a comment AND a real ProgramArguments mention, or a mention inside CDATA that
+  # merely looks like a comment, stay unreadable (INCONCLUSIVE, state kept)
+  case_dir s16b; mkcomment_plist "$C/plists/a.plist"
+  printf '%s\n' '<?xml version="1.0"?><!-- BEADS_DOLT_PORT in a comment --><plist version="1.0"><dict><key>ProgramArguments</key><array><string>/bin/sh</string><string>-c</string><string>BEADS_DOLT_PORT=52757 bd list</string></array></dict></plist>' > "$C/plists/b.plist"; echo keep > "$C/state"
+  run "$S"; grep -q "INCONCLUSIVE" "$C/log" && grep -q "b.plist names a Dolt port variable outside EnvironmentVariables" "$C/log" && [ "$(cat "$C/state")" = keep ] && r16b=1 || r16b=0
+  case_dir s16c
+  printf '%s\n' '<?xml version="1.0"?><plist version="1.0"><dict><key>ProgramArguments</key><array><string>/bin/sh</string><string><![CDATA[<!-- x --> BEADS_DOLT_PORT=52757 bd list <!-- y -->]]></string></array></dict></plist>' > "$C/plists/c.plist"; echo keep > "$C/state"
+  run "$S"; grep -q "INCONCLUSIVE" "$C/log" && grep -q "c.plist names a Dolt port variable outside EnvironmentVariables" "$C/log" && [ "$(cat "$C/state")" = keep ] && r16c=1 || r16c=0
+  [ "$r16b$r16c" = 11 ] && echo comment_not_free_pass=ok || echo "comment_not_free_pass=bad($r16b$r16c)"
+  # 17 the guard over the plists THIS REPO SHIPS (scripts/*.plist, comments and all) says OK: none carries a pin, and the
+  # comments that say "SEM BEADS_DOLT_PORT" do not turn the world unreadable. A glob that matches nothing is INCONCLUSIVE -> bad.
+  case_dir s17; mkrig "$C/rig/r" 52756; BEADS_DIRS="$C/rig/r"
+  run "$S" DPPG_PLIST_GLOB="$HERE/*.plist"; grep -q "OK: live=52756, .*unreadable=0" "$C/log" && [ "$(nnotify)" = 0 ] && echo shipped_plists_clean=ok || echo "shipped_plists_clean=bad($(tail -1 "$C/log" 2>/dev/null | cut -c1-120))"
 }
 
 echo "== scenarios (real guard)"
 res="$(scenarios "$GUARD")"
-for l in clean stale_plist pinned_eq_live gc_dolt_port rig_three_sources rig_config_only live_unknown recovery unreadable_inconclusive lock skip_dir detection_only live_file_not_live notify_fail_retries limpos_fail_retries empty_state unjudgeable_not_clean other_shapes nested_no_port_clean; do
+for l in clean stale_plist pinned_eq_live gc_dolt_port rig_three_sources rig_config_only live_unknown recovery unreadable_inconclusive lock skip_dir detection_only live_file_not_live notify_fail_retries limpos_fail_retries empty_state unjudgeable_not_clean other_shapes nested_no_port_clean comment_only_clean comment_not_free_pass shipped_plists_clean; do
   if printf '%s\n' "$res" | grep -qx "$l=ok"; then ok "$l"; else nope "$l ($(printf '%s\n' "$res" | grep "^$l=" || echo 'no answer'))"; fi
 done
 
@@ -149,6 +180,11 @@ mutant glob-empty-is-clean      's/^if \[ "\${#_plists\[@\]}" -eq 0 \] || \[ ! -
 mutant empty-port-file-is-clean 's/_chk dolt-server.port "\${_v:-?}"/_chk dolt-server.port "$_v"/' unjudgeable_not_clean
 mutant nested-config-ignored    's/indolt \&\& \/\^\[ \\t\]+port/indolt \&\& \/^NEVER[ \\t]+port/' other_shapes
 mutant skip-dirs-ignored       's/^  case " \$SKIP_DIRS " in .*$/  :/' skip_dir
+mutant comment-not-stripped     's/|<!--\.\*?-->}/|<!--ZZNEVERZZ-->}/' comment_only_clean
+mutant cdata-dropped-with-comments 's/defined \$1 ? \$1 : ""/""/' comment_not_free_pass
+mutant strip-failure-is-clean   's/if \[ "\$_prc" -ne 0 \] || \[ -z "\$_nocomment" \]; then/if false; then/' unjudgeable_not_clean
+mutant second-grep-failure-is-clean 's/\[ "\$_grc2" -gt 1 \]/[ "$_grc2" -gt 99 ]/' unjudgeable_not_clean
+mutant real-mention-is-clean    's/if \[ "\$_grc2" -eq 0 \]; then/if [ "$_grc2" -eq 99 ]; then/' comment_not_free_pass
 
 echo; echo "dolt-port-pin-guard selftest: PASS=$PASS FAIL=$FAIL"
 [ "$FAIL" -eq 0 ]

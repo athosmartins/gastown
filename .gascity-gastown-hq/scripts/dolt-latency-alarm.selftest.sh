@@ -361,6 +361,17 @@ echo "$deadpid" > "$TICK_STATE/dolt-latency-alarm.lock.d/pid"
 DLA_CONN_COUNT=50 DLA_GC_LATENCY_MS=900 run_tick
 [ -s "$TICK_STATE/dolt-latency-alarm.conn-window" ] && ok "lock: dead holder PID → reclaimed, tick proceeded" || nope "dead-holder lock should have been reclaimed"
 
+# 4i. (ga-3v2zt00 gate round 3) live Dolt port UNKNOWN: the connection count is not recorded, and the tick SAYS so in the log
+# (a tick that samples nothing and logs nothing reads as healthy). No server process, no port file, no pin.
+_SAVE_TS="$TICK_STATE"; _SAVE_NC="${NOTIFY_CALLS:-}"; _SAVE_GC="${GC_CALLS:-}"   # restored below: section 5 must see the state section 4 left
+TICK_STATE="$WORK/tick-unknown"; mkdir -p "$TICK_STATE"; NOTIFY_CALLS="$WORK/tick-unknown.notify"; GC_CALLS="$WORK/tick-unknown.gc"; TICK_LOG="$WORK/tick-unknown.log"
+: > "$NOTIFY_CALLS"; : > "$GC_CALLS"; : > "$TICK_LOG"
+_NF4="$WORK/no-such-city"; mkdir -p "$_NF4"
+GC_CITY="$_NF4" BEADS_DOLT_PORT= TICK_NO_DOLT=1 DLA_CONN_COUNT=50 DLA_GC_LATENCY_MS=150 run_tick
+grep -q "NO READING: the live Dolt port is unknown" "$TICK_LOG" && ok "4i unknown port: the tick logs NO READING (not silent)" || nope "4i unknown port: no NO READING line in the tick log: $(cat "$TICK_LOG" 2>/dev/null | head -3)"
+[ ! -s "$TICK_STATE/dolt-latency-alarm.conn-window" ] && ok "4i unknown port: nothing recorded in the connection window (not a 0, not a blank)" || nope "4i unknown port: conn window holds: $(cat "$TICK_STATE/dolt-latency-alarm.conn-window")"
+unset TICK_LOG; TICK_STATE="$_SAVE_TS"; NOTIFY_CALLS="$_SAVE_NC"; GC_CALLS="$_SAVE_GC"
+
 # ══ 5. (ga-0k78d4) Dolt scheduling-priority (nice) detector ═════════════════════════
 # The why is in the SECOND SIGNAL block of dolt-latency-alarm.sh's header. Three states, never
 # collapsed: ok (nice 0) / alarm (nice != 0) / unknown (could not read -- and that is NOT nice 0).

@@ -23,7 +23,8 @@
 # THREE ANSWERS (root-class:error-vs-empty): no findings = OK; findings = ALERT; live port UNKNOWN = the guard
 # cannot judge -> it logs UNKNOWN and changes NOTHING (no alert, no "recovered"). A plist plutil cannot parse is counted
 # and logged ("unreadable") -- never read as "no pin". A plist that names a port variable but carries no EnvironmentVariables
-# pin (the name sits in ProgramArguments / script text), an EMPTY dolt-server.port, a plist glob that matches nothing and a
+# pin (the name sits in ProgramArguments / script text -- NOT in an XML comment: a comment-only mention is a plist that was READ
+# and holds no pin, so it is clean), an EMPTY dolt-server.port, a plist glob that matches nothing and a
 # LaunchAgents dir that cannot be read are "unreadable" too: the guard could not judge them, and that is not "clean".
 # A binary-format plist is invisible to the grep prefilter (the city's plists are XML); that is a known blind spot, not a clean bill.
 #
@@ -97,9 +98,27 @@ while IFS= read -r f; do
     if [ "$v" = "$LIVE" ]; then FINDINGS+=("PINNED $(basename "$f") $k=$v (== live today; breaks on the next flip)")
     else                         FINDINGS+=("STALE $(basename "$f") $k=$v (live=$LIVE)"); fi
   done
-  # the grep prefilter matched, extraction found no EnvironmentVariables pin: the name sits somewhere we do not parse
-  # (ProgramArguments / script text) -- cannot judge it, so it must not read as clean
-  if [ "$_got" -eq 0 ]; then UNREADABLE=$((UNREADABLE + 1)); log "unreadable: $(basename "$f") names a Dolt port variable outside EnvironmentVariables (ProgramArguments/script text) -- not judged"; fi
+  # the grep prefilter matched, extraction found no EnvironmentVariables pin: the name sits somewhere else in the file.
+  # Two different somewheres, and they must not be mixed up (gate round 3):
+  #   - only inside an XML COMMENT (the shipped plists say "SEM BEADS_DOLT_PORT" on purpose) -> the plist was READ and holds
+  #     no pin: clean. Reading it as unreadable would keep the dedup state stuck and mute a recurring alert.
+  #   - in ProgramArguments / script text (not comment) -> we do not parse that, cannot judge it: unreadable, never clean.
+  # The plist already passed plutil -lint, so it is well-formed XML; a comment is dropped unless it sits inside a CDATA block.
+  # vazio (no comment-free mention) -> clean; falhou (perl cannot run) -> UNREADABLE, the file stays unjudged, never clean
+  if [ "$_got" -eq 0 ]; then
+    _nocomment="$(perl -0777 -pe 's{(<!\[CDATA\[.*?\]\]>)|<!--.*?-->}{defined $1 ? $1 : ""}gse' "$f" 2>/dev/null)"; _prc=$?
+    if [ "$_prc" -ne 0 ] || [ -z "$_nocomment" ]; then
+      UNREADABLE=$((UNREADABLE + 1)); log "unreadable: $(basename "$f") -- could not strip its XML comments (rc $_prc) -- not judged"
+    else
+      # grep rc: 0 = the name is in real (non-comment) text; 1 = only in comments -> clean; >= 2 = grep itself failed -> unreadable
+      grep -qE 'BEADS_DOLT_PORT|BEADS_DOLT_SERVER_PORT|GC_DOLT_PORT' <<< "$_nocomment"; _grc2=$?   # here-string, not a pipe: no SIGPIPE rc from an early-exiting grep -q
+      if [ "$_grc2" -eq 0 ]; then
+        UNREADABLE=$((UNREADABLE + 1)); log "unreadable: $(basename "$f") names a Dolt port variable outside EnvironmentVariables (ProgramArguments/script text) -- not judged"
+      elif [ "$_grc2" -gt 1 ]; then
+        UNREADABLE=$((UNREADABLE + 1)); log "unreadable: $(basename "$f") -- grep over the comment-free text failed (rc $_grc2) -- not judged"
+      fi
+    fi
+  fi
 done <<< "${_hits:-}"
 
 # --- 2. rig .beads dirs --------------------------------------------------------------------------------------------

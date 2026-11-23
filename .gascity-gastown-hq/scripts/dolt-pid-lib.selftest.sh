@@ -246,6 +246,12 @@ sc_porta_desconhecida() {   # nothing at all: EMPTY with rc 1 -- never a default
   assert_eq "nothing known: empty, no default port" "" "$GOT"; assert_eq "nothing known: rc 1" 1 "$GOT_RC"
   run_port "$b" "$c" BEADS_DOLT_PORT=0 GC_DOLT_PORT_OVERRIDE=70000
   assert_eq "out-of-range pin and override are not ports" "" "$GOT"
+  # gate round 3: `[ "+5" -ge 1 ]` and `[ " 5" -ge 1 ]` are TRUE in test(1), so only the non-digit arm of _dolt_port_valid keeps a
+  # signed or space-padded value from being read as a port (a port printed with a stray character would be passed on verbatim)
+  run_port "$b" "$c" BEADS_DOLT_PORT=+5
+  assert_eq "a signed pin (+5) is not a port" "" "$GOT"
+  run_port "$b" "$c" "GC_DOLT_PORT_OVERRIDE= 5"
+  assert_eq "a space-padded override is not a port" "" "$GOT"
 }
 sc_porta_override() {   # the explicit seam wins over a live server, and a non-numeric override is ignored
   local b="$SCRATCH/pt5/bin" c="$SCRATCH/pt5/city"
@@ -300,7 +306,9 @@ mutant pin-vence-o-vivo      '  _pid="$(dolt_server_pid || true)"' '  if _dolt_p
 mutant arquivo-vence-o-vivo  '  _pid="$(dolt_server_pid || true)"' '  _pid=""' sc_porta_viva
 mutant desconhecida-vira-52756 '    printf '"'%s'"' "$BEADS_DOLT_PORT"; return 0\n  fi\n  printf '"''"'\n  return 1' '    printf '"'%s'"' "$BEADS_DOLT_PORT"; return 0\n  fi\n  printf 52756\n  return 0' sc_porta_desconhecida
 mutant faixa-de-porta-ignorada '  [ "$1" -ge 1 ] && [ "$1" -le 65535 ]' '  true' sc_porta_desconhecida
-# EQUIVALENT (L `case "$1" in '"''"'|*[!0-9]*) return 1 ;; esac` without the `*[!0-9]*` arm): a non-numeric value then reaches `[ "$1" -ge 1 ]`, which errors (rc 2) and rejects it by itself -- same answer, only stderr noise differs.
+# (gate round 3) NOT equivalent, as it was first declared: without the `*[!0-9]*` arm a "+5" or a space-padded "5" still passes `[ "$1" -ge 1 ]`, so
+# the scenario above feeds both and this mutant must die.
+mutant nao-digito-aceito     'case "$1" in '"''"'|*[!0-9]*) return 1 ;; esac' 'case "$1" in '"''"') return 1 ;; esac' sc_porta_desconhecida
 mutant live-cai-no-arquivo   "  fi\n  printf ''\n  return 1\n}\ndolt_server_port() {" "  fi\n  if [ -r \"\${GC_CITY:-/x}/.beads/dolt-server.port\" ]; then head -1 \"\${GC_CITY:-/x}/.beads/dolt-server.port\" | tr -d '[:space:]'; return 0; fi\n  printf ''\n  return 1\n}\ndolt_server_port() {" sc_porta_viva_estrita
 mutant live-cai-no-pin       "  fi\n  printf ''\n  return 1\n}\ndolt_server_port() {" "  fi\n  if _dolt_port_valid \"\${BEADS_DOLT_PORT:-}\"; then printf '%s' \"\$BEADS_DOLT_PORT\"; return 0; fi\n  printf ''\n  return 1\n}\ndolt_server_port() {" sc_porta_viva_estrita
 mutant override-ignorado     '  if _dolt_port_valid "${GC_DOLT_PORT_OVERRIDE:-}"; then' '  if false; then' sc_porta_override

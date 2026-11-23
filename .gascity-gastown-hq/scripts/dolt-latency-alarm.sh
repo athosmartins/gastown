@@ -447,6 +447,10 @@ nice_tick
 _lat="$(get_latency_ms)"
 _conns="$(conn_count)"
 
+# ga-3v2zt00 (gate round 3): conn_count prints nothing ONLY when the live Dolt port is unknown (the lsof pipeline itself always
+# prints a number). A tick that samples nothing and logs nothing looks exactly like a healthy one, so say it, once per tick.
+[ -n "$_conns" ] || log "NO READING: the live Dolt port is unknown (no server process, no port file, no pin) -- connection count NOT sampled this tick (latency reading: ${_lat:-none})"
+
 [ -n "$_lat" ] && record_reading "$LATENCY_WINDOW_FILE" "$_lat"
 # ga-3v2zt00: an unreadable connection count (port unknown) is NOT recorded -- a blank/0 in the window would pull the median toward "healthy".
 [ -n "$_conns" ] && record_reading "$CONN_WINDOW_FILE" "$_conns"
