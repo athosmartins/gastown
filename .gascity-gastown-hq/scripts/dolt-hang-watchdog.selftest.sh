@@ -1150,6 +1150,40 @@ PYF
   rm -rf "$_nolib"
   _reset up   # deixa o cenario do caso I como estava
 
+  # --- P. ga-3v2zt00 (gate round 2): porta do Dolt DESCONHECIDA (sem override, sem LISTEN verificado, sem arquivo de porta, sem pin). ---
+  # Terceiro estado: a pergunta "o Dolt serve?" nao pode ser feita. Nao e "serve" (limparia strikes/veto como "provado vivo") nem "nao serve"
+  # (somaria strike rumo a restart): e INCONCLUSIVO -> sem strike, sem restart, contadores como estavam, e o log diz por que.
+  # O ps/lsof falsos atestam o PID sacrificial mas o lsof NAO imprime porta alguma, entao a porta so pode vir do override (vazio aqui).
+  _unk() { _sim DOLT_WATCHDOG_MAX_STRIKES=3 GC_DOLT_PORT_OVERRIDE= BEADS_DOLT_PORT= "$@"; }
+  _unk_seed() { _reset up; echo down > "$_sd/health"; echo 2 > "$_sd/state/s"; echo 1 > "$_sd/state/v"; }
+  _unk_seed
+  _unk
+  if [ "$(_restarts)" = "0" ] && [ "$(cat "$_sd/state/s" 2>/dev/null)" = "2" ] && [ "$(cat "$_sd/state/v" 2>/dev/null)" = "1" ] \
+     && grep -q 'Dolt port is UNKNOWN' "$_sd/l" && ! grep -q 'SERVES\|true unresponsiveness' "$_sd/l"; then
+    ok "P: porta desconhecida + sonda de saude falhou -> INCONCLUSIVO: 0 restart, strikes (2) e veto (1) intactos, o log diz 'port is UNKNOWN'"
+  else bad "P: porta desconhecida mexeu em contador/restart (restarts=$(_restarts) strikes='$(cat "$_sd/state/s" 2>/dev/null)' veto='$(cat "$_sd/state/v" 2>/dev/null)' log='$(tail -2 "$_sd/l" 2>/dev/null)')"; fi
+  # controle: a MESMA semeadura com a porta fixada (1 = nada escuta) -> o SELECT 1 e feito, falha, e o strike SOBE (2->3 = MAX -> restart)
+  _unk_seed
+  _sim DOLT_WATCHDOG_MAX_STRIKES=3
+  [ "$(_restarts)" = "1" ] && grep -q 'true unresponsiveness, strike 3/3' "$_sd/l" \
+    && ok "P: controle -- com a porta conhecida o mesmo estado vira strike 3/3 e restart (o ramo de porta desconhecida e o unico que segura)" \
+    || bad "P: controle falhou (restarts=$(_restarts); $(tail -2 "$_sd/l" 2>/dev/null))"
+  # mutantes do ramo de porta desconhecida: "serve" (return 0) e "nao serve" (return 1) -- cada um tem de ser MORTO pelo cenario P
+  for _mut in 'return 0' 'return 1'; do
+    _mdir=$(mktemp -d)
+    cp "$(dirname "$SRC")/dolt-pid-lib.sh" "$(dirname "$SRC")/dolt-hold-lib.sh" "$_mdir/"
+    sed "s/if \[ -z \"\$_port\" \]; then return 2; fi/if [ -z \"\$_port\" ]; then $_mut; fi/" "$SRC" > "$_mdir/dolt-hang-watchdog.sh"
+    if cmp -s "$SRC" "$_mdir/dolt-hang-watchdog.sh"; then bad "P mutante '$_mut': o sed nao alterou o script (mutante vazio)"; rm -rf "$_mdir"; continue; fi
+    _unk_seed
+    SIM_SRC="$_mdir/dolt-hang-watchdog.sh" _unk
+    if [ "$(cat "$_sd/state/s" 2>/dev/null)" = "2" ] && [ "$(cat "$_sd/state/v" 2>/dev/null)" = "1" ] && [ "$(_restarts)" = "0" ]; then
+      bad "P mutante '$_mut' SOBREVIVEU: o cenario nao distingue porta desconhecida de serve/nao-serve"
+    else ok "P mutante '$_mut' morto (strikes='$(cat "$_sd/state/s" 2>/dev/null)' veto='$(cat "$_sd/state/v" 2>/dev/null)' restarts=$(_restarts))"; fi
+    rm -rf "$_mdir"
+  done
+  unset -f _unk _unk_seed
+  _reset up
+
   # --- I. DOLT_DUMP=1 com PID conhecido: AGORA sim o SIGQUIT chega (ultimo: mata o sacrificial). ---
   _reset up
   _sim DOLT_DUMP=1

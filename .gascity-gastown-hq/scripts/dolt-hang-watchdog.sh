@@ -437,13 +437,14 @@ dolt_actually_serving() {
   # Two bounds on the same wait must not disagree, or raising the visible one
   # changes nothing — the invisible one still decides.
   local _ct=$(( SERVE_CONFIRM_TIMEOUT > 4 ? SERVE_CONFIRM_TIMEOUT - 4 : SERVE_CONFIRM_TIMEOUT )) _port
-  # ga-3v2zt00: three answers. vazio (port derived) → raw SELECT 1 on it; falhou/ilegível (port unknown: no live server, no port file, no pin) → return 0 "serving" = INERT (no strike, no restart) and SERVE_BASIS says so — an aim we could not take is not proof the server is hung, and "not serving" here is the input to a kill/restart
+  # ga-3v2zt00 (gate round 2): THREE answers, three return codes -- 0 = the raw SELECT 1 was served; 1 = it was asked and NOT served
+  # (the input to strike/restart); 2 = it could not be asked at all (port unknown: no live server, no port file, no pin).
+  # vazio (port derived) → ask it; falhou/ilegível (port unknown) → rc 2, and the caller changes NOTHING: no strike, no restart, AND no
+  # "proven serving = clean slate" either -- an aim we could not take proves neither a hang nor a healthy server, so the strike and CPU-veto
+  # counters (the evidence of an episode in progress) must survive it.
   SERVE_BASIS="raw SELECT 1"
   _port="$(dolt_server_port || true)"
-  if [ -z "$_port" ]; then
-    SERVE_BASIS="port unknown (no live server, port file or pin) -- INCONCLUSIVE, treated as serving so nothing is struck or restarted"
-    return 0
-  fi
+  if [ -z "$_port" ]; then return 2; fi
   timeout "$SERVE_CONFIRM_TIMEOUT" python3 - "$_port" "$_ct" <<'PY' 2>/dev/null
 import sys
 try:
@@ -455,6 +456,10 @@ try:
 except Exception:
     sys.exit(1)
 PY
+  # rc 2 is RESERVED for "could not ask" (port unknown, above): whatever the ask itself returned that is not a served SELECT 1
+  # (client refused/timed out = 1 or 124, python missing = 127, anything else) is "asked, not served" = 1, never 2
+  [ $? -eq 0 ] && return 0
+  return 1
 }
 
 # ga-153cq: CPU of the live dolt sql-server, as a whole number ("" if unknown).
@@ -644,7 +649,14 @@ fi
 
 # Saturation guard: probe failed, but is Dolt actually serving? If a raw SELECT 1
 # succeeds, it's busy/slow (saturation), NOT hung — don't strike, don't restart.
-if dolt_actually_serving; then
+# ga-3v2zt00 (gate round 2): rc 2 = the question could not be asked (Dolt port unknown) → INCONCLUSIVE: say so, touch no counter, exit.
+# (rc 0 would wipe the strikes/veto as "proven serving"; rc 1 would add a strike toward a restart -- both claim knowledge we do not have.)
+_serve_rc=0; dolt_actually_serving || _serve_rc=$?
+if [ "$_serve_rc" -eq 2 ]; then
+  log "Health-probe failed and the Dolt port is UNKNOWN (no live server, port file or pin) — cannot tell serving from hung. INCONCLUSIVE: no strike, no restart, strike/veto counters left as they are."
+  exit 0
+fi
+if [ "$_serve_rc" -eq 0 ]; then
   _cpu="$(dolt_cpu_pct)"
   log "Health-probe failed but Dolt SERVES (${SERVE_BASIS}) (cpu=${_cpu:-?}%) — saturation, NOT a hang. Skipping strike/restart."
   # ga-153cq (gate attempt 2): same class as the probe_ok branch above — proven

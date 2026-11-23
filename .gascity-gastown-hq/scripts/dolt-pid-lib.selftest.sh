@@ -212,6 +212,11 @@ run_port() {
   local b="$1" c="$2"; shift 2
   GOT="$( ( PATH="$b:$PATH"; GC_CITY="$c"; unset GC_DOLT_PORT_OVERRIDE BEADS_DOLT_PORT; if [ $# -gt 0 ]; then export "$@"; fi; dolt_server_port ) )"; GOT_RC=$?
 }
+# dolt_server_live_port (the strict half: no file, no pin) with the same stubs/city/env as run_port -> GOT and GOT_RC
+run_live() {
+  local b="$1" c="$2"; shift 2
+  GOT="$( ( PATH="$b:$PATH"; GC_CITY="$c"; unset GC_DOLT_PORT_OVERRIDE BEADS_DOLT_PORT; if [ $# -gt 0 ]; then export "$@"; fi; dolt_server_live_port ) )"; GOT_RC=$?
+}
 mkportcity() { mkdir -p "$1/.beads"; rm -f "$1/.beads/dolt-server.port"; }
 sc_porta_viva() {   # live LISTEN socket (3333) beats the port file (1111) and the legacy pin (2222): both are exactly the stale numbers that blinded the city
   local b="$SCRATCH/pt1/bin" c="$SCRATCH/pt1/city"
@@ -250,7 +255,26 @@ sc_porta_override() {   # the explicit seam wins over a live server, and a non-n
   run_port "$b" "$c" GC_DOLT_PORT_OVERRIDE=abc
   assert_eq "non-numeric override ignored (live port used)" 3333 "$GOT"
 }
-sc_porta_viva; sc_porta_arquivo; sc_porta_pin_ultimo; sc_porta_desconhecida; sc_porta_override
+sc_porta_viva_estrita() {   # gate round 2 (ga-3v2zt00): the strict "live" answer NEVER comes from a file or a pin -- no verified server = UNKNOWN
+  local b="$SCRATCH/pt6/bin" c="$SCRATCH/pt6/city"
+  mkportcity "$c"; printf '4444\n' > "$c/.beads/dolt-server.port"; mkport_stubs "$b" "" listen 3333
+  run_live "$b" "$c" BEADS_DOLT_PORT=2222
+  assert_eq "no verified server + port file + pin: live port UNKNOWN (empty, never the file)" "" "$GOT"; assert_eq "no verified server: rc 1" 1 "$GOT_RC"
+  mkport_stubs "$b" "$REAL_PID" nolisten 3333
+  run_live "$b" "$c" BEADS_DOLT_PORT=2222
+  assert_eq "verified server with unreadable LISTEN: live port UNKNOWN (not the file)" "" "$GOT"; assert_eq "unreadable LISTEN: rc 1" 1 "$GOT_RC"
+  mkport_stubs "$b" "$REAL_PID" listen 3333
+  run_live "$b" "$c" BEADS_DOLT_PORT=2222
+  assert_eq "verified server: the LISTEN port" 3333 "$GOT"; assert_eq "verified server: rc 0" 0 "$GOT_RC"
+  run_live "$b" "$c" GC_DOLT_PORT_OVERRIDE=1
+  assert_eq "the explicit override still answers" 1 "$GOT"
+  run_port "$b" "$c" BEADS_DOLT_PORT=2222   # the loose half still works for connect-only callers
+  assert_eq "dolt_server_port is unchanged for a live server" 3333 "$GOT"
+  mkport_stubs "$b" "" listen 3333
+  run_port "$b" "$c" BEADS_DOLT_PORT=2222
+  assert_eq "dolt_server_port without a server still falls to the file (connect-only callers)" 4444 "$GOT"
+}
+sc_porta_viva; sc_porta_arquivo; sc_porta_pin_ultimo; sc_porta_desconhecida; sc_porta_override; sc_porta_viva_estrita
 
 echo "── mutants: one loose edit of the lib, the scenario must FAIL ──"
 mutant() {   # name · original piece (\n = newline) · loose piece · scenario that must catch it
@@ -277,6 +301,8 @@ mutant arquivo-vence-o-vivo  '  _pid="$(dolt_server_pid || true)"' '  _pid=""' s
 mutant desconhecida-vira-52756 '    printf '"'%s'"' "$BEADS_DOLT_PORT"; return 0\n  fi\n  printf '"''"'\n  return 1' '    printf '"'%s'"' "$BEADS_DOLT_PORT"; return 0\n  fi\n  printf 52756\n  return 0' sc_porta_desconhecida
 mutant faixa-de-porta-ignorada '  [ "$1" -ge 1 ] && [ "$1" -le 65535 ]' '  true' sc_porta_desconhecida
 # EQUIVALENT (L `case "$1" in '"''"'|*[!0-9]*) return 1 ;; esac` without the `*[!0-9]*` arm): a non-numeric value then reaches `[ "$1" -ge 1 ]`, which errors (rc 2) and rejects it by itself -- same answer, only stderr noise differs.
+mutant live-cai-no-arquivo   "  fi\n  printf ''\n  return 1\n}\ndolt_server_port() {" "  fi\n  if [ -r \"\${GC_CITY:-/x}/.beads/dolt-server.port\" ]; then head -1 \"\${GC_CITY:-/x}/.beads/dolt-server.port\" | tr -d '[:space:]'; return 0; fi\n  printf ''\n  return 1\n}\ndolt_server_port() {" sc_porta_viva_estrita
+mutant live-cai-no-pin       "  fi\n  printf ''\n  return 1\n}\ndolt_server_port() {" "  fi\n  if _dolt_port_valid \"\${BEADS_DOLT_PORT:-}\"; then printf '%s' \"\$BEADS_DOLT_PORT\"; return 0; fi\n  printf ''\n  return 1\n}\ndolt_server_port() {" sc_porta_viva_estrita
 mutant override-ignorado     '  if _dolt_port_valid "${GC_DOLT_PORT_OVERRIDE:-}"; then' '  if false; then' sc_porta_override
 
 if [ "$FAILURES" -eq 0 ]; then

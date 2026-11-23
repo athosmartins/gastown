@@ -246,6 +246,10 @@ STATE3="$WORK/state-unit3"; mkdir -p "$STATE3"
   # directly, the same override knob gc-dolt-probe.sh's own internal selftest uses.
   export GC_BIN="$STUBS/gc"
   export GC_CALLS="$WORK/gc.calls.probe"; : > "$GC_CALLS"
+  # ga-3v2zt00 (gate round 2, blocking 3): timed_serve_confirm now returns 1 (no reading) when the port is UNKNOWN, so this block's fallback
+  # case would read the HOST (a live Dolt or a port file on the mini; nothing on the Linux node). GC_DOLT_PORT_OVERRIDE is the seam that pins it;
+  # the fallback python is a stub (DLA_PY_*), the port number only has to be a valid one.
+  export GC_DOLT_PORT_OVERRIDE=52756
   # shellcheck disable=SC1090
   source "$SCRIPT"
 

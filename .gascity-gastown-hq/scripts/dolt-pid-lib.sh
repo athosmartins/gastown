@@ -99,17 +99,30 @@ _dolt_port_valid() {
   case "$1" in ''|*[!0-9]*) return 1 ;; esac
   [ "$1" -ge 1 ] && [ "$1" -le 65535 ]
 }
-dolt_server_port() {
-  local _city="${GC_CITY:-/Users/athos/gt/.gascity-gastown-hq}" _pid _port=""
+# dolt_server_live_port (ga-3v2zt00, gate round 2) -- the STRICT half of dolt_server_port: only an answer that cannot be a
+# stale copy of itself. First answer wins: (1) GC_DOLT_PORT_OVERRIDE, (2) the LISTEN socket of the verified live server.
+# NO file, NO pin. Prints the port and returns 0; prints nothing and returns 1 = UNKNOWN (no verified server, or one whose
+# LISTEN line cannot be read). WHY it exists: a guard that audits the port FILES must not take its idea of "live" from one of
+# those files -- with the server undetectable the file would be judged against itself and the guard would announce "all clear".
+# Callers that judge files (dolt-port-pin-guard.sh) use THIS; callers that only need somewhere to connect use dolt_server_port.
+dolt_server_live_port() {
+  local _pid _port=""
   if _dolt_port_valid "${GC_DOLT_PORT_OVERRIDE:-}"; then
     printf '%s' "$GC_DOLT_PORT_OVERRIDE"; return 0
   fi
   _pid="$(dolt_server_pid || true)"
   if [ -n "$_pid" ]; then
-    # vazio (no LISTEN line) / falhou (lsof error): fall through to the port file -- never to a default
+    # vazio (no LISTEN line) / falhou (lsof error): UNKNOWN (rc 1) -- never a file, never a default
     _port="$(lsof -nP -a -p "$_pid" -iTCP -sTCP:LISTEN -Fn 2>/dev/null | sed -n 's/^n.*:\([0-9][0-9]*\)$/\1/p' | head -1)"
     if _dolt_port_valid "$_port"; then printf '%s' "$_port"; return 0; fi
   fi
+  printf ''
+  return 1
+}
+dolt_server_port() {
+  local _city="${GC_CITY:-/Users/athos/gt/.gascity-gastown-hq}" _port=""
+  _port="$(dolt_server_live_port || true)"
+  if [ -n "$_port" ]; then printf '%s' "$_port"; return 0; fi
   if [ -r "$_city/.beads/dolt-server.port" ]; then
     _port="$(head -1 "$_city/.beads/dolt-server.port" 2>/dev/null | tr -d '[:space:]')"
     if _dolt_port_valid "$_port"; then printf '%s' "$_port"; return 0; fi

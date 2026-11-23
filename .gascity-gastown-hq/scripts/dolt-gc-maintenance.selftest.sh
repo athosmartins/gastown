@@ -949,8 +949,12 @@ if [ -z "$EP" ] || [ ! -d "$EP" ]; then bad "entry: mktemp failed — real-entry
   entry_reset() { rm -f "$EP/bd.calls" "$EP/dolt.calls" "$EP/notify.calls" "$EP/job.log" "$EP/run.lock.d.stuck-alerted" "$EP/run.lock.d.stuck-age-unknown"; rm -f "$EP/run.lock.d/pid" 2>/dev/null; rmdir "$EP/run.lock.d" 2>/dev/null; printf '62 1\n' > "$EP/streak.state"; }
   # run the job exactly as launchd does (script, not library) but with DOLT_GC_MAINT_LIB forced off — this
   # selftest exports it as 1 for its own library loads, which would make the child do nothing at all.
+  #   ga-3v2zt00 (gate round 2): the job now DERIVES its Dolt port (dolt_server_port: override > live server > port file > pin). On a host
+  #   with no Dolt and no port file (the Linux node) that is UNKNOWN and the probe is skipped before the stub dolt is ever called, so the
+  #   refused/control cases below would read host state. GC_DOLT_PORT_OVERRIDE pins the port (same seam the watchdog selftest uses); a case
+  #   that wants the UNKNOWN answer overrides it LAST with an empty value (the "$@" comes after).
   run_entry() { env PATH="$EP/bin:$PATH" DOLT_GC_MAINT_LIB=0 DOLT_MAINT_CONF="$EP/conf.env" DOLT_GC_MAINT_LOG="$EP/job.log" \
-                    GC_SKIP_STREAK_STATE="$EP/streak.state" GC_MAINT_LOCKDIR="$EP/run.lock.d" "$@" /bin/bash "$SCRIPT" >/dev/null 2>&1; }
+                    GC_SKIP_STREAK_STATE="$EP/streak.state" GC_MAINT_LOCKDIR="$EP/run.lock.d" GC_DOLT_PORT_OVERRIDE=52756 "$@" /bin/bash "$SCRIPT" >/dev/null 2>&1; }
 
   # (a) a free lock: the run happens, and the lock is released when it exits (the EXIT trap)
   entry_reset; run_entry; rc=$?
@@ -1057,6 +1061,20 @@ if [ -z "$EP" ] || [ ! -d "$EP" ]; then bad "entry: mktemp failed — real-entry
      && [ "$(wc -l < "$EP/dolt.calls" | tr -d '[:space:]')" = "2" ] && sed -n 2p "$EP/dolt.calls" | grep -q 'CALL dolt_gc' && sed -n 1p "$EP/dolt.calls" | grep -q 'SELECT 1'; then
     ok "entry: (control) a Dolt that answers → probe first, then CALL dolt_gc, outcome gc-ok, streak cleared — through the real timeout and a real client exec"
   else bad "entry control: rc=$rc streak='$(cat "$EP/streak.state" 2>/dev/null)' outcome='$(entry_oc)' dolt_calls='$(cat "$EP/dolt.calls" 2>/dev/null)' log='$(tail -2 "$EP/job.log" 2>/dev/null)'"; fi
+  # (g) ga-3v2zt00 (gate round 2, blocking 3): the port is UNKNOWN (no override, no verified server, no port file, no pin) -- the
+  #     third state. The job must NOT ask a guessed port: the stub dolt is never called, the outcome is the inert 'dolt-unreachable',
+  #     the streak is untouched, nothing is pushed, and the log says WHY ("port unknown"). Real script, real timeout; a `dolt` that would
+  #     answer is installed on purpose, so a regression (probing a default/empty port anyway) shows up as a recorded client call.
+  mkdir -p "$EP/nobin" "$EP/nocity/.beads"
+  printf '#!/bin/sh\nexit 1\n' > "$EP/nobin/pgrep"; printf '#!/bin/sh\necho sleep\n' > "$EP/nobin/ps"; printf '#!/bin/sh\nexit 1\n' > "$EP/nobin/lsof"
+  chmod +x "$EP/nobin/pgrep" "$EP/nobin/ps" "$EP/nobin/lsof"
+  entry_reset; rm -f "$EP/outcome.state"; entry_dolt up
+  run_entry GC_TRIGGERED_RUN=1 GC_TRIGGERED_KIND=direct GC_RUN_TOKEN=100.7 GC_RUN_OUTCOME_STATE="$EP/outcome.state" \
+            GC_DOLT_PORT_OVERRIDE= BEADS_DOLT_PORT= GC_CITY="$EP/nocity" PATH="$EP/nobin:$EP/bin:$PATH"; rc=$?
+  if [ "$rc" -eq 0 ] && [ "$(cat "$EP/streak.state" 2>/dev/null)" = "62 1" ] && [ "$(entry_oc)" = "token=100.7 outcome=dolt-unreachable" ] \
+     && [ ! -e "$EP/dolt.calls" ] && [ ! -e "$EP/notify.calls" ] && grep -q 'port unknown' "$EP/job.log" && ! grep -q 'dolt_gc FAILED' "$EP/job.log"; then
+    ok "entry: Dolt port UNKNOWN (no override/server/file/pin) → the client is never called, outcome dolt-unreachable, streak still 62, no push, the log says 'port unknown'"
+  else bad "entry port-unknown: rc=$rc streak='$(cat "$EP/streak.state" 2>/dev/null)' outcome='$(entry_oc)' dolt_calls='$(cat "$EP/dolt.calls" 2>/dev/null)' notify='$(cat "$EP/notify.calls" 2>/dev/null)' log='$(tail -3 "$EP/job.log" 2>/dev/null)'"; fi
   unset -f entry_dolt entry_oc
 
   unset -f entry_reset run_entry
