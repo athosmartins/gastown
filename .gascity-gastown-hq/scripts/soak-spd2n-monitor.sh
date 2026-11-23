@@ -16,7 +16,9 @@ source "$(dirname "${BASH_SOURCE[0]:-$0}")/dolt-pid-lib.sh"
 LOG="$CITY/.gc/logs/soak-spd2n.jsonl"
 START_F="$CITY/.gc/soak-spd2n.start"           # epoch of soak start
 STRIKES_F="/tmp/soak-spd2n.strikes"            # consecutive wedge checks
-DOLT_PORT=52756
+# ga-3v2zt00: derived from the live server (dolt_server_port), never a number written here -- it flips on every Dolt start.
+# vazio/falhou (port unknown) → dolt_ok=0 below, the same "could not confirm serving" answer a refused connection gives.
+DOLT_PORT="$(dolt_server_port || true)"
 SOAK_HOURS="${SOAK_HOURS:-24}"
 WEDGE_FAIL_STRIKES="${WEDGE_FAIL_STRIKES:-3}"  # 3 consecutive 30min checks = 90min sustained
 GATE_LOG="$CITY/.gc/logs/quality-gate-dispatcher.log"
@@ -34,6 +36,7 @@ elapsed_h=$(( (now - start) / 3600 ))
 fresh() { local f="$1"; [ -f "$f" ] || { echo 0; return; }; local m=$(( (now - $(stat -f %m "$f" 2>/dev/null || echo 0)) / 60 )); [ "$m" -le 15 ] && echo 1 || echo 0; }
 gate_alive=$(fresh "$GATE_LOG")
 pilot_alive=$(fresh "$PILOT_LOG")
+[ -n "$DOLT_PORT" ] || DOLT_PORT=0   # 0 is never a listening port: the connect below fails fast → dolt_ok=0
 dolt_ok=$(timeout 8 python3 -c "import pymysql;pymysql.connect(host='127.0.0.1',port=$DOLT_PORT,user='root',connect_timeout=6).cursor().execute('SELECT 1');print(1)" 2>/dev/null || echo 0)
 dolt_cpu=$(ps -p "$(dolt_server_pid)" -o %cpu= 2>/dev/null | tr -d ' ' || echo "?")
 refino_ok=$(launchctl list 2>/dev/null | grep -E 'com.gascity.(auto-refino|refino-gate)-dispatcher' >/dev/null && echo 1 || echo 0)

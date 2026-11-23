@@ -17,13 +17,14 @@
     com o Hetzner ocioso (load 3/16) e o teto remoto em 7. Run não alcançada vai para a frente da
     próxima rodada (GATE_PHASE_C_DEFERRED_FILE); custo = finalize/timeout de uma run atrasa ~1 rodada.
   - GATE_FULL_SUITE_ADVISORY_RIGS=whatsapp_automation: estava só no instalado (drift), trazido p/ cá.
+  - SEM BEADS_DOLT_PORT (ga-3v2zt00, 23/11): a porta do Dolt muda a cada start (52756 -> 52757 -> 52756 em 24 h);
+    o numero fixo aqui cegou o gate (leitura do marker falhava -> "raced away", 80 min de fila parada). O `bd -C`
+    acha a porta sozinho por .beads/dolt-server.port. NAO volte a escrever porta neste arquivo.
 -->
 <plist version="1.0">
 <dict>
 	<key>EnvironmentVariables</key>
 	<dict>
-		<key>BEADS_DOLT_PORT</key>
-		<string>52756</string>
 		<key>GATE_CODE_REVIEWERS</key>
 		<string>1</string>
 		<key>GATE_DOLT_CPU_HOT</key>

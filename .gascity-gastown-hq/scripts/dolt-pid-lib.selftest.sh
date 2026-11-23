@@ -195,6 +195,63 @@ sc_pidfile_morto() {   # dolt.pid of a process that already exited; ps/lsof stub
 }
 sc_rc_sucesso; sc_pidfile_vazio; sc_pidfile_morto
 
+# ── dolt_server_port (ga-3v2zt00): the port is read from the live server, never from a number written down ──
+# mkport_stubs <dir> <pgrep pid or ""> <lsof mode: listen|nolisten> <port the stubbed listener holds>
+mkport_stubs() {
+  local d="$1" pg="$2" mode="$3" port="$4"
+  mkdir -p "$d"
+  if [ -n "$pg" ]; then printf '#!/usr/bin/env bash\nprintf "%%s\\n" "%s"\n' "$pg" > "$d/pgrep"; else printf '#!/usr/bin/env bash\nexit 1\n' > "$d/pgrep"; fi
+  printf '#!/usr/bin/env bash\ncase " $* " in *"%%cpu"*) echo 0.0 ;; *) echo dolt ;; esac\n' > "$d/ps"
+  if [ "$mode" = listen ]; then   # -Fn shape: one "p<pid>" line, then "n<addr>:<port>"
+    printf '#!/usr/bin/env bash\nprintf "p1\\nn*:%s\\n"\n' "$port" > "$d/lsof"
+  else printf '#!/usr/bin/env bash\nexit 0\n' > "$d/lsof"; fi   # a live server whose LISTEN line cannot be read
+  chmod +x "$d/pgrep" "$d/ps" "$d/lsof"
+}
+# dolt_server_port with the stubs of $1, the city $2 and the extra env VAR=val of $3.. -> GOT (stdout) and GOT_RC
+run_port() {
+  local b="$1" c="$2"; shift 2
+  GOT="$( ( PATH="$b:$PATH"; GC_CITY="$c"; unset GC_DOLT_PORT_OVERRIDE BEADS_DOLT_PORT; if [ $# -gt 0 ]; then export "$@"; fi; dolt_server_port ) )"; GOT_RC=$?
+}
+mkportcity() { mkdir -p "$1/.beads"; rm -f "$1/.beads/dolt-server.port"; }
+sc_porta_viva() {   # live LISTEN socket (3333) beats the port file (1111) and the legacy pin (2222): both are exactly the stale numbers that blinded the city
+  local b="$SCRATCH/pt1/bin" c="$SCRATCH/pt1/city"
+  mkportcity "$c"; printf '1111\n' > "$c/.beads/dolt-server.port"; mkport_stubs "$b" "$REAL_PID" listen 3333
+  run_port "$b" "$c" BEADS_DOLT_PORT=2222
+  assert_eq "live server: its LISTEN port wins over file and pin" 3333 "$GOT"; assert_eq "live server: rc 0" 0 "$GOT_RC"
+}
+sc_porta_arquivo() {   # no live server, or one whose LISTEN line cannot be read: the port file (the one bd reads) beats the pin
+  local b="$SCRATCH/pt2/bin" c="$SCRATCH/pt2/city"
+  mkportcity "$c"; printf '4444\n' > "$c/.beads/dolt-server.port"; mkport_stubs "$b" "" listen 3333
+  run_port "$b" "$c" BEADS_DOLT_PORT=2222
+  assert_eq "no live server: the port file wins over the pin" 4444 "$GOT"
+  mkport_stubs "$b" "$REAL_PID" nolisten 3333
+  run_port "$b" "$c" BEADS_DOLT_PORT=2222
+  assert_eq "live server with unreadable LISTEN: falls to the port file, not to a default" 4444 "$GOT"
+}
+sc_porta_pin_ultimo() {   # the legacy pin is the LAST resort; a junk port file does not count as an answer
+  local b="$SCRATCH/pt3/bin" c="$SCRATCH/pt3/city"
+  mkportcity "$c"; printf 'abc\n' > "$c/.beads/dolt-server.port"; mkport_stubs "$b" "" listen 3333
+  run_port "$b" "$c" BEADS_DOLT_PORT=2222
+  assert_eq "junk port file + pin: the pin, last resort" 2222 "$GOT"; assert_eq "pin as last resort: rc 0" 0 "$GOT_RC"
+}
+sc_porta_desconhecida() {   # nothing at all: EMPTY with rc 1 -- never a default number (callers read empty as "could not tell")
+  local b="$SCRATCH/pt4/bin" c="$SCRATCH/pt4/city"
+  mkportcity "$c"; mkport_stubs "$b" "" listen 3333
+  run_port "$b" "$c"
+  assert_eq "nothing known: empty, no default port" "" "$GOT"; assert_eq "nothing known: rc 1" 1 "$GOT_RC"
+  run_port "$b" "$c" BEADS_DOLT_PORT=0 GC_DOLT_PORT_OVERRIDE=70000
+  assert_eq "out-of-range pin and override are not ports" "" "$GOT"
+}
+sc_porta_override() {   # the explicit seam wins over a live server, and a non-numeric override is ignored
+  local b="$SCRATCH/pt5/bin" c="$SCRATCH/pt5/city"
+  mkportcity "$c"; mkport_stubs "$b" "$REAL_PID" listen 3333
+  run_port "$b" "$c" GC_DOLT_PORT_OVERRIDE=1
+  assert_eq "override wins over the live server" 1 "$GOT"
+  run_port "$b" "$c" GC_DOLT_PORT_OVERRIDE=abc
+  assert_eq "non-numeric override ignored (live port used)" 3333 "$GOT"
+}
+sc_porta_viva; sc_porta_arquivo; sc_porta_pin_ultimo; sc_porta_desconhecida; sc_porta_override
+
 echo "── mutants: one loose edit of the lib, the scenario must FAIL ──"
 mutant() {   # name · original piece (\n = newline) · loose piece · scenario that must catch it
   local name="$1" old="$2" new="$3" case_fn="$4" res
@@ -215,6 +272,12 @@ mutant morto-vira-servidor   'kill -0 "$_p" 2>/dev/null || return 1' 'kill -0 "$
 mutant vivo-fica-com-ps-lsof 'kill -0 "$_p" 2>/dev/null || return 1' 'kill -0 "$_p" 2>/dev/null' sc_pidfile_morto
 mutant pidfile-sucesso-rc-1  "printf '%s' \"\$_cand\"\\n      return 0" "printf '%s' \"\$_cand\"\\n      return 1" sc_rc_sucesso
 mutant pgrep-sucesso-rc-1    "printf '%s' \"\$_p\"\\n      return 0" "printf '%s' \"\$_p\"\\n      return 1" sc_rc_sucesso
+mutant pin-vence-o-vivo      '  _pid="$(dolt_server_pid || true)"' '  if _dolt_port_valid "${BEADS_DOLT_PORT:-}"; then printf "%s" "$BEADS_DOLT_PORT"; return 0; fi\n  _pid="$(dolt_server_pid || true)"' sc_porta_viva
+mutant arquivo-vence-o-vivo  '  _pid="$(dolt_server_pid || true)"' '  _pid=""' sc_porta_viva
+mutant desconhecida-vira-52756 '    printf '"'%s'"' "$BEADS_DOLT_PORT"; return 0\n  fi\n  printf '"''"'\n  return 1' '    printf '"'%s'"' "$BEADS_DOLT_PORT"; return 0\n  fi\n  printf 52756\n  return 0' sc_porta_desconhecida
+mutant faixa-de-porta-ignorada '  [ "$1" -ge 1 ] && [ "$1" -le 65535 ]' '  true' sc_porta_desconhecida
+# EQUIVALENT (L `case "$1" in '"''"'|*[!0-9]*) return 1 ;; esac` without the `*[!0-9]*` arm): a non-numeric value then reaches `[ "$1" -ge 1 ]`, which errors (rc 2) and rejects it by itself -- same answer, only stderr noise differs.
+mutant override-ignorado     '  if _dolt_port_valid "${GC_DOLT_PORT_OVERRIDE:-}"; then' '  if false; then' sc_porta_override
 
 if [ "$FAILURES" -eq 0 ]; then
   echo "ALL PASS"

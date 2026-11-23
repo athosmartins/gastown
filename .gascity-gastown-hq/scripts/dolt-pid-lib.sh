@@ -76,3 +76,47 @@ dolt_server_pid() {
   printf ''
   return 1
 }
+
+# dolt_server_port (ga-3v2zt00) -- the TCP port the live Dolt server answers on, NEVER a number
+# written in a plist, a script default or a session env.
+#
+# WHY: the port changes on every Dolt start (52756 -> 52757 at the 22/11 reboot, back to 52756 at the
+# 23/11 09:52 hang-watchdog restart). Every place that wrote the number down went blind on the next
+# flip: the gate saw its own queue as "raced away" for 80 min, the Pilot refused to dispatch, the
+# sentinel and the disk-floor guard raised "Dolt unreachable" on a server that never went down, and
+# the hang watchdog's raw SELECT 1 aimed at a dead port reads as "not serving" -- the input to a restart.
+#
+# Order (first answer wins):
+#   1. GC_DOLT_PORT_OVERRIDE -- explicit seam for selftests/operators, numeric only.
+#   2. The LISTEN socket of the verified live server (dolt_server_pid): the only source that cannot be stale.
+#   3. $GC_CITY/.beads/dolt-server.port -- the file bd itself reads (numeric only). Stale when the server
+#      is down, which is fine: a refused connection there is the right "down" answer.
+#   4. BEADS_DOLT_PORT, last resort only. It is the legacy pin: it must never outrank a live process.
+# Prints the port and returns 0; prints nothing and returns 1 when NONE of the four answers = UNKNOWN.
+# Callers MUST treat empty as "could not tell" -- inert (no restart, no alarm "down", no write) -- and never
+# as "Dolt is down" nor as a default port.
+_dolt_port_valid() {
+  case "$1" in ''|*[!0-9]*) return 1 ;; esac
+  [ "$1" -ge 1 ] && [ "$1" -le 65535 ]
+}
+dolt_server_port() {
+  local _city="${GC_CITY:-/Users/athos/gt/.gascity-gastown-hq}" _pid _port=""
+  if _dolt_port_valid "${GC_DOLT_PORT_OVERRIDE:-}"; then
+    printf '%s' "$GC_DOLT_PORT_OVERRIDE"; return 0
+  fi
+  _pid="$(dolt_server_pid || true)"
+  if [ -n "$_pid" ]; then
+    # vazio (no LISTEN line) / falhou (lsof error): fall through to the port file -- never to a default
+    _port="$(lsof -nP -a -p "$_pid" -iTCP -sTCP:LISTEN -Fn 2>/dev/null | sed -n 's/^n.*:\([0-9][0-9]*\)$/\1/p' | head -1)"
+    if _dolt_port_valid "$_port"; then printf '%s' "$_port"; return 0; fi
+  fi
+  if [ -r "$_city/.beads/dolt-server.port" ]; then
+    _port="$(head -1 "$_city/.beads/dolt-server.port" 2>/dev/null | tr -d '[:space:]')"
+    if _dolt_port_valid "$_port"; then printf '%s' "$_port"; return 0; fi
+  fi
+  if _dolt_port_valid "${BEADS_DOLT_PORT:-}"; then
+    printf '%s' "$BEADS_DOLT_PORT"; return 0
+  fi
+  printf ''
+  return 1
+}

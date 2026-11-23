@@ -68,7 +68,8 @@ STRIKES="${DOLT_WATCHDOG_STRIKES_FILE:-$STATE_DIR/dolt-hang-watchdog.strikes}"
 MAX_STRIKES="${DOLT_WATCHDOG_MAX_STRIKES:-3}"
 PROBE_TIMEOUT="${DOLT_WATCHDOG_PROBE_TIMEOUT:-12}"
 ENABLED="${DOLT_WATCHDOG_ENABLED:-1}"
-DOLT_PORT="${BEADS_DOLT_PORT:-52756}"            # live Dolt server port
+# ga-3v2zt00: no port is written here -- dolt_actually_serving derives it per call (dolt_server_port, dolt-pid-lib.sh).
+SERVE_BASIS="raw SELECT 1"                      # what the "serving" verdict rests on (the log line says so)
 # ga-153cq: 12 -> 25. This bound decides "alive but slow" vs "dead", so it has to
 # sit ABOVE legitimate worst-case latency or it cannot separate them. Kept well
 # under the 60s launchd StartInterval so runs never overlap. Not raised further:
@@ -435,8 +436,15 @@ dolt_actually_serving() {
   # bound decorative: the connect gave up at 8s and the extra 4s were never usable.
   # Two bounds on the same wait must not disagree, or raising the visible one
   # changes nothing — the invisible one still decides.
-  local _ct=$(( SERVE_CONFIRM_TIMEOUT > 4 ? SERVE_CONFIRM_TIMEOUT - 4 : SERVE_CONFIRM_TIMEOUT ))
-  timeout "$SERVE_CONFIRM_TIMEOUT" python3 - "$DOLT_PORT" "$_ct" <<'PY' 2>/dev/null
+  local _ct=$(( SERVE_CONFIRM_TIMEOUT > 4 ? SERVE_CONFIRM_TIMEOUT - 4 : SERVE_CONFIRM_TIMEOUT )) _port
+  # ga-3v2zt00: three answers. vazio (port derived) → raw SELECT 1 on it; falhou/ilegível (port unknown: no live server, no port file, no pin) → return 0 "serving" = INERT (no strike, no restart) and SERVE_BASIS says so — an aim we could not take is not proof the server is hung, and "not serving" here is the input to a kill/restart
+  SERVE_BASIS="raw SELECT 1"
+  _port="$(dolt_server_port || true)"
+  if [ -z "$_port" ]; then
+    SERVE_BASIS="port unknown (no live server, port file or pin) -- INCONCLUSIVE, treated as serving so nothing is struck or restarted"
+    return 0
+  fi
+  timeout "$SERVE_CONFIRM_TIMEOUT" python3 - "$_port" "$_ct" <<'PY' 2>/dev/null
 import sys
 try:
     import pymysql
@@ -638,7 +646,7 @@ fi
 # succeeds, it's busy/slow (saturation), NOT hung — don't strike, don't restart.
 if dolt_actually_serving; then
   _cpu="$(dolt_cpu_pct)"
-  log "Health-probe failed but Dolt SERVES a raw SELECT 1 (cpu=${_cpu:-?}%) — saturation, NOT a hang. Skipping strike/restart."
+  log "Health-probe failed but Dolt SERVES (${SERVE_BASIS}) (cpu=${_cpu:-?}%) — saturation, NOT a hang. Skipping strike/restart."
   # ga-153cq (gate attempt 2): same class as the probe_ok branch above — proven
   # serving means "clean slate" for real, but only when we're not simulating.
   if is_dry_run; then

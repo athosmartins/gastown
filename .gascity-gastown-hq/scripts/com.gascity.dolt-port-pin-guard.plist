@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- ga-3v2zt00: detection-only guard (dolt-port-pin-guard.sh). Looks for a Dolt port written down anywhere that is
+     not the live one (launchd env pins, rig .beads port files) and notifies once per change of the finding set.
+     600 s: one run is ~1 s; the guard keeps its own mkdir lock, so a slow run can never stack (ga-y0g5x).
+     NO BEADS_DOLT_PORT here, on purpose: this job must not carry the very kind of number it hunts. -->
+<plist version="1.0"><dict>
+  <key>Label</key><string>com.gascity.dolt-port-pin-guard</string>
+  <key>ProgramArguments</key><array>
+    <string>/bin/bash</string>
+    <string>/Users/athos/gt/.gascity-gastown-hq/scripts/dolt-port-pin-guard.sh</string>
+  </array>
+  <key>WorkingDirectory</key><string>/Users/athos/gt/.gascity-gastown-hq</string>
+  <key>StartInterval</key><integer>600</integer>
+  <key>RunAtLoad</key><true/>
+  <key>StandardOutPath</key><string>/Users/athos/gt/.gascity-gastown-hq/.gc/logs/dolt-port-pin-guard-launchd.out</string>
+  <key>StandardErrorPath</key><string>/Users/athos/gt/.gascity-gastown-hq/.gc/logs/dolt-port-pin-guard-launchd.err</string>
+  <key>EnvironmentVariables</key><dict>
+    <key>PATH</key><string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:/Users/athos/go/bin:/Users/athos/.local/bin</string>
+    <key>HOME</key><string>/Users/athos</string>
+  </dict>
+</dict></plist>

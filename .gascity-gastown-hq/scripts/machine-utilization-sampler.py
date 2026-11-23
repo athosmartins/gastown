@@ -138,9 +138,17 @@ def dolt_ok():
     'winding_down'). Neither is true: the machine may be working AND have work; we
     simply couldn't MEASURE it. So on a failed probe we emit state='unknown' and the
     report/panel EXCLUDE it (a measurement gap, never counted as machine failure)."""
+    # ga-3v2zt00: the port is derived from the live server (dolt_server_port, dolt-pid-lib.sh), never a number
+    # written here -- it flips on every Dolt start, and a probe aimed at the old one reads "unreachable" on a
+    # healthy server. vazio/falhou (port unknown, or the lib unreadable) -> the probe cannot run -> False, which the
+    # caller already turns into state='unknown' (a measurement gap, excluded from the report), never into 'idle'.
     out = sh(["bash", "-c",
-              "timeout 6 env DOLT_CLI_PASSWORD='' dolt --host 127.0.0.1 --port 52756 "
-              "--user root --no-tls sql -q 'SELECT 1;' 2>/dev/null"], timeout=10)
+              'source "$1/scripts/dolt-pid-lib.sh" 2>/dev/null || exit 1; '
+              'port="$(dolt_server_port)" && [ -n "$port" ] || exit 1; '
+              "timeout 6 env DOLT_CLI_PASSWORD='' dolt --host 127.0.0.1 --port \"$port\" "
+              "--user root --no-tls sql -q 'SELECT 1;' 2>/dev/null",
+              "bash", os.environ.get("GC_CITY") or os.environ.get("GC_CITY_PATH") or "/Users/athos/gt/.gascity-gastown-hq"],
+             timeout=10)
     return "1" in out
 
 

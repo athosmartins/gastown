@@ -132,7 +132,8 @@ source "$(dirname "${BASH_SOURCE[0]:-$0}")/dolt-pid-lib.sh"
 # DOLT_WATCHDOG_LOG) so the selftest can assert on log lines -- and stop writing its fake
 # ALARM/CLEARED lines into the live log. Unset in production: the path is unchanged.
 LOG="${DOLT_LATENCY_ALARM_LOG:-$CITY/.gc/logs/dolt-latency-alarm.log}"
-DOLT_PORT_DEFAULT="${BEADS_DOLT_PORT:-52756}"
+# ga-3v2zt00: no default port is written here any more (it flips on every Dolt start; a stale 52756 made conn_count
+# read 0 = "healthy" on a server that was alive on 52757). live_dolt_port derives it; unknown = no reading, never a number.
 
 LATENCY_ALARM_MS="${DOLT_LATENCY_ALARM_MS:-500}"
 CONN_ALARM_COUNT="${DOLT_CONN_ALARM_COUNT:-100}"
@@ -201,8 +202,8 @@ _PROBE="$CITY/scripts/gc-dolt-probe.sh"
 
 # ── live Dolt port (never trust a config default alone — a stale port would make
 # conn_count silently read 0, i.e. "empty" masquerading as "healthy", exactly the
-# failure class this bead's own doctrine warns about). Falls back to the
-# configured default only if no live `dolt sql-server` process is found. ──
+# failure class this bead's own doctrine warns about). No live `dolt sql-server` process → the port
+# file / legacy pin via dolt_server_port; nothing answers → UNKNOWN (empty, rc 1), never a default number. ──
 live_dolt_port() {
   # port MUST be initialized, not just declared. This script runs under
   # `set -u` (line 75). When NO `dolt sql-server` process exists, $pid is empty,
@@ -226,7 +227,11 @@ live_dolt_port() {
   if [ -n "$pid" ]; then
     port=$(lsof -nP -p "$pid" 2>/dev/null | grep LISTEN | grep -oE ':[0-9]+ \(LISTEN\)' | head -1 | grep -oE '[0-9]+')
   fi
-  [ -n "$port" ] && echo "$port" || echo "$DOLT_PORT_DEFAULT"
+  # vazio (no live process / no LISTEN line) → dolt_server_port: port file the bd client reads, then the legacy pin;
+  # falhou/ilegível (nothing answers) → prints NOTHING and returns 1 = port UNKNOWN. Callers treat that as "no reading" (inert), never as 0 and never as a default port.
+  [ -n "$port" ] || port="$(dolt_server_port || true)"
+  [ -n "$port" ] || return 1
+  echo "$port"
 }
 
 # ── connection count: TCP ESTABLISHED on the live Dolt port via lsof. Zero Dolt
@@ -234,7 +239,8 @@ live_dolt_port() {
 # connection-attribution sampling) — this signal works even when Dolt itself is
 # too wedged to answer a query. ──
 conn_count() {
-  local port; port=$(live_dolt_port)
+  local port; port=$(live_dolt_port) || true
+  [ -n "$port" ] || return 0     # port unknown → prints nothing = no reading (an empty -iTCP: filter would count EVERY connection on the box)
   lsof -nP -iTCP:"$port" -sTCP:ESTABLISHED 2>/dev/null | tail -n +2 | wc -l | tr -d ' '
 }
 
@@ -246,7 +252,8 @@ conn_count() {
 # 8s today reads as "healthy" to every existing check in this codebase). Prints
 # elapsed ms to stdout on success; prints nothing and returns 1 on failure. ──
 timed_serve_confirm() {
-  local port; port=$(live_dolt_port)
+  local port; port=$(live_dolt_port) || true
+  [ -n "$port" ] || return 1     # port unknown → no latency reading (the caller already handles "no reading"), not a probe at a guessed port
   timeout "$SERVE_CONFIRM_TIMEOUT" python3 - "$port" <<'PY' 2>/dev/null
 import sys, time
 t0 = time.time()
@@ -441,7 +448,8 @@ _lat="$(get_latency_ms)"
 _conns="$(conn_count)"
 
 [ -n "$_lat" ] && record_reading "$LATENCY_WINDOW_FILE" "$_lat"
-record_reading "$CONN_WINDOW_FILE" "$_conns"
+# ga-3v2zt00: an unreadable connection count (port unknown) is NOT recorded -- a blank/0 in the window would pull the median toward "healthy".
+[ -n "$_conns" ] && record_reading "$CONN_WINDOW_FILE" "$_conns"
 
 _med_lat="$(median_of "$LATENCY_WINDOW_FILE")"
 _med_conn="$(median_of "$CONN_WINDOW_FILE")"
@@ -463,10 +471,10 @@ fi
 
 if [ "$_degraded" = "1" ]; then
   if [ ! -f "$ALARM_ACTIVE_FILE" ]; then
-    log "ALARM (pre-collapse, ga-7j5vf knee=9-15 bd-concurrent): ${_reason} — this tick lat=${_lat:-?}ms conns=${_conns}"
+    log "ALARM (pre-collapse, ga-7j5vf knee=9-15 bd-concurrent): ${_reason} — this tick lat=${_lat:-?}ms conns=${_conns:-?}"
     if [ "$LATENCY_ALARM_ENABLED" = "1" ]; then
       command -v notify >/dev/null 2>&1 && \
-        notify -p 3 -t 'Dolt degradando' "${_reason} (agora: lat=${_lat:-?}ms conns=${_conns}) — pre-colapso, so aviso, dolt-hang-watchdog cuida de hang confirmado" >/dev/null 2>&1 || true
+        notify -p 3 -t 'Dolt degradando' "${_reason} (agora: lat=${_lat:-?}ms conns=${_conns:-?}) — pre-colapso, so aviso, dolt-hang-watchdog cuida de hang confirmado" >/dev/null 2>&1 || true
     fi
     touch "$ALARM_ACTIVE_FILE" 2>/dev/null || true
   fi

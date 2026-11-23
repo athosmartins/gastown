@@ -217,12 +217,22 @@ STATE2="$WORK/state-unit2"; mkdir -p "$STATE2"
   source "$SCRIPT"
 
   echo "port_found=$(DLA_PGREP_PID=$DLA_REAL_PID DLA_LISTEN_PORT=52756 live_dolt_port)"
-  echo "port_fallback=$(live_dolt_port)"   # no pgrep hit → DOLT_PORT_DEFAULT
+  # ga-3v2zt00: no live process → the port file the bd client reads (never a number written in the script);
+  # no process AND no file/pin → UNKNOWN: prints nothing, rc 1, and conn_count / timed_serve_confirm give "no reading".
+  _PF="$WORK/portfile-city"; mkdir -p "$_PF/.beads"; printf '52999\n' > "$_PF/.beads/dolt-server.port"
+  _NF="$WORK/noport-city";   mkdir -p "$_NF/.beads"
+  echo "port_fallback=$(GC_CITY="$_PF" live_dolt_port)"
+  echo "port_unknown=[$(GC_CITY="$_NF" BEADS_DOLT_PORT= live_dolt_port)] rc=$(GC_CITY="$_NF" BEADS_DOLT_PORT= live_dolt_port >/dev/null; echo $?)"
+  echo "conns_unknown=[$(GC_CITY="$_NF" BEADS_DOLT_PORT= conn_count)]"
+  GC_CITY="$_NF" BEADS_DOLT_PORT= timed_serve_confirm >/dev/null; echo "serve_unknown_rc=$?"
   echo "conns=$(DLA_PGREP_PID=$DLA_REAL_PID DLA_LISTEN_PORT=52756 DLA_CONN_COUNT=7 conn_count)"
 ) > "$WORK/probe.out" 2>&1
 
 grep -q "^port_found=52756$"    "$WORK/probe.out" && ok "live_dolt_port: derives port from live pgrep+lsof, not config default" || nope "live_dolt_port found mismatch: $(cat "$WORK/probe.out")"
-grep -q "^port_fallback=52756$" "$WORK/probe.out" && ok "live_dolt_port: falls back to DOLT_PORT_DEFAULT when no process found" || nope "live_dolt_port fallback mismatch"
+grep -q "^port_fallback=52999$" "$WORK/probe.out" && ok "live_dolt_port: no process → port file (not a default baked into the script)" || nope "live_dolt_port fallback mismatch: $(grep port_fallback= "$WORK/probe.out")"
+grep -q "^port_unknown=\[\] rc=1$" "$WORK/probe.out" && ok "live_dolt_port: no process, no file, no pin → empty + rc 1 (UNKNOWN, never a guessed port)" || nope "live_dolt_port unknown mismatch: $(grep port_unknown= "$WORK/probe.out")"
+grep -q "^conns_unknown=\[\]$" "$WORK/probe.out" && ok "conn_count: unknown port → no reading (not 0, not a whole-box count)" || nope "conn_count unknown mismatch: $(grep conns_unknown= "$WORK/probe.out")"
+grep -q "^serve_unknown_rc=1$" "$WORK/probe.out" && ok "timed_serve_confirm: unknown port → rc 1 = no reading (no probe at a guessed port)" || nope "timed_serve_confirm unknown mismatch: $(grep serve_unknown_rc= "$WORK/probe.out")"
 grep -q "^conns=7$"             "$WORK/probe.out" && ok "conn_count: reports lsof ESTABLISHED count on the derived port" || nope "conn_count mismatch: $(grep conns= "$WORK/probe.out")"
 
 # 2b. get_latency_ms: primary (gc_dolt_probe_json) vs fallback (timed_serve_confirm)

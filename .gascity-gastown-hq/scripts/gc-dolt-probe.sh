@@ -83,7 +83,7 @@ _GC_DOLT_PROBE_DUMP_SENTINEL="${GC_DOLT_PROBE_DUMP_SENTINEL:-/tmp/gc-dolt-probe-
 _GC_DOLT_PROBE_RETRIES="${GC_DOLT_PROBE_RETRIES:-3}"          # health-probe attempts per sweep
 _GC_DOLT_PROBE_RETRY_SLEEP="${GC_DOLT_PROBE_RETRY_SLEEP:-2}"  # backoff between attempts (sec)
 _GC_DOLT_SERVE_CONFIRM_TIMEOUT="${GC_DOLT_SERVE_CONFIRM_TIMEOUT:-12}"  # SELECT 1 hard timeout (sec)
-_GC_DOLT_PORT="${BEADS_DOLT_PORT:-52756}"                     # live Dolt server port
+# ga-3v2zt00: the live port is derived at CALL time by dolt_server_port (dolt-pid-lib.sh) -- no default, no env pin.
 
 # ── internal helpers ──────────────────────────────────────────────────────────
 _gc_dolt_ts() { date -u +%Y-%m-%dT%H:%M:%SZ; }
@@ -141,10 +141,14 @@ gc_dolt_probe() {
 # timeout was mere saturation, NOT an outage. Bounded by _GC_DOLT_SERVE_CONFIRM_TIMEOUT so
 # it can never itself hang. Read-only (SELECT 1); never calls bd/gc.
 # Returns: 0 = SERVED (Dolt UP) | 1 = refused / query hung (DOWN) | 2 = inconclusive
-#          (no MySQL client available → fail-open, do NOT treat as outage).
+#          (no MySQL client available, OR the live port could not be derived -- dolt_server_port
+#          answered nothing: fail-open, do NOT treat as outage; ga-3v2zt00).
 _gc_dolt_serve_confirm() {
-  local rc
-  timeout "$_GC_DOLT_SERVE_CONFIRM_TIMEOUT" python3 - "$_GC_DOLT_PORT" <<'PY' 2>/dev/null
+  local rc port
+  # vazio (port derived) → SELECT 1 on it; falhou/ilegível (no live server, no port file, no pin → port unknown) → rc 2 = inconclusive, never DOWN: a port we could not learn says nothing about the server (ga-3v2zt00)
+  port="$(dolt_server_port || true)"
+  [ -n "$port" ] || return 2
+  timeout "$_GC_DOLT_SERVE_CONFIRM_TIMEOUT" python3 - "$port" <<'PY' 2>/dev/null
 import sys
 try:
     import pymysql
@@ -535,6 +539,7 @@ GCEOF
   _GC_DOLT_PROBE_RETRIES=3
   _GC_DOLT_PROBE_RETRY_SLEEP=0     # no real backoff sleeps in tests
   _GC_DOLT_PROBE_TIMEOUT=1         # short so the timeout case (R2) is quick
+  local _REAL_SERVE_CONFIRM; _REAL_SERVE_CONFIRM="$(declare -f _gc_dolt_serve_confirm)"   # R1-R5 stub it; R6 needs the real one
 
   # --- R1: first health attempt healthy → robust rc=0 (serve-confirm NOT consulted) ---
   cat > "$FAKE_GC" <<'GCEOF'
@@ -589,6 +594,13 @@ GCEOF
     bad "R5: expected rc=0 via retry + serve-confirm skipped; got rc=$rc serve_called=$([ -f "$R5_SERVE_MARKER" ] && echo yes || echo no)"
   fi
   rm -f "$R5_COUNTER" 2>/dev/null || true
+
+  # --- R6 (ga-3v2zt00): the REAL serve-confirm with the live port UNKNOWN → rc 2 (inconclusive), never 1 (DOWN) ---
+  eval "$_REAL_SERVE_CONFIRM"
+  dolt_server_port() { return 1; }          # no live server, no port file, no pin
+  _gc_dolt_serve_confirm; rc=$?
+  if [ "$rc" -eq 2 ]; then ok "R6: serve-confirm with port unknown → rc=2 inconclusive (not DOWN, no probe at a guessed port)"; else bad "R6: expected rc=2, got $rc"; fi
+  unset -f dolt_server_port; source "$(dirname "${BASH_SOURCE[0]:-$0}")/dolt-pid-lib.sh"   # give the later code the real lib back
 
   # Restore
   _GC_DOLT_PROBE_GC="$_saved_gc"

@@ -89,7 +89,10 @@ CITY="/Users/athos/gt/.gascity-gastown-hq"
 source "$(dirname "${BASH_SOURCE[0]:-$0}")/dolt-pid-lib.sh"
 
 DB="hq"
-PORT="52756"
+# ga-3v2zt00: derived from the live server (dolt_server_port, dolt-pid-lib.sh), never a number written here --
+# the port flips on every Dolt start. vazio/falhou (no live server, no port file, no pin) → PORT="" and both
+# dolt calls below are SKIPPED as "could not ask" (rc 1 of _gc_dolt_reachable, the same inert answer as a refused connection).
+PORT="$(dolt_server_port || true)"
 THRESHOLD_G="1"            # online gc when hq store >= 1 GB (ga-ftmci: re-bloats fast;
                            # a bigger store slows the per-rig reconcile full-table scan).
 # ga-3euoj: GC_MIN_FREE_PCT's default depends on PRUNE_ENABLED — resolved in main()
@@ -1018,6 +1021,7 @@ _gc_dolt_reachable() {
   _GC_DOLT_UNREACHABLE_WHY=""
   t="$(_gc_dolt_probe_timeout_s)"
   case "$t" in ''|*[!0-9]*) t=15 ;; esac     # a failed $(...) under fork pressure hands back blank
+  if [ -z "$PORT" ]; then _GC_DOLT_UNREACHABLE_WHY="port unknown (no live server, port file or pin)"; return 1; fi
   out="$(DOLT_CLI_PASSWORD='' timeout "$t" dolt --host 127.0.0.1 --port "$PORT" --user root --no-tls sql -q "USE \`$DB\`; SELECT 1;" 2>&1)"; rc=$?
   [ "$rc" -eq 0 ] && return 0
   out="${out%%$'\n'*}"
