@@ -1082,9 +1082,17 @@ iso_obs() { local R=$1 rc s; ISO_OBS=""
   reset; date > "$NODEFLAG"; HETZNER_ISOLATE=1 "$R" --host mbp --repo wa --dir "$T/wt" -- tests/test_x.py >/dev/null 2>"$T/err"; rc=$?
   [ "$rc" = 97 ] && [ ! -e "$(lsf RUN mbp)" ] && grep -q 'só vale no nó Linux' "$T/err" && ISO_OBS="$ISO_OBS fora-do-no:97-sem-rodar"
   reset; date > "$NODEFLAG"; HETZNER_ISOLATE=1 STUB_RUNMODE=exec "$R" --host linux --repo wa --dir "$T/wt" -- tests/test_x.py >"$T/out" 2>&1; rc=$?   # o HOME falso não tem ~/gt-remote/bin/gt-iso-run
-  [ "$rc" = 97 ] && grep -q 'GTN-ISO: inerte wrapper-ausente' "$T/out" && ISO_OBS="$ISO_OBS sem-wrapper:97"; }
+  [ "$rc" = 97 ] && grep -q 'GTN-ISO: inerte wrapper-ausente' "$T/out" && ISO_OBS="$ISO_OBS sem-wrapper:97"
+  # HETZNER_ISO_LANES (ga-282sl1d, a noturna em pistas): 2..8 viram `--lanes N` no gt-iso-run; vazio/1 = como sempre; qualquer outra coisa = 97 sem rodar (nunca "uma pista" calado)
+  reset; date > "$NODEFLAG"; HETZNER_ISOLATE=1 HETZNER_ISO_LANES=2 "$R" --host linux --repo wa --dir "$T/wt" -- tests/test_x.py >/dev/null 2>&1; s=$(lastscript RUN hetzner)
+  case "$s" in *'"$HOME/gt-remote/bin/gt-iso-run" --lanes 2 -- "$HOME/gt-remote/venv-wa/bin/python" -m pytest'*) ISO_OBS="$ISO_OBS lanes:repassa";; esac
+  reset; date > "$NODEFLAG"; HETZNER_ISOLATE=1 HETZNER_ISO_LANES=1 "$R" --host linux --repo wa --dir "$T/wt" -- tests/test_x.py >/dev/null 2>&1; s=$(lastscript RUN hetzner)
+  case "$s" in *'"$HOME/gt-remote/bin/gt-iso-run" -- "$HOME/gt-remote/venv-wa/bin/python" -m pytest'*) case "$s" in *--lanes*) ;; *) ISO_OBS="$ISO_OBS lanes-1:igual";; esac;; esac
+  for v in 0 9 abc 2.5 "2 -- rm"; do
+    reset; date > "$NODEFLAG"; HETZNER_ISOLATE=1 HETZNER_ISO_LANES="$v" "$R" --host linux --repo wa --dir "$T/wt" -- tests/test_x.py >/dev/null 2>"$T/err"; rc=$?
+    if [ "$rc" = 97 ] && [ ! -e "$(lsf RUN hetzner)" ] && grep -q 'HETZNER_ISO_LANES=.* inválido' "$T/err"; then ISO_OBS="$ISO_OBS lanes-ruim:97-sem-rodar"; else ISO_OBS="${ISO_OBS//lanes-ruim:97-sem-rodar/}"; break; fi; done; }
 iso_obs "$RUN"
-for o in sem-iso:limpo com-iso:embrulha com-iso:guard fora-do-no:97-sem-rodar sem-wrapper:97; do
+for o in sem-iso:limpo com-iso:embrulha com-iso:guard fora-do-no:97-sem-rodar sem-wrapper:97 lanes:repassa lanes-1:igual lanes-ruim:97-sem-rodar; do
   case " $ISO_OBS " in *" $o "*) ok "HETZNER_ISOLATE ($o)";; *) bad "HETZNER_ISOLATE ($o) — observado:$ISO_OBS";; esac; done
 # controles negativos: cada defeito do gancho tem de sumir da observação que o guarda (senão o caso não enxerga o defeito)
 iso_mut() { local nome=$1 expr=$2 perde=$3 f="$MUT/iso-mut-$1.sh"; sed "$expr" "$RUN" > "$f"; chmod +x "$f"
@@ -1094,6 +1102,9 @@ iso_mut sem-embrulho  's/ \${ISO}"\\$HOME\/gt-remote\/\$rv/ "\\$HOME\/gt-remote\
 iso_mut sem-guard     's/^  \[ -z "\$ISO" \] || pathline=.*$/  :/' com-iso:guard
 iso_mut iso-no-mbp    's/^    \[ "\$HOSTKIND" = linux \] || { say "HETZNER_ISOLATE=1.*$/    :/' fora-do-no:97-sem-rodar
 iso_mut iso-sempre    's/^  if \[ "\${HETZNER_ISOLATE:-0}" = 1 \]; then$/  if true; then/' sem-iso:limpo
+iso_mut lanes-nao-repassadas 's/^      \[2-8\]) ISO=.*$/      [2-8]) ;;/' lanes:repassa
+iso_mut lanes-ruim-aceito    's/^      \*) say "HETZNER_ISO_LANES=.*$/      *) ;;/' lanes-ruim:97-sem-rodar
+iso_mut lanes-1-repassa      's/^      \x27\x27|1) ;;$/      \x27\x27) ;;/' lanes-1:igual
 # controle negativo 1: sem o --filter, o vazamento aparece — prova que o teste enxerga o defeito
 sed 's/--filter=". \$NODE_FILTER" //' "$RUN" > "$MUT/mut-nofilter.sh"; chmod +x "$MUT/mut-nofilter.sh"
 n=$((n+1)); if cmp -s "$RUN" "$MUT/mut-nofilter.sh"; then echo "FAIL controle: o sed não mudou nada"; fails=$((fails+1)); else

@@ -1180,6 +1180,13 @@ _attempt_pytest() {
   if [ "${HETZNER_ISOLATE:-0}" = 1 ]; then
     [ "$HOSTKIND" = linux ] || { say "HETZNER_ISOLATE=1 só vale no nó Linux — nada rodou"; fall isolamento-so-no-no 97; return 97; }
     ISO='"$HOME/gt-remote/bin/gt-iso-run" -- '   # texto literal: o $HOME é expandido no nó
+    # HETZNER_ISO_LANES=N (ga-282sl1d, a noturna em pistas): repassa `--lanes N` ao gt-iso-run, que registra a pista, soma a memória das outras e pode sair com 95 (sem espaço para uma pista EXTRA agora; o comando NÃO rodou).
+    # vazio ou 1 → como sempre (nenhum --lanes). 2..8 → vale. Qualquer outra coisa (0, 9, abc, 2.5) → 97 sem rodar nada: quem pediu pistas e não as teve nunca vira "uma pista" calado.
+    case "${HETZNER_ISO_LANES:-}" in
+      ''|1) ;;
+      [2-8]) ISO='"$HOME/gt-remote/bin/gt-iso-run" --lanes '"$HETZNER_ISO_LANES"' -- ' ;;
+      *) say "HETZNER_ISO_LANES='${HETZNER_ISO_LANES}' inválido (precisa ser vazio ou um inteiro de 1 a 8) — nada rodou"; fall iso-lanes-invalido 97; return 97 ;;
+    esac
   fi
   cpcmd="cp -cR"; [ "$HOSTKIND" = linux ] && cpcmd="cp -a --reflink=auto"   # APFS clone no macOS; no Linux, cópia (reflink quando o disco deixa)
   venvchk='[ -x "$HOME/gt-remote/'"$rv"'/bin/python" ] || { echo NOVENV; exit 97; }'; [ "$rv" != none ] || venvchk=':'   # hq: selftest bash, sem venv a conferir

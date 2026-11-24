@@ -14,6 +14,8 @@
 # pegaria no meio). O relógio, e não só o prazo contado do início, é o que garante isso quando a ordem nasce atrasada (24/11: o script começou ~05:06Z).
 # Janela real para os lotes: 05:00Z → 08:40Z = ~13200 s (era 12300 s com o prazo fixo de 12600 s). Medido: 22/11 11706 s, 23/11 12276 s, 24/11 ~14000 s projetados para 11 lotes (nó mais lento); quando não couber,
 # o relatório diz o ritmo e o orçamento, e compara os lotes que rodaram (comparação PARCIAL, ga-z6bc623). Mudou o orçamento? Confira esta conta e a do reseed.
+# PISTAS (ga-282sl1d): até HZN_LANES (2) lotes rodam ao mesmo tempo no nó (cada um um gt-iso-run --lanes N, com orçamento de memória e piso de CPU próprios): a conta acima é a de UMA pista; com duas, a noite de 24/11 (~14000 s sequenciais)
+# deve caber folgada. A 1ª noite com pistas diz o ganho real na linha `pistas:` do relatório. Desligar: HZN_LANES=1.
 # o script tem trava de instância única, então uma rodada que passe da hora não empilha com a seguinte.
 #
 # Conferir depois de um reload:  gc order show hetzner-nightly-tests          -> Source: .../packs/town-deltas/...

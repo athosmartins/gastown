@@ -10,13 +10,17 @@
 # TETO DE MEMÓRIA E WORKERS (ga-84gkpab): sem GTN_WORKERS os workers saem do MemAvailable lido na hora (teto de 20 GiB, reserva de 6 GiB, nproc−2), o comando roda DENTRO do escopo
 #   systemd-run com MemoryMax e MemorySwapMax=0, e o teto só vale com a prova (o escopo lê o próprio memory.max); MemAvailable ilegível/zero, memória que não cabe um worker, escopo recusado
 #   ou teto que não aparece no cgroup = INERTE (rc 97, o comando NÃO roda). Com GTN_WORKERS (o lastro) nada muda.
-# CONTROLES NEGATIVOS: mutantes W1-W7 (wrapper), P1-P5 (sonda) e C1-C8 (teto/workers) têm de ser REPROVADOS pelo caso correspondente (o caso falha no mutante).
+# PISTAS (ga-282sl1d): `--lanes N` registra a pista em GTN_LANES_DIR, soma o que as outras vivas ainda podem crescer (teto − uso do cgroup delas), limita a pista a 10 GiB e a (nproc−2)/N workers; pista EXTRA sem
+#   espaço (memória, CPU/PSI, PSI ilegível) sai com rc 95 e o comando NÃO roda; pid morto ou reaproveitado some do registro; linha ilegível conta como viva com o teto inteiro; lock tomado de dono morto;
+#   --lanes inválido = INERTE; sem --lanes (ou 1) nada muda e nenhum registro nasce.
+# CONTROLES NEGATIVOS: mutantes W1-W7 (wrapper), P1-P5 (sonda), C1-C8 (teto/workers) e L1-L15 (pistas) têm de ser REPROVADOS pelo caso correspondente (o caso falha no mutante).
 # O QUE NÃO PROVA: que o helper de root isola de verdade num kernel real. Isso só o canário prova, no nó, depois que o root instalar o helper (`gt-iso-run --canary`).
 set -u
 HERE="$(cd "$(dirname "$0")" && pwd)"
 SUT0="$HERE/hetzner-iso-run.sh"
 T=$(mktemp -d "${TMPDIR:-/tmp}/hzn-iso-selftest.XXXXXX")
-trap 'find "$T" -mindepth 1 -delete 2>/dev/null; rmdir "$T" 2>/dev/null' EXIT
+FAKEPIDS=""
+trap '[ -z "$FAKEPIDS" ] || kill $FAKEPIDS 2>/dev/null; find "$T" -mindepth 1 -delete 2>/dev/null; rmdir "$T" 2>/dev/null' EXIT
 mkdir -p "$T/bin" "$T/home"; OUT="$T/out"; CALLS="$T/calls"; : > "$CALLS"
 printf '#!/usr/bin/env bash\n[ "$1" = -n ] && shift\nexec "$@"\n' > "$T/bin/sudo"
 cat > "$T/helper-stub.sh" <<'EOF'
@@ -32,7 +36,7 @@ case "$*" in
       nocnt) echo "GTN-PROBE: isolated"; exit 0 ;;
       setup) echo "GTN-ISO: setup-falhou:nft" >&2; exit 98 ;;
     esac ;;
-  *) printf 'CMD: %s\n' "$*" >> "$CALLS"; exit "${CMD_RC:-0}" ;;
+  *) printf 'CMD: %s\n' "$*" >> "$CALLS"; [ -z "${LANE_PROBE:-}" ] || printf 'LANEFILE: %s pid=%s\n' "$(cd "$GTN_LANES_DIR" 2>/dev/null && cat lane.* 2>/dev/null | tr '\n' ';')" "$$" >> "$CALLS"; exit "${CMD_RC:-0}" ;;
 esac
 EOF
 cat > "$T/probe-drv.py" <<'EOF'
@@ -143,7 +147,71 @@ case_probe() { extract "$1" > "$T/probe.py"; local m exp
     python3 -I "$T/probe-drv.py" "${m%%:*}" "$T/probe.py" > "$OUT" 2>&1; RC=$?; exp=${m#*:}
     ck "sonda ($m): veredito" has "$OUT" "^GTN-PROBE: $exp"; [ "${m%%:*}" = ok ] && ck "sonda (ok): sem vazamento e rc 0" rcis 0 || ck "sonda (${m%%:*}): rc 1" rcis 1; done; }
 
-for c in canary run cap probe; do "case_$c" "$SUT0"; done
+# ---- pistas: um "outro" vivo é um `sleep` com /proc/<pid>/stat e cgroup de mentira -----------------------------------------------------------------------------------------------------------
+mkother() { # nome ceil início usado_mb → cria o registro de uma pista viva (processo de verdade + /proc e cgroup falsos); o pid fica em OTHERPID
+  sleep 300 & OTHERPID=$!; FAKEPIDS="$FAKEPIDS $OTHERPID"
+  mkdir -p "$GTN_LANES_DIR" "$GTN_PROC/$OTHERPID" "$GTN_CGROOT/fake.slice/$1.scope"
+  printf '%s (sleep) S 1 1 1 0 -1 4194304 100 0 0 0 0 0 0 0 20 0 1 0 %s 1000 100 18446744073709551615\n' "$OTHERPID" "${3:-5555}" > "$GTN_PROC/$OTHERPID/stat"
+  printf '0::/fake.slice/%s.scope\n' "$1" > "$GTN_PROC/$OTHERPID/cgroup"; echo $(( ${4:-0} * 1048576 )) > "$GTN_CGROOT/fake.slice/$1.scope/memory.current"
+  printf '%s %s %s\n' "$OTHERPID" "${3:-5555}" "$2" > "$GTN_LANES_DIR/lane.$OTHERPID"; }
+lreset() { find "$T/lanes" "$T/lanes.lock" "$T/proc" "$T/cg" "$T/psi" "$T/arquivo" -delete 2>/dev/null; mkdir -p "$T/proc" "$T/cg"
+           printf 'some avg10=10.00 avg60=15.20 avg300=14.00 total=1\nfull avg10=0.00 avg60=0.00 avg300=0.00 total=0\n' > "$T/psi"
+           export GTN_LANES_DIR="$T/lanes" GTN_PROC="$T/proc" GTN_CGROOT="$T/cg" GTN_PSI_FILE="$T/psi"; unset GTN_LANE_LOCK_TRIES; }
+case_lanes() { local f
+  lreset; LANE_PROBE=1 go "$1" --lanes 2 -- python -m pytest
+  ck "pista sozinha: roda (rc 0)" rcis 0; ck "pista sozinha: teto de 10 GiB por pista (MemAvailable dava 13387M) e 6 workers" has "$OUT" '^GTN-CAP: MemoryMax=10240M MemorySwapMax=0 workers=6 '
+  ck "pista sozinha: a linha GTN-LANE diz que não há outra viva e o teto" has "$OUT" '^GTN-LANE: pistas=2 outras-vivas=0 reservado-pelas-outras=0M orcamento=13387M teto-da-pista=10240M psi60=-$'
+  ck "pista sozinha: o comando leva os 6 workers" has "$CALLS" '^CMD: WA_PYTEST_MAX_WORKERS=6 '
+  ck "pista sozinha: o registro tem a pista (pid do próprio gt-iso-run, início, teto) ANTES do comando rodar" has "$CALLS" '^LANEFILE: ([0-9]+) [0-9?]+ 10240;? pid=\1$'
+  # sem --lanes e com --lanes 1: igual a antes (teto 13387M, 9 workers) e NENHUM registro
+  lreset; go "$1" -- true; ck "sem --lanes: o de sempre (13387M, 9 workers)" has "$OUT" '^GTN-CAP: MemoryMax=13387M MemorySwapMax=0 workers=9 '; ck "sem --lanes: nenhum registro nasce" test ! -e "$GTN_LANES_DIR"
+  go "$1" --lanes 1 -- true; ck "--lanes 1: o de sempre" has "$OUT" '^GTN-CAP: MemoryMax=13387M MemorySwapMax=0 workers=9 '; ck "--lanes 1: nenhum registro nasce" test ! -e "$GTN_LANES_DIR"
+  # a CPU divide por pistas: muita memória e teto de pista alto → (16−2)/2 = 7 workers (sem a divisão seriam 14)
+  lreset; printf 'MemAvailable:   40000000 kB\n' > "$T/meminfo.l"; GTN_MEMINFO="$T/meminfo.l" GTN_LANE_CEIL_MAX_MB=20480 go "$1" --lanes 2 -- true
+  ck "CPU dividida por pistas: 7 workers (14 / 2)" has "$OUT" '^GTN-CAP: MemoryMax=20480M MemorySwapMax=0 workers=7 '
+  # pista EXTRA com a outra usando pouco: ela ainda pode crescer 8192M → orçamento 19531−6144−8192 = 5195M < 2048+3×1200 → sem espaço, rc 95, o comando NÃO roda
+  lreset; mkother a 10240 5555 2048; go "$1" --lanes 2 -- touch /tmp/NUNCA
+  ck "extra sem memória: rc 95" rcis 95; ck "extra sem memória: diz sem-espaco e o motivo (memoria, o que a outra ainda pode usar)" has "$OUT" '^GTN-CAP: sem-espaco memoria \(orçamento 5195M = MemAvailable 19531M − reserva 6144M − 8192M que as 1 outra'
+  ck "extra sem memória: o comando NÃO roda" nocalls; ck "extra sem memória: não deixa registro próprio (só a pista de mentira)" test "$(ls "$GTN_LANES_DIR" | grep -c '^lane\.')" = 1
+  ck "extra sem memória: a linha GTN-LANE mostra o que leu" has "$OUT" '^GTN-LANE: pistas=2 outras-vivas=1 reservado-pelas-outras=8192M orcamento=5195M psi60=-$'
+  # a outra já usa 6144M do teto de 10240M: ainda pode crescer 4096M → orçamento 9291M: a extra entra com 6 workers
+  lreset; mkother a 10240 5555 6144; LANE_PROBE=1 go "$1" --lanes 2 -- true
+  ck "extra com espaço: roda" rcis 0; ck "extra com espaço: teto 9291M e 6 workers" has "$OUT" '^GTN-CAP: MemoryMax=9291M MemorySwapMax=0 workers=6 '; ck "extra com espaço: GTN-LANE mostra a outra e o PSI lido" has "$OUT" '^GTN-LANE: pistas=2 outras-vivas=1 reservado-pelas-outras=4096M orcamento=9291M teto-da-pista=9291M psi60=15$'
+  ck "extra com espaço: o registro tem as DUAS pistas" has "$CALLS" '^LANEFILE: .*;.* pid='
+  # CPU disputada: PSI acima do piso (50) → sem espaço (cpu); PSI ilegível → sem espaço (não entra); PSI no limite (50) entra
+  lreset; mkother a 10240 5555 6144; printf 'some avg10=90.00 avg60=70.30 avg300=40.00 total=1\n' > "$T/psi"; go "$1" --lanes 2 -- touch /tmp/NUNCA
+  ck "extra com CPU disputada: rc 95 e diz cpu" has "$OUT" '^GTN-CAP: sem-espaco cpu \(o nó está disputando CPU: some avg60=70% > 50%\)'; ck "extra com CPU disputada: rc" rcis 95; ck "extra com CPU disputada: o comando NÃO roda" nocalls
+  lreset; mkother a 10240 5555 6144; GTN_PSI_FILE="$T/psi-nao-existe" go "$1" --lanes 2 -- touch /tmp/NUNCA; ck "PSI ilegível: extra não entra (cpu-ilegivel)" has "$OUT" '^GTN-CAP: sem-espaco cpu-ilegivel'; ck "PSI ilegível: rc 95" rcis 95
+  lreset; mkother a 10240 5555 6144; printf 'some avg10=1.00 avg60=50.00 avg300=1.00 total=1\n' > "$T/psi"; go "$1" --lanes 2 -- true; ck "PSI no limite (50): entra" rcis 0
+  # a pista que chega SOZINHA não olha o PSI (é a 1ª: as regras de sempre)
+  lreset; GTN_PSI_FILE="$T/psi-nao-existe" go "$1" --lanes 2 -- true; ck "sozinha com PSI ilegível: roda (o PSI só vale para a EXTRA)" rcis 0
+  # pista morta some do registro e não conta; pid reaproveitado (início do processo diferente) também
+  lreset; mkother a 10240 5555 0; kill "$OTHERPID" 2>/dev/null; wait "$OTHERPID" 2>/dev/null; go "$1" --lanes 2 -- true
+  ck "outra morta: não conta (outras-vivas=0)" has "$OUT" '^GTN-LANE: pistas=2 outras-vivas=0 '; ck "outra morta: sai do registro" test ! -e "$GTN_LANES_DIR/lane.$OTHERPID"
+  lreset; mkother a 10240 5555 0; printf '%s (sleep) S 1 1 1 0 -1 4194304 100 0 0 0 0 0 0 0 20 0 1 0 7777 1000 100 18446744073709551615\n' "$OTHERPID" > "$GTN_PROC/$OTHERPID/stat"; go "$1" --lanes 2 -- true
+  ck "pid reaproveitado (início diferente): não conta" has "$OUT" '^GTN-LANE: pistas=2 outras-vivas=0 '; ck "pid reaproveitado: sai do registro" test ! -e "$GTN_LANES_DIR/lane.$OTHERPID"
+  # cgroup da outra ilegível: conta o teto INTEIRO como ainda por usar (o lado seguro) → 19531−6144−10240 = 3147M: sem espaço
+  lreset; mkother a 10240 5555 0; printf '0::/fake.slice/inexistente.scope\n' > "$GTN_PROC/$OTHERPID/cgroup"; go "$1" --lanes 2 -- touch /tmp/NUNCA; ck "cgroup da outra ilegível: teto inteiro reservado (orçamento 3147M, sem espaço)" has "$OUT" '^GTN-CAP: sem-espaco memoria \(orçamento 3147M '
+  # linha do registro ilegível NÃO é pista morta: conta como viva com o teto inteiro (e continua lá)
+  lreset; mkdir -p "$GTN_LANES_DIR"; echo "lixo" > "$GTN_LANES_DIR/lane.999999"; go "$1" --lanes 2 -- touch /tmp/NUNCA
+  ck "registro ilegível: conta como viva (outras-vivas=1, 10240M reservados)" has "$OUT" '^GTN-LANE: pistas=2 outras-vivas=1 reservado-pelas-outras=10240M '; ck "registro ilegível: rc 95" rcis 95; ck "registro ilegível: a linha continua lá (nada foi apagado às cegas)" test -e "$GTN_LANES_DIR/lane.999999"
+  # --lanes inválido = INERTE, nunca "1 pista" calado
+  for f in abc 0 9 -1 vazio; do lreset; if [ "$f" = vazio ]; then go "$1" --lanes -- touch /tmp/NUNCA; else go "$1" --lanes "$f" -- touch /tmp/NUNCA; fi
+    ck "--lanes '$f': INERTE rc 97" rcis 97; ck "--lanes '$f': diz lanes-invalido" has "$OUT" '^GTN-CAP: inerte lanes-invalido'; done
+  # constante das pistas inválida = INERTE
+  lreset; GTN_LANE_MIN_WORKERS=abc go "$1" --lanes 2 -- touch /tmp/NUNCA; ck "constante das pistas inválida: INERTE rc 97" rcis 97; ck "constante das pistas inválida: diz constante-invalida-pistas" has "$OUT" '^GTN-CAP: inerte constante-invalida-pistas'
+  # GTN_WORKERS explícito (o lastro) ignora as pistas: nada de registro
+  lreset; GTN_WORKERS=3 go "$1" --lanes 2 -- true; ck "GTN_WORKERS com --lanes: segue sem teto" has "$OUT" '^GTN-CAP: sem-teto \(GTN_WORKERS=3'; ck "GTN_WORKERS com --lanes: nenhum registro" test ! -e "$GTN_LANES_DIR"
+  # lock: dono vivo segura (INERTE depois das tentativas); dono morto é tomado
+  lreset; mkdir -p "$GTN_LANES_DIR.lock"; sleep 300 & FAKEPIDS="$FAKEPIDS $!"; echo $! > "$GTN_LANES_DIR.lock/pid"; GTN_LANE_LOCK_TRIES=2 go "$1" --lanes 2 -- touch /tmp/NUNCA
+  ck "lock com dono vivo: INERTE rc 97 (sem o lock a soma de memória não é segura)" rcis 97; ck "lock com dono vivo: diz pistas-sem-lock" has "$OUT" '^GTN-CAP: inerte pistas-sem-lock'; ck "lock com dono vivo: o comando NÃO roda" nocalls
+  lreset; mkdir -p "$GTN_LANES_DIR.lock"; ( exit 0 ) & f=$!; echo "$f" > "$GTN_LANES_DIR.lock/pid"; wait "$f"; go "$1" --lanes 2 -- true; ck "lock com dono morto: tomado, a pista roda" rcis 0; ck "lock com dono morto: o lock é solto no fim" test ! -e "$GTN_LANES_DIR.lock"
+  # o registro não pode ser criado: INERTE (pista que as outras não enxergam estoura a soma)
+  lreset; : > "$T/arquivo"; GTN_LANES_DIR="$T/arquivo/dentro" go "$1" --lanes 2 -- touch /tmp/NUNCA; ck "registro impossível de criar: INERTE rc 97" rcis 97; ck "registro impossível de criar: diz pistas-sem-registro" has "$OUT" '^GTN-CAP: inerte pistas-sem-registro'
+  # vazou: o canário vence (nada de pista)
+  lreset; PROBE_MODE=leak go "$1" --lanes 2 -- true; ck "vazou com --lanes: nenhum registro e nenhuma linha GTN-LANE" test ! -e "$GTN_LANES_DIR" -a "$(grep -c '^GTN-LANE' "$OUT")" = 0; }
+
+for c in canary run cap probe lanes; do "case_$c" "$SUT0"; done
 
 M=0
 mutant() { # nome expr-sed caso
@@ -172,5 +240,20 @@ mutant P2-sonda-sem-dns 's/; leak.append("dns")/; pass/' probe
 mutant P3-sonda-sem-interface 's/^if bad: leak.append.*$/pass/' probe
 mutant P4-sonda-sem-udp 's/; leak.append("udp:1.1.1.1:53")/; pass/' probe
 mutant P5-sonda-sem-8888 's/ ("8.8.8.8", 443),//' probe
+mutant L1-pista-extra-ignora-o-que-a-outra-ainda-cresce 's/^    \[ "\$used" -lt "\$ceil" \] && unspent=.*$/    :/' lanes
+mutant L2-pista-extra-sem-piso-de-memoria 's/^    \[ "\$CEIL" -ge \$(( BASE + LMINW \* PER )) \] || why=.*$/    :/' lanes
+mutant L3-pista-extra-ignora-o-psi 's/elif \[ "\$psi" -gt "\$PSIMAX" \]; then why=/elif false; then why=/' lanes
+mutant L4-psi-ilegivel-vira-livre 's/if ! num "\$psi"; then why=/if false; then why=/' lanes
+mutant L5-pista-morta-conta-como-viva 's/if ! kill -0 "\$pid" 2>\/dev\/null; then .*; continue; fi/:/' lanes
+mutant L6-pid-reaproveitado-nao-detectado 's/if \[ "\$st" != "?" \] \&\& \[ -n "\$cur" \] \&\& \[ "\$cur" != "\$st" \]; then .*; continue; fi/:/' lanes
+mutant L7-cgroup-ilegivel-vira-uso-total 's/num "\$cur" \&\& used=\$(( cur \/ 1048576 ))/used=$ceil/' lanes
+mutant L8-cpu-nao-dividida-por-pistas 's/^  CPUDIV=\$LANES$/  CPUDIV=1/' lanes
+mutant L9-pista-nao-registrada 's/printf .%s %s %s\\n. "\$\$" "\${self:-?}" "\$CEIL" > "\$LD\/\.lane\.\$\$\.tmp" \&\& mv -f "\$LD\/\.lane\.\$\$\.tmp" "\$LD\/lane\.\$\$"/:/' lanes
+mutant L10-registro-ilegivel-vira-pista-morta 's/^    else pid=""; ceil=\$LCEIL; fi$/    else continue; fi/' lanes
+mutant L11-lanes-invalido-aceito 's/num "\$LANES_RAW" \&\& \[ "\$LANES_RAW" -ge 1 \] \&\& \[ "\$LANES_RAW" -le 8 \] || cap_inert/true || cap_inert/' lanes
+mutant L12-sem-espaco-vira-inerte 's/echo "GTN-CAP: sem-espaco \$why"; exit 95/echo "GTN-CAP: sem-espaco $why"; exit 97/' lanes
+mutant L13-lock-ignorado 's/^  lane_lock "\$LD" || cap_inert.*$/  :/' lanes
+mutant L14-teto-da-pista-ignorado 's/CEIL=\$budget; \[ "\$CEIL" -le "\$LCEIL" \] || CEIL=\$LCEIL;/CEIL=$budget;/' lanes
+mutant L15-pista-sem-espaco-segue-rodando 's/^    echo "GTN-CAP: sem-espaco \$why"; exit 95$/    echo "GTN-CAP: sem-espaco $why"/' lanes
 echo "---"; echo "$((n-fails))/$n ok ($M mutantes)"
 [ $fails -eq 0 ] && echo "SELFTEST OK" || { echo "SELFTEST FALHOU ($fails)"; exit 1; }

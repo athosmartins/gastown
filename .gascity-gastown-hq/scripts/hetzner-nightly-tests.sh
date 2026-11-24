@@ -2,7 +2,7 @@
 # hetzner-nightly-tests.sh — a suíte INTEIRA do WA no nó Linux (Hetzner), toda madrugada, em LOTES por arquivo, sem rede de saída e sem segredo, com relatório ao Mayor (ga-9p6pte, ga-84gkpab).
 #
 # ## Contents
-#   Por quê · Lotes · Veredito · Como roda · O que NÃO faz · Ambiente
+#   Por quê · Lotes · Pistas · Veredito · Como roda · O que NÃO faz · Ambiente
 #
 # POR QUÊ: em 04/10 um teste de branch antiga mandou um e-mail de verdade. Rodar a suíte inteira toda noite só é aceitável com a saída de rede PROVADA
 #   cortada (canário do hetzner-iso-run.sh + helper de root hetzner-netns-run.sh) e ambiente limpo. Sem essa prova nada roda.
@@ -14,6 +14,12 @@
 #   não começou por falta de orçamento, que estourou o prazo dele, que morreu (rc 137 = teto/OOM, worker caído) ou ficou inerte é "NÃO RODOU" e aparece assim — nunca como verde. Sem todos os
 #   lotes rodados não há COMPLETO, não há total da suíte e a linha de base não anda; os lotes que rodaram ainda são comparados com a última noite COMPLETA, só nos arquivos deles, e o relatório diz
 #   "comparação PARCIAL" (compare=parcial no jsonl) com o orçamento da noite e o ritmo medido.
+# PISTAS (ga-282sl1d): até HZN_LANES (2) lotes rodam AO MESMO TEMPO. Medido em 22-24/11: o tempo do lote quase não depende dos workers (5 workers: 998 s; 14 workers: 1631 s) e cada lote gasta 30-450 s em overhead fixo
+#   (rsync do espelho, canário, partida do pytest); a noite de 24/11 projetava ~14000 s de 11 lotes para uma janela de ~13200 s. Cada pista é um `gt-iso-run --lanes N` próprio (HETZNER_ISO_LANES do mbp-run): quem
+#   impede que as pistas somem mais memória do que o nó tem é o registro de pistas do gt-iso-run (memória das outras, piso de memória e de CPU/PSI para a pista EXTRA; ver hetzner-iso-run.sh). Pista extra sem espaço
+#   agora (rc 95) ESPERA HZN_LANE_WAIT_S e tenta de novo, sem gastar tentativa nem virar "NÃO RODOU"; pista extra que não consegue rodar por causa do nó (sem slot, ssh, canário, bandeira) devolve o lote à fila e
+#   sai: a pista 1 (a de sempre) o pega, então a falha de uma pista extra não faz perder lote que a noite sem pistas teria rodado. Os lotes são tirados da fila em ordem; o resultado de cada um vai para $SCR/res.<n> e a leitura (soma, tabela,
+#   comparação, relatório) acontece DEPOIS, na ordem dos lotes: nada do que o relatório diz mudou. Vazamento medido ou lote sem prova em QUALQUER pista para a fila e derruba as outras pistas. HZN_LANES=1 = o laço sequencial de antes.
 # VEREDITO (última linha do stdout `VEREDITO: <x>`; uma linha jsonl por noite em $CITY/.gc/logs/hetzner-nightly.jsonl; um e-mail ao Mayor, salvo PULADO)
 #   COMPLETO  TODOS os lotes rodaram DENTRO do isolamento provado e o resumo do pytest de cada um foi lido: total (somado), falhas, novas falhas contra a última noite COMPLETA, duração.
 #             Teste que falha é dado do relatório, não falha do job (exit 0).
@@ -34,7 +40,7 @@
 #   HZN_NODE_HOST (hetzner-teste; é também o que o mbp-run recebe como HETZNER_NODE_HOST: instalar e rodar no MESMO nó), HZN_SSH (ssh), HZN_NO_FETCH=1 (não buscar o origin),
 #   HZN_KEEP_DAYS (14; a linha de base last-complete.* não entra na limpeza), HZN_BATCH_DEFS (8000: `def test_` por lote), HZN_BATCH_TIMEOUT_S (2400: prazo de UM lote),
 #   HZN_MIN_BATCH_S (180: com menos orçamento que isto o lote nem começa), HZN_FINAL_MARGIN_S (300: o que fica para o relatório), HZN_BATCH_TRIES (2) e HZN_RETRY_S (90) para o que é transitório
-#   (teto/MemAvailable inerte, sem slot, ssh/rsync caído).
+#   (teto/MemAvailable inerte, sem slot, ssh/rsync caído), HZN_LANES (2: lotes ao mesmo tempo, 1 a 8; 1 = sequencial) e HZN_LANE_WAIT_S (120: espera da pista extra quando o nó não tem espaço para ela agora).
 set -uo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 CITY=${MBP_CITY:-${GC_CITY_PATH:-/Users/athos/gt/.gascity-gastown-hq}}
@@ -55,17 +61,20 @@ DAY=$(date +%Y-%m-%d)
 T0=$(date +%s)
 say() { printf '%s hetzner-nightly: %s\n' "$(date +%Y-%m-%dT%H:%M:%S%z)" "$*"; }
 SCR=""; OUT="$LOGDIR/$DAY.out"; REPORT="$LOGDIR/$DAY.md"
-cleanup() { [ -z "$SCR" ] || find "$SCR" -mindepth 1 -delete 2>/dev/null; [ -z "$SCR" ] || rmdir "$SCR" 2>/dev/null; [ ! -f "$LOCK/pid" ] || [ "$(cat "$LOCK/pid" 2>/dev/null)" != "$$" ] || { rm -f "$LOCK/pid"; rmdir "$LOCK" 2>/dev/null; }; return 0; }
+LANE_PIDS=""
+cleanup() { [ -z "$LANE_PIDS" ] || kill_lanes 2>/dev/null; [ -z "$SCR" ] || find "$SCR" -mindepth 1 -delete 2>/dev/null; [ -z "$SCR" ] || rmdir "$SCR" 2>/dev/null; [ ! -f "$LOCK/pid" ] || [ "$(cat "$LOCK/pid" 2>/dev/null)" != "$$" ] || { rm -f "$LOCK/pid"; rmdir "$LOCK" 2>/dev/null; }; return 0; }
 trap cleanup EXIT
+trap 'exit 143' TERM INT HUP   # o kill da ordem (prazo) também passa pelo cleanup: as pistas e o scratch não ficam para trás
 mkdir -p "$LOGDIR" 2>/dev/null || { say "FALHOU — não consegui criar $LOGDIR"; exit 1; }
 
+LANES=1; NWAITS=0   # as pistas da rodada (validadas mais abaixo; até lá, 1) e quantas vezes uma pista esperou o nó ter espaço
 SHA="?"; ISO_LINE=""; EGRESS="?"; MAILRC=0; FETCHST="?"; CMPST="-"; STALE_NOTE=""; DEPLOY=""; NB=0; NRAN=0; NSKIP=0; NMAC=0; NHELD=0; NHF=0; NHP=0; ESCSUM=0; ESCUNK=0
 jline() { # veredito motivo — a linha do jsonl desta noite (também a das noites PULADAS por lock: uma por noite)
   local escj=null   # escudo: nenhum lote rodou ou a linha GTN-ESCUDO de algum lote veio ilegível → null (não afirmo 0 sem ter lido)
   [ "$ESCUNK" = 0 ] && [ "$NRAN" -gt 0 ] && escj=$ESCSUM
   jq -cn --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" --arg v "$1" --arg why "$2" --arg sha "$SHA" --arg iso "$ISO_LINE" --arg egress "$EGRESS" --arg fetch "$FETCHST" --arg cmp "$CMPST" \
-     --argjson wall "$(( $(date +%s) - T0 ))" --argjson mailrc "$MAILRC" --argjson nb "$NB" --argjson nr "$NRAN" --argjson ns "$NSKIP" --argjson nm "$NMAC" --argjson nh "$NHELD" --argjson esc "$escj" \
-     '{ts:$ts,verdict:$v,reason:$why,sha:$sha,isolation:$iso,egress_attempts:$egress,fetch:$fetch,compare:$cmp,wall_s:$wall,mail_failed:$mailrc,batches:$nb,batches_ran:$nr,batches_skipped:$ns,mac_only_excluded:$nm,node_held_excluded:$nh,escudo_reports:$esc}' >> "$JSONL" 2>/dev/null \
+     --argjson wall "$(( $(date +%s) - T0 ))" --argjson mailrc "$MAILRC" --argjson nb "$NB" --argjson nr "$NRAN" --argjson ns "$NSKIP" --argjson nm "$NMAC" --argjson nh "$NHELD" --argjson esc "$escj" --argjson lanes "$LANES" --argjson waits "$NWAITS" \
+     '{ts:$ts,verdict:$v,reason:$why,sha:$sha,isolation:$iso,egress_attempts:$egress,fetch:$fetch,compare:$cmp,wall_s:$wall,mail_failed:$mailrc,batches:$nb,batches_ran:$nr,batches_skipped:$ns,mac_only_excluded:$nm,node_held_excluded:$nh,escudo_reports:$esc,lanes:$lanes,lane_waits:$waits}' >> "$JSONL" 2>/dev/null \
      || say "WARN: não gravei $JSONL"
 }
 finish() { # veredito motivo [exit] — grava o relatório, o jsonl, manda o e-mail (salvo PULADO) e sai
@@ -131,11 +140,13 @@ done
 
 # ── constantes: inteiro ou nada (vazio/ilegível → FALHOU, nunca um padrão escolhido por mim às cegas) ─────────────────────────────────────────────────────────────────────────────────────
 BATCH_DEFS=${HZN_BATCH_DEFS:-8000}; BATCH_T=${HZN_BATCH_TIMEOUT_S:-2400}; MIN_BATCH=${HZN_MIN_BATCH_S:-180}; MARGIN=${HZN_FINAL_MARGIN_S:-300}
-TRIES=${HZN_BATCH_TRIES:-2}; RETRY_S=${HZN_RETRY_S:-90}; ARGS_MAX=${HZN_BATCH_ARGS_MAX:-60000}
-for v in TIMEOUT_S MIN_TOTAL BATCH_DEFS BATCH_T MIN_BATCH MARGIN TRIES RETRY_S ARGS_MAX; do
+TRIES=${HZN_BATCH_TRIES:-2}; RETRY_S=${HZN_RETRY_S:-90}; ARGS_MAX=${HZN_BATCH_ARGS_MAX:-60000}; LANES_REQ=${HZN_LANES:-2}; LANE_WAIT=${HZN_LANE_WAIT_S:-120}
+for v in TIMEOUT_S MIN_TOTAL BATCH_DEFS BATCH_T MIN_BATCH MARGIN TRIES RETRY_S ARGS_MAX LANES_REQ LANE_WAIT; do
   x=${!v}; case "$x" in ''|*[!0-9]*) finish FALHOU "constante inválida: $v='$x' (precisa ser inteiro >= 0); nada rodou" 1 ;; esac
 done
-for v in BATCH_DEFS BATCH_T TRIES ARGS_MAX; do x=${!v}; [ "$x" -ge 1 ] || finish FALHOU "constante inválida: $v=$x (precisa ser >= 1); nada rodou" 1; done
+for v in BATCH_DEFS BATCH_T TRIES ARGS_MAX LANES_REQ; do x=${!v}; [ "$x" -ge 1 ] || finish FALHOU "constante inválida: $v=$x (precisa ser >= 1); nada rodou" 1; done
+[ "$LANES_REQ" -le 8 ] || finish FALHOU "constante inválida: HZN_LANES=$LANES_REQ (precisa ser de 1 a 8); nada rodou" 1
+LANES=$LANES_REQ; ISOLANES=""; [ "$LANES" -le 1 ] || ISOLANES=$LANES   # o mbp-run só recebe HETZNER_ISO_LANES com 2 ou mais: com 1 pista a chamada é a de sempre
 # vazio é VÁLIDO (desliga o limite do relógio); preenchido e fora de HH:MM → FALHOU (um relógio que eu não entendi não vira "sem limite" calado: a rodada passaria do reseed do nó)
 case "$STOP_UTC" in ''|[01][0-9]:[0-5][0-9]|2[0-3]:[0-5][0-9]) ;; *) finish FALHOU "constante inválida: HZN_STOP_UTC='$STOP_UTC' (precisa ser HH:MM em UTC, ou vazio); nada rodou" 1 ;; esac
 
@@ -213,7 +224,8 @@ NDEFS=$(awk '{s+=$3} END{print s+0}' "$SCR/batch.meta")
 
 # ── a rodada ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
 # O orçamento é do SCRIPT: DEADLINE = T0 + TIMEOUT_S − margem do relatório. Cada lote recebe min(o que resta, HZN_BATCH_TIMEOUT_S); com menos que HZN_MIN_BATCH_S ele nem começa.
-# Estado de um lote (B_ST): ran | nao-rodou | retry-cap | retry-mbp | inerte-iso | vazamento | sem-prova | pulado — só `ran` entra na soma; o resto é "NÃO RODOU" no relatório.
+# Estado de um lote (B_ST): ran | nao-rodou | retry-cap | retry-mbp | inerte-iso | vazamento | sem-prova | pulado | sem-espaco — só `ran` entra na soma; o resto é "NÃO RODOU" no relatório
+# (sem-espaco nunca chega ao relatório: a pista espera e tenta de novo dentro do orçamento).
 rm -f "$LOGDIR/$DAY".b*.out 2>/dev/null; : > "$OUT"
 TABLE="$SCR/table.md"; : > "$TABLE"; : > "$SCR/ids.all"
 # O fim do orçamento é o MENOR de dois: T0 + TIMEOUT_S (prazo) e a próxima ocorrência de STOP_UTC (relógio). A noite de 24/11 perdeu os lotes 10 e 11 porque o prazo era contado só de T0 e a suíte cresceu para 11 lotes:
@@ -237,6 +249,7 @@ classify() { # saída-do-lote rc → B_ST B_WHY B_ISO B_CAP B_SUM (vazio/ilegív
   B_CAP=$(sed -n 's/^GTN-CAP: //p' "$f" 2>/dev/null | head -n 1)   # só `MemoryMax=… MemorySwapMax=0 …` vale como prova do teto de memória
   B_SUM=""; B_ST=nao-rodou; B_WHY=""; t1=$(tail1 "$f")
   case "$rc" in
+    95) B_ST=sem-espaco; B_WHY="o nó não tem espaço (memória/CPU) para uma pista EXTRA agora: GTN-CAP: ${B_CAP:-vazio}"; return ;;   # rc 95 do gt-iso-run: o comando NÃO rodou; NÃO é falha do lote nem gasta tentativa
     99) B_ST=pulado; B_WHY="nó Linux desligado (falta $CITY/.gc/hetzner-node.on)"; return ;;
     96|97|98)
       case "$B_ISO" in
@@ -289,9 +302,12 @@ emit_table() {
   echo "| lote | arquivos | def test_ | workers | s | situação | detalhe |"; echo "|---|---|---|---|---|---|---|"; cat "$TABLE"
 }
 
-i=0
-while [ "$i" -lt "$NB" ]; do
-  i=$((i+1)); nn=$(printf '%02d' "$i")
+# Um lote são DUAS funções: run_one_batch (roda, com as tentativas, e grava o resultado em $SCR/res.<n>; só escreve em arquivo e na saída, então roda igual dentro de uma pista) e post_one_batch (lê o resultado
+# e faz o que o laço sequencial fazia depois: tabela, soma, os casos que encerram a noite). Com 1 pista é o laço de sempre, lote a lote; com N pistas (ga-282sl1d, ver PISTAS no cabeçalho) até N lotes rodam ao mesmo
+# tempo e a leitura vem DEPOIS, na ordem dos lotes, então soma, tabela, comparação e relatório são os mesmos.
+run_one_batch() { # n → o resultado vai para $SCR/res.<n>
+  local i=$1 meta l left t1 RC
+  nn=$(printf '%02d' "$i")
   BOUT="$LOGDIR/$DAY.b$nn.out"; : > "$BOUT"; BSEC=0; tries=0; bt=0; LASTWHY=""
   meta=$(awk -v b="$i" '$1==b{print $2" "$3}' "$SCR/batch.meta"); nf=${meta%% *}; nd=${meta##* }
   BF=(); while IFS= read -r l; do BF[${#BF[@]}]=$l; done < "$SCR/batch.$i"
@@ -305,17 +321,36 @@ while [ "$i" -lt "$NB" ]; do
     bt=$BATCH_T; [ "$left" -ge "$bt" ] || bt=$left
     say "lote $nn/$NB: $nf arquivos, $nd def test_, prazo ${bt}s (restam ${left}s do orçamento)${LASTWHY:+; tentativa $tries}"
     t1=$(date +%s)
-    HETZNER_ISOLATE=1 HETZNER_NODE_HOST="$NODE" MBP_RUN_TIMEOUT_S="$bt" "$RUN" --host linux --repo wa --dir "$TREE" -- "${BF[@]}" -n auto -p gtn_stable_ids --timeout=300 -q -rfE --tb=line --continue-on-collection-errors > "$BOUT" 2>&1
+    HETZNER_ISOLATE=1 HETZNER_ISO_LANES="$ISOLANES" HETZNER_NODE_HOST="$NODE" MBP_RUN_TIMEOUT_S="$bt" "$RUN" --host linux --repo wa --dir "$TREE" -- "${BF[@]}" -n auto -p gtn_stable_ids --timeout=300 -q -rfE --tb=line --continue-on-collection-errors > "$BOUT" 2>&1
     RC=$?
     BSEC=$(( $(date +%s) - t1 ))
     classify "$BOUT" "$RC"
     case "$B_ST" in
+      sem-espaco) # gt-iso-run rc 95: o nó não tem espaço para esta pista AGORA. Não é falha, não gasta tentativa e não conta no retry: espera a outra pista soltar memória e tenta de novo (o `left < MIN_BATCH` do topo fecha a conta)
+        LASTWHY=$B_WHY; tries=$((tries-1)); echo "$nn" >> "$SCR/waits"; say "lote $nn: $B_WHY; espera ${LANE_WAIT}s"; sleep "$LANE_WAIT"; continue ;;
       retry-*) # transitório (teto/MemAvailable inerte, sem slot, ssh/rsync caído): tenta de novo se ainda couber no orçamento
         if [ "$tries" -lt "$TRIES" ] && [ $(( DEADLINE - $(date +%s) )) -gt $(( RETRY_S + MIN_BATCH )) ]; then LASTWHY=$B_WHY; say "lote $nn: $B_WHY; nova tentativa em ${RETRY_S}s"; sleep "$RETRY_S"; continue; fi
         B_WHY="$B_WHY (após $tries tentativa(s))"; break ;;
       *) break ;;
     esac
   done
+  # gravação atômica; %q deixa cada valor ser relido por `.` sem perder aspas, acento nem quebra de linha
+  { printf 'B_ST=%q B_WHY=%q B_ISO=%q B_CAP=%q B_SUM=%q BSEC=%q tries=%q bt=%q nf=%q nd=%q\n' "$B_ST" "$B_WHY" "$B_ISO" "$B_CAP" "$B_SUM" "$BSEC" "$tries" "$bt" "$nf" "$nd"; } > "$SCR/res.$i.tmp" && mv -f "$SCR/res.$i.tmp" "$SCR/res.$i"
+}
+load_batch() { # n → B_ST... do resultado gravado; sem resultado (a pista foi derrubada antes de o lote terminar, ou ele nunca saiu da fila) → NÃO RODOU com o motivo, nunca um lote "vazio" que passaria por verde
+  local i=$1 meta
+  nn=$(printf '%02d' "$i"); BOUT="$LOGDIR/$DAY.b$nn.out"
+  meta=$(awk -v b="$i" '$1==b{print $2" "$3}' "$SCR/batch.meta"); nf=${meta%% *}; nd=${meta##* }
+  B_ST=nao-rodou; B_WHY=""; B_ISO=""; B_CAP=""; B_SUM=""; BSEC=0; tries=0; bt=0
+  if [ -s "$SCR/res.$i" ] && . "$SCR/res.$i" 2>/dev/null; then :
+  else B_ST=nao-rodou; B_ISO=""; B_CAP=""; B_SUM=""; BSEC=0; tries=0
+    if [ -d "$SCR/claim.$i" ]; then B_WHY="a rodada parou antes de o lote terminar (outra pista achou vazamento/lote sem prova, ou o orçamento acabou)"; else B_WHY="o lote não chegou a começar (a rodada parou antes: outra pista achou vazamento/lote sem prova)"; fi
+    : > "$BOUT" 2>/dev/null
+  fi
+}
+post_one_batch() { # n → lê o resultado do lote n e o soma
+  local i=$1
+  load_batch "$i"
   if [ "$B_ST" = pulado ]; then   # bandeira do nó desligada: no 1º lote é PULADO (nada rodou, sem e-mail); no meio da rodada o lote simplesmente NÃO RODOU
     [ "$i" -ne 1 ] || finish PULADO "nó Linux desligado (falta $CITY/.gc/hetzner-node.on)" 0
     B_ST=nao-rodou; B_WHY="o nó foi desligado no meio da rodada: $B_WHY"
@@ -367,9 +402,59 @@ while [ "$i" -lt "$NB" ]; do
     cat "$SCR/batch.$i" >> "$SCR/ran.files" 2>/dev/null || RANFILES_BAD=1
     agg_batch "$BOUT" "$nn"
   else NSKIP=$(( NSKIP + 1 )); SKIPLIST="$SKIPLIST${SKIPLIST:+, }$nn"; say "lote $nn NÃO RODOU: $B_WHY"; fi
-done
+}
+claim_next() { # → o menor lote ainda sem dono (mkdir é atômico: duas pistas nunca pegam o mesmo); sem lote → rc 1
+  local j=0
+  while [ "$j" -lt "$NB" ]; do j=$((j+1)); mkdir "$SCR/claim.$j" 2>/dev/null && { echo "$j"; return 0; }; done
+  return 1
+}
+lane_loop() { # índice da pista (0 = a primeira, a que nunca devolve lote): tira lotes da fila, roda e olha o resultado. Só lê/escreve arquivos: roda em subshell
+  local ln=$1 k
+  while [ ! -e "$SCR/stop" ]; do
+    k=$(claim_next) || break
+    run_one_batch "$k"
+    case "$B_ST" in
+      vazamento|sem-prova) : > "$SCR/stop"; break ;;   # vazamento medido ou lote sem prova: a noite acaba aqui, em qualquer pista (os lotes seguintes não rodam)
+      pulado|inerte-iso|retry-cap|retry-mbp)
+        # o lote 1 nesses estados decide a noite inteira (INERTE/PULADO/FALHOU): para a fila, o resto seria trabalho jogado fora
+        [ "$k" -ne 1 ] || { : > "$SCR/stop"; break; }
+        # pista EXTRA (ln > 0) que não conseguiu rodar por causa do nó (sem slot, ssh, canário, bandeira): devolve o lote e sai; a pista 0 o pega. Assim a falha de uma pista extra não faz perder lote que a noite sem pistas teria rodado
+        if [ "$ln" -gt 0 ]; then find "$SCR/res.$k" -delete 2>/dev/null; rmdir "$SCR/claim.$k" 2>/dev/null; say "pista $((ln+1)): lote $k devolvido à fila ($B_ST: $B_WHY); a pista 1 o pega"; break; fi ;;
+    esac
+  done
+}
+kill_tree() { local p=$1 c; for c in $(pgrep -P "$p" 2>/dev/null); do kill_tree "$c"; done; kill "$p" 2>/dev/null; return 0; }
+kill_lanes() { local p; for p in $LANE_PIDS; do kill_tree "$p"; done; return 0; }
+
+if [ "$LANES" -le 1 ]; then
+  k=0; while [ "$k" -lt "$NB" ]; do k=$((k+1)); run_one_batch "$k"; post_one_batch "$k"; done
+else
+  say "pistas: até $LANES lotes ao mesmo tempo (HZN_LANES=$LANES; pista extra sem espaço no nó espera ${LANE_WAIT}s)"
+  LANE_T0=$(date +%s); LANE_PIDS=""; ln=0
+  # a pista k começa k/10 s depois da 0: a 0 sempre tira o lote 1 da fila (o lote 1 decide a noite no INERTE/PULADO/FALHOU de sempre) e as extras pegam os seguintes
+  while [ "$ln" -lt "$LANES" ]; do ( export HZN_LANE_NO=$ln; sleep "0.$ln"; lane_loop "$ln" ) & LANE_PIDS="$LANE_PIDS $!"; ln=$((ln+1)); done
+  while :; do
+    alive=0; for p in $LANE_PIDS; do ! kill -0 "$p" 2>/dev/null || alive=1; done
+    [ "$alive" = 1 ] || break
+    if [ -e "$SCR/stop" ]; then say "uma pista pediu parada (vazamento, lote sem prova ou nó inerte no lote 1): derrubando as outras"; kill_lanes; break; fi
+    # as pistas só começam lote até DEADLINE e cada lote tem prazo ≤ o que resta: quem passar do fim do orçamento (BUDGET_END, que inclui a margem do relatório) está preso e cai
+    if [ "$(date +%s)" -gt "$BUDGET_END" ]; then say "WARN: pista passou do fim do orçamento; derrubando"; kill_lanes; break; fi
+    sleep 0.3
+  done
+  wait 2>/dev/null; LANE_SPAN=$(( $(date +%s) - LANE_T0 ))
+  NWAITS=$(wc -l < "$SCR/waits" 2>/dev/null | tr -d ' '); case "$NWAITS" in ''|*[!0-9]*) NWAITS=0 ;; esac
+  # lote que uma pista devolveu à fila DEPOIS de a outra ter visto a fila vazia não tem resultado nem dono: roda aqui, sozinho (a parada por vazamento/sem prova não passa por isto)
+  if [ ! -e "$SCR/stop" ]; then k=0; while [ "$k" -lt "$NB" ]; do k=$((k+1)); [ -s "$SCR/res.$k" ] || { say "lote $k ficou sem resultado depois das pistas: rodando sozinho"; run_one_batch "$k"; }; done; fi
+  k=0; while [ "$k" -lt "$NB" ]; do k=$((k+1)); post_one_batch "$k"; done
+fi
 WALL=$(( $(date +%s) - T0 ))
 TOTAL=$(( TP + TF + TE + TS + TXF + TXP ))
+# pistas (só com HZN_LANES >= 2): quantos lotes andaram ao mesmo tempo, em média (soma dos segundos dos lotes ÷ relógio das pistas) e quantas vezes uma pista esperou o nó ter espaço. vazio/zero → "?", nunca um número inventado
+LANETXT=""
+if [ "$LANES" -gt 1 ]; then
+  AVGPAR=$(awk -v a="${RANSEC:-0}" -v b="${LANE_SPAN:-0}" 'BEGIN { if (b+0 > 0) printf "%.1f", a/b; else print "?" }')
+  LANETXT="pistas: $LANES configuradas, média de $AVGPAR lotes ao mesmo tempo (${RANSEC}s de lote em ${LANE_SPAN:-?}s de relógio); a pista extra esperou o nó ter espaço $NWAITS vez(es)"
+fi
 PASSED=$TP; FAILED=$TF; ERRORS=$TE; SKIPPED=$TS; XF=$TXF; XP=$TXP
 DUR="?"; [ "$PYUNK" = 0 ] || PYSECS=""; [ -z "$PYSECS" ] || DUR="$(( PYSECS / 3600 ))h$(( (PYSECS % 3600) / 60 ))min"
 EGLINE="$EGRESS tentativa(s) de saída barradas pelo nft"
@@ -402,6 +487,7 @@ if [ "$NSKIP" -gt 0 ]; then
   BUDGETTXT="orçamento da noite: $(( BUDGET_END - T0 ))s ($(( BUDGET_END - T0 - MARGIN ))s para os lotes, o resto é a margem do relatório); limite: $BUDGET_BY"
   PACE="ritmo desconhecido (nenhum lote rodou até o fim)"
   if [ "$NRAN" -gt 0 ] && [ "$RANDEFS" -gt 0 ]; then PACE="ritmo medido ${RANSEC}s para $RANDEFS def test_ (~$(( RANSEC * NDEFS / RANDEFS ))s para os $NDEFS da árvore)"; fi
+  [ "$LANES" -le 1 ] || PACE="$PACE; $LANETXT"
   { echo "# Hetzner nightly $DAY — FALHOU: $NSKIP de $NB lotes NÃO RODARAM"; echo
     echo "- origin/main @$SHA, nó $NODE, $NFILES arquivos de tests/ ($NDEFS def test_) em $NB lotes de ~$BATCH_DEFS"
     [ "$NMAC" -eq 0 ] || echo "- fora da rodada por regra do nó: $NMAC arquivos mac-only (lista em $MACX; rodam no MBP/mini)"
@@ -451,6 +537,7 @@ ESCTXT="$ESCSUM relatório(s) refeito(s) sem o hook da suíte que quebrou (o tes
   echo "- instalado no nó: $DEPLOY"
   echo "- total: $TOTAL ($PASSED passaram, $FAILED falharam, $ERRORS erros, $SKIPPED pulados, $XF xfail, $XP xpass); $NRAN de $NB lotes rodaram"
   echo "- duração: pytest somado ${DUR} (${PYSECS:-?} s), relógio total ${WALL} s; meta de $(( TIMEOUT_S / 60 )) min: $GOAL"
+  [ -z "$LANETXT" ] || echo "- $LANETXT"
   echo "- $CMP"
   echo "- isolamento: \`GTN-ISO: $ISO_LINE\`; teto (lote 01): \`GTN-CAP: $FIRSTCAP\`; $EGLINE"
   echo "- escudo do relatório (plugin gtn_stable_ids): $ESCTXT"

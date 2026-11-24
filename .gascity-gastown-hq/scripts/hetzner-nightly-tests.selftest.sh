@@ -19,7 +19,9 @@
 #   duração ilegível sai "?" (não 0h0min) · ids com " - " ficam distintos (irmãos de parametrize) · lista parcial / sem a linha GTN-FAILED / contagem que não bate / linha que não é JSON =
 #   comparação INDISPONÍVEL com a baseline intacta · fetch que falha aparece no relatório · lock velho com pid reaproveitado é tomado · PULADO por lock deixa linha no jsonl ·
 #   a limpeza de 14 dias não apaga a baseline · nao-isolado (vazamento medido) é FALHOU, não INERTE · o nó do mbp-run é o mesmo do instalador · o que foi ao nó fica no relatório.
-# CONTROLES NEGATIVOS: cada mutante do script (M1-M89, mais M0 neutro) tem de ser REPROVADO pelo caso correspondente (o caso falha quando roda no mutante). Antes deles, um mutante NEUTRO (cópia que só muda
+# PISTAS (ga-282sl1d): lanes_basic (2 lotes ao mesmo tempo, mesmos totais e comparação, ordem dos lotes, 1 pista = o de sempre) · lanes_wait (rc 95 espera sem gastar tentativa) · lanes_nospace (sem espaço até o fim do orçamento = NÃO RODOU) ·
+#   lanes_requeue / lanes_orphan (pista extra que não roda devolve o lote; devolvido tarde roda sozinho) · lanes_leak (vazamento numa pista derruba a outra, sem órfão) · lanes_inerte1 · lanes_order · lanes_invalid.
+# CONTROLES NEGATIVOS: cada mutante do script (M1-M89 e N1-N13, mais M0 neutro) tem de ser REPROVADO pelo caso correspondente (o caso falha quando roda no mutante). Antes deles, um mutante NEUTRO (cópia que só muda
 #   um comentário) tem de PASSAR: sem isso o controle não prova nada (a falta dos arquivos irmãos no diretório do mutante reprovava TODO caso, qualquer que fosse a mutação).
 set -u
 HERE="$(cd "$(dirname "$0")" && pwd)"
@@ -39,7 +41,7 @@ git init -q -b main "$T/wa" && ( cd "$T/wa" && echo hi > marker.txt
   # o que a poda (norecursedirs do pytest.ini) e o padrão de nome têm de deixar de fora
   mkdefs tests/test_mac_launchd.py 3; mkdefs tests/mac/test_x.py 2   # os da lista mac-only (abaixo): ficam FORA da rodada, o mbp-run mandaria a bateria inteira ao Mac (rc 98)
   # lista de CPFs (forma de CPF, valores de mentira): o hetzner-pii-scan.py retém (>=3) e o nó NUNCA recebe; o alvo que não chega ao nó faz o pytest abortar o lote inteiro (rc 4/5)
-  printf 'CPFS = ["123.456.789-09", "987.654.321-00", "111.222.333-96"]\ndef test_p1():\n    pass\ndef test_p2():\n    pass\n' > tests/test_pii_lista.py
+  printf 'CPFS = ["123.456.789%s", "987.654.321%s", "111.222.333%s"]\ndef test_p1():\n    pass\ndef test_p2():\n    pass\n' "-09" "-00" "-96" > tests/test_pii_lista.py   # montado na hora: escrito por extenso, o scanner de PII seguraria este selftest no mini
   for d in venv .hidden crew archive node_modules; do mkdefs "tests/$d/test_x.py" 3; done; mkdefs tests/helper.py 3; echo "def test_n" > tests/test_notes.txt
   git add -A && git -c user.name=t -c user.email=t@t commit -qm m && git update-ref refs/remotes/origin/main HEAD && echo wip > untracked.txt )
 git init -q -b main "$T/wa-notests" && ( cd "$T/wa-notests" && echo hi > marker.txt && git add -A && git -c user.name=t -c user.email=t@t commit -qm m && git update-ref refs/remotes/origin/main HEAD )
@@ -55,6 +57,21 @@ c=$(cat "$STUB_CNT" 2>/dev/null || echo 0); c=$((c+1)); echo "$c" > "$STUB_CNT";
 [ "${STUB_UNREADABLE_BATCH:-}" != "$c" ] || chmod 000 "$(dirname "$d")/batch.$c"   # a lista de arquivos do lote fica ilegível DEPOIS de o script a ter lido para montar a chamada
 o="$STUB_OUT.$c"; [ -f "$o" ] || o="$STUB_OUT"; cat "$o" 2>/dev/null; v="STUB_RC_$c"; exit "${!v:-${STUB_RC:-0}}"
 EOF
+cat > "$T/lanes-stub.sh" <<'EOF'
+#!/usr/bin/env bash
+# mbp-run de mentira para as PISTAS (ga-282sl1d): duas pistas chamam ao mesmo tempo, então nada de contador global; o lote é achado pelo 1º arquivo da chamada (batch.<k> do scratch). Saída STUB_OUT.<k>;
+# rc STUB_RC_<k>_<n> (n = nº da chamada DESTE lote) ou STUB_RC_<k>. LSTUB_SLEEP[_<k>|_LANE1] dorme; LSTUB_FAIL_LANE1=<rc> faz a pista 2 (HZN_LANE_NO=1) falhar; LSTUB_95_<k>=1|always devolve o rc 95 do gt-iso-run (1 = só na 1ª chamada).
+echo "ARGS: $*" >> "$STUB_CALLS"; echo "ENV: ISOLATE=${HETZNER_ISOLATE:-} TIMEOUT=${MBP_RUN_TIMEOUT_S:-} NODE=${HETZNER_NODE_HOST:-} LANES=${HETZNER_ISO_LANES:-} LANE_NO=${HZN_LANE_NO:--}" >> "$STUB_CALLS"
+d=""; first=""; prev=""; for a in "$@"; do [ "$prev" = --dir ] && d=$a; [ "$prev" = -- ] && [ -z "$first" ] && first=$a; prev=$a; done
+k=$(grep -l -x -F "$first" "$(dirname "$d")"/batch.[0-9]* 2>/dev/null | head -n 1 | sed 's/.*batch\.//')
+mkdir -p "$STUB_LDIR"; n=$(( $(cat "$STUB_LDIR/n.$k" 2>/dev/null || echo 0) + 1 )); echo "$n" > "$STUB_LDIR/n.$k"
+echo "S $k lane=${HZN_LANE_NO:--} n=$n" >> "$STUB_LDIR/ev"
+trap 'echo "K $k" >> "$STUB_LDIR/ev"; exit 143' TERM
+v="LSTUB_SLEEP_$k"; sl=${!v:-${LSTUB_SLEEP:-0}}; [ "${HZN_LANE_NO:--}" != 1 ] || sl=${LSTUB_SLEEP_LANE1:-$sl}; [ "$sl" = 0 ] || sleep "$sl"
+v="LSTUB_95_$k"; if [ "${!v:-}" = always ] || { [ "${!v:-}" = 1 ] && [ "$n" = 1 ]; }; then echo "GTN-ISO: isolado (sonda barrou 5 tentativas)"; echo "GTN-CAP: sem-espaco memoria (orçamento 1M)"; echo "E $k" >> "$STUB_LDIR/ev"; exit 95; fi
+if [ "${HZN_LANE_NO:--}" = 1 ] && [ -n "${LSTUB_FAIL_LANE1:-}" ]; then echo "mbp-run: sem slot (pista 2)"; echo "E $k" >> "$STUB_LDIR/ev"; exit "$LSTUB_FAIL_LANE1"; fi
+cat "$STUB_OUT.$k" 2>/dev/null; v="STUB_RC_${k}_$n"; w="STUB_RC_$k"; rc=${!v:-${!w:-0}}; echo "E $k" >> "$STUB_LDIR/ev"; exit "$rc"
+EOF
 cat > "$T/mail-stub.sh" <<'EOF'
 #!/usr/bin/env bash
 echo "MAIL-CALL" >> "$MAIL_LOG"; printf '%s\n' "$*" >> "$MAIL_LOG"; exit "${MAIL_RC:-0}"
@@ -69,7 +86,7 @@ export MBP_CITY="$C" HZN_RUN="$T/run-stub.sh" HZN_WA_REPO="$T/wa" HZN_MAIL_CMD="
 printf '# filtro de mentira: barra tests/test_zero.py por nome\n- /tests/test_zero.py\n+ /tests/***\n+ /marker.txt\n- *\n' > "$T/filter-bar.txt"; printf '+ /marker.txt\n- *\n' > "$T/filter-none.txt"
 printf '#!/bin/sh\nexit 3\n' > "$T/pii-fail.sh"; printf '#!/bin/sh\nprintf "marker.txt\\ntests/a_test.py\\n"; exit 23\n' > "$T/rsync-partial.sh"; printf '#!/bin/sh\nexit 0\n' > "$T/rsync-empty.sh"; chmod +x "$T/rsync-partial.sh" "$T/rsync-empty.sh"
 printf '# comentário\n\n  tests/test_mac_*.py  \ntests/mac/*\n' > "$T/mac-only.txt"; export HETZNER_MAC_ONLY_LIST="$T/mac-only.txt"   # glob por linha, espaços e comentário como no mbp-run
-export LOCK_PATH="$LOCK" MAIL_LOG STUB_CALLS="$CALLS" STUB_OUT STUB_DIR_SEEN="$T/dirseen" SSH_LOG="$T/ssh.log" STUB_CNT="$T/stub.cnt" HZN_RETRY_S=0 HZN_STOP_UTC=
+export LOCK_PATH="$LOCK" MAIL_LOG STUB_CALLS="$CALLS" STUB_OUT STUB_DIR_SEEN="$T/dirseen" SSH_LOG="$T/ssh.log" STUB_CNT="$T/stub.cnt" HZN_RETRY_S=0 HZN_STOP_UTC= HZN_LANES=1 HZN_LANE_WAIT_S=0 STUB_LDIR="$T/lstub"
 n=0; fails=0; BAD=0; QUIET=0
 reset() { find "$LOGDIR" -mindepth 1 -delete 2>/dev/null; : > "$JSONL"; : > "$MAIL_LOG"; : > "$CALLS"; : > "$SSH_LOG"; rm -f "$STUB_OUT" "$STUB_OUT".* "$STUB_CNT"; chmod -R u+rwx "$LOCK" 2>/dev/null
           find "$LOCK" -mindepth 1 -delete 2>/dev/null; rmdir "$LOCK" 2>/dev/null; mkdir -p "$LOGDIR"; unset STUB_RC MAIL_RC SSH_RC HZN_MIN_TOTAL STUB_SLEEP STUB_RC_1 STUB_RC_2 STUB_RC_3 STUB_RC_4 STUB_UNREADABLE_BATCH HZN_COMM; export HZN_WA_REPO="$T/wa"; }
@@ -430,7 +447,79 @@ case_escudo() { reset; local A='tests/a_test.py::t1'
   reset; mkout "$ISO_OK" 0 "1500 passed in 3000.00s" "$(fl 0)"; printf 'GTN-ESCUDO: n=abc\n' >> "$STUB_OUT"; STUB_RC=0 go "$1"
   ck "escudo ilegível: segue COMPLETO (o escudo não muda o veredito)" vd COMPLETO; ck "escudo ilegível: o relatório diz ILEGÍVEL e não afirma zero" has "$REPORT" 'escudo do relatório \(plugin gtn_stable_ids\): contagem ILEGÍVEL'
   ck "escudo ilegível: o jsonl tem null (não 0)" test "$(tail -n 1 "$JSONL" | jq -c .escudo_reports)" = null; }
-ALL="first second cleanslate xfail inerte leak 97_sem_iso pulado timeout abort noiso nosum implausible lock lock_stale prev_unreadable mailfail egress ssh no_origin stale_report listfail prev_format dash partial fetch keep provenance dur maconly retidos batches batch_list overbudget batch_killed crash nocap cap_inert cap_retry cap_late leak_mid flag_mid badconst notests nobatch escudo partial_cmp stop_clock"
+# ---- pistas (ga-282sl1d): até 2 lotes ao mesmo tempo. O mbp-run de mentira acha o lote pelo 1º arquivo da chamada e registra início/fim em $STUB_LDIR/ev --------------------------------------------------------------
+maxconc() { awk '$1=="S"{c++; if(c>m)m=c} $1=="E"||$1=="K"{c--} END{print m+0}' "$STUB_LDIR/ev" 2>/dev/null; }
+lreset() { reset; mkdir -p "$STUB_LDIR"; find "$STUB_LDIR" -mindepth 1 -delete 2>/dev/null; }
+rows() { awk -F'|' '/^\| [0-9][0-9] \|/ { gsub(/ /, "", $2); printf "%s ", $2 }' "$REPORT"; }
+case_lanes_basic() { lreset; seed_prev tests/old.py::gone
+  local A='tests/a_test.py::t1' B='tests/test_b.py::t2' C='tests/test_b.py::t3'
+  EG=2 okb 1 "1 failed, 400 passed in 100.00s (0:01:40)" 1 "$A"
+  okb 2 "500 passed, 1 skipped in 200.00s (0:03:20)" 0; EG=0 okb 3 "1 failed, 1 error, 300 passed in 50.00s" 2 "$B" "$C"
+  HZN_RUN="$T/lanes-stub.sh" HZN_LANES=2 LSTUB_SLEEP=1.5 STUB_RC_1=1 STUB_RC_2=0 STUB_RC_3=1 HZN_BATCH_DEFS=10 go "$1"
+  ck "pistas: COMPLETO, exit 0, 1 e-mail" vd COMPLETO; ck "pistas: exit 0" rcis 0; ck "pistas: 1 e-mail" mailn 1
+  ck "pistas: 3 chamadas do mbp-run, uma por lote (nenhum lote rodou duas vezes)" test "$(grep -c '^ARGS:' "$CALLS")" = 3
+  ck "pistas: DOIS lotes andaram ao mesmo tempo" test "$(maxconc)" -ge 2; ck "pistas: nunca mais de 2 ao mesmo tempo" test "$(maxconc)" -le 2
+  ck "pistas: o mbp-run recebeu HETZNER_ISO_LANES=2 (e a pista que o chamou)" has "$CALLS" 'LANES=2 LANE_NO=[01]$'
+  ck "pistas: totais SOMADOS dos 3 lotes (iguais aos de uma pista só)" has "$REPORT" 'total: 1204 \(1200 passaram, 2 falharam, 1 erros, 1 pulados, 0 xfail, 0 xpass\); 3 de 3 lotes rodaram'
+  ck "pistas: a comparação com a noite anterior é a mesma (3 novas, 1 corrigida)" has "$REPORT" '3 falhas NOVAS, 1 corrigidas'; ck "pistas: a baseline avançou com a união dos 3 lotes" test "$(decoded "$PREV" | grep -c 'a_test\|test_b')" = 3
+  ck "pistas: a tabela sai na ORDEM dos lotes" test "$(rows)" = "01 02 03 "; ck "pistas: a junta das saídas sai na ordem dos lotes" test "$(grep -o '^=== lote [0-9][0-9]' "$LOGDIR/$DAY.out" | tr -d '\n')" = "=== lote 01=== lote 02=== lote 03"
+  ck "pistas: o relatório diz as pistas e quantos lotes andaram juntos" has "$REPORT" '^- pistas: 2 configuradas, média de [0-9.]+ lotes ao mesmo tempo \('; ck "pistas: o jsonl diz lanes=2 e 0 esperas" test "$(tail -n 1 "$JSONL" | jq -c '[.lanes,.lane_waits]')" = '[2,0]'
+  ck "pistas: scratch apagado" empty_dir "$C/.gc/run"
+  # 1 pista (HZN_LANES=1, o padrão dos outros casos): o laço de sempre — o mbp-run NÃO recebe HETZNER_ISO_LANES e nada anda ao mesmo tempo
+  lreset; seed_prev tests/old.py::gone; EG=2 okb 1 "1 failed, 400 passed in 100.00s (0:01:40)" 1 "$A"; okb 2 "500 passed, 1 skipped in 200.00s (0:03:20)" 0; EG=0 okb 3 "1 failed, 1 error, 300 passed in 50.00s" 2 "$B" "$C"
+  HZN_RUN="$T/lanes-stub.sh" HZN_LANES=1 LSTUB_SLEEP=0.3 STUB_RC_1=1 STUB_RC_2=0 STUB_RC_3=1 HZN_BATCH_DEFS=10 go "$1"
+  ck "1 pista: COMPLETO e o mbp-run NÃO recebe HETZNER_ISO_LANES" vd COMPLETO; ck "1 pista: sem --lanes na chamada" hasnt "$CALLS" 'LANES=[0-9]'; ck "1 pista: nada ao mesmo tempo" test "$(maxconc)" -le 1
+  ck "1 pista: o relatório não tem linha de pistas" hasnt "$REPORT" '^- pistas:'; ck "1 pista: o jsonl diz lanes=1" test "$(tail -n 1 "$JSONL" | jq -c .lanes)" = 1; }
+case_lanes_wait() { lreset
+  # o lote 2 volta rc 95 (o gt-iso-run sem espaço para a pista extra) na 1ª chamada, rc 98 (sem slot, transitório) na 2ª e roda na 3ª. A espera NÃO gasta tentativa: com HZN_BATCH_TRIES=2 o rc 98 ainda tem a retentativa dele
+  okb 1 "100 passed in 10.00s" 0; okb 2 "200 passed in 20.00s" 0; okb 3 "300 passed in 30.00s" 0
+  HZN_RUN="$T/lanes-stub.sh" HZN_LANES=2 LSTUB_SLEEP=0.6 LSTUB_95_2=1 STUB_RC_2_2=98 HZN_BATCH_DEFS=10 HZN_BATCH_TRIES=2 HZN_MIN_TOTAL=100 go "$1"
+  ck "espera por espaço: COMPLETO (o rc 95 não é lote que não rodou, e não gasta a retentativa do rc 98)" vd COMPLETO; ck "espera por espaço: 3 lotes rodaram" has "$REPORT" '3 de 3 lotes rodaram'
+  ck "espera por espaço: o lote 2 foi chamado 3 vezes (95, 98, ok)" test "$(cat "$STUB_LDIR/n.2")" = 3; ck "espera por espaço: a tabela não tem NÃO RODOU" hasnt "$REPORT" 'NÃO RODOU'
+  ck "espera por espaço: a espera foi dita na saída" has "$OUT" 'lote 02: o nó não tem espaço .*espera 0s'; ck "espera por espaço: o jsonl conta 1 espera" test "$(tail -n 1 "$JSONL" | jq -c .lane_waits)" = 1
+  ck "espera por espaço: o relatório conta a espera" has "$REPORT" 'a pista extra esperou o nó ter espaço 1 vez\(es\)'
+  ck "espera por espaço: quem fez a 3ª chamada foi a MESMA pista (a retentativa do rc 98 sobrou; sem ela o lote seria devolvido à outra pista)" has "$STUB_LDIR/ev" '^S 2 lane=1 n=3$'; }
+case_lanes_nospace() { lreset
+  # espaço que nunca aparece: o lote espera até o orçamento acabar e então é NÃO RODOU (nunca verde, nunca espera para sempre)
+  okb 1 "100 passed in 10.00s" 0; okb 2 "200 passed in 20.00s" 0; okb 3 "300 passed in 30.00s" 0
+  HZN_RUN="$T/lanes-stub.sh" HZN_LANES=2 LSTUB_95_2=always HZN_LANE_WAIT_S=1 HZN_BATCH_DEFS=10 HZN_TIMEOUT_S=20 HZN_FINAL_MARGIN_S=2 HZN_MIN_BATCH_S=3 HZN_MIN_TOTAL=100 go "$1"
+  ck "sem espaço até o fim do orçamento: FALHOU, exit 1" rcis 1; ck "sem espaço até o fim do orçamento: o lote 2 NÃO RODOU por orçamento" has "$REPORT" '^\| 02 \| .* NÃO RODOU \| orçamento esgotado: restam .*antes: o nó não tem espaço'; }
+case_lanes_requeue() { lreset
+  # a pista 2 não consegue rodar por causa do nó (rc 98 de sempre): devolve o lote e sai; a pista 1 roda os três e a noite fecha COMPLETO (nunca menos lotes que sem pistas)
+  okb 1 "100 passed in 10.00s" 0; okb 2 "200 passed in 20.00s" 0; okb 3 "300 passed in 30.00s" 0
+  HZN_RUN="$T/lanes-stub.sh" HZN_LANES=2 LSTUB_SLEEP=0.6 LSTUB_SLEEP_LANE1=0 LSTUB_FAIL_LANE1=98 HZN_BATCH_DEFS=10 HZN_BATCH_TRIES=1 HZN_MIN_TOTAL=100 go "$1"
+  ck "pista extra sem rodar: COMPLETO, os 3 lotes rodaram pela pista 1" vd COMPLETO; ck "pista extra sem rodar: 3 de 3 rodaram" has "$REPORT" '3 de 3 lotes rodaram'
+  ck "pista extra sem rodar: a saída diz que o lote voltou à fila" has "$OUT" 'lote [23] devolvido à fila \(retry-mbp'; ck "pista extra sem rodar: nenhum lote NÃO RODOU" hasnt "$REPORT" 'NÃO RODOU'; }
+case_lanes_orphan() { lreset
+  # a pista 2 devolve o lote DEPOIS de a pista 1 já ter visto a fila vazia e sair: o lote fica sem dono e sem resultado, e a rodada o roda sozinha antes de fechar (nunca "não chegou a começar")
+  okb 1 "100 passed in 10.00s" 0; okb 2 "200 passed in 20.00s" 0; okb 3 "300 passed in 30.00s" 0
+  HZN_RUN="$T/lanes-stub.sh" HZN_LANES=2 LSTUB_SLEEP=0.4 LSTUB_SLEEP_LANE1=1.5 LSTUB_FAIL_LANE1=98 HZN_BATCH_DEFS=10 HZN_BATCH_TRIES=1 HZN_MIN_TOTAL=100 go "$1"
+  ck "lote devolvido tarde: COMPLETO" vd COMPLETO; ck "lote devolvido tarde: 3 de 3 rodaram" has "$REPORT" '3 de 3 lotes rodaram'; ck "lote devolvido tarde: a rodada o rodou sozinha e disse" has "$OUT" 'lote [23] ficou sem resultado depois das pistas: rodando sozinho'; }
+case_lanes_leak() { local t0 t1 obs
+  lreset; mkout "nao-isolado tcp:1.1.1.1:53" "" ""; mv -f "$STUB_OUT" "$STUB_OUT.2"; okb 1 "100 passed in 10.00s" 0; okb 3 "300 passed in 30.00s" 0
+  # o lote 2 vaza (rc 97 + nao-isolado) enquanto o lote 1 dorme 31,7 s: a noite acaba JÁ, o lote em andamento é derrubado (nada de processo órfão) e a tabela diz que ele não terminou
+  t0=$(date +%s); HZN_RUN="$T/lanes-stub.sh" HZN_LANES=2 LSTUB_SLEEP_1=31.7 STUB_RC_2=97 HZN_BATCH_DEFS=10 HZN_MIN_TOTAL=100 go "$1"; t1=$(date +%s)
+  ck "vazamento numa pista: FALHOU, exit 1" rcis 1; ck "vazamento numa pista: o assunto diz VAZAMENTO" has "$MAIL_LOG" 'FALHOU: VAZAMENTO.*tcp:1\.1\.1\.1:53'
+  ck "vazamento numa pista: a noite não esperou o lote lento (menos de 25 s)" test $(( t1 - t0 )) -lt 25
+  ck "vazamento numa pista: o lote que estava em andamento aparece como NÃO RODOU, com o motivo" has "$REPORT" '^\| 01 \| .* NÃO RODOU \| a rodada parou antes de o lote terminar'
+  sleep 0.5; obs=$(pgrep -f 'sleep 31.7' 2>/dev/null | wc -l | tr -d ' '); ck "vazamento numa pista: nenhum processo órfão do lote derrubado" test "$obs" = 0; [ "$obs" = 0 ] || pkill -f 'sleep 31.7' 2>/dev/null; return 0; }
+case_lanes_inerte1() { lreset
+  # o lote 1 inerte decide a noite (INERTE, exit 0) mesmo com a outra pista já em andamento: ela é derrubada, nada divulgado
+  mkout "inerte helper-ausente (/usr/local/sbin/gt-netns-run: o root ainda não o instalou)" "" ""; mv -f "$STUB_OUT" "$STUB_OUT.1"; okb 2 "200 passed in 20.00s" 0; okb 3 "300 passed in 30.00s" 0
+  HZN_RUN="$T/lanes-stub.sh" HZN_LANES=2 LSTUB_SLEEP=0.3 STUB_RC_1=97 HZN_BATCH_DEFS=10 HZN_MIN_TOTAL=100 go "$1"
+  ck "lote 1 inerte com pistas: exit 0 e veredito INERTE" rcis 0; ck "lote 1 inerte com pistas: veredito INERTE" vd INERTE; ck "lote 1 inerte com pistas: nenhum total divulgado" hasnt "$REPORT" 'total:'; }
+case_lanes_order() { lreset
+  # o lote 1 é o mais lento: as pistas terminam 3 e 2 antes dele, e mesmo assim tabela, junta e soma saem na ordem dos lotes
+  okb 1 "100 passed in 10.00s" 0; okb 2 "200 passed in 20.00s" 0; okb 3 "300 passed in 30.00s" 0
+  HZN_RUN="$T/lanes-stub.sh" HZN_LANES=2 LSTUB_SLEEP_1=1.5 HZN_BATCH_DEFS=10 HZN_MIN_TOTAL=100 go "$1"
+  ck "ordem dos lotes: COMPLETO" vd COMPLETO; ck "ordem dos lotes: a tabela sai 01 02 03" test "$(rows)" = "01 02 03 "
+  ck "ordem dos lotes: os lotes 2 e 3 terminaram ANTES do 1 (o caso prova o que diz)" test "$(grep -E '^E (1|2|3)$' "$STUB_LDIR/ev" | head -n 1)" != "E 1"
+  ck "ordem dos lotes: a junta sai 01 02 03" test "$(grep -o '^=== lote [0-9][0-9]' "$LOGDIR/$DAY.out" | tr -d '\n')" = "=== lote 01=== lote 02=== lote 03"; ck "ordem dos lotes: soma de 600" has "$REPORT" 'total: 600 '; }
+case_lanes_invalid() { local v
+  for v in abc 0 9 "2 3" -1; do lreset; STUB_RC=0 HZN_LANES="$v" go "$1"
+    ck "HZN_LANES='$v': FALHOU, exit 1" rcis 1; ck "HZN_LANES='$v': diz constante inválida" has "$MAIL_LOG" 'constante inválida: (LANES_REQ|HZN_LANES)'; ck "HZN_LANES='$v': nada rodou" empty_dir_file "$CALLS"; done; }
+
+ALL="first second cleanslate xfail inerte leak 97_sem_iso pulado timeout abort noiso nosum implausible lock lock_stale prev_unreadable mailfail egress ssh no_origin stale_report listfail prev_format dash partial fetch keep provenance dur maconly retidos batches batch_list overbudget batch_killed crash nocap cap_inert cap_retry cap_late leak_mid flag_mid badconst notests nobatch escudo partial_cmp stop_clock lanes_basic lanes_wait lanes_nospace lanes_requeue lanes_orphan lanes_leak lanes_inerte1 lanes_order lanes_invalid"
 for c in $ALL; do "case_$c" "$SUT0"; done
 
 # ---- controles negativos: o caso correspondente tem de FALHAR quando roda no mutante -----------------------------------------
@@ -541,6 +630,22 @@ mutantl M86-o-prazo-do-relogio-nao-aparece-no-aviso stop_clock 'BUDGET_BY="reló
 mutantl M87-comparacao-que-falha-vira-0-novas partial_cmp $'if LC_ALL=C $COMM -13 "$SCR/prev.partial" "$CUR" > "$NEW" 2>/dev/null && FIXED=$(LC_ALL=C $COMM -23 "$SCR/prev.partial" "$CUR" | wc -l | tr -d \' \') && [ -n "$FIXED" ]; then' $'LC_ALL=C $COMM -13 "$SCR/prev.partial" "$CUR" > "$NEW" 2>/dev/null; FIXED=$(LC_ALL=C $COMM -23 "$SCR/prev.partial" "$CUR" | wc -l | tr -d \' \'); if true; then'
 mutantl M88-lista-do-lote-ilegivel-ignorada partial_cmp 'cat "$SCR/batch.$i" >> "$SCR/ran.files" 2>/dev/null || RANFILES_BAD=1' 'cat "$SCR/batch.$i" >> "$SCR/ran.files" 2>/dev/null || true'
 mutantl M89-lista-ilegivel-nao-vira-indisponivel partial_cmp 'elif [ "$RANFILES_BAD" = 1 ]; then PCMP=' 'elif false; then PCMP='
+# pistas (ga-282sl1d)
+mutantl N1-pistas-ignoradas lanes_basic 'LANES=$LANES_REQ; ISOLANES=""' 'LANES=1; ISOLANES=""'
+mutantl N2-iso-lanes-nao-repassado lanes_basic 'HETZNER_ISO_LANES="$ISOLANES" ' ''
+mutantl N3-sem-espaco-vira-falha lanes_wait '95) B_ST=sem-espaco;' '95) B_ST=nao-rodou;'
+mutantl N4-espera-gasta-a-retentativa lanes_wait 'LASTWHY=$B_WHY; tries=$((tries-1)); echo' 'LASTWHY=$B_WHY; echo'
+mutantl N5-pista-extra-nao-devolve-o-lote lanes_requeue 'if [ "$ln" -gt 0 ]; then find' 'if false; then find'
+mutantl N6-vazamento-nao-para-a-fila lanes_leak 'vazamento|sem-prova) : > "$SCR/stop"; break ;;' 'vazamento|sem-prova) break ;;'
+mutantl N7-lote-sem-resultado-vira-rodou lanes_leak '  else B_ST=nao-rodou; B_ISO=""; B_CAP=""; B_SUM=""; BSEC=0; tries=0' '  else B_ST=ran; B_ISO=""; B_CAP=""; B_SUM=""; BSEC=0; tries=0'
+mutantl N8-pistas-nao-derrubadas lanes_leak 'kill_lanes() { local p; for p in $LANE_PIDS; do kill_tree "$p"; done; return 0; }' 'kill_lanes() { return 0; }'
+mutantl N9-pistas-demais-aceitas lanes_invalid '[ "$LANES_REQ" -le 8 ] || finish' ': || finish'
+mutantl N10-espera-nao-contada lanes_wait 'echo "$nn" >> "$SCR/waits"; ' ''
+mutantl N11-lote-devolvido-tarde-fica-sem-rodar lanes_orphan '[ -s "$SCR/res.$k" ] || { say "lote $k ficou sem resultado depois das pistas: rodando sozinho"; run_one_batch "$k"; }' '[ -s "$SCR/res.$k" ] || :'
+mutantl N12-leitura-fora-de-ordem lanes_order '  k=0; while [ "$k" -lt "$NB" ]; do k=$((k+1)); post_one_batch "$k"; done
+fi' '  k=0; while [ "$k" -lt "$NB" ]; do k=$((k+1)); post_one_batch "$(( NB - k + 1 ))"; done
+fi'
+mutantl N13-lote-1-inerte-nao-para-a-fila lanes_inerte1 '[ "$k" -ne 1 ] || { : > "$SCR/stop"; break; }' ':'
 reset
 echo "---"; echo "$((n-fails))/$n ok ($M mutantes)"
 [ $fails -eq 0 ] && echo "SELFTEST OK" || { echo "SELFTEST FALHOU ($fails)"; exit 1; }
