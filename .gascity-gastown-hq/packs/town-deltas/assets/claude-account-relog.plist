@@ -46,6 +46,8 @@
     <!-- Fail-closed: leave CLAUDE_RELOG_ENABLED UNSET until the account pool is
          populated and Athos opts in. Add <key>CLAUDE_RELOG_ENABLED</key><string>1</string>
          here to arm auto-relog. -->
+    <key>BEADS_DOLT_AUTO_START</key>
+    <string>0</string>
   </dict>
 </dict>
 </plist>

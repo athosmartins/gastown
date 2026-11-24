@@ -36,5 +36,8 @@
 
   <key>StandardOutPath</key><string>/Users/athos/gt/.gascity-gastown-hq/.gc/logs/bd-metrics-disable-env-launchd.out</string>
   <key>StandardErrorPath</key><string>/Users/athos/gt/.gascity-gastown-hq/.gc/logs/bd-metrics-disable-env-launchd.err</string>
+  <key>EnvironmentVariables</key><dict>
+    <key>BEADS_DOLT_AUTO_START</key><string>0</string>
+  </dict>
 </dict>
 </plist>

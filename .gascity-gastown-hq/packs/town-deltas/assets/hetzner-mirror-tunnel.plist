@@ -8,6 +8,8 @@
 		<string>/Users/athos</string>
 		<key>PATH</key>
 		<string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+		<key>BEADS_DOLT_AUTO_START</key>
+		<string>0</string>
 	</dict>
 	<key>Label</key>
 	<string>com.gascity.hetzner-mirror-tunnel</string>

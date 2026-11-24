@@ -20,5 +20,6 @@
   <key>EnvironmentVariables</key><dict>
     <key>BD_ACTOR</key><string>automation</string>
     <key>PATH</key><string>/Users/athos/.local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    <key>BEADS_DOLT_AUTO_START</key><string>0</string>
   </dict>
 </dict></plist>

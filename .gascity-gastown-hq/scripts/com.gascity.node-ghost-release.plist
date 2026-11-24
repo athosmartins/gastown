@@ -33,6 +33,7 @@
     <key>NODE_GHOST_ENABLED</key><string>1</string>
     <key>NODE_GHOST_DRY_RUN</key><string>0</string>
     <key>NODE_GHOST_CALL_TIMEOUT</key><string>150</string>
+    <key>BEADS_DOLT_AUTO_START</key><string>0</string>
   </dict>
 </dict>
 </plist>

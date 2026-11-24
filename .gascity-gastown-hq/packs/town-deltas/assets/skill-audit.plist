@@ -32,6 +32,8 @@
     <string>/Users/athos/gt/.gascity-gastown-hq</string>
     <key>GC</key>
     <string>gc</string>
+    <key>BEADS_DOLT_AUTO_START</key>
+    <string>0</string>
   </dict>
 
   <key>ThrottleInterval</key><integer>10</integer>

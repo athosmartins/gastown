@@ -30,5 +30,6 @@
     <!-- <key>GTM_DRY_RUN</key><string>1</string> -->
     <!-- Kill-switch: GTM_ENABLED=0 turns the meter off entirely. -->
     <!-- <key>GTM_ENABLED</key><string>1</string> -->
+    <key>BEADS_DOLT_AUTO_START</key><string>0</string>
   </dict>
 </dict></plist>

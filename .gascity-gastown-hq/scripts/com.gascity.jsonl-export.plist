@@ -85,6 +85,8 @@
     <string>/Users/athos/gt/.gascity-gastown-hq/.gc/runtime</string>
     <key>GC_PACK_STATE_DIR</key>
     <string>/Users/athos/gt/.gascity-gastown-hq/.gc/runtime/packs/town-deltas</string>
+    <key>BEADS_DOLT_AUTO_START</key>
+    <string>0</string>
   </dict>
 </dict>
 </plist>

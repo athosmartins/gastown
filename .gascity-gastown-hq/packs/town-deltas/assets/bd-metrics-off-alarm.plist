@@ -37,6 +37,8 @@
     <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:/Users/athos/go/bin:/Users/athos/.local/bin</string>
     <key>HOME</key>
     <string>/Users/athos</string>
+    <key>BEADS_DOLT_AUTO_START</key>
+    <string>0</string>
   </dict>
 </dict>
 </plist>

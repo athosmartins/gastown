@@ -21,5 +21,6 @@
     <key>PATH</key><string>/opt/homebrew/bin:/Users/athos/.local/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
     <key>HOME</key><string>/Users/athos</string>
     <key>GC_CITY_PATH</key><string>/Users/athos/gt/.gascity-gastown-hq</string>
+    <key>BEADS_DOLT_AUTO_START</key><string>0</string>
   </dict>
 </dict></plist>

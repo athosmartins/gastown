@@ -77,6 +77,8 @@
     <!-- Re-escalation cooldown por bead (3h). Evita spam enquanto Mayor age. -->
     <key>COOLDOWN_SEC</key>
     <string>10800</string>
+    <key>BEADS_DOLT_AUTO_START</key>
+    <string>0</string>
   </dict>
 </dict>
 </plist>

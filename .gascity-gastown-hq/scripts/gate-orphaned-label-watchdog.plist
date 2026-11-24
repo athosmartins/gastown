@@ -36,5 +36,6 @@
     <!-- <key>GOLW_ENABLED</key><string>1</string> -->
     <!-- Dry-run: GOLW_DRY_RUN=1 logs findings but sends no comment/notify/mail. -->
     <!-- <key>GOLW_DRY_RUN</key><string>0</string> -->
+    <key>BEADS_DOLT_AUTO_START</key><string>0</string>
   </dict>
 </dict></plist>

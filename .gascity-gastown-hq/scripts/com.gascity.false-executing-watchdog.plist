@@ -42,6 +42,8 @@
     <string>1</string>
     <key>FALSE_EXEC_DRY_RUN</key>
     <string>1</string>
+    <key>BEADS_DOLT_AUTO_START</key>
+    <string>0</string>
   </dict>
 </dict>
 </plist>

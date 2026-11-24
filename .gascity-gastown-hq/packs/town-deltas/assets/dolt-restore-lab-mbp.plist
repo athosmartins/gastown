@@ -68,6 +68,8 @@
          dentro do teto do job (12600 s). -->
     <key>LABMBP_STREAM_S</key>
     <string>9000</string>
+    <key>BEADS_DOLT_AUTO_START</key>
+    <string>0</string>
   </dict>
 </dict>
 </plist>
