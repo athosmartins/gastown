@@ -1,0 +1,254 @@
+diff --git a/cmd/gc/builtin_worker_prompt_claim_actor_test.go b/cmd/gc/builtin_worker_prompt_claim_actor_test.go
+new file mode 100644
+index 0000000000..0175b56e59
+--- /dev/null
++++ b/cmd/gc/builtin_worker_prompt_claim_actor_test.go
+@@ -0,0 +1,156 @@
++package main
++
++import (
++	"os"
++	"os/exec"
++	"path/filepath"
++	"regexp"
++	"strings"
++	"testing"
++
++	"github.com/gastownhall/gascity/internal/citylayout"
++)
++
++// ga-znmm7w1: the builtin worker prompts (the ones an engine-synthesized <rig>/claude-headless agent runs on) tell the agent to claim
++// with `bd update <id> --claim` and then to check that "the assignee must be $GC_SESSION_NAME". A claim is recorded under the bd
++// ACTOR, and the engine stamps BEADS_ACTOR with the pool slot ALIAS (setTemplateEnvIdentity), so the claim never landed on the
++// session: the worker refused the bead it had just won and drained (wa-fj2lqh, 19/11: 5 sessions in ~35 min, 0 commits, each ended by
++// "drain acknowledged"). The engine's own scripted claim already passes `--actor $GC_SESSION_NAME` first (agentScriptClaimActor);
++// these tests hold the prompt text to the same identity.
++
++const claimActorFlag = `--actor "$GC_SESSION_NAME"`
++
++type builtinWorkerPrompt struct{ name, text string }
++
++// builtinWorkerPromptsForClaimTest returns the three texts a session without its own prompt_template can be primed with: the compiled-in
++// fallback and the two core-pack prompts, read the way the binary ships them (materialized from the embedded pack).
++func builtinWorkerPromptsForClaimTest(t *testing.T) []builtinWorkerPrompt {
++	t.Helper()
++	dir := t.TempDir()
++	if err := MaterializeBuiltinPacks(dir); err != nil {
++		t.Fatalf("MaterializeBuiltinPacks() error: %v", err)
++	}
++	out := []builtinWorkerPrompt{{"defaultPrimePrompt", defaultPrimePrompt}}
++	for _, name := range []string{"pool-worker.template.md", "graph-worker.template.md"} {
++		path := filepath.Join(dir, citylayout.SystemPacksRoot, "core", "assets", "prompts", name)
++		// vazio → the test fails below (no claim command found); falhou/ilegível → Fatalf: a prompt that cannot be read proves nothing.
++		data, err := os.ReadFile(path)
++		if err != nil {
++			t.Fatalf("ReadFile(%s): %v", path, err)
++		}
++		out = append(out, builtinWorkerPrompt{name: name, text: string(data)})
++	}
++	return out
++}
++
++// claimCommandRE finds every `bd update <id> --claim ...` the prompt tells the agent to run or documents: from "bd update" to the
++// first backtick, ';' or end of line after it.
++var claimCommandRE = regexp.MustCompile("bd update <id> --claim[^`;\n]*")
++
++func claimCommandsIn(text string) []string {
++	var out []string
++	for _, m := range claimCommandRE.FindAllString(text, -1) {
++		out = append(out, strings.TrimSpace(m))
++	}
++	return out
++}
++
++func TestBuiltinWorkerPromptsClaimAsSessionActor(t *testing.T) {
++	for _, p := range builtinWorkerPromptsForClaimTest(t) {
++		t.Run(p.name, func(t *testing.T) {
++			cmds := claimCommandsIn(p.text)
++			if len(cmds) == 0 {
++				t.Fatalf("no `bd update <id> --claim` command found: the test cannot say what the prompt tells the agent to run")
++			}
++			for _, c := range cmds {
++				if !strings.Contains(c, claimActorFlag) {
++					t.Errorf("claim command %q does not carry %s: the claim would be recorded under $BEADS_ACTOR (the pool slot alias) and the prompt's own verification (the assignee must be $GC_SESSION_NAME) would refuse the bead", c, claimActorFlag)
++				}
++			}
++		})
++	}
++}
++
++// The verification half of the pair: the prompts check the claim against the SESSION name. The claim above must keep recording that
++// same identity; if a future edit loosens the check instead, this test says the pair changed and the claim line must be re-read.
++func TestBuiltinWorkerPromptsVerifyTheClaimAgainstTheSessionName(t *testing.T) {
++	re := regexp.MustCompile(`(?i)assign[^\n]*\$GC_SESSION_NAME`)
++	for _, p := range builtinWorkerPromptsForClaimTest(t) {
++		if !re.MatchString(p.text) {
++			t.Errorf("%s: no line ties the assignee to $GC_SESSION_NAME any more: the claim identity (%s) and the verification must name the same thing", p.name, claimActorFlag)
++		}
++	}
++}
++
++// fakeBdForClaim stands in for bd's claim: it records the actor the real bd would write as the assignee. bd resolves that actor as
++// `--actor` flag > $BEADS_ACTOR > $BD_ACTOR (third_party/beads/cmd/bd/main.go, getActorWithGit), and `bd update --claim` hands it to
++// ClaimIssueInTx as the new assignee (internal/storage/issueops/claim.go).
++const fakeBdForClaim = `#!/bin/sh
++actor=""; claim=0
++while [ $# -gt 0 ]; do
++  case "$1" in
++    --claim) claim=1 ;;
++    --actor) shift; actor="$1" ;;
++    --actor=*) actor="${1#--actor=}" ;;
++  esac
++  shift
++done
++[ "$claim" = 1 ] || exit 2
++[ -n "$actor" ] || actor="${BEADS_ACTOR:-${BD_ACTOR:-}}"
++printf '%s' "$actor" > "$FAKE_BD_OUT"
++`
++
++func TestBuiltinWorkerPromptClaimCommandRecordsTheSession(t *testing.T) {
++	const (
++		alias   = "whatsapp_automation/claude-headless-1"
++		session = "claude-headless-ga7bku77s"
++	)
++	binDir := t.TempDir()
++	if err := os.WriteFile(filepath.Join(binDir, "bd"), []byte(fakeBdForClaim), 0o755); err != nil {
++		t.Fatalf("WriteFile(fake bd): %v", err)
++	}
++	outFile := filepath.Join(t.TempDir(), "assignee")
++	// A pool slot as the engine stamps it: BEADS_ACTOR and GC_ALIAS are the alias, GC_SESSION_NAME is the incarnation.
++	runClaim := func(t *testing.T, command string) string {
++		t.Helper()
++		_ = os.Remove(outFile)
++		// The command text is the repo's own prompt text (an embedded constant / embedded pack file), never external input. It goes
++		// through a shell on purpose: the agent's shell expands "$GC_SESSION_NAME" in that text, and that expansion is what is under test.
++		cmd := exec.Command("sh", "-c", command)
++		cmd.Env = []string{
++			"PATH=" + binDir + ":" + os.Getenv("PATH"),
++			"BEADS_ACTOR=" + alias, "GC_ALIAS=" + alias, "GC_AGENT=" + alias,
++			"GC_SESSION_NAME=" + session, "GC_TEMPLATE=whatsapp_automation/claude-headless",
++			"FAKE_BD_OUT=" + outFile,
++		}
++		if out, err := cmd.CombinedOutput(); err != nil {
++			t.Fatalf("running %q: %v\n%s", command, err, out)
++		}
++		// vazio → "" (the fake never ran: the comparisons below fail); falhou/ilegível → Fatalf: no answer is not "the session".
++		data, err := os.ReadFile(outFile)
++		if err != nil {
++			t.Fatalf("the fake bd recorded no assignee for %q: %v", command, err)
++		}
++		return string(data)
++	}
++
++	// Control: the claim the prompts used to spell out reproduces the incident, so the fake is not vacuous and the environment is
++	// the one the engine stamps.
++	if got := runClaim(t, "bd update ga-test1 --claim"); got != alias {
++		t.Fatalf("control: `bd update <id> --claim` recorded %q, want the alias %q (the environment does not reproduce the incident)", got, alias)
++	}
++
++	for _, p := range builtinWorkerPromptsForClaimTest(t) {
++		t.Run(p.name, func(t *testing.T) {
++			cmds := claimCommandsIn(p.text)
++			if len(cmds) == 0 {
++				t.Fatalf("no `bd update <id> --claim` command found")
++			}
++			for _, c := range cmds {
++				if got := runClaim(t, strings.ReplaceAll(c, "<id>", "ga-test1")); got != session {
++					t.Errorf("the prompt's claim command %q recorded %q as the assignee, want the session %q: Step 5 of the prompt (the assignee must be $GC_SESSION_NAME) would refuse it", c, got, session)
++				}
++			}
++		})
++	}
++}
+diff --git a/cmd/gc/cmd_prime.go b/cmd/gc/cmd_prime.go
+index 611656cf42..c6ceef7449 100644
+--- a/cmd/gc/cmd_prime.go
++++ b/cmd/gc/cmd_prime.go
+@@ -36,7 +36,7 @@ manual work instead.
+ - ` + "`bd list --assignee=\"$GC_SESSION_NAME\" --status=in_progress --json`" + ` — resume work already claimed by this session
+ - ` + "`bd ready --assignee=\"$GC_SESSION_NAME\" --json --limit=1`" + ` — find assigned ready work
+ - ` + "`gc hook`" + ` — find routed pool work
+-- ` + "`bd update <id> --claim`" + ` — atomically claim an unassigned bead
++- ` + "`bd update <id> --claim --actor \"$GC_SESSION_NAME\"`" + ` — atomically claim an unassigned bead for this session
+ - ` + "`bd show <id> --json`" + ` — verify claim and inspect metadata
+ - ` + "`bd close <id>`" + ` — mark work done when no outcome metadata is required
+ - ` + "`gc runtime drain-ack`" + ` — tell the controller this session is idle and can stop
+@@ -49,7 +49,10 @@ manual work instead.
+    ` + "`bd ready --assignee=\"$GC_SESSION_NAME\" --json --limit=1`" + `
+ 3. If none, run ` + "`gc hook`" + ` for routed pool work.
+ 4. If ` + "`gc hook`" + ` returns an unassigned bead, claim it before doing anything else:
+-   ` + "`bd update <id> --claim`" + `
++   ` + "`bd update <id> --claim --actor \"$GC_SESSION_NAME\"`" + `
++   The ` + "`--actor`" + ` flag is required: a claim is recorded under the bd actor, and
++   without the flag that is $BEADS_ACTOR, which for a pool session is its slot
++   alias and not $GC_SESSION_NAME, so the verification in step 5 would fail.
+    If the claim command fails, another session won the race. Do not work that
+    bead; run ` + "`gc hook`" + ` again or drain if no valid work remains.
+ 5. Verify the claimed bead before doing work:
+diff --git a/internal/bootstrap/packs/core/assets/prompts/graph-worker.template.md b/internal/bootstrap/packs/core/assets/prompts/graph-worker.template.md
+index 5ac9e7abb3..d097c94a50 100644
+--- a/internal/bootstrap/packs/core/assets/prompts/graph-worker.template.md
++++ b/internal/bootstrap/packs/core/assets/prompts/graph-worker.template.md
+@@ -23,8 +23,10 @@ bd list --assignee="$GC_SESSION_NAME" --status=in_progress --json
+ # Step 3: If still nothing, check the routed queue (multi-session configs only)
+ gc hook
+ 
+-# Step 4: If gc hook returned an unassigned routed bead, claim it atomically
+-bd update <id> --claim
++# Step 4: If gc hook returned an unassigned routed bead, claim it atomically,
++# as THIS session: bd records the --actor as the assignee, and without the
++# flag that is $BEADS_ACTOR (the pool slot alias), not $GC_SESSION_NAME.
++bd update <id> --claim --actor "$GC_SESSION_NAME"
+ 
+ # Step 5: Verify the claim before doing work
+ bd show <id> --json
+@@ -39,7 +41,7 @@ gc runtime drain-ack
+ ## How To Work
+ 
+ 1. Find your assigned bead (see Startup above).
+-2. If the bead came from `gc hook`, claim it with `bd update <id> --claim`
++2. If the bead came from `gc hook`, claim it with `bd update <id> --claim --actor "$GC_SESSION_NAME"`
+    before doing any work. Do not start work with `bd update --status in_progress`;
+    only `--claim` sets both assignee and in-progress state atomically.
+ 3. Verify the claimed bead is assigned to `$GC_SESSION_NAME` and routed to
+diff --git a/internal/bootstrap/packs/core/assets/prompts/pool-worker.template.md b/internal/bootstrap/packs/core/assets/prompts/pool-worker.template.md
+index 82eac2561f..d5f50417c0 100644
+--- a/internal/bootstrap/packs/core/assets/prompts/pool-worker.template.md
++++ b/internal/bootstrap/packs/core/assets/prompts/pool-worker.template.md
+@@ -23,12 +23,16 @@ bd list --assignee="$GC_SESSION_NAME" --status=in_progress
+ # Step 3: If still nothing, check the routed queue
+ gc hook
+ 
+-# Step 4: Claim it ATOMICALLY — and STOP if you lost the race.
++# Step 4: Claim it ATOMICALLY — as THIS session — and STOP if you lost the race.
+ # `bd update --claim` is a dolt-layer CAS (assignee IS NULL -> you); a
+ # sibling pool session may have claimed this bead first. On a lost claim
+ # the CLI exits NON-ZERO (gastownhall/gascity#1052). Never proceed on a
+ # failed claim — that is the duplicate-execution bug.
+-if ! bd update <id> --claim; then
++# `--actor "$GC_SESSION_NAME"` is NOT optional: "you" is the bd actor, and
++# without the flag bd records $BEADS_ACTOR, which for a pool session is the
++# slot alias (<agent>-<N>), not $GC_SESSION_NAME. Step 5 would then see
++# assignee != $GC_SESSION_NAME, refuse the bead you just won, and drain.
++if ! bd update <id> --claim --actor "$GC_SESSION_NAME"; then
+   # Lost the race. Do NOT work this bead. Return to the hook for the next
+   # unclaimed item (restart from Step 3); drain if none remains. Do NOT
+   # continue to Step 5/6 for this <id>.
+@@ -95,7 +99,7 @@ the bead description directly.
+ 
+ - `{{ .AssignedReadyQuery }}` — find pre-assigned work
+ - `gc hook` — find routed pool work through the configured hook
+-- `bd update <id> --claim` — claim a work item
++- `bd update <id> --claim --actor "$GC_SESSION_NAME"` — claim a work item as this session
+ - `bd show <id>` — see details of a work item or step
+ - `bd mol current <molecule-id>` — show position in molecule workflow
+ - `bd mol progress <molecule-id>` — show molecule progress summary
+@@ -106,7 +110,7 @@ the bead description directly.
+ ## How to Work
+ 
+ 1. Find work: `bd list --assignee="$GC_SESSION_NAME" --status=in_progress` or `{{ .AssignedReadyQuery }}` or `gc hook`
+-2. Claim if unclaimed: `bd update <id> --claim`
++2. Claim if unclaimed: `bd update <id> --claim --actor "$GC_SESSION_NAME"`
+ 3. Verify the claimed bead is assigned to `$GC_SESSION_NAME` and routed to `$GC_TEMPLATE`
+ 4. **Check for molecule:** `bd show <id>` — look for `molecule_id` in METADATA
+ 5. **If molecule exists:** `bd mol current <mol-id>` → work each step in order (show → do → close → repeat)

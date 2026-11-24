@@ -40,6 +40,8 @@
 # KNOBS: GC_CTX_AB=0 (this launch) / touch $GC_CITY_PATH/.gc/no-ctx-ab (every new launch, no config reload).
 # SEAMS (tests): GC_CTXCAP_NEXT_BIN = the next hop instead of the sibling claude-lowprio.sh;
 # GC_LOWPRIO_CLAUDE_BIN = the real claude, only used if the next hop is not executable.
+# ALSO ON THIS LAUNCH PATH, unrelated to the A/B (each one is documented where it sits below, with its own knobs): the refusal of a
+# remote-only role on the mini (ga-pshalqe) and the claim identity of the implicit claude-headless agent (ga-znmm7w1).
 set -u
 
 city="${GC_CITY_PATH:-}"
@@ -94,6 +96,42 @@ if [ -n "$rl_hit" ]; then
     exit 78
   fi
 fi
+
+# CLAIM AS THE SESSION (ga-znmm7w1). The engine-synthesized <rig>/claude-headless agent (the sling target of the rig builders: no
+# agents/ entry, the engine builds it from [providers.claude-headless]) gets the engine's BUILTIN worker prompt, whose claim protocol is
+# `bd update <id> --claim` followed by "the assignee must be $GC_SESSION_NAME". `--claim` records the bd ACTOR, and for a pool slot the
+# engine stamps BEADS_ACTOR with the slot's ALIAS (whatsapp_automation/claude-headless-1; setTemplateEnvIdentity in
+# cmd/gc/build_desired_state.go), not with the session name (claude-headless-ga7bku77s). So the claim never "landed on you": the prompt
+# tells the worker to leave the bead and drain, and by the engine's code the controller, whose assigned-work match knows the session id
+# and name but not the alias, would see no work either. As reported by the builder, 19/11, wa-fj2lqh: 5 sessions in ~35 min, 0 commits,
+# each one ended by "drain acknowledged" 2.5-3.7 min after its claim. The engine's own scripted claim already does the right thing
+# (agentScriptClaimActor: `--actor $GC_SESSION_NAME` first);
+# only the prompt text does not, and fixing that needs an engine window (docs/pending-engine-window/ga-znmm7w1-*). Until then this
+# launcher hands the session its OWN NAME as the bd actor, for that one template only: GC_TEMPLATE is "claude-headless" or
+# "<rig>/claude-headless". Every explicit agent (dog, wa-worker, ps-worker, the reviewers, the crews) keeps the identity the engine gave
+# it: the Pilot, the reclaim guard and bead_state.py read their alias claims on purpose. A future explicit agent that takes the name
+# `claude-headless` is covered too (the template is all this wrapper can see); the knobs below are there for it.
+# FAIL-OPEN: a session name that is empty, longer than 200 characters, starts with '-' or has a character outside [A-Za-z0-9._:@-] is
+# never put in the environment (the engine's value stays, WARN in the log). The kill-switch file is a plain `-e` test: when it cannot be
+# tested (no city path, no permission) it reads as absent and the fix stays ON, like every other knob here.
+# KNOBS: GC_CLAIM_AS_SESSION=0 (this launch) / touch $GC_CITY_PATH/.gc/no-claim-as-session (every new launch, no config reload).
+cs_tpl="${GC_TEMPLATE:-}"
+case "$cs_tpl" in
+  claude-headless|*/claude-headless)
+    # vazio → cs_sn="" and the launch goes on with the engine's BEADS_ACTOR, WARN in the log; falhou/ilegível → an unset variable reads as empty: the same
+    cs_sn="${GC_SESSION_NAME:-}"
+    if [ "${GC_CLAIM_AS_SESSION:-}" = "0" ] || { [ -n "$city" ] && [ -e "$city/.gc/no-claim-as-session" ]; }; then
+      note "CLAIM-AS-SESSION OVERRIDE template=$cs_tpl session=${cs_sn:-?} actor=${BEADS_ACTOR:-<unset>} - left as the engine set it, on purpose"
+    elif [ -z "$cs_sn" ]; then
+      note "CLAIM-AS-SESSION WARN template=$cs_tpl has no GC_SESSION_NAME - left alone"
+    elif [ "${#cs_sn}" -gt 200 ] || [ -n "${cs_sn//[A-Za-z0-9._:@-]/}" ] || [ "${cs_sn#-}" != "$cs_sn" ]; then
+      note "CLAIM-AS-SESSION WARN template=$cs_tpl session name is not a plain token (length ${#cs_sn}) - left alone"
+    elif [ "${BEADS_ACTOR-}" != "$cs_sn" ]; then
+      note "CLAIM-AS-SESSION template=$cs_tpl session=$cs_sn was=${BEADS_ACTOR:-<unset>}"
+      export BEADS_ACTOR="$cs_sn"
+    fi
+    ;;
+esac
 
 argv=("$@")
 ab_conf=""

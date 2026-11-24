@@ -15,6 +15,8 @@
 # any `--` (T9), and a missing next hop still launches claude (T13). The same launch path also carries the guard that
 # refuses a remote-only role (dog-remote, gate-reviewer-remote, ...) on the mini unless someone overrides it on purpose
 # (ga-pshalqe, T15-T21): it refuses out loud, and it must refuse NOTHING else, so T16 sweeps every template under agents/ both ways.
+# It also hands the engine-synthesized <rig>/claude-headless agent its session name as the bd actor (ga-znmm7w1, T22-T30), and must
+# touch NO other role: T25 sweeps every template under agents/ plus the near-miss names a substring match would swallow.
 #
 # MUTATION CONTROLS (bottom): the selftest is re-run against copies of the script with one guard removed each;
 # every copy must make it FAIL. A test that stays green when the guard is gone proves nothing.
@@ -36,9 +38,12 @@ CONF="$CITY/.gc/context-ab.conf"
 LOG="$CITY/.gc/logs/claude-lowprio.log"
 OUT="$WORKDIR/argv.out"
 STUB="$WORKDIR/stub-next.sh"
+ACTOR_OUT="$WORKDIR/actor.out"
 cat > "$STUB" <<'EOF'
 #!/bin/bash
 printf '%s\n' "$@" > "${STUB_OUT:?}"
+# What the next hop (and so claude, and so every `bd update --claim` it runs) would see as the bd actor: ga-znmm7w1.
+printf '%s\n' "${BEADS_ACTOR-UNSET}" > "${STUB_ACTOR_OUT:-/dev/null}"
 exit "${STUB_RC:-0}"
 EOF
 chmod +x "$STUB"
@@ -53,12 +58,12 @@ run_wrapper() {
   local envs=()
   while [ "$#" -gt 0 ] && [ "$1" != "--" ]; do envs+=("$1"); shift; done
   shift
-  : > "$OUT"
-  env -i PATH="$PATH" HOME="$WORKDIR" GC_CITY_PATH="$CITY" GC_CTXCAP_NEXT_BIN="$STUB" STUB_OUT="$OUT" \
+  : > "$OUT"; : > "$ACTOR_OUT"
+  env -i PATH="$PATH" HOME="$WORKDIR" GC_CITY_PATH="$CITY" GC_CTXCAP_NEXT_BIN="$STUB" STUB_OUT="$OUT" STUB_ACTOR_OUT="$ACTOR_OUT" \
     GC_TEMPLATE=gastown.dog GC_AGENT=gastown.dog-1 GC_SESSION_NAME=dog-aaa111 \
     ${envs[@]+"${envs[@]}"} /bin/bash "$SCRIPT" "$@"   # /bin/bash = the script's shebang = bash 3.2 on macOS, not the PATH bash
 }
-reset() { rm -f "$CONF" "$CITY/.gc/no-ctx-ab" "$CITY/.gc/no-remote-local-guard"; : > "$LOG"; }
+reset() { rm -f "$CONF" "$CITY/.gc/no-ctx-ab" "$CITY/.gc/no-remote-local-guard" "$CITY/.gc/no-claim-as-session"; : > "$LOG"; }
 conf()  { printf '%s\n' "$@" > "$CONF"; }
 got_argv() { paste -sd'|' "$OUT"; }
 expect_argv() { # name want
@@ -307,6 +312,120 @@ reset
 run_wrapper ${REMOTE_ID[@]+"${REMOTE_ID[@]}"} GC_SESSION_NAME=dog-remote-gawisp302f1x -- "${ARGS[@]}" 2>/dev/null; rc=$?
 expect_refused "T21 dog-remote-<tail> on the mini" "$rc"
 
+# ---- ga-znmm7w1: the engine-synthesized <rig>/claude-headless agent claims AS ITS SESSION --------------------------
+# WHAT BROKE (19/11, wa-fj2lqh): 5 claude-headless sessions in ~35 min, 0 commits, each one ended by "drain acknowledged" a few
+# minutes after it claimed. The engine stamps BEADS_ACTOR with the POOL ALIAS of a slot (whatsapp_automation/claude-headless-1), so the
+# `bd update <id> --claim` of the builtin worker prompt recorded the alias, while the prompt's very next step ("the assignee must be
+# $GC_SESSION_NAME") and the controller's assigned-work match both read the SESSION NAME (claude-headless-ga7bku77s): the claim never
+# "landed on you". T22-T30 run the REAL launcher with that identity and read the BEADS_ACTOR the next hop receives.
+IMPL_TPL=whatsapp_automation/claude-headless
+IMPL_SESS=claude-headless-ga7bku77s
+IMPL_ID=(GC_TEMPLATE="$IMPL_TPL" GC_AGENT="$IMPL_TPL-1" GC_ALIAS="$IMPL_TPL-1" GC_SESSION_NAME="$IMPL_SESS" GC_SESSION_ID=ga-7bku77s BEADS_ACTOR="$IMPL_TPL-1")
+# vazio → "" (the next hop never ran: every comparison below fails, none passes by accident); falhou/ilegível → the same ""
+got_actor() { cat "$ACTOR_OUT" 2>/dev/null; }
+expect_actor() { # name want
+  local g; g="$(got_actor)"
+  if [ "$g" = "$2" ]; then ok "$1"; else bad "$1 — the next hop saw BEADS_ACTOR=[$g], want [$2]"; fi
+}
+
+echo "T22 the incident: a pool slot's BEADS_ACTOR is its alias; the launch hands claude the SESSION name instead"
+reset
+run_wrapper ${IMPL_ID[@]+"${IMPL_ID[@]}"} -- "${ARGS[@]}"; rc=$?
+expect_actor "T22 BEADS_ACTOR is the session name" "$IMPL_SESS"
+expect_argv "T22 argv untouched (only the environment moves)" "$ARGS_J"
+expect_log "T22 the log line says what moved" "CLAIM-AS-SESSION template=$IMPL_TPL session=$IMPL_SESS was=$IMPL_TPL-1"
+if [ "$rc" -eq 0 ]; then ok "T22 launched"; else bad "T22 rc=$rc, want 0"; fi
+
+echo "T23 the city-scope implicit agent, and a launch where BEADS_ACTOR was never set"
+reset
+run_wrapper GC_TEMPLATE=claude-headless GC_AGENT=claude-headless-1 GC_ALIAS=claude-headless-1 GC_SESSION_NAME=claude-headless-abc123 BEADS_ACTOR=claude-headless-1 -- "${ARGS[@]}"
+expect_actor "T23 city scope (a template with no rig in front)" "claude-headless-abc123"
+reset
+run_wrapper GC_TEMPLATE="$IMPL_TPL" GC_SESSION_NAME=claude-headless-def456 -- "${ARGS[@]}"
+expect_actor "T23 BEADS_ACTOR unset: bd would fall back to git user.name / \$USER, so the session name is set too" "claude-headless-def456"
+expect_log "T23 the log says was=<unset>" "CLAIM-AS-SESSION .*was=<unset>"
+
+echo "T24 BEADS_ACTOR is already the session name (alias deferred): nothing moves, nothing is logged"
+reset
+run_wrapper GC_TEMPLATE="$IMPL_TPL" GC_SESSION_NAME="$IMPL_SESS" BEADS_ACTOR="$IMPL_SESS" -- "${ARGS[@]}"
+expect_actor "T24 unchanged" "$IMPL_SESS"
+expect_nolog "T24 silent" "CLAIM-AS-SESSION"
+
+echo "T25 class sweep: ONLY the implicit claude-headless agent moves; every explicit role and every near-miss name keeps what the engine stamped"
+n_kept=0
+if [ -d "$AGENTS_DIR" ]; then
+  for dir in "$AGENTS_DIR"/*/; do
+    t="${dir%/}"; t="${t##*/}"
+    case "$t" in *remote*) continue ;; esac   # a remote-only role is refused before it gets here (T15-T21)
+    reset
+    run_wrapper GC_TEMPLATE="$t" GC_AGENT="$t-1" GC_ALIAS="$t-1" GC_SESSION_NAME="s-ga-wisp-t25a$n_kept" BEADS_ACTOR="$t-1" -- "${ARGS[@]}" 2>/dev/null
+    expect_actor "T25 explicit template $t keeps BEADS_ACTOR=$t-1" "$t-1"
+    n_kept=$((n_kept+1))
+  done
+fi
+for t in gastown.dog gastown.mayor gastown.witness lexbh/gastown.witness control-dispatcher whatsapp_automation/wa-worker \
+         claude-headless-extra foo-claude-headless claude-headless2 "$IMPL_TPL-extra" whatsapp_automation/my-claude-headless claude-headless/x; do
+  reset
+  run_wrapper GC_TEMPLATE="$t" GC_AGENT="$t-1" GC_ALIAS="$t-1" GC_SESSION_NAME="s-ga-wisp-t25b$n_kept" BEADS_ACTOR="$t-1" -- "${ARGS[@]}" 2>/dev/null
+  expect_actor "T25 template $t keeps BEADS_ACTOR=$t-1" "$t-1"
+  n_kept=$((n_kept+1))
+done
+if [ "$n_kept" -ge 12 ]; then ok "T25 swept $n_kept templates"; else bad "T25 empty sweep ($n_kept): the agents/ listing came back empty"; fi
+
+echo "T26 a session name that is empty or not a plain token never reaches the environment (fail-open: the engine's value stays)"
+reset
+run_wrapper ${IMPL_ID[@]+"${IMPL_ID[@]}"} GC_SESSION_NAME= -- "${ARGS[@]}"; rc=$?
+expect_actor "T26 no session name -> the alias stays" "$IMPL_TPL-1"
+expect_log "T26 WARN logged" "CLAIM-AS-SESSION WARN"
+if [ "$rc" -eq 0 ]; then ok "T26 and the session still launches"; else bad "T26 rc=$rc: a doubtful name must never stop a launch"; fi
+n=0
+for evil in "a b" "a;touch /tmp/x" 'a$(id)' "-rf" "a/b" "$(printf 'a\nb')" "$(printf 'x%.0s' $(seq 1 201))"; do
+  n=$((n+1)); reset
+  run_wrapper ${IMPL_ID[@]+"${IMPL_ID[@]}"} GC_SESSION_NAME="$evil" -- "${ARGS[@]}"
+  expect_actor "T26.$n [${evil:0:12}] the alias stays" "$IMPL_TPL-1"
+  expect_log "T26.$n WARN logged" "CLAIM-AS-SESSION WARN"
+done
+reset
+run_wrapper ${IMPL_ID[@]+"${IMPL_ID[@]}"} GC_SESSION_NAME="$(printf 'x%.0s' $(seq 1 200))" -- "${ARGS[@]}"
+expect_actor "T26 the 200-character bound itself is accepted" "$(printf 'x%.0s' $(seq 1 200))"
+
+echo "T27 kill switches: a deliberate override leaves the engine's identity alone, and says so"
+reset; run_wrapper ${IMPL_ID[@]+"${IMPL_ID[@]}"} GC_CLAIM_AS_SESSION=0 -- "${ARGS[@]}"
+expect_actor "T27 GC_CLAIM_AS_SESSION=0 keeps the alias" "$IMPL_TPL-1"
+expect_log "T27 the override leaves a line" "CLAIM-AS-SESSION OVERRIDE"
+reset; : > "$CITY/.gc/no-claim-as-session"
+run_wrapper ${IMPL_ID[@]+"${IMPL_ID[@]}"} -- "${ARGS[@]}"
+expect_actor "T27 .gc/no-claim-as-session keeps the alias" "$IMPL_TPL-1"
+expect_log "T27 the file override leaves a line" "CLAIM-AS-SESSION OVERRIDE"
+reset
+run_wrapper ${IMPL_ID[@]+"${IMPL_ID[@]}"} GC_CLAIM_AS_SESSION=1 -- "${ARGS[@]}"
+expect_actor "T27 any value but 0 keeps the fix on" "$IMPL_SESS"
+run_wrapper ${IMPL_ID[@]+"${IMPL_ID[@]}"} GC_CLAIM_AS_SESSION= -- "${ARGS[@]}"
+expect_actor "T27 an empty value keeps the fix on" "$IMPL_SESS"
+reset; run_wrapper GC_TEMPLATE=gastown.dog BEADS_ACTOR=gastown.dog-1 GC_CLAIM_AS_SESSION=0 -- "${ARGS[@]}"
+expect_nolog "T27 an explicit role with the switch on says nothing" "CLAIM-AS-SESSION"
+
+echo "T28 a log that cannot be written, or no city path at all, never undoes the fix"
+rm -rf "$CITY/.gc/logs"
+run_wrapper ${IMPL_ID[@]+"${IMPL_ID[@]}"} -- "${ARGS[@]}"
+expect_actor "T28 no log directory" "$IMPL_SESS"
+run_wrapper ${IMPL_ID[@]+"${IMPL_ID[@]}"} GC_CITY_PATH= -- "${ARGS[@]}"
+expect_actor "T28 no city path (the kill-switch file cannot be tested, it reads as absent: the fix stays on)" "$IMPL_SESS"
+mkdir -p "$CITY/.gc/logs"
+
+echo "T29 the context A/B and the claim identity are independent: one launch gets both"
+# The A/B conf only takes [A-Za-z0-9._ -] (a "/" would make it ignore the whole file), so a rig-scoped template cannot be enrolled by
+# name: this case uses the city-scope implicit agent, which can.
+reset; conf salt=t1 "enroll=claude-headless" treat_window=200000 treat_pct=100
+run_wrapper GC_TEMPLATE=claude-headless GC_AGENT=claude-headless-1 GC_ALIAS=claude-headless-1 GC_SESSION_NAME=claude-headless-abc123 BEADS_ACTOR=claude-headless-1 -- "${ARGS[@]}"
+expect_argv "T29 the arm landed" "--autocompact|200000|$ARGS_J"
+expect_actor "T29 and so did the claim identity" "claude-headless-abc123"
+
+echo "T30 the fail-open launch of claude itself (next hop missing) carries the same environment"
+reset
+run_wrapper ${IMPL_ID[@]+"${IMPL_ID[@]}"} GC_CTXCAP_NEXT_BIN="$WORKDIR/does-not-exist" GC_LOWPRIO_CLAUDE_BIN="$STUB" -- "${ARGS[@]}"
+expect_actor "T30 the direct claude exec sees the session name" "$IMPL_SESS"
+
 echo
 echo "RESULT: PASS=$PASS FAIL=$FAIL"
 
@@ -357,6 +476,27 @@ if [ "$FAIL" -eq 0 ] && [ -z "${CTXCAP_NO_MUTATE:-}" ]; then
   mutate remote-kill-env-any      's/"\${GC_REMOTE_LOCAL_GUARD:-}" = "0"/"${GC_REMOTE_LOCAL_GUARD:-}" != ""/'
   mutate remote-kill-file         's/-e "\$city\/.gc\/no-remote-local-guard"/-e "$city\/.gc\/never"/'
   mutate remote-override-unlogged 's/note "REMOTE-ONLY OVERRIDE \$rl_id - starting on the mini on purpose"/:/'
+  # ga-znmm7w1: the claim identity (T22-T30)
+  mutate claim-pattern-none       's/  claude-headless|\*\/claude-headless)/  never-matches)/'
+  mutate claim-pattern-no-city    's/  claude-headless|\*\/claude-headless)/  *\/claude-headless)/'
+  mutate claim-pattern-no-rig     's/  claude-headless|\*\/claude-headless)/  claude-headless)/'
+  mutate claim-pattern-substring  's/  claude-headless|\*\/claude-headless)/  *claude-headless*)/'
+  mutate claim-pattern-all        's/  claude-headless|\*\/claude-headless)/  *)/'
+  mutate claim-no-export          's/export BEADS_ACTOR="\$cs_sn"/BEADS_ACTOR="$cs_sn"/'
+  mutate claim-wrong-name         's/export BEADS_ACTOR="\$cs_sn"/export BEADS_ACTOR="${GC_ALIAS:-x}"/'
+  mutate claim-wrong-source       's/cs_sn="\${GC_SESSION_NAME:-}"/cs_sn="${GC_AGENT:-}"/'
+  mutate claim-empty-name-ok      's/elif \[ -z "\$cs_sn" \]; then/elif [ -z "never" ]; then/'
+  mutate claim-length-unbounded   's/"\${#cs_sn}" -gt 200/"${#cs_sn}" -gt 20000/'
+  mutate claim-charset-off        's#\[ -n "\${cs_sn//\[A-Za-z0-9._:@-\]/}" \]#[ -n "" ]#'
+  mutate claim-leading-dash-ok    's|\[ "\${cs_sn#-}" != "\$cs_sn" \]|[ -n "" ]|'
+  mutate claim-noisy-unchanged    's/elif \[ "\${BEADS_ACTOR-}" != "\$cs_sn" \]; then/elif true; then/'
+  mutate claim-kill-env-any       's/"\${GC_CLAIM_AS_SESSION:-}" = "0"/"${GC_CLAIM_AS_SESSION:-}" != ""/'
+  mutate claim-kill-env-ignored   's/"\${GC_CLAIM_AS_SESSION:-}" = "0"/"never" = "0"/'
+  mutate claim-kill-file          's/-e "\$city\/.gc\/no-claim-as-session"/-e "$city\/.gc\/never"/'
+  mutate claim-override-unlogged  's/note "CLAIM-AS-SESSION OVERRIDE /: "CLAIM-AS-SESSION OVERRIDE /'
+  mutate claim-change-unlogged    's/note "CLAIM-AS-SESSION template=/: "CLAIM-AS-SESSION template=/'
+  mutate claim-warn-empty-silent  's/note "CLAIM-AS-SESSION WARN template=\$cs_tpl has no/: "CLAIM-AS-SESSION WARN template=$cs_tpl has no/'
+  mutate claim-warn-token-silent  's/note "CLAIM-AS-SESSION WARN template=\$cs_tpl session name is not/: "CLAIM-AS-SESSION WARN template=$cs_tpl session name is not/'
   if [ "$MFAIL" -ne 0 ]; then FAIL=$((FAIL+MFAIL)); fi
 fi
 
