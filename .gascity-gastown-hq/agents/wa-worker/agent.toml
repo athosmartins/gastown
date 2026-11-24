@@ -148,7 +148,8 @@ min_active_sessions = 0
 # Mayor 2026-11-23 00:0x (regra horaria ga-v8p1tx.1): 2 -> 3. Disco 11925 MB, swap 0 (mini reiniciou 23:41), fila do gate 4; foco Joice SDR na madrugada.
 # Mayor 2026-11-23 10:1x (regra horaria ga-v8p1tx.1): freio 3 -> 2. Disco 5384 MB (< 6000), swap 2,4 GB, load 57; Dolt reiniciou 09:52.
 # Mayor 2026-11-23 19:0x (regra horaria ga-v8p1tx.1): 2 -> 3. Disco 9452 MB (>= 9000), swap 2,5 GB, load 45.
-max_active_sessions = 3
+# Mayor 2026-11-24 16:0x (regra horaria ga-v8p1tx.1): freio 3 -> 2. Disco 5461 MB (< 6000), swap 2,5 GB.
+max_active_sessions = 2
 idle_timeout = "2h"
 wake_mode = "fresh"
 model = "sonnet"
