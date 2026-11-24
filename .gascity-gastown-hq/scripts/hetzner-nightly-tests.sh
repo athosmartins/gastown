@@ -42,6 +42,7 @@ RUN=${HZN_RUN:-$HERE/mbp-run.sh}
 WA=${HZN_WA_REPO:-/Users/athos/gt/whatsapp_automation}
 MAIL=${HZN_MAIL_CMD:-gc mail send mayor}
 TIMEOUT_S=${HZN_TIMEOUT_S:-13500}
+COMM=${HZN_COMM:-comm}   # só o selftest troca (para injetar a falha da comparação parcial)
 STOP_UTC=${HZN_STOP_UTC-08:45}   # hora UTC (HH:MM) em que a rodada TEM de acabar (o reseed do nó é 08:55Z); vazio = só o prazo TIMEOUT_S vale
 MIN_TOTAL=${HZN_MIN_TOTAL:-1000}
 NODE=${HZN_NODE_HOST:-${HETZNER_NODE_HOST:-hetzner-teste}}
@@ -225,7 +226,7 @@ if [ -n "$STOP_UTC" ]; then
   if [ $(( T0 + CLK_DELTA )) -lt "$BUDGET_END" ]; then BUDGET_END=$(( T0 + CLK_DELTA )); BUDGET_BY="relógio ${STOP_UTC} UTC"; fi
 fi
 DEADLINE=$(( BUDGET_END - MARGIN ))
-NRAN=0; NSKIP=0; RANSEC=0; RANDEFS=0; : > "$SCR/ran.files"; SKIPLIST=""; TP=0; TF=0; TE=0; TS=0; TXF=0; TXP=0; LISTOK=1; LISTWHY=""; PYSECS=0; PYUNK=0; EGSUM=0; EGUNK=0; EGSEEN=0; FIRSTCAP=""
+NRAN=0; NSKIP=0; RANSEC=0; RANDEFS=0; RANFILES_BAD=0; : > "$SCR/ran.files"; SKIPLIST=""; TP=0; TF=0; TE=0; TS=0; TXF=0; TXP=0; LISTOK=1; LISTWHY=""; PYSECS=0; PYUNK=0; EGSUM=0; EGUNK=0; EGSEEN=0; FIRSTCAP=""
 say "rodando a suíte do WA @$SHA em $NODE: $NFILES arquivos ($NMAC mac-only e $NHELD não enviados ao nó ficaram de fora), $NDEFS def test_, $NB lotes de ~$BATCH_DEFS (orçamento $(( DEADLINE - $(date +%s) ))s para os lotes, limite: $BUDGET_BY)"
 
 tail1() { grep . "$1" 2>/dev/null | tail -n 1 | cut -c1-200; }
@@ -361,7 +362,10 @@ while [ "$i" -lt "$NB" ]; do
       [ "$i" -ne 1 ] || finish FALHOU "$B_WHY" 1
       B_ST=nao-rodou ;;
   esac
-  if [ "$B_ST" = ran ]; then NRAN=$(( NRAN + 1 )); RANSEC=$(( RANSEC + BSEC )); RANDEFS=$(( RANDEFS + ${nd:-0} )); cat "$SCR/batch.$i" >> "$SCR/ran.files"; agg_batch "$BOUT" "$nn"
+  if [ "$B_ST" = ran ]; then NRAN=$(( NRAN + 1 )); RANSEC=$(( RANSEC + BSEC )); RANDEFS=$(( RANDEFS + ${nd:-0} ))
+    # vazio (lote sem arquivo) não existe: o awk só abre lote com arquivo; falhou/ilegível (a lista do lote sumiu) → RANFILES_BAD, e a comparação parcial fica INDISPONÍVEL: sem a lista não sei quais ids da baseline comparar
+    cat "$SCR/batch.$i" >> "$SCR/ran.files" 2>/dev/null || RANFILES_BAD=1
+    agg_batch "$BOUT" "$nn"
   else NSKIP=$(( NSKIP + 1 )); SKIPLIST="$SKIPLIST${SKIPLIST:+, }$nn"; say "lote $nn NÃO RODOU: $B_WHY"; fi
 done
 WALL=$(( $(date +%s) - T0 ))
@@ -381,15 +385,18 @@ if [ "$NSKIP" -gt 0 ]; then
   PCMP="comparação parcial: não feita (nenhum lote rodou)"; NEWTXT="sem comparação"
   if [ "$NRAN" -eq 0 ]; then CMPST=-
   elif [ "$LISTOK" = 0 ]; then PCMP="comparação parcial INDISPONÍVEL: $LISTWHY (a linha de base não foi tocada)"; CMPST=indisponivel
+  elif [ "$RANFILES_BAD" = 1 ]; then PCMP="comparação parcial INDISPONÍVEL: a lista de arquivos de um lote que rodou não pôde ser lida (a linha de base não foi tocada)"; CMPST=indisponivel
   elif [ ! -e "$PREV" ]; then PCMP="comparação parcial: não há noite completa anterior para comparar (as $NIDS falhas dos lotes que rodaram estão em $CUR)"; CMPST=-
   elif [ -r "$PREV" ] && jq -en '[inputs | type == "string"] | all' "$PREV" >/dev/null 2>&1 \
        && jq -r --rawfile rf "$SCR/ran.files" '($rf | split("\n") | map(select(length > 0) | {(.): true}) | add // {}) as $m | ($m[(split("::")[0])] // false)' "$PREV" > "$SCR/prev.flags" 2>/dev/null \
        && [ "$(wc -l < "$SCR/prev.flags" | tr -d ' ')" = "$(wc -l < "$PREV" | tr -d ' ')" ] \
        && paste -d '|' "$SCR/prev.flags" "$PREV" | LC_ALL=C awk '/^true[|]/ { sub(/^true[|]/, ""); print }' | LC_ALL=C sort -u > "$SCR/prev.partial" 2>/dev/null; then
-    # id de $CUR cujo arquivo não está entre os que rodaram (não deveria existir) não casa com a baseline filtrada e entra como NOVO: erra para o lado de avisar
-    LC_ALL=C comm -13 "$SCR/prev.partial" "$CUR" > "$NEW"; FIXED=$(LC_ALL=C comm -23 "$SCR/prev.partial" "$CUR" | wc -l | tr -d ' ')
-    NEWTXT="$(wc -l < "$NEW" | tr -d ' ') falhas novas nos arquivos que rodaram"; CMPST=parcial
-    PCMP="comparação PARCIAL contra a última noite completa ($(cat "$PMETA" 2>/dev/null || echo 'data ilegível')), só dos $(sort -u "$SCR/ran.files" | wc -l | tr -d ' ') arquivos dos $NRAN lotes que rodaram: $(wc -l < "$NEW" | tr -d ' ') falhas NOVAS, $FIXED corrigidas (os arquivos dos lotes que não rodaram NÃO foram comparados)"
+    # id de $CUR cujo arquivo não está entre os que rodaram (não deveria existir) não casa com a baseline filtrada e entra como NOVO: erra para o lado de avisar.
+    # vazio (comm sem saída) = "0 novas" é um resultado VÁLIDO; falhou (comm com rc != 0, ou a contagem de corrigidas ilegível) NÃO é "0 novas": cai em INDISPONÍVEL e $NEW volta a vazio.
+    if LC_ALL=C $COMM -13 "$SCR/prev.partial" "$CUR" > "$NEW" 2>/dev/null && FIXED=$(LC_ALL=C $COMM -23 "$SCR/prev.partial" "$CUR" | wc -l | tr -d ' ') && [ -n "$FIXED" ]; then
+      NEWTXT="$(wc -l < "$NEW" | tr -d ' ') falhas novas nos arquivos que rodaram"; CMPST=parcial
+      PCMP="comparação PARCIAL contra a última noite completa ($(cat "$PMETA" 2>/dev/null || echo 'data ilegível')), só dos $(sort -u "$SCR/ran.files" | wc -l | tr -d ' ') arquivos dos $NRAN lotes que rodaram: $(wc -l < "$NEW" | tr -d ' ') falhas NOVAS, $FIXED corrigidas (os arquivos dos lotes que não rodaram NÃO foram comparados)"
+    else : > "$NEW"; PCMP="comparação parcial INDISPONÍVEL: o comando de comparação ($COMM) falhou (as falhas dos lotes que rodaram estão em $CUR)"; CMPST=indisponivel; fi
   else PCMP="comparação parcial INDISPONÍVEL: $PREV existe e não pôde ser lido ou filtrado como lista de ids em JSON (as falhas dos lotes que rodaram estão em $CUR)"; CMPST=indisponivel; fi
   # orçamento e ritmo: segundos por `def test_` dos lotes que rodaram × todos os `def test_` da árvore, contra o orçamento da noite (vazio/zero → ritmo desconhecido: não afirmo que cabia nem que não)
   BUDGETTXT="orçamento da noite: $(( BUDGET_END - T0 ))s ($(( BUDGET_END - T0 - MARGIN ))s para os lotes, o resto é a margem do relatório); limite: $BUDGET_BY"

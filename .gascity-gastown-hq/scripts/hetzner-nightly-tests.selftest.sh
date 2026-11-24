@@ -19,7 +19,7 @@
 #   duração ilegível sai "?" (não 0h0min) · ids com " - " ficam distintos (irmãos de parametrize) · lista parcial / sem a linha GTN-FAILED / contagem que não bate / linha que não é JSON =
 #   comparação INDISPONÍVEL com a baseline intacta · fetch que falha aparece no relatório · lock velho com pid reaproveitado é tomado · PULADO por lock deixa linha no jsonl ·
 #   a limpeza de 14 dias não apaga a baseline · nao-isolado (vazamento medido) é FALHOU, não INERTE · o nó do mbp-run é o mesmo do instalador · o que foi ao nó fica no relatório.
-# CONTROLES NEGATIVOS: cada mutante do script (M1-M86, mais M0 neutro) tem de ser REPROVADO pelo caso correspondente (o caso falha quando roda no mutante). Antes deles, um mutante NEUTRO (cópia que só muda
+# CONTROLES NEGATIVOS: cada mutante do script (M1-M89, mais M0 neutro) tem de ser REPROVADO pelo caso correspondente (o caso falha quando roda no mutante). Antes deles, um mutante NEUTRO (cópia que só muda
 #   um comentário) tem de PASSAR: sem isso o controle não prova nada (a falta dos arquivos irmãos no diretório do mutante reprovava TODO caso, qualquer que fosse a mutação).
 set -u
 HERE="$(cd "$(dirname "$0")" && pwd)"
@@ -52,6 +52,7 @@ d=""; while [ $# -gt 0 ]; do [ "$1" = --dir ] && d=$2; shift; done
 echo "$d" > "$STUB_DIR_SEEN"
 # uma saída e um rc POR CHAMADA: STUB_OUT.<n> e STUB_RC_<n> (a n-ésima chamada); sem eles, STUB_OUT e STUB_RC valem para todas
 c=$(cat "$STUB_CNT" 2>/dev/null || echo 0); c=$((c+1)); echo "$c" > "$STUB_CNT"; [ -z "${STUB_SLEEP:-}" ] || sleep "$STUB_SLEEP"
+[ "${STUB_RM_BATCH:-}" != "$c" ] || rm -f "$(dirname "$d")/batch.$c"   # a lista de arquivos do lote some DEPOIS de o script a ter lido para montar a chamada
 o="$STUB_OUT.$c"; [ -f "$o" ] || o="$STUB_OUT"; cat "$o" 2>/dev/null; v="STUB_RC_$c"; exit "${!v:-${STUB_RC:-0}}"
 EOF
 cat > "$T/mail-stub.sh" <<'EOF'
@@ -71,7 +72,7 @@ printf '# comentário\n\n  tests/test_mac_*.py  \ntests/mac/*\n' > "$T/mac-only.
 export LOCK_PATH="$LOCK" MAIL_LOG STUB_CALLS="$CALLS" STUB_OUT STUB_DIR_SEEN="$T/dirseen" SSH_LOG="$T/ssh.log" STUB_CNT="$T/stub.cnt" HZN_RETRY_S=0 HZN_STOP_UTC=
 n=0; fails=0; BAD=0; QUIET=0
 reset() { find "$LOGDIR" -mindepth 1 -delete 2>/dev/null; : > "$JSONL"; : > "$MAIL_LOG"; : > "$CALLS"; : > "$SSH_LOG"; rm -f "$STUB_OUT" "$STUB_OUT".* "$STUB_CNT"; chmod -R u+rwx "$LOCK" 2>/dev/null
-          find "$LOCK" -mindepth 1 -delete 2>/dev/null; rmdir "$LOCK" 2>/dev/null; mkdir -p "$LOGDIR"; unset STUB_RC MAIL_RC SSH_RC HZN_MIN_TOTAL STUB_SLEEP STUB_RC_1 STUB_RC_2 STUB_RC_3 STUB_RC_4; export HZN_WA_REPO="$T/wa"; }
+          find "$LOCK" -mindepth 1 -delete 2>/dev/null; rmdir "$LOCK" 2>/dev/null; mkdir -p "$LOGDIR"; unset STUB_RC MAIL_RC SSH_RC HZN_MIN_TOTAL STUB_SLEEP STUB_RC_1 STUB_RC_2 STUB_RC_3 STUB_RC_4 STUB_RM_BATCH HZN_COMM; export HZN_WA_REPO="$T/wa"; }
 go() { "$1" > "$OUT" 2> "$T/err"; RC=$?; }
 ck() { local l=$1; shift; [ "$QUIET" = 1 ] || n=$((n+1)); if "$@"; then [ "$QUIET" = 1 ] || echo "ok   $l"; else [ "$QUIET" = 1 ] || { echo "FAIL $l"; fails=$((fails+1)); }; BAD=1; fi; }
 rcis() { [ "$RC" = "$1" ]; }
@@ -338,7 +339,18 @@ case_partial_cmp() { reset; seed_prev tests/a_test.py::t_fixed tests/sub/test_c.
   reset; seed_prev tests/a_test.py::t_fixed; cp "$PREV" "$T/prev.before"; for k in 1 2 3; do MK_TO="$STUB_OUT.$k" mkout "$ISO_OK" 0 "" "Killed"; done
   STUB_RC_1=137 STUB_RC_2=137 STUB_RC_3=137 HZN_BATCH_DEFS=10 go "$1"
   ck "nenhum lote rodou: FALHOU" vd FALHOU; ck "nenhum lote rodou: a comparação parcial diz que não foi feita" has "$REPORT" 'comparação parcial: não feita \(nenhum lote rodou\)'; ck "nenhum lote rodou: ritmo desconhecido, sem inventar" has "$REPORT" 'ritmo desconhecido'
-  ck "nenhum lote rodou: compare='-'" test "$(tail -n 1 "$JSONL" | jq -r .compare)" = -; ck "nenhum lote rodou: baseline intacta" cmp -s "$PREV" "$T/prev.before"; }
+  ck "nenhum lote rodou: compare='-'" test "$(tail -n 1 "$JSONL" | jq -r .compare)" = -; ck "nenhum lote rodou: baseline intacta" cmp -s "$PREV" "$T/prev.before";
+  # falhou a lista de arquivos de um lote que RODOU (sumiu depois da chamada): sem ela não sei quais ids da baseline comparar → INDISPONÍVEL, nunca "o lote não tinha arquivos"
+  reset; seed_prev tests/a_test.py::t_fixed tests/sub/test_c.py::t_still tests/test_a.py::t_skip2 tests/test_b.py::t_gone3; cp "$PREV" "$T/prev.before"; pc_mk
+  STUB_RM_BATCH=1 STUB_RC_1=1 STUB_RC_2=137 STUB_RC_3=1 HZN_BATCH_DEFS=10 go "$1"
+  ck "lista do lote que rodou ilegível: INDISPONÍVEL com o porquê" has "$REPORT" 'comparação parcial INDISPONÍVEL: a lista de arquivos de um lote que rodou não pôde ser lida'; ck "lista do lote ilegível: compare=indisponivel" test "$(tail -n 1 "$JSONL" | jq -r .compare)" = indisponivel
+  ck "lista do lote ilegível: baseline intacta" cmp -s "$PREV" "$T/prev.before"; ck "lista do lote ilegível: o assunto não afirma contagem" hasnt "$MAIL_LOG" 'falhas novas nos arquivos'; ck "lista do lote ilegível: segue FALHOU" vd FALHOU
+  # falhou o comando da comparação (rc != 0): NÃO é "0 novas" — INDISPONÍVEL, .new vazio, baseline intacta
+  reset; seed_prev tests/a_test.py::t_fixed tests/sub/test_c.py::t_still tests/test_a.py::t_skip2 tests/test_b.py::t_gone3; cp "$PREV" "$T/prev.before"; pc_mk
+  HZN_COMM=false STUB_RC_1=1 STUB_RC_2=137 STUB_RC_3=1 HZN_BATCH_DEFS=10 go "$1"
+  ck "comparação que falha: INDISPONÍVEL com o comando que falhou" has "$REPORT" 'comparação parcial INDISPONÍVEL: o comando de comparação \(false\) falhou'; ck "comparação que falha: compare=indisponivel" test "$(tail -n 1 "$JSONL" | jq -r .compare)" = indisponivel
+  ck "comparação que falha: nunca '0 falhas NOVAS'" hasnt "$REPORT" '0 falhas NOVAS'; ck "comparação que falha: o assunto não afirma contagem" hasnt "$MAIL_LOG" 'falhas novas nos arquivos'; ck "comparação que falha: .new vazio" test ! -s "$LOGDIR/$DAY.new"
+  ck "comparação que falha: baseline intacta" cmp -s "$PREV" "$T/prev.before"; }
 # ga-z6bc623 — o fim do orçamento é o MENOR entre o prazo (T0 + HZN_TIMEOUT_S) e o relógio (próxima HZN_STOP_UTC): a janela da noite termina no reseed do nó, não num número de lotes.
 # HZN_NOW_S fixa "agora" só na conta do relógio. Epochs: 1699920000 = 00:00:00Z; 05:30 = 1699939800; 08:40 = 1699951200; 08:45 = 1699951500; 08:50 = 1699951800.
 case_stop_clock() { reset; okb 1 "1200 passed in 100.00s" 0
@@ -525,6 +537,9 @@ mutantl M83-agora-ilegivel-aceito stop_clock "''|*[!0-9]*) finish FALHOU \"HZN_N
 mutantl M84-hora-com-zero-vira-octal stop_clock '10#${STOP_UTC%:*}' '${STOP_UTC%:*}'
 mutantl M85-relogio-vazio-nao-desliga stop_clock 'STOP_UTC=${HZN_STOP_UTC-08:45}' 'STOP_UTC=${HZN_STOP_UTC:-08:45}'
 mutantl M86-o-prazo-do-relogio-nao-aparece-no-aviso stop_clock 'BUDGET_BY="relógio ${STOP_UTC} UTC"' 'BUDGET_BY="prazo HZN_TIMEOUT_S=${TIMEOUT_S}s"'
+mutantl M87-comparacao-que-falha-vira-0-novas partial_cmp $'if LC_ALL=C $COMM -13 "$SCR/prev.partial" "$CUR" > "$NEW" 2>/dev/null && FIXED=$(LC_ALL=C $COMM -23 "$SCR/prev.partial" "$CUR" | wc -l | tr -d \' \') && [ -n "$FIXED" ]; then' $'LC_ALL=C $COMM -13 "$SCR/prev.partial" "$CUR" > "$NEW" 2>/dev/null; FIXED=$(LC_ALL=C $COMM -23 "$SCR/prev.partial" "$CUR" | wc -l | tr -d \' \'); if true; then'
+mutantl M88-lista-do-lote-ilegivel-ignorada partial_cmp 'cat "$SCR/batch.$i" >> "$SCR/ran.files" 2>/dev/null || RANFILES_BAD=1' 'cat "$SCR/batch.$i" >> "$SCR/ran.files" 2>/dev/null || true'
+mutantl M89-lista-ilegivel-nao-vira-indisponivel partial_cmp 'elif [ "$RANFILES_BAD" = 1 ]; then PCMP=' 'elif false; then PCMP='
 reset
 echo "---"; echo "$((n-fails))/$n ok ($M mutantes)"
 [ $fails -eq 0 ] && echo "SELFTEST OK" || { echo "SELFTEST FALHOU ($fails)"; exit 1; }
