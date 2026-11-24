@@ -1,0 +1,594 @@
+diff --git a/cmd/gc/session_drift_interactive_crew.go b/cmd/gc/session_drift_interactive_crew.go
+new file mode 100644
+index 0000000000..2c51138746
+--- /dev/null
++++ b/cmd/gc/session_drift_interactive_crew.go
+@@ -0,0 +1,114 @@
++package main
++
++import (
++	"strings"
++
++	"github.com/gastownhall/gascity/internal/beads"
++	"github.com/gastownhall/gascity/internal/config"
++	"github.com/gastownhall/gascity/internal/runtime"
++	sessionpkg "github.com/gastownhall/gascity/internal/session"
++	"github.com/gastownhall/gascity/internal/shellquote"
++)
++
++// remoteControlFlag is the Claude Code CLI flag that makes a session reachable
++// from the Claude app (Remote Control). The launch command takes it either as
++// `--remote-control [name]` (the name is the next argv token) or as
++// `--remote-control=<name>`.
++const remoteControlFlag = "--remote-control"
++
++// commandLaunchesRemoteControl reports whether a resolved launch command starts
++// the provider with Remote Control: one argv token is exactly --remote-control
++// or starts with --remote-control=. The command is split with the same
++// shell-like splitter the provider-option code uses, so a quoted argument that
++// merely mentions the flag (a prompt, a settings blob) is ONE token and does
++// not match.
++//
++// vazio → false (no token: not a Remote Control launch, the previous behavior);
++// ilegível → not applicable: shellquote.Split has no error path, an unclosed
++// quote is read literally and the worst case is a false negative, which keeps
++// the previous behavior. A false POSITIVE only withholds a drain, the inert
++// direction.
++func commandLaunchesRemoteControl(command string) bool {
++	for _, token := range shellquote.Split(command) {
++		if token == remoteControlFlag || strings.HasPrefix(token, remoteControlFlag+"=") {
++			return true
++		}
++	}
++	return false
++}
++
++// sessionInteractiveCrewForConfigDrift reports whether a live session is an
++// interactive crew member that a config drift must NEVER drain or restart: its
++// agent resumes its conversation across restarts (wake_mode is not "fresh"), the
++// session is past its creating window, it is not a gate-reviewer, and it was
++// launched with Remote Control (commandLaunchesRemoteControl on the CURRENT
++// resolved command). ga-fsm94q1.
++//
++// Why a static, probe-independent clause. A human reaches a Remote Control
++// session through the Claude app, which the engine cannot observe: Remote
++// Control is not a tmux client (IsAttached reads false), the session need not
++// be pinned, a conversation between two turns has no pending interaction, and a
++// crew need not be a configured named session. Every signal the drift paths
++// consult (attached, pinned, pending interaction, named-session activity, live
++// assigned work) can therefore read "idle" for a crew the human is in the middle
++// of a conversation with, and the drain closes the session out of the app.
++// Reported 24/11 13:41:43 (ga-fsm94q1): peter-wa drained ("session.draining:
++// config drift detected", then asleep/config-drift) while the Athos was working
++// with it through Remote Control. It is the same reasoning as
++// sessionIsAlwaysOnNamed: a clause that depends on no probe and no timing cannot
++// have a false negative.
++//
++// Scope, on purpose narrow: resume-wake crews launched with Remote Control only.
++// A fresh-wake pool worker (disposable, recycled on drift by design) and a
++// resume-wake session without Remote Control (a tmux attach is already honored
++// by sessionAttachedForConfigDrift) keep their existing behavior. Callers defer
++// the drift (reconciler: the stored hash stays stale and the drift stays
++// pending) or accept it in place (watch reload: the stored hash is rebaselined).
++// Either way the running process keeps its old config and the new one lands at
++// the session's next natural restart.
++func sessionInteractiveCrewForConfigDrift(
++	session beads.Bead,
++	cfg *config.City,
++	cfgAgent *config.Agent,
++	agentCfg runtime.Config,
++	stateBeforeHeal sessionpkg.State,
++) bool {
++	// vazio → agent not in the config (cfgAgent nil): not protected, as before (the
++	// drift check itself only runs for a configured agent); falhou → n/a, pure
++	// predicate over values already read by the caller
++	if cfgAgent == nil || cfgAgent.EffectiveWakeMode() != "resume" {
++		return false
++	}
++	if stateBeforeHeal == sessionpkg.StateCreating {
++		return false
++	}
++	if sessionIsGateReviewerTemplate(session, cfg) {
++		return false
++	}
++	return commandLaunchesRemoteControl(agentCfg.Command)
++}
++
++// sessionInteractiveCrewForDriftAcceptance is sessionInteractiveCrewForConfigDrift
++// for the watch-reload acceptance pass (acceptConfigDriftForProtectedSessions),
++// which runs before the reconciler and has none of its locals: it resolves the
++// agent and the pre-heal state from the session bead and the desired-state entry,
++// the same way the reconciler does.
++func sessionInteractiveCrewForDriftAcceptance(
++	session beads.Bead,
++	cfg *config.City,
++	tp TemplateParams,
++	agentCfg runtime.Config,
++) bool {
++	template := tp.TemplateName
++	if template == "" {
++		template = normalizedSessionTemplate(session, cfg)
++	}
++	// vazio → no template or agent not found: not protected, the session keeps the
++	// existing watch-reload handling; falhou → n/a, in-memory lookups
++	if template == "" {
++		return false
++	}
++	cfgAgent := findAgentByTemplate(cfg, template)
++	stateBeforeHeal := sessionpkg.State(strings.TrimSpace(session.Metadata["state"]))
++	return sessionInteractiveCrewForConfigDrift(session, cfg, cfgAgent, agentCfg, stateBeforeHeal)
++}
+diff --git a/cmd/gc/session_drift_interactive_crew_test.go b/cmd/gc/session_drift_interactive_crew_test.go
+new file mode 100644
+index 0000000000..e0d0eee9c4
+--- /dev/null
++++ b/cmd/gc/session_drift_interactive_crew_test.go
+@@ -0,0 +1,124 @@
++package main
++
++import (
++	"testing"
++
++	"github.com/gastownhall/gascity/internal/beads"
++	"github.com/gastownhall/gascity/internal/config"
++	"github.com/gastownhall/gascity/internal/runtime"
++	sessionpkg "github.com/gastownhall/gascity/internal/session"
++)
++
++// ga-fsm94q1 — unit tests of the interactive-crew predicate. The behavior of the
++// reconciler and of the watch-reload acceptance pass is covered by
++// session_reconciler_drift_interactive_crew_test.go.
++
++func TestCommandLaunchesRemoteControl(t *testing.T) {
++	cases := []struct {
++		name    string
++		command string
++		want    bool
++	}{
++		{"named, name as next token", "claude --dangerously-skip-permissions --remote-control Peter --model opus", true},
++		{"unnamed", "claude --remote-control", true},
++		{"unnamed, flag last after others", "claude --model opus --remote-control", true},
++		{"equals form", "claude --remote-control=Peter --model opus", true},
++		{"quoted name with a space", "claude --remote-control 'Batista PS' --model opus", true},
++		{"flag itself quoted", `claude "--remote-control" Peter`, true},
++		{"no flag", "claude --dangerously-skip-permissions --model opus", false},
++		{"empty command", "", false},
++		{"blank command", "   ", false},
++		{"longer flag with the same prefix", "claude --remote-controller", false},
++		{"negated flag", "claude --no-remote-control", false},
++		{"settings blob that mentions the setting", `claude --settings '{"remoteControlAtStartup":false}'`, false},
++		{"quoted prompt that mentions the flag", "claude --append-system-prompt 'start with --remote-control when asked'", false},
++		{"flag only inside a longer quoted token", `claude "x --remote-control y"`, false},
++	}
++	for _, tc := range cases {
++		t.Run(tc.name, func(t *testing.T) {
++			if got := commandLaunchesRemoteControl(tc.command); got != tc.want {
++				t.Fatalf("commandLaunchesRemoteControl(%q) = %v, want %v", tc.command, got, tc.want)
++			}
++		})
++	}
++}
++
++func TestSessionInteractiveCrewForConfigDrift(t *testing.T) {
++	resumeAgent := &config.Agent{Name: "peter-wa"}
++	freshAgent := &config.Agent{Name: "wa-worker", WakeMode: "fresh"}
++	gateReviewerAgent := &config.Agent{Name: gateReviewerTemplateName}
++	rc := runtime.Config{Command: rcCrewCommand}
++	plain := runtime.Config{Command: plainCrewCommand}
++	sessionOf := func(template string) beads.Bead {
++		return beads.Bead{Metadata: map[string]string{"template": template}}
++	}
++	cfg := &config.City{Agents: []config.Agent{*resumeAgent, *freshAgent, *gateReviewerAgent}}
++
++	cases := []struct {
++		name     string
++		template string
++		agent    *config.Agent
++		agentCfg runtime.Config
++		state    sessionpkg.State
++		want     bool
++	}{
++		{"resume-wake crew with Remote Control, active", "peter-wa", resumeAgent, rc, sessionpkg.StateActive, true},
++		{"unknown state does not remove the protection", "peter-wa", resumeAgent, rc, sessionpkg.State(""), true},
++		{"still in the creating window keeps the old handling", "peter-wa", resumeAgent, rc, sessionpkg.StateCreating, false},
++		{"fresh-wake worker is recycled on drift by design", "wa-worker", freshAgent, rc, sessionpkg.StateActive, false},
++		{"resume-wake crew without Remote Control", "peter-wa", resumeAgent, plain, sessionpkg.StateActive, false},
++		{"agent not in the config", "peter-wa", nil, rc, sessionpkg.StateActive, false},
++		{"gate-reviewer template is never treated as a crew", gateReviewerTemplateName, gateReviewerAgent, rc, sessionpkg.StateActive, false},
++	}
++	for _, tc := range cases {
++		t.Run(tc.name, func(t *testing.T) {
++			got := sessionInteractiveCrewForConfigDrift(sessionOf(tc.template), cfg, tc.agent, tc.agentCfg, tc.state)
++			if got != tc.want {
++				t.Fatalf("sessionInteractiveCrewForConfigDrift = %v, want %v", got, tc.want)
++			}
++		})
++	}
++}
++
++// The acceptance-pass wrapper resolves the agent and the pre-heal state itself.
++func TestSessionInteractiveCrewForDriftAcceptance(t *testing.T) {
++	cfg := &config.City{Agents: []config.Agent{
++		{Name: "peter-wa"},
++		{Name: "wa-worker", WakeMode: "fresh"},
++	}}
++	rc := runtime.Config{Command: rcCrewCommand}
++	sessionWith := func(template, state string) beads.Bead {
++		return beads.Bead{Metadata: map[string]string{"template": template, "state": state}}
++	}
++
++	t.Run("template from the desired-state entry", func(t *testing.T) {
++		if !sessionInteractiveCrewForDriftAcceptance(sessionWith("", "active"), cfg, TemplateParams{TemplateName: "peter-wa"}, rc) {
++			t.Fatal("want true for a resume-wake Remote Control crew")
++		}
++	})
++	t.Run("template from the session bead when the entry has none", func(t *testing.T) {
++		if !sessionInteractiveCrewForDriftAcceptance(sessionWith("peter-wa", "active"), cfg, TemplateParams{}, rc) {
++			t.Fatal("want true: the template resolves from the session bead")
++		}
++	})
++	t.Run("no template anywhere", func(t *testing.T) {
++		if sessionInteractiveCrewForDriftAcceptance(sessionWith("", "active"), cfg, TemplateParams{}, rc) {
++			t.Fatal("want false: no template, so no agent to classify")
++		}
++	})
++	t.Run("agent not configured", func(t *testing.T) {
++		if sessionInteractiveCrewForDriftAcceptance(sessionWith("ghost", "active"), cfg, TemplateParams{TemplateName: "ghost"}, rc) {
++			t.Fatal("want false: agent missing from the config")
++		}
++	})
++	t.Run("creating state is not accepted", func(t *testing.T) {
++		if sessionInteractiveCrewForDriftAcceptance(sessionWith("peter-wa", "creating"), cfg, TemplateParams{TemplateName: "peter-wa"}, rc) {
++			t.Fatal("want false: a creating session keeps the existing handling")
++		}
++	})
++	t.Run("fresh-wake worker", func(t *testing.T) {
++		if sessionInteractiveCrewForDriftAcceptance(sessionWith("wa-worker", "active"), cfg, TemplateParams{TemplateName: "wa-worker"}, rc) {
++			t.Fatal("want false: fresh-wake workers are recycled on drift")
++		}
++	})
++}
+diff --git a/cmd/gc/session_reconciler.go b/cmd/gc/session_reconciler.go
+index 66cdbdecbb..bb3945b7fc 100644
+--- a/cmd/gc/session_reconciler.go
++++ b/cmd/gc/session_reconciler.go
+@@ -1854,6 +1854,30 @@ func reconcileSessionBeadsTracedWithNamedDemand(
+ 							}
+ 							continue
+ 						}
++						// Interactive crew (resume-wake agent launched with Remote
++						// Control) is never drained or restarted for a config drift of
++						// ANY kind (ga-fsm94q1). A human reaches it through the Claude
++						// app, which no probe above can see: Remote Control is not a
++						// tmux client, the crew need not be pinned, and between two
++						// turns there is no pending interaction. Without this clause
++						// such a session fell through to beginSessionDrain below and
++						// vanished from the app mid-conversation. Probe-independent on
++						// purpose, like the always-on named clause further down: it has
++						// no false negative to destroy conversation context. The drift
++						// is NOT accepted (started_config_hash stays) — it stays
++						// pending and lands at the next natural restart; any in-flight
++						// config-drift drain is canceled. Creating-state sessions keep
++						// the existing behavior (a stuck start must still be recycled).
++						if sessionInteractiveCrewForConfigDrift(*session, cfg, cfgAgent, agentCfg, stateBeforeHeal) {
++							drainCancelled := cancelSessionConfigDriftDrain(*session, sp, dt)
++							if trace != nil {
++								trace.recordDecision("reconciler.session.config_drift", tp.TemplateName, name, "config_drift", string(TraceOutcomeDeferredActive), configDriftTracePayload(storedHash, currentHash, driftedFields, traceRecordPayload{
++									"active_reason":  "interactive_crew",
++									"drain_canceled": drainCancelled,
++								}), nil, "")
++							}
++							continue
++						}
+ 						if recentlyDeferredSessionAttachedConfigDrift(*session, clk, driftKey) {
+ 							if trace != nil {
+ 								trace.recordDecision("reconciler.session.config_drift", tp.TemplateName, name, "config_drift", string(TraceOutcomeDeferredAttached), configDriftTracePayload(storedHash, currentHash, driftedFields, traceRecordPayload{
+diff --git a/cmd/gc/session_reconciler_drift_interactive_crew_test.go b/cmd/gc/session_reconciler_drift_interactive_crew_test.go
+new file mode 100644
+index 0000000000..0c5943c385
+--- /dev/null
++++ b/cmd/gc/session_reconciler_drift_interactive_crew_test.go
+@@ -0,0 +1,260 @@
++package main
++
++import (
++	"context"
++	"encoding/json"
++	"testing"
++	"time"
++
++	"github.com/gastownhall/gascity/internal/agent"
++	"github.com/gastownhall/gascity/internal/beads"
++	"github.com/gastownhall/gascity/internal/config"
++	"github.com/gastownhall/gascity/internal/runtime"
++)
++
++// ga-fsm94q1 — interactive crew (a resume-wake agent launched with Remote
++// Control) is never drained or restarted by config drift.
++//
++// Reported 24/11 13:41:43: a config-reload tick drained peter-wa while the
++// Athos was working with it through the Claude app ("session.draining: config
++// drift detected", then asleep/config-drift); the session left the app with no
++// warning. Remote Control is not a tmux client, the crew was not pinned, and
++// between two turns there is no pending interaction, so the attached/pinned/
++// pending/active guards all read "idle" and the ordinary-session branch of the
++// reconciler called beginSessionDrain.
++//
++// These tests drive the real reconcile loop (and the watch-reload acceptance
++// pass) against an in-memory store and a fake runtime, with the shape of that
++// session: alive, idle, unpinned, unattached, NOT a configured named session.
++// Every "spared" case has a sibling control that still drains, so a pass cannot
++// come from a session the reconciler never reached.
++//
++// On the unpatched base the "spared" cases FAIL by assertion (a drain is
++// begun / the drift is not accepted); the controls pass on both trees.
++
++const (
++	crewTemplate = "worker"
++	// rcCrewCommand is the shape of a named crew's resolved launch command
++	// (providers claude-rc-*: args_append = ["--remote-control", "<Name>", ...]).
++	rcCrewCommand = "claude --dangerously-skip-permissions --remote-control Peter --model opus"
++	// plainCrewCommand is the same crew WITHOUT Remote Control.
++	plainCrewCommand = "claude --dangerously-skip-permissions --model opus"
++)
++
++// setupCrewDrift wires an alive, idle, unpinned, unattached, non-named session
++// of `agentDef` whose live desired config is `tp` and whose stored start-time
++// fingerprint is mutate(current) — the config as it was BEFORE the drift. The
++// stored breakdown is written in the shape the start path uses, so the
++// reconciler observes real, field-level drift confined to what `mutate` changes.
++func setupCrewDrift(
++	t *testing.T,
++	agentDef config.Agent,
++	tp TemplateParams,
++	mutate func(current runtime.Config) runtime.Config,
++) (*reconcilerTestEnv, beads.Bead) {
++	t.Helper()
++	env := newReconcilerTestEnv()
++	env.cfg = &config.City{Agents: []config.Agent{agentDef}}
++	env.desiredState[tp.SessionName] = tp
++	_ = env.sp.Start(context.Background(), tp.SessionName, runtime.Config{Command: tp.Command})
++	session := env.createSessionBead(tp.SessionName, tp.TemplateName)
++	env.markSessionActive(&session)
++
++	currentCfg := sessionCoreConfigForHash(tp, session)
++	oldCfg := mutate(currentCfg)
++	started := runtime.CoreFingerprint(oldCfg)
++	if started == runtime.CoreFingerprint(currentCfg) {
++		t.Fatalf("test setup: stored (old) and live (current) core hashes must differ")
++	}
++	breakdownJSON, err := json.Marshal(runtime.CoreFingerprintBreakdown(oldCfg))
++	if err != nil {
++		t.Fatalf("marshaling stored breakdown: %v", err)
++	}
++	env.setSessionMetadata(&session, map[string]string{
++		"started_config_hash": started,
++		"core_hash_breakdown": string(breakdownJSON),
++	})
++	return env, session
++}
++
++func crewTemplateParams(command string, copyFiles ...runtime.CopyEntry) TemplateParams {
++	return TemplateParams{
++		Command:      command,
++		SessionName:  crewTemplate,
++		TemplateName: crewTemplate,
++		Hints:        agent.StartupHints{CopyFiles: copyFiles},
++	}
++}
++
++// commandDrift changes only the launch command: the drift is NOT scripts-only,
++// so the ga-epdbe3 scripts-only acceptance (if present in the stack) cannot be
++// what spares the session.
++func commandDrift(current runtime.Config) runtime.Config {
++	old := current
++	old.Command = "old-cmd"
++	return old
++}
++
++// TestRemoteControlCrewSparedFromConfigDriftDrain is the reported case: an
++// idle, unpinned, unattached crew launched with Remote Control, in drift on a
++// field other than the scripts copy. It must be neither drained nor stopped, and
++// the drift must stay PENDING (started_config_hash is not rewritten), so the new
++// config lands at the next natural restart instead of being silently dropped.
++func TestRemoteControlCrewSparedFromConfigDriftDrain(t *testing.T) {
++	env, session := setupCrewDrift(t, config.Agent{Name: crewTemplate}, crewTemplateParams(rcCrewCommand), commandDrift)
++	staleHash := storedConfigHash(t, env.store, session.ID)
++
++	env.reconcile([]beads.Bead{session})
++
++	if ds := env.dt.get(session.ID); ds != nil {
++		t.Fatalf("ga-fsm94q1: Remote Control crew must NOT be drained on config drift; got drain=%+v stderr=%s", ds, env.stderr.String())
++	}
++	if !env.sp.IsRunning(crewTemplate) {
++		t.Fatalf("ga-fsm94q1: Remote Control crew must keep running through config drift; stderr=%s", env.stderr.String())
++	}
++	if got := storedConfigHash(t, env.store, session.ID); got != staleHash {
++		t.Fatalf("ga-fsm94q1: the drift must stay pending (hash untouched); stored=%q want stale=%q", got, staleHash)
++	}
++}
++
++// TestRemoteControlCrewSparedFromScriptsOnlyConfigDriftDrain is the shape of a
++// commit under the city scripts/ tree: only the staged .gc/scripts copy changes
++// content. Whatever else guards that drift, the crew must not be drained.
++func TestRemoteControlCrewSparedFromScriptsOnlyConfigDriftDrain(t *testing.T) {
++	tp := crewTemplateParams(rcCrewCommand, settingsCopyEntry("settings-hash"), scriptsCopyEntry("scripts-hash-NEW"))
++	env, session := setupCrewDrift(t, config.Agent{Name: crewTemplate}, tp, func(current runtime.Config) runtime.Config {
++		old := current
++		old.CopyFiles = []runtime.CopyEntry{settingsCopyEntry("settings-hash"), scriptsCopyEntry("scripts-hash-OLD")}
++		return old
++	})
++
++	env.reconcile([]beads.Bead{session})
++
++	if ds := env.dt.get(session.ID); ds != nil {
++		t.Fatalf("ga-fsm94q1: Remote Control crew must NOT be drained for a scripts-only drift; got drain=%+v stderr=%s", ds, env.stderr.String())
++	}
++	if !env.sp.IsRunning(crewTemplate) {
++		t.Fatalf("ga-fsm94q1: Remote Control crew must keep running; stderr=%s", env.stderr.String())
++	}
++}
++
++// TestRemoteControlCrewConfigDriftDrainInFlightIsCanceled: a config-drift drain
++// already registered for the crew (a tick that did not know it was interactive)
++// is canceled instead of being left to escalate on the next tick.
++func TestRemoteControlCrewConfigDriftDrainInFlightIsCanceled(t *testing.T) {
++	env, session := setupCrewDrift(t, config.Agent{Name: crewTemplate}, crewTemplateParams(rcCrewCommand), commandDrift)
++	env.dt.set(session.ID, &drainState{
++		startedAt:  env.clk.Now(),
++		deadline:   env.clk.Now().Add(time.Minute),
++		reason:     "config-drift",
++		generation: 1,
++	})
++
++	env.reconcile([]beads.Bead{session})
++
++	if ds := env.dt.get(session.ID); ds != nil {
++		t.Fatalf("ga-fsm94q1: an in-flight config-drift drain of a Remote Control crew must be canceled; got drain=%+v stderr=%s", ds, env.stderr.String())
++	}
++}
++
++// TestResumeCrewWithoutRemoteControlStillDrainsOnConfigDrift is the control for
++// the three tests above: the SAME crew, the SAME drift, but launched without
++// Remote Control, still drains. The protection is the Remote Control launch, not
++// "every resume-wake session".
++func TestResumeCrewWithoutRemoteControlStillDrainsOnConfigDrift(t *testing.T) {
++	env, session := setupCrewDrift(t, config.Agent{Name: crewTemplate}, crewTemplateParams(plainCrewCommand), commandDrift)
++
++	env.reconcile([]beads.Bead{session})
++
++	ds := env.dt.get(session.ID)
++	if ds == nil {
++		t.Fatalf("control: a resume-wake session WITHOUT Remote Control must still drain on config drift; stderr=%s", env.stderr.String())
++	}
++	if ds.reason != "config-drift" {
++		t.Errorf("drain reason = %q, want config-drift", ds.reason)
++	}
++}
++
++// TestFreshWakeWorkerWithRemoteControlStillDrainsOnConfigDrift is the second
++// control: a fresh-wake (disposable pool) worker is recycled on drift by design,
++// even if its command happens to carry the flag.
++func TestFreshWakeWorkerWithRemoteControlStillDrainsOnConfigDrift(t *testing.T) {
++	env, session := setupCrewDrift(t, config.Agent{Name: crewTemplate, WakeMode: "fresh"}, crewTemplateParams(rcCrewCommand), commandDrift)
++
++	env.reconcile([]beads.Bead{session})
++
++	ds := env.dt.get(session.ID)
++	if ds == nil {
++		t.Fatalf("control: a fresh-wake worker must still drain on config drift; stderr=%s", env.stderr.String())
++	}
++	if ds.reason != "config-drift" {
++		t.Errorf("drain reason = %q, want config-drift", ds.reason)
++	}
++}
++
++// The watch-reload acceptance pass (acceptConfigDriftForProtectedSessions) is the
++// path the controller's own config-watch reload runs BEFORE the reconciler: it
++// accepts drift in place only for protected sessions, and every other drifted
++// session is left for the reconciler. A Remote Control crew is invisible to the
++// probes that pass uses, so it was left for the reconciler on every such reload.
++
++// TestRemoteControlCrewConfigDriftAcceptedInPlaceOnWatchReload: the crew's drift
++// is accepted in place (the hash is rebaselined off the stale one) and the
++// reconcile that follows sees no drift, so nothing is drained.
++func TestRemoteControlCrewConfigDriftAcceptedInPlaceOnWatchReload(t *testing.T) {
++	env, session := setupCrewDrift(t, config.Agent{Name: crewTemplate}, crewTemplateParams(rcCrewCommand), commandDrift)
++	staleHash := storedConfigHash(t, env.store, session.ID)
++
++	res := acceptConfigDriftForProtectedSessions(
++		env.store, env.desiredState, reloadSnapshot(t, env.store),
++		env.sp, env.dt, "", env.cfg, env.clk, &env.stderr,
++	)
++	if res.Updated != 1 {
++		t.Fatalf("ga-fsm94q1: Remote Control crew drift must be accepted in place on a watch reload; updated=%d stderr=%s", res.Updated, env.stderr.String())
++	}
++	if got := storedConfigHash(t, env.store, session.ID); got == staleHash || got == "" {
++		t.Fatalf("started_config_hash must be rebaselined off the stale hash; got=%q stale=%q", got, staleHash)
++	}
++
++	env.reconcile(reloadSnapshot(t, env.store).Open())
++	if ds := env.dt.get(session.ID); ds != nil {
++		t.Fatalf("ga-fsm94q1: Remote Control crew must NOT drain after the watch-reload acceptance; got drain=%+v stderr=%s", ds, env.stderr.String())
++	}
++}
++
++// TestResumeCrewWithoutRemoteControlNotAcceptedOnWatchReload is the control: the
++// same crew without Remote Control is left untouched by the acceptance pass (the
++// reconciler still decides), exactly as before.
++func TestResumeCrewWithoutRemoteControlNotAcceptedOnWatchReload(t *testing.T) {
++	env, session := setupCrewDrift(t, config.Agent{Name: crewTemplate}, crewTemplateParams(plainCrewCommand), commandDrift)
++	staleHash := storedConfigHash(t, env.store, session.ID)
++
++	res := acceptConfigDriftForProtectedSessions(
++		env.store, env.desiredState, reloadSnapshot(t, env.store),
++		env.sp, env.dt, "", env.cfg, env.clk, &env.stderr,
++	)
++	if res.Updated != 0 {
++		t.Fatalf("control: an unprotected crew must not be accepted in place; updated=%d stderr=%s", res.Updated, env.stderr.String())
++	}
++	if got := storedConfigHash(t, env.store, session.ID); got != staleHash {
++		t.Fatalf("control: hash must stay untouched; got=%q want=%q", got, staleHash)
++	}
++}
++
++// TestFreshWakeWorkerWithRemoteControlNotAcceptedOnWatchReload: second control
++// for the acceptance pass — a fresh-wake worker is not protected by the flag.
++func TestFreshWakeWorkerWithRemoteControlNotAcceptedOnWatchReload(t *testing.T) {
++	env, session := setupCrewDrift(t, config.Agent{Name: crewTemplate, WakeMode: "fresh"}, crewTemplateParams(rcCrewCommand), commandDrift)
++	staleHash := storedConfigHash(t, env.store, session.ID)
++
++	res := acceptConfigDriftForProtectedSessions(
++		env.store, env.desiredState, reloadSnapshot(t, env.store),
++		env.sp, env.dt, "", env.cfg, env.clk, &env.stderr,
++	)
++	if res.Updated != 0 {
++		t.Fatalf("control: a fresh-wake worker must not be accepted in place; updated=%d stderr=%s", res.Updated, env.stderr.String())
++	}
++	if got := storedConfigHash(t, env.store, session.ID); got != staleHash {
++		t.Fatalf("control: hash must stay untouched; got=%q want=%q", got, staleHash)
++	}
++}
+diff --git a/cmd/gc/soft_reload.go b/cmd/gc/soft_reload.go
+index 1932e01734..132560eb3a 100644
+--- a/cmd/gc/soft_reload.go
++++ b/cmd/gc/soft_reload.go
+@@ -244,13 +244,15 @@ func sessionProtectedFromConfigDrift(
+ // acceptConfigDriftAcrossSessions. Where the latter (gc reload --soft) accepts
+ // drift for EVERY open session, this accepts drift in place ONLY for sessions
+ // that sessionProtectedFromConfigDrift reports as attached / pinned / actively
+-// running. Idle/unattached sessions are left untouched so the reconciler still
+-// drains/restarts them on drift.
++// running, and for interactive crew (sessionInteractiveCrewForDriftAcceptance:
++// a resume-wake agent launched with Remote Control, which no attach/activity
++// probe can see; ga-fsm94q1). Idle/unattached sessions are left untouched so
++// the reconciler still drains/restarts them on drift.
+ //
+ // It runs on every config-changed tick that is NOT an explicit `gc reload
+ // --soft` (i.e. internal config-watch reloads and plain `gc reload`), enforcing
+ // the invariant that a config_revision change never drains, re-primes, or
+-// restarts an attached, pinned, or active session.
++// restarts an attached, pinned, or active session, or an interactive crew.
+ func acceptConfigDriftForProtectedSessions(
+ 	store beads.Store,
+ 	desired map[string]TemplateParams,
+@@ -302,11 +304,14 @@ func acceptConfigDriftForProtectedSessions(
+ 		if storedHash == currentHash {
+ 			continue
+ 		}
+-		// Only attached/pinned/active sessions are accepted in place; idle ones
+-		// fall through to the reconciler. Evaluated only on a real drift so the
+-		// (potentially live) attachment probe is not run for steady-state
+-		// sessions.
+-		if !sessionProtectedFromConfigDrift(session, sp, cityPath, store, cfg, name, clk) {
++		// Only attached/pinned/active sessions and interactive crew (Remote
++		// Control) are accepted in place; idle ones fall through to the
++		// reconciler. Evaluated only on a real drift so the (potentially live)
++		// attachment probe is not run for steady-state sessions. The crew clause
++		// is a pure predicate over the desired state: it adds no probe call, and
++		// it still holds when the attachment probe errors or reads idle.
++		if !sessionProtectedFromConfigDrift(session, sp, cityPath, store, cfg, name, clk) &&
++			!sessionInteractiveCrewForDriftAcceptance(session, cfg, tp, agentCfg) {
+ 			continue
+ 		}
+ 		if err := clearSoftReloadConfigDriftDrainAck(session, sp, dt); err != nil {
