@@ -33,8 +33,8 @@ Nada disto foi (nem podia ser) feito do nó Hetzner; o dog do mini ou o Mayor fa
 ## Como provar
 ```bash
 python3 .gascity-gastown-hq/scripts/plist-bd-env-lint.py | tail -2                 # a árvore do repositório: 0 fail
-bash .gascity-gastown-hq/scripts/plist-bd-env-lint.selftest.sh | tail -2            # 82 casos; 33 mutantes escritos à mão, 33 pegos
-bash .gascity-gastown-hq/packs/town-deltas/assets/pilot-dispatcher.lanes-unmeasured.selftest.sh | tail -2   # 67 casos + 22 mutantes
+bash .gascity-gastown-hq/scripts/plist-bd-env-lint.selftest.sh | tail -2            # 97 casos; 39 mutantes escritos à mão sobre o lint (bateria à parte), 39 pegos
+bash .gascity-gastown-hq/packs/town-deltas/assets/pilot-dispatcher.lanes-unmeasured.selftest.sh | tail -2   # 77 asserções + 27 mutantes embutidos (cada guarda desligada numa cópia do dispatcher reprova o arquivo)
 bash .githooks/pre-push_test.sh | tail -2                                           # 67 asserções (9 novas, nos testes 52 a 58)
 ```
 O selftest do lint inclui um **ida e volta sobre os 104 plists reais**: tira a chave de cada um, roda `--fix` e exige os bytes originais de volta, então o que foi commitado é exatamente o que o `--fix` escreve. Cada edição também foi conferida por fora: o parse do `HEAD` mais a chave é igual ao parse do arquivo novo, em 103 de 103, e nenhum byte antigo mudou.
@@ -42,7 +42,7 @@ O selftest do lint inclui um **ida e volta sobre os 104 plists reais**: tira a c
 ## Faixa não medida no Pilot: o que o log diz e os botões
 Quando a leitura de `story:in-flight` falha em qualquer loja (HQ ou rig), `IN_FLIGHT_QUERY_OK=0`. A trava da ga-1fssl **continua**: o mini fica com 0 vaga (um número que ninguém leu nunca libera lugar lá). O que mudou é o resto:
 - O log diz **«ga-d3ryi7k: faixas NÃO MEDIDAS …»** (e, se recuar, «Lanes NOT MEASURED … Pilot backing off»). Nunca «Both lanes full»: essa frase fica só para a pista lida e cheia, com o texto de sempre.
-- Com `PILOT_NODE_FIRST=on` e fora do DRY_RUN a varredura **segue na passada só-nó** (a mesma do disk floor e do RAM floor: nada vai ao mini) com **1 vaga de sondagem por pista** se o que foi lido ainda deixa folga. Quem decide o que vai ao nó é a própria passada (veredito node, vaga do nó, rc 12 do apply). O top-up dos pools do mini roda antes, como sempre, porque não depende dessa contagem.
+- Com `PILOT_NODE_FIRST=on`, fora do DRY_RUN e **com a leitura do próprio HQ respondendo** (`IN_FLIGHT_HQ_QUERY_OK`; foi o caso de 23/11: o HQ lia bem e só as rigs com redirect falhavam) a varredura **segue na passada só-nó** (a mesma do disk floor e do RAM floor: nada vai ao mini) com **1 vaga de sondagem por pista** se o que foi lido ainda deixa folga. Quem decide o que vai ao nó é a própria passada (veredito node, vaga do nó, rc 12 do apply). Se foi o **HQ** que não leu, o Dolt dele não está respondendo e as claims do nó são escritas lá: o Pilot recua, e o motivo dito no log é «a leitura do próprio HQ falhou». O top-up dos pools do mini roda antes, como sempre, porque não depende dessa contagem.
 - **Alarme** (`notify`, prioridade 4): na 2ª varredura seguida sem medida e a cada 6ª (~30 min). Uma leitura que falha uma vez só aparece no log. Quando volta, o contador é apagado e, se já tinha havido alarme, sai o aviso de recuperação (prioridade 2). DRY_RUN não grava nem avisa.
 - Botões (ambiente do Pilot): `PILOT_LANES_UNMEASURED_NODE_PASS=off` volta ao recuo de antes (com a frase honesta), `PILOT_LANES_UNMEASURED_ALERT_AFTER` (2), `PILOT_LANES_UNMEASURED_ALERT_EVERY` (6), `PILOT_LANES_UNMEASURED_STATE` (o contador, `$GC_CITY/.gc/pilot-lanes-unmeasured.count`). Nenhum precisa estar no plist: os padrões estão no código.
 - Ler no log: `grep -E 'NÃO MEDIDAS|NOT MEASURED|voltaram a ser MEDIDAS' .gc/logs/pilot-dispatcher.log`.

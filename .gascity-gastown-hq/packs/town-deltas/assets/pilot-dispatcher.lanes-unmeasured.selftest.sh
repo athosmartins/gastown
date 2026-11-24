@@ -9,8 +9,9 @@
 # A trava da ga-1fssl está certa para o MINI (contagem que não se leu nunca libera vaga lá); o erro foi chamar o desconhecido de "cheio" e deixar o nó pagar por isso.
 #
 # O QUE PROVA: (1) inflight_slots_unmeasured (pura): 1 se o que FOI lido deixa folga, 0 se não; número ilegível = 0 (o inerte); a de ga-1fssl continua dando 0 com a consulta falha.
-#   (2) _pilot_lanes_unmeasured, EXECUTADA em filho sob `set -euo pipefail`: com PILOT_NODE_FIRST=on fora do DRY_RUN a varredura vira a passada só-nó (_PILOT_NODE_ONLY=1) com as vagas de sondagem, e SÓ
-#   nesse caso; off, shadow, vazio, DRY_RUN, a chave PILOT_LANES_UNMEASURED_NODE_PASS=off ou pista lida como cheia recuam, e dizem "NÃO MEDIDAS", nunca "Both lanes full"; o alarme (notify) sai na 2a varredura
+#   (2) _pilot_lanes_unmeasured, EXECUTADA em filho sob `set -euo pipefail`: com PILOT_NODE_FIRST=on fora do DRY_RUN e com a leitura do PRÓPRIO HQ respondendo a varredura vira a passada só-nó
+#   (_PILOT_NODE_ONLY=1) com as vagas de sondagem, e SÓ nesse caso; off, shadow, vazio, DRY_RUN, a chave PILOT_LANES_UNMEASURED_NODE_PASS=off, o HQ que não leu (ou o flag dele vazio/nunca posto) ou
+#   pista lida como cheia recuam, e dizem "NÃO MEDIDAS", nunca "Both lanes full"; o alarme (notify) sai na 2a varredura
 #   seguida e a cada 6a, não a cada varredura; o DRY_RUN não escreve estado nem avisa; contador ilegível recomeça de 0 e AVISA; a recuperação limpa o contador e avisa quando houve alarme.
 #   (3) o ponto de chamada, a região VERBATIM do dispatcher: medido e cheio sai com o texto de sempre, byte a byte; não medido + on segue; não medido + off sai SEM chamar a pista de "cheia".
 #   (4) a ligação no arquivo real (deriva): a recuperação é chamada, SMALL_SLOTS/BIG_SLOTS seguem vindo de inflight_slots_from_query, o top-up de pool roda ANTES do ponto de chamada.
@@ -75,6 +76,7 @@ GC_CITY="$WORK/city"
 [ -z "${LU_STATE+x}" ] || export PILOT_LANES_UNMEASURED_STATE="$LU_STATE"
 MAX_SMALL="${LU_MAX_SMALL-3}"; MAX_BIG="${LU_MAX_BIG-1}"; IN_FLIGHT_SMALL="${LU_IN_SMALL-0}"; IN_FLIGHT_BIG="${LU_IN_BIG-0}"
 SMALL_SLOTS=0; BIG_SLOTS=0; _PILOT_NODE_ONLY=0
+IN_FLIGHT_HQ_QUERY_OK=1; [ -z "${LU_HQ+x}" ] || IN_FLIGHT_HQ_QUERY_OK="$LU_HQ"; [ -z "${LU_HQ_UNSET+x}" ] || unset IN_FLIGHT_HQ_QUERY_OK
 PILOT_NODE_FIRST="${LU_MODE-on}"; DRY_RUN="${LU_DRY:-0}"
 [ -z "${LU_SWITCH+x}" ] || PILOT_LANES_UNMEASURED_NODE_PASS="$LU_SWITCH"
 [ -z "${LU_AFTER+x}" ] || PILOT_LANES_UNMEASURED_ALERT_AFTER="$LU_AFTER"
@@ -123,6 +125,14 @@ fresh; lu LU_MODE=on LU_SWITCH=off; expect_back "PILOT_LANES_UNMEASURED_NODE_PAS
 fresh; lu LU_MODE=on LU_SWITCH=maybe; expect_back "PILOT_LANES_UNMEASURED_NODE_PASS=maybe (valor que não existe nunca liga a passada)"
 fresh; lu LU_MODE=on LU_MAX_SMALL= LU_MAX_BIG=; expect_back "tetos ilegíveis (vazios): não sei quanta folga há, o inerte é recuar"
 fresh; lu LU_MODE=on LU_IN_SMALL=abc LU_IN_BIG=abc; expect_back "contagens lidas que não são número: o inerte é recuar"
+fresh; lu LU_MODE=on LU_HQ=0
+expect_back "a leitura do PRÓPRIO HQ falhou (o Dolt do HQ não responde): não continua, as claims do nó são escritas lá"
+says "HQ" && says "NÃO MEDIDAS" && ok "e diz que foi o HQ que não respondeu, sem chamar de 'cheia'" || bad "o recuo por HQ ilegível não diz HQ / NÃO MEDIDAS :: $LU_OUT"
+fresh; lu LU_MODE=on LU_HQ=1; expect_go "o HQ respondeu e só uma rig falhou (o caso real de 23/11)" 1 1
+fresh; lu LU_MODE=on LU_HQ=; expect_back "o flag do HQ vazio não é 'o HQ respondeu': recua"
+fresh; lu LU_MODE=on LU_HQ_UNSET=1; expect_back "o flag do HQ que nunca foi posto não é 'o HQ respondeu': recua (o inerte)"
+fresh; lu LU_MODE=on LU_HQ=maybe; expect_back "o flag do HQ com valor que não existe: recua"
+fresh; lu LU_MODE=on LU_HQ=0; lu LU_MODE=on LU_HQ=0; [ "$(notifies)" = 1 ] && ok "o HQ fora também alarma (na 2a): o problema é real, só não há o que o nó faça" || bad "HQ fora sem alarme na 2a varredura"
 
 echo "── (2) o alarme: não a cada varredura; na 2a seguida e a cada 6a"
 fresh
@@ -176,6 +186,7 @@ GC_CITY="$WORK/city"; export PILOT_LANES_UNMEASURED_STATE="$WORK/city/.gc/branch
 MAX_SMALL=3; MAX_BIG=1; IN_FLIGHT_SMALL="${B_IN_SMALL-0}"; IN_FLIGHT_BIG="${B_IN_BIG-0}"
 IN_FLIGHT_SMALL_CLASSIFIED=3; IN_FLIGHT_UNCLASSIFIED=0
 IN_FLIGHT_QUERY_OK="${B_QOK-1}"
+IN_FLIGHT_HQ_QUERY_OK=1; [ -z "${B_HQ+x}" ] || IN_FLIGHT_HQ_QUERY_OK="$B_HQ"
 SMALL_SLOTS="${B_SMALL-0}"; BIG_SLOTS="${B_BIG-0}"; _PILOT_NODE_ONLY=0
 PILOT_NODE_FIRST="${B_MODE-on}"; DRY_RUN="${B_DRY:-0}"
 bd() { if [ "${B_BD_FAIL:-0}" = 1 ]; then return 1; fi; echo '[{"id":"x-1","labels":["story:approved"]}]'; }
@@ -197,6 +208,9 @@ branch B_QOK=0 B_MODE=on
 { [ "$B_EXIT" = 0 ] && [ "$B_RC" = 0 ]; } && ok "consulta que falhou + on: NÃO sai — a varredura segue para a passada do nó" || bad "consulta que falhou + on saiu em 'Both lanes full' (o defeito de 23/11) :: $B_OUT"
 printf '%s\n' "$B_OUT" | grep -q 'FELL_THROUGH node_only=1 small=1 big=1' && ok "chega ao resto da varredura com node_only=1 e as vagas de sondagem" || bad "estado ao seguir inesperado :: $B_OUT"
 printf '%s\n' "$B_OUT" | grep -q 'Both lanes full' && bad "a varredura que segue ainda diz 'Both lanes full' :: $B_OUT" || ok "a varredura que segue não diz 'Both lanes full'"
+branch B_QOK=0 B_MODE=on B_HQ=0
+{ [ "$B_EXIT" = 1 ] && [ "$B_RC" = 0 ]; } && ok "consulta que falhou + on + HQ que não respondeu: recua" || bad "seguiu para a passada do nó com o HQ fora :: $B_OUT"
+printf '%s\n' "$B_OUT" | grep -qF 'LOG Lanes NOT MEASURED' && ok "e o recuo diz 'Lanes NOT MEASURED'" || bad "recuo com HQ fora sem a linha 'Lanes NOT MEASURED' :: $B_OUT"
 branch B_QOK=0 B_MODE=off
 { [ "$B_EXIT" = 1 ] && [ "$B_RC" = 0 ]; } && ok "consulta que falhou + off: recua (não há passada do nó)" || bad "consulta que falhou + off não recuou :: $B_OUT"
 printf '%s\n' "$B_OUT" | grep -qF 'Both lanes full' && bad "o recuo por leitura falha chama a pista de 'Both lanes full' :: $B_OUT" || ok "e o recuo NÃO a chama de 'Both lanes full'"
@@ -214,6 +228,11 @@ grep -qE '^_pilot_lanes_unmeasured_clear( \|\| true)?$|_pilot_lanes_unmeasured_c
 grep -qE 'SMALL_SLOTS=\$\(inflight_slots_from_query "\$IN_FLIGHT_QUERY_OK" "\$MAX_SMALL" "\$IN_FLIGHT_SMALL"\)' "$DISPATCHER" && ok "SMALL_SLOTS continua vindo de inflight_slots_from_query (a trava da ga-1fssl no mini, intacta)" || bad "SMALL_SLOTS deixou de vir de inflight_slots_from_query"
 grep -qE 'BIG_SLOTS=\$\(inflight_slots_from_query "\$IN_FLIGHT_QUERY_OK" "\$MAX_BIG" "\$IN_FLIGHT_BIG"\)' "$DISPATCHER" && ok "BIG_SLOTS idem" || bad "BIG_SLOTS deixou de vir de inflight_slots_from_query"
 [ "$(grep -c '_pilot_lanes_unmeasured ' "$DISPATCHER")" -ge 1 ] && ok "a função é chamada de algum ponto do fluxo" || bad "_pilot_lanes_unmeasured nunca é chamada"
+# o flag do HQ só cai no ramo do HQ (antes do laço das rigs), nunca no das rigs: a falha de uma rig não é o HQ fora
+_hq_lines="$(grep -n 'IN_FLIGHT_HQ_QUERY_OK=0' "$DISPATCHER" | cut -d: -f1 | tr '\n' ' ')"; _rig_loop="$(grep -n '^_in_flight_rig_json=""' "$DISPATCHER" | head -1 | cut -d: -f1)"
+{ [ "$(printf '%s' "$_hq_lines" | wc -w | tr -d ' ')" = 1 ] && [ -n "$_rig_loop" ] && [ "${_hq_lines% }" -lt "$_rig_loop" ]; } \
+  && ok "IN_FLIGHT_HQ_QUERY_OK=0 é posto UMA vez, no ramo do HQ (linha ${_hq_lines% }, antes do laço das rigs na $_rig_loop)" \
+  || bad "o flag do HQ é posto em outro lugar que o ramo do HQ (linhas: ${_hq_lines:-nenhuma}; laço das rigs: ${_rig_loop:-?})"
 # as 2 chamadas do top-up seguem ANTES do recuo (ga-swnsg3): o pool do mini não espera a leitura que falhou
 _ord="$(awk '/^_pilot_pool_topup "wa-worker"/{t=NR} /^_pilot_pool_topup "ps-worker"/{t2=NR} /_pilot_lanes_unmeasured \|\| true/{c=NR} END{print (t>0 && t2>0 && c>t2) ? "ok" : "bad"}' "$DISPATCHER")"
 [ "$_ord" = ok ] && ok "o top-up de pool (wa-worker, ps-worker) roda ANTES do ponto de chamada: o mini segue enchendo o pool com a faixa não medida" || bad "ordem: o ponto de chamada ficou antes do top-up de pool"
@@ -238,6 +257,11 @@ open(sys.argv[4],"w",encoding="utf-8").write(s.replace(sys.argv[2],sys.argv[3]))
   mutant "a passada só-nó liga no DRY_RUN" 'if [ "${PILOT_NODE_FIRST:-off}" = "on" ] && [ "${DRY_RUN:-0}" != "1" ] && [ "${PILOT_LANES_UNMEASURED_NODE_PASS:-on}" = "on" ]' 'if [ "${PILOT_NODE_FIRST:-off}" = "on" ] && [ "${PILOT_LANES_UNMEASURED_NODE_PASS:-on}" = "on" ]'
   mutant "a chave PILOT_LANES_UNMEASURED_NODE_PASS=off não desliga" 'if [ "${PILOT_NODE_FIRST:-off}" = "on" ] && [ "${DRY_RUN:-0}" != "1" ] && [ "${PILOT_LANES_UNMEASURED_NODE_PASS:-on}" = "on" ]' 'if [ "${PILOT_NODE_FIRST:-off}" = "on" ] && [ "${DRY_RUN:-0}" != "1" ]'
   mutant "a passada só-nó liga mesmo com o que se leu enchendo as pistas" $'     && { [ "$_lu_s" -gt 0 ] || [ "$_lu_b" -gt 0 ]; }; then\n    _lu_go=1' $'     && true; then\n    _lu_go=1'
+  mutant "a passada só-nó continua mesmo com a leitura do HQ falha" '[ "$_lu_hq" = 1 ] \' 'true \'
+  mutant "o flag do HQ nunca é lido" 'if [ "${IN_FLIGHT_HQ_QUERY_OK:-}" != "1" ]; then _lu_hq=0; fi' ':'
+  mutant "o flag do HQ que não está posto vale como 'respondeu'" 'if [ "${IN_FLIGHT_HQ_QUERY_OK:-}" != "1" ]; then _lu_hq=0; fi' 'if [ "${IN_FLIGHT_HQ_QUERY_OK:-1}" != "1" ]; then _lu_hq=0; fi'
+  mutant "o ramo do HQ não derruba o flag do HQ" $'  IN_FLIGHT_QUERY_OK=0\n  IN_FLIGHT_HQ_QUERY_OK=0\n' $'  IN_FLIGHT_QUERY_OK=0\n'
+  mutant "a falha de uma rig derruba o flag do HQ" $'    _rig_inflight="[]"\n    IN_FLIGHT_QUERY_OK=0\n' $'    _rig_inflight="[]"\n    IN_FLIGHT_QUERY_OK=0\n    IN_FLIGHT_HQ_QUERY_OK=0\n'
   mutant "seguir dá vaga mas NÃO liga o só-nó (o mini despacharia)" 'SMALL_SLOTS="$_lu_s"; BIG_SLOTS="$_lu_b"; _PILOT_NODE_ONLY=1' 'SMALL_SLOTS="$_lu_s"; BIG_SLOTS="$_lu_b"; _PILOT_NODE_ONLY=0'
   mutant "a vaga de sondagem passa de 1" '  [ "$slots" -gt 1 ] && slots=1' '  :'
   mutant "a vaga de sondagem ignora o que se leu" 'slots=$((10#$max_slots - 10#$read_count))' 'slots=$((10#$max_slots))'

@@ -433,6 +433,8 @@ case "$args" in
     # ga-d3ryi7k: FAKE_INFLIGHT_QUERY_FAIL=1 makes the in-flight COUNT itself fail (the gate-status probes above keep answering): a bd that
     # exits != 0 for `-l story:in-flight`, which is what the 23/11 decoy Dolt did to the rig stores.
     if [ "${FAKE_INFLIGHT_QUERY_FAIL:-0}" = "1" ]; then case "$*" in *" -l story:in-flight"*) exit 1 ;; esac; fi
+    # FAKE_INFLIGHT_QUERY_FAIL=rig fails ONLY the count scoped to the rig dir FAKE_FAIL_RIG_DIR (`bd -C <dir> list ...`): the HQ answers, as on 23/11
+    if [ "${FAKE_INFLIGHT_QUERY_FAIL:-0}" = "rig" ] && [ -n "${FAKE_FAIL_RIG_DIR:-}" ]; then case "$*" in *"-C $FAKE_FAIL_RIG_DIR "*" -l story:in-flight"*) exit 1 ;; esac; fi
     printf '%s' "${FAKE_INFLIGHT_JSON:-[]}" ;;
   *"-t bug"*)
     if [ -n "${FAKE_BUGS_JSON:-}" ]; then
@@ -1059,7 +1061,8 @@ run_capacity() {
 # query the backoff path's cheap WAITING_APPROVED/ELIGIBLE_APPROVED count uses.
 #   $1 = FAKE_TIER2_JSON (the -l story:approved query result)
 #   $2 = FAKE_TIER2_QUERY_FAIL (1 = simulate the query itself failing)
-#   $3 = FAKE_INFLIGHT_QUERY_FAIL (ga-d3ryi7k: 1 = the story:in-flight COUNT fails, so the lanes are NOT MEASURED)
+#   $3 = FAKE_INFLIGHT_QUERY_FAIL (ga-d3ryi7k: 1 = the story:in-flight COUNT fails, so the lanes are NOT MEASURED; "rig" = only the count of rig dir $5 fails)
+#   $4 = FAKE_RIG_LIST_JSON (what `gc rig list` answers: the rigs the Pilot will count) · $5 = FAKE_FAIL_RIG_DIR (the rig whose count fails in "rig" mode)
 run_lanefull() {
   : > "$FIXCITY/.gc/logs/pilot-dispatcher.log"
   rm -f "$FIXCITY/.gc/pilot-dispatcher.jsonl"
@@ -1079,6 +1082,8 @@ run_lanefull() {
     FAKE_TIER2_JSON="${1:-[]}" \
     FAKE_TIER2_QUERY_FAIL="${2:-0}" \
     FAKE_INFLIGHT_QUERY_FAIL="${3:-0}" \
+    FAKE_RIG_LIST_JSON="${4:-}" \
+    FAKE_FAIL_RIG_DIR="${5:-}" \
     FAKE_BLOCKED_IDS="" \
     bash "$DISPATCHER" >/dev/null 2>&1 || true
   cat "$FIXCITY/.gc/logs/pilot-dispatcher.log"
@@ -11544,6 +11549,11 @@ if echo "$LOGUM" | grep "ga-d3ryi7k: faixas NÃO MEDIDAS" >/dev/null && echo "$L
 else
   bad "ga-d3ryi7k: a failed in-flight count did not produce the 'NÃO MEDIDAS' / 'Lanes NOT MEASURED' lines"
 fi
+if echo "$LOGUM" | grep "a leitura do próprio HQ falhou" >/dev/null; then
+  ok "ga-d3ryi7k: when the HQ's own count fails the back-off says so (the HQ Dolt is not answering; nothing to continue on)"
+else
+  bad "ga-d3ryi7k: an HQ whose own count failed was not named as the reason to back off"
+fi
 if echo "$LOGUM" | grep "Both lanes full" >/dev/null; then
   bad "ga-d3ryi7k: REGRESSION — an UNREAD lane was logged as 'Both lanes full' (the defect of 23/11)"
 else
@@ -11563,6 +11573,25 @@ if [ ! -e "$FIXCITY/.gc/pilot-lanes-unmeasured.count" ]; then
   ok "ga-d3ryi7k: DRY_RUN wrote no alarm counter (a dry sweep makes zero state changes)"
 else
   bad "ga-d3ryi7k: DRY_RUN wrote the alarm counter $FIXCITY/.gc/pilot-lanes-unmeasured.count"
+fi
+
+echo "Scenario ga-d3ryi7k-c: only a RIG's in-flight count fails (the HQ answers, as on 23/11) -> NOT MEASURED, and the HQ is not blamed"
+mkdir -p "$FIXCITY/rig-unmeasured"
+LOGUR="$(run_lanefull "$TIER2_ONE_ELIGIBLE" "0" "rig" "{\"schema_version\":\"1\",\"ok\":true,\"rigs\":[{\"name\":\"rigx\",\"path\":\"$FIXCITY/rig-unmeasured\",\"hq\":false}]}" "$FIXCITY/rig-unmeasured")"
+if echo "$LOGUR" | grep "story:in-flight query failed for rig db $FIXCITY/rig-unmeasured" >/dev/null && ! echo "$LOGUR" | grep "story:in-flight query failed for HQ" >/dev/null; then
+  ok "ga-d3ryi7k: the failed rig count is reported for the RIG, and the HQ count is not reported as failed"
+else
+  bad "ga-d3ryi7k: the rig-only failure was not isolated to the rig (fixture or wiring): $(echo "$LOGUR" | grep 'story:in-flight query failed' | head -2)"
+fi
+if echo "$LOGUR" | grep "faixas NÃO MEDIDAS" >/dev/null && ! echo "$LOGUR" | grep "Both lanes full" >/dev/null; then
+  ok "ga-d3ryi7k: a rig that could not be counted makes the lanes NOT MEASURED, never 'Both lanes full'"
+else
+  bad "ga-d3ryi7k: the rig-only failure did not produce NÃO MEDIDAS (or produced 'Both lanes full')"
+fi
+if echo "$LOGUR" | grep "sem passada do nó para rodar" >/dev/null && ! echo "$LOGUR" | grep "a leitura do próprio HQ falhou" >/dev/null; then
+  ok "ga-d3ryi7k: the HQ is NOT blamed when only a rig failed (the reason is the DRY_RUN of the fixture, not an HQ that did not answer)"
+else
+  bad "ga-d3ryi7k: a rig-only failure was blamed on the HQ (the rig failure tainted the HQ flag?)"
 fi
 
 echo "Scenario ga-d3ryi7k-b: the count is READ and the lanes are full -> 'Both lanes full', unchanged, and no 'NOT MEASURED' anywhere"
