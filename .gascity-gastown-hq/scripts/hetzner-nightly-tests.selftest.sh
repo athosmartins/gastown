@@ -254,11 +254,12 @@ case_batch_list() { reset; seed_prev tests/old.py::gone; cp "$PREV" "$T/prev.bef
   ck "lista de um lote inconsistente: baseline intacta" cmp -s "$PREV" "$T/prev.before"; ck "lista de um lote inconsistente: nunca 0 novas" hasnt "$MAIL_LOG" '0 novas'; ck "lista de um lote inconsistente: os 3 lotes somam" has "$REPORT" 'total: 1203 '; }
 case_overbudget() { reset; seed_prev tests/a.py::t1; cp "$PREV" "$T/prev.before"
   okb 1 "1200 passed in 100.00s" 0
-  # orçamento de 12 s − 2 s de margem; o lote 1 leva 6 s; sobram ~3 s (< 5 s de mínimo): os lotes 2 e 3 NÃO começam
-  STUB_RC_1=0 STUB_SLEEP=6 HZN_BATCH_DEFS=10 HZN_TIMEOUT_S=12 HZN_FINAL_MARGIN_S=2 HZN_MIN_BATCH_S=5 go "$1"
+  # orçamento de 32 s − 2 s de margem = 30 s (menos o setup do script, que sob carga leva de 0 a vários s); o lote 1 dorme 26 s; sobram < 5 s (o mínimo) para QUALQUER setup >= 0: os lotes 2 e 3 NÃO começam.
+  # O lote 1 só começa se o setup couber em 25 s. Eram 12 s / 6 s e a conta quebrava com o setup sob load 55-65 (medido em 24/11, inclusive contra o origin/main, sem nenhuma mudança minha).
+  STUB_RC_1=0 STUB_SLEEP=26 HZN_BATCH_DEFS=10 HZN_TIMEOUT_S=32 HZN_FINAL_MARGIN_S=2 HZN_MIN_BATCH_S=5 go "$1"
   ck "orçamento esgotado: FALHOU, exit 1" rcis 1; ck "orçamento esgotado: veredito FALHOU (nunca COMPLETO)" vd FALHOU; ck "orçamento esgotado: o assunto diz quais lotes não rodaram" has "$MAIL_LOG" 'FALHOU: 2 de 3 lotes NÃO RODARAM \(02, 03\)'
   ck "orçamento esgotado: a tabela diz por quê" has "$REPORT" '^\| 02 \| 1 \| 6 \| .* NÃO RODOU \| orçamento esgotado: restam'; ck "orçamento esgotado: só 1 chamada ao mbp-run" test "$(grep -c '^ARGS:' "$CALLS")" = 1
-  ck "orçamento esgotado: o 1º lote recebeu o que restava do orçamento, não 2400 s" has "$CALLS" 'TIMEOUT=(9|10) '; ck "orçamento esgotado: o parcial vem marcado como parcial" has "$REPORT" 'parcial, NÃO é o total da suíte'
+  ck "orçamento esgotado: o 1º lote recebeu o que restava do orçamento, não 2400 s" has "$CALLS" 'TIMEOUT=([0-9]|[12][0-9]|30) '; ck "orçamento esgotado: o parcial vem marcado como parcial" has "$REPORT" 'parcial, NÃO é o total da suíte'
   ck "orçamento esgotado: baseline intacta" cmp -s "$PREV" "$T/prev.before"; ck "orçamento esgotado: nunca 0 novas" hasnt "$MAIL_LOG" '0 novas'; ck "orçamento esgotado: o jsonl diz 3/1/2" test "$(tail -n 1 "$JSONL" | jq -c '[.batches,.batches_ran,.batches_skipped]')" = '[3,1,2]'; }
 case_batch_killed() { reset; seed_prev tests/a.py::t1; cp "$PREV" "$T/prev.before"
   okb 1 "600 passed in 100.00s" 0; MK_TO="$STUB_OUT.2" mkout "$ISO_OK" 0 "" "Killed"; okb 3 "600 passed in 100.00s" 0
