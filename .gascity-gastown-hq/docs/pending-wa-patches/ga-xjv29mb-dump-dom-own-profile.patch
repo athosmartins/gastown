@@ -1,0 +1,354 @@
+diff --git a/tests/_chrome_dump_dom.py b/tests/_chrome_dump_dom.py
+index eca8195..8c5cc02 100644
+--- a/tests/_chrome_dump_dom.py
++++ b/tests/_chrome_dump_dom.py
+@@ -40,7 +40,10 @@ shows up.
+ import os
+ import re
+ import select
++import shutil
++import signal
+ import subprocess
++import tempfile
+ import time
+ 
+ #: Matches dump-dom's own closing tag at the very end of the captured stdout
+@@ -70,10 +73,35 @@ def dump_dom(chrome_path, url, *extra_flags, timeout=180):
+ 
+     Raises `subprocess.TimeoutExpired` if nothing is captured within
+     `timeout` seconds (mirrors `subprocess.run`'s own contract).
++
++    The browser gets a PRIVATE profile (`--user-data-dir=<fresh temp dir>`, plus
++    the `--incognito` Chrome itself adds when it makes its own profile), deleted
++    here once the whole process tree is dead. Without one, a headless Chrome
++    makes itself a throwaway `scoped_dirXXXXXX` under ~/Library/Application
++    Support/Google/Chrome-headless (Chromium d36b68b00, 2026-06-11) and removes
++    it only on an ORDERLY exit; this helper kills Chrome on purpose, so every
++    call left one behind (8,223 folders / 22 GB on the mini by 2026-11-19,
++    ga-xjv29mb). A caller that passes its own --user-data-dir keeps it and owns it.
+     """
++    profile = None
++    own_flags = []
++    if not any(f.startswith("--user-data-dir") for f in extra_flags):
++        profile = tempfile.mkdtemp(prefix="dump_dom_profile_")
++        own_flags = ["--user-data-dir=" + profile, "--incognito"]
+     cmd = [chrome_path, "--headless=new", "--disable-gpu", "--no-sandbox",
+-           *extra_flags, "--dump-dom", url]
+-    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
++           *own_flags, *extra_flags, "--dump-dom", url]
++    try:
++        return _run_dump_dom(cmd, timeout)
++    finally:
++        if profile is not None:
++            _remove_profile(profile)
++
++
++def _run_dump_dom(cmd, timeout):
++    # Its own session: the process group is then exactly Chrome's tree (browser,
++    # GPU, network service, renderers), which _kill_tree can end in one call.
++    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
++                            start_new_session=True)
+     out_fd = proc.stdout.fileno()
+     err_fd = proc.stderr.fileno()
+     bufs = {out_fd: bytearray(), err_fd: bytearray()}
+@@ -124,13 +152,45 @@ def dump_dom(chrome_path, url, *extra_flags, timeout=180):
+             if done:
+                 break
+     finally:
+-        if proc.poll() is None:
+-            proc.kill()
++        _kill_tree(proc)
+         try:
+             proc.wait(timeout=5)
+         except subprocess.TimeoutExpired:
+-            proc.kill()
++            _kill_tree(proc)
+             proc.wait(timeout=5)
+     stdout = bufs[out_fd].decode("utf-8", "replace")
+     stderr = bufs[err_fd].decode("utf-8", "replace")
+     return subprocess.CompletedProcess(cmd, proc.returncode, stdout, stderr)
++
++
++def _kill_tree(proc):
++    """SIGKILL the browser and every process it started. Killing only the main
++    process would leave a helper that can still be writing into the profile
++    while `_remove_profile` deletes it. Called BEFORE the main process is reaped,
++    so its pid (the group id) cannot have been reused by something else."""
++    try:
++        os.killpg(proc.pid, signal.SIGKILL)
++    except (ProcessLookupError, PermissionError):
++        pass  # nobody left in the group (or only a zombie leader): nothing to kill
++    try:
++        proc.kill()
++    except ProcessLookupError:
++        pass
++
++
++def _remove_profile(path):
++    """Delete the private profile once the whole tree is dead. A process that is
++    still closing a file can make the first attempts fail, so try a few times;
++    what cannot be removed is left to the OS (it lives under the system temp dir)
++    rather than failing a test that only wanted a DOM."""
++    for _ in range(5):
++        try:
++            shutil.rmtree(path)
++            return
++        except OSError:
++            # vazio (the path is already gone) → done; falhou/ilegível (exists()
++            # also says False when it cannot stat) → treated as done too: best effort.
++            if not os.path.exists(path):
++                return
++            time.sleep(0.2)
++    shutil.rmtree(path, ignore_errors=True)
+diff --git a/tests/_fake_profile_chrome.py b/tests/_fake_profile_chrome.py
+new file mode 100755
+index 0000000..d7ed705
+--- /dev/null
++++ b/tests/_fake_profile_chrome.py
+@@ -0,0 +1,72 @@
++#!/usr/bin/env python3
++"""ga-xjv29mb test double for how a headless Chrome treats its PROFILE directory.
++
++The real browser (Chromium chrome/browser/headless/headless_mode_init.cc, since 2026-06-11): started WITHOUT
++--user-data-dir it makes itself a throwaway profile `scoped_dirXXXXXX` under "<default user data dir>-headless" (on the
++mini: ~/Library/Application Support/Google/Chrome-headless) and deletes it only on an ORDERLY exit (a ScopedTempDir
++destructor), so a SIGKILL leaves it for good. Started WITH --user-data-dir it uses that directory and makes none.
++
++This fake keeps exactly those profile rules and nothing else Chrome does: it creates (or uses) the profile, writes a DOM
++to stdout, stays silent for FAKE_CHROME_SLEEP seconds (Chrome's own shutdown hang, the reason dump_dom kills it), and
++only then exits — removing the profile if it was its own. Knobs, all environment (argv is only read for --user-data-dir):
++  HOME                     where "default user data dir" lives, like the real thing (Library/Application Support/...)
++  FAKE_CHROME_ARGV_LOG     file that gets one JSON line with this run's argv
++  FAKE_CHROME_PRE_WRITE_SLEEP  seconds of silence before the DOM (Chrome's startup + --virtual-time-budget wait)
++  FAKE_CHROME_SLEEP        seconds of silence after the DOM, before the orderly exit
++  FAKE_CHROME_WRITER_SECS  a helper process (same process group, like Chrome's GPU/renderer processes) that keeps
++                           writing into the profile for that many seconds
++"""
++import json
++import os
++import shutil
++import subprocess
++import sys
++import tempfile
++import time
++
++WRITER = (
++    "import os, sys, time\n"
++    "udd, secs = sys.argv[1], float(sys.argv[2])\n"
++    "end = time.time() + secs\n"
++    "i = 0\n"
++    "while time.time() < end:\n"
++    "    d = os.path.join(udd, 'Default', 'Cache')\n"
++    "    os.makedirs(d, exist_ok=True)\n"
++    "    with open(os.path.join(d, 'f%d' % (i % 5)), 'w') as fh:\n"
++    "        fh.write('x')\n"
++    "    i += 1\n"
++    "    time.sleep(0.03)\n"
++)
++
++
++def main():
++    argv = sys.argv[1:]
++    log = os.environ.get("FAKE_CHROME_ARGV_LOG")
++    if log:
++        with open(log, "a") as fh:
++            fh.write(json.dumps(argv) + "\n")
++    given = [a.split("=", 1)[1] for a in argv if a.startswith("--user-data-dir=")]
++    own = not given
++    if own:
++        root = os.path.join(os.environ["HOME"], "Library", "Application Support", "Google", "Chrome-headless")
++        os.makedirs(root, exist_ok=True)
++        profile = tempfile.mkdtemp(prefix="scoped_dir", dir=root)
++    else:
++        profile = given[0]
++    os.makedirs(os.path.join(profile, "Default"), exist_ok=True)
++    with open(os.path.join(profile, "Local State"), "w") as fh:
++        fh.write("{}")
++    writer = os.environ.get("FAKE_CHROME_WRITER_SECS")
++    if writer:
++        subprocess.Popen([sys.executable, "-c", WRITER, profile, writer])
++    time.sleep(float(os.environ.get("FAKE_CHROME_PRE_WRITE_SLEEP", "0")))
++    sys.stdout.write("<!doctype html><html><head><title>fake</title></head><body>fake dom</body></html>\n")
++    sys.stdout.flush()
++    time.sleep(float(os.environ.get("FAKE_CHROME_SLEEP", "0")))
++    if own:
++        shutil.rmtree(profile, ignore_errors=True)  # the ScopedTempDir destructor: orderly exit only
++    sys.exit(0)
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/tests/test_chrome_dump_dom_own_profile_ga_xjv29mb.py b/tests/test_chrome_dump_dom_own_profile_ga_xjv29mb.py
+new file mode 100644
+index 0000000..0e6ac4f
+--- /dev/null
++++ b/tests/test_chrome_dump_dom_own_profile_ga_xjv29mb.py
+@@ -0,0 +1,168 @@
++"""ga-xjv29mb — dump_dom must hand headless Chrome a PRIVATE --user-data-dir and delete it itself.
++
++Why: since Chromium commit d36b68b00 (2026-06-11) a headless Chrome started without --user-data-dir makes itself a
++throwaway profile `scoped_dirXXXXXX` under ~/Library/Application Support/Google/Chrome-headless and removes it only on
++an orderly exit. dump_dom SIGKILLs Chrome as soon as it has the DOM (that is its whole point, wa-d1wbl), so every call
++left one behind: 8,223 folders / 22 GB on the mini by 2026-11-19.
++
++The fake Chrome (_fake_profile_chrome.py) has the same profile rules, so the first block runs anywhere. The live test at
++the bottom runs the real browser under an isolated HOME and is skipped where there is no Chrome.
++"""
++import json
++import os
++import pathlib
++import signal
++import subprocess
++import tempfile
++import time
++import types
++
++import pytest
++
++from tests._chrome_dump_dom import dump_dom
++
++FAKE = str(pathlib.Path(__file__).with_name("_fake_profile_chrome.py"))
++REAL_CHROME = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
++HEADLESS_ROOTS = (
++    "Library/Application Support/Google/Chrome-headless",
++    "Library/Caches/Google/Chrome-headless",
++)
++
++
++def scoped_dirs(home):
++    """Names of the throwaway profiles under the headless roots of `home` (the fake and real Chrome both put them there)."""
++    out = []
++    for rel in HEADLESS_ROOTS:
++        root = home / rel
++        if root.is_dir():
++            out += sorted(p.name for p in root.iterdir() if p.name.startswith("scoped_dir"))
++    return out
++
++
++def argvs(env):
++    return [json.loads(line) for line in env.argv_log.read_text().splitlines()]
++
++
++def user_data_dirs(argv):
++    return [a.split("=", 1)[1] for a in argv if a.startswith("--user-data-dir=")]
++
++
++@pytest.fixture
++def env(tmp_path, monkeypatch):
++    home, tmp = tmp_path / "home", tmp_path / "tmp"
++    home.mkdir()
++    tmp.mkdir()
++    monkeypatch.setenv("HOME", str(home))                      # where Chrome's default user data dir lives
++    monkeypatch.setattr(tempfile, "tempdir", str(tmp))         # where dump_dom makes its private profiles
++    monkeypatch.setenv("FAKE_CHROME_SLEEP", "30")              # the shutdown hang dump_dom exists to cut short
++    monkeypatch.setenv("FAKE_CHROME_ARGV_LOG", str(tmp_path / "argv.jsonl"))
++    return types.SimpleNamespace(home=home, tmp=tmp, argv_log=tmp_path / "argv.jsonl")
++
++
++def test_three_calls_leave_no_throwaway_profile_and_no_private_profile(env):
++    for _ in range(3):
++        r = dump_dom(FAKE, "file:///dummy", timeout=30)
++        assert "<title>fake</title>" in r.stdout
++    assert scoped_dirs(env.home) == [], "Chrome made its own throwaway profile: dump_dom did not give it one"
++    assert list(env.tmp.iterdir()) == [], "dump_dom's own profile directories were not removed"
++
++
++def test_control_the_fake_leaks_like_real_chrome_when_killed_without_a_profile(env):
++    """The OLD call pattern (no --user-data-dir, SIGKILL as soon as the DOM is out): proves the fake reproduces the leak,
++    so the green above is dump_dom's doing and not a fake that never leaves anything."""
++    proc = subprocess.Popen([FAKE], stdout=subprocess.PIPE)
++    assert b"</html>" in proc.stdout.readline()
++    proc.kill()
++    proc.wait()
++    assert len(scoped_dirs(env.home)) == 1
++
++
++def test_control_an_orderly_exit_cleans_up_after_itself(env, monkeypatch):
++    monkeypatch.setenv("FAKE_CHROME_SLEEP", "0")
++    subprocess.run([FAKE], capture_output=True, timeout=30)
++    assert scoped_dirs(env.home) == []
++
++
++def test_the_private_profile_is_removed_when_dump_dom_gives_up(env, monkeypatch):
++    monkeypatch.setenv("FAKE_CHROME_PRE_WRITE_SLEEP", "30")    # never writes: dump_dom runs into its own timeout
++    with pytest.raises(subprocess.TimeoutExpired):
++        dump_dom(FAKE, "file:///dummy", timeout=2)
++    assert list(env.tmp.iterdir()) == []
++    assert scoped_dirs(env.home) == []
++
++
++def test_no_private_profile_is_left_when_chrome_cannot_even_start(env):
++    with pytest.raises(OSError):
++        dump_dom("/no/such/chrome", "file:///dummy", timeout=5)
++    assert list(env.tmp.iterdir()) == []
++
++
++def test_each_call_gets_its_own_fresh_profile_under_the_temp_dir(env):
++    dump_dom(FAKE, "file:///a", timeout=30)
++    dump_dom(FAKE, "file:///b", timeout=30)
++    first, second = (user_data_dirs(a) for a in argvs(env))
++    assert len(first) == 1 and len(second) == 1
++    assert first != second
++    assert pathlib.Path(first[0]).parent == env.tmp and pathlib.Path(second[0]).parent == env.tmp
++
++
++def test_a_caller_that_names_its_own_profile_keeps_it(env, tmp_path):
++    mine = tmp_path / "mine"
++    mine.mkdir()
++    dump_dom(FAKE, "file:///dummy", f"--user-data-dir={mine}", timeout=30)
++    (argv,) = argvs(env)
++    assert user_data_dirs(argv) == [str(mine)], "dump_dom must not add a second --user-data-dir over the caller's"
++    assert mine.exists(), "the caller's own profile is the caller's to delete"
++    assert list(env.tmp.iterdir()) == []
++    assert scoped_dirs(env.home) == []
++
++
++def test_the_private_profile_runs_incognito_like_the_one_chrome_would_have_made(env):
++    """headless_mode_init.cc adds --incognito itself when it makes its own profile; the private one keeps that."""
++    dump_dom(FAKE, "file:///dummy", timeout=30)
++    (argv,) = argvs(env)
++    assert argv.count("--incognito") == 1
++
++
++def test_helpers_still_writing_into_the_profile_die_with_the_browser(env, monkeypatch):
++    """Chrome is a tree (browser, GPU, renderers). Killing only the main process would leave a helper recreating files
++    in the profile while it is being deleted."""
++    monkeypatch.setenv("FAKE_CHROME_WRITER_SECS", "5")
++    dump_dom(FAKE, "file:///dummy", timeout=30)
++    time.sleep(0.5)  # a surviving writer would have re-created files by now
++    assert list(env.tmp.iterdir()) == []
++
++
++@pytest.mark.skipif(not pathlib.Path(REAL_CHROME).exists(), reason="Chrome não disponível")
++def test_live_chrome_three_calls_do_not_grow_the_headless_profile_folder(env, tmp_path):
++    """The bead's acceptance check, on the real browser: under an isolated HOME, the old call pattern leaves a
++    scoped_dir (the control), and three dump_dom calls leave no more than that."""
++    page = tmp_path / "trivial.html"
++    page.write_text("<!doctype html><html><head><title>t</title></head><body>x</body></html>", encoding="utf-8")
++    url = f"file://{page}"
++    flags = ["--use-mock-keychain", "--virtual-time-budget=1000"]  # no Keychain prompt under an isolated HOME
++    proc = subprocess.Popen(
++        [REAL_CHROME, "--headless=new", "--disable-gpu", "--no-sandbox", *flags, "--dump-dom", url],
++        stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, start_new_session=True,
++    )
++    try:
++        out = b""
++        deadline = time.monotonic() + 90
++        while b"</html>" not in out and time.monotonic() < deadline:
++            chunk = os.read(proc.stdout.fileno(), 65536)
++            if not chunk:
++                break
++            out += chunk
++    finally:
++        try:
++            os.killpg(proc.pid, signal.SIGKILL)
++        except ProcessLookupError:
++            pass
++        proc.wait(timeout=10)
++    leaked = scoped_dirs(env.home)
++    if b"</html>" not in out or not leaked:
++        pytest.skip("the control run did not leave a scoped_dir under an isolated HOME: nothing to compare against")
++    for _ in range(3):
++        r = dump_dom(REAL_CHROME, url, *flags, timeout=120)
++        assert "<title>t</title>" in r.stdout
++    assert scoped_dirs(env.home) == leaked, "dump_dom left more throwaway profiles behind"

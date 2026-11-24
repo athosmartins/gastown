@@ -1,0 +1,69 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.gascity.chrome-headless-janitor</string>
+
+  <!-- Chrome Headless Janitor (2026-11-24, ga-xjv29mb).
+
+       PROBLEM: since Chromium commit d36b68b00 (2026-06-11) a headless Chrome started without a user data dir makes
+       itself a throwaway profile, scoped_dirXXXXXX, under ~/Library/Application Support/Google/Chrome-headless (its disk
+       cache twin goes under ~/Library/Caches/Google/Chrome-headless). Chrome deletes it only on an orderly shutdown; a
+       kill or a crash leaves it for good. The WA smoke tests (tests/_chrome_dump_dom.py) start Chrome
+       that way and SIGKILL it on purpose, once per call: 8,223 folders and 22 GB by 19/11.
+
+       OPERATION per run: in each of the four roots (Chrome-headless and Chrome for Testing-headless, Application Support
+       and Caches) delete the scoped_dir* entries that are real directories, have nothing written in them (at any depth)
+       for 24 h, and are cited by no running process. The fix at the source is a private user data dir in the caller (a WA
+       bead); this job is the net under it, and it also catches a caller nobody has found yet.
+
+       LEFT ALONE: anything it cannot prove stale. A root it cannot list, a ps that does not answer, a profile it cannot
+       read in full = nothing deleted (exit 1, visible in the log and in launchctl print). Symlinks, look-alike names and
+       the normal Chrome profile are never touched.
+
+       KILL-SWITCH: CHROME_HEADLESS_JANITOR_ENABLED=0 -> no-op. DRY-RUN: CHROME_HEADLESS_JANITOR_DRY_RUN=1 (or the script
+       run by hand with its dry-run option: nothing deleted). CHROME_HEADLESS_JANITOR_PROD=1 below is what lets it act on
+       the REAL roots; without it those are only ever a dry run.
+       CADENCE: StartInterval=3607 (~1 h), far above the measured run: 6.8 s for 2,000 profiles and 120,000 files on the
+       Linux node (1.0 s of it the walk alone); not yet measured on the mini. Off the round hour to decorrelate from the
+       other hourly jobs. No KeepAlive. Single instance (flock). Nice 10 + low-priority IO: the mini lives at load 40-60.
+
+       NOT LOADED BY MERGING THIS FILE. Mergeado != vivo: copy it to ~/Library/LaunchAgents and launchctl bootstrap it;
+       see docs/runbooks/chrome-headless-janitor.md. Run it in dry-run mode first. -->
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>/usr/bin/python3</string>
+    <string>/Users/athos/gt/.gascity-gastown-hq/scripts/chrome-headless-janitor.py</string>
+  </array>
+
+  <key>WorkingDirectory</key>
+  <string>/Users/athos/gt/.gascity-gastown-hq</string>
+
+  <key>StartInterval</key><integer>3607</integer>
+
+  <key>Nice</key><integer>10</integer>
+  <key>LowPriorityIO</key><true/>
+
+  <key>StandardOutPath</key>
+  <string>/Users/athos/gt/.gascity-gastown-hq/.gc/logs/chrome-headless-janitor.out</string>
+  <key>StandardErrorPath</key>
+  <string>/Users/athos/gt/.gascity-gastown-hq/.gc/logs/chrome-headless-janitor.err</string>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:/Users/athos/go/bin:/Users/athos/.local/bin</string>
+    <key>HOME</key>
+    <string>/Users/athos</string>
+    <key>GC_CITY_PATH</key>
+    <string>/Users/athos/gt/.gascity-gastown-hq</string>
+    <key>CHROME_HEADLESS_JANITOR_ENABLED</key>
+    <string>1</string>
+    <key>CHROME_HEADLESS_JANITOR_DRY_RUN</key>
+    <string>0</string>
+    <key>CHROME_HEADLESS_JANITOR_PROD</key>
+    <string>1</string>
+  </dict>
+</dict>
+</plist>
