@@ -249,9 +249,22 @@ def host_block() -> dict:
 
 # A identidade que o wrapper do mini aceita para o MBP (ga-gkm3hbn): a sessão de TESTE da prova (`remote-test-remote-mbp-<1-3 dígitos>`) e a sessão REAL do pool, o template
 # `wa-worker-remote-mbp` (e `wa-worker-remote-mbp-<1-3 dígitos | 3-12 alnum>`) — a mesma forma do IDENTITY_PATTERN do Hetzner (gc-session-ssh.md), com o papel e o sufixo -mbp do MBP.
-# O wrapper confere GC_ALIAS, GC_AGENT, GC_SESSION_NAME e GC_TEMPLATE contra ele (remote-shim-wrapper.py): os quatro têm de casar. Nada de dog/gate-reviewer/ps-worker aqui: o
+# O wrapper confere GC_ALIAS, GC_AGENT, GC_SESSION_NAME e GC_TEMPLATE contra ele (remote-shim-wrapper.py decide()): confere cada um que vier no ambiente e exige GC_ALIAS ou GC_AGENT;
+# um que não vier não é conferido (o selftest manda os quatro, cada um casando). Fora o Hetzner, esta forma NÃO tem a alternativa adhoc-<10> nem remote-e2e-1: sessão avulsa não vai ao MBP. Nada de dog/gate-reviewer/ps-worker aqui: o
 # MBP só recebe wa-worker (escopo do ga-gkm3hbn, decisão do Mayor em 23/11); outro papel que venha a ir para o MBP é decisão e bead próprias.
 MBP_IDENTITY_PATTERN = "^(remote-test-remote-mbp-[0-9]{1,3}|wa-worker-remote-mbp(-([0-9]{1,3}|[A-Za-z0-9]{3,12}))?)$"
+
+
+def previous_wrapper_configs() -> list:
+    """As configs do wrapper que ESTA ferramenta já gravou antes (ga-gkm3hbn, gate round 1): o install só troca o arquivo vivo quando ele é, byte a byte, uma delas — a única forma de
+    o `install --apply` do passo C do ga-w7qwl1.2.5 subir o padrão novo no mini sem edição à mão. Qualquer outro conteúdo (de outra ferramenta, editado à mão) continua recusado.
+    Hoje: a de antes do ga-gkm3hbn, só com a sessão de teste da prova (`^remote-test-remote-mbp-[0-9]{1,3}$`)."""
+    return [{"city": CITY, "identity_pattern": "^remote-test-remote-mbp-[0-9]{1,3}$", "nudge_pattern": "gastown\\.(mayor|deacon)", "gate_done_bin": None,
+             "log": os.path.join(MINI_HOME, ".gastown", "logs", "remote-shim-mbp.log")}]
+
+
+def wrapper_config_text(cfg: dict) -> str:
+    return json.dumps(cfg, indent=1) + "\n"
 
 
 def wrapper_config() -> dict:
@@ -1497,7 +1510,7 @@ def cmd_install(a: argparse.Namespace) -> int:
     plan = [f"construir o bundle com o builder (--remote-root {BUNDLE} --remote-home {BUNDLE}/home, sem --skills, --guard-layer session: nada vai para o ~/.claude do MBP, o guarda sai em guard/ e no --settings da sessão; --session-path {':'.join(SESSION_PATH)}: o zdot do bundle) em {out} e conferi-lo aqui",
             f"enviar por tar/ssh para {MGT}/bundle.new.{stage_id}, conferir LÁ (verify + bundle_hash) e trocar por {BUNDLE} (a pasta run/ do provider é preservada)",
             f"instalar o cliente do atalho em {SHIMBIN} (bd, gc, gate-done → remote-shim; dolt → remote-shim, que o RECUSA) e remote-shim.json = {json.dumps(client_config())}",
-            f"criar o spool {SPOOL} (0700) e levar remote-bundle-build.py para {MBIN}", f"gravar {WRAPPER_CFG} no mini"]
+            f"criar o spool {SPOOL} (0700) e levar remote-bundle-build.py para {MBIN}", f"gravar {WRAPPER_CFG} no mini (ausente → grava; igual a uma config anterior DESTA prova, byte a byte → troca; qualquer outra → o install recusa, sem tocar no MBP)"]
     print("\n".join(("" if a.apply else "[dry-run] ") + f"{i}. {x}" for i, x in enumerate(plan, 1)))
     if not a.apply:
         print("[dry-run] nada foi gravado nem conectado; repita com --apply (exige o MBP livre)")
@@ -1522,15 +1535,19 @@ def cmd_install(a: argparse.Namespace) -> int:
     if ts != "livre":
         pr.say("NAO INSTALEI: " + (f"sessão aberta no socket do provider: {s['tmux']['out']}" if ts == "aberta" else f"não consegui saber se há sessão aberta no socket do provider ({s.get('_erro') or s.get('tmux')})"))
         return 3
-    wc = json.dumps(wrapper_config(), indent=1) + "\n"
+    wc = wrapper_config_text(wrapper_config())
+    prev = [wrapper_config_text(c) for c in previous_wrapper_configs()]
     try:
         have = open(WRAPPER_CFG).read() if os.path.exists(WRAPPER_CFG) else None
     except OSError as e:
         pr.say(f"NAO INSTALEI: {WRAPPER_CFG} existe e não consigo ler ({type(e).__name__}); confira à mão (não sobrescrevo) antes de repetir")
         return 1
-    if have is not None and have != wc:
-        pr.say(f"NAO INSTALEI: {WRAPPER_CFG} já existe e é diferente do que a prova grava; confira à mão (não sobrescrevo) antes de repetir")
+    # três estados do arquivo vivo: ausente ou igual ao de agora → grava; igual, byte a byte, a uma config que ESTA ferramenta já gravou antes → sobe para a de agora; qualquer outra → recusa
+    if have is not None and have != wc and have not in prev:
+        pr.say(f"NAO INSTALEI: {WRAPPER_CFG} já existe e é diferente do que a prova grava (e de qualquer config anterior dela); confira à mão (não sobrescrevo) antes de repetir")
         return 1
+    if have is not None and have != wc:
+        pr.say(f"{WRAPPER_CFG} é a config anterior desta prova (byte a byte): será trocada pela de agora no fim do install")
     steps = [[sys.executable, "-I", BUILDER, "build", "--city", CITY, "--claude-home", os.path.expanduser("~/.claude"), "--role", "dog", "--role-dir", role_dir,
               "--remote-root", BUNDLE, "--remote-home", BUNDLE + "/home", "--session-path", ":".join(SESSION_PATH),
               "--guard-layer", "session", "--out", out],

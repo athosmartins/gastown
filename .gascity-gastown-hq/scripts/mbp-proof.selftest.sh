@@ -457,7 +457,7 @@ for sh in ("bash","zsh"):
 rx=re.compile(M.wrapper_config()["identity_pattern"])
 good=("remote-test-remote-mbp-1","remote-test-remote-mbp-123","wa-worker-remote-mbp","wa-worker-remote-mbp-1","wa-worker-remote-mbp-12","wa-worker-remote-mbp-123","wa-worker-remote-mbp-a2lb9b","wa-worker-remote-mbp-gawisp1x2y3z")
 assert all(rx.fullmatch(x) for x in good), [x for x in good if not rx.fullmatch(x)]
-bad=("remote-test-remote-mbp-1234","remote-e2e-1","gastown.dog-1","remote-test-remote-mbp-1; x","remote-mbp-1","gastown.mayor","wa-worker-remote","wa-worker-remote-1","wa-worker-remote-adhoc-abcdefghij","wa-worker-mbp","dog-remote-mbp","dog-remote-mbp-1","gate-reviewer-remote-mbp-1","ps-worker-remote-mbp-1","kimi-worker-remote-mbp-1","wa-worker-remote-mbp-","wa-worker-remote-mbp-ab","wa-worker-remote-mbp-abcdefghijklm","wa-worker-remote-mbp-a b","wa-worker-remote-mbp-1;x","wa-worker-remote-mbp-1/x","xwa-worker-remote-mbp","wa-worker-remote-mbpx","wa-worker-remote-mbp\n")
+bad=("remote-test-remote-mbp-1234","remote-e2e-1","gastown.dog-1","remote-test-remote-mbp-1; x","remote-mbp-1","gastown.mayor","wa-worker-remote","wa-worker-remote-1","wa-worker-remote-adhoc-abcdefghij","wa-worker-remote-mbp-adhoc-abcdefghij","wa-worker-mbp","dog-remote-mbp","dog-remote-mbp-1","gate-reviewer-remote-mbp-1","ps-worker-remote-mbp-1","kimi-worker-remote-mbp-1","wa-worker-remote-mbp-","wa-worker-remote-mbp-ab","wa-worker-remote-mbp-abcdefghijklm","wa-worker-remote-mbp-a b","wa-worker-remote-mbp-1;x","wa-worker-remote-mbp-1/x","xwa-worker-remote-mbp","wa-worker-remote-mbpx","wa-worker-remote-mbp\n")
 assert not any(rx.fullmatch(x) for x in bad), [x for x in bad if rx.fullmatch(x)]
 assert M.wrapper_config()["gate_done_bin"] is None'; ok $? "unit: a identidade do wrapper do MBP aceita a sessão de teste e a REAL do wa-worker (template e <template>-<cauda>), e nada de outro papel, outro host ou sem a cauda -mbp (ga-gkm3hbn)"; }
   # ga-gkm3hbn: quem confere é o wrapper de verdade (fullmatch em GC_ALIAS, GC_AGENT, GC_SESSION_NAME e GC_TEMPLATE): com a config que o install grava, os QUATRO têm de casar, e um só fora derruba o pedido
@@ -737,6 +737,20 @@ g_install() {
     [ $RC = 1 ] && has "$T/out" "FAIL (e) bundle instalado" && [ -e "$SRV/gt-remote/bundle/run/gastown.dog-1.stop" ]; ok $? "install: marca de sessão que NÃO é de teste continua em run/ e o (e) a acusa — só o padrão exato das sessões de teste sai (rc=$RC)"; }
   c inst-wrapper && { srv_skeleton; world_reset; mkdir -p "$MINI/.gastown"; echo '{"city": "outra"}' > "$MINI/.gastown/remote-shim-mbp.json"; before=$(dsig "$SRV"); proof install --apply > "$T/out" 2> "$T/err"; RC=$?
     [ $RC = 1 ] && has "$T/out" "NAO INSTALEI" && [ "$(dsig "$SRV")" = "$before" ] && [ "$(cat "$MINI/.gastown/remote-shim-mbp.json")" = '{"city": "outra"}' ]; ok $? "install: config do wrapper que já existe e é diferente → não sobrescreve e NÃO toca no MBP (rc=$RC)"; }
+  # ga-gkm3hbn (gate round 1): o estado REAL do mini é a config ANTIGA que esta mesma ferramenta gravou (padrão estreito). O install tem que subir dela para a de agora sem edição à mão,
+  # e SÓ dela, byte a byte: o mesmo texto com um campo mexido, ou sem o "\n" final, ainda é "arquivo que não é meu" e é recusado sem tocar no MBP.
+  c inst-wrapper-upgrade && { OLDRX='^remote-test-remote-mbp-[0-9]{1,3}$'
+    old_wrapper_cfg() { python3 -I -c 'import json,sys; print(json.dumps({"city": sys.argv[1], "identity_pattern": sys.argv[3], "nudge_pattern": sys.argv[4], "gate_done_bin": None, "log": sys.argv[2] + "/.gastown/logs/remote-shim-mbp.log"}, indent=1))' "$CITY" "$MINI" "$1" "${2:-gastown\\.(mayor|deacon)}"; }
+    srv_skeleton; world_reset; mkdir -p "$MINI/.gastown"; old_wrapper_cfg "$OLDRX" > "$MINI/.gastown/remote-shim-mbp.json"; proof install --apply > "$T/out" 2> "$T/err"; RC=$?; [ -z "${MBPT_DEBUG:-}" ] || cat "$T/out" "$T/err" >&2
+    [ $RC = 0 ] && has "$T/out" "INSTALAÇÃO OK" && has "$T/out" "config anterior desta prova" && ! has "$T/out" "NAO INSTALEI" && ! has "$T/out" "FAIL"; ok $? "install: o arquivo vivo é a config ANTERIOR desta prova (padrão estreito, byte a byte) → instala e a troca, sem edição à mão (rc=$RC)"
+    python3 -I -c 'import json,re,sys; d=json.load(open(sys.argv[1])); rx=re.compile(d["identity_pattern"]); assert rx.fullmatch("wa-worker-remote-mbp-gawisp1") and rx.fullmatch("remote-test-remote-mbp-1") and not rx.fullmatch("gastown.dog-1") and d["gate_done_bin"] is None and d["city"]==sys.argv[2], d' "$MINI/.gastown/remote-shim-mbp.json" "$CITY"; ok $? "install: depois da troca o arquivo vivo aceita a sessão real do wa-worker, continua sem gate-done e na cidade certa"
+    proof install --apply > "$T/out" 2> "$T/err"; RC=$?
+    [ $RC = 0 ] && has "$T/out" "INSTALAÇÃO OK" && ! has "$T/out" "config anterior desta prova"; ok $? "install: repetir depois da troca é inofensivo e não anuncia troca de novo (rc=$RC)"
+    srv_skeleton; world_reset; mkdir -p "$MINI/.gastown"; old_wrapper_cfg "$OLDRX" 'gastown\\.(mayor)' > "$MINI/.gastown/remote-shim-mbp.json"; seed=$(cat "$MINI/.gastown/remote-shim-mbp.json"); before=$(dsig "$SRV"); proof install --apply > "$T/out" 2> "$T/err"; RC=$?
+    [ $RC = 1 ] && has "$T/out" "NAO INSTALEI" && [ "$(dsig "$SRV")" = "$before" ] && [ "$(cat "$MINI/.gastown/remote-shim-mbp.json")" = "$seed" ]; ok $? "install: a config anterior com UM campo mexido à mão (nudge_pattern) NÃO é a da prova → recusa, MBP e arquivo intactos (rc=$RC)"
+    srv_skeleton; world_reset; mkdir -p "$MINI/.gastown"; old_wrapper_cfg "$OLDRX" | python3 -I -c 'import sys; sys.stdout.write(sys.stdin.read().rstrip("\n"))' > "$MINI/.gastown/remote-shim-mbp.json"; seed=$(cat "$MINI/.gastown/remote-shim-mbp.json"); before=$(dsig "$SRV"); proof install --apply > "$T/out" 2> "$T/err"; RC=$?
+    [ $RC = 1 ] && has "$T/out" "NAO INSTALEI" && [ "$(dsig "$SRV")" = "$before" ] && [ "$(cat "$MINI/.gastown/remote-shim-mbp.json")" = "$seed" ]; ok $? "install: a config anterior sem o \"\\n\" final (comparação é byte a byte, não por JSON) → recusa, MBP e arquivo intactos (rc=$RC)"
+  }
   c inst-tamper && { srv_skeleton; before=$(dsig "$SRV"); FAKE_TAMPER=1 inst
     [ $RC = 1 ] && has "$T/out" "verify NO MBP reprovou" && [ ! -e "$SRV/gt-remote/bundle" ] && [ -n "$(ls "$SRV/gt-remote" | grep 'bundle.new')" ] && [ ! -e "$MINI/.gastown/remote-shim-mbp.json" ]; ok $? "install: pacote adulterado na transferência → verify LÁ reprova, o bundle vivo não é trocado, a pasta fica para inspeção e o mini não é tocado (rc=$RC)"; }
   c inst-tamper-live && { cp -a "$GOLD/." /dev/null 2>/dev/null; mkgold && { find "$SRV" -mindepth 1 -delete; cp -a "$GOLD/." "$SRV/"; before=$(dsig "$SRV/gt-remote/bundle"); FAKE_TAMPER=1 inst
@@ -974,6 +988,7 @@ open(sys.argv[4], "w").write(s.replace(old, new))' "$P" "$1" "$2" "$3"
   mutant() {  # mutant GRUPO CASOS DESCRIÇÃO OLD NEW
     group "$1" || return 0
     local m="$T/mut.$RANDOM" r; mkdir -p "$m"; ln -s "$HERE/mbp-host.sh" "$m/mbp-host.sh"   # (ga-bmmxka: o mbp-proof.py pergunta o host ao helper que fica ao lado dele)
+    ln -s "$HERE/remote-shim-wrapper.py" "$m/remote-shim-wrapper.py"   # (ga-gkm3hbn: o caso identity-wrapper carrega o wrapper de verdade ao lado do mbp-proof.py; sem isto ele morria em TODO mutante e o "pego" era vácuo)
     if ! mutate "$4" "$5" "$m/mbp-proof.py" 2> "$T/muterr"; then ok 1 "mutante '$3': $(cat "$T/muterr")"; return; fi
     r=$(MBPT_MUTANT=1 MBPT_T="$T" MBPT_ONLY="$1" MBPT_CASES="$2" MBPT_UNDER_TEST="$m/mbp-proof.py" bash "$0" 2>&1 | tail -1)
     case "$r" in "RESULT 0/0") ok 1 "mutante '$3': nenhum caso rodou ($r)";; "RESULT 0/"*) ok 1 "mutante '$3' NÃO foi pego ($r)";; "RESULT "*) ok 0 "mutante '$3' pego ($r)";; *) ok 1 "mutante '$3': execução sem resultado ($r)";; esac
@@ -1007,7 +1022,9 @@ open(sys.argv[4], "w").write(s.replace(old, new))' "$P" "$1" "$2" "$3"
         print("[dry-run] nada foi gravado' '    if False:
         print("[dry-run] nada foi gravado'
   mutant install inst-tmux-unknown "tmux que falha vira \"sem sessão\"" '    if ts != "livre":' '    if ts == "aberta":'
-  mutant install inst-wrapper "config do wrapper diferente é sobrescrita" 'if have is not None and have != wc:' 'if False:'
+  mutant install inst-wrapper "config do wrapper diferente é sobrescrita" 'if have is not None and have != wc and have not in prev:' 'if False:'
+  mutant install inst-wrapper-upgrade "a config anterior da prova deixa de ser reconhecida (o upgrade volta a ser edição à mão)" 'prev = [wrapper_config_text(c) for c in previous_wrapper_configs()]' 'prev = []'
+  mutant install inst-wrapper-upgrade "qualquer config que pareça a anterior vale (comparação frouxa em vez de byte a byte)" 'if have is not None and have != wc and have not in prev:' 'if have is not None and have != wc and not any(have.strip() == p.strip() or json.loads(have) == json.loads(p) for p in prev if have.strip().startswith("{")):'
   mutant install inst-wrapper-dir "config do wrapper ilegível estoura em vez de recusar" 'have = open(WRAPPER_CFG).read() if os.path.exists(WRAPPER_CFG) else None
     except OSError as e:' 'have = open(WRAPPER_CFG).read() if os.path.exists(WRAPPER_CFG) else None
     except KeyError as e:'
@@ -1019,7 +1036,14 @@ open(sys.argv[4], "w").write(s.replace(old, new))' "$P" "$1" "$2" "$3"
   mutant unit identity,identity-wrapper "a identidade perde a sessão real do wa-worker" '|wa-worker-remote-mbp(-([0-9]{1,3}|[A-Za-z0-9]{3,12}))?)$' ')$'
   mutant unit identity,identity-wrapper "a identidade aceita também o dog no MBP" '|wa-worker-remote-mbp(' '|(wa-worker|dog)-remote-mbp('
   mutant unit identity,identity-wrapper "a identidade aceita a sessão real sem a cauda -mbp (a do Hetzner)" '|wa-worker-remote-mbp(' '|wa-worker-remote(-mbp)?('
-  mutant unit,install identity,inst-ok "gate_done_bin deixa de ser nulo" '"gate_done_bin": None,' '"gate_done_bin": "/x/gate-done",'
+  # o caso identity-wrapper SOZINHO (sem o identity ao lado) tem que pegar cada mutante de padrão: prova que o wrapper de verdade tem dentes e que o "pego" não é o crash de um arquivo ausente
+  mutant unit identity-wrapper "(só o wrapper de verdade) a identidade perde a sessão real do wa-worker" '|wa-worker-remote-mbp(-([0-9]{1,3}|[A-Za-z0-9]{3,12}))?)$' ')$'
+  mutant unit identity-wrapper "(só o wrapper de verdade) a identidade aceita também o dog no MBP" '|wa-worker-remote-mbp(' '|(wa-worker|dog)-remote-mbp('
+  mutant unit identity-wrapper "(só o wrapper de verdade) a identidade aceita a sessão real sem a cauda -mbp" '|wa-worker-remote-mbp(' '|wa-worker-remote(-mbp)?('
+  # controle de vida: a cópia NÃO mutada, no MESMO layout de pasta dos mutantes (mbp-proof.py + mbp-host.sh + remote-shim-wrapper.py), passa o identity-wrapper (RESULT 0/1) — senão o "pego" acima seria vácuo
+  group unit && { m="$T/mut.ctl.$RANDOM"; mkdir -p "$m"; ln -s "$HERE/mbp-host.sh" "$m/mbp-host.sh"; ln -s "$HERE/remote-shim-wrapper.py" "$m/remote-shim-wrapper.py"; cp "$P" "$m/mbp-proof.py"
+    r=$(MBPT_MUTANT=1 MBPT_T="$T" MBPT_ONLY=unit MBPT_CASES=identity-wrapper MBPT_UNDER_TEST="$m/mbp-proof.py" bash "$0" 2>&1 | tail -1); [ "$r" = "RESULT 0/1" ]; ok $? "controle: o identity-wrapper numa cópia NÃO mutada, no layout dos mutantes, passa ($r)"; }
+  mutant unit,install identity,inst-ok "gate_done_bin deixa de ser nulo" '"identity_pattern": MBP_IDENTITY_PATTERN, "nudge_pattern": "gastown\\.(mayor|deacon)", "gate_done_bin": None,' '"identity_pattern": MBP_IDENTITY_PATTERN, "nudge_pattern": "gastown\\.(mayor|deacon)", "gate_done_bin": "/x/gate-done",'
   mutant install inst-ok "a troca perde run/" '[ ! -d "$B/run" ] || mv "$B/run" "$N/run"\n' ''
   mutant install inst-ok "o spool não vira 0700" ' && chmod 700 {q(SPOOL)}' ''
   mutant e2e athos "o gate do MBP é ignorado" 'return g.returncode == 0, v.get("reason") or self.out(g)[:160]' 'return True, "livre"'
@@ -1171,7 +1195,7 @@ def new_run() -> str:'
   mutant e2e meas-contentlist "resultado que não é texto vale" 'isinstance(x["out"], str) and ' ''
   mutant e2e meas-none "sem medição vira texto vazio" 'out = calls[-1]["out"] if calls else None' 'out = calls[-1]["out"] if calls else ""'
   mutant e2e ok "a leitura da transcrição aceita linhas que não são da conversa" 'if o.get("type") in ("assistant", "user") else None' 'if True else None'
-  mutant install inst-ok "o install esquece o --session-path" '"--session-path", ":".join(SESSION_PATH), ' ''
+  mutant install inst-ok "o install esquece o --session-path" '"--session-path", ":".join(SESSION_PATH),' ''
   mutant install inst-ok "o install esquece o --refuse-dolt" ' --refuse-dolt --apply' ' --apply'
   echo "== final: $((n-fails))/$n ok, $skipped sem rodar =="
 }
