@@ -473,7 +473,7 @@ case_lanes_basic() { lreset; seed_prev tests/old.py::gone
 case_lanes_wait() { lreset
   # o lote 2 volta rc 95 (o gt-iso-run sem espaço para a pista extra) na 1ª chamada, rc 98 (sem slot, transitório) na 2ª e roda na 3ª. A espera NÃO gasta tentativa: com HZN_BATCH_TRIES=2 o rc 98 ainda tem a retentativa dele
   okb 1 "100 passed in 10.00s" 0; okb 2 "200 passed in 20.00s" 0; okb 3 "300 passed in 30.00s" 0
-  HZN_RUN="$T/lanes-stub.sh" HZN_LANES=2 LSTUB_SLEEP=0.6 LSTUB_95_2=1 STUB_RC_2_2=98 HZN_BATCH_DEFS=10 HZN_BATCH_TRIES=2 HZN_MIN_TOTAL=100 go "$1"
+  HZN_RUN="$T/lanes-stub.sh" HZN_LANES=2 LSTUB_SLEEP=2 LSTUB_95_2=1 STUB_RC_2_2=98 HZN_BATCH_DEFS=10 HZN_BATCH_TRIES=2 HZN_MIN_TOTAL=100 go "$1"
   ck "espera por espaço: COMPLETO (o rc 95 não é lote que não rodou, e não gasta a retentativa do rc 98)" vd COMPLETO; ck "espera por espaço: 3 lotes rodaram" has "$REPORT" '3 de 3 lotes rodaram'
   ck "espera por espaço: o lote 2 foi chamado 3 vezes (95, 98, ok)" test "$(cat "$STUB_LDIR/n.2")" = 3; ck "espera por espaço: a tabela não tem NÃO RODOU" hasnt "$REPORT" 'NÃO RODOU'
   ck "espera por espaço: a espera foi dita na saída" has "$OUT" 'lote 02: o nó não tem espaço .*espera 0s'; ck "espera por espaço: o jsonl conta 1 espera" test "$(tail -n 1 "$JSONL" | jq -c .lane_waits)" = 1
@@ -487,13 +487,13 @@ case_lanes_nospace() { lreset
 case_lanes_requeue() { lreset
   # a pista 2 não consegue rodar por causa do nó (rc 98 de sempre): devolve o lote e sai; a pista 1 roda os três e a noite fecha COMPLETO (nunca menos lotes que sem pistas)
   okb 1 "100 passed in 10.00s" 0; okb 2 "200 passed in 20.00s" 0; okb 3 "300 passed in 30.00s" 0
-  HZN_RUN="$T/lanes-stub.sh" HZN_LANES=2 LSTUB_SLEEP=0.6 LSTUB_SLEEP_LANE1=0 LSTUB_FAIL_LANE1=98 HZN_BATCH_DEFS=10 HZN_BATCH_TRIES=1 HZN_MIN_TOTAL=100 go "$1"
+  HZN_RUN="$T/lanes-stub.sh" HZN_LANES=2 LSTUB_SLEEP=2 LSTUB_SLEEP_LANE1=0 LSTUB_FAIL_LANE1=98 HZN_BATCH_DEFS=10 HZN_BATCH_TRIES=1 HZN_MIN_TOTAL=100 go "$1"
   ck "pista extra sem rodar: COMPLETO, os 3 lotes rodaram pela pista 1" vd COMPLETO; ck "pista extra sem rodar: 3 de 3 rodaram" has "$REPORT" '3 de 3 lotes rodaram'
   ck "pista extra sem rodar: a saída diz que o lote voltou à fila" has "$OUT" 'lote [23] devolvido à fila \(retry-mbp'; ck "pista extra sem rodar: nenhum lote NÃO RODOU" hasnt "$REPORT" 'NÃO RODOU'; }
 case_lanes_orphan() { lreset
   # a pista 2 devolve o lote DEPOIS de a pista 1 já ter visto a fila vazia e sair: o lote fica sem dono e sem resultado, e a rodada o roda sozinha antes de fechar (nunca "não chegou a começar")
   okb 1 "100 passed in 10.00s" 0; okb 2 "200 passed in 20.00s" 0; okb 3 "300 passed in 30.00s" 0
-  HZN_RUN="$T/lanes-stub.sh" HZN_LANES=2 LSTUB_SLEEP=0.4 LSTUB_SLEEP_LANE1=1.5 LSTUB_FAIL_LANE1=98 HZN_BATCH_DEFS=10 HZN_BATCH_TRIES=1 HZN_MIN_TOTAL=100 go "$1"
+  HZN_RUN="$T/lanes-stub.sh" HZN_LANES=2 LSTUB_SLEEP_1=3 LSTUB_SLEEP_LANE1=6 LSTUB_FAIL_LANE1=98 HZN_BATCH_DEFS=10 HZN_BATCH_TRIES=1 HZN_MIN_TOTAL=100 go "$1"
   ck "lote devolvido tarde: COMPLETO" vd COMPLETO; ck "lote devolvido tarde: 3 de 3 rodaram" has "$REPORT" '3 de 3 lotes rodaram'; ck "lote devolvido tarde: a rodada o rodou sozinha e disse" has "$OUT" 'lote [23] ficou sem resultado depois das pistas: rodando sozinho'; }
 case_lanes_leak() { local t0 t1 obs
   lreset; mkout "nao-isolado tcp:1.1.1.1:53" "" ""; mv -f "$STUB_OUT" "$STUB_OUT.2"; okb 1 "100 passed in 10.00s" 0; okb 3 "300 passed in 30.00s" 0
@@ -506,8 +506,9 @@ case_lanes_leak() { local t0 t1 obs
 case_lanes_inerte1() { lreset
   # o lote 1 inerte decide a noite (INERTE, exit 0) mesmo com a outra pista já em andamento: ela é derrubada, nada divulgado
   mkout "inerte helper-ausente (/usr/local/sbin/gt-netns-run: o root ainda não o instalou)" "" ""; mv -f "$STUB_OUT" "$STUB_OUT.1"; okb 2 "200 passed in 20.00s" 0; okb 3 "300 passed in 30.00s" 0
-  HZN_RUN="$T/lanes-stub.sh" HZN_LANES=2 LSTUB_SLEEP=0.3 STUB_RC_1=97 HZN_BATCH_DEFS=10 HZN_MIN_TOTAL=100 go "$1"
-  ck "lote 1 inerte com pistas: exit 0 e veredito INERTE" rcis 0; ck "lote 1 inerte com pistas: veredito INERTE" vd INERTE; ck "lote 1 inerte com pistas: nenhum total divulgado" hasnt "$REPORT" 'total:'; }
+  HZN_RUN="$T/lanes-stub.sh" HZN_LANES=2 LSTUB_SLEEP_2=4 STUB_RC_1=97 HZN_BATCH_DEFS=10 HZN_MIN_TOTAL=100 go "$1"
+  ck "lote 1 inerte com pistas: exit 0 e veredito INERTE" rcis 0; ck "lote 1 inerte com pistas: veredito INERTE" vd INERTE; ck "lote 1 inerte com pistas: nenhum total divulgado" hasnt "$REPORT" 'total:'
+  ck "lote 1 inerte com pistas: a fila parou (o lote 3, de test_b.py, nunca foi chamado)" hasnt "$CALLS" 'tests/test_b.py'; }
 case_lanes_order() { lreset
   # o lote 1 é o mais lento: as pistas terminam 3 e 2 antes dele, e mesmo assim tabela, junta e soma saem na ordem dos lotes
   okb 1 "100 passed in 10.00s" 0; okb 2 "200 passed in 20.00s" 0; okb 3 "300 passed in 30.00s" 0
