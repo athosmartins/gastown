@@ -27,6 +27,17 @@
        stores); jittered off the 300 s / 318 s tiers to decorrelate the Dolt connect-storm.
        No KeepAlive. Single instance (flock).
 
+       BD NEVER STARTS A DOLT FROM THIS JOB (ga-u4z4hwb, 24/11): BEADS_DOLT_AUTO_START=0 below, and the script forces
+       the same value on every bd it runs, so the live job is covered as soon as the script merges, before this plist is
+       reinstalled. At the 23/11 23:41 reboot a bd under launchd, without this variable, started a local decoy Dolt for
+       gastown, lexbh and marketing and wrote the decoy's port into their dolt-server.port (measured by the Mayor, see
+       the ga-u4z4hwb comments); the decoy had no database, every job that then read those rigs got "database not
+       found", this sweep exited 1 and the Pilot read its lanes as full for ~12 h. It is the same switch gc already sets
+       on the bd it runs; with it off bd has no server of its own to fall back on, so a server that does not answer is
+       an error in the log and nothing is left listening. No Dolt port is written in this
+       file, on purpose (ga-3v2zt00: the port changes on every start). Exit code: an unreadable active rig or the HQ
+       still exits 1; a SUSPENDED rig that cannot be read is logged with its cause and does not fail the sweep.
+
        NOT LOADED BY MERGING THIS FILE. Mergeado != vivo: load it (launchctl bootstrap) and register
        it in daemon-presence-watchdog.sh together, in the same change; see
        docs/runbooks/child-priority-janitor.md. Run it with DRY_RUN=1 first. -->
@@ -63,6 +74,8 @@
     <string>15</string>
     <key>BD_ACTOR</key>
     <string>automation</string>
+    <key>BEADS_DOLT_AUTO_START</key>
+    <string>0</string>
   </dict>
 </dict>
 </plist>

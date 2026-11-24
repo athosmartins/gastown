@@ -78,7 +78,7 @@ _STATIC_FALLBACK_RIG_STORES = [
 ]
 
 # ── test seams (monkeypatched in --selftest) ───────────────────────────────────
-_stores_fn = None    # () -> list[(name, path)] | None
+_stores_fn = None    # () -> list[(name, path, suspended)] | None
 _list_fn = None      # (store_path) -> list[dict] | None   (None = could not read)
 _update_fn = None    # (store_path, id, prio, stamp) -> bool
 _show_fn = None      # (store_path, id) -> dict | None
@@ -223,20 +223,48 @@ def _parse_list(raw):
     return d if isinstance(d, list) else None
 
 
-def _list_store(path):
+def _one_line(text, cap):
+    """`text` on ONE line, cut to `cap` chars. A failure cause goes into the log, which is one line per event and the
+    watchdog's heartbeat: a multi-line stderr would tear it, an unbounded one would drown it."""
+    return " ".join(str(text or "").split())[:cap]
+
+
+def _why(r, what):
+    """Why a `bd` call gave no usable answer, in one line; None when it ran and exited 0. `r` is None when the process
+    could not run at all (timeout, missing binary, undecodable output): _sh has already logged the exception, this
+    names the call it belongs to."""
+    if r is None:
+        return "%s did not run (see the subprocess WARN above)" % what
+    if r.returncode != 0:
+        # vazio → "(empty stderr)"; falhou → the stderr text on one line, cut at 300: the cause the log used to throw away (ga-u4z4hwb)
+        return "%s rc=%d: %s" % (what, r.returncode, _one_line(r.stderr, 300) or "(empty stderr)")
+    return None
+
+
+def _read_store(path):
+    """(recs, why). recs: the store's non-closed beads ([] = a store with nothing open); None = the store could NOT be
+    read, and `why` says why in one line. A failed read is never []: "could not tell" is not "no children"."""
     if _list_fn is not None:
-        return _list_fn(path)
+        recs = _list_fn(path)
+        return recs, (None if recs is not None else "the list seam returned None")
     r = _sh([BD_BIN, "-C", path, "list", "--limit", "0", "--json"], BD_TIMEOUT)
-    if r is None or r.returncode != 0:
-        return None
-    return _parse_list(r.stdout)
+    why = _why(r, "bd list")
+    if why is not None:
+        return None, why
+    # vazio (rc 0, no output) → (None, cause), NEVER []; falhou/ilegível (not JSON, or JSON that is not a list) → the same
+    recs = _parse_list(r.stdout)
+    if recs is None:
+        return None, "bd list rc=0 but stdout is not a JSON list: %s" % (_one_line(r.stdout, 120) or "(empty)")
+    return recs, None
 
 
 def _show(path, bid):
     if _show_fn is not None:
         return _show_fn(path, bid)
     r = _sh([BD_BIN, "-C", path, "show", bid, "--json"], BD_TIMEOUT)
-    if r is None or r.returncode != 0:
+    why = _why(r, "bd show")
+    if why is not None:
+        _log("WARN: %s (%s)" % (why, bid))
         return None
     d = _parse_list(r.stdout)
     return d[0] if d and isinstance(d[0], dict) else None
@@ -247,19 +275,29 @@ def _update(path, bid, prio, stamp):
         return _update_fn(path, bid, prio, stamp)
     r = _sh([BD_BIN, "-C", path, "update", bid, "-p", str(prio), "--set-metadata", "%s=%s" % (STAMP_KEY, stamp)],
             BD_TIMEOUT)
-    return r is not None and r.returncode == 0
+    why = _why(r, "bd update")
+    if why is not None:
+        _log("WARN: %s (%s)" % (why, bid))
+        return False
+    return True
 
 
 def _comment(path, bid, text):
     if _comment_fn is not None:
         return _comment_fn(path, bid, text)
     r = _sh([BD_BIN, "-C", path, "comment", bid, text], BD_TIMEOUT)
-    return r is not None and r.returncode == 0
+    why = _why(r, "bd comment")
+    if why is not None:
+        _log("WARN: %s (%s)" % (why, bid))
+        return False
+    return True
 
 
 def _stores():
-    """[(name, path)] — HQ first, then every non-HQ rig. None when the live rig list could not be
-    derived (the caller falls back to the static list and says so)."""
+    """[(name, path, suspended)] — HQ first, then every non-HQ rig. `suspended` is True only when `gc rig list --json`
+    says `"suspended": true`; a missing key or any other value is "not known to be suspended" and keeps the alarm on
+    (the HQ never is). None when the live rig list could not be derived (the caller falls back to the static list and
+    says so)."""
     if _stores_fn is not None:
         return _stores_fn()
     r = _sh([GC_BIN, "--city", CITY, "rig", "list", "--json"], BD_TIMEOUT)
@@ -271,13 +309,14 @@ def _stores():
     except Exception as e:
         _log("WARN: gc rig list parse: %r" % e)
         return None
-    out = [("hq", CITY)]
+    out = [("hq", CITY, False)]
     for rig in rigs:
         if not isinstance(rig, dict) or rig.get("hq") is True:
             continue
         p = rig.get("path")
         if p and p != CITY and os.path.isdir(p):
-            out.append((rig.get("name") or os.path.basename(p), p))
+            # vazio (no "suspended" key) → active, the alarm stays on; ilegível (anything but the JSON boolean true) → active too
+            out.append((rig.get("name") or os.path.basename(p), p, rig.get("suspended") is True))
     return out if len(out) > 1 else None
 
 
@@ -286,18 +325,27 @@ def _fmt(p):
 
 
 def run_cycle():
-    """One sweep. Returns (raised, failed, unreadable_stores)."""
+    """One sweep. Returns (raised, failed, unreadable, unreadable_active): `unreadable` counts every store that could not
+    be read, `unreadable_active` only those whose rig is not known to be suspended. `failed` and `unreadable_active`
+    are what make the sweep fail (see main)."""
     stores = _stores()
     if stores is None:
         _log("DEGRADED stores: using HQ + static fallback (%s)" % ", ".join(n for n, _ in _STATIC_FALLBACK_RIG_STORES))
-        stores = [("hq", CITY)] + [s for s in _STATIC_FALLBACK_RIG_STORES if os.path.isdir(s[1]) or _list_fn is not None]
-    raised = failed = unreadable = 0
+        stores = [("hq", CITY, False)] + [(n, p, False) for n, p in _STATIC_FALLBACK_RIG_STORES
+                                          if os.path.isdir(p) or _list_fn is not None]
+    raised = failed = unreadable = unreadable_active = 0
     capped = False
-    for name, path in stores:
-        recs = _list_store(path)
+    for name, path, suspended in stores:
+        recs, why = _read_store(path)
         if recs is None:
-            _log("WARN: bd list failed/unreadable in %s — store skipped (NOT read as 'no children')" % name)
             unreadable += 1
+            if suspended:
+                # ga-u4z4hwb criterion: a failed read of a SUSPENDED rig is logged with its cause but is not the sweep's
+                # failure. An unreadable ACTIVE rig, or the HQ, is.
+                _log("WARN: bd list failed/unreadable in %s (rig SUSPENDED) — store skipped, not counted toward the exit code: %s" % (name, why))
+            else:
+                unreadable_active += 1
+                _log("WARN: bd list failed/unreadable in %s — store skipped (NOT read as 'no children'): %s" % (name, why))
             continue
         changes, stats = plan_raises(recs)
         _log("store=%s open=%d raise=%d kept=%s" % (
@@ -334,8 +382,9 @@ def run_cycle():
         _notify("child-priority-janitor bateu o teto de %d por varredura — resta backlog, segue no próximo ciclo" % MAX_PER_SWEEP, 3)
     if failed:
         _notify("child-priority-janitor: %d subida(s) de prioridade NÃO confirmadas na releitura (ver .gc/logs/child-priority-janitor.out)" % failed, 4)
-    _log("sweep done: raised=%d failed=%d unreadable_stores=%d dry_run=%s" % (raised, failed, unreadable, DRY_RUN))
-    return raised, failed, unreadable
+    _log("sweep done: raised=%d failed=%d unreadable_stores=%d (active=%d suspended=%d) dry_run=%s" % (
+        raised, failed, unreadable, unreadable_active, unreadable - unreadable_active, DRY_RUN))
+    return raised, failed, unreadable, unreadable_active
 
 
 def main():
@@ -354,10 +403,19 @@ def main():
     except OSError as e:
         _log("WARN: cannot take the lock (%r) — NOT running unguarded" % e)
         return 1
+    # ga-u4z4hwb: `bd` must never start a Dolt server of its own from this job. On 23/11 (reboot, 23:43) a `bd` under
+    # launchd without this variable started a local decoy Dolt for three rigs and wrote its port into their
+    # dolt-server.port; it had no database and answered "database not found" to every job that read those rigs, this one
+    # included. No `gc` wraps these calls to set the variable (the plist runs this script directly), so it is set here.
+    # Forced, not setdefault: a 1 inherited from the environment must not win. The plist carries the same value.
+    os.environ["BEADS_DOLT_AUTO_START"] = "0"
     t0 = time.time()
-    raised, failed, unreadable = run_cycle()
+    _, failed, _, unreadable_active = run_cycle()
     _log("elapsed=%.1fs" % (time.time() - t0))
-    return 1 if failed or (unreadable and not raised) else 0
+    # Exit 1 = the sweep did not do its whole job: a raise was not confirmed, or an ACTIVE store (the HQ included) could
+    # not be read. Before ga-u4z4hwb it was `unreadable and not raised`, which let one raise in a store hide another store
+    # that was never read (r1 unreadable + 1 raise in the HQ exited 0); now only SUSPENDED rigs are exempt, and they say why.
+    return 1 if failed or unreadable_active else 0
 
 
 # ── selftest ───────────────────────────────────────────────────────────────────
@@ -458,8 +516,8 @@ def _selftest():
     check("registros sem id string são ignorados", ch == {"c": (2, 0)})
 
     # ── end-to-end through the seams ──
-    global _stores_fn, _list_fn, _update_fn, _show_fn, _comment_fn, _notify_fn, DRY_RUN, MAX_PER_SWEEP
-    saved = (_stores_fn, _list_fn, _update_fn, _show_fn, _comment_fn, _notify_fn, DRY_RUN, MAX_PER_SWEEP)
+    global _stores_fn, _list_fn, _update_fn, _show_fn, _comment_fn, _notify_fn, _sh, DRY_RUN, MAX_PER_SWEEP
+    saved = (_stores_fn, _list_fn, _update_fn, _show_fn, _comment_fn, _notify_fn, _sh, DRY_RUN, MAX_PER_SWEEP)
     try:
         store = {"hq": [B("p", 0), B("c1", 2, "p"), B("c2", 2, "p")], "wa": [B("q", 1), B("d1", 3, "q")], "bad": None}
         writes, comments, notes = [], [], []
@@ -473,7 +531,7 @@ def _selftest():
                         r["priority"] = prio
             return True
 
-        _stores_fn = lambda: [("hq", "hq"), ("wa", "wa"), ("bad", "bad")]
+        _stores_fn = lambda: [("hq", "hq", False), ("wa", "wa", False), ("bad", "bad", False)]
         _list_fn = lambda path: None if store[path] is None else [dict(r) for r in store[path]]
         _update_fn = fake_update
         _show_fn = lambda path, bid: next((dict(r) for r in store[path] if r["id"] == bid), None)
@@ -481,20 +539,20 @@ def _selftest():
         _notify_fn = lambda msg, prio: notes.append((msg, prio))
         DRY_RUN = False
         MAX_PER_SWEEP = 15
-        raised, failed, unread = run_cycle()
-        check("e2e: 3 subidas em 2 lojas, loja ilegível pulada e contada", (raised, failed, unread) == (3, 0, 1))
+        raised, failed, unread, unread_act = run_cycle()
+        check("e2e: 3 subidas em 2 lojas, loja ilegível pulada e contada", (raised, failed, unread, unread_act) == (3, 0, 1, 1))
         check("e2e: -p e carimbo gravados, 1 comentário por subida",
               sorted((w[1], w[2]) for w in writes) == [("c1", 0), ("c2", 0), ("d1", 1)]
               and all(w[3].startswith("P") and "from" in w[3] for w in writes) and len(comments) == 3)
         writes.clear(); comments.clear()
-        raised, failed, unread = run_cycle()
+        raised, failed, unread, unread_act = run_cycle()
         check("e2e: segunda varredura sobre o estado já corrigido não escreve nada", raised == 0 and not writes)
 
         # a write that exits 0 but does not persist is a FAILURE, with an alarm
         store["hq"] = [B("p", 0), B("c1", 2, "p")]
         persist[0] = False
         writes.clear(); comments.clear(); notes.clear()
-        raised, failed, _ = run_cycle()
+        raised, failed, _, _ = run_cycle()
         check("e2e: update que não persiste -> falha contada, sem comentário, com alarme",
               (raised, failed) == (0, 1) and not comments and any(p == 4 for _, p in notes))
         persist[0] = True
@@ -503,7 +561,7 @@ def _selftest():
         store["hq"] = [B("p", 0)] + [B("c%d" % i, 2, "p") for i in range(5)]
         MAX_PER_SWEEP = 2
         writes.clear(); notes.clear()
-        raised, failed, _ = run_cycle()
+        raised, failed, _, _ = run_cycle()
         check("e2e: teto por varredura respeitado e avisado", raised == 2 and len(writes) == 2 and any("teto" in m for m, _ in notes))
         MAX_PER_SWEEP = 15
 
@@ -511,16 +569,148 @@ def _selftest():
         store["hq"] = [B("p", 0), B("c1", 2, "p")]
         DRY_RUN = True
         writes.clear(); comments.clear()
-        raised, failed, _ = run_cycle()
+        raised, failed, _, _ = run_cycle()
         check("e2e: DRY_RUN conta mas não escreve", raised == 1 and not writes and not comments)
         DRY_RUN = False
 
         # unreadable everywhere → nothing raised, reported as unreadable (exit-1 material), never "no children"
-        _stores_fn = lambda: [("bad", "bad")]
-        raised, failed, unread = run_cycle()
-        check("e2e: todas as lojas ilegíveis -> 0 subidas e unreadable=1", (raised, failed, unread) == (0, 0, 1))
+        _stores_fn = lambda: [("bad", "bad", False)]
+        raised, failed, unread, unread_act = run_cycle()
+        check("e2e: todas as lojas ilegíveis -> 0 subidas, unreadable=1 e a ativa conta", (raised, failed, unread, unread_act) == (0, 0, 1, 1))
+
+        # ga-u4z4hwb: a SUSPENDED rig is read like any other; when it cannot be read it is logged, but only the ACTIVE ones count
+        store["hq"] = [B("p", 0), B("c1", 2, "p")]
+        store["wa"] = [B("q", 1), B("d1", 3, "q")]
+        writes.clear()
+        _stores_fn = lambda: [("hq", "hq", False), ("wa", "wa", True)]
+        raised, failed, unread, unread_act = run_cycle()
+        check("e2e: rig suspensa legível é varrida e sobe como qualquer outra",
+              (raised, failed, unread, unread_act) == (2, 0, 0, 0) and sorted(w[1] for w in writes) == ["c1", "d1"])
+        _stores_fn = lambda: [("hq", "hq", False), ("bad", "bad", True)]
+        store["hq"] = [B("p", 0), B("c1", 2, "p")]
+        raised, failed, unread, unread_act = run_cycle()
+        check("e2e: rig suspensa ilegível -> contada em unreadable mas não nas ativas", (raised, failed, unread, unread_act) == (1, 0, 1, 0))
+        _stores_fn = lambda: [("bad", "bad", True), ("hq", "hq", False), ("wa", "wa", True)]
+        store["hq"] = [B("p", 0), B("c1", 2, "p")]
+        store["wa"] = None
+        raised, failed, unread, unread_act = run_cycle()
+        check("e2e: duas suspensas ilegíveis e o HQ lido -> unreadable=2, nenhuma ativa", (unread, unread_act) == (2, 0))
+        _stores_fn = lambda: [("bad", "bad", False), ("hq", "hq", False)]
+        store["hq"] = [B("p", 0), B("c1", 2, "p")]
+        raised, failed, unread, unread_act = run_cycle()
+        check("e2e: loja ativa ilegível + uma subida feita em outra -> a ativa ainda conta (nada a esconde)",
+              (raised, unread, unread_act) == (1, 1, 1))
     finally:
-        (_stores_fn, _list_fn, _update_fn, _show_fn, _comment_fn, _notify_fn, DRY_RUN, MAX_PER_SWEEP) = saved
+        (_stores_fn, _list_fn, _update_fn, _show_fn, _comment_fn, _notify_fn, _sh, DRY_RUN, MAX_PER_SWEEP) = saved
+
+    # ── the readers with a fake `bd`/`gc` process: what a failure says reaches the log (ga-u4z4hwb) ──
+    import contextlib
+    import io
+    import tempfile
+    saved_io = (_sh, _stores_fn, _list_fn, _update_fn, _show_fn, _comment_fn)
+    try:
+        _stores_fn = _list_fn = _update_fn = _show_fn = _comment_fn = None
+
+        def proc(rc, out="", err=""):
+            return subprocess.CompletedProcess(["bd"], rc, out, err)
+
+        def read_with(r):
+            global _sh
+            _sh = lambda args, timeout: r
+            return _read_store("/x")
+
+        check("leitura: rc 0 + lista JSON -> as beads, sem causa", read_with(proc(0, '[{"id": "a"}]')) == ([{"id": "a"}], None))
+        check("leitura: rc 0 + [] -> ([], None): loja sem nada aberto não é leitura que falhou", read_with(proc(0, "[]")) == ([], None))
+        check("leitura: rc 1 -> None e o stderr como causa",
+              read_with(proc(1, "", "Error: database not found: marketing\n")) == (None, "bd list rc=1: Error: database not found: marketing"))
+        check("leitura: rc 1 com lista no stdout continua ilegível; stderr vazio é dito",
+              read_with(proc(1, "[]", "")) == (None, "bd list rc=1: (empty stderr)"))
+        recs, why = read_with(proc(1, "", "a\n  b\t\tc\n" + "x" * 400))
+        check("leitura: a causa vem numa linha só, espremida e cortada em 300 caracteres",
+              recs is None and why == "bd list rc=1: a b c " + "x" * 294)
+        check("leitura: processo que não rodou -> None e 'did not run'",
+              read_with(None) == (None, "bd list did not run (see the subprocess WARN above)"))
+        check("leitura: rc 0 sem nenhuma saída NÃO é []", read_with(proc(0, "")) == (None, "bd list rc=0 but stdout is not a JSON list: (empty)"))
+        recs, why = read_with(proc(0, "garbage{{{\n" + "y" * 200))
+        check("leitura: rc 0 com lixo -> None, a cabeça do stdout (120 caracteres, uma linha) é a causa",
+              recs is None and why == "bd list rc=0 but stdout is not a JSON list: garbage{{{ " + "y" * 109)
+        check("leitura: rc 0 com JSON que não é lista -> None", read_with(proc(0, '{"issues": []}'))[0] is None)
+        check("leitura: processo morto por sinal (rc -9) é leitura que falhou, nunca 'ok'",
+              read_with(proc(-9, "[]")) == (None, "bd list rc=-9: (empty stderr)"))
+        _list_fn = lambda path: None
+        check("leitura: a costura de lista devolvendo None é leitura que falhou, com causa",
+              _read_store("/x") == (None, "the list seam returned None"))
+        # gc rig list failed (`_stores()` is None): nothing says who is suspended, so the HQ and every fallback store are ACTIVE
+        _stores_fn = lambda: None
+        with contextlib.redirect_stdout(io.StringIO()):
+            res = run_cycle()
+        n = len(_STATIC_FALLBACK_RIG_STORES) + 1
+        check("degradado: sem lista de rigs, o HQ e todas as lojas de reserva ilegíveis contam como ativos", res == (0, 0, n, n))
+        _stores_fn = None
+        _list_fn = None
+
+        def cause_logged(fn, r, *args):
+            global _sh
+            _sh = lambda a, timeout: r
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                res = fn(*args)
+            return res, buf.getvalue()
+
+        res, out = cause_logged(_update, proc(1, "", "Error: update refused"), "/x", "c1", 0, "stamp")
+        check("update: rc 1 -> False e a causa vai ao log com o id da bead",
+              res is False and "[child-priority] WARN: bd update rc=1: Error: update refused (c1)\n" in out)
+        res, out = cause_logged(_update, proc(0), "/x", "c1", 0, "stamp")
+        check("update: rc 0 -> True e nada no log", res is True and out == "")
+        res, out = cause_logged(_update, None, "/x", "c1", 0, "stamp")
+        check("update: processo que não rodou -> False, 'did not run' no log", res is False and "bd update did not run" in out)
+        res, out = cause_logged(_show, proc(1, "", "Error: show refused"), "/x", "c1")
+        check("show: rc 1 -> None e a causa vai ao log", res is None and "WARN: bd show rc=1: Error: show refused (c1)" in out)
+        res, out = cause_logged(_show, proc(0, '[{"id": "c1", "priority": 0}]'), "/x", "c1")
+        check("show: rc 0 + lista -> a bead, nada no log", res == {"id": "c1", "priority": 0} and out == "")
+        res, out = cause_logged(_comment, proc(1, "", "Error: comment refused"), "/x", "c1", "texto")
+        check("comment: rc 1 -> False e a causa vai ao log", res is False and "WARN: bd comment rc=1: Error: comment refused (c1)" in out)
+        res, out = cause_logged(_comment, proc(0), "/x", "c1", "texto")
+        check("comment: rc 0 -> True e nada no log", res is True and out == "")
+
+        # `suspended` is read from `gc rig list --json` and only a real JSON true counts
+        with tempfile.TemporaryDirectory(prefix="cpj-st.") as tmp:
+            dirs = {n: os.path.join(tmp, n) for n in "abcde"}
+            for d in dirs.values():
+                os.mkdir(d)
+            rig_json = json.dumps({"rigs": [
+                {"name": "gascity", "hq": True, "path": CITY, "suspended": True},
+                {"name": "a", "path": dirs["a"], "suspended": True},
+                {"name": "b", "path": dirs["b"], "suspended": False},
+                {"name": "c", "path": dirs["c"]},
+                {"name": "d", "path": dirs["d"], "suspended": "true"},
+                {"name": "e", "path": dirs["e"], "suspended": 1}]})
+            _sh = lambda args, timeout: proc(0, rig_json)
+            check("lojas: só `suspended: true` de verdade marca a rig; o HQ nunca; texto, número e chave ausente ficam ativos",
+                  _stores() == [("hq", CITY, False), ("a", dirs["a"], True), ("b", dirs["b"], False),
+                                ("c", dirs["c"], False), ("d", dirs["d"], False), ("e", dirs["e"], False)])
+
+        # a whole sweep through the fake process: each store line carries its own cause and the summary splits active from suspended
+        def sh_by_store(args, timeout):
+            if args[2] == "hq":
+                return proc(0, "[]")
+            return proc(1, "", "Error: database not found: %s" % args[2])
+        _sh = sh_by_store
+        _stores_fn = lambda: [("hq", "hq", False), ("sus", "sus", True), ("act", "act", False)]
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            res = run_cycle()
+        out = buf.getvalue()
+        check("varredura: ativa + suspensa ilegíveis -> (0, 0, 2, 1)", res == (0, 0, 2, 1))
+        check("varredura: a linha da suspensa diz SUSPENDED, que não conta no rc, e a causa",
+              "WARN: bd list failed/unreadable in sus (rig SUSPENDED) — store skipped, not counted toward the exit code: "
+              "bd list rc=1: Error: database not found: sus\n" in out)
+        check("varredura: a linha da ativa diz que NÃO é 'sem filhos' e traz a causa",
+              "WARN: bd list failed/unreadable in act — store skipped (NOT read as 'no children'): "
+              "bd list rc=1: Error: database not found: act\n" in out)
+        check("varredura: o resumo separa ativas de suspensas", "unreadable_stores=2 (active=1 suspended=1) dry_run=" in out)
+    finally:
+        (_sh, _stores_fn, _list_fn, _update_fn, _show_fn, _comment_fn) = saved_io
 
     # parser three states
     check("parse: vazio -> None (não é 'sem filhos')", _parse_list("") is None and _parse_list("   ") is None)

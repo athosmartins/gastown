@@ -18,7 +18,7 @@ command -v python3 >/dev/null || { echo "FATAL: python3 missing"; exit 1; }
 W="$(mktemp -d "${TMPDIR:-/tmp}/cpj-selftest.XXXXXX")"
 trap 'rm -rf "$W"' EXIT
 CITY="$W/city"; RIG="$W/rig"; RIG2="$W/rig2"; mkdir -p "$CITY" "$RIG" "$RIG2"
-CALLS="$W/calls"; NOTES="$W/notes"; STATE="$W/prio"
+CALLS="$W/calls"; NOTES="$W/notes"; STATE="$W/prio"; ENVLOG="$W/envlog"
 PASS=0; FAIL=0
 ok()   { PASS=$((PASS+1)); printf 'ok   - %s\n' "$1"; }
 nope() { FAIL=$((FAIL+1)); printf 'FAIL - %s\n' "$1"; [ -n "${OUT:-}" ] && printf '%s\n' "$OUT" | sed 's/^/        | /' | head -14; }
@@ -28,12 +28,15 @@ nope() { FAIL=$((FAIL+1)); printf 'FAIL - %s\n' "$1"; [ -n "${OUT:-}" ] && print
 cat > "$W/bd" <<'STUB'
 #!/usr/bin/env bash
 cmd="$3"; echo "$cmd|$2|$*" >> "$STUB_CALLS"
+echo "$cmd AUTO_START=${BEADS_DOLT_AUTO_START-<unset>}" >> "$STUB_ENVLOG"
 emit_list() {
   [ "$2" = "$STUB_HQ" ] || { echo '[]'; return; }
   printf '[{"id":"p","title":"pai","issue_type":"feature","status":"open","priority":0,"labels":[]},{"id":"c","title":"fatia","issue_type":"feature","status":"open","priority":%s,"parent":"p","labels":[]}]\n' "$(cat "$STUB_STATE")"
 }
 case "$cmd" in
   list)
+    # a store listed in STUB_FAIL_PATHS answers the way a decoy Dolt did (ga-u4z4hwb): rc 1 and the cause on stderr
+    case " $STUB_FAIL_PATHS " in *" $2 "*) printf '%s\n' "${STUB_FAIL_ERR-Error: database not found: ${2##*/}}" >&2; exit 1 ;; esac
     case "$STUB_LIST_MODE" in
       ok)         emit_list "$@" ;;
       garbage)    echo 'garbage{{{ not json' ;;
@@ -41,22 +44,23 @@ case "$cmd" in
       empty)      : ;;
       rc1_empty)  echo '[]'; exit 1 ;;
       rc1_raise)  emit_list "$@"; exit 1 ;;
+      killed)     kill -KILL $$ ;;        # an OOM-killed bd: the parent sees rc -9, which is not 0 and not > 0
       slow)       exec sleep 5 ;;
     esac ;;
   show)
     case "$STUB_SHOW_MODE" in
       ok)      printf '[{"id":"c","issue_type":"feature","status":"open","priority":%s,"parent":"p"}]\n' "$(cat "$STUB_STATE")" ;;
       garbage) echo 'garbage{{{ not json' ;;
-      rc1)     exit 1 ;;
+      rc1)     echo "Error: show refused" >&2; exit 1 ;;
       rc1_json) printf '[{"id":"c","issue_type":"feature","status":"open","priority":%s,"parent":"p"}]\n' "$(cat "$STUB_STATE")"; exit 1 ;;
     esac ;;
   update)
     case "$STUB_UPDATE_MODE" in
       ok)   while [ $# -gt 0 ]; do [ "$1" = "-p" ] && { echo "$2" > "$STUB_STATE"; break; }; shift; done ;;
-      rc1)  exit 1 ;;                 # fails, nothing persisted
+      rc1)  echo "Error: update refused" >&2; exit 1 ;;   # fails, nothing persisted
       lie)  : ;;                      # exits 0, nothing persisted
     esac ;;
-  comment) [ "$STUB_COMMENT_MODE" = rc1 ] && exit 1 ;;
+  comment) [ "$STUB_COMMENT_MODE" = rc1 ] && { echo "Error: comment refused" >&2; exit 1; } ;;
 esac
 exit 0
 STUB
@@ -65,6 +69,10 @@ cat > "$W/gc" <<'STUB'
 #!/usr/bin/env bash
 case "$STUB_GC_MODE" in
   ok)      printf '{"rigs":[{"name":"r1","path":"%s"}]}\n' "$STUB_RIG" ;;
+  # `suspended` as `gc rig list --json` reports it (auto-rehome-janitor.py reads the same key); r2 is the active rig
+  susp)    printf '{"rigs":[{"name":"r1","path":"%s","suspended":true},{"name":"r2","path":"%s","suspended":false}]}\n' "$STUB_RIG" "$STUB_RIG2" ;;
+  suspall) printf '{"rigs":[{"name":"r1","path":"%s","suspended":true},{"name":"r2","path":"%s","suspended":true}]}\n' "$STUB_RIG" "$STUB_RIG2" ;;
+  suspstr) printf '{"rigs":[{"name":"r1","path":"%s","suspended":"true"}]}\n' "$STUB_RIG" ;;
   tricky)  printf '{"rigs":["junk",{"name":"hqx","hq":true,"path":"%s"},{"name":"samecity","path":"%s"},{"name":"nopath"},{"name":"nodir","path":"%s/nope"},{"name":"r1","path":"%s"}]}\n' "$STUB_RIG2" "$STUB_HQ" "$STUB_RIG" "$STUB_RIG" ;;
   norigs)  echo '{"rigs":[]}' ;;
   garbage) echo 'garbage{{{ not json' ;;
@@ -79,8 +87,9 @@ STUB
 chmod +x "$W/bd" "$W/gc" "$W/notify"
 
 reset() {
-  echo 2 > "$STATE"; : > "$CALLS"; : > "$NOTES"
-  export STUB_LIST_MODE=ok STUB_UPDATE_MODE=ok STUB_SHOW_MODE=ok STUB_GC_MODE=ok STUB_COMMENT_MODE=ok
+  echo 2 > "$STATE"; : > "$CALLS"; : > "$NOTES"; : > "$ENVLOG"
+  export STUB_LIST_MODE=ok STUB_UPDATE_MODE=ok STUB_SHOW_MODE=ok STUB_GC_MODE=ok STUB_COMMENT_MODE=ok STUB_FAIL_PATHS=
+  unset STUB_FAIL_ERR BEADS_DOLT_AUTO_START   # the janitor must be the one that puts AUTO_START in the child's environment
   export JAN_BD="$W/bd" JAN_GC="$W/gc" JAN_DRY=0 JAN_ENABLED=1 JAN_TIMEOUT=20 JAN_LOCK="$W/lock" JAN_MAX=15
 }
 run() {
@@ -88,7 +97,7 @@ run() {
         CHILD_PRIORITY_JANITOR_LOCK="$JAN_LOCK" CHILD_PRIORITY_JANITOR_BD_TIMEOUT="$JAN_TIMEOUT" \
         CHILD_PRIORITY_JANITOR_MAX_PER_SWEEP="$JAN_MAX" STUB_RIG2="$RIG2" \
         CHILD_PRIORITY_JANITOR_DRY_RUN="$JAN_DRY" CHILD_PRIORITY_JANITOR_ENABLED="$JAN_ENABLED" \
-        STUB_CALLS="$CALLS" STUB_NOTES="$NOTES" STUB_STATE="$STATE" STUB_HQ="$CITY" STUB_RIG="$RIG" \
+        STUB_CALLS="$CALLS" STUB_NOTES="$NOTES" STUB_STATE="$STATE" STUB_HQ="$CITY" STUB_RIG="$RIG" STUB_ENVLOG="$ENVLOG" \
         python3 "$JAN" 2>&1); RC=$?
 }
 n_calls() { grep -c "^$1|" "$CALLS" 2>/dev/null || true; }
@@ -167,6 +176,109 @@ for mode in garbage rc1 rc1_json; do
     ok "show '$mode' -> sem como confirmar, então NÃO conta nem comenta (falha visível)"
   else nope "show '$mode' contou como confirmado (rc=$RC)"; fi
 done
+
+# ── ga-u4z4hwb: o motivo da falha no log, rigs suspensas, BEADS_DOLT_AUTO_START ────────────────────────────────
+# Em 23/11 23:43, no reboot, um `bd` sob o launchd (sem esta variável) subiu um Dolt isca para três rigs com redirect (gastown, lexbh, marketing); ele
+# respondia "database not found" a todo job que lia essas rigs, e o janitor saía 1 com o log dizendo só "failed/unreadable": o motivo estava no stderr do bd.
+case_ "BEADS_DOLT_AUTO_START: todo filho bd nasce com 0, mesmo partindo de um ambiente sem a variável"
+# vazio → o stub registra '<unset>' (o janitor não passou nada), vermelho; falhou → algum filho com valor diferente de 0, vermelho.
+run
+if [ "$RC" = 0 ] && [ -s "$ENVLOG" ] && ! grep -qv 'AUTO_START=0$' "$ENVLOG" \
+   && grep -q '^list ' "$ENVLOG" && grep -q '^update ' "$ENVLOG" && grep -q '^show ' "$ENVLOG" && grep -q '^comment ' "$ENVLOG"; then
+  ok "list, update, show e comment recebem AUTO_START=0 (o bd nunca sobe um Dolt por conta própria a partir daqui)"
+else nope "algum filho bd sem AUTO_START=0: $(sort -u "$ENVLOG" | tr '\n' ';')"; fi
+case_ "BEADS_DOLT_AUTO_START=1 herdado do ambiente não vence"
+BEADS_DOLT_AUTO_START=1 run
+if [ "$RC" = 0 ] && [ -s "$ENVLOG" ] && ! grep -qv 'AUTO_START=0$' "$ENVLOG"; then
+  ok "ambiente com AUTO_START=1 -> o filho ainda recebe 0 (o janitor força o valor, não usa o que veio)"
+else nope "AUTO_START=1 herdado chegou ao bd: $(sort -u "$ENVLOG" | tr '\n' ';')"; fi
+case_ "DRY_RUN=1 também roda o bd list: o AUTO_START=0 vale ali também"
+JAN_DRY=1 run
+if [ "$RC" = 0 ] && [ -s "$ENVLOG" ] && ! grep -qv 'AUTO_START=0$' "$ENVLOG" && grep -q '^list ' "$ENVLOG" && [ "$(n_calls update)" = 0 ]; then
+  ok "dry-run: só o list roda (nada é escrito) e já leva AUTO_START=0"
+else nope "dry-run sem AUTO_START=0: $(sort -u "$ENVLOG" | tr '\n' ';')"; fi
+
+case_ "loja ATIVA ilegível: o log traz a causa e o rc é 1 mesmo com uma subida feita"
+STUB_FAIL_PATHS="$RIG" run
+if [ "$RC" = 1 ] && [ "$(prio)" = 0 ] \
+   && has "WARN: bd list failed/unreadable in r1 — store skipped (NOT read as 'no children'): bd list rc=1: Error: database not found: rig" \
+   && has "raised=1 failed=0 unreadable_stores=1 (active=1 suspended=0)"; then
+  ok "r1 ativa falha com 'database not found': a causa está no log, o HQ subiu P2 -> P0 e o rc é 1 (loja não lida nunca vira 'sem filhas', nem com outra loja bem-sucedida)"
+else nope "loja ativa ilegível (rc=$RC prio=$(prio))"; fi
+
+case_ "rig SUSPENSA ilegível sozinha: rc 0, motivo no log, o resto da varredura segue"
+STUB_GC_MODE=susp STUB_FAIL_PATHS="$RIG" run
+if [ "$RC" = 0 ] && [ "$(prio)" = 0 ] \
+   && has "WARN: bd list failed/unreadable in r1 (rig SUSPENDED) — store skipped, not counted toward the exit code: bd list rc=1: Error: database not found: rig" \
+   && has "unreadable_stores=1 (active=0 suspended=1)" && has "store=r2 open=0"; then
+  ok "r1 suspensa falha: aviso com a causa e a marca SUSPENDED, rc 0; o HQ subiu e a r2 (ativa) foi lida"
+else nope "rig suspensa ilegível sozinha (rc=$RC prio=$(prio))"; fi
+
+case_ "rig suspensa e rig ativa ilegíveis juntas: a ativa decide, rc 1"
+STUB_GC_MODE=susp STUB_FAIL_PATHS="$RIG $RIG2" run
+if [ "$RC" = 1 ] && has "unreadable_stores=2 (active=1 suspended=1)" && has "in r1 (rig SUSPENDED)" && has "in r2 — store skipped (NOT read as 'no children')"; then
+  ok "r1 suspensa + r2 ativa falham: cada uma com a sua marca no log, rc 1 pela ativa"
+else nope "suspensa + ativa ilegíveis (rc=$RC)"; fi
+
+case_ "o HQ ilegível nunca é tratado como suspenso: com todas as rigs suspensas o rc ainda é 1"
+STUB_GC_MODE=suspall STUB_FAIL_PATHS="$CITY $RIG $RIG2" run
+if [ "$RC" = 1 ] && has "unreadable_stores=3 (active=1 suspended=2)" && has "in hq — store skipped (NOT read as 'no children')"; then
+  ok "HQ + 2 rigs suspensas ilegíveis: só o HQ conta como ativo, rc 1"
+else nope "HQ ilegível com as rigs suspensas (rc=$RC)"; fi
+
+case_ "\"suspended\": \"true\" (texto, não booleano) não vale como suspensa"
+STUB_GC_MODE=suspstr STUB_FAIL_PATHS="$RIG" run
+if [ "$RC" = 1 ] && has "unreadable_stores=1 (active=1 suspended=0)" && ! has "SUSPENDED"; then
+  ok "só true de verdade isenta: o texto 'true' deixa a rig ativa, rc 1"
+else nope "suspended como texto (rc=$RC)"; fi
+
+case_ "rig suspensa LEGÍVEL é varrida como qualquer outra"
+STUB_GC_MODE=susp run
+if [ "$RC" = 0 ] && has "store=r1 open=0" && has "store=r2 open=0" && has "unreadable_stores=0 (active=0 suspended=0)" && ! has "SUSPENDED"; then
+  ok "suspensa não é pulada: a r1 é lida, nenhum aviso, rc 0"
+else nope "rig suspensa legível (rc=$RC)"; fi
+
+case_ "a causa no log é uma linha só, espremida e cortada em 300 caracteres"
+A=$(printf 'A%.0s' $(seq 250)); B=$(printf 'B%.0s' $(seq 250)); EXP="$A $(printf 'B%.0s' $(seq 49))"
+STUB_FAIL_PATHS="$RIG" STUB_FAIL_ERR="$A
+$B" run
+if has "bd list rc=1: $EXP" && ! has "bd list rc=1: ${EXP}B" && [ "$(printf '%s\n' "$OUT" | grep -c 'unreadable in r1')" = 1 ] && ! printf '%s\n' "$OUT" | grep -q '^B'; then
+  ok "stderr de duas linhas e 501 caracteres -> uma linha só com exatamente 300 (250 A, espaço, 49 B)"
+else nope "causa não ficou numa linha de 300 caracteres"; fi
+case_ "stderr vazio: o log diz '(empty stderr)' em vez de deixar o buraco"
+STUB_FAIL_PATHS="$RIG" STUB_FAIL_ERR= run
+if has "in r1 — store skipped (NOT read as 'no children'): bd list rc=1: (empty stderr)"; then ok "rc 1 sem stderr -> '(empty stderr)'"; else nope "stderr vazio sem marca"; fi
+
+for spec in "garbage|bd list rc=0 but stdout is not a JSON list: garbage{{{ not json" \
+            "empty|bd list rc=0 but stdout is not a JSON list: (empty)" \
+            "rc1_empty|bd list rc=1: (empty stderr)" \
+            "killed|bd list rc=-9: (empty stderr)" \
+            "badutf8|bd list did not run (see the subprocess WARN above)"; do
+  mode=${spec%%|*}; want=${spec#*|}
+  case_ "bd list '$mode': a causa certa aparece no log"
+  STUB_LIST_MODE=$mode run
+  if has "store skipped (NOT read as 'no children'): $want"; then ok "'$mode' -> $want"; else nope "'$mode' sem a causa esperada ($want)"; fi
+done
+case_ "bd list estoura o tempo: a causa diz que não rodou"
+STUB_LIST_MODE=slow JAN_TIMEOUT=1 run
+if has "store skipped (NOT read as 'no children'): bd list did not run (see the subprocess WARN above)" && has "subprocess failed"; then ok "timeout -> 'did not run' ao lado do aviso do subprocesso"; else nope "timeout sem a causa"; fi
+
+case_ "gc rig list falha (modo degradado): o HQ não-lido vale como ATIVO e o rc é 1"
+# Sem a lista de rigs ninguém diz quem está suspenso: o HQ e as lojas de reserva nunca ganham a isenção.
+STUB_GC_MODE=rc1 STUB_FAIL_PATHS="$CITY" run
+if [ "$RC" = 1 ] && has "DEGRADED stores" && has "in hq — store skipped (NOT read as 'no children')" && has "unreadable_stores=1 (active=1 suspended=0)"; then
+  ok "gc rc 1 + HQ ilegível -> modo degradado, HQ ativo, rc 1"
+else nope "HQ ilegível em modo degradado (rc=$RC)"; fi
+
+case_ "bd update que falha diz a causa no log"
+STUB_UPDATE_MODE=rc1 run
+if has "WARN: bd update rc=1: Error: update refused (c)" && [ "$RC" = 1 ]; then ok "update rc 1 -> 'bd update rc=1: Error: update refused (c)'"; else nope "update sem causa (rc=$RC)"; fi
+case_ "bd show (a releitura) que falha diz a causa no log"
+STUB_SHOW_MODE=rc1 run
+if has "WARN: bd show rc=1: Error: show refused (c)" && [ "$RC" = 1 ]; then ok "show rc 1 -> 'bd show rc=1: Error: show refused (c)'"; else nope "show sem causa (rc=$RC)"; fi
+case_ "bd comment que falha diz a causa no log"
+STUB_COMMENT_MODE=rc1 run
+if has "WARN: bd comment rc=1: Error: comment refused (c)" && has "audit comment failed" && [ "$RC" = 0 ]; then ok "comment rc 1 -> a causa vem antes do aviso de auditoria; a subida confirmada vale, rc 0"; else nope "comment sem causa (rc=$RC)"; fi
 
 case_ "DRY_RUN=1"
 JAN_DRY=1 run
