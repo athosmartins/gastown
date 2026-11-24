@@ -46,6 +46,7 @@
 #   S34 --fix leaves no temp file behind
 #   S35 --installed: the copies of the tracked plists, by Label; a third-party plist in the same dir is neither read nor touched
 #   S36 --installed with a FILE, or with nothing installed there: 2
+#   S38 discovery where every tracked plist is archived: 2, zero judged is not clean
 #   S37 --installed: a Label with a slash (it would leave the agents dir) is refused and nothing outside is touched; archived plists are not judged
 # Every run also asserts there is no traceback on stderr.
 #
@@ -242,6 +243,7 @@ echo "S13: discovery root with zero tracked plists"
 EMPTY="$TMP/empty-repo"; mkdir -p "$EMPTY"; git -C "$EMPTY" init -q 2>/dev/null
 OUT="$(PLIST_LINT_ROOT="$EMPTY" "${PY[@]}" "$LINT" 2>"$TMP/err")"; RC=$?; ERR="$(cat "$TMP/err")"
 expect_rc 2 "zero tracked plists is not clean"
+printf '%s' "$ERR" | grep -q "no plist tracked under" && ok "and it says there is no tracked plist at all (not the all-archived message)" || bad "expected 'no plist tracked under'" "$ERR"
 
 echo "S14: discovery root that is not a git repo"
 NOGIT="$TMP/not-a-repo"; mkdir -p "$NOGIT"
@@ -532,7 +534,7 @@ expect_rc 2 "--installed takes no FILE (even where the installed copy exists and
 EMPTYAG="$TMP/inst-empty"; mkdir -p "$EMPTYAG"
 OUT="$(PLIST_LINT_ROOT="$IR" PLIST_LINT_AGENTS_DIR="$EMPTYAG" "${PY[@]}" "$LINT" --installed 2>"$TMP/err")"; RC=$?; ERR="$(cat "$TMP/err")"
 expect_rc 2 "an agents dir with none of our plists is not clean (wrong directory?)"
-printf '%s' "$ERR" | grep -q "refusing to call that clean" && ok "and it says so" || bad "expected 'refusing to call that clean'" "$ERR"
+printf '%s' "$ERR" | grep -q "no installed copy of any tracked plist" && ok "and it says WHY (no installed copy), not the archive message of the discovery guard" || bad "expected 'no installed copy of any tracked plist'" "$ERR"
 OUT="$(PLIST_LINT_ROOT="$IR" PLIST_LINT_AGENTS_DIR="$TMP/no-such-dir" "${PY[@]}" "$LINT" --installed 2>"$TMP/err")"; RC=$?
 expect_rc 2 "an agents dir that does not exist is not clean either"
 
@@ -554,6 +556,13 @@ OUT="$(PLIST_LINT_ROOT="$TR" PLIST_LINT_AGENTS_DIR="$TAG/sub" "${PY[@]}" "$LINT"
 [ "$(printf '%s' "$ERR" | grep -c "no usable Label")" = 3 ] && ok "both traversal Labels and the empty one are refused as unusable, no guess at a path (rc 2, not 'not installed')" || bad "expected 'no usable Label' three times (../outside, real/../../outside, empty)" "$ERR"
 same_bytes "$TMP/outside.orig" "$TAG/outside.plist" "the file a ../ Label would have reached is byte-identical"
 same_bytes "$TMP/retired.orig" "$TAG/sub/com.test.retired.plist" "the installed copy of an ARCHIVED plist is not judged or touched"
+
+echo "S38: discovery where EVERY tracked plist is archived judges nothing, and zero judged is not clean"
+AR="$TMP/all-archived"; mkdir -p "$AR/docs/launchd-archive/retired"; git -C "$AR" init -q 2>/dev/null
+mk_noenv "$AR/docs/launchd-archive/retired/old.plist"; git -C "$AR" add -A 2>/dev/null
+OUT="$(PLIST_LINT_ROOT="$AR" "${PY[@]}" "$LINT" 2>"$TMP/err")"; RC=$?; ERR="$(cat "$TMP/err")"
+expect_rc 2 "no live plist among the tracked ones is not a clean 0"
+printf '%s' "$ERR" | grep -q "refusing to call that clean" && ok "and it says so" || bad "expected 'refusing to call that clean'" "$ERR"
 
 echo "S29: a failure inside the lint is 'could not decide' (2), never a finding (1)"
 mk_noenv "$TMP/ação.plist"

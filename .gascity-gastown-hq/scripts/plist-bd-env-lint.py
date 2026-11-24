@@ -351,6 +351,10 @@ def main(argv):
             fixed.append(path)
             print("FIXED %s" % shown(path))
 
+    # vazio → a lista tem arquivos mas nenhum é plist vivo (todos arquivados/templates): descoberta que julgou 0 não é "limpa", é rc 2; com FILE explícito, 0 julgados é só "nada a checar" (rc 0)
+    if not explicit and judged == 0 and not undecided:
+        print("plist-bd-env-lint: none of the %d tracked plist(s) is a live one (all archived or templates); refusing to call that clean" % len(skipped), file=sys.stderr)
+        return 2
     if explicit:
         for path in skipped:
             print("skip %s: not a live plist (archive or engine template)" % shown(path))

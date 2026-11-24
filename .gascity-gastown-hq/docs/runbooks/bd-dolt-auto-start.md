@@ -33,7 +33,7 @@ Nada disto foi (nem podia ser) feito do nó Hetzner; o dog do mini ou o Mayor fa
 ## Como provar
 ```bash
 python3 .gascity-gastown-hq/scripts/plist-bd-env-lint.py | tail -2                 # a árvore do repositório: 0 fail
-bash .gascity-gastown-hq/scripts/plist-bd-env-lint.selftest.sh | tail -2            # 97 casos; 39 mutantes escritos à mão sobre o lint (bateria à parte), 39 pegos
+bash .gascity-gastown-hq/scripts/plist-bd-env-lint.selftest.sh | tail -2            # 100 casos; 40 mutantes escritos à mão sobre o lint (bateria à parte), 40 pegos
 bash .gascity-gastown-hq/packs/town-deltas/assets/pilot-dispatcher.lanes-unmeasured.selftest.sh | tail -2   # 77 asserções + 27 mutantes embutidos (cada guarda desligada numa cópia do dispatcher reprova o arquivo)
 bash .githooks/pre-push_test.sh | tail -2                                           # 67 asserções (9 novas, nos testes 52 a 58)
 ```
