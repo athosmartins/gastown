@@ -9,9 +9,11 @@
 # o veredito da noite é INERTE e o relatório diz o que falta. Nunca se roda a suíte sem a prova do canário (04/10: um teste de branch antiga mandou
 # e-mail de verdade).
 #
-# timeout 13500s (3h45) > o prazo do próprio script (HZN_TIMEOUT_S=12600, repartido entre os lotes, + busca, envio e relatório), para o script conseguir registrar o desfecho;
-# começa 05:00Z, então termina no máximo ~08:45Z, ANTES do hetzner-node-reseed (08:55Z), que reinstala o venv do nó se o freeze mudou: uma noite que passasse dessa hora o pegaria no meio.
-# Medido em 15/11 (dia, nó com load ~18): lotes de ~8000 testes levaram 1113/947/868/1353 s, ~1070 s em média; 10 lotes ≈ 11000 s. Mudou o orçamento? Confira esta conta e a do reseed.
+# timeout 13800s (3h50) > o fim do próprio script: o script para pelo MENOR de HZN_TIMEOUT_S=13500 contado do início e HZN_STOP_UTC=08:45 (relógio UTC), e ainda reserva 300 s para o relatório,
+# então registra o desfecho antes do kill da ordem. A ordem começa 05:00Z (a janela vai até 08:55Z, o hetzner-node-reseed, que reinstala o venv do nó se o freeze mudou: uma noite que passasse dessa hora o
+# pegaria no meio). O relógio, e não só o prazo contado do início, é o que garante isso quando a ordem nasce atrasada (24/11: o script começou ~05:06Z).
+# Janela real para os lotes: 05:00Z → 08:40Z = ~13200 s (era 12300 s com o prazo fixo de 12600 s). Medido: 22/11 11706 s, 23/11 12276 s, 24/11 ~14000 s projetados para 11 lotes (nó mais lento); quando não couber,
+# o relatório diz o ritmo e o orçamento, e compara os lotes que rodaram (comparação PARCIAL, ga-z6bc623). Mudou o orçamento? Confira esta conta e a do reseed.
 # o script tem trava de instância única, então uma rodada que passe da hora não empilha com a seguinte.
 #
 # Conferir depois de um reload:  gc order show hetzner-nightly-tests          -> Source: .../packs/town-deltas/...
@@ -21,4 +23,4 @@ description = "Madrugada (02:00 local): pytest completo do WhatsApp no nó Hetzn
 trigger = "cron"
 schedule = "0 5 * * *"
 exec = "bash $PACK_DIR/../../scripts/hetzner-nightly-tests.sh"
-timeout = "13500s"
+timeout = "13800s"

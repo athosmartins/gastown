@@ -19,7 +19,7 @@
 #   duração ilegível sai "?" (não 0h0min) · ids com " - " ficam distintos (irmãos de parametrize) · lista parcial / sem a linha GTN-FAILED / contagem que não bate / linha que não é JSON =
 #   comparação INDISPONÍVEL com a baseline intacta · fetch que falha aparece no relatório · lock velho com pid reaproveitado é tomado · PULADO por lock deixa linha no jsonl ·
 #   a limpeza de 14 dias não apaga a baseline · nao-isolado (vazamento medido) é FALHOU, não INERTE · o nó do mbp-run é o mesmo do instalador · o que foi ao nó fica no relatório.
-# CONTROLES NEGATIVOS: cada mutante do script (M1-M69, mais M0 neutro) tem de ser REPROVADO pelo caso correspondente (o caso falha quando roda no mutante). Antes deles, um mutante NEUTRO (cópia que só muda
+# CONTROLES NEGATIVOS: cada mutante do script (M1-M86, mais M0 neutro) tem de ser REPROVADO pelo caso correspondente (o caso falha quando roda no mutante). Antes deles, um mutante NEUTRO (cópia que só muda
 #   um comentário) tem de PASSAR: sem isso o controle não prova nada (a falta dos arquivos irmãos no diretório do mutante reprovava TODO caso, qualquer que fosse a mutação).
 set -u
 HERE="$(cd "$(dirname "$0")" && pwd)"
@@ -68,7 +68,7 @@ export MBP_CITY="$C" HZN_RUN="$T/run-stub.sh" HZN_WA_REPO="$T/wa" HZN_MAIL_CMD="
 printf '# filtro de mentira: barra tests/test_zero.py por nome\n- /tests/test_zero.py\n+ /tests/***\n+ /marker.txt\n- *\n' > "$T/filter-bar.txt"; printf '+ /marker.txt\n- *\n' > "$T/filter-none.txt"
 printf '#!/bin/sh\nexit 3\n' > "$T/pii-fail.sh"; printf '#!/bin/sh\nprintf "marker.txt\\ntests/a_test.py\\n"; exit 23\n' > "$T/rsync-partial.sh"; printf '#!/bin/sh\nexit 0\n' > "$T/rsync-empty.sh"; chmod +x "$T/rsync-partial.sh" "$T/rsync-empty.sh"
 printf '# comentário\n\n  tests/test_mac_*.py  \ntests/mac/*\n' > "$T/mac-only.txt"; export HETZNER_MAC_ONLY_LIST="$T/mac-only.txt"   # glob por linha, espaços e comentário como no mbp-run
-export LOCK_PATH="$LOCK" MAIL_LOG STUB_CALLS="$CALLS" STUB_OUT STUB_DIR_SEEN="$T/dirseen" SSH_LOG="$T/ssh.log" STUB_CNT="$T/stub.cnt" HZN_RETRY_S=0
+export LOCK_PATH="$LOCK" MAIL_LOG STUB_CALLS="$CALLS" STUB_OUT STUB_DIR_SEEN="$T/dirseen" SSH_LOG="$T/ssh.log" STUB_CNT="$T/stub.cnt" HZN_RETRY_S=0 HZN_STOP_UTC=
 n=0; fails=0; BAD=0; QUIET=0
 reset() { find "$LOGDIR" -mindepth 1 -delete 2>/dev/null; : > "$JSONL"; : > "$MAIL_LOG"; : > "$CALLS"; : > "$SSH_LOG"; rm -f "$STUB_OUT" "$STUB_OUT".* "$STUB_CNT"; chmod -R u+rwx "$LOCK" 2>/dev/null
           find "$LOCK" -mindepth 1 -delete 2>/dev/null; rmdir "$LOCK" 2>/dev/null; mkdir -p "$LOGDIR"; unset STUB_RC MAIL_RC SSH_RC HZN_MIN_TOTAL STUB_SLEEP STUB_RC_1 STUB_RC_2 STUB_RC_3 STUB_RC_4; export HZN_WA_REPO="$T/wa"; }
@@ -95,7 +95,7 @@ case_first() { reset; mkout "$ISO_OK" 7 "$SUM1" "FAILED tests/a.py::t1 - Asserti
   ck "1ª noite: exit 0 e veredito COMPLETO" rcis 0; ck "1ª noite: COMPLETO na última linha e no jsonl" vd COMPLETO; ck "1ª noite: 1 e-mail" mailn 1
   ck "1ª noite: assunto diz primeira rodada" has "$MAIL_LOG" 'COMPLETO: 1205 testes em 1 lotes, 3 falhas, 0 erros \(primeira rodada\)'
   ck "1ª noite: relatório com a linha de base" has "$REPORT" 'primeira rodada completa.*as 3 falhas de hoje viram a linha de base'
-  ck "1ª noite: totais" has "$REPORT" 'total: 1205 \(1200 passaram, 3 falharam, 0 erros, 2 pulados'; ck "1ª noite: duração e meta de 210 min (o padrão de produção, HZN_TIMEOUT_S=12600)" has "$REPORT" 'pytest somado 1h6min.*meta de 210 min: ATINGIDA'
+  ck "1ª noite: totais" has "$REPORT" 'total: 1205 \(1200 passaram, 3 falharam, 0 erros, 2 pulados'; ck "1ª noite: duração e meta de 225 min (o padrão de produção, HZN_TIMEOUT_S=13500)" has "$REPORT" 'pytest somado 1h6min.*meta de 225 min: ATINGIDA'
   ck "1ª noite: contador do nft no relatório" has "$REPORT" '7 tentativa\(s\) de saída barradas pelo nft'
   ck "1ª noite: mbp-run com o isolamento ligado, o prazo e o MESMO nó do instalador" has "$CALLS" 'ENV: ISOLATE=1 TIMEOUT=2400 NODE=stub-node'
   ck "1ª noite: mbp-run no nó linux, os arquivos do lote (ordem de caminho), -n auto e o plugin" has "$CALLS" 'ARGS: --host linux --repo wa --dir .*-- tests/a_test.py tests/sub/test_c.py tests/test_a.py tests/test_b.py tests/test_zero.py -n auto -p gtn_stable_ids --timeout=300'
@@ -306,6 +306,65 @@ case_badconst() { reset; mkout "$ISO_OK" 0 "1500 passed in 3000.00s" "$(fl 0)"; 
   reset; STUB_RC=0 HZN_BATCH_DEFS=0 go "$1"; ck "constante zero onde precisa >= 1: FALHOU" has "$MAIL_LOG" 'constante inválida: BATCH_DEFS=0'
   # as que só a 1ª checagem cobre (a 2ª só olha BATCH_DEFS/BATCH_T/TRIES/ARGS_MAX): sem ela, 'abc' entraria numa conta aritmética e viraria 0 em silêncio
   reset; mkout "$ISO_OK" 0 "1500 passed in 3000.00s" "$(fl 0)"; STUB_RC=0 HZN_FINAL_MARGIN_S=abc go "$1"; ck "margem não numérica: FALHOU, exit 1" rcis 1; ck "margem não numérica: diz qual" has "$MAIL_LOG" 'constante inválida: MARGIN='; ck "margem não numérica: nada rodou" empty_dir_file "$CALLS"; }
+# ga-z6bc623 — lote que NÃO RODOU não apaga a comparação dos que rodaram: PARCIAL, só dos arquivos dos lotes que rodaram, contra a última noite COMPLETA; a baseline nunca anda
+case_partial_cmp() { reset; seed_prev tests/a_test.py::t_fixed tests/sub/test_c.py::t_still tests/test_a.py::t_skip2 tests/test_b.py::t_gone3; cp "$PREV" "$T/prev.before"; cp "$LOGDIR/last-complete.meta" "$T/meta.before"
+  # 3 lotes (HZN_BATCH_DEFS=10): [a_test, sub/test_c] [test_a] [test_b, test_zero]. O lote 2 é MORTO (rc 137): NÃO RODOU, sem depender de relógio. Os lotes 1 e 3 rodam.
+  # Lote 1: t_new (nova) e t_still (já reprovava) reprovam; t_fixed saiu. Lote 3: t_new3 (nova) reprova; t_gone3 saiu. A baseline tem t_skip2 no arquivo do lote 2: NÃO pode virar "corrigida".
+  pc_mk() { okb 1 "2 failed, 400 passed in 100.00s" 2 tests/a_test.py::t_new tests/sub/test_c.py::t_still; MK_TO="$STUB_OUT.2" mkout "$ISO_OK" 0 "" "Killed"; okb 3 "1 failed, 300 passed in 50.00s" 1 tests/test_b.py::t_new3; }
+  pc_mk; STUB_RC_1=1 STUB_RC_2=137 STUB_RC_3=1 HZN_BATCH_DEFS=10 go "$1"
+  ck "parcial: FALHOU, exit 1 (noite incompleta nunca é verde)" rcis 1; ck "parcial: veredito FALHOU" vd FALHOU; ck "parcial: só o lote 02 não rodou" has "$MAIL_LOG" '1 de 3 lotes NÃO RODARAM \(02\)'
+  ck "parcial: compara SÓ os 4 arquivos dos 2 lotes que rodaram: 2 novas e 2 corrigidas (t_skip2, do lote que faltou, NÃO é corrigida)" has "$REPORT" 'comparação PARCIAL contra a última noite completa \(2026-01-01 @abc\), só dos 4 arquivos dos 2 lotes que rodaram: 2 falhas NOVAS, 2 corrigidas \(os arquivos dos lotes que não rodaram NÃO foram comparados\)'
+  ck "parcial: a nova do lote 1 está listada (decodificada)" has "$REPORT" '^  - tests/a_test.py::t_new$'; ck "parcial: a nova do lote 3 (depois do lote morto) está listada" has "$REPORT" '^  - tests/test_b.py::t_new3$'; ck "parcial: a que já reprovava não é listada" hasnt "$REPORT" '^  - tests/sub/test_c.py::t_still$'
+  ck "parcial: o arquivo .new guarda as 2 novas" test "$(wc -l < "$LOGDIR/$DAY.new" | tr -d ' ')" = 2; ck "parcial: o assunto diz a comparação parcial" has "$MAIL_LOG" '\(2 falhas novas nos arquivos que rodaram\)'
+  ck "parcial: o jsonl diz compare=parcial" test "$(tail -n 1 "$JSONL" | jq -r .compare)" = parcial
+  ck "parcial: a baseline NÃO avançou" cmp -s "$PREV" "$T/prev.before"; ck "parcial: a meta da baseline intacta" cmp -s "$LOGDIR/last-complete.meta" "$T/meta.before"
+  ck "parcial: o relatório diz o ritmo medido (17 def test_ rodaram, de 23)" has "$REPORT" 'ritmo medido [0-9]+s para 17 def test_ \(~[0-9]+s para os 23 da árvore\)'
+  ck "parcial: o relatório diz o orçamento e o limite que mandou (padrão: prazo de 13500 s, margem de 300 s)" has "$REPORT" 'orçamento da noite: 13500s \(13200s para os lotes, o resto é a margem do relatório\); limite: prazo HZN_TIMEOUT_S=13500s'
+  ck "parcial: o relatório não diz mais que não há comparação" hasnt "$REPORT" 'não há comparação com a noite anterior'
+  # sem noite completa anterior: nada a comparar (e não é "primeira rodada": a baseline não nasce de uma noite incompleta)
+  reset; pc_mk; STUB_RC_1=1 STUB_RC_2=137 STUB_RC_3=1 HZN_BATCH_DEFS=10 go "$1"
+  ck "parcial sem baseline: diz que não há noite completa anterior" has "$REPORT" 'comparação parcial: não há noite completa anterior para comparar'; ck "parcial sem baseline: compare='-'" test "$(tail -n 1 "$JSONL" | jq -r .compare)" = -
+  ck "parcial sem baseline: nenhuma baseline nasce" test ! -e "$PREV"; ck "parcial sem baseline: o assunto não afirma nenhuma contagem de novas" hasnt "$MAIL_LOG" 'falhas novas nos arquivos'
+  # baseline com duas strings JSON na MESMA linha: o jq lê 2 valores de 1 linha, a filtragem linha a linha não bate → INDISPONÍVEL (nunca "0 novas"), baseline intacta
+  reset; printf '"tests/a_test.py::x" "tests/test_a.py::y"\n' > "$PREV"; echo "2026-01-01 @abc" > "$LOGDIR/last-complete.meta"; cp "$PREV" "$T/prev.before"; pc_mk
+  STUB_RC_1=1 STUB_RC_2=137 STUB_RC_3=1 HZN_BATCH_DEFS=10 go "$1"
+  ck "parcial com baseline ilegível: INDISPONÍVEL" has "$REPORT" 'comparação parcial INDISPONÍVEL: .* não pôde ser lido ou filtrado'; ck "parcial com baseline ilegível: compare=indisponivel" test "$(tail -n 1 "$JSONL" | jq -r .compare)" = indisponivel
+  ck "parcial com baseline ilegível: baseline intacta" cmp -s "$PREV" "$T/prev.before"; ck "parcial com baseline ilegível: o assunto não afirma contagem" hasnt "$MAIL_LOG" 'falhas novas nos arquivos'
+  # lista de ids de um lote que rodou inconsistente (o plugin não imprimiu a linha GTN-FAILED): INDISPONÍVEL, com o porquê
+  reset; seed_prev tests/a_test.py::t_fixed; cp "$PREV" "$T/prev.before"; MK_TO="$STUB_OUT.1" mkout "$ISO_OK" 0 "1 failed, 400 passed in 100.00s" "FAILED tests/a_test.py::t_new"; MK_TO="$STUB_OUT.2" mkout "$ISO_OK" 0 "" "Killed"; okb 3 "300 passed in 50.00s" 0
+  STUB_RC_1=1 STUB_RC_2=137 STUB_RC_3=0 HZN_BATCH_DEFS=10 go "$1"
+  ck "parcial com lista de ids inconsistente: INDISPONÍVEL com o porquê" has "$REPORT" 'comparação parcial INDISPONÍVEL: lote 01: o pytest não imprimiu a linha GTN-FAILED'; ck "parcial com lista inconsistente: baseline intacta" cmp -s "$PREV" "$T/prev.before"
+  # nenhum lote rodou (os 3 mortos): nada a comparar
+  reset; seed_prev tests/a_test.py::t_fixed; cp "$PREV" "$T/prev.before"; for k in 1 2 3; do MK_TO="$STUB_OUT.$k" mkout "$ISO_OK" 0 "" "Killed"; done
+  STUB_RC_1=137 STUB_RC_2=137 STUB_RC_3=137 HZN_BATCH_DEFS=10 go "$1"
+  ck "nenhum lote rodou: FALHOU" vd FALHOU; ck "nenhum lote rodou: a comparação parcial diz que não foi feita" has "$REPORT" 'comparação parcial: não feita \(nenhum lote rodou\)'; ck "nenhum lote rodou: ritmo desconhecido, sem inventar" has "$REPORT" 'ritmo desconhecido'
+  ck "nenhum lote rodou: compare='-'" test "$(tail -n 1 "$JSONL" | jq -r .compare)" = -; ck "nenhum lote rodou: baseline intacta" cmp -s "$PREV" "$T/prev.before"; }
+# ga-z6bc623 — o fim do orçamento é o MENOR entre o prazo (T0 + HZN_TIMEOUT_S) e o relógio (próxima HZN_STOP_UTC): a janela da noite termina no reseed do nó, não num número de lotes.
+# HZN_NOW_S fixa "agora" só na conta do relógio. Epochs: 1699920000 = 00:00:00Z; 05:30 = 1699939800; 08:40 = 1699951200; 08:45 = 1699951500; 08:50 = 1699951800.
+case_stop_clock() { reset; okb 1 "1200 passed in 100.00s" 0
+  # (a) agora = 08:40Z, limite 08:45Z: sobram 300 s e a margem do relatório (300 s) consome tudo → o lote 1 NÃO começa (nunca roda por cima do reseed)
+  HZN_STOP_UTC=08:45 HZN_NOW_S=1699951200 go "$1"
+  ck "relógio: FALHOU, exit 1" rcis 1; ck "relógio: o lote não começou (nenhuma chamada ao mbp-run)" test "$(grep -c '^ARGS:' "$CALLS")" = 0; ck "relógio: a tabela diz orçamento esgotado" has "$REPORT" 'orçamento esgotado: restam -?[0-9]+s'
+  ck "relógio: o log do início diz que o limite é o relógio" has "$OUT" 'limite: relógio 08:45 UTC'; ck "relógio: o relatório diz o limite" has "$REPORT" 'limite: relógio 08:45 UTC'
+  # (b) agora = 05:30Z: até 08:45Z são 11700 s; menos 300 de margem = ~11400 s para os lotes, e a rodada normal roda inteira
+  reset; okb 1 "1200 passed in 100.00s" 0; STUB_RC_1=0 HZN_STOP_UTC=08:45 HZN_NOW_S=1699939800 go "$1"
+  ck "relógio 05:30Z: COMPLETO" vd COMPLETO; ck "relógio 05:30Z: o orçamento é o do relógio (~11400 s)" has "$OUT" 'orçamento 11[34][0-9]{2}s para os lotes, limite: relógio 08:45 UTC'
+  # (c) agora = 08:50Z (depois do limite de hoje): a próxima ocorrência é amanhã, longe; vale o prazo
+  reset; okb 1 "1200 passed in 100.00s" 0; STUB_RC_1=0 HZN_STOP_UTC=08:45 HZN_NOW_S=1699951800 go "$1"
+  ck "relógio 08:50Z: vale o prazo (o limite é amanhã)" has "$OUT" 'orçamento 13[01][0-9]{2}s para os lotes, limite: prazo HZN_TIMEOUT_S=13500s'; ck "relógio 08:50Z: COMPLETO" vd COMPLETO
+  # (d) agora = 08:45:00Z em ponto: delta 0 não é "agora": é a ocorrência de amanhã (não nasce sem orçamento)
+  reset; okb 1 "1200 passed in 100.00s" 0; STUB_RC_1=0 HZN_STOP_UTC=08:45 HZN_NOW_S=1699951500 go "$1"
+  ck "relógio 08:45:00Z em ponto: vale o prazo, a rodada roda" has "$OUT" 'limite: prazo HZN_TIMEOUT_S=13500s'; ck "relógio 08:45:00Z em ponto: COMPLETO" vd COMPLETO
+  # (e) HZN_STOP_UTC vazio desliga o relógio (mesmo com "agora" = 08:40Z)
+  reset; okb 1 "1200 passed in 100.00s" 0; STUB_RC_1=0 HZN_STOP_UTC= HZN_NOW_S=1699951200 go "$1"
+  ck "relógio vazio: só o prazo vale" has "$OUT" 'limite: prazo HZN_TIMEOUT_S=13500s'; ck "relógio vazio: COMPLETO" vd COMPLETO
+  # (f) o relógio é HH:MM de verdade; lixo → FALHOU antes de rodar qualquer coisa (nunca vira "sem limite" calado)
+  reset; okb 1 "1200 passed in 100.00s" 0; HZN_STOP_UTC=25:99 go "$1"
+  ck "relógio inválido: FALHOU, exit 1" rcis 1; ck "relógio inválido: diz qual" has "$MAIL_LOG" 'constante inválida: HZN_STOP_UTC='; ck "relógio inválido: nada rodou" empty_dir_file "$CALLS"
+  reset; okb 1 "1200 passed in 100.00s" 0; HZN_STOP_UTC=8:45 go "$1"; ck "relógio sem o zero (8:45): FALHOU" has "$MAIL_LOG" 'constante inválida: HZN_STOP_UTC='
+  # (g) o "agora" injetado também é inteiro ou nada
+  reset; okb 1 "1200 passed in 100.00s" 0; HZN_STOP_UTC=08:45 HZN_NOW_S=abc go "$1"
+  ck "agora ilegível: FALHOU, exit 1" rcis 1; ck "agora ilegível: diz qual" has "$MAIL_LOG" 'HZN_NOW_S='; ck "agora ilegível: nada rodou" empty_dir_file "$CALLS"; }
 case_notests() { reset; HZN_WA_REPO="$T/wa-notests" go "$1"; ck "origin/main sem tests/: FALHOU, exit 1" rcis 1; ck "origin/main sem tests/: diz que não tem tests/" has "$MAIL_LOG" 'não tem tests/'; ck "origin/main sem tests/: nada rodou" empty_dir_file "$CALLS"; }
 
 case_maconly() { reset; mkout "$ISO_OK" 0 "1500 passed in 3000.00s" "$(fl 0)"
@@ -358,7 +417,7 @@ case_escudo() { reset; local A='tests/a_test.py::t1'
   reset; mkout "$ISO_OK" 0 "1500 passed in 3000.00s" "$(fl 0)"; printf 'GTN-ESCUDO: n=abc\n' >> "$STUB_OUT"; STUB_RC=0 go "$1"
   ck "escudo ilegível: segue COMPLETO (o escudo não muda o veredito)" vd COMPLETO; ck "escudo ilegível: o relatório diz ILEGÍVEL e não afirma zero" has "$REPORT" 'escudo do relatório \(plugin gtn_stable_ids\): contagem ILEGÍVEL'
   ck "escudo ilegível: o jsonl tem null (não 0)" test "$(tail -n 1 "$JSONL" | jq -c .escudo_reports)" = null; }
-ALL="first second cleanslate xfail inerte leak 97_sem_iso pulado timeout abort noiso nosum implausible lock lock_stale prev_unreadable mailfail egress ssh no_origin stale_report listfail prev_format dash partial fetch keep provenance dur maconly retidos batches batch_list overbudget batch_killed crash nocap cap_inert cap_retry cap_late leak_mid flag_mid badconst notests nobatch escudo"
+ALL="first second cleanslate xfail inerte leak 97_sem_iso pulado timeout abort noiso nosum implausible lock lock_stale prev_unreadable mailfail egress ssh no_origin stale_report listfail prev_format dash partial fetch keep provenance dur maconly retidos batches batch_list overbudget batch_killed crash nocap cap_inert cap_retry cap_late leak_mid flag_mid badconst notests nobatch escudo partial_cmp stop_clock"
 for c in $ALL; do "case_$c" "$SUT0"; done
 
 # ---- controles negativos: o caso correspondente tem de FALHAR quando roda no mutante -----------------------------------------
@@ -448,6 +507,24 @@ mutantl M66-nb-lixo-derruba-a-linha-do-jsonl nobatch 'NBX=$(wc -l < "$SCR/batch.
 mutantl M67-escudo-nao-somado escudo 'ESCSUM=$(( ESCSUM + es ))' 'ESCSUM=$ESCSUM'
 mutantl M68-escudo-ilegivel-vira-zero escudo '*[!0-9]*) ESCUNK=1 ;;' '*[!0-9]*) ;;'
 mutantl M69-escudo-fora-do-relatorio escudo $'  echo "- escudo do relatório (plugin gtn_stable_ids): $ESCTXT"\n' ''
+# ga-z6bc623: comparação parcial e limite do relógio
+mutantl M70-parcial-sem-filtro-por-arquivo partial_cmp '($m[(split("::")[0])] // false)' 'true'
+mutantl M71-parcial-novas-lidas-como-comuns partial_cmp 'LC_ALL=C comm -13 "$SCR/prev.partial" "$CUR" > "$NEW"' 'LC_ALL=C comm -12 "$SCR/prev.partial" "$CUR" > "$NEW"'
+mutantl M72-parcial-avanca-a-baseline partial_cmp 'NEWTXT="$(wc -l < "$NEW" | tr -d '"'"' '"'"') falhas novas nos arquivos que rodaram"; CMPST=parcial' 'NEWTXT="$(wc -l < "$NEW" | tr -d '"'"' '"'"') falhas novas nos arquivos que rodaram"; CMPST=parcial; cp "$CUR" "$PREV"'
+mutantl M73-parcial-ignora-lista-de-ids-inconsistente partial_cmp 'elif [ "$LISTOK" = 0 ]; then PCMP=' 'elif false; then PCMP='
+mutantl M74-parcial-sem-baseline-vira-indisponivel partial_cmp 'elif [ ! -e "$PREV" ]; then PCMP=' 'elif false; then PCMP='
+mutantl M75-parcial-aceita-filtragem-que-nao-bate-linha-a-linha partial_cmp '&& [ "$(wc -l < "$SCR/prev.flags" | tr -d '"'"' '"'"')" = "$(wc -l < "$PREV" | tr -d '"'"' '"'"')" ] \' '\'
+mutantl M76-parcial-sem-nenhum-lote-vira-comparacao partial_cmp 'if [ "$NRAN" -eq 0 ]; then CMPST=-' 'if false; then CMPST=-'
+mutantl M77-arquivos-dos-lotes-que-rodaram-nao-guardados partial_cmp 'cat "$SCR/batch.$i" >> "$SCR/ran.files"; ' ''
+mutantl M78-parcial-fora-do-relatorio partial_cmp $'    echo "- $PCMP"\n' ''
+mutantl M79-ritmo-fora-do-relatorio partial_cmp $'    echo "- $PACE"\n' ''
+mutantl M80-relogio-ignorado stop_clock 'if [ $(( T0 + CLK_DELTA )) -lt "$BUDGET_END" ]; then' 'if false; then'
+mutantl M81-relogio-zero-nao-vira-amanha stop_clock '[ "$CLK_DELTA" -gt 0 ] || CLK_DELTA=86400' ':'
+mutantl M82-relogio-invalido-aceito stop_clock "''|[01][0-9]:[0-5][0-9]|2[0-3]:[0-5][0-9]) ;; *) finish FALHOU \"constante inválida: HZN_STOP_UTC" "*) ;; nunca_casa) finish FALHOU \"constante inválida: HZN_STOP_UTC"
+mutantl M83-agora-ilegivel-aceito stop_clock "''|*[!0-9]*) finish FALHOU \"HZN_NOW_S=" "nunca_casa) finish FALHOU \"HZN_NOW_S="
+mutantl M84-hora-com-zero-vira-octal stop_clock '10#${STOP_UTC%:*}' '${STOP_UTC%:*}'
+mutantl M85-relogio-vazio-nao-desliga stop_clock 'STOP_UTC=${HZN_STOP_UTC-08:45}' 'STOP_UTC=${HZN_STOP_UTC:-08:45}'
+mutantl M86-o-prazo-do-relogio-nao-aparece-no-aviso stop_clock 'BUDGET_BY="relógio ${STOP_UTC} UTC"' 'BUDGET_BY="prazo HZN_TIMEOUT_S=${TIMEOUT_S}s"'
 reset
 echo "---"; echo "$((n-fails))/$n ok ($M mutantes)"
 [ $fails -eq 0 ] && echo "SELFTEST OK" || { echo "SELFTEST FALHOU ($fails)"; exit 1; }

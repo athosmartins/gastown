@@ -10,9 +10,10 @@
 #   dos 31 GB do nó: o OOM do kernel matou o job com rc=137 aos ~1700 s em 13, 14 e 15/11. Agora: os arquivos test_*.py/*_test.py de tests/ (menos o que o pytest.ini manda ignorar) são
 #   agrupados em ordem de caminho em lotes de ~HZN_BATCH_DEFS `def test_` (o nº de lotes sai da árvore, nunca fixo) e CADA lote é um `mbp-run.sh` + um pytest NOVO (a memória zera). Quem limita a
 #   memória é o `gt-iso-run` no nó (hetzner-iso-run.sh): lê o MemAvailable na hora, deriva os workers (nunca um número fixo), roda o pytest dentro de
-#   `systemd-run --user --scope -p MemoryMax=<teto> -p MemorySwapMax=0` e fica INERTE se não leu ou não provou o teto. O orçamento de tempo é do script inteiro (HZN_TIMEOUT_S − margem): lote que
+#   `systemd-run --user --scope -p MemoryMax=<teto> -p MemorySwapMax=0` e fica INERTE se não leu ou não provou o teto. O orçamento de tempo é do script inteiro: o MENOR entre HZN_TIMEOUT_S (contado do início) e o relógio HZN_STOP_UTC, menos a margem (ga-z6bc623): lote que
 #   não começou por falta de orçamento, que estourou o prazo dele, que morreu (rc 137 = teto/OOM, worker caído) ou ficou inerte é "NÃO RODOU" e aparece assim — nunca como verde. Sem todos os
-#   lotes rodados não há COMPLETO, não há comparação e a linha de base não anda.
+#   lotes rodados não há COMPLETO, não há total da suíte e a linha de base não anda; os lotes que rodaram ainda são comparados com a última noite COMPLETA, só nos arquivos deles, e o relatório diz
+#   "comparação PARCIAL" (compare=parcial no jsonl) com o orçamento da noite e o ritmo medido.
 # VEREDITO (última linha do stdout `VEREDITO: <x>`; uma linha jsonl por noite em $CITY/.gc/logs/hetzner-nightly.jsonl; um e-mail ao Mayor, salvo PULADO)
 #   COMPLETO  TODOS os lotes rodaram DENTRO do isolamento provado e o resumo do pytest de cada um foi lido: total (somado), falhas, novas falhas contra a última noite COMPLETA, duração.
 #             Teste que falha é dado do relatório, não falha do job (exit 0).
@@ -29,7 +30,7 @@
 #   `-n auto` só limita por cima: o `gt-iso-run` cobra do nó o número real de workers). O scratch é apagado.
 # O QUE NÃO FAZ: não cai no MBP nem no mini (--host linux, sem cadeia); não decide se uma falha é regressão (só diz quais são novas); não instala o helper de root; não mexe no que roda no nó
 #   além do próprio pytest (os diretórios velhos de /dev/shm do nó são de outro agente).
-# AMBIENTE (selftest e rodada manual): MBP_CITY, HZN_RUN (mbp-run.sh), HZN_WA_REPO, HZN_MAIL_CMD (padrão `gc mail send mayor`), HZN_TIMEOUT_S (12600: o orçamento do script todo; medido 15/11: ~1070 s por lote × 10 lotes ≈ 11000 s), HZN_MIN_TOTAL (1000),
+# AMBIENTE (selftest e rodada manual): MBP_CITY, HZN_RUN (mbp-run.sh), HZN_WA_REPO, HZN_MAIL_CMD (padrão `gc mail send mayor`), HZN_TIMEOUT_S (13500: o prazo do script todo, contado do início), HZN_STOP_UTC (08:45: hora UTC em que a rodada acaba, antes do reseed do nó das 08:55Z; vazio desliga; HZN_NOW_S só para o selftest), HZN_MIN_TOTAL (1000),
 #   HZN_NODE_HOST (hetzner-teste; é também o que o mbp-run recebe como HETZNER_NODE_HOST: instalar e rodar no MESMO nó), HZN_SSH (ssh), HZN_NO_FETCH=1 (não buscar o origin),
 #   HZN_KEEP_DAYS (14; a linha de base last-complete.* não entra na limpeza), HZN_BATCH_DEFS (8000: `def test_` por lote), HZN_BATCH_TIMEOUT_S (2400: prazo de UM lote),
 #   HZN_MIN_BATCH_S (180: com menos orçamento que isto o lote nem começa), HZN_FINAL_MARGIN_S (300: o que fica para o relatório), HZN_BATCH_TRIES (2) e HZN_RETRY_S (90) para o que é transitório
@@ -40,7 +41,8 @@ CITY=${MBP_CITY:-${GC_CITY_PATH:-/Users/athos/gt/.gascity-gastown-hq}}
 RUN=${HZN_RUN:-$HERE/mbp-run.sh}
 WA=${HZN_WA_REPO:-/Users/athos/gt/whatsapp_automation}
 MAIL=${HZN_MAIL_CMD:-gc mail send mayor}
-TIMEOUT_S=${HZN_TIMEOUT_S:-12600}
+TIMEOUT_S=${HZN_TIMEOUT_S:-13500}
+STOP_UTC=${HZN_STOP_UTC-08:45}   # hora UTC (HH:MM) em que a rodada TEM de acabar (o reseed do nó é 08:55Z); vazio = só o prazo TIMEOUT_S vale
 MIN_TOTAL=${HZN_MIN_TOTAL:-1000}
 NODE=${HZN_NODE_HOST:-${HETZNER_NODE_HOST:-hetzner-teste}}
 SSH=${HZN_SSH:-ssh}
@@ -133,6 +135,8 @@ for v in TIMEOUT_S MIN_TOTAL BATCH_DEFS BATCH_T MIN_BATCH MARGIN TRIES RETRY_S A
   x=${!v}; case "$x" in ''|*[!0-9]*) finish FALHOU "constante inválida: $v='$x' (precisa ser inteiro >= 0); nada rodou" 1 ;; esac
 done
 for v in BATCH_DEFS BATCH_T TRIES ARGS_MAX; do x=${!v}; [ "$x" -ge 1 ] || finish FALHOU "constante inválida: $v=$x (precisa ser >= 1); nada rodou" 1; done
+# vazio é VÁLIDO (desliga o limite do relógio); preenchido e fora de HH:MM → FALHOU (um relógio que eu não entendi não vira "sem limite" calado: a rodada passaria do reseed do nó)
+case "$STOP_UTC" in ''|[01][0-9]:[0-5][0-9]|2[0-3]:[0-5][0-9]) ;; *) finish FALHOU "constante inválida: HZN_STOP_UTC='$STOP_UTC' (precisa ser HH:MM em UTC, ou vazio); nada rodou" 1 ;; esac
 
 # ── os lotes ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
 # Lista: os test_*.py / *_test.py de tests/ DA ÁRVORE QUE VAI AO NÓ (o git archive acima), em ordem de caminho (LC_ALL=C), menos as pastas que o pytest.ini manda ignorar (norecursedirs: os
@@ -211,9 +215,18 @@ NDEFS=$(awk '{s+=$3} END{print s+0}' "$SCR/batch.meta")
 # Estado de um lote (B_ST): ran | nao-rodou | retry-cap | retry-mbp | inerte-iso | vazamento | sem-prova | pulado — só `ran` entra na soma; o resto é "NÃO RODOU" no relatório.
 rm -f "$LOGDIR/$DAY".b*.out 2>/dev/null; : > "$OUT"
 TABLE="$SCR/table.md"; : > "$TABLE"; : > "$SCR/ids.all"
-DEADLINE=$(( T0 + TIMEOUT_S - MARGIN ))
-NRAN=0; NSKIP=0; SKIPLIST=""; TP=0; TF=0; TE=0; TS=0; TXF=0; TXP=0; LISTOK=1; LISTWHY=""; PYSECS=0; PYUNK=0; EGSUM=0; EGUNK=0; EGSEEN=0; FIRSTCAP=""
-say "rodando a suíte do WA @$SHA em $NODE: $NFILES arquivos ($NMAC mac-only e $NHELD não enviados ao nó ficaram de fora), $NDEFS def test_, $NB lotes de ~$BATCH_DEFS (orçamento $(( DEADLINE - $(date +%s) ))s de ${TIMEOUT_S}s)"
+# O fim do orçamento é o MENOR de dois: T0 + TIMEOUT_S (prazo) e a próxima ocorrência de STOP_UTC (relógio). A noite de 24/11 perdeu os lotes 10 e 11 porque o prazo era contado só de T0 e a suíte cresceu para 11 lotes:
+# o que limita de verdade é a JANELA (a ordem começa 05:00Z, o reseed do nó é 08:55Z), não um número de lotes. Segundos do dia em UTC saem de `epoch % 86400` (sem `date -d`/`-j`: igual no mini e no nó).
+# HZN_NOW_S existe só para o selftest fixar "agora" nessa conta (T0 e o relógio da rodada continuam os reais).
+BUDGET_END=$(( T0 + TIMEOUT_S )); BUDGET_BY="prazo HZN_TIMEOUT_S=${TIMEOUT_S}s"
+if [ -n "$STOP_UTC" ]; then
+  NOW0=${HZN_NOW_S:-$T0}; case "$NOW0" in ''|*[!0-9]*) finish FALHOU "HZN_NOW_S='$NOW0' não é um epoch inteiro; nada rodou" 1 ;; esac
+  CLK_DELTA=$(( ( 10#${STOP_UTC%:*} * 3600 + 10#${STOP_UTC#*:} * 60 - NOW0 % 86400 + 86400 ) % 86400 )); [ "$CLK_DELTA" -gt 0 ] || CLK_DELTA=86400
+  if [ $(( T0 + CLK_DELTA )) -lt "$BUDGET_END" ]; then BUDGET_END=$(( T0 + CLK_DELTA )); BUDGET_BY="relógio ${STOP_UTC} UTC"; fi
+fi
+DEADLINE=$(( BUDGET_END - MARGIN ))
+NRAN=0; NSKIP=0; RANSEC=0; RANDEFS=0; : > "$SCR/ran.files"; SKIPLIST=""; TP=0; TF=0; TE=0; TS=0; TXF=0; TXP=0; LISTOK=1; LISTWHY=""; PYSECS=0; PYUNK=0; EGSUM=0; EGUNK=0; EGSEEN=0; FIRSTCAP=""
+say "rodando a suíte do WA @$SHA em $NODE: $NFILES arquivos ($NMAC mac-only e $NHELD não enviados ao nó ficaram de fora), $NDEFS def test_, $NB lotes de ~$BATCH_DEFS (orçamento $(( DEADLINE - $(date +%s) ))s para os lotes, limite: $BUDGET_BY)"
 
 tail1() { grep . "$1" 2>/dev/null | tail -n 1 | cut -c1-200; }
 cnt() { printf '%s' "$SUM" | sed -n -E "s/.*[^0-9]([0-9]+) $1.*/\1/p;s/^([0-9]+) $1.*/\1/p" | head -n 1; }
@@ -348,7 +361,7 @@ while [ "$i" -lt "$NB" ]; do
       [ "$i" -ne 1 ] || finish FALHOU "$B_WHY" 1
       B_ST=nao-rodou ;;
   esac
-  if [ "$B_ST" = ran ]; then NRAN=$(( NRAN + 1 )); agg_batch "$BOUT" "$nn"
+  if [ "$B_ST" = ran ]; then NRAN=$(( NRAN + 1 )); RANSEC=$(( RANSEC + BSEC )); RANDEFS=$(( RANDEFS + ${nd:-0} )); cat "$SCR/batch.$i" >> "$SCR/ran.files"; agg_batch "$BOUT" "$nn"
   else NSKIP=$(( NSKIP + 1 )); SKIPLIST="$SKIPLIST${SKIPLIST:+, }$nn"; say "lote $nn NÃO RODOU: $B_WHY"; fi
 done
 WALL=$(( $(date +%s) - T0 ))
@@ -359,20 +372,45 @@ EGLINE="$EGRESS tentativa(s) de saída barradas pelo nft"
 case "$EGRESS" in 0) EGLINE="0 tentativas de saída (contador do nft lido em todos os lotes que rodaram)" ;; '?') EGLINE="contador do nft ILEGÍVEL em algum lote — não afirmo zero tentativas" ;; esac
 CUR="$LOGDIR/$DAY.failed"; LC_ALL=C sort -u "$SCR/ids.all" > "$CUR"
 
-# algum lote não rodou → FALHOU: sem total confiável, sem comparação, sem avançar a linha de base (a lista de falhas dos que rodaram fica em $CUR, só para leitura)
+# algum lote não rodou → FALHOU: sem total confiável e sem avançar a linha de base. A comparação, porém, não se perde com os lotes que faltaram: os lotes que RODARAM são comparados com a última noite COMPLETA, mas só
+# nos arquivos deles (a baseline filtrada pelos arquivos dos lotes que rodaram), e o relatório diz que é PARCIAL (ga-z6bc623: a noite de 24/11 rodou 9 de 11 lotes e saiu sem nenhuma comparação).
+# vazio (nenhum lote rodou / não há noite completa anterior) → "-", sem comparação; falhou/ilegível (lista de ids não confiável, baseline que não abre ou sem o mesmo nº de linhas na filtragem) → INDISPONÍVEL,
+# nunca "0 novas": INDISPONÍVEL deixa a baseline como estava, e a parcial NUNCA a avança (só a noite COMPLETA avança).
 if [ "$NSKIP" -gt 0 ]; then
+  NIDS=$(wc -l < "$CUR" | tr -d ' '); PREV="$LOGDIR/last-complete.failed"; PMETA="$LOGDIR/last-complete.meta"; NEW="$LOGDIR/$DAY.new"; : > "$NEW"
+  PCMP="comparação parcial: não feita (nenhum lote rodou)"; NEWTXT="sem comparação"
+  if [ "$NRAN" -eq 0 ]; then CMPST=-
+  elif [ "$LISTOK" = 0 ]; then PCMP="comparação parcial INDISPONÍVEL: $LISTWHY (a linha de base não foi tocada)"; CMPST=indisponivel
+  elif [ ! -e "$PREV" ]; then PCMP="comparação parcial: não há noite completa anterior para comparar (as $NIDS falhas dos lotes que rodaram estão em $CUR)"; CMPST=-
+  elif [ -r "$PREV" ] && jq -en '[inputs | type == "string"] | all' "$PREV" >/dev/null 2>&1 \
+       && jq -r --rawfile rf "$SCR/ran.files" '($rf | split("\n") | map(select(length > 0) | {(.): true}) | add // {}) as $m | ($m[(split("::")[0])] // false)' "$PREV" > "$SCR/prev.flags" 2>/dev/null \
+       && [ "$(wc -l < "$SCR/prev.flags" | tr -d ' ')" = "$(wc -l < "$PREV" | tr -d ' ')" ] \
+       && paste -d '|' "$SCR/prev.flags" "$PREV" | LC_ALL=C awk '/^true[|]/ { sub(/^true[|]/, ""); print }' | LC_ALL=C sort -u > "$SCR/prev.partial" 2>/dev/null; then
+    # id de $CUR cujo arquivo não está entre os que rodaram (não deveria existir) não casa com a baseline filtrada e entra como NOVO: erra para o lado de avisar
+    LC_ALL=C comm -13 "$SCR/prev.partial" "$CUR" > "$NEW"; FIXED=$(LC_ALL=C comm -23 "$SCR/prev.partial" "$CUR" | wc -l | tr -d ' ')
+    NEWTXT="$(wc -l < "$NEW" | tr -d ' ') falhas novas nos arquivos que rodaram"; CMPST=parcial
+    PCMP="comparação PARCIAL contra a última noite completa ($(cat "$PMETA" 2>/dev/null || echo 'data ilegível')), só dos $(sort -u "$SCR/ran.files" | wc -l | tr -d ' ') arquivos dos $NRAN lotes que rodaram: $(wc -l < "$NEW" | tr -d ' ') falhas NOVAS, $FIXED corrigidas (os arquivos dos lotes que não rodaram NÃO foram comparados)"
+  else PCMP="comparação parcial INDISPONÍVEL: $PREV existe e não pôde ser lido ou filtrado como lista de ids em JSON (as falhas dos lotes que rodaram estão em $CUR)"; CMPST=indisponivel; fi
+  # orçamento e ritmo: segundos por `def test_` dos lotes que rodaram × todos os `def test_` da árvore, contra o orçamento da noite (vazio/zero → ritmo desconhecido: não afirmo que cabia nem que não)
+  BUDGETTXT="orçamento da noite: $(( BUDGET_END - T0 ))s ($(( BUDGET_END - T0 - MARGIN ))s para os lotes, o resto é a margem do relatório); limite: $BUDGET_BY"
+  PACE="ritmo desconhecido (nenhum lote rodou até o fim)"
+  if [ "$NRAN" -gt 0 ] && [ "$RANDEFS" -gt 0 ]; then PACE="ritmo medido ${RANSEC}s para $RANDEFS def test_ (~$(( RANSEC * NDEFS / RANDEFS ))s para os $NDEFS da árvore)"; fi
   { echo "# Hetzner nightly $DAY — FALHOU: $NSKIP de $NB lotes NÃO RODARAM"; echo
     echo "- origin/main @$SHA, nó $NODE, $NFILES arquivos de tests/ ($NDEFS def test_) em $NB lotes de ~$BATCH_DEFS"
     [ "$NMAC" -eq 0 ] || echo "- fora da rodada por regra do nó: $NMAC arquivos mac-only (lista em $MACX; rodam no MBP/mini)"
     [ "$NHELD" -eq 0 ] || echo "- fora da rodada porque o nó não os recebe: $NHELD arquivos ($NHF barrados pelo filtro do rsync, $NHP com lista de telefones/CPFs; lista em $HELDX; rodam no mini)"
     [ -z "$STALE_NOTE" ] || echo "- ATENÇÃO: $STALE_NOTE"
     echo "- instalado no nó: $DEPLOY"
-    echo "- lotes que NÃO rodaram: $SKIPLIST (motivo na tabela). Sem eles a suíte NÃO foi completa: não há veredito verde, não há comparação com a noite anterior e a linha de base não foi tocada"
+    echo "- lotes que NÃO rodaram: $SKIPLIST (motivo na tabela). Sem eles a suíte NÃO foi completa: não há veredito verde, não há total da suíte e a linha de base não foi tocada"
+    echo "- $PCMP"
+    echo "- $BUDGETTXT"
+    echo "- $PACE"
     echo "- só dos $NRAN lotes que rodaram (parcial, NÃO é o total da suíte): $TOTAL testes ($PASSED passaram, $FAILED falharam, $ERRORS erros, $SKIPPED pulados, $XF xfail, $XP xpass); relógio total ${WALL} s"
     echo "- isolamento: \`GTN-ISO: ${ISO_LINE:-vazio}\`; teto: \`GTN-CAP: ${FIRSTCAP:-vazio}\`; $EGLINE"
+    if [ -s "$NEW" ]; then echo; echo "Falhas novas nos arquivos que rodaram (até 30 de $(wc -l < "$NEW" | tr -d ' ')):"; head -n 30 "$NEW" | jq -r . | sed 's/^/  - /'; fi
     echo; emit_table; echo
     echo "Saída por lote: $LOGDIR/$DAY.bNN.out; junta: $OUT; ids reprovados dos lotes que rodaram (um JSON por linha; \`jq -r .\` para ler): $CUR"; } > "$REPORT"
-  finish FALHOU "$NSKIP de $NB lotes NÃO RODARAM ($SKIPLIST); parcial dos $NRAN que rodaram: $TOTAL testes, $FAILED falhas, $ERRORS erros" 1
+  finish FALHOU "$NSKIP de $NB lotes NÃO RODARAM ($SKIPLIST); parcial dos $NRAN que rodaram: $TOTAL testes, $FAILED falhas, $ERRORS erros ($NEWTXT)" 1
 fi
 case "$ISO_LINE" in isolado*) ;; *) finish FALHOU "ATENÇÃO: nenhum lote trouxe a linha de prova do isolamento (GTN-ISO: '${ISO_LINE:-vazio}'); resultado descartado" 1 ;; esac
 [ "$TOTAL" -ge "$MIN_TOTAL" ] || finish FALHOU "total implausível ($TOTAL testes < $MIN_TOTAL em $NB lotes)" 1
