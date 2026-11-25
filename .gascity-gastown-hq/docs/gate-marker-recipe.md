@@ -2,12 +2,14 @@
 
 ## Contents
 
-• Correct submission · `-t chore`, NOT `-t task` (this line used to be wrong)
+• Correct submission · Label-routed markers (oracle-wa's shape) · `-t chore`, NOT `-t task` (this line used to be wrong)
 
-The quality-gate-dispatcher extracts fields from the marker's **DESCRIPTION**
-(via `extract()` = `grep "^field:"` on `$DESC`), NOT from labels. A marker with
-the fields only in labels → BEAD_ID/BRANCH extract EMPTY → author unresolvable →
-`gate-status:deferred` forever (observed: wa-14w76/wa-oly1 stuck 2026-06-25).
+The quality-gate guard and dispatcher extract fields from the marker's **DESCRIPTION**
+(via `extract()` = `grep "^field:"` on `$DESC`) first. A marker with the fields
+nowhere (neither in the description nor in the labels below) → BEAD_ID/BRANCH
+extract EMPTY → the guard refuses it (`gate-status:error`, with a "Gate guard
+rejected marker:" comment). See "Label-routed markers" for the one case where the
+labels are read.
 
 ## Correct submission
 
@@ -55,6 +57,29 @@ the guard itself rejected as born-queued has no such stamps and must go back as
 `ready` (`label remove gate-status:error && label add gate-status:ready`), so the
 guard vets it; the rejection comment on the marker says the same.
 
+## Label-routed markers (oracle-wa's shape)
+
+A marker whose routing sits ONLY in its labels (`branch:<val>`, `source-bead:<val>`,
+`bead-rig:<val>`) and whose description is prose has no `branch:` / `bead_id:` /
+`rig:` line. Both the guard (ga-nt0b18f) and the dispatcher (ga-9oxah) read such a
+field from its label, and only when its description line is empty or missing, so
+a canonical marker is untouched and the description always wins. In the guard,
+what a label supplies goes through Step 4's validators like any other value
+(branch characters, bead-id shape, registered rig), and each fallback is logged
+("resolved from label"), so the sweep log names the bead.
+
+The point is that the guard vets the marker before the dispatcher reviews it:
+dedup, the E11 caps, the A/B base test, the bash 3.2 and skill-token checks and
+the hard checks 2b-2e (step 2e draws and records the bead's arm). Before
+ga-nt0b18f the guard refused such a marker WITHOUT a comment (the comment waited
+for `bead_id`), `gate-recovery-watchdog` took the `gate-status:error` for a
+transient one and re-queued it (`grw-requeue:1`), and the dispatcher reviewed it
+with none of that. The 24/11 arm-coverage alarm saw it as 8 of 71 beads without
+an arm, all `crew/oracle/*`. The description is still the canonical channel; `/gate-done`
+writes it, and `author:` / `base_commit:` / `bead_rig:` have no label to fall
+back to (the claim receipt records `base_commit: unknown`). Step 4b dedup also
+reads description lines only, so a label-routed sibling is never superseded.
+
 ## `-t chore`, NOT `-t task` (this line used to be wrong)
 
 `bd create` defaults to `task`. **Every marker the gate has actually processed is
@@ -83,6 +108,7 @@ guard carries this same warning at L3480).
 
 The DESCRIPTION fields are MANDATORY: `branch:`, `bead_id:`, `author:`,
 `base_commit:`, `rig:`, `bead_rig:`. Labels (`source-bead:`, `branch:`,
-`bead-rig:`) are secondary/display, but real markers carry them — include them.
+`bead-rig:`) are the fallback routing and the painel's display (see "Label-routed
+markers"); real markers carry them — include them.
 Safety net: a `crew/wa-worker/*` branch with unresolved author now falls back to
 author=mayor (commit d8f2d7e7a) — but the description must still carry branch+bead_id.

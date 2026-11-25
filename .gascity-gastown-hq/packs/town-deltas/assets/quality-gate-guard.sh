@@ -901,9 +901,12 @@ is_newest_alive_in_group() {
 # otherwise surface a closed bead as a false candidate). Matches on the
 # DESCRIPTION's branch:/rig: lines, not the branch: LABEL — the label is
 # display-only for the painel (docs/gate-marker-recipe.md), the description is
-# the field every real consumer (including this guard's own Step 3 extract())
-# trusts. Exact string equality, not substring/regex — avoids fix/ga-1
-# matching fix/ga-10.
+# the field every real consumer trusts FIRST (this guard's own Step 3 extract()
+# reads a label only for a field whose description line is empty, ga-nt0b18f).
+# So a sibling routed by labels alone (oracle-wa's shape) has no `branch:` line
+# here and is never superseded by this function: "cannot confirm" fails toward
+# NOT superseding, the same rule as the rig below. Exact string equality, not
+# substring/regex — avoids fix/ga-1 matching fix/ga-10.
 #
 # ga-95tq3p: rig is REQUIRED to match too, not just branch. Two different
 # repos (e.g. gascity and whatsapp_automation) can legitimately carry a
@@ -8260,6 +8263,7 @@ log "Marker $MARKER_ID claimed."
 
 # ── Step 3: Extract metadata from marker description ─────────────────────────
 
+# SELFTEST-EXTRACT marker-fields: BEGIN
 DESC=$(printf '%s\n' "$MARKER" | jq -r '.description // ""')
 
 # ga-7zjs1 (ported from the dispatcher's extract, quality-gate-dispatcher.sh): a
@@ -8285,10 +8289,52 @@ RIG=$(extract "rig")
 # then degrades to its pre-existing RIG_PATH/GC_CITY behavior, unchanged.
 BEAD_RIG=$(extract "bead_rig")
 
+# ga-nt0b18f: format-tolerant fallback, the twin of the dispatcher's ga-9oxah block. A marker submitted OUTSIDE /gate-done's
+# canonical writer (oracle-wa's shape: the routing sits in the LABELS branch:<val>, source-bead:<val>, bead-rig:<val> and the
+# description is human prose) has no branch:/bead_id:/rig: line, so the extract() calls above come back empty. The guard used
+# to answer that with Step 4's refusal, and Step 4 only left its refusal comment (the one gate-recovery-watchdog matches on) when
+# bead_id was known: the marker sat in gate-status:error looking transient, gate-recovery-watchdog re-queued it (grw-requeue:1 on every one of
+# them) and the dispatcher, which reads the same labels, reviewed it without anything the guard runs after Step 4: 4b dedup,
+# the E11 caps, the A/B base test, the bash 3.2 and skill-token checks and hard checks 2b-2e, so step 2e never recorded an arm
+# (the 24/11 alarm gate:3o-estado-braco-nao-gravado: 8 of 71 beads, all crew/oracle/*). Strictly additive: a field is read from
+# its label only when its description line came back empty, so a canonical marker is untouched, and what a label supplies goes
+# through Step 4's validators like any other value. Same labels and same precedence as the dispatcher's on purpose: the guard
+# has to vet what the dispatcher is going to review. Run VERBATIM by gate-guard-label-fallback.selftest.sh, which stubs only
+# log/warn: keep the sentinels, keep the block self-contained (it needs $MARKER, $MARKER_ID, log and warn).
+if [ -z "$BRANCH" ] || [ -z "$BEAD_ID" ] || [ -z "$RIG" ]; then
+  # vazio → nenhum rótulo: os campos seguem vazios e o Step 4 recusa o marker, agora com comentário; falhou/ilegível (jq) → a mesma lista vazia, com WARN no log: "não consegui ler os rótulos" não é "o marker não tem rótulos", e o Step 4 recusa do mesmo jeito (inerte: o marker fica em error, reenviável, nunca vetado às cegas)
+  MARKER_LABEL_LIST=$(printf '%s\n' "$MARKER" | jq -r '(.labels // [])[]' 2>/dev/null) || {
+    warn "marker $MARKER_ID: its labels could not be read (not a JSON list?), so the field fallback has nothing to read and Step 4 judges the description alone (ga-nt0b18f)"
+    MARKER_LABEL_LIST=""
+  }
+  label_fallback() {
+    # $1 = label prefix with its colon ("branch:"): the first matching label, prefix stripped. The colon anchors the boundary
+    # ("source-bead:" never matches "source-bead-type:"); the terminator is there because a no-match grep exits 1 and pipefail
+    # would abort the sweep on the first marker without that label (ga-7zjs1, the class extract() above already guards)
+    printf '%s\n' "$MARKER_LABEL_LIST" | grep -E "^$1" | head -1 | sed "s/^$1//" || true
+  }
+  if [ -z "$BRANCH" ]; then
+    LBL_VAL=$(label_fallback "branch:")
+    if [ -n "$LBL_VAL" ]; then BRANCH="$LBL_VAL"; log "  branch: description had none — resolved from label 'branch:$LBL_VAL' (ga-nt0b18f)."; fi
+  fi
+  if [ -z "$BEAD_ID" ]; then
+    LBL_VAL=$(label_fallback "source-bead:")
+    if [ -n "$LBL_VAL" ]; then BEAD_ID="$LBL_VAL"; log "  bead_id: description had none — resolved from label 'source-bead:$LBL_VAL' (ga-nt0b18f)."; fi
+  fi
+  if [ -z "$RIG" ]; then
+    LBL_VAL=$(label_fallback "bead-rig:")
+    # "unknown" is /gate-done's could-not-determine sentinel, not a rig name: taken as one it would make Step 4's validate_rig
+    # refuse a marker (no rig: line, bead-rig:unknown) that this guard accepted, with an empty RIG, before the fallback existed
+    if [ -n "$LBL_VAL" ] && [ "$LBL_VAL" != "unknown" ]; then RIG="$LBL_VAL"; log "  rig: description had none — resolved from label 'bead-rig:$LBL_VAL' (ga-nt0b18f)."; fi
+  fi
+fi
+# SELFTEST-EXTRACT marker-fields: END
+
 log "  branch=$BRANCH  bead_id=$BEAD_ID  marker_author=${MARKER_AUTHOR:-<EMPTY>}  rig=$RIG  bead_rig=${BEAD_RIG:-<EMPTY>}"
 
 # ── Step 4: Input validation (security: prevent injection) ──────────────────
 
+# SELFTEST-EXTRACT field-validation: BEGIN
 VALIDATION_OK=true
 
 if [ -z "$BRANCH" ] || ! validate_branch "$BRANCH"; then
@@ -8330,16 +8376,23 @@ if [ "$VALIDATION_OK" = "false" ]; then
   # ga-jhyu: atomic single-label transition; do NOT close (gate-health-monitor.py
   # pages a human on OPEN gate-status:error markers — see Vector A note).
   set_gate_status "$MARKER_ID" "error"
-  # Bug 3 fix: no Mayor mail — autonomous gate; author gets nudge if resolvable
-  if [ -n "$BEAD_ID" ]; then
-    bd -C "$GC_CITY" comment "$MARKER_ID" "Gate guard rejected marker: invalid/unsafe field values.
+  # Bug 3 fix: no Mayor mail — autonomous gate; gate-recovery-watchdog nudges the author (else mails the Mayor) off this comment
+  # ga-nt0b18f: the comment goes on the MARKER, which is always known, so it no longer waits for BEAD_ID. It used to, and a
+  # marker whose description and labels named no bead was refused in silence: nothing on it said "the guard rejected this on
+  # purpose", gate-recovery-watchdog took the error for a transient one and re-queued it, and the dispatcher reviewed it without
+  # the guard's checks (the watchdog does not re-queue a marker whose comments carry this one, ga-hp4wrx: it tells the author, or
+  # the Mayor, instead). Keep the opening words as they are: the watchdog matches on them. A comment that cannot be written is
+  # said in the log, not swallowed.
+  bd -C "$GC_CITY" comment "$MARKER_ID" "Gate guard rejected marker: invalid/unsafe field values.
 branch='$BRANCH' bead_id='$BEAD_ID' rig='$RIG'
-Marker set to gate-status:error. Fix the marker fields and re-submit." 2>/dev/null || true
-  fi
+The guard reads branch, bead_id and rig from the description lines branch:, bead_id: and rig: and, for each one whose line is empty or missing, from the labels branch:, source-bead: and bead-rig:. An empty value above means neither had it; a value that is not empty failed validation.
+Marker set to gate-status:error. Fix the marker fields and re-submit." 2>/dev/null \
+    || warn "could not write the refusal comment on $MARKER_ID: gate-recovery-watchdog will take this error for a transient one and may re-queue the marker past the guard (ga-nt0b18f)"
   # wa-uthi: non-terminal (marker error, fixable + resubmittable) — no push. Logged only.
   log "SUPPRESSED PUSH (wa-uthi non-terminal): invalid marker $MARKER_ID — security check failed (gate-status:error)."
   exit 1
 fi
+# SELFTEST-EXTRACT field-validation: END
 
 # ── Step 4b (ga-o64z1): supersede duplicate open markers for the same branch — rig-scoped since ga-95tq3p ──
 # BUG: every /gate-done resubmission (gate FAIL -> author fixes -> resubmit)
@@ -8678,6 +8731,7 @@ fi
 # resolve_bead_city's prefix heuristic still picks the most-likely store, and a
 # wrong guess only leaves the bead attached — exactly the pre-fix behavior, never
 # worse.
+# SELFTEST-EXTRACT rig-path: BEGIN
 RIG_PATH=""
 # ga-07509: on failure RIG_LIST_JSON stays "" (never the look-alike-valid
 # '{}' the old fallback produced). Every fallback below already treats
@@ -8716,6 +8770,7 @@ if [ -n "${BEAD_RIG:-}" ] && [ "$BEAD_RIG" != "unknown" ]; then
     | jq -r --arg r "$BEAD_RIG" '.rigs[] | select(.name == $r or .prefix == $r) | .path' 2>/dev/null | head -1 || echo "")
 fi
 [ -d "$BEAD_RIG_PATH" ] || BEAD_RIG_PATH=""
+# SELFTEST-EXTRACT rig-path: END
 
 # resolve_bead_city <bead-id> — echo the store dir whose Dolt DB owns <bead-id>.
 # Probes BEAD_RIG_PATH first (wa-2ddr0: the bead's own resolved store — the
