@@ -323,6 +323,24 @@ outer-repo work; the deployed tree agents actually run from is
           echo "WARNING: plist-comment-lint.py could not decide (rc=$_plist_rc); push allowed."
         fi
       fi
+      # ga-d3ryi7k: a plist that does not set BEADS_DOLT_AUTO_START=0 lets a bd that launchd starts raise a Dolt of its
+      # own (the 23/11 decoy: three rigs read "database not found" and the Pilot read its lanes as full for ~12 h).
+      # Same tradeoff as the lint above, on the same list of touched plists: rc 1 (one lacks it) blocks; rc 2 (could not
+      # decide: python or git trouble; a plist that does not parse is the lint above's to refuse) warns and lets the
+      # push through. Paths under docs/launchd-archive/ and internal/templates/ are skipped by the lint itself.
+      if [[ ${#plist_touch[@]} -gt 0 ]] && command -v python3 &>/dev/null; then
+        _benv_rc=0
+        python3 .gascity-gastown-hq/scripts/plist-bd-env-lint.py "${plist_touch[@]}" || _benv_rc=$?
+        if [[ "$_benv_rc" == "1" ]]; then
+          echo ""
+          echo "BLOCKED: the plist above does not set BEADS_DOLT_AUTO_START=0 in its EnvironmentVariables."
+          echo "A bd that launchd starts without it can start a Dolt of its own (the 23/11 decoy). Add it, or run:"
+          echo "  python3 .gascity-gastown-hq/scripts/plist-bd-env-lint.py --fix <file>"
+          exit 1
+        elif [[ "$_benv_rc" != "0" ]]; then
+          echo "WARNING: plist-bd-env-lint.py could not decide (rc=$_benv_rc); push allowed."
+        fi
+      fi
     fi
   fi
 

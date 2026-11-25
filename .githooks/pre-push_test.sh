@@ -806,6 +806,102 @@ local_sha=$(get_sha HEAD)
 assert_block "Conflicting identity lands on the inert side" run_hook_as "GC_AGENT=gastown.mayor GC_TEMPLATE=gastown.dog" "refs/heads/$DEFAULT_BRANCH" "$local_sha" "refs/heads/$DEFAULT_BRANCH" "$remote_sha"
 cleanup
 
+# Tests 52-58: the BEADS_DOLT_AUTO_START=0 plist guard (ga-d3ryi7k). The hook runs the lint by its repo-relative path
+# (.gascity-gastown-hq/scripts/plist-bd-env-lint.py), so each repo below carries the real one on its default branch.
+BENV_BAD='<?xml version="1.0" encoding="UTF-8"?>
+<plist version="1.0"><dict>
+  <key>Label</key><string>com.test.bad</string>
+  <key>EnvironmentVariables</key><dict>
+    <key>PATH</key><string>/usr/bin</string>
+  </dict>
+</dict></plist>'
+BENV_GOOD='<?xml version="1.0" encoding="UTF-8"?>
+<plist version="1.0"><dict>
+  <key>Label</key><string>com.test.good</string>
+  <key>EnvironmentVariables</key><dict>
+    <key>PATH</key><string>/usr/bin</string>
+    <key>BEADS_DOLT_AUTO_START</key><string>0</string>
+  </dict>
+</dict></plist>'
+ZERO_SHA="0000000000000000000000000000000000000000"
+seed_benv_lint() {
+  mkdir -p .gascity-gastown-hq/scripts
+  cp "$SCRIPT_DIR/../.gascity-gastown-hq/scripts/plist-bd-env-lint.py" .gascity-gastown-hq/scripts/
+  git add .gascity-gastown-hq/scripts/plist-bd-env-lint.py && git commit -m "seed the plist lint" >/dev/null 2>&1
+  git push origin "$DEFAULT_BRANCH" >/dev/null 2>&1
+}
+
+echo "Test 52: New branch adds a plist WITHOUT BEADS_DOLT_AUTO_START=0 — blocked, and says which variable"
+setup_repos; cd "$TMPDIR/local"; seed_benv_lint
+git checkout -b fix/ga-99999-plist-bad >/dev/null 2>&1
+commit_file ".gascity-gastown-hq/scripts/com.test.bad.plist" "$BENV_BAD" "add a plist without the variable"
+local_sha=$(get_sha HEAD)
+assert_block_says "Plist without the variable is refused, naming it" "BEADS_DOLT_AUTO_START" run_hook "refs/heads/fix/ga-99999-plist-bad" "$local_sha" "refs/heads/fix/ga-99999-plist-bad" "$ZERO_SHA"
+cleanup
+
+echo "Test 53: New branch adds a plist WITH BEADS_DOLT_AUTO_START=0 — allowed"
+setup_repos; cd "$TMPDIR/local"; seed_benv_lint
+git checkout -b fix/ga-99999-plist-good >/dev/null 2>&1
+commit_file ".gascity-gastown-hq/scripts/com.test.good.plist" "$BENV_GOOD" "add a plist with the variable"
+local_sha=$(get_sha HEAD)
+assert_pass "Plist with the variable allowed" run_hook "refs/heads/fix/ga-99999-plist-good" "$local_sha" "refs/heads/fix/ga-99999-plist-good" "$ZERO_SHA"
+cleanup
+
+echo "Test 54: A plist under docs/launchd-archive/ (a retired job nothing loads) without the variable — allowed"
+setup_repos; cd "$TMPDIR/local"; seed_benv_lint
+git checkout -b fix/ga-99999-plist-archive >/dev/null 2>&1
+commit_file ".gascity-gastown-hq/docs/launchd-archive/retired/com.test.old.plist" "$BENV_BAD" "archive a retired plist"
+local_sha=$(get_sha HEAD)
+assert_pass "Archived plist is not judged" run_hook "refs/heads/fix/ga-99999-plist-archive" "$local_sha" "refs/heads/fix/ga-99999-plist-archive" "$ZERO_SHA"
+cleanup
+
+echo "Test 55: One good and one bad plist in the same push — blocked, and only the bad one is named"
+setup_repos; cd "$TMPDIR/local"; seed_benv_lint
+git checkout -b fix/ga-99999-plist-two >/dev/null 2>&1
+commit_file ".gascity-gastown-hq/scripts/com.test.good.plist" "$BENV_GOOD" "good"
+commit_file ".gascity-gastown-hq/scripts/com.test.bad.plist" "$BENV_BAD" "bad"
+local_sha=$(get_sha HEAD)
+assert_block_says "The bad plist decides" "FAIL .gascity-gastown-hq/scripts/com.test.bad.plist" run_hook "refs/heads/fix/ga-99999-plist-two" "$local_sha" "refs/heads/fix/ga-99999-plist-two" "$ZERO_SHA"
+out=$(run_hook "refs/heads/fix/ga-99999-plist-two" "$local_sha" "refs/heads/fix/ga-99999-plist-two" "$ZERO_SHA" 2>&1 || true)
+if [[ "$out" == *"FAIL .gascity-gastown-hq/scripts/com.test.good.plist"* ]]; then
+  echo "  FAIL: the compliant plist was named as a failure"; FAIL=$((FAIL + 1))
+else
+  echo "  PASS: the compliant plist is not named"; PASS=$((PASS + 1))
+fi
+cleanup
+
+echo "Test 56: The lint is not in the repo (cannot decide) — the push is allowed, with a warning: a missing tool never blocks"
+setup_repos; cd "$TMPDIR/local"
+git checkout -b fix/ga-99999-plist-nolint >/dev/null 2>&1
+commit_file ".gascity-gastown-hq/scripts/com.test.bad.plist" "$BENV_BAD" "bad plist, no lint available"
+local_sha=$(get_sha HEAD)
+assert_pass "Undecided is not a block" run_hook "refs/heads/fix/ga-99999-plist-nolint" "$local_sha" "refs/heads/fix/ga-99999-plist-nolint" "$ZERO_SHA"
+out=$(run_hook "refs/heads/fix/ga-99999-plist-nolint" "$local_sha" "refs/heads/fix/ga-99999-plist-nolint" "$ZERO_SHA" 2>&1 || true)
+if [[ "$out" == *"plist-bd-env-lint.py could not decide"* ]]; then
+  echo "  PASS: the warning says the lint could not decide"; PASS=$((PASS + 1))
+else
+  echo "  FAIL: expected the 'could not decide' warning"; FAIL=$((FAIL + 1))
+fi
+cleanup
+
+echo "Test 57: Modifying an EXISTING plist so it still lacks the variable — blocked (a touched plist is judged, not only a new one)"
+setup_repos; cd "$TMPDIR/local"; seed_benv_lint
+commit_file ".gascity-gastown-hq/scripts/com.test.old.plist" "$BENV_BAD" "a plist that predates the rule"
+git push --no-verify origin "$DEFAULT_BRANCH" >/dev/null 2>&1   # --no-verify: the very hook under test would refuse this push
+git checkout -b fix/ga-99999-plist-touch >/dev/null 2>&1
+commit_file ".gascity-gastown-hq/scripts/com.test.old.plist" "${BENV_BAD/\/usr\/bin/\/usr\/bin:\/bin}" "touch it"
+local_sha=$(get_sha HEAD)
+assert_block "Touching a plist that lacks the variable is refused" run_hook "refs/heads/fix/ga-99999-plist-touch" "$local_sha" "refs/heads/fix/ga-99999-plist-touch" "$ZERO_SHA"
+cleanup
+
+echo "Test 58: The same bad plist, with GT_SKIP_ORPHAN_TREE_GUARD=1 — allowed (the one documented bypass covers this block too)"
+setup_repos; cd "$TMPDIR/local"; seed_benv_lint
+git checkout -b fix/ga-99999-plist-skip >/dev/null 2>&1
+commit_file ".gascity-gastown-hq/scripts/com.test.bad.plist" "$BENV_BAD" "bad plist, bypass"
+local_sha=$(get_sha HEAD)
+assert_pass "Bypass allows it" env GT_SKIP_ORPHAN_TREE_GUARD=1 bash -c 'echo "$0 $1 $2 $3" | bash "$4" origin' "refs/heads/fix/ga-99999-plist-skip" "$local_sha" "refs/heads/fix/ga-99999-plist-skip" "$ZERO_SHA" "$HOOK"
+cleanup
+
 echo ""
 echo "=== Results: $PASS passed, $FAIL failed ==="
 if [[ $FAIL -gt 0 ]]; then
