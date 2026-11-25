@@ -6507,6 +6507,114 @@ inflight_slots_from_query() {
   echo "$slots"
 }
 
+# ── ga-d3ryi7k: a lane the Pilot could not MEASURE is not a lane that is FULL ───────────────────────────────────────────────────────
+# At the 23/11 23:41 reboot a bd started by launchd (no BEADS_DOLT_AUTO_START=0 in its plist) raised a decoy Dolt for three rigs; every read of
+# those rigs answered "database not found", the story:in-flight count above failed, inflight_slots_from_query (ga-1fssl) reported 0 slots in both
+# lanes, and the sweep left at "Both lanes full ... Pilot backing off" BEFORE the node pass: the Hetzner node sat idle ~12 h. ga-1fssl is right for
+# the MINI: a count nobody could read never frees a slot there. What was wrong is that "could not read" was spelled "full" and the node paid for it.
+# The three helpers below keep ga-1fssl as it is for the mini and give the node pass its turn back; they are called from the both-lanes-0 branch (Step 1).
+
+# inflight_slots_unmeasured <max_slots> <in_flight_read>
+# The probe budget of a lane whose in-flight count could NOT be read in full this sweep: 1 when what WAS read still leaves room in the lane, else 0.
+# Only the node-only pass spends it (nothing goes to the mini on it), so an unreadable count never frees the mini (inflight_slots_from_query keeps
+# answering 0 for that); it only keeps the node reachable, one bead per lane per sweep. A number that is not a number is "cannot tell" and gets 0
+# (the inert answer). 10# keeps a count with a leading zero from being read as octal.
+inflight_slots_unmeasured() {
+  local max_slots="$1" read_count="$2" slots
+  case "$max_slots" in ''|*[!0-9]*) echo 0; return ;; esac
+  case "$read_count" in ''|*[!0-9]*) echo 0; return ;; esac
+  slots=$((10#$max_slots - 10#$read_count))
+  [ "$slots" -gt 1 ] && slots=1
+  [ "$slots" -lt 0 ] && slots=0
+  echo "$slots"
+}
+
+# _pilot_lanes_unmeasured — called ONCE per sweep, only when both lanes show 0 slots AND IN_FLIGHT_QUERY_OK != 1 (the story:in-flight count of at
+# least one store could not be read). Returns 0 or 1 and never aborts the sweep (every read and write below is best-effort and says so):
+#   1. says NOT MEASURED (log, and an alarm that does not repeat every sweep) — never "full";
+#   2. the mini keeps ZERO slots: SMALL_SLOTS/BIG_SLOTS stay 0 unless the node-only pass takes over, and then nothing goes to the mini on them;
+#   3. with PILOT_NODE_FIRST=on outside DRY_RUN (the same two conditions as the disk and RAM floors), the HQ's own in-flight read answered
+#      (IN_FLIGHT_HQ_QUERY_OK: the node writes its claims in the HQ Dolt, so an HQ that did not answer is no place to continue; the 23/11 decoy broke the
+#      redirect rigs and left the HQ readable) and at least one lane that what WAS read leaves room in, the sweep goes on as the NODE-ONLY pass
+#      (_PILOT_NODE_ONLY=1) with one probe slot per such lane; the pass itself (node verdict, node capacity, the apply's rc 12) decides what really goes
+#      to the node. PILOT_LANES_UNMEASURED_NODE_PASS=off turns this step off (back to backing off).
+# Returns 0 = the sweep goes on as a node-only pass, 1 = the caller backs off (with the honest wording).
+# The alarm: a streak counter in PILOT_LANES_UNMEASURED_STATE (consecutive sweeps without a measurement); the notify goes out on the
+# PILOT_LANES_UNMEASURED_ALERT_AFTER-th (default 2: one failed read is a blip the log already shows) and on every PILOT_LANES_UNMEASURED_ALERT_EVERY-th
+# (default 6; sweeps start ~12-16 min apart, see ga-h6trx3 above, so ~1.2-1.6 h), and on EVERY sweep while the counter cannot be written (an alarm with no memory repeats instead of falling
+# silent). DRY_RUN writes no state and sends nothing (it "makes zero state changes", like every mutation here).
+_pilot_lanes_unmeasured() {
+  local _lu_f="${PILOT_LANES_UNMEASURED_STATE:-${GC_CITY:-/nonexistent}/.gc/pilot-lanes-unmeasured.count}"
+  local _lu_after="${PILOT_LANES_UNMEASURED_ALERT_AFTER:-2}" _lu_every="${PILOT_LANES_UNMEASURED_ALERT_EVERY:-6}"
+  local _lu_n=0 _lu_s _lu_b _lu_go=0 _lu_hq=1 _lu_streak="" _lu_why _lu_wrote=1
+  case "$_lu_after" in ''|*[!0-9]*|0) _lu_after=2 ;; esac
+  case "$_lu_every" in ''|*[!0-9]*|0) _lu_every=6 ;; esac
+  # vazio/ilegível (teto ou contagem que não é número) → 0 vaga de sondagem: o inerte é recuar
+  _lu_s=$(inflight_slots_unmeasured "${MAX_SMALL:-}" "${IN_FLIGHT_SMALL:-}") || _lu_s=0
+  _lu_b=$(inflight_slots_unmeasured "${MAX_BIG:-}" "${IN_FLIGHT_BIG:-}") || _lu_b=0
+  case "$_lu_s" in ''|*[!0-9]*) _lu_s=0 ;; esac
+  case "$_lu_b" in ''|*[!0-9]*) _lu_b=0 ;; esac
+  # só "1" (a leitura do HQ respondeu) conta: vazio/nunca posto → não sei se o HQ respondeu, e falhou (0) → o Dolt do HQ não está respondendo; nos dois casos NÃO continua (o estado inerte), e o recuo diz
+  if [ "${IN_FLIGHT_HQ_QUERY_OK:-}" != "1" ]; then _lu_hq=0; fi
+  if [ "${PILOT_NODE_FIRST:-off}" = "on" ] && [ "${DRY_RUN:-0}" != "1" ] && [ "${PILOT_LANES_UNMEASURED_NODE_PASS:-on}" = "on" ] && [ "$_lu_hq" = 1 ] \
+     && { [ "$_lu_s" -gt 0 ] || [ "$_lu_b" -gt 0 ]; }; then
+    _lu_go=1
+  fi
+  if [ "${DRY_RUN:-0}" != "1" ]; then
+    # vazio (sem arquivo: a 1a varredura sem medida) → 0; falhou/ilegível (conteúdo que não é número) → 0 também: conta como a primeira e AVISA (o estado inerte de um alarme é falar)
+    if [ -f "$_lu_f" ]; then
+      _lu_n=$(cat "$_lu_f" 2>/dev/null) || _lu_n=""
+      case "$_lu_n" in ''|*[!0-9]*) warn "ga-d3ryi7k: contador de varreduras sem medida ilegível em $_lu_f — recomeço de 0"; _lu_n=0 ;; esac
+    fi
+    _lu_n=$((10#$_lu_n + 1))
+    _lu_streak="${_lu_n}a varredura seguida sem medida; "
+    if ! { mkdir -p "$(dirname "$_lu_f")" && echo "$_lu_n" > "$_lu_f"; } 2>/dev/null; then
+      _lu_wrote=0
+      warn "ga-d3ryi7k: não consegui gravar o contador de varreduras sem medida em $_lu_f — o alarme conta sem memória nesta varredura"
+    fi
+    if [ "$_lu_n" -eq "$_lu_after" ] || [ $((_lu_n % _lu_every)) -eq 0 ] || [ "$_lu_wrote" = 0 ]; then
+      notify -t "⚠️ Pilot: faixas NÃO MEDIDAS" -p 4 "Pilot: a leitura de story:in-flight falhou (${_lu_n}a varredura seguida). Isto NÃO é faixa cheia: o mini não recebe despacho novo e $([ "$_lu_go" = 1 ] && echo 'o nó Hetzner segue na passada só-nó' || echo 'a varredura recua'). Causa provável: Dolt isca ou porta velha numa rig (dolt-port-pin-guard.log). Ver pilot-dispatcher.log (ga-d3ryi7k)." 2>/dev/null || true
+    fi
+  fi
+  if [ "$_lu_go" = 1 ]; then
+    SMALL_SLOTS="$_lu_s"; BIG_SLOTS="$_lu_b"; _PILOT_NODE_ONLY=1
+    log "ga-d3ryi7k: faixas NÃO MEDIDAS — a leitura de story:in-flight falhou nesta varredura (${_lu_streak}isto NÃO é 'cheia'). O mini fica SEM despacho novo (nada vai ao mini), mas a varredura segue na passada só-nó e o nó Hetzner tem a sua vez (vagas de sondagem, do que se leu: small=$_lu_s big=$_lu_b)."
+    return 0
+  fi
+  if [ "$_lu_hq" != 1 ]; then
+    _lu_why="a leitura do próprio HQ falhou (o Dolt do HQ não responde): o nó escreve as claims lá, então não há passada do nó para rodar"
+  elif [ "${PILOT_NODE_FIRST:-off}" != "on" ] || [ "${DRY_RUN:-0}" = "1" ] || [ "${PILOT_LANES_UNMEASURED_NODE_PASS:-on}" != "on" ]; then
+    _lu_why="sem passada do nó para rodar (PILOT_NODE_FIRST=${PILOT_NODE_FIRST:-off}, DRY_RUN=${DRY_RUN:-0}, PILOT_LANES_UNMEASURED_NODE_PASS=${PILOT_LANES_UNMEASURED_NODE_PASS:-on})"
+  else
+    _lu_why="o que se leu já enche as duas pistas (small=$_lu_s big=$_lu_b de vaga de sondagem)"
+  fi
+  log "ga-d3ryi7k: faixas NÃO MEDIDAS — a leitura de story:in-flight falhou nesta varredura (${_lu_streak}isto NÃO é 'cheia'). O Pilot recua nesta varredura: $_lu_why."
+  return 1
+}
+
+# _pilot_lanes_unmeasured_clear — called when the in-flight count WAS read in full: ends the streak (removes the counter), says so in the log, and,
+# when the streak had reached the alarm (PILOT_LANES_UNMEASURED_ALERT_AFTER), or the counter cannot be read (an alarm that may have gone out gets its all-clear),
+# sends the all-clear. Silent when there is no counter. DRY_RUN touches nothing.
+# Always returns 0.
+_pilot_lanes_unmeasured_clear() {
+  local _lc_f="${PILOT_LANES_UNMEASURED_STATE:-${GC_CITY:-/nonexistent}/.gc/pilot-lanes-unmeasured.count}" _lc_n _lc_after="${PILOT_LANES_UNMEASURED_ALERT_AFTER:-2}"
+  case "$_lc_after" in ''|*[!0-9]*|0) _lc_after=2 ;; esac
+  [ "${DRY_RUN:-0}" != "1" ] || return 0
+  [ -f "$_lc_f" ] || return 0
+  # vazio/ilegível (conteúdo que não é número) → "?": a recuperação é dita do mesmo jeito, e como não sei se houve alarme, o aviso de recuperação sai (um alarme sem fim é pior que um aviso a mais)
+  _lc_n=$(cat "$_lc_f" 2>/dev/null) || _lc_n="?"
+  case "$_lc_n" in ''|*[!0-9]*) _lc_n="?" ;; esac
+  if rm -f "$_lc_f" 2>/dev/null; then
+    log "ga-d3ryi7k: as faixas voltaram a ser MEDIDAS (a leitura de story:in-flight respondeu) depois de ${_lc_n} varredura(s) sem medida."
+    if [ "$_lc_n" = "?" ] || [ "$_lc_n" -ge "$_lc_after" ]; then
+      notify -t "✅ Pilot: faixas medidas de novo" -p 2 "Pilot: a leitura de story:in-flight voltou a responder depois de ${_lc_n} varredura(s) sem medida (ga-d3ryi7k)." 2>/dev/null || true
+    fi
+  else
+    warn "ga-d3ryi7k: as faixas voltaram a ser medidas, mas não consegui apagar o contador $_lc_f — a próxima varredura sem medida soma sobre ele"
+  fi
+  return 0
+}
+
 # ga-mfeip: fan-out to HQ + every non-HQ rig store so rig-native in-flight beads
 # (wa-*/ps-*/lx-* prefixes, living in rig-own Dolt stores) are visible to the
 # dead-worker detector and busy-builder tracker below. Attach _rig_db to each bead
@@ -6522,9 +6630,12 @@ inflight_slots_from_query() {
 # this fetch already redirects to /dev/null — and only bites once real
 # in-flight count crosses it, exactly when this counter matters most.
 IN_FLIGHT_QUERY_OK=1
+# ga-d3ryi7k: IN_FLIGHT_QUERY_OK is the union of every store; this one is the HQ alone (a rig that cannot be read is not the HQ that cannot be read)
+IN_FLIGHT_HQ_QUERY_OK=1
 if ! _IN_FLIGHT_HQ=$(bd -C "$GC_CITY" list --json -l "story:in-flight" -n 0 2>/dev/null \
     | jq --arg db "$GC_CITY" '[ .[] | . + {"_rig_db": $db} ]' 2>/dev/null); then
   IN_FLIGHT_QUERY_OK=0
+  IN_FLIGHT_HQ_QUERY_OK=0
   _IN_FLIGHT_HQ="[]"
   warn "story:in-flight query failed for HQ ($GC_CITY) — in-flight lane capacity is UNKNOWN this sweep; failing safe as fully-occupied (no dispatch) rather than guessing empty (root-class:error-vs-empty, ga-1fssl)."
 fi
@@ -10223,6 +10334,8 @@ SMALL_SLOTS=$(inflight_slots_from_query "$IN_FLIGHT_QUERY_OK" "$MAX_SMALL" "$IN_
 BIG_SLOTS=$(inflight_slots_from_query "$IN_FLIGHT_QUERY_OK" "$MAX_BIG" "$IN_FLIGHT_BIG")
 
 log "Available slots: small=$SMALL_SLOTS  big=$BIG_SLOTS"
+# ga-d3ryi7k: a sweep that READ every in-flight store ends the "lanes not measured" streak (counter + all-clear); one that did not is handled at the both-lanes-0 branch below.
+[ "$IN_FLIGHT_QUERY_OK" != "1" ] || _pilot_lanes_unmeasured_clear || true
 
 # ── ga-8c1 AC5: gate reviewer slot readout (observability) ───────────────────
 # Surface free gate-reviewer slots every sweep so the log shows the WHOLE
@@ -12001,6 +12114,14 @@ _pilot_heal_hq_blind_routes
 _pilot_pool_topup "wa-worker" "${PILOT_WA_WORKER_MAX:-4}"
 _pilot_pool_topup "ps-worker" "${PILOT_PS_WORKER_MAX:-2}"
 
+# ga-d3ryi7k: the lanes show 0 slots, but when the cause is a count that could not be READ (IN_FLIGHT_QUERY_OK != 1, ga-1fssl) that is "not measured", not "full", and the node
+# pass further down (after the candidate scan) must not pay for it: on 23/11 it did, ~12 h. _pilot_lanes_unmeasured says so, alarms (with a cooldown) and, with PILOT_NODE_FIRST=on
+# outside DRY_RUN, turns this sweep into the node-only pass with one probe slot per lane that what WAS read leaves room in (the mini keeps none); when it cannot, both stay at 0 and
+# the exit below is taken with honest wording. The worker-pool top-up above ran either way (it does not depend on this count). A lane that was read never gets in here.
+if [ "$SMALL_SLOTS" -eq "0" ] && [ "$BIG_SLOTS" -eq "0" ] && [ "${IN_FLIGHT_QUERY_OK:-1}" != "1" ]; then
+  _pilot_lanes_unmeasured || true
+fi
+
 if [ "$SMALL_SLOTS" -eq "0" ] && [ "$BIG_SLOTS" -eq "0" ]; then
   # ga-8c1 AC5: even when backing off, surface the dispatch-queue depth so every
   # sweep's log reports what's waiting (cheap count — no full tier scan).
@@ -12051,10 +12172,17 @@ if [ "$SMALL_SLOTS" -eq "0" ] && [ "$BIG_SLOTS" -eq "0" ]; then
     log "Dispatch queue: story:approved waiting/eligible counts UNKNOWN this sweep (HQ query failed) — not claiming lane capacity is or isn't the blocker."
   elif [ "$ELIGIBLE_APPROVED" = "0" ]; then
     log "Dispatch queue: ${WAITING_APPROVED} story:approved waiting (HQ), 0 eligible — all parked on purpose (veto label), not lane capacity."
+  elif [ "${IN_FLIGHT_QUERY_OK:-1}" != "1" ]; then
+    # ga-d3ryi7k: the lanes were not measured, so "both lanes full" would be a claim nobody checked
+    log "Dispatch queue: ${WAITING_APPROVED} story:approved waiting, ${ELIGIBLE_APPROVED} eligible (HQ; lanes NOT MEASURED this sweep — none can dispatch)."
   else
     log "Dispatch queue: ${WAITING_APPROVED} story:approved waiting, ${ELIGIBLE_APPROVED} eligible (HQ; both lanes full — none can dispatch this sweep)."
   fi
-  log "Both lanes full (small=${IN_FLIGHT_SMALL_CLASSIFIED}/${MAX_SMALL} unclassified_lane=${IN_FLIGHT_UNCLASSIFIED}, big=${IN_FLIGHT_BIG}/${MAX_BIG}). Pilot backing off."
+  if [ "${IN_FLIGHT_QUERY_OK:-1}" != "1" ]; then
+    log "Lanes NOT MEASURED (what could be read: small=${IN_FLIGHT_SMALL_CLASSIFIED}/${MAX_SMALL} unclassified_lane=${IN_FLIGHT_UNCLASSIFIED}, big=${IN_FLIGHT_BIG}/${MAX_BIG}; the story:in-flight count of at least one store could not be read, and that is not 'full'). Pilot backing off (ga-d3ryi7k)."
+  else
+    log "Both lanes full (small=${IN_FLIGHT_SMALL_CLASSIFIED}/${MAX_SMALL} unclassified_lane=${IN_FLIGHT_UNCLASSIFIED}, big=${IN_FLIGHT_BIG}/${MAX_BIG}). Pilot backing off."
+  fi
   exit 0
 fi
 
