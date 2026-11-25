@@ -2299,7 +2299,7 @@ gc_variable_session_count() {
     printf '%s' "$GC_VARIABLE_SESSION_COUNT_OVERRIDE"
     return 0
   fi
-  timeout 10 gc --city "$GC_CITY" session list --json 2>/dev/null \
+  timeout "${PILOT_SESSION_LIST_TIMEOUT_SECS:-30}" gc --city "$GC_CITY" session list --json 2>/dev/null \
     | jq '[.sessions[]? | select((.template=="wa-worker" or .template=="ps-worker" or .template=="gate-reviewer") and (.state=="active" or .state=="creating"))] | length' 2>/dev/null \
     || echo "0"
 }
@@ -3224,7 +3224,7 @@ _pilot_pool_target_has_live_session() {
     gastown.dog|gastown.dog-*|wa-worker|wa-worker-*|ps-worker|ps-worker-*) : ;;
     *) return 1 ;;
   esac
-  _plts_count=$(timeout 10 gc --city "$GC_CITY" session list --json 2>/dev/null \
+  _plts_count=$(timeout "${PILOT_SESSION_LIST_TIMEOUT_SECS:-30}" gc --city "$GC_CITY" session list --json 2>/dev/null \
     | jq --arg t "$_plts_target" \
         '[.sessions[]? | select((.template // "") == $t and (.state=="active" or .state=="creating"))] | length' \
         2>/dev/null)
@@ -13406,7 +13406,7 @@ _pilot_node_pick_alias() {
   case "$_pk_eff" in ''|*[!0-9]*|0*) return 1 ;; esac
   [ "${#_pk_eff}" -le 3 ] || return 1
   # vazio/falhou (rc≠0, sem saída, não JSON, ok:false) → sem alias: lista que não deu para ler NÃO é "sem sessões" — seria escolher dog-remote-1 às cegas, por cima de uma sessão que talvez já o ocupe
-  _pk_json=$(gc_json_or_unknown timeout 20 gc --city "$GC_CITY" session list --json) || return 1
+  _pk_json=$(gc_json_or_unknown timeout "${PILOT_SESSION_LIST_TIMEOUT_SECS:-30}" gc --city "$GC_CITY" session list --json) || return 1
   # sem o array .sessions (ou não-array) → sem alias: `.sessions[]?` sobre um não-array dá "zero sessões", que é exatamente a leitura errada acima
   printf '%s' "$_pk_json" | jq -e '.sessions | type == "array"' >/dev/null 2>&1 || return 1
   # vazio = nenhum alias livre dentro do teto (→ sem alias); jq que falha → sem alias
@@ -13527,7 +13527,7 @@ _pilot_kimi_pick_alias() {
   local _kp_json="" _kp_pick="" _kp_template="${1:-$PILOT_KIMI_TEMPLATE}"
   _PKL_ALIAS=""; _PKL_ALIAS_STATE=""; _PKL_PICK_UNREAD=0
   # vazio/falhou (rc≠0, sem saída, não JSON, ok:false) → sem vaga: lista que não se leu NÃO é "sem sessões"; devolve 1 como a vaga ocupada (nada é escrito), mas _PKL_PICK_UNREAD=1 diz que foi leitura que não rendeu, para o chamador não a contar como espera calma
-  _kp_json=$(gc_json_or_unknown timeout 20 gc --city "$GC_CITY" session list --json) || { _PKL_PICK_UNREAD=1; return 1; }
+  _kp_json=$(gc_json_or_unknown timeout "${PILOT_SESSION_LIST_TIMEOUT_SECS:-30}" gc --city "$GC_CITY" session list --json) || { _PKL_PICK_UNREAD=1; return 1; }
   printf '%s' "$_kp_json" | jq -e '.sessions | type == "array"' >/dev/null 2>&1 || { _PKL_PICK_UNREAD=1; return 1; }
   # UMA vaga Kimi cobre os dois rigs; o alias acordado/aberto é só o do template pedido. vazio = vaga ocupada (→ 1); jq que falha → 1
   _kp_pick=$(printf '%s' "$_kp_json" | jq -r --arg kt "$PILOT_KIMI_TEMPLATE" --arg kw "$PILOT_KIMI_WA_TEMPLATE" --arg want "$_kp_template" '
@@ -14021,7 +14021,7 @@ _pilot_node_remote_open() {
   # decisão que não saiu, sessão que não abriu, aviso que falhou: nada disso é do alias, outro alias não conserta). Zerado na entrada: ler o que sobrou de outra chamada nunca vira "busy".
   _PNR_FAIL=""; _PNR_FAIL_ALIAS=""
   [ -n "$_ro_rig" ] || _ro_rig="$_ro_store"
-  _ro_sj=$(gc_json_or_unknown timeout 20 gc --city "$GC_CITY" session list --json) || _ro_sj=""
+  _ro_sj=$(gc_json_or_unknown timeout "${PILOT_SESSION_LIST_TIMEOUT_SECS:-30}" gc --city "$GC_CITY" session list --json) || _ro_sj=""
   if ! printf '%s' "$_ro_sj" | jq -e '.sessions | type == "array"' >/dev/null 2>&1; then
     _ro_step="não consegui ler a lista de sessões"
   else

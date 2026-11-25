@@ -201,7 +201,7 @@ fi
 echo "Scenario H: drift-guard — helper defined, timeout-bounded, and wired independently of the REUSE branch"
 has() { local pat="$1" desc="$2"; if grep -Eq "$pat" "$DISPATCHER"; then ok "$desc"; else bad "$desc — pattern not found: $pat"; fi; }
 has '_pilot_pool_target_has_live_session\(\) \{'                          "helper _pilot_pool_target_has_live_session is defined"
-has 'timeout 10 gc --city "\$GC_CITY" session list --json'                "gc session list call stays timeout-bounded (never blocks a sweep on a wedged gc)"
+has 'timeout "\${PILOT_SESSION_LIST_TIMEOUT_SECS:-30}" gc --city "\$GC_CITY" session list --json'                "gc session list call stays timeout-bounded (never blocks a sweep on a wedged gc)"
 has '_pilot_pool_target_has_live_session "\$_SLING_TARGET"'               "dispatch_one() call site invokes the helper with \$_SLING_TARGET"
 
 # The pool-template case list here must stay in sync with gt-4st3n's
