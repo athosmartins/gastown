@@ -2,7 +2,8 @@
 
 ## Contents
 
-• O que é · Causa · O que apaga e o que nunca apaga · Correção na origem (WA) · Instalar (Mayor, depois do merge) · Provar · Medido, lido no código, não testado
+• O que é · Causa · O que apaga e o que nunca apaga · Correção na origem (WA) — falta fazer
+• Instalar (Mayor, depois do merge) · Provar · Medido, lido no código, não testado
 
 Bead ga-xjv29mb (achado do Mayor, 19/11). **Mergeado ≠ vivo: nada aqui está instalado** — o `.plist` só passa a valer depois do `launchctl bootstrap` abaixo. **A causa fica no rig WA e ainda não foi corrigida**: o janitor é só a rede de segurança (seção "Correção na origem").
 
