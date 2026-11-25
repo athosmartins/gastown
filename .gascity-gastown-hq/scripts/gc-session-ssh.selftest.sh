@@ -699,7 +699,21 @@ g_memgate() {
   mode uso; pv gate m </dev/null; [ $RC = 1 ] && [ "$(jq -r .ok "$T/out")" = false ]
   ok $? "memgate: com o Athos usando o gate recusa como antes (a memória não muda a presença)"
   mode livremem; pv --dry-run gate m </dev/null; [ $RC = 2 ] && [ "$(jq -r .ok "$T/out")" = null ]
-  ok $? "memgate: o dry-run continua sem consultar nada (exit 2, ok null)"
+  ok $? "memgate: o dry-run continua sem consultar nada (exit 2, ok null)"  # --- ga-dzexg3i: o oráculo diz o que o start diria. Host com worktree_rigs e SEM o helper do wt-add executável recusa o gate (o Pilot só olhava "libera" e dava a bead como avisada para um alias que nunca existiu) ---
+  local hb="$T/mbp-helper.sh"; printf '#!/bin/sh\nexit 0\n' > "$hb"; chmod +x "$hb"; rm -f "$T/mbp-nohelper.sh"
+  cfgm "$(jq -nc --arg b "$hb" '{worktree_rigs:{w:"gascity"},worktree_bin:$b}')"; fresh; mode livre; pv gate m </dev/null
+  [ $RC = 0 ] && [ "$(jq -r .ok "$T/out")" = true ]; ok $? "memgate: helper do worktree presente e executável no host → o gate libera como antes (rc=$RC $(head -c 200 "$T/out"))"
+  cfgm "$(jq -nc --arg b "$T/mbp-nohelper.sh" '{worktree_rigs:{w:"gascity"},worktree_bin:$b}')"; fresh; mode livre; pv gate m </dev/null
+  [ $RC = 1 ] && [ "$(jq -r .ok "$T/out")" = false ] && jq -e '.reason | contains("helper do worktree") and contains("worktree_bin")' "$T/out" >/dev/null; ok $? "memgate: helper AUSENTE no host (o incidente do MBP) → o gate recusa dizendo o helper e a chave, mesmo com o Athos fora e a máquina saudável (rc=$RC $(head -c 260 "$T/out"))"
+  printf '#!/bin/sh\nexit 0\n' > "$T/mbp-noexec.sh"; chmod -x "$T/mbp-noexec.sh"; cfgm "$(jq -nc --arg b "$T/mbp-noexec.sh" '{worktree_rigs:{w:"gascity"},worktree_bin:$b}')"; fresh; mode livre; pv gate m </dev/null
+  [ $RC = 1 ] && [ "$(jq -r .ok "$T/out")" = false ]; ok $? "memgate: helper que existe mas NÃO é executável também recusa (rc=$RC)"
+  FAKE_SSH_FAIL_HOST=fakembp pv gate m </dev/null; [ $RC = 1 ] && [ "$(jq -r .ok "$T/out")" = false ]; ok $? "memgate: ssh que não responde ao conferir o helper recusa ('não sei' não é 'libera') (rc=$RC $(head -c 200 "$T/out"))"
+  cfgm "$(jq -nc --arg b "$T/mbp-nohelper.sh" '{worktree_bin:$b}')"; fresh; mode livre; pv gate m </dev/null
+  [ $RC = 0 ] && [ "$(jq -r .ok "$T/out")" = true ] && nossh; ok $? "memgate: host SEM worktree_rigs não confere helper nenhum (nada de ssh a mais): o gate segue liberando (rc=$RC)"
+  cfgm "$(jq -nc --arg b "$T/mbp-nohelper.sh" '{worktree_rigs:{w:"gascity"},worktree_bin:$b}')"; fresh; mode uso; pv gate m </dev/null
+  [ $RC = 1 ] && has "$T/out" "Athos está no MBP" && nossh; ok $? "memgate: com o Athos usando, a recusa de presença vem primeiro e nem toca o host (rc=$RC)"
+  cfgm "$(jq -nc --arg b "$T/mbp-nohelper.sh" '{worktree_rigs:{w:"gascity"},worktree_bin:$b}')"; fresh; mode livre; pv --dry-run gate m </dev/null
+  [ $RC = 2 ] && nossh; ok $? "memgate: o dry-run segue sem consultar nem o helper (exit 2, sem ssh)"
 }
 
 # ---------- gui: o tmux do MBP nasce num LaunchAgent do domínio gráfico (ga-w7qwl1.1.8) — as 7 condições do Mayor (19/10) viram casos ----------
@@ -1197,6 +1211,20 @@ g_wt() {
   wtmirror; w=$(WTD dog-remote-gaaddfail); FAKE_RG_FAIL=add pv start dog-remote-gaaddfail < <(req cat "$eng"); [ $RC = 1 ] && has "$T/err" 'wt-add' && sess_zero dog-remote-gaaddfail && [ ! -e "$w" ]; ok $? "wt: wt-add que falha derruba o start dizendo qual: nada aberto, nenhum worktree (rc=$RC)"
   cfg 3 25 '{"worktree_prepare":false,"worktree_rigs":{"dog":"gascity"}}'; wtmirror; w=$(WTD dog-remote-gaaddfail2); FAKE_RG_FAIL=add pv start dog-remote-gaaddfail2 < <(req cat "$eng")
   [ $RC = 1 ] && has "$T/err" 'wt-add' && sess_zero dog-remote-gaaddfail2 && [ ! -e "$w" ]; ok $? "wt: ...e MESMO sem o preparo (worktree_prepare=false, onde nada mais confere a pasta) o wt-add que falha derruba o start: a pasta não vira um diretório comum com a sessão dentro (rc=$RC)"; cfg 3 25 "$base"
+  # --- ga-dzexg3i: a recusa do preparo vira evento refused (o placar lê events.jsonl); helper do wt-add por host (worktree_bin/worktree_git), padrão = o do Hetzner ---
+  refev() { jq -e -s --arg s "$1" 'map(select(.session==$s and .event=="refused" and (.reason | startswith("preparo do worktree")))) | length == 1' "$ev" >/dev/null 2>&1; }  # refev SESSÃO: exatamente 1 refused de preparo dela
+  wtmirror; FAKE_RG_FAIL=add pv start dog-remote-gaadevt01 < <(req cat "$eng"); [ $RC = 1 ] && refev dog-remote-gaadevt01; ok $? "wt: wt-add que falha grava o evento refused 'preparo do worktree' (antes só ia ao log e o placar via 0 recusa) (rc=$RC)"
+  wtmirror; rm -f "$RGBIN"; pv start dog-remote-gamissbin1 < <(req cat "$eng"); [ $RC = 1 ] && has "$T/err" 'wt-add' && sess_zero dog-remote-gamissbin1 && refev dog-remote-gamissbin1; ok $? "wt: helper do wt-add AUSENTE no host (o incidente do MBP, 24-25/11) recusa o start e grava refused (rc=$RC $(head -c 160 "$T/err"))"; install_rg
+  local mb="$RH/mbp-wt" nm1=dog-remote-gambp0001 nm2=dog-remote-gambp0002
+  mkdir -p "$mb/bin"; cp "$RGBIN" "$mb/bin/mbp-git.sh"; ln -sfn "$RH/gt-remote/git" "$mb/git"; rm -f "$RGBIN"
+  cfg 3 25 "$(jq -nc --arg b "$mb/bin/mbp-git.sh" --arg g "$mb/git" '{worktree_prepare:true,worktree_rigs:{dog:"gascity"},worktree_bin:$b,worktree_git:$g}')"; : > "$T/rg.log"
+  fresh; pv --dry-run start $nm1 < <(req cat "$eng"); [ $RC = 0 ] && jq -e --arg b "$mb/bin/mbp-git.sh" --arg p "$mb/git/gascity/wt/$nm1" '(.worktree.add | startswith($b + " wt-add")) and (.worktree.rm | startswith($b + " wt-rm")) and .worktree.path == $p and .work_dir == $p' "$T/out" >/dev/null; ok $? "wt: worktree_bin/worktree_git no dry-run: wt-add, wt-rm e a pasta saem do helper e da raiz do host (rc=$RC)"
+  wtmirror; rm -f "$RGBIN"; pv start $nm1 < <(req cat "$eng"); [ $RC = 0 ] && [ -d "$mb/git/gascity/wt/$nm1" ] && has "$T/rg.log" "wt-add gascity $nm1 GR=$mb/git"; ok $? "wt: ...e o start usa o helper do host (o do Hetzner nem existe aqui) com GT_REMOTE_GIT = worktree_git (rc=$RC $(head -c 160 "$T/err"))"
+  : > "$T/rg.log"; pv stop $nm1 </dev/null; [ $RC = 0 ] && has "$T/rg.log" "wt-rm gascity $nm1 GR=$mb/git"; ok $? "wt: ...e o stop recolhe pelo MESMO helper (rc=$RC)"
+  for v in 'worktree_bin="rel/helper.sh"' 'worktree_bin=5' 'worktree_bin="/a b"' 'worktree_bin="-x"' 'worktree_git="rel/git"' 'worktree_git=["/x"]' 'worktree_git="/"'; do
+    cfg 3 25 "$base"; jq ".hosts.a.${v%%=*}=${v#*=}" "$T/cfg.json" > "$T/cfg2.json" && mv "$T/cfg2.json" "$T/cfg.json"; fresh; pv start dog-remote-gacf0002 < <(req cat "$eng"); [ $RC = 1 ] && has "$T/err" "'${v%%=*}'" && nossh; ok $? "wt: $v → config recusada dizendo a chave, sem ssh (rc=$RC)"
+  done
+  cfg 3 25 "$base"; install_rg
   wtmirror '{"disableAllHooks":true}'; w=$(WTD dog-remote-gaguard01); pv start dog-remote-gaguard01 < <(req cat "$eng"); [ $RC = 1 ] && has "$T/err" 'disableAllHooks' && sess_zero dog-remote-gaguard01; ok $? "wt: o guarda de clone olha o worktree JÁ criado: disableAllHooks que vem no checkout recusa a sessão real (rc=$RC $(head -c 200 "$T/err"))"
   [ ! -e "$w" ] && has "$T/rg.log" "wt-rm gascity dog-remote-gaguard01"; ok $? "wt: ...e o worktree que o start tinha criado é desfeito (wt-rm)"
   wtmirror; w=$(WTD dog-remote-gaprep001); cp "$RH/.claude.json" "$T/claude.ok"; printf '{ nao e json' > "$RH/.claude.json"; pv start dog-remote-gaprep001 < <(req cat "$eng")
@@ -1845,6 +1873,9 @@ case "$shn" in [1-9]*) ;; *) shard_bad;; esac
   mutant memgate "mem_free_pct com zeros demais vira número" 's/ and len(mem_raw) <= 3//'
   mutant memgate "mem_free_pct não é repassado no JSON do gate" 's/, "mem_free_pct": mem}/}/'
   mutant memgate "mem_free_pct ilegível vira 0 (um número inventado)" 's/\(mem = int(mem_raw) if .*\) else None$/\1 else 0/'
+  mutant memgate "o gate não confere o helper do worktree (libera um host que o start recusa)" 's/^        why = wt_helper_gap(cfg)$/        why = ""/'
+  mutant memgate "helper ausente conta como presente (rc do teste ignorado)" 's/^    if rc:$/    if False:/'
+  mutant memgate "host que não responde ao conferir o helper vira 'libera'" 's/^        return f"não consegui conferir o helper do worktree em/        return ""  # f"não consegui conferir o helper do worktree em/'
   mutant dry "lançador de pool do mini não vira claude" 's/^    command = re.sub(.*$/    command = m.map(req.get("command") or "")/'
   mutant dry "lançador de pool: sem a âncora do começo (env X=1 <lançador> também vira)" 's/re.sub("^" + /re.sub("" + /'
   mutant dry "lançador de pool: sem a fronteira do fim (<lançador>.bak também vira)" 's/ + r"(?=\\s|\$)", "claude"/ + "", "claude"/'
@@ -1926,6 +1957,10 @@ case "$shn" in [1-9]*) ;; *) shard_bad;; esac
   mutant wt "o desfazer não tira o branch novo" 's/\[ "\$wub" = "\$wum" \] \&\& git/false \&\& git/'
   mutant wt "o desfazer não chama o wt-rm" 's/^  GT_REMOTE_GIT=@GR@ @BIN@ wt-rm @RIG@ @NAME@ >\/dev\/null 2>\&1$/  :/'
   mutant wt "aviso do git em stderr é jogado fora (parte da árvore não lida vira 'limpo')" 's/status --porcelain 2>"\$wse"/status --porcelain 2>\/dev\/null/'
+  mutant wt "o preparo recusado só vai ao log, sem o evento refused (o placar não vê)" 's/^            cfg.event("refused", name, reason="preparo do worktree: "/            pass  # cfg.event("refused", name, reason="preparo do worktree: "/'
+  mutant wt "worktree_bin ignorado: o helper volta a ser o do Hetzner" 's/^            "bin": cfg.wt_bin}/            "bin": f"{cfg.home}\/gt-remote\/bin\/hetzner-remote-git.sh"}/'
+  mutant wt "worktree_git ignorado: a raiz dos clones volta a ser a do Hetzner" 's/^    gr = cfg.wt_git  #/    gr = f"{cfg.home}\/gt-remote\/git"  #/'
+  mutant wt "worktree_bin mal formado vira 'ausente' em silêncio (padrão do Hetzner)" 's|self.wt_bin = self.need(h, "worktree_bin", PATH_RE, self.home + |self.wt_bin = (h.get("worktree_bin") if isinstance(h.get("worktree_bin"), str) and PATH_RE.fullmatch(h.get("worktree_bin")) else None) or (self.home + |'
   mutant acct "claude_account nunca lido (a sessão nunca ganha a chave)" 's/^        if ca is not None:$/        if False:/'
   mutant acct "claude_account de qualquer forma aceito" 's/            if not isinstance(ca, dict) or set(ca) - {"current_file", "secret"}:/            if False:/'
   mutant acct "sessão que não é claude também ganha a chave (e toca no cofre)" 's/^    elif cfg.acct and runs_claude(p\["command"\]):$/    elif cfg.acct:/'

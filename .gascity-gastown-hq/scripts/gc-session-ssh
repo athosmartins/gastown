@@ -12,7 +12,7 @@ USO
   gc-session-ssh --dry-run start <sessão> < start.json     (ou GC_SSH_DRYRUN=1) imprime o que rodaria no host e NÃO conecta
                                                            (`would_refuse`: a recusa LOCAL de política — sessão real sem liberação… — que o start de verdade daria; null = nenhuma recusa
                                                            local, NÃO "o start vai ser aceito": o sha e o --selfcheck do guarda só rodam no host, no start de verdade)
-  gc-session-ssh gate <host>      (não é do protocolo do engine) o veredito de um start AGORA nesse host, sem abrir nada: JSON, exit 0/1 (com `ok`: cap, slot_cap e, no host com presença, mem_free_pct: a memória livre %, 0..100, ou null)
+  gc-session-ssh gate <host>      (não é do protocolo do engine) o veredito de um start AGORA nesse host, sem abrir nada: JSON, exit 0/1 (com `ok`: cap, slot_cap e, no host com presença, mem_free_pct: a memória livre %, 0..100, ou null; host com worktree_rigs: recusa (exit 1) se o helper do wt-add não está executável no host, que é onde o start morreria — ga-dzexg3i)
 
 O QUE FAZ
   Cada operação é UM ssh (ControlMaster em ~/.ssh/cm, o mesmo do mbp-run.sh) que leva um script sh pela entrada padrão (o start são
@@ -93,7 +93,7 @@ CONFIGURAÇÃO  $GC_SSH_CONFIG ou <cidade>/.gc/session-ssh.json (cidade = pasta 
   obrigatórios: ssh (alias/destino), cap (teto de sessões deste host, contado SÓ no socket do provider, separado do teto do mini),
   remote_root (= --remote-root do remote-bundle-build.py), remote_home. opcionais: socket (gc-remote), connect_timeout (10),
   timeout (25) e start_timeout (60) em segundos, list_cache_s (10; inteiro de 0 a 120, 0 desliga o cache do list-running INTEIRO; qualquer outra coisa recusa a config), list_down_cache_s (30; inteiro de 0 a 60, 0 desliga só o cache do host fora; qualquer outra coisa recusa a config), ssh_opts [], env_allow [], mini_home, real_sessions_released_by (ver acima), worktree_prepare (true/false; padrão true, e false num host
-  com presence_gate: preparo do worktree no start, ver acima; texto no lugar de true/false é erro de configuração), worktree_rigs ({"dog": "gascity"}: papel → rig dos worktrees que o provider cria e recolhe; ausente = nenhum). Só para o notebook (MBP): path_extra [] (dirs
+  com presence_gate: preparo do worktree no start, ver acima; texto no lugar de true/false é erro de configuração), worktree_rigs ({"dog": "gascity"}: papel → rig dos worktrees que o provider cria e recolhe; ausente = nenhum), worktree_bin e worktree_git (ga-dzexg3i: caminho ABSOLUTO do helper do wt-add/wt-rm no host e da raiz dos clones dele, GT_REMOTE_GIT; ausentes = o layout do Hetzner, <remote_home>/gt-remote/bin/hetzner-remote-git.sh e <remote_home>/gt-remote/git; o MBP, que não tem esse helper, aponta o próprio; texto fora do formato de caminho recusa a config nomeando a chave). Só para o notebook (MBP): path_extra [] (dirs
   absolutos à frente do PATH do ssh sem login: /opt/homebrew/bin), presence_gate (true), gate_cmd ([lista]), presence_lib (padrão
   <remote_home>/gt-remote/bin/mbp-presence.sh), watch_s (5), sleeps (true), session_env ({"path": [pastas], "claude": "/abs/claude"}; OBRIGATÓRIO em
   host que dorme, ga-w7qwl1.1.5: o claude da sessão roda com ZDOTDIR=<remote_root>/zdot e CLAUDE_ENV_FILE=<remote_root>/zdot/env.sh do bundle
@@ -531,6 +531,11 @@ class Cfg:
         if not isinstance(wr, dict) or not all(isinstance(k, str) and ROLE_RE.fullmatch(k) and isinstance(v, str) and RIG_RE.fullmatch(v) for k, v in wr.items()):
             raise Fail(f"host {self.host}: 'worktree_rigs' tem que ser um objeto papel → rig, ex.: {{'dog': 'gascity'}} (papel [a-z][a-z0-9-]*, rig no formato do hetzner-remote-git.sh) ({wr!r})")
         self.wt_rigs = wr
+        # onde o host guarda o helper do wt-add/wt-rm e a raiz dos clones (ga-dzexg3i): o padrão é o layout do HETZNER (servidor do espelho), então sem estas chaves nada muda. O MBP não tem esse helper
+        # (3 starts de wa-worker-remote-mbp-* morreram em 24-25/11 com "hetzner-remote-git.sh: No such file"); ele aponta as chaves para o helper PRÓPRIO. Ausente → o padrão; mal formada (não-texto, caminho
+        # relativo, com espaço ou aspas) → recusa a config, nunca "ausente": o padrão silencioso reabriria a falha que a chave existe para evitar.
+        self.wt_bin = self.need(h, "worktree_bin", PATH_RE, self.home + "/gt-remote/bin/hetzner-remote-git.sh")
+        self.wt_git = self.need(h, "worktree_git", PATH_RE, self.home + "/gt-remote/git")
         # conta Claude do pool do mini (ga-2hd02v.7.1): ausente → nada muda; presente e mal formada → recusa a config, nunca "ausente" (a chave que faltasse abriria a sessão no login fixo do nó, em silêncio)
         ca = h.get("claude_account")
         self.acct = None
@@ -928,6 +933,20 @@ def gate_check(cfg: Cfg) -> dict:
     return {"host": cfg.host, "ok": True, "reason": "Athos fora e MBP saudável", "slot_cap": int(cap), "mem_free_pct": mem}
 
 
+def wt_helper_gap(cfg: Cfg) -> str:
+    """ga-dzexg3i: "" = o start não vai esbarrar no helper do worktree; texto = por que vai. Só host com `worktree_rigs` (os outros não chamam o wt-add). O helper tem que ser executável NO host: sem ele o start
+    morre em exit 13 e o Pilot, que só leu "libera", dava a bead como "avisada" para um alias que nunca existiu. Host mudo ou que não responde → texto também: "não sei" não é "libera"."""
+    if not cfg.wt_rigs:
+        return ""
+    try:
+        rc, _out, err = remote(cfg, f"[ -x {q(cfg.wt_bin)} ]", 10)  # 10 s: o oráculo (mbp-node-capacity.py) dá 25 s ao gate inteiro, e a checagem de presença já gastou parte
+    except (Unreachable, Fail) as e:
+        return f"não consegui conferir o helper do worktree em {cfg.host} ({e})"
+    if rc:
+        return f"o host {cfg.host} não tem o helper do worktree executável ({cfg.wt_bin}): o start dos papéis de worktree_rigs morreria no wt-add; aponte worktree_bin para o helper do host"
+    return ""
+
+
 def op_gate(cfg: Cfg, name: str, args: list, dry: bool) -> int:
     """`gate <host>`: o veredito de um start AGORA, sem abrir nada (para o teto/escala do pool): JSON, exit 0 libera, 1 recusa,
     2 = não consultei (dry-run num host com regra de presença: um GC_SSH_DRYRUN vazado num pool não pode virar "sempre libera")."""
@@ -936,6 +955,10 @@ def op_gate(cfg: Cfg, name: str, args: list, dry: bool) -> int:
                          ensure_ascii=False, sort_keys=True))
         return 2
     v = gate_check(cfg) if cfg.gate else {"host": cfg.host, "ok": True, "slot_cap": None, "reason": "este host não tem regra de presença"}
+    if v["ok"]:
+        why = wt_helper_gap(cfg)
+        if why:  # o host diria "libera" e o start morreria no wt-add (MBP, 24-25/11): o veredito tem que ser o do start
+            v = {"host": cfg.host, "ok": False, "reason": why, "slot_cap": None}
     print(json.dumps(dict(v, cap=cfg.cap), ensure_ascii=False, sort_keys=True))
     return 0 if v["ok"] else 1
 
@@ -1011,9 +1034,9 @@ def managed_worktree(cfg: Cfg, name: str) -> dict:
         return {}
     if not WT_NAME_RE.fullmatch(name):
         raise Fail(f"sessão {name!r}: o nome vira o do worktree e do branch worker/<nome> e tem que casar [a-z0-9][a-z0-9._-]{{0,60}} (minúsculas) — o papel {m.group(1)!r} tem worktree do provider")
-    gr = f"{cfg.home}/gt-remote/git"  # o padrão do hetzner-remote-git.sh (GT_REMOTE_GIT), passado explícito nas chamadas
+    gr = cfg.wt_git  # padrão {home}/gt-remote/git = o do hetzner-remote-git.sh (GT_REMOTE_GIT); host com helper próprio (MBP) aponta worktree_git, passado explícito nas chamadas
     return {"rig": rig, "git": gr, "path": f"{gr}/{rig}/wt/{name}", "repo": f"{gr}/{rig}/repo.git", "branch": f"worker/{name}",
-            "bin": f"{cfg.home}/gt-remote/bin/hetzner-remote-git.sh"}
+            "bin": cfg.wt_bin}
 
 
 def wt_fill(tmpl: str, wt: dict, name: str) -> str:
@@ -1171,6 +1194,8 @@ T has-session -t @TGT@ 2>/dev/null || { echo "sessão @NAME@ terminou logo após
             cfg.event("refused", name, reason="gui_agent: " + " ".join(err.split())[:200])
         if rc == EX_PREP:
             cfg.log(f"start {name} recusado: preparo do worktree falhou: {err[:300]}")
+            # ga-dzexg3i: a recusa do preparo só ia para o log; o placar (session-host-scoreboard.py) lê events.jsonl, onde essa recusa não aparecia
+            cfg.event("refused", name, reason="preparo do worktree: " + " ".join(err.split())[:200])
         raise Fail(err or f"start de {name} recusado em {cfg.host} (rc={rc}, sem mensagem)")
     if rc != 0:
         raise Fail(f"start em {cfg.host} falhou (rc={rc}): {err or out or 'sem mensagem'}")
