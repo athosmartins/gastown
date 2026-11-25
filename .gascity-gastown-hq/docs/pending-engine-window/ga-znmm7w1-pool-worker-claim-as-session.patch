@@ -1,9 +1,9 @@
 diff --git a/cmd/gc/builtin_worker_prompt_claim_actor_test.go b/cmd/gc/builtin_worker_prompt_claim_actor_test.go
 new file mode 100644
-index 0000000000..0175b56e59
+index 0000000000..e2ab6e1fe2
 --- /dev/null
 +++ b/cmd/gc/builtin_worker_prompt_claim_actor_test.go
-@@ -0,0 +1,156 @@
+@@ -0,0 +1,261 @@
 +package main
 +
 +import (
@@ -49,9 +49,11 @@ index 0000000000..0175b56e59
 +	return out
 +}
 +
-+// claimCommandRE finds every `bd update <id> --claim ...` the prompt tells the agent to run or documents: from "bd update" to the
-+// first backtick, ';' or end of line after it.
-+var claimCommandRE = regexp.MustCompile("bd update <id> --claim[^`;\n]*")
++// claimCommandRE finds every `bd update <bead> --claim ...` the prompt tells the agent to run or documents, whatever the bead
++// placeholder is spelled (<id>, $ID, "$BEAD", ...) and whatever precedes "bd update" (`gc bd update` included): from "bd update" to
++// the first backtick, ';' or end of line after it. The bead token must not start with '-', so prose that names the flag alone
++// ("`bd update --claim` is a CAS") is not a command.
++var claimCommandRE = regexp.MustCompile("bd update +[^ `;\n-][^ `;\n]* +--claim[^`;\n]*")
 +
 +func claimCommandsIn(text string) []string {
 +	var out []string
@@ -61,9 +63,32 @@ index 0000000000..0175b56e59
 +	return out
 +}
 +
++// unrecognisedClaimLines returns every line that mentions a `bd update ... --claim` the regexp above did not capture and that is not
++// a shell comment (a comment line is never run, so it can say "bd update --claim" in prose). Such a line is a claim spelled in a way
++// the claim tests cannot see: a silent fail-open if it were ignored, so the test fails on it and someone must teach the regexp.
++func unrecognisedClaimLines(text string) []string {
++	var out []string
++	for _, line := range strings.Split(text, "\n") {
++		if !strings.Contains(line, "bd update") || !strings.Contains(line, "--claim") {
++			continue
++		}
++		if claimCommandRE.MatchString(line) || strings.HasPrefix(strings.TrimSpace(line), "#") {
++			continue
++		}
++		out = append(out, strings.TrimSpace(line))
++	}
++	return out
++}
++
++// claimBeadTokenRE is the "bd update <bead>" head of a claim command; runClaim swaps the placeholder for a real id.
++var claimBeadTokenRE = regexp.MustCompile("^(bd update +)[^ ]+")
++
 +func TestBuiltinWorkerPromptsClaimAsSessionActor(t *testing.T) {
 +	for _, p := range builtinWorkerPromptsForClaimTest(t) {
 +		t.Run(p.name, func(t *testing.T) {
++			if lines := unrecognisedClaimLines(p.text); len(lines) > 0 {
++				t.Errorf("claim spelled in a way the claim tests do not recognise (teach claimCommandRE, do not skip the line): %q", lines)
++			}
 +			cmds := claimCommandsIn(p.text)
 +			if len(cmds) == 0 {
 +				t.Fatalf("no `bd update <id> --claim` command found: the test cannot say what the prompt tells the agent to run")
@@ -77,14 +102,94 @@ index 0000000000..0175b56e59
 +	}
 +}
 +
-+// The verification half of the pair: the prompts check the claim against the SESSION name. The claim above must keep recording that
-+// same identity; if a future edit loosens the check instead, this test says the pair changed and the claim line must be re-read.
-+func TestBuiltinWorkerPromptsVerifyTheClaimAgainstTheSessionName(t *testing.T) {
-+	re := regexp.MustCompile(`(?i)assign[^\n]*\$GC_SESSION_NAME`)
-+	for _, p := range builtinWorkerPromptsForClaimTest(t) {
-+		if !re.MatchString(p.text) {
-+			t.Errorf("%s: no line ties the assignee to $GC_SESSION_NAME any more: the claim identity (%s) and the verification must name the same thing", p.name, claimActorFlag)
++// claimVerificationPins is the verification half of the pair, pinned per prompt to the EXACT wording that checks the bead's assignee
++// against the SESSION name (the text the agent reads right after claiming). The claim above records $GC_SESSION_NAME, so this check must
++// keep naming the same thing: if a later edit loosens it or retargets it (for example "assignee must be $GC_ALIAS") the claim and the
++// check would diverge again and the original drain-on-your-own-claim bug would be back. A loose "assign ... $GC_SESSION_NAME" regexp
++// over the whole prompt is NOT enough: the startup queries (`bd list --assignee="$GC_SESSION_NAME"`, `bd ready --assignee=...`) match
++// it in every prompt, so it would stay green with the verification deleted.
++var claimVerificationPins = map[string][]string{
++	"defaultPrimePrompt": {
++		"The assignee must be `$GC_SESSION_NAME`",
++	},
++	"pool-worker.template.md": {
++		"assignee != $GC_SESSION_NAME (or routed_to != $GC_TEMPLATE)",
++		"# assignee must be $GC_SESSION_NAME; routed_to == $GC_TEMPLATE",
++		"Verify the claimed bead is assigned to `$GC_SESSION_NAME`",
++	},
++	"graph-worker.template.md": {
++		"Verify the claimed bead is assigned to `$GC_SESSION_NAME`",
++	},
++}
++
++// missingVerificationPins returns the pinned verification phrases of the named prompt that its text no longer contains. A prompt with
++// no pins registered is reported as missing everything: a new builtin prompt cannot slip through unchecked.
++func missingVerificationPins(name, text string) []string {
++	pins := claimVerificationPins[name]
++	if len(pins) == 0 {
++		return []string{"(no verification pins registered for " + name + ")"}
++	}
++	var missing []string
++	for _, pin := range pins {
++		if !strings.Contains(text, pin) {
++			missing = append(missing, pin)
 +		}
++	}
++	return missing
++}
++
++func TestBuiltinWorkerPromptsVerifyTheClaimAgainstTheSessionName(t *testing.T) {
++	for _, p := range builtinWorkerPromptsForClaimTest(t) {
++		for _, pin := range missingVerificationPins(p.name, p.text) {
++			t.Errorf("%s: the verification wording %q is gone: the claim identity (%s) and the check on the assignee must name the same thing, so re-read both before changing either", p.name, pin, claimActorFlag)
++		}
++	}
++}
++
++// Mutate-then-red for the pins: the check above is only worth something if it goes red when the verification is loosened, retargeted
++// or deleted. Each pin is mutated in a copy of the real prompt both ways, and each mutation must be reported missing (and must have
++// changed the text: a mutation that changes nothing proves nothing).
++func TestClaimVerificationPinsGoRedWhenTheVerificationChanges(t *testing.T) {
++	for _, p := range builtinWorkerPromptsForClaimTest(t) {
++		if got := missingVerificationPins(p.name, p.text); len(got) != 0 {
++			t.Fatalf("%s: precondition: the real prompt already misses its pins %q", p.name, got)
++		}
++		for _, pin := range claimVerificationPins[p.name] {
++			retargeted := strings.ReplaceAll(p.text, pin, strings.ReplaceAll(pin, "$GC_SESSION_NAME", "$GC_ALIAS"))
++			deleted := strings.ReplaceAll(p.text, pin, "")
++			for kind, mutated := range map[string]string{"retargeted to $GC_ALIAS": retargeted, "deleted": deleted} {
++				if mutated == p.text {
++					t.Fatalf("%s: mutation %q of pin %q changed nothing: the pin is not in the text or has no $GC_SESSION_NAME to retarget", p.name, kind, pin)
++				}
++				found := false
++				for _, m := range missingVerificationPins(p.name, mutated) {
++					if m == pin {
++						found = true
++					}
++				}
++				if !found {
++					t.Errorf("%s: pin %q does not go red when the verification is %s: the check is vacuous for it", p.name, pin, kind)
++				}
++			}
++		}
++	}
++}
++
++// The same proof for the claim-spelling guard: a claim in a spelling the claim regexp cannot see must be reported, not ignored.
++func TestUnrecognisedClaimSpellingIsReported(t *testing.T) {
++	for _, line := range []string{
++		"gc bd update --claim ga-1",         // the bead token comes after the flag
++		"if ! bd update --claim <id>; then", // same, in a conditional
++	} {
++		if got := unrecognisedClaimLines(line); len(got) != 1 {
++			t.Errorf("unrecognisedClaimLines(%q) = %q, want the line reported once", line, got)
++		}
++	}
++	if got := unrecognisedClaimLines("# `bd update --claim` is a CAS"); len(got) != 0 {
++		t.Errorf("a shell comment line must not be reported: %q", got)
++	}
++	if got := unrecognisedClaimLines(`bd update <id> --claim --actor "$GC_SESSION_NAME"`); len(got) != 0 {
++		t.Errorf("a recognised claim must not be reported: %q", got)
 +	}
 +}
 +
@@ -153,7 +258,7 @@ index 0000000000..0175b56e59
 +				t.Fatalf("no `bd update <id> --claim` command found")
 +			}
 +			for _, c := range cmds {
-+				if got := runClaim(t, strings.ReplaceAll(c, "<id>", "ga-test1")); got != session {
++				if got := runClaim(t, claimBeadTokenRE.ReplaceAllString(c, "${1}ga-test1")); got != session {
 +					t.Errorf("the prompt's claim command %q recorded %q as the assignee, want the session %q: Step 5 of the prompt (the assignee must be $GC_SESSION_NAME) would refuse it", c, got, session)
 +				}
 +			}

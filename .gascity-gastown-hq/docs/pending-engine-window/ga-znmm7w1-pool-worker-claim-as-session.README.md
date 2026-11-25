@@ -4,13 +4,13 @@
 
 • State · What was measured · Root cause · What the patch does · Tests · What it does NOT fix · Until the window · Apply / verify
 
-Patch: `ga-znmm7w1-pool-worker-claim-as-session.patch` (4 files: `cmd/gc/cmd_prime.go` and the two core-pack prompts `pool-worker.template.md` / `graph-worker.template.md` edited, `cmd/gc/builtin_worker_prompt_claim_actor_test.go` new; +174 / -9).
+Patch: `ga-znmm7w1-pool-worker-claim-as-session.patch` (4 files: `cmd/gc/cmd_prime.go` and the two core-pack prompts `pool-worker.template.md` / `graph-worker.template.md` edited, `cmd/gc/builtin_worker_prompt_claim_actor_test.go` new; +279 / -9).
 Base: `consolidated/engine-window-20261023` (`8f1be0e2b3`), the same anchor as the other staged patches (`git rev-parse HEAD:cmd/gc/session_reconciler.go` = `66cdbdecbb`, the `index` line of `ga-fsm94q1`). It is the base of the live binary only according to the READMEs of 11/11 (not re-checked on the mini).
 NOT applied. No build, no binary swap, no supervisor kickstart was done to produce it. The engine window stays Mayor-coordinated.
 
 ## State
 
-Built and tested on the Hetzner node (Go 1.26.5 linux/arm64) from the exact base tarball. The new tests FAIL by assertion on the pristine base and pass on the patched tree (table below); `gofmt` is clean; the patch applies with `patch -p1` to a fresh base copy and reproduces the tested files byte for byte. No other pending patch touches these four files, and none declares the new test identifiers. **Not verified on a running patched binary** (only possible after the window; checks below).
+Built and tested on the Hetzner node (Go 1.26.5 linux/arm64) from the exact base tarball. The new tests FAIL by assertion on the pristine base and pass on the patched tree (table below); `gofmt` is clean; the patch applies with `patch -p1` to a fresh base copy and reproduces the tested files byte for byte. No other pending patch touches these four files, and none declares the new test identifiers. The gate-fix revision of the tests (24/11) was run on the MBP through `mbp-run.sh --exec --go` on the same base: `gofmt -l` and `go vet ./cmd/gc/` clean, the six new tests pass patched; only those tests were run there, not the full `./cmd/gc` package. **Not verified on a running patched binary** (only possible after the window; checks below).
 
 ## What was measured
 
@@ -43,10 +43,22 @@ Every `bd update <id> --claim` the three prompts tell the agent to run (or list 
 
 | test | pristine `8f1be0e2b3` | patched |
 |---|---|---|
-| `TestBuiltinWorkerPromptsClaimAsSessionActor` (every `bd update <id> --claim` of each prompt carries `--actor "$GC_SESSION_NAME"`) | **FAIL** x3 prompts | pass |
+| `TestBuiltinWorkerPromptsClaimAsSessionActor` (every `bd update <bead> --claim` of each prompt carries `--actor "$GC_SESSION_NAME"`; and no line mentions a claim in a spelling the regexp does not capture, shell comments aside) | **FAIL** x3 prompts | pass |
 | `TestBuiltinWorkerPromptClaimCommandRecordsTheSession` (runs each claim command through `sh` with a fake bd that resolves the actor like bd does, in an environment stamped like a pool slot: `BEADS_ACTOR`=alias, `GC_SESSION_NAME`=session) | **FAIL** x3: recorded `whatsapp_automation/claude-headless-1`, want `claude-headless-ga7bku77s` | pass |
 | same test, control: the OLD bare `bd update ga-test1 --claim` must record the alias (the fake is not vacuous and the environment reproduces the incident) | pass | pass |
-| `TestBuiltinWorkerPromptsVerifyTheClaimAgainstTheSessionName` (the verification still names the session) | pass | pass |
+| `TestBuiltinWorkerPromptsVerifyTheClaimAgainstTheSessionName` (the EXACT verification wording of each prompt is still there: `claimVerificationPins`, 1 phrase for `defaultPrimePrompt` and `graph-worker`, 3 for `pool-worker`) | pass | pass |
+| `TestClaimVerificationPinsGoRedWhenTheVerificationChanges` (mutate-then-red inside the test: each pin is retargeted to `$GC_ALIAS` and deleted in a copy of the real prompt, and each mutation must be reported missing) | pass | pass |
+| `TestUnrecognisedClaimSpellingIsReported` (`gc bd update --claim <id>` style spellings are reported, comments and recognised claims are not) | pass | pass |
+
+Gate fix (attempt 1, gate_run ga-ezyyt9c): the verification test used to be one loose `assign...$GC_SESSION_NAME` regexp over the whole prompt, which the startup queries (`bd list --assignee="$GC_SESSION_NAME"`) satisfy in all three prompts, so it stayed green with the verification deleted. Proven red now, on the real prompt files, by editing them on the node and running the tests (cmd/gc, 24/11):
+
+| mutation of the patched prompts | result |
+|---|---|
+| `pool-worker` Step 5 `# assignee must be $GC_SESSION_NAME` -> `$GC_ALIAS` (claim still carries `--actor`) | `TestBuiltinWorkerPromptsVerifyTheClaimAgainstTheSessionName` **FAIL** |
+| `graph-worker` "Verify the claimed bead is assigned to `$GC_SESSION_NAME`" -> "Verify the claimed bead" | same test **FAIL** |
+| `defaultPrimePrompt` "The assignee must be `$GC_SESSION_NAME`" -> `$GC_ALIAS` | `TestBuiltinWorkerPromptsVerifyTheClaimAgainstTheSessionName` **FAIL** |
+| `graph-worker` gets a second claim spelled `gc bd update --claim ga-9` | `TestBuiltinWorkerPromptsClaimAsSessionActor` **FAIL** (claim spelled in a way the tests do not recognise) |
+| the three prompts' claim lines put back to the bare claim (pristine text) | claim tests **FAIL** x3 (recorded the alias), verification tests pass |
 
 Neighbours, same selection on both trees (`-run 'Prime|Prompt|Builtin|Materialize|PoolWorker|GraphWorker|Implicit|Sling'` over `./cmd/gc ./internal/bootstrap/... ./internal/config/...`, umask 022): the only failures are `TestCmdSlingInlineBeadRigScopedBdProvider` and `TestCmdSlingInlineBeadBareTargetFromRigCwdBdProvider`, which fail identically on the pristine base (known baseline reds of the node). The full `./cmd/gc` package was not run for this patch.
 
