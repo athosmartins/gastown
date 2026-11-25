@@ -4,7 +4,7 @@
 
 • State · What was measured · Root cause · What the patch does · Tests · What it does NOT fix · Until the window · Apply / verify
 
-Patch: `ga-znmm7w1-pool-worker-claim-as-session.patch` (4 files: `cmd/gc/cmd_prime.go` and the two core-pack prompts `pool-worker.template.md` / `graph-worker.template.md` edited, `cmd/gc/builtin_worker_prompt_claim_actor_test.go` new; +279 / -9).
+Patch: `ga-znmm7w1-pool-worker-claim-as-session.patch` (4 files: `cmd/gc/cmd_prime.go` and the two core-pack prompts `pool-worker.template.md` / `graph-worker.template.md` edited, `cmd/gc/builtin_worker_prompt_claim_actor_test.go` new; +280 / -9).
 Base: `consolidated/engine-window-20261023` (`8f1be0e2b3`), the same anchor as the other staged patches (`git rev-parse HEAD:cmd/gc/session_reconciler.go` = `66cdbdecbb`, the `index` line of `ga-fsm94q1`). It is the base of the live binary only according to the READMEs of 11/11 (not re-checked on the mini).
 NOT applied. No build, no binary swap, no supervisor kickstart was done to produce it. The engine window stays Mayor-coordinated.
 

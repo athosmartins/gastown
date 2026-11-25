@@ -1,9 +1,9 @@
 diff --git a/cmd/gc/builtin_worker_prompt_claim_actor_test.go b/cmd/gc/builtin_worker_prompt_claim_actor_test.go
 new file mode 100644
-index 0000000000..e2ab6e1fe2
+index 0000000000..fae82152d1
 --- /dev/null
 +++ b/cmd/gc/builtin_worker_prompt_claim_actor_test.go
-@@ -0,0 +1,261 @@
+@@ -0,0 +1,262 @@
 +package main
 +
 +import (
@@ -63,9 +63,10 @@ index 0000000000..e2ab6e1fe2
 +	return out
 +}
 +
-+// unrecognisedClaimLines returns every line that mentions a `bd update ... --claim` the regexp above did not capture and that is not
-+// a shell comment (a comment line is never run, so it can say "bd update --claim" in prose). Such a line is a claim spelled in a way
-+// the claim tests cannot see: a silent fail-open if it were ignored, so the test fails on it and someone must teach the regexp.
++// unrecognisedClaimLines returns every line that contains both "bd update" and "--claim" but in which the regexp above finds NO claim
++// command, unless the line is a shell comment (a comment line is never run, so it can say "bd update --claim" in prose). Such a line
++// is a claim spelled in a way the claim tests cannot see: a silent fail-open if it were ignored, so the test fails on it and someone
++// must teach the regexp. A line that holds one captured claim is taken as understood, even if it also held a second, odd spelling.
 +func unrecognisedClaimLines(text string) []string {
 +	var out []string
 +	for _, line := range strings.Split(text, "\n") {
