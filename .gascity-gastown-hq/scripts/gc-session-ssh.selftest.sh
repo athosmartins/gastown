@@ -26,6 +26,8 @@
 #   mbp (ga-w7qwl1) — host de presença (notebook que dorme): `presence_gate`/`sleeps`/`path_extra` validados na config; start só abre com a regra de
 #   presença livre (pausa, bandeira, slot_cap e vigia de prioridade), a política local do guarda de clone vale ANTES dela; list-running tolera host
 #   que dorme e mantém o registro de sessões; recusa clara do host limpa o registro; /Users/ de outro home recusa.
+#   memgate (ga-ixr6fh4) — o `gate <host>` repassa ao oráculo do MBP a memória livre que o --check já lê (mem_free_pct): só inteiro ASCII de 0 a 100 (até 3 dígitos) vira número; vazio, texto, sinal, decimal, não-ASCII,
+#   zeros demais e acima de 100 viram null (nunca um número inventado); o gate segue liberando com o Athos fora e recusando com ele usando, e o dry-run continua sem consultar.
 #   lay (ga-w7qwl1.2.7) — a camada de guarda da SESSÃO: num host que dorme (o MBP) `guard_layer` é "session" por padrão (outro valor, e "home" ali, recusa a config sem ssh;
 #   o servidor segue "home"); o `start` real confere o guarda e o --selfcheck do BUNDLE (<raiz>/guard, <raiz>/city/settings.json, com o python3 do PATH da sessão) e NÃO lê nem escreve nada em
 #   $HOME/.claude (nem com ele ilegível, envenenado ou chmod 000); o último --settings do comando tem que ser o do bundle (nenhum, outro, ou o do bundle antes de outro recusa); python3
@@ -429,6 +431,17 @@ setup_mbp() {
 case "\$(cat "$T/chk.mode" 2>/dev/null)" in
   livre)    printf 'presence=livre\npresence_why=bloqueada\npaused=0\npaused_local=0\noffload_flag=on\nslot_cap=%s\n' "\${SLOT:-3}"; exit 0 ;;
   slot1)    printf 'presence=livre\npresence_why=bloqueada\npaused=0\npaused_local=0\noffload_flag=on\nslot_cap=1\n'; exit 0 ;;
+  # ga-ixr6fh4: a linha mem_free_pct do --check (o memory_pressure do MBP): número, vazia, texto, acima de 100, negativa, decimal, dígitos não ASCII, com zeros demais
+  livremem)     printf 'presence=livre\npresence_why=bloqueada\npaused=0\npaused_local=0\noffload_flag=on\nslot_cap=3\nmem_free_pct=52\n'; exit 0 ;;
+  livremem0)    printf 'presence=livre\npresence_why=bloqueada\npaused=0\npaused_local=0\noffload_flag=on\nslot_cap=3\nmem_free_pct=\n'; exit 0 ;;
+  livrememx)    printf 'presence=livre\npresence_why=bloqueada\npaused=0\npaused_local=0\noffload_flag=on\nslot_cap=3\nmem_free_pct=abc\n'; exit 0 ;;
+  livremem101)  printf 'presence=livre\npresence_why=bloqueada\npaused=0\npaused_local=0\noffload_flag=on\nslot_cap=3\nmem_free_pct=101\n'; exit 0 ;;
+  livrememneg)  printf 'presence=livre\npresence_why=bloqueada\npaused=0\npaused_local=0\noffload_flag=on\nslot_cap=3\nmem_free_pct=-5\n'; exit 0 ;;
+  livrememdec)  printf 'presence=livre\npresence_why=bloqueada\npaused=0\npaused_local=0\noffload_flag=on\nslot_cap=3\nmem_free_pct=52.5\n'; exit 0 ;;
+  livrememuni)  printf 'presence=livre\npresence_why=bloqueada\npaused=0\npaused_local=0\noffload_flag=on\nslot_cap=3\nmem_free_pct=٥٢\n'; exit 0 ;;
+  livrememlong) printf 'presence=livre\npresence_why=bloqueada\npaused=0\npaused_local=0\noffload_flag=on\nslot_cap=3\nmem_free_pct=0052\n'; exit 0 ;;
+  livremem100)  printf 'presence=livre\npresence_why=bloqueada\npaused=0\npaused_local=0\noffload_flag=on\nslot_cap=3\nmem_free_pct=100\n'; exit 0 ;;
+  livremem0pct) printf 'presence=livre\npresence_why=bloqueada\npaused=0\npaused_local=0\noffload_flag=on\nslot_cap=3\nmem_free_pct=0\n'; exit 0 ;;
   uso)      printf 'presence=uso\npresence_why=input_recente\npaused=0\npaused_local=0\noffload_flag=on\nslot_cap=3\n'; exit 0 ;;
   pausado)  printf 'presence=livre\npaused=1\npaused_local=0\noffload_flag=on\nslot_cap=3\n'; exit 99 ;;
   semsaude) printf 'presence=livre\npaused=0\npaused_local=0\noffload_flag=on\nslot_cap=3\n'; exit 98 ;;
@@ -667,6 +680,26 @@ g_mbp() {
   pv start w-remote-m-1 < <(req "$HOLD"); pv list-running w- </dev/null; [ $RC = 0 ] && has "$T/out" w-remote-m-1; ok $? "mbp: sem default_host o list-running ainda junta os hosts (rc=$RC $(head -c 120 "$T/err"))"
   pv stop w-remote-m-1 </dev/null
   cfg 3
+}
+
+# ---------- memgate: o gate repassa a memória livre que o --check já lê (ga-ixr6fh4) — o oráculo do MBP decide o teto de sessões por ela ----------
+# Só inteiro ASCII de 0 a 100 (até 3 dígitos) vira número; vazio, texto, sinal, decimal, não-ASCII, zeros demais e acima de 100 viram null, nunca um número inventado. O gate segue liberando: quem decide o que fazer com a memória é o oráculo.
+g_memgate() {
+  setup_mbp; cfgm; fresh; local m
+  mode livremem; pv gate m </dev/null; [ $RC = 0 ] && [ "$(jq -r .ok "$T/out")" = true ] && [ "$(jq -r .mem_free_pct "$T/out")" = 52 ] && [ "$(jq -r '.mem_free_pct | type' "$T/out")" = number ] && [ "$(jq -r .slot_cap "$T/out")" = 3 ] && [ "$(jq -r .cap "$T/out")" = 2 ]
+  ok $? "memgate: gate m repassa mem_free_pct (52, número) junto do slot_cap e do cap (rc=$RC $(head -c 200 "$T/out"))"
+  for m in livremem100:100 livremem0pct:0; do
+    mode "${m%%:*}"; pv gate m </dev/null; [ $RC = 0 ] && [ "$(jq -r '.mem_free_pct | type' "$T/out")" = number ] && [ "$(jq -r .mem_free_pct "$T/out")" = "${m##*:}" ]
+    ok $? "memgate: nas pontas da faixa (${m##*:}%) mem_free_pct vira o número (rc=$RC $(head -c 200 "$T/out"))"
+  done
+  for m in livremem0 livrememx livremem101 livrememneg livrememdec livrememuni livrememlong livre; do
+    mode $m; pv gate m </dev/null; [ $RC = 0 ] && [ "$(jq -r .ok "$T/out")" = true ] && jq -e 'has("mem_free_pct") and .mem_free_pct == null' "$T/out" >/dev/null
+    ok $? "memgate: checagem '$m' (memória vazia, texto, acima de 100, negativa, decimal, dígitos não ASCII, zeros demais, ou sem a linha): o gate segue liberando e mem_free_pct é null (rc=$RC $(head -c 200 "$T/out"))"
+  done
+  mode uso; pv gate m </dev/null; [ $RC = 1 ] && [ "$(jq -r .ok "$T/out")" = false ]
+  ok $? "memgate: com o Athos usando o gate recusa como antes (a memória não muda a presença)"
+  mode livremem; pv --dry-run gate m </dev/null; [ $RC = 2 ] && [ "$(jq -r .ok "$T/out")" = null ]
+  ok $? "memgate: o dry-run continua sem consultar nada (exit 2, ok null)"
 }
 
 # ---------- gui: o tmux do MBP nasce num LaunchAgent do domínio gráfico (ga-w7qwl1.1.8) — as 7 condições do Mayor (19/10) viram casos ----------
@@ -1745,7 +1778,7 @@ g_shard() {  # o filtro do PRÓPRIO selftest (GCSSH_SHARD, GCSSH_ONLY, GCSSH_MUT
   [ $rr = 0 ] && [ "$(printf '%s\n' "$oo" | grep -c '^ok   mutante .* pego')" = 1 ] && printf '%s\n' "$oo" | grep -q '^== final: 1/1 ok ==$' && ! printf '%s\n' "$oo" | grep -q 'NADA RODOU'; ok $? "shard: (controle) GCSSH_SHARD=1/9999 roda exatamente 1 mutante, pego, e sai 0 (rc=$rr: $(printf '%s' "$oo" | tail -c 110))"
 }
 
-all() { group proto && g_proto; group dry && g_dry; group live && g_live; group cap && g_cap; group down && g_down; group meta && g_meta; group ident && g_ident; group conf && g_conf; group guard && g_guard; group terr && g_terr; group gate && g_gate; group lay && g_lay; group prep && g_prep; group wt && g_wt; group mbp && g_mbp; group gui && g_gui; group diag && g_diag; group acct && g_acct; group gacct && g_gacct; group prof && g_prof; group lr && g_lr; group lrd && g_lrd; group abort && g_abort; group term && g_term; group shard && g_shard; return 0; }
+all() { group proto && g_proto; group dry && g_dry; group live && g_live; group cap && g_cap; group down && g_down; group meta && g_meta; group ident && g_ident; group conf && g_conf; group guard && g_guard; group terr && g_terr; group gate && g_gate; group lay && g_lay; group prep && g_prep; group wt && g_wt; group mbp && g_mbp; group memgate && g_memgate; group gui && g_gui; group diag && g_diag; group acct && g_acct; group gacct && g_gacct; group prof && g_prof; group lr && g_lr; group lrd && g_lrd; group abort && g_abort; group term && g_term; group shard && g_shard; return 0; }
 
 if [ -n "${GCSSH_MUTANT:-}" ]; then all; echo "RESULT $fails/$n"; exit $((fails > 0)); fi
 # GCSSH_SHARD=K/N: dois decimais canônicos (sem sinal, sem espaço, sem zero à esquerda: `[ 3 = 03 ]` é falso e $((mn % 010)) é octal, então a fatia ficaria vazia ou trocada sem aviso), N de 1 a 9999 e K de 0 a N-1
@@ -1807,6 +1840,11 @@ case "$shn" in [1-9]*) ;; *) shard_bad;; esac
   mutant mbp "list-running apaga registro mais novo que a pergunta" 's/ and os.stat(os.path.join(run_d, m)).st_mtime < t0//'
   mutant mbp "notebook sem regra de presença aceito" 's/if self.sleeps and not self.gate:/if False:/'
   mutant mbp "número do pool lido como host" 's/if m and m.group(1).isdigit():/if False:/'
+  mutant memgate "mem_free_pct acima de 100 vira número" 's/ and int(mem_raw) <= 100//'
+  mutant memgate "mem_free_pct com dígito não ASCII vira número" 's/mem_raw.isascii() and //'
+  mutant memgate "mem_free_pct com zeros demais vira número" 's/ and len(mem_raw) <= 3//'
+  mutant memgate "mem_free_pct não é repassado no JSON do gate" 's/, "mem_free_pct": mem}/}/'
+  mutant memgate "mem_free_pct ilegível vira 0 (um número inventado)" 's/\(mem = int(mem_raw) if .*\) else None$/\1 else 0/'
   mutant dry "lançador de pool do mini não vira claude" 's/^    command = re.sub(.*$/    command = m.map(req.get("command") or "")/'
   mutant dry "lançador de pool: sem a âncora do começo (env X=1 <lançador> também vira)" 's/re.sub("^" + /re.sub("" + /'
   mutant dry "lançador de pool: sem a fronteira do fim (<lançador>.bak também vira)" 's/ + r"(?=\\s|\$)", "claude"/ + "", "claude"/'

@@ -12,11 +12,12 @@
 #   segunda cópia da lógica de escrita. Sempre no modo pilot (dono + marca pilot.wa_node_alias, SEM gc.routed_to): nenhuma bead é roteada ao pool do MBP, que pede ZERO sessões por construção. Quem o chama é o gancho do Pilot (_pilot_mbp_node_decide, corte 2, PILOT_WA_MBP_ROUTE, padrão off) e,
 #   sem o host `mbp` na config, o oráculo devolve `unknown` e esta casca sai 11 sem escrever. Cadeia e decisões: docs/runbooks/mbp-wa-node.md.
 # O QUE ESTA CASCA GARANTE (e o selftest cobra):
-#   1. alias `wa-worker-remote-mbp-1..2`, template, classificador, log (.gc/mbp-node-route.jsonl), modo pilot, slots e, acima de tudo, O ORÁCULO (mbp-node-capacity.py: Athos fora e MBP saudável) são FIXADOS aqui e vencem qualquer
+#   1. alias `wa-worker-remote-mbp-1..4`, template, classificador, log (.gc/mbp-node-route.jsonl), modo pilot, slots e, acima de tudo, O ORÁCULO (mbp-node-capacity.py: Athos fora, MBP saudável e memória livre) são FIXADOS aqui e vencem qualquer
 #      WA_NODE_* do ambiente: um WA_NODE_CAPACITY herdado do Hetzner deixaria um "node" dele autorizar sessão no MBP, e um WA_NODE_ALIAS herdado mandaria a bead ao nó errado;
 #   2. só bead `wa-*`: id de outro prefixo sai 11 sem rodar nada;
 #   3. nada a decidir sozinha: o código do despachante real chega ao chamador; ausente ou não executável = 11. Em dúvida o código é 10-13, nunca 0;
-#   4. slots: 2 (o teto do agente); MBP_NODE_SLOTS=1 baixa para 1 (canário); qualquer outro valor definido (vazio, 0, 3, texto) vale 1: erro de digitação nunca vira mais sessões.
+#   4. slots: 4 (o teto do agente); MBP_NODE_SLOTS=1..4 baixa (1 = canário); qualquer outro valor definido (vazio, 0, 5, texto) vale 1: erro de digitação nunca vira mais sessões. O número é o TETO ESTÁTICO: quantas sessões cabem AGORA o oráculo decide
+#      (4 com o Athos fora e memória livre >= 35%; abaixo disso ou sem leitura da memória, 2; com o Athos no MBP, nenhuma nova), a cada chamada.
 # SAÍDA: a do wa-node-dispatch.sh (0 feito · 10 fica no mini · 11 não consegui decidir · 12 não elegível/sem vaga · 13 escrita não confirmada · 14 bead bloqueada ou vetada (ga-0qcsdce) · 2 uso). Env de teste: MBP_NODE_{BD,GC,PY,TIMEOUT,SESSION_TIMEOUT} (repassados como WA_NODE_*),
 #   MBP_NODE_{CAPACITY,CLASSIFY,LOG,DISPATCH,SLOTS}.
 set -u
@@ -39,10 +40,11 @@ fi
 [ -z "${MBP_NODE_TIMEOUT:-}" ] || export WA_NODE_TIMEOUT="$MBP_NODE_TIMEOUT"
 [ -z "${MBP_NODE_SESSION_TIMEOUT:-}" ] || export WA_NODE_SESSION_TIMEOUT="$MBP_NODE_SESSION_TIMEOUT"
 
-# slots: nada definido -> 2 (o teto do agente); definido -> só "1" ou "2" valem; o resto é 1 (vazio, 0, 3+, texto: o inerte)
-SLOTS=2
+# slots (ga-ixr6fh4): nada definido -> 4 (o teto do agente); definido -> só 1, 2, 3 ou 4 valem; o resto é 1 (vazio, 0, 5+, texto, decimal: o inerte)
+# O número de slots é só o TETO ESTÁTICO (quantos aliases -mbp-1..N podem ter bead); quantas sessões o MBP aguenta AGORA (Athos fora, memória livre, saúde) é o oráculo (mbp-node-capacity.py), a cada chamada.
+SLOTS=4
 if [ "${MBP_NODE_SLOTS+set}" = set ]; then
-  case "$MBP_NODE_SLOTS" in 1|2) SLOTS="$MBP_NODE_SLOTS" ;; *) SLOTS=1; say "MBP_NODE_SLOTS='$MBP_NODE_SLOTS' não é 1 nem 2 — uso 1 slot" ;; esac
+  case "$MBP_NODE_SLOTS" in 1|2|3|4) SLOTS="$MBP_NODE_SLOTS" ;; *) SLOTS=1; say "MBP_NODE_SLOTS='$MBP_NODE_SLOTS' não é 1..4 — uso 1 slot" ;; esac
 fi
 
 export GC_CITY="$CITY"
@@ -52,7 +54,7 @@ export WA_NODE_ROUTE_TEMPLATE="wa-worker-remote-mbp"
 export WA_NODE_CLASSIFY="${MBP_NODE_CLASSIFY:-$HERE/wa-node-classify.py}"
 export WA_NODE_LOG="${MBP_NODE_LOG:-$CITY/.gc/mbp-node-route.jsonl}"
 export WA_NODE_CAPACITY="${MBP_NODE_CAPACITY:-$HERE/mbp-node-capacity.py}"
-# modo pilot (a sessão do alias é aberta pelo Pilot, só com o veredito do oráculo) e 1..2 slots
+# modo pilot (a sessão do alias é aberta pelo Pilot, só com o veredito do oráculo) e 1..4 slots
 export WA_NODE_SPAWN="pilot"
 export WA_NODE_SLOTS="$SLOTS"
 # só o TEXTO das mensagens e dos comentários da bead (o despachante do WA os lê desde o ga-2hd02v.3)

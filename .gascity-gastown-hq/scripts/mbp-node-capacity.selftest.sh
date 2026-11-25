@@ -4,7 +4,8 @@
 # Contents
 #   Casos · Controle negativo · Como rodar
 #
-# CASOS: gate libera (vaga = min(cap, slot_cap) − sessões do MBP vivas) · gate RECUSA (o motivo passa adiante; a lista nem é esperada) · gate ilegível/incoerente/sem teto/de outro host/prazo NUNCA vira node ·
+# CASOS: gate libera (vaga = min(cap, slot_cap, teto da memória) − sessões do MBP vivas; teto da memória = 4 com leitura positiva de memória livre >= 35%, 2 sem ela, ga-ixr6fh4) · gate RECUSA (o motivo passa adiante; a lista nem é esperada;
+#   o Athos de volta = nenhuma sessão nova, com qualquer memória) · gate ilegível/incoerente/sem teto/de outro host/prazo NUNCA vira node ·
 #   só as sessões do MBP contam (fechada ou dormindo não ocupa; estado ausente ou desconhecido ocupa) · lista ilegível = unknown · config de teste ilegível = unknown · prazo mata o GRUPO · saída é UM objeto JSON.
 # CONTROLE NEGATIVO: cada mutante troca UMA linha do oráculo numa cópia e o caso designado tem de reprovar; mutante que sobrevive reprova esta bateria.
 # COMO RODAR: bash scripts/mbp-node-capacity.selftest.sh   (macOS /bin/bash 3.2 e Linux; precisa de jq e python3)
@@ -65,6 +66,63 @@ reset; sess '{"sessions":[{"template":"wa-worker-remote-mbp","state":"active"},{
 expect "2 sessões do MBP vivas (teto 2): local sem_vaga, free 0" 1 local sem_vaga 0
 reset; sess '{"sessions":[{"template":"wa-worker-remote-mbp","state":"active"},{"template":"wa-worker-remote-mbp","state":"active"},{"template":"wa-worker-remote-mbp","state":"active"}]}'; verd
 expect "3 sessões vivas (acima do teto): local sem_vaga, free 0 (nunca negativo)" 1 local sem_vaga 0
+
+# ---- o teto DINÂMICO (ga-ixr6fh4): leitura POSITIVA de memória livre >= 35% (memory_pressure, que o gate repassa) -> teto 4; menos, ausente ou ilegível -> 2, o teto de antes. O cap do host e o slot_cap só baixam.
+sessn() { # sessn <n>: n sessões vivas do MBP (template do agente, ativas, alias -mbp-1..n)
+  local i=1 rows=""; while [ "$i" -le "$1" ]; do rows="$rows${rows:+,}{\"template\":\"wa-worker-remote-mbp\",\"alias\":\"wa-worker-remote-mbp-$i\",\"state\":\"active\"}"; i=$((i+1)); done
+  sess "{\"sessions\":[$rows]}"
+}
+gate_mem() { # gate_mem <cap> <slot_cap> <mem_free_pct em JSON: 52, null, "abc" (com aspas), true...>: o gate libera com esse campo
+  gate "{\"cap\":$1,\"host\":\"mbp\",\"ok\":true,\"reason\":\"Athos fora e MBP saudável\",\"slot_cap\":$2,\"mem_free_pct\":$3}"
+}
+eff() { # eff <rótulo> <effective esperado> <mem_cap esperado> <mem_free_pct esperado no JSON de saída; vazio = nulo>
+  local why=""
+  [ "$(jget effective)" = "$2" ] || why="effective=$(jget effective) (esperado $2)"
+  [ "$(jget mem_cap)" = "$3" ] || why="$why mem_cap=$(jget mem_cap) (esperado $3)"
+  [ "$(jget mem_free_pct)" = "$4" ] || why="$why mem_free_pct='$(jget mem_free_pct)' (esperado '$4')"
+  if [ -n "$why" ]; then bad "$1 ::$why :: $(printf '%s' "$OUT" | cut -c1-260)"; else ok "$1"; fi
+}
+reset; gate_mem 4 8 52; verd; expect "Athos fora, 52% de memória livre, cap 4, slot_cap 8, nenhuma sessão: node, free 4" 0 node ok 4
+eff "  teto 4 pela memória (mem_cap 4) e o JSON diz o que leu (mem_free_pct 52)" 4 4 52
+for pair in 35:4 36:4 52:4 100:4 34:2 20:2 0:2; do
+  p="${pair%%:*}"; want="${pair##*:}"
+  reset; gate_mem 4 8 "$p"; verd; expect "memória $p% livre (cap 4, slot_cap 8): teto $want" 0 node ok "$want"
+  eff "  mem_cap $want e mem_free_pct $p no JSON" "$want" "$want" "$p"
+  [ "$(jget mem_state)" = ok ] && ok "  mem_state ok (leitura positiva)" || bad "  mem_state=$(jget mem_state) (esperado ok)"
+done
+# TRÊS estados: tem (número 0..100) / não tem (campo ausente ou nulo) / não consegui saber (texto, booleano, decimal, fora da faixa, lista, objeto): os dois últimos NUNCA liberam o 4
+for v in null '"52"' '"abc"' '""' true false -1 101 1000 52.5 '[]' '{}'; do
+  reset; gate_mem 4 8 "$v"; verd; expect "mem_free_pct=$v (ausente ou ilegível): teto 2 (o de antes), nunca o 4" 0 node ok 2
+  eff "  mem_cap 2 e o JSON não repete o valor que não se leu (mem_free_pct nulo)" 2 2 ""
+  want_state=ilegivel; [ "$v" = null ] && want_state=ausente
+  [ "$(jget mem_state)" = "$want_state" ] && ok "  mem_state $want_state (a mesma decisão, o motivo fica no JSON)" || bad "  mem_state=$(jget mem_state) (esperado $want_state)"
+done
+reset; gate '{"cap":4,"host":"mbp","ok":true,"reason":"x","slot_cap":8}'; verd; expect "gate sem a chave mem_free_pct (provider antigo): teto 2, nunca o 4" 0 node ok 2
+[ "$(jget mem_state)" = ausente ] && ok "  mem_state ausente" || bad "  mem_state=$(jget mem_state) (esperado ausente)"
+reset; gate_mem 4 8 52; sessn 3; verd; expect "3 vivas com teto 4: ainda cabe a 4ª (free 1)" 0 node ok 1
+reset; gate_mem 4 8 52; sessn 4; verd; expect "4 vivas (teto 4): local sem_vaga, free 0" 1 local sem_vaga 0
+reset; gate_mem 4 8 52; sessn 5; verd; expect "5 vivas (acima do teto): local sem_vaga, free 0 (nunca negativo)" 1 local sem_vaga 0
+# a memória cai com sessões vivas: o oráculo só decide a PRÓXIMA (as vivas seguem); sem leitura positiva volta o teto de antes
+reset; gate_mem 4 8 30; sessn 1; verd; expect "memória 30% com 1 viva: node, free 1 (teto de antes, 2)" 0 node ok 1
+reset; gate_mem 4 8 30; sessn 2; verd; expect "memória caiu a 30% com 2 vivas: local sem_vaga (o 3º não abre)" 1 local sem_vaga 0
+reset; gate_mem 4 8 30; sessn 3; verd; expect "memória 30% com 3 vivas (acima do teto 2): local sem_vaga, free 0" 1 local sem_vaga 0
+reset; gate_mem 4 8 35; sessn 3; verd; expect "memória volta a 35% com 3 vivas: node, free 1 (a 4ª)" 0 node ok 1
+# o cap do host (a config do provider) e o slot_cap (RAM do mbp-run.sh) só BAIXAM; o teto do agente (4) nunca é passado
+reset; gate_mem 2 8 52; verd; expect "cap 2 (config antiga do host) com memória 52%: o cap baixa -> free 2" 0 node ok 2
+eff "  effective 2, mem_cap 4" 2 4 52
+reset; gate_mem 3 8 52; verd; expect "cap 3 -> free 3" 0 node ok 3
+reset; gate_mem 4 3 52; verd; expect "slot_cap 3 (RAM) < 4 -> free 3" 0 node ok 3
+reset; gate_mem 4 1 52; verd; expect "slot_cap 1 -> free 1" 0 node ok 1
+reset; gate_mem 8 8 52; verd; expect "cap 8 e slot_cap 8: o teto do agente (4) segura -> free 4, nunca mais" 0 node ok 4
+eff "  effective 4 (não 8)" 4 4 52
+reset; gate_mem 8 8 90; sessn 4; verd; expect "cap 8, slot_cap 8, 90% livre e 4 vivas: local sem_vaga" 1 local sem_vaga 0
+# o Athos usando: o gate recusa e a memória NÃO muda isso (a regra de presença é só dele); a queda de 4 para nenhuma sessão nova é a recusa
+reset; gate '{"cap":4,"host":"mbp","ok":false,"reason":"Athos está no MBP (presença=uso, motivo=input_recente)","slot_cap":null,"mem_free_pct":90}' 1; verd
+expect "Athos usando, 90% de memória livre: local gate (nenhuma sessão nova)" 1 local gate
+[ -z "$(jget free)" ] && ok "  e o JSON não diz que há vaga (free nulo)" || bad "  free=$(jget free)"
+reset; gate_mem 4 8 90; sessn 1; verd; expect "Athos fora, 90% livre, 1 viva: free 3" 0 node ok 3
+gate '{"cap":4,"host":"mbp","ok":false,"reason":"Athos está no MBP (presença=uso, motivo=input_recente)","slot_cap":null,"mem_free_pct":90}' 1; verd
+expect "o Athos volta (a mesma memória, a mesma viva): local gate, sem vaga nenhuma" 1 local gate
 
 # ---- o gate RECUSA: o motivo do provider passa adiante, e a lista de sessões nem é esperada
 for why in "Athos está no MBP (presença=uso, motivo=input_recente)" "pausa do Athos ativa" "MBP sem saúde ou fora do ar (rc 98)" "bandeira mbp-offload desligada" "MBP desligado ou pausado (bandeira ou pausa do Athos)"; do
@@ -213,7 +271,7 @@ mutant cap-ausente-passa      'for nm, v in (("cap", cap), ("slot_cap", slot)):'
 mutant rc1-com-ok-true-libera 'if rc == 0 and ok is True:'                                                  'if ok is True:'                                            sc_rc1ok 2 gate_incoerente
 mutant rc0-com-ok-false-recusa 'if rc == 1 and ok is False:'                                                'if ok is False:'                                           sc_rc0no 2 gate_incoerente
 mutant host-errado-passa      'if doc.get("host") != HOST:'                                                 'if False:'                                                 sc_hetz 2 gate_outro_host
-mutant vaga-pelo-maior        'effective = min(cap, slot)'                                                  'effective = max(cap, slot)'                                sc_max 1 sem_vaga
+mutant vaga-pelo-maior        'effective = min(cap, slot, mcap)'                                            'effective = max(cap, slot, mcap)'                          sc_max 1 sem_vaga
 mutant vaga-zero-passa        'if free < 1:'                                                                'if free < 0:'                                              sc_full 1 sem_vaga
 mutant dormindo-ocupa         'closed|stopped|archived|drained|asleep'                                      'closed|stopped|archived|drained'                           sc_asleep 0 ok
 mutant sem-estado-nao-ocupa   'if s.get("closed") is True or DEAD_STATE_RE.search(state):'                 'if s.get("closed") is True or not state or DEAD_STATE_RE.search(state):' sc_nostate 1 sem_vaga
@@ -229,5 +287,35 @@ mutant item-nao-objeto-ok     'if not isinstance(s, dict):
 mutant config-ruim-vira-padrao 'raise ValueError(f"{name} não é JSON ({e})")'                               'return default'                                            sc_badcfg 2 config
 mutant prazo-sem-matar-o-grupo 'os.killpg(p.pid, signal.SIGKILL)'                                           'p.kill()'                                                  sc_hang 2 gate_prazo v_noorphan
 mutant gate-recusa-espera-a-lista 'if g[0] == "local":'                                                     'if g[0] == "local" and sess.wait()[0] != "x":'              sc_refuse_hang 1 gate v_fast
+# ---- o teto dinâmico (ga-ixr6fh4): cada mutante tira UMA peça da regra (o mínimo dos três, o limiar, as três leituras da memória, os dois números) e o caso designado tem de reprovar
+sc_mem52()    { reset; gate_mem 4 8 52; }
+sc_mem35()    { reset; gate_mem 4 8 35; }
+sc_mem30x1()  { reset; gate_mem 4 8 30; sessn 1; }
+sc_mem30x2()  { reset; gate_mem 4 8 30; sessn 2; }
+sc_memabcx2() { reset; gate_mem 4 8 '"abc"'; sessn 2; }
+sc_mem101x2() { reset; gate_mem 4 8 101; sessn 2; }
+sc_membool()  { reset; gate_mem 4 8 true; }
+sc_memnull()  { reset; gate_mem 4 8 null; }
+sc_cap2mem()  { reset; gate_mem 2 8 52; sessn 2; }
+sc_slot1mem() { reset; gate_mem 4 1 52; sessn 1; }
+sc_cap8()     { reset; gate_mem 8 8 90; sessn 4; }
+v_eff4()   { [ "$(jget effective)" = 4 ]; }
+v_free4()  { [ "$(jget free)" = 4 ]; }
+v_mem52()  { [ "$(jget mem_free_pct)" = 52 ] && [ "$(jget mem_state)" = ok ]; }
+v_unread() { [ "$(jget mem_state)" = ilegivel ] && [ -z "$(jget mem_free_pct)" ]; }
+v_absent() { [ "$(jget mem_state)" = ausente ]; }
+mutant memoria-ignorada       'effective = min(cap, slot, mcap)'                  'effective = min(cap, slot)'                         sc_mem30x2 1 sem_vaga
+mutant cap-do-host-ignorado   'effective = min(cap, slot, mcap)'                  'effective = min(slot, mcap)'                        sc_cap2mem 1 sem_vaga
+mutant slot-cap-ignorado      'effective = min(cap, slot, mcap)'                  'effective = min(cap, mcap)'                         sc_slot1mem 1 sem_vaga
+mutant limiar-exclusivo       'mem >= MEM_FREE_FOR_MAX_PCT'                       'mem > MEM_FREE_FOR_MAX_PCT'                         sc_mem35 0 ok v_eff4
+mutant abaixo-do-limiar-vale-o-maximo 'else SESSIONS_BASE'                        'else SESSIONS_MAX'                                  sc_mem30x2 1 sem_vaga
+mutant sem-leitura-vale-o-maximo 'SESSIONS_MAX if mem is not None and mem >= MEM_FREE_FOR_MAX_PCT' 'SESSIONS_MAX if mem is None or mem >= MEM_FREE_FOR_MAX_PCT' sc_memabcx2 1 sem_vaga
+mutant fora-da-faixa-vale     'and 0 <= v <= 100:'                                'and 0 <= v:'                                        sc_mem101x2 1 sem_vaga
+mutant booleano-vale          'isinstance(v, int) and not isinstance(v, bool) and 0 <= v <= 100' 'isinstance(v, int) and 0 <= v <= 100' sc_membool 0 ok v_unread
+mutant ausente-vira-ilegivel  'return None, "ausente"'                            'return None, "ilegivel"'                            sc_memnull 0 ok v_absent
+mutant teto-do-agente-passa   'SESSIONS_MAX = 4'                                  'SESSIONS_MAX = 8'                                   sc_cap8 1 sem_vaga
+mutant base-vira-1            'SESSIONS_BASE = 2'                                 'SESSIONS_BASE = 1'                                  sc_mem30x1 0 ok
+mutant maximo-vira-3          'SESSIONS_MAX = 4'                                  'SESSIONS_MAX = 3'                                   sc_mem52 0 ok v_free4
+mutant memoria-fora-do-json   '"mem_free_pct": mem, '                             ''                                                   sc_mem52 0 ok v_mem52
 echo "---"; echo "$((n-fails))/$n ok"
 [ $fails -eq 0 ] && echo "SELFTEST OK" || { echo "SELFTEST FALHOU ($fails)"; exit 1; }

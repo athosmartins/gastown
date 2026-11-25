@@ -12,9 +12,12 @@ CONTRATO  O wa-node-dispatch.sh (modo pilot) roda `python3 -I mbp-node-capacity.
 
 O QUE DECIDE  Duas leituras, em paralelo (cabem no prazo de 45 s do despachante): (1) `gc-session-ssh gate mbp`, o MESMO veredito que o start do provider aplica (bandeira, pausa do Athos, presença, saúde, slot_cap): este oráculo
   não tem regra de presença própria, para não haver duas regras que discordem; (2) `gc session list --json`, as sessões do MBP que o engine vê (template wa-worker-remote-mbp, ou nome/alias com `-remote-mbp-`).
-  Vagas = min(cap do host, slot_cap) − vivas; fechada ou dormindo não ocupa e estado que não conheço conta como VIVA (o lado inerte). O teto do mini e o do Hetzner não entram na conta.
+  Vagas = teto − vivas, com o teto DINÂMICO (ga-ixr6fh4) = min(cap do host, slot_cap, teto da memória): o teto da memória é SESSIONS_MAX (4) com leitura positiva de memória livre >= 35% (`mem_free_pct`, o
+  memory_pressure do MBP que o gate repassa) e SESSIONS_BASE (2, o teto de antes) sem ela; cap e slot_cap só baixam. Athos usando = o gate recusa = nenhuma sessão nova (o "1 quando ele usa" do aceite fica mais protetor: nada novo abre).
+  Fechada ou dormindo não ocupa e estado que não conheço conta como VIVA (o lado inerte). O teto do mini e o do Hetzner não entram na conta. A memória que caiu NÃO derruba sessão viva: só segura a PRÓXIMA.
 
 TRÊS ESTADOS  tem / não tem / não consegui saber: cada leitura abaixo diz, em comentário, o que o código faz no vazio e no que falhou, e falhou NUNCA vira `node`. Gate que RECUSA (ok false) → local, sem esperar a lista.
+  A memória livre tem os três (`mem_state` no JSON: ok · ausente · ilegivel): só `ok` com >= 35% sobe o teto a 4; ausente e ilegível decidem igual (o teto de antes), e o estado fica no JSON para quem investiga.
 
 Env (teste): MBP_NODE_GATE_CMD e MBP_NODE_SESSIONS_CMD (lista JSON de argv que troca o gc-session-ssh / o `gc session list`; texto não-JSON ou lista vazia = unknown, nunca o padrão),
   MBP_NODE_GATE_TIMEOUT_S (25) e MBP_NODE_SESSIONS_TIMEOUT_S (35): inteiro de 1 a 40; outro valor volta ao padrão (nunca a um prazo maior que o do despachante). GC_CITY: a cidade.
@@ -32,6 +35,12 @@ HERE = os.path.dirname(os.path.realpath(__file__))
 CITY = os.environ.get("GC_CITY") or os.path.dirname(HERE)
 HOST = "mbp"
 TEMPLATE = "wa-worker-remote-mbp"
+# O teto DINÂMICO de sessões do MBP (ga-ixr6fh4). SESSIONS_MAX é o max_active_sessions do agente wa-worker-remote-mbp (e o padrão do MBP_NODE_SLOTS na casca): é o que o MBP leva com o Athos fora
+# E leitura POSITIVA de memória livre >= MEM_FREE_FOR_MAX_PCT (o `memory_pressure` do MBP, que o gate repassa). SESSIONS_BASE é o teto de ANTES desta mudança (2): vale sempre que essa leitura não é positiva
+# (memória abaixo do limiar, ausente ou ilegível), porque o teto maior só sobe com evidência, nunca por falta dela. O SESSIONS_MAX (4) tem que ser o mesmo número do agente, da casca e do Pilot (o selftest da casca confere os quatro arquivos).
+SESSIONS_MAX = 4
+SESSIONS_BASE = 2
+MEM_FREE_FOR_MAX_PCT = 35
 MBP_NAME_RE = re.compile(r"(^|-)remote-mbp-")        # o mesmo pedido de host que o provider lê no nome da sessão (host_of)
 DEAD_STATE_RE = re.compile(r"closed|stopped|archived|drained|asleep")   # o mesmo corte do wa-node-dispatch.sh (+ asleep: o modo pilot não conta dormindo)
 
@@ -109,8 +118,23 @@ def one_line(text: str, limit: int = 200) -> str:
     return " ".join(str(text).split())[:limit]
 
 
+def read_mem(v):
+    """(valor, estado) da memória livre (%) que o gate repassou. estado: `ok` (inteiro de 0 a 100: o único com valor) · `ausente` (campo ausente ou nulo: provider antigo, ou o memory_pressure do MBP não respondeu)
+    · `ilegivel` (qualquer outra coisa: texto, booleano, decimal, fora da faixa, lista, objeto). Os dois últimos têm a MESMA decisão (mem_cap abaixo: o teto de antes), e o estado fica no JSON para quem investiga."""
+    if v is None:
+        return None, "ausente"
+    if isinstance(v, int) and not isinstance(v, bool) and 0 <= v <= 100:
+        return v, "ok"
+    return None, "ilegivel"
+
+
+def mem_cap(mem):
+    """O teto de sessões que a memória livre dá: SESSIONS_MAX com leitura positiva >= MEM_FREE_FOR_MAX_PCT; senão SESSIONS_BASE (mem None = não houve leitura positiva)."""
+    return SESSIONS_MAX if mem is not None and mem >= MEM_FREE_FOR_MAX_PCT else SESSIONS_BASE
+
+
 def judge_gate(res):
-    """('ok', cap, slot_cap) | ('local', razão) | ('unknown', código, detalhe)."""
+    """('ok', cap, slot_cap, mem, estado_da_mem) | ('local', razão) | ('unknown', código, detalhe)."""
     if res[0] == "unknown":
         return res
     _, rc, out, err = res
@@ -133,7 +157,9 @@ def judge_gate(res):
                 return ("unknown", "gate_sem_teto", f"o gate liberou mas {nm}={v!r} não é um inteiro >= 1 (host sem regra de presença?)")
         if doc.get("host") != HOST:
             return ("unknown", "gate_outro_host", f"o veredito é do host {doc.get('host')!r}, não de {HOST!r}")
-        return ("ok", cap, slot)
+        # vazio (campo ausente ou nulo) → mem None, estado `ausente`, e o teto é o de antes (SESSIONS_BASE); falhou/ilegível (texto, booleano, decimal, fora de 0..100) → mem None, estado `ilegivel`, o mesmo teto: só leitura positiva sobe o teto
+        mem, mem_state = read_mem(doc.get("mem_free_pct"))
+        return ("ok", cap, slot, mem, mem_state)
     return ("unknown", "gate_incoerente", f"rc={rc} e ok={ok!r} não combinam (0 libera com ok true; 1 recusa com ok false)")
 
 
@@ -186,16 +212,19 @@ def verdict() -> tuple:
             return 1, {"verdict": "local", "reason": "gate", "detail": g[1], "free": None}
         if g[0] == "unknown":
             return 2, {"verdict": "unknown", "reason": g[1], "detail": g[2], "free": None}
-        _, cap, slot = g
+        _, cap, slot, mem, mem_state = g
         s = judge_sessions(sess.wait())
         if s[0] == "unknown":
             return 2, {"verdict": "unknown", "reason": s[1], "detail": s[2], "free": None, "host_cap": cap, "slot_cap": slot}
-        effective = min(cap, slot)
+        # o teto é o MENOR dos três: o cap do host (a config do provider), o slot_cap (RAM do mbp-run.sh) e o da memória livre (SESSIONS_MAX só com leitura positiva); nenhum SOBE o outro
+        mcap = mem_cap(mem)
+        effective = min(cap, slot, mcap)
         free = effective - s[1]
-        base = {"host_cap": cap, "slot_cap": slot, "effective": effective, "live": s[1], "free": max(free, 0)}
+        mem_txt = f"{mem}% livre" if mem_state == "ok" else mem_state
+        base = {"host_cap": cap, "slot_cap": slot, "mem_free_pct": mem, "mem_state": mem_state, "mem_cap": mcap, "effective": effective, "live": s[1], "free": max(free, 0)}
         if free < 1:
-            return 1, dict(base, verdict="local", reason="sem_vaga", detail=f"teto {effective} (cap {cap}, slot_cap {slot}) e {s[1]} sessão(ões) do MBP viva(s)")
-        return 0, dict(base, verdict="node", reason="ok", detail=f"Athos fora e MBP saudável; {free} vaga(s) de {effective}")
+            return 1, dict(base, verdict="local", reason="sem_vaga", detail=f"teto {effective} (cap {cap}, slot_cap {slot}, memória {mem_txt} → {mcap}) e {s[1]} sessão(ões) do MBP viva(s)")
+        return 0, dict(base, verdict="node", reason="ok", detail=f"Athos fora e MBP saudável; {free} vaga(s) de {effective} (memória {mem_txt} → teto {mcap})")
     finally:
         gate.kill()
         sess.kill()

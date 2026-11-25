@@ -12,7 +12,7 @@ USO
   gc-session-ssh --dry-run start <sessão> < start.json     (ou GC_SSH_DRYRUN=1) imprime o que rodaria no host e NÃO conecta
                                                            (`would_refuse`: a recusa LOCAL de política — sessão real sem liberação… — que o start de verdade daria; null = nenhuma recusa
                                                            local, NÃO "o start vai ser aceito": o sha e o --selfcheck do guarda só rodam no host, no start de verdade)
-  gc-session-ssh gate <host>      (não é do protocolo do engine) o veredito de um start AGORA nesse host, sem abrir nada: JSON, exit 0/1
+  gc-session-ssh gate <host>      (não é do protocolo do engine) o veredito de um start AGORA nesse host, sem abrir nada: JSON, exit 0/1 (com `ok`: cap, slot_cap e, no host com presença, mem_free_pct: a memória livre %, 0..100, ou null)
 
 O QUE FAZ
   Cada operação é UM ssh (ControlMaster em ~/.ssh/cm, o mesmo do mbp-run.sh) que leva um script sh pela entrada padrão (o start são
@@ -921,7 +921,11 @@ def gate_check(cfg: Cfg) -> dict:
         return no("bandeira mbp-offload desligada")
     if not cap.isdigit() or int(cap) < 1:
         return no(f"teto de slots ilegível ou zero na checagem (slot_cap={cap!r})")
-    return {"host": cfg.host, "ok": True, "reason": "Athos fora e MBP saudável", "slot_cap": int(cap)}
+    # mem_free_pct: o "System-wide memory free percentage" do memory_pressure do MBP, que o --check já lê e até aqui só informava; o oráculo do MBP (mbp-node-capacity.py) passa a decidir o teto de sessões por ele (ga-ixr6fh4).
+    # vazio (a chave sem valor: o memory_pressure não respondeu) → None; falhou/ilegível (texto, sinal, decimal, dígito não ASCII, mais de 3 dígitos, acima de 100) → None também: quem lê trata None como "sem leitura positiva" e NÃO sobe o teto
+    mem_raw = kv.get("mem_free_pct", "")
+    mem = int(mem_raw) if mem_raw.isascii() and mem_raw.isdigit() and len(mem_raw) <= 3 and int(mem_raw) <= 100 else None
+    return {"host": cfg.host, "ok": True, "reason": "Athos fora e MBP saudável", "slot_cap": int(cap), "mem_free_pct": mem}
 
 
 def op_gate(cfg: Cfg, name: str, args: list, dry: bool) -> int:

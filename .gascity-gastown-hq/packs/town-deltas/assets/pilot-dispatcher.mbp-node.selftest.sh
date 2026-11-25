@@ -267,7 +267,8 @@ for c in 10 11 12 2 125 126 127 1 3; do reset; r=$(D on $c); eq "script rc $c: n
 for c in 13 124 137 143 129 130 139 141 255; do reset; r=$(D on $c); eq "script rc $c: pode ter escrito → 2 (segura)" "$r" "rc=2"; done
 # a sessão
 reset; r=$(FAKE_APPLY_WRITES=0 D on 0); eq "apply disse 0 mas a bead segue livre na releitura: 2, sem sessão, sem desfazer" "$r $(ngc) $(nupd)" "rc=2 0 0"
-for spec in 'dono do Hetzner|in_progress|wa-worker-remote-1|wa-worker-remote-1' 'dono do Hetzner com marca|in_progress|wa-worker-remote-2|wa-worker-remote-2' 'dono de outra pessoa|in_progress|mila-wa|mila-wa' 'alias do MBP 3|in_progress|wa-worker-remote-mbp-3|wa-worker-remote-mbp-3' \
+for spec in 'dono do Hetzner|in_progress|wa-worker-remote-1|wa-worker-remote-1' 'dono do Hetzner com marca|in_progress|wa-worker-remote-2|wa-worker-remote-2' 'dono de outra pessoa|in_progress|mila-wa|mila-wa' 'alias do MBP 5 (acima do teto 4)|in_progress|wa-worker-remote-mbp-5|wa-worker-remote-mbp-5' \
+            'alias do MBP 9|in_progress|wa-worker-remote-mbp-9|wa-worker-remote-mbp-9' \
             'alias do MBP 0|in_progress|wa-worker-remote-mbp-0|wa-worker-remote-mbp-0' 'alias do MBP 12|in_progress|wa-worker-remote-mbp-12|wa-worker-remote-mbp-12' \
             'marca de outro alias|in_progress|wa-worker-remote-mbp-1|wa-worker-remote-mbp-2' 'sem marca|in_progress|wa-worker-remote-mbp-1|' 'status open|open|wa-worker-remote-mbp-1|wa-worker-remote-mbp-1'; do
   IFS='|' read -r nm st as mk <<EOF_S
@@ -278,6 +279,11 @@ EOF_S
 done
 reset; mkb "$T/b.2.json" in_progress wa-worker-remote-mbp-2 wa-worker-remote-mbp-2; export FAKE_BEAD2="$T/b.2.json"; r=$(D on 0)
 grep -qF -- '|new|wa-worker-remote-mbp|--alias|wa-worker-remote-mbp-2|' "$T/gccalls" && eq "o alias 2 do MBP também abre" "$r" "rc=0" || fail "alias 2: $r $(cat "$T/gccalls")"
+# ga-ixr6fh4: o despachante do MBP agora entrega até o alias -mbp-4; sem a sessão aberta a bead ficaria dona de um alias que ninguém serve (o gancho a segurava como "já é do nó")
+for k in 3 4; do
+  reset; mkb "$T/b.$k.json" in_progress wa-worker-remote-mbp-$k wa-worker-remote-mbp-$k; export FAKE_BEAD2="$T/b.$k.json"; r=$(D on 0)
+  grep -qF -- "|new|wa-worker-remote-mbp|--alias|wa-worker-remote-mbp-$k|" "$T/gccalls" && eq "o alias $k do MBP também abre" "$r" "rc=0" || fail "alias $k: $r $(cat "$T/gccalls")"
+done
 reset; r=$(FAKE_BD_SHOW_FAIL_FROM=2 D on 0); eq "a releitura depois do apply falha: 2, sem sessão" "$r $(ngc)" "rc=2 0"
 reset; r=$(FAKE_GC_NEW_RC=1 D on 0)
 eq "session new falhou: fecha a sessão, solta a bead e confirma — 1 (segue no mini)" "$r $(ord)$(stt)" "rc=1 bd:show script:apply bd:show gc:list gc:new gc:close bd:update bd:show $FREE"
@@ -290,6 +296,13 @@ for c in 13 124 143 130; do
   reset; r=$(FAKE_APPLY_WRITES=1 D on $c)
   eq "rc $c e a escrita pegou (cara do apply, sem sessão): desfaz e devolve 2" "$r $(stt)" "rc=2 $FREE"
 done
+# ga-ixr6fh4: o desfazer do rc incerto vale para os 4 aliases do MBP e só para eles (o -mbp-5 não é do despachante do MBP: não toca)
+for k in 3 4; do
+  reset; mkb "$T/b.$k.json" in_progress wa-worker-remote-mbp-$k wa-worker-remote-mbp-$k; export FAKE_BEAD2="$T/b.$k.json"; r=$(FAKE_APPLY_WRITES=1 D on 13)
+  eq "rc 13 e a escrita pegou no alias -mbp-$k (cara do apply, sem sessão): desfaz e devolve 2" "$r $(stt)" "rc=2 $FREE"
+done
+reset; mkb "$T/b.5.json" in_progress wa-worker-remote-mbp-5 wa-worker-remote-mbp-5; export FAKE_BEAD2="$T/b.5.json"; r=$(FAKE_APPLY_WRITES=1 D on 13)
+eq "rc 13 e a bead é do alias -mbp-5 (acima do teto 4): não toca — 2" "$r $(nupd) $(stt)" "rc=2 0 in_progress,wa-worker-remote-mbp-5,wa-worker-remote-mbp-5"
 reset; r=$(FAKE_APPLY_WRITES=0 D on 13); eq "rc 13 e a bead segue livre: não escreve nada — 2" "$r $(nupd)" "rc=2 0"
 reset; export FAKE_BEAD2="$T/b.foreign.json"; r=$(FAKE_APPLY_WRITES=1 D on 13); eq "rc 13 e a bead é de OUTRO dono: não toca — 2" "$r $(stt) $(nupd)" "rc=2 in_progress,mila-wa,- 0"
 reset; export FAKE_BEAD2="$T/b.hz1.json"; r=$(FAKE_APPLY_WRITES=1 D on 13); eq "rc 13 e a bead tem a forma do apply do HETZNER (dono = marca = wa-worker-remote-1): não toca — 2" "$r $(nupd) $(stt)" "rc=2 0 in_progress,wa-worker-remote-1,wa-worker-remote-1"
@@ -450,8 +463,10 @@ mut cheio-teto-ilegivel $M1 "''|*[!0-9]*) return 1 ;; esac" "''|*[!0-9]*) return
 mut cheio-sem-flag      $M1 '[ "${PILOT_SPAWN_WA_WORKER:-1}" = "1" ] || return 1' ':'
 mut cheio-igual-nao     $M1 '[ "$_PCAP_N" -ge "$_mf_max" ]' '[ "$_PCAP_N" -gt "$_mf_max" ]'
 mut cheio-sempre        $M1 '[ "$_PCAP_N" -ge "$_mf_max" ]' ':'
-mut open-sem-alias      $O1 'wa-worker-remote-mbp-[1-2]) ;;' '*) ;;'
-mut open-alias-hetzner  $O1 'wa-worker-remote-mbp-[1-2]) ;;' 'wa-worker-remote-[1-9]|wa-worker-remote-mbp-[1-2]) ;;'
+mut open-sem-alias      $O1 'wa-worker-remote-mbp-[1-4]) ;;' '*) ;;'
+mut open-alias-hetzner  $O1 'wa-worker-remote-mbp-[1-4]) ;;' 'wa-worker-remote-[1-9]|wa-worker-remote-mbp-[1-4]) ;;'
+mut open-so-ate-3       $O1 'wa-worker-remote-mbp-[1-4]) ;;' 'wa-worker-remote-mbp-[1-3]) ;;'
+mut open-ate-5          $O1 'wa-worker-remote-mbp-[1-4]) ;;' 'wa-worker-remote-mbp-[1-5]) ;;'
 mut open-sem-marca      $O1 'if [ "$_PWR_STATUS" != in_progress ] || [ "$_PWR_MARK" != "$_PWR_ALIAS" ]; then' 'if false; then'
 mut open-template       $O1 '_pilot_node_remote_open wa-worker-remote-mbp ' '_pilot_node_remote_open wa-worker-remote '
 mut open-chave          $O1 'pilot.wa_node_alias "$(_pilot_node_idle_secs)" whatsapp_automation' 'pilot.mbp_node_alias "$(_pilot_node_idle_secs)" whatsapp_automation'
@@ -460,7 +475,9 @@ mut open-rig-do-ps      $O1 'whatsapp_automation || _mo_rc=$?' 'property_scraper
 mut open-rc-engolido    $O1 'return "$_mo_rc"' 'return 0'
 mut settle-sem-forma    $S1 'if [ "$_PWR_STATUS" != in_progress ] || [ "$_PWR_MARK" != "$_PWR_ALIAS" ]; then return 0; fi' ':'
 mut settle-chave        $S1 '0 pilot.wa_node_alias || true' '0 pilot.mbp_node_alias || true'
-mut settle-sem-alias    $S1 'case "$_PWR_ALIAS" in wa-worker-remote-mbp-[1-2]) ;; *) return 0 ;; esac' ':'
+mut settle-sem-alias    $S1 'case "$_PWR_ALIAS" in wa-worker-remote-mbp-[1-4]) ;; *) return 0 ;; esac' ':'
+mut settle-so-ate-3     $S1 'case "$_PWR_ALIAS" in wa-worker-remote-mbp-[1-4]) ;; *) return 0 ;; esac' 'case "$_PWR_ALIAS" in wa-worker-remote-mbp-[1-3]) ;; *) return 0 ;; esac'
+mut settle-ate-5        $S1 'case "$_PWR_ALIAS" in wa-worker-remote-mbp-[1-4]) ;; *) return 0 ;; esac' 'case "$_PWR_ALIAS" in wa-worker-remote-mbp-[1-5]) ;; *) return 0 ;; esac'
 mut fia-sem-chamada     - '_pilot_mbp_node_decide "$STORY_ID" "$STORY_BEAD_CITY" "$_SLING_TARGET" || _RP_MBP_RC=$?' ':'
 mut fia-sempre-chama    - 'if [ "$_RP_NODE_RC" = 1 ]; then
           local _RP_MBP_RC=0' 'if true; then

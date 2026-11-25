@@ -5,8 +5,9 @@
 # Contents
 #   Casos · Controle negativo · Como rodar
 #
-# CASOS: a casca fixa a identidade do MBP (alias -mbp-1..2, template, log, modo pilot SEM gc.routed_to) mesmo com WA_NODE_* no ambiente, inclusive o ORÁCULO · o oráculo manda (Athos no MBP/sem vaga/ilegível/ausente = fica no mini, nada escrito) ·
-#   2 slots, MBP_NODE_SLOTS=1, valor ilegível = 1, slot só do MBP · só bead wa-* · despachante ausente = 11 · release só solta bead de alias do MBP · ponta a ponta com o oráculo e o classificador REAIS.
+# CASOS: a casca fixa a identidade do MBP (alias -mbp-1..4, template, log, modo pilot SEM gc.routed_to) mesmo com WA_NODE_* no ambiente, inclusive o ORÁCULO · o oráculo manda (Athos no MBP/sem vaga/ilegível/ausente = fica no mini, nada escrito) ·
+#   até 4 slots (padrão 4; MBP_NODE_SLOTS=1..4 baixa; qualquer outro valor definido = 1), slot só do MBP · só bead wa-* · despachante ausente = 11 · release só solta bead de alias do MBP · ponta a ponta com o oráculo e o classificador REAIS
+#   (3 e 4 construtores com o Athos fora e memória livre; a queda com a memória baixa e com o Athos de volta) · o teto 4 é o mesmo no agente, na casca, no oráculo e no Pilot (ga-ixr6fh4).
 # CONTROLE NEGATIVO: cada mutante troca UMA linha da casca numa cópia e o caso designado tem de reprovar; mutante que sobrevive reprova esta bateria.
 # COMO RODAR: bash scripts/mbp-node-dispatch.selftest.sh   (macOS /bin/bash 3.2 e Linux; precisa de jq e python3)
 set -u
@@ -168,20 +169,39 @@ got=$( unset WA_NODE_TIMEOUT; export MBP_NODE_TIMEOUT=7 MBP_NODE_DISPATCH="$T/ec
 got=$( unset MBP_NODE_TIMEOUT; export WA_NODE_TIMEOUT=9 MBP_NODE_DISPATCH="$T/echo-timeout.sh"; "$REAL" check wa-t1 2>&1 )
 [ "$got" = "WA_NODE_TIMEOUT=9" ] && ok "sem MBP_NODE_TIMEOUT o WA_NODE_TIMEOUT=9 do ambiente passa intacto" || bad "sem MBP_NODE_TIMEOUT: o despachante recebeu '$got' (esperado 9 herdado)"
 
-# ---- 2 slots do MBP (e só do MBP)
+# ---- até 4 slots do MBP (e só do MBP) — ga-ixr6fh4. Padrão 4 (o teto do agente); MBP_NODE_SLOTS=1..4 baixa; o resto vale 1 (o inerte: erro de digitação nunca vira mais sessões)
 fresh; busy wa-b1 wa-worker-remote-mbp-1; d apply wa-t1
 expect_rc "1º slot ocupado (bead em andamento do -mbp-1) -> a bead vai ao 2º slot -> 0" 0
-[ "$(bead '."wa-t1".assignee')" = wa-worker-remote-mbp-2 ] && ok "2 slots: a bead foi ao wa-worker-remote-mbp-2" || bad "2 slots: dono $(bead '."wa-t1".assignee')"
-fresh; busy wa-b1 wa-worker-remote-mbp-1; busy wa-b2 wa-worker-remote-mbp-2; d apply wa-t1
-expect_rc "os 2 slots ocupados -> 12 sem escrita (não há 3º)" 12 w0
-fresh; busy wa-b1 wa-worker-remote-mbp-1; MBP_NODE_SLOTS=1 d apply wa-t1
-expect_rc "MBP_NODE_SLOTS=1 com o -mbp-1 ocupado -> 12 sem escrita" 12 w0
-fresh; busy wa-b1 wa-worker-remote-mbp-1; MBP_NODE_SLOTS=2 d apply wa-t1
-expect_rc "MBP_NODE_SLOTS=2 com o -mbp-1 ocupado -> 0" 0
-fresh; busy wa-b1 wa-worker-remote-mbp-1; MBP_NODE_SLOTS=3 d apply wa-t1
-expect_rc "MBP_NODE_SLOTS=3 (acima do teto do agente) vale 1 slot: -mbp-1 ocupado -> 12 sem escrita" 12 w0
-fresh; busy wa-b1 wa-worker-remote-mbp-1; MBP_NODE_SLOTS= d apply wa-t1
-expect_rc "MBP_NODE_SLOTS definido e vazio vale 1 slot (não 'sem valor'): -mbp-1 ocupado -> 12 sem escrita" 12 w0
+[ "$(bead '."wa-t1".assignee')" = wa-worker-remote-mbp-2 ] && ok "slots: a bead foi ao wa-worker-remote-mbp-2" || bad "slots: dono $(bead '."wa-t1".assignee')"
+# O oráculo-stub vê 9 vagas: só o número de slots decide (com free 2 ele recusaria antes: as beads já atribuídas e ainda sem sessão descontam da vaga dele, e o caso testaria o oráculo, não a casca)
+CAP_NODE9='{"verdict":"node","free":9,"reason":"ok"}'
+fill() { local i=1; while [ "$i" -le "$1" ]; do busy "wa-b$i" "wa-worker-remote-mbp-$i"; i=$((i+1)); done; }   # fill <n>: uma bead em andamento por alias, -mbp-1..n
+slots_case() { # slots_case <rótulo> <MBP_NODE_SLOTS | -: não definida> <quantos aliases ocupados> <rc esperado> <alias que recebe a bead | -: nada escrito>
+  fresh; cap "$CAP_NODE9" 0; fill "$3"
+  if [ "$2" = - ]; then d apply wa-t1; else MBP_NODE_SLOTS="$2" d apply wa-t1; fi
+  if [ "$5" = - ]; then expect_rc "$1" "$4" w0
+  else expect_rc "$1" "$4" && { [ "$(bead '."wa-t1".assignee')" = "$5" ] && ok "  e foi ao $5" || bad "  dono '$(bead '."wa-t1".assignee')' (esperado $5)"; }
+  fi
+}
+slots_case "padrão (MBP_NODE_SLOTS não definida): 0 ocupados -> -mbp-1" - 0 0 wa-worker-remote-mbp-1
+slots_case "padrão 4: 2 ocupados -> o 3º slot (-mbp-3)" - 2 0 wa-worker-remote-mbp-3
+slots_case "padrão 4: 3 ocupados -> o 4º slot (-mbp-4)" - 3 0 wa-worker-remote-mbp-4
+slots_case "padrão 4: os 4 ocupados -> 12 sem escrita (não há 5º)" - 4 12 -
+slots_case "MBP_NODE_SLOTS=4: 3 ocupados -> -mbp-4" 4 3 0 wa-worker-remote-mbp-4
+slots_case "MBP_NODE_SLOTS=4: 4 ocupados -> 12 sem escrita" 4 4 12 -
+slots_case "MBP_NODE_SLOTS=3: 2 ocupados -> -mbp-3" 3 2 0 wa-worker-remote-mbp-3
+slots_case "MBP_NODE_SLOTS=3: 3 ocupados -> 12 sem escrita (o 4º não abre)" 3 3 12 -
+slots_case "MBP_NODE_SLOTS=2 (o teto de antes): 1 ocupado -> -mbp-2" 2 1 0 wa-worker-remote-mbp-2
+slots_case "MBP_NODE_SLOTS=2: 2 ocupados -> 12 sem escrita (o 3º não abre)" 2 2 12 -
+slots_case "MBP_NODE_SLOTS=1 (canário): 0 ocupados -> -mbp-1" 1 0 0 wa-worker-remote-mbp-1
+slots_case "MBP_NODE_SLOTS=1: com o -mbp-1 ocupado -> 12 sem escrita" 1 1 12 -
+# valor definido e ilegível (fora de 1..4, vazio, texto, decimal, com zero à esquerda ou espaço) vale 1 slot — nunca o número digitado e nunca o padrão 4
+for badv in 5 9 10 0 "" abc 2.5 -1 04 " 2" "3 "; do
+  slots_case "MBP_NODE_SLOTS='$badv' (fora de 1..4): vale 1 slot — 1 ocupado -> 12 sem escrita" "$badv" 1 12 -
+  slots_case "MBP_NODE_SLOTS='$badv': sem ocupados a bead vai ao -mbp-1 (1 slot, não o padrão 4)" "$badv" 0 0 wa-worker-remote-mbp-1
+done
+fresh; cap "$CAP_NODE9" 0; MBP_NODE_SLOTS=5 d apply wa-t1; printf '%s' "$OUT" | grep -qF "MBP_NODE_SLOTS='5' não é 1..4" && ok "valor ilegível AVISA no stderr (não é 1..4) e diz que usa 1 slot" || bad "aviso do valor ilegível: $OUT"
+fresh; cap "$CAP_NODE9" 0; MBP_NODE_SLOTS=3 d apply wa-t1; printf '%s' "$OUT" | grep -q 'MBP_NODE_SLOTS' && bad "valor válido (3) não devia avisar: $OUT" || ok "valor válido (3) não avisa"
 # ---- o slot do MBP é só do MBP
 fresh; busy wa-hz wa-worker-remote-1; d apply wa-t1
 expect_rc "bead em andamento do wa-worker-remote-1 (Hetzner) NÃO ocupa o slot do MBP -> 0" 0
@@ -189,10 +209,38 @@ fresh; echo '{"ok":true,"sessions":[{"template":"wa-worker-remote","state":"acti
 d apply wa-t1; expect_rc "sessão ativa do wa-worker-remote (Hetzner) NÃO ocupa o slot do MBP -> 0" 0
 fresh; echo '{"ok":true,"sessions":[{"template":"wa-worker","state":"active","alias":"wa-worker-adhoc-1"}]}' > "$SESS"
 d apply wa-t1; expect_rc "wa-worker do mini ativo não ocupa o slot do MBP -> 0" 0
-fresh; echo '{"ok":true,"sessions":[{"template":"wa-worker-remote-mbp","state":"active","closed":false,"alias":"wa-worker-remote-mbp-1"},{"template":"wa-worker-remote-mbp","state":"active","closed":false,"alias":"wa-worker-remote-mbp-2"}]}' > "$SESS"
-d apply wa-t1; expect_rc "2 sessões ativas do wa-worker-remote-mbp -> 12 sem escrita" 12 w0
+live_mbp() { # live_mbp <n>: n sessões ativas do template do MBP, uma por alias -mbp-1..n (a lista que o `gc session list --json` devolve)
+  local i=1 rows=""; while [ "$i" -le "$1" ]; do rows="$rows${rows:+,}{\"template\":\"wa-worker-remote-mbp\",\"state\":\"active\",\"closed\":false,\"alias\":\"wa-worker-remote-mbp-$i\"}"; i=$((i+1)); done
+  printf '{"ok":true,"sessions":[%s]}\n' "$rows" > "$SESS"
+}
+fresh; cap "$CAP_NODE9" 0; live_mbp 4
+d apply wa-t1; expect_rc "4 sessões ativas do wa-worker-remote-mbp (padrão 4) -> 12 sem escrita" 12 w0
+fresh; cap "$CAP_NODE9" 0; live_mbp 3
+d apply wa-t1; expect_rc "3 sessões ativas (padrão 4) -> a bead vai ao 4º alias -> 0" 0
+[ "$(bead '."wa-t1".assignee')" = wa-worker-remote-mbp-4 ] && ok "3 sessões ativas: a bead foi ao -mbp-4 (o alias que NENHUMA sessão viva tem)" || bad "3 sessões ativas: dono '$(bead '."wa-t1".assignee')'"
+fresh; cap "$CAP_NODE9" 0; live_mbp 2
+MBP_NODE_SLOTS=2 d apply wa-t1; expect_rc "2 sessões ativas com MBP_NODE_SLOTS=2 -> 12 sem escrita" 12 w0
+fresh; cap "$CAP_NODE9" 0; live_mbp 2
+MBP_NODE_SLOTS=3 d apply wa-t1; expect_rc "2 sessões ativas com MBP_NODE_SLOTS=3 -> 0 (o 3º slot)" 0
 fresh; echo '{"ok":true,"sessions":[{"template":"wa-worker-remote-mbp","state":"asleep","closed":false,"alias":"wa-worker-remote-mbp-1"}]}' > "$SESS"
 d apply wa-t1; expect_rc "sessão do wa-worker-remote-mbp DORMINDO não segura o slot (o Pilot a acorda) -> 0" 0
+# ---- o teto 4 mora em QUATRO arquivos (seis pontos) e tem de ser o MESMO número (ga-ixr6fh4): o agente (max_active_sessions), o padrão e o último valor aceito da casca, o SESSIONS_MAX do oráculo e os dois padrões de
+# alias do Pilot (abrir a sessão do alias e desfazer o apply incerto). Um deles diferente deixa bead dona de um alias que ninguém serve: o Pilot recusa abrir a sessão e a bead fica segura como "já é do nó".
+# vazio (arquivo ou padrão que não achei) → o número fica vazio e o caso REPROVA; nunca "igual" por falta de leitura.
+AGENT_TOML="$HERE/../agents/wa-worker-remote-mbp/agent.toml"; PILOT_SH="$HERE/../packs/town-deltas/assets/pilot-dispatcher.sh"
+t_agent=$(sed -n 's/^max_active_sessions *= *\([0-9][0-9]*\).*/\1/p' "$AGENT_TOML" 2>/dev/null | head -n 1)
+t_default=$(sed -n 's/^SLOTS=\([0-9][0-9]*\)$/\1/p' "$REAL" 2>/dev/null | head -n 1)
+t_upto=$(sed -n 's/.*case "\$MBP_NODE_SLOTS" in \([0-9|]*\)) SLOTS=.*/\1/p' "$REAL" 2>/dev/null | tr '|' '\n' | sort -n | tail -n 1)
+t_oracle=$(sed -n 's/^SESSIONS_MAX = \([0-9][0-9]*\).*/\1/p' "$HERE/mbp-node-capacity.py" 2>/dev/null | head -n 1)
+t_pilot=$(grep -o 'wa-worker-remote-mbp-\[1-[0-9]\]' "$PILOT_SH" 2>/dev/null | sed 's/.*\[1-\([0-9]\)\]/\1/' | sort -u | tr '\n' ' ')
+t_pilot_n=$(grep -o 'wa-worker-remote-mbp-\[1-[0-9]\]' "$PILOT_SH" 2>/dev/null | wc -l | tr -d ' ')
+case "$t_agent" in ''|*[!0-9]*) bad "teto do agente ilegível em $AGENT_TOML ('$t_agent')" ;; *)
+  [ "$t_default" = "$t_agent" ] && ok "o padrão de SLOTS da casca ($t_default) é o max_active_sessions do agente ($t_agent)" || bad "padrão de SLOTS da casca '$t_default' ≠ max_active_sessions do agente '$t_agent'"
+  [ "$t_upto" = "$t_agent" ] && ok "o último valor que MBP_NODE_SLOTS aceita ($t_upto) é o teto do agente ($t_agent)" || bad "MBP_NODE_SLOTS aceita até '$t_upto' ≠ teto do agente '$t_agent'"
+  [ "$t_oracle" = "$t_agent" ] && ok "o SESSIONS_MAX do oráculo ($t_oracle) é o teto do agente ($t_agent)" || bad "SESSIONS_MAX do oráculo '$t_oracle' ≠ teto do agente '$t_agent'"
+  [ "$t_pilot" = "$t_agent " ] && [ "${t_pilot_n:-0}" -ge 2 ] && ok "os padrões de alias do Pilot (abrir e desfazer: $t_pilot_n) vão até -mbp-$t_agent, o teto do agente" || bad "padrões de alias do Pilot: '$t_pilot' ($t_pilot_n) ≠ -mbp-$t_agent"
+;; esac
+
 # ---- o oráculo de capacidade do MBP manda (modo pilot): sem vaga, ilegível ou ausente a bead fica no mini e nada é escrito
 fresh; cap "$CAP_LOCAL" 1; d apply wa-t1; expect_rc "oráculo diz local (rc 1: Athos no MBP, pausa, sem saúde, bandeira off) -> 12 sem escrita" 12 w0
 fresh; cap '{"verdict":"unknown","reason":"gate_ilegivel"}' 2; d apply wa-t1; expect_rc "oráculo diz unknown (rc 2) -> 11 sem escrita" 11 w0
@@ -230,6 +278,36 @@ e2e; gate '' 0; d apply wa-t1; expect_rc "oráculo real: gate com saída vazia e
 e2e; gate '{"cap":2,"host":"mbp","ok":true,"reason":"x","slot_cap":null}' 0; d apply wa-t1; expect_rc "oráculo real: ok com slot_cap nulo (host sem presence_gate) -> 11 sem escrita" 11 w0
 e2e; gate "$GATE_OK" 0; echo 'não é json' > "$SESS"; d apply wa-t1; expect_rc "oráculo real: gate libera mas a lista de sessões é ilegível -> 11 sem escrita" 11 w0
 e2e; gate "$GATE_OK" 0; MBP_NODE_SLOTS=1 d apply wa-t1; expect_rc "oráculo real + 1 slot -> 0" 0
+# ---- ga-ixr6fh4: o teto DINÂMICO ponta a ponta (despachante, oráculo e classificador REAIS; só o gate e a lista de sessões são stubs). `up <n>`: os aliases -mbp-1..n têm bead em andamento E sessão ativa.
+GATE_M52='{"cap":4,"host":"mbp","ok":true,"reason":"Athos fora e MBP saudável","slot_cap":8,"mem_free_pct":52}'
+GATE_M30='{"cap":4,"host":"mbp","ok":true,"reason":"Athos fora e MBP saudável","slot_cap":8,"mem_free_pct":30}'
+GATE_NOMEM='{"cap":4,"host":"mbp","ok":true,"reason":"Athos fora e MBP saudável","slot_cap":8}'
+GATE_CAP2='{"cap":2,"host":"mbp","ok":true,"reason":"Athos fora e MBP saudável","slot_cap":8,"mem_free_pct":52}'
+GATE_USO90='{"cap":4,"host":"mbp","ok":false,"reason":"Athos está no MBP (presença=uso, motivo=input_recente)","slot_cap":null,"mem_free_pct":90}'
+e2e_up() { # e2e_up <json do gate> <rc do gate> <n>
+  e2e; gate "$1" "$2"; fill "$3"; live_mbp "$3"
+}
+dyn_case() { # dyn_case <rótulo> <json do gate> <rc do gate> <n no ar> <rc esperado> <alias que recebe | -: nada escrito>
+  e2e_up "$2" "$3" "$4"; d apply wa-t1
+  if [ "$6" = - ]; then expect_rc "$1" "$5" w0
+  else expect_rc "$1" "$5" && { [ "$(bead '."wa-t1".assignee')" = "$6" ] && ok "  e foi ao $6" || bad "  dono '$(bead '."wa-t1".assignee')' (esperado $6)"; }
+  fi
+}
+dyn_case "Athos fora, 52% livres, nenhuma no ar: -> -mbp-1" "$GATE_M52" 0 0 0 wa-worker-remote-mbp-1
+dyn_case "Athos fora, 52% livres, 2 no ar: a 3ª construtora -> -mbp-3" "$GATE_M52" 0 2 0 wa-worker-remote-mbp-3
+dyn_case "Athos fora, 52% livres, 3 no ar: a 4ª construtora -> -mbp-4" "$GATE_M52" 0 3 0 wa-worker-remote-mbp-4
+dyn_case "Athos fora, 52% livres, 4 no ar: não há 5ª -> 12 sem escrita" "$GATE_M52" 0 4 12 -
+dyn_case "memória em 30% (abaixo de 35), 1 no ar: a 2ª ainda abre (o teto de antes) -> -mbp-2" "$GATE_M30" 0 1 0 wa-worker-remote-mbp-2
+dyn_case "memória caiu a 30% com 2 no ar: a 3ª NÃO abre -> 12 sem escrita (as 2 seguem)" "$GATE_M30" 0 2 12 -
+dyn_case "provider antigo (sem mem_free_pct), 2 no ar: a 3ª NÃO abre -> 12 sem escrita" "$GATE_NOMEM" 0 2 12 -
+dyn_case "cap 2 na config do host, 52% livres, 2 no ar: o cap segura -> 12 sem escrita" "$GATE_CAP2" 0 2 12 -
+dyn_case "Athos de volta (gate recusa), nenhuma no ar: -> 12 sem escrita, mesmo com 90% livres" "$GATE_USO90" 1 0 12 -
+dyn_case "Athos de volta com 1 no ar: -> 12 sem escrita (nenhuma sessão nova; a viva segue em prioridade de fundo)" "$GATE_USO90" 1 1 12 -
+# a queda: o mesmo MBP com 2 no ar aceita a 3ª e, com o Athos de volta, a 4ª não vem
+dyn_case "queda, antes: Athos fora, 52% livres, 2 no ar -> -mbp-3" "$GATE_M52" 0 2 0 wa-worker-remote-mbp-3
+dyn_case "queda, depois: o Athos volta, 3 no ar -> 12 sem escrita" "$GATE_USO90" 1 3 12 -
+e2e_up "$GATE_M52" 0 2; MBP_NODE_SLOTS=2 d apply wa-t1; expect_rc "Athos fora, 52% livres e MBP_NODE_SLOTS=2 (canário): 2 no ar -> 12 sem escrita (a casca baixa o teto)" 12 w0
+e2e_up "$GATE_M52" 0 3; MBP_NODE_SLOTS=3 d apply wa-t1; expect_rc "MBP_NODE_SLOTS=3: 3 no ar -> 12 sem escrita (o 4º não abre)" 12 w0
 unset MBP_NODE_GATE_CMD MBP_NODE_SESSIONS_CMD
 # ---- o classificador REAL do WA, ponta a ponta (sem MBP_NODE_CLASSIFY): o padrão da casca aponta para scripts/wa-node-classify.py
 fresh '{"description":"Em lib/foo_parser.py a funcao quebra com string vazia. Teste em tests/test_foo_parser.py."}'
@@ -249,7 +327,9 @@ export MBP_NODE_CLASSIFY="$REAL_CLS_SAVED"
 # ---- controle negativo: cada mutante troca UMA linha da casca (numa cópia) e o caso designado tem de reprovar
 # O mutante mora em $CITY/scripts/mbp-node-dispatch.mut.sh (ao lado do despachante, do classificador e do oráculo copiados, que é como a casca os acha).
 mk_mutant() { # mk_mutant <nome> <trecho original> <trecho novo> -> $CITY/scripts/mbp-node-dispatch.mut.sh; rc 1 se o trecho não existe
-  python3 -I - "$REAL" "$CITY/scripts/mbp-node-dispatch.mut.sh" "$2" "$3" <<'EOF'
+  # o arquivo do mutante anterior sai ANTES: com a âncora ausente o rc do python (1) é o da função, e o `chmod` final não o esconde nem deixa um mutante velho rodar no lugar deste (ga-ixr6fh4)
+  rm -f "$CITY/scripts/mbp-node-dispatch.mut.sh"
+  python3 -I - "$REAL" "$CITY/scripts/mbp-node-dispatch.mut.sh" "$2" "$3" <<'EOF' || return 1
 import sys
 src = open(sys.argv[1], encoding="utf-8").read()
 if sys.argv[3] not in src:
@@ -278,16 +358,21 @@ sc_cap_default() { e2e; gate "$GATE_NO" 1; SC_ARGS="apply wa-t1"; }
 # 1 slot e uma sessão viva do TEMPLATE do MBP com um alias que não é do slot: só o template (a rota) a prende; com o template do Hetzner o slot pareceria livre
 sc_tpl()       { fresh; SC_ARGS="apply wa-t1"; export MBP_NODE_SLOTS=1; echo '{"ok":true,"sessions":[{"template":"wa-worker-remote-mbp","state":"active","closed":false,"alias":"outro-alias"}]}' > "$SESS"; }
 sc_tpl_env()   { sc_tpl; export WA_NODE_ROUTE_TEMPLATE=wa-worker-remote; }
-# oráculo com 5 vagas: as 2 beads já atribuídas (sem sessão) descontam 2, sobram 3 — só o nº de slots decide (com free 2 o oráculo recusaria antes e o mutante nunca seria exercido)
-sc_slots_env() { fresh; SC_ARGS="apply wa-t1"; busy wa-b1 wa-worker-remote-mbp-1; busy wa-b2 wa-worker-remote-mbp-2; cap '{"verdict":"node","free":5,"reason":"ok"}' 0; export WA_NODE_SLOTS=3; }
-sc_two()       { fresh; SC_ARGS="apply wa-t1"; busy wa-b1 wa-worker-remote-mbp-1; }
-sc_bad3()      { fresh; SC_ARGS="apply wa-t1"; busy wa-b1 wa-worker-remote-mbp-1; busy wa-b2 wa-worker-remote-mbp-2; cap '{"verdict":"node","free":5,"reason":"ok"}' 0; export MBP_NODE_SLOTS=3; }
-sc_empty()     { fresh; SC_ARGS="apply wa-t1"; busy wa-b1 wa-worker-remote-mbp-1; export MBP_NODE_SLOTS=; }
+# oráculo-stub com 9 vagas (CAP_NODE9): as beads já atribuídas (sem sessão) descontam da vaga dele, e só o nº de slots decide (com free 2 o oráculo recusaria antes e o mutante nunca seria exercido)
+sc_slots_env() { fresh; SC_ARGS="apply wa-t1"; cap "$CAP_NODE9" 0; fill 4; export WA_NODE_SLOTS=5; }   # 4 ocupados e o ambiente diz 5: o da casca (4) manda -> 12; o mutante abre o 5º
+sc_two()       { fresh; SC_ARGS="apply wa-t1"; cap "$CAP_NODE9" 0; fill 1; }                           # padrão: o -mbp-2 recebe; com 1 slot só -> 12
+sc_def4()      { fresh; SC_ARGS="apply wa-t1"; cap "$CAP_NODE9" 0; fill 3; }                           # padrão 4: o -mbp-4 recebe; com padrão 2 (ou 3) -> 12
+sc_bad5()      { fresh; SC_ARGS="apply wa-t1"; cap "$CAP_NODE9" 0; fill 1; export MBP_NODE_SLOTS=5; }  # 5 é ilegível: 1 slot -> 12; quem aceita o 5 deixa o -mbp-2 receber
+sc_three()     { fresh; SC_ARGS="apply wa-t1"; cap "$CAP_NODE9" 0; fill 2; export MBP_NODE_SLOTS=3; }  # 3 vale: o -mbp-3 recebe; quem só aceita 1|2 deixa em 1 slot -> 12
+sc_four()      { fresh; SC_ARGS="apply wa-t1"; cap "$CAP_NODE9" 0; fill 3; export MBP_NODE_SLOTS=4; }  # 4 vale: o -mbp-4 recebe; quem só aceita até 3 deixa em 1 slot -> 12
+sc_empty()     { fresh; SC_ARGS="apply wa-t1"; cap "$CAP_NODE9" 0; fill 1; export MBP_NODE_SLOTS=; }   # definida e vazia: 1 slot -> 12
 st_mbp()       { [ "$(bead '."wa-t1".assignee')" = wa-worker-remote-mbp-1 ] && [ "$(bead '."wa-t1".metadata["pilot.wa_node_alias"]')" = wa-worker-remote-mbp-1 ]; }
 st_pilot()     { [ "$(bead '."wa-t1".metadata["pilot.wa_node_alias"]')" = wa-worker-remote-mbp-1 ] && [ "$(bead '."wa-t1".metadata["gc.routed_to"] // ""')" = "" ]; }
 st_log()       { [ -s "$MBPLOG" ] && [ ! -e "$WALOG" ]; }
 st_clean()     { ! wrote; }
 st_second()    { [ "$(bead '."wa-t1".assignee')" = wa-worker-remote-mbp-2 ]; }
+st_third()     { [ "$(bead '."wa-t1".assignee')" = wa-worker-remote-mbp-3 ]; }
+st_fourth()    { [ "$(bead '."wa-t1".assignee')" = wa-worker-remote-mbp-4 ]; }
 mutant prefixo-do-hetzner   'export WA_NODE_ALIAS_PREFIX="wa-worker-remote-mbp-"'   'export WA_NODE_ALIAS_PREFIX="wa-worker-remote-"'   sc_apply 0 st_mbp
 mutant rota-do-hetzner      'export WA_NODE_ROUTE_TEMPLATE="wa-worker-remote-mbp"'  'export WA_NODE_ROUTE_TEMPLATE="wa-worker-remote"'  sc_tpl 12 st_clean
 mutant log-do-hetzner       '${MBP_NODE_LOG:-$CITY/.gc/mbp-node-route.jsonl}'       '${MBP_NODE_LOG:-$CITY/.gc/wa-node-route.jsonl}'    sc_apply 0 st_log
@@ -299,10 +384,16 @@ mutant oraculo-do-hetzner   '$HERE/mbp-node-capacity.py}"'                      
 mutant modo-pool            'export WA_NODE_SPAWN="pilot"'                           'export WA_NODE_SPAWN="pool"'                        sc_apply 0 st_pilot
 mutant modo-do-ambiente-vence 'export WA_NODE_SPAWN="pilot"'                         'export WA_NODE_SPAWN="${WA_NODE_SPAWN:-pilot}"'     sc_pool_env 0 st_pilot
 mutant slots-do-ambiente-vence 'export WA_NODE_SLOTS="$SLOTS"'                       'export WA_NODE_SLOTS="${WA_NODE_SLOTS:-$SLOTS}"'    sc_slots_env 12 st_clean
-mutant um-slot-so           'SLOTS=2
+mutant um-slot-so           'SLOTS=4
 if'                                                                                  'SLOTS=1
 if'                                                                                  sc_two 0 st_second
-mutant slot-ilegivel-vale-o-valor 'SLOTS=1; say "MBP_NODE_SLOTS='"'"'$MBP_NODE_SLOTS'"'"' não é 1 nem 2'  'SLOTS="$MBP_NODE_SLOTS"; say "MBP_NODE_SLOTS='"'"'$MBP_NODE_SLOTS'"'"' não é 1 nem 2' sc_bad3 12 st_clean
+mutant padrao-volta-a-2     'SLOTS=4
+if'                                                                                  'SLOTS=2
+if'                                                                                  sc_def4 0 st_fourth
+mutant slot-ilegivel-vale-o-valor 'SLOTS=1; say "MBP_NODE_SLOTS='"'"'$MBP_NODE_SLOTS'"'"' não é 1..4'  'SLOTS="$MBP_NODE_SLOTS"; say "MBP_NODE_SLOTS='"'"'$MBP_NODE_SLOTS'"'"' não é 1..4' sc_bad5 12 st_clean
+mutant aceita-ate-5         '1|2|3|4)'                                               '1|2|3|4|5)'                                         sc_bad5 12 st_clean
+mutant so-1-ou-2            '1|2|3|4)'                                               '1|2)'                                               sc_three 0 st_third
+mutant so-ate-3             '1|2|3|4)'                                               '1|2|3)'                                             sc_four 0 st_fourth
 mutant slots-vazio-vale-padrao '"${MBP_NODE_SLOTS+set}" = set'                       '"${MBP_NODE_SLOTS:+set}" = set'                     sc_empty 12 st_clean
 mutant sem-guarda-de-prefixo 'case "$2" in wa-*) ;; *) say "$2 não é uma bead do WA (prefixo wa-): não decido — fica onde está"; exit 11 ;; esac' ':' sc_ps 11 st_clean
 mutant sem-guarda-do-despachante '[ -x "$REAL" ] || { say "despachante $REAL ausente ou não executável — fica no mini"; exit 11; }' ':' sc_missing 11 st_clean
