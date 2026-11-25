@@ -75,6 +75,8 @@
     <!-- Rolling window for log-grep counts: 300s = last 5 min -->
     <key>FLC_WINDOW_SEC</key>
     <string>300</string>
+    <key>BEADS_DOLT_AUTO_START</key>
+    <string>0</string>
   </dict>
 </dict>
 </plist>

@@ -34,6 +34,8 @@
          would block discovery of the town-root repo's own .git. -->
     <key>GIT_CEILING_DIRECTORIES</key>
     <string>/Users</string>
+    <key>BEADS_DOLT_AUTO_START</key>
+    <string>0</string>
   </dict>
 
   <!-- Throttle: if the job exits too quickly, launchd waits 10s before restart -->

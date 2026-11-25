@@ -58,6 +58,8 @@
          warrant -> shutdown-dance -> kill/restart, then reload this agent. -->
     <key>WARRANT_ENABLED</key>
     <string>0</string>
+    <key>BEADS_DOLT_AUTO_START</key>
+    <string>0</string>
   </dict>
 </dict>
 </plist>

@@ -31,6 +31,8 @@
     <string>gc</string>
     <key>GIT_CEILING_DIRECTORIES</key>
     <string>/Users/athos/gt</string>
+    <key>BEADS_DOLT_AUTO_START</key>
+    <string>0</string>
   </dict>
 
   <!-- Throttle: if the job exits too quickly, launchd waits 10s before restart -->

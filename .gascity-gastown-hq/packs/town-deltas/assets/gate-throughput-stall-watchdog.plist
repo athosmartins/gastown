@@ -23,5 +23,6 @@
     <!-- <key>GTSW_AUTORECOVER</key><string>1</string> -->
     <!-- Kill-switch: GTSW_ENABLED=0 disables the watchdog entirely. -->
     <!-- <key>GTSW_ENABLED</key><string>1</string> -->
+    <key>BEADS_DOLT_AUTO_START</key><string>0</string>
   </dict>
 </dict></plist>

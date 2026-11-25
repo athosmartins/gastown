@@ -17,6 +17,7 @@
   <dict>
     <key>DOLT_ATTR_CYCLES</key><string>40</string>
     <key>DOLT_ATTR_GAP</key><string>1.0</string>
+    <key>BEADS_DOLT_AUTO_START</key><string>0</string>
   </dict>
   <key>StartInterval</key><integer>600</integer>
   <key>RunAtLoad</key><true/>

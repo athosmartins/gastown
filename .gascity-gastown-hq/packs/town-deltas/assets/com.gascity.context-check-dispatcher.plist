@@ -64,6 +64,8 @@
     <string>gt:agent gt:rig gt:convoy gc:nudge digest pinned gt:message</string>
     <key>CONTEXT_CHECK_EXCLUDE_PREFIXES</key>
     <string>type:quality-gate gate-status: nudge: reviewer-index: verdict: refino-gate: auto-refino: gate-reclaim-count: order-run: ctx:</string>
+    <key>BEADS_DOLT_AUTO_START</key>
+    <string>0</string>
   </dict>
 </dict>
 </plist>

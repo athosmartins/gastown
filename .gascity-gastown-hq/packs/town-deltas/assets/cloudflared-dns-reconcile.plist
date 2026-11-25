@@ -17,5 +17,10 @@
     <string>/tmp/cloudflared-dns-reconcile.log</string>
     <key>StandardErrorPath</key>
     <string>/tmp/cloudflared-dns-reconcile-error.log</string>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>BEADS_DOLT_AUTO_START</key>
+        <string>0</string>
+    </dict>
 </dict>
 </plist>

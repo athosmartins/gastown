@@ -45,5 +45,10 @@
     <string>/Users/athos/gt/.gascity-gastown-hq/.gc/logs/crew-pushguard-check.log</string>
     <key>StandardErrorPath</key>
     <string>/Users/athos/gt/.gascity-gastown-hq/.gc/logs/crew-pushguard-check.err</string>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>BEADS_DOLT_AUTO_START</key>
+        <string>0</string>
+    </dict>
 </dict>
 </plist>

@@ -71,6 +71,8 @@
     <string>/Users/athos/gt/.gascity-gastown-hq</string>
     <key>GC_CITY_RUNTIME_DIR</key>
     <string>/Users/athos/gt/.gascity-gastown-hq/.gc/runtime</string>
+    <key>BEADS_DOLT_AUTO_START</key>
+    <string>0</string>
   </dict>
 </dict>
 </plist>

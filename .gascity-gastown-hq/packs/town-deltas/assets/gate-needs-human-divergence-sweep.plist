@@ -54,6 +54,8 @@
     <string>/Users/athos/gt/.gascity-gastown-hq</string>
     <key>DIVERGENCE_LOG_STDOUT</key>
     <string>1</string>
+    <key>BEADS_DOLT_AUTO_START</key>
+    <string>0</string>
   </dict>
 </dict>
 </plist>
