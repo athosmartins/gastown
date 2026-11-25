@@ -2299,7 +2299,7 @@ gc_variable_session_count() {
     printf '%s' "$GC_VARIABLE_SESSION_COUNT_OVERRIDE"
     return 0
   fi
-  timeout "${PILOT_SESSION_LIST_TIMEOUT_SECS:-30}" gc --city "$GC_CITY" session list --json 2>/dev/null \
+  timeout 10 gc --city "$GC_CITY" session list --json 2>/dev/null \
     | jq '[.sessions[]? | select((.template=="wa-worker" or .template=="ps-worker" or .template=="gate-reviewer") and (.state=="active" or .state=="creating"))] | length' 2>/dev/null \
     || echo "0"
 }
