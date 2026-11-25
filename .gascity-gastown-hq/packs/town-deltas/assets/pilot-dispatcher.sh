@@ -6541,7 +6541,7 @@ inflight_slots_unmeasured() {
 # Returns 0 = the sweep goes on as a node-only pass, 1 = the caller backs off (with the honest wording).
 # The alarm: a streak counter in PILOT_LANES_UNMEASURED_STATE (consecutive sweeps without a measurement); the notify goes out on the
 # PILOT_LANES_UNMEASURED_ALERT_AFTER-th (default 2: one failed read is a blip the log already shows) and on every PILOT_LANES_UNMEASURED_ALERT_EVERY-th
-# (default 6, ~30 min at one sweep per 5 min), and on EVERY sweep while the counter cannot be written (an alarm with no memory repeats instead of falling
+# (default 6; sweeps start ~12-16 min apart, see ga-h6trx3 above, so ~1.2-1.6 h), and on EVERY sweep while the counter cannot be written (an alarm with no memory repeats instead of falling
 # silent). DRY_RUN writes no state and sends nothing (it "makes zero state changes", like every mutation here).
 _pilot_lanes_unmeasured() {
   local _lu_f="${PILOT_LANES_UNMEASURED_STATE:-${GC_CITY:-/nonexistent}/.gc/pilot-lanes-unmeasured.count}"
