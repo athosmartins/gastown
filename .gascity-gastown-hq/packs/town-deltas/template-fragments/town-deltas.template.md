@@ -43,6 +43,12 @@ Formato OBRIGATÓRIO, sem exceção:
 5. Em sessão Claude Code: use a ferramenta **AskUserQuestion** (o campo "Other"
    já satisfaz o item 4 por construção). Fora dela (mail/nudge/WhatsApp):
    escreva as opções numeradas 1/2/3 no corpo da mensagem, mesma estrutura.
+   **Worker de POOL (dog, wa-worker, ps-worker, revisor) não pergunta por aqui:**
+   o menu só existiria no pane dele e o Athos só abre o Mayor e as crews. Grave
+   a pergunta, na mesma estrutura, como comentário da bead, rode
+   `bd label add <bead> aguarda:athos` e `bd label add <bead> next-action:mayor` (o
+   2º é o turno do Mayor, que os vigias respeitam) e pare; o Mayor a refaz ao Athos
+   no app e te acorda com a resposta (o hook barra a chamada; ga-ij162cl).
 
 ❌ PROIBIDO: "O que você acha?", "Como prefere que eu siga?", "Pode confirmar?",
 "Alguma preferência?" — qualquer coisa que obrigue o Athos a redigir a resposta
@@ -526,7 +532,8 @@ distintas antes da versão final, nunca construa direto uma só:**
    do rig) só reconhece URL de OPÇÃO (`…/mockups/<slug>-<8 hex>`); a URL do
    grupo (`…/mockups/g/<grupo>`) NÃO o satisfaz — citar só o link do grupo não
    destrava o push.
-5. Pergunte via **AskUserQuestion** qual direção seguir: o contexto da
+5. Pergunte via **AskUserQuestion** (worker de pool: pelo comentário da bead +
+   `aguarda:athos` da Regra Nº 1, e o Mayor faz a pergunta) qual direção seguir: o contexto da
    pergunta leva o link do GRUPO, uma vez (a linha `grupo:` do script) — é UM
    card com as opções em abas. Depois, uma opção por ABA (A, B, C…): o tradeoff
    da frase do passo 1 na descrição e, pra levar o Athos direto na aba, o link

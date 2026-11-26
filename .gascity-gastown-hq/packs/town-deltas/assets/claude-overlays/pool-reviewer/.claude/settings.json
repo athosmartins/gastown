@@ -40,6 +40,16 @@
             "timeout": 10
           }
         ]
+      },
+      {
+        "matcher": "^AskUserQuestion$",
+        "hooks": [
+          {
+            "type": "command",
+            "command": ": ask-athos-relay; P='/Users/athos/gt/.gascity-gastown-hq/scripts/ask-athos-relay.sh'; [ -f \"$P\" ] || exit 0; e=$(/bin/bash \"$P\" 2>&1 >/dev/null); r=$?; case \"$r:$e\" in 2:\"ask-athos-relay: BLOCKED\"*) printf \"%s\\n\" \"$e\" >&2; exit 2;; esac; exit 0",
+            "timeout": 10
+          }
+        ]
       }
     ],
     "PostToolUse": [
