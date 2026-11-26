@@ -301,6 +301,12 @@ JEX_BUDGET_SECONDS=$(env_whole_number "${GC_JSONL_BUDGET_SECONDS:-690}" 690 1)
 JEX_COST_MARGIN_PCT=$(env_whole_number "${GC_JSONL_COST_MARGIN_PCT:-125}" 125 100)
 JEX_UNKNOWN_COST_SECONDS=$(env_whole_number "${GC_JSONL_UNKNOWN_COST_SECONDS:-240}" 240 0)
 JEX_POST_RESERVE_SECONDS=$(env_whole_number "${GC_JSONL_POST_RESERVE_SECONDS:-200}" 200 0)
+# ga-w1sot98: the table cutoff above only stops a table from STARTING; a table that started before it is still read to its end, and a big one is dozens of pages of ~40 s (Dolt cuts a read there), so one
+# table in flight could carry the run to the order's timeout (TERM at 840 s, nothing committed — the 840 s deaths of ga-w1sot98, and each one stamps its database `tried`, which sends it to the back
+# and made the runs alternate). No PAGE of a supplemental table is started in the last JEX_PAGE_STOP_MARGIN_SECONDS of the budget: a page that starts before that ends before the budget does (one read is
+# cut at ~40 s), so BUDGET is the ceiling of the READS too. The table that is cut keeps its previous version like any table the budget has no time for (` partial=` names it, issues still commit).
+JEX_PAGE_STOP_MARGIN_SECONDS=$(env_whole_number "${GC_JSONL_PAGE_STOP_MARGIN_SECONDS:-50}" 50 0)
+JEX_TABLE_LOG_MIN_SECONDS=$(env_whole_number "${GC_JSONL_TABLE_LOG_MIN_SECONDS:-10}" 10 0)   # a supplemental table that took this long (or came out short/failed) gets a `TABLE` line in the log
 # The archive lives under packs/maintenance whichever pack's copy of this script
 # runs (ga-7sxdmb). gc sets GC_PACK_STATE_DIR to the state dir of the pack that
 # OWNS the order, so for this vendored copy PACK_STATE_DIR is packs/town-deltas;
@@ -1462,6 +1468,11 @@ jex_table_cutoff_passed() {
     [ "$(jex_elapsed)" -ge $(( JEX_BUDGET_SECONDS - JEX_POST_RESERVE_SECONDS )) ]
 }
 
+# jex_page_deadline_passed — rc 0 once the run is past BUDGET - JEX_PAGE_STOP_MARGIN_SECONDS: no further PAGE of a supplemental table is read (ga-w1sot98), whatever table it belongs to.
+jex_page_deadline_passed() {
+    [ "$(jex_elapsed)" -ge $(( JEX_BUDGET_SECONDS - JEX_PAGE_STOP_MARGIN_SECONDS )) ]
+}
+
 is_user_database() {
     case "$1" in
         information_schema|mysql|dolt_cluster|performance_schema|sys|__gc_probe|benchdb|testdb_*|beads_pt*|beads_vr*|beads_test_bench_*|doctest_*|doctortest_*)
@@ -1825,6 +1836,11 @@ read_keyed_pages() {
     : > "$out.err"
     : > "$keys_file" || return 1
     while :; do
+        # ga-w1sot98: the read stops BETWEEN pages once the budget has no room for another one — the table keeps its previous version (the caller's rc 1), the run goes on to its commit instead of to the timeout
+        if jex_page_deadline_passed; then
+            echo "jsonl-export: reading $what stopped before page $((n + 1)): $(jex_elapsed)s into the ${JEX_BUDGET_SECONDS}s budget (${kept} pages, ${total} rows read so far)" >&2
+            return 1
+        fi
         n=$((n + 1))
         where=""
         [ -z "$literal" ] || where=" WHERE ($collist) > ($literal)"
@@ -2084,6 +2100,11 @@ export_supplemental_table() {
         if [ "$attempt" -ge "$SUPP_EXPORT_ATTEMPTS" ]; then
             break
         fi
+        # ga-w1sot98: a read that stopped at the page deadline is not retried — the second attempt would start from page 1 with the budget already gone
+        if jex_page_deadline_passed; then
+            echo "jsonl-export: $db.$table not retried: $(jex_elapsed)s into the ${JEX_BUDGET_SECONDS}s budget" >&2
+            break
+        fi
         attempt=$((attempt + 1))
         sleep "$SUPP_EXPORT_RETRY_DELAY"
     done
@@ -2232,7 +2253,14 @@ while IFS= read -r DB; do
             continue
         fi
         SUPP_RC=0
+        JEX_TABLE_T0="$(jex_elapsed)"
         export_supplemental_table "$DB" "$TABLE" || SUPP_RC=$?
+        # ga-w1sot98: what each table costs, in the log: the run's time was only known per database, so the table that carried a run to its timeout could not be named
+        # (only a table that took JEX_TABLE_LOG_MIN_SECONDS or more, or did not come out whole: 5 tables x 8 databases x 96 runs a day of "took 0s" would bury the log, and the log is the watchdog's heartbeat)
+        JEX_TABLE_TOOK=$(( $(jex_elapsed) - JEX_TABLE_T0 ))
+        if [ "$SUPP_RC" != 0 ] || [ "$JEX_TABLE_TOOK" -ge "$JEX_TABLE_LOG_MIN_SECONDS" ]; then
+            jex_log "TABLE $DB.$TABLE rc=$SUPP_RC rows=${SUPP_RAW_ROWS:-?} took ${JEX_TABLE_TOOK}s at ${JEX_TABLE_T0}s"
+        fi
         # the rows this export wrote, for split_db_tables to check the pieces against (a kept table: no count, no check)
         if [ "$TABLE" = comments ] && { [ "$SUPP_RC" = 0 ] || [ "$SUPP_RC" = 3 ]; }; then COMMENTS_ROWS="$SUPP_RAW_ROWS"; fi
         case "$SUPP_RC" in

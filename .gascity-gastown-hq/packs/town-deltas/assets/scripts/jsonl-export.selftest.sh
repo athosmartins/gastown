@@ -2129,8 +2129,9 @@ cad 10240 0 200; cad 10240 1 210; cad 10240 2 220
   && ok "control, 10 GB: three runs in three seconds all export (220 rows, 3 commits)" \
   || bad "control, 10 GB: skip=$(yn is_skip) head=$(head_rows) commits=$(commits) (rc=$RC): $OUT"
 # the run's own `start pid=N` / `end rc=N` lines (ga-iqsy9c7) are not cadence lines: they are there on every run, so what must stay empty is the log WITHOUT them.
+# ga-w1sot98: nor is a ` TABLE db.table rc=… took Ns` line (a slow or short supplemental table, written whatever the disk does).
 # vazio → no cadence line; falhou (the log cannot be read) → the text is "?", which is not empty
-cadence_lines() { grep -v -e ' start pid=[0-9]' -e ' end rc=[0-9]' -e ' end signal ' "$JEX_TLOG" 2>/dev/null || { [ $? -eq 1 ] || echo '?'; }; }
+cadence_lines() { grep -v -e ' start pid=[0-9]' -e ' end rc=[0-9]' -e ' end signal ' -e ' TABLE ' "$JEX_TLOG" 2>/dev/null || { [ $? -eq 1 ] || echo '?'; }; }
 [ -z "$(cadence_lines)" ] && ok "control, 10 GB: a healthy disk writes no cadence line to the log (only the run's start/end)" || bad "control, 10 GB: the log has cadence lines: $(cadence_lines | tr '\n' '|')"
 
 # a stamp nobody can trust never blocks the export: garbage, and a stamp from the future
