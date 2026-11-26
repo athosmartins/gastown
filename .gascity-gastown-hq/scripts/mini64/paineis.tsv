@@ -1,0 +1,22 @@
+# paineis.tsv — os painéis que o go-nogo.sh confere com curl em 127.0.0.1 (ga-ke5w2ie.3).
+#
+# ## Contents
+#   Formato · Origem · Pendências · Como acrescentar
+#
+# FORMATO. Uma linha por painel, 3 colunas separadas por TAB (nunca espaço): nome, porta, caminho. Linha em branco e linha que começa com # são ignoradas.
+#   nome: letras, números, ponto, sublinhado e hífen (na saída vira "painel-<nome>") · porta: número de 1 a 65535 · caminho: começa com / e não tem espaço.
+#   Vale HTTP 200, 401 ou 403 (GONOGO_HTTP_OK). Qualquer outro código, inclusive 302, é NO-GO: o caminho tem de responder direto, sem redirecionar. Nada escutando = NO-GO; sem resposta no prazo = INCERTO.
+# ORIGEM. Cada linha abaixo tem uma fonte no próprio repositório (o nó que escreveu isto não enxerga o mini nem o repo do WhatsApp):
+#   demand-dashboard 8095 e o caminho de saúde /api/outreach/config · map-viewer 8099 em / · ficha360 8207 em / · clientes-dashboard 8104 em /   (scripts/disk-recovery-d3-ram-daemons.sh: port_of e health_of, a prova de que o daemon voltou)
+#   admin-dashboard 8097 em /api/mockups   (a rota que scripts/publicar_mockup.py consulta, citada no CLAUDE.md da cidade)
+# PENDÊNCIAS (conferir no mini atual, em modo leitura, ANTES da noite do corte: `bash scripts/mini64/go-nogo.sh`).
+#   · ficha360 e clientes-dashboard: só a porta e o "/" têm fonte (o script do D3 aceita 200 a 399 ali). Se o "/" responder 302, troque o caminho por uma rota que responda 200/401/403 direto.
+#   · Portas que o repositório cita sem nome nem caminho de saúde confirmados (scripts/disk-recovery-d35-load-shed.sh, DENY_PORTS e comentários): 8086 (classification), 8203 (frota), 8090, 8088, 5599, 5600.
+#     Descomente e preencha a linha de cada uma que o mini 64 precisa ter de pé; enquanto não estiver aqui, o go-nogo.sh NÃO a confere.
+# COMO ACRESCENTAR. Uma linha nova com TAB entre as colunas; rode o selftest (scripts/mini64/go-nogo.selftest.sh), que confere o formato desta lista.
+#
+demand-dashboard	8095	/api/outreach/config
+map-viewer	8099	/
+ficha360	8207	/
+clientes-dashboard	8104	/
+admin-dashboard	8097	/api/mockups
