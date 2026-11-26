@@ -2210,12 +2210,13 @@ _pilot_node_failed_create_one() {
   case "$_fo_alias" in
     wa-worker-remote-mbp-*)
       _fo_cool="${PILOT_MBP_COOL_SECS:-1800}"; case "$_fo_cool" in ''|*[!0-9]*) _fo_cool=1800 ;; esac
-      if _pilot_mbp_cool_set "$_fo_cool"; then log "  ga-dzexg3i.1: rota do MBP esfriada por ${_fo_cool}s (alias $_fo_alias perdeu a sessão $_fo_sid ao nascer)"; fi ;;
+      if [ "$_fo_cool" -eq 0 ]; then log "  ga-dzexg3i.1: rota do MBP NÃO esfriou (PILOT_MBP_COOL_SECS=0 desliga o resfriamento; alias $_fo_alias perdeu a sessão $_fo_sid ao nascer)"
+      elif _pilot_mbp_cool_set "$_fo_cool"; then log "  ga-dzexg3i.1: rota do MBP esfriada por ${_fo_cool}s (alias $_fo_alias perdeu a sessão $_fo_sid ao nascer)"; fi ;;
   esac
   return 0
 }
 
-# _pilot_node_failed_create_pass — a vigia, uma vez por varredura, depois do despacho. Para cada loja de WA e de PS lista as beads in_progress que trazem PILOT_NODE_SESSION_KEY, fica só com as de cara do nó (dono wa-/ps-worker-remote[-mbp]-N, marca =
+# _pilot_node_failed_create_pass — a vigia, uma vez por varredura, logo depois do lock e do self-heal e ANTES de qualquer pausa, despacho ou `exit 0` do fluxo principal. Para cada loja de WA e de PS lista as beads in_progress que trazem PILOT_NODE_SESSION_KEY, fica só com as de cara do nó (dono wa-/ps-worker-remote[-mbp]-N, marca =
 # dono, id da sessão de forma de id) e chama _pilot_node_failed_create_one em cada uma. O teto PILOT_NODE_FC_MAX (6) vale para o que ESCREVE ou avisa (soltas + vistas + desfazer não confirmado): bead viva é só uma leitura e não gasta teto
 # (gate ga-7kbg9he, medium 1: 6 beads vivas esgotavam o teto e a morta da 7ª nunca era examinada, sem sinal). O que ficou sem exame, por teto ou por PILOT_NODE_FC_BUDGET_SECS (90 s de relógio: a vigia agora roda ANTES das pausas e não pode
 # atrasar a varredura quando o Dolt está lento), aparece no resumo como nao_examinadas=N, com aviso. Uma linha de resumo só quando viu alguma bead. Sempre devolve 0.
@@ -2266,6 +2267,9 @@ EOF_FCP
   done
   if [ "$_fp_skip" -gt 0 ]; then
     warn "ga-dzexg3i.1: vigia do failed-create: $_fp_skip bead(s) do nó com sessão guardada NÃO foram examinadas nesta varredura (teto de escrita PILOT_NODE_FC_MAX=$_fp_max ou prazo PILOT_NODE_FC_BUDGET_SECS=$_fp_bud s); a próxima varredura as lê"
+  fi
+  if [ "$_fp_unk" -gt 0 ]; then
+    warn "ga-dzexg3i.1: vigia do failed-create: $_fp_unk leitura(s) NÃO deram resposta nesta varredura (lista de uma loja, bead do nó ou bead da sessão); nada foi solto por causa delas, mas a vigia ficou cega para essa parte — se repetir a cada varredura, confira o bd/Dolt"
   fi
   if [ "$_fp_n" -gt 0 ] || [ "$_fp_unk" -gt 0 ] || [ "$_fp_skip" -gt 0 ]; then
     log "ga-dzexg3i.1: vigia do failed-create ($_fp_mode): $_fp_n bead(s) do nó com sessão guardada examinadas — vivas=$_fp_alive, failed-create soltas=$_fp_rel, vistas sem soltar=$_fp_seen, desfazer não confirmado=$_fp_held, mudaram=$_fp_stale, ilegíveis=$_fp_unk, nao_examinadas=$_fp_skip"

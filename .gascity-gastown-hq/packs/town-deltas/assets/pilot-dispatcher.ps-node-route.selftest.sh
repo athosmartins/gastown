@@ -217,7 +217,7 @@ else
   echo "  (pasta sem permissão: pulado — root escreve em qualquer pasta; os cenários acima são à prova de root)"
 fi
 reset; mkdir -p "$CITYGC/ps-node-route.jsonl"; r=$(D label 0)
-eq "label com o log impossível de gravar: o despacho segue (0), a sessão abre e avisa — o log é medição, não decisão" "$r $(ord)" "rc=0 bd:show script:apply bd:show gc:list gc:new gc:nudge "
+eq "label com o log impossível de gravar: o despacho segue (0), a sessão abre e avisa — o log é medição, não decisão" "$r $(ord)" "rc=0 bd:show script:apply bd:show gc:list bd:update gc:new gc:nudge "
 reset; mkdir -p "$CITYGC/ps-node-route.jsonl"; r=$(D auto 12); eq "auto com o script em 12 e o log impossível de gravar: segue devolvendo 1 (a bead fica no mini)" "$r" "rc=1"
 # a peça sozinha: devolve 1 só quando perdeu
 reset; r=$(H _pilot_ps_node_log "$ID" shadow 0 'texto'); eq "_pilot_ps_node_log com a pasta normal: grava e devolve 0" "$r $(jsonl | jq -r .bead) $(lostn)" "rc=0 $ID "
@@ -230,7 +230,7 @@ logfix
 echo; echo "=== C. label/auto: leitura de três estados, mapa de rc, sessão ==="
 reset; r=$(D label 0)
 eq "label, tudo certo: 0" "$r" "rc=0"
-eq "ordem: lê a bead, apply, relê a bead, lista as sessões, abre, avisa" "$(ord)" "bd:show script:apply bd:show gc:list gc:new gc:nudge "
+eq "ordem: lê a bead, apply, relê a bead, lista as sessões, abre, avisa" "$(ord)" "bd:show script:apply bd:show gc:list bd:update gc:new gc:nudge "
 eq "apply com a base da etiqueta" "$(cat "$T/calls")" "apply $ID --store $ST --basis label"
 grep -qF -- "|--city|$T/city|session|new|ps-worker-remote|--alias|ps-worker-remote-1|--no-attach|--title-hint|build $ID: Título X" "$T/gccalls" && ok "abre 'session new ps-worker-remote --alias ps-worker-remote-1 --no-attach' (template e alias do PS)" || fail "new: $(cat "$T/gccalls")"
 grep -qF -- 'session|nudge|ps-worker-remote-1|Bead nova para você: ps-abc12 — Título X.' "$T/gccalls" && ok "e avisa o alias do PS" || fail "nudge: $(cat "$T/gccalls")"
@@ -265,7 +265,7 @@ EOF_S
 done
 reset; r=$(FAKE_BD_SHOW_FAIL_FROM=2 D label 0); eq "a releitura depois do apply falha: 2, sem sessão" "$r $(wc -l < "$T/gccalls" | tr -d ' ')" "rc=2 0"
 reset; r=$(FAKE_GC_NEW_RC=1 D label 0)
-eq "session new falhou: fecha a sessão, solta a bead e confirma — 1 (segue no mini)" "$r $(ord)$(stt)" "rc=1 bd:show script:apply bd:show gc:list gc:new gc:close bd:update bd:show $FREE"
+eq "session new falhou: fecha a sessão, solta a bead e confirma — 1 (segue no mini)" "$r $(ord)$(stt)" "rc=1 bd:show script:apply bd:show gc:list bd:update gc:new gc:close bd:update bd:show $FREE"
 grep -qxF -- "$(UPD ps-worker-remote-1)" "$T/bdcalls" && ok "o desfazer é UMA escrita guardada com a chave pilot.wa_node_alias" || fail "update: $(cat "$T/bdcalls")"
 reset; r=$(FAKE_GC_LIST_RC=1 D label 0); eq "a lista de sessões não leu: não abre, desfaz sem fechar sessão — 1" "$r $(ord)$(stt)" "rc=1 bd:show script:apply bd:show gc:list bd:update bd:show $FREE"
 reset; r=$(FAKE_GC_NUDGE_RC=1 D label 0); eq "o aviso falhou: desfaz — 1" "$r $(stt)" "rc=1 $FREE"

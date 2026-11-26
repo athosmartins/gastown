@@ -240,6 +240,7 @@ r=$(P); eq "campos com tipo errado (state número, creation_complete_at número)
 reset; mkbead wa-eee1 in_progress $NODE_MBP $NODE_MBP ga-s1; mkfail ga-s1; echo 1 > "$FAKE_OVER/__list__.rc"
 r=$(P); eq "bd list da loja falha: nada lido, nada escrito" "$r $(nupd) $(ncom) $(cooled) $(stt wa-eee1)" "rc=0 0 0 - in_progress,$NODE_MBP,$NODE_MBP,ga-s1"
 errhas "ilegíveis=" && ok "...e o resumo conta a loja como ilegível" || fail "resumo: $(cat "$T/err")"
+errhas "WARN ga-dzexg3i.1: vigia do failed-create: " && errhas "leitura(s) NÃO deram resposta" && ok "...e há um WARN (não só a contagem no log): a vigia cega para uma loja não passa em silêncio (gate ga-jp6z6sg, low)" || fail "sem WARN de leitura sem resposta: $(cat "$T/err")"
 reset; mkbead wa-eee2 in_progress $NODE_MBP $NODE_MBP ga-s1; mkfail ga-s1; echo '{"nao":"array"}' > "$FAKE_OVER/__list__"
 r=$(P); eq "bd list devolve um objeto, não array: nada escrito" "$r $(nupd) $(cooled)" "rc=0 0 -"
 reset; mkbead wa-eee3 in_progress $NODE_MBP $NODE_MBP ga-s1; mkfail ga-s1; echo 'lixo' > "$FAKE_OVER/__list__"
@@ -464,6 +465,8 @@ reset; mkbead wa-mmm2 in_progress $NODE_MBP $NODE_MBP ga-s1; mkfail ga-s1; expor
 d=$(( $(cat "$COOL" 2>/dev/null || echo 0) - $(nowts) )); { [ "$d" -ge 1760 ] && [ "$d" -le 1802 ]; } && ok "PILOT_MBP_COOL_SECS ilegível: vale o padrão (1800 s)" || fail "COOL_SECS ruim: d=$d"
 reset; mkbead wa-mmm3 in_progress $NODE_MBP $NODE_MBP ga-s1; mkfail ga-s1; export PILOT_MBP_COOL_SECS=0; r=$(P); unset PILOT_MBP_COOL_SECS
 eq "PILOT_MBP_COOL_SECS=0: a bead é solta e a rota NÃO esfria (0 desliga o resfriamento)" "$(stt wa-mmm3) $(cooled)" "$FREE -"
+errhas "rota do MBP NÃO esfriou (PILOT_MBP_COOL_SECS=0" && ok "...e o log diz que NÃO esfriou" || fail "log do COOL_SECS=0: $(cat "$T/err")"
+errhas "rota do MBP esfriada por" && fail "...mas o log diz «esfriada por 0s»: linha em forma de sucesso para um esfriamento que não houve (gate ga-jp6z6sg, low)" || ok "...e nenhuma linha «esfriada por» (nada esfriou)"
 
 echo; echo "=== F. a fiação ==="
 # gate ga-7kbg9he (blocking): a vigia ficava no FIM do fluxo, depois de 11 `exit 0` (pausas, horário quieto, lock ocupado por outra, pistas cheias, sem candidatas) — o selftest só conferia a ordem das linhas de texto e deixava passar.
@@ -642,6 +645,8 @@ mut cool-eacces-aviso-repete   $CL 'if [ "${_PMC_WARNED:-0}" != 1 ]; then _PMC_W
 mut cool-longe-sem-aviso       $CL 'warn "ga-dzexg3i.1: $_c_file diz que' ': "ga-dzexg3i.1: $_c_file diz que'
 mut cool-longe-aviso-repete    $CL '-gt $((_c_now + 86400)) ] && [ "${_PMC_WARNED:-0}" != 1 ]; then' '-gt $((_c_now + 86400)) ]; then'
 mut cool-longe-limite-alto     $CL '_c_now + 86400' '_c_now + 86400000'
+mut pass-unk-sem-warn          $PA 'warn "ga-dzexg3i.1: vigia do failed-create: $_fp_unk leitura(s)' ': "ga-dzexg3i.1: vigia do failed-create: $_fp_unk leitura(s)'
+mut cool-zero-diz-esfriada     $ON 'if [ "$_fo_cool" -eq 0 ]; then log "  ga-dzexg3i.1: rota do MBP NÃO esfriou' 'if false; then log "  ga-dzexg3i.1: rota do MBP NÃO esfriou'
 mut rb-sem-confirmar          $RB 'if [ -z "$_rb_asg" ] && [ "$_rb_st" = open ] && [ -z "$_rb_mk" ]; then return 0; fi' 'return 0'
 
 echo "---"; echo "$PASS/$((PASS+FAIL)) ok"

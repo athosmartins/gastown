@@ -885,7 +885,8 @@ mut gate-ausente-sem-porque $GATE_ '_PMS_GATE_WHY=missing; warn' ':; warn'
 # ga-dzexg3i.1: a rota esfriando fecha o filtro antes do oráculo
 mut gate-sem-esfriamento $GATE_ 'if _pilot_mbp_cooling; then _PMS_GATE_WHY=cooling; return 1; fi' ':'
 mut gate-esfria-sem-porque $GATE_ '_PMS_GATE_WHY=cooling; return 1; fi' 'return 1; fi'
-mut gate-esfria-so-avisa $GATE_ 'if _pilot_mbp_cooling; then _PMS_GATE_WHY=cooling; return 1; fi' 'if _pilot_mbp_cooling; then _PMS_GATE_WHY=cooling; fi'# ── _pilot_mbp_stamped_check
+mut gate-esfria-so-avisa $GATE_ 'if _pilot_mbp_cooling; then _PMS_GATE_WHY=cooling; return 1; fi' 'if _pilot_mbp_cooling; then _PMS_GATE_WHY=cooling; fi'
+# ── _pilot_mbp_stamped_check
 mut check-rc0-qualquer   $CHK_ 'if [ "${_sc_vb%%|*}" = node ]; then' 'if true; then'
 mut check-10-node        $CHK_ '10) _PMS_V=mini ;;' '10) _PMS_V=node ;;'
 mut check-erro-node      $CHK_ '_PMS_V="error"; _PMS_BASIS=""' '_PMS_V="node"; _PMS_BASIS=""'
