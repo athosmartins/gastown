@@ -27,7 +27,7 @@ No mini atual, na pasta da cidade (`~/gt/.gascity-gastown-hq`): `bash scripts/mi
 
 ## Como ler o inventário
 
-«não apurado» = a sonda não conseguiu responder (comando ausente, rc diferente de zero, prazo estourado, formato inesperado, arquivo ilegível) e a linha diz por quê. «nenhum» ou 0 = o comando respondeu e a resposta era vazia. As duas coisas nunca se misturam: um «não apurado» não prova que o item não existe.
+«não apurado» = a sonda não conseguiu responder (comando ausente, rc diferente de zero, prazo estourado, formato inesperado, arquivo ilegível) e a linha diz por quê. «nenhum» ou 0 = o comando respondeu e a resposta era vazia. As duas coisas nunca se misturam: um «não apurado» não prova que o item não existe. «Nenhum python sem caminho» e «nenhum bw serve» dos plists valem só para os argumentos dos plists de `~/Library/LaunchAgents` que o script leu (plist binário vira «não apurado»; dos plists de `/Library` só o nome é listado).
 
 ## Fatias do programa
 

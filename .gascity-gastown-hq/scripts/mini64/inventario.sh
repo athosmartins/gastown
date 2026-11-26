@@ -61,10 +61,11 @@ sec() { fim; SEC_N=$((SEC_N + 1)); SEC_NAME="$1"; say ""; say "## $SEC_N. $1"; s
 nao() { SEC_BAD=$((SEC_BAD + 1)); say "- **não apurado**: $1"; }
 # nomatch <padrão> <1º resultado do glob>: 0 = o glob não casou nada (devolveu o próprio padrão e nenhum arquivo tem esse nome). Casou = «não vazio», mesmo que o 1º nome seja link quebrado ou a pasta só tenha r-- (o -e dele falharia)
 nomatch() { [ "$2" = "$1" ] && [ ! -e "$2" ]; }
-# pl_nao <o que fica incompleto>: a leitura dos plists foi parcial? 0 = sim (já contou o «não apurado» com o motivo); 1 = não (pasta lida e todos os plists lidos, ou pasta sem plist)
+# pl_nao <o que fica incompleto> [args]: a leitura dos plists foi parcial? 0 = sim (já contou o «não apurado» com o motivo); 1 = não (pasta lida e todos os plists lidos, ou pasta sem plist). Com «args», plist binário também conta: o awk não lê o argumento dele
 pl_nao() {
   if [ "$PL_STATE" = nao ]; then nao "plists (~/Library/LaunchAgents): $PL_WHY; $1"
   elif [ "$PL_FULL" != 1 ]; then nao "só $PL_LIDOS de $PL_TOTAL plists foram lidos; $1"
+  elif [ "${2:-}" = args ] && [ "$PL_ARGS" != 1 ]; then nao "${PL_BIN:-?} plist(s) em formato binário: os argumentos deles não são lidos; $1"
   else return 1; fi
 }
 
@@ -109,26 +110,27 @@ ldis() {
   if ! filtra 'disabled services|=> *(enabled|disabled|true|false)'; then nao "launchctl print-disabled $1: formato inesperado"; return; fi
   printf '%s\n' "$PROBE_OUT" | awk '/=> *(disabled|true)/ { gsub(/"/, "", $1); print $1 }' >"$2"; DIS_OK=1
 }
-# um awk só para todos os plists: arquivo, Label, Disabled, 3 primeiros ProgramArguments, binário? (binário = só o nome do arquivo)
-# vazio → PL_STATE=vazio (a pasta existe sem *.plist); falhou/ilegível → PL_STATE=nao (pasta ausente/sem leitura) ou ok com PL_LIDOS < PL_TOTAL
+# um awk só para todos os plists: UMA linha por arquivo = arquivo, Label, Disabled, binário?, TODOS os ProgramArguments (campos 5..NF; binário = só o nome do arquivo). TAB, CR e LF do valor e do nome viram espaço: wc -l conta ARQUIVOS
+# vazio → PL_STATE=vazio (a pasta existe sem *.plist); falhou/ilegível → PL_STATE=nao (pasta ausente/sem leitura) ou ok com PL_LIDOS < PL_TOTAL; PL_ARGS=1 só com todos lidos e nenhum binário (o argumento dele não é lido)
 scan_plists() {
-  local dir="$H/Library/LaunchAgents"; PL_STATE=nao; PL_WHY=""; PL_TOTAL=0; PL_LIDOS=0; PL_FULL=0
+  local dir="$H/Library/LaunchAgents"; PL_STATE=nao; PL_WHY=""; PL_TOTAL=0; PL_LIDOS=0; PL_FULL=0; PL_BIN=0; PL_ARGS=0
   if [ ! -d "$dir" ] || [ ! -r "$dir" ]; then PL_WHY="$dir ausente ou sem leitura"; return; fi
   set -- "$dir"/*.plist
-  if nomatch "$dir/*.plist" "$1"; then PL_STATE=vazio; PL_FULL=1; return; fi
+  if nomatch "$dir/*.plist" "$1"; then PL_STATE=vazio; PL_FULL=1; PL_ARGS=1; return; fi
   PL_TOTAL=$#
   awk -v RS='<' '
-    function out() { if (f != "") printf "%s\t%s\t%d\t%s\t%s\t%s\t%d\n", f, (l == "" ? substr(f, 1, length(f) - 6) : l), d, a[1], a[2], a[3], b }
-    FNR == 1 { out(); f = FILENAME; sub(/.*\//, "", f); l = ""; d = 0; na = 0; pa = 0; dep = 0; key = ""; a[1] = a[2] = a[3] = ""; b = ($0 ~ /^bplist/) }
+    function out(  i, s) { if (f == "") return; s = sprintf("%s\t%s\t%d\t%d", f, (l == "" ? substr(f, 1, length(f) - 6) : l), d, b); for (i = 1; i <= na; i++) s = s "\t" a[i]; print s }
+    FNR == 1 { out(); f = FILENAME; sub(/.*\//, "", f); gsub(/[\t\r\n]/, " ", f); l = ""; d = 0; na = 0; pa = 0; dep = 0; key = ""; b = ($0 ~ /^bplist/) }
     /^dict>/ { dep++; next }
     /^\/dict>/ { dep--; next }
     /^key>/ { key = substr($0, 5); sub(/[ \t\r\n]+$/, "", key); next }
     /^array>/ { if (dep == 1 && key == "ProgramArguments") pa = 1; next }
     /^\/array>/ { pa = 0; next }
     /^true\/>/ { if (dep == 1 && key == "Disabled") d = 1; next }
-    /^string>/ { v = substr($0, 8); sub(/[ \t\r\n]+$/, "", v); if (pa) { na++; if (na <= 3) a[na] = v } else if (dep == 1 && key == "Label") l = v; next }
+    /^string>/ { v = substr($0, 8); gsub(/[\t\r\n]+/, " ", v); gsub(/^ +| +$/, "", v); if (pa) a[++na] = v; else if (dep == 1 && key == "Label") l = v; next }
     END { out() }' "$@" >"$PL" 2>/dev/null
-  PL_LIDOS=$(wc -l <"$PL" | tr -d ' '); PL_STATE=ok; [ "$PL_LIDOS" -ge "$PL_TOTAL" ] && PL_FULL=1
+  PL_LIDOS=$(wc -l <"$PL" | tr -d ' '); PL_BIN=$(awk -F'\t' '$4 == 1' "$PL" | wc -l | tr -d ' '); PL_STATE=ok; [ "$PL_LIDOS" -ge "$PL_TOTAL" ] && PL_FULL=1
+  [ "$PL_FULL" = 1 ] && [ "$PL_BIN" = 0 ] && PL_ARGS=1
 }
 
 # =================================================================== seções
@@ -213,13 +215,14 @@ done
 
 sec "Command Line Tools e Python"
 PROBE_RC=$PK_RC; PROBE_OUT=$PK_OUT; PROBE_ERR=$PK_ERR   # o resultado do pkgutil lido antes da seção 1
-if [ "$PROBE_RC" = 0 ]; then CLTV=$(printf '%s\n' "$PROBE_OUT" | sed -n 's/^version: //p'); say "- Command Line Tools: \`$(val "$CLTV")\`"
+# rc 0 sem a linha «version:» = formato inesperado (não apurado), nunca um valor vazio
+if [ "$PROBE_RC" = 0 ]; then CLTV=$(printf '%s\n' "$PROBE_OUT" | sed -n 's/^version: //p'); if [ -n "$CLTV" ]; then say "- Command Line Tools: \`$(val "$CLTV")\`"; else CLTV="?"; nao "Command Line Tools: pkgutil respondeu sem a linha «version:» (formato inesperado)"; fi
 elif [ "$PROBE_RC" = 1 ] && printf '%s' "$PROBE_ERR" | grep -qi 'no receipt'; then CLTV="não instalado"; say "- Command Line Tools: não instalados (pkgutil: sem recibo)"
 else CLTV="?"; nao "Command Line Tools: $(why pkgutil)"; fi
 kvp "xcode-select -p" 5 xcode-select -p
-pl_nao "a lista de pythons e de wrappers dos plists está incompleta"
+pl_nao "a lista de pythons e de wrappers dos plists está incompleta" args
 # pythons: os de sempre + os caminhos absolutos que os plists citam; /usr/bin/python3 NUNCA roda sem CLT confirmadas, nem se um plist o citar (o shim abriria o instalador gráfico)
-pyall=$(awk -F'\t' '{ for (i = 4; i <= 6; i++) if ($i ~ /^\/.*python/) print $i }' "$PL" | sort | uniq -c | sort -rn); pyd=$(printf '%s\n' "$pyall" | head -n 10)
+pyall=$(awk -F'\t' '{ for (i = 5; i <= NF; i++) if ($i ~ /^\/.*python/) print $i }' "$PL" | sort | uniq -c | sort -rn); pyd=$(printf '%s\n' "$pyall" | head -n 10)
 pys="$R/Library/Developer/CommandLineTools/usr/bin/python3 $R/opt/homebrew/bin/python3 $R/usr/local/bin/python3"
 CLT_OK=0; if [ "$CLTV" != "não instalado" ] && [ "$CLTV" != "?" ] && [ -n "${CLTV:-}" ]; then CLT_OK=1; pys="$pys $R/usr/bin/python3"; fi
 CLT_PY="?"; say "- pythons (caminho · versão · plists que o citam direto):"
@@ -231,10 +234,10 @@ for p in $(printf '%s\n' $pys $(printf '%s\n' "$pyd" | awk '{ print $2 }') | sor
   else nao "$(val "$p") --version: $(why python)"; fi
 done
 npy=$(printf '%s\n' "$pyall" | grep -c .); [ "$npy" -gt 10 ] && say "  - (+$((npy - 10)) caminhos de python citados pelos plists não listados; só os 10 mais citados)"
-bare=$(awk -F'\t' '{ for (i = 4; i <= 6; i++) if ($i ~ /^python[0-9.]*$/) print $i }' "$PL" | sort | uniq -c | sed 's/^ *//' | tr '\n' ';')
-if [ "$PL_FULL" = 1 ]; then bare="${bare:-nenhum}"; else bare="não apurado (nem todos os plists foram lidos)${bare:+; nos lidos: $bare}"; fi
-say "- plists que chamam python SEM caminho (o PATH do launchd decide, em geral /usr/bin/python3 = o das CLT): $bare"
-awk -F'\t' '{ for (i = 4; i <= 6; i++) if ($i ~ /^\// && ($i ~ /[.](sh|py)$/ || $i ~ /wrapper/)) print $i }' "$PL" | sort -u >"$WORK/wr.all"
+bare=$(awk -F'\t' '{ for (i = 5; i <= NF; i++) if ($i ~ /^python[0-9.]*$/) print $i }' "$PL" | sort | uniq -c | sed 's/^ *//' | tr '\n' ';')
+if [ "$PL_ARGS" = 1 ]; then bare="${bare:-nenhum}"; else bare="não apurado (nem todos os plists foram lidos ou há plist binário)${bare:+; nos lidos: $bare}"; fi
+say "- plists de ~/Library/LaunchAgents com argumento python SEM caminho (o PATH do launchd decide, em geral /usr/bin/python3 = o das CLT; comando dentro de bash -c não é decomposto; dos plists de /Library só o nome é listado): $bare"
+awk -F'\t' '{ for (i = 5; i <= NF; i++) if ($i ~ /^\// && ($i ~ /[.](sh|py)$/ || $i ~ /wrapper/)) print $i }' "$PL" | sort -u >"$WORK/wr.all"
 : >"$WORK/wrappers.lst"; wmiss=0
 while IFS= read -r w; do if [ -f "$w" ]; then printf '%s\n' "$w" >>"$WORK/wrappers.lst"; else wmiss=$((wmiss + 1)); fi; done <"$WORK/wr.all"
 if [ -s "$WORK/wrappers.lst" ]; then
@@ -268,9 +271,9 @@ else
     /^ +[^ :][^:]*:$/ { flush(); nm = $0; sub(/^ +/, "", nm); sub(/:$/, "", nm); next }
     /Product ID:/ { pid = $NF }
     /Vendor ID:/ { vid = $3 }
-    /Serial Number:/ { sn = $NF }
+    /Serial Number:/ { sn = "…" substr($NF, length($NF) - 3) }
     END { flush() }')
-  say "- dispositivos USB (nome · vendor · produto · serial; vendor 0x1a86 = WCH). Placa A03: a ordem do Athos é mantê-la DESLIGADA, então o inventário só registra e o Athos aponta qual linha é ela:"; bloco "${usb:-(nenhum dispositivo com vendor/produto no texto)}"
+  say "- dispositivos USB (nome · vendor · produto · serial mascarado nos 4 últimos; vendor 0x1a86 = WCH). Placa A03: a ordem do Athos é mantê-la DESLIGADA, então o inventário só registra e o Athos aponta qual linha é ela:"; bloco "${usb:-(nenhum dispositivo com vendor/produto no texto)}"
 fi
 probe 5 pgrep -x adb
 if [ "$PROBE_RC" = 1 ]; then nao "celulares: o servidor adb não está rodando e o inventário não o inicia"
@@ -323,7 +326,7 @@ case "$PL_STATE" in
     if [ "$PROBE_RC" != 0 ]; then nao "launchctl list: $(why launchctl)"
     elif ! printf '%s\n' "$PROBE_OUT" | head -n 1 | grep -q '^PID'; then nao "launchctl list: formato inesperado"
     else printf '%s\n' "$PROBE_OUT" | awk -F'\t' 'NR > 1 { print $3 }' >"$WORK/lod.user"; LOD_OK=1; fi
-    say "- $PL_LIDOS plists lidos ($(awk -F'\t' '$7 == 1' "$PL" | wc -l | tr -d ' ') em formato binário: só o nome do arquivo). Prefixos da cidade levam *; «desabilitados» = override do launchctl; «Disabled» = chave no plist."
+    say "- $PL_LIDOS plists lidos ($PL_BIN em formato binário: só o nome do arquivo). Prefixos da cidade levam *; «desabilitados» = override do launchctl; «Disabled» = chave no plist."
     say ""; say "| prefixo | plists | desabilitados | carregados | Disabled no arquivo |"; say "|---|---|---|---|---|"
     awk -F'\t' -v dok="$DIS_OK" -v lok="$LOD_OK" -v city=" $CITY_PRE " '
       FILENAME == ARGV[1] { dis[$1] = 1; next }
@@ -434,14 +437,18 @@ else nao "pontos de montagem citados no código: a varredura de nomes da seção
 sec "bw serve (Bitwarden)"
 kvp "bw" 8 bw --version
 probe 8 ps -axo command=
-if [ "$PROBE_RC" != 0 ]; then nao "processos: $(why ps)"; else
-  bs=$(printf '%s\n' "$PROBE_OUT" | awk '/(^|\/)bw +serve/ { p = ""; h = ""; for (i = 1; i <= NF; i++) { if ($i == "--port") p = $(i + 1); if ($i == "--hostname") h = $(i + 1) } print "bw serve --port " (p == "" ? "(padrão)" : p) " --hostname " (h == "" ? "(padrão)" : h) }')
+if [ "$PROBE_RC" != 0 ]; then nao "processos: $(why ps)"
+elif [ -z "$PROBE_OUT" ]; then nao "processos: ps respondeu vazio (o esperado é ao menos o próprio ps); não vale como «nenhum bw serve»"
+else
+  # opção ausente → «(padrão)»; «--port N» e «--port=N» valem; opção SEM valor legível (fim da linha, «=» vazio, outra opção no lugar) → «não apurado», nunca «(padrão)»
+  bs=$(printf '%s\n' "$PROBE_OUT" | awk '/(^|\/)bw +serve/ { p = h = "(padrão)"; for (i = 1; i <= NF; i++) { o = $i; v = $(i + 1); if (o ~ /^--(port|hostname)=/) { v = substr(o, index(o, "=") + 1); o = substr(o, 1, index(o, "=") - 1) }; if (v == "" || v ~ /^-/) v = "não apurado"; if (o == "--port") p = v; else if (o == "--hostname") h = v } print "bw serve --port " p " --hostname " h }')
   if [ -n "$bs" ]; then say "- rodando agora (só porta e hostname; o resto da linha de comando não é copiado):"; bloco "$bs"; else say "- nenhum «bw serve» rodando agora (ps respondeu)"; fi
+  case "$bs" in (*"não apurado"*) nao "bw serve rodando: porta ou hostname sem valor legível na linha do ps; confira à mão" ;; esac
 fi
-# vazio → «nenhum» só com TODOS os plists lidos; leitura parcial (pasta ilegível, link quebrado, plist ilegível) → «não apurado» + nao, nunca «nenhum»
-bj=$(awk -F'\t' '($4 " " $5 " " $6) ~ /bw +serve/ { print $2 }' "$PL" | sort -u | tr '\n' ' ' | sed 's/ *$//')
-if [ "$PL_FULL" = 1 ]; then bj="${bj:-nenhum}"; else bj="não apurado (nem todos os plists foram lidos)${bj:+; nos lidos: $bj}"; pl_nao "a lista de plists com «bw serve» direto está incompleta"; fi
-say "- plists com «bw serve» direto nos argumentos: $(val "$bj")"
+# vazio → «nenhum» só com TODOS os plists lidos e nenhum binário (PL_ARGS=1); leitura parcial (pasta ilegível, link quebrado, plist ilegível) ou plist binário → «não apurado» + nao, nunca «nenhum»
+bj=$(awk -F'\t' '{ s = ""; for (i = 5; i <= NF; i++) s = s " " $i } s ~ /bw +serve/ { print $2 }' "$PL" | sort -u | tr '\n' ' ' | sed 's/ *$//')
+if [ "$PL_ARGS" = 1 ]; then bj="${bj:-nenhum}"; else bj="não apurado (nem todos os plists foram lidos ou há plist binário)${bj:+; nos lidos: $bj}"; pl_nao "a lista de plists com «bw serve» direto está incompleta" args; fi
+say "- plists de ~/Library/LaunchAgents (não os de /Library) com «bw serve» direto nos argumentos: $(val "$bj")"
 if [ -s "$WORK/wrappers.lst" ]; then
   # vazio → «nenhum» (grep rc 1); falhou → não apurado
   probe 25 grep -lE 'bw +serve' $(cat "$WORK/wrappers.lst")
@@ -480,7 +487,7 @@ ipx=$(tk "${LANIP:-}"); lhx=$(tk "${LH:-}")   # o marcador <…> do item 7 não 
 ALL="$WORK/all.md"
 { printf '\n## Resumo\n\n| seção | estado |\n|---|---|\n'; awk -F'\t' '{ printf "| %s. %s | %s |\n", $1, $2, $3 }' "$SUMM"; cat "$BODY"; } >"$ALL" \
   || { echo "inventario: não consegui montar o corpo do doc" >&2; exit 1; }
-N_SEC=$(grep -c '^## ' "$ALL")
+N_SEC=$(grep -c '^## [0-9]' "$ALL")   # só as seções numeradas (o Resumo e o Checklist não contam)
 # vazio → 0 linhas suspeitas (grep rc 1); falhou (rc ≥ 2) → NÃO grava: um doc sem varredura pode vazar segredo
 HITS=$(grep -cE -e "$SECRET_RE" "$ALL"); rc=$?
 case "$rc" in (0|1) ;; (*) echo "inventario: não consegui varrer o doc atrás de segredo (grep rc=$rc); nada foi escrito" >&2; exit 1 ;; esac

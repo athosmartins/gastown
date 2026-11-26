@@ -13,6 +13,9 @@
 #   R7 duas rodadas: sem sobra .inventario-work   R8 estático: bash -n (3.2 se MINI64_B32), sem recurso de bash 4, sem comando que varre pasta protegida
 #   R9 uma falha só: o R2 quebra tudo junto e uma seção que falha por outro caminho esconde o «ok» indevido; aqui cada mundo tem 1-3 falhas em seções
 #      DISJUNTAS e o Resumo tem de apontar exatamente essas (e nenhuma no mundo feliz). O mundo mora em /tmp: um TMPDIR longo casaria o SECRET_RE
+#   R10 plists: argumento do 4º em diante («timeout -k 20 840 /bin/bash w.sh»), valor multilinha, nome com LF, plist binário (argumento ilegível = não
+#      apurado, nunca «nenhum»); bw serve com «--port=N» e sem valor
+#   R11 harness: o calls.log (gravado pelos wrappers) não mistura as linhas de 2 etapas concorrentes de um pipeline (antes: «chamada fora da allowlist» ao acaso)
 set -u
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SCRIPT="${MINI64_INVENTARIO:-$HERE/inventario.sh}"   # o override é da bateria de mutantes: aponta uma cópia mutante
@@ -44,11 +47,11 @@ mkworld() {   # mkworld <nome>: mundo novo e feliz em $TMP/<nome>
     "$C/scripts/mini64" "$C/packs" "$W/wrappers" "$B" "$G" "$FX"
   : >"$CALLS"; cp "$SCRIPT" "$C/scripts/mini64/inventario.sh"
   for t in awk sed sort uniq cut tr head wc mkdir mv rm date basename dirname xargs shasum ssh-keygen perl id mktemp cat sleep; do p=$(type -P "$t") && ln -s "$p" "$G/$t"; done
-  for t in ls grep; do printf '#!/bin/sh\nprintf "%%s" "${0##*/}" >>"$CALLS"; for a in "$@"; do printf " %%s" "$a" >>"$CALLS"; done; printf "\\n" >>"$CALLS"\nexec %s "$@"\n' "$(type -P "$t")" >"$G/$t"; chmod +x "$G/$t"; done
+  for t in ls grep; do printf '#!/bin/sh\nl="${0##*/}"; for a in "$@"; do l="$l $a"; done; printf "%%s\\n" "$l" >>"$CALLS"\nexec %s "$@"\n' "$(type -P "$t")" >"$G/$t"; chmod +x "$G/$t"; done   # a linha inteira num ÚNICO printf: pedaços separados se misturam quando 2 etapas de um pipeline (grep | … | grep) gravam juntas (R11)
   cat >"$W/stub.sh" <<'EOF'
 #!/bin/sh
 n=${0##*/}; k=""; best="$n"
-{ printf '%s' "$n"; for a in "$@"; do printf ' %s' "$a"; done; printf '\n'; } >>"$CALLS"
+l="$n"; for a in "$@"; do l="$l $a"; done; printf '%s\n' "$l" >>"$CALLS"
 for a in "$@"; do
   t=$(printf '%s' "$a" | tr -c 'A-Za-z0-9' '_' | sed 's/^_*//; s/_*$//'); k="${k:+${k}_}$t"
   if [ -e "$FX/$n.$k.out" ] || [ -e "$FX/$n.$k.rc" ]; then best="$n.$k"; fi
@@ -68,7 +71,7 @@ EOF
   cp "$W/k1" "$H/.ssh/id_ed25519"; cp "$W/k1.pub" "$H/.ssh/id_ed25519.pub"; cat "$W/k1.pub" "$W/k2.pub" >"$H/.ssh/authorized_keys"; cp "$W/hk.pub" "$R/etc/ssh/ssh_host_ed25519_key.pub"
   printf 'hetzner.example %s\n' "$(cut -d' ' -f1,2 "$W/k2.pub")" >"$H/.ssh/known_hosts"
   printf 'Host hetzner\n  HostName 203.0.113.9\n  User athos\n  IdentityFile ~/.ssh/id_ed25519\n  ProxyCommand sh -c PROXYSECRETWORD\n' >"$H/.ssh/config"
-  # plists: estilo uma linha (com env secreto), duas linhas (python direto), Disabled=true, bw serve por bash -c, outros prefixos, um binário
+  # plists: estilo uma linha (com env secreto), duas linhas (python direto), Disabled=true, bw serve por bash -c, outros prefixos (o binário vive no R10: ele torna as seções 3 e 14 não apuradas)
   LA="$H/Library/LaunchAgents"
   printf '<?xml version="1.0"?><plist version="1.0"><dict><key>Label</key><string>com.whatsapp.a</string><key>ProgramArguments</key><array><string>/bin/bash</string><string>%s/wrappers/w1.sh</string></array><key>EnvironmentVariables</key><dict><key>MOTHERDUCK_TOKEN</key><string>PLANTEDPLISTENVSECRET1234567890</string></dict></dict></plist>\n' "$W" >"$LA/com.whatsapp.a.plist"
   cat >"$LA/com.whatsapp.b.plist" <<EOF
@@ -88,7 +91,6 @@ EOF
   printf '<plist><dict><key>Label</key><string>com.gascity.c</string><key>Disabled</key><true/><key>ProgramArguments</key><array><string>python3</string><string>x.py</string></array></dict></plist>\n' >"$LA/com.gascity.c.plist"
   printf '<plist><dict><key>Label</key><string>com.gascity.d</string><key>ProgramArguments</key><array><string>/bin/bash</string><string>-c</string><string>bw serve --port 8087</string></array></dict></plist>\n' >"$LA/com.gascity.d.plist"
   for l in com.urblink.e br.urblink.f com.athos.g org.other.h; do printf '<plist><dict><key>Label</key><string>%s</string><key>ProgramArguments</key><array><string>/bin/echo</string></array></dict></plist>\n' "$l" >"$LA/$l.plist"; done
-  printf 'bplist00\000\001\002 binario' >"$LA/com.whatsapp.bin.plist"
   printf '#!/bin/bash\nexec /Users/test/venv/bin/python3 foo.py\nbw serve --port 8087\n' >"$W/wrappers/w1.sh"
   # nomes de item citados pelo código; perfis Claude com token plantado; canários nas pastas protegidas
   printf 'security find-generic-password -s "Claude Code-credentials" >/dev/null 2>&1\nsecurity find-generic-password -s "Pool-Item-Absent" >/dev/null\nsecurity find-generic-password -s "Device-Only-Item" >/dev/null\nTOK=$(secret whapi-token)\nsecret pipedrive-api | head -n1\nx=~/Library/CloudStorage/GoogleDrive-athos@example.test/My\\ Drive\n' >"$C/scripts/keys.sh"
@@ -132,6 +134,12 @@ USB:
               Product ID: 0x7523
               Vendor ID: 0x1a86  (QinHeng Electronics)
               Serial Number: WCH0001
+
+        SM-A135M:
+
+          Product ID: 0x6860
+          Vendor ID: 0x04e8  (Samsung Electronics Co., Ltd.)
+          Serial Number: R58N00AAAA1234
 EOF
   fxrc pgrep.x_Google_Drive 1; fx adb.devices_l 'List of devices attached\nR58N00AAAA1234 device usb:1-1 product:x model:SM_A135M device:a13 transport_id:1\nR58N00BBBB5678 device usb:1-2 product:y model:SM_A035M device:a03 transport_id:2'
   fx lsof 'p100\ncpython3\nf5\nn*:8095\np200\ncnode\nf9\nn127.0.0.1:8087'; fx brew.leaves 'jq\nnode'; fx brew.list_cask 'wch-ch34x-usb-serial-driver'
@@ -160,9 +168,10 @@ has 2 'python3 → .*Python 3\.9\.6' "2: python3 com versão"; has 2 'claude →
 has 2 'Acesso Total ao Disco · /opt/homebrew/bin/python3\.11' "2: FDA do python3.11"; has 2 'Acesso Total ao Disco · com\.apple\.Terminal' "2: FDA do Terminal"; has 2 '2 da cidade, 1 de outros apps' "2: conta o que é da cidade e o que não é"; hasnt 2 'zoom' "2: app fora da lista não é listado"
 has 3 'Command Line Tools: .16\.2\.0\.0\.1\.1733547573.' "3: versão das CLT"; has 3 'python3\.11. · Python 3\.11\.9 · 1 plist' "3: python citado direto pelo plist"; has 3 '/usr/bin/python3' "3: /usr/bin/python3 consultado com CLT"; has 3 'venv/bin/python3' "3: python dentro de wrapper"; has 3 '1 lidos, 1 citados e ausentes' "3: o wrapper do plist foi lido e o x.py que outro plist cita, ausente, foi contado"
 has 4 'cn\.wch\.CH34xVCPDriver' "4: extensão da WCH"; has 4 'kexts: nenhum da WCH' "4: kextstat sem WCH medido"; has 4 'cu\.wchusbserial1410' "4: porta serial"
-has 5 '0x1a86 \| produto 0x7523 \| serial WCH0001' "5: placa WCH no USB"; has 5 '…1234 · device · SM_A135M' "5: celular com serial mascarado"; has 5 'A03 visível no adb: 1' "5: A03 visível é contado"
+has 5 '0x1a86 \| produto 0x7523 \| serial …0001' "5: placa WCH no USB, serial mascarado nos 4 últimos como o do adb"; has 5 'SM-A135M \| vendor 0x04e8 \| produto 0x6860 \| serial …1234' "5: celular no USB, serial mascarado"; hasnt 5 'R58N00AAAA1234|WCH0001|000000000626' "5: nenhum serial USB inteiro no doc"
+has 5 '…1234 · device · SM_A135M' "5: celular com serial mascarado"; has 5 'A03 visível no adb: 1' "5: A03 visível é contado"
 has 6 'id_ed25519\.pub: 256 SHA256:' "6: impressão da chave pública"; has 6 'athos@mbp' "6: authorized_keys diz a máquina"; has 6 'hetzner\.example' "6: known_hosts lista o host"; has 6 'ssh_host_ed25519_key\.pub: 256 SHA256:' "6: chave de host"; has 6 'HostName 203\.0\.113\.9' "6: ssh config"; hasnt 6 'ProxyCommand|PROXYSECRETWORD' "6: ProxyCommand não é copiado"
-has 7 '\| com\.whatsapp \* \| 3 \| 0 \| 1 \| 0 \|' "7: com.whatsapp 3 plists, 0 desabilitado, 1 carregado"; has 7 '\| com\.gascity \* \| 2 \| 1 \| 1 \| 1 \|' "7: com.gascity: desabilitado, carregado e Disabled somam"; has 7 '\| org\.other \| 1 \|' "7: prefixo de fora sem estrela"; has 7 '1 em formato binário' "7: binário contado"; has 7 'com\.gascity\.d' "7: lista de desabilitados"
+has 7 '\| com\.whatsapp \* \| 2 \| 0 \| 1 \| 0 \|' "7: com.whatsapp 2 plists, 0 desabilitado, 1 carregado"; has 7 '\| com\.gascity \* \| 2 \| 1 \| 1 \| 1 \|' "7: com.gascity: desabilitado, carregado e Disabled somam"; has 7 '\| org\.other \| 1 \|' "7: prefixo de fora sem estrela"; has 7 '8 plists lidos \(0 em formato binário' "7: um plist por arquivo, nenhum binário"; has 7 'com\.gascity\.d' "7: lista de desabilitados"
 has 8 '3 plist\(s\), 2 com prefixo da cidade' "8: LaunchDaemons"; has 8 'gascity-nopasswd' "8: nome do sudoers.d"; has 9 'jq' "9: brew leaves"; has 9 'wch-ch34x' "9: brew cask"
 has 10 '8095 · python3' "10: porta e processo"; has 10 '8087 · node' "10: outra porta"
 has 11 'Claude Code-credentials. · presente · ThisDeviceOnly: não \(ck\)' "11: item presente, classe ck"; has 11 'Device-Only-Item. · presente · ThisDeviceOnly: SIM' "11: ThisDeviceOnly SIM"; has 11 'Pool-Item-Absent. · ausente' "11: item ausente"; has 11 'whapi-token' "11: nome passado ao secret"; has 11 'pipedrive-api' "11: segundo nome do secret"
@@ -171,6 +180,7 @@ has 13 'GoogleDrive-athos@example\.test' "13: nome de montagem lido do código";
 has 14 'bw serve --port 8087 --hostname 127\.0\.0\.1' "14: bw serve em execução (só porta e hostname)"; has 14 'com\.gascity\.d' "14: plist com bw serve"; has 14 'w1\.sh' "14: wrapper com bw serve"; has 15 'sleep 0' "15: pmset -g custom"
 docs 'sudo pmset -c autorestart 1' "checklist: comandos do pmset do mini atual"; docs 'Nome do computador = «Mini de Teste»' "checklist: nome"; docs '192\.168\.0\.77 \(MAC atual aa:bb:cc:dd:ee:01\)' "checklist: IP e MAC"; docs '«Python 3\.9\.6»' "checklist: python das CLT"
 docs '^## Resumo' "tem Resumo"; docs '0 linha\(s\) com cara de segredo' "relata zero supressões no mundo limpo"; sf "" "R1/Resumo: no mundo feliz nenhuma seção é parcial"
+[ "${OUT#*inventario: 15 seções,}" != "$OUT" ] && ok "o eco final conta as 15 seções numeradas (não o Resumo nem o Checklist)" || bad "contagem de seções do eco" "$OUT"
 hasnt 11 '[{]svc[}]|[(][[]\^|item_service' "11: nome montado por variável ({svc}, ([^…, item_service()) não vira item do Keychain"
 FIRST=$(grep -n '^## ' "$DOC" | head -n 1 | cut -d: -f2); [ "$FIRST" = "## Contents" ] && ok "## Contents é a primeira seção" || bad "## Contents primeiro" "$FIRST"
 if [ -f "$HERE/../doc-rules-lint.py" ] && command -v python3 >/dev/null 2>&1; then lo=$(python3 -I "$HERE/../doc-rules-lint.py" --check --root "$(dirname "$DOC")" 01-inventario.md 2>&1); lrc=$?; [ "$lrc" = 0 ] && ok "doc passa no doc-rules-lint" || bad "doc-rules-lint" "rc=$lrc $lo"; fi
@@ -200,7 +210,7 @@ has 1 "${NA}ipconfig getifaddr en0" "R2/1: ipconfig rc 1 com erro é não apurad
 has 2 'não apurado.*TCC\.db.*[Ss]em Acesso Total ao Disco' "R2/2: TCC.db ilegível"; hasnt 2 '[0-9]+ da cidade,' "R2/2: sem leitura não há contagem «0 da cidade»"; has 2 'python3 → .* · versão não apurada' "R2/2: versão que falhou mantém o caminho"
 has 3 "${NA}Command Line Tools" "R2/3: CLT"; hasnt 3 'não instalados' "R2/3: pkgutil rc 1 com erro não vira «CLT não instaladas»"; has 4 "${NA}systemextensionsctl list" "R2/4: systemextensionsctl"; has 4 "${NA}kextstat: respondeu vazio" "R2/4: kextstat vazio não vale como «nenhum kext»"; hasnt 4 'nenhum da WCH|nenhuma da WCH' "R2/4: falha não vira «nenhum da WCH»"
 has 5 'não apurado.*system_profiler' "R2/5: system_profiler"; has 5 "${NA}celulares: o servidor adb não está rodando" "R2/5: adb parado não vira «0 celulares»"; hasnt 5 'celulares no adb' "R2/5: sem adb não há contagem de celulares"
-has 7 '\| com\.whatsapp \* \| 3 \| \? \| \? \|' "R2/7: sem launchctl as colunas são «?», não 0"; has 7 'não apurado.*print-disabled.*formato inesperado' "R2/7: print-disabled fora do formato"; hasnt 7 'desabilitados pelo launchctl' "R2/7: sem lista de desabilitados inventada"
+has 7 '\| com\.whatsapp \* \| 2 \| \? \| \? \|' "R2/7: sem launchctl as colunas são «?», não 0"; has 7 'não apurado.*print-disabled.*formato inesperado' "R2/7: print-disabled fora do formato"; hasnt 7 'desabilitados pelo launchctl' "R2/7: sem lista de desabilitados inventada"
 has 8 'não apurado.*print-disabled system' "R2/8: domínio system"; has 9 'brew leaves: brew ausente nesta máquina' "R2/9: brew ausente (command not found) é dito"; has 10 "${NA}lsof: lsof falhou" "R2/10: lsof"; hasnt 10 'nenhum listener' "R2/10: falha não vira «nenhum listener»"
 has 11 "${NA}Keychain" "R2/11: Keychain da sessão"; has 11 'Claude Code-credentials. · não apurado \(keychain desta sessão' "R2/11: item sem resposta é não apurado"; hasnt 11 ' · ausente| · presente' "R2/11: nem «ausente» nem «presente» sem resposta"
 has 12 "${NA}claude" "R2/12: claude --version"; has 12 'não apurado \(keychain desta sessão' "R2/12: itens das contas"; has 13 'não apurado.*pgrep' "R2/13: processo do Drive"; has 13 "${NA}extensões File Provider: pluginkit ausente nesta máquina" "R2/13: pluginkit ausente é dito"; has 14 "${NA}processos" "R2/14: ps"; has 15 "${NA}pmset" "R2/15: pmset"
@@ -208,19 +218,20 @@ docs 'não apurado: o pmset -g custom falhou' "R2/checklist: pmset que falhou n�
 [ "$(grep -c '^| [0-9]*\. .* | ok |$' "$DOC")" = 0 ] && ok "R2/Resumo: nenhuma seção «ok»" || bad "R2/Resumo" "$(grep '^| [0-9]*\. .* | ok |$' "$DOC")"
 if [ "$ROOTUSER" = 0 ]; then
   has 6 "${NA}~/\.ssh/config ausente ou sem leitura" "R2/6: ssh config ilegível"; has 12 'NÃO APURADO' "R2/12: .claude.json ilegível"
-  chmod 000 "$H/Library/LaunchAgents"; runinv; has 7 'não apurado.*Library/LaunchAgents ausente ou sem leitura' "R2/7: pasta de plists sem leitura"; hasnt 7 'nenhum \*\.plist' "R2/7: pasta ilegível não vira «nenhum plist»"; has 3 'SEM caminho.*não apurado \(nem todos os plists foram lidos\)' "R2/3: plists ilegíveis não viram «nenhum python sem caminho»"; chmod 755 "$H/Library/LaunchAgents"
+  chmod 000 "$H/Library/LaunchAgents"; runinv; has 7 'não apurado.*Library/LaunchAgents ausente ou sem leitura' "R2/7: pasta de plists sem leitura"; hasnt 7 'nenhum \*\.plist' "R2/7: pasta ilegível não vira «nenhum plist»"; has 3 'SEM caminho.*não apurado \(nem todos os plists foram lidos' "R2/3: plists ilegíveis não viram «nenhum python sem caminho»"; chmod 755 "$H/Library/LaunchAgents"
   chmod 000 "$W/wrappers/w1.sh"; runinv; has 3 "${NA}wrappers dos plists: grep falhou" "R2/3: wrapper ilegível deixa a lista de python parcial, não «nenhum»"; chmod 644 "$W/wrappers/w1.sh"
 fi
 
 echo "== R2b Keychain destravado mas o item responde rc 36; kextstat ausente; print-disabled com rc≠0"
 fx security.list_keychains_d_user '    "/Users/t/Library/Keychains/login.keychain-db"'; fxrc security.list_keychains_d_user 0; fxrc security.find_generic_password 36; fxerr security.find_generic_password 'User interaction is not allowed.'
 rm -f "$B/kextstat"; fxrc launchctl.print_disabled 3; fx launchctl.print_disabled ''
-for b in systemextensionsctl system_profiler networksetup.listallhardwareports launchctl.list lsof; do fxrc "$b" 0; fx "$b" 'lixo que nao e do comando'; done; runinv
+for b in systemextensionsctl system_profiler networksetup.listallhardwareports launchctl.list lsof pkgutil; do fxrc "$b" 0; fx "$b" 'lixo que nao e do comando'; done; fxrc ps 0; fx ps ''; runinv
 has 4 "${NA}systemextensionsctl list: formato inesperado" "R2b/4: resposta fora do formato é não apurado (systemextensionsctl)"; has 5 "${NA}system_profiler SPUSBDataType: formato inesperado" "R2b/5: system_profiler fora do formato"
 has 10 'sem nenhuma linha de porta \(formato inesperado\)' "R2b/10: lsof fora do formato não vira «nenhum listener»"; has 1 "${NA}networksetup -listallhardwareports: formato inesperado" "R2b/1: networksetup fora do formato"; has 7 "${NA}launchctl list: formato inesperado" "R2b/7: launchctl list fora do formato"
 has 4 "${NA}kextstat: kextstat ausente nesta máquina" "R2b/4: kextstat ausente (command not found) é «não apurado», o exemplo da aceitação"; hasnt 4 'nenhum da WCH|nenhum kext' "R2b/4: kextstat ausente não vira «nenhum»"
-has 7 "${NA}launchctl print-disabled gui/[0-9]+: launchctl falhou" "R2b/7: print-disabled com rc≠0 é não apurado"; has 7 '\| com\.whatsapp \* \| 3 \| \? \| \? \|' "R2b/7: colunas «?», não 0 desabilitados"
+has 7 "${NA}launchctl print-disabled gui/[0-9]+: launchctl falhou" "R2b/7: print-disabled com rc≠0 é não apurado"; has 7 '\| com\.whatsapp \* \| 2 \| \? \| \? \|' "R2b/7: colunas «?», não 0 desabilitados"
 has 11 'Claude Code-credentials. · não apurado \(security falhou \(rc=36' "R2b/11: item que responde rc 36 é não apurado"; hasnt 11 ' · ausente| · presente' "R2b/11: rc 36 não vira «ausente»"
+has 3 "${NA}Command Line Tools: pkgutil respondeu sem a linha «version:»" "R2b/3: pkgutil rc 0 sem «version:» é não apurado (formato inesperado)"; hasnt 3 'Command Line Tools: ``' "R2b/3: nem valor vazio"; has 14 "${NA}processos: ps respondeu vazio" "R2b/14: ps rc 0 sem nenhuma linha é não apurado"; hasnt 14 'nenhum «bw serve» rodando' "R2b/14: nem «nenhum bw serve»"
 
 echo "== R3 mundo que responde vazio (controle positivo)"
 mkworld r3; rm -f "$R/Library/LaunchDaemons"/* "$R/etc/sudoers.d"/* "$R/dev"/*; : >"$CALLS"
@@ -252,10 +263,11 @@ docnot 'abcd1234efgh5678ijkl|ghp_0123' "R4: token na saída de um comando é sup
 if [ -f "$HERE/../doc-rules-lint.py" ] && command -v python3 >/dev/null 2>&1; then python3 -I "$HERE/../doc-rules-lint.py" --check --root "$(dirname "$DOC")" 01-inventario.md >/dev/null 2>&1 && ok "R4: doc segue válido no doc-rules-lint" || bad "R4 lint" "doc-rules-lint reprovou"; fi
 
 echo "== R5 sonda pendurada"
-mkworld r5; printf '30\n' >"$FX/system_profiler.sleep"; for s in pkgutil brew lsof pmset; do printf '3\n' >"$FX/$s.sleep"; done; runinv MINI64_PROBE_S=2 MINI64_BUDGET_S=9
+mkworld r5; for s in system_profiler pkgutil lsof brew.leaves brew.list_cask pmset.g_custom pmset.g_sched; do printf '30\n' >"$FX/$s.sleep"; done   # a chave do .sleep é a MAIS LONGA que existe no fx (brew.leaves, não brew): 7 chamadas penduradas × 3 s = 21 s, bem acima do orçamento de 15 s
+runinv MINI64_PROBE_S=3 MINI64_BUDGET_S=15
 [ "$RC" = 0 ] && ok "R5: sai 0" || bad "R5 rc" "rc=$RC $ERR"
-[ "$ELAPSED" -le 25 ] && ok "R5: o orçamento corta a espera (${ELAPSED}s, com sondas de 30 s penduradas)" || bad "R5 tempo" "${ELAPSED}s"
-has 5 'system_profiler estourou o prazo' "R5/5: sonda estourada é dita"; docs 'orçamento de 9s esgotado' "R5: acabou o orçamento e o doc diz"
+[ "$ELAPSED" -le 28 ] && ok "R5: o orçamento corta a espera (${ELAPSED}s, com sondas de 30 s penduradas)" || bad "R5 tempo" "${ELAPSED}s"
+has 5 'system_profiler estourou o prazo' "R5/5: sonda estourada é dita"; docs 'orçamento de 15s esgotado' "R5: acabou o orçamento e o doc diz"
 
 echo "== R6 pasta sem escrita / HOME vazio"
 mkworld r6; runinv; cksum "$DOC" >"$W/doc.ck"
@@ -312,4 +324,26 @@ sf "" "R9/8 pasta de plists que existe e está vazia, CLT confirmadas: nenhuma s
 has 14 'argumentos: nenhum' "R9/8: nenhum bw serve nos plists"; has 2 'python3 → .*usr/bin/python3. · Python 3\.9\.6' "R9/8: com CLT confirmadas o python3 de /usr/bin é executado"
 mkworld f9; rm -f "$H/Library/LaunchAgents"/*; printf '<plist><dict><key>Label</key><string>com.gascity.estrela</string><key>ProgramArguments</key><array><string>/bin/echo</string></array></dict></plist>\n' >"$H/Library/LaunchAgents/*.plist"; runinv
 sf "" "R9/9 uma pasta com um único arquivo chamado «*.plist»: o glob devolve o próprio padrão e o arquivo existe"; has 7 '1 plists lidos' "R9/9: o arquivo é lido, a pasta não é «vazia»"; hasnt 7 'nenhum \*\.plist' "R9/9: não vira «nenhum *.plist»"
+echo "== R10 plists: argumentos do 4º em diante, valor multilinha, binário; bw serve com «=» e sem valor"
+plist() { printf '<plist><dict><key>Label</key><string>%s</string><key>ProgramArguments</key><array>' "$1"; shift; for a in "$@"; do printf '<string>%s</string>' "$a"; done; printf '</array></dict></plist>\n'; }   # plist <Label> <arg>...
+mkworld g1; LA="$H/Library/LaunchAgents"; rm -f "$LA"/*; printf '#!/bin/bash\nexec /Users/test/venv2/bin/python3 foo.py\nbw serve --port 8088\n' >"$W/wrappers/w2.sh"
+plist com.gascity.t1 /opt/homebrew/bin/timeout -k 20 840 /bin/bash "$(printf '\n\t  ')$W/wrappers/w2.sh" >"$LA/com.gascity.t1.plist"; plist com.gascity.t2 /bin/bash -l -c 'bw serve --port 8087' >"$LA/com.gascity.t2.plist"
+plist com.gascity.t3 /opt/homebrew/bin/timeout -k 20 /opt/px/bin/python3 z.py >"$LA/com.gascity.t3.plist"; plist com.gascity.t4 /opt/homebrew/bin/timeout -k 20 840 python3 y.py >"$LA/com.gascity.t4.plist"
+plist com.gascity.t5 /bin/bash -c "$(printf 'cd /tmp\n\techo um\nbw serve --port 8090')" >"$LA/com.gascity.t5.plist"; plist com.gascity.t6 /bin/echo >"$LA/com.gascity.t6"$'\n'"x.plist"; runinv
+sf "" "R10/1 plists com argumentos além do 3º, valor multilinha e nome de arquivo com LF: nada fica parcial"
+has 3 'venv2/bin/python3' "R10/1: python dentro do wrapper que vem atrás de «timeout -k 20 840 /bin/bash» (6º argumento)"; has 3 '1 lidos, 0 citados e ausentes' "R10/1: o wrapper do 6º argumento foi lido"; has 3 'opt/px/bin/python3' "R10/1: python absoluto no 4º argumento"; has 3 'SEM caminho.*: 1 python3;' "R10/1: python sem caminho no 5º argumento"
+has 14 'argumentos: com\.gascity\.t2 com\.gascity\.t5' "R10/1: «bw serve» no 4º argumento e dentro de um valor multilinha"; has 14 'w2\.sh' "R10/1: o wrapper do 6º argumento que sobe «bw serve»"; has 3 'plists de ~/Library/LaunchAgents' "R10/1: a seção 3 diz que só lê os plists do usuário"; has 14 'plists de ~/Library/LaunchAgents \(não os de /Library\)' "R10/1: a seção 14 também"
+has 7 '6 plists lidos' "R10/1: conta ARQUIVOS (o valor multilinha e o nome com LF não viram linhas a mais)"; has 7 '\| com\.gascity \* \| 6 \|' "R10/1: os 6 plists no prefixo"
+pfx=$(sect 7 | awk -F'|' '/^\| / && !/^\| prefixo / { c = $2; gsub(/^ +| +$/, "", c); sub(/ [*]$/, "", c); print c }' | sort | tr '\n' ,); [ "$pfx" = "br.urblink,com.athos,com.gascity,com.urblink,com.whatsapp," ] && ok "R10/1: a tabela só tem os prefixos reais (a continuação do valor multilinha não vira linha-fantasma)" || bad "R10/1 linha-fantasma na tabela" "$pfx"
+mkworld g2; rm -f "$H/Library/LaunchAgents/com.gascity.c.plist" "$H/Library/LaunchAgents/com.gascity.d.plist"; runinv
+sf "" "R10/2 controle: sem plist binário e sem python sem caminho nem bw serve nos argumentos, tudo lido"; has 3 'SEM caminho.*: nenhum' "R10/2 controle: «nenhum python sem caminho» quando MEDIU"; has 14 'argumentos: nenhum' "R10/2 controle: «nenhum bw serve» nos plists quando MEDIU"
+printf 'bplist00\000\001\002 binario' >"$H/Library/LaunchAgents/com.whatsapp.bin.plist"; runinv
+sf "3 14 " "R10/2 plist binário: o awk não lê os argumentos dele, então as seções 3 e 14 ficam parciais"; has 3 "${NA}1 plist\(s\) em formato binário" "R10/2: a seção 3 diz o motivo"; hasnt 3 'SEM caminho.*: nenhum' "R10/2: «nenhum python sem caminho» não vale com binário"; hasnt 14 'argumentos: nenhum' "R10/2: nem «nenhum bw serve» nos plists"; has 7 '7 plists lidos \(1 em formato binário' "R10/2: o binário continua contado na seção 7"
+mkworld g3; fx ps '/opt/homebrew/bin/bw serve --port=9999 --hostname=0.0.0.0 --session SECRETSESSIONKEYabcdef123456\nbw serve --hostname\nbw serve --port --hostname 127.0.0.1\nbw serve --port='; runinv
+sf "14 " "R10/3 bw serve com «=», sem valor ou com outra opção no lugar do valor: não apurado, nunca «(padrão)»"; has 14 'bw serve --port 9999 --hostname 0\.0\.0\.0' "R10/3: a forma «--port=N --hostname=H» é lida"; has 14 'bw serve --port \(padrão\) --hostname não apurado' "R10/3: --hostname sem valor"
+has 14 'bw serve --port não apurado --hostname 127\.0\.0\.1' "R10/3: --port seguido de outra opção"; has 14 'bw serve --port não apurado --hostname \(padrão\)' "R10/3: --port= vazio"; has 14 "${NA}bw serve" "R10/3: o Resumo conta a linha ilegível"; docnot 'SECRETSESSIONKEYabcdef123456' "R10/3: o --session não vaza"
+echo "== R11 harness: o calls.log sobrevive a 2 wrappers concorrentes (etapas de um pipeline do script)"
+: >"$CALLS"; for i in $(seq 1 150); do echo x | CALLS="$CALLS" "$G/grep" -E aa | CALLS="$CALLS" "$G/grep" -vE bb >/dev/null; done
+BADL=$(grep -vE '^grep -(E aa|vE bb)$' "$CALLS" | head -n 2); NL=$(grep -c . "$CALLS")   # controle de vivacidade: 300 linhas = os wrappers gravaram mesmo (sem CALLS o log fica vazio e o teste passaria vazio)
+{ [ -z "$BADL" ] && [ "$NL" = 300 ]; } && ok "R11: 150 pipelines com 2 grep concorrentes: 300 linhas, todas inteiras no calls.log (sem isso a allowlist reprova por acaso)" || bad "R11 calls.log com linhas misturadas («grepgrep -vE -E …») ou vazio" "linhas=$NL (esperado 300) $BADL"
 echo "== $PASS ok, $FAIL BAD"; [ "$FAIL" = 0 ]
