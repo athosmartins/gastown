@@ -218,6 +218,72 @@ class Refusals(T):
         self.assertIn("… mais 1 grupo(s) sem rótulo só no JSON", self.go(table)[1])
 
 
+W1, W2 = "2026-11-12T16:00:00Z", "2026-11-19T16:00:00Z"  # --days 14 ending NOW: the older week is [W1, W2], the newer (W2, NOW]
+
+
+def cellw(frm, to, lab, unl, unread, pct, state):
+    return {"from": frm, "to": to, "labeled": lab, "unlabeled": unl, "unread": unread, "n": lab + unl, "pct": pct, "state": state}
+
+
+class Weekly(T):
+    def weeks(self, spec, *args):
+        """spec: [(bead, ts, kind)], kind labeled|unlabeled|unread, one reviewer FAIL each -> (refusals.weekly, the whole report)."""
+        table = dict(NO_RIGS)
+        self.log(*[rec(b, "FAIL", reason=REV, ts=ts) for b, ts, _ in spec])
+        for b, _, kind in spec:
+            table[rd("gr-" + b)] = (1, "") if kind == "unread" else comments(gate_text("x " + TAGS if kind == "labeled" else "sem etiqueta"))
+        self.table = table
+        rc, j, _ = self.js(table, *args)
+        return j["refusals"]["weekly"], j
+
+    def test_the_labelled_fraction_is_per_week_oldest_first_and_only_over_the_refusals_that_were_read(self):
+        old = [("o%d" % i, "2026-11-1%dT10:00:00Z" % (3 + i), k) for i, k in enumerate(("labeled", "unlabeled", "unlabeled", "unlabeled"))]
+        new = [("n%d" % i, "2026-11-2%dT10:00:00Z" % i, k) for i, k in enumerate(("labeled",) * 4 + ("unlabeled",))] + [("u1", "2026-11-22T10:00:00Z", "unread")]
+        w, j = self.weeks(old + new, "--days", "14")
+        self.assertEqual(w, [cellw(W1, W2, 1, 3, 0, 25.0, "n<5"), dict(cellw(W2, NOW, 4, 1, 1, 80.0, "ok"))])  # the unread one is in `unread`, not in the denominator
+        self.assertEqual((j["refusals"]["total"], j["refusals"]["labeled"], j["refusals"]["unlabeled"], j["refusals"]["unread"]), (10, 5, 4, 1))  # the totals the meter always had are untouched
+
+    def test_a_week_with_nothing_read_is_sem_dado_never_zero_percent(self):
+        w, _ = self.weeks([("a", "2026-11-25T10:00:00Z", "unread"), ("b", "2026-11-24T10:00:00Z", "unread")], "--days", "14")
+        self.assertEqual(w, [cellw(W1, W2, 0, 0, 0, None, "sem dado"), cellw(W2, NOW, 0, 0, 2, None, "sem dado")])
+        self.assertEqual(self.go(self.table, "--days", "14")[1].splitlines()[1], "  rotuladas por semana (só as lidas): 11-12→11-19 sem dado · 11-19→11-26 sem dado +2 SEM LEITURA")  # in words, never 0%
+        self.log(rec("p"))  # no refusal at all
+        self.assertEqual([c["state"] for c in self.js(NO_RIGS, "--days", "14")[1]["refusals"]["weekly"]], ["sem dado", "sem dado"])
+
+    def test_every_refusal_lands_in_exactly_one_week_the_edges_included(self):
+        spec = [("a", NOW, "labeled"), ("b", "2026-11-19T16:00:01Z", "labeled"), ("c", W2, "unlabeled"), ("d", W1, "unlabeled"), ("e", "2026-11-12T16:00:01Z", "labeled")]
+        w, j = self.weeks(spec, "--days", "14")
+        self.assertEqual([(c["from"], c["to"], c["labeled"], c["unlabeled"]) for c in w], [(W1, W2, 1, 2), (W2, NOW, 2, 0)])  # a refusal exactly 7 days old is the OLDER week's; `lo` itself is in the window
+        self.assertEqual((sum(c["n"] for c in w), [c["pct"] for c in w]), (j["refusals"]["total"], [33.3, 100.0]))  # the percentage keeps one decimal
+
+    def test_the_cells_follow_days_the_oldest_one_clipped_by_the_window(self):
+        spec = [("a", "2026-11-25T10:00:00Z", "labeled"), ("b", "2026-11-17T10:00:00Z", "unlabeled")]
+        for days, want in (("7", [(W2, NOW)]), ("10", [("2026-11-16T16:00:00Z", W2), (W2, NOW)]), ("14", [(W1, W2), (W2, NOW)]), ("21", [("2026-11-05T16:00:00Z", W1), (W1, W2), (W2, NOW)])):
+            with self.subTest(days):
+                w, _ = self.weeks(spec, "--days", days)
+                self.assertEqual([(c["from"], c["to"]) for c in w], want)
+        self.assertEqual([sum(c["n"] for c in self.weeks(spec, "--days", d)[0]) for d in ("7", "10")], [1, 2])  # the 11-17 refusal is outside a 7-day window and inside a 10-day one
+
+    def test_text_mode_shows_the_fraction_right_under_the_headline(self):
+        w, _ = self.weeks([("a", "2026-11-25T10:00:00Z", "labeled"), ("b", "2026-11-24T10:00:00Z", "unlabeled"), ("c", "2026-11-23T10:00:00Z", "unread")], "--days", "7")
+        out = self.go(self.table_for(("a", "labeled"), ("b", "unlabeled"), ("c", "unread")), "--days", "7")[1].splitlines()
+        self.assertEqual(out[1], "  rotuladas por semana (só as lidas): 11-19→11-26 n<5 (1/2) +1 SEM LEITURA")
+        rows = [rec("r%d" % i, "FAIL", reason=REV, ts="2026-11-2%dT10:00:00Z" % (i % 6)) for i in range(5)]
+        self.log(*rows)
+        t = dict(NO_RIGS)
+        t.update({rd("gr-r%d" % i): comments(gate_text("x " + TAGS)) for i in range(5)})
+        self.assertEqual(self.go(t, "--days", "7")[1].splitlines()[1], "  rotuladas por semana (só as lidas): 11-19→11-26 100% (5/5)")
+
+    def table_for(self, *spec):
+        t = dict(NO_RIGS)
+        t.update({rd("gr-" + b): (1, "") if kind == "unread" else comments(gate_text("x " + TAGS if kind == "labeled" else "sem etiqueta")) for b, kind in spec})
+        return t
+
+    def test_nao_sei_report_has_no_weeks(self):
+        rc, j, _ = self.js()  # no log at all
+        self.assertTrue(rc == 2 and j["refusals"] is None)
+
+
 def ls(store, cls):
     return ("-C", store, "list", "--label", "root-class:" + cls, "--status", "all", "--json", "--limit", "0")
 
@@ -309,7 +375,7 @@ class Output(T):
         rc, out, err, _ = self.go(t)
         self.assertEqual([" ".join(x.split()) for x in out.splitlines()], [  # spacing is layout, the words and their order are the contract
             "gate-refusal-meter 7d até 2026-11-26T16:00:00Z: 1ª tentativa 43% (3/7) · recusas 3 = 1 rotuladas + 1 sem rótulo + 1 SEM LEITURA (+1 outras FAIL) · inventário 1 store(s) · INCOMPLETO",
-            "classe error-vs-empty 1 recusa(s) em 1 bead(s)", "sem rótulo 1× teste que passa (ex.: b3)", "inventário error-vs-empty gascity 2 (+1 na janela)",
+            "rotuladas por semana (só as lidas): 11-19→11-26 n<5 (1/2) +1 SEM LEITURA", "classe error-vs-empty 1 recusa(s) em 1 bead(s)", "sem rótulo 1× teste que passa (ex.: b3)", "inventário error-vs-empty gascity 2 (+1 na janela)",
             "⚠ 1 recusa(s) SEM LEITURA do comentário do gate-run: não entram em classe nem em sem-rótulo"])
         self.assertEqual((rc, err), (0, ""))
         rc, j, _ = self.js(t)
