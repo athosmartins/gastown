@@ -21,6 +21,11 @@ spec = importlib.util.spec_from_file_location("ciw", AQUI / "crew-idle-wake.py")
 ciw = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(ciw)
 ciw.time.sleep = lambda *_: None
+# gate ga-d0n3664: lista positiva — crews nomeadas = agentes com provider claude-rc*; pool com claude-headless
+for nome, prov in (("oracle-wa", "claude-rc-oracle"), ("peter-wa", "claude-rc-peter"), ("wa-worker", "claude-headless")):
+    (TMP / "agents" / nome).mkdir(parents=True, exist_ok=True)
+    (TMP / "agents" / nome / "agent.toml").write_text(f'provider = "{prov}"   # comentário\n')
+(TMP / "agents" / "sem-toml").mkdir()
 
 OCIOSA = "⏺ Combinado, deixei essa pergunta de lado.\n\n───────\n❯ \n───────\n  [Opus 5.5] ctx: 9%\n  ⏵⏵ bypass permissions on\n"
 OCUPADA = "✳ Twisting… (5m)\n───────\n❯ \n───────\n  ⏵⏵ bypass permissions on · esc to interrupt\n"
@@ -327,7 +332,25 @@ check(fim.get("prog") == "2026-11-26T09:00:00Z" and not fim.get("parcial"), "11c
 ciw.STORES = [str(TMP)]
 
 # 7. pool fica de fora; Mayor casa por «gastown.mayor» → «gastown__mayor»
-check(ciw.e_pool("wa-worker-adhoc-0cad1bdf00") and ciw.e_pool("dog-ga2695nnf"), "7a. pools fora do vigia")
+crews = ciw.crews_nomeadas()
+check(crews == {"oracle-wa", "peter-wa"}, "7a. crews = provider claude-rc*; pool e agent.toml ilegível ficam fora")
+check(not any(ciw.e_vigiada(n, crews) for n in ("wa-worker-adhoc-0cad1bdf00", "dog-gawispq8n8tg", "sem-toml-gawispabc123",
+                                                  "novo-pool-gawispabc123", "control-dispatcher")),
+      "7a. pool, dog e nome que ninguém cadastrou: fora (o desconhecido não age)")
+check(ciw.e_vigiada("oracle-wa-gawispgux5v0", crews) and ciw.e_vigiada("gastown__mayor", crews), "7a. crew e Mayor dentro")
+limpa()
+r = Runner(["novo-pool-gawispabc123"], [dict(ORACLE, assignee="novo-pool")], {"novo-pool-gawispabc123": OCIOSA})
+for k in range(4):
+    ciw.passada(run=r, agora=1000 + k * 601)
+check(r.enviados == [], "7h. sessão de nome desconhecido com bead em andamento: nenhuma ordem digitada")
+limpa()
+ciw.AGENTS_DIR = TMP / "agents-sumiu"
+r = Runner(["oracle-wa-gawispgux5v0"], [ORACLE], {"oracle-wa-gawispgux5v0": OCIOSA})
+for k in range(4):
+    ciw.passada(run=r, agora=1000 + k * 601)
+check(r.enviados == [] and ciw.ler_estado("_cego").get("passadas") == 4,
+      "7i. lista de crews ilegível: ninguém recebe ordem e a passada conta como cega")
+ciw.AGENTS_DIR = TMP / "agents"
 check(ciw.dono_da_sessao("gastown__mayor", "gastown.mayor"), "7b. Mayor casa pelo nome do tmux")
 check(not ciw.dono_da_sessao("oracle-wa-gawispgux5v0", "oracle"), "7c. prefixo solto não casa")
 for a in ("mayor", "mayor/", "gastown.mayor", "gastown__mayor"):          # gate ga-r62eowk: os grafismos reais do Mayor

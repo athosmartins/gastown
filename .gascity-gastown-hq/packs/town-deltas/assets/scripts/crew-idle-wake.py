@@ -56,8 +56,9 @@ STORES = os.environ.get("CREW_IDLE_WAKE_STORES",
 IDLE_MIN_SEC = int(os.environ.get("CREW_IDLE_WAKE_IDLE_SEC", "600"))
 MAX_KICKS = int(os.environ.get("CREW_IDLE_WAKE_MAX_KICKS", "3"))
 BLIND_ALARM_PASSES = 5
-# pools têm ciclo de vida próprio (sobem pra uma bead e saem); este vigia é das crews nomeadas e do Mayor
-POOL_PREFIXES = ("wa-worker", "ps-worker", "dog", "gastown.dog", "gate-reviewer", "kimi-worker", "refine")
+# gate ga-d0n3664: lista POSITIVA — o vigia só digita no pane do Mayor e das crews nomeadas (agente da cidade com provider
+# claude-rc*, o Remote Control que só Mayor e crews têm). Pool, dog, reviewer ou sessão de nome que ninguém cadastrou: fora.
+AGENTS_DIR = Path(os.environ.get("CREW_IDLE_WAKE_AGENTS", CITY / "agents"))
 NAO_PENDENTE_PREFIXOS = ("next-action:", "waiting-on:", "blocked")
 NAO_PENDENTE_EXATOS = {"gate:queued", "gate:reviewing", "gate:merging", "gate:passed"}
 # toda sessão do gc (Mayor e crews) vive no servidor tmux da cidade, não no padrão (gate ga-lw03yn6): sob o launchd não há $TMUX
@@ -141,8 +142,26 @@ def dono_da_sessao(sess: str, assignee: str) -> bool:
     return a in nomes or any(re.fullmatch(re.escape(n) + r"-gawisp[a-z0-9]+", a) for n in nomes)
 
 
-def e_pool(nome: str) -> bool:
-    return nome.startswith(POOL_PREFIXES)
+def crews_nomeadas():
+    """Nomes dos agentes com provider claude-rc* em AGENTS_DIR. Diretório ilegível → None («não sei quem é crew»: ninguém
+    recebe ordem); agent.toml ilegível → aquele agente fica fora (desconhecido não age)."""
+    try:
+        dirs = list(AGENTS_DIR.iterdir())
+    except OSError:
+        return None
+    crews = set()
+    for d in dirs:
+        try:
+            txt = (d / "agent.toml").read_text()
+        except OSError:
+            continue
+        if re.search(r'^provider\s*=\s*"claude-rc', txt, re.M):
+            crews.add(d.name)
+    return crews
+
+
+def e_vigiada(nome: str, crews) -> bool:
+    return nome in MAYORS or re.sub(r"-gawisp[a-z0-9]+$", "", nome) in (crews or ())
 
 
 def pendente(bead: dict) -> bool:
@@ -236,7 +255,10 @@ def passada(dry: bool = False, run=rodar, agora=None) -> int:
     sess_list = sessoes_tmux(run)
     # gate ga-vww9tud: store configurado que sumiu não é descartado em silêncio — `bd -C` num caminho ausente sai rc≠0 → None → «ilegível»
     lidos = {s: beads_em_andamento(s, run) for s in STORES}
-    if sess_list is None or all(v is None for v in lidos.values()):
+    crews = crews_nomeadas()
+    if crews is None:
+        log(f"NÃO SEI quais sessões são crews: {AGENTS_DIR} ilegível — nenhuma ordem nesta passada")
+    if sess_list is None or crews is None or all(v is None for v in lidos.values()):
         n = cego.get("passadas", 0) + 1
         gravar_estado("_cego", {"passadas": n, "avisado": cego.get("avisado", False)})
         log(f"NÃO SEI: tmux={'falhou' if sess_list is None else 'ok'}, stores ilegíveis — nenhuma injeção ({n} seguida(s))")
@@ -257,7 +279,7 @@ def passada(dry: bool = False, run=rodar, agora=None) -> int:
         log(f"{len(orfas)} bead(s) em andamento sem sessão viva do dono: {', '.join(map(str, orfas[:8]))}{' …' if len(orfas) > 8 else ''}")
     injetadas = 0
     for sess in sess_list:
-        if e_pool(sess):
+        if not e_vigiada(sess, crews):
             continue
         minhas = [b for b in beads if dono_da_sessao(sess, b.get("assignee", ""))]
         trabalho = [b["id"] for b in minhas if pendente(b)]
@@ -276,7 +298,8 @@ def passada(dry: bool = False, run=rodar, agora=None) -> int:
         if estado == "desconhecida":
             log(f"{sess}: não reconheci o prompt do Claude na tela — sem ordem nesta passada")
         sig = assinatura(texto)
-        # progresso de verdade = a bead andou (comentário, commit, troca de rótulo mexem no updated_at). A tela NÃO serve pra
+        # progresso de verdade = a bead andou (updated_at; no bd 1.1.0 só bd update o move — bd comment e bd label NÃO, então
+        # crew que só comenta conta como parada e o teto de 3 ordens limita o custo). A tela NÃO serve pra
         # isso: a própria ordem injetada muda a tela, e o teto de tentativas nunca dispararia.
         prog = max(str(b.get("updated_at") or "") for b in minhas if b["id"] in trabalho)
         # gate ga-z3s8i5y: com algum store ilegível o `prog` só vê parte das beads — «mudou» pode ser só a bead que não veio.
