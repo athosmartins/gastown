@@ -245,6 +245,26 @@ DPW_CRASHLOOP_HEAL_MAX="${DPW_CRASHLOOP_HEAL_MAX:-2}"   # max kickstart attempts
 _loaded()    { launchctl list "$1" >/dev/null 2>&1; }
 # The last-exit-status column (2nd field) for a loaded label; empty if not listed.
 _last_exit() { launchctl list 2>/dev/null | awk -v l="$1" '$3==l {print $2}'; }
+# ga-w1sot98: PID and last-exit of a loaded label from ONE `launchctl list` read ("PID EXIT", PID is
+# "-" when nothing is running). The two columns must come from the same read: the exit column is the
+# status of the PREVIOUS run, and while a StartInterval job is running (numeric PID) it still shows
+# that previous run's code — read separately, a run that ends between the two reads would pair a
+# stale PID with a fresh exit (or the reverse). Empty if the label is not listed.
+_last_status() { launchctl list 2>/dev/null | awk -v l="$1" '$3==l {print $1, $2}'; }
+# ga-w1sot98: a label is a SCHEDULED job (launchd starts it, it runs and exits) iff its plist has
+# StartInterval/StartCalendarInterval and no KeepAlive. Only for those is "PID present" the same as
+# "a run is in flight, its exit column is the run before"; a KeepAlive daemon with a PID is the
+# process launchd keeps restarting, and its exit column is exactly what crash-loop detection reads.
+# Unreadable plist / no positive evidence → not scheduled (the old behaviour, never a guess).
+_plist_is_scheduled() {
+  local plist="$1"
+  [ -f "$plist" ] || return 1
+  awk '
+    /<key>KeepAlive<\/key>/ { ka=1 }
+    /<key>(StartInterval|StartCalendarInterval)<\/key>/ { sched=1 }
+    END { exit (sched && !ka) ? 0 : 1 }
+  ' "$plist" 2>/dev/null
+}
 # Previous exit recorded for a label (from the state file); empty if none.
 _prev_exit() { awk -v l="$1" '$1==l {print $2}' "$STATE" 2>/dev/null; }
 # ga-g92h: classify a launchctl exit code. 137 is SIGKILL (128+9) -- the exact
@@ -833,7 +853,7 @@ run_presence_drift_sweep() {
 }
 
 run_sweep() {
-  local absent="" reloaded="" crashloop="" failing="" oom_killed="" wedged="" path_missing="" healthy=0 newstate="" lbl plist ex prev _hb _hblog _hbmax _age fc prog heal_n healing_inflight=""
+  local absent="" reloaded="" crashloop="" failing="" oom_killed="" wedged="" path_missing="" healthy=0 newstate="" lbl plist ex prev _hb _hblog _hbmax _age fc prog heal_n healing_inflight="" _st _pid inflight
   local NOW; NOW="$(date +%s)"
   # How long the machine has been awake-and-up (for WEDGE sleep/boot suppression).
   # DPW_TEST_AVAIL_AGE lets the selftest inject a value without calling sysctl.
@@ -853,12 +873,25 @@ run_sweep() {
     fi
 
     if _loaded "$lbl"; then
-      ex="$(_last_exit "$lbl")"; ex="${ex:-0}"
+      _st="$(_last_status "$lbl")"; _pid="${_st%% *}"; ex="${_st#* }"; ex="${ex:-0}"
       prev="$(_prev_exit "$lbl")"
+      _es="$(_exit_streak "$lbl")"   # ga-77f9q9h: a label with its own streak limit is judged by imp05 below (N consecutive sweeps), not by the 2-in-a-row crash-loop + kickstart
+      # ga-w1sot98: a SCHEDULED job with a numeric PID is a run IN FLIGHT, and the exit column is the run
+      # BEFORE it — the same code the previous sweep already judged. Judging it again counted one old
+      # failure once per sweep (a 470s jsonl-export run spans 1-2 sweeps → "9 consecutive sweeps" from a
+      # single exit 3) and, worse, the crash-loop heal below `kickstart -k`-killed the healthy run (TERM
+      # at ~295s). A run in flight is neither a failure nor a recovery: no heal, no fail count, no reset;
+      # the state carries what the last FINISHED run left, so the next idle sweep still sees it. A genuine
+      # crash-loop leaves PID "-" between runs and is still caught there; KeepAlive daemons are unchanged.
+      inflight=0
+      case "$_pid" in ''|*[!0-9]*) ;; *) _plist_is_scheduled "$plist" && inflight=1 ;; esac
+      if [ "$inflight" = "1" ]; then
+        [ "$ex" -gt 0 ] 2>/dev/null && log "RUN-IN-FLIGHT: $lbl pid=$_pid running; last finished run exit=$ex is not re-judged while it runs (no auto-heal, no fail count) (ga-w1sot98)"
+        ex="${prev:-0}"
+        healthy=$((healthy + 1))
       # CRASH-LOOP = a POSITIVE exit (a real error, not a negative=signal restart) seen
       # on TWO consecutive checks. One transient nonzero exit never alerts.
-      _es="$(_exit_streak "$lbl")"   # ga-77f9q9h: a label with its own streak limit is judged by imp05 below (N consecutive sweeps), not by the 2-in-a-row crash-loop + kickstart
-      if [ "$ex" -gt 0 ] 2>/dev/null && [ -n "$prev" ] && [ "$prev" -gt 0 ] 2>/dev/null && [ -z "$_es" ]; then
+      elif [ "$ex" -gt 0 ] 2>/dev/null && [ -n "$prev" ] && [ "$prev" -gt 0 ] 2>/dev/null && [ -z "$_es" ]; then
         # imp17: attempt auto-heal before paging a human
         if [ "${DPW_CRASHLOOP_AUTOHEAL:-1}" = "1" ]; then
           heal_n=$(( $(_cl_heal_get "$lbl") + 1 ))
@@ -900,7 +933,9 @@ run_sweep() {
       # label: imp17's own design is to heal silently first and escalate only once its
       # heal budget is exhausted (see heal-kickstart-failed / heals-exhausted below,
       # which add to $crashloop directly and so are never affected by this).
-      if [ "$ex" -gt 0 ] 2>/dev/null; then
+      if [ "$inflight" = "1" ]; then
+        :   # ga-w1sot98: run in flight — the fail count and the heal counter keep what the last finished run left
+      elif [ "$ex" -gt 0 ] 2>/dev/null; then
         fc=$(( $(_fail_count_get "$lbl") + 1 ))
         _fail_count_set "$lbl" "$fc"
         if [ "$fc" -ge "${_es:-${DPW_FAIL_THRESHOLD:-2}}" ]; then
@@ -1086,7 +1121,8 @@ case "\$1" in
     # table form: emit "PID EXIT LABEL" for loaded labels (exit from DPW_TEST_EXIT map).
     for l in \$DPW_TEST_LOADED; do
       e=0; for kv in \$DPW_TEST_EXIT; do case "\$kv" in "\$l:"*) e="\${kv#*:}";; esac; done
-      printf '%s\t%s\t%s\n' "-" "\$e" "\$l"
+      pid="-"; for kv in \${DPW_TEST_PID:-}; do case "\$kv" in "\$l:"*) pid="\${kv#*:}";; esac; done   # ga-w1sot98: PID column ("-" = idle)
+      printf '%s\t%s\t%s\n' "\$pid" "\$e" "\$l"
     done ;;
   bootstrap) echo "\$2 \$3" >> "\$DPW_TEST_BOOTSTRAPS"; exit 0 ;;
   kickstart) echo "\$*" >> "\$DPW_TEST_KICKSTARTS"; exit 0 ;;
@@ -1158,6 +1194,7 @@ PLIST
   export DPW_TEST_LOADED DPW_TEST_EXIT DPW_RELOAD   # exported so the stub subprocess sees them
   export DPW_TEST_PLIST_PATH DPW_TEST_PLIST_PATH_UNKNOWN   # ga-sb1wu: same reasoning, for the print stub
   DPW_TEST_DISABLED=""; export DPW_TEST_DISABLED   # ga-d0s6dc: same reasoning, for the print-disabled stub
+  DPW_TEST_PID=""; export DPW_TEST_PID   # ga-w1sot98: "label:pid" map for the PID column of the list stub (unset label = "-", idle)
   ALL="com.gascity.alpha com.gascity.beta com.gascity.gamma"
 
   # Disable provenance checks for scenarios 1-12 (tested explicitly in scenarios 13-17)
@@ -1379,7 +1416,8 @@ case "$1" in
     fi
     for l in $DPW_TEST_LOADED; do
       e=0; for kv in $DPW_TEST_EXIT; do case "$kv" in "$l:"*) e="${kv#*:}";; esac; done
-      printf '%s\t%s\t%s\n' "-" "$e" "$l"
+      pid="-"; for kv in ${DPW_TEST_PID:-}; do case "$kv" in "$l:"*) pid="${kv#*:}";; esac; done   # ga-w1sot98: PID column ("-" = idle)
+      printf '%s\t%s\t%s\n' "$pid" "$e" "$l"
     done ;;
   bootstrap) echo "$2 $3" >> "$DPW_TEST_BOOTSTRAPS"; exit 0 ;;
   kickstart) echo "$*" >> "$DPW_TEST_KICKSTARTS"; exit 0 ;;
@@ -2266,6 +2304,87 @@ GCSTUB43
   else
     bad "_binary_has_marker's herestring fix is missing — REGRESSION risk"
   fi
+
+  # ── ga-w1sot98: a StartInterval job with a PID is a RUN IN FLIGHT, not a crash-loop ─────────────────────
+  # launchctl list columns are PID, LAST-EXIT, LABEL. The exit column of a job that is running now is the
+  # run BEFORE it. The sweep used to read only the exit column, so one old exit 3 was counted on every
+  # sweep that overlapped a long run ("9 consecutive sweeps") and the imp17 heal `kickstart -k`-killed the
+  # healthy run (jsonl-export TERM at ~295s). The stub's DPW_TEST_PID map is what none of scenarios 1-48 could
+  # express (their PID column is always "-"), which is how this went unseen.
+  _s49_sched() {   # $1=label $2=extra plist keys: beta becomes a scheduled job (StartInterval) / a KeepAlive daemon
+    cat > "$LAUNCH_DIR/$1.plist" <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<plist version="1.0"><dict>
+  <key>Label</key><string>$1</string>
+  <key>ProgramArguments</key><array><string>/bin/bash</string><string>$TMP/fake-script.sh</string></array>
+  $2
+</dict></plist>
+PLIST
+  }
+  _s49_reset() { : > "$STATE"; rm -rf "${STATE}.crashloop-heals" "${STATE}.fail-counts"; : > "$LOG"; : > "$DPW_TEST_KICKSTARTS"; }
+  DPW_CRITICAL="com.gascity.beta"; DPW_HEARTBEAT=""; DPW_TEST_LOADED="com.gascity.beta"
+  export DPW_TEST_LOADED DPW_TEST_EXIT DPW_TEST_PID   # the launchctl stub is a subprocess: by here an earlier scenario's one-shot `VAR=x run_sweep` has left DPW_TEST_EXIT unexported (the stub then reads exit 0)
+  DPW_CRASHLOOP_AUTOHEAL=1; DPW_CRASHLOOP_HEAL_MAX=2; DPW_FAIL_THRESHOLD=2
+
+  echo "Scenario 49 (ga-w1sot98): scheduled job, PID present + old exit 3 over 3 sweeps → no kickstart, no alert, no fail count"
+  _s49_sched com.gascity.beta '<key>StartInterval</key><integer>900</integer>'
+  _s49_reset; printf 'com.gascity.beta 3\n' > "$STATE"
+  DPW_TEST_EXIT="com.gascity.beta:3"; DPW_TEST_PID="com.gascity.beta:90842"
+  _s49_rc=0; for _s49_i in 1 2 3; do run_sweep >/dev/null 2>&1 || _s49_rc=1; done
+  [ "$_s49_rc" -eq 0 ] && ok "in-flight run: 3 sweeps return 0 (no CRASH-LOOP/FAILING alert)" || bad "in-flight run raised an alert (exit column of the PREVIOUS run re-judged)"
+  [ ! -s "$DPW_TEST_KICKSTARTS" ] && ok "in-flight run: never kickstart -k'd (the healthy run is not killed)" || bad "in-flight run was kickstart -k'd: $(cat "$DPW_TEST_KICKSTARTS")"
+  [ "$(_fail_count_get com.gascity.beta)" = "0" ] && ok "in-flight run: fail count not incremented" || bad "in-flight run incremented the fail count to $(_fail_count_get com.gascity.beta)"
+  grep -q "RUN-IN-FLIGHT: com.gascity.beta pid=90842" "$LOG" && ok "in-flight run: logged as RUN-IN-FLIGHT, not as a failure" || bad "RUN-IN-FLIGHT not logged"
+  grep -q 'CRASH-LOOP\|FAILING' "$LOG" && bad "in-flight run logged CRASH-LOOP/FAILING" || ok "in-flight run: no CRASH-LOOP/FAILING line in the log"
+  [ "$(_prev_exit com.gascity.beta)" = "3" ] && ok "in-flight run: state carries the last FINISHED run's exit (3), not a guess" || bad "state after in-flight sweeps: '$(_prev_exit com.gascity.beta)' (expected 3)"
+
+  echo "Scenario 50 (ga-w1sot98): the SAME job idle (PID '-') with exit 3 twice → a genuine crash-loop is still caught and healed"
+  _s49_reset; DPW_TEST_PID=""
+  run_sweep >/dev/null 2>&1
+  run_sweep >/dev/null 2>&1
+  grep -q "com.gascity.beta" "$DPW_TEST_KICKSTARTS" && ok "idle + exit 3 on 2 consecutive sweeps: auto-heal kickstart issued (detection unchanged)" || bad "genuine crash-loop no longer healed"
+  _s49_reset; DPW_CRASHLOOP_AUTOHEAL=0
+  run_sweep >/dev/null 2>&1
+  run_sweep >/dev/null 2>&1 && bad "idle crash-loop must alert with AUTOHEAL=0" || ok "idle + exit 3 twice, AUTOHEAL=0: alert (return 1)"
+  DPW_CRASHLOOP_AUTOHEAL=1
+
+  echo "Scenario 51 (ga-w1sot98): in-flight sweeps neither add to nor erase the failure → the next IDLE sweep still sees it"
+  _s49_reset; DPW_TEST_PID=""
+  run_sweep >/dev/null 2>&1                                   # idle, exit 3 → state 'beta 3', first sighting
+  DPW_TEST_PID="com.gascity.beta:90842"
+  run_sweep >/dev/null 2>&1; run_sweep >/dev/null 2>&1        # a long run: two sweeps overlap it
+  [ ! -s "$DPW_TEST_KICKSTARTS" ] && ok "two sweeps during the run: no kickstart" || bad "kickstart during the run"
+  DPW_TEST_PID=""
+  run_sweep >/dev/null 2>&1                                   # the run ended with the same exit 3 → second FINISHED failure
+  grep -q "com.gascity.beta" "$DPW_TEST_KICKSTARTS" && ok "run ended, exit 3 again: second finished failure heals (state was carried through the run)" || bad "the carried state was lost across the in-flight sweeps"
+
+  echo "Scenario 52 (ga-w1sot98): PID + exit 0 (a run in flight after a success) is healthy, never kickstarted"
+  _s49_reset; DPW_TEST_EXIT="com.gascity.beta:0"; DPW_TEST_PID="com.gascity.beta:90842"
+  run_sweep >/dev/null 2>&1 && ok "PID + exit 0: healthy" || bad "PID + exit 0 alerted"
+  [ ! -s "$DPW_TEST_KICKSTARTS" ] && ok "PID + exit 0: no kickstart" || bad "PID + exit 0 kickstarted"
+
+  echo "Scenario 53 (ga-w1sot98): a KeepAlive daemon (or a plist with no schedule) with a PID is NOT treated as a run in flight — crash-loop detection unchanged"
+  DPW_TEST_EXIT="com.gascity.beta:1"; DPW_TEST_PID="com.gascity.beta:90842"
+  _s49_sched com.gascity.beta '<key>KeepAlive</key><true/>'
+  _s49_reset
+  run_sweep >/dev/null 2>&1; run_sweep >/dev/null 2>&1
+  grep -q "com.gascity.beta" "$DPW_TEST_KICKSTARTS" && ok "KeepAlive + PID + exit 1 twice: still a crash-loop (healed)" || bad "KeepAlive daemon wrongly exempted as 'run in flight'"
+  _s49_sched com.gascity.beta ''
+  _s49_reset
+  run_sweep >/dev/null 2>&1; run_sweep >/dev/null 2>&1
+  grep -q "com.gascity.beta" "$DPW_TEST_KICKSTARTS" && ok "no StartInterval/StartCalendarInterval + PID + exit 1 twice: old behaviour (no positive evidence it is a scheduled job)" || bad "an unscheduled plist was exempted without evidence"
+  _s49_sched com.gascity.beta '<key>StartCalendarInterval</key><dict><key>Hour</key><integer>3</integer></dict>'
+  _s49_reset
+  run_sweep >/dev/null 2>&1; run_sweep >/dev/null 2>&1
+  [ ! -s "$DPW_TEST_KICKSTARTS" ] && ok "StartCalendarInterval + PID + exit 1 twice: run in flight, not healed" || bad "a StartCalendarInterval job was kickstart -k'd while running"
+
+  echo "Scenario 54 (ga-w1sot98): one read — PID and exit come from the same launchctl list line"
+  _s54_out="$(DPW_TEST_LOADED="com.gascity.beta" DPW_TEST_EXIT="com.gascity.beta:3" DPW_TEST_PID="com.gascity.beta:77" PATH="$TMP:$PATH" bash -c 'source <(awk "/^_last_status\(\) \{/{print; exit}" "$0"); _last_status com.gascity.beta' "$0" 2>/dev/null)" || _s54_out=""
+  [ "$_s54_out" = "77 3" ] && ok "_last_status returns 'PID EXIT' from one list read" || bad "_last_status returned '$_s54_out' (expected '77 3')"
+
+  # restore the minimal plist the earlier scenarios expect
+  _s49_sched com.gascity.beta ''
+  DPW_TEST_PID=""; DPW_CRITICAL="com.gascity.alpha com.gascity.beta com.gascity.gamma"; DPW_TEST_LOADED="$ALL"; DPW_TEST_EXIT=""
 
   echo ""
   echo "daemon-presence-watchdog selftest: PASS=$PASS FAIL=$FAIL"
