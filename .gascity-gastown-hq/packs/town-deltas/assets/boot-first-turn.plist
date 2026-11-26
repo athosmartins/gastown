@@ -1,0 +1,37 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.gascity.boot-first-turn</string>
+
+  <!-- ga-esorlre.13 (camada 1 da ga-esorlre.12): depois de um boot, crew nomeada e Mayor com bead em andamento recebem 1 linha DIGITADA no pane (nudge vira "deferred reminder" e nao acorda sessao ociosa).
+       Cadencia 60 s; RunAtLoad de proposito (o caso e o pos-boot); passe parado so lista as sessoes do tmux. Contrato: cabecalho de scripts/boot-first-turn.py; instalar e desligar: docs/runbooks/boot-primeiro-turno.md.
+       ROLLBACK: touch .gc/boot-first-turn.off (proximo passe) ou launchctl bootout gui/$(id -u)/com.gascity.boot-first-turn. -->
+  <key>ProgramArguments</key>
+  <array>
+    <string>/usr/bin/python3</string>
+    <string>/Users/athos/gt/.gascity-gastown-hq/scripts/boot-first-turn.py</string>
+  </array>
+
+  <key>WorkingDirectory</key>
+  <string>/Users/athos/gt/.gascity-gastown-hq</string>
+
+  <key>StartInterval</key><integer>60</integer>
+  <key>RunAtLoad</key><true/>
+
+  <key>StandardOutPath</key><string>/Users/athos/gt/.gascity-gastown-hq/.gc/logs/boot-first-turn-launchd.out</string>
+  <key>StandardErrorPath</key><string>/Users/athos/gt/.gascity-gastown-hq/.gc/logs/boot-first-turn-launchd.err</string>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:/Users/athos/go/bin:/Users/athos/.local/bin</string>
+    <key>HOME</key>
+    <string>/Users/athos</string>
+    <key>GC_CITY_PATH</key>
+    <string>/Users/athos/gt/.gascity-gastown-hq</string>
+    <key>BEADS_DOLT_AUTO_START</key>
+    <string>0</string>
+  </dict>
+</dict>
+</plist>
