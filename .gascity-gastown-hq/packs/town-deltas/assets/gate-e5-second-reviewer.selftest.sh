@@ -488,6 +488,11 @@ Blocking issue 1 (class: comment-lies): run.sh:40 swallows the curl failure and 
 EOF
 mk_payload "1=$TMP/c1.txt" "2=$TMP/c2.txt" | union | jq -r '.stats | "\(.duplicates_merged),\(.distinct_issues)"' > "$TMP/o.txt"
 check "different explicit class tags -> not duplicates" "0,2" "$(cat "$TMP/o.txt")"
+# ga-mw5gdyu.5: the gate now asks every reviewer to end a blocking issue with root-class:<name>. That label is the refusal meter's metadata: not a class: tag, not description words (root, class, error, empty...)
+check "the SAME defect under two different root-class labels still merges (the label is not a class: tag)" "1,1" \
+  "$(u_pair 'Blocking issue 1: scripts/foo.py:40-44 the retry loop swallows the timeout error and reports success to the caller root-class:error-vs-empty' 'Blocking issue 1: scripts/foo.py:42 retry loop: a timeout error is swallowed, the caller is told success root-class:incomplete-error-handling')"
+check "two DIFFERENT short defects under the SAME root-class label stay apart (the label words are not shared description)" "0,2" \
+  "$(u_pair 'Blocking issue 1: scripts/foo.py:40 cache never expires root-class:incomplete-error-handling' 'Blocking issue 1: scripts/foo.py:41 counter never resets root-class:incomplete-error-handling')"
 # a comment with no 'Blocking issue' marker is kept whole, never dropped
 cat > "$TMP/free.txt" <<'EOF'
 VERDICT: FAIL

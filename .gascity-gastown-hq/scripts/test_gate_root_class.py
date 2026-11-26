@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """test_gate_root_class.py (ga-mw5gdyu.5): hermetic suite for packs/town-deltas/assets/gate-root-class.py, the closed root-class vocabulary a reviewer's FAIL must use and the audit the gate runs on it.
-FAIL_REASONS is fed in its real shape: one string where an entry break is the two characters backslash-n (see raw()). `python3 -I scripts/test_gate_root_class.py` (3.9+); GRC_UNDER_TEST=<copy> runs it against a mutant."""
+FAIL_REASONS is fed in its real shape: one string where an entry break is the two characters backslash-n and a reviewer's own line break stays a real newline (see raw(), entry(), union_entry()). `python3 -I scripts/test_gate_root_class.py` (3.9+); GRC_UNDER_TEST=<copy> runs it against a mutant."""
 import contextlib, importlib.util, io, json, os, re, subprocess, sys, unittest  # noqa: E401
 from unittest import mock
 
@@ -16,13 +16,26 @@ def load(name, path):
     return mod
 
 
+ASSETS = os.path.join(HERE, "..", "packs", "town-deltas", "assets")
+DISPATCHER = os.path.join(ASSETS, "quality-gate-dispatcher.sh")
 G = load("grc", SUT)
 METER = load("grm", os.path.join(HERE, "gate-refusal-meter.py"))
+UNION = load("e5union", os.path.join(ASSETS, "gate-e5-union.py"))
 
 
 def raw(*lines):
     """FAIL_REASONS as the dispatcher builds it: lines joined by the two characters backslash-n, the last one closed too."""
     return "\\n".join(lines) + "\\n"
+
+
+def entry(n, comment):
+    """One entry as gate_collect_verdicts appends it: every backslash of the comment doubled, a real newline inside it kept, the two characters backslash-n at the end."""
+    return "Reviewer %d FAIL: %s\\n" % (n, comment.replace("\\", "\\\\"))
+
+
+def union_entry(*comments):
+    """FAIL_REASONS as gate_e5_union_reasons leaves it: the union text as it is (real newlines, nothing doubled) closed by the two characters backslash-n."""
+    return UNION.union([{"index": i + 1, "text": c} for i, c in enumerate(comments)])[0].rstrip("\n") + "\\n"
 
 
 REV = "Reviewer 1 FAIL: VERDICT: FAIL"
@@ -142,6 +155,13 @@ class Audit(unittest.TestCase):
         r = self.a(raw(REV, "Blocking issue 1: a", TAIL, "Reviewer 2 FAIL: VERDICT: FAIL", "Blocking issue 1: b root-class:error-vs-empty", TAIL))
         self.assertEqual((r["state"], r["valid"], r["invalid"]), ("sem_classe", [], []))
 
+    def test_the_not_classified_notes_say_how_far_they_read_so_they_never_promise_the_whole_text(self):
+        for t in (fail("x with no class"), fail("x root-class:made-up"), raw(REV, "Blocking issue 1: a", TAIL, "Reviewer 2 FAIL: VERDICT: FAIL", "Blocking issue 1: b root-class:error-vs-empty", TAIL)):
+            with self.subTest(t[:40]):
+                r = self.a(t)
+                self.assertEqual(r["state"] != "classificada", True)
+                self.assertIn("lê-se até o 1º «Non-blocking findings:»", r["note"])  # the 3rd case: reviewer 2's class is past the cut, and the note must not say none of the blocking issues has one
+
     def test_the_prefix_is_read_as_the_meter_reads_it_a_wrong_case_prefix_is_no_label(self):
         r = self.a(fail("x Root-Class:error-vs-empty"))
         self.assertEqual((r["state"], r["valid"], r["invalid"]), ("sem_classe", [], []))
@@ -165,6 +185,62 @@ class Audit(unittest.TestCase):
         t = fail("x root-class:comment-lies")[:-2]  # an input that does not end in the two-character break: the note starts its own entry
         self.assertFalse(t.endswith("\\n"))
         self.assertEqual(self.a(t)["text"], t + "\\n" + self.a(t)["note"])
+
+
+class Unread(unittest.TestCase):
+    """A verdict:FAIL whose reason the dispatcher does not have is not a reviewer who left the class out: what it writes in that reviewer's place has no class to lack (gate attempt 1)."""
+
+    def bodies(self):
+        # vazio (the wording moved or went) → the count assertion fails the suite; falhou/ilegível (no dispatcher next to the helper) → the test errors: never a pass on strings that no longer exist
+        with open(DISPATCHER, encoding="utf-8") as f:
+            found = re.findall(r'^\s*FAIL_COMMENT="((?:verdict:FAIL|INCONCLUSIVE) [^"]*)"$', f.read(), re.M)
+        self.assertEqual(len(found), 2, found)  # unread (bd comments failed) and empty (answered, nothing parseable): a third body must be taught to UNREAD in gate-root-class.py
+        return [b.replace("$VB", "ga-vb1") for b in found]
+
+    def test_each_placeholder_the_dispatcher_writes_is_nao_sei_with_the_text_untouched_and_no_note(self):
+        for b in self.bodies():
+            with self.subTest(b[:32]):
+                t = entry(1, b)
+                self.assertEqual(G.audit(t), {"state": "nao_sei", "valid": [], "invalid": [], "text": t, "note": ""})
+
+    def test_next_to_an_unread_reviewer_the_judged_one_decides_the_state_in_either_order(self):
+        un = self.bodies()[0]
+        judged = lambda n, label: "Reviewer %d FAIL: VERDICT: FAIL\\nBlocking issue 1: x%s\\nNon-blocking findings: none\\n" % (n, label)  # noqa: E731
+        for t, want in ((entry(1, un) + judged(2, ""), "sem_classe"), (judged(1, "") + entry(2, un), "sem_classe"),
+                        (entry(1, un) + judged(2, " root-class:error-vs-empty"), "classificada"), (judged(1, " root-class:error-vs-empty") + entry(2, un), "classificada")):
+            with self.subTest(want=want):
+                self.assertEqual(G.audit(t)["state"], want)
+
+    def test_a_reviewer_who_quotes_a_placeholder_inside_a_sentence_is_still_judged(self):
+        # a reviewer of the dispatcher quotes these very strings: only an entry that IS the placeholder is unread
+        for b in self.bodies():
+            for label, want in ((" root-class:error-vs-empty", "classificada"), ("", "sem_classe")):
+                with self.subTest(b[:12], want=want):
+                    t = entry(1, "VERDICT: FAIL\nBlocking issue 1: gate_collect_verdicts writes %s as if a reviewer had said it%s\nNon-blocking findings: none" % (b, label))
+                    self.assertEqual(G.audit(t)["state"], want)
+
+    def test_an_e5_union_of_nothing_but_placeholders_is_nao_sei_and_one_real_reviewer_makes_it_judged(self):
+        un, em = self.bodies()
+        real = "VERDICT: FAIL\nBlocking issue 1: scripts/foo.py:40 x never checks the read%s\nNon-blocking findings: none"
+        for cs, want in (((un, em), "nao_sei"), ((un, un.replace("ga-vb1", "ga-vb2")), "nao_sei"), ((un, un), "nao_sei"),  # the last pair merges into ONE issue: still nothing a reviewer wrote
+                         ((real % "", un), "sem_classe"), ((un, real % " root-class:error-vs-empty"), "classificada")):
+            with self.subTest(want=want, comments=[c[:12] for c in cs]):
+                t = union_entry(*cs)
+                self.assertTrue(t.startswith("Reviewer 1 FAIL: VERDICT: FAIL — E5: union"), t[:60])  # the producer's own header: if it is reworded this test must say so
+                r = G.audit(t)
+                self.assertEqual((r["state"], r["text"] == t, r["note"] == ""), (want, want == "nao_sei", want == "nao_sei"))
+        quoting = "VERDICT: FAIL\nBlocking issue 1: scripts/foo.py:40 the dispatcher writes " + un + " as if a reviewer had said it\nNon-blocking findings: none"
+        self.assertEqual(G.audit(union_entry(quoting, un))["state"], "sem_classe")  # a reviewer quoting a placeholder mid-sentence is no placeholder line: 1 line of 2 issues
+        self.assertEqual(G.audit(union_entry(real % "", un) + entry(3, un))["state"], "sem_classe")  # a placeholder ENTRY after a union that holds a real reviewer does not make the union one
+        pasted = "VERDICT: FAIL\nBlocking issue 1: x\n" + "\n".join([un] * 3) + "\nNon-blocking findings: none"  # a reviewer pasting the dispatcher's line three times on lines of its own
+        self.assertEqual(G.audit(union_entry(pasted, "VERDICT: FAIL\nBlocking issue 1: y"))["state"], "sem_classe")  # 3 placeholder lines for 2 issues: not "every issue is one"
+
+    def test_the_real_shape_real_newlines_inside_an_entry_doubled_backslashes_and_the_backslash_n_terminator(self):
+        c = "VERDICT: FAIL\nSummary: regex \\b and \\n stay\nBlocking issue 1: x never checks the read root-class:error-vs-empty\nNon-blocking findings: none"
+        t = entry(1, c)
+        self.assertEqual((t.count("\n"), t.count("\\\\n")), (3, 1))  # three REAL newlines, and the reviewer's own backslash-n doubled
+        self.assertEqual(G.audit(t)["state"], "classificada")
+        self.assertEqual(G.audit(entry(1, c.replace(" root-class:error-vs-empty", "")))["state"], "sem_classe")
 
 
 class WithTheMeter(unittest.TestCase):

@@ -11637,10 +11637,13 @@ else
   # long comment at the newly-inserted `fi` above this if for the full story.
   # ga-mw5gdyu.5: every reviewer rejection is audited against the closed root-class vocabulary BEFORE anything reads FAIL_REASONS, so the gate-run comment (what scripts/gate-refusal-meter.py
   # counts), the GATE-FEEDBACK, the nudge and the run's event all carry the audited text. A FAIL that is no reviewer rejection (merge failure, no verdict) comes back untouched, record null;
-  # an auditor that cannot answer leaves the text alone and records nao_sei (said out loud). An older lib without the function = today's behaviour (declare -F first, as for the other optional pieces).
+  # an auditor that cannot answer leaves the text alone and records nao_sei (said out loud). An older lib without the function (a half-deployed city) audited NOTHING: that is nao_sei and a WARN, not the null of "nothing to classify".
   # SELFTEST-EXTRACT root-class-audit: BEGIN
   if declare -F gate_root_class_apply >/dev/null 2>&1; then
     gate_root_class_apply || true
+  else
+    GATE_ROOT_CLASS_JSON='{"state":"nao_sei"}'
+    warn "ga-mw5gdyu.5: gate_root_class_apply is not defined (gate-review-task.lib.sh older than this dispatcher?) — root-class audit NOT done; FAIL_REASONS left untouched, the run's record says nao_sei"
   fi
   # SELFTEST-EXTRACT root-class-audit: END
   log "Gate FAILED: $FAIL_REASONS"

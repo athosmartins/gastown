@@ -47,8 +47,8 @@ R_NONE='Reviewer 1 FAIL: VERDICT: FAIL\nBlocking issue 1: x never checks the rea
 R_BAD='Reviewer 1 FAIL: VERDICT: FAIL\nBlocking issue 1: x root-class:third-state\nNon-blocking findings: none\n'
 R_MERGE='Merge failed after all-PASS verdict. Merge result: failed. Check git state of rig r.'
 R_NASTY=$'Reviewer 1 FAIL: VERDICT: FAIL\\nBlocking issue 1: a $HOME `x` "q" \\\\b *.py % tab\there ção 😀 root-class:comment-lies\\nNon-blocking findings: none\\n'
-run_apply() {  # run_apply <FAIL_REASONS> [script] [python] -> $TMP/a.text (FAIL_REASONS after), a.json (GATE_ROOT_CLASS_JSON), a.meta ("<warn count> <rc>")
-  GATE_ROOT_CLASS_SCRIPT="${2-$HELPER}" GATE_ROOT_CLASS_PY="${3-$PY}" "$BASH32" -c 'set -euo pipefail; WARNS=0; log() { :; }; warn() { WARNS=$((WARNS+1)); }; source "$1"; FAIL_REASONS=$2
+run_apply() {  # run_apply <FAIL_REASONS> [script] [python] -> $TMP/a.text (FAIL_REASONS after), a.json (GATE_ROOT_CLASS_JSON), a.meta ("<warn count> <rc>"), a.warn (what was warned)
+  GATE_ROOT_CLASS_SCRIPT="${2-$HELPER}" GATE_ROOT_CLASS_PY="${3-$PY}" "$BASH32" -c 'set -euo pipefail; WARNS=0; D=$3; : > "$D/a.warn"; log() { :; }; warn() { WARNS=$((WARNS+1)); printf "%s\n" "$1" >> "$D/a.warn"; }; source "$1"; FAIL_REASONS=$2
     rc=0; gate_root_class_apply || rc=$?
     printf "%s" "$FAIL_REASONS" > "$3/a.text"; printf "%s" "$GATE_ROOT_CLASS_JSON" > "$3/a.json"; echo "$WARNS $rc" > "$3/a.meta"' _ "$LIB" "$1" "$TMP"
 }
@@ -70,6 +70,16 @@ if jq_ok '.state == "classificada" and .valid == ["comment-lies"] and .invalid =
 run_apply "$R_MERGE"; same_text "$R_MERGE" && check "not a reviewer rejection: text untouched, record null, nothing warned" "null|0 0" "$(cat "$TMP/a.json")|$(cat "$TMP/a.meta")" || bad "merge failure was touched"
 run_apply "$R_NASTY"; printf '%s%s' "$R_NASTY" "$("$PY" "$HELPER" audit <<<"$R_NASTY" | jq -j '.note')" > "$TMP/want.text"
 if cmp -s "$TMP/want.text" "$TMP/a.text"; then ok "backslashes, \$, backticks, quotes, globs, %, a tab, accents and an emoji cross the glue byte for byte"; else bad "the reviewer's text was altered by the glue"; fi
+
+echo "-- a reason the dispatcher could not get is not a class the reviewer left out (gate attempt 1, blocking issue 1)"
+# vazio (the count below is not 2: the dispatcher was reworded or moved) → bad; falhou/ilegível (no dispatcher to read) → sed prints nothing, so the same bad: never a pass on strings that no longer exist
+UNREAD_BODIES="$(sed -nE 's/^[[:space:]]*FAIL_COMMENT="((verdict:FAIL|INCONCLUSIVE) [^"]*)"$/\1/p' "$DISPATCHER" | sed 's/\$VB/ga-vb1/')"   # the two bodies gate_collect_verdicts writes for a verdict:FAIL it has no reason for
+check "the dispatcher writes exactly the two placeholder bodies the auditor knows (a third must be taught to UNREAD)" "2" "$(printf '%s\n' "$UNREAD_BODIES" | grep -c .)"
+while IFS= read -r body; do
+  R_UNREAD="Reviewer 1 FAIL: $body"'\n'
+  run_apply "$R_UNREAD"
+  if same_text "$R_UNREAD" && jq_ok '.state == "nao_sei" and (keys | length) == 1' && [ "$(cat "$TMP/a.meta")" = "1 0" ] && grep -q 'not read' "$TMP/a.warn"; then ok "${body%% *}…: text untouched (no SEM CLASSE note), the record is {state:nao_sei}, warned once and why"; else bad "placeholder ${body%% *}…: json=$(cat "$TMP/a.json") meta=$(cat "$TMP/a.meta") warn=$(cat "$TMP/a.warn")"; fi
+done <<<"$UNREAD_BODIES"
 
 echo "-- the auditor cannot answer: the text stays as it was and the record says nao_sei (never a state)"
 printf 'import sys\nsys.exit(3)\n' > "$TMP/exit3.py"; printf 'print("not json")\n' > "$TMP/garbage.py"
@@ -121,7 +131,7 @@ check "a refusal with no label: the event says root_class.state=sem_classe (coun
 line="$(run_dispatcher PASS "" -)"
 check "a PASS with the record never set: root_class is null (the event writer reads it as ${GATE_ROOT_CLASS_JSON:-null}, set -u safe)" "null" "$(printf '%s' "$line" | jq -c '.root_class')"
 printf '%s\n' "$AUDIT_BLOCK" > "$TMP/audit.sh"
-check "the audit block without the lib loaded (a half-deployed city): no error, no noise, FAIL_REASONS untouched" "0|$R_NONE" "$("$BASH32" -c 'set -euo pipefail; FAIL_REASONS=$2; . "$1/audit.sh"; echo "$?|$FAIL_REASONS"' _ "$TMP" "$R_NONE" 2>&1)"
+check "the audit block without the lib loaded (a half-deployed city): no abort, ONE warning, the record says nao_sei (the run was NOT audited: not the null of nothing to classify), FAIL_REASONS untouched" "0|$R_NONE|1|nao_sei" "$("$BASH32" -c 'set -euo pipefail; WARNS=0; warn() { WARNS=$((WARNS+1)); }; FAIL_REASONS=$2; . "$1/audit.sh"; echo "$?|$FAIL_REASONS|$WARNS|$(printf "%s" "$GATE_ROOT_CLASS_JSON" | jq -r .state)"' _ "$TMP" "$R_NONE" 2>&1)"
 check "an apply that returns non-zero does not abort the dispatcher (the call site is its own seatbelt)" "alive" "$("$BASH32" -c 'set -euo pipefail; gate_root_class_apply() { return 7; }; FAIL_REASONS=x; . "$1/audit.sh"; echo alive' _ "$TMP" 2>&1)"
 line="$(run_dispatcher FAIL "$R_OK" -)"
 check "a labelled refusal: the event carries the classes" '["error-vs-empty"]' "$(printf '%s' "$line" | jq -c '.root_class.valid')"

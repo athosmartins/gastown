@@ -453,15 +453,16 @@ A class outside this set is not accepted: the gate records the issue as not clas
 RCBLOCK
 }
 
-# _gate_rc_unknown <why> — the audit could not run: FAIL_REASONS stays as the reviewers wrote it and the run's record says nao_sei. Never a state, never null (null = nothing to classify).
+# _gate_rc_unknown <why> — the run is NOT classified (the audit could not run, or what a reviewer wrote was never read): FAIL_REASONS stays untouched and the run's record says nao_sei. Never a state, never null (null = nothing to classify).
 _gate_rc_unknown() {
   GATE_ROOT_CLASS_JSON='{"state":"nao_sei"}'
-  _gate_rc_say warn "ga-mw5gdyu.5: root-class audit NOT done ($1) — FAIL_REASONS left as the reviewers wrote it; the run's record says nao_sei"
+  _gate_rc_say warn "ga-mw5gdyu.5: root-class audit NOT done ($1) — FAIL_REASONS left untouched; the run's record says nao_sei"
 }
 
 # gate_root_class_apply — the gate's audit of a reviewer rejection against the closed vocabulary. Reads FAIL_REASONS (the dispatcher's escaped one-string form) and, when it holds a
 # judged "Reviewer N FAIL:" entry, rewrites it: a rejected label is renamed root-class-invalida:<name> and a note says the state, so the gate-run comment (what the meter reads) only
-# carries accepted classes. Sets GATE_ROOT_CLASS_JSON (the `root_class` of the run's quality-gate.jsonl event; the dispatcher resets it per run) to {state, valid, invalid}, or "null" when there was nothing to classify. Always returns 0.
+# carries accepted classes. Sets GATE_ROOT_CLASS_JSON (the `root_class` of the run's quality-gate.jsonl event; the dispatcher resets it per run) to {state, valid, invalid}, to {state:nao_sei} when the run could not be classified
+# (no auditor, or every reviewer entry is the dispatcher's placeholder for a reason it never read), or "null" when there was nothing to classify. Always returns 0.
 gate_root_class_apply() {
   local _out _state _rec _new _bad
   GATE_ROOT_CLASS_JSON="null"
@@ -473,6 +474,7 @@ gate_root_class_apply() {
   if ! _state=$(printf '%s' "$_out" | jq -r '.state // empty' 2>/dev/null); then _gate_rc_unknown "its answer is not JSON"; return 0; fi
   case "$_state" in
     (nao_se_aplica) return 0 ;;
+    (nao_sei) _gate_rc_unknown "a reviewer's reason was not read: its entry is the dispatcher's own placeholder, not what the reviewer wrote"; return 0 ;;
     (classificada|sem_classe|fora_do_vocabulario) ;;
     (*) _gate_rc_unknown "its answer names no state this gate knows: '${_state:-?}'"; return 0 ;;
   esac

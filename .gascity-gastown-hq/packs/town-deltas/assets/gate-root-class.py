@@ -10,8 +10,11 @@ Why: 244 of 308 refusals in 14 days carried no root-class (scripts/gate-refusal-
           sem_classe            a reviewer rejection with no label at all: counted as not classified, never dropped.
           fora_do_vocabulario   labels, but none accepted (not in the list, or outra with no why): the class is NOT accepted, it is listed in `invalid` and counts as not classified.
           nao_se_aplica         no judged "Reviewer N FAIL:" entry (a merge failure, a reviewer that never judged): nothing to classify, text unchanged.
-Read as the meter reads (scripts/gate-refusal-meter.py): the blocking part is the text up to the first "Non-blocking findings:" and the label is the lowercase `root-class:` prefix; only the NAME is read wider
-(Error-vs-empty is seen and rejected, where the meter would not see it at all).
+          nao_sei               every "Reviewer N FAIL:" entry is what the dispatcher writes when it has NO reason for a verdict:FAIL (its comments could not be read, or held nothing to parse), alone or as every issue of an E5 union:
+                                what the reviewer wrote is unknown, so it is neither "no label" nor a class. Text unchanged, no note.
+Read as the meter reads (scripts/gate-refusal-meter.py): the blocking part is the text up to the FIRST "Non-blocking findings:", if there is one (what follows it, a second reviewer's labels included, is neither read nor renamed, as the meter does not read it) and the label
+is the lowercase `root-class:` prefix; only the NAME is read wider (Error-vs-empty is seen and rejected, where the meter would not see it at all). The notes say how far they read. Run it ONCE per run: its own note and the
+renamed labels are not recognised on a second pass.
 EXIT 0 answered · 2 usage · 3 could not audit (stdin unreadable or not UTF-8, or an internal error): NOTHING on stdout, so a caller records "não sei" and never a state."""
 import json
 import re
@@ -29,11 +32,17 @@ VOCAB = (
     ("outra", "none of the above fits: write root-class:outra - <one line: why no class fits>, on the same line"),
 )
 NAMES = tuple(n for n, _ in VOCAB)
+# What the dispatcher writes IN PLACE OF a reason it does not have (quality-gate-dispatcher.sh, gate_collect_verdicts, the verdict:FAIL branch): "verdict:FAIL — its reason could not be read this sweep (…)" when `bd comments` failed,
+# "INCONCLUSIVE — verdict:FAIL with empty/unparseable reason (…)" when it answered with nothing to parse. Neither is what a reviewer wrote, so neither can lack a class; test_gate_root_class.py and the selftest read both from the dispatcher.
+UNREAD = r"(?:verdict:FAIL [\u2013\u2014-] its reason could not be read this sweep|INCONCLUSIVE [\u2013\u2014-] verdict:FAIL with empty/unparseable reason)"
+UNREAD_AT, UNREAD_LINE = re.compile(r"[ \t]*" + UNREAD), re.compile(r"\n" + UNREAD)  # at the start of an entry body / on a line of an E5 union (whose lines are real newlines)
+UNION_RE = re.compile(r"E5: union of \d+ independent reviews.*?(\d+) distinct issue\(s\) below")  # the header gate-e5-union.py writes
 USAGE = "uso: gate-root-class.py task-block | audit   (audit lê o FAIL_REASONS no stdin)"
 TOKEN_RE = re.compile(r"root-class:([A-Za-z0-9][A-Za-z0-9_-]*)")  # wider than the meter's NAME on purpose: an attempt at a label (Error-vs-empty) must be SEEN to be rejected
 ENTRY_RE = re.compile(r"(?:^|\\n|\n)Reviewer \S+ FAIL:")  # a judged rejection starts an entry (after the escaped break backslash-n, or a real one)
 BREAK_RE = re.compile(r"\\n|\n")
 NONBLOCKING, MIN_WHY, NOTE = "Non-blocking findings:", 8, "Classificação da recusa (gate): "
+READ = " (lê-se até o 1º «Non-blocking findings:», se houver, como o medidor)"
 
 
 def task_block():
@@ -50,9 +59,20 @@ def has_why(rest):
     return len(re.sub(r"^[\s:()\[\]*_`,.;\u2013\u2014-]+", "", line)) >= MIN_WHY
 
 
+def unread(body):
+    """body = the text from just after one "Reviewer N FAIL:" header: True when no reviewer wrote the entry it opens, only what the dispatcher writes in its place (UNREAD), alone or as EVERY distinct issue of an
+    E5 union (its header counts them; a real reviewer always adds at least one issue of its own, a free-form comment included). A later entry cannot change the answer: its placeholder follows its own header on the same line."""
+    if UNREAD_AT.match(body):
+        return True
+    u = UNION_RE.search(body)
+    return bool(u) and len(UNREAD_LINE.findall(body)) == int(u.group(1))
+
+
 def audit(text):
-    if not ENTRY_RE.search(text):
-        return {"state": "nao_se_aplica", "valid": [], "invalid": [], "text": text, "note": ""}
+    ents = list(ENTRY_RE.finditer(text))
+    if all(unread(text[m.end():]) for m in ents):
+        # vazio (no "Reviewer N FAIL:" entry: a merge failure, no verdict) → nao_se_aplica; ilegível (every entry is the dispatcher's own placeholder: what the reviewer wrote was never read) → nao_sei, never "no label"
+        return {"state": "nao_sei" if ents else "nao_se_aplica", "valid": [], "invalid": [], "text": text, "note": ""}
     cut = text.find(NONBLOCKING)
     head, rest = (text, "") if cut < 0 else (text[:cut], text[cut:])
     valid, invalid = [], []
@@ -68,8 +88,8 @@ def audit(text):
     state = "classificada" if valid else "fora_do_vocabulario" if invalid else "sem_classe"
     bad = "Classe(s) NÃO aceita(s) (fora do vocabulário fechado, ou outra sem porquê): %s." % ", ".join(invalid)
     note = NOTE + {"classificada": "classificada — %s." % ", ".join(valid) + (" " + bad if invalid else ""),
-                   "sem_classe": "SEM CLASSE — nenhum bloqueante traz uma classe do vocabulário fechado; contada como não classificada.",
-                   "fora_do_vocabulario": "SEM CLASSE — " + bad + " Nenhuma classe válida consta; contada como não classificada."}[state] + "\\n"
+                   "sem_classe": "SEM CLASSE — nenhum bloqueante traz uma classe do vocabulário fechado" + READ + "; contada como não classificada.",
+                   "fora_do_vocabulario": "SEM CLASSE — " + bad + " Nenhuma classe válida consta" + READ + "; contada como não classificada."}[state] + "\\n"
     return {"state": state, "valid": valid, "invalid": invalid, "text": (out if out.endswith("\\n") else out + "\\n") + note, "note": note}
 
 
