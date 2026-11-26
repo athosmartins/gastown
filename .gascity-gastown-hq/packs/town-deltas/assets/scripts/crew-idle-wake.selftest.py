@@ -197,6 +197,33 @@ for k in range(8):
 check(r.mails == [] and not ciw.ler_estado("oracle-wa-gawispgux5v0").get("tentativas"),
       "10b. send-keys que falha não conta tentativa nem dispara o mail de «não reage»")
 
+# 11. gate ga-c2ci9f8 — um store que cai no meio do episódio não zera tentativas nem o aviso
+limpa()
+st_a, st_b = TMP / "storeA", TMP / "storeB"
+st_a.mkdir(exist_ok=True); st_b.mkdir(exist_ok=True)
+ciw.STORES = [str(st_a), str(st_b)]
+
+
+class Runner2(Runner):
+    cai = False
+
+    def __call__(self, cmd, timeout=30):
+        if cmd[0] == "bd":
+            if cmd[2] == str(st_b):
+                return (1, "", "timeout") if self.cai else (0, json.dumps(self.beads), "")
+            return 0, "[]", ""
+        return super().__call__(cmd, timeout)
+
+
+r = Runner2(["oracle-wa-gawispgux5v0"], [ORACLE], {"oracle-wa-gawispgux5v0": OCIOSA})
+for k in range(5):
+    ciw.passada(run=r, agora=1000 + k * 601)
+antes = ciw.ler_estado("oracle-wa-gawispgux5v0")
+r.cai = True
+ciw.passada(run=r, agora=1000 + 5 * 601)
+check(ciw.ler_estado("oracle-wa-gawispgux5v0") == antes and antes.get("tentativas"), "11. store que cai não zera o episódio")
+ciw.STORES = [str(TMP)]
+
 # 7. pool fica de fora; Mayor casa por «gastown.mayor» → «gastown__mayor»
 check(ciw.e_pool("wa-worker-adhoc-0cad1bdf00") and ciw.e_pool("dog-ga2695nnf"), "7a. pools fora do vigia")
 check(ciw.dono_da_sessao("gastown__mayor", "gastown.mayor"), "7b. Mayor casa pelo nome do tmux")

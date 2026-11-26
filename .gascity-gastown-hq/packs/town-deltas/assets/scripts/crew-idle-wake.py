@@ -31,7 +31,7 @@ andar. A tela não zera as tentativas: a própria ordem injetada muda a tela.
 
 Falhas (nunca injeta sob dúvida): `tmux` ou `bd` que não respondem → nenhuma injeção na passada, log «não sei»;
 5 passadas seguidas sem conseguir ler → mail ao Mayor (o vigia está cego). Store de beads ilegível (com outro legível) →
-as sessões com bead nele não recebem ordem nesta passada e o relógio delas recomeça (inerte: atrasa, nunca injeta por palpite).
+as sessões com bead nele não recebem ordem nesta passada e o estado do episódio delas (tentativas, avisado) fica como estava.
 
 Uso: crew-idle-wake.py [--dry-run]   (launchd a cada 120 s; kill switch: .gc/state/crew-idle-wake.disabled)
 """
@@ -236,6 +236,7 @@ def passada(dry: bool = False, run=rodar, agora=None) -> int:
         return 0
     gravar_estado("_cego", {"passadas": 0, "avisado": False})
     beads = [b for v in lidos.values() if v for b in v]
+    ilegiveis = [st for st, v in lidos.items() if v is None]
     for store, v in lidos.items():
         if v is None:
             log(f"store ilegível nesta passada: {store} — sessões com bead nele ficam sem ordem nesta passada")
@@ -247,7 +248,9 @@ def passada(dry: bool = False, run=rodar, agora=None) -> int:
         trabalho = [b["id"] for b in minhas if pendente(b)]
         st = ler_estado(sess)
         if not trabalho:
-            if st:
+            # gate ga-c2ci9f8: com algum store ilegível, «sem trabalho» pode ser só a bead que não veio — o estado do episódio
+            # (tentativas, avisado) fica como está; só uma leitura completa de todos os stores pode zerá-lo
+            if st and not ilegiveis:
                 gravar_estado(sess, {})
             continue
         texto = tela(sess, run)
