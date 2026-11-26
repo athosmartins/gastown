@@ -1,0 +1,11 @@
+# celulares.tsv — os seriais que `adb devices` tem de listar em estado "device" para o go-nogo.sh dar GO (ga-ke5w2ie.3).
+#
+# ## Contents
+#   Formato · Estado atual · Como preencher
+#
+# FORMATO. Uma linha por celular, 2 colunas separadas por TAB: serial, apelido. Linha em branco e linha que começa com # são ignoradas.
+#   serial: letras, números, ponto, sublinhado, dois-pontos e hífen (a 1ª coluna de `adb devices`) · apelido: como a equipe chama o aparelho (cel-1, cel-2...). NUNCA número de telefone, nem no apelido.
+# ESTADO ATUAL. SEM LINHAS, de propósito: os seriais dos 8 celulares não estão em nenhum arquivo do repositório que o nó enxergue e inventar um serial daria um veredito falso. Enquanto a lista estiver vazia
+#   o go-nogo.sh devolve INCERTO na linha "adb" (nunca GO). A lista é prévia ao dia do corte: quem tem os aparelhos nas mãos preenche.
+# COMO PREENCHER. Com os celulares ligados por USB e autorizados: `adb devices -l`; copie a 1ª coluna de cada linha em estado "device" para cá, uma linha por aparelho, e dê um apelido. Rode o go-nogo.sh:
+#   a linha "adb" deve dizer N/N celulares em estado device. A cada troca de aparelho ou de cabo, atualize esta lista.
