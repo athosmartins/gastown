@@ -161,6 +161,40 @@ check(r.enviados == [], "6e. estado corrompido: o relógio recomeça, nenhuma or
 ciw.passada(run=r, agora=1000 + 1400)
 check(len(r.enviados) == 2, "6f. e 10 min depois a ordem sai normalmente")
 
+# 6g. gate ga-vww9tud — bd rc 0 com stdout VAZIO = não sei (None); o episódio da sessão (tentativas/avisado/relógio) fica intacto
+class RunnerBdMudo(Runner):
+    def __call__(self, cmd, timeout=30):
+        if cmd[0] == "bd":
+            return 0, "", ""
+        return super().__call__(cmd, timeout)
+limpa()
+r = Runner(["oracle-wa-gawispgux5v0"], [ORACLE], {"oracle-wa-gawispgux5v0": OCIOSA})
+ciw.passada(run=r, agora=1000)
+antes = (TMP / "st" / "oracle-wa-gawispgux5v0.json").read_text()
+r2 = RunnerBdMudo(["oracle-wa-gawispgux5v0"], [ORACLE], {"oracle-wa-gawispgux5v0": OCIOSA})
+check(ciw.beads_em_andamento(str(TMP), r2) is None, "6g. stdout vazio do bd = não sei (None), nunca «nenhuma bead»")
+ciw.passada(run=r2, agora=1000 + 700)
+check(r2.enviados == [] and (TMP / "st" / "oracle-wa-gawispgux5v0.json").read_text() == antes,
+      "6g. com o bd mudo nenhuma ordem sai e o estado do episódio não é apagado")
+
+# 6h. gate ga-vww9tud — store configurado que não existe vira «ilegível», nunca some da conta em silêncio
+class RunnerStoreSumido(Runner):
+    def __call__(self, cmd, timeout=30):
+        if cmd[0] == "bd" and not Path(cmd[cmd.index("-C") + 1]).is_dir():
+            return 1, "", "no beads database"
+        return super().__call__(cmd, timeout)
+limpa()
+sumido = str(TMP / "rig-que-sumiu")
+ciw.STORES = [str(TMP), sumido]
+r = RunnerStoreSumido(["oracle-wa-gawispgux5v0"], [ORACLE], {"oracle-wa-gawispgux5v0": OCIOSA})
+ciw.passada(run=r, agora=1000)
+antes = (TMP / "st" / "oracle-wa-gawispgux5v0.json").read_text()
+ciw.passada(run=r, agora=1000 + 700)
+log = (TMP / "log").read_text() if (TMP / "log").exists() else ""
+check(sumido in log, "6h. store ausente aparece no log como ilegível")
+check((TMP / "st" / "oracle-wa-gawispgux5v0.json").read_text() != "{}", "6h. e o estado do episódio não é zerado")
+ciw.STORES = [str(TMP)]
+
 # 8. gate ga-lw03yn6 — tela que o vigia não reconhece nunca recebe ordem; «Try "..."» é caixa vazia
 for nome, t in (("vazia", ""), ("shell", "athos@mini ~ % \n"), ("transcript", "  ⎿ Read 1 file\n  ⎿ Ran 2 commands\n")):
     check(ciw.estado_da_tela(t) == "desconhecida", f"8a. tela {nome}: desconhecida")

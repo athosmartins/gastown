@@ -109,8 +109,10 @@ def beads_em_andamento(store, run=rodar):
     rc, out, _ = run(["bd", "-C", store, "list", "--status", "in_progress", "--limit", "0", "--json"], timeout=60)
     if rc != 0:
         return None
+    if not (out or "").strip():
+        return None          # gate ga-vww9tud: o bd imprime «[]» quando não há bead; stdout VAZIO com rc 0 é «não sei», não «nenhuma»
     try:
-        dados = json.loads(out or "[]")   # third-state-waiver: JSON corrompido coberto no caso 6c/6d de crew-idle-wake.selftest.py (o check não lê selftest .py)
+        dados = json.loads(out)   # third-state-waiver: JSON corrompido coberto no caso 6c/6d e stdout vazio no 6g e store ausente no 6h de crew-idle-wake.selftest.py (o check não lê selftest .py)
     except ValueError:
         return None
     return dados if isinstance(dados, list) else None
@@ -225,7 +227,8 @@ def passada(dry: bool = False, run=rodar, agora=None) -> int:
     agora = agora or time.time()
     cego = ler_estado("_cego")
     sess_list = sessoes_tmux(run)
-    lidos = {s: beads_em_andamento(s, run) for s in STORES if Path(s).is_dir()}
+    # gate ga-vww9tud: store configurado que sumiu não é descartado em silêncio — `bd -C` num caminho ausente sai rc≠0 → None → «ilegível»
+    lidos = {s: beads_em_andamento(s, run) for s in STORES}
     if sess_list is None or all(v is None for v in lidos.values()):
         n = cego.get("passadas", 0) + 1
         gravar_estado("_cego", {"passadas": n, "avisado": cego.get("avisado", False)})
