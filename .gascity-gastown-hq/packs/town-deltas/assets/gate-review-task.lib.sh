@@ -37,6 +37,13 @@
 # (from the task-rapida lane decision); the builder pre-gate run never does. The short body does not carry the TEST WRAPPER paragraph: it
 # sends the reviewer to run at most the tests the diff itself adds or changes, so there is no battery to offload.
 #
+# A FIFTH piece (ga-mw5gdyu.5): the CLOSED root-class vocabulary. gate_root_class_task_block prints the block of the verdict tail that asks for
+# one root-class:<class> per blocking issue. It is EMBEDDED here on purpose: what a reviewer is asked must not depend on a sibling file or an
+# interpreter at render time (the E5 selftest renders this lib from a copy elsewhere, and a python that fails for a moment would drop the rule from
+# the task). The list the gate VALIDATES against lives in gate-root-class.py, and gate-root-class.selftest.sh fails if the two texts differ.
+# gate_root_class_apply is the gate's audit of what came back. apply is the one function here that is NOT pure: it rewrites FAIL_REASONS and sets
+# GATE_ROOT_CLASS_JSON, and only the dispatcher calls it; it is the only part that needs python.
+#
 # Editing the prompt text below changes what every reviewer is told, and what the builder rehearses against. Keep the
 # prose free of apostrophes: while this text sat inside a command substitution in the dispatcher, one stray apostrophe
 # made /bin/bash 3.2 misparse the whole file and the gate spawned no reviewer for ~3h (ga-6aj348). It no longer sits in a
@@ -413,9 +420,85 @@ _gate_review_task_pick_body() {
   esac
 }
 
+# ── ga-mw5gdyu.5: the closed root-class vocabulary — what the reviewer is told, and what the gate does with what it wrote ─────────────────────────
+# 244 of 308 refusals in 14 days carried no root-class, so scripts/gate-refusal-meter.py had nothing to hand the auto-improvement cycle. The audit lives in ONE helper
+# (gate-root-class.py); GATE_ROOT_CLASS_SCRIPT / GATE_ROOT_CLASS_PY are the test seams. The dispatcher's log and warn write to STDOUT and the task is captured with $( ):
+# nothing on the render path may call them.
+_GATE_RC_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)" || _GATE_RC_DIR=""
+
+# _gate_rc_helper <args> — runs the helper with the caller's stdin: its own rc and stdout, or 127/2 when there is no python or no helper (a caller that ignores stderr reads both as "cannot").
+_gate_rc_helper() {
+  "${GATE_ROOT_CLASS_PY:-python3}" "${GATE_ROOT_CLASS_SCRIPT:-$_GATE_RC_DIR/gate-root-class.py}" "$@"
+}
+
+# _gate_rc_say <log|warn> <text> — through the dispatcher's own logger when there is one, else stderr (the lib is also sourced by selftests and the builder).
+_gate_rc_say() {
+  if declare -F "$1" >/dev/null 2>&1; then "$1" "$2"; else printf '%s\n' "$2" >&2; fi
+}
+
+# gate_root_class_task_block — the vocabulary block of the verdict tail: always the same text, no process, no file. It must equal `gate-root-class.py task-block` (the selftest compares).
+gate_root_class_task_block() {
+  cat <<'RCBLOCK'
+ROOT CLASS OF EACH BLOCKING ISSUE (required in a FAIL): end every "Blocking issue N:" line with exactly one root-class:<class>, <class> being one of this CLOSED set:
+  error-vs-empty - a read that could not be made (failed, unreadable, timed out) is treated as the same result as an empty or a known one: the third state collapsed, a silent fail-open, an error reported as success
+  comment-lies - a comment, docstring, log line or doc promises more than the code next to it does
+  instance-not-class - the fix covers the instance that was cited and leaves sibling instances of the same defect in the code it touches
+  stale-state - state that goes stale, contradicts itself or is never reset: a cache, counter, label, cursor or flag read after its truth changed
+  test-misses-bug - a test that passes without exercising the path it claims to test, or that would still pass with the defect in place
+  wrong-scope - the change does less or more than the task asked (a missing piece, an unrelated edit) or acts on the wrong target, store or file
+  incomplete-error-handling - an error or exception path that is not handled at all: a crash, an unhandled branch, a missing cleanup or rollback
+  race-concurrency - an ordering or concurrency defect: a race, a duplicate run, a lock taken twice or not at all, a check-then-act gap
+  outra - none of the above fits: write root-class:outra - <one line: why no class fits>, on the same line
+A class outside this set is not accepted: the gate records the issue as not classified and counts it. A FAIL whose issues carry no class at all is recorded as "sem classe" and counted too. Choose the class by the kind of defect, not by the file it is in.
+RCBLOCK
+}
+
+# _gate_rc_unknown <why> — the audit could not run: FAIL_REASONS stays as the reviewers wrote it and the run's record says nao_sei. Never a state, never null (null = nothing to classify).
+_gate_rc_unknown() {
+  GATE_ROOT_CLASS_JSON='{"state":"nao_sei"}'
+  _gate_rc_say warn "ga-mw5gdyu.5: root-class audit NOT done ($1) — FAIL_REASONS left as the reviewers wrote it; the run's record says nao_sei"
+}
+
+# gate_root_class_apply — the gate's audit of a reviewer rejection against the closed vocabulary. Reads FAIL_REASONS (the dispatcher's escaped one-string form) and, when it holds a
+# judged "Reviewer N FAIL:" entry, rewrites it: a rejected label is renamed root-class-invalida:<name> and a note says the state, so the gate-run comment (what the meter reads) only
+# carries accepted classes. Sets GATE_ROOT_CLASS_JSON (the `root_class` of the run's quality-gate.jsonl event; the dispatcher resets it per run) to {state, valid, invalid}, or "null" when there was nothing to classify. Always returns 0.
+gate_root_class_apply() {
+  local _out _state _rec _new _bad
+  GATE_ROOT_CLASS_JSON="null"
+  # vazio → the helper answers nao_se_aplica itself; falhou (no python, no helper, rc != 0) → nao_sei, FAIL_REASONS untouched
+  if ! _out=$(printf '%s' "${FAIL_REASONS-}" | _gate_rc_helper audit 2>/dev/null); then
+    _gate_rc_unknown "the auditor did not answer"; return 0
+  fi
+  # vazio (no .state) → the nao_sei arm of the case; falhou/ilegível (not JSON, jq missing) → nao_sei at once
+  if ! _state=$(printf '%s' "$_out" | jq -r '.state // empty' 2>/dev/null); then _gate_rc_unknown "its answer is not JSON"; return 0; fi
+  case "$_state" in
+    (nao_se_aplica) return 0 ;;
+    (classificada|sem_classe|fora_do_vocabulario) ;;
+    (*) _gate_rc_unknown "its answer names no state this gate knows: '${_state:-?}'"; return 0 ;;
+  esac
+  # vazio/ilegível (valid or invalid missing or not an array: jq builds no object) or falhou → no record → nao_sei, never an empty list standing in for the missing one
+  if ! _rec=$(printf '%s' "$_out" | jq -c '{state: .state, valid: (.valid | arrays), invalid: (.invalid | arrays)}' 2>/dev/null) || [ -z "$_rec" ]; then
+    _gate_rc_unknown "its answer has no usable record"; return 0
+  fi
+  # vazio (no .text, or an empty one) → nao_sei; falhou → "" through the sentinel: the x printed last keeps a trailing newline alive through $( ) and makes the substitution itself never fail
+  _new=$(printf '%s' "$_out" | jq -j '.text | strings' 2>/dev/null; printf x); _new=${_new%x}
+  if [ -z "$_new" ]; then _gate_rc_unknown "its answer has no text"; return 0; fi
+  FAIL_REASONS="$_new"; GATE_ROOT_CLASS_JSON="$_rec"
+  _bad=$(printf '%s' "$_rec" | jq -r '.invalid | join(",")')   # $_rec is jq's own object: .invalid is an array, so this cannot fail
+  if [ "$_state" = classificada ] && [ -z "$_bad" ]; then
+    _gate_rc_say log "  ga-mw5gdyu.5: reviewer rejection classified: $(printf '%s' "$_rec" | jq -r '.valid | join(",")')"
+  else
+    _gate_rc_say warn "ga-mw5gdyu.5: reviewer rejection is $_state (counted as not classified when no class was accepted); classes NOT accepted: ${_bad:-none}"
+  fi
+  return 0
+}
+
 # _gate_review_task_verdict_bead — where the gate's reviewer records its verdict: a verdict bead.
 _gate_review_task_verdict_bead() {
+  local _rcb _nl=$'\n'
+  _rcb=$(gate_root_class_task_block)
   cat <<TASK
+${_rcb}${_nl}
 After completing your review, record your verdict with EXACTLY these bash commands:
 
 bd -C "$GC_CITY" label remove "$VERDICT_BEAD_ID" "verdict:pending"
@@ -429,8 +512,8 @@ bd -C "$GC_CITY" close "$VERDICT_BEAD_ID"
 # If FAIL:
 # bd -C "$GC_CITY" label add "$VERDICT_BEAD_ID" "verdict:FAIL"
 # bd -C "$GC_CITY" comment "$VERDICT_BEAD_ID" "VERDICT: FAIL
-# Blocking issue 1: <description>
-# Blocking issue 2: <description> (if any)
+# Blocking issue 1: <description> root-class:<class>
+# Blocking issue 2: <description> root-class:<class> (if any)
 # Non-blocking findings: <one per line as severity: description, or none>"
 # bd -C "$GC_CITY" close "$VERDICT_BEAD_ID"
 
@@ -441,7 +524,10 @@ TASK
 # _gate_review_task_verdict_text — where the builder's pre-gate reviewer records its verdict: its final message.
 # There is no verdict bead and no gate here, so the reviewer must NOT run bd or gc.
 _gate_review_task_verdict_text() {
+  local _rcb _nl=$'\n'
+  _rcb=$(gate_root_class_task_block)
   cat <<TASK
+${_rcb}${_nl}
 After completing your review, deliver your verdict as the FINAL TEXT of your last message.
 This is the builder pre-submission run of the gate review: there is no verdict bead and
 nothing to record, so do NOT run bd or gc and do not try to write anywhere.
@@ -454,8 +540,8 @@ Non-blocking findings: <one per line as severity: description, or none>
 
 # If FAIL:
 VERDICT: FAIL
-Blocking issue 1: <description>
-Blocking issue 2: <description> (if any)
+Blocking issue 1: <description> root-class:<class>
+Blocking issue 2: <description> root-class:<class> (if any)
 Non-blocking findings: <one per line as severity: description, or none>
 
 Then stop. Do not start other work.

@@ -8928,6 +8928,9 @@ gate_finalize_run() {
 NOTIFY_AUTHOR=$(printf '%s' "$BRANCH" | sed -n 's#^crew/\([^/]\{1,\}\)/.*#\1#p')
 [ -z "$NOTIFY_AUTHOR" ] && NOTIFY_AUTHOR="$AUTHOR"
 # SELFTEST-EXTRACT notify-author-resolve: END
+# ga-mw5gdyu.5: the root-class record of THIS run (gate_root_class_apply sets it on the FAIL path). Reset here, before either verdict path: this function runs once per marker in the
+# same process (Phase C), and a PASS, or a FAIL that is no reviewer rejection, must not inherit the record of the run finalized just before it.
+GATE_ROOT_CLASS_JSON=null
 
 # ── Step 9: Close reviewer sessions ──────────────────────────────────────────
 # Close promptly here (before the Step 10 merge) to free the gate-reviewer cap
@@ -11632,6 +11635,14 @@ else
   # (e.g. failed_sha_resolution after an all-PASS verdict), not only when it
   # was FAIL from before this function's outer merge-attempt check — see the
   # long comment at the newly-inserted `fi` above this if for the full story.
+  # ga-mw5gdyu.5: every reviewer rejection is audited against the closed root-class vocabulary BEFORE anything reads FAIL_REASONS, so the gate-run comment (what scripts/gate-refusal-meter.py
+  # counts), the GATE-FEEDBACK, the nudge and the run's event all carry the audited text. A FAIL that is no reviewer rejection (merge failure, no verdict) comes back untouched, record null;
+  # an auditor that cannot answer leaves the text alone and records nao_sei (said out loud). An older lib without the function = today's behaviour (declare -F first, as for the other optional pieces).
+  # SELFTEST-EXTRACT root-class-audit: BEGIN
+  if declare -F gate_root_class_apply >/dev/null 2>&1; then
+    gate_root_class_apply || true
+  fi
+  # SELFTEST-EXTRACT root-class-audit: END
   log "Gate FAILED: $FAIL_REASONS"
 
   # ── ga-mzw9dt: a reviewer FAIL ends any earlier approval of this bead's content ───────────────────────────────────
@@ -12436,10 +12447,12 @@ jq -c -n \
   --arg dry_run "$DRY_RUN" \
   --arg lane "${GATE_LANE:-normal}" \
   --arg remerge "${GATE_REMERGE:-0}" \
+  --arg root_class "${GATE_ROOT_CLASS_JSON:-null}" \
   '{ts: $ts, event: "dispatcher_complete", branch: $branch, bead: $bead,
     rig: $rig, tier: $tier, result: $result, reason: $reason,
     gate_run: $gate_run, marker: $marker, elapsed_s: $elapsed_s,
-    reviewers: $reviewers, dry_run: $dry_run, lane: $lane, remerge: $remerge}' \
+    reviewers: $reviewers, dry_run: $dry_run, lane: $lane, remerge: $remerge,
+    root_class: ($root_class | try fromjson catch {state: "nao_sei"})}' \
   >> "$QG_LOG" 2>/dev/null || true
 # SELFTEST-EXTRACT dispatcher-complete-event: END
 # ga-syxaki (E5): outcome line for a run that had an extra reviewer slot (no-op otherwise).
