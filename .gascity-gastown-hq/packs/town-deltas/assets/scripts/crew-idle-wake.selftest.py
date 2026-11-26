@@ -128,6 +128,29 @@ limpa()
 r = Runner([], [ORACLE], {}, falha_tmux=True)
 check(ciw.sessoes_tmux(r) is None, "6b. tmux sem resposta = não sei (None), nunca «nenhuma sessão»")
 
+# 6c. bd responde rc 0 com JSON corrompido → ilegível (None), nenhuma ordem
+class RunnerJsonRuim(Runner):
+    def __call__(self, cmd, timeout=30):
+        if cmd[0] == "bd":
+            return 0, "{corrompido", ""
+        return super().__call__(cmd, timeout)
+limpa()
+r = RunnerJsonRuim(["oracle-wa-gawispgux5v0"], [ORACLE], {"oracle-wa-gawispgux5v0": OCIOSA})
+check(ciw.beads_em_andamento(str(TMP), r) is None, "6c. JSON corrompido do bd = não sei (None), nunca «nenhuma bead»")
+for k in range(4):
+    ciw.passada(run=r, agora=1000 + k * 700)
+check(r.enviados == [], "6d. com o bd ilegível nenhuma ordem sai")
+
+# 6e. arquivo de estado corrompido/ilegível → recomeça o relógio (não injeta na hora)
+limpa()
+r = Runner(["oracle-wa-gawispgux5v0"], [ORACLE], {"oracle-wa-gawispgux5v0": OCIOSA})
+ciw.passada(run=r, agora=1000)
+(TMP / "st" / "oracle-wa-gawispgux5v0.json").write_text("{lixo")
+ciw.passada(run=r, agora=1000 + 700)
+check(r.enviados == [], "6e. estado corrompido: o relógio recomeça, nenhuma ordem por palpite")
+ciw.passada(run=r, agora=1000 + 1400)
+check(len(r.enviados) == 2, "6f. e 10 min depois a ordem sai normalmente")
+
 # 7. pool fica de fora; Mayor casa por «gastown.mayor» → «gastown__mayor»
 check(ciw.e_pool("wa-worker-adhoc-0cad1bdf00") and ciw.e_pool("dog-ga2695nnf"), "7a. pools fora do vigia")
 check(ciw.dono_da_sessao("gastown__mayor", "gastown.mayor"), "7b. Mayor casa pelo nome do tmux")
