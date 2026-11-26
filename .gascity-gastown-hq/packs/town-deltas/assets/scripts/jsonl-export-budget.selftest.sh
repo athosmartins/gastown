@@ -2,7 +2,7 @@
 # jsonl-export-budget.selftest.sh — ga-fegzc8h: the exporter fits ITS WORK in a time budget and commits what is complete, instead of dying at the order's timeout with nothing committed.
 #
 # Contents
-#   Harness · A rotation over four runs · B the first database always starts · C a killed database goes to the back · D the table cutoff · E a state this scheme did not write ·
+#   Harness · A rotation over four runs · B the first database always starts · C a killed database goes to the back · D the table cutoff · D2 the page deadline (a table in flight) · E a state this scheme did not write ·
 #   F "no changes" still names the deferred · G the budget fits under the order's timeout · H validate_and_count_issues
 #
 # THE FAILURE (28/10, load 70-120 on 10 cores): the exporter commits ONCE, after the last database. A whole pass is ~960 s (hq alone 530 s); the order's timeout is 840 s and has to stay under the 15 m
@@ -55,6 +55,20 @@ stub_tick() {  # stub_tick <seconds> — the fake clock moves
   now=$(cat "$E2E_CLOCK" 2>/dev/null || echo 0)
   printf '%s' "$((now + $1))" > "$E2E_CLOCK"
 }
+stub_keyed_page() {  # a page of STUB_KEYED_DB.comments: ids r0001..r<STUB_KEYED_ROWS> after the cursor, <LIMIT> of them; a ROWS page costs STUB_PAGE_COST s on the fake clock and is logged with the time it STARTED
+  local q="$1" lit="" lim=2000 last=0 first end
+  [[ "$q" =~ \>\ \(\'([^\']*)\'\) ]] && lit="${BASH_REMATCH[1]}"
+  [[ "$q" =~ LIMIT\ ([0-9]+)$ ]] && lim="${BASH_REMATCH[1]}"
+  [ -z "$lit" ] || last=$((10#${lit#r}))
+  first=$((last + 1)); end=$((last + lim)); [ "$end" -le "${STUB_KEYED_ROWS:-0}" ] || end="${STUB_KEYED_ROWS:-0}"
+  if [[ "$q" == "SELECT *"* ]]; then
+    printf 'page from=%s at=%s\n' "$first" "$(cat "$E2E_CLOCK" 2>/dev/null || echo 0)" >> "$E2E_PAGES"
+    stub_tick "${STUB_PAGE_COST:-0}"
+    jq -n -c --argjson a "$first" --argjson b "$end" --arg tag "${STUB_TAG:-0}" '{rows: [range($a; $b + 1) | {id: ("r" + (("0000" + tostring)[-4:])), text: "row run \($tag)"}]}'
+  else
+    jq -n -c --argjson a "$first" --argjson b "$end" '{rows: [range($a; $b + 1) | {id: ("r" + (("0000" + tostring)[-4:]))}]}'
+  fi
+}
 dolt_sql() {
   local q="" db cost extra
   while [ $# -gt 0 ]; do
@@ -63,9 +77,14 @@ dolt_sql() {
   done
   case "$q" in
     "SHOW DATABASES") printf 'Database\n'; for db in $STUB_DBS; do printf '%s\n' "$db"; done; return 0 ;;
-    *KEY_COLUMN_USAGE*) printf 'COLUMN_NAME\n'; return 0 ;;
+    *KEY_COLUMN_USAGE*)
+      printf 'COLUMN_NAME\n'
+      # ga-w1sot98: ONE keyed table (STUB_KEYED_DB.comments, primary key id), so the exporter pages it BY KEY
+      case "$q" in *"TABLE_SCHEMA = '${STUB_KEYED_DB:-.none}'"*"TABLE_NAME = 'comments'"*) printf 'id\n' ;; esac
+      return 0 ;;
   esac
   db=$(stub_db "$q")
+  if [ -n "${STUB_KEYED_DB:-}" ] && [ "$db" = "$STUB_KEYED_DB" ] && [[ "$q" == *'`.`comments`'* ]]; then stub_keyed_page "$q"; return 0; fi
   case "$q" in
     "SELECT COUNT(*) AS row_count FROM \`$db\`.issues"*) printf 'row_count\n%s\n' "$STUB_ROWS"; return 0 ;;
     "SELECT COUNT(*)"*) printf 'row_count\n0\n'; return 0 ;;
@@ -102,16 +121,16 @@ OUT=""; RC=0
 fresh() {  # fresh <name> — a new archive, a new state, a new log, the run counter back to 0
   SCEN="$1"; ARCH="$E2E/archive-$1"; E2E_STATE="$E2E/state-$1"; RUN_N=0; TAG_FIXED=""
   mkdir -p "$E2E_STATE"
-  unset STUB_KILL_DB GC_JSONL_BUDGET_SECONDS GC_JSONL_UNKNOWN_COST_SECONDS GC_JSONL_POST_RESERVE_SECONDS
+  unset STUB_KILL_DB GC_JSONL_BUDGET_SECONDS GC_JSONL_UNKNOWN_COST_SECONDS GC_JSONL_POST_RESERVE_SECONDS STUB_KEYED_DB STUB_KEYED_ROWS STUB_PAGE_COST GC_JSONL_SUPP_CHUNK_ROWS GC_JSONL_SUPP_EXPORT_RETRY_DELAY GC_JSONL_PAGE_STOP_MARGIN_SECONDS
   for v in aa bb cc dd; do unset "STUB_COST_$v" "STUB_TABLE_COST_$v"; done
   export STUB_DBS="aa bb cc dd"
 }
 run_export() {  # run_export — one run of the whole exporter in the current scenario; sets OUT and RC
   RUN_N=$((RUN_N + 1))
   printf '0' > "$E2E/clock"
-  : > "$E2E/gc.log"
+  : > "$E2E/gc.log"; : > "$E2E/pages.log"
   OUT=$(
-    E2E_GC_LOG="$E2E/gc.log" E2E_CLOCK="$E2E/clock" JEX_CLOCK_FILE="$E2E/clock" STUB_TAG="${TAG_FIXED:-$RUN_N}" JEX_LOG="$E2E/log-$SCEN" \
+    E2E_PAGES="$E2E/pages.log" E2E_GC_LOG="$E2E/gc.log" E2E_CLOCK="$E2E/clock" JEX_CLOCK_FILE="$E2E/clock" STUB_TAG="${TAG_FIXED:-$RUN_N}" JEX_LOG="$E2E/log-$SCEN" \
     PATH="$SANDBOX_PATH" GC_CITY="$E2E/city" GC_PACK_STATE_DIR="$E2E_STATE" GC_JSONL_ARCHIVE_REPO="$ARCH" \
     bash "$E2E/scripts/jsonl-export.sh" 2>&1
   )
@@ -205,6 +224,33 @@ has "$OUT" "aa.metadata not read: 610s into the 690s budget" && ok "run 2: the r
 [ "$(git -C "$ARCH" rev-parse HEAD:aa/metadata.jsonl 2>/dev/null || echo none)" = "$MD_BEFORE" ] && ok "run 2: aa/metadata.jsonl in HEAD is the previous version" || bad "run 2: aa/metadata.jsonl changed"
 in_head aa/labels.jsonl && ok "run 2: the table read before the cutoff (labels) is committed" || bad "run 2: aa/labels.jsonl missing"
 log_has 'budget: .*1 table(s) kept at their previous version' && ok "run 2: the log has the budget line with the table the cutoff kept" || bad "run 2: no 'budget: ... 1 table(s) kept at their previous version' line in the log"
+
+# ── D2: a table that is IN FLIGHT stops at the page deadline (ga-w1sot98) ────────────────────────────────────────────────────────
+# The cutoff of D only stops a table from STARTING. hq's comments/labels/dependencies are dozens of pages; one that starts before the cutoff and is read to its end carried the run to the order's timeout (TERM
+# at 840 s, nothing committed; the killed database is stamped `tried`, goes to the back, and the runs alternated). The stub pages one keyed table (aa.comments, 100 rows, 10 a page) at 100 s a page:
+# issues end at 10 s, so the pages START at 10, 110, ... 610 (7 of them) and the 8th would start at 710 s, past BUDGET - 50 = 640 s. On the base commit the pager has no deadline and reads all 11 (10 + the empty one that ends it).
+echo "--- D2: a table in flight stops between pages once the budget has no room for another ---"
+fresh pagedl
+export STUB_DBS="aa" STUB_COST_aa=10 STUB_KEYED_DB=aa STUB_KEYED_ROWS=100 STUB_PAGE_COST=0 GC_JSONL_SUPP_CHUNK_ROWS=10 GC_JSONL_SUPP_EXPORT_RETRY_DELAY=0
+run_export
+[ "$RC" = "0" ] && [ "$(wc -l < "$E2E/pages.log" | tr -d ' ')" = "11" ] && ok "run 1 (fast pages): the whole table is read, 10 pages of rows and the empty one that ends it" || bad "run 1: rc=$RC pages=$(wc -l < "$E2E/pages.log" | tr -d ' '): $OUT"
+has "$(subject)" "partial=" && bad "run 1: nothing was cut but the subject says partial=: '$(subject)'" || ok "run 1: no partial="
+C_BEFORE=$(git -C "$ARCH" rev-parse HEAD:aa/comments.jsonl 2>/dev/null || echo none)
+[ "$C_BEFORE" != "none" ] && ok "run 1: aa/comments.jsonl is in HEAD" || bad "run 1: aa/comments.jsonl not in HEAD (the split may have changed its layout)"
+export STUB_PAGE_COST=100
+run_export
+[ "$RC" = "0" ] && ok "run 2 (100 s a page): exits 0 and commits instead of running into the timeout" || bad "run 2: rc=$RC: $OUT"
+PG=$(wc -l < "$E2E/pages.log" | tr -d ' ')
+[ "$PG" = "7" ] && ok "run 2: 7 pages read (the last one started at 610 s), none after the 640 s page deadline" || bad "run 2: $PG pages read, want 7: $(tr '\n' ' ' < "$E2E/pages.log")"
+has "$OUT" "stopped before page 8: 710s into the 690s budget" && ok "run 2: the run says where it stopped and when" || bad "run 2: no 'stopped before page 8: 710s into the 690s budget' in: $OUT"
+has "$OUT" "aa.comments not retried" && ok "run 2: the cut read is not retried from page 1" || bad "run 2: no 'aa.comments not retried' in: $OUT"
+has "$(subject)" "partial=aa(comments" && ok "run 2: the subject names the table the deadline cut" || bad "run 2: subject '$(subject)', want partial=aa(comments..."
+[ "$(git -C "$ARCH" rev-parse HEAD:aa/comments.jsonl 2>/dev/null || echo none)" = "$C_BEFORE" ] && ok "run 2: aa/comments.jsonl in HEAD is the previous version (a cut read never replaces a whole one)" || bad "run 2: aa/comments.jsonl changed"
+log_has 'TABLE aa.comments rc=1 .* took 700s at 10s' && ok "run 2: the log has the per-table line (rc, rows, seconds, start) that names what the run's time went to" || bad "run 2: no 'TABLE aa.comments rc=1 ... took 700s at 10s' in the log: $(grep TABLE "$E2E/log-$SCEN" | tr '\n' '|')"
+export GC_JSONL_PAGE_STOP_MARGIN_SECONDS=0
+export STUB_PAGE_COST=30
+run_export
+[ "$RC" = "0" ] && [ "$(wc -l < "$E2E/pages.log" | tr -d ' ')" = "11" ] && ok "run 3 (30 s a page, margin 0): a table that fits is read whole — the deadline does not cut what the budget has room for" || bad "run 3: rc=$RC pages=$(wc -l < "$E2E/pages.log" | tr -d ' '): $OUT"
 
 # ── E: a state this scheme did not write ───────────────────────────────────────────────────────────────────────────────────────────────
 echo "--- E: a state edited by hand or reset does not stop the run ---"
