@@ -3,16 +3,19 @@
 #
 # O problema: `gc session new` só enfileira a abertura; o `start` roda depois, no reconciliador do motor, e quando falha a bead da SESSÃO vira state=failed-create (com pending_create_rollback_reason) minutos
 # depois. O Pilot descartava a saída do `session new`, e a bead do nó ficava dona do alias, «avisada», até o TTL de 25 min. Agora o _pilot_node_remote_open guarda o session_id na bead (pilot.node_session) e o
-# _pilot_node_failed_create_pass, uma vez por varredura, lê a bead da sessão: failed-create → WARN alto + solta a bead (confirma relendo) + esfria a rota do MBP; ativa/viva → nada; ilegível → nada.
+# _pilot_node_failed_create_pass, uma vez por varredura (logo depois do lock, ANTES de toda pausa e de todo `exit 0` do fluxo principal), lê a bead da sessão: failed-create → WARN alto + solta a bead (confirma relendo) + esfria a rota do MBP;
+# ativa/viva → nada; ilegível → nada.
 #
 # As funções são as REAIS (extraídas palavra por palavra do pilot-dispatcher.sh); bd (com estado) e gc são falsos. A parte do `session new --json` (guardar o id) e os ganchos do esfriamento no
 # _pilot_mbp_stamped_gate e no _pilot_mbp_node_decide têm os casos nos selftests wa-node-spawn, mbp-stamped e mbp-node.
 #   A. o veredito: failed-create (e fechada sem nunca ter nascido) solta a bead e avisa com o motivo; viva, criando, dormindo, ativa que fechou depois e failed-create COM creation_complete_at não tocam em nada.
 #   B. nunca por «não sei»: bead da sessão que não lê (rc, vazio, lixo, id outro, tipo outro, purgada), lista que falha ou não é array → nada escrito, e o resumo conta como ilegível.
-#   C. a cara da bead do nó: alias que não é de nó, marca ≠ dono, id de sessão fora da forma → ignorada; a bead que mudou entre a lista e a leitura (stale) → nada; o teto por varredura.
+#   C. a cara da bead do nó: alias que não é de nó, marca ≠ dono, id de sessão fora da forma → ignorada; a bead que mudou entre a lista e a leitura (stale) → nada; a releitura que não lê (unknown ≠ stale);
+#      o teto por varredura conta só o que ESCREVE (bead viva não gasta teto), o que ficou sem exame é contado e avisado (nao_examinadas), o prazo de relógio PILOT_NODE_FC_BUDGET_SECS.
 #   D. modos: PILOT_NODE_FAILED_CREATE=off|warn|valor ruim, DRY_RUN; o desfazer que não se confirma (held), a corrida que o --if-assignee barra; o comentário que não grava.
-#   E. o resfriamento da rota do MBP: _pilot_mbp_cooling e _pilot_mbp_cool_set de três estados; só o alias do MBP esfria; nunca encurta.
-#   F. a fiação: a vigia roda UMA vez na varredura, depois das pistas e antes do resumo da carimbada; nunca fecha sessão (nenhuma chamada ao gc).
+#   E. o resfriamento da rota do MBP: _pilot_mbp_cooling e _pilot_mbp_cool_set de três estados (a pasta que não deixa consultar esfria COM aviso; valor a mais de 1 dia esfria COM aviso); só o alias do MBP esfria; nunca encurta.
+#   F. a fiação (gate ga-7kbg9he, blocking): a vigia é chamada UMA vez, no nível de cima do fluxo, depois do lock e ANTES de todo `exit` do fluxo principal (pausas, horário quieto, pistas cheias, sem candidatas); as funções de que
+#      ela depende são definidas antes da chamada; nunca fecha sessão (nenhuma chamada ao gc).
 #   G. mutantes: cada quebra tem de derrubar este selftest. Cada um roda o arquivo inteiro e para no 1º FAIL.
 #
 # Run:  bash packs/town-deltas/assets/pilot-dispatcher.node-failed-create.selftest.sh
@@ -66,6 +69,7 @@ over() { # over <nome>: se há saída trocada, imprime e sai com o rc dela
 case "$verb" in
   show)
     id="${4:-}"; over "$id"
+    [ -z "${FAKE_BD_SLEEP:-}" ] || sleep "$FAKE_BD_SLEEP"   # Dolt lento: cada leitura de bead gasta relógio (o teste do prazo)
     [ -f "$FAKE_DIR/$id.json" ] || exit 1
     printf '['; cat "$FAKE_DIR/$id.json"; printf ']\n'; exit 0 ;;
   list)
@@ -140,7 +144,7 @@ mkactive() { mksess "$1" awake 2026-11-25T22:03:16Z 2026-11-25T22:03:07Z open ""
 reset() {
   rm -f "$FAKE_DIR"/*.json "$FAKE_OVER"/* "$FAKE_RACE" "$COOL" "$COOL".* 2>/dev/null || true
   : > "$FAKE_BD_LOG"; : > "$FAKE_GC_LOG"; : > "$FAKE_COMMENTS"; : > "$T/err"
-  unset FAKE_BD_UPDATE_MODE FAKE_COMMENT_RC PILOT_NODE_FAILED_CREATE DRY_RUN PILOT_NODE_FC_MAX PILOT_NODE_SESSION_KEY PILOT_MBP_COOL_SECS
+  unset FAKE_BD_UPDATE_MODE FAKE_COMMENT_RC FAKE_BD_SLEEP PILOT_NODE_FAILED_CREATE DRY_RUN PILOT_NODE_FC_MAX PILOT_NODE_FC_BUDGET_SECS PILOT_NODE_SESSION_KEY PILOT_MBP_COOL_SECS
 }
 # H <função> <args…> — roda a função REAL (extraída) num shell novo, com os falsos no PATH; imprime só "rc=N".
 H() {
@@ -283,6 +287,14 @@ jq '.status = "closed"' "$FAKE_DIR/wa-fff8.json" > "$FAKE_DIR/x" && mv "$FAKE_DI
 r=$(P); eq "a bead fechou entre a lista e a releitura: não se reabre — nada escrito" "$r $(nupd) $(cooled)" "rc=0 0 -"
 reset; mkbead wa-fff9 in_progress $NODE_MBP $NODE_MBP ga-s1; mkfail ga-s1; jq -s '.' "$FAKE_DIR/wa-fff9.json" > "$FAKE_OVER/__list__"; echo 1 > "$FAKE_OVER/wa-fff9.rc"
 r=$(P); eq "a releitura da bead do nó falha: nada escrito (o desfazer guardado seria o 2º freio, e nem chega a ser tentado)" "$r $(nupd) $(cooled)" "rc=0 0 -"
+errhas "mudaram=0, ilegíveis=1" && ok "...e o resumo conta 1 ILEGÍVEL, não «mudou» (não sei ≠ mudou; gate ga-7kbg9he, low)" || fail "resumo da releitura que falha: $(cat "$T/err")"
+for badre in "" "lixo não json" "[]" "[{\"id\":\"outra-bead\"}]" "42" "null"; do
+  reset; mkbead wa-fffa in_progress $NODE_MBP $NODE_MBP ga-s1; mkfail ga-s1; jq -s '.' "$FAKE_DIR/wa-fffa.json" > "$FAKE_OVER/__list__"; printf '%s' "$badre" > "$FAKE_OVER/wa-fffa"
+  r=$(P); eq "a releitura devolve '$badre' (não é a bead pedida): nada escrito, conta como ilegível e não como «mudou»" "$r $(nupd) $(cooled) $(errhas 'mudaram=0, ilegíveis=1' && echo conta)" "rc=0 0 - conta"
+done
+reset; mkbead wa-fffb in_progress $NODE_MBP $NODE_MBP ga-s1; mkfail ga-s1; jq -s '.' "$FAKE_DIR/wa-fffb.json" > "$FAKE_OVER/__list__"
+jq '.assignee = "outro-dono"' "$FAKE_DIR/wa-fffb.json" > "$FAKE_DIR/x" && mv "$FAKE_DIR/x" "$FAKE_DIR/wa-fffb.json"
+r=$(P); errhas "mudaram=1, ilegíveis=0" && ok "a bead LIDA com outro dono segue sendo «mudou» (stale), não ilegível" || fail "stale vs unknown: $(cat "$T/err")"
 
 reset
 for i in 1 2 3 4 5; do mkbead wa-ggg$i in_progress $NODE_MBP $NODE_MBP ga-g$i; mkfail ga-g$i; done
@@ -298,6 +310,47 @@ for i in 1 2 3 4 5 6 7 8; do mkbead wa-iii$i in_progress $NODE_MBP $NODE_MBP ga-
 export PILOT_NODE_FC_MAX=abc; r=$(P); unset PILOT_NODE_FC_MAX
 n=0; for i in 1 2 3 4 5 6 7 8; do [ "$(stt wa-iii$i)" = "$FREE" ] && n=$((n+1)); done
 eq "teto ilegível ('abc') vale o padrão (6): de 8 beads failed-create, 6 são soltas (não todas)" "$n" "6"
+# o teto conta o que ESCREVE: 7 beads de sessão viva não gastam teto, a failed-create da 8ª é examinada e solta (gate ga-7kbg9he, medium: com o teto em «beads examinadas» ela ficava sem exame, sem sinal)
+reset
+for i in 1 2 3 4 5 6 7; do mkbead wa-lv$i in_progress $NODE_HZ $NODE_HZ ga-v$i; mkactive ga-v$i; done
+mkbead wa-lv8 in_progress $NODE_MBP $NODE_MBP ga-v8; mkfail ga-v8
+r=$(P); eq "7 beads vivas + 1 failed-create (a última na ordem): a failed-create é solta (bead viva não gasta o teto de 6)" "$(stt wa-lv8)" "$FREE"
+errhas "vivas=7" && errhas "nao_examinadas=0" && ok "...o resumo conta 7 vivas e 0 não examinadas" || fail "resumo: $(cat "$T/err")"
+# o que o teto deixa de fora é CONTADO e avisado
+reset
+for i in 1 2 3 4 5 6 7 8; do mkbead wa-nx$i in_progress $NODE_MBP $NODE_MBP ga-g$i; mkfail ga-g$i; done
+export PILOT_NODE_FC_MAX=3; r=$(P); unset PILOT_NODE_FC_MAX
+errhas "soltas=3" && errhas "nao_examinadas=5" && ok "PILOT_NODE_FC_MAX=3, 8 failed-create: 3 soltas e o resumo diz nao_examinadas=5" || fail "resumo do teto: $(cat "$T/err")"
+errhas "5 bead(s) do nó com sessão guardada NÃO foram examinadas nesta varredura" && ok "...com WARN que diz quantas e por quê (teto ou prazo)" || fail "WARN do teto: $(cat "$T/err")"
+reset; mkbead wa-nx9 in_progress $NODE_MBP $NODE_MBP ga-g1; mkfail ga-g1; r=$(P)
+errhas "NÃO foram examinadas" && fail "WARN de não examinadas sem motivo (1 bead, teto 6): $(cat "$T/err")" || ok "sem sobra: sem o WARN de não examinadas"
+# o que escreve ou avisa gasta o teto: o desfazer que não se confirma (held) e a bead só vista em modo warn (seen) contam como a solta
+reset
+for i in 1 2 3 4 5 6 7 8; do mkbead wa-hd$i in_progress $NODE_MBP $NODE_MBP ga-g$i; mkfail ga-g$i; done
+export FAKE_BD_UPDATE_MODE=noop PILOT_NODE_FC_MAX=4; r=$(P); unset FAKE_BD_UPDATE_MODE PILOT_NODE_FC_MAX
+errhas "desfazer não confirmado=4" && errhas "nao_examinadas=4" && ok "desfazer que não se confirma (held) gasta o teto: 8 beads, teto 4 → 4 held e nao_examinadas=4" || fail "held no teto: $(cat "$T/err")"
+reset
+for i in 1 2 3 4 5 6 7 8; do mkbead wa-sn$i in_progress $NODE_MBP $NODE_MBP ga-g$i; mkfail ga-g$i; done
+export PILOT_NODE_FAILED_CREATE=warn PILOT_NODE_FC_MAX=4; r=$(P); unset PILOT_NODE_FAILED_CREATE PILOT_NODE_FC_MAX
+errhas "vistas sem soltar=4" && errhas "nao_examinadas=4" && ok "modo warn: a bead só vista (seen) gasta o teto: 8 beads, teto 4 → 4 vistas e nao_examinadas=4" || fail "seen no teto: $(cat "$T/err")"
+# o prazo de relógio: cada leitura de bead gasta 0,6 s; com prazo de 1 s a 1ª bead (2 leituras = 1,2 s) é examinada e as outras 2 ficam de fora
+reset
+for i in 1 2 3; do mkbead wa-pz$i in_progress $NODE_MBP $NODE_MBP ga-g$i; mkfail ga-g$i; done
+export FAKE_BD_SLEEP=0.6 PILOT_NODE_FC_BUDGET_SECS=1; r=$(P); unset FAKE_BD_SLEEP PILOT_NODE_FC_BUDGET_SECS
+n=0; for i in 1 2 3; do [ "$(stt wa-pz$i)" = "$FREE" ] && n=$((n+1)); done
+eq "PILOT_NODE_FC_BUDGET_SECS=1 com leitura lenta: 1 bead examinada e solta, o resto fica para a próxima varredura" "$n" "1"
+errhas "nao_examinadas=2" && errhas "PILOT_NODE_FC_BUDGET_SECS=1 s" && ok "...contadas (nao_examinadas=2) e avisadas com o prazo no WARN" || fail "resumo do prazo: $(cat "$T/err")"
+reset
+for i in 1 2 3; do mkbead wa-pw$i in_progress $NODE_MBP $NODE_MBP ga-g$i; mkfail ga-g$i; done
+export FAKE_BD_SLEEP=0.6 PILOT_NODE_FC_BUDGET_SECS=0; r=$(P); unset FAKE_BD_SLEEP PILOT_NODE_FC_BUDGET_SECS
+n=0; for i in 1 2 3; do [ "$(stt wa-pw$i)" = "$FREE" ] && n=$((n+1)); done
+eq "PILOT_NODE_FC_BUDGET_SECS=0 desliga o prazo: as 3 são examinadas e soltas apesar da lentidão" "$n" "3"
+reset
+for i in 1 2 3; do mkbead wa-px$i in_progress $NODE_MBP $NODE_MBP ga-g$i; mkfail ga-g$i; done
+export PILOT_NODE_FC_BUDGET_SECS=abc; r=$(P); unset PILOT_NODE_FC_BUDGET_SECS
+n=0; for i in 1 2 3; do [ "$(stt wa-px$i)" = "$FREE" ] && n=$((n+1)); done
+eq "prazo ilegível ('abc'): vale o padrão (90 s), as 3 são soltas" "$n" "3"
+grep -q 'integer expression' "$T/err" && fail "prazo ilegível chegou ao [ -gt ]: $(cat "$T/err")" || ok "...sem erro de «integer expression» (o valor ruim é trocado antes de comparar)"
 reset; mkbead wa-jjj1 in_progress $NODE_MBP $NODE_MBP ga-a1; mkfail ga-a1; mkbead wa-jjj2 in_progress $NODE_HZ $NODE_HZ ga-a2; mkactive ga-a2; mkbead ps-jjj3 in_progress $NODE_PS $NODE_PS ga-a3; mkfail ga-a3
 r=$(P); eq "uma loja WA e uma PS na mesma varredura: soltas as duas failed-create, a ativa fica" "$(stt wa-jjj1) $(stt wa-jjj2) $(stt ps-jjj3)" "$FREE in_progress,$NODE_HZ,$NODE_HZ,ga-a2 $FREE"
 reset; mkbead wa-jjj4 in_progress $NODE_MBP $NODE_MBP ga-a1; mkfail ga-a1
@@ -359,6 +412,26 @@ reset; mkdir -p "$COOL"; r=$(cool); eq "o caminho é uma PASTA (não lê): esfri
 reset; echo garbage > "$COOL"; GC_CITY="$CITY" PILOT_MBP_COOL_FILE="$COOL" bash -c "$PRELUDE"$'\n'"$FNS"$'\n''_pilot_mbp_cooling; _pilot_mbp_cooling; _pilot_mbp_cooling' 2>>"$T/err" || true; n=$(grep -c 'não tem um inteiro legível' "$T/err")
 eq "o aviso do arquivo ilegível sai UMA vez por varredura (3 consultas, 1 aviso)" "$n" "1"
 
+# a pasta existe mas não deixa nem consultar o arquivo (sem x): «não sei» → esfriando (0) COM aviso, uma vez por varredura (gate ga-7kbg9he, low). Rodando como root a pasta 000 ainda se atravessa: o teste se pula.
+NP="$T/noperm"; rm -rf "$NP"; mkdir -p "$NP"; chmod 000 "$NP"
+if [ -x "$NP" ]; then echo "  (pasta 000 atravessável por este usuário — teste pulado)"; else
+  reset; r=$(GC_CITY="$CITY" PILOT_MBP_COOL_FILE="$NP/cool" bash -c "$PRELUDE"$'\n'"$FNS"$'\n''_pilot_mbp_cooling; echo "rc=$?"' 2>>"$T/err" | tail -1)
+  eq "pasta que não deixa consultar o arquivo: esfriando (0), o MBP fica FORA" "$r" "rc=0"
+  errhas "não consigo consultar $NP/cool" && ok "...com aviso que diz o arquivo" || fail "aviso: $(cat "$T/err")"
+  reset; GC_CITY="$CITY" PILOT_MBP_COOL_FILE="$NP/cool" bash -c "$PRELUDE"$'\n'"$FNS"$'\n''_pilot_mbp_cooling; _pilot_mbp_cooling; _pilot_mbp_cooling' 2>>"$T/err" || true; n=$(grep -c 'não consigo consultar' "$T/err")
+  eq "...e o aviso sai UMA vez por varredura (3 consultas, 1 aviso)" "$n" "1"
+fi
+chmod 755 "$NP"; rm -rf "$NP"
+reset; r=$(GC_CITY="$CITY" PILOT_MBP_COOL_FILE="$T/pasta-que-nao-existe/cool" bash -c "$PRELUDE"$'\n'"$FNS"$'\n''_pilot_mbp_cooling; echo "rc=$?"' 2>>"$T/err" | tail -1)
+eq "pasta que nem existe: a rota nunca esfriou (1), sem aviso" "$r $([ -s "$T/err" ] && echo avisou || echo mudo)" "rc=1 mudo"
+# um fim de resfriamento a mais de 1 dia à frente não vem da vigia (teto 30 min): esfria (o inerte), COM aviso e a dica de apagar
+reset; echo $(( $(nowts) + 200000 )) > "$COOL"; r=$(cool); eq "fim a mais de 1 dia no futuro: esfriando (0)" "$r" "rc=0"
+errhas "mais de 1 dia à frente" && errhas "apague o arquivo" && ok "...com aviso que diz o valor e manda apagar o arquivo" || fail "aviso: $(cat "$T/err")"
+reset; printf '999999999999\n' > "$COOL"; r=$(cool); eq "valor absurdo de 12 dígitos: esfriando (0) com o aviso de dia" "$r $(errhas 'mais de 1 dia à frente' && echo avisou)" "rc=0 avisou"
+reset; echo $(( $(nowts) + 3600 )) > "$COOL"; r=$(cool); eq "fim a 1 h no futuro (dentro do dia): esfriando (0)" "$r" "rc=0"; [ ! -s "$T/err" ] && ok "...sem aviso nenhum (é um valor plausível)" || fail "aviso à toa: $(cat "$T/err")"
+reset; echo $(( $(nowts) + 200000 )) > "$COOL"; GC_CITY="$CITY" PILOT_MBP_COOL_FILE="$COOL" bash -c "$PRELUDE"$'\n'"$FNS"$'\n''_pilot_mbp_cooling; _pilot_mbp_cooling; _pilot_mbp_cooling' 2>>"$T/err" || true; n=$(grep -c 'mais de 1 dia à frente' "$T/err")
+eq "o aviso de valor a mais de 1 dia sai UMA vez por varredura (3 consultas, 1 aviso)" "$n" "1"
+
 setc() { H _pilot_mbp_cool_set "$@"; }
 reset; r=$(setc 600); v=$(cat "$COOL" 2>/dev/null); d=$(( v - $(nowts) ))
 { [ "$r" = rc=0 ] && [ "$d" -ge 560 ] && [ "$d" -le 602 ]; } && ok "cool_set 600: grava agora+600 (folga de 40 s para a máquina carregada)" || fail "cool_set 600: $r d=$d"
@@ -393,9 +466,27 @@ reset; mkbead wa-mmm3 in_progress $NODE_MBP $NODE_MBP ga-s1; mkfail ga-s1; expor
 eq "PILOT_MBP_COOL_SECS=0: a bead é solta e a rota NÃO esfria (0 desliga o resfriamento)" "$(stt wa-mmm3) $(cooled)" "$FREE -"
 
 echo; echo "=== F. a fiação ==="
-eq "a vigia é chamada em UM lugar do fluxo principal" "$(grep -c '^_pilot_node_failed_create_pass || true$' "$DISPATCHER")" "1"
-w1=$(awk '$0 == "_pilot_node_failed_create_pass || true" {print NR; exit}' "$DISPATCHER"); s1=$(awk '$0 ~ /_pilot_mbp_stamped_summary; fi$/ {print NR; exit}' "$DISPATCHER"); e1=$(awk '$0 == "_pilot_sweep_emit" {print NR; exit}' "$DISPATCHER"); d1=$(awk '$0 ~ /^dispatch_lane\(\)/ {print NR; exit}' "$DISPATCHER")
-{ [ -n "$w1" ] && [ -n "$s1" ] && [ -n "$e1" ] && [ -n "$d1" ] && [ "$d1" -lt "$w1" ] && [ "$w1" -lt "$s1" ] && [ "$s1" -lt "$e1" ]; } && ok "...depois das pistas (dispatch_lane), antes do resumo da carimbada e do evento agregado" || fail "ordem (dispatch_lane $d1, vigia $w1, resumo $s1, evento $e1)"
+# gate ga-7kbg9he (blocking): a vigia ficava no FIM do fluxo, depois de 11 `exit 0` (pausas, horário quieto, lock ocupado por outra, pistas cheias, sem candidatas) — o selftest só conferia a ordem das linhas de texto e deixava passar.
+# A propriedade que importa: toda varredura que SEGURA o lock roda a vigia ANTES de qualquer `exit` do fluxo principal. Aqui ela é conferida no texto do fonte: depois do bloco do lock, nenhum `exit` aparece antes da chamada.
+LK=$(awk '$0 == "if _acquire_pilot_lock; then" {print NR; exit}' "$DISPATCHER")
+LE=$(awk -v s="${LK:-0}" 'NR > s && $0 == "fi" {print NR; exit}' "$DISPATCHER")     # o `fi` que fecha o bloco do lock (o `exit 0` do «backing off» fica DENTRO dele, antes da vigia, de propósito: quem não pega o lock não varre)
+eq "a vigia é chamada em UM lugar, no nível de cima do fluxo (coluna 0, sem se esconder dentro de if/função)" "$(grep -c '^_pilot_node_failed_create_pass || true$' "$DISPATCHER")" "1"
+CALL=$(awk '$0 == "_pilot_node_failed_create_pass || true" {print NR; exit}' "$DISPATCHER")
+{ [ -n "$LK" ] && [ -n "$LE" ] && [ -n "$CALL" ] && [ "$LK" -lt "$LE" ] && [ "$LE" -lt "$CALL" ]; } && ok "...depois do bloco do lock (lock $LK–$LE, vigia $CALL)" || fail "a vigia não vem depois do bloco do lock (lock $LK–$LE, vigia $CALL)"
+EX=$(awk -v s="${LE:-0}" -v c="${CALL:-0}" 'NR > s && NR < c && $0 !~ /^[[:space:]]*#/ && $0 ~ /(^|[^A-Za-z0-9_-])exit[ ]+[0-9]/ {print NR}' "$DISPATCHER" | tr '\n' ' ')
+eq "NENHUM exit entre o lock e a vigia: toda varredura que segura o lock a roda antes de qualquer pausa" "${EX:-nenhum}" "nenhum"
+NEXT=$(awk -v c="${CALL:-0}" 'NR > c && $0 !~ /^[[:space:]]*#/ && $0 ~ /(^|[^A-Za-z0-9_-])exit[ ]+[0-9]/ {print NR; exit}' "$DISPATCHER")
+NEXIT=$(awk -v s="${LE:-0}" 'NR > s && $0 !~ /^[[:space:]]*#/ && $0 ~ /(^|[^A-Za-z0-9_-])exit[ ]+[0-9]/ {n++} END {print n+0}' "$DISPATCHER")
+{ [ -n "$NEXT" ] && [ "$NEXIT" -ge 8 ]; } && ok "...e o fluxo principal tem $NEXIT saídas depois dela (a 1ª na linha $NEXT): a vigia vem antes de todas" || fail "sem exits depois da vigia? (n=$NEXIT, 1º=$NEXT) — a varredura do fonte mudou, revise esta seção"
+# as funções de que a vigia depende estão DEFINIDAS antes da chamada (bash só acha a função se a definição já rodou; as pausas saem antes de várias definições)
+DEPS=$(printf '%s\n' "$FNS" | sed -E 's/^[[:space:]]*#.*$//; s/[[:space:]]#[[:space:]].*$//' | grep -oE '(_pilot_[a-z0-9_]+|\bwarn\b|\blog\b)' | sort -u)
+nd=0; for d in $DEPS; do
+  nd=$((nd+1)); dl=$(awk -v n="$d" '$0 ~ "^"n"\\(\\)" {print NR; exit}' "$DISPATCHER")
+  if [ -z "$dl" ]; then fail "a vigia usa $d e ele não é uma função definida no dispatcher"
+  elif [ "$dl" -ge "$CALL" ]; then fail "a vigia usa $d, definida na linha $dl — DEPOIS da chamada (linha $CALL): na hora da chamada a função não existe"
+  fi
+done
+[ "$nd" -ge 6 ] && ok "toda função de que a vigia depende ($nd: $(printf '%s' "$DEPS" | tr '\n' ' ')) é definida antes da chamada" || fail "poucas dependências lidas ($nd) — a extração falhou"
 grep -qF -- '--json 2>/dev/null) || _ro_rc=$?' "$DISPATCHER" && ok "o _pilot_node_remote_open pede --json do session new e guarda a saída" || fail "session new --json ausente"
 # o corpo da vigia nunca fecha sessão nem chama o gc
 body="$(fn_of _pilot_node_failed_create_pass; fn_of _pilot_node_failed_create_one)"
@@ -411,8 +502,8 @@ fi
 echo; echo "=== G. mutantes ==="
 # mut <nome> <função|-> <trecho original> <trecho novo> — troca a 1ª ocorrência DENTRO da função (ou do arquivo, com "-") numa cópia do pilot-dispatcher.sh e roda este arquivo contra ela; tem de reprovar
 mut() {
-  local name="$1" fn="$2" old="$3" new="$4" copy="$T/mut.sh"
-  python3 -I - "$DISPATCHER" "$copy" "$fn" "$old" "$new" <<'EOF' || { fail "mutante $name: o trecho original não existe em $2 (o fonte mudou? atualize o mutante)"; return; }
+  local name="$1" fn="$2" old="$3" new="$4" old2="${5-}" new2="${6-}" copy="$T/mut.sh"
+  python3 -I - "$DISPATCHER" "$copy" "$fn" "$old" "$new" "$old2" "$new2" <<'EOF' || { fail "mutante $name: o trecho original não existe em $2 (o fonte mudou? atualize o mutante)"; return; }
 import re, sys
 src = open(sys.argv[1], encoding="utf-8").read()
 fn, old, new = sys.argv[3], sys.argv[4], sys.argv[5]
@@ -423,7 +514,13 @@ if fn != "-":
     lo, hi = m.span()
 if src.count(old, lo, hi) < 1: sys.exit(1)
 i = src.find(old, lo, hi)
-open(sys.argv[2], "w", encoding="utf-8").write(src[:i] + new + src[i + len(old):])
+out = src[:i] + new + src[i + len(old):]
+old2, new2 = sys.argv[6], sys.argv[7]
+if old2:   # 2º par (mover uma linha): vale no arquivo inteiro e tem de existir também
+    if out.count(old2) < 1: sys.exit(1)
+    j = out.find(old2)
+    out = out[:j] + new2 + out[j + len(old2):]
+open(sys.argv[2], "w", encoding="utf-8").write(out)
 EOF
   if FC_SELFTEST_FILE="$copy" bash "$SELF" >/dev/null 2>&1; then fail "mutante $name SOBREVIVEU"; else ok "mutante $name morreu"; fi
 }
@@ -471,18 +568,23 @@ mut pass-lista-ilegivel       $PA 'if ! printf '"'"'%s'"'"' "$_fp_lj" | jq -e '"
 mut pass-sem-regex-alias      $PA '| select($a | test("^(wa|ps)-worker-remote(-mbp)?-[0-9]+$"))' ''
 mut pass-sem-marca-igual-dono $PA '| select($mk == $a)' ''
 mut pass-sem-forma-sessao     $PA '| select(($s | type) == "string" and ($s | test("^[A-Za-z0-9][A-Za-z0-9._-]*$")))' ''
-mut pass-sem-teto             $PA 'if [ "$_fp_n" -ge "$_fp_max" ]; then break; fi' ':'
+mut pass-sem-teto             $PA '[ $((_fp_rel + _fp_seen + _fp_held)) -ge "$_fp_max" ] || ' 'false || '
 mut pass-teto-ruim            $PA "case \"\$_fp_max\" in ''|*[!0-9]*) _fp_max=6 ;; esac" ':'
 mut pass-sem-loja-ps          $PA 'for _fp_pfx in wa ps; do' 'for _fp_pfx in wa; do'
 mut pass-loja-vazia-lida      $PA 'if [ -z "$_fp_st" ]; then _fp_unk=$((_fp_unk + 1)); continue; fi' ':'
 # o resfriamento
-mut cool-arquivo-ausente      $CL '[ -e "$_c_file" ] || return 1' ':'
+mut cool-arquivo-ausente      $CL '    return 1
+  fi
+  { IFS= read' '    return 0
+  fi
+  { IFS= read'
 mut cool-ilegivel-livre       $CL '  if [ -z "$_c_until" ]; then
     if [ "${_PMC_WARNED:-0}" != 1 ]; then' '  if [ -z "$_c_until" ]; then
     return 1
     if [ "${_PMC_WARNED:-0}" != 1 ]; then'
 mut cool-sem-aviso            $CL 'warn "ga-dzexg3i.1: $_c_file existe' ': "ga-dzexg3i.1: $_c_file existe'
-mut cool-aviso-repete         $CL '_PMC_WARNED=1' ':'
+mut cool-aviso-repete         $CL '      _PMC_WARNED=1
+      warn "ga-dzexg3i.1: $_c_file existe' '      warn "ga-dzexg3i.1: $_c_file existe'
 mut cool-passado-esfria       $CL '[ "$((10#$_c_until))" -gt "$_c_now" ]' '[ "$((10#$_c_until))" -le "$_c_now" ]'
 mut cool-octal                $CL '[ "$((10#$_c_until))" -gt "$_c_now" ]' '[ "$((_c_until))" -gt "$_c_now" ]'
 mut cool-sem-limite-digitos   $CL '*) if [ "${#_c_until}" -gt 12 ]; then _c_until=""; fi ;;' '*) ;;'
@@ -493,10 +595,53 @@ mut set-sem-mv-atomico        $CS 'printf '"'"'%s\n'"'"' "$_until" > "$_tmp" 2>/
 mut set-falha-devolve-0       $CS '  warn "ga-dzexg3i.1: não consegui gravar $_file — a rota do MBP NÃO foi esfriada"
   return 1' '  warn "ga-dzexg3i.1: não consegui gravar $_file — a rota do MBP NÃO foi esfriada"
   return 0'
-# a fiação
-mut fia-sem-chamada           - '_pilot_node_failed_create_pass || true' ':'
-mut fia-depois-do-evento      - '_pilot_node_failed_create_pass || true
-' ''
+# a fiação: a chamada some, vai para o fim da varredura (depois de todos os exit), vai para depois da 1ª pausa, ou a vigia usa uma função que só é definida depois dela
+mut fia-sem-chamada           - '
+_pilot_node_failed_create_pass || true
+' '
+:
+'
+mut fia-no-fim                - '
+_pilot_node_failed_create_pass || true
+' '
+:
+' '
+_pilot_sweep_emit
+' '
+_pilot_node_failed_create_pass || true
+_pilot_sweep_emit
+'
+mut fia-depois-da-1a-pausa    - '
+_pilot_node_failed_create_pass || true
+' '
+:
+' '
+  _pilot_write_sweep_pause_state 1 "quota-limited"' '
+  _pilot_node_failed_create_pass || true
+  _pilot_write_sweep_pause_state 1 "quota-limited"'
+mut fia-chamada-dobrada       - '
+_pilot_node_failed_create_pass || true
+' '
+_pilot_node_failed_create_pass || true
+_pilot_node_failed_create_pass || true
+'
+mut fia-dependencia-tardia    $PA '_fp_t0=$SECONDS' '_fp_t0=$SECONDS; _pilot_sweep_emit'
+# o teto, o prazo, o que fica sem exame, unknown ≠ stale e os dois avisos do resfriamento
+mut pass-teto-conta-examinadas $PA '[ $((_fp_rel + _fp_seen + _fp_held)) -ge "$_fp_max" ]' '[ "$_fp_n" -ge "$_fp_max" ]'
+mut pass-teto-sem-held         $PA '_fp_rel + _fp_seen + _fp_held' '_fp_rel + _fp_seen'
+mut pass-teto-sem-seen         $PA '_fp_rel + _fp_seen + _fp_held' '_fp_rel + _fp_held'
+mut pass-sem-prazo             $PA '{ [ "$_fp_bud" -gt 0 ] && [ $((SECONDS - _fp_t0)) -ge "$_fp_bud" ]; }' 'false'
+mut pass-prazo-zero-estoura    $PA '[ "$_fp_bud" -gt 0 ] && ' ''
+mut pass-prazo-ruim            $PA "case \"\$_fp_bud\" in ''|*[!0-9]*) _fp_bud=90 ;; esac" ':'
+mut pass-skip-sem-contar       $PA '_fp_skip=$((_fp_skip + 1)); continue; fi' 'continue; fi'
+mut pass-skip-sem-aviso        $PA 'NÃO foram examinadas nesta varredura' 'foram examinadas nesta varredura'
+mut unknown-vira-stale         $ON "type == \"object\" and .id == \$id' >/dev/null 2>&1; then _FC_RESULT=unknown; return 0; fi" "type == \"object\" and .id == \$id' >/dev/null 2>&1; then _FC_RESULT=stale; return 0; fi"
+mut cool-sem-eacces            $CL 'if [ -d "${_c_file%/*}" ] && [ ! -x "${_c_file%/*}" ]; then' 'if false; then'
+mut cool-eacces-sem-aviso      $CL 'warn "ga-dzexg3i.1: não consigo consultar' ': "ga-dzexg3i.1: não consigo consultar'
+mut cool-eacces-aviso-repete   $CL 'if [ "${_PMC_WARNED:-0}" != 1 ]; then _PMC_WARNED=1; warn "ga-dzexg3i.1: não consigo' 'if true; then warn "ga-dzexg3i.1: não consigo'
+mut cool-longe-sem-aviso       $CL 'warn "ga-dzexg3i.1: $_c_file diz que' ': "ga-dzexg3i.1: $_c_file diz que'
+mut cool-longe-aviso-repete    $CL '-gt $((_c_now + 86400)) ] && [ "${_PMC_WARNED:-0}" != 1 ]; then' '-gt $((_c_now + 86400)) ]; then'
+mut cool-longe-limite-alto     $CL '_c_now + 86400' '_c_now + 86400000'
 mut rb-sem-confirmar          $RB 'if [ -z "$_rb_asg" ] && [ "$_rb_st" = open ] && [ -z "$_rb_mk" ]; then return 0; fi' 'return 0'
 
 echo "---"; echo "$PASS/$((PASS+FAIL)) ok"

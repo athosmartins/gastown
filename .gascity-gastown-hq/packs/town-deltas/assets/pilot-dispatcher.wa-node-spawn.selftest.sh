@@ -110,6 +110,8 @@ case "$verb" in
       esac
     done
     if [ -n "$sm" ] && [ -n "${FAKE_BD_SET_RC:-}" ]; then exit "${FAKE_BD_SET_RC}"; fi
+    # ga-dzexg3i.1 (gate ga-7kbg9he): o update de PRÉ-voo (só --unset-metadata, sem --assignee: não é o desfazer) falha com FAKE_BD_PRE_RC
+    if [ -n "$ums" ] && [ "$asg" = "__keep__" ] && [ -z "$sm" ] && [ -n "${FAKE_BD_PRE_RC:-}" ]; then exit "${FAKE_BD_PRE_RC}"; fi
     cur=$(jq -r '.assignee // ""' "$FAKE_STATE" 2>/dev/null) || exit 1
     if [ "$ifa" != "__none__" ] && [ "$cur" != "$ifa" ]; then exit 1; fi
     f='.'
@@ -190,7 +192,7 @@ reset() {
   echo 0 > "$T/nshow"; echo 0 > "$T/slow"
   rm -f "$T/city/.gc/wa-node-route.jsonl" "$T/rsv" "$T/pnr" "$T/pnr.done"
   cp "$T/b.free.json" "$T/state.json"
-  unset FAKE_BD_UPDATE_MODE FAKE_BD_UPDATE_RC FAKE_BD_SET_RC FAKE_BD_SHOW_FAIL_FROM FAKE_GC_LIST_RC FAKE_GC_NEW_RC FAKE_GC_NEW_OUT FAKE_GC_WAKE_RC FAKE_GC_CLOSE_RC FAKE_GC_NUDGE_RC FAKE_GC_NUDGE_QUEUES FAKE_GC_NUDGE_JSON \
+  unset FAKE_BD_UPDATE_MODE FAKE_BD_UPDATE_RC FAKE_BD_SET_RC FAKE_BD_PRE_RC FAKE_BD_SHOW_FAIL_FROM FAKE_GC_LIST_RC FAKE_GC_NEW_RC FAKE_GC_NEW_OUT FAKE_GC_WAKE_RC FAKE_GC_CLOSE_RC FAKE_GC_NUDGE_RC FAKE_GC_NUDGE_QUEUES FAKE_GC_NUDGE_JSON \
         FAKE_APPLY_WRITES FAKE_RC FAKE_RC_SKIP FAKE_BEAD2_SKIP FAKE_OUT PRE_SLOW PRE_EVAL _PILOT_HALT PWN_SPAWN PWN_SLOTS PWN_BJ PRE_PASS PRE_NODEONLY PRE_RSV PILOT_WA_NODE_RESERVE PILOT_WA_NODE_SPAWN PILOT_WA_NODE_SLOTS PILOT_WA_NODE_ROUTE DRY_RUN PILOT_SLOW_SPAWN_SECS
   export FAKE_SESSIONS="$T/s.empty.json" FAKE_BEAD2="$T/b.ap2.json"
 }
@@ -219,6 +221,8 @@ qs() { printf '[{"alias":"%s","template":"%s","state":"active","closed":false,"l
 
 ord()   { tr '\n' ' ' < "$T/order"; }   # cada chamada + 1 espaço (inclusive a última): quem junta com outra coisa não põe espaço
 nupd()  { grep -c '|update|' "$T/bdcalls" || true; }
+# ga-dzexg3i.1 (gate ga-7kbg9he): antes de abrir/acordar/avisar o despacho tira a chave velha da sessão (1 update de pré-voo, guardado); nupd_w conta as escritas que NÃO são essa
+nupd_w() { { grep '|update|' "$T/bdcalls" | grep -vc -- '|update|[^|]*|--if-assignee|[^|]*|--unset-metadata|pilot.node_session|-q$'; } || true; }
 nshow() { grep -c '|show|' "$T/bdcalls" || true; }
 stt()   { jq -r '[.status, (.assignee // "-"), (.metadata["pilot.wa_node_alias"] // "-")] | join(",")' "$T/state.json"; }
 slow()  { cat "$T/slow"; }
@@ -269,7 +273,7 @@ echo "=== B. _pilot_node_remote_open (genérica) ==="
 reset; cp "$T/b.ap2.json" "$T/state.json"
 r=$(O wa-worker-remote-2)
 eq "alias livre: devolve 0" "$r" "rc=0"
-eq "alias livre: lê as sessões, abre e avisa — nessa ordem, e não mexe na bead" "$(ord)" "gc:list gc:new gc:nudge "
+eq "alias livre: lê as sessões, abre e avisa — nessa ordem, e não mexe na bead" "$(ord)" "gc:list bd:update gc:new gc:nudge "
 hasgc 'session|list|--json' && ok "lê as sessões com 'session list --json'" || fail "list: $(cat "$T/gccalls")"
 hasgc 'session|new|wa-worker-remote|--alias|wa-worker-remote-2|--no-attach|--title-hint|build wa-abc12: Título X|--json' && ok "abre 'session new wa-worker-remote --alias wa-worker-remote-2 --no-attach --title-hint …' (o template e o alias vêm dos argumentos)" || fail "new: $(cat "$T/gccalls")"
 grep -qF -- "|--city|$T/city|session|nudge|wa-worker-remote-2|Bead nova para você: $ID — Título X. Ela já está atribuída ao seu alias (GC_ALIAS=wa-worker-remote-2): ache com " "$T/gccalls" \
@@ -294,25 +298,25 @@ reset; cp "$T/b.ap2.json" "$T/state.json"
 sj "$T/s.asleep.json" '[{"alias":"wa-worker-remote-2","template":"wa-worker-remote","state":"asleep","closed":false}]'; export FAKE_SESSIONS="$T/s.asleep.json"
 r=$(O wa-worker-remote-2)
 eq "sessão do alias dormindo: devolve 0" "$r" "rc=0"
-eq "dormindo: ACORDA (wake) e avisa; nada de session new" "$(ord)" "gc:list gc:wake gc:nudge "
+eq "dormindo: ACORDA (wake) e avisa; nada de session new" "$(ord)" "gc:list bd:update gc:wake gc:nudge "
 grep '|session|nudge|' "$T/gccalls" | grep -qF -- '--delivery' && fail "dormindo: o aviso foi com --delivery: $(cat "$T/gccalls")" || ok "dormindo: o aviso à sessão que acordou é o padrão, sem --delivery"
 hasgc 'session|wake|wa-worker-remote-2' && ok "o wake leva o alias" || fail "wake: $(cat "$T/gccalls")"
 reset; cp "$T/b.ap2.json" "$T/state.json"
 sj "$T/s.asleep2.json" '[{"alias":"wa-worker-remote-2","template":"wa-worker-remote","state":"asleep"},{"alias":"wa-worker-remote-2","template":"wa-worker-remote","state":"asleep","closed":false}]'; export FAKE_SESSIONS="$T/s.asleep2.json"
-r=$(O wa-worker-remote-2); eq "duas sessões do alias, as duas dormindo: wake" "$(ord)" "gc:list gc:wake gc:nudge "
+r=$(O wa-worker-remote-2); eq "duas sessões do alias, as duas dormindo: wake" "$(ord)" "gc:list bd:update gc:wake gc:nudge "
 
 # --- outros alias não importam; mortas não seguram o alias ---
 reset; cp "$T/b.ap2.json" "$T/state.json"
 sj "$T/s.outros.json" '[null,"x",{"alias":"wa-worker-remote-1","template":"wa-worker-remote","state":"active"},{"alias":"dog-remote-2","template":"dog-remote","state":"active"},{"alias":"","template":"x","state":"active"}]'; export FAKE_SESSIONS="$T/s.outros.json"
 r=$(O wa-worker-remote-2)
-eq "sessões vivas de OUTROS alias (e itens que não são objeto) não seguram o alias: abre" "$r $(ord)" "rc=0 gc:list gc:new gc:nudge "
+eq "sessões vivas de OUTROS alias (e itens que não são objeto) não seguram o alias: abre" "$r $(ord)" "rc=0 gc:list bd:update gc:new gc:nudge "
 reset; cp "$T/b.ap2.json" "$T/state.json"
 sj "$T/s.closed.json" '[{"alias":"wa-worker-remote-2","template":"wa-worker-remote","state":"active","closed":true}]'; export FAKE_SESSIONS="$T/s.closed.json"
-r=$(O wa-worker-remote-2); eq "sessão com closed:true não segura o alias: abre uma nova" "$r $(ord)" "rc=0 gc:list gc:new gc:nudge "
+r=$(O wa-worker-remote-2); eq "sessão com closed:true não segura o alias: abre uma nova" "$r $(ord)" "rc=0 gc:list bd:update gc:new gc:nudge "
 for stt_ in closed stopped archived drained; do
   reset; cp "$T/b.ap2.json" "$T/state.json"
   sj "$T/s.dead.json" "[{\"alias\":\"wa-worker-remote-2\",\"template\":\"wa-worker-remote\",\"state\":\"$stt_\"}]"; export FAKE_SESSIONS="$T/s.dead.json"
-  r=$(O wa-worker-remote-2); eq "sessão em estado '$stt_' não segura o alias (o script concorda): abre uma nova" "$r $(ord)" "rc=0 gc:list gc:new gc:nudge "
+  r=$(O wa-worker-remote-2); eq "sessão em estado '$stt_' não segura o alias (o script concorda): abre uma nova" "$r $(ord)" "rc=0 gc:list bd:update gc:new gc:nudge "
 done
 
 # --- alias ocupado: não abre, desfaz sem fechar sessão alheia ---
@@ -339,7 +343,7 @@ r=$(O wa-worker-remote-2); hasbd "$(UPD wa-worker-remote-2)" && ok "o desfazer �
 # do chamador: sem ele (o dog, qualquer chamador antigo) o alias ativo segue ocupado, como antes.
 reset; cp "$T/b.ap2.json" "$T/state.json"; sj "$T/s.idle.json" "$(qs 600)"; export FAKE_SESSIONS="$T/s.idle.json"
 r=$(OR wa-worker-remote-2); eq "ociosa (quieta há 10 min), reaproveitamento ligado: devolve 0" "$r" "rc=0"
-eq "ociosa: lê as sessões e SÓ avisa — nada de session new nem wake" "$(ord)" "gc:list gc:nudge "
+eq "ociosa: lê as sessões e SÓ avisa — nada de session new nem wake" "$(ord)" "gc:list bd:update gc:nudge "
 grep -qF -- "|--city|$T/city|session|nudge|--delivery|immediate|--json|wa-worker-remote-2|Bead nova para você: $ID — Título X. Ela já está atribuída ao seu alias (GC_ALIAS=wa-worker-remote-2)" "$T/gccalls" && ok "ociosa: o aviso diz a bead, o título e o alias (as flags do aviso digitado vão antes do alvo)" || fail "nudge: $(cat "$T/gccalls")"
 eq "ociosa: a bead segue como o apply a deixou" "$(stt)" "$AP2"
 eq "ociosa: não gasta o orçamento de spawn (ninguém foi aberto)" "$(slow)" "0"
@@ -384,15 +388,15 @@ for iv in abc -1 3.5 '' '3 0'; do
 done
 # o aviso falhou numa sessão que JÁ EXISTIA: desfaz a bead e NÃO fecha a sessão (ela pode estar trabalhando); desfazer não confirmado = 2 (segura), também sem fechar
 reset; cp "$T/b.ap2.json" "$T/state.json"; sj "$T/s.idle.json" "$(qs 600)"; export FAKE_SESSIONS="$T/s.idle.json" FAKE_GC_NUDGE_RC=1
-r=$(OR wa-worker-remote-2); eq "ociosa, o aviso falhou: solta a bead e NÃO fecha a sessão que já existia" "$r $(ord)$(stt)" "rc=1 gc:list gc:nudge bd:update bd:show $FREE"
+r=$(OR wa-worker-remote-2); eq "ociosa, o aviso falhou: solta a bead e NÃO fecha a sessão que já existia" "$r $(ord)$(stt)" "rc=1 gc:list bd:update gc:nudge bd:update bd:show $FREE"
 hasgc 'session|close|wa-worker-remote-2' && fail "ociosa: o desfazer FECHOU a sessão ociosa que já existia" || ok "ociosa: nenhum session close foi chamado"
 grep -q 'o aviso falhou (rc=1)' "$T/err" && ok "ociosa, o aviso falhou: o aviso diz o rc do nudge (não se confunde com 'não entregue')" || fail "ociosa, rc do nudge: aviso: $(cat "$T/err")"
 reset; cp "$T/b.ap2.json" "$T/state.json"; sj "$T/s.idle.json" "$(qs 600)"; export FAKE_SESSIONS="$T/s.idle.json" FAKE_GC_NUDGE_RC=1 FAKE_BD_UPDATE_MODE=noop
-r=$(OR wa-worker-remote-2); eq "ociosa, o aviso falhou e o desfazer não se confirma: 2 (segura), sem fechar a sessão" "$r $(ord)$(stt)" "rc=2 gc:list gc:nudge bd:update bd:show $AP2"
+r=$(OR wa-worker-remote-2); eq "ociosa, o aviso falhou e o desfazer não se confirma: 2 (segura), sem fechar a sessão" "$r $(ord)$(stt)" "rc=2 gc:list bd:update gc:nudge bd:update bd:show $AP2"
 # ga-hqtpf34: o aviso à sessão OCIOSA tem de ser DIGITADO e CONFIRMADO. No provider do nó o padrão (wait-idle) só ENFILEIRA e sai 0; a fila de uma sessão parada só é drenada por um poller que pode morrer
 # (ga-55jx16q) ou pelo hook do próximo prompt, que ela não dispara: o idle_timeout a matava em minutos, com a bead (aic37 e v7z1t, 08/11). O gc falso modela o CLI real: sem --delivery o outcome é queued.
 reset; cp "$T/b.ap2.json" "$T/state.json"; sj "$T/s.idle.json" "$(qs 600)"; export FAKE_SESSIONS="$T/s.idle.json"
-r=$(OR wa-worker-remote-2); eq "ociosa: aviso DIGITADO e confirmado (outcome delivered): devolve 0, só lê e avisa" "$r $(ord)" "rc=0 gc:list gc:nudge "
+r=$(OR wa-worker-remote-2); eq "ociosa: aviso DIGITADO e confirmado (outcome delivered): devolve 0, só lê e avisa" "$r $(ord)" "rc=0 gc:list bd:update gc:nudge "
 grep -qE -- '\|session\|nudge\|--delivery\|immediate\|--json\|wa-worker-remote-2\|Bead nova para você: [^|]*$' "$T/gccalls" && ok "ociosa: o aviso vai com --delivery immediate --json (nunca o padrão, que só enfileira)" || fail "ociosa: nudge sem --delivery immediate --json: $(cat "$T/gccalls")"
 grep -q 'alias wa-worker-remote-2 (sessão idle), avisada, entregue' "$T/err" && ok "ociosa: o log diz que o aviso foi ENTREGUE" || fail "ociosa: log sem 'entregue': $(cat "$T/err")"
 # o que não for 'entregue' (enfileirou mesmo no immediate, saída lixo, ok falso, sem outcome, outcome fora do enum, saída vazia) NÃO é aviso: desfaz, devolve 1 e a sessão que já existia nunca é fechada
@@ -400,17 +404,17 @@ for spec in "queued-mesmo-immediate|QUEUES=always" "json-lixo|JSON=nudge accepte
   nm="${spec%%|*}"; kv="${spec#*|}"
   reset; cp "$T/b.ap2.json" "$T/state.json"; sj "$T/s.idle.json" "$(qs 600)"; export FAKE_SESSIONS="$T/s.idle.json" "FAKE_GC_NUDGE_$kv"
   r=$(OR wa-worker-remote-2)
-  eq "ociosa ($nm): aviso NÃO entregue -> solta a bead, devolve 1, sem fechar a sessão que já existia" "$r $(ord)$(stt)" "rc=1 gc:list gc:nudge bd:update bd:show $FREE"
+  eq "ociosa ($nm): aviso NÃO entregue -> solta a bead, devolve 1, sem fechar a sessão que já existia" "$r $(ord)$(stt)" "rc=1 gc:list bd:update gc:nudge bd:update bd:show $FREE"
   grep -q 'o aviso à sessão ociosa não foi entregue' "$T/err" && ok "ociosa ($nm): o aviso diz que não foi entregue" || fail "ociosa ($nm): aviso: $(cat "$T/err")"
 done
 reset; cp "$T/b.ap2.json" "$T/state.json"; export FAKE_SESSIONS="$T/s.bad.json" FAKE_GC_LIST_RC=1; printf '' > "$T/s.bad.json"
 r=$(OR wa-worker-remote-2); eq "ociosa: a lista de sessões não leu -> não reaproveita (três estados), desfaz" "$r $(stt)" "rc=1 $FREE"
 # os dois chamadores optam: o gancho do WA e o do PS (o PS usa o mesmo despachante, com um alias só)
 reset; pilot 3; export FAKE_BEAD2="$T/b.ap2.json" FAKE_SESSIONS="$T/s.idle.json"; sj "$T/s.idle.json" "$(qs 600)"; r=$(D label 0)
-eq "WA, o decide inteiro: o script escolheu o -2 e a sessão dele é a ociosa -> só avisa" "$r $(ord)" "rc=0 bd:show script:apply bd:show gc:list gc:nudge "
+eq "WA, o decide inteiro: o script escolheu o -2 e a sessão dele é a ociosa -> só avisa" "$r $(ord)" "rc=0 bd:show script:apply bd:show gc:list bd:update gc:nudge "
 mkb "$T/b.ps1.json" in_progress ps-worker-remote-1 ps-worker-remote-1 "Titulo PS"
 reset; cp "$T/b.ps1.json" "$T/state.json"; sj "$T/s.psidle.json" "$(qs 600 ps-worker-remote-1 ps-worker-remote)"; export FAKE_SESSIONS="$T/s.psidle.json"
-r=$(PSO); eq "PS: a sessão ociosa do ps-worker-remote-1 é reaproveitada (relê a bead, lê as sessões, só avisa)" "$r $(ord)" "rc=0 bd:show gc:list gc:nudge "
+r=$(PSO); eq "PS: a sessão ociosa do ps-worker-remote-1 é reaproveitada (relê a bead, lê as sessões, só avisa)" "$r $(ord)" "rc=0 bd:show gc:list bd:update gc:nudge "
 grep -qF -- "|session|nudge|--delivery|immediate|--json|ps-worker-remote-1|" "$T/gccalls" && ok "PS: o aviso vai para o alias do PS" || fail "PS: $(cat "$T/gccalls")"
 reset; cp "$T/b.ps1.json" "$T/state.json"; sj "$T/s.psbusy.json" "$(qs 60 ps-worker-remote-1 ps-worker-remote)"; export FAKE_SESSIONS="$T/s.psbusy.json"
 r=$(PSO); eq "PS: quieta há só 60 s -> ocupada, desfaz sem fechar" "$r $(ord)" "rc=1 bd:show gc:list bd:update bd:show "
@@ -440,25 +444,25 @@ skv()   { jq -r --arg k "$SK" '.metadata[$k] // "-"' "$T/state.json"; }
 SIDJ='{"session_id":"ga-sess1","alias":"wa-worker-remote-2","template":"wa-worker-remote"}'
 reset; cp "$T/b.ap2.json" "$T/state.json"; export FAKE_GC_NEW_OUT="$SIDJ"
 r=$(O wa-worker-remote-2)
-eq "session new devolve o id: guarda na bead ANTES do aviso e devolve 0" "$r $(ord)$(skv)" "rc=0 gc:list gc:new bd:update gc:nudge ga-sess1"
+eq "session new devolve o id: guarda na bead ANTES do aviso e devolve 0" "$r $(ord)$(skv)" "rc=0 gc:list bd:update gc:new bd:update gc:nudge ga-sess1"
 hasbd "$(SET wa-worker-remote-2 ga-sess1)" && ok "a escrita é guardada: --if-assignee <alias> --set-metadata pilot.node_session=<id> -q" || fail "set: $(cat "$T/bdcalls")"
 eq "o dono e a marca do alias seguem como o apply deixou" "$(stt)" "$AP2"
 grep -qF 'alias wa-worker-remote-2 (sessão new ga-sess1), avisada' "$T/err" && ok "o log de sucesso diz o id da sessão" || fail "log: $(cat "$T/err")"
 for bad in 'não é json' '{}' '{"session_id":""}' '{"session_id":5}' '{"session_id":null}' '{"session_id":"-x"}' '{"session_id":".x"}' '{"session_id":"a b"}' '{"session_id":"a/b"}' '{"session_id":"a;b"}' '[{"session_id":"ga-s1"}]' '{"session_id":"ga-s1"}{"session_id":"ga-s2"}'; do
   reset; cp "$T/b.ap2.json" "$T/state.json"; export FAKE_GC_NEW_OUT="$bad"
   r=$(O wa-worker-remote-2)
-  eq "session new com saída ilegível ($bad): abre e avisa mesmo assim, não grava id" "$r $(ord)$(nupd) $(skv)" "rc=0 gc:list gc:new gc:nudge 0 -"
+  eq "session new com saída ilegível ($bad): abre e avisa mesmo assim, não grava id" "$r $(ord)$(nupd_w) $(skv)" "rc=0 gc:list bd:update gc:new gc:nudge 0 -"
   grep -qF 'não trouxe um session_id legível' "$T/err" && ok "  e avisa alto que ficou sem a vigia ($bad)" || fail "aviso ($bad): $(cat "$T/err")"
 done
 reset; cp "$T/b.ap2.json" "$T/state.json"
-r=$(O wa-worker-remote-2); eq "session new sem NADA na saída: abre e avisa, não grava id" "$r $(ord)$(nupd) $(skv)" "rc=0 gc:list gc:new gc:nudge 0 -"
+r=$(O wa-worker-remote-2); eq "session new sem NADA na saída: abre e avisa, não grava id" "$r $(ord)$(nupd_w) $(skv)" "rc=0 gc:list bd:update gc:new gc:nudge 0 -"
 reset; cp "$T/b.ap2.json" "$T/state.json"; export FAKE_GC_NEW_OUT="$SIDJ" FAKE_BD_SET_RC=13
 r=$(O wa-worker-remote-2)
-eq "guardar o id falhou (rc 13: o dono mudou): o despacho SEGUE (abre e avisa), sem id na bead" "$r $(ord)$(skv)" "rc=0 gc:list gc:new bd:update gc:nudge -"
+eq "guardar o id falhou (rc 13: o dono mudou): o despacho SEGUE (abre e avisa), sem id na bead" "$r $(ord)$(skv)" "rc=0 gc:list bd:update gc:new bd:update gc:nudge -"
 grep -qF 'não consegui guardar o id da sessão ga-sess1' "$T/err" && ok "o aviso do id que não foi guardado existe" || fail "aviso: $(cat "$T/err")"
 reset; cp "$T/b.ap2.json" "$T/state.json"; export FAKE_GC_NEW_OUT="$SIDJ" FAKE_GC_NUDGE_RC=1
 r=$(O wa-worker-remote-2)
-eq "o aviso falhou com o id guardado: o desfazer leva a chave junto e confere — devolve 1" "$r $(ord)$(stt) $(skv)" "rc=1 gc:list gc:new bd:update gc:nudge gc:close bd:update bd:show $FREE -"
+eq "o aviso falhou com o id guardado: o desfazer leva a chave junto e confere — devolve 1" "$r $(ord)$(stt) $(skv)" "rc=1 gc:list bd:update gc:new bd:update gc:nudge gc:close bd:update bd:show $FREE -"
 hasbd "$(UPDSK wa-worker-remote-2)" && ok "o desfazer é UMA escrita guardada que também tira pilot.node_session" || fail "rollback: $(cat "$T/bdcalls")"
 reset; cp "$T/b.ap2.json" "$T/state.json"; export FAKE_GC_NEW_OUT="$SIDJ" FAKE_GC_NUDGE_RC=1 FAKE_BD_UPDATE_MODE=keepsk
 r=$(O wa-worker-remote-2); eq "o desfazer soltou tudo MENOS o id da sessão: a releitura pega a chave que ficou — devolve 2" "$r $(stt) $(skv)" "rc=2 $FREE ga-sess1"
@@ -466,20 +470,42 @@ reset; cp "$T/b.ap2.json" "$T/state.json"; export FAKE_GC_NEW_OUT="$SIDJ" FAKE_B
 r=$(O wa-worker-remote-2); eq "o id não foi guardado e o aviso falhou: o desfazer é o de sempre, sem a chave da sessão" "$r $(stt)" "rc=1 $FREE"
 hasbd "$(UPD wa-worker-remote-2)" && ok "e a escrita do desfazer é a de antes (sem --unset-metadata da sessão)" || fail "rollback sem id: $(cat "$T/bdcalls")"
 reset; cp "$T/b.ap2.json" "$T/state.json"; export FAKE_GC_NEW_OUT="$SIDJ" FAKE_GC_NEW_RC=1
-r=$(O wa-worker-remote-2); eq "session new FALHOU (rc 1) mesmo com saída: nada de id na bead, o desfazer é o de sempre" "$r $(ord)$(stt)" "rc=1 gc:list gc:new gc:close bd:update bd:show $FREE"
+r=$(O wa-worker-remote-2); eq "session new FALHOU (rc 1) mesmo com saída: nada de id na bead, o desfazer é o de sempre" "$r $(ord)$(stt)" "rc=1 gc:list bd:update gc:new gc:close bd:update bd:show $FREE"
 reset; cp "$T/b.ap2.json" "$T/state.json"; export FAKE_GC_NEW_OUT="$SIDJ" PRE_EVAL='PILOT_NODE_SESSION_KEY=pilot.outra_chave'
 r=$(O wa-worker-remote-2); hasbd "$(SET wa-worker-remote-2 ga-sess1 pilot.outra_chave)" && eq "PILOT_NODE_SESSION_KEY troca a chave onde o id é guardado" "$r" "rc=0" || fail "chave: $(cat "$T/bdcalls")"
+# --- gate ga-7kbg9he (medium 2): a chave VELHA do id da sessão sai da bead ANTES de qualquer sessão ser aberta, acordada ou avisada ---
+PRE()   { printf '|-C|%s|update|%s|--if-assignee|%s|--unset-metadata|%s|-q' "$ST" "$ID" "$1" "$SK"; }   # PRE <alias>: a escrita guardada de pré-voo
+stale() { jq --arg k "$SK" '.metadata[$k] = "ga-velha"' "$T/b.ap2.json" > "$T/state.json"; }   # a bead do alias 2 com o id de uma sessão que já morreu
+reset; stale; export FAKE_GC_NEW_OUT="$SIDJ"
+r=$(O wa-worker-remote-2); eq "chave velha + session new com id novo: a chave velha sai antes e o id novo entra (nunca fica a velha)" "$r $(ord)$(skv)" "rc=0 gc:list bd:update gc:new bd:update gc:nudge ga-sess1"
+hasbd "$(PRE wa-worker-remote-2)" && ok "o pré-voo é UMA escrita guardada: --if-assignee <alias> --unset-metadata pilot.node_session -q" || fail "pré-voo: $(cat "$T/bdcalls")"
+reset; stale; export FAKE_GC_NEW_OUT='não é json'
+r=$(O wa-worker-remote-2); eq "chave velha + session new SEM id legível: a velha saiu e nada novo entrou (a vigia não lê a sessão morta de antes)" "$r $(skv)" "rc=0 -"
+reset; stale; export FAKE_GC_NEW_OUT="$SIDJ" FAKE_BD_SET_RC=13
+r=$(O wa-worker-remote-2); eq "chave velha + o id novo não pôde ser guardado: a velha já tinha saído, fica sem chave" "$r $(skv)" "rc=0 -"
+reset; stale; sj "$T/s.asleep.json" '[{"alias":"wa-worker-remote-2","template":"wa-worker-remote","state":"asleep","closed":false}]'; export FAKE_SESSIONS="$T/s.asleep.json"
+r=$(O wa-worker-remote-2); eq "chave velha + WAKE (não grava id novo): a velha sai ANTES do wake, a bead fica sem chave" "$r $(ord)$(skv)" "rc=0 gc:list bd:update gc:wake gc:nudge -"
+reset; stale; export FAKE_SESSIONS="$T/s.idle.json"; sj "$T/s.idle.json" "$(qs 600 wa-worker-remote-2)"
+r=$(OR wa-worker-remote-2 "Título X" 300); eq "chave velha + sessão OCIOSA reaproveitada (só avisa): a velha sai antes do aviso" "$r $(ord)$(skv)" "rc=0 gc:list bd:update gc:nudge -"
+reset; stale; export FAKE_BD_PRE_RC=13 FAKE_GC_NEW_OUT="$SIDJ"
+r=$(O wa-worker-remote-2); eq "o pré-voo falhou (rc 13: o dono mudou): NÃO abre, não acorda, não avisa — desfaz e devolve 1" "$r $(ord)" "rc=1 gc:list bd:update bd:update bd:show "
+grep -qF 'não consegui tirar da bead a chave da sessão antiga' "$T/err" && ok "...o aviso diz que foi a chave velha que não saiu" || fail "aviso do pré-voo: $(cat "$T/err")"
+hasgc "new" && fail "o pré-voo falhou e mesmo assim abriu sessão" || ok "...e nenhuma sessão foi aberta (session new ausente)"
+reset; stale; export FAKE_BD_PRE_RC=13; sj "$T/s.asleep.json" '[{"alias":"wa-worker-remote-2","template":"wa-worker-remote","state":"asleep","closed":false}]'; export FAKE_SESSIONS="$T/s.asleep.json"
+r=$(O wa-worker-remote-2); eq "o pré-voo falhou com a sessão dormindo: NÃO acorda (a chave velha ficaria mandando na vigia)" "$r $(ord)" "rc=1 gc:list bd:update bd:update bd:show "
+reset; export FAKE_SESSIONS="$T/s.empty.json" FAKE_GC_LIST_RC=1; cp "$T/b.ap2.json" "$T/state.json"
+r=$(O wa-worker-remote-2); hasbd "$(PRE wa-worker-remote-2)" && fail "lista ilegível mas o pré-voo rodou: $(cat "$T/bdcalls")" || ok "alias ocupado/lista ilegível: o pré-voo NÃO roda (nada será aberto; só o desfazer escreve)"
 reset; mkb "$T/b.ps.json" in_progress ps-worker-remote-1 ps-worker-remote-1 "Titulo PS" "$ID" pilot.ps_node_alias; cp "$T/b.ps.json" "$T/state.json"; export FAKE_GC_NEW_OUT='{"session_id":"ga-sess9"}'
 H _pilot_node_remote_open ps-worker-remote ps-worker-remote-1 "$ID" "$ST" "Titulo PS" pilot.ps_node_alias > "$T/r"; r=$(cat "$T/r")
 hasbd "$(SET ps-worker-remote-1 ga-sess9)" && eq "a bead de PS pelo nó guarda o id do mesmo jeito (mesma chave)" "$r" "rc=0" || fail "ps set: $(cat "$T/bdcalls")"
 reset; cp "$T/b.ap2.json" "$T/state.json"; export FAKE_GC_NEW_OUT="$SIDJ"
 sj "$T/s.asleep.json" '[{"alias":"wa-worker-remote-2","template":"wa-worker-remote","state":"asleep","closed":false}]'; export FAKE_SESSIONS="$T/s.asleep.json"
-r=$(O wa-worker-remote-2); eq "wake (a sessão já existia): NÃO guarda id — a vigia é só da sessão nova" "$r $(ord)$(skv)" "rc=0 gc:list gc:wake gc:nudge -"
+r=$(O wa-worker-remote-2); eq "wake (a sessão já existia): NÃO guarda id — a vigia é só da sessão nova" "$r $(ord)$(skv)" "rc=0 gc:list bd:update gc:wake gc:nudge -"
 
 # --- falha ao abrir / acordar / avisar: desfaz, fecha a sessão (tocou nela) e confirma ---
 reset; cp "$T/b.ap2.json" "$T/state.json"; export FAKE_GC_NEW_RC=1
 r=$(O wa-worker-remote-2)
-eq "session new falhou: fecha a sessão (pode ter nascido), solta a bead, confirma — devolve 1" "$r $(ord)$(stt)" "rc=1 gc:list gc:new gc:close bd:update bd:show $FREE"
+eq "session new falhou: fecha a sessão (pode ter nascido), solta a bead, confirma — devolve 1" "$r $(ord)$(stt)" "rc=1 gc:list bd:update gc:new gc:close bd:update bd:show $FREE"
 hasgc 'session|close|wa-worker-remote-2' && ok "o close leva o alias" || fail "close: $(cat "$T/gccalls")"
 hasbd "$(UPD wa-worker-remote-2)" && ok "e a bead é solta com a escrita guardada" || fail "update: $(cat "$T/bdcalls")"
 grep -q 'não abriu (rc=1)' "$T/err" && ok "o aviso diz o rc" || fail "aviso: $(cat "$T/err")"
@@ -491,12 +517,12 @@ eq "o prazo estourado GASTA o orçamento de spawn do sweep (a flag chega ao shel
 grep -q 'estourou o prazo: ela pode ter nascido' "$T/err" && ok "o aviso diz que a sessão pode ter nascido" || fail "aviso 124: $(cat "$T/err")"
 reset; cp "$T/b.ap2.json" "$T/state.json"; export FAKE_SESSIONS="$T/s.asleep.json" FAKE_GC_WAKE_RC=1
 r=$(O wa-worker-remote-2)
-eq "wake falhou: fecha, solta, confirma — devolve 1" "$r $(ord)$(stt)" "rc=1 gc:list gc:wake gc:close bd:update bd:show $FREE"
+eq "wake falhou: fecha, solta, confirma — devolve 1" "$r $(ord)$(stt)" "rc=1 gc:list bd:update gc:wake gc:close bd:update bd:show $FREE"
 reset; cp "$T/b.ap2.json" "$T/state.json"; export FAKE_SESSIONS="$T/s.asleep.json" FAKE_GC_WAKE_RC=124
 r=$(O wa-worker-remote-2); eq "wake estourou o prazo: gasta o orçamento" "$r $(slow)" "rc=1 1"
 reset; cp "$T/b.ap2.json" "$T/state.json"; export FAKE_GC_NUDGE_RC=1
 r=$(O wa-worker-remote-2)
-eq "o aviso (nudge) falhou: a sessão abriu mas ninguém avisou — fecha, solta, confirma, devolve 1" "$r $(ord)$(stt)" "rc=1 gc:list gc:new gc:nudge gc:close bd:update bd:show $FREE"
+eq "o aviso (nudge) falhou: a sessão abriu mas ninguém avisou — fecha, solta, confirma, devolve 1" "$r $(ord)$(stt)" "rc=1 gc:list bd:update gc:new gc:nudge gc:close bd:update bd:show $FREE"
 grep -q 'o aviso falhou (rc=1)' "$T/err" && ok "o aviso diz que foi o nudge" || fail "aviso nudge: $(cat "$T/err")"
 reset; cp "$T/b.ap2.json" "$T/state.json"; export FAKE_GC_NUDGE_RC=124
 r=$(O wa-worker-remote-2); eq "nudge com rc 124: desfaz do mesmo jeito (o nudge não é o spawn lento)" "$r $(stt)" "rc=1 $FREE"
@@ -535,14 +561,14 @@ hasbd "$(UPD ps-worker-remote-1 pilot.ps_node_alias)" && eq "o desfazer solta a 
 reset; mkb "$T/b.ps.json" in_progress ps-worker-remote-1 ps-worker-remote-1 "Titulo PS" "$ID" pilot.ps_node_alias; cp "$T/b.ps.json" "$T/state.json"
 sj "$T/s.ps.json" '[{"alias":"ps-worker-remote-1","template":"ps-worker-remote","state":"asleep"}]'; export FAKE_SESSIONS="$T/s.ps.json"
 H _pilot_node_remote_open ps-worker-remote ps-worker-remote-1 "$ID" "$ST" "Titulo PS" pilot.ps_node_alias > "$T/r"; r=$(cat "$T/r")
-eq "outro template dormindo: acorda o alias dele" "$r $(ord)" "rc=0 gc:list gc:wake gc:nudge "
+eq "outro template dormindo: acorda o alias dele" "$r $(ord)" "rc=0 gc:list bd:update gc:wake gc:nudge "
 
 # ═════════════════════════════════════════════════════════════════════════════════════════════════════════════
 echo
 echo "=== C. _pilot_wa_node_open (só abre para a cara exata do que o apply escreve) ==="
 for n in 1 2 3 4 5 6 7 8 9; do
   reset; cp "$T/b.ap$n.json" "$T/state.json"
-  r=$(W); eq "apply escolheu wa-worker-remote-$n: abre a sessão DESSE alias (nada de alias fixo)" "$r $(ord)" "rc=0 bd:show gc:list gc:new gc:nudge "
+  r=$(W); eq "apply escolheu wa-worker-remote-$n: abre a sessão DESSE alias (nada de alias fixo)" "$r $(ord)" "rc=0 bd:show gc:list bd:update gc:new gc:nudge "
   hasgc "session|new|wa-worker-remote|--alias|wa-worker-remote-$n|--no-attach|--title-hint|build wa-abc12: Título X|--json" || fail "alias $n: $(cat "$T/gccalls")"
 done
 eq "o gancho relê a bead UMA vez, na loja certa" "$(hasbd "|-C|$ST|show|$ID|--json" && nshow)" "1"
@@ -596,21 +622,21 @@ r=$(W); hasbd "$(UPD wa-worker-remote-3)" && eq "falha ao abrir: o gancho do WA 
 echo
 echo "=== D. o decide inteiro em modo pilot ==="
 reset; pilot 3; r=$(D label 0)
-eq "label + pilot, script rc 0: lê, escreve (script), relê, abre e avisa — devolve 0" "$r $(ord)" "rc=0 bd:show script:apply bd:show gc:list gc:new gc:nudge "
+eq "label + pilot, script rc 0: lê, escreve (script), relê, abre e avisa — devolve 0" "$r $(ord)" "rc=0 bd:show script:apply bd:show gc:list bd:update gc:new gc:nudge "
 eq "o apply recebe a base e o AMBIENTE: pilot e 3 slots" "$(cat "$T/calls")" "apply $ID --store $ST --basis label | SPAWN=pilot SLOTS=3"
 hasgc 'session|new|wa-worker-remote|--alias|wa-worker-remote-2|--no-attach|--title-hint|build wa-abc12: Título X|--json' && ok "a sessão é a do alias que o script escolheu" || fail "new: $(cat "$T/gccalls")"
-eq "o gancho do modo pilot NÃO escreve na bead (só o script escreveu)" "$(nupd) $(stt)" "0 $AP2"
+eq "o gancho do modo pilot NÃO escreve na bead além do pré-voo (só o script escreveu; o pré-voo só tira a chave velha da sessão)" "$(nupd_w) $(stt)" "0 $AP2"
 jq -e 'select(.mode=="label" and .rc==0 and .spawn=="pilot" and .slots==3)' "$T/city/.gc/wa-node-route.jsonl" >/dev/null 2>&1 && ok "a linha de sombra diz spawn=pilot e slots=3" || fail "jsonl: $(cat "$T/city/.gc/wa-node-route.jsonl" 2>/dev/null)"
 reset; pilot 5; export FAKE_BEAD2="$T/b.ap4.json"; r=$(D auto 0)
 eq "auto + pilot: base 'any', 5 slots, alias -4" "$r $(cat "$T/calls")" "rc=0 apply $ID --store $ST --basis any | SPAWN=pilot SLOTS=5"
 hasgc 'session|new|wa-worker-remote|--alias|wa-worker-remote-4|--no-attach|--title-hint|build wa-abc12: Título X|--json' && ok "alias -4 aberto" || fail "alias 4: $(cat "$T/gccalls")"
 reset; pilot 3; export FAKE_BEAD2="$T/b.ap2.json" FAKE_SESSIONS="$T/s.asleep.json"; r=$(D label 0)
-eq "alias dormindo: o gancho ACORDA em vez de abrir outra" "$r $(ord)" "rc=0 bd:show script:apply bd:show gc:list gc:wake gc:nudge "
+eq "alias dormindo: o gancho ACORDA em vez de abrir outra" "$r $(ord)" "rc=0 bd:show script:apply bd:show gc:list bd:update gc:wake gc:nudge "
 # ga-31u0zl7 (gate-fix 1): o veto de rótulo vale no modo pilot (o de produção) e ANTES de qualquer escrita ou sessão: a bead que o worker devolveu (node:never) só é relida — nada de apply, de gc nem de update
 reset; pilot 3; jq '. + {labels:["story:approved","node:never"]}' "$T/b.free.json" > "$T/state.json"; r=$(D label 0)
 eq "pilot + bead com node:never: 1, só relê (nem o apply, nem o gc, nem escrita na bead)" "$r|$(ord)|$(nupd)" "rc=1|bd:show |0"
 reset; pilot 3; jq '. + {labels:["story:approved"]}' "$T/b.free.json" > "$T/state.json"; r=$(D label 0)
-eq "pilot + bead com outro rótulo (controle): o caminho de sempre, 0 e abre a sessão" "$r $(ord)" "rc=0 bd:show script:apply bd:show gc:list gc:new gc:nudge "
+eq "pilot + bead com outro rótulo (controle): o caminho de sempre, 0 e abre a sessão" "$r $(ord)" "rc=0 bd:show script:apply bd:show gc:list bd:update gc:new gc:nudge "
 
 # o modo é do ambiente: o script sempre recebe a decisão do gancho
 reset; export PILOT_WA_NODE_SLOTS=5; r=$(D label 0)
@@ -633,7 +659,7 @@ for c in 1 2 10 11 12 99 125 126 127; do
 done
 # a sessão não abriu: desfeito e confirmado → 1; não confirmado → 2
 reset; pilot 3; export FAKE_GC_NEW_RC=1; r=$(D label 0)
-eq "pilot, session new falhou: desfaz, confirma, devolve 1 (a bead segue no mini)" "$r $(ord)$(stt)" "rc=1 bd:show script:apply bd:show gc:list gc:new gc:close bd:update bd:show $FREE"
+eq "pilot, session new falhou: desfaz, confirma, devolve 1 (a bead segue no mini)" "$r $(ord)$(stt)" "rc=1 bd:show script:apply bd:show gc:list bd:update gc:new gc:close bd:update bd:show $FREE"
 jq -e 'select(.rc==0 and .spawn=="pilot")' "$T/city/.gc/wa-node-route.jsonl" >/dev/null 2>&1 && ok "a linha de sombra foi gravada (o apply deu 0)" || fail "jsonl: $(cat "$T/city/.gc/wa-node-route.jsonl" 2>/dev/null)"
 reset; pilot 3; export FAKE_GC_NUDGE_RC=1; r=$(D label 0)
 eq "pilot, o aviso falhou: desfaz e devolve 1" "$r $(stt)" "rc=1 $FREE"
@@ -685,7 +711,7 @@ napply() { grep -c '^apply' "$T/calls" || true; }
 BUSYW() { reset; cp "$T/b.ap2.json" "$T/state.json"; export FAKE_SESSIONS="$T/s.busy.json"; }
 for k in 1 2 3; do jq -c --argjson p "$k" '.priority=$p' "$T/b.free.json" > "$T/b.free.p$k.json"; done   # a bead livre com prioridade 1, 2 e 3 (a classe vem do JSON que o decide relê)
 B1="$(cat "$T/b.free.p1.json")"; B2="$(cat "$T/b.free.p2.json")"
-OK3="bd:show script:apply bd:show gc:list bd:update bd:show script:apply bd:show gc:list gc:new gc:nudge "
+OK3="bd:show script:apply bd:show gc:list bd:update bd:show script:apply bd:show gc:list bd:update gc:new gc:nudge "
 reset; pilot 3; export FAKE_SESSIONS="$T/s.busy.json" FAKE_BEAD2_SKIP="$T/b.ap3.json"; r=$(D label 0)
 eq "pilot 3 slots, alias 2 ocupado, o script acha o 3: desfaz o 2, refaz o apply sem ele e abre o 3 — devolve 0" "$r $(ord)$(stt)" "rc=0 ${OK3}in_progress,wa-worker-remote-3,wa-worker-remote-3"
 eq "o 2º apply leva o pulo (WA_NODE_SKIP_ALIASES) e o 1º não" "$(cat "$T/calls")" "apply $ID --store $ST --basis label | SPAWN=pilot SLOTS=3
@@ -893,9 +919,9 @@ fi
 if [ -z "${WA_NODE_SPAWN_SELFTEST_FILE:-}" ] && [ -z "${WA_NODE_SPAWN_ST_NOMUT:-}" ]; then
   echo
   echo "=== G. mutantes (cada um tem de derrubar o selftest) ==="
-  # o mutador mora em arquivo próprio. ausente/ilegível (python falha) → `fail`; vazio (lista sem nomes) ou com menos que o piso de hoje (132) → `fail` também: tirar um mutante tem de ser decisão visível, nunca "todos mortos" por lista curta
+  # o mutador mora em arquivo próprio. ausente/ilegível (python falha) → `fail`; vazio (lista sem nomes) ou com menos que o piso de hoje (140) → `fail` também: tirar um mutante tem de ser decisão visível, nunca "todos mortos" por lista curta
   MUT_LIST="$(python3 -I "$MUTATOR" --list)" || { fail "o mutador não carregou"; MUT_LIST=""; }
-  [ "$(echo "$MUT_LIST" | wc -w | tr -d ' ')" -ge 132 ] || fail "o mutador listou menos de 132 mutantes ($(echo "$MUT_LIST" | wc -w | tr -d ' '))"
+  [ "$(echo "$MUT_LIST" | wc -w | tr -d ' ')" -ge 140 ] || fail "o mutador listou menos de 140 mutantes ($(echo "$MUT_LIST" | wc -w | tr -d ' '))"
   run_mut() { # run_mut <nome> — escreve $T/res.<nome>: morto | SOBREVIVEU | ERRO
     local n="$1"
     if ! python3 -I "$MUTATOR" "$DISPATCHER" "$T/mut.$n.sh" "$n" > "$T/res.$n.apply" 2>&1; then echo ERRO > "$T/res.$n"; return; fi

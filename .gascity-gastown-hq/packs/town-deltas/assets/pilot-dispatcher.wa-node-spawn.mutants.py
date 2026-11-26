@@ -1,4 +1,4 @@
-# pilot-dispatcher.wa-node-spawn.mutants.py — o mutador do pilot-dispatcher.wa-node-spawn.selftest.sh (ga-2hd02v.3): 132 quebras de UMA linha do pilot-dispatcher.sh, cada uma com um nome.
+# pilot-dispatcher.wa-node-spawn.mutants.py — o mutador do pilot-dispatcher.wa-node-spawn.selftest.sh (ga-2hd02v.3): 140 quebras de UMA linha do pilot-dispatcher.sh, cada uma com um nome.
 #
 # Contents
 #   Uso · Como cada mutante é escrito
@@ -726,6 +726,51 @@ def _():
 @m("decide-sinal-nao-reserva")
 def _():
     rep('_pilot_node_reserve_set "$_bj" "$_id" "apply rc=$_rc (morto por sinal)" 2', ':')
+
+
+# ── ga-dzexg3i.1 (gate ga-7kbg9he, medium 2): a chave VELHA do id da sessão sai da bead ANTES de abrir/acordar/avisar ──
+PRE_OLD = 'update "$_ro_id" --if-assignee "$_ro_alias" --unset-metadata "$_ro_sk" -q >/dev/null 2>&1'
+
+
+@m("pre-nao-limpa")
+def _():
+    rep(PRE_OLD, 'update "$_ro_id" --if-assignee "$_ro_alias" -q >/dev/null 2>&1')
+
+
+@m("pre-chave-errada")
+def _():
+    rep(PRE_OLD, 'update "$_ro_id" --if-assignee "$_ro_alias" --unset-metadata "${_ro_sk}x" -q >/dev/null 2>&1')
+
+
+@m("pre-sem-dono")
+def _():
+    rep(PRE_OLD, 'update "$_ro_id" --unset-metadata "$_ro_sk" -q >/dev/null 2>&1')
+
+
+@m("pre-falha-segue")
+def _():
+    rep('|| _ro_step="não consegui tirar da bead a chave da sessão antiga', '|| : "não consegui tirar da bead a chave da sessão antiga')
+
+
+@m("pre-falha-sem-aviso")
+def _():
+    rep('|| _ro_step="não consegui tirar da bead a chave da sessão antiga', '|| _ro_step="falhou')
+
+
+@m("pre-so-no-new")
+def _():
+    rep('  if [ -z "$_ro_step" ]; then\n    # ga-dzexg3i.1 (gate ga-7kbg9he, medium 2)', '  if [ -z "$_ro_step" ] && [ "$_ro_st" = new ]; then\n    # ga-dzexg3i.1 (gate ga-7kbg9he, medium 2)')
+
+
+@m("pre-so-fora-do-ocioso")
+def _():
+    rep('  if [ -z "$_ro_step" ]; then\n    # ga-dzexg3i.1 (gate ga-7kbg9he, medium 2)', '  if [ -z "$_ro_step" ] && [ "$_ro_st" != idle ]; then\n    # ga-dzexg3i.1 (gate ga-7kbg9he, medium 2)')
+
+
+@m("pre-nunca-roda")
+def _():
+    # o bloco de pré-voo nunca roda (a chave velha fica na bead)
+    rep('  if [ -z "$_ro_step" ]; then\n    # ga-dzexg3i.1 (gate ga-7kbg9he, medium 2)', '  if false; then\n    # ga-dzexg3i.1 (gate ga-7kbg9he, medium 2)')
 
 
 if len(sys.argv) == 2 and sys.argv[1] == "--list":

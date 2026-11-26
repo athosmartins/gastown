@@ -238,13 +238,13 @@ reset; mkdir -p "$CITYGC/mbp-node-route.jsonl"; r=$(D shadow 0)
 eq "log impossível de gravar (o jsonl é uma pasta): shadow segue devolvendo 1" "$r" "rc=1"
 grep -q 'WARN mbp-node: linha de wa-abc12 (shadow, rc=0) NÃO gravada em mbp-node-route.jsonl' "$T/err" && ok "...e AVISA qual linha se perdeu (bead, modo, rc)" || fail "sem aviso da linha perdida: $(cat "$T/err")"
 reset; mkdir -p "$CITYGC/mbp-node-route.jsonl"; r=$(D on 0)
-eq "on com o log impossível de gravar: o despacho segue (0), a sessão abre — o log é medição, não decisão" "$r $(ord)" "rc=0 bd:show script:apply bd:show gc:list gc:new gc:nudge "
+eq "on com o log impossível de gravar: o despacho segue (0), a sessão abre — o log é medição, não decisão" "$r $(ord)" "rc=0 bd:show script:apply bd:show gc:list bd:update gc:new gc:nudge "
 logfix
 
 echo; echo "=== D. on: leitura de três estados, mapa de rc, sessão ==="
 reset; r=$(D on 0)
 eq "on, tudo certo: 0" "$r" "rc=0"
-eq "ordem: lê a bead, apply, relê a bead, lista as sessões, abre, avisa" "$(ord)" "bd:show script:apply bd:show gc:list gc:new gc:nudge "
+eq "ordem: lê a bead, apply, relê a bead, lista as sessões, abre, avisa" "$(ord)" "bd:show script:apply bd:show gc:list bd:update gc:new gc:nudge "
 eq "apply com a base 'any' e a loja" "$(cat "$T/calls")" "apply $ID --store $ST --basis any"
 grep -qF -- "|--city|$T/city|session|new|wa-worker-remote-mbp|--alias|wa-worker-remote-mbp-1|--no-attach|--title-hint|build $ID: Título X" "$T/gccalls" && ok "abre 'session new wa-worker-remote-mbp --alias wa-worker-remote-mbp-1 --no-attach' (template e alias do MBP)" || fail "new: $(cat "$T/gccalls")"
 grep -qF -- 'session|nudge|wa-worker-remote-mbp-1|Bead nova para você: wa-abc12 — Título X.' "$T/gccalls" && ok "e avisa o alias do MBP" || fail "nudge: $(cat "$T/gccalls")"
@@ -286,7 +286,7 @@ for k in 3 4; do
 done
 reset; r=$(FAKE_BD_SHOW_FAIL_FROM=2 D on 0); eq "a releitura depois do apply falha: 2, sem sessão" "$r $(ngc)" "rc=2 0"
 reset; r=$(FAKE_GC_NEW_RC=1 D on 0)
-eq "session new falhou: fecha a sessão, solta a bead e confirma — 1 (segue no mini)" "$r $(ord)$(stt)" "rc=1 bd:show script:apply bd:show gc:list gc:new gc:close bd:update bd:show $FREE"
+eq "session new falhou: fecha a sessão, solta a bead e confirma — 1 (segue no mini)" "$r $(ord)$(stt)" "rc=1 bd:show script:apply bd:show gc:list bd:update gc:new gc:close bd:update bd:show $FREE"
 grep -qxF -- "$(UPD wa-worker-remote-mbp-1)" "$T/bdcalls" && ok "o desfazer é UMA escrita guardada com a chave pilot.wa_node_alias" || fail "update: $(cat "$T/bdcalls")"
 reset; r=$(FAKE_GC_LIST_RC=1 PILOT_TEST_WA_WORKER_LIVE_COUNT=4 D on 0); eq "a lista de sessões não leu: não abre, desfaz sem fechar sessão — 1" "$r $(ord)$(stt)" "rc=1 bd:show script:apply bd:show gc:list bd:update bd:show $FREE"
 reset; r=$(FAKE_GC_NUDGE_RC=1 D on 0); eq "o aviso falhou: desfaz — 1" "$r $(stt)" "rc=1 $FREE"

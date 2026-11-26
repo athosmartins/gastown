@@ -2050,6 +2050,229 @@ _pilot_selfheal_expired_slings() {
   return 0
 }
 
+# ── ga-dzexg3i.1: a vigia do failed-create e o que ela usa moram AQUI, antes do lock — não onde nasceram ───────────────────────────────────────────────────────────────────────────────────
+# A vigia roda a cada varredura, logo depois do lock (ver a chamada abaixo, ao lado do self-heal do ga-h6trx3), porque o fluxo principal tem 11 `exit 0` ANTES do despacho (pausas de cota/RAM/swap/disco/memória, drain, quiet hours,
+# cross-stage, pistas cheias, sem candidatas): uma função definida depois deles (o _pilot_node_remote_rollback e o _pilot_bead_home_store ficavam em ~14100 e ~8860) NÃO EXISTE quando a varredura sai ali. Gate ga-7kbg9he:
+# a vigia no fim do fluxo não rodava nas varreduras de 00h-08h nem na do «sem candidatas» (o caso comum), e a bead do nó presa num failed-create ficava até o TTL de 25 min. Mover só a chamada não basta: quem ela chama
+# tem de estar definido antes. Os três blocos abaixo foram MOVIDOS sem mudar de corpo (exceto onde a seção diz o contrário): _pilot_bead_home_store, _pilot_node_remote_rollback e a vigia com o resfriamento.
+
+# _pilot_bead_home_store <bead_id> — print the absolute directory of the store <bead_id> LIVES in, from the
+# authoritative prefix -> store map $GC_CITY/.beads/routes.jsonl (ga -> HQ, wa -> whatsapp_automation, ...). A
+# relative path is relative to $GC_CITY, the directory holding .beads. `bd -C <rig> show <ga-id>` does not route
+# by prefix, and story.rig names the rig a bead is ABOUT, not the one it is stored in — only the id is reliable.
+# vazio → the bead's store is unknown to the caller (no id, no routes file, prefix not listed, directory missing):
+# the verdict becomes "unknown" and nothing is dispatched or queued on it; falhou/ilegível → the same: a routes
+# file jq cannot parse prints nothing, never a guessed store. Always exit 0.
+_pilot_bead_home_store() {
+  local _id="${1:-}" _prefix _rel _dir
+  _prefix="${_id%%-*}"
+  [ -n "$_id" ] && [ -n "$_prefix" ] && [ "$_prefix" != "$_id" ] || return 0
+  [ -r "$GC_CITY/.beads/routes.jsonl" ] || return 0
+  _rel=$(jq -rn --arg p "$_prefix" 'first(inputs | select(.prefix == $p) | .path) // empty' "$GC_CITY/.beads/routes.jsonl" 2>/dev/null) || _rel=""
+  [ -n "$_rel" ] || return 0
+  case "$_rel" in /*) _dir="$_rel" ;; *) _dir="$GC_CITY/$_rel" ;; esac
+  [ -d "$_dir" ] || return 0
+  (cd -P "$_dir" 2>/dev/null && pwd -P) || true
+  return 0
+}
+
+# _pilot_node_remote_rollback <alias> <id> <loja> <sessao_tocada 0|1> <chave_da_marca> [<chave_da_sessao>] — desfaz o despacho ao nó: fecha a sessão (se chegou a tocar nela), solta a bead e CONFIRMA lendo. Devolve 0 SÓ quando a releitura
+# mostra a bead livre (sem dono, sem a marca, open); 1 quando não dá para confirmar (a bead pode ainda estar com o alias, com outro dono, ou ilegível).
+# 6º argumento (ga-dzexg3i.1, opcional): a chave onde o Pilot guardou o id da sessão que abriu (PILOT_NODE_SESSION_KEY). Com ele a MESMA escrita guardada também a tira, e a releitura só confirma com os DOIS ausentes (o id de uma sessão morta
+# não pode ficar numa bead livre: o próximo despacho a leria como dele). vazio (chamador antigo, ou despacho que não guardou id) → a escrita e a releitura são as de sempre, palavra por palavra.
+# Mesma ordem do dog (_pilot_node_first_rollback): 1º a sessão, depois a bead — uma sessão viva com a bead solta a acharia pelo GC_ALIAS e o mini a construiria também. A soltura é UMA escrita guardada
+# (--if-assignee <alias>: nunca pisa em quem pegou a bead depois; rc 1 e rc 13 caem os dois na releitura, que decide) e põe o status de volta a open (o `release` do script NÃO faz isso: só limpa dono e marca).
+# vazio (sem sessão tocada) → pula o close; falhou (o close que falha) → avisa alto e solta a bead mesmo assim: ela nunca fica presa no nó. Releitura vazia/ilegível/sem status → 1 (NÃO confirmado).
+_pilot_node_remote_rollback() {
+  local _rb_alias="$1" _rb_id="$2" _rb_store="$3" _rb_sess="${4:-0}" _rb_key="$5" _rb_sk="${6:-}" _rb_json="" _rb_rec="" _rb_asg="" _rb_st="" _rb_mk=""
+  if [ "$_rb_sess" = "1" ]; then
+    timeout 20 gc --city "$GC_CITY" session close "$_rb_alias" >/dev/null 2>&1 \
+      || warn "ga-2hd02v.3: não consegui fechar a sessão $_rb_alias ao desfazer o despacho de $_rb_id (esperado se ela nem chegou a nascer) — solto a bead mesmo assim: ela nunca fica presa no nó"
+  fi
+  timeout 15 bd -C "$_rb_store" update "$_rb_id" --if-assignee "$_rb_alias" --assignee "" ${_rb_sk:+--unset-metadata "$_rb_sk"} --status open --unset-metadata "$_rb_key" -q >/dev/null 2>&1 || true
+  _rb_json=$(timeout 15 bd -C "$_rb_store" show "$_rb_id" --json 2>/dev/null) || _rb_json=""
+  # (a marca e, quando veio, a chave da sessão vão juntas no 3º campo: qualquer uma que sobrar o deixa não vazio, e aí não se confirma)
+  _rb_rec=$(printf '%s' "$_rb_json" | jq -r --arg id "$_rb_id" --arg k "$_rb_key" --arg sk "$_rb_sk" 'if type == "array" then .[0] else . end | select(type == "object" and .id == $id and (.status | type == "string")) | "\(.assignee // "")|\(.status)|\(.metadata[$k] // "")\(if $sk == "" then "" else (.metadata[$sk] // "") end)"' 2>/dev/null) || _rb_rec=""
+  if [ -z "$_rb_rec" ]; then
+    warn "ga-2hd02v.3: não consegui ler $_rb_id para confirmar o desfazer do despacho ao nó (alias $_rb_alias) — NÃO mando a bead ao mini; o claim fica para o TTL"
+    return 1
+  fi
+  _rb_asg="${_rb_rec%%|*}"; _rb_rec="${_rb_rec#*|}"; _rb_st="${_rb_rec%%|*}"; _rb_mk="${_rb_rec#*|}"
+  if [ -z "$_rb_asg" ] && [ "$_rb_st" = open ] && [ -z "$_rb_mk" ]; then return 0; fi
+  warn "ga-2hd02v.3: o desfazer do despacho de $_rb_id ao nó (alias $_rb_alias) não se confirmou — a bead está com assignee='${_rb_asg:-}' status='$_rb_st' marca='${_rb_mk:-}'; NÃO mando ao mini (podia ser construída duas vezes); o claim fica para o TTL"
+  return 1
+}
+
+# ── ga-dzexg3i.1: sessão aberta no nó que vira failed-create — a vigia + o resfriamento da rota do MBP ─────────────────────────────────────────────────────────────────────────────────────
+# O problema (MBP, 24-25/11): `gc session new` só enfileira a abertura. A bead da sessão nasce na hora e o `start` roda depois, no reconciliador do motor; quando ele falha (state=failed-create, medido 7m36s depois, com
+# metadata.pending_create_rollback_reason) NINGUÉM avisa o Pilot: a bead do nó ficava dona do alias, «avisada», até o TTL de 25 min do inflight-reclaim-guard, e a rota seguia mandando a próxima bead ao mesmo nó. O Pilot descartava a saída do
+# `session new` (_pilot_node_remote_open agora guarda o session_id na bead, chave pilot.node_session) e _pilot_node_failed_create_pass, uma vez por varredura, olha a bead da sessão de cada bead do nó que a tem:
+#   failed-create (ou fechada sem ter chegado a creation_complete) → WARN alto com o motivo + SOLTA a bead (o mesmo _pilot_node_remote_rollback, que confere relendo) + esfria a rota do MBP quando o alias é do MBP;
+#   viva, criando, ativa, dormindo, fechada DEPOIS de ter sido ativa → NADA (nunca fecha sessão, nunca solta bead de sessão que andou: o node-ghost-release e o worker têm esse caso);
+#   bead da sessão que não lê (purgada, bd falhou, JSON ruim) → NADA: «não sei» nunca solta bead.
+# PILOT_NODE_FAILED_CREATE: on (padrão) | warn (só avisa, não escreve) | off. Valor que não é um destes → warn (o erro cai no que não escreve).
+
+# _pilot_mbp_cooling — exit 0 iff a rota do MBP está em RESFRIAMENTO: a vigia viu uma sessão do MBP morrer ao nascer e gravou, em PILOT_MBP_COOL_FILE (padrão $GC_CITY/.gc/state/pilot-mbp-cool-until), até quando (segundos-epoch).
+# Consultada por _pilot_mbp_stamped_gate (antes de qualquer claim) e por _pilot_mbp_node_decide (antes de escrever). vazio (arquivo ausente: a rota nunca esfriou) → 1, a rota segue como sempre; falhou/ilegível (o arquivo existe e
+# não abre, está vazio ou não tem um inteiro de até 12 dígitos) → 0 COM aviso (uma vez por varredura): sem saber, o MBP fica FORA, o inerte de uma rota que escreve em bead; o aviso diz qual arquivo apagar.
+_pilot_mbp_cooling() {
+  local _c_file _c_until="" _c_now=0
+  _c_file="${PILOT_MBP_COOL_FILE:-${GC_CITY:-/nonexistent}/.gc/state/pilot-mbp-cool-until}"
+  # vazio (arquivo ausente numa pasta que se lê) → 1, a rota nunca esfriou; falhou (a pasta existe mas não deixa nem consultar o arquivo: sem x) → 0 COM aviso, o inerte, em vez de ler «não sei» como «não esfria» (gate ga-7kbg9he, low)
+  if [ ! -e "$_c_file" ]; then
+    if [ -d "${_c_file%/*}" ] && [ ! -x "${_c_file%/*}" ]; then
+      if [ "${_PMC_WARNED:-0}" != 1 ]; then _PMC_WARNED=1; warn "ga-dzexg3i.1: não consigo consultar $_c_file (a pasta não deixa) — não sei se a rota do MBP está esfriando; o MBP fica FORA até a pasta voltar a ser legível"; fi
+      return 0
+    fi
+    return 1
+  fi
+  { IFS= read -r _c_until < "$_c_file"; } 2>/dev/null || [ -n "$_c_until" ] || _c_until=""
+  case "$_c_until" in
+    ''|*[!0-9]*) _c_until="" ;;
+    *) if [ "${#_c_until}" -gt 12 ]; then _c_until=""; fi ;;
+  esac
+  if [ -z "$_c_until" ]; then
+    if [ "${_PMC_WARNED:-0}" != 1 ]; then
+      _PMC_WARNED=1
+      warn "ga-dzexg3i.1: $_c_file existe e não tem um inteiro legível — não sei se a rota do MBP está esfriando; o MBP fica FORA até apagar esse arquivo"
+    fi
+    return 0
+  fi
+  _c_now=$(date +%s 2>/dev/null) || return 0
+  # um fim de resfriamento a mais de 1 dia no futuro não vem da vigia (o teto dela é PILOT_MBP_COOL_SECS, 30 min): esfria mesmo assim (o inerte), mas com aviso e a dica de apagar o arquivo, uma vez por varredura (low do gate)
+  if [ "$((10#$_c_until))" -gt $((_c_now + 86400)) ] && [ "${_PMC_WARNED:-0}" != 1 ]; then
+    _PMC_WARNED=1
+    warn "ga-dzexg3i.1: $_c_file diz que a rota do MBP esfria até $_c_until (mais de 1 dia à frente; a vigia nunca grava isso) — o MBP fica FORA; se o valor está errado, apague o arquivo"
+  fi
+  [ "$((10#$_c_until))" -gt "$_c_now" ]
+}
+
+# _pilot_mbp_cool_set <segundos> — grava (escrita atômica: tmp + mv) o fim do resfriamento = agora + <segundos>, e NUNCA encurta um resfriamento que já vale mais. Devolve 0 gravou (ou nada a gravar: 0 s desliga o resfriamento), 1 não gravou.
+# vazio (sem argumento) → 1; falhou/ilegível (argumento que não é inteiro, date, mkdir ou escrita que falham, arquivo atual ilegível) → 1 com aviso: o MBP NÃO esfria e a próxima sessão morta ao nascer tenta de novo (o aviso da vigia já saiu).
+_pilot_mbp_cool_set() {
+  local _s="${1:-}" _file _now=0 _until=0 _cur="" _tmp
+  case "$_s" in ''|*[!0-9]*) return 1 ;; esac
+  [ "${#_s}" -le 9 ] || return 1
+  [ "$((10#$_s))" -gt 0 ] || return 0
+  _file="${PILOT_MBP_COOL_FILE:-${GC_CITY:-/nonexistent}/.gc/state/pilot-mbp-cool-until}"
+  _now=$(date +%s 2>/dev/null) || { warn "ga-dzexg3i.1: date falhou — a rota do MBP NÃO foi esfriada"; return 1; }
+  _until=$((_now + 10#$_s))
+  # vazio/ilegível (arquivo atual ausente, sem inteiro) → grava o novo; legível e maior que o novo → mantém (nunca encurta)
+  if [ -e "$_file" ]; then { IFS= read -r _cur < "$_file"; } 2>/dev/null || true; fi
+  case "$_cur" in ''|*[!0-9]*) ;; *) if [ "${#_cur}" -le 12 ] && [ "$((10#$_cur))" -ge "$_until" ]; then return 0; fi ;; esac
+  mkdir -p "$(dirname "$_file")" 2>/dev/null || { warn "ga-dzexg3i.1: não consegui criar a pasta de $_file — a rota do MBP NÃO foi esfriada"; return 1; }
+  _tmp="$_file.$$"
+  if printf '%s\n' "$_until" > "$_tmp" 2>/dev/null && mv -f "$_tmp" "$_file" 2>/dev/null; then return 0; fi
+  rm -f "$_tmp" 2>/dev/null || true
+  warn "ga-dzexg3i.1: não consegui gravar $_file — a rota do MBP NÃO foi esfriada"
+  return 1
+}
+
+# _pilot_node_failed_create_one <id> <loja> <alias> <sid> <modo on|warn> — uma bead do nó com sessão guardada. Deixa em _FC_RESULT: alive (sessão viva ou que andou: nada feito) · unknown (bead da sessão ou do nó que não leu: nada feito) ·
+# stale (a bead do nó mudou desde a lista: dono, marca, status ou id da sessão diferentes: nada feito) · seen (failed-create visto, modo warn ou DRY_RUN: só avisou) · released (failed-create visto, bead solta e CONFIRMADA) · held (failed-create
+# visto e o desfazer NÃO se confirmou: a bead pode ainda estar com o alias, o aviso já saiu). Sempre devolve 0.
+# O veredito sai da bead da sessão (loja da cidade, onde moram as ga-*): `failed` SÓ com metadata objeto, creation_complete_at vazio E (state=failed-create OU status=closed com state preenchido e sem last_woke_at); qualquer coisa com creation_complete_at, ou viva, é `alive`; sem metadata/state legível → «não sei» (nada).
+_pilot_node_failed_create_one() {
+  local _fo_id="${1:-}" _fo_store="${2:-}" _fo_alias="${3:-}" _fo_sid="${4:-}" _fo_mode="${5:-warn}" _fo_sk _fo_sj="" _fo_v="" _fo_why="" _fo_bj="" _fo_ok="" _fo_cool=1800
+  _FC_RESULT=unknown
+  _fo_sk="${PILOT_NODE_SESSION_KEY:-pilot.node_session}"
+  # vazio (bd sem saída) → "" e inerte; falhou/ilegível (bd falhou: bead purgada ou loja indisponível, JSON que o jq não lê, bead de OUTRO id, que não é de sessão) → "" também: «não sei» NUNCA solta bead
+  _fo_sj=$(timeout "${PILOT_NODE_FC_READ_TIMEOUT:-20}" bd -C "${GC_CITY:-/nonexistent}" show "$_fo_sid" --json 2>/dev/null) || _fo_sj=""
+  _fo_v=$(printf '%s' "$_fo_sj" | jq -r --arg id "$_fo_sid" 'if type == "array" then .[0] else . end | select(type == "object" and .id == $id and .issue_type == "session" and ((.metadata | type) == "object")) | .metadata as $m | if (($m.creation_complete_at // "") == "") and ((($m.state // "") == "failed-create") or ((.status // "") == "closed" and ((($m.state // "") | type) == "string") and (($m.state // "") != "") and ($m.last_woke_at // "") == "")) then "failed|" + (((($m.pending_create_rollback_reason // .close_reason // "") | tostring) | gsub("[\r\n|]"; " "))) else "alive|" end' 2>/dev/null) || _fo_v=""
+  case "$_fo_v" in
+    alive\|*) _FC_RESULT=alive; return 0 ;;
+    failed\|*) _fo_why="${_fo_v#failed|}" ;;
+    *) return 0 ;;
+  esac
+  # a bead do nó pode ter mudado desde a lista desta varredura: relê e exige a MESMA cara (in_progress, dono = alias, marca = dono, id da sessão igual). vazio/falhou/ilegível → nada feito (o desfazer guardado seria o 2º freio)
+  _fo_bj=$(timeout "${PILOT_NODE_FC_READ_TIMEOUT:-20}" bd -C "$_fo_store" show "$_fo_id" --json 2>/dev/null) || _fo_bj=""
+  _fo_ok=$(printf '%s' "$_fo_bj" | jq -r --arg id "$_fo_id" --arg a "$_fo_alias" --arg k "$_fo_sk" --arg s "$_fo_sid" 'if type == "array" then .[0] else . end | select(type == "object" and .id == $id and .status == "in_progress" and (.assignee // "") == $a and (.metadata["pilot.wa_node_alias"] // "") == $a and (.metadata[$k] // "") == $s) | "ok"' 2>/dev/null) || _fo_ok=""
+  # vazio/falhou/ilegível (a releitura não trouxe UMA bead com o id pedido) → unknown: «não consegui ler» NÃO é «mudou» (gate ga-7kbg9he, low); legível mas com outra cara → stale
+  if ! printf '%s' "$_fo_bj" | jq -e --arg id "$_fo_id" 'if type == "array" then .[0] else . end | type == "object" and .id == $id' >/dev/null 2>&1; then _FC_RESULT=unknown; return 0; fi
+  if [ "$_fo_ok" != ok ]; then _FC_RESULT=stale; return 0; fi
+  warn "ga-dzexg3i.1: $_fo_id foi ao nó (alias $_fo_alias) mas a sessão $_fo_sid NÃO nasceu: failed-create — motivo: ${_fo_why:-a bead da sessão não diz}"
+  if [ "$_fo_mode" != on ] || [ "${DRY_RUN:-0}" = "1" ]; then
+    _FC_RESULT=seen
+    log "  ga-dzexg3i.1: $_fo_id: WOULD soltar a bead e (se for do MBP) esfriar a rota — modo=$_fo_mode DRY_RUN=${DRY_RUN:-0}: nada escrito"
+    return 0
+  fi
+  # a sessão já está morta: o rollback NÃO fecha nada (4º argumento 0) — «nunca fechar sessão que andou» vale por construção; a chave da sessão sai na MESMA escrita guardada que solta a bead
+  if _pilot_node_remote_rollback "$_fo_alias" "$_fo_id" "$_fo_store" 0 pilot.wa_node_alias "$_fo_sk"; then
+    _FC_RESULT=released
+    log "  ga-dzexg3i.1: $_fo_id solta (open, sem dono, sem marca, sem id de sessão — confirmado relendo); volta ao Pilot"
+    # vazio/falhou (o comentário não grava) → só o log fica; a bead já está solta e confirmada
+    timeout 15 bd -C "$_fo_store" comments add "$_fo_id" "ga-dzexg3i.1: a sessão $_fo_sid do alias $_fo_alias virou failed-create antes de nascer (motivo: ${_fo_why:-não informado}); a bead foi solta e volta ao Pilot." >/dev/null 2>&1 || true
+  else
+    _FC_RESULT=held
+    warn "ga-dzexg3i.1: $_fo_id: o desfazer NÃO se confirmou — a bead pode ainda estar com $_fo_alias; a próxima varredura tenta de novo (a vigia segue vendo a sessão morta)"
+  fi
+  # o MBP que perdeu uma sessão ao nascer esfria, com o desfazer confirmado ou não: a próxima bead não vai ao mesmo nó. O Hetzner não esfria (esta bead é só do MBP).
+  case "$_fo_alias" in
+    wa-worker-remote-mbp-*)
+      _fo_cool="${PILOT_MBP_COOL_SECS:-1800}"; case "$_fo_cool" in ''|*[!0-9]*) _fo_cool=1800 ;; esac
+      if _pilot_mbp_cool_set "$_fo_cool"; then log "  ga-dzexg3i.1: rota do MBP esfriada por ${_fo_cool}s (alias $_fo_alias perdeu a sessão $_fo_sid ao nascer)"; fi ;;
+  esac
+  return 0
+}
+
+# _pilot_node_failed_create_pass — a vigia, uma vez por varredura, depois do despacho. Para cada loja de WA e de PS lista as beads in_progress que trazem PILOT_NODE_SESSION_KEY, fica só com as de cara do nó (dono wa-/ps-worker-remote[-mbp]-N, marca =
+# dono, id da sessão de forma de id) e chama _pilot_node_failed_create_one em cada uma. O teto PILOT_NODE_FC_MAX (6) vale para o que ESCREVE ou avisa (soltas + vistas + desfazer não confirmado): bead viva é só uma leitura e não gasta teto
+# (gate ga-7kbg9he, medium 1: 6 beads vivas esgotavam o teto e a morta da 7ª nunca era examinada, sem sinal). O que ficou sem exame, por teto ou por PILOT_NODE_FC_BUDGET_SECS (90 s de relógio: a vigia agora roda ANTES das pausas e não pode
+# atrasar a varredura quando o Dolt está lento), aparece no resumo como nao_examinadas=N, com aviso. Uma linha de resumo só quando viu alguma bead. Sempre devolve 0.
+# vazio (nenhuma bead com a chave, ou rota do nó nunca usada) → nada, sem linha; falhou/ilegível (loja que não lista, JSON que não é array, prefixo sem loja no routes.jsonl) → essa loja fica de fora e conta como «ilegível» no resumo: nada é solto sem leitura.
+_pilot_node_failed_create_pass() {
+  local _fp_mode="${PILOT_NODE_FAILED_CREATE:-on}" _fp_sk _fp_max _fp_n=0 _fp_alive=0 _fp_seen=0 _fp_rel=0 _fp_held=0 _fp_unk=0 _fp_stale=0 _fp_skip=0 _fp_stores="" _fp_pfx _fp_st _fp_lj="" _fp_rows="" _fp_id _fp_al _fp_sid _fp_bud _fp_t0
+  [ "$_fp_mode" != off ] || return 0
+  case "$_fp_mode" in
+    on|warn) ;;
+    *) warn "ga-dzexg3i.1: PILOT_NODE_FAILED_CREATE='$_fp_mode' não é on|warn|off — uso warn (só avisa, não escreve)"; _fp_mode=warn ;;
+  esac
+  [ -n "${GC_CITY:-}" ] || return 0
+  _fp_sk="${PILOT_NODE_SESSION_KEY:-pilot.node_session}"
+  _fp_max="${PILOT_NODE_FC_MAX:-6}"; case "$_fp_max" in ''|*[!0-9]*) _fp_max=6 ;; esac
+  # vazio/falhou (valor que não é número) → 90 s; 0 desliga o prazo de relógio
+  _fp_bud="${PILOT_NODE_FC_BUDGET_SECS:-90}"; case "$_fp_bud" in ''|*[!0-9]*) _fp_bud=90 ;; esac
+  _fp_t0=$SECONDS
+  for _fp_pfx in wa ps; do
+    # vazio (prefixo fora do routes.jsonl, pasta ausente) → loja desconhecida: fica de fora e conta; falhou/ilegível (routes.jsonl que o jq não lê) → o mesmo
+    _fp_st=$(_pilot_bead_home_store "$_fp_pfx-x") || _fp_st=""
+    if [ -z "$_fp_st" ]; then _fp_unk=$((_fp_unk + 1)); continue; fi
+    case " $_fp_stores " in *" $_fp_st "*) continue ;; esac
+    _fp_stores="$_fp_stores $_fp_st"
+    # vazio (bd sem saída) → não é array: conta como ilegível; falhou/ilegível (bd que falha ou estoura o prazo, JSON que não é array) → loja fora e contada, nada decidido
+    _fp_lj=$(timeout "${PILOT_NODE_FC_LIST_TIMEOUT:-30}" bd -C "$_fp_st" list --status in_progress --has-metadata-key "$_fp_sk" --json --limit 0 2>/dev/null) || _fp_lj=""
+    if ! printf '%s' "$_fp_lj" | jq -e 'type == "array"' >/dev/null 2>&1; then _fp_unk=$((_fp_unk + 1)); continue; fi
+    _fp_rows=$(printf '%s' "$_fp_lj" | jq -r --arg k "$_fp_sk" '
+        .[] | select(type == "object") | (.assignee // "") as $a | (.metadata["pilot.wa_node_alias"] // "") as $mk | (.metadata[$k] // "") as $s | (.id // "") as $id
+        | select($a | test("^(wa|ps)-worker-remote(-mbp)?-[0-9]+$")) | select($mk == $a) | select(($s | type) == "string" and ($s | test("^[A-Za-z0-9][A-Za-z0-9._-]*$"))) | select($id | test("^[A-Za-z0-9][A-Za-z0-9._-]*$"))
+        | [$id, $a, $s] | join("\u001f")' 2>/dev/null) || { _fp_unk=$((_fp_unk + 1)); continue; }
+    while IFS=$'\037' read -r _fp_id _fp_al _fp_sid; do
+      [ -n "$_fp_id" ] || continue
+      # teto de escrita (soltas + vistas + não confirmadas) ou prazo de relógio estourado → esta bead NÃO é examinada, e é contada
+      if [ $((_fp_rel + _fp_seen + _fp_held)) -ge "$_fp_max" ] || { [ "$_fp_bud" -gt 0 ] && [ $((SECONDS - _fp_t0)) -ge "$_fp_bud" ]; }; then _fp_skip=$((_fp_skip + 1)); continue; fi
+      _fp_n=$((_fp_n + 1))
+      _pilot_node_failed_create_one "$_fp_id" "$_fp_st" "$_fp_al" "$_fp_sid" "$_fp_mode" || true
+      case "${_FC_RESULT:-unknown}" in
+        alive) _fp_alive=$((_fp_alive + 1)) ;;
+        seen) _fp_seen=$((_fp_seen + 1)) ;;
+        released) _fp_rel=$((_fp_rel + 1)) ;;
+        held) _fp_held=$((_fp_held + 1)) ;;
+        stale) _fp_stale=$((_fp_stale + 1)) ;;
+        *) _fp_unk=$((_fp_unk + 1)) ;;
+      esac
+    done <<EOF_FCP
+$_fp_rows
+EOF_FCP
+  done
+  if [ "$_fp_skip" -gt 0 ]; then
+    warn "ga-dzexg3i.1: vigia do failed-create: $_fp_skip bead(s) do nó com sessão guardada NÃO foram examinadas nesta varredura (teto de escrita PILOT_NODE_FC_MAX=$_fp_max ou prazo PILOT_NODE_FC_BUDGET_SECS=$_fp_bud s); a próxima varredura as lê"
+  fi
+  if [ "$_fp_n" -gt 0 ] || [ "$_fp_unk" -gt 0 ] || [ "$_fp_skip" -gt 0 ]; then
+    log "ga-dzexg3i.1: vigia do failed-create ($_fp_mode): $_fp_n bead(s) do nó com sessão guardada examinadas — vivas=$_fp_alive, failed-create soltas=$_fp_rel, vistas sem soltar=$_fp_seen, desfazer não confirmado=$_fp_held, mudaram=$_fp_stale, ilegíveis=$_fp_unk, nao_examinadas=$_fp_skip"
+  fi
+  return 0
+}
+
 if _acquire_pilot_lock; then
   trap '_release_pilot_lock' EXIT
 else
@@ -2065,6 +2288,13 @@ log "=== Pilot sweep start (DRY_RUN=${DRY_RUN}) ==="
 # whether the rest of this sweep proceeds or pauses below (quota/RAM/quiet-
 # hours). See _pilot_selfheal_expired_slings' own header comment.
 _pilot_selfheal_expired_slings "$GC_CITY"
+
+# ga-dzexg3i.1: a vigia do failed-create, UMA vez por varredura, aqui — logo depois do lock e do self-heal, ANTES da 1ª pausa. É a posição que toda varredura que segura o lock atravessa: as pausas (cota 5h, RAM, swap, disco,
+# memória, drain, quiet hours, cross-stage), o «pistas cheias» e o «sem candidatas» saem com `exit 0` mais abaixo, e a vigia não pode depender de a varredura chegar ao fim (a bead do nó que nasceu morta ficaria dona do alias até
+# o TTL de 25 min, a noite inteira). Ela só LÊ beads do nó e, no failed-create, solta a bead e grava um arquivo: não abre sessão, então a pausa de despacho não tem por que a impedir. A varredura que não pega o lock (a de cima,
+# «backing off») não roda: quem segura o lock está no meio de uma varredura e roda a vigia por ela.
+# falhou (a vigia nunca derruba a varredura: o `|| true` é do set -e; o que ela não leu ela já contou e avisou)
+_pilot_node_failed_create_pass || true
 
 # ── Dolt-saturation probe (ga-rk5va constraint a) ─────────────────────────────
 # One health probe per sweep seeds DOLT_PID + DOLT_LATENCY_MS; the cheap CPU
@@ -8851,26 +9081,6 @@ _pilot_same_dir() {
 # all ask it here: _pilot_bead_home_store (where the bead lives) and _pilot_pool_store_verdict (does the pool
 # read it), each with a third state for "cannot tell" that every caller lands in the inert branch.
 
-# _pilot_bead_home_store <bead_id> — print the absolute directory of the store <bead_id> LIVES in, from the
-# authoritative prefix -> store map $GC_CITY/.beads/routes.jsonl (ga -> HQ, wa -> whatsapp_automation, ...). A
-# relative path is relative to $GC_CITY, the directory holding .beads. `bd -C <rig> show <ga-id>` does not route
-# by prefix, and story.rig names the rig a bead is ABOUT, not the one it is stored in — only the id is reliable.
-# vazio → the bead's store is unknown to the caller (no id, no routes file, prefix not listed, directory missing):
-# the verdict becomes "unknown" and nothing is dispatched or queued on it; falhou/ilegível → the same: a routes
-# file jq cannot parse prints nothing, never a guessed store. Always exit 0.
-_pilot_bead_home_store() {
-  local _id="${1:-}" _prefix _rel _dir
-  _prefix="${_id%%-*}"
-  [ -n "$_id" ] && [ -n "$_prefix" ] && [ "$_prefix" != "$_id" ] || return 0
-  [ -r "$GC_CITY/.beads/routes.jsonl" ] || return 0
-  _rel=$(jq -rn --arg p "$_prefix" 'first(inputs | select(.prefix == $p) | .path) // empty' "$GC_CITY/.beads/routes.jsonl" 2>/dev/null) || _rel=""
-  [ -n "$_rel" ] || return 0
-  case "$_rel" in /*) _dir="$_rel" ;; *) _dir="$GC_CITY/$_rel" ;; esac
-  [ -d "$_dir" ] || return 0
-  (cd -P "$_dir" 2>/dev/null && pwd -P) || true
-  return 0
-}
-
 # _pilot_pool_store_verdict <pool> <store_dir> — sets the globals _PSV_VERDICT and _PSV_POOL_RIG (globals, not
 # stdout, so the rig-list memo it warms stays warm in the CALLER's shell); always exit 0.
 #   _PSV_VERDICT=serves   <pool> is not a wa-worker/ps-worker pool (this predicate does not apply to it), or its
@@ -14093,33 +14303,6 @@ EOF_PWR
   return 0
 }
 
-# _pilot_node_remote_rollback <alias> <id> <loja> <sessao_tocada 0|1> <chave_da_marca> [<chave_da_sessao>] — desfaz o despacho ao nó: fecha a sessão (se chegou a tocar nela), solta a bead e CONFIRMA lendo. Devolve 0 SÓ quando a releitura
-# mostra a bead livre (sem dono, sem a marca, open); 1 quando não dá para confirmar (a bead pode ainda estar com o alias, com outro dono, ou ilegível).
-# 6º argumento (ga-dzexg3i.1, opcional): a chave onde o Pilot guardou o id da sessão que abriu (PILOT_NODE_SESSION_KEY). Com ele a MESMA escrita guardada também a tira, e a releitura só confirma com os DOIS ausentes (o id de uma sessão morta
-# não pode ficar numa bead livre: o próximo despacho a leria como dele). vazio (chamador antigo, ou despacho que não guardou id) → a escrita e a releitura são as de sempre, palavra por palavra.
-# Mesma ordem do dog (_pilot_node_first_rollback): 1º a sessão, depois a bead — uma sessão viva com a bead solta a acharia pelo GC_ALIAS e o mini a construiria também. A soltura é UMA escrita guardada
-# (--if-assignee <alias>: nunca pisa em quem pegou a bead depois; rc 1 e rc 13 caem os dois na releitura, que decide) e põe o status de volta a open (o `release` do script NÃO faz isso: só limpa dono e marca).
-# vazio (sem sessão tocada) → pula o close; falhou (o close que falha) → avisa alto e solta a bead mesmo assim: ela nunca fica presa no nó. Releitura vazia/ilegível/sem status → 1 (NÃO confirmado).
-_pilot_node_remote_rollback() {
-  local _rb_alias="$1" _rb_id="$2" _rb_store="$3" _rb_sess="${4:-0}" _rb_key="$5" _rb_sk="${6:-}" _rb_json="" _rb_rec="" _rb_asg="" _rb_st="" _rb_mk=""
-  if [ "$_rb_sess" = "1" ]; then
-    timeout 20 gc --city "$GC_CITY" session close "$_rb_alias" >/dev/null 2>&1 \
-      || warn "ga-2hd02v.3: não consegui fechar a sessão $_rb_alias ao desfazer o despacho de $_rb_id (esperado se ela nem chegou a nascer) — solto a bead mesmo assim: ela nunca fica presa no nó"
-  fi
-  timeout 15 bd -C "$_rb_store" update "$_rb_id" --if-assignee "$_rb_alias" --assignee "" ${_rb_sk:+--unset-metadata "$_rb_sk"} --status open --unset-metadata "$_rb_key" -q >/dev/null 2>&1 || true
-  _rb_json=$(timeout 15 bd -C "$_rb_store" show "$_rb_id" --json 2>/dev/null) || _rb_json=""
-  # (a marca e, quando veio, a chave da sessão vão juntas no 3º campo: qualquer uma que sobrar o deixa não vazio, e aí não se confirma)
-  _rb_rec=$(printf '%s' "$_rb_json" | jq -r --arg id "$_rb_id" --arg k "$_rb_key" --arg sk "$_rb_sk" 'if type == "array" then .[0] else . end | select(type == "object" and .id == $id and (.status | type == "string")) | "\(.assignee // "")|\(.status)|\(.metadata[$k] // "")\(if $sk == "" then "" else (.metadata[$sk] // "") end)"' 2>/dev/null) || _rb_rec=""
-  if [ -z "$_rb_rec" ]; then
-    warn "ga-2hd02v.3: não consegui ler $_rb_id para confirmar o desfazer do despacho ao nó (alias $_rb_alias) — NÃO mando a bead ao mini; o claim fica para o TTL"
-    return 1
-  fi
-  _rb_asg="${_rb_rec%%|*}"; _rb_rec="${_rb_rec#*|}"; _rb_st="${_rb_rec%%|*}"; _rb_mk="${_rb_rec#*|}"
-  if [ -z "$_rb_asg" ] && [ "$_rb_st" = open ] && [ -z "$_rb_mk" ]; then return 0; fi
-  warn "ga-2hd02v.3: o desfazer do despacho de $_rb_id ao nó (alias $_rb_alias) não se confirmou — a bead está com assignee='${_rb_asg:-}' status='$_rb_st' marca='${_rb_mk:-}'; NÃO mando ao mini (podia ser construída duas vezes); o claim fica para o TTL"
-  return 1
-}
-
 # _pilot_node_idle_secs — imprime a quietude mínima (s) que uma sessão sem bead precisa ter para valer como vaga, lida de WA_NODE_IDLE_SECS do MESMO jeito que o wa-node-dispatch.sh (ga-2hd02v.3.12): o script escolhe
 # o alias e esta conta confere de novo, então os dois têm de ler o mesmo número. vazio (variável ausente) → 300; ilegível (letra, sinal, ponto, espaço, mais de 9 dígitos) → 300 também: o erro cai no prazo mais LONGO,
 # nunca no mais curto. 0 vale. Zero à esquerda é decimal (o 10# evita o octal).
@@ -14173,6 +14356,15 @@ _pilot_node_remote_open() {
       *) _ro_step="não consegui decidir entre abrir e acordar a sessão" ;;
     esac
   fi
+  _ro_sk="${PILOT_NODE_SESSION_KEY:-pilot.node_session}"
+  if [ -z "$_ro_step" ]; then
+    # ga-dzexg3i.1 (gate ga-7kbg9he, medium 2): a chave do id da sessão pode ser VELHA — a bead voltou ao mini por outro caminho (guard de 25 min, node-ghost-release, à mão: nenhum deles a conhece) com o id de uma sessão que morreu
+    # ao nascer. Se esta bead for ao nó por wake/ocioso (que não gravam id novo), ou se a gravação do id novo falhar, a vigia leria a sessão VELHA (failed-create) e soltaria uma bead que um worker vivo constrói. Por isso a chave sai,
+    # na escrita guardada, ANTES de qualquer sessão ser aberta, acordada ou avisada: o único id que a vigia pode ler é o gravado por ESTE despacho.
+    # vazio (bead sem a chave) → tirar chave ausente sai 0 e não muda nada; falhou (rc≠0: o dono mudou, o bd falhou) → NÃO abre, não acorda e não avisa sessão nenhuma (nada foi tocado: _ro_sess fica 0) e desfaz como qualquer falha antes da sessão
+    timeout 15 bd -C "$_ro_store" update "$_ro_id" --if-assignee "$_ro_alias" --unset-metadata "$_ro_sk" -q >/dev/null 2>&1 \
+      || _ro_step="não consegui tirar da bead a chave da sessão antiga ($_ro_sk) — não abro, não acordo e não aviso sessão nenhuma"
+  fi
   if [ -z "$_ro_step" ] && [ "$_ro_st" != idle ]; then
     _ro_sess=1; _ro_rc=0; _ro_t0=$SECONDS
     if [ "$_ro_st" = asleep ]; then
@@ -14188,7 +14380,6 @@ _pilot_node_remote_open() {
     elif [ "$_ro_st" = new ]; then
       # ga-dzexg3i.1: guarda o id da sessão na bead, antes do aviso (a vigia do failed-create precisa dele desde o 1º instante).
       # vazio (resposta sem session_id) → _ro_sid "" → avisa, nada guardado; falhou/ilegível (não é UM objeto JSON, session_id que não é texto, id com forma de não-id) → _ro_sid "" também: o inerte é a vigia ficar de fora, nunca um id chutado
-      _ro_sk="${PILOT_NODE_SESSION_KEY:-pilot.node_session}"
       _ro_sid=$(printf '%s' "$_ro_new" | jq -rs 'if length == 1 and (.[0] | type) == "object" and ((.[0].session_id | type) == "string") then .[0].session_id else "" end' 2>/dev/null) || _ro_sid=""
       case "$_ro_sid" in -*|.*|*[!A-Za-z0-9._-]*) _ro_sid="" ;; esac
       if [ -z "$_ro_sid" ]; then
@@ -14579,153 +14770,6 @@ _pilot_mbp_node_settle() {
   if [ "$_PWR_STATUS" != in_progress ] || [ "$_PWR_MARK" != "$_PWR_ALIAS" ]; then return 0; fi
   warn "mbp-node: $_ms_id ficou com o alias $_PWR_ALIAS depois de um apply incerto e sem sessão — desfaço (a próxima varredura tenta de novo)"
   _pilot_node_remote_rollback "$_PWR_ALIAS" "$_ms_id" "$_ms_store" 0 pilot.wa_node_alias || true
-  return 0
-}
-
-# ── ga-dzexg3i.1: sessão aberta no nó que vira failed-create — a vigia + o resfriamento da rota do MBP ─────────────────────────────────────────────────────────────────────────────────────
-# O problema (MBP, 24-25/11): `gc session new` só enfileira a abertura. A bead da sessão nasce na hora e o `start` roda depois, no reconciliador do motor; quando ele falha (state=failed-create, medido 7m36s depois, com
-# metadata.pending_create_rollback_reason) NINGUÉM avisa o Pilot: a bead do nó ficava dona do alias, «avisada», até o TTL de 25 min do inflight-reclaim-guard, e a rota seguia mandando a próxima bead ao mesmo nó. O Pilot descartava a saída do
-# `session new` (_pilot_node_remote_open agora guarda o session_id na bead, chave pilot.node_session) e _pilot_node_failed_create_pass, uma vez por varredura, olha a bead da sessão de cada bead do nó que a tem:
-#   failed-create (ou fechada sem ter chegado a creation_complete) → WARN alto com o motivo + SOLTA a bead (o mesmo _pilot_node_remote_rollback, que confere relendo) + esfria a rota do MBP quando o alias é do MBP;
-#   viva, criando, ativa, dormindo, fechada DEPOIS de ter sido ativa → NADA (nunca fecha sessão, nunca solta bead de sessão que andou: o node-ghost-release e o worker têm esse caso);
-#   bead da sessão que não lê (purgada, bd falhou, JSON ruim) → NADA: «não sei» nunca solta bead.
-# PILOT_NODE_FAILED_CREATE: on (padrão) | warn (só avisa, não escreve) | off. Valor que não é um destes → warn (o erro cai no que não escreve).
-
-# _pilot_mbp_cooling — exit 0 iff a rota do MBP está em RESFRIAMENTO: a vigia viu uma sessão do MBP morrer ao nascer e gravou, em PILOT_MBP_COOL_FILE (padrão $GC_CITY/.gc/state/pilot-mbp-cool-until), até quando (segundos-epoch).
-# Consultada por _pilot_mbp_stamped_gate (antes de qualquer claim) e por _pilot_mbp_node_decide (antes de escrever). vazio (arquivo ausente: a rota nunca esfriou) → 1, a rota segue como sempre; falhou/ilegível (o arquivo existe e
-# não abre, está vazio ou não tem um inteiro de até 12 dígitos) → 0 COM aviso (uma vez por varredura): sem saber, o MBP fica FORA, o inerte de uma rota que escreve em bead; o aviso diz qual arquivo apagar.
-_pilot_mbp_cooling() {
-  local _c_file _c_until="" _c_now=0
-  _c_file="${PILOT_MBP_COOL_FILE:-${GC_CITY:-/nonexistent}/.gc/state/pilot-mbp-cool-until}"
-  [ -e "$_c_file" ] || return 1
-  { IFS= read -r _c_until < "$_c_file"; } 2>/dev/null || [ -n "$_c_until" ] || _c_until=""
-  case "$_c_until" in
-    ''|*[!0-9]*) _c_until="" ;;
-    *) if [ "${#_c_until}" -gt 12 ]; then _c_until=""; fi ;;
-  esac
-  if [ -z "$_c_until" ]; then
-    if [ "${_PMC_WARNED:-0}" != 1 ]; then
-      _PMC_WARNED=1
-      warn "ga-dzexg3i.1: $_c_file existe e não tem um inteiro legível — não sei se a rota do MBP está esfriando; o MBP fica FORA até apagar esse arquivo"
-    fi
-    return 0
-  fi
-  _c_now=$(date +%s 2>/dev/null) || return 0
-  [ "$((10#$_c_until))" -gt "$_c_now" ]
-}
-
-# _pilot_mbp_cool_set <segundos> — grava (escrita atômica: tmp + mv) o fim do resfriamento = agora + <segundos>, e NUNCA encurta um resfriamento que já vale mais. Devolve 0 gravou (ou nada a gravar: 0 s desliga o resfriamento), 1 não gravou.
-# vazio (sem argumento) → 1; falhou/ilegível (argumento que não é inteiro, date, mkdir ou escrita que falham, arquivo atual ilegível) → 1 com aviso: o MBP NÃO esfria e a próxima sessão morta ao nascer tenta de novo (o aviso da vigia já saiu).
-_pilot_mbp_cool_set() {
-  local _s="${1:-}" _file _now=0 _until=0 _cur="" _tmp
-  case "$_s" in ''|*[!0-9]*) return 1 ;; esac
-  [ "${#_s}" -le 9 ] || return 1
-  [ "$((10#$_s))" -gt 0 ] || return 0
-  _file="${PILOT_MBP_COOL_FILE:-${GC_CITY:-/nonexistent}/.gc/state/pilot-mbp-cool-until}"
-  _now=$(date +%s 2>/dev/null) || { warn "ga-dzexg3i.1: date falhou — a rota do MBP NÃO foi esfriada"; return 1; }
-  _until=$((_now + 10#$_s))
-  # vazio/ilegível (arquivo atual ausente, sem inteiro) → grava o novo; legível e maior que o novo → mantém (nunca encurta)
-  if [ -e "$_file" ]; then { IFS= read -r _cur < "$_file"; } 2>/dev/null || true; fi
-  case "$_cur" in ''|*[!0-9]*) ;; *) if [ "${#_cur}" -le 12 ] && [ "$((10#$_cur))" -ge "$_until" ]; then return 0; fi ;; esac
-  mkdir -p "$(dirname "$_file")" 2>/dev/null || { warn "ga-dzexg3i.1: não consegui criar a pasta de $_file — a rota do MBP NÃO foi esfriada"; return 1; }
-  _tmp="$_file.$$"
-  if printf '%s\n' "$_until" > "$_tmp" 2>/dev/null && mv -f "$_tmp" "$_file" 2>/dev/null; then return 0; fi
-  rm -f "$_tmp" 2>/dev/null || true
-  warn "ga-dzexg3i.1: não consegui gravar $_file — a rota do MBP NÃO foi esfriada"
-  return 1
-}
-
-# _pilot_node_failed_create_one <id> <loja> <alias> <sid> <modo on|warn> — uma bead do nó com sessão guardada. Deixa em _FC_RESULT: alive (sessão viva ou que andou: nada feito) · unknown (bead da sessão ou do nó que não leu: nada feito) ·
-# stale (a bead do nó mudou desde a lista: dono, marca, status ou id da sessão diferentes: nada feito) · seen (failed-create visto, modo warn ou DRY_RUN: só avisou) · released (failed-create visto, bead solta e CONFIRMADA) · held (failed-create
-# visto e o desfazer NÃO se confirmou: a bead pode ainda estar com o alias, o aviso já saiu). Sempre devolve 0.
-# O veredito sai da bead da sessão (loja da cidade, onde moram as ga-*): `failed` SÓ com metadata objeto, creation_complete_at vazio E (state=failed-create OU status=closed com state preenchido e sem last_woke_at); qualquer coisa com creation_complete_at, ou viva, é `alive`; sem metadata/state legível → «não sei» (nada).
-_pilot_node_failed_create_one() {
-  local _fo_id="${1:-}" _fo_store="${2:-}" _fo_alias="${3:-}" _fo_sid="${4:-}" _fo_mode="${5:-warn}" _fo_sk _fo_sj="" _fo_v="" _fo_why="" _fo_bj="" _fo_ok="" _fo_cool=1800
-  _FC_RESULT=unknown
-  _fo_sk="${PILOT_NODE_SESSION_KEY:-pilot.node_session}"
-  # vazio (bd sem saída) → "" e inerte; falhou/ilegível (bd falhou: bead purgada ou loja indisponível, JSON que o jq não lê, bead de OUTRO id, que não é de sessão) → "" também: «não sei» NUNCA solta bead
-  _fo_sj=$(timeout "${PILOT_NODE_FC_READ_TIMEOUT:-20}" bd -C "${GC_CITY:-/nonexistent}" show "$_fo_sid" --json 2>/dev/null) || _fo_sj=""
-  _fo_v=$(printf '%s' "$_fo_sj" | jq -r --arg id "$_fo_sid" 'if type == "array" then .[0] else . end | select(type == "object" and .id == $id and .issue_type == "session" and ((.metadata | type) == "object")) | .metadata as $m | if (($m.creation_complete_at // "") == "") and ((($m.state // "") == "failed-create") or ((.status // "") == "closed" and ((($m.state // "") | type) == "string") and (($m.state // "") != "") and ($m.last_woke_at // "") == "")) then "failed|" + (((($m.pending_create_rollback_reason // .close_reason // "") | tostring) | gsub("[\r\n|]"; " "))) else "alive|" end' 2>/dev/null) || _fo_v=""
-  case "$_fo_v" in
-    alive\|*) _FC_RESULT=alive; return 0 ;;
-    failed\|*) _fo_why="${_fo_v#failed|}" ;;
-    *) return 0 ;;
-  esac
-  # a bead do nó pode ter mudado desde a lista desta varredura: relê e exige a MESMA cara (in_progress, dono = alias, marca = dono, id da sessão igual). vazio/falhou/ilegível → nada feito (o desfazer guardado seria o 2º freio)
-  _fo_bj=$(timeout "${PILOT_NODE_FC_READ_TIMEOUT:-20}" bd -C "$_fo_store" show "$_fo_id" --json 2>/dev/null) || _fo_bj=""
-  _fo_ok=$(printf '%s' "$_fo_bj" | jq -r --arg id "$_fo_id" --arg a "$_fo_alias" --arg k "$_fo_sk" --arg s "$_fo_sid" 'if type == "array" then .[0] else . end | select(type == "object" and .id == $id and .status == "in_progress" and (.assignee // "") == $a and (.metadata["pilot.wa_node_alias"] // "") == $a and (.metadata[$k] // "") == $s) | "ok"' 2>/dev/null) || _fo_ok=""
-  if [ "$_fo_ok" != ok ]; then _FC_RESULT=stale; return 0; fi
-  warn "ga-dzexg3i.1: $_fo_id foi ao nó (alias $_fo_alias) mas a sessão $_fo_sid NÃO nasceu: failed-create — motivo: ${_fo_why:-a bead da sessão não diz}"
-  if [ "$_fo_mode" != on ] || [ "${DRY_RUN:-0}" = "1" ]; then
-    _FC_RESULT=seen
-    log "  ga-dzexg3i.1: $_fo_id: WOULD soltar a bead e (se for do MBP) esfriar a rota — modo=$_fo_mode DRY_RUN=${DRY_RUN:-0}: nada escrito"
-    return 0
-  fi
-  # a sessão já está morta: o rollback NÃO fecha nada (4º argumento 0) — «nunca fechar sessão que andou» vale por construção; a chave da sessão sai na MESMA escrita guardada que solta a bead
-  if _pilot_node_remote_rollback "$_fo_alias" "$_fo_id" "$_fo_store" 0 pilot.wa_node_alias "$_fo_sk"; then
-    _FC_RESULT=released
-    log "  ga-dzexg3i.1: $_fo_id solta (open, sem dono, sem marca, sem id de sessão — confirmado relendo); volta ao Pilot"
-    # vazio/falhou (o comentário não grava) → só o log fica; a bead já está solta e confirmada
-    timeout 15 bd -C "$_fo_store" comments add "$_fo_id" "ga-dzexg3i.1: a sessão $_fo_sid do alias $_fo_alias virou failed-create antes de nascer (motivo: ${_fo_why:-não informado}); a bead foi solta e volta ao Pilot." >/dev/null 2>&1 || true
-  else
-    _FC_RESULT=held
-    warn "ga-dzexg3i.1: $_fo_id: o desfazer NÃO se confirmou — a bead pode ainda estar com $_fo_alias; a próxima varredura tenta de novo (a vigia segue vendo a sessão morta)"
-  fi
-  # o MBP que perdeu uma sessão ao nascer esfria, com o desfazer confirmado ou não: a próxima bead não vai ao mesmo nó. O Hetzner não esfria (esta bead é só do MBP).
-  case "$_fo_alias" in
-    wa-worker-remote-mbp-*)
-      _fo_cool="${PILOT_MBP_COOL_SECS:-1800}"; case "$_fo_cool" in ''|*[!0-9]*) _fo_cool=1800 ;; esac
-      if _pilot_mbp_cool_set "$_fo_cool"; then log "  ga-dzexg3i.1: rota do MBP esfriada por ${_fo_cool}s (alias $_fo_alias perdeu a sessão $_fo_sid ao nascer)"; fi ;;
-  esac
-  return 0
-}
-
-# _pilot_node_failed_create_pass — a vigia, uma vez por varredura, depois do despacho. Para cada loja de WA e de PS lista as beads in_progress que trazem PILOT_NODE_SESSION_KEY, fica só com as de cara do nó (dono wa-/ps-worker-remote[-mbp]-N, marca =
-# dono, id da sessão de forma de id) e chama _pilot_node_failed_create_one em até PILOT_NODE_FC_MAX (6) delas. Uma linha de resumo só quando viu alguma bead. Sempre devolve 0.
-# vazio (nenhuma bead com a chave, ou rota do nó nunca usada) → nada, sem linha; falhou/ilegível (loja que não lista, JSON que não é array, prefixo sem loja no routes.jsonl) → essa loja fica de fora e conta como «ilegível» no resumo: nada é solto sem leitura.
-_pilot_node_failed_create_pass() {
-  local _fp_mode="${PILOT_NODE_FAILED_CREATE:-on}" _fp_sk _fp_max _fp_n=0 _fp_alive=0 _fp_seen=0 _fp_rel=0 _fp_held=0 _fp_unk=0 _fp_stale=0 _fp_stores="" _fp_pfx _fp_st _fp_lj="" _fp_rows="" _fp_id _fp_al _fp_sid
-  [ "$_fp_mode" != off ] || return 0
-  case "$_fp_mode" in
-    on|warn) ;;
-    *) warn "ga-dzexg3i.1: PILOT_NODE_FAILED_CREATE='$_fp_mode' não é on|warn|off — uso warn (só avisa, não escreve)"; _fp_mode=warn ;;
-  esac
-  [ -n "${GC_CITY:-}" ] || return 0
-  _fp_sk="${PILOT_NODE_SESSION_KEY:-pilot.node_session}"
-  _fp_max="${PILOT_NODE_FC_MAX:-6}"; case "$_fp_max" in ''|*[!0-9]*) _fp_max=6 ;; esac
-  for _fp_pfx in wa ps; do
-    # vazio (prefixo fora do routes.jsonl, pasta ausente) → loja desconhecida: fica de fora e conta; falhou/ilegível (routes.jsonl que o jq não lê) → o mesmo
-    _fp_st=$(_pilot_bead_home_store "$_fp_pfx-x") || _fp_st=""
-    if [ -z "$_fp_st" ]; then _fp_unk=$((_fp_unk + 1)); continue; fi
-    case " $_fp_stores " in *" $_fp_st "*) continue ;; esac
-    _fp_stores="$_fp_stores $_fp_st"
-    # vazio (bd sem saída) → não é array: conta como ilegível; falhou/ilegível (bd que falha ou estoura o prazo, JSON que não é array) → loja fora e contada, nada decidido
-    _fp_lj=$(timeout "${PILOT_NODE_FC_LIST_TIMEOUT:-30}" bd -C "$_fp_st" list --status in_progress --has-metadata-key "$_fp_sk" --json --limit 0 2>/dev/null) || _fp_lj=""
-    if ! printf '%s' "$_fp_lj" | jq -e 'type == "array"' >/dev/null 2>&1; then _fp_unk=$((_fp_unk + 1)); continue; fi
-    _fp_rows=$(printf '%s' "$_fp_lj" | jq -r --arg k "$_fp_sk" '
-        .[] | select(type == "object") | (.assignee // "") as $a | (.metadata["pilot.wa_node_alias"] // "") as $mk | (.metadata[$k] // "") as $s | (.id // "") as $id
-        | select($a | test("^(wa|ps)-worker-remote(-mbp)?-[0-9]+$")) | select($mk == $a) | select(($s | type) == "string" and ($s | test("^[A-Za-z0-9][A-Za-z0-9._-]*$"))) | select($id | test("^[A-Za-z0-9][A-Za-z0-9._-]*$"))
-        | [$id, $a, $s] | join("\u001f")' 2>/dev/null) || { _fp_unk=$((_fp_unk + 1)); continue; }
-    while IFS=$'\037' read -r _fp_id _fp_al _fp_sid; do
-      [ -n "$_fp_id" ] || continue
-      if [ "$_fp_n" -ge "$_fp_max" ]; then break; fi
-      _fp_n=$((_fp_n + 1))
-      _pilot_node_failed_create_one "$_fp_id" "$_fp_st" "$_fp_al" "$_fp_sid" "$_fp_mode" || true
-      case "${_FC_RESULT:-unknown}" in
-        alive) _fp_alive=$((_fp_alive + 1)) ;;
-        seen) _fp_seen=$((_fp_seen + 1)) ;;
-        released) _fp_rel=$((_fp_rel + 1)) ;;
-        held) _fp_held=$((_fp_held + 1)) ;;
-        stale) _fp_stale=$((_fp_stale + 1)) ;;
-        *) _fp_unk=$((_fp_unk + 1)) ;;
-      esac
-    done <<EOF_FCP
-$_fp_rows
-EOF_FCP
-  done
-  if [ "$_fp_n" -gt 0 ] || [ "$_fp_unk" -gt 0 ]; then
-    log "ga-dzexg3i.1: vigia do failed-create ($_fp_mode): $_fp_n bead(s) do nó com sessão guardada — vivas=$_fp_alive, failed-create soltas=$_fp_rel, vistas sem soltar=$_fp_seen, desfazer não confirmado=$_fp_held, mudaram=$_fp_stale, ilegíveis=$_fp_unk"
-  fi
   return 0
 }
 
@@ -19555,10 +19599,6 @@ fi
 if [ -n "${_PILOT_HALT:-}" ]; then
   log "ga-5je3zv: dispatch phase was HALTED this sweep (${_PILOT_HALT}) after $(( SECONDS - ${_PILOT_DISPATCH_T0:-$SECONDS} ))s; dispatched=$DISPATCHED — candidates not attempted stay story:approved for the next sweep."
 fi
-
-# ga-dzexg3i.1: a vigia do failed-create — olha a bead da sessão de cada bead do nó que a tem e solta a que nasceu morta (ver _pilot_node_failed_create_pass). Depois do despacho (nunca atrasa uma bead) e ANTES do resumo da carimbada, que fica colado no evento agregado.
-# falhou (a vigia nunca derruba a varredura: o `|| true` é do set -e; o que ela não leu ela já contou e avisou)
-_pilot_node_failed_create_pass || true
 
 # ga-w7qwl1.2.6: o resumo do passo da carimbada no MBP (uma linha de log + um evento), só com o passo ligado e antes do evento agregado, para uma falha adiante não o perder.
 if [ "${PILOT_WA_MBP_ROUTE:-off}" != off ]; then _pilot_mbp_stamped_summary; fi
