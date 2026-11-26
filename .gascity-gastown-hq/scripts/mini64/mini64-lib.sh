@@ -76,6 +76,18 @@ m64_carregado() {
   case "$rc" in (0) return 0;; (113) return 1;; (*) return 2;; esac
 }
 
+# m64_nao_carregados: dos plists da cidade em stdin (a saída de m64_classificados), imprime os que o launchctl diz NÃO carregados
+m64_nao_carregados() {
+  local l o st duvida=0
+  # vazio → nada impresso, rc 0 (todos carregados, ou nenhum plist); falhou/sem resposta → rc 2 e quem chama NÃO conclui "todos carregados"
+  while IFS=$'\t' read -r l _ o || [ -n "$l" ]; do
+    [ -n "$l" ] && [ "$o" != fora ] || continue
+    m64_carregado "$l" </dev/null; st=$?   # o </dev/null protege a lista do laço de um comando que leia a entrada
+    case "$st" in (0) ;; (1) printf '%s\n' "$l";; (*) duvida=1;; esac
+  done
+  return $((duvida * 2))
+}
+
 # m64_contar <texto>: linhas não vazias · m64_por_camada: resumo " [camada K: n]" da saída de m64_classificados em stdin
 m64_contar() { printf '%s\n' "$1" | awk 'NF { n++ } END { print n + 0 }'; }
 m64_por_camada() { awk -F'\t' 'NF && $3 != "fora" { print $2 }' | sort -n | uniq -c | awk '{ printf " [camada %s: %s]", $2, $1 }'; }

@@ -6,7 +6,7 @@
 #   @camada <N> <nome> <exige>    define a camada N; `exige` = a chave que carregar-camada.sh pede em --confirmo (ou -)
 #   @familia <prefixo> <N>        tudo que começa assim é da cidade: espera.sh o move, e sem linha própria ele carrega na camada N
 #   <prefixo> <N> <motivo>        linha própria (um label inteiro ou um começo de label)
-# REGRA: na dúvida, a camada 5 (a última). Plist do repo sem linha própria reprova mini64.selftest.sh; plist novo do WA cai na família.
+# REGRA: na dúvida, a camada 5 (a última). Sem linha própria reprovam mini64.selftest.sh: plist ou template de plist do repo (S6), job da política wait-for-dolt (S8b) e o túnel do post-check (S8c; o sender dele tem de cair na camada 5). Plist novo do WA cai na família.
 # A tabela é lida INTEIRA: linha fora do formato recusa a tabela (rc 2), nunca é pulada.
 #
 # CAMADAS
@@ -86,6 +86,20 @@ com.gascity.supervisor	1	supervisor do motor
 com.gascity.throughput-stall-watchdog	1	guarda do motor
 com.gascity.town-root-reconciler	1	guarda do motor
 com.gascity.worktree-reaper	1	faxina de worktrees
+# jobs do HQ sem plist rastreado no repo, que a política wait-for-dolt.policy.tsv lista (o selftest S8b exige linha própria para todos os dela)
+com.gascity.adhoc-session-reaper	1	faxina de sessões adhoc
+com.gascity.config-drift-watcher	1	guarda do motor (KeepAlive)
+com.gascity.funnel-flow-healer	1	healer do fluxo refino→gate
+com.gascity.git-lock-hygiene	1	faxina de locks do git
+com.gascity.lifecycle-correctness-auditor	1	auditor bead↔git
+com.gascity.pool-autoscale-watchdog	1	guarda do pool (KeepAlive)
+com.gascity.suavez-first-watch	1	avisa na 1ª bead em needs-approval
+com.gascity.wa-beads-config-guard	1	guarda do rig do WA
+com.gascity.wa-root-main-guard	1	guarda do rig do WA
+com.gascity.wisp-	1	faxina de wisps (wisp-reaper e wisp-table-reaper)
+# e dois que a política não lista: o template do teto do pool (o selftest S6 o cobre) e o gate (quality-gate-guard, que o city-health-sentinel reinicia, e o avaliador semanal)
+com.gascity.pool-ceiling-engine	1	teto dinâmico do pool (só existe como .plist.template; instalar é do Mayor)
+com.gascity.quality-gate-	1	gate: guarda e avaliador semanal (o dispatcher tem linha própria acima)
 #
 # CAMADA 2 — backups e cópias para fora (só depois que o servidor antigo foi aposentado: fatia .4)
 com.gascity.dolt-s3-backup	2	backup do Dolt no S3
@@ -97,6 +111,8 @@ com.whatsapp.dolthub-backup	2	backup no DoltHub
 com.whatsapp.pipedrive-recents-backup	2	backup do Pipedrive
 com.urblink.backup-	2	backup do health.db
 com.urblink.sync-critical-dbs	2	cópia horária dos bancos críticos
+com.athos.mini-restic-	2	backup diário do mini (restic) e restore de prova mensal
+com.athos.claude-history-backup	2	backup do histórico do Claude
 #
 # CAMADA 3 — painéis só-leitura e apoio (nada que fale com lead)
 com.gascity.hetzner-	3	apoio ao nó Hetzner (espelho, ssh, auditoria)
@@ -128,9 +144,11 @@ com.urblink.chip-kpi-dashboard	3	painel
 com.urblink.dashboard-availability-probe	3	sonda de disponibilidade dos painéis
 br.urblink.motherduck-dashboard	3	painel
 #
-# CAMADA 4 — cloudflared (UM conector só; o label real do mini não está em nenhum repo: confira com ls ~/Library/LaunchAgents | grep -i cloudflare)
-com.cloudflare.cloudflared	4	cloudflared instalado por `cloudflared service install` (label provável)
-homebrew.mxcl.cloudflared	4	cloudflared via brew services (label provável)
+# CAMADA 4 — cloudflared (UM conector só). O PLIST do túnel não está em nenhum repo, mas o LABEL está: TUNNEL_LABEL de scripts/nightly-reboot-postcheck.sh, que o confere no pós-boot noturno; o selftest S8c lê dele
+br.urblink.cloudflared.urblink-ops	4	o túnel urblink-ops (sem esta linha ele cairia na camada 5, com os envios)
+com.cloudflare.cloudflared	4	palpite, sem plist visto em repo: cloudflared instalado por `cloudflared service install`
+homebrew.mxcl.cloudflared	4	palpite, sem plist visto em repo: cloudflared via brew services
 com.gascity.cloudflared-	4	reconciliador de DNS do túnel
 #
-# CAMADA 5 — envios WhatsApp e ligações: é o padrão das famílias, não precisa de linha própria
+# CAMADA 5 — envios WhatsApp e ligações: é o padrão das famílias; linha própria só onde há o que explicar
+com.gascity.city-night-window	5	suspende/retoma a cidade; a política wait-for-dolt o dá como DESLIGADO hoje: confira se o antigo o tinha carregado antes de subir

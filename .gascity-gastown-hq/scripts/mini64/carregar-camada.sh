@@ -8,7 +8,7 @@
 # A camada N é o que camadas.tsv manda para N: o que está na espera volta para ~/Library/LaunchAgents e é carregado com `bootstrap gui/<uid>`, em
 # ordem alfabética; o que já voltou é conferido (já carregado = nada a fazer), então rodar de novo é seguro. Nada é apagado nem sobrescrito.
 # RECUSA (rc 1, nada muda): camada que a tabela não define · espera desligada (sem marcador) · plist de camada ANTERIOR ainda na espera (a ordem é
-#   dolt, motor, backups, painéis, cloudflared, envios) · plist de camada POSTERIOR já solto em LaunchAgents (rode espera.sh ligar --aplicar) ·
+#   dolt, motor, backups, painéis, cloudflared, envios) · plist de camada POSTERIOR já solto em LaunchAgents (rode espera.sh ligar --aplicar --confirmo mini-novo) ·
 #   camada com `exige` na tabela e sem --confirmo <chave> (backups e envios: servidor antigo aposentado; cloudflared: conector antigo parado).
 # SAÍDA: 0 feito (ou prévia) · 1 recusado · 2 não sei (uma leitura falhou) · 3 feito com falha: plist que não voltou ou não carregou, ou sem resposta.
 set -uo pipefail
@@ -37,7 +37,7 @@ recusar() { echo "carregar-camada $N ($nome): RECUSADO: $1" >&2; exit 1; }
 
 case "$(m64_marcador)" in
   (sim) ;;
-  (nao) recusar "a espera não está ligada (sem $M64_MARCADOR): não há o que devolver; rode espera.sh ligar --aplicar";;
+  (nao) recusar "a espera não está ligada (sem $M64_MARCADOR): não há o que devolver; rode espera.sh ligar --aplicar --confirmo mini-novo";;
   (*) echo "carregar-camada: o marcador $M64_MARCADOR existe e não dá para ler; nada foi feito" >&2; exit 2;;
 esac
 # vazio → nada na espera / nada solto; falhou/ilegível → rc 2: não decido o plano sem ter lido os dois lados
@@ -47,7 +47,7 @@ agt="$(m64_classificados "$M64_AGENTS")" || { echo "carregar-camada: não conseg
 ant="$(printf '%s\n' "$esp" | awk -F'\t' -v n="$N" 'NF && $3 != "fora" && $2 + 0 < n + 0' | m64_por_camada)"
 [ -z "$ant" ] || recusar "ainda há plists de camada anterior na espera:$ant; carregue as camadas na ordem"
 adi="$(printf '%s\n' "$agt" | awk -F'\t' -v n="$N" 'NF && $3 != "fora" && $2 + 0 > n + 0 { print $1 }')"
-[ -z "$adi" ] || recusar "$(m64_contar "$adi") plists de camada posterior estão soltos em LaunchAgents (carregariam no próximo login); rode espera.sh ligar --aplicar"
+[ -z "$adi" ] || recusar "$(m64_contar "$adi") plists de camada posterior estão soltos em LaunchAgents (carregariam no próximo login); rode espera.sh ligar --aplicar --confirmo mini-novo"
 if [ "$exige" != "-" ] && [ "$conf" != "$exige" ]; then recusar "esta camada exige --confirmo $exige (o fato que a tabela cita para ela; ver o runbook)"; fi
 
 volta="$(printf '%s\n' "$esp" | awk -F'\t' -v n="$N" 'NF && $3 != "fora" && $2 + 0 == n + 0 { print $1 }')"
