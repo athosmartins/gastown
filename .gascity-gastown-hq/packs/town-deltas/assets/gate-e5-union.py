@@ -20,7 +20,8 @@ DEDUPE — what counts as "the same issue" (the bead says "por arquivo+linha+cla
     (Jaccard: shared / union) reaches the threshold. A symmetric measure on purpose: overlap
     divided by the SMALLER side lets a terse finding be swallowed whole by a long one about
     another defect that merely names the same identifier. If BOTH issues carry an explicit
-    "class: <x>" tag and the tags differ, that decides it: not duplicates.
+    "class: <x>" tag and the tags differ, that decides it: not duplicates. The gate's own root-class:<name> label (ga-mw5gdyu.5: every reviewer now ends a blocking issue with one) is metadata for the
+    refusal meter, not part of the defect: it is taken out of the description and is never read as that "class:" tag, so labelling an issue does not change what merges.
   * thresholds are deliberately conservative: a false MERGE hides a real finding behind another
     issue's text (harmful); a false KEEP only shows the same defect twice (harmless). Measured on
     the fixtures of gate-e5-second-reviewer.selftest.sh: different defects in one file score
@@ -60,7 +61,8 @@ VERDICT_LINE_RE = re.compile(r'^[ \t]*VERDICT[ \t]*:[ \t]*FAIL\b[ \t]*[-—–:,
 CITE_RE = re.compile(
     r'(?<![\w/.-])((?:[\w.-]+/)*[\w.-]+\.(?:py|sh|js|jsx|ts|tsx|toml|json|md|yaml|yml|html|css|sql|go|plist|txt|cfg|ini))'
     r'(?::(\d+)(?:-(\d+))?)?', re.I)
-CLASS_TAG_RE = re.compile(r'\bclass[ \t]*:[ \t]*([A-Za-z0-9_.\- ]{1,40}?)(?=[,);:\]]|$)', re.I)
+CLASS_TAG_RE = re.compile(r'(?<![\w-])class[ \t]*:[ \t]*([A-Za-z0-9_.\- ]{1,40}?)(?=[,);:\]]|$)', re.I)   # not after a hyphen: root-class:<name> is the gate's label, not this tag
+ROOT_CLASS_RE = re.compile(r'\broot-class:[A-Za-z0-9][A-Za-z0-9_-]*')   # the label as gate-root-class.py reads it; the union runs BEFORE the audit, on what the reviewer wrote
 TOKEN_RE = re.compile(r'[A-Za-z_][A-Za-z0-9_]{3,}')
 STOPWORDS = frozenset("""
 this that with from have which because there their then than when where while would could should
@@ -156,8 +158,8 @@ def cite_strength(ca, cb):
 def description_of(body):
     """The defect description: the issue text without its 'Blocking issue N' header and without
     any file citation (path tokens say WHERE, not WHAT — and two different defects in one file
-    share every one of them)."""
-    return CITE_RE.sub(" ", ISSUE_RE.sub("", body, count=1))
+    share every one of them) and without the gate's root-class:<name> label (its words, root class error empty..., are not the defect and would be shared by every pair labelled alike)."""
+    return CITE_RE.sub(" ", ROOT_CLASS_RE.sub(" ", ISSUE_RE.sub("", body, count=1)))
 
 
 def tokens_of(body):

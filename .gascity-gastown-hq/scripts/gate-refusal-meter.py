@@ -8,9 +8,11 @@ MEASURES  (window = --days, default 7, ending --now)
   refusal         a FAIL in the window whose reason is a reviewer's ("Reviewer ..."). Other FAILs (merge after all-PASS, bead closed) are counted apart: nobody rejected the code.
   class           every root-class:<name> in the BLOCKING part of the gate-run comment (HQ store) — all classes, not one. A refusal naming two classes counts once in each; with none it is "sem rótulo" and is
                   grouped by the title of each of its blocking issues (the verdict's own words, normalised). A refusal whose comment cannot be read is "sem leitura": neither labelled nor unlabelled.
+  weekly          (ga-mw5gdyu.5) the labelled fraction per 7-day cell back from --now, oldest first: labelled / (labelled + unlabelled); a refusal whose comment could not be read is in `unread` and in no fraction;
+                  a cell with nothing read is "sem dado", never 0%. Display only: what a refusal counts as (labelled / unlabelled / unread) is decided exactly as before.
   inventory       beads carrying root-class:<name>, per store of `gc rig list` (never a hardcoded list), for the classes seen above + error-vs-empty + --class; labelled beads, NOT refusals (see root-class-count.sh).
 THREE STATES everywhere: measured / "sem dado" / NÃO MEDIDO (a log, store, command or comment that could not be read is never 0). `complete` is false and `gaps` says why whenever anything was not measured.
-EVALUATOR  json.evaluator.sha256 is the hash of THIS file: a comparison between two runs is only valid when it is equal; a later slice that edits this script changes it.
+EVALUATOR  json.evaluator.sha256 is the hash of THIS file: a comparison between two runs is only valid when it is equal; a later slice that edits this script changes it (ga-mw5gdyu.5 did: the hash moved when `weekly` was added).
 EXIT  0 report printed (cells may be NÃO MEDIDO) · 1 --save could not write (the report was still printed) · 2 NÃO SEI: the gate log is absent, unreadable or has no usable row (nothing is counted) · 64 usage."""
 import argparse
 import concurrent.futures
@@ -28,6 +30,7 @@ SCHEMA, MIN_N, TOP, WORKERS, CALL_TIMEOUT = 1, 5, 10, 8, 60
 DEFAULT_CITY = "/Users/athos/gt/.gascity-gastown-hq"
 USAGE = "uso: gate-refusal-meter.py [--days N>=1] [--now YYYY-MM-DDTHH:MM:SSZ] [--city DIR] [--class NOME ...] [--json] [--save]"
 UTC = datetime.timezone.utc
+WEEK = datetime.timedelta(days=7)
 TS_RE = re.compile(r'"ts"\s*:\s*"(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ)"')
 NAME = r"[a-z0-9](?:[a-z0-9_-]*[a-z0-9])?"
 CLASS_RE = re.compile(r"root-class:(%s)" % NAME)
@@ -150,22 +153,44 @@ def title_key(title):
     return " ".join(re.findall(r"[a-z]+", unicodedata.normalize("NFKD", t).encode("ascii", "ignore").decode().lower())[:8])
 
 
-def classify(refs, bd, city):
-    """refs: reviewer rejections [(t, i, row)] in time order. -> the `refusals` block: classes by label, unlabelled grouped by words, unread apart."""
+def weekly(items, lo, now):
+    """items: [(t, labeled|unlabeled|unread)] -> one cell per 7 days back from `now`, OLDEST first, the oldest clipped by the window. A refusal exactly 7 days old is the older cell's, `lo` itself the oldest's."""
+    # vazio → every cell "sem dado" (a week with no refusal read is not 0%); a refusal whose comment could not be read stays in `unread` and in NO fraction: pct = labeled / (labeled + unlabeled)
+    k = -(-(now - lo) // WEEK)
+    cells = [{"labeled": 0, "unlabeled": 0, "unread": 0} for _ in range(k)]
+    for ts, st in items:
+        cells[min((now - ts) // WEEK, k - 1)][st] += 1
+    out = []
+    for i in range(k - 1, -1, -1):
+        c = cells[i]
+        n = c["labeled"] + c["unlabeled"]
+        out.append(dict(c, n=n, pct=round(100.0 * c["labeled"] / n, 1) if n else None, state="sem dado" if n == 0 else "n<5" if n < MIN_N else "ok", **{"from": iso(max(lo, now - WEEK * (i + 1))), "to": iso(now - WEEK * i)}))
+    return out
+
+
+def week_cell(w):
+    frac = {"sem dado": "sem dado", "n<5": "n<5 (%d/%d)" % (w["labeled"], w["n"])}.get(w["state"]) or "%.0f%% (%d/%d)" % (w["pct"], w["labeled"], w["n"])
+    return "%s→%s %s%s" % (w["from"][5:10], w["to"][5:10], frac, " +%d SEM LEITURA" % w["unread"] if w["unread"] else "")
+
+
+def classify(refs, bd, city, lo, now):
+    """refs: reviewer rejections [(t, i, row)] in time order. -> the `refusals` block: classes by label, unlabelled grouped by words, unread apart, the labelled fraction per week."""
     gr = lambda d: d["gate_run"] if isinstance(d.get("gate_run"), str) else ""  # noqa: E731
     runs = sorted({gr(d) for _, _, d in refs} - {""})
     with concurrent.futures.ThreadPoolExecutor(max_workers=WORKERS) as ex:
         parts = dict(zip(runs, ex.map(lambda r: read_part(bd, city, r, CALL_TIMEOUT), runs)))
-    classes, groups, unread, labeled = {}, {}, [], 0
-    for _, _, d in refs:
+    classes, groups, unread, labeled, items = {}, {}, [], 0, []
+    for ts, _, d in refs:
         # vazio → no gate_run to ask about: unread (listed by bead), never "unlabelled"; falhou → parts[run] is None, the same
         part = parts.get(gr(d))
         if part is None:
             unread.append(gr(d) or "bead:" + d["bead"])
+            items.append((ts, "unread"))
             continue
         rig = d["rig"] if isinstance(d.get("rig"), str) and d["rig"] else "unknown"
         names = sorted(set(CLASS_RE.findall(part)))
         labeled += bool(names)
+        items.append((ts, "labeled" if names else "unlabeled"))
         for n in names:
             c = classes.setdefault(n, {"refusals": 0, "beads": set(), "rigs": {}})
             c["refusals"], c["rigs"][rig] = c["refusals"] + 1, c["rigs"].get(rig, 0) + 1
@@ -175,7 +200,7 @@ def classify(refs, bd, city):
             g["refusals"] += 1
     top = sorted(groups.values(), key=lambda g: (-g["refusals"], g["key"]))
     return {"total": len(refs), "labeled": labeled, "unlabeled": len(refs) - len(unread) - labeled, "unread": len(unread), "unread_runs": sorted(unread), "unlabeled_groups_total": len(groups), "unlabeled_groups": top[:TOP],
-            "classes": {n: dict(c, beads=len(c["beads"])) for n, c in sorted(classes.items())}}
+            "classes": {n: dict(c, beads=len(c["beads"])) for n, c in sorted(classes.items())}, "weekly": weekly(items, lo, now)}
 
 
 def rig_stores(gc):
@@ -270,7 +295,7 @@ def measure(args, now):
     fails = [x for x in vs if lo <= x[0] <= now and x[2]["result"] == "FAIL"]
     # vazio → a FAIL with no reason is not a reviewer's rejection (it lands in other_fail, as in third-state-report.py); the reason is the dispatcher's own first line, "Reviewer N FAIL: ..." for a rejection
     rev = [x for x in fails if str(x[2].get("reason", "")).startswith("Reviewer")]
-    rep["refusals"] = dict(classify(rev, args.bd, args.city), other_fail=len(fails) - len(rev))
+    rep["refusals"] = dict(classify(rev, args.bd, args.city, lo, now), other_fail=len(fails) - len(rev))
     if rep["refusals"]["unread"]:
         rep["gaps"].append("%d recusa(s) SEM LEITURA do comentário do gate-run: não entram em classe nem em sem-rótulo" % rep["refusals"]["unread"])
     inv = rep["inventory"] = inventory(args, lo, now, rep["refusals"]["classes"])
@@ -292,6 +317,7 @@ def render(rep):
     out, r, inv = [rep["line"]], rep["refusals"], rep["inventory"]
     if r is None:
         return out
+    out.append("  rotuladas por semana (só as lidas): " + " · ".join(map(week_cell, r["weekly"])))
     out += ["  classe %-32s %3d recusa(s) em %d bead(s)" % (n, c["refusals"], c["beads"]) for n, c in sorted(r["classes"].items(), key=lambda x: (-x[1]["refusals"], x[0]))]
     out += ["  sem rótulo %3d× %s (ex.: %s)" % (g["refusals"], g["key"], g["example"]["bead"]) for g in r["unlabeled_groups"]]
     if r["unlabeled_groups_total"] > len(r["unlabeled_groups"]):
