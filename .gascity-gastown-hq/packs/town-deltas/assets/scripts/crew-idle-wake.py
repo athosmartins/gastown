@@ -280,9 +280,17 @@ def passada(dry: bool = False, run=rodar, agora=None) -> int:
         # isso: a própria ordem injetada muda a tela, e o teto de tentativas nunca dispararia.
         prog = max(str(b.get("updated_at") or "") for b in minhas if b["id"] in trabalho)
         # gate ga-z3s8i5y: com algum store ilegível o `prog` só vê parte das beads — «mudou» pode ser só a bead que não veio.
-        # «A bead andou» (e o episódio recomeçar) só com TODOS os stores lidos; senão vale o prog gravado.
-        if st.get("prog") != prog and (not ilegiveis or "prog" not in st):
-            st = {"prog": prog, "tentativas": 0, "avisado": False}
+        # «A bead andou» (e o episódio recomeçar) só com TODOS os stores lidos E um prog gravado completo; senão vale o gravado.
+        # gate ga-anzip7u: episódio que nasce com store ilegível grava o prog como «parcial»; quando todos os stores leem,
+        # adota o prog completo SEM zerar tentativas/avisado (subir ali é a bead que não veio, não a bead que andou).
+        if "prog" not in st:
+            st = {"prog": prog, "tentativas": 0, "avisado": False, "parcial": bool(ilegiveis)}
+        elif st.get("parcial"):
+            if not ilegiveis:
+                st.update({"prog": prog, "parcial": False})
+                gravar_estado(sess, st)
+        elif st.get("prog") != prog and not ilegiveis:
+            st = {"prog": prog, "tentativas": 0, "avisado": False, "parcial": False}
         if estado != "ociosa" or st.get("sig") != sig:
             # tela mudou (ou não está ociosa): só o relógio da ociosidade recomeça; as tentativas seguem até a bead andar
             st.update({"sig": sig, "desde": agora} if estado == "ociosa" else {"sig": None, "desde": agora})

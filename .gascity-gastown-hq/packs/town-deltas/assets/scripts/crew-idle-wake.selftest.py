@@ -308,6 +308,22 @@ for k in range(11, 40):
     ciw.passada(run=r, agora=1000 + k * 601)
 ordens = [e for e in r.enviados if e[1] != "Enter"]
 check(len(ordens) == 3 and len(r.mails) == 1, "11b. com o store de volta: nenhuma ordem nem mail a mais")
+
+# 11c. gate ga-anzip7u — ordem inversa: o store da bead mais nova está fora DESDE a 1ª passada e volta depois do teto; o
+# prog parcial não pode virar «a bead andou» → 3 ordens e 1 mail no total
+limpa()
+r = Runner3(["oracle-wa-gawispgux5v0"], [], {"oracle-wa-gawispgux5v0": OCIOSA})
+r.cai = True
+for k in range(10):
+    ciw.passada(run=r, agora=1000 + k * 601)
+check(ciw.ler_estado("oracle-wa-gawispgux5v0").get("tentativas") == 3, "11c. com o store fora: o episódio chega ao teto")
+r.cai = False
+for k in range(10, 45):
+    ciw.passada(run=r, agora=1000 + k * 601)
+ordens = [e for e in r.enviados if e[1] != "Enter"]
+check(len(ordens) == 3 and len(r.mails) == 1, "11c. store volta depois do teto: nenhuma ordem nem mail a mais")
+fim = ciw.ler_estado("oracle-wa-gawispgux5v0")
+check(fim.get("prog") == "2026-11-26T09:00:00Z" and not fim.get("parcial"), "11c. com todos lidos o prog completo é adotado")
 ciw.STORES = [str(TMP)]
 
 # 7. pool fica de fora; Mayor casa por «gastown.mayor» → «gastown__mayor»
