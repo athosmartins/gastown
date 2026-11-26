@@ -37,21 +37,31 @@ def check(cond, nome):
 
 
 class Runner:
-    def __init__(self, sess, beads, telas, falha_tmux=False, falha_bd=False):
+    def __init__(self, sess, beads, telas, falha_tmux=False, falha_bd=False, falha_mail=False, falha_keys=False):
         self.sess, self.beads, self.telas = sess, beads, telas
         self.falha_tmux, self.falha_bd, self.enviados, self.mails = falha_tmux, falha_bd, [], []
+        self.falha_mail, self.falha_keys, self.mails_tentados = falha_mail, falha_keys, 0
 
     def __call__(self, cmd, timeout=30):
-        if cmd[:2] == ["tmux", "ls"]:
-            return (None, "", "") if self.falha_tmux else (0, "\n".join(self.sess), "")
+        if cmd[0] == "tmux":
+            # gate ga-lw03yn6: toda chamada tmux vai pro servidor da cidade (-L gascity), nunca pro padrão
+            assert cmd[1:3] == ["-L", "gascity"], f"tmux sem o socket da cidade: {cmd}"
+            sub = cmd[3]
+            if sub == "ls":
+                return (None, "", "") if self.falha_tmux else (0, "\n".join(self.sess), "")
+            if sub == "capture-pane":
+                return 0, self.telas[cmd[cmd.index("-t") + 1]], ""
+            if sub == "send-keys":
+                if self.falha_keys:
+                    return 1, "", "can't find pane"
+                self.enviados.append((cmd[cmd.index("-t") + 1], cmd[-1]))
+                return 0, "", ""
         if cmd[0] == "bd":
             return (1, "", "dolt down") if self.falha_bd else (0, json.dumps(self.beads), "")
-        if cmd[:2] == ["tmux", "capture-pane"]:
-            return 0, self.telas[cmd[cmd.index("-t") + 1]], ""
-        if cmd[:2] == ["tmux", "send-keys"]:
-            self.enviados.append((cmd[3], cmd[-1]))
-            return 0, "", ""
         if cmd[:3] == ["gc", "mail", "send"]:
+            self.mails_tentados += 1
+            if self.falha_mail:
+                return 1, "", "dolt down"
             self.mails.append(cmd[cmd.index("-s") + 1])
             return 0, "", ""
         raise AssertionError(cmd)
@@ -150,6 +160,42 @@ ciw.passada(run=r, agora=1000 + 700)
 check(r.enviados == [], "6e. estado corrompido: o relógio recomeça, nenhuma ordem por palpite")
 ciw.passada(run=r, agora=1000 + 1400)
 check(len(r.enviados) == 2, "6f. e 10 min depois a ordem sai normalmente")
+
+# 8. gate ga-lw03yn6 — tela que o vigia não reconhece nunca recebe ordem; «Try "..."» é caixa vazia
+for nome, t in (("vazia", ""), ("shell", "athos@mini ~ % \n"), ("transcript", "  ⎿ Read 1 file\n  ⎿ Ran 2 commands\n")):
+    check(ciw.estado_da_tela(t) == "desconhecida", f"8a. tela {nome}: desconhecida")
+check(ciw.estado_da_tela('───────\n❯ Try "fix lint errors"\n───────\n') == "ociosa", "8b. «Try ...» de conversa sem turno = caixa vazia")
+check(ciw.estado_da_tela("───────\n❯ 1. Sim\n  2. Não\n") == "pergunta", "8c. menu numerado = pergunta")
+check(ciw.estado_da_tela(OCIOSA.replace("bypass permissions on", "bypass permissions on · 2 shells")) == "ocupada",
+      "8d. trabalho de fundo no rodapé = ocupada")
+limpa()
+r = Runner(["oracle-wa-gawispgux5v0"], [ORACLE], {"oracle-wa-gawispgux5v0": "athos@mini ~ % "})
+for k in range(4):
+    ciw.passada(run=r, agora=1000 + k * 700)
+check(r.enviados == [], "8e. pane de shell parado: nenhuma ordem")
+
+# 9. gate ga-lw03yn6 — dry-run não grava estado
+limpa()
+ciw._DRY = True
+r = Runner(["oracle-wa-gawispgux5v0"], [ORACLE], {"oracle-wa-gawispgux5v0": OCIOSA})
+for k in range(5):
+    ciw.passada(dry=True, run=r, agora=1000 + k * 700)
+ciw._DRY = False
+check(not list((TMP / "st").glob("*.json")) and r.enviados == [] and r.mails == [], "9. dry-run: nenhum estado, nenhuma tecla, nenhum mail")
+
+# 10. gate ga-lw03yn6 — mail que falhou não marca avisado (tenta de novo); send-keys que falhou não conta
+limpa()
+r = Runner([], [ORACLE], {}, falha_bd=True, falha_mail=True)
+r.sess = ["oracle-wa-gawispgux5v0"]
+for k in range(7):
+    ciw.passada(run=r, agora=1000 + k * 700)
+check(r.mails_tentados >= 2 and r.mails == [], "10a. mail «cego» que falhou é tentado de novo na passada seguinte")
+limpa()
+r = Runner(["oracle-wa-gawispgux5v0"], [ORACLE], {"oracle-wa-gawispgux5v0": OCIOSA}, falha_keys=True)
+for k in range(8):
+    ciw.passada(run=r, agora=1000 + k * 700)
+check(r.mails == [] and not ciw.ler_estado("oracle-wa-gawispgux5v0").get("tentativas"),
+      "10b. send-keys que falha não conta tentativa nem dispara o mail de «não reage»")
 
 # 7. pool fica de fora; Mayor casa por «gastown.mayor» → «gastown__mayor»
 check(ciw.e_pool("wa-worker-adhoc-0cad1bdf00") and ciw.e_pool("dog-ga2695nnf"), "7a. pools fora do vigia")

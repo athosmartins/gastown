@@ -40,6 +40,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import subprocess
 import sys
 import time
@@ -59,8 +60,18 @@ BLIND_ALARM_PASSES = 5
 POOL_PREFIXES = ("wa-worker", "ps-worker", "dog", "gastown.dog", "gate-reviewer", "kimi-worker", "refine")
 NAO_PENDENTE_PREFIXOS = ("next-action:", "waiting-on:", "blocked")
 NAO_PENDENTE_EXATOS = {"gate:queued", "gate:reviewing", "gate:merging", "gate:passed"}
-BUSY = "esc to interrupt"
-PERGUNTA_ABERTA = ("Enter to select", "Do you want to proceed?")
+# toda sessão do gc (Mayor e crews) vive no servidor tmux da cidade, não no padrão (gate ga-lw03yn6): sob o launchd não há $TMUX
+TMUX = [os.environ.get("CREW_IDLE_WAKE_TMUX") or "tmux", "-L", os.environ.get("CREW_IDLE_WAKE_TMUX_SOCKET") or "gascity"]
+# leitura da tela = a MESMA da camada 1 (boot-first-turn.py, ga-esorlre.13), que veio do nightly-session-compact.py
+_DUR = r"([0-9]+h[ \t]+)?([0-9]+m[ \t]+)?[0-9]+s"
+_GLYPH = r"(✻|✽|✳|✶|✢|✺|✹|·|\*)"
+DIALOG_RE = re.compile(r"Do you want to proceed\?|requires confirmation|Enter to select|Esc to cancel")
+BUSY_RE = re.compile(r"(…|\.\.\.)[^(]*\(" + _DUR + "|esc to interrupt")
+SPIN_RE = re.compile(r"^\s*" + _GLYPH + r"\s+\S+(…|\.\.\.)", re.M)
+FOOT_RE = re.compile(r"\b\d+ (?:shells?|bash(?:es)?|tasks?|monitors?)\b")
+MENU_RE = re.compile(r"^\s*❯\s*\d+\.\s")
+PLACEHOLDER_RE = re.compile(r'^Try ".*"$')   # a sugestão de conversa sem turno: caixa VAZIA
+_DRY = False      # --dry-run: nada é gravado no estado (gate ga-lw03yn6: o ensaio consumia o alarme real)
 
 
 def log(msg: str) -> None:
@@ -87,7 +98,7 @@ def rodar(cmd, timeout=30):
 
 def sessoes_tmux(run=rodar):
     """Nomes das sessões tmux. vazio → [] (nenhuma sessão); falhou/ilegível → None (não sei)."""
-    rc, out, err = run(["tmux", "ls", "-F", "#{session_name}"], timeout=15)
+    rc, out, err = run([*TMUX, "ls", "-F", "#{session_name}"], timeout=15)
     if rc == 0:
         return [l.strip() for l in out.splitlines() if l.strip()]
     return [] if rc is not None and ("no server running" in err or "no sessions" in err) else None
@@ -107,7 +118,7 @@ def beads_em_andamento(store, run=rodar):
 
 def tela(sess, run=rodar):
     """As últimas 40 linhas do pane. vazio → "" (pane sem texto); falhou → None."""
-    rc, out, _ = run(["tmux", "capture-pane", "-p", "-t", sess, "-S", "-40"], timeout=15)
+    rc, out, _ = run([*TMUX, "capture-pane", "-p", "-t", sess, "-S", "-40"], timeout=15)
     return out if rc == 0 else None
 
 
@@ -132,24 +143,25 @@ def pendente(bead: dict) -> bool:
     return not any(l.startswith(NAO_PENDENTE_PREFIXOS) for l in labels)
 
 
-def caixa_de_entrada(texto: str) -> str:
-    """O que está digitado na caixa do prompt («❯ …» entre as duas réguas). Sem caixa achada → ""."""
-    linhas = texto.splitlines()
-    for i in range(len(linhas) - 1, -1, -1):
-        l = linhas[i]
-        if l.startswith("❯"):
-            return l[1:].strip()
-    return ""
-
-
 def estado_da_tela(texto: str) -> str:
-    """'ocupada' | 'pergunta' | 'digitando' | 'ociosa'."""
-    if BUSY in texto:
-        return "ocupada"
-    if any(m in texto for m in PERGUNTA_ABERTA):
+    """'ociosa' SÓ com o prompt do Claude à vista, nada rodando, nenhum diálogo, caixa vazia (a sugestão «Try "..."» conta
+    como vazia) e nenhum trabalho de fundo no rodapé. Senão: 'ocupada' | 'pergunta' | 'digitando' | 'desconhecida' (tela que
+    o vigia não soube ler — pane vazio, shell, transcript: nunca recebe ordem). Mesmas regras de boot-first-turn.read_pane."""
+    linhas = [x.rstrip() for x in texto.splitlines() if x.strip()]
+    prompt = next((x for x in reversed(linhas) if x.lstrip().startswith("❯")), None)
+    if DIALOG_RE.search("\n".join(linhas[-12:])):
         return "pergunta"
-    if caixa_de_entrada(texto):
+    if BUSY_RE.search(texto):
+        return "ocupada"
+    if SPIN_RE.search(texto) or prompt is None:
+        return "desconhecida"
+    if MENU_RE.match(prompt):
+        return "pergunta"
+    rascunho = prompt.lstrip()[1:].strip()
+    if rascunho and not PLACEHOLDER_RE.match(rascunho):
         return "digitando"
+    if any("·" in x and FOOT_RE.search(x) for x in linhas[-3:]):
+        return "ocupada"
     return "ociosa"
 
 
@@ -177,27 +189,34 @@ def ler_estado(nome: str) -> dict:
 
 
 def gravar_estado(nome: str, st: dict) -> None:
+    if _DRY:
+        return
     STATE_DIR.mkdir(parents=True, exist_ok=True)
     (STATE_DIR / f"{nome}.json").write_text(json.dumps(st))
 
 
-def mail_mayor(assunto: str, corpo: str, dry: bool, run=rodar) -> None:
+def mail_mayor(assunto: str, corpo: str, dry: bool, run=rodar) -> bool:
+    """True só se o mail SAIU. Falhou → False e quem chama NÃO marca como avisado (tenta de novo na próxima passada)."""
     if dry:
         log(f"DRY-RUN mail ao Mayor: {assunto}")
-        return
+        return False
     rc, _, _ = run(["gc", "mail", "send", "mayor/", "-s", assunto, "-m", corpo], timeout=60)
     if rc != 0:
-        log(f"mail ao Mayor FALHOU ({assunto}) — avisar à mão")
+        log(f"mail ao Mayor FALHOU ({assunto}) — tento de novo na próxima passada")
+        return False
+    return True
 
 
 def injetar(sess: str, texto: str, dry: bool, run=rodar) -> bool:
     if dry:
         log(f"DRY-RUN injetaria em {sess}: {texto[:90]}…")
         return True
-    rc1, _, _ = run(["tmux", "send-keys", "-t", sess, "-l", texto], timeout=15)
+    rc1, _, _ = run([*TMUX, "send-keys", "-t", sess, "-l", texto], timeout=15)
+    if rc1 != 0:
+        return False      # o texto não entrou: nem tenta o Enter
     time.sleep(1)
-    rc2, _, _ = run(["tmux", "send-keys", "-t", sess, "Enter"], timeout=15)
-    return rc1 == 0 and rc2 == 0
+    rc2, _, _ = run([*TMUX, "send-keys", "-t", sess, "Enter"], timeout=15)
+    return rc2 == 0
 
 
 # ───────────────────────────── passada ─────────────────────────────
@@ -212,8 +231,8 @@ def passada(dry: bool = False, run=rodar, agora=None) -> int:
         gravar_estado("_cego", {"passadas": n, "avisado": cego.get("avisado", False)})
         log(f"NÃO SEI: tmux={'falhou' if sess_list is None else 'ok'}, stores ilegíveis — nenhuma injeção ({n} seguida(s))")
         if n >= BLIND_ALARM_PASSES and not cego.get("avisado"):
-            mail_mayor("crew-idle-wake cego", f"{n} passadas seguidas sem ler tmux/beads: crew parada não seria acordada.", dry, run)
-            gravar_estado("_cego", {"passadas": n, "avisado": True})
+            if mail_mayor("crew-idle-wake cego", f"{n} passadas seguidas sem ler tmux/beads: crew parada não seria acordada.", dry, run):
+                gravar_estado("_cego", {"passadas": n, "avisado": True})
         return 0
     gravar_estado("_cego", {"passadas": 0, "avisado": False})
     beads = [b for v in lidos.values() if v for b in v]
@@ -236,6 +255,8 @@ def passada(dry: bool = False, run=rodar, agora=None) -> int:
             log(f"{sess}: não li a tela — sem veredito")
             continue
         estado = estado_da_tela(texto)
+        if estado == "desconhecida":
+            log(f"{sess}: não reconheci o prompt do Claude na tela — sem ordem nesta passada")
         sig = assinatura(texto)
         # progresso de verdade = a bead andou (comentário, commit, troca de rótulo mexem no updated_at). A tela NÃO serve pra
         # isso: a própria ordem injetada muda a tela, e o teto de tentativas nunca dispararia.
@@ -251,20 +272,24 @@ def passada(dry: bool = False, run=rodar, agora=None) -> int:
         if parado < IDLE_MIN_SEC:
             continue
         if st.get("tentativas", 0) >= MAX_KICKS:
-            if not st.get("avisado"):
-                mail_mayor(f"crew {sess} não reage ao vigia (ga-esorlre.14)",
-                           f"{sess} parada há {int(parado // 60)} min com {', '.join(trabalho)}; {MAX_KICKS} ordens no pane "
-                           f"sem a bead andar. Confira com gc session peek {sess}.", dry, run)
+            if not st.get("avisado") and mail_mayor(
+                    f"crew {sess} não reage ao vigia (ga-esorlre.14)",
+                    f"{sess} parada há {int(parado // 60)} min com {', '.join(trabalho)}; {MAX_KICKS} ordens ENTREGUES no pane "
+                    f"sem a bead andar. Confira com gc session peek {sess}.", dry, run):
                 st["avisado"] = True
                 gravar_estado(sess, st)
             continue
         msg = mensagem(trabalho, int(parado // 60))
-        ok = injetar(sess, msg, dry, run)
+        if not injetar(sess, msg, dry, run):
+            # o vigia não conseguiu digitar: NÃO conta como ordem entregue (o mail do teto afirma «ordens entregues») e o
+            # relógio não recomeça — tenta de novo na próxima passada
+            log(f"{sess}: parada {int(parado // 60)} min com {', '.join(trabalho)} → send-keys FALHOU, não contado")
+            continue
         st["tentativas"] = st.get("tentativas", 0) + 1
         st["desde"] = agora          # a próxima tentativa só depois de mais IDLE_MIN_SEC parada
         gravar_estado(sess, st)
         log(f"{sess}: parada {int(parado // 60)} min com {', '.join(trabalho)} → ordem no pane "
-            f"(tentativa {st['tentativas']}/{MAX_KICKS}, {'ok' if ok else 'send-keys FALHOU'})")
+            f"(tentativa {st['tentativas']}/{MAX_KICKS}{', dry-run' if dry else ''})")
         injetadas += 1
     log(f"passada ok: {len(sess_list)} sessão(ões), {len(beads)} bead(s) em andamento, {injetadas} ordem(ns)")
     return injetadas
@@ -282,7 +307,9 @@ def main() -> int:
     except OSError:
         log("outra passada ainda rodando — esta sai sem fazer nada")
         return 0
-    passada(dry="--dry-run" in sys.argv)
+    global _DRY
+    _DRY = "--dry-run" in sys.argv
+    passada(dry=_DRY)
     return 0
 
 
