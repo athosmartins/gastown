@@ -43,6 +43,7 @@ com.gascity.athos-acao-guard	1	guarda do motor
 com.gascity.auto-	1	refino e rehome automáticos de bead
 com.gascity.bd-metrics-	1	bd
 com.gascity.beads-upstream-pr-watchdog	1	bd
+com.gascity.boot-first-turn	1	primeiro turno do Mayor e das crews depois do boot
 com.gascity.child-priority-janitor	1	faxina de beads
 com.gascity.chrome-headless-janitor	1	faxina local
 com.gascity.city-health-sentinel	1	guarda do motor

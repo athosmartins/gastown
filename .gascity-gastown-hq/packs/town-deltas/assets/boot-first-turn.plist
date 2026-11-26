@@ -1,0 +1,42 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.gascity.boot-first-turn</string>
+
+  <!-- ga-esorlre.13 (camada 1 da P0 ga-esorlre.12): toda vez que o Mayor ou uma crew nomeada SOBE (reboot, wake, reinicio), a sessao fica parada no prompt e tudo que chega pra ela por
+       `gc session nudge` vira "deferred reminder" (so aparece quando um humano digita: noite 25-26/11, peter-wa e oracle-wa). Este job DIGITA no pane, como input de verdade, a ordem
+       de retomar a bead em andamento e o ultimo handoff (ou pegar a proxima por prioridade), UMA vez por partida do claude, e prova que o turno comecou (senao alarma o celular).
+       Cadencia 60 s; RunAtLoad true de proposito (o caso que ele existe pra pegar e o pos-boot). Passe parado (todas as crews com dias de vida) nao chama bd, gc, ps nem tmux e nao escreve log.
+       Contrato, estados e botoes: cabecalho de scripts/boot-first-turn.py; instalar, conferir e desligar: docs/runbooks/boot-primeiro-turno.md.
+       INSTALL no mini (ate ser carregado o watchdog PRESENCE-DRIFT acusa este arquivo): primeiro `/usr/bin/python3 scripts/boot-first-turn.py` com a opcao dry-run (a linha `alvos=` tem de listar o Mayor e
+       cada crew; `WOULD type` so aparece pra sessao que subiu ha menos de 20 min), depois cp deste plist para ~/Library/LaunchAgents/ e `launchctl bootstrap gui/$(id -u)` nele.
+       ROLLBACK: touch .gc/boot-first-turn.off (proximo passe, sem launchctl) ou launchctl bootout gui/$(id -u)/com.gascity.boot-first-turn. -->
+  <key>ProgramArguments</key>
+  <array>
+    <string>/usr/bin/python3</string>
+    <string>/Users/athos/gt/.gascity-gastown-hq/scripts/boot-first-turn.py</string>
+  </array>
+
+  <key>WorkingDirectory</key>
+  <string>/Users/athos/gt/.gascity-gastown-hq</string>
+
+  <key>StartInterval</key><integer>60</integer>
+  <key>RunAtLoad</key><true/>
+
+  <key>StandardOutPath</key><string>/Users/athos/gt/.gascity-gastown-hq/.gc/logs/boot-first-turn-launchd.out</string>
+  <key>StandardErrorPath</key><string>/Users/athos/gt/.gascity-gastown-hq/.gc/logs/boot-first-turn-launchd.err</string>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:/Users/athos/go/bin:/Users/athos/.local/bin</string>
+    <key>HOME</key>
+    <string>/Users/athos</string>
+    <key>GC_CITY_PATH</key>
+    <string>/Users/athos/gt/.gascity-gastown-hq</string>
+    <key>BEADS_DOLT_AUTO_START</key>
+    <string>0</string>
+  </dict>
+</dict>
+</plist>
