@@ -9,7 +9,7 @@
 #   imparavel (o VEREDITO do imparavel-check.py) · painel-<nome> (curl nas linhas de paineis.tsv; vale 200/401/403) · adb (seriais de celulares.tsv) · cloudflared-job e cloudflared-conectores (exatamente 1) · disco · swap ·
 #   espera (o marcador da fatia .2 no estado esperado, --espera) · envio (com a espera ligada o central-sender NÃO está carregado).
 # SAÍDA  [OK]/[NO-GO]/[INCERTO] por checagem e, na ÚLTIMA linha, VEREDITO: GO (exit 0) | NO-GO (1) | INCERTO (2); 64 = uso errado. NO-GO = falha CONFIRMADA; INCERTO = leitura sem resposta (comando ausente, estouro,
-#   saída ilegível) e nunca conta como GO; falha e incerto juntos = NO-GO. Cada checagem tem prazo de no máximo 20 s, do próprio script (sem `timeout` do sistema). O que fazer em cada veredito: docs/runbooks/mini64/03-go-nogo.md
+#   saída ilegível) e nunca conta como GO; falha e incerto juntos = NO-GO. Cada checagem tem prazo de 20 s, do próprio script (sem `timeout` do sistema; medido no relógio com 1 s de resolução, mais 1 s de graça no TERM). O que fazer em cada veredito: docs/runbooks/mini64/03-go-nogo.md
 # VARIÁVEIS  GC_CITY_PATH · CLOUDFLARED_CONFIG · GONOGO_{BD_STORES,IMPARAVEL,PAINEIS,CELULARES,TIMEOUT,BD_SLOW_S,HTTP_OK,DISCO_MIN_MB,SWAP_MAX_MB,VOLUME,ESPERA_MARCADOR,PRAZO,EXTRA_PATH,LABEL_*} (runbook, "Ensaio")
 # TESTE  bash scripts/mini64/go-nogo.selftest.sh
 set -u
@@ -34,7 +34,7 @@ num_or() { case "$1" in (''|*[!0-9]*) printf '%s' "$2"; return 0 ;; esac; [ "${#
 TMO="$(num_or "${GONOGO_TIMEOUT:-}" 20)"; [ "$TMO" -le 20 ] || TMO=20
 BD_SLOW_S="$(num_or "${GONOGO_BD_SLOW_S:-}" 10)"; DISCO_MIN_MB="$(num_or "${GONOGO_DISCO_MIN_MB:-}" 102400)"; SWAP_MAX_MB="$(num_or "${GONOGO_SWAP_MAX_MB:-}" 2048)"
 HTTP_OK="${GONOGO_HTTP_OK:-200 401 403}"; case "$HTTP_OK" in (*[!0-9\ ]*) HTTP_OK="200 401 403" ;; esac
-PRAZO="${GONOGO_PRAZO:-04:30}"; PRAZO_NOTA=""
+PRAZO="${GONOGO_PRAZO:-04:30}"; PRAZO_NOTA=""; PRAZO_PASSOU=0
 case "$PRAZO" in ([01][0-9]:[0-5][0-9]|2[0-3]:[0-5][0-9]) ;; (*) PRAZO_NOTA=" (GONOGO_PRAZO inválido: '$PRAZO'; usei 04:30)"; PRAZO="04:30" ;; esac
 usage() { cat <<'EOF'
 uso: go-nogo.sh [--espera ligada|desligada] [--help]
@@ -60,10 +60,10 @@ WORK="$(mktemp -d "${TMPDIR:-/tmp}/go-nogo.XXXXXX" 2>/dev/null)" || { echo "go-n
 cleanup() { rm -f "$WORK"/* 2>/dev/null; rmdir "$WORK" 2>/dev/null; return 0; }
 trap cleanup EXIT; trap 'exit 130' INT TERM
 
-# bounded <segundos> <comando ou função> [args]: stdout em $RB_OUT, stderr em $RB_ERR. rc do comando; 124 = estourou (TERM, 1 s de graça, KILL; filhos primeiro); 125 = não consegui lançar; 127 = comando ausente
+# bounded <segundos> <comando ou função> [args]: (estoura quando a soma nominal dos sleeps chega ao prazo OU o relógio SECONDS passa dele, o que vier primeiro; o relógio tem 1 s de resolução; mais 1 s de graça no TERM) stdout em $RB_OUT, stderr em $RB_ERR. rc do comando; 124 = estourou (TERM, 1 s de graça, KILL; filhos primeiro); 125 = não consegui lançar; 127 = comando ausente
 RB_N=0; RB_OUT=""; RB_ERR=""
 bounded() {
-  local secs="$1" pid elapsed_ms=0 step_ms=20 limit_ms g
+  local secs="$1" pid elapsed_ms=0 step_ms=20 limit_ms g t0=$SECONDS
   shift
   command -v "$1" >/dev/null 2>&1 || return 127
   RB_N=$((RB_N + 1)); RB_OUT="$WORK/out.$RB_N"; RB_ERR="$WORK/err.$RB_N"
@@ -71,7 +71,7 @@ bounded() {
   "$@" > "$RB_OUT" 2> "$RB_ERR" < /dev/null &
   pid=$!; limit_ms=$((secs * 1000))
   while kill -0 "$pid" 2>/dev/null; do
-    if [ "$elapsed_ms" -ge "$limit_ms" ]; then
+    if [ "$elapsed_ms" -ge "$limit_ms" ] || [ "$((SECONDS - t0))" -gt "$secs" ]; then
       pkill -TERM -P "$pid" 2>/dev/null; kill -TERM "$pid" 2>/dev/null
       g=0; while [ "$g" -lt 10 ] && kill -0 "$pid" 2>/dev/null; do sleep 0.1; g=$((g + 1)); done
       if kill -0 "$pid" 2>/dev/null; then pkill -KILL -P "$pid" 2>/dev/null; kill -KILL "$pid" 2>/dev/null; fi
@@ -89,7 +89,7 @@ report() {  # report <ok|nogo|inc> <nome> <detalhe>
   local tag d="$3"
   case "$1" in (ok) tag="OK"; N_OK=$((N_OK + 1)) ;; (nogo) tag="NO-GO"; N_NOGO=$((N_NOGO + 1)) ;; (*) tag="INCERTO"; N_INC=$((N_INC + 1)) ;; esac
   d="${d//$'\n'/ }"; d="${d//$'\r'/ }"; d="${d//$'\t'/ }"
-  printf '%-9s %-24s %s\n' "[$tag]" "$2" "${d:0:230}"
+  printf '%-9s %-24s %s\n' "[$tag]" "$2" "${d:0:360}"
 }
 # rc 124/125/127 de bounded viram a frase de INCERTO; rc 0 desta função = já reportou (o chamador faz return)
 bounded_inc() {  # bounded_inc <nome> <rc> <comando> <o que era>
@@ -179,7 +179,7 @@ chk_imparavel() {
   # vazio → INCERTO (sem linha VEREDITO: um crash também sai rc 1 e NÃO é "não imparável"); falhou/estourou → INCERTO; rc que não bate com a linha → INCERTO
   bounded "$TMO" python3 "$IMPARAVEL"; rc=$?
   bounded_inc imparavel "$rc" python3 "imparavel-check.py" && return
-  while IFS= read -r _l; do case "$_l" in (VEREDITO:*) vline="$_l"; break ;; esac; done < "$RB_OUT"
+  while IFS= read -r _l || [ -n "$_l" ]; do case "$_l" in (VEREDITO:*) vline="$_l"; break ;; esac; done < "$RB_OUT"
   if [ -z "$vline" ]; then report inc imparavel "rc $rc e sem linha VEREDITO na saída (quebrou?): $(snip "$RB_ERR")"; return; fi
   case "$vline" in
     (*"NÃO IMPARÁVEL"*) want=1; verdict=nogo ;;
@@ -208,7 +208,7 @@ chk_paineis() {
   local nome porta caminho rest n=0 lineno=0 ruim
   if [ ! -r "$PAINEIS" ]; then report inc paineis "lista de painéis ausente ou ilegível: $PAINEIS"; return; fi
   # vazio → INCERTO (nenhum painel listado); linha ilegível → INCERTO com o número da linha (as boas continuam); arquivo que não abre → INCERTO
-  while IFS="$TAB" read -r nome porta caminho rest; do
+  while IFS="$TAB" read -r nome porta caminho rest || [ -n "$nome" ]; do
     lineno=$((lineno + 1)); caminho="${caminho%$'\r'}"
     case "$nome" in (''|'#'*) continue ;; esac
     ruim=0
@@ -225,7 +225,7 @@ chk_adb() {
   local serial apelido rest n=0 ok_n=0 achados=0 rc estado problemas="" lineno=0 listados="" ruim="" linha hdr=0 devs="" total=0 resto
   if [ ! -r "$CELULARES" ]; then report inc adb "lista de celulares ausente ou ilegível: $CELULARES"; return; fi
   # vazio → INCERTO (lista sem nenhum serial: não sei o que esperar); linha ilegível → INCERTO; arquivo que não abre → INCERTO
-  while IFS="$TAB" read -r serial apelido rest; do
+  while IFS="$TAB" read -r serial apelido rest || [ -n "$serial" ]; do
     lineno=$((lineno + 1)); serial="${serial%$'\r'}"; apelido="${apelido%$'\r'}"
     case "$serial" in (''|'#'*) continue ;; esac
     case "$serial" in (*[!A-Za-z0-9._:-]*) ruim="$ruim linha $lineno;"; continue ;; esac
@@ -239,7 +239,7 @@ chk_adb() {
   bounded "$TMO" adb devices; rc=$?
   bounded_inc adb "$rc" adb "adb devices" && return
   if [ "$rc" -ne 0 ]; then report inc adb "adb devices falhou (rc $rc): $(snip "$RB_ERR")"; return; fi
-  while IFS= read -r linha; do
+  while IFS= read -r linha || [ -n "$linha" ]; do
     linha="${linha%$'\r'}"
     case "$linha" in ('List of devices attached'*) hdr=1; continue ;; esac
     [ "$hdr" = 1 ] || continue
@@ -248,7 +248,7 @@ chk_adb() {
     devs="$devs|$1=$2"; total=$((total + 1))
   done < "$RB_OUT"
   if [ "$hdr" != 1 ]; then report inc adb "saída ilegível: sem o cabeçalho 'List of devices attached': $(snip "$RB_OUT")"; return; fi
-  while IFS="$TAB" read -r serial apelido; do
+  while IFS="$TAB" read -r serial apelido || [ -n "$serial" ]; do
     [ -n "$serial" ] || continue
     resto="${devs#*|$serial=}"
     if [ "$resto" = "$devs" ]; then problemas="$problemas $apelido ($serial): não aparece;"; continue; fi
@@ -260,10 +260,10 @@ EOF
   if [ -n "$problemas" ]; then report nogo adb "$ok_n/$n celulares em estado device;$problemas"; else report ok adb "$ok_n/$n celulares em estado device (+$((total - achados)) fora da lista)"; fi
 }
 chk_cf_conectores() {
-  local id="" rc n=0 hdr=0 _l _t _h UUID_GLOB
+  local id="" rc n=0 hdr=0 _l _t _h UUID_GLOB cons=""
   if [ ! -r "$CF_CONFIG" ]; then report inc cloudflared-conectores "config do túnel ausente ou ilegível: $CF_CONFIG"; return; fi
   # vazio → INCERTO (config sem a chave tunnel:); falhou/ilegível → INCERTO
-  while IFS= read -r _l; do case "$_l" in (tunnel:*) id="${_l#tunnel:}"; id="${id//[[:space:]]/}"; break ;; esac; done < "$CF_CONFIG"
+  while IFS= read -r _l || [ -n "$_l" ]; do case "$_l" in (tunnel:*) id="${_l#tunnel:}"; id="${id//[[:space:]]/}"; break ;; esac; done < "$CF_CONFIG"
   case "$id" in
     ('') report inc cloudflared-conectores "config $CF_CONFIG sem a chave tunnel:"; return ;;
     (*[!0-9a-fA-F-]*) report inc cloudflared-conectores "tunnel: '$id' em $CF_CONFIG não parece um UUID"; return ;;
@@ -273,17 +273,17 @@ chk_cf_conectores() {
   bounded_inc cloudflared-conectores "$rc" cloudflared "cloudflared tunnel info" && return
   if [ "$rc" -ne 0 ]; then report inc cloudflared-conectores "cloudflared tunnel info falhou (rc $rc): $(snip "$RB_ERR")"; return; fi
   _h='[0-9a-fA-F]'; UUID_GLOB="$_h$_h$_h$_h$_h$_h$_h$_h-$_h$_h$_h$_h-$_h$_h$_h$_h-$_h$_h$_h$_h-$_h$_h$_h$_h$_h$_h$_h$_h$_h$_h$_h$_h"
-  while IFS= read -r _l; do
+  while IFS= read -r _l || [ -n "$_l" ]; do
     case "$_l" in
       ('ID:'*) hdr=1 ;;
-      ($UUID_GLOB*) _t="${_l:36:1}"; if [ -z "$_t" ] || [ "$_t" = " " ]; then n=$((n + 1)); fi ;;
+      ($UUID_GLOB*) _t="${_l:36:1}"; if [ -z "$_t" ] || [ "$_t" = " " ]; then n=$((n + 1)); set -f; set -- $_l; set +f; _t="$*"; cons="$cons [${_t:0:100}]"; fi ;;
     esac
   done < "$RB_OUT"
   if [ "$hdr" != 1 ]; then report inc cloudflared-conectores "formato não reconhecido (sem a linha ID:): $(snip "$RB_OUT")"; return; fi
   case "$n" in
-    (1) report ok cloudflared-conectores "1 conector ativo no túnel $id" ;;
+    (1) report ok cloudflared-conectores "1 conector ativo no túnel $id (confira a ORIGIN IP:$cons)" ;;
     (0) report inc cloudflared-conectores "0 conectores lidos no túnel $id (túnel fora ou formato mudou: não sei qual)" ;;
-    (*) report nogo cloudflared-conectores "$n conectores ativos no túnel $id (esperado 1: o servidor antigo ainda está vivo?)" ;;
+    (*) report nogo cloudflared-conectores "$n conectores ativos no túnel $id (esperado 1: o servidor antigo ainda está vivo?):$cons" ;;
   esac
 }
 chk_disco() {
@@ -331,14 +331,14 @@ chk_espera() {
   if [ -z "$MARCADOR" ]; then report inc espera "caminho do marcador vazio (HOME vazio e GONOGO_ESPERA_MARCADOR sem valor)"; return; fi
   case "$MARCADOR" in */*) dir="${MARCADOR%/*}"; [ -n "$dir" ] || dir="/" ;; *) dir="." ;; esac
   # vazio → ausente só se a pasta dele dá para olhar; pasta que não existe ou não abre → INCERTO ("não consigo olhar" ≠ "o marcador não existe")
-  if [ ! -d "$dir" ] || [ ! -x "$dir" ]; then report inc espera "não consigo olhar: a pasta $dir não existe ou não abre"; return; fi
+  if [ ! -d "$dir" ] || [ ! -x "$dir" ]; then report inc espera "não consigo olhar o marcador (a pasta dele não existe ou não abre): $dir"; return; fi
   # marcador que existe mas não é um arquivo legível (pasta, link, sem permissão) → INCERTO: a fatia .2 também lê isso como "nao-sei"
   if [ -f "$MARCADOR" ] && [ -r "$MARCADOR" ]; then presente=1
-  elif [ -e "$MARCADOR" ] || [ -L "$MARCADOR" ]; then report inc espera "o marcador $MARCADOR existe mas não é um arquivo legível (a fatia .2 lê isso como nao-sei)"; return; fi
-  if [ "$ESPERA" = ligada ] && [ "$presente" = 1 ]; then report ok espera "marcador presente em $MARCADOR (esperado: ligada)"
-  elif [ "$ESPERA" = ligada ]; then report nogo espera "marcador ausente em $MARCADOR (esperado: ligada): a espera NÃO está ligada, a cidade pode carregar e enviar"
-  elif [ "$presente" = 0 ]; then report ok espera "marcador ausente em $MARCADOR (esperado: desligada)"
-  else report nogo espera "marcador presente em $MARCADOR (esperado: desligada): a espera ainda está ligada"; fi
+  elif [ -e "$MARCADOR" ] || [ -L "$MARCADOR" ]; then report inc espera "o marcador existe mas não é um arquivo legível (a fatia .2 lê isso como nao-sei): $MARCADOR"; return; fi
+  if [ "$ESPERA" = ligada ] && [ "$presente" = 1 ]; then report ok espera "marcador presente (esperado: ligada): $MARCADOR"
+  elif [ "$ESPERA" = ligada ]; then report nogo espera "marcador ausente (esperado: ligada): a espera NÃO está ligada, a cidade pode carregar e enviar: $MARCADOR"
+  elif [ "$presente" = 0 ]; then report ok espera "marcador ausente (esperado: desligada): $MARCADOR"
+  else report nogo espera "marcador presente (esperado: desligada): a espera ainda está ligada: $MARCADOR"; fi
 }
 chk_envio() {
   launchd_read "$LABEL_SENDER" || { report inc envio "$LD_WHY"; return; }
@@ -367,7 +367,7 @@ prazo_linha() {
   hh="${hhmm%??}"; mm="${hhmm#??}"
   agora=$((10#$hh * 60 + 10#$mm)); limite=$((10#${PRAZO%%:*} * 60 + 10#${PRAZO##*:})); delta=$((limite - agora))
   if [ "$delta" -ge 0 ]; then printf 'PRAZO %s: faltam %s min%s\n' "$PRAZO" "$delta" "$PRAZO_NOTA"
-  elif [ "$agora" -lt 720 ]; then printf 'PRAZO %s: PASSOU há %s min — sem GO até agora vale NO-GO (rollback)%s\n' "$PRAZO" "$((0 - delta))" "$PRAZO_NOTA"
+  elif [ "$delta" -ge -360 ]; then PRAZO_PASSOU=1; printf 'PRAZO %s: PASSOU há %s min — sem GO até agora vale NO-GO (rollback)%s\n' "$PRAZO" "$((0 - delta))" "$PRAZO_NOTA"
   else printf 'PRAZO %s: faltam %s min (o próximo horário-limite)%s\n' "$PRAZO" "$((delta + 1440))" "$PRAZO_NOTA"; fi
 }
 
@@ -379,10 +379,13 @@ chk_job supervisor "$LABEL_SUPERVISOR" pid; chk_job pilot "$LABEL_PILOT" carrega
 chk_gc; chk_imparavel; chk_paineis; chk_adb
 chk_job cloudflared-job "$LABEL_TUNEL" pid; chk_cf_conectores
 chk_disco; chk_swap; chk_espera; chk_envio
+PRAZO_TXT=""
 if [ "$N_NOGO" -gt 0 ]; then VEREDITO="NO-GO"; RC=1
 elif [ "$N_INC" -gt 0 ]; then VEREDITO="INCERTO"; RC=2
 elif [ "$N_OK" -gt 0 ]; then VEREDITO="GO"; RC=0
 else VEREDITO="INCERTO"; RC=2; fi
+# GO que chega depois do prazo, antes de ligar os envios (--espera ligada), não vale: sem GO no prazo é NO-GO (depois do go, --espera desligada, o prazo já não manda)
+if [ "$VEREDITO" = GO ] && [ "$PRAZO_PASSOU" = 1 ] && [ "$ESPERA" = ligada ]; then VEREDITO="NO-GO"; RC=1; PRAZO_TXT=" — todas as checagens OK, mas o prazo $PRAZO passou: sem GO no prazo vale NO-GO"; fi
 echo "Leia: docs/runbooks/mini64/03-go-nogo.md (o que fazer em GO, NO-GO e INCERTO; horário-limite $PRAZO)"
-printf 'VEREDITO: %s — %s falha(s), %s incerto(s), %s ok\n' "$VEREDITO" "$N_NOGO" "$N_INC" "$N_OK"
+printf 'VEREDITO: %s — %s falha(s), %s incerto(s), %s ok%s\n' "$VEREDITO" "$N_NOGO" "$N_INC" "$N_OK" "$PRAZO_TXT"
 exit "$RC"

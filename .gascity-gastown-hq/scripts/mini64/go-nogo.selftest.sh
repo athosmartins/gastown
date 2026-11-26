@@ -6,7 +6,7 @@
 #
 # SIMULADO  o script roda com `env -i` num PATH só com utilitários básicos (links) e stubs de bd, gc, python3 (o imparavel-check), launchctl, pgrep/ps/lsof (porta do Dolt), curl, adb, cloudflared, df, sysctl e date; cada stub lê o
 #   modo dele em $W/world e anota a chamada em $W/calls.log. Comando AUSENTE = stub sem link no PATH. Nada real é lido, parado ou gravado fora de $W.
-# SEÇÕES    tudo ok · uma falha · comando ausente · estouro · leitura vazia · precedência · porta do Dolt · espera esperada · horário-limite · teto do timeout · somente leitura · fronteiras e formatos · arquivos de dados · bash 3.2
+# SEÇÕES    tudo ok · uma falha · comando ausente · estouro · leitura vazia · precedência · porta do Dolt · espera esperada · horário-limite · teto do timeout · somente leitura · fronteiras e formatos · última linha sem LF · arquivos de dados · bash 3.2
 # COMO RODAR  bash scripts/mini64/go-nogo.selftest.sh   ·   GONOGO_ST_SUT=<arquivo> · GONOGO_ST_BASH=<bash que roda o script> · GONOGO_ST_B32=<bash 3.2: confere o -n> · GONOGO_ST_FAILFAST=1 · GONOGO_ST_ONLY=<trecho do título da seção>
 set -uo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
@@ -50,7 +50,7 @@ mkstub python3 <<'S'
 case "$(cat "$W_WORLD/imparavel" 2>/dev/null || echo ok)" in
   (ok) echo "VEREDITO: ✅ IMPARÁVEL agora" ;; (nogo) echo "VEREDITO: ❌ NÃO IMPARÁVEL"; exit 1 ;; (semlinha) echo "relatório sem veredito" ;; (trava) exec sleep 30 ;;
   (incerto) echo "VEREDITO: ⚠️  INCERTO (não posso afirmar ✅ com honestidade)"; exit 2 ;; (diverge) echo "VEREDITO: ✅ IMPARÁVEL agora"; exit 1 ;;
-  (crash) echo "Traceback (most recent call last):" >&2; exit 1 ;;
+  (crash) echo "Traceback (most recent call last):" >&2; exit 1 ;; (nogo-semlf) printf 'VEREDITO: ❌ NÃO IMPARÁVEL'; exit 1 ;;
 esac
 S
 mkstub launchctl <<'S'
@@ -90,6 +90,7 @@ mkstub df <<'S'
 H='Filesystem    1048576-blocks   Used Available Capacity Mounted on'
 case "$(cat "$W_WORLD/df.mode" 2>/dev/null || echo ok)" in
   (ok) printf '%s\n/dev/disk3s5 953344 441344 %s 47%% %s\n' "$H" "$(cat "$W_WORLD/df.free")" "${*: -1}" ;;
+  (semlf) printf '%s\n/dev/disk3s5 953344 441344 %s 47%% %s' "$H" "$(cat "$W_WORLD/df.free")" "${*: -1}" ;;
   (outromontagem) printf '%s\n/dev/disk3s1s1 953344 11000 %s 2%% /\n' "$H" "$(cat "$W_WORLD/df.free")" ;;
   (lixo) echo "df: sem resposta" ;; (falha) echo "df: No such file or directory" >&2; exit 1 ;; (trava) exec sleep 30 ;;
 esac
@@ -162,6 +163,8 @@ nogo_case "celular que não aparece no adb" adb 'printf "List of devices attache
 nogo_case "celular unauthorized" adb 'printf "List of devices attached\nSERIAL1\tdevice\nSERIAL2\tunauthorized\n\n" > "$W/world/adb.out"' "unauthorized"
 nogo_case "celular offline" adb 'printf "List of devices attached\nSERIAL1\toffline\nSERIAL2\tdevice\n\n" > "$W/world/adb.out"' "offline"
 nogo_case "2 conectores no túnel (o antigo ainda vivo)" cloudflared-conectores 'printf "8f7a9b2c-aaaa-4222-8333-444455556666 2025-11-20T07:00:00Z darwin_arm64 2025.11.0 198.51.100.7 1xgru01\n" >> "$W/world/cf.info"' "2 conectores"
+has "$(line_of cloudflared-conectores)" "198.51.100.7" "o NO-GO mostra a ORIGIN IP do outro conector"
+t "1 conector: a linha mostra a ORIGIN IP para conferir de quem é" 'true' cloudflared-conectores OK "203.0.113.9"
 nogo_case "disco abaixo do piso" disco 'printf 1000 > "$W/world/df.free"' "abaixo do piso"
 nogo_case "swap acima do teto" swap 'swap_is 3072.50M' "acima do teto"
 nogo_case "marcador de espera ausente (esperado: ligada)" espera 'rm -f "$W/home/.mini64-espera"' "marcador ausente"
@@ -241,6 +244,9 @@ inc_case "sysctl com unidade que não conheço" swap 'swap_is 12,00K' "ilegível
 inc_case "launchctl devolve texto sem o dicionário do job" supervisor 'echo lixo > "$W/world/launchd/com.gascity.supervisor"' "sem dicionário" 1
 inc_case "launchctl rc 1 que não é 'Could not find service'" pilot 'echo falha > "$W/world/launchd/com.gascity.pilot"' "launchctl" 1
 t "marcador que é uma pasta (existe e não é arquivo legível)" 'rm -f "$W/home/.mini64-espera"; mkdir "$W/home/.mini64-espera"' espera INCERTO "não é um arquivo legível"
+LONGN="$(printf '%0200d' 0)"
+t "marcador que é uma pasta com caminho de 200+ caracteres (o diagnóstico vem antes do caminho)" 'mkdir -p "$W/home/$LONGN"; EXTRA="GONOGO_ESPERA_MARCADOR=$W/home/$LONGN"' espera INCERTO "não é um arquivo legível"
+t "pasta do marcador que não existe, com caminho de 200+ caracteres" 'EXTRA="GONOGO_ESPERA_MARCADOR=$W/$LONGN/nao-existe/marcador"' espera INCERTO "não consigo olhar"
 t "marcador numa pasta que não existe (ausente ≠ não consigo olhar)" 'EXTRA="GONOGO_ESPERA_MARCADOR=$W/nao-existe/marcador"' espera INCERTO "não consigo olhar"
 
 section "precedência: uma falha confirmada vence o incerto"
@@ -269,12 +275,22 @@ world_ok; SUT_ARGS="--help"; run_sut
 eq "$RC" "0" "--help: rc 0"; has "$OUT" "NO-GO" "--help explica o NO-GO"; has "$OUT" "INCERTO" "--help explica o INCERTO"; eq "$(<"$W/calls.log")" "" "--help não chama comando nenhum"
 
 section "horário-limite 04:30"
-for c in "0412|faltam 18 min" "0445|PASSOU há 15 min" "0430|faltam 0 min" "2300|faltam 330 min" "1330|faltam 900 min"; do
+for c in "0412|faltam 18 min" "0445|PASSOU há 15 min" "0530|PASSOU há 60 min" "1030|PASSOU há 360 min" "1031|faltam 1079 min" "0430|faltam 0 min" "2300|faltam 330 min" "1330|faltam 900 min"; do
   world_ok; echo "${c%%|*}" > "$W/world/now_hhmm"; run_sut; has "$OUT" "PRAZO 04:30: ${c#*|}" "${c%%|*} → ${c#*|}"
 done
 hasnt "$OUT" "vale NO-GO" "antes do prazo a linha não ameaça"
 world_ok; echo 0445 > "$W/world/now_hhmm"; run_sut; has "$OUT" "vale NO-GO" "depois do prazo a linha lembra que sem GO vale NO-GO"
 world_ok; run_sut GONOGO_PRAZO=05:00; has "$OUT" "PRAZO 05:00: faltam 48 min" "GONOGO_PRAZO muda o horário"
+world_ok; echo 1700 > "$W/world/now_hhmm"; run_sut GONOGO_PRAZO=16:00; has "$OUT" "PRAZO 16:00: PASSOU há 60 min" "prazo depois do meio-dia: 1 h depois dele já passou (não 'faltam 1380 min')"
+world_ok; echo 0445 > "$W/world/now_hhmm"; run_sut
+eq "$RC" "1" "tudo OK mas depois do prazo (espera ligada): rc 1"; has "$(last_line)" "VEREDITO: NO-GO" "GO tardio vira NO-GO"; has "$(last_line)" "o prazo 04:30 passou" "e a última linha diz por quê"
+eq "$(count_tag OK)/$(count_tag NO-GO)/$(count_tag INCERTO)" "18/0/0" "nenhuma checagem mudou: só o prazo decidiu"
+world_ok; echo 0445 > "$W/world/now_hhmm"; rm -f "$W/home/.mini64-espera"; printf pid:7777 > "$W/world/launchd/com.whatsapp.central-sender"; SUT_ARGS="--espera desligada"; run_sut
+eq "$RC" "0" "depois do go (--espera desligada) o prazo já não manda: GO"; has "$(last_line)" "VEREDITO: GO" "GO depois do prazo com a espera desligada"
+world_ok; echo 0445 > "$W/world/now_hhmm"; echo 500 > "$W/world/curl.8101"; run_sut
+eq "$RC" "1" "falha confirmada depois do prazo segue NO-GO"; hasnt "$(last_line)" "o prazo" "sem a frase do prazo quando a falha já decide"
+world_ok; echo 0445 > "$W/world/now_hhmm"; echo falha > "$W/world/gc"; run_sut
+eq "$RC" "2" "INCERTO depois do prazo segue INCERTO (a frase do prazo é só para o GO tardio)"
 world_ok; run_sut GONOGO_PRAZO=abc; has "$OUT" "PRAZO 04:30" "prazo inválido volta ao 04:30"; has "$OUT" "GONOGO_PRAZO inválido" "e diz que o valor era inválido"
 world_ok; echo FALHA > "$W/world/now_hhmm"; run_sut; has "$OUT" "hora ilegível" "date que falha: a linha diz hora ilegível (não inventa minutos)"; eq "$RC" "0" "a hora ilegível não muda o veredito"
 
@@ -286,11 +302,11 @@ has "$OUT" "timeout por checagem: 20 s" "sem GONOGO_TIMEOUT o padrão é 20 s"
 
 section "somente leitura: o que o script chama e o que o texto dele contém"
 world_ok; run_sut
-ALLOWED='^(bd -C [^ ]+ list -n 1 --json|gc session list|python3 [^ ]+imparavel-check\.py|launchctl list [A-Za-z0-9._-]+|curl .*http://127\.0\.0\.1:[0-9]+/[^ ]*|adb devices|cloudflared tunnel info [0-9a-f-]+|df -Pm /System/Volumes/Data|sysctl -n vm\.swapusage|pgrep -f dolt sql-server|ps -o comm= -p [0-9]+|lsof -nP -a -p [0-9]+ -iTCP -sTCP:LISTEN( -Fn)?)$'
+ALLOWED='^(bd -C [^ ]+ list -n 1 --json|gc session list|python3 [^ ]+imparavel-check\.py|launchctl list [A-Za-z0-9._-]+|curl -sS -g -o /dev/null -w %\{http_code\} --max-time [0-9]+ http://127\.0\.0\.1:[0-9]+/[^ ]*|adb devices|cloudflared tunnel info [0-9a-f-]+|df -Pm /System/Volumes/Data|sysctl -n vm\.swapusage|pgrep -f dolt sql-server|ps -o comm= -p [0-9]+|lsof -nP -a -p [0-9]+ -iTCP -sTCP:LISTEN( -Fn)?)$'
 eq "$(grep -Evc "$ALLOWED" "$W/calls.log")" "0" "toda chamada externa é uma leitura conhecida (nenhuma escrita)"
 [ -s "$W/calls.log" ] && ok "o log de chamadas tem conteúdo (o teste prova algo)" || nope "o log de chamadas está vazio"
 eq "$(grep -c '^launchctl ' "$W/calls.log")" "5" "launchctl: 5 leituras (supervisor, pilot, gate, túnel e central-sender), todas 'list'"
-for pat in 'launchctl +(bootstrap|bootout|kickstart|load|unload|enable|disable|remove|submit|start|stop)' 'kill -9' 'pkill -f' 'rm -rf' '(^|[ ;])eval ' '(^|[ ;])sudo ' '(^|[ ;])git ' 'bd +(update|close|comment|create|label|dolt|sql|import)' 'adb +(kill-server|start-server|reboot|install|uninstall|shell|push|pull|connect|disconnect)' 'cloudflared +(tunnel +(run|delete|create|route|cleanup)|service|update)' '(>|>>) */(etc|usr|System|Library|var)/' 'dolt-server\.port|BEADS_DOLT_PORT' '(^|[^_a-z])dolt_server_port([^_a-z]|$)'; do
+for pat in 'launchctl +(bootstrap|bootout|kickstart|load|unload|enable|disable|remove|submit|start|stop)' 'kill -9' 'pkill -f' 'rm -rf' '(^|[ ;])eval ' '(^|[ ;])sudo ' '(^|[ ;])git ' 'bd +(update|close|comment|create|label|dolt|sql|import)' 'adb +(kill-server|start-server|reboot|install|uninstall|shell|push|pull|connect|disconnect)' 'cloudflared +(tunnel +(run|delete|create|route|cleanup)|service|update)' 'curl [^|;]*( -X| --request| -d | --data| -T | --upload-file| -F | --form)' '(>|>>) */(etc|usr|System|Library|var)/' 'dolt-server\.port|BEADS_DOLT_PORT' '(^|[^_a-z])dolt_server_port([^_a-z]|$)'; do
   if grep -Eq "$pat" "$SUT"; then nope "o texto do script contém um padrão proibido: $pat"; else ok "o texto do script não contém: $pat"; fi
 done
 grep -q 'dolt_server_live_port' "$SUT" && ok "usa dolt_server_live_port (a metade estrita: sem arquivo, sem pin)" || nope "não usa dolt_server_live_port"
@@ -315,13 +331,26 @@ t "GONOGO_BD_STORES vazio vale como não definido" 'EXTRA="GONOGO_BD_STORES="' b
 t "GONOGO_HTTP_OK com 302 aceita o redirecionamento" 'echo 302 > "$W/world/curl.8101"; EXTRA="GONOGO_HTTP_OK=200 302"' painel-alpha OK
 t "GONOGO_HTTP_OK inválido volta ao padrão" 'echo 302 > "$W/world/curl.8101"; EXTRA=GONOGO_HTTP_OK=abc' painel-alpha NO-GO
 
+section "última linha SEM LF final (arquivo editado à mão e saída de comando que não termina em LF: nenhuma linha pode sumir)"
+nogo_case "paineis.tsv sem LF final: a última linha (beta, HTTP 500) conta" painel-beta 'printf "alpha\t8101\t/\nbeta\t8102\t/health" > "$W/paineis.tsv"; echo 500 > "$W/world/curl.8102"' "HTTP 500"
+t "paineis.tsv de UMA linha, sem LF final (o único painel não pode sumir)" 'printf "alpha\t8101\t/" > "$W/paineis.tsv"' painel-alpha OK
+eq "$(count_tag INCERTO)" "0" "o painel único sem LF não vira 'nenhum painel listado'"
+nogo_case "celulares.tsv sem LF final: o último serial (SERIAL9, fora do adb) conta" adb 'printf "SERIAL1\tcel-1\nSERIAL9\tcel-9" > "$W/celulares.tsv"' "cel-9"
+t "celulares.tsv de um serial só, sem apelido e sem LF final" 'printf "SERIAL1" > "$W/celulares.tsv"' adb OK "1/1"
+nogo_case "saída do adb sem LF final: o último aparelho está offline" adb 'printf "List of devices attached\nSERIAL1\tdevice\nSERIAL2\toffline" > "$W/world/adb.out"' "offline"
+nogo_case "cloudflared: 2 conectores e a saída acaba sem LF" cloudflared-conectores 'X=$(cat "$W/world/cf.info"); printf "%s\n8f7a9b2c-aaaa-4222-8333-444455556666 2025-11-20T07:00:00Z darwin_arm64 2025.11.0 198.51.100.7 1xgru01" "$X" > "$W/world/cf.info"' "2 conectores"
+t "cloudflared: 1 conector e a saída acaba sem LF" 'X=$(cat "$W/world/cf.info"); printf "%s" "$X" > "$W/world/cf.info"' cloudflared-conectores OK "1 conector"
+t "config do túnel com tunnel: na última linha, sem LF" 'printf "# config\ntunnel: %s" "$TUNNEL_ID" > "$W/home/.cloudflared/urblink-ops.yml"' cloudflared-conectores OK "1 conector"
+nogo_case "imparavel: a linha VEREDITO é a última e não tem LF" imparavel 'echo nogo-semlf > "$W/world/imparavel"' "NÃO IMPARÁVEL"
+t "df: a linha do volume é a última e não tem LF" 'echo semlf > "$W/world/df.mode"' disco OK
+
 section "arquivos de dados versionados"
 DATA_P="$HERE/paineis.tsv"; DATA_C="$HERE/celulares.tsv"
 [ -f "$DATA_P" ] && ok "paineis.tsv existe" || nope "paineis.tsv não existe ($DATA_P)"
 [ -f "$DATA_C" ] && ok "celulares.tsv existe" || nope "celulares.tsv não existe ($DATA_C)"
 if [ -f "$DATA_P" ]; then
   N_ROWS=0; BAD_ROWS=0; NAMES=""
-  while IFS="$(printf '\t')" read -r n p c rest; do
+  while IFS="$(printf '\t')" read -r n p c rest || [ -n "$n" ]; do
     case "$n" in ''|'#'*) continue ;; esac
     N_ROWS=$((N_ROWS+1)); NAMES="$NAMES $n"
     case "$p" in ''|*[!0-9]*) BAD_ROWS=$((BAD_ROWS+1)) ;; esac
@@ -329,6 +358,7 @@ if [ -f "$DATA_P" ]; then
     case "$n" in *[!A-Za-z0-9._-]*) BAD_ROWS=$((BAD_ROWS+1)) ;; esac
   done < "$DATA_P"
   [ "$N_ROWS" -ge 1 ] && ok "paineis.tsv lista ao menos 1 painel ($N_ROWS)" || nope "paineis.tsv sem nenhum painel"
+  eq "$N_ROWS" "$(grep -Evc '^[[:space:]]*(#|$)' "$DATA_P")" "paineis.tsv: o laço leu as mesmas linhas de dados que o grep -c (a última, sem LF, não some)"
   eq "$BAD_ROWS" "0" "paineis.tsv: nome, porta numérica e caminho com / em toda linha"
   eq "$(printf '%s\n' $NAMES | sort | uniq -d | wc -l | tr -d ' ')" "0" "paineis.tsv: nomes sem repetição"
   world_ok; run_sut GONOGO_PAINEIS="$DATA_P"
@@ -336,13 +366,15 @@ if [ -f "$DATA_P" ]; then
 fi
 if [ -f "$DATA_C" ]; then
   if grep -Eq '(\+?55 ?\(?[0-9]{2}\)? ?9?[0-9]{4}-?[0-9]{4}|\([0-9]{2}\) ?9[0-9]{4}|9[0-9]{4}-[0-9]{4})' "$DATA_C"; then nope "celulares.tsv parece ter número de telefone"; else ok "celulares.tsv não tem número de telefone"; fi
-  BAD_S=0
-  while IFS="$(printf '\t')" read -r s a rest; do
+  BAD_S=0; N_CEL=0
+  while IFS="$(printf '\t')" read -r s a rest || [ -n "$s" ]; do
     case "$s" in ''|'#'*) continue ;; esac
+    N_CEL=$((N_CEL+1))
     case "$s" in *[!A-Za-z0-9._:-]*) BAD_S=$((BAD_S+1)) ;; esac
     [ -n "$a" ] || BAD_S=$((BAD_S+1))
   done < "$DATA_C"
   eq "$BAD_S" "0" "celulares.tsv: serial (letras, números, . _ : -) e apelido em toda linha de dados"
+  eq "$N_CEL" "$(grep -Evc '^[[:space:]]*(#|$)' "$DATA_C")" "celulares.tsv: o laço leu as mesmas linhas de dados que o grep -c"
 fi
 
 section "bash 3.2 (a versão do /bin/bash do mini)"

@@ -29,7 +29,7 @@ A saída é uma linha por checagem e, na última, o veredito (o cabeçalho e a l
 VEREDITO: NO-GO — 1 falha(s), 1 incerto(s), 18 ok
 ```
 
-O script **só lê**: não carrega, não para, não grava e não envia nada. A única coisa que ele pode provocar é o `adb devices` subir o servidor do adb, se ele ainda não estiver de pé. Cada checagem tem prazo de no máximo 20 s (`GONOGO_TIMEOUT` só pode baixar esse teto) e o script termina sozinho mesmo com tudo pendurado.
+O script **só lê**: não carrega, não para, não grava e não envia nada. A única coisa que ele pode provocar é o `adb devices` subir o servidor do adb, se ele ainda não estiver de pé. Cada checagem tem prazo de 20 s (`GONOGO_TIMEOUT` só pode baixar esse teto) e o script termina sozinho mesmo com tudo pendurado. O prazo é medido no relógio, com resolução de 1 s, mais 1 s de graça no TERM: com a máquina carregada uma checagem pode levar até uns 2 s além dos 20.
 
 ## O que fazer em cada veredito
 
@@ -45,7 +45,9 @@ Falha confirmada e incerto na mesma rodada dão NO-GO: a falha decide.
 
 Risco 5 do épico: sem prazo de go/no-go o rollback fica tarde demais, porque ele só existe até o 1º envio no 64, e o WhatsApp só pode ficar fora até as 07:00 (decisão do Athos no grill de 25/11). Regra: **sem GO às 04:30, vale NO-GO.** Um INCERTO que ainda está de pé às 04:30 conta como NO-GO.
 
-A terceira linha da saída (depois do cabeçalho) diz quanto falta (`PRAZO 04:30: faltam 18 min`) ou que passou (`PASSOU há 15 min`). É informação, não uma checagem: se o `date` não responder, a linha diz "hora ilegível" e nenhum minuto é inventado. Entre 04:30 e meio-dia ela conta como "passou"; fora disso, como o tempo até o próximo 04:30. `GONOGO_PRAZO=HH:MM` muda o horário (valor inválido volta ao 04:30 e a linha avisa).
+A terceira linha da saída (depois do cabeçalho) diz quanto falta (`PRAZO 04:30: faltam 18 min`) ou que passou (`PASSOU há 15 min`). É informação, não uma checagem: se o `date` não responder, a linha diz "hora ilegível" e nenhum minuto é inventado. Nas 6 horas depois do limite (até 10:30) ela conta como "passou"; fora disso, como o tempo até o próximo 04:30. `GONOGO_PRAZO=HH:MM` muda o horário (valor inválido volta ao 04:30 e a linha avisa).
+
+**A regra também é mecânica:** com a espera LIGADA (antes de liberar os envios), um GO que chega depois do prazo sai como `VEREDITO: NO-GO` (exit 1) e a última linha diz que todas as checagens deram OK mas o prazo passou. Com `--espera desligada` (depois do go) o prazo já não manda. Para ensaiar depois das 04:30, ponha um `GONOGO_PRAZO` à frente do relógio.
 
 ## Cada checagem
 
@@ -60,7 +62,7 @@ A terceira linha da saída (depois do cabeçalho) diz quanto falta (`PRAZO 04:30
 | `painel-<nome>` | `curl` em `127.0.0.1:<porta><caminho>` de cada linha de `paineis.tsv` | HTTP fora de 200/401/403 (inclusive 302); conexão recusada | sem resposta no prazo, `curl` ausente, código ilegível | `curl -i http://127.0.0.1:<porta><caminho>` |
 | `adb` | `adb devices` contra `celulares.tsv` | serial que não aparece ou não está em `device` (`unauthorized`, `offline`) | lista vazia, `adb` ausente ou com erro, saída sem o cabeçalho | `adb devices -l` |
 | `cloudflared-job` | `launchctl list br.urblink.cloudflared.urblink-ops` | não carregado ou sem PID | `launchctl` ausente ou com erro | o mesmo comando |
-| `cloudflared-conectores` | `cloudflared tunnel info <id>` (o id vem de `~/.cloudflared/urblink-ops.yml`) | 2 ou mais conectores (o antigo ainda vivo) | 0 conectores lidos, formato que não reconheço, config ou cert ausentes | `cloudflared tunnel info <id>` |
+| `cloudflared-conectores` | `cloudflared tunnel info <id>` (o id vem de `~/.cloudflared/urblink-ops.yml`) | 2 ou mais conectores (o antigo ainda vivo); a linha mostra a linha de cada conector (a ORIGIN IP diz de qual máquina é) | 0 conectores lidos, formato que não reconheço, config ou cert ausentes | `cloudflared tunnel info <id>` |
 | `disco` | `df -Pm /System/Volumes/Data` (nunca `df /`, que lê o volume de sistema selado) | livre abaixo de 100 GB | resposta ilegível ou de outro volume | `df -h /System/Volumes/Data` |
 | `swap` | `sysctl vm.swapusage` (com `LC_ALL=C`; vírgula decimal também aceita) | mais de 2048 MB em uso | ilegível ou unidade que não é M nem G | `sysctl vm.swapusage` |
 | `espera` | o marcador `~/.mini64-espera` da fatia .2 | estado diferente do esperado (`--espera`) | a pasta dele não abre | `ls -la ~/.mini64-espera` |
@@ -71,6 +73,8 @@ A terceira linha da saída (depois do cabeçalho) diz quanto falta (`PRAZO 04:30
 ## Arquivos de dados
 
 `scripts/mini64/paineis.tsv` (nome, porta, caminho, separados por TAB; `#` comenta). Cada linha entregue tem fonte no repositório: demand-dashboard `:8095` (`/api/outreach/config`), map-viewer `:8099`, ficha360 `:8207`, clientes-dashboard `:8104` e admin-dashboard `:8097` (`/api/mockups`). **Conferir no mini atual antes da noite** (modo leitura, ver abaixo): ficha360 e clientes-dashboard só têm a porta e o `/` como fonte, e um `/` que responda 302 vira NO-GO (troque por uma rota que responda 200/401/403 direto). As portas 8086, 8203, 8090, 8088, 5599 e 5600 aparecem no repositório sem nome nem caminho de saúde confirmados: estão comentadas no arquivo e **não são conferidas** até alguém preencher.
+
+As duas listas são lidas inteiras, inclusive a última linha quando o arquivo não termina em LF (editor ou ferramenta sem quebra de linha final é comum na véspera): o gate pegou essa perda silenciosa na 1ª revisão e há um caso de selftest por entrada.
 
 `scripts/mini64/celulares.tsv` (serial, apelido, separados por TAB). Vazio. Com os celulares ligados por USB e autorizados, `adb devices -l` mostra os seriais; uma linha por aparelho em estado `device`, com apelido (`cel-1`...), **nunca número de telefone**. O selftest recusa um arquivo que pareça ter telefone.
 
@@ -95,7 +99,7 @@ Outras variáveis (todas opcionais): `GC_CITY_PATH`, `GONOGO_BD_STORES` (`"hq=<c
 ## Limites conhecidos
 
 1. **`dolt-porta` nunca dá NO-GO.** A lib não distingue "Dolt fora" de "não consegui ver o processo"; um Dolt fora aparece como INCERTO aí e como INCERTO nas duas linhas `bd-*`. É INCERTO de propósito: confundir os dois é o erro que a regra de terceiro estado proíbe.
-2. **O teto de 20 s por checagem é duro** (critério da bead). Se o `imparavel-check.py` demorar mais no 64 carregado, a linha sai INCERTO e vale a leitura manual do veredito dele.
+2. **O teto de 20 s por checagem é aproximado** (relógio de 1 s de resolução, mais 1 s de graça no TERM; critério da bead). Se o `imparavel-check.py` demorar mais no 64 carregado, a linha sai INCERTO e vale a leitura manual do veredito dele.
 3. **Só confere o que a bead lista.** Não olha Wi-Fi ou chave do servidor antigo (fatia .4), backup S3, camadas ainda não carregadas, nem o IP LAN reservado.
 4. Os labels do launchd (supervisor, pilot, dispatcher do gate, túnel, sender) vêm de `daemon-presence-watchdog.sh` e `nightly-reboot-postcheck.sh`. Se o 64 usar outros, ajuste as variáveis `GONOGO_LABEL_*`. O `launchctl list` só enxerga os agentes do usuário na sessão dele: rode do Terminal do mini ou do tmux das sessões da cidade, não de um ssh sem sessão gráfica (lá um job carregado pode aparecer como "não está carregado"). Comando fora do PATH (por exemplo o `adb`) sai INCERTO "ausente no PATH": aponte a pasta dele em `GONOGO_EXTRA_PATH`.
 5. O script lê o marcador direto (`~/.mini64-espera`, o caminho que `mini64-lib.sh` da fatia .2 grava; conferido no código dela, branch `fix/ga-ke5w2ie.2-espera-camadas`). Marcador que existe mas não é arquivo legível dá INCERTO, como o `nao-sei` dela. `espera.sh status` (a mesma fatia, depois do merge) dá o estado completo (`ligada`, `em-carga`, `carga-completa`...); os daemons não leem o marcador, a barreira real é o plist ausente, e é por isso que `envio` olha o launchd.
