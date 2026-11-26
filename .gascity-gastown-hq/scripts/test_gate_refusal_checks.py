@@ -2,7 +2,7 @@
 """test_gate_refusal_checks.py (ga-mw5gdyu.2): hermetic suite for scripts/gate-refusal-checks.py. The gate log, the registry and the meter's JSON are REAL files in a temp city; `bd` is `Bd`, a fake that RECORDS every call
 (so the argv of every read and of the create is part of the contract), keeps the beads it "creates" in its list (dedup is tested end to end) and fails on a call nobody planned; `Real` runs real processes.
 `python3 -I scripts/test_gate_refusal_checks.py` (3.9+); GRC_UNDER_TEST=<copy> runs it against a mutant (the meter stays the real one)."""
-import contextlib, fcntl, importlib.util, io, json, os, re, shutil, subprocess, sys, tempfile, unittest  # noqa: E401
+import contextlib, errno, fcntl, importlib.util, io, json, os, re, shutil, subprocess, sys, tempfile, unittest  # noqa: E401
 from unittest import mock
 
 sys.dont_write_bytecode = True
@@ -28,6 +28,38 @@ def ts_n(n):
 def verdict(*issues, nonblocking="- sugestão root-class:so-nao-bloqueante"):
     body = "\n".join("Blocking issue %d: %s\n%s%s" % (i, t, ("root-class:%s\n" % c) if c else "", b) for i, (t, c, b) in enumerate(issues, 1))
     return "Verdict: FAIL\nBlocking reasons:\n" + body + "\nNon-blocking findings:\n" + nonblocking + "\n"
+
+
+# A real executable standing in for `bd` in the end-to-end tests: it keeps its beads in state.json beside it, appends every verb to calls.log, and exits 9 on a verb nobody planned. @PY@ / @TEXT@ are filled in by Real.e2e_city.
+STUB_BD = r'''#!@PY@
+import json, os, sys
+a = sys.argv[1:]
+here = os.path.dirname(os.path.abspath(__file__))
+state, calls = os.path.join(here, "state.json"), os.path.join(here, "calls.log")
+with open(calls, "a") as fh:
+    fh.write(a[2] + "\n")
+beads = json.load(open(state)) if os.path.exists(state) else []
+if a[2] == "list":
+    print(json.dumps(beads))
+elif a[2] == "comments":
+    print(json.dumps([{"text": @TEXT@}]))
+elif a[2] == "create":
+    opts, i = {}, 3
+    while i < len(a) - 1:
+        if a[i] == "--silent":
+            i += 1
+        else:
+            opts[a[i]], i = a[i + 1], i + 2
+    bid = "ga-e2e%d" % (len(beads) + 1)
+    beads.append({"id": bid, "status": "open", "labels": opts["-l"].split(","), "metadata": json.loads(opts["--metadata"]), "title": a[-1], "description": opts["-d"]})
+    with open(state, "w") as fh:
+        json.dump(beads, fh)
+    print(bid)
+elif a[2] == "show":
+    print(json.dumps([b for b in beads if b["id"] == a[3]]))
+else:
+    sys.exit(9)
+'''
 
 
 class Bd:
@@ -126,11 +158,12 @@ class T(unittest.TestCase):
             with open(self.mj, "w") as fh:
                 json.dump(self.meter(), fh)
 
-    def go(self, *args):
+    def go(self, *args, entry=False):
+        """entry=True drives P.entry (main under its net: exit 70 for an exception nobody planned) instead of P.main."""
         self.flush()
         out, err = io.StringIO(), io.StringIO()
         with mock.patch.object(P, "run", self.bd), mock.patch.object(M, "run", self.bd), contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
-            rc = P.main(["--city", self.city, "--registry", self.reg, "--meter", METER, "--meter-json", self.mj, "--bd", "bd", "--gc", "gc"] + list(args))
+            rc = (P.entry if entry else P.main)(["--city", self.city, "--registry", self.reg, "--meter", METER, "--meter-json", self.mj, "--bd", "bd", "--gc", "gc"] + list(args))
         return rc, out.getvalue(), err.getvalue()
 
     def js(self, *args):
@@ -228,6 +261,43 @@ class MeterInput(T):
         self.assertIn("medidor: 3 recusa(s) SEM LEITURA", j["gaps"])
         self.assertEqual(j["meter"]["complete"], False)
 
+    def test_the_schema_this_script_reads_is_the_one_the_meter_writes(self):
+        self.assertEqual(P.METER_SCHEMA, M.SCHEMA)  # a meter that bumps its schema must fail HERE first, not feed this script a shape it was not written for
+
+    def test_a_meter_json_that_breaks_the_contract_is_nao_sei_and_nothing_is_asked(self):
+        # after the top-level check the old code indexed g["key"], rep.get("gaps", []) ... and trusted them: a traceback (exit 1) where the answer is NÃO SEI (exit 2)
+        def case(name, change):
+            m = json.loads(json.dumps(self.meter()))
+            change(m)
+            return name, json.dumps(m)
+        for name, text in (case("sem schema", lambda m: m.pop("schema")), case("schema 2", lambda m: m.update(schema=2)), case("schema em texto", lambda m: m.update(schema="1")),
+                           case("gaps null", lambda m: m.update(gaps=None)), case("gaps em texto", lambda m: m.update(gaps="3 recusas SEM LEITURA")), case("sem gaps", lambda m: m.pop("gaps")),
+                           case("evaluator lista", lambda m: m.update(evaluator=[1])), case("evaluator null", lambda m: m.update(evaluator=None)), case("sem evaluator", lambda m: m.pop("evaluator")),
+                           case("unlabeled_groups null", lambda m: m["refusals"].update(unlabeled_groups=None)), case("unlabeled_groups objeto", lambda m: m["refusals"].update(unlabeled_groups={})),
+                           case("sem unlabeled_groups", lambda m: m["refusals"].pop("unlabeled_groups")), case("classes lista", lambda m: m["refusals"].update(classes=[])),
+                           case("window lista", lambda m: m.update(window=[])), case("window em texto", lambda m: m.update(window="14"))):
+            with self.subTest(name):
+                self.meter_text = text
+                self.bd.calls.clear()
+                rc, j = self.js("--apply")
+                self.assertEqual((rc, j["opened"], self.bd.calls, self.bd.created), (2, [], [], []))
+                self.assertTrue(j["line"].startswith("NÃO SEI") and "NÃO é" in j["line"], j["line"])
+
+    def test_malformed_entries_inside_a_valid_report_never_crash_and_are_said(self):
+        self.refuse("novo-x", 5)
+        self.mclasses["torto"] = {"refusals": "9"}
+        self.mclasses["Nome Inválido"] = {"refusals": 9}
+        self.unl = [{"refusals": 9, "example": {"bead": "b0"}}, {"key": "sem exemplo", "refusals": 8, "example": None}, {"key": "exemplo lista", "refusals": 7, "example": []},
+                    {"key": "exemplo sem bead", "refusals": 6, "example": {}}, {"key": "bom", "refusals": 5, "example": {"bead": "b1", "gate_run": "g"}}, {"key": "bead numérico", "refusals": 5, "example": {"bead": 7}}, "lixo"]
+        rc, j = self.js("--apply")
+        self.assertEqual((rc, self.verds(j)), (0, {"novo-x": "aberta"}))  # the labelled class that IS well formed is still opened
+        self.assertEqual([(u["key"], u["example"]) for u in j["unlabeled_candidates"]], [("sem exemplo", None), ("exemplo lista", None), ("exemplo sem bead", None), ("bom", "b1"), ("bead numérico", None)])
+        gaps = [g for g in j["gaps"] if g.startswith("medidor:")]
+        self.assertTrue(any("2 classe(s)" in g and "torto" in g and "Nome Inválido" in g for g in gaps), gaps)
+        self.assertTrue(any("2 grupo(s)" in g for g in gaps), gaps)  # the group without a key and the string
+        rc, out, _ = self.go("--apply")  # the text output survives the same input
+        self.assertIn("(ex.: ?)", out)
+
 
 class BeadStore(T):
     def test_unreadable_bead_store_is_nao_sei_and_nothing_is_opened(self):
@@ -302,6 +372,40 @@ class Decision(T):
         self.assertIn("sem rótulo   7× third state (ex.: b1) → não aberta", out)
         self.assertNotIn(M.NO_TITLE, out)
 
+    def test_a_closed_bead_with_no_registry_row_is_a_visible_gap_not_a_silent_suppression(self):
+        # a bead closed without the registry row (won't-fix, a janitor, a dog that failed) keeps the class "ja-aberta" for good: that has to be SAID, not look like a healthy run
+        self.refuse("novo-x", 5)
+        self.bd.beads = [{"id": "ga-old", "status": "closed", "labels": ["auto-melhoria:checagem", "auto-melhoria:classe:novo-x"]}]
+        rc, j = self.js()
+        self.assertEqual((rc, self.verds(j)), (0, {"novo-x": "ja-aberta"}))
+        gap = [g for g in j["gaps"] if "novo-x" in g]
+        self.assertEqual(len(gap), 1, j["gaps"])
+        self.assertTrue("ga-old" in gap[0] and "registro" in gap[0] and "auto-melhoria:classe:novo-x" in gap[0], gap)  # names the bead, the registry, and the label that would reopen the class
+        rc, out, _ = self.go()
+        self.assertIn("⚠", out)
+        self.assertIn("ga-old", out)
+        # no gap when nothing is wrong: the bead is still open (work in progress), or the class has its row (covered, whatever the bead says)
+        self.bd.beads[0]["status"] = "open"
+        self.assertEqual([g for g in self.js()[1]["gaps"] if "novo-x" in g], [])
+        self.bd.beads[0]["status"] = "closed"
+        self.put_reg(SEED + "novo-x\tdesligada\tmotivo\n")
+        rc, j = self.js()
+        self.assertEqual((self.verds(j), [g for g in j["gaps"] if "novo-x" in g]), ({"novo-x": "coberta"}, []))
+        self.bd.beads[0]["status"] = ""  # a status nobody could read is not "closed": no claim either way
+        self.put_reg(SEED)
+        self.assertEqual([g for g in self.js()[1]["gaps"] if "novo-x" in g], [])
+        # a class carried by two beads shows the one still in play, whichever comes first in the list: it is abandoned only when ALL of them are closed
+        labels = ["auto-melhoria:checagem", "auto-melhoria:classe:novo-x"]
+        still, done = {"id": "ga-open", "status": "open", "labels": labels}, {"id": "ga-closed", "status": "closed", "labels": labels}
+        for order in ((still, done), (done, still)):
+            with self.subTest([b["id"] for b in order]):
+                self.bd.beads = list(order)
+                rc, j = self.js()
+                self.assertEqual(([(c["verdict"], c["bead"]) for c in j["classes"]], [g for g in j["gaps"] if "novo-x" in g]), ([("ja-aberta", "ga-open")], []))
+        self.bd.beads = [dict(done, id="ga-c1"), dict(done, id="ga-c2")]
+        rc, j = self.js()
+        self.assertEqual(len([g for g in j["gaps"] if "novo-x" in g]), 1)
+
 
 class Apply(T):
     def test_the_bead_is_a_routed_approved_feature_citing_three_examples_as_data(self):
@@ -357,7 +461,12 @@ class Apply(T):
         for name, setup, want in (("bd create falhou", lambda: setattr(self.bd, "create_rc", 1), "erro-ao-abrir"), ("não devolveu id", lambda: setattr(self.bd, "create_out", "Error: boom\n"), "erro-ao-abrir"),
                                   ("saída vazia", lambda: setattr(self.bd, "create_out", ""), "erro-ao-abrir"), ("show falhou", lambda: setattr(self.bd, "show_override", (1, "")), "aberta-nao-verificada"),
                                   ("show lixo", lambda: setattr(self.bd, "show_override", (0, "lixo")), "aberta-nao-verificada"), ("show sem os rótulos", lambda: setattr(self.bd, "show_override", (0, json.dumps([{"id": "ga-new1", "labels": ["exec:auto"], "metadata": {}}]))), "aberta-nao-verificada"),
-                                  ("show sem a rota", lambda: setattr(self.bd, "show_override", (0, json.dumps([{"id": "ga-new1", "labels": ["story:approved", "auto-melhoria:classe:novo-x"], "metadata": {"gc.routed_to": "outra"}}]))), "aberta-nao-verificada")):
+                                  ("show sem a rota", lambda: setattr(self.bd, "show_override", (0, json.dumps([{"id": "ga-new1", "labels": ["story:approved", "auto-melhoria:classe:novo-x"], "metadata": {"gc.routed_to": "outra"}}]))), "aberta-nao-verificada"),
+                                  ("show sem story:approved", lambda: setattr(self.bd, "show_override", (0, json.dumps([{"id": "ga-new1", "labels": ["auto-melhoria:classe:novo-x"], "metadata": {"gc.routed_to": "gastown.dog"}}]))), "aberta-nao-verificada"),
+                                  ("show sem o rótulo da classe", lambda: setattr(self.bd, "show_override", (0, json.dumps([{"id": "ga-new1", "labels": ["story:approved"], "metadata": {"gc.routed_to": "gastown.dog"}}]))), "aberta-nao-verificada"),
+                                  ("show falhou mas imprimiu JSON bom", lambda: setattr(self.bd, "show_override", (1, json.dumps([{"id": "ga-new1", "labels": ["story:approved", "auto-melhoria:classe:novo-x"], "metadata": {"gc.routed_to": "gastown.dog"}}]))), "aberta-nao-verificada"),
+                                  ("show com metadata que não é objeto", lambda: setattr(self.bd, "show_override", (0, json.dumps([{"id": "ga-new1", "labels": ["story:approved", "auto-melhoria:classe:novo-x"], "metadata": []}]))), "aberta-nao-verificada"),
+                                  ("show com labels em texto que contém os rótulos", lambda: setattr(self.bd, "show_override", (0, json.dumps([{"id": "ga-new1", "labels": "auto-melhoria:classe:novo-x story:approved", "metadata": {"gc.routed_to": "gastown.dog"}}]))), "aberta-nao-verificada")):
             with self.subTest(name):
                 self.bd = Bd(self.city)
                 self.refuse_comments_again()
@@ -371,6 +480,17 @@ class Apply(T):
         """A fresh Bd forgot the planned comments: plan them again for the rows already in the log."""
         for r in self.rows:
             self.bd.comments[r["gate_run"]] = (0, json.dumps([{"text": verdict(("Falha de novo-x", "novo-x", "veja scripts/a.sh:1\n"))}]))
+
+    def test_a_create_that_timed_out_says_the_bead_may_exist_and_how_to_check(self):
+        self.refuse("novo-x", 5)
+        self.bd.create_rc = None  # run() answers (None, ""): bd did not run, or the timeout fired, possibly after it had created the bead
+        rc, j = self.js("--apply")
+        self.assertEqual((rc, self.verds(j), self.bd.created), (1, {"novo-x": "erro-ao-abrir"}, []))
+        self.assertIn("bd list --label auto-melhoria:classe:novo-x --status all", j["classes"][0]["why"])
+        self.bd.create_rc = 1  # a plain failure of bd (it answered) carries no such hint: it did not create anything
+        rc, j = self.js("--apply")
+        self.assertEqual((rc, self.verds(j)), (1, {"novo-x": "erro-ao-abrir"}))
+        self.assertNotIn("pode ter sido criada", j["classes"][0]["why"])
 
     def test_brakes_per_run_and_open_at_once(self):
         for n, k in (("aa-um", 9), ("bb-dois", 7), ("cc-tres", 5), ("dd-quatro", 5)):
@@ -391,6 +511,76 @@ class Apply(T):
         self.refuse("aa-um", 6)
         rc, j = self.js("--apply", "--max-new", "0")
         self.assertEqual((rc, self.verds(j), self.bd.created), (0, {"aa-um": "teto-por-rodada"}, []))
+
+    def test_a_class_the_meter_gave_no_bead_count_still_opens_and_the_text_does_not_invent_one(self):
+        # decide() admits it on purpose (--meter-json, a schema change); the old text formatted "?" through %d and crashed AFTER the first bead was open
+        self.refuse("aa-um", 6)
+        self.refuse("bb-dois", 5)
+        del self.mclasses["bb-dois"]["beads"]
+        for mode in ((), ("--apply",)):
+            with self.subTest(mode):
+                rc, j = self.js(*mode)
+                self.assertEqual((rc, self.verds(j)), (0, {"aa-um": "aberta" if mode else "abriria", "bb-dois": "aberta" if mode else "abriria"}))
+        text = {c["title"]: c["-d"] for c in self.bd.created}
+        um, dois = [d for t, d in sorted(text.items())]
+        self.assertIn("citada em 6 recusa(s) de revisor, em 6 bead(s), entre", um)
+        self.assertIn("citada em 5 recusa(s) de revisor, entre", dois)  # no count, no "?" and no zero: the phrase is simply not there
+        self.assertNotIn("bead(s)", dois.split("\n")[1])
+        self.assertNotIn("?", dois.split("\n")[1])
+
+    def test_the_dry_run_previews_exactly_the_bead_apply_creates(self):
+        self.refuse("novo-x", 5)
+        rc, dry = self.js()
+        row = dry["classes"][0]
+        self.assertEqual((rc, row["verdict"], self.bd.created), (0, "abriria", []))
+        rc, ap = self.js("--apply")
+        c = self.bd.created[0]
+        prev = row["preview"]
+        self.assertEqual((prev["title"], ",".join(prev["labels"]), prev["metadata"], prev["description"]), (c["title"], c["-l"], json.loads(c["--metadata"]), c["-d"]))
+        self.assertEqual(row["why"], c["title"])  # the text output of the preview shows the title it would open
+        rc, again = self.js()  # dry-run once more: the class is ja-aberta now, so there is nothing to preview
+        self.assertEqual((self.verds(again), "preview" in again["classes"][0]), ({"novo-x": "ja-aberta"}, False))
+
+    def test_the_dry_run_reports_a_text_it_cannot_build_instead_of_promising_it(self):
+        self.refuse("novo-x", 5)
+        with mock.patch.object(P, "describe", side_effect=TypeError("%d format: a real number is required, not str")):
+            rc, j = self.js()
+        self.assertEqual((rc, self.verds(j), self.bd.created, j["opened"]), (1, {"novo-x": "erro-ao-abrir"}, [], []))
+        self.assertTrue(any("novo-x" in g and "TypeError" in g for g in j["gaps"]), j["gaps"])
+
+    def test_a_crash_on_one_class_does_not_hide_the_beads_already_opened(self):
+        self.refuse("aa-um", 9)
+        self.refuse("bb-dois", 7)
+        real = P.describe
+
+        def boom(name, *a, **k):
+            if name == "bb-dois":
+                raise TypeError("%d format: a real number is required, not str")
+            return real(name, *a, **k)
+        with mock.patch.object(P, "describe", boom):
+            rc, j = self.js("--apply")
+        self.assertEqual((rc, self.verds(j), j["opened"], len(self.bd.created)), (1, {"aa-um": "aberta", "bb-dois": "erro-ao-abrir"}, ["ga-new1"], 1))
+        self.assertTrue(any("bb-dois" in g and "TypeError" in g and "auto-melhoria:classe:bb-dois" in g for g in j["gaps"]), j["gaps"])  # says how to check whether the bead exists
+        self.assertIn("1 aberta(s)", j["line"])
+        self.assertIn("1 erro(s) ao abrir", j["line"])
+        with mock.patch.object(P, "describe", boom):
+            rc, out, _ = self.go("--apply")  # the second run: aa-um is ja-aberta, bb-dois still cannot be built, and the text report says so
+        self.assertEqual(rc, 1)
+        self.assertIn("bb-dois", out)
+        self.assertIn("TypeError", out)
+
+    def test_control_characters_of_a_verdict_never_reach_bd_create(self):
+        # a NUL in an argv entry makes subprocess.run raise ValueError (not an OSError): it ended an --apply with a traceback after earlier beads were open
+        self.refuse("novo-x", 5)
+        for i in range(5):
+            self.bd.comments["gr-novo-x-%d" % i] = (0, json.dumps([{"text": verdict(("Falha\x00 de novo-x", "novo-x", "veja scripts/x-%d.sh:1 \x1b[31mvermelho\x07 \x85fim\n" % i))}]))
+        rc, j = self.js("--apply")
+        self.assertEqual((rc, self.verds(j)), (0, {"novo-x": "aberta"}))
+        d = self.bd.created[0]["-d"]
+        self.assertIsNone(re.search(r"[\x00-\x08\x0b-\x1f\x7f-\x9f]", d), repr(d))  # the description's own line breaks (\n) are the only control characters left
+        self.assertIn("vermelho", d)  # neutralised, not dropped
+        self.assertEqual(P.defang("a\x00b\x1b[0m\x7f\x85c\td"), "a b [0m  c d")  # one space per control character (C0, DEL, C1)
+        self.assertEqual(P.defang("a<b>c"), "a‹b›c")
 
 
 class Examples(T):
@@ -467,7 +657,7 @@ class Lock(T):
         self.refuse("novo-x", 5)
         self.hold()
         rc, j = self.js("--apply")
-        self.assertEqual((rc, self.bd.created, self.bd.verbs("comments")), (0, [], []))
+        self.assertEqual((rc, self.bd.created, self.bd.calls), (0, [], []))  # the lock comes first: a held lock means not even a read is asked
         self.assertIn("outra rodada em curso", j["line"])
         rc, j = self.js()
         self.assertEqual(self.verds(j), {"novo-x": "abriria"})
@@ -480,6 +670,61 @@ class Lock(T):
         rc, j = self.js("--apply")
         self.assertEqual((rc, j["opened"]), (2, []))
         self.assertTrue(j["line"].startswith("NÃO SEI") and "lock" in j["line"], j["line"])
+
+    def test_a_flock_failure_that_is_not_contention_is_nao_sei_never_the_benign_skip(self):
+        self.refuse("novo-x", 5)
+        for name in ("ENOLCK", "EOPNOTSUPP", "EINVAL", "EIO"):
+            with self.subTest(name), mock.patch.object(P.fcntl, "flock", side_effect=OSError(getattr(errno, name), os.strerror(getattr(errno, name)))):
+                self.bd.calls.clear()
+                rc, j = self.js("--apply")
+                self.assertEqual((rc, j["opened"], self.bd.calls, self.bd.created), (2, [], [], []))
+                self.assertTrue(j["line"].startswith("NÃO SEI") and "lock" in j["line"], j["line"])
+                self.assertNotIn("outra rodada", j["line"])  # "I could not tell" must not read as "somebody else is running"
+                self.assertTrue(any(g.startswith("NÃO SEI") for g in j["gaps"]), j["gaps"])
+
+    def test_contention_in_either_spelling_is_still_the_benign_skip(self):
+        self.refuse("novo-x", 5)
+        for name in ("EAGAIN", "EWOULDBLOCK"):
+            with self.subTest(name), mock.patch.object(P.fcntl, "flock", side_effect=OSError(getattr(errno, name), os.strerror(getattr(errno, name)))):
+                rc, j = self.js("--apply")
+                self.assertEqual((rc, self.bd.calls, self.bd.created), (0, [], []))
+                self.assertIn("outra rodada em curso", j["line"])
+
+    def rival_finishes_as_the_lock_is_taken(self, before):
+        """The real instance_lock, then `before()` runs: a rival run created the bead (or registered the class) and released the lock a moment before this run got it. Whatever this run read BEFORE the lock is stale."""
+        real = P.instance_lock
+
+        @contextlib.contextmanager
+        def lock(city):
+            with real(city) as held:
+                before()
+                yield held
+        return mock.patch.object(P, "instance_lock", lock)
+
+    def test_the_bead_store_is_read_after_the_lock_is_taken(self):
+        self.refuse("novo-x", 5)
+        rival = lambda: self.bd.beads.append({"id": "ga-rival", "status": "open", "labels": ["auto-melhoria:checagem", "auto-melhoria:classe:novo-x"]})  # noqa: E731
+        with self.rival_finishes_as_the_lock_is_taken(rival):
+            rc, j = self.js("--apply")
+        self.assertEqual((rc, self.verds(j), self.bd.created), (0, {"novo-x": "ja-aberta"}, []))
+
+    def test_the_registry_is_read_after_the_lock_is_taken(self):
+        self.refuse("novo-x", 5)
+        with self.rival_finishes_as_the_lock_is_taken(lambda: self.put_reg(SEED + "novo-x\tem-teste\tx\n")):
+            rc, j = self.js("--apply")
+        self.assertEqual((rc, self.verds(j), self.bd.created), (0, {"novo-x": "coberta"}, []))
+
+    def test_an_oserror_after_the_lock_is_taken_is_not_reported_as_a_lock_failure(self):
+        # the old try/except OSError wrapped the whole body: an OSError from decide()/create_bead() printed "não consegui abrir o lock ... Nada foi aberto", false if a bead was already open
+        self.refuse("novo-x", 5)
+        with mock.patch.object(P, "decide", side_effect=OSError("disco cheio")), self.assertRaises(OSError):
+            self.go("--apply")
+        with mock.patch.object(P, "decide", side_effect=OSError("disco cheio")):
+            rc, out, err = self.go("--apply", entry=True)  # the net under main: exit 70, the cause on stderr, and not one word about a lock
+        self.assertEqual((rc, out), (70, ""))
+        self.assertIn("disco cheio", err)
+        self.assertNotIn("não consegui abrir o lock", err)  # the false claim the wide try made
+        self.assertNotIn("Nada foi aberto", err)
 
 
 class Usage(T):
@@ -501,24 +746,41 @@ class Real(unittest.TestCase):
         for exc in (OSError("sem binário"), subprocess.TimeoutExpired("x", 1), subprocess.SubprocessError("x")):  # injected: the command layer itself fails
             with self.subTest(type(exc).__name__), mock.patch.object(P.subprocess, "run", side_effect=exc):
                 self.assertEqual(P.run(["x"], 1), (None, ""))
+        # an argument that cannot be passed (a NUL) makes subprocess.run raise ValueError, which is neither: it is still "could not run", never an exception into the caller
+        self.assertEqual(P.run([sys.executable, "-c", "print(1)", "a\0b"], 5), (None, ""))
 
     def test_the_script_never_opens_a_file_for_writing_except_the_lock(self):
+        # a static tripwire over the source text, not a proof: it reads every open() whose mode string can write and the usual ways round it (the real guard is that the script only ever calls bd and the meter)
         with open(SUT) as fh:
             src = fh.read()
-        self.assertEqual(re.findall(r"open\([^)]*[\"'](?:w|a|wb|ab|x|r\+)[\"']", src), [])
+        self.assertEqual(re.findall(r"open\([^)]*[\"'][rbt]*[wax+][rbtwax+]*[\"']", src), [])
         self.assertEqual(len(re.findall(r"os\.open\(", src)), 1)
-        for forbidden in ("gate-refusal-meter.py\", \"w", "os.replace", "os.rename", "shutil.", "os.remove", "os.unlink", "--save"):
+        for forbidden in ("gate-refusal-meter.py\", \"w", "os.replace", "os.rename", "shutil.", "os.remove", "os.unlink", "--save", "write_text", "write_bytes", "makedirs", "mkdir", "os.write(", "io.open", "tempfile", "pathlib"):
             self.assertNotIn(forbidden, src)
 
-    def test_end_to_end_with_real_processes_and_a_stub_bd(self):
+    def test_entry_turns_an_unplanned_exception_into_exit_70_and_leaves_exit_1_to_the_bead(self):
+        err = io.StringIO()
+        with mock.patch.object(P, "main", side_effect=RuntimeError("bug de teste")), contextlib.redirect_stderr(err):
+            self.assertEqual(P.entry([]), 70)
+        for need in ("ERRO INESPERADO", "RuntimeError: bug de teste", "Traceback", "auto-melhoria:checagem"):  # the traceback, and where to look for what the run already opened
+            self.assertIn(need, err.getvalue())
+        for code in (0, 1, 2, 64):  # every planned exit code passes through untouched
+            with self.subTest(code), mock.patch.object(P, "main", return_value=code):
+                self.assertEqual(P.entry(["--x"]), code)
+        for exc in (KeyboardInterrupt, SystemExit):  # not Exceptions: the net does not swallow them
+            with self.subTest(exc.__name__), mock.patch.object(P, "main", side_effect=exc), self.assertRaises(exc):
+                P.entry([])
+
+    def e2e_city(self):
+        """REAL files for the processes below: a city with the gate log (5 reviewer refusals of one class), the registry and the meter's JSON, and a stub `bd` that keeps its beads in state.json and logs every verb to calls.log.
+        -> (root, city, stub, args every run shares)."""
         root = tempfile.mkdtemp(prefix="grc-e2e-")
         self.addCleanup(shutil.rmtree, root, True)
         city = os.path.join(root, "city")
         os.makedirs(os.path.join(city, ".gc"))
         stub = os.path.join(root, "bd")
-        text = verdict(("Falha de real-x", "real-x", "veja scripts/a.sh:1\n"))
         with open(stub, "w") as fh:
-            fh.write("#!%s\nimport sys, json\na = sys.argv[1:]\nif a[2] == 'list':\n    print('[]')\nelif a[2] == 'comments':\n    print(json.dumps([{'text': %r}]))\nelse:\n    sys.exit(9)\n" % (sys.executable, text))
+            fh.write(STUB_BD.replace("@PY@", sys.executable).replace("@TEXT@", repr(verdict(("Falha de real-x", "real-x", "veja scripts/a.sh:1\n")))))
         os.chmod(stub, 0o755)
         with open(os.path.join(city, ".gc", "quality-gate.jsonl"), "w") as fh:
             for i in range(5):
@@ -526,14 +788,62 @@ class Real(unittest.TestCase):
         with open(os.path.join(root, "reg.tsv"), "w") as fh:
             fh.write(SEED)
         with open(os.path.join(root, "m.json"), "w") as fh:
-            json.dump({"window": {"days": 14, "from": FROM, "to": NOW}, "evaluator": {"sha256": "z"}, "refusals": {"classes": {"real-x": {"refusals": 5, "beads": 5}}, "unlabeled_groups": []}}, fh)
-        p = subprocess.run([sys.executable, "-I", SUT, "--city", city, "--registry", os.path.join(root, "reg.tsv"), "--meter", METER, "--meter-json", os.path.join(root, "m.json"), "--bd", stub, "--json"],
-                           capture_output=True, text=True, timeout=120)
+            json.dump({"schema": 1, "gaps": [], "window": {"days": 14, "from": FROM, "to": NOW}, "evaluator": {"sha256": "z"}, "refusals": {"classes": {"real-x": {"refusals": 5, "beads": 5}}, "unlabeled_groups": []}}, fh)
+        return root, city, stub, ["--city", city, "--registry", os.path.join(root, "reg.tsv"), "--meter", METER, "--meter-json", os.path.join(root, "m.json"), "--bd", stub, "--json"]
+
+    def test_end_to_end_with_real_processes_and_a_stub_bd(self):
+        root, city, stub, common = self.e2e_city()
+        p = subprocess.run([sys.executable, "-I", SUT] + common, capture_output=True, text=True, timeout=120)
         self.assertEqual(p.returncode, 0, p.stderr)
         j = json.loads(p.stdout)
         self.assertEqual([(c["class"], c["verdict"], len(c["examples"])) for c in j["classes"]], [("real-x", "abriria", 3)])
         p = subprocess.run([sys.executable, "-I", SUT, "--days", "0"], capture_output=True, text=True, timeout=60)
         self.assertEqual((p.returncode, p.stdout), (64, ""))
+
+    def test_end_to_end_an_unplanned_exception_exits_70_through_the_real_entry_point(self):
+        # the __main__ wiring is only seen by a real process: a meter module that loads but lacks what gather_examples calls is a bug nobody planned for; -S because an UNcaught traceback is 20 s of apport on the node
+        root, city, stub, common = self.e2e_city()
+        hollow = os.path.join(root, "hollow-meter.py")
+        with open(hollow, "w") as fh:
+            fh.write('NO_TITLE = "(vazio)"\n')
+        args = [a if a != METER else hollow for a in common]
+        p = subprocess.run([sys.executable, "-I", "-S", SUT] + args + ["--apply"], capture_output=True, text=True, timeout=120)
+        self.assertEqual((p.returncode, p.stdout), (70, ""), p.stderr)
+        for need in ("ERRO INESPERADO", "AttributeError", "auto-melhoria:checagem"):
+            self.assertIn(need, p.stderr)
+
+    def test_end_to_end_apply_opens_once_and_a_real_process_that_finds_the_lock_taken_asks_nothing(self):
+        root, city, stub, common = self.e2e_city()
+        calls = os.path.join(root, "calls.log")
+
+        def read_calls():
+            if not os.path.exists(calls):
+                return []
+            with open(calls) as fh:
+                return fh.read().split()
+        run = lambda *extra: subprocess.run([sys.executable, "-I", SUT] + common + list(extra), capture_output=True, text=True, timeout=120)  # noqa: E731
+        p = run("--apply")
+        self.assertEqual(p.returncode, 0, p.stderr)
+        j = json.loads(p.stdout)
+        self.assertEqual(([(c["class"], c["verdict"]) for c in j["classes"]], j["opened"]), ([("real-x", "aberta")], ["ga-e2e1"]))
+        self.assertTrue({"list", "comments", "create", "show"} <= set(read_calls()), read_calls())  # the stub really ran: a fake that never ran would make every line below vacuous
+        with open(os.path.join(root, "state.json")) as fh:
+            state = json.load(fh)
+        self.assertEqual([(b["id"], b["status"], sorted(b["labels"]), b["metadata"]["gc.routed_to"]) for b in state],
+                         [("ga-e2e1", "open", ["auto-melhoria:checagem", "auto-melhoria:classe:real-x", "exec:auto", "story:approved"], "gastown.dog")])
+        p = run("--apply")  # a second process: the class is found through the real `list` and is not opened again
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertEqual([(c["class"], c["verdict"]) for c in json.loads(p.stdout)["classes"]], [("real-x", "ja-aberta")])
+        with open(os.path.join(root, "state.json")) as fh:
+            self.assertEqual(len(json.load(fh)), 1)
+        fd = os.open(os.path.join(city, ".gc", "gate-refusal-checks.lock"), os.O_RDWR | os.O_CREAT, 0o644)
+        self.addCleanup(os.close, fd)
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)  # another run is in progress
+        before = read_calls()
+        p = run("--apply")
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertIn("outra rodada em curso", json.loads(p.stdout)["line"])
+        self.assertEqual(read_calls(), before)  # it did not so much as read the bead store
 
 
 if __name__ == "__main__":
