@@ -1,4 +1,4 @@
-# pilot-dispatcher.wa-node-spawn.mutants.py — o mutador do pilot-dispatcher.wa-node-spawn.selftest.sh (ga-2hd02v.3): 118 quebras de UMA linha do pilot-dispatcher.sh, cada uma com um nome.
+# pilot-dispatcher.wa-node-spawn.mutants.py — o mutador do pilot-dispatcher.wa-node-spawn.selftest.sh (ga-2hd02v.3): 132 quebras de UMA linha do pilot-dispatcher.sh, cada uma com um nome.
 #
 # Contents
 #   Uso · Como cada mutante é escrito
@@ -234,12 +234,12 @@ def _():
 
 @m("titulo-sub")
 def _():
-    rep(r'''gsub("[\r\n|]"; " ")''', r'''sub("[\r\n|]"; " ")''')
+    frep("_pilot_wa_node_read", r'''gsub("[\r\n|]"; " ")''', r'''sub("[\r\n|]"; " ")''')
 
 
 @m("titulo-sem-barra")
 def _():
-    rep(r'''gsub("[\r\n|]"; " ")''', r'''gsub("[\r\n]"; " ")''')
+    frep("_pilot_wa_node_read", r'''gsub("[\r\n|]"; " ")''', r'''gsub("[\r\n]"; " ")''')
 
 
 @m("read-sem-r")
@@ -306,6 +306,77 @@ def _():
 @m("dica-sem-id")
 def _():
     rep('--title-hint "build $_ro_id: $_ro_title"', '--title-hint "build: $_ro_title"')
+
+
+# ga-dzexg3i.1: o id da sessão nova vai para a bead (a vigia do failed-create lê a sessão por ele)
+@m("sid-nao-guarda")
+def _():
+    rep('elif timeout 15 bd -C "$_ro_store" update "$_ro_id" --if-assignee "$_ro_alias" --set-metadata "$_ro_sk=$_ro_sid" -q >/dev/null 2>&1; then', 'elif true; then')
+
+
+@m("sid-guarda-sem-dono")
+def _():
+    rep('--if-assignee "$_ro_alias" --set-metadata "$_ro_sk=$_ro_sid"', '--set-metadata "$_ro_sk=$_ro_sid"')
+
+
+@m("sid-chave-fixa")
+def _():
+    rep('_ro_sk="${PILOT_NODE_SESSION_KEY:-pilot.node_session}"', '_ro_sk="pilot.node_session"')
+
+
+@m("sid-forma-livre")
+def _():
+    rep('case "$_ro_sid" in -*|.*|*[!A-Za-z0-9._-]*) _ro_sid="" ;; esac', ':')
+
+
+@m("sid-aceita-varios-objetos")
+def _():
+    rep('if length == 1 and (.[0] | type) == "object" and', 'if (.[0] | type) == "object" and')
+
+
+@m("sid-aceita-nao-texto")
+def _():
+    rep(' and ((.[0].session_id | type) == "string") then .[0].session_id', ' then (.[0].session_id | tostring)')
+
+
+@m("sid-ilegivel-sem-aviso")
+def _():
+    rep('warn "ga-dzexg3i.1: o \\`session new\\` de $_ro_id', ': "ga-dzexg3i.1: o \\`session new\\` de $_ro_id')
+
+
+@m("sid-falha-guardar-sem-aviso")
+def _():
+    rep('warn "ga-dzexg3i.1: não consegui guardar o id da sessão', ': "ga-dzexg3i.1: não consegui guardar o id da sessão')
+
+
+@m("sid-falha-guardar-desfaz")
+def _():
+    rep('else\n        warn "ga-dzexg3i.1: não consegui guardar', 'else\n        _ro_step="guardar falhou"; warn "ga-dzexg3i.1: não consegui guardar')
+
+
+@m("sid-falha-guardar-conta-guardado")
+def _():
+    rep('else\n        warn "ga-dzexg3i.1: não consegui guardar', 'else\n        _ro_skset="$_ro_sk"; warn "ga-dzexg3i.1: não consegui guardar')
+
+
+@m("sid-desfazer-sem-chave")
+def _():
+    rep('"$_ro_sess" "$_ro_key" "$_ro_skset"; then return 1; fi', '"$_ro_sess" "$_ro_key" ""; then return 1; fi')
+
+
+@m("sid-log-sem-id")
+def _():
+    rep('(sessão $_ro_st${_ro_skset:+ $_ro_sid}), avisada', '(sessão $_ro_st), avisada')
+
+
+@m("sid-rb-nao-tira-chave")
+def _():
+    rep('${_rb_sk:+--unset-metadata "$_rb_sk"} ', '')
+
+
+@m("sid-rb-nao-confere-chave")
+def _():
+    rep('else (.metadata[$sk] // "") end)', 'else "" end)')
 
 
 @m("sem-aviso")
@@ -397,12 +468,12 @@ def _():
 
 @m("desfaz-confirmado-vira-2")
 def _():
-    rep('"$_ro_sess" "$_ro_key"; then return 1; fi', '"$_ro_sess" "$_ro_key"; then return 2; fi')
+    rep('"$_ro_sess" "$_ro_key" "$_ro_skset"; then return 1; fi', '"$_ro_sess" "$_ro_key" "$_ro_skset"; then return 2; fi')
 
 
 @m("sem-desfazer")
 def _():
-    rep('if _pilot_node_remote_rollback "$_ro_alias" "$_ro_id" "$_ro_store" "$_ro_sess" "$_ro_key"; then return 1; fi', 'if true; then return 1; fi')
+    rep('if _pilot_node_remote_rollback "$_ro_alias" "$_ro_id" "$_ro_store" "$_ro_sess" "$_ro_key" "$_ro_skset"; then return 1; fi', 'if true; then return 1; fi')
 
 
 # ── o desfazer ──

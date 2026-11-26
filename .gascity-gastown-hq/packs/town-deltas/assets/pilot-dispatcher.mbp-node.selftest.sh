@@ -33,7 +33,7 @@ eq() { if [ "$2" = "$3" ]; then ok "$1"; else fail "$1 — obtido '$2', esperado
 [ -f "$DISPATCHER" ] || { echo "FATAL: $DISPATCHER não existe" >&2; exit 2; }
 fn_of() { awk -v n="$1" '$0 ~ "^"n"\\(\\)"{f=1} f{print} f&&/^}$/{exit}' "$DISPATCHER"; }
 FNS=""
-for _f in _pilot_mbp_node_decide _pilot_mbp_mini_full _pilot_mbp_node_open _pilot_mbp_node_settle _pilot_pool_live_count _pilot_live_session_count _pilot_wa_node_read _pilot_node_remote_open _pilot_node_remote_rollback \
+for _f in _pilot_mbp_node_decide _pilot_mbp_cooling _pilot_mbp_mini_full _pilot_mbp_node_open _pilot_mbp_node_settle _pilot_pool_live_count _pilot_live_session_count _pilot_wa_node_read _pilot_node_remote_open _pilot_node_remote_rollback \
           _pilot_node_idle_secs _pilot_slow_spawn_budget_spent _pilot_note_spawn_timing gc_json_or_unknown; do
   _b="$(fn_of "$_f")"
   [ -n "$_b" ] || { echo "FATAL: $_f() não está em $DISPATCHER" >&2; exit 2; }
@@ -311,6 +311,19 @@ reset; r=$(FAKE_APPLY_WRITES=1 FAKE_BD_SHOW_FAIL_FROM=2 D on 13); eq "rc 13 e a 
 reset; r=$(PRE_SLOW=1 D on 0); eq "sessão lenta já gastou o orçamento do sweep: nem escreve — 1" "$r $(ncalls)" "rc=1 0"
 reset; r=$(PRE_SLOW=1 D shadow 0); eq "o orçamento gasto não afeta o shadow" "$r $(ncalls)" "rc=1 1"
 reset; r=$(PRE_SLOW=1 D on 0 1); eq "nem o dry-run" "$r $(ncalls)" "rc=1 1"
+# ── ga-dzexg3i.1: a rota do MBP em RESFRIAMENTO (uma sessão do MBP morreu ao nascer): a escrita de verdade nem começa (a bead segue no mini); o shadow e o dry-run não escrevem e seguem medindo;
+#    o arquivo que existe mas não se lê deixa o MBP fora
+COOLF="$T/city/.gc/state/pilot-mbp-cool-until"; mkdir -p "$T/city/.gc/state"; rm -f "$COOLF"
+cool_in() { printf '%s\n' "$(( $(date +%s) + $1 ))" > "$COOLF"; }   # cool_in <s>: esfria até daqui a N s (negativo = já passou)
+reset; cool_in 600; r=$(D on 0); eq "rota esfriando: o apply nunca é chamado, nada escrito na bead — 1 (a bead segue no mini)" "$r $(ncalls) $(nupd)" "rc=1 0 0"
+grep -qF 'a rota do MBP está em resfriamento' "$T/err" && ok "...e o log diz que foi o resfriamento" || fail "log do resfriamento: $(cat "$T/err")"
+reset; cool_in 600; r=$(D shadow 0); eq "esfriando não afeta o shadow (não escreve, segue medindo)" "$r $(ncalls)" "rc=1 1"
+reset; cool_in 600; r=$(D on 0 1); eq "nem o dry-run" "$r $(ncalls)" "rc=1 1"
+reset; printf 'lixo\n' > "$COOLF"; r=$(D on 0); eq "arquivo de resfriamento ilegível: o MBP fica FORA — 1, nada escrito" "$r $(ncalls) $(nupd)" "rc=1 0 0"
+grep -qF 'não tem um inteiro legível' "$T/err" && ok "...e o aviso diz qual arquivo não se lê" || fail "aviso do arquivo ilegível: $(cat "$T/err")"
+reset; cool_in -5; r=$(D on 0); eq "resfriamento que já passou: o caminho abre como sempre (o apply roda)" "$r $(ncalls)" "rc=0 1"
+reset; rm -f "$COOLF"; r=$(D on 0); eq "sem arquivo de resfriamento (a rota nunca esfriou): o caminho abre como sempre" "$r $(ncalls)" "rc=0 1"
+rm -f "$COOLF"
 
 echo; echo "=== E. aceite: o Athos volta, o Hetzner e o mini não se mexem ==="
 reset; r=$(D on 0); eq "gate liberando e mini cheio: a bead vai ao alias do MBP e a sessão abre" "$r $(stt)" "rc=0 $AP1"
@@ -451,6 +464,12 @@ mut log-muda-despacho   $D1 '|| warn "mbp-node: linha de $_id ($_mode, rc=$_rc) 
 mut script-do-hetzner   $D1 '"$_dir/mbp-node-dispatch.sh" apply "$_id" --store "$_store" --basis any --dry-run' '"$_dir/wa-node-dispatch.sh" apply "$_id" --store "$_store" --basis any --dry-run'
 mut script-real-hetzner $D1 '"$_dir/mbp-node-dispatch.sh" apply "$_id" --store "$_store" --basis any 2>/dev/null' '"$_dir/wa-node-dispatch.sh" apply "$_id" --store "$_store" --basis any 2>/dev/null'
 mut sem-orcamento       $D1 'if _pilot_slow_spawn_budget_spent; then' 'if false; then'
+# ga-dzexg3i.1: rota do MBP em resfriamento — a escrita de verdade nem começa
+mut sem-resfriamento    $D1 'if _pilot_mbp_cooling; then' 'if false; then'
+mut resfriamento-segue  $D1 'a rota do MBP está em resfriamento (uma sessão do MBP virou failed-create ao nascer); nada escrito"
+      return 1' 'a rota do MBP está em resfriamento (uma sessão do MBP virou failed-create ao nascer); nada escrito"
+      :'
+mut resfriamento-sem-log $D1 'a rota do MBP está em resfriamento' 'a rota do MBP está pronta'
 mut sem-13              $D1 '13|124|137|143)' '124|137|143)'
 mut sem-sinal           $D1 '12[89]|1[3-9][0-9]|' '1[3-9][0-9]|'
 mut sem-settle-13       $D1 '_pilot_mbp_node_settle "$_id" "$_store"; return 2 ;;' 'return 2 ;;'

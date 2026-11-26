@@ -31,7 +31,7 @@ eq() { if [ "$2" = "$3" ]; then ok "$1"; else fail "$1 — obtido '$2', esperado
 [ -f "$DISPATCHER" ] || { echo "FATAL: $DISPATCHER não existe" >&2; exit 2; }
 fn_of() { awk -v n="$1" '$0 ~ "^"n"\\(\\)"{f=1} f{print} f&&/^}$/{exit}' "$DISPATCHER"; }
 FNS=""
-for _f in _pilot_mbp_stamped_pre _pilot_mbp_stamped_gate _pilot_mbp_stamped_check _pilot_mbp_stamped_after _pilot_mbp_stamped_skip _pilot_mbp_stamped_tally _pilot_mbp_stamped_summary _pilot_mbp_stamped_upd_now \
+for _f in _pilot_mbp_stamped_pre _pilot_mbp_cooling _pilot_mbp_stamped_gate _pilot_mbp_stamped_check _pilot_mbp_stamped_after _pilot_mbp_stamped_skip _pilot_mbp_stamped_tally _pilot_mbp_stamped_summary _pilot_mbp_stamped_upd_now \
           _pilot_wa_node_pass_memo_hit _pilot_wa_node_pass_memo_put _pilot_wa_node_pass_state _pilot_wa_node_adopt _pilot_wa_node_unadopt _pilot_bead_home_store \
           _pilot_mbp_node_decide _pilot_mbp_mini_full _pilot_mbp_node_open _pilot_mbp_node_settle _pilot_pool_live_count _pilot_live_session_count _pilot_wa_node_read _pilot_node_remote_open _pilot_node_remote_rollback \
           _pilot_node_idle_secs _pilot_slow_spawn_budget_spent _pilot_note_spawn_timing gc_json_or_unknown; do
@@ -232,6 +232,22 @@ for spec in '3|' '5|{"verdict":"node","free":2}' '126|' '127|'; do
 done
 reset; mv "$T/scripts/mbp-node-capacity.py" "$T/scripts/x.py"; r=$(gate2); mv "$T/scripts/x.py" "$T/scripts/mbp-node-capacity.py"; eq "oráculo ausente: fecha, motivo missing, e o aviso de sempre" "$r $(nwarn)" "rc=1 gate=no why=missing 1"
 reset; r=$(FAKE_CAP_RC=2 FAKE_CAP_OUT='{"verdict":"unknown","reason":"config"}' R '_pilot_mbp_stamped_gate || true; _pilot_mbp_stamped_gate || true; _pilot_mbp_stamped_gate || true; echo done' | tail -1); eq "o 'não' guardado não repete o aviso: uma ida ao oráculo, UM aviso por varredura" "$(ncap) $(nwarn)" "1 1"
+# ── ga-dzexg3i.1: a rota do MBP em RESFRIAMENTO (uma sessão do MBP morreu ao nascer) fecha o filtro ANTES do oráculo e de qualquer claim — recusa limpa, sem aviso por bead;
+#    o arquivo de resfriamento que existe mas não se lê deixa o MBP FORA (o inerte de uma rota que escreve em bead), com o aviso de sempre
+COOLF="$T/city/.gc/state/pilot-mbp-cool-until"; mkdir -p "$T/city/.gc/state"
+cool_in() { printf '%s\n' "$(( $(date +%s) + $1 ))" > "$COOLF"; }   # cool_in <s>: esfria até daqui a N s (negativo = já passou)
+reset; rm -f "$COOLF"; cool_in 600; r=$(gate2)
+eq "rota esfriando (até daqui a 600 s): o filtro fecha com motivo 'cooling', SEM aviso e SEM ir ao oráculo" "$r $(nwarn) $(ncap)" "rc=1 gate=no why=cooling 0 0"
+reset; cool_in 600; r=$(P "$BASE"); eq "esfriando: a candidata NÃO é oferecida, a varredura para no filtro e nenhum check/oráculo roda (nenhuma claim por causa do MBP)" "$r $(ncalls) $(ncap)" "rc=1 why=gate stop=gate probes=0 0 0"
+reset; cool_in 600; r=$(R '_pilot_mbp_stamped_gate || true; _pilot_mbp_stamped_gate || true; echo done' | tail -1); eq "esfriando, duas perguntas na mesma varredura: o 'não' fica guardado (nenhuma ida ao oráculo)" "$(ncap)" "0"
+reset; cool_in -5; r=$(gate2); eq "resfriamento que já passou: a rota volta — o oráculo é perguntado e abre" "$r $(nwarn) $(ncap)" "rc=0 gate=ok why= 0 1"
+reset; rm -f "$COOLF"; r=$(gate2); eq "sem arquivo de resfriamento (a rota nunca esfriou): o oráculo decide como sempre" "$r $(nwarn) $(ncap)" "rc=0 gate=ok why= 0 1"
+for lixo in 'lixo' '' '12x' '-5' '1234567890123' '1.5'; do
+  reset; printf '%s\n' "$lixo" > "$COOLF"; r=$(gate2)
+  eq "arquivo de resfriamento ilegível ('$lixo'): o MBP fica FORA (fechado) e AVISA uma vez, sem ir ao oráculo" "$r $(nwarn) $(ncap)" "rc=1 gate=no why=cooling 1 0"
+done
+grep -q 'não tem um inteiro legível' "$T/err" && ok "...e o aviso diz que o arquivo não tem um inteiro legível" || fail "aviso do arquivo ilegível: $(cat "$T/err")"
+rm -f "$COOLF"
 echo; echo "=== B. o check: o terceiro estado nunca vira node ==="
 chk() { R '_pilot_mbp_stamped_check wa-abc12 '"$STORE"'; echo "v=$_PMS_V basis=$_PMS_BASIS"' | tail -1; }
 reset; r=$(chk); eq "node/label" "$r" "v=node basis=label"
@@ -866,7 +882,10 @@ mut gate-porque-unknown-some $GATE_ '2:unknown) _PMS_GATE_WHY=unknown;' '2:unkno
 mut gate-prazo-vira-erro $GATE_ '124:*|137:*|143:*) _PMS_GATE_WHY=timeout;' '124:*|137:*|143:*) _PMS_GATE_WHY=error;'
 mut gate-ilegivel-vira-erro $GATE_ '0:*|1:*|2:*) _PMS_GATE_WHY=unreadable;' '0:*|1:*|2:*) _PMS_GATE_WHY=error;'
 mut gate-ausente-sem-porque $GATE_ '_PMS_GATE_WHY=missing; warn' ':; warn'
-# ── _pilot_mbp_stamped_check
+# ga-dzexg3i.1: a rota esfriando fecha o filtro antes do oráculo
+mut gate-sem-esfriamento $GATE_ 'if _pilot_mbp_cooling; then _PMS_GATE_WHY=cooling; return 1; fi' ':'
+mut gate-esfria-sem-porque $GATE_ '_PMS_GATE_WHY=cooling; return 1; fi' 'return 1; fi'
+mut gate-esfria-so-avisa $GATE_ 'if _pilot_mbp_cooling; then _PMS_GATE_WHY=cooling; return 1; fi' 'if _pilot_mbp_cooling; then _PMS_GATE_WHY=cooling; fi'# ── _pilot_mbp_stamped_check
 mut check-rc0-qualquer   $CHK_ 'if [ "${_sc_vb%%|*}" = node ]; then' 'if true; then'
 mut check-10-node        $CHK_ '10) _PMS_V=mini ;;' '10) _PMS_V=node ;;'
 mut check-erro-node      $CHK_ '_PMS_V="error"; _PMS_BASIS=""' '_PMS_V="node"; _PMS_BASIS=""'
