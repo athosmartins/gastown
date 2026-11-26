@@ -121,6 +121,16 @@ class T(unittest.TestCase):
         self.assertEqual((c["nao-sei"], c["alvos"], c["digitou"]), (1, 0, 0))
         self.assertEqual(w.typed(), [])
 
+    def test_file_reads_that_raise_are_none_not_empty(self):
+        agents = os.path.join(self.tmp, "agents")
+        self.assertEqual(sorted(bft.crews(agents)), ["oracle-wa"])  # controle: a leitura sã acha a crew
+        self.assertIsNone(bft.crews(os.path.join(self.tmp, "nao-existe")))
+        with mock.patch.object(bft.os, "listdir", side_effect=PermissionError):
+            self.assertIsNone(bft.crews(agents))
+        with mock.patch("builtins.open", side_effect=PermissionError):
+            self.assertIsNone(bft.crews(agents))  # toml que existe e não abre: None, nunca {}
+            self.assertEqual(bft.load_state(os.path.join(self.tmp, "state.json")), {})  # sem estado legível: vazio (documentado: UMA linha a mais)
+
     def test_corrupt_bd_json_is_not_no_work(self):
         for body in ("not json", '{"error": "dolt down"}', '[1, "x"]'):
             w = self.world(beads={self.tmp: body, RIG: "[]"})
