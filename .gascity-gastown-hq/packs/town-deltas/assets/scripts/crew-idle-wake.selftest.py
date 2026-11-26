@@ -274,6 +274,42 @@ ciw.passada(run=r, agora=1000 + 5 * 601)
 check(ciw.ler_estado("oracle-wa-gawispgux5v0") == antes and antes.get("tentativas"), "11. store que cai não zera o episódio")
 ciw.STORES = [str(TMP)]
 
+
+# 11b. gate ga-z3s8i5y — a MESMA sessão com bead pendente nos DOIS stores; o store da bead mais nova cai depois do teto:
+# nem tentativas nem aviso zeram, e com o store de volta não sai 2ª rodada de ordens nem 2º mail
+limpa()
+VELHA = dict(ORACLE, id="wa-velha", updated_at="2026-11-26T03:00:00Z")
+NOVA = dict(ORACLE, id="ga-nova", updated_at="2026-11-26T09:00:00Z")
+
+
+class Runner3(Runner):
+    cai = False
+
+    def __call__(self, cmd, timeout=30):
+        if cmd[0] == "bd":
+            if cmd[2] == str(st_b):
+                return (1, "", "timeout") if self.cai else (0, json.dumps([NOVA]), "")
+            return 0, json.dumps([VELHA]), ""
+        return super().__call__(cmd, timeout)
+
+
+ciw.STORES = [str(st_a), str(st_b)]
+r = Runner3(["oracle-wa-gawispgux5v0"], [], {"oracle-wa-gawispgux5v0": OCIOSA})
+for k in range(10):
+    ciw.passada(run=r, agora=1000 + k * 601)
+cheio = ciw.ler_estado("oracle-wa-gawispgux5v0")
+check(cheio.get("tentativas") == 3 and cheio.get("avisado"), "11b. episódio no teto: 3 ordens e o aviso")
+r.cai = True
+ciw.passada(run=r, agora=1000 + 10 * 601)
+depois = ciw.ler_estado("oracle-wa-gawispgux5v0")
+check(depois.get("tentativas") == 3 and depois.get("avisado"), "11b. store da bead nova cai: o episódio não zera")
+r.cai = False
+for k in range(11, 40):
+    ciw.passada(run=r, agora=1000 + k * 601)
+ordens = [e for e in r.enviados if e[1] != "Enter"]
+check(len(ordens) == 3 and len(r.mails) == 1, "11b. com o store de volta: nenhuma ordem nem mail a mais")
+ciw.STORES = [str(TMP)]
+
 # 7. pool fica de fora; Mayor casa por «gastown.mayor» → «gastown__mayor»
 check(ciw.e_pool("wa-worker-adhoc-0cad1bdf00") and ciw.e_pool("dog-ga2695nnf"), "7a. pools fora do vigia")
 check(ciw.dono_da_sessao("gastown__mayor", "gastown.mayor"), "7b. Mayor casa pelo nome do tmux")

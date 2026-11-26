@@ -279,7 +279,9 @@ def passada(dry: bool = False, run=rodar, agora=None) -> int:
         # progresso de verdade = a bead andou (comentário, commit, troca de rótulo mexem no updated_at). A tela NÃO serve pra
         # isso: a própria ordem injetada muda a tela, e o teto de tentativas nunca dispararia.
         prog = max(str(b.get("updated_at") or "") for b in minhas if b["id"] in trabalho)
-        if st.get("prog") != prog:
+        # gate ga-z3s8i5y: com algum store ilegível o `prog` só vê parte das beads — «mudou» pode ser só a bead que não veio.
+        # «A bead andou» (e o episódio recomeçar) só com TODOS os stores lidos; senão vale o prog gravado.
+        if st.get("prog") != prog and (not ilegiveis or "prog" not in st):
             st = {"prog": prog, "tentativas": 0, "avisado": False}
         if estado != "ociosa" or st.get("sig") != sig:
             # tela mudou (ou não está ociosa): só o relógio da ociosidade recomeça; as tentativas seguem até a bead andar
