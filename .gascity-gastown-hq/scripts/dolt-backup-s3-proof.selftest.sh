@@ -286,6 +286,34 @@ N_UP="$(grep -c 's3 sync .* --exclude manifest' "$CALLS")"
 [ "$N_UP" -eq 1 ] && ok "…after exactly ONE upload attempt (no retry of a failed upload)" || bad "expected 1 upload attempt, saw $N_UP"
 grep -q 'table upload to .* FAILED' "$LOGF" && ! grep -q 'still NOT proven' "$LOGF" && ok "…saying the upload failed, not that the repair rounds ran out" || bad "wrong reason: $(cat "$LOGF")"
 
+echo "── _s3proof_mirror_up: the servidor-aposentado marker refuses every upload (ga-ke5w2ie.4) ──"
+# mutants a6b674d833 (first `||` of the refusal test -> `&&`), 0644422742 (second `||` -> `&&`), 07f646a2ac (the refusal's `return 1` -> `return 0`).
+# The header points SERVIDOR_APOSENTADO_FILE at a path that does not exist, so the cases above reach the upload code; aposentar-guards.selftest.sh proves the refusal
+# but sits outside this file's family. Here each shape of "marker present, or cannot tell" runs against the same complete dir and must end in: rc 1, the
+# refusal's own reason in the log (emptied first), not one aws call and nothing in the bucket. The control goes first: same dir, no marker, it uploads.
+mkdir_backup "$T/A1" 6; printf 'x' > "$T/marcador"; ln -s "$T/nada-aqui" "$T/marcador-quebrado"
+mkdir -p "$T/home-com" "$T/home-sem"; printf 'x' > "$T/home-com/.servidor-aposentado"
+ap_run() { reset_bucket; AP_RC=0; ( SERVIDOR_APOSENTADO_FILE="$1"; _s3proof_mirror_up "$T/A1" db1 ) || AP_RC=$?; }
+ap_run_home() { reset_bucket; AP_RC=0; ( unset SERVIDOR_APOSENTADO_FILE; if [ -n "$1" ]; then HOME="$1"; else unset HOME; fi; _s3proof_mirror_up "$T/A1" db1 ) || AP_RC=$?; }
+ap_uploaded() { [ "$AP_RC" -eq 0 ] && [ -f "$FB/db1/manifest" ] && ok "$1 → uploads" || bad "$1 → expected an upload: rc=$AP_RC bucket='$(ls -A "$FB")' log='$(cat "$LOGF")'"; }
+ap_refused() {
+  local left
+  [ "$AP_RC" -eq 1 ] && grep -q 'este servidor esta APOSENTADO' "$LOGF" && ok "$1 → refused (rc 1, with its reason)" || bad "$1 → expected a refusal: rc=$AP_RC log='$(cat "$LOGF")'"
+  # vazio → nada subiu (the call log exists with size 0 and the bucket dir lists nothing); falhou/ilegivel (ls errors, the call log is gone) → NOT "empty": the case fails
+  left="$(ls -A "$FB" 2>&1)"
+  [ -e "$CALLS" ] && [ ! -s "$CALLS" ] && [ -d "$FB" ] && [ -z "$left" ] && ok "…and not one aws call, nothing in the bucket" || bad "$1: aws was called or the bucket was written (or one of them cannot be read): calls=$(grep -c . "$CALLS" 2>&1) bucket='$left'"
+}
+ap_run "$T/sem-marcador";               ap_uploaded "control: no marker, folder searchable"
+ap_run "$T/marcador";                   ap_refused "marker is a regular file"
+grep -qF "marcador $T/marcador," "$LOGF" && ok "…and the log names the marker that refused" || bad "log does not name the marker: $(cat "$LOGF")"
+ap_run "$T/marcador-quebrado";          ap_refused "marker is a dangling symlink (-L without -e)"
+ap_run "$T/pasta-que-nao-existe/m";     ap_refused "the marker's folder does not exist (cannot tell)"
+ap_run_home "";                         ap_refused "no override and no HOME (cannot tell)"
+ap_run_home "$T/home-sem";              ap_uploaded "default path under HOME, no marker there"
+ap_run_home "$T/home-com";              ap_refused "default path under HOME, marker there"
+reset_bucket; AP_RC=0; ( HOME="$T/home-com"; SERVIDOR_APOSENTADO_FILE="$T/sem-marcador"; _s3proof_mirror_up "$T/A1" db1 ) || AP_RC=$?
+ap_uploaded "SERVIDOR_APOSENTADO_FILE beats a marker under HOME (how the selftests isolate themselves)"
+
 # ── the ga-tyaozh checksum export reaches the aws child ──────────────────────────
 echo "── AWS_REQUEST_CHECKSUM_CALCULATION (ga-tyaozh) ──"
 [ "${AWS_REQUEST_CHECKSUM_CALCULATION:-}" = "when_required" ] && ok "exported by the lib on source" || bad "lib did not export AWS_REQUEST_CHECKSUM_CALCULATION"
