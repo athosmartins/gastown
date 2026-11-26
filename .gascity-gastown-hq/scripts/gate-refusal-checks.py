@@ -8,10 +8,13 @@ WHICH CLASSES  only the root-class:<name> labels. The meter's "sem rótulo" grou
 COVERED        a row in scripts/gate-refusal-checks.registry.tsv (versioned; ANY status counts, ativa|em-teste|desligada: a check that was turned off is not retried by this loop). The bead this script opens tells the builder
                to add the row in the same delivery. Registry absent, unreadable or without its header = NÃO SEI: nothing is opened (an empty file would look like "nothing is covered").
 ALREADY OPENED a bead (ANY status, closed included) labelled auto-melhoria:classe:<name> in the HQ store; the labels are written by the same `bd create` that makes the bead, so dedup cannot lag behind creation. A store that
-               cannot be read = NÃO SEI, nothing is opened. One run at a time (flock on .gc/gate-refusal-checks.lock, --apply only).
+               cannot be read = NÃO SEI, nothing is opened. A class whose bead is closed while it has no registry row stays "ja-aberta" for good (the loop never retries it): that is listed in the gaps, not hidden.
+ONE RUN        at a time: --apply takes the flock on .gc/gate-refusal-checks.lock FIRST and reads the registry, the meter and the bead store only after it (a snapshot older than the lock lets two runs open one class twice). Contention,
+               and only contention, = exit 0 and nothing done; any other failure to take the lock = NÃO SEI. The dry-run takes no lock and builds the very bead text --apply would create (`preview` in --json).
 BRAKES         --max-new beads per run (2) and --max-open unfinished beads of this loop at once (3): the loop must never flood the dog pool. A class whose 3 examples cannot be read is NOT opened (it is retried next run).
 NEVER          edits the meter, its test or the A/B arm code (the cycle never edits its own evaluator): it reads the meter's JSON and creates beads, nothing else.
-EXIT  0 report printed (also when nothing was opened) · 1 a bead was created but could not be verified, or `bd create` failed · 2 NÃO SEI (meter, registry or bead store unreadable; nothing opened) · 64 usage."""
+EXIT  0 report printed (also when nothing was opened) · 1 a bead was created but could not be verified, `bd create` failed, or building/creating the bead of one class raised (that class only: the others are still done and listed) · 2 NÃO SEI
+      (lock, meter, registry or bead store unreadable; nothing opened) · 64 usage · 70 an exception nobody planned (a bug: stderr has the traceback and where to look for what the run had already opened)."""
 import argparse
 import concurrent.futures
 import contextlib
@@ -22,11 +25,12 @@ import os
 import re
 import subprocess
 import sys
+import traceback
 
 sys.dont_write_bytecode = True
 HERE = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_CITY = "/Users/athos/gt/.gascity-gastown-hq"
-SLICE, SCHEMA = "ga-mw5gdyu.2", 1
+SLICE, SCHEMA, METER_SCHEMA = "ga-mw5gdyu.2", 1, 1  # SCHEMA is this script's own output; METER_SCHEMA is the shape of the .1 meter's JSON it reads (the test fails when the meter's SCHEMA moves)
 DAYS, MIN_REFUSALS, EXAMPLES, MAX_NEW, MAX_OPEN = 14, 5, 3, 2, 3
 WORKERS, CHUNK, CALL_TIMEOUT, METER_TIMEOUT, EXCERPT = 8, 16, 60, 900, 420
 ROUTE = "gastown.dog"
@@ -36,6 +40,7 @@ HEADER = ("class", "status", "check")
 NAME = r"[a-z0-9](?:[a-z0-9_-]*[a-z0-9])?"
 BEAD_ID = re.compile(r"^[A-Za-z][A-Za-z0-9]*-[A-Za-z0-9.]+$")
 FILE_RE = re.compile(r"(?<![\w/.-])((?:[\w.-]+/)*[\w.-]+\.(?:sh|py|toml|md|go|tsx?|jsx?|json|plist|tsv|ya?ml|html|css|sql))(?::(\d+))?")
+CONTROL = re.compile(r"[\x00-\x1f\x7f-\x9f]")  # C0, DEL and C1: a NUL in an argument makes subprocess.run raise, an ESC sequence repaints the terminal of whoever reads the bead
 USAGE = ("uso: gate-refusal-checks.py [--apply] [--json] [--days N>=1] [--min N>=1] [--max-new N>=0] [--max-open N>=1] [--city DIR] [--registry FILE] [--meter FILE] [--meter-json FILE]")
 REGISTRY_REL = os.path.join("scripts", "gate-refusal-checks.registry.tsv")
 _METER = None
@@ -58,10 +63,10 @@ def load_meter(path):
 
 def run(argv, timeout):
     """-> (rc, stdout); (None, "") when the command could not run or timed out."""
-    # vazio → (rc, ""): it ran and printed nothing; falhou → (None, ""): not run / timed out, which every caller reads as NÃO SEI and never as an empty answer
+    # vazio → (rc, ""): it ran and printed nothing; falhou → (None, ""): not run / timed out / an argument that cannot be passed (a NUL is a ValueError, not an OSError), which every caller reads as NÃO SEI and never as an empty answer
     try:
         p = subprocess.run(argv, capture_output=True, text=True, errors="replace", timeout=timeout)
-    except (OSError, subprocess.SubprocessError):
+    except (OSError, ValueError, subprocess.SubprocessError):
         return None, ""
     return p.returncode, p.stdout
 
@@ -100,9 +105,24 @@ def read_registry(path):
     return ("ok" if header else "sem-cabecalho"), rows, problems
 
 
+def meter_contract(rep):
+    """-> why when the meter's JSON is not the shape this script reads, "" when it is. Checked ONCE, here: past it the code indexes what it reads, so a field of the wrong type is NÃO SEI and never quietly an empty list."""
+    # vazio → "": nothing wrong; falhou/ilegível → a reason: not an object, another schema, or refusals.classes / refusals.unlabeled_groups / window / gaps / evaluator missing or of the wrong type
+    if not isinstance(rep, dict):
+        return "o medidor não trouxe um objeto JSON"
+    if rep.get("schema") != METER_SCHEMA:
+        return "o medidor fala o esquema %r e este script lê o %d" % (rep.get("schema"), METER_SCHEMA)
+    r = rep.get("refusals")
+    if not (isinstance(r, dict) and isinstance(r.get("classes"), dict) and isinstance(rep.get("window"), dict)):
+        return "o medidor não trouxe refusals.classes e window (NÃO SEI do estado do portão)"
+    if not (isinstance(r.get("unlabeled_groups"), list) and isinstance(rep.get("gaps"), list) and isinstance(rep.get("evaluator"), dict)):
+        return "o medidor não trouxe refusals.unlabeled_groups, gaps e evaluator na forma do esquema %d" % METER_SCHEMA
+    return ""
+
+
 def meter_report(args, meter_path):
     """-> (report, why): the meter's JSON, or None with why (NÃO SEI)."""
-    # vazio → (None, why): the meter printed nothing; falhou/ilegível → (None, why): not run/timeout, rc != 0 (rc 2 is the meter's own NÃO SEI), bad JSON, a shape without refusals.classes, or another window
+    # vazio → (None, why): the meter printed nothing; falhou/ilegível → (None, why): not run/timeout, rc != 0 (rc 2 is the meter's own NÃO SEI), bad JSON, a shape that is not the contract (meter_contract), or another window
     if args.meter_json:
         try:
             with open(args.meter_json, "rb") as fh:
@@ -117,12 +137,11 @@ def meter_report(args, meter_path):
         rep = json.loads(out, strict=False)
     except ValueError:
         return None, "resposta do medidor ilegível"
-    r = rep.get("refusals") if isinstance(rep, dict) else None
-    w = rep.get("window") if isinstance(rep, dict) else None
-    if not (isinstance(r, dict) and isinstance(r.get("classes"), dict) and isinstance(w, dict)):
-        return None, "o medidor não trouxe refusals.classes e window (NÃO SEI do estado do portão)"
-    if w.get("days") != args.days:
-        return None, "janela do medidor é %r dia(s), o limiar é de %d" % (w.get("days"), args.days)
+    why = meter_contract(rep)
+    if why:
+        return None, why
+    if rep["window"].get("days") != args.days:
+        return None, "janela do medidor é %r dia(s), o limiar é de %d" % (rep["window"].get("days"), args.days)
     return rep, ""
 
 
@@ -209,20 +228,22 @@ def pick(examples):
 
 
 def defang(value):
-    """Text from the gate log or a verdict, safe to sit inside the <conteudo_externo> fence: no `<` or `>` survives, so no spelling of the closing tag (any case, any spacing) can end the fence early."""
+    """Text from the gate log or a verdict, safe to sit inside the <conteudo_externo> fence and in a `bd create` argument: no `<` or `>` survives, so no spelling of the closing tag (any case, any spacing) can end the fence early,
+    and no control character does either (each becomes a space: the human still reads the words)."""
     # vazio → "": nothing to neutralise; falhou/ilegível → n/a, a pure string transform (a non-string is stringified first, never dropped)
-    return str(value).replace("<", "‹").replace(">", "›")
+    return CONTROL.sub(" ", str(value)).replace("<", "‹").replace(">", "›")
 
 
 def describe(name, entry, rep, chosen, args):
-    w, sha = rep["window"], (rep.get("evaluator") or {}).get("sha256")
+    w, sha = rep["window"], rep["evaluator"].get("sha256")
+    n_beads = entry.get("beads")  # the meter always gives it, but decide() admits a class without (--meter-json, a schema change): the phrase is left out, never filled with a made-up number
     ex = []
     for i, e in enumerate(chosen, 1):
         # every field of an example comes from the gate log or a reviewer comment (builder text can be quoted in it): DATA, never able to close the fence below
         ex.append("%d) bead %s · gate-run %s · %s · arquivo: %s\n<conteudo_externo>\n%s\n</conteudo_externo>" % (i, defang(e["bead"]), defang(e["gate_run"]), defang(e["ts"]), defang(e["file"]), defang(e["excerpt"])))
     return "\n".join([
         "O QUE FAZER: entregar UMA checagem mecânica (determinística, sem LLM) que ache no diff o padrão da classe-raiz `%s`, antes de o revisor recusar." % name,
-        "- A classe foi citada em %d recusa(s) de revisor, em %d bead(s), entre %s e %s (%d dias), e não tem checagem registrada." % (entry["refusals"], entry["beads"] if isinstance(entry.get("beads"), int) else "?", w.get("from"), w.get("to"), args.days),
+        "- A classe foi citada em %d recusa(s) de revisor%s, entre %s e %s (%d dias), e não tem checagem registrada." % (entry["refusals"], ", em %d bead(s)" % n_beads if isinstance(n_beads, int) else "", w.get("from"), w.get("to"), args.days),
         "- Estilo: packs/town-deltas/assets/third-state-reads-check.py, ligada pelo gate-hard-checks.sh. Com selftest que REPROVA sem a checagem e passa com ela (teste que só passa não prova nada).",
         "- Na MESMA entrega, acrescente a linha de `%s` em scripts/gate-refusal-checks.registry.tsv com status `em-teste` (a catraca da fatia .3 a põe no braço A/B e a promove ou desliga)." % name,
         "- Não dá para desenhar uma checagem determinística sem recusa falsa? Feche a bead com --reason dizendo por quê e registre a classe com status `desligada` e o motivo na coluna note: não force uma checagem frouxa.",
@@ -232,48 +253,90 @@ def describe(name, entry, rep, chosen, args):
         "ORIGEM: auto-melhoria .2 (épico ga-mw5gdyu, Athos 26/11). Medidor: scripts/gate-refusal-meter.py, sha256 do avaliador %s. Limiar: >= %d recusas em %d dias." % (sha or "(não lido)", args.min, args.days)])
 
 
-def create_bead(args, name, entry, rep, chosen):
+def bead_spec(args, name, entry, rep, chosen):
+    """The bead as it will be created: title, labels, metadata, description. Pure, and the dry-run builds it too, so a text that cannot be built fails in the preview and not on the first --apply."""
+    # vazio → n/a (everything is built from values checked before); falhou → raises, and the caller makes that THIS class's erro-ao-abrir
+    return {"title": "Checagem mecânica da classe-raiz %s: %d recusas em %d dias (auto-melhoria .2)" % (name, entry["refusals"], args.days),
+            "labels": ["exec:auto", "story:approved", LABEL_LOOP, LABEL_CLASS + name],
+            "metadata": {"gc.routed_to": ROUTE, "auto_melhoria.slice": SLICE, "auto_melhoria.classe": name, "auto_melhoria.refusals": entry["refusals"], "auto_melhoria.window_days": args.days,
+                         "auto_melhoria.evaluator_sha256": rep["evaluator"].get("sha256") or ""},
+            "description": describe(name, entry, rep, chosen, args)}
+
+
+def confirmed(out, name):
+    """True when the `bd show` of the new bead carries the class label, story:approved and the route."""
+    # vazio → False; falhou/ilegível → False (junk, or a shape that hides the labels): never an exception, because the bead already exists when this runs and must come back as aberta-nao-verificada
+    try:
+        d = json.loads(out, strict=False)
+    except ValueError:
+        return False
+    b = d[0] if isinstance(d, list) and d else d
+    if not isinstance(b, dict):
+        return False
+    labels, meta = b.get("labels"), b.get("metadata")
+    return isinstance(labels, list) and isinstance(meta, dict) and LABEL_CLASS + name in labels and "story:approved" in labels and meta.get("gc.routed_to") == ROUTE
+
+
+def create_bead(args, name, spec):
     """-> (state, bead_id, why): aberta | aberta-nao-verificada | erro-ao-abrir."""
     # vazio → erro-ao-abrir: bd printed no id; falhou/ilegível → erro-ao-abrir (no run/timeout, rc != 0, an id that does not look like one); the verification read failing leaves the bead as aberta-nao-verificada, never as "not created"
-    title = "Checagem mecânica da classe-raiz %s: %d recusas em %d dias (auto-melhoria .2)" % (name, entry["refusals"], args.days)
-    meta = {"gc.routed_to": ROUTE, "auto_melhoria.slice": SLICE, "auto_melhoria.classe": name, "auto_melhoria.refusals": entry["refusals"], "auto_melhoria.window_days": args.days,
-            "auto_melhoria.evaluator_sha256": (rep.get("evaluator") or {}).get("sha256") or ""}
-    labels = ",".join(["exec:auto", "story:approved", LABEL_LOOP, LABEL_CLASS + name])
-    rc, out = run([args.bd, "-C", args.city, "create", "--silent", "-t", "feature", "-p", "2", "-l", labels, "--metadata", json.dumps(meta, ensure_ascii=False, sort_keys=True), "-d", describe(name, entry, rep, chosen, args), title], CALL_TIMEOUT)
+    rc, out = run([args.bd, "-C", args.city, "create", "--silent", "-t", "feature", "-p", "2", "-l", ",".join(spec["labels"]), "--metadata", json.dumps(spec["metadata"], ensure_ascii=False, sort_keys=True), "-d", spec["description"], spec["title"]], CALL_TIMEOUT)
     lines = [l.strip() for l in out.splitlines() if l.strip()]
     if rc != 0 or not lines or not BEAD_ID.match(lines[-1]):
-        return "erro-ao-abrir", "", "bd create não rodou ou estourou o prazo" if rc is None else "bd create falhou (rc=%s) ou não devolveu um id" % rc
+        return "erro-ao-abrir", "", ("bd create não rodou ou estourou o prazo (se estourou, a bead pode ter sido criada: bd list --label %s%s --status all)" % (LABEL_CLASS, name)) if rc is None else "bd create falhou (rc=%s) ou não devolveu um id" % rc
     bid = lines[-1]
     rc, out = run([args.bd, "-C", args.city, "show", bid, "--json"], CALL_TIMEOUT)
-    try:
-        d = json.loads(out, strict=False) if rc == 0 else None
-        b = d[0] if isinstance(d, list) and d else d
-        ok = isinstance(b, dict) and LABEL_CLASS + name in (b.get("labels") or []) and (b.get("metadata") or {}).get("gc.routed_to") == ROUTE and "story:approved" in (b.get("labels") or [])
-    except ValueError:
-        ok = False
-    return ("aberta", bid, "") if ok else ("aberta-nao-verificada", bid, "criada, mas bd show não confirmou os rótulos e a rota para %s" % ROUTE)
+    if rc == 0 and confirmed(out, name):
+        return "aberta", bid, ""
+    return "aberta-nao-verificada", bid, "criada, mas bd show não confirmou os rótulos e a rota para %s" % ROUTE
 
 
 @contextlib.contextmanager
 def instance_lock(city):
-    """Yields True with the lock held, False when another run holds it; raises OSError when the lock file cannot be opened (the caller says NÃO SEI)."""
+    """Yields True with the lock held, False when another run holds it; raises OSError when the lock file cannot be opened or the lock cannot be taken for any reason but contention (the caller says NÃO SEI)."""
     fd = os.open(os.path.join(city, ".gc", "gate-refusal-checks.lock"), os.O_RDWR | os.O_CREAT, 0o644)
     try:
+        # vazio → n/a (a lock is held or it is not); falhou → BlockingIOError (EWOULDBLOCK/EAGAIN) is the ONLY "another run holds it"; any other errno (ENOLCK, EOPNOTSUPP, EINVAL...) propagates, because "I could not tell" must not do what "it is held" does
         try:
             fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except OSError:
-            yield False
-            return
-        yield True
+            got = True
+        except BlockingIOError:
+            got = False
+        yield got
     finally:
         os.close(fd)
 
 
+def class_ok(name, c):
+    """A class entry of the meter this script can count: a valid class name and an integer `refusals`."""
+    return bool(re.fullmatch(NAME, name)) and isinstance(c, dict) and isinstance(c.get("refusals"), int)
+
+
+def example_bead(g):
+    """The bead id of an unlabelled group's example; None when the meter gave none in a readable form."""
+    # vazio → None; falhou/ilegível → None (no example, an example that is not an object, a bead that is not a string): the listing says "?", it does not crash
+    ex = g.get("example")
+    b = ex.get("bead") if isinstance(ex, dict) else None
+    return b if isinstance(b, str) else None
+
+
+def closed_without_row(rows, beads):
+    """-> gap lines for the classes whose bead is closed while the class has no registry row. decide() answers `coberta` first for a registered class, so every ja-aberta row is an unregistered one: with its bead closed nobody ever
+    registered a check and the loop will not reopen the class. That is said, not left looking like a healthy run."""
+    # vazio → []: no ja-aberta row, or its bead is open / of a status nobody could read; falhou/ilegível → a status that could not be read is not "closed": no claim either way
+    status = {b["id"]: b["status"] for b in beads}
+    return ["classe %s: a bead %s do ciclo foi FECHADA sem linha no registro (descartada? dog que falhou?): a checagem nunca foi registrada e a classe não reabre sozinha. Registre a classe em scripts/gate-refusal-checks.registry.tsv "
+            "(status desligada, com o motivo) ou tire o rótulo %s%s da bead para o ciclo reabri-la" % (r["class"], r["bead"], LABEL_CLASS, r["class"]) for r in rows if r["verdict"] == "ja-aberta" and status.get(r["bead"]) == "closed"]
+
+
 def decide(args, rep, registry, beads, examples_of):
     """-> list of class rows with a verdict. `examples_of(names)` -> ({class: [ex]}, unread, why) and is only called for classes that survive the dedup."""
-    cands = sorted(((n, c) for n, c in rep["refusals"]["classes"].items() if re.fullmatch(NAME, n) and isinstance(c, dict) and isinstance(c.get("refusals"), int) and c["refusals"] >= args.min),
-                   key=lambda x: (-x[1]["refusals"], x[0]))
-    opened = {c: b for b in beads for c in b["classes"]}
+    cands = sorted(((n, c) for n, c in rep["refusals"]["classes"].items() if class_ok(n, c) and c["refusals"] >= args.min), key=lambda x: (-x[1]["refusals"], x[0]))
+    opened = {}
+    for b in beads:  # a class carried by two beads shows the one still in play: a closed bead must not hide an open one
+        for c in b["classes"]:
+            if c not in opened or opened[c]["status"] == "closed":
+                opened[c] = b
     out, eligible = [], []
     for n, c in cands:
         row = {"class": n, "refusals": c["refusals"], "beads": c.get("beads") if isinstance(c.get("beads"), int) else None}
@@ -336,11 +399,27 @@ def main(argv=None):
         rep_out["line"] = line
         body = json.dumps(rep_out, ensure_ascii=False, sort_keys=True, indent=1) + "\n"
         text = line + "\n" + "".join("  classe %-32s %3d recusa(s) → %s: %s\n" % (c["class"], c["refusals"], c["verdict"], c.get("why") or c.get("bead", "")) for c in rep_out["classes"])
-        text += "".join("  sem rótulo %3d× %s (ex.: %s) → não aberta: chave por palavras\n" % (u["refusals"], u["key"], u["example"]) for u in rep_out["unlabeled_candidates"])
+        text += "".join("  sem rótulo %3d× %s (ex.: %s) → não aberta: chave por palavras\n" % (u["refusals"], u["key"], u["example"] or "?") for u in rep_out["unlabeled_candidates"])
         text += "".join("  ⚠ %s\n" % g for g in rep_out["gaps"])
         sys.stdout.write(body if args.json else text)
         return rc
 
+    # the lock comes FIRST (--apply only): everything `cycle` reads (registry, meter, bead store) is read with the run already exclusive, so no snapshot is older than the lock
+    # vazio → n/a (a lock is held or it is not); falhou/ilegível → OSError from the open or from flock() for any reason but contention: NÃO SEI, nothing read, nothing asked, nothing opened
+    stack = contextlib.ExitStack()
+    try:
+        held = stack.enter_context(instance_lock(args.city)) if args.apply else True
+    except OSError as e:
+        rep_out["gaps"].append("NÃO SEI: não consegui tomar o lock de instância única: %s" % e)
+        return finish(2, "NÃO SEI: não consegui tomar o lock de instância única (%s). Nada foi lido nem aberto." % e)
+    with stack:
+        if not held:
+            return finish(0, "gate-refusal-checks: outra rodada em curso (flock em .gc/gate-refusal-checks.lock); nada feito aqui.")
+        return cycle(args, rep_out, finish, registry_path)
+
+
+def cycle(args, rep_out, finish, registry_path):
+    """One run, with the instance lock held (--apply) or not needed (dry-run): registry → meter → bead store → decision → beads. -> the exit code (through finish)."""
     st, regs, problems = read_registry(registry_path)
     rep_out["registry"].update(state=st, classes=len(regs), problems=problems)
     rep_out["gaps"] += problems
@@ -355,40 +434,58 @@ def main(argv=None):
     if rep is None:
         rep_out["gaps"].append("NÃO SEI: %s" % why)
         return finish(2, "NÃO SEI: %s. Nada foi aberto — isto NÃO é 'nenhuma classe repete'." % why)
-    rep_out["meter"] = {"complete": rep.get("complete"), "evaluator_sha256": (rep.get("evaluator") or {}).get("sha256"), "line": rep.get("line"), "window": rep["window"]}
-    rep_out["gaps"] += ["medidor: %s" % g for g in rep.get("gaps", []) if isinstance(g, str)]
+    rep_out["meter"] = {"complete": rep.get("complete"), "evaluator_sha256": rep["evaluator"].get("sha256"), "line": rep.get("line"), "window": rep["window"]}
+    rep_out["gaps"] += ["medidor: %s" % g for g in rep["gaps"] if isinstance(g, str)]
     beads, why = read_beads(args.bd, args.city)
     rep_out["beads"] = {"state": "ok" if not why else "nao-sei", "why": why, "loop_beads": len(beads), "unfinished": sum(1 for b in beads if b["status"] != "closed")}
     if why:
         rep_out["gaps"].append("NÃO SEI: %s; nada foi aberto" % why)
         return finish(2, "NÃO SEI: não consegui ler os beads do ciclo (%s). Nada foi aberto — sem isso não sei que classes já têm bead." % why)
     r = rep["refusals"]
-    rep_out["unlabeled_candidates"] = [{"key": g["key"], "refusals": g["refusals"], "example": g.get("example", {}).get("bead")} for g in r.get("unlabeled_groups", [])
-                                       if isinstance(g, dict) and isinstance(g.get("refusals"), int) and g["refusals"] >= args.min and g.get("key") != M.NO_TITLE]
-    lock = instance_lock(args.city) if args.apply else contextlib.nullcontext(True)
-    try:
-        with lock as held:
-            if not held:
-                return finish(0, "gate-refusal-checks: outra rodada em curso (flock em .gc/gate-refusal-checks.lock); nada feito aqui.")
-            rows = decide(args, rep, regs, beads, lambda names: gather_examples(M, args, rep, names))
-            rc = 0
-            for row in rows:
-                if row.get("verdict") == "pendente":
-                    row["verdict"], row["bead"], row["why"] = create_bead(args, row["class"], row, rep, row["examples"])
-                    rep_out["opened"].append(row["bead"]) if row["bead"] else None
-                    rc = 1 if row["verdict"] != "aberta" else rc
-                    if row["verdict"] != "aberta":
-                        rep_out["gaps"].append("%s: %s" % (row["class"], row["why"]))
-            rep_out["classes"] = rows
-    except OSError as e:
-        rep_out["gaps"].append("NÃO SEI: não consegui abrir o lock: %s" % e)
-        return finish(2, "NÃO SEI: não consegui abrir o lock de instância única (%s). Nada foi aberto." % e)
+    # an entry the meter gave in a shape this script cannot count is "não sei" for that entry: it is left out of the count AND said, never dropped in silence
+    bad = sorted(n for n, c in r["classes"].items() if not class_ok(n, c))
+    if bad:
+        rep_out["gaps"].append("medidor: %d classe(s) com nome ou contagem ilegível, fora da conta: %s%s" % (len(bad), ", ".join(repr(n) for n in bad[:5]), " ..." if len(bad) > 5 else ""))
+    groups = [g for g in r["unlabeled_groups"] if isinstance(g, dict) and isinstance(g.get("refusals"), int) and isinstance(g.get("key"), str)]
+    if len(groups) != len(r["unlabeled_groups"]):
+        rep_out["gaps"].append("medidor: %d grupo(s) sem rótulo com forma ilegível, fora da lista" % (len(r["unlabeled_groups"]) - len(groups)))
+    rep_out["unlabeled_candidates"] = [{"key": g["key"], "refusals": g["refusals"], "example": example_bead(g)} for g in groups if g["refusals"] >= args.min and g["key"] != M.NO_TITLE]
+    rows = decide(args, rep, regs, beads, lambda names: gather_examples(M, args, rep, names))
+    rep_out["classes"] = rows
+    rep_out["gaps"] += closed_without_row(rows, beads)
+    rc = 0
+    for row in rows:
+        if row.get("verdict") not in ("abriria", "pendente"):
+            continue
+        # vazio → n/a; falhou/ilegível → whatever building or creating THIS bead raises becomes this class's erro-ao-abrir: the run goes on with the next class and finish() still lists the beads already opened (a crash here used to end the run with a traceback and no report)
+        try:
+            spec = bead_spec(args, row["class"], row, rep, row["examples"])
+            if args.apply:
+                row["verdict"], row["bead"], row["why"] = create_bead(args, row["class"], spec)
+            else:  # the preview is the exact bead --apply would create, text included
+                row["why"], row["preview"] = spec["title"], spec
+        except Exception as e:  # noqa: BLE001 - see above: a bug in one class must not hide what the others did
+            row["verdict"], row["bead"], row["why"] = "erro-ao-abrir", "", "exceção inesperada (%s: %s); antes de repetir, confira se a bead existe: bd list --label %s%s --status all" % (type(e).__name__, e, LABEL_CLASS, row["class"])
+        if row.get("bead"):
+            rep_out["opened"].append(row["bead"])
+        if row["verdict"] not in ("abriria", "aberta"):
+            rc = 1
+            rep_out["gaps"].append("%s: %s" % (row["class"], row["why"]))
     count = lambda v: sum(1 for c in rep_out["classes"] if c["verdict"] == v)  # noqa: E731
-    line = ("gate-refusal-checks %dd até %s [%s]: %d classe(s) com >=%d recusas · %d coberta(s) · %d já aberta(s) · %d %s · %d sem exemplos · %d seguradas pelo teto · %d sem rótulo listadas, não abertas"
+    line = ("gate-refusal-checks %dd até %s [%s]: %d classe(s) com >=%d recusas · %d coberta(s) · %d já aberta(s) · %d %s · %d sem exemplos · %d seguradas pelo teto · %d erro(s) ao abrir · %d sem rótulo listadas, não abertas"
             % (args.days, rep["window"].get("to"), rep_out["mode"], len(rep_out["classes"]), args.min, count("coberta"), count("ja-aberta"), count("aberta") + count("aberta-nao-verificada") if args.apply else count("abriria"),
-               "aberta(s)" if args.apply else "abriria(m)", count("exemplos-insuficientes"), count("teto-por-rodada") + count("teto-de-abertas"), len(rep_out["unlabeled_candidates"])))
+               "aberta(s)" if args.apply else "abriria(m)", count("exemplos-insuficientes"), count("teto-por-rodada") + count("teto-de-abertas"), count("erro-ao-abrir"), len(rep_out["unlabeled_candidates"])))
     return finish(rc, line)
 
 
+def entry(argv=None):
+    """main() with a net under it: an exception nobody planned is exit 70 with the traceback on stderr, so exit 1 keeps its one meaning (a bead that could not be opened or confirmed)."""
+    try:
+        return main(argv)
+    except Exception:  # noqa: BLE001 - anything unplanned is a bug of this script: say so loudly, with where to look for what the run had already opened
+        sys.stderr.write("gate-refusal-checks: ERRO INESPERADO (bug do script). O que esta rodada já abriu está em `bd list --label %s --status all`; nada além disso é garantido.\n%s" % (LABEL_LOOP, traceback.format_exc()))
+        return 70
+
+
 if __name__ == "__main__":
-    sys.exit(main())
+    sys.exit(entry())
