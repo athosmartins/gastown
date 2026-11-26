@@ -98,7 +98,7 @@ _deliberately_disabled() {
 # system sleep, NOT to a hung daemon); 0 = legacy behaviour (flag regardless).
 DPW_WAKE_GRACE="${DPW_WAKE_GRACE:-1}"
 
-DPW_CRITICAL="${DPW_CRITICAL:-com.gascity.pilot com.gascity.context-check-dispatcher com.gascity.quality-gate-dispatcher com.gascity.auto-refino-dispatcher com.gascity.refino-gate-dispatcher com.gascity.story-delivery com.gascity.supervisor com.gascity.supervisor-config-guard com.gascity.inflight-reclaim-guard com.gascity.gate-recovery-watchdog com.gascity.dolt-hang-watchdog com.gascity.production-stall-watchdog com.gascity.crew-hang-detector com.gascity.lifecycle-coherence-janitor com.gascity.crew-autopin-guard com.gascity.lifecycle-correctness-auditor com.gascity.throughput-stall-watchdog com.gascity.gate-throughput-stall-watchdog com.gascity.git-lock-hygiene com.gascity.crew-liveness-probe com.gascity.agent-stuck-escalation com.gascity.quorum-convergence-watchdog com.gascity.approved-state-reconciler com.gascity.auto-rehome-janitor com.gascity.sling-task-janitor com.gascity.gate-marker-rehome-janitor com.gascity.silent-ignorance-watch com.gascity.child-priority-janitor com.gascity.hetzner-occupancy-watch com.gascity.jsonl-hourly-offsite-age com.gascity.jsonl-export com.gascity.jsonl-hourly-offsite com.gascity.node-ghost-release}"
+DPW_CRITICAL="${DPW_CRITICAL:-com.gascity.pilot com.gascity.context-check-dispatcher com.gascity.quality-gate-dispatcher com.gascity.auto-refino-dispatcher com.gascity.refino-gate-dispatcher com.gascity.story-delivery com.gascity.supervisor com.gascity.supervisor-config-guard com.gascity.inflight-reclaim-guard com.gascity.gate-recovery-watchdog com.gascity.dolt-hang-watchdog com.gascity.production-stall-watchdog com.gascity.crew-hang-detector com.gascity.lifecycle-coherence-janitor com.gascity.crew-autopin-guard com.gascity.lifecycle-correctness-auditor com.gascity.throughput-stall-watchdog com.gascity.gate-throughput-stall-watchdog com.gascity.git-lock-hygiene com.gascity.crew-liveness-probe com.gascity.agent-stuck-escalation com.gascity.quorum-convergence-watchdog com.gascity.approved-state-reconciler com.gascity.auto-rehome-janitor com.gascity.sling-task-janitor com.gascity.gate-marker-rehome-janitor com.gascity.silent-ignorance-watch com.gascity.child-priority-janitor com.gascity.hetzner-occupancy-watch com.gascity.jsonl-hourly-offsite-age com.gascity.jsonl-export com.gascity.jsonl-hourly-offsite com.gascity.node-ghost-release com.gascity.ask-athos-relay}"
 
 HQ="${DPW_HQ:-/Users/athos/gt/.gascity-gastown-hq}"
 
@@ -164,7 +164,15 @@ com.gascity.hetzner-occupancy-watch|$HQ/.gc/logs/hetzner-occupancy-watch.out|270
 com.gascity.jsonl-hourly-offsite-age|$HQ/.gc/logs/jsonl-hourly-offsite-age.out|1500
 com.gascity.jsonl-export|$HQ/.gc/logs/jsonl-export.log|2700
 com.gascity.jsonl-hourly-offsite|$HQ/.gc/logs/jsonl-hourly-offsite-launchd.out|5400
-com.gascity.node-ghost-release|$HQ/.gc/logs/node-ghost-release.out|900}"
+com.gascity.node-ghost-release|$HQ/.gc/logs/node-ghost-release.out|900
+com.gascity.ask-athos-relay|$HQ/.gc/logs/ask-athos-relay.out|540}"
+#
+# ga-77f9q9h — ask-athos-relay (ga-ij162cl, camadas 2 e 3): a varredura que leva ao Mayor a pergunta que um worker de pool tem para o Athos. 540 s = 3 ciclos do StartInterval de 180 s
+# (> 2x = 360 s, sob o teto de 3000 s). Heartbeat = o .out do plist (StandardOutPath): ask-athos-relay.py main() imprime `start` ANTES do kill-switch e do lock (só um argumento inválido sai antes), então
+# o .out anda a cada tick do launchd, inclusive com a varredura desligada (`.gc/ask-athos-relay.off`: linha `desligado`) e com uma rodada lenta em curso (linha `outra instância segura o
+# lock`; uma rodada legítima chega a ~15 min no pior caso, por causa dos peeks, e kickstart -k a mataria). Então .out parado por 3 ciclos = o launchd não disparou nem uma vez (DAS
+# "pended nondemand spawn") — é o que este vigia enxerga. Uma rodada PENDURADA que segura o lock NÃO envelhece o .out: ela é limitada pelos timeouts de cada chamada (ASK_ATHOS_CALL_TIMEOUT_S 40 s,
+# ASK_ATHOS_PEEK_TIMEOUT_S 15 s), não por este batimento. O rótulo também está no DPW_CRITICAL (acima): o laço do sweep só itera sobre ele, então sem isso esta linha seria código morto.
 
 # ── RECYCLER — memory-bounded restart of known-leaky Python dashboards ────────
 # Knobs (override via env or the launchd plist EnvironmentVariables):
@@ -197,6 +205,17 @@ log() { mkdir -p "$(dirname "$LOG")" 2>/dev/null || true; echo "[$(ts)] $*" >> "
 # "FAILING" state so the alert message is unambiguous. Default threshold = 2 (same as
 # crash-loop) but override-able for daemons that occasionally fail transiently.
 DPW_FAIL_THRESHOLD="${DPW_FAIL_THRESHOLD:-2}"
+
+# ga-77f9q9h — DPW_EXIT_STREAK: "label|N", one per line. A job in this list needs N consecutive nonzero sweeps (not 2) before CRASH-LOOP / FAILING fire; every other label keeps 2.
+# Why it exists: com.gascity.ask-athos-relay exits 1 on any round where a pane could not be read (NAO-CONFERIDO: its designed "I could not tell", logged and escalated to the Mayor by the
+# relay itself after 2 rounds on the SAME pane). The pane list includes remote gate-reviewer sessions whose peek flaps (3 of the first 10 rounds, two remote sessions alternating), and this
+# watchdog resets its counters on every clean sweep, so with the default 2 a normal flap pair (estimate from those 3 of 10: ~9% of sweeps, about one per hour) became CRASH-LOOP-AUTOHEAL: kickstart -k killing a round
+# + a priority-3 push to the phone, for a job that was not crashing. N = 6 sweeps (~29 min at the 291 s sweep) still catches a relay that fails EVERY round: a CRASH in run() (rc 1 with
+# the heartbeat still advancing, so the WEDGE check is blind to it), LOCK-ERROR, STATE-ERROR, a nudge that never arrives. The kickstart auto-heal (imp17) is skipped for these labels: a relay
+# that exits 1 every round is not fixed by a restart. A value that is not a whole number >= 1 is read as "no override" (the strict default 2): never a silent tolerance.
+DPW_EXIT_STREAK="${DPW_EXIT_STREAK:-com.gascity.ask-athos-relay|6}"
+# vazio (rótulo sem linha) → vazio → o limite padrão (2); falhou/ilegível (awk rc != 0, N que não é número ≥ 1) → mesma saída vazia → o limite padrão, nunca uma tolerância maior
+_exit_streak() { printf '%s\n' "$DPW_EXIT_STREAK" | awk -F'|' -v l="$1" '$1==l && $2 ~ /^[1-9][0-9]*$/ {print $2; exit}'; }
 
 # ── imp05: binary-provenance config (DEFAULT-OFF — false-positive under launchd) ─
 # These check that a build marker is present in the gc/gt binary (gc: IsTransientDoltError,
@@ -838,7 +857,8 @@ run_sweep() {
       prev="$(_prev_exit "$lbl")"
       # CRASH-LOOP = a POSITIVE exit (a real error, not a negative=signal restart) seen
       # on TWO consecutive checks. One transient nonzero exit never alerts.
-      if [ "$ex" -gt 0 ] 2>/dev/null && [ -n "$prev" ] && [ "$prev" -gt 0 ] 2>/dev/null; then
+      _es="$(_exit_streak "$lbl")"   # ga-77f9q9h: a label with its own streak limit is judged by imp05 below (N consecutive sweeps), not by the 2-in-a-row crash-loop + kickstart
+      if [ "$ex" -gt 0 ] 2>/dev/null && [ -n "$prev" ] && [ "$prev" -gt 0 ] 2>/dev/null && [ -z "$_es" ]; then
         # imp17: attempt auto-heal before paging a human
         if [ "${DPW_CRASHLOOP_AUTOHEAL:-1}" = "1" ]; then
           heal_n=$(( $(_cl_heal_get "$lbl") + 1 ))
@@ -883,7 +903,7 @@ run_sweep() {
       if [ "$ex" -gt 0 ] 2>/dev/null; then
         fc=$(( $(_fail_count_get "$lbl") + 1 ))
         _fail_count_set "$lbl" "$fc"
-        if [ "$fc" -ge "${DPW_FAIL_THRESHOLD:-2}" ]; then
+        if [ "$fc" -ge "${_es:-${DPW_FAIL_THRESHOLD:-2}}" ]; then
           case " $healing_inflight " in
             *" $lbl "*)
               log "FAILING: $lbl exiting non-zero (exit=$ex) for $fc consecutive sweeps (mail suppressed: imp17 auto-heal in-budget attempt $heal_n)" ;;
@@ -1702,6 +1722,84 @@ GCSTUB20
   esac
   if [ "${_ng_max:-99999}" -le 3000 ] 2>/dev/null; then ok "$_ng_lbl threshold ${_ng_max}s is <= 3000 s (still catches a hang)"; else bad "$_ng_lbl threshold [${_ng_max}] is not a number <= 3000 s"; fi
   unset _ng_lbl _ng_line _ng_file _ng_max
+
+  echo "Scenario 22f (ga-77f9q9h): real default covers ask-athos-relay (heartbeat entry on its .out + DPW_CRITICAL + 3-cycle limit) and a STALE .out is a WEDGE"
+  # Mesma classe da 22e, mais o fim da cadeia: a metade que lê o plist e o script (limite > 2x o StartInterval 180; arquivo = StandardOutPath; `start` antes do kill-switch) mora em
+  # daemon-presence-watchdog.selftest.sh. Aqui: a entrada REAL (rótulo e limite lidos do default, só o caminho trocado pelo do mktemp) tem de produzir WEDGE + kickstart com o .out velho
+  # e nada com o .out novo — o alarme que o bead pede, não só a linha de configuração.
+  _ar_lbl="com.gascity.ask-athos-relay"
+  # vazio (sem entrada) → _ar_line/_ar_max vazios → os ramos "MISSING"/"not numeric" abaixo reprovam; falhou (awk rc != 0) → mesma saída vazia → reprova, nunca passa
+  _ar_line="$(printf '%s\n' "$_REAL_DEFAULT_HEARTBEAT" | awk -F'|' -v l="$_ar_lbl" '$1==l{print; exit}')"
+  _ar_file="$(printf '%s' "$_ar_line" | awk -F'|' '{n=split($2,a,"/"); print a[n]}')"
+  _ar_max="$(printf '%s' "$_ar_line" | awk -F'|' '{print $3}')"
+  if [ -n "$_ar_line" ]; then ok "DPW_HEARTBEAT default covers $_ar_lbl ($_ar_line)"; else bad "DPW_HEARTBEAT default MISSING an entry for $_ar_lbl"; fi
+  if [ "$_ar_file" = "ask-athos-relay.out" ]; then ok "$_ar_lbl heartbeat file is ask-athos-relay.out (the plist's StandardOutPath)"; else bad "$_ar_lbl heartbeat file is [$_ar_file], expected ask-athos-relay.out"; fi
+  case "$_ar_max" in ''|*[!0-9]*) bad "$_ar_lbl heartbeat threshold is not numeric ([$_ar_max])" ;; *) ok "$_ar_lbl heartbeat threshold is numeric ($_ar_max s)" ;; esac
+  case " $_REAL_DEFAULT_CRITICAL " in
+    *" $_ar_lbl "*) ok "$_ar_lbl is also in DPW_CRITICAL (heartbeat entry is reachable)" ;;
+    *) bad "$_ar_lbl has a heartbeat entry but is NOT in DPW_CRITICAL (dead config)" ;;
+  esac
+  if [ "${_ar_max:-0}" -gt 360 ] 2>/dev/null && [ "${_ar_max:-0}" -le 3000 ] 2>/dev/null; then ok "$_ar_lbl threshold ${_ar_max}s is > 2x the 180 s cycle and <= 3000 s"; else bad "$_ar_lbl threshold [${_ar_max}] is not a number in (360, 3000] s"; fi
+  # fim da cadeia: o sweep com ESTA entrada. Sem entrada ou limite ilegível não há o que simular: pula, e os "bad" acima já reprovaram a suite.
+  if [ -n "$_ar_line" ] && [ -n "$_ar_max" ]; then
+    _ar_sv_crit="$DPW_CRITICAL"; _ar_sv_hb="$DPW_HEARTBEAT"
+    _ar_hb="$TMP/relay-hb.out"
+    sed "s|<string>com.gascity.beta</string>|<string>$_ar_lbl</string>|" "$LAUNCH_DIR/com.gascity.beta.plist" > "$LAUNCH_DIR/$_ar_lbl.plist"
+    DPW_CRITICAL="$_ar_lbl"; DPW_TEST_LOADED="$_ar_lbl"; DPW_TEST_EXIT=""; DPW_TEST_AVAIL_AGE=99999
+    DPW_HEARTBEAT="$_ar_lbl|$_ar_hb|$_ar_max"
+    : > "$STATE"; rm -rf "${STATE}.fail-counts"; : > "$DPW_TEST_KICKSTARTS"
+    touch -t "$(date -v-1H +%Y%m%d%H%M 2>/dev/null || echo 202601010000)" "$_ar_hb"   # .out parado há ~1 h (> 540 s)
+    run_sweep >/dev/null 2>&1 && bad "$_ar_lbl with a stale .out should alert (return 1)" || ok "$_ar_lbl with a stale .out → WEDGE alert (return 1)"
+    grep -q "$_ar_lbl" "$DPW_TEST_KICKSTARTS" && ok "$_ar_lbl wedged → kickstarted" || bad "$_ar_lbl wedged but NOT kickstarted"
+    : > "$STATE"; rm -rf "${STATE}.fail-counts"; : > "$DPW_TEST_KICKSTARTS"; touch "$_ar_hb"   # .out novo
+    run_sweep >/dev/null 2>&1 && ok "$_ar_lbl with a fresh .out → no wedge (return 0)" || bad "$_ar_lbl with a fresh .out falsely wedged"
+    [ ! -s "$DPW_TEST_KICKSTARTS" ] && ok "$_ar_lbl fresh .out → no kickstart" || bad "$_ar_lbl kickstarted despite a fresh .out"
+    DPW_CRITICAL="$_ar_sv_crit"; DPW_HEARTBEAT="$_ar_sv_hb"; DPW_TEST_LOADED="$ALL"; unset DPW_TEST_AVAIL_AGE
+    unset _ar_sv_crit _ar_sv_hb _ar_hb
+  fi
+  unset _ar_lbl _ar_line _ar_file _ar_max
+
+  echo "Scenario 22g (ga-77f9q9h): DPW_EXIT_STREAK — a label with its own streak limit needs N consecutive nonzero sweeps (not 2) and is never auto-healed; others keep 2"
+  # O relay sai 1 numa rodada com pane ilegível (NAO-CONFERIDO, por desenho) e o vigia zera o contador a cada sweep limpo: com o limite 2 um par de flaps normais virava CRASH-LOOP-AUTOHEAL
+  # (kickstart -k + push). Aqui: alpha ganha o limite 3 só neste cenário; o default real (relay|6) é conferido à parte; o restante da suite volta ao default no fim.
+  _ex_sv_streak="$DPW_EXIT_STREAK"; _ex_sv_crit="$DPW_CRITICAL"; _ex_sv_hb="$DPW_HEARTBEAT"
+  DPW_CRITICAL="com.gascity.alpha"; DPW_HEARTBEAT=""; DPW_TEST_LOADED="com.gascity.alpha"
+  _ex_fresh() { : > "$STATE"; rm -rf "${STATE}.fail-counts" "${STATE}.crashloop-heals"; : > "$DPW_TEST_KICKSTARTS"; : > "$LOG"; }
+  DPW_EXIT_STREAK="com.gascity.alpha|3"
+  _ex_fresh; DPW_TEST_EXIT="com.gascity.alpha:1"
+  : > "$STATE"; run_sweep >/dev/null 2>&1 && ok "streak 3: 1st nonzero exit → no alert" || bad "streak 3: 1st nonzero exit alerted"
+  : > "$STATE"; run_sweep >/dev/null 2>&1 && ok "streak 3: 2nd consecutive nonzero exit → still no alert (the default 2 would have fired)" || bad "streak 3: 2nd consecutive nonzero exit alerted (limit ignored)"
+  [ ! -s "$DPW_TEST_KICKSTARTS" ] && ok "streak 3: no auto-heal kickstart for a label with its own streak limit" || bad "streak 3: kickstarted a label with its own streak limit"
+  grep -q "CRASH-LOOP" "$LOG" && bad "streak 3: CRASH-LOOP logged before the limit" || ok "streak 3: no CRASH-LOOP line before the limit"
+  : > "$STATE"; run_sweep >/dev/null 2>&1 && bad "streak 3: 3rd consecutive nonzero exit should alert (return 1)" || ok "streak 3: 3rd consecutive nonzero exit → alert (return 1)"
+  grep -q "FAILING: com.gascity.alpha exiting non-zero (exit=1) for 3 consecutive sweeps" "$LOG" && ok "streak 3: FAILING logged at 3 sweeps" || bad "streak 3: FAILING line missing at 3 sweeps"
+  [ ! -s "$DPW_TEST_KICKSTARTS" ] && ok "streak 3: still no kickstart at the limit (a relay that exits 1 every round is not fixed by a restart)" || bad "streak 3: kickstarted at the limit"
+  # the 2-in-a-row crash-loop (imp17) reads the PREVIOUS exit from the state file, so the sweeps above (which truncate it, like scenario 13) never reach it: keep the state between two sweeps
+  # and the crash-loop path would fire here (and kickstart) unless the label's own streak limit skips it
+  _ex_fresh; DPW_TEST_EXIT="com.gascity.alpha:1"
+  run_sweep >/dev/null 2>&1; run_sweep >/dev/null 2>&1 && ok "streak 3: 2 consecutive nonzero exits with the state kept → no crash-loop alert" || bad "streak 3: the 2-in-a-row crash-loop fired for a label with its own streak limit"
+  [ ! -s "$DPW_TEST_KICKSTARTS" ] && ok "streak 3: ...and no CRASH-LOOP-AUTOHEAL kickstart" || bad "streak 3: CRASH-LOOP-AUTOHEAL kicked a label with its own streak limit"
+  grep -q "CRASH-LOOP" "$LOG" && bad "streak 3: CRASH-LOOP logged with the state kept" || ok "streak 3: no CRASH-LOOP line with the state kept"
+  # a clean sweep resets the count: 1, 1, 0, 1, 1 never reaches 3
+  _ex_fresh
+  for _e in 1 1 0 1 1; do DPW_TEST_EXIT="com.gascity.alpha:$_e"; : > "$STATE"; run_sweep >/dev/null 2>&1; _ex_rc=$?; done
+  [ "$_ex_rc" -eq 0 ] && ok "streak 3: 1,1,0,1,1 never alerts (a clean sweep resets the count)" || bad "streak 3: a clean sweep did not reset the count (rc=$_ex_rc)"
+  # a label NOT in the list keeps the strict default: beta, 2 consecutive → alert
+  _ex_fresh; DPW_CRITICAL="com.gascity.beta"; DPW_TEST_LOADED="com.gascity.beta"; DPW_TEST_EXIT="com.gascity.beta:1"
+  : > "$STATE"; run_sweep >/dev/null 2>&1
+  : > "$STATE"; run_sweep >/dev/null 2>&1 && bad "a label without a streak limit: 2 consecutive should still alert" || ok "a label without a streak limit keeps the default 2"
+  # a value that is not a whole number >= 1 is "no override" (strict 2), never a silent tolerance
+  for _bad in abc 0 "" -3 1.5; do
+    DPW_EXIT_STREAK="com.gascity.alpha|$_bad"; _ex_fresh; DPW_CRITICAL="com.gascity.alpha"; DPW_TEST_LOADED="com.gascity.alpha"; DPW_TEST_EXIT="com.gascity.alpha:1"
+    : > "$STATE"; run_sweep >/dev/null 2>&1 && ok "streak value [$_bad]: 1st nonzero exit → no alert (strict default, not a limit of 0)" || bad "streak value [$_bad]: the 1st nonzero exit alerted (read as a limit of 0)"
+    : > "$STATE"; run_sweep >/dev/null 2>&1 && bad "streak value [$_bad] was read as a tolerance (2nd sweep did not alert)" || ok "streak value [$_bad] → strict default 2 (2nd sweep alerts)"
+  done
+  # the real default: the relay is in the list with 6, nothing else is
+  DPW_EXIT_STREAK="$_ex_sv_streak"
+  [ "$(_exit_streak com.gascity.ask-athos-relay)" = "6" ] && ok "default DPW_EXIT_STREAK gives com.gascity.ask-athos-relay a limit of 6" || bad "default DPW_EXIT_STREAK for the relay is [$(_exit_streak com.gascity.ask-athos-relay)], expected 6"
+  [ -z "$(_exit_streak com.gascity.pilot)" ] && ok "default DPW_EXIT_STREAK leaves other labels on the default 2" || bad "default DPW_EXIT_STREAK touches another label"
+  DPW_CRITICAL="$_ex_sv_crit"; DPW_HEARTBEAT="$_ex_sv_hb"; DPW_TEST_LOADED="$ALL"; DPW_TEST_EXIT=""
+  unset -f _ex_fresh; unset _ex_sv_streak _ex_sv_crit _ex_sv_hb _e _ex_rc _bad
 
   echo "Scenario 23 (ga-g92h): _exit_class distinguishes OOM-killed (137) from a real failure"
   # Provenance checks off (matches the imp17 block's own convention above) --

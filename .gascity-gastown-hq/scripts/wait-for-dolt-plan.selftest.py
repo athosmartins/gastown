@@ -11,7 +11,7 @@ CASOS: plano é SÓ LEITURA (checksum da pasta não muda) e a medição separa c
   wrap fica byte a byte igual, backup byte a byte do original, idempotente (2ª vez não embrulha de novo) · --revert devolve o original e é idempotente · RECUSAS (nada é escrito): divergência,
   wrapper ausente/não executável/com sintaxe ruim, wrap em KeepAlive, wrap sem chamada medida, label em 2 arquivos · plist symlink / com chave Program / que o plutil -lint recusa não são
   alterados · política ilegível, com decisão desconhecida ou label repetido = exit 3 · uso errado = exit 2 · --revert com plist ilegível (lista e sai 1) · wrapper embrulhado por OUTRO caminho ·
-  política × vivo (isento embrulhado, nao-medido que mede LÊ, wrap sem gatilho) · backup (falha de criação sem traceback; --backup-dir reaproveitado não sobrescreve) · sonda ao lado do wrapper · a política REAL do repo isenta o vigia de ocupação (ga-2hd02v.1.17).
+  política × vivo (isento embrulhado, nao-medido que mede LÊ, wrap sem gatilho) · backup (falha de criação sem traceback; --backup-dir reaproveitado não sobrescreve) · sonda ao lado do wrapper · a política REAL do repo isenta o vigia de ocupação (ga-2hd02v.1.17) · o relay de perguntas ao Athos é isento sem linha (RunAtLoad=false fora do escopo; true = NÃO CLASSIFICADO; linha isento = divergência) (ga-77f9q9h).
 CONTROLE NEGATIVO: cada guarda (marca `GUARD:` no script) é adulterada numa cópia e o caso que a cobre TEM que passar a falhar; mutante que não muda o arquivo também falha.
 VARIÁVEIS: WFDP_UNDER_TEST (script a testar) · WFDP_NO_MUTANTS=1
 """
@@ -394,6 +394,41 @@ def c_real_policy_hetzner_occupancy():
     return bool(m) and m.group(1) == "1" and m.group(2).startswith(f"{label} [") and f"NÃO CLASSIFICADO (fora da política): {label}" not in out
 
 
+def c_real_policy_ask_athos_relay():
+    """ga-77f9q9h: o ask-athos-relay é ISENTO do wait-for-dolt SEM linha na política, e este caso prova os três estados contra a política REAL do repo (plist do repo copiado para mktemp; os outros
+    rótulos da política não têm plist aqui, então o exit é 1 sempre e o que vale é a saída):
+      1. plist do repo, RunAtLoad=false → "0 com RunAtLoad, 0 no escopo HQ": o plano o lê e o deixa de fora, sem NÃO CLASSIFICADO e sem divergência com o nome dele (nunca é embrulhado);
+      2. a mesma plist com RunAtLoad=true → "NÃO CLASSIFICADO (fora da política)": se alguém ligar o RunAtLoad, o plano obriga a decidir (a rede de segurança que a isenção precisa);
+      3. a política real + uma linha `isento` para ele → "política cita job sem plist RunAtLoad vivo": é por isso que a linha NÃO existe (ela derrubaria o --apply da cidade inteira)."""
+    label = "com.gascity.ask-athos-relay"
+    pol, src = os.path.join(HERE, "wait-for-dolt.policy.tsv"), os.path.join(HERE, f"{label}.plist")
+    # vazio → plist existente e vazio cai na contagem do estado 1 ("0 plists"/ilegível) e reprova; falhou/ilegível → política ou plist ausente: reprova aqui, limpo, em vez de uma exceção do shutil.copy
+    if not (os.path.isfile(pol) and os.path.isfile(src)):
+        return False
+    text = open(src, encoding="utf-8").read()
+    on = text.replace("<key>RunAtLoad</key><false/>", "<key>RunAtLoad</key><true/>")
+    # o plist do repo deixou de dizer RunAtLoad=false nesta forma: a troca não mudou nada e o estado 2 mediria o mesmo plist do estado 1 — reprova, nunca passa em branco
+    if on == text:
+        return False
+    d1 = f"{T}/la-real-relay-off"
+    os.makedirs(d1)
+    shutil.copy(src, d1)
+    out1 = run([], d1, pol)[1]
+    # "1 plists, 0 com RunAtLoad, 0 no escopo HQ": o plist FOI lido (1) e julgado fora do escopo; ilegível mudaria a contagem (e acrescentaria "ilegíveis"), então não passa por falta de dado
+    off_ok = "1 plists, 0 com RunAtLoad, 0 no escopo HQ, 0 fora (outro rig/label), 0 ilegíveis" in out1 and label not in out1
+    d2 = f"{T}/la-real-relay-on"
+    os.makedirs(d2)
+    open(f"{d2}/{label}.plist", "w", encoding="utf-8").write(on)
+    out2 = run([], d2, pol)[1]
+    on_ok = f"NÃO CLASSIFICADO (fora da política): {label}" in out2
+    d3 = f"{T}/la-real-relay-line"
+    os.makedirs(d3)
+    shutil.copy(src, d3)
+    out3 = run([], d3, policy(open(pol, encoding="utf-8").read().rstrip("\n") + f"\n{label}\tisento\tteste\n"))[1]
+    line_ok = f"política cita job sem plist RunAtLoad vivo: {label}" in out3
+    return off_ok and on_ok and line_ok
+
+
 SUITE = [
     (c_plan_readonly, "plano é só leitura; medição separa chamada de texto (b.sh = TALVEZ); script direto é lido; script citado e ausente = ILEGÍVEL; escopo; ilegível; plutil; contagens"),
     (c_apply_revert, "--apply exato + chaves/ordem + backup byte a byte + idempotente; --revert devolve o original e é idempotente"),
@@ -416,6 +451,7 @@ SUITE = [
     (c_odd_plists, "plist com topo que não é dicionário / Label que não é texto → listado como ilegível, sem traceback, o resto do plano sai"),
     (c_unreadable_refuses_apply, "plist que não consegui ler é divergência: o plano sai 1 e --apply recusa sem escrever nada"),
     (c_real_policy_hetzner_occupancy, "a política REAL do repo isenta o vigia de ocupação: o plist do repo cai em ISENTOS e não em NÃO CLASSIFICADO (ga-2hd02v.1.17)"),
+    (c_real_policy_ask_athos_relay, "o relay de perguntas ao Athos é isento sem linha: RunAtLoad=false fica fora do escopo; RunAtLoad=true vira NÃO CLASSIFICADO; uma linha isento dele vira divergência (ga-77f9q9h)"),
 ]
 MUTANTS = [   # (nome, expressão sed, cenário)
     ("aplica-com-divergencia", "/GUARD:apply-refuses-divergence/ s/if div:/if False:/", c_refuse_divergence),

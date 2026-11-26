@@ -21,6 +21,9 @@
 # The exporter is the exception to "the heartbeat is the plist's StandardOutPath": a clean run with no change prints nothing to stdout, so its heartbeat is
 # the script's own log (jsonl-export.log: `start pid=` on a run that exports, `skipped-low-disk` on a tick skipped for the disk) and `wiring` proves THAT instead
 # (5th/6th arguments): a static grep for the file name and for both writers. That they are REACHED (one start + one end rc=0 per clean run, the skip line) is jsonl-export.selftest.sh.
+#
+# ga-77f9q9h: the same proof for com.gascity.ask-athos-relay (StartInterval 180, limit 540 s, heartbeat = the plist's .out), plus a static proof on ask-athos-relay.py that `start` is logged BEFORE the kill-switch
+# and the flock (so the .out advances on every tick, off-switch and slow round included). The sweep that turns a stale .out into WEDGE + kickstart is scenario 22f of daemon-presence-watchdog.sh --selftest.
 set -uo pipefail
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
@@ -259,6 +262,48 @@ ng_expect_reprova "node-ghost-release: start log removed" "$W/ng-no-start.py" "n
 # awk, not `sed i\`: the one-line form is GNU-only and BSD sed (the mini) wants a newline after the backslash
 awk '/_log\("start enabled=/{print "    if not ENABLED or os.path.exists(OFF_PATH): return 0"} {print}' "$NG_SCRIPT" > "$W/ng-kill-first.py"
 ng_expect_reprova "node-ghost-release: kill-switch test moved above the start log" "$W/ng-kill-first.py" "AFTER the kill-switch"
+
+# ga-77f9q9h: ask-athos-relay (ga-ij162cl). The job runs on launchd with no entry here: loaded, so PRESENCE-DRIFT stays quiet, but with no entry nothing reloads it if it goes absent and nothing
+# kickstarts it if launchd stops spawning it, and the relay going silent is exactly the failure it exists to prevent (a worker's question to the Athos that nobody forwards). 180 s cycle -> limit 540 s
+# (3 cycles; > 2x 180 = 360, under the 3000 s cap); its heartbeat is the plist's .out. The "threshold too low" mutation uses 300: it must sit BELOW 2x StartInterval (360), and the default 1000 is above it,
+# so it would still be accepted and prove nothing.
+AR_LBL="com.gascity.ask-athos-relay"
+AR_PLIST="${ASK_ATHOS_RELAY_PLIST_PATH:-$HERE/$AR_LBL.plist}"
+AR_SCRIPT="${ASK_ATHOS_RELAY_SCRIPT_PATH:-$HERE/ask-athos-relay.py}"
+jsonl_job_cases "$AR_LBL" "$AR_PLIST" 540 3000 "ask-athos-relay.out" "ask-athos-relay.err" "" "" 300
+
+# The heartbeat is the .out, so main() must print a line on EVERY tick before anything can return: `log("start ...` BEFORE the kill-switch test (a deliberately switched-off relay would otherwise stop
+# advancing its .out and read as WEDGED: kickstart -k + alert on a job somebody turned off on purpose) AND before the flock (a tick that finds the lock held, i.e. a slow round in flight, would
+# otherwise be silent and a legitimately slow round, up to ~15 min of peeks, would age the .out past 540 s and be killed by the watchdog).
+# prints "OK ..."/"BAD ..."; rc 1 on BAD. unreadable → BAD; read ok but a marker absent → BAD "not found" (another state); all present → compared. Never OK on a blank.
+ar_start_first() {
+  local s="$1" a b c
+  if [ ! -r "$s" ]; then echo "BAD ask-athos-relay.py unreadable or missing ($s)"; return 1; fi
+  # vazio (sem a linha) → a/b/c vazios → BAD "not found"; falhou (grep rc != 0) → mesma saída vazia → BAD, nunca OK
+  a="$(grep -n 'log("start dry_run=' "$s" 2>/dev/null | head -1 | cut -d: -f1)"
+  b="$(grep -n 'os\.path\.exists(cfg\.off_path)' "$s" 2>/dev/null | head -1 | cut -d: -f1)"
+  c="$(grep -n 'fcntl\.flock(' "$s" 2>/dev/null | head -1 | cut -d: -f1)"
+  if [ -z "$a" ] || [ -z "$b" ] || [ -z "$c" ]; then echo "BAD start-log line, kill-switch test or flock not found (start=[$a] kill=[$b] flock=[$c])"; return 1; fi
+  if [ "$a" -ge "$b" ]; then echo "BAD the start log (line $a) comes AFTER the kill-switch test (line $b): a switched-off relay would stop its heartbeat"; return 1; fi
+  if [ "$a" -ge "$c" ]; then echo "BAD the start log (line $a) comes AFTER the lock (line $c): a tick that finds the lock held would be silent and a slow round would age the .out"; return 1; fi
+  echo "OK the script logs start (line $a) before the kill-switch test (line $b) and the lock (line $c): the .out advances on every tick"
+}
+if o="$(ar_start_first "$AR_SCRIPT" 2>&1)"; then ok "ask-athos-relay: the script logs start before the kill-switch and the lock"; else nope "ask-athos-relay: start-before-kill-switch-and-lock NOT proven"; fi
+printf '%s\n' "$o" | sed 's/^/        | /'
+ar_expect_reprova() {  # <name> <script> <needle>
+  local o2; o2="$(ar_start_first "$2" 2>&1)"
+  if [ $? -eq 0 ]; then nope "$1 — passed (rc 0); a broken script must reprove"; return; fi
+  if ! printf '%s\n' "$o2" | grep -q "$3"; then nope "$1 — reproved, but not for the expected reason ($3): $o2"; return; fi
+  ok "$1 → rc != 0 ($3)"
+}
+ar_expect_reprova "ask-athos-relay: script missing" "$W/nonexistent-ar.py" "unreadable or missing"
+sed '/log("start dry_run=/d' "$AR_SCRIPT" > "$W/ar-no-start.py"
+ar_expect_reprova "ask-athos-relay: start log removed" "$W/ar-no-start.py" "not found"
+awk '/log\("start dry_run=/{print "    if os.path.exists(cfg.off_path): return 0"} {print}' "$AR_SCRIPT" > "$W/ar-kill-first.py"
+ar_expect_reprova "ask-athos-relay: kill-switch test moved above the start log" "$W/ar-kill-first.py" "AFTER the kill-switch"
+# a flock above the start log, the kill-switch test left below it: only the lock ordering is wrong, so only that needle may fire
+awk '/log\("start dry_run=/{print "    fcntl.flock(None, 0)"} {print}' "$AR_SCRIPT" > "$W/ar-lock-first.py"
+ar_expect_reprova "ask-athos-relay: flock moved above the start log" "$W/ar-lock-first.py" "AFTER the lock"
 
 echo
 echo "PASS=$PASS FAIL=$FAIL"

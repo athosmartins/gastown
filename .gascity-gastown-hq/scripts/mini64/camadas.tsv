@@ -39,6 +39,7 @@ com.gastown.machine-	1	relatório de saúde da máquina
 com.gastown.git-	1	manutenção dos repos locais
 com.gascity.agent-stuck-escalation	1	guarda do motor
 com.gascity.approved-state-reconciler	1	guarda do motor
+com.gascity.ask-athos-relay	1	leva ao Mayor a pergunta de worker de pool ao Athos (nudge interno + push no celular dele; nada sai para lead nem cliente)
 com.gascity.athos-acao-guard	1	guarda do motor
 com.gascity.auto-	1	refino e rehome automáticos de bead
 com.gascity.bd-metrics-	1	bd
