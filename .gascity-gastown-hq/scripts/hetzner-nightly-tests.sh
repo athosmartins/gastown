@@ -38,7 +38,7 @@
 #   além do próprio pytest (os diretórios velhos de /dev/shm do nó são de outro agente).
 # AMBIENTE (selftest e rodada manual): MBP_CITY, HZN_RUN (mbp-run.sh), HZN_WA_REPO, HZN_MAIL_CMD (padrão `gc mail send mayor`), HZN_TIMEOUT_S (13500: o prazo do script todo, contado do início), HZN_STOP_UTC (08:45: hora UTC em que a rodada acaba, antes do reseed do nó das 08:55Z; vazio desliga; HZN_NOW_S só para o selftest), HZN_MIN_TOTAL (1000),
 #   HZN_NODE_HOST (hetzner-teste; é também o que o mbp-run recebe como HETZNER_NODE_HOST: instalar e rodar no MESMO nó), HZN_SSH (ssh), HZN_NO_FETCH=1 (não buscar o origin),
-#   HZN_KEEP_DAYS (14; a linha de base last-complete.* não entra na limpeza), HZN_BATCH_DEFS (8000: `def test_` por lote), HZN_BATCH_TIMEOUT_S (2400: prazo de UM lote),
+#   HZN_KEEP_DAYS (14; a linha de base last-complete.* não entra na limpeza), HZN_BATCH_DEFS (8000: `def test_` por lote), HZN_BATCH_TIMEOUT_S (3600: prazo de UM lote; era 2400, ver BATCH_T abaixo),
 #   HZN_MIN_BATCH_S (180: com menos orçamento que isto o lote nem começa), HZN_FINAL_MARGIN_S (300: o que fica para o relatório), HZN_BATCH_TRIES (2) e HZN_RETRY_S (90) para o que é transitório
 #   (teto/MemAvailable inerte, sem slot, ssh/rsync caído), HZN_LANES (2: lotes ao mesmo tempo, 1 a 8; 1 = sequencial) e HZN_LANE_WAIT_S (120: espera da pista extra quando o nó não tem espaço para ela agora).
 set -uo pipefail
@@ -139,7 +139,9 @@ for f in hetzner-iso-run.sh:gt-iso-run gtn_stable_ids.py:gtn_stable_ids.py; do
 done
 
 # ── constantes: inteiro ou nada (vazio/ilegível → FALHOU, nunca um padrão escolhido por mim às cegas) ─────────────────────────────────────────────────────────────────────────────────────
-BATCH_DEFS=${HZN_BATCH_DEFS:-8000}; BATCH_T=${HZN_BATCH_TIMEOUT_S:-2400}; MIN_BATCH=${HZN_MIN_BATCH_S:-180}; MARGIN=${HZN_FINAL_MARGIN_S:-300}
+# PRAZO DO LOTE (ga-u820brw): 2400 s matava o lote 03 em 25/11 (2587 s) e 26/11 (2533 s): 2400 s de nó gastos e NADA lido (o pytest morto não imprime resumo nem ids), e o lote vira "NÃO RODOU". Lote lento é normal (22-24/11 sem pistas: 760-1750 s;
+# com 2 pistas medidas em 25/11, 1,8-2,3 x mais: 2318-2587 s nos lotes 1-3). O prazo existe para pegar lote PENDURADO, não lote lento: o orçamento da noite (DEADLINE) já limita o conjunto, então o do lote sobe para 3600 s. Matar mais cedo só perde trabalho.
+BATCH_DEFS=${HZN_BATCH_DEFS:-8000}; BATCH_T=${HZN_BATCH_TIMEOUT_S:-3600}; MIN_BATCH=${HZN_MIN_BATCH_S:-180}; MARGIN=${HZN_FINAL_MARGIN_S:-300}
 TRIES=${HZN_BATCH_TRIES:-2}; RETRY_S=${HZN_RETRY_S:-90}; ARGS_MAX=${HZN_BATCH_ARGS_MAX:-60000}; LANES_REQ=${HZN_LANES:-2}; LANE_WAIT=${HZN_LANE_WAIT_S:-120}
 for v in TIMEOUT_S MIN_TOTAL BATCH_DEFS BATCH_T MIN_BATCH MARGIN TRIES RETRY_S ARGS_MAX LANES_REQ LANE_WAIT; do
   x=${!v}; case "$x" in ''|*[!0-9]*) finish FALHOU "constante inválida: $v='$x' (precisa ser inteiro >= 0); nada rodou" 1 ;; esac
@@ -321,7 +323,7 @@ run_one_batch() { # n → o resultado vai para $SCR/res.<n>
     bt=$BATCH_T; [ "$left" -ge "$bt" ] || bt=$left
     say "lote $nn/$NB: $nf arquivos, $nd def test_, prazo ${bt}s (restam ${left}s do orçamento)${LASTWHY:+; tentativa $tries}"
     t1=$(date +%s)
-    HETZNER_ISOLATE=1 HETZNER_ISO_LANES="$ISOLANES" HETZNER_NODE_HOST="$NODE" MBP_RUN_TIMEOUT_S="$bt" "$RUN" --host linux --repo wa --dir "$TREE" -- "${BF[@]}" -n auto -p gtn_stable_ids --timeout=300 -q -rfE --tb=line --continue-on-collection-errors > "$BOUT" 2>&1
+    HETZNER_ISOLATE=1 HETZNER_ISO_LANES="$ISOLANES" HETZNER_NODE_HOST="$NODE" MBP_RUN_TIMEOUT_S="$bt" "$RUN" --host linux --repo wa --dir "$TREE" -- "${BF[@]}" -n auto -p gtn_stable_ids --timeout=300 --durations=25 --durations-min=5 -q -rfE --tb=line --continue-on-collection-errors > "$BOUT" 2>&1
     RC=$?
     BSEC=$(( $(date +%s) - t1 ))
     classify "$BOUT" "$RC"

@@ -115,8 +115,8 @@ case_first() { reset; mkout "$ISO_OK" 7 "$SUM1" "FAILED tests/a.py::t1 - Asserti
   ck "1ª noite: relatório com a linha de base" has "$REPORT" 'primeira rodada completa.*as 3 falhas de hoje viram a linha de base'
   ck "1ª noite: totais" has "$REPORT" 'total: 1205 \(1200 passaram, 3 falharam, 0 erros, 2 pulados'; ck "1ª noite: duração e meta de 225 min (o padrão de produção, HZN_TIMEOUT_S=13500)" has "$REPORT" 'pytest somado 1h6min.*meta de 225 min: ATINGIDA'
   ck "1ª noite: contador do nft no relatório" has "$REPORT" '7 tentativa\(s\) de saída barradas pelo nft'
-  ck "1ª noite: mbp-run com o isolamento ligado, o prazo e o MESMO nó do instalador" has "$CALLS" 'ENV: ISOLATE=1 TIMEOUT=2400 NODE=stub-node'
-  ck "1ª noite: mbp-run no nó linux, os arquivos do lote (ordem de caminho), -n auto e o plugin" has "$CALLS" 'ARGS: --host linux --repo wa --dir .*-- tests/a_test.py tests/sub/test_c.py tests/test_a.py tests/test_b.py tests/test_zero.py -n auto -p gtn_stable_ids --timeout=300'
+  ck "1ª noite: mbp-run com o isolamento ligado, o prazo e o MESMO nó do instalador" has "$CALLS" 'ENV: ISOLATE=1 TIMEOUT=3600 NODE=stub-node'
+  ck "1ª noite: mbp-run no nó linux, os arquivos do lote (ordem de caminho), -n auto e o plugin" has "$CALLS" 'ARGS: --host linux --repo wa --dir .*-- tests/a_test.py tests/sub/test_c.py tests/test_a.py tests/test_b.py tests/test_zero.py -n auto -p gtn_stable_ids --timeout=300 --durations=25 --durations-min=5 -q'
   ck "1ª noite: a poda do pytest.ini (venv, .hidden, crew, archive, node_modules) e o que não é test_*.py ficam de fora" hasnt "$CALLS" 'venv|hidden|crew|archive|node_modules|helper\.py|notes'
   ck "1ª noite: os arquivos mac-only (lista do mbp-run) ficam FORA do lote" hasnt "$CALLS" 'test_mac_|tests/mac/'; ck "1ª noite: o jsonl conta 2 mac-only fora" test "$(tail -n 1 "$JSONL" | jq -c .mac_only_excluded)" = 2
   ck "1ª noite: o relatório diz que a bateria NÃO cobre os mac-only" has "$REPORT" 'fora da rodada por regra do nó: 2 arquivos mac-only .*NÃO os cobre'; ck "1ª noite: a lista dos excluídos fica em arquivo" has "$LOGDIR/$DAY.mac-only.lst" '^tests/mac/test_x.py$'
@@ -253,7 +253,7 @@ case_batches() { reset; seed_prev tests/old.py::gone
   ck "lotes: lote 2 = tests/test_a.py sozinho (o próximo, de peso 7, não cabe)" has "$CALLS" '-- tests/test_a.py -n auto -p gtn_stable_ids'
   ck "lotes: lote 3 = test_b e test_zero (peso mínimo 1 para arquivo sem def)" has "$CALLS" '-- tests/test_b.py tests/test_zero.py -n auto -p gtn_stable_ids'
   ck "lotes: nenhum arquivo em dois lotes e nenhum fora" test "$(grep '^ARGS:' "$CALLS" | grep -o 'tests/[A-Za-z_/]*\.py' | sort | tr '\n' ' ')" = 'tests/a_test.py tests/sub/test_c.py tests/test_a.py tests/test_b.py tests/test_zero.py '
-  ck "lotes: cada lote com o prazo do lote (não o do script inteiro)" test "$(grep -c 'TIMEOUT=2400 ' "$CALLS")" = 3
+  ck "lotes: cada lote com o prazo do lote (não o do script inteiro)" test "$(grep -c 'TIMEOUT=3600 ' "$CALLS")" = 3
   ck "lotes: totais SOMADOS dos 3 lotes" has "$REPORT" 'total: 1204 \(1200 passaram, 2 falharam, 1 erros, 1 pulados, 0 xfail, 0 xpass\); 3 de 3 lotes rodaram'
   ck "lotes: duração somada (100+200+50 s)" has "$REPORT" 'pytest somado 0h5min \(350 s\)'; ck "lotes: contador do nft somado (2+0+0)" has "$REPORT" '2 tentativa\(s\) de saída barradas pelo nft'
   ck "lotes: o assunto diz os 3 lotes" has "$MAIL_LOG" 'COMPLETO: 1204 testes em 3 lotes, 2 falhas, 1 erros'; ck "lotes: o jsonl diz 3/3/0" test "$(tail -n 1 "$JSONL" | jq -c '[.batches,.batches_ran,.batches_skipped]')" = '[3,3,0]'
@@ -276,7 +276,7 @@ case_overbudget() { reset; seed_prev tests/a.py::t1; cp "$PREV" "$T/prev.before"
   STUB_RC_1=0 STUB_SLEEP=26 HZN_BATCH_DEFS=10 HZN_TIMEOUT_S=32 HZN_FINAL_MARGIN_S=2 HZN_MIN_BATCH_S=5 go "$1"
   ck "orçamento esgotado: FALHOU, exit 1" rcis 1; ck "orçamento esgotado: veredito FALHOU (nunca COMPLETO)" vd FALHOU; ck "orçamento esgotado: o assunto diz quais lotes não rodaram" has "$MAIL_LOG" 'FALHOU: 2 de 3 lotes NÃO RODARAM \(02, 03\)'
   ck "orçamento esgotado: a tabela diz por quê" has "$REPORT" '^\| 02 \| 1 \| 6 \| .* NÃO RODOU \| orçamento esgotado: restam'; ck "orçamento esgotado: só 1 chamada ao mbp-run" test "$(grep -c '^ARGS:' "$CALLS")" = 1
-  ck "orçamento esgotado: o 1º lote recebeu o que restava do orçamento, não 2400 s" has "$CALLS" 'TIMEOUT=([0-9]|[12][0-9]|30) '; ck "orçamento esgotado: o parcial vem marcado como parcial" has "$REPORT" 'parcial, NÃO é o total da suíte'
+  ck "orçamento esgotado: o 1º lote recebeu o que restava do orçamento, não 3600 s" has "$CALLS" 'TIMEOUT=([0-9]|[12][0-9]|30) '; ck "orçamento esgotado: o parcial vem marcado como parcial" has "$REPORT" 'parcial, NÃO é o total da suíte'
   ck "orçamento esgotado: baseline intacta" cmp -s "$PREV" "$T/prev.before"; ck "orçamento esgotado: nunca 0 novas" hasnt "$MAIL_LOG" '0 novas'; ck "orçamento esgotado: o jsonl diz 3/1/2" test "$(tail -n 1 "$JSONL" | jq -c '[.batches,.batches_ran,.batches_skipped]')" = '[3,1,2]'; }
 case_batch_killed() { reset; seed_prev tests/a.py::t1; cp "$PREV" "$T/prev.before"
   okb 1 "600 passed in 100.00s" 0; MK_TO="$STUB_OUT.2" mkout "$ISO_OK" 0 "" "Killed"; okb 3 "600 passed in 100.00s" 0

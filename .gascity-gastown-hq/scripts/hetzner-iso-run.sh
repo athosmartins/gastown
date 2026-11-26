@@ -27,7 +27,9 @@
 #   não somem mais memória do que o nó tem é um registro em ~/gt-remote/iso-lanes (uma linha `pid início-do-processo teto` por pista viva), lido e escrito dentro de um lock (mkdir):
 #       orçamento = MemAvailable − reserva − o que as OUTRAS pistas vivas ainda podem crescer (teto delas − o que o cgroup delas usa agora; cgroup ilegível = o teto inteiro, o lado seguro);
 #       teto da pista = min(orçamento, 10 GiB); workers = min((teto − base) / por-worker, (nproc − 2) / N). Pista que já existe e some = pid morto OU início do processo diferente (pid reaproveitado).
-#   A 1ª pista (nenhuma outra viva) mantém o piso de sempre (base + 1 worker; sem isso = INERTE, rc 97) e leva o teto de 10 GiB e os (nproc − 2) / N workers das pistas. Uma pista que chega com OUTRA viva é EXTRA e só entra se (a) o orçamento der pelo menos base + 3 workers
+#   ASSENTO (ga-u820brw): a 1ª pista (nenhuma outra viva) tira do orçamento (N − 1) assentos de base + 3 workers ANTES de tomar o teto, se sobrar pelo menos um assento para ela; senão leva tudo, como antes. Sem isso, com o nó a
+#   17,9 GB (26/11) ela tomava 10 GiB, a extra via 3,5 GB e esperava a noite inteira. A linha GTN-LANE ganha `assento-p-extra=<n>M` quando o assento baixou o teto da pista.
+#   A 1ª pista (nenhuma outra viva) mantém o piso de sempre (base + 1 worker; sem isso = INERTE, rc 97) e leva o teto de 10 GiB (menos o assento, acima) e os (nproc − 2) / N workers das pistas. Uma pista que chega com OUTRA viva é EXTRA e só entra se (a) o orçamento der pelo menos base + 3 workers
 #   (GTN_LANE_MIN_WORKERS) e (b) o nó não estiver disputando CPU: /proc/pressure/cpu `some avg60` <= 50 (GTN_LANE_PSI_MAX; o lastro sozinho dá ~15). PSI ilegível = não entra. Não entrar NÃO é falha:
 #   `GTN-CAP: sem-espaco <porquê>`, rc 95, o comando não roda, e quem chamou espera a outra pista soltar memória e tenta de novo (nunca conta como lote que não rodou). Uma linha `GTN-LANE: ...` diz o que foi lido.
 # CÓDIGOS: o do comando (via helper) · 95 sem espaço/CPU para uma pista EXTRA agora (o comando NÃO rodou; tente de novo mais tarde) · 97 canário não deu `isolado` OU o teto/MemAvailable não pôde ser lido/provado (o comando NÃO rodou: quem chamou trata como "bateria não rodou", nunca como teste)
@@ -108,7 +110,7 @@ lane_start() { # pid → início do processo (campo 22 de /proc/<pid>/stat, que 
 lane_admit() { # lê o registro das outras pistas e decide o teto desta; muda CEIL, OTHERS, CPUDIV; sai com 95 (sem espaço para uma pista EXTRA) ou 97 (INERTE) sem rodar o comando
   local LD=${GTN_LANES_DIR:-$HOME/gt-remote/iso-lanes} PROC=${GTN_PROC:-/proc} CGR=${GTN_CGROOT:-/sys/fs/cgroup} PSIF=${GTN_PSI_FILE:-/proc/pressure/cpu}
   local LCEIL=${GTN_LANE_CEIL_MAX_MB:-10240} LMINW=${GTN_LANE_MIN_WORKERS:-3} PSIMAX=${GTN_LANE_PSI_MAX:-50}
-  local v f pid st ceil cur cg used unspent=0 budget psi="-" why="" self
+  local v f pid st ceil cur cg used unspent=0 budget psi="-" why="" self seat=0 seat_txt=""
   for v in "$LCEIL" "$LMINW" "$PSIMAX"; do num "$v" && [ "$v" -ge 1 ] || cap_inert "constante-invalida-pistas (teto-da-pista=$LCEIL min-workers=$LMINW psi-max=$PSIMAX)"; done
   mkdir -p "$LD" 2>/dev/null || cap_inert "pistas-sem-registro (não criei $LD)"
   lane_lock "$LD" || cap_inert "pistas-sem-lock (não consegui o lock de $LD em 30 s; sem ele duas pistas podem somar memória acima do que o nó tem)"
@@ -129,7 +131,16 @@ lane_admit() { # lê o registro das outras pistas e decide o teto desta; muda CE
     [ "$used" -lt "$ceil" ] && unspent=$(( unspent + ceil - used ))
   done
   budget=$(( AVAIL_MB - RESERVE - unspent ))
-  CEIL=$budget; [ "$CEIL" -le "$LCEIL" ] || CEIL=$LCEIL; [ "$CEIL" -le "$CEILMAX" ] || CEIL=$CEILMAX
+  # ASSENTO PARA A PISTA EXTRA (ga-u820brw): a 1ª pista (nenhuma outra viva) levava o teto inteiro de 10 GiB e o registro a contava como "ainda pode crescer" até o cgroup dela encher; com o nó a 17,9 GB de MemAvailable
+  #   (26/11) sobravam 3,5 GB para a 2ª pista, que precisa de base + LMINW workers (5,6 GB): ela esperou 48 x 120 s e a noite rodou ~0,9 lote ao mesmo tempo. Agora a 1ª pista deixa (LANES−1) assentos de base + LMINW workers
+  #   no orçamento ANTES de tomar o teto. Só vale se SOBRA para a própria pista pelo menos um assento (orçamento − assentos >= base + LMINW workers): senão a 1ª pista segue com o orçamento inteiro, como antes, e a extra
+  #   espera (nunca INERTE por causa do assento). Noite rica (orçamento >= 15,9 GB) não muda nada: o teto de 10 GiB já deixava mais que um assento.
+  if [ "$OTHERS" -eq 0 ]; then
+    seat=$(( (LANES - 1) * (BASE + LMINW * PER) ))
+    [ $(( budget - seat )) -ge $(( BASE + LMINW * PER )) ] || seat=0
+    [ $(( budget - seat )) -lt "$LCEIL" ] || seat=0   # o assento só conta quando ele de fato baixa o teto (noite rica: o teto de 10 GiB já deixa mais que um assento)
+  fi
+  CEIL=$(( budget - seat )); [ "$CEIL" -le "$LCEIL" ] || CEIL=$LCEIL; [ "$CEIL" -le "$CEILMAX" ] || CEIL=$CEILMAX
   if [ "$OTHERS" -gt 0 ]; then
     [ "$CEIL" -ge $(( BASE + LMINW * PER )) ] || why="memoria (orçamento ${budget}M = MemAvailable ${AVAIL_MB}M − reserva ${RESERVE}M − ${unspent}M que as $OTHERS outra(s) pista(s) ainda podem usar; uma pista extra precisa de base ${BASE}M + $LMINW workers de ${PER}M)"
     if [ -z "$why" ]; then
@@ -148,7 +159,8 @@ lane_admit() { # lê o registro das outras pistas e decide o teto desta; muda CE
   if ! { printf '%s %s %s\n' "$$" "${self:-?}" "$CEIL" > "$LD/.lane.$$.tmp" && mv -f "$LD/.lane.$$.tmp" "$LD/lane.$$"; } 2>/dev/null; then lane_unlock "$LD"; cap_inert "pistas-sem-registro (não gravei $LD/lane.$$)"; fi
   lane_unlock "$LD"
   CPUDIV=$LANES
-  echo "GTN-LANE: pistas=$LANES outras-vivas=$OTHERS reservado-pelas-outras=${unspent}M orcamento=${budget}M teto-da-pista=${CEIL}M psi60=$psi"
+  seat_txt=""; [ "$seat" -le 0 ] || seat_txt=" assento-p-extra=${seat}M"
+  echo "GTN-LANE: pistas=$LANES outras-vivas=$OTHERS reservado-pelas-outras=${unspent}M orcamento=${budget}M teto-da-pista=${CEIL}M${seat_txt} psi60=$psi"
 }
 CAP=()
 if [ -n "${GTN_WORKERS:-}" ]; then

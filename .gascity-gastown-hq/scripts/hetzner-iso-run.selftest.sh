@@ -10,10 +10,10 @@
 # TETO DE MEMÓRIA E WORKERS (ga-84gkpab): sem GTN_WORKERS os workers saem do MemAvailable lido na hora (teto de 20 GiB, reserva de 6 GiB, nproc−2), o comando roda DENTRO do escopo
 #   systemd-run com MemoryMax e MemorySwapMax=0, e o teto só vale com a prova (o escopo lê o próprio memory.max); MemAvailable ilegível/zero, memória que não cabe um worker, escopo recusado
 #   ou teto que não aparece no cgroup = INERTE (rc 97, o comando NÃO roda). Com GTN_WORKERS (o lastro) nada muda.
-# PISTAS (ga-282sl1d): `--lanes N` registra a pista em GTN_LANES_DIR, soma o que as outras vivas ainda podem crescer (teto − uso do cgroup delas), limita a pista a 10 GiB e a (nproc−2)/N workers; pista EXTRA sem
+# PISTAS (ga-282sl1d): `--lanes N` registra a pista em GTN_LANES_DIR, soma o que as outras vivas ainda podem crescer (teto − uso do cgroup delas), limita a pista a 10 GiB e a (nproc−2)/N workers (a 1ª pista ainda deixa o assento da extra, ga-u820brw); pista EXTRA sem
 #   espaço (memória, CPU/PSI, PSI ilegível) sai com rc 95 e o comando NÃO roda; pid morto ou reaproveitado some do registro; linha ilegível conta como viva com o teto inteiro; lock tomado de dono morto;
 #   --lanes inválido = INERTE; sem --lanes (ou 1) nada muda e nenhum registro nasce.
-# CONTROLES NEGATIVOS: mutantes W1-W7 (wrapper), P1-P5 (sonda), C1-C8 (teto/workers) e L1-L15 (pistas) têm de ser REPROVADOS pelo caso correspondente (o caso falha no mutante).
+# CONTROLES NEGATIVOS: mutantes W1-W7 (wrapper), P1-P5 (sonda), C1-C8 (teto/workers) e L1-L19 (pistas) têm de ser REPROVADOS pelo caso correspondente (o caso falha no mutante).
 # O QUE NÃO PROVA: que o helper de root isola de verdade num kernel real. Isso só o canário prova, no nó, depois que o root instalar o helper (`gt-iso-run --canary`).
 set -u
 HERE="$(cd "$(dirname "$0")" && pwd)"
@@ -159,10 +159,26 @@ lreset() { find "$T/lanes" "$T/lanes.lock" "$T/proc" "$T/cg" "$T/psi" "$T/arquiv
            export GTN_LANES_DIR="$T/lanes" GTN_PROC="$T/proc" GTN_CGROOT="$T/cg" GTN_PSI_FILE="$T/psi"; unset GTN_LANE_LOCK_TRIES; }
 case_lanes() { local f
   lreset; LANE_PROBE=1 go "$1" --lanes 2 -- python -m pytest
-  ck "pista sozinha: roda (rc 0)" rcis 0; ck "pista sozinha: teto de 10 GiB por pista (MemAvailable dava 13387M) e 6 workers" has "$OUT" '^GTN-CAP: MemoryMax=10240M MemorySwapMax=0 workers=6 '
-  ck "pista sozinha: a linha GTN-LANE diz que não há outra viva e o teto" has "$OUT" '^GTN-LANE: pistas=2 outras-vivas=0 reservado-pelas-outras=0M orcamento=13387M teto-da-pista=10240M psi60=-$'
-  ck "pista sozinha: o comando leva os 6 workers" has "$CALLS" '^CMD: WA_PYTEST_MAX_WORKERS=6 '
-  ck "pista sozinha: o registro tem a pista (pid do próprio gt-iso-run, início, teto) ANTES do comando rodar" has "$CALLS" '^LANEFILE: ([0-9]+) [0-9?]+ 10240;? pid=\1$'
+  # ASSENTO (ga-u820brw): MemAvailable 19531M → orçamento 13387M; a 1ª pista deixa um assento da extra (2048 + 3 × 1200 = 5648M) → teto 7739M, (7739 − 2048) / 1200 = 4 workers (antes: 10240M e 6, e a extra via 3,5 GB e esperava a noite toda)
+  ck "pista sozinha: roda (rc 0)" rcis 0; ck "pista sozinha: deixa o assento da extra (orçamento 13387M − 5648M = teto 7739M) e 4 workers" has "$OUT" '^GTN-CAP: MemoryMax=7739M MemorySwapMax=0 workers=4 '
+  ck "pista sozinha: a linha GTN-LANE diz que não há outra viva, o teto e o assento" has "$OUT" '^GTN-LANE: pistas=2 outras-vivas=0 reservado-pelas-outras=0M orcamento=13387M teto-da-pista=7739M assento-p-extra=5648M psi60=-$'
+  ck "pista sozinha: o comando leva os 4 workers" has "$CALLS" '^CMD: WA_PYTEST_MAX_WORKERS=4 '
+  ck "pista sozinha: o registro tem a pista (pid do próprio gt-iso-run, início, teto) ANTES do comando rodar" has "$CALLS" '^LANEFILE: ([0-9]+) [0-9?]+ 7739;? pid=\1$'
+  # a noite de 26/11 (MemAvailable 17912M, a 1ª pista com 800M já usados): a 1ª pista fica com 6120M e 3 workers; a EXTRA entra na hora (orçamento 17912 − 6144 − (6120 − 800) = 6448M >= 5648M) com 3 workers
+  lreset; printf 'MemAvailable:   18341888 kB\n' > "$T/meminfo.n"; GTN_MEMINFO="$T/meminfo.n" go "$1" --lanes 2 -- true
+  ck "26/11: a 1ª pista fica com 6120M e 3 workers (deixou o assento)" has "$OUT" '^GTN-CAP: MemoryMax=6120M MemorySwapMax=0 workers=3 '; ck "26/11: GTN-LANE mostra o orçamento 11768M e o assento" has "$OUT" '^GTN-LANE: pistas=2 outras-vivas=0 reservado-pelas-outras=0M orcamento=11768M teto-da-pista=6120M assento-p-extra=5648M psi60=-$'
+  lreset; mkother a 6120 5555 800; GTN_MEMINFO="$T/meminfo.n" go "$1" --lanes 2 -- true
+  ck "26/11: a EXTRA entra (rc 0) em vez de esperar" rcis 0; ck "26/11: a EXTRA leva 6448M e 3 workers" has "$OUT" '^GTN-CAP: MemoryMax=6448M MemorySwapMax=0 workers=3 '
+  ck "26/11: a EXTRA não tem assento (só a 1ª pista deixa)" has "$OUT" '^GTN-LANE: pistas=2 outras-vivas=1 reservado-pelas-outras=5320M orcamento=6448M teto-da-pista=6448M psi60=15$'
+  # noite rica: o teto de 10 GiB já deixa mais que um assento → nada muda (sem texto de assento)
+  lreset; printf 'MemAvailable:   28000000 kB\n' > "$T/meminfo.r"; GTN_MEMINFO="$T/meminfo.r" go "$1" --lanes 2 -- true
+  ck "noite rica: teto de 10 GiB e 6 workers, como antes" has "$OUT" '^GTN-CAP: MemoryMax=10240M MemorySwapMax=0 workers=6 '; ck "noite rica: GTN-LANE sem texto de assento" has "$OUT" '^GTN-LANE: pistas=2 outras-vivas=0 reservado-pelas-outras=0M orcamento=21199M teto-da-pista=10240M psi60=-$'
+  # noite pobre demais para um assento (orçamento 8856M − 5648M < 5648M): a 1ª pista leva tudo, como antes (5 workers), e NÃO fica INERTE
+  lreset; printf 'MemAvailable:   15360000 kB\n' > "$T/meminfo.p"; GTN_MEMINFO="$T/meminfo.p" go "$1" --lanes 2 -- true
+  ck "pobre demais para o assento: a 1ª pista leva o orçamento inteiro (8856M, 5 workers)" has "$OUT" '^GTN-CAP: MemoryMax=8856M MemorySwapMax=0 workers=5 '; ck "pobre demais: GTN-LANE sem assento" has "$OUT" '^GTN-LANE: pistas=2 outras-vivas=0 reservado-pelas-outras=0M orcamento=8856M teto-da-pista=8856M psi60=-$'
+  # 3 pistas: a 1ª deixa DOIS assentos (11296M): MemAvailable 25390M → orçamento 19246M − 11296M = 7950M, (7950 − 2048) / 1200 = 4 workers (a CPU, (16 − 2) / 3 = 4, também limita a 4)
+  lreset; printf 'MemAvailable:   25999360 kB\n' > "$T/meminfo.t"; GTN_MEMINFO="$T/meminfo.t" go "$1" --lanes 3 -- true
+  ck "3 pistas: a 1ª deixa dois assentos (teto 7950M, 4 workers)" has "$OUT" '^GTN-CAP: MemoryMax=7950M MemorySwapMax=0 workers=4 '; ck "3 pistas: GTN-LANE diz os dois assentos" has "$OUT" '^GTN-LANE: pistas=3 outras-vivas=0 reservado-pelas-outras=0M orcamento=19246M teto-da-pista=7950M assento-p-extra=11296M psi60=-$'
   # sem --lanes e com --lanes 1: igual a antes (teto 13387M, 9 workers) e NENHUM registro
   lreset; go "$1" -- true; ck "sem --lanes: o de sempre (13387M, 9 workers)" has "$OUT" '^GTN-CAP: MemoryMax=13387M MemorySwapMax=0 workers=9 '; ck "sem --lanes: nenhum registro nasce" test ! -e "$GTN_LANES_DIR"
   go "$1" --lanes 1 -- true; ck "--lanes 1: o de sempre" has "$OUT" '^GTN-CAP: MemoryMax=13387M MemorySwapMax=0 workers=9 '; ck "--lanes 1: nenhum registro nasce" test ! -e "$GTN_LANES_DIR"
@@ -253,7 +269,11 @@ mutant L10-registro-ilegivel-vira-pista-morta 's/^    else pid=""; ceil=\$LCEIL;
 mutant L11-lanes-invalido-aceito 's/num "\$LANES_RAW" \&\& \[ "\$LANES_RAW" -ge 1 \] \&\& \[ "\$LANES_RAW" -le 8 \] || cap_inert/true || cap_inert/' lanes
 mutant L12-sem-espaco-vira-inerte 's/echo "GTN-CAP: sem-espaco \$why"; exit 95/echo "GTN-CAP: sem-espaco $why"; exit 97/' lanes
 mutant L13-lock-ignorado 's/^  lane_lock "\$LD" || cap_inert.*$/  :/' lanes
-mutant L14-teto-da-pista-ignorado 's/CEIL=\$budget; \[ "\$CEIL" -le "\$LCEIL" \] || CEIL=\$LCEIL;/CEIL=$budget;/' lanes
+mutant L14-teto-da-pista-ignorado 's/CEIL=\$(( budget - seat )); \[ "\$CEIL" -le "\$LCEIL" \] || CEIL=\$LCEIL;/CEIL=$(( budget - seat ));/' lanes
 mutant L15-pista-sem-espaco-segue-rodando 's/^    echo "GTN-CAP: sem-espaco \$why"; exit 95$/    echo "GTN-CAP: sem-espaco $why"/' lanes
+mutant L16-1a-pista-sem-assento 's/^    seat=\$(( (LANES - 1) \* (BASE + LMINW \* PER) ))$/    seat=0/' lanes
+mutant L17-assento-sem-piso-deixa-a-1a-pista-sem-memoria 's/^    \[ \$(( budget - seat )) -ge \$(( BASE + LMINW \* PER )) \] || seat=0$/    :/' lanes
+mutant L18-assento-de-uma-pista-so 's/^    seat=\$(( (LANES - 1) \* (BASE + LMINW \* PER) ))$/    seat=$(( BASE + LMINW * PER ))/' lanes
+mutant L19-assento-baixa-o-teto-da-noite-rica 's/^    \[ \$(( budget - seat )) -lt "\$LCEIL" \] || seat=0 .*$/    :/' lanes
 echo "---"; echo "$((n-fails))/$n ok ($M mutantes)"
 [ $fails -eq 0 ] && echo "SELFTEST OK" || { echo "SELFTEST FALHOU ($fails)"; exit 1; }
