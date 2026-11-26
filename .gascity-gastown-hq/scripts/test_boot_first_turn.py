@@ -3,6 +3,7 @@
 import importlib.util
 import json
 import os
+import shutil
 import tempfile
 import time
 import unittest
@@ -103,6 +104,39 @@ class T(unittest.TestCase):
         w = self.world(bd=True)  # bd não respondeu: não é «sem trabalho»
         c = bft.run_pass(w)[1]
         self.assertEqual((c["nao-sei"], c["sem-trabalho"], c["digitou"]), (1, 0, 0))
+
+    def test_unreadable_agents_is_not_no_crews(self):
+        os.makedirs(os.path.join(self.tmp, "agents", "stray"))  # pasta sem agent.toml: não é crew, e isso não é dúvida
+        w = self.world()
+        self.assertEqual(bft.run_pass(w)[1]["digitou"], 1)
+        toml = os.path.join(self.tmp, "agents", "oracle-wa", "agent.toml")
+        os.remove(toml)
+        os.mkdir(toml)  # existe e não abre: não dá para saber quem é crew
+        w = self.world()
+        c = bft.run_pass(w)[1]
+        self.assertEqual((c["nao-sei"], c["alvos"], c["digitou"]), (1, 0, 0))
+        shutil.rmtree(os.path.join(self.tmp, "agents"))  # agents/ sumiu: o mesmo
+        w = self.world()
+        c = bft.run_pass(w)[1]
+        self.assertEqual((c["nao-sei"], c["alvos"], c["digitou"]), (1, 0, 0))
+        self.assertEqual(w.typed(), [])
+
+    def test_corrupt_bd_json_is_not_no_work(self):
+        for body in ("not json", '{"error": "dolt down"}', '[1, "x"]'):
+            w = self.world(beads={self.tmp: body, RIG: "[]"})
+            c = bft.run_pass(w)[1]
+            self.assertEqual((c["nao-sei"], c["sem-trabalho"], c["digitou"]), (1, 0, 0), body)
+            self.assertEqual(w.typed(), [])
+
+    def test_corrupt_state_types_once_and_heals(self):
+        for body in ("{corrupt", "[1, 2]", '{"x": "texto"}'):
+            w = self.world()
+            with open(w.state_path, "w") as fh:
+                fh.write(body)
+            self.assertEqual(bft.run_pass(w)[1]["digitou"], 1, body)  # pior caso: UMA linha a mais; não trava o 1º turno
+            with open(w.state_path) as fh:
+                self.assertEqual(len(json.load(fh)), 1)  # estado reescrito legível
+            self.assertEqual(bft.run_pass(self.world())[1]["feito"], 1)
 
     def test_only_boot_window_named_crews_and_mayor(self):
         for age in (30, 3 * 3600):  # nova demais / já passou do boot

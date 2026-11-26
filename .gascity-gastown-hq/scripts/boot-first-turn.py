@@ -53,8 +53,8 @@ def compose(ids):
 
 
 def crews(agents_dir):
-    """{nome do agente: work_dir} das crews nomeadas, ou None se agents/ não foi lido. Pasta sem agent.toml legível não é crew."""
-    # vazio ({}): só o Mayor é alvo; falhou (None): quem chama conta nao-sei e segue só com o Mayor
+    """{nome do agente: work_dir} das crews nomeadas, ou None se não deu para ler (agents/ ou um agent.toml que existe e não abre). Pasta SEM agent.toml não é crew."""
+    # vazio ({}): só o Mayor é alvo; falhou (None): quem chama conta nao-sei e segue só com o Mayor — um toml ilegível não vira «não é crew» em silêncio
     try:
         names = sorted(os.listdir(agents_dir))
     except OSError:
@@ -64,8 +64,10 @@ def crews(agents_dir):
         try:
             with open(os.path.join(agents_dir, n, "agent.toml"), encoding="utf-8") as fh:
                 txt = fh.read()
-        except (OSError, ValueError):
+        except FileNotFoundError:
             continue
+        except (OSError, ValueError):
+            return None
         wd = re.search(r'^work_dir\s*=\s*"([^"]*)"', txt, re.M)
         mx = re.search(r"^max_active_sessions\s*=\s*(\d+)", txt, re.M)
         slug = re.search(r"/crew/([^/]+)$", wd.group(1)) if wd else None
@@ -142,7 +144,8 @@ class Job:
                     j = json.loads(out)
                 except ValueError:
                     j = None
-                got = [b for b in j if isinstance(b, dict) and isinstance(b.get("id"), str)] if isinstance(j, list) else None
+                # lista de objetos com id: qualquer item fora disso torna a leitura inteira ilegível (None), não «menos beads»
+                got = j if isinstance(j, list) and all(isinstance(b, dict) and isinstance(b.get("id"), str) for b in j) else None
             self.stores[store] = got
         return self.stores[store]
 
@@ -207,7 +210,8 @@ def run_pass(job):
         return 0, c  # estado de regime (todas as sessões com dias): nenhuma chamada a bd/gc/tmux além da lista
     known = crews(os.path.join(job.city, "agents"))
     if known is None:
-        job.log("WARN: agents/ ilegível: só o Mayor é alvo neste passe")
+        c["nao-sei"] += 1
+        job.log("WARN: agents/ ou um agent.toml ilegível: só o Mayor é alvo neste passe")
     state = load_state(job.state_path)
     dirty = False
     for name, created in sorted(young):
