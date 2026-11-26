@@ -1,0 +1,39 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.gascity.crew-idle-wake</string>
+  <!-- ga-esorlre.14 (camada 2 da P0 ga-esorlre.12): crew nomeada ou Mayor PARADA no prompt há 10 min com bead
+       in_progress atribuída recebe a ordem de retomar COMO INPUT no pane (tmux send-keys), não como nudge — o
+       nudge numa sessão ociosa vira reminder diferido e só aparece quando o Athos digita (noite 25-26/11).
+       Decide pela tela do tmux e pelas beads; não lê transcript nem gc session list. Detalhe no docstring do script.
+       Cadência 120 s; RunAtLoad true de propósito: o caso que este vigia existe pra pegar é o pós-boot (ele só age
+       depois de 10 min de tela parada, então a subida do sistema não dispara nada).
+       Kill switch: .gc/state/crew-idle-wake.disabled -->
+  <key>ProgramArguments</key>
+  <array>
+    <string>/usr/bin/env</string>
+    <string>python3</string>
+    <string>/Users/athos/gt/.gascity-gastown-hq/packs/town-deltas/assets/scripts/crew-idle-wake.py</string>
+  </array>
+  <key>WorkingDirectory</key>
+  <string>/Users/athos/gt/.gascity-gastown-hq</string>
+  <key>StartInterval</key><integer>120</integer>
+  <key>RunAtLoad</key><true/>
+  <key>StandardOutPath</key><string>/Users/athos/gt/.gascity-gastown-hq/.gc/logs/crew-idle-wake-launchd.out</string>
+  <key>StandardErrorPath</key><string>/Users/athos/gt/.gascity-gastown-hq/.gc/logs/crew-idle-wake-launchd.err</string>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:/Users/athos/go/bin:/Users/athos/.local/bin</string>
+    <key>HOME</key>
+    <string>/Users/athos</string>
+    <key>GC_CITY_PATH</key>
+    <string>/Users/athos/gt/.gascity-gastown-hq</string>
+    <key>BD_ACTOR</key>
+    <string>automation</string>
+    <key>BEADS_DOLT_AUTO_START</key>
+    <string>0</string>
+  </dict>
+</dict>
+</plist>
