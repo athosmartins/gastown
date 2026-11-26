@@ -17,6 +17,9 @@ bad() { FAIL=$((FAIL+1)); echo "  FAIL: $1"; }
 
 T="$(mktemp -d "${TMPDIR:-/tmp}/s3proof-selftest.XXXXXX")"
 trap 'rm -rf "$T"' EXIT
+# ga-ke5w2ie.4: com o marcador ~/.servidor-aposentado este caminho de upload recusa subir. Aqui ele roda de verdade contra um aws de mentira, entao o marcador do HOME
+# REAL nao pode decidir o resultado (no mini 16 aposentado este selftest quebraria). Aponta para um caminho que nao existe; aposentar-guards.selftest.sh prova a recusa.
+export SERVIDOR_APOSENTADO_FILE="$T/sem-marcador"
 FB="$T/bucket"; mkdir -p "$FB"          # fake bucket root: $FB/<db>/<object>
 CALLS="$T/aws-calls.log"; : > "$CALLS"
 

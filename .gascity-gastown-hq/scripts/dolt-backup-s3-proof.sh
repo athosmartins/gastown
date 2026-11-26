@@ -163,6 +163,13 @@ _s3proof_mirror_identical() {
 # disk. Returns 0 iff both phases succeeded.
 _s3proof_mirror_up() {
   local dir="$1" db="$2" lg="${S3PROOF_LOG:-/dev/null}"
+  # servidor-aposentado (ga-ke5w2ie.4): com o marcador este servidor NAO sobe nada ao S3. A unica funcao desta lib que ESCREVE (a prova so le): o dolt-gc-maintenance.sh e o reseed
+  # chegam aqui por conta propria, sem passar pelo dolt-s3-backup.sh. vazio (sem marcador, pasta legivel) → segue; falhou/ilegivel (sem HOME, pasta sem acesso, link quebrado) → recusa ("nao provado")
+  local _apos_f="${SERVIDOR_APOSENTADO_FILE:-${HOME:-/sem-home}/.servidor-aposentado}"
+  if [ -e "$_apos_f" ] || [ -L "$_apos_f" ] || [ ! -x "$(dirname "$_apos_f")" ]; then
+    _s3proof_log "servidor-aposentado: este servidor esta APOSENTADO (marcador $_apos_f, ou a pasta dele nao abre): NAO subo '$dir' para s3://${BUCKET:-?}/$db/ (rc 1)"
+    return 1
+  fi
   if [ -z "${AWS:-}" ] || [ -z "${BUCKET:-}" ]; then
     _s3proof_log "mirror up: AWS/BUCKET not set — refusing"; return 1
   fi

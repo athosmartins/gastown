@@ -180,6 +180,9 @@ LIB_SCRATCH="/tmp/reseed-selftest-lib.$$"
 mkdir -p "$LIB_SCRATCH/bin"
 write_fake_aws "$LIB_SCRATCH/bin/aws"
 export FAKE_BUCKET_DIR="$LIB_SCRATCH/bucket" FAKE_AWS_CALLS="$LIB_SCRATCH/aws-calls.log"
+# ga-ke5w2ie.4: com o marcador ~/.servidor-aposentado _publish_db_fingerprint recusa publicar no S3. Aqui ele roda de verdade contra um aws de mentira, entao o marcador do HOME
+# REAL nao pode decidir o resultado (no mini 16 aposentado este selftest quebraria). Aponta para um caminho que nao existe; aposentar-guards.selftest.sh prova a recusa.
+export SERVIDOR_APOSENTADO_FILE="$LIB_SCRATCH/sem-marcador"
 FB="$FAKE_BUCKET_DIR"; mkdir -p "$FB"; : > "$FAKE_AWS_CALLS"
 
 # RESEED_LOG points at scratch: log() tees to $LOG, which would otherwise be the

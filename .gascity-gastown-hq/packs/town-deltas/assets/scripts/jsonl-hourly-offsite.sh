@@ -390,6 +390,17 @@ case "${1:-}" in
   *) echo "uso: jsonl-hourly-offsite.sh [--status | --age-check | --table-age]" >&2; exit 3 ;;
 esac
 
+# servidor-aposentado (ga-ke5w2ie.4): com o marcador este servidor NAO sobe nada ao S3 (o de producao e outro; scripts/mini64/aposentar-servidor.sh o grava e o remove). So o modo run
+# escreve (put-object, delete-object): --status, --age-check e --table-age so leem e seguem. rc 69 = nada tentado (nem estado, log ou lock; nao conta para o alerta de runs sem snapshot).
+# vazio (sem marcador, pasta legivel) → segue; falhou/ilegivel (sem HOME, pasta sem acesso, link quebrado) → recusa
+if [ "$MODE" = run ]; then
+  _apos_f="${SERVIDOR_APOSENTADO_FILE:-${HOME:-/sem-home}/.servidor-aposentado}"
+  if [ -e "$_apos_f" ] || [ -L "$_apos_f" ] || [ ! -x "$(dirname "$_apos_f")" ]; then
+    echo "servidor-aposentado: este servidor esta APOSENTADO (marcador $_apos_f, ou a pasta dele nao abre): NAO sobe backup para o S3, o de producao e outro servidor. Nao apague o marcador: fale com o Mayor (rc 69)" >&2
+    exit 69
+  fi
+fi
+
 unknown() { # rc 2, sem veredito. Em run conta como run sem snapshot (antes só stderr: PATH sem /opt/homebrew/bin falhava toda hora, mudo); em --age-check conta como verificação sem leitura; em --status só diz
   if [ "$MODE" = run ]; then log "UNKNOWN: $*"; register_not_ok "unknown: $*"; echo "RESULT: unknown $*"
   elif [ "$MODE" = age ]; then age_unreadable "$*"

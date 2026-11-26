@@ -29,6 +29,9 @@ eq() { # descrição, obtido, esperado
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/jho-selftest.XXXXXX")"
 case "$WORK" in "${TMPDIR:-/tmp}"/jho-selftest.*) ;; *) echo "mktemp inesperado: $WORK" >&2; exit 2 ;; esac
 trap 'rm -rf "$WORK"; [ -n "${BG_PID:-}" ] && kill "$BG_PID" 2>/dev/null' EXIT
+# ga-ke5w2ie.4: com o marcador ~/.servidor-aposentado o modo run recusa subir. Aqui ele roda de verdade contra um aws de mentira, entao o marcador do HOME
+# REAL nao pode decidir o resultado (no mini 16 aposentado este selftest quebraria). Aponta para um caminho que nao existe; aposentar-guards.selftest.sh prova a recusa.
+export SERVIDOR_APOSENTADO_FILE="$WORK/sem-marcador"
 
 # ── stub do aws ─────────────────────────────────────────────────────────────────────────────────
 mkdir -p "$WORK/bin"

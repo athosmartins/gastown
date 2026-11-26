@@ -390,6 +390,14 @@ _should_release_manifestless_primary() {
 _publish_db_fingerprint() {
   local db="$1" local_dir="$2" issues="$3"
 
+  # servidor-aposentado (ga-ke5w2ie.4): com o marcador este servidor NAO sobe nada ao S3: o sync --delete abaixo APAGARIA no bucket o que este staging nao tem. Nao fatal, como o resto
+  # desta funcao (o reseed LOCAL ja foi feito). vazio (sem marcador, pasta legivel) → segue; falhou/ilegivel (sem HOME, pasta sem acesso, link quebrado) → recusa
+  local _apos_f="${SERVIDOR_APOSENTADO_FILE:-${HOME:-/sem-home}/.servidor-aposentado}"
+  if [ -e "$_apos_f" ] || [ -L "$_apos_f" ] || [ ! -x "$(dirname "$_apos_f")" ]; then
+    log "publish-fingerprint: ${db} — servidor-aposentado: este servidor esta APOSENTADO (marcador $_apos_f, ou a pasta dele nao abre): NAO publico nada em s3://$BUCKET/ (nem o sync --delete nem o _meta/latest.json)"
+    return 1
+  fi
+
   if ! timeout "$RESEED_S3_SYNC_TIMEOUT_SECS" "$AWS" s3 sync "$local_dir/" "s3://$BUCKET/$db/" --delete --only-show-errors; then
     log "publish-fingerprint: ${db} — aws s3 sync FAILED; not publishing a fingerprint that would claim S3 content it doesn't have"
     return 1

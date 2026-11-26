@@ -1476,6 +1476,14 @@ if [ "${DOLT_S3_BACKUP_LIB:-0}" = "1" ]; then
   return 0 2>/dev/null || exit 0
 fi
 
+# servidor-aposentado (ga-ke5w2ie.4): com o marcador este servidor NAO sobe nada ao S3 (o de producao e outro; scripts/mini64/aposentar-servidor.sh o grava e o remove).
+# vazio (sem marcador, pasta legivel) → segue; falhou/ilegivel (sem HOME, pasta sem acesso, link quebrado) → recusa. Antes do mkdir e do lock: nada e criado.
+_apos_f="${SERVIDOR_APOSENTADO_FILE:-${HOME:-/sem-home}/.servidor-aposentado}"
+if [ -e "$_apos_f" ] || [ -L "$_apos_f" ] || [ ! -x "$(dirname "$_apos_f")" ]; then
+  echo "servidor-aposentado: este servidor esta APOSENTADO (marcador $_apos_f, ou a pasta dele nao abre): NAO sobe backup para o S3, o de producao e outro servidor. Nao apague o marcador: fale com o Mayor (rc 69)" >&2
+  exit 69
+fi
+
 mkdir -p "$CITY/.gc/logs" "$BACKUP_ROOT" 2>/dev/null || true
 
 # --- single-instance lock (portable; no flock dependency) with staleness reclaim ---

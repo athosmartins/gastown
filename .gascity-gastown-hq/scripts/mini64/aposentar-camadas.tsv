@@ -1,0 +1,53 @@
+# aposentar-camadas.tsv — o que aposentar-servidor.sh (ga-ke5w2ie.4) aposenta no mini 16 e o que fica. Colunas (TAB): acao(aposentar|manter) camada dominio(gui|system) tipo(exato|prefixo) padrao nota.
+# Vale a regra MAIS especifica (formato completo no cabecalho de aposentar-classifica.py). Camadas = os nomes do camadas.tsv da fatia .2 (envios backups cloudflared paineis) + reboot-noturno (so daqui);
+# a ordem do aplicar e a da 1a aparicao entre as 'aposentar' (a inversa da carga da .2). Na .2 a ingestao nao e camada: cai no padrao da familia = envios; aqui familia do WhatsApp sem regra = APOSENTAR.
+# Evidencia (26/11): 313 labels dos plists do repo do WA + 105 da cidade. O que nenhuma regra cobre aparece em FICAM RODANDO no plano: leia antes do aplicar. Dolt e motor (com.gastown/com.gascity) ficam.
+# ===== envios: envio de WhatsApp, ligacoes e ingestao — a familia inteira (222+69+8+4+2+1 labels no repo do WA), menos o que tem regra propria =====
+aposentar	envios	gui	exato	com.whatsapp.central-sender	remetente central; o rotulo que nightly-reboot-postcheck.sh confere toda noite (SENDER_LABEL)
+aposentar	envios	gui	prefixo	com.whatsapp.	familia do WhatsApp: envio, ligacoes, ingestao, ETL
+aposentar	envios	gui	prefixo	com.urblink.	campanhas, voicebot, inbound, coletores
+aposentar	envios	gui	prefixo	br.urblink.	ETL e monitores (o painel motherduck-dashboard fica; o tunel tem camada propria)
+aposentar	envios	gui	prefixo	com.phoneproxy.	adbforward e relay dos celulares: o caminho de envio (os 8 celulares passam ao mini 64)
+aposentar	envios	gui	prefixo	com.realestate.	motherduck-sync escreve no MotherDuck (DuckDB tem UM escritor)
+aposentar	envios	gui	prefixo	com.whatsapp-automation.	monitor do WA
+# ===== paineis (camada 3 da .2): so-leitura e apoio. FICAM: 'desligar Dolt e paineis so-leitura' esta fora do escopo da bead. Prefixos, como na .2 =====
+manter	paineis	gui	prefixo	com.whatsapp.admin-dashboard	painel
+manter	paineis	gui	prefixo	com.whatsapp.analytics-dashboard	painel
+manter	paineis	gui	prefixo	com.whatsapp.anuncios-dashboard	painel
+manter	paineis	gui	prefixo	com.whatsapp.ban-risk-dashboard	painel
+manter	paineis	gui	prefixo	com.whatsapp.campaign-dashboard	painel
+manter	paineis	gui	prefixo	com.whatsapp.classification-dashboard	painel e o watchdog de login dele
+manter	paineis	gui	prefixo	com.whatsapp.clientes-dashboard	painel
+manter	paineis	gui	prefixo	com.whatsapp.daemon-dashboard	painel
+manter	paineis	gui	prefixo	com.whatsapp.dashboard-portas-watchdog	vigia das portas dos paineis
+manter	paineis	gui	prefixo	com.whatsapp.demand-dashboard	painel (e a amostra fina)
+manter	paineis	gui	prefixo	com.whatsapp.ficha360	painel e o refresh do indice de busca
+manter	paineis	gui	prefixo	com.whatsapp.frota-dashboard	painel
+manter	paineis	gui	prefixo	com.whatsapp.getzip-dashboard	painel
+manter	paineis	gui	prefixo	com.whatsapp.map-viewer	painel; origem do mapa
+manter	paineis	gui	prefixo	com.whatsapp.pbh-dashboard	painel
+manter	paineis	gui	prefixo	com.whatsapp.procob-dashboard	painel
+manter	paineis	gui	prefixo	com.whatsapp.public-docs-dashboard	painel
+manter	paineis	gui	prefixo	com.whatsapp.terreno-publico	app do incorporador, so servidor
+manter	paineis	gui	prefixo	com.urblink.chip-kpi-dashboard	painel
+manter	paineis	gui	prefixo	com.urblink.dashboard-availability-probe	sonda dos paineis
+manter	paineis	gui	prefixo	br.urblink.motherduck-dashboard	painel
+# ===== cloudflared (camada 4): o conector do tunel. UM so: o antigo para quando o 64 assumir. O plist do tunel nao esta em repo nenhum; o rotulo vem do postcheck =====
+aposentar	cloudflared	gui	prefixo	br.urblink.cloudflared.	o tunel urblink-ops: TUNNEL_LABEL de nightly-reboot-postcheck.sh (default; o plist dele nao o sobrescreve)
+aposentar	cloudflared	gui	exato	com.cloudflare.cloudflared	PALPITE da .2 (cloudflared service install): o plano diz se existe
+aposentar	cloudflared	gui	exato	homebrew.mxcl.cloudflared	PALPITE da .2 (brew services)
+aposentar	cloudflared	gui	prefixo	com.gascity.cloudflared-	reconciliador de DNS do tunel: dois servidores brigariam pelos CNAMEs
+# ===== backups (camada 2): so os que SOBEM ou copiam producao. O que LE o S3 fica. Os scripts de upload deste repo tambem recusam sozinhos com o marcador =====
+aposentar	backups	gui	exato	com.gascity.dolt-s3-backup	aws s3 sync --delete em urblink-dolt-backups (04:00)
+aposentar	backups	gui	exato	com.gascity.jsonl-hourly-offsite	put-object e delete-object em jsonl-hourly/ (a cada 30 min, RunAtLoad=true)
+aposentar	backups	gui	prefixo	com.whatsapp.backup-	backups dos bancos do WA (repo do WA)
+aposentar	backups	gui	exato	com.whatsapp.dolthub-backup	backup no DoltHub (repo do WA)
+aposentar	backups	gui	exato	com.whatsapp.pipedrive-recents-backup	backup do Pipedrive (repo do WA)
+aposentar	backups	gui	prefixo	com.urblink.backup-	backup do health.db (repo do WA)
+aposentar	backups	gui	prefixo	com.urblink.sync-critical-dbs	copia horaria dos bancos criticos (repo do WA)
+aposentar	backups	gui	exato	com.gascity.mbp-nightly-reseed	rsync --delete da arvore-base de teste para o MBP (mbp-run.sh --seed): copia para fora; dois minis alternariam bases diferentes
+manter	backups	gui	prefixo	com.gascity.dolt-restore-	a .2 poe em backups, mas LE do S3: e o restore de prova que faz do 16 uma reserva
+manter	backups	gui	prefixo	com.gascity.jsonl-	export local e alarmes de idade (leitura do S3); o unico que SOBE e o offsite, acima
+# ===== reboot-noturno (so desta fatia): 'tirar o nightly-reboot do antigo'. O LaunchDaemon e de root: o script so imprime os 2 comandos com sudo =====
+aposentar	reboot-noturno	gui	exato	com.gascity.nightly-reboot-postcheck	conferencia pos-boot; sem reboot noturno ela so alarmaria
+aposentar	reboot-noturno	system	exato	com.gascity.nightly-reboot	LaunchDaemon root, 23:00 (docs/runbooks/nightly-reboot-drain-cutover.md)
