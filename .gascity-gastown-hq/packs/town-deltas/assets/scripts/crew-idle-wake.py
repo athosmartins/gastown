@@ -146,13 +146,13 @@ def crews_nomeadas():
     """Nomes dos agentes com provider claude-rc* em AGENTS_DIR. Diretório ilegível → None («não sei quem é crew»: ninguém
     recebe ordem); agent.toml ilegível → aquele agente fica fora (desconhecido não age)."""
     try:
-        dirs = list(AGENTS_DIR.iterdir())
+        dirs = list(AGENTS_DIR.iterdir())   # third-state-waiver: diretório ausente coberto no caso 7i de crew-idle-wake.selftest.py (o check não lê selftest .py)
     except OSError:
         return None
     crews = set()
     for d in dirs:
         try:
-            txt = (d / "agent.toml").read_text()
+            txt = (d / "agent.toml").read_text()   # third-state-waiver: agent.toml ausente (sem-toml) coberto no caso 7a de crew-idle-wake.selftest.py
         except OSError:
             continue
         if re.search(r'^provider\s*=\s*"claude-rc', txt, re.M):
