@@ -1,0 +1,136 @@
+# camadas.tsv — em que camada cada job launchd da cidade carrega no mini 64 (ga-ke5w2ie.2).
+#
+# Contents: formato · camadas · famílias · linhas por camada
+#
+# FORMATO (campos separados por TAB; label = nome do plist sem .plist; vale a linha própria de prefixo MAIS LONGO que casa, e só sem nenhuma a família):
+#   @camada <N> <nome> <exige>    define a camada N; `exige` = a chave que carregar-camada.sh pede em --confirmo (ou -)
+#   @familia <prefixo> <N>        tudo que começa assim é da cidade: espera.sh o move, e sem linha própria ele carrega na camada N
+#   <prefixo> <N> <motivo>        linha própria (um label inteiro ou um começo de label)
+# REGRA: na dúvida, a camada 5 (a última). Plist do repo sem linha própria reprova mini64.selftest.sh; plist novo do WA cai na família.
+# A tabela é lida INTEIRA: linha fora do formato recusa a tabela (rc 2), nunca é pulada.
+#
+# CAMADAS
+@camada	0	dolt	-
+@camada	1	motor	-
+@camada	2	backups	antigo-aposentado
+@camada	3	paineis	-
+@camada	4	cloudflared	conector-unico
+@camada	5	envios	antigo-aposentado
+#
+# FAMÍLIAS (prefixos medidos nos plists dos repos da cidade e do WA; as quatro da bead + br.urblink, com.gastown, com.phoneproxy, com.realestate)
+@familia	com.whatsapp	5
+@familia	com.urblink	5
+@familia	br.urblink	5
+@familia	com.gascity	5
+@familia	com.gastown	5
+@familia	com.athos	5
+@familia	com.phoneproxy	5
+@familia	com.realestate	5
+#
+# CAMADA 0 — Dolt
+com.gastown.dolt-server	0	o Dolt da cidade (KeepAlive, roda gc dolt start)
+#
+# CAMADA 1 — bd, motor gc, supervisor, pilot, gate e os guardas que só olham a cidade
+com.gastown.bw-serve	1	bw serve: o `secret` (cofre) responde por ele
+com.gastown.disk-	1	monitor de disco
+com.gastown.drive-pressure	1	monitor do Drive
+com.gastown.ram-	1	monitor de RAM
+com.gastown.machine-	1	relatório de saúde da máquina
+com.gastown.git-	1	manutenção dos repos locais
+com.gascity.agent-stuck-escalation	1	guarda do motor
+com.gascity.approved-state-reconciler	1	guarda do motor
+com.gascity.athos-acao-guard	1	guarda do motor
+com.gascity.auto-	1	refino e rehome automáticos de bead
+com.gascity.bd-metrics-	1	bd
+com.gascity.beads-upstream-pr-watchdog	1	bd
+com.gascity.child-priority-janitor	1	faxina de beads
+com.gascity.chrome-headless-janitor	1	faxina local
+com.gascity.city-health-sentinel	1	guarda do motor
+com.gascity.claude-	1	contas e guardas do Claude
+com.gascity.code-mode-mcp-reaper	1	faxina de processos
+com.gascity.config-drift-wake	1	guarda do motor
+com.gascity.context-check-dispatcher	1	despachante do motor
+com.gascity.crew-	1	crews
+com.gascity.daemon-	1	guardas de daemon
+com.gascity.disk-	1	guardas de disco
+com.gascity.dolt-	1	guardas e manutenção do Dolt local (precisam do Dolt da camada 0 de pé)
+com.gascity.engine-refusal-strip-watchdog	1	guarda do motor
+com.gascity.eval-window-concurrency-guard	1	guarda do motor
+com.gascity.false-executing-watchdog	1	guarda do motor
+com.gascity.flow-ledger-collector	1	coletor do motor
+com.gascity.gate	1	gate (inclui gatefix-)
+com.gascity.idle-crew-suspender	1	crews
+com.gascity.inflight-reclaim-guard	1	guarda do motor
+com.gascity.jev-daily-report	1	relatório diário
+com.gascity.lifecycle-coherence-janitor	1	faxina de beads
+com.gascity.live-conversation-capture	1	captura de sessão
+com.gascity.login-rc-restore	1	crews
+com.gascity.machine-utilization-sampler	1	amostrador local
+com.gascity.merged-bead-janitor	1	faxina de beads
+com.gascity.nightly-	1	checagens noturnas locais
+com.gascity.node-ghost-release	1	guarda do motor
+com.gascity.order-exec-failure-watchdog	1	guarda do motor
+com.gascity.pilot	1	pilot
+com.gascity.pipeline-throughput-heartbeat	1	guarda do motor
+com.gascity.production-	1	guardas de produção
+com.gascity.quality-gate-dispatcher	1	gate
+com.gascity.quorum-convergence-watchdog	1	guarda do motor
+com.gascity.ram-owner-sampler	1	amostrador local
+com.gascity.reclaim-cap-escalation-sweep	1	guarda do motor
+com.gascity.reconciler-stall-detector	1	guarda do motor
+com.gascity.refino-gate-dispatcher	1	gate
+com.gascity.silent-ignorance-watch	1	guarda do motor
+com.gascity.skill-audit	1	auditoria local
+com.gascity.sling-task-janitor	1	faxina de beads
+com.gascity.supervisor	1	supervisor do motor
+com.gascity.throughput-stall-watchdog	1	guarda do motor
+com.gascity.town-root-reconciler	1	guarda do motor
+com.gascity.worktree-reaper	1	faxina de worktrees
+#
+# CAMADA 2 — backups e cópias para fora (só depois que o servidor antigo foi aposentado: fatia .4)
+com.gascity.dolt-s3-backup	2	backup do Dolt no S3
+com.gascity.dolt-restore-	2	restore de prova do backup
+com.gascity.jsonl-	2	export dos beads e envio offsite
+com.gascity.mbp-nightly-reseed	2	semeia o MBP, laboratório de restore
+com.whatsapp.backup-	2	backups dos bancos do WA
+com.whatsapp.dolthub-backup	2	backup no DoltHub
+com.whatsapp.pipedrive-recents-backup	2	backup do Pipedrive
+com.urblink.backup-	2	backup do health.db
+com.urblink.sync-critical-dbs	2	cópia horária dos bancos críticos
+#
+# CAMADA 3 — painéis só-leitura e apoio (nada que fale com lead)
+com.gascity.hetzner-	3	apoio ao nó Hetzner (espelho, ssh, auditoria)
+com.gascity.wa-schema-dbs	3	cópia só-schema dos bancos do WA para o nó
+com.gascity.cdp-	3	Chrome CDP: guardas de aba e de MCP
+com.gascity.storage-inventory-monthly	3	inventário mensal, só leitura
+com.athos.chrome-cdp	3	Chrome com CDP (9222) e o watchdog dele
+com.gastown.painel-	3	painéis
+com.gastown.ficha360	3	painel
+com.whatsapp.admin-dashboard	3	painel
+com.whatsapp.analytics-dashboard	3	painel
+com.whatsapp.anuncios-dashboard	3	painel
+com.whatsapp.ban-risk-dashboard	3	painel
+com.whatsapp.campaign-dashboard	3	painel
+com.whatsapp.classification-dashboard	3	painel (e o watchdog de login dele)
+com.whatsapp.clientes-dashboard	3	painel
+com.whatsapp.daemon-dashboard	3	painel
+com.whatsapp.dashboard-portas-watchdog	3	vigia das portas dos painéis
+com.whatsapp.demand-dashboard	3	painel
+com.whatsapp.ficha360	3	painel
+com.whatsapp.frota-dashboard	3	painel
+com.whatsapp.getzip-dashboard	3	painel
+com.whatsapp.map-viewer	3	painel
+com.whatsapp.pbh-dashboard	3	painel
+com.whatsapp.procob-dashboard	3	painel
+com.whatsapp.public-docs-dashboard	3	painel
+com.whatsapp.terreno-publico	3	app do incorporador, só servidor
+com.urblink.chip-kpi-dashboard	3	painel
+com.urblink.dashboard-availability-probe	3	sonda de disponibilidade dos painéis
+br.urblink.motherduck-dashboard	3	painel
+#
+# CAMADA 4 — cloudflared (UM conector só; o label real do mini não está em nenhum repo: confira com ls ~/Library/LaunchAgents | grep -i cloudflare)
+com.cloudflare.cloudflared	4	cloudflared instalado por `cloudflared service install` (label provável)
+homebrew.mxcl.cloudflared	4	cloudflared via brew services (label provável)
+com.gascity.cloudflared-	4	reconciliador de DNS do túnel
+#
+# CAMADA 5 — envios WhatsApp e ligações: é o padrão das famílias, não precisa de linha própria
