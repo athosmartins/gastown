@@ -208,11 +208,18 @@ def pick(examples):
     return (first + rest)[:EXAMPLES]
 
 
+def defang(value):
+    """Text from the gate log or a verdict, safe to sit inside the <conteudo_externo> fence: no `<` or `>` survives, so no spelling of the closing tag (any case, any spacing) can end the fence early."""
+    # vazio → "": nothing to neutralise; falhou/ilegível → n/a, a pure string transform (a non-string is stringified first, never dropped)
+    return str(value).replace("<", "‹").replace(">", "›")
+
+
 def describe(name, entry, rep, chosen, args):
     w, sha = rep["window"], (rep.get("evaluator") or {}).get("sha256")
     ex = []
     for i, e in enumerate(chosen, 1):
-        ex.append("%d) bead %s · gate-run %s · %s · arquivo: %s\n<conteudo_externo>\n%s\n</conteudo_externo>" % (i, e["bead"], e["gate_run"], e["ts"], e["file"], e["excerpt"]))
+        # every field of an example comes from the gate log or a reviewer comment (builder text can be quoted in it): DATA, never able to close the fence below
+        ex.append("%d) bead %s · gate-run %s · %s · arquivo: %s\n<conteudo_externo>\n%s\n</conteudo_externo>" % (i, defang(e["bead"]), defang(e["gate_run"]), defang(e["ts"]), defang(e["file"]), defang(e["excerpt"])))
     return "\n".join([
         "O QUE FAZER: entregar UMA checagem mecânica (determinística, sem LLM) que ache no diff o padrão da classe-raiz `%s`, antes de o revisor recusar." % name,
         "- A classe foi citada em %d recusa(s) de revisor, em %d bead(s), entre %s e %s (%d dias), e não tem checagem registrada." % (entry["refusals"], entry["beads"] if isinstance(entry.get("beads"), int) else "?", w.get("from"), w.get("to"), args.days),
