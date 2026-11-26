@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """nightly-reboot-crew-proof.py (ga-esorlre.15, layer 3 of ga-esorlre.12): at 00:10, after the nightly reboot, PROVES that every named crew that had a bead in_progress at the boot has done something since: a commit in
 its clone, or a comment of its own on one of its in_progress beads. No proof = a night of work lost = a push that vibrates the Athos's phone. Layers 1-2 prevent it; this one MEASURES it, and depends on nothing the crews
-depend on (no engine, pane or session): launchd, the files of the city, bd, git, notify. Install and log lines: docs/runbooks/nightly-reboot-crew-proof.md; knobs: the NRCP_* names read in Cfg.
+depend on (no engine, pane or session): launchd, the files of the city, bd, git, notify (`gc mail` is only the Mayor's second channel, after the push). Install and log lines: docs/runbooks/nightly-reboot-crew-proof.md; knobs: the NRCP_* names read in Cfg.
 
 WINDOW  boot = kern.boottime, the night's only if >= the last 23:00 local (older = no reboot tonight, nothing judged). Deadline = max(00:10 local, boot + 20 min); the run waits for it (--dry-run does not).
 ASKED   named crews (Layer-1 rule: agents/<n>/agent.toml with work_dir .../crew/<slug>, slug != worker, max_active_sessions <= 1), not suspended (agent.toml, or their rig in city.toml), with a bead in_progress AT the
@@ -10,8 +10,9 @@ PROOF   between boot and deadline: a `commit` entry in the reflog of the clone (
   one of those beads.
 STATES  every read is retried NRCP_TRIES times; one that still fails is NAO-SEI: never "none" and never ok. OK as soon as any readable source proves; FALTA only if every source was read and none proves.
   FALTA and NAO-SEI both push, twice if needed: priority 4 + NOTIFY_FORCE_PUSH (the default route is the silent digest) + NOTIFY_STRICT_EXIT (only then does notify's exit code say whether the phone was reached:
-  0 and 11 yes; 10 held-until-07:00, 12, 13, 14 and timeout no); the text carries the dates (notify drops a repeated text). Not delivered = ERROR + stderr "NÃO ENTREGUE". A good night sends only the routine
-  digest line (and names the crews it did not cover), so "no alarm" can be told from "no guard". A crash is the same alarm. --dry-run judges as of now and sends and writes nothing.
+  0 and 11 yes; 10 held-until-07:00, 12, 13, 14 and timeout no); the text carries the dates (notify drops a repeated text). They ALSO mail the Mayor (`gc mail send mayor`, the same text + an `[origem: ...]` line, NRCP_TRIES tries,
+  after the push and whatever it did; ga-esorlre.16): FORCE_PUSH does not pierce the night, so at 00:10 the push is held until 07:00 (rc 10) and the mail is what reaches someone now. Neither delivered = ERROR + stderr "NÃO ENTREGUE"; one is enough.
+  A good night sends only the routine digest line (no mail; it names the crews it did not cover), so "no alarm" can be told from "no guard". A crash is the same alarm. --dry-run judges as of now and sends and writes nothing.
 EXIT    0 nothing to prove / all proven / off (touch .gc/nightly-reboot-crew-proof.off) · 1 an alarm was raised · 2 usage."""
 import calendar
 import datetime
@@ -26,6 +27,7 @@ CITY_DEFAULT = "/Users/athos/gt/.gascity-gastown-hq"
 USAGE = "usage: nightly-reboot-crew-proof.py [--dry-run]"
 TITLE_MISSING, TITLE_UNKNOWN, TITLE_OK = "Reboot noturno: crew SEM retomar", "Reboot noturno: retomada das crews NÃO CONFERIDA", "Reboot noturno: crews retomaram"
 MAX_BODY = 800  # a phone notification: the rest is in the log
+MAIL_FOOT = "\n\n[origem: nightly-reboot-crew-proof.py]"  # the Mayor's mail has no --from (see alarm): under launchd its sender is `human`, so the origin goes at the end, as in nightly-reboot-postcheck.sh
 NOTIFY_DELIVERED = (0, 11)  # `notify` with NOTIFY_STRICT_EXIT=1: 0 pushed, 11 the same text already went out; 10 held until 07:00 (too late for 00:10), 12 digest/cap, 13, 14, a timeout, anything else: not delivered
 COMMIT_RE = re.compile(r"^commit( \([a-z-]+\))?:")  # reflog subjects of a local commit: `commit:`, `commit (amend):`, `commit (merge):`
 REFLOG_RE = re.compile(r"^\S+@\{(\d+)\}\t(.*)$")
@@ -53,7 +55,7 @@ class Cfg:
         self.agents, self.city_toml, self.off_path = os.path.join(self.city, "agents"), os.path.join(self.city, "city.toml"), os.path.join(gc_dir, "nightly-reboot-crew-proof.off")
         self.log_path = g("NRCP_LOG") or os.path.join(gc_dir, "logs", "nightly-reboot.log")
         self.sysctl, self.bd, self.git = g("NRCP_SYSCTL") or g("SYSCTL_BIN") or "/usr/sbin/sysctl", g("NRCP_BD") or g("BD_BIN") or "bd", g("NRCP_GIT") or "git"
-        self.notify = g("NRCP_NOTIFY") or g("NOTIFY_BIN") or "notify"
+        self.notify, self.gc = g("NRCP_NOTIFY") or g("NOTIFY_BIN") or "notify", g("NRCP_GC") or g("GC_BIN") or "gc"
         self.window_from, self.deadline_at = hhmm(g("NRCP_WINDOW_FROM_HHMM"), (23, 0)), hhmm(g("NRCP_DEADLINE_HHMM"), (0, 10))
         self.grace_s, self.tries, self.retry_s, self.call_t, self.notify_pause = num(g("NRCP_MIN_GRACE_S"), 1200), num(g("NRCP_TRIES"), 3), num(g("NRCP_RETRY_S"), 20), num(g("NRCP_CALL_TIMEOUT_S"), 90), num(g("NRCP_NOTIFY_RETRY_S"), 15)
 
@@ -284,9 +286,16 @@ def push(io, cfg, log, title, body, force):
 
 def alarm(io, cfg, log, dry, title, body):
     if dry:
-        return print("DRY-RUN: enviaria push p4 (force): %s\n%s" % (title, body))
-    if not push(io, cfg, log, title, body, True):
-        msg = "ALERTA NÃO ENTREGUE: o push falhou 2x — %s: %s" % (title, body.replace("\n", " | "))
+        return print("DRY-RUN: enviaria push p4 (force): %s\n%s\nDRY-RUN: enviaria mail ao mayor (mesmo texto, com a origem no fim): %s" % (title, body, title))
+    pushed = push(io, cfg, log, title, body, True)
+    # Second channel, tried whatever the push did: FORCE_PUSH does not pierce the night, so at 00:10 the push normally comes back rc 10 (held until 07:00) and this mail is what reaches someone now (the city's convention, docs/claude-crew-account.md).
+    # No --from: the engine takes only human, controller or a live session as the sender, so any other name fails every time (ga-42bmt8h); the default sender stays and MAIL_FOOT names the origin.
+    # An answer that never came is retried, so the mail can arrive twice: better twice than never.
+    # vazio → n/a (só o rc importa); falhou/ilegível (rc≠0, estouro, gc ausente) → tenta de novo e, esgotadas as tentativas, WARN no log: ERROR + stderr só se o push também não saiu
+    mailed, why = ask(io, cfg, [cfg.gc, "--city", cfg.city, "mail", "send", "mayor", "-s", title, "-m", body + MAIL_FOOT])
+    log("gc mail send mayor: enviado" if mailed else "WARN: gc mail send mayor falhou (%s)" % why)
+    if not (pushed or mailed):
+        msg = "ALERTA NÃO ENTREGUE: o push falhou 2x e o mail ao Mayor também (%s) — %s: %s" % (why, title, body.replace("\n", " | "))
         log("ERROR: " + msg)
         sys.stderr.write(msg + "\n")
 

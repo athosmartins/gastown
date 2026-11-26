@@ -74,11 +74,11 @@ class World:
 
 
 class FakeIO:
-    """sysctl/bd/git/notify answered from tables ("FAIL" = rc 1, "TIMEOUT" = no rc, a str = raw stdout, else JSON); a call nobody planned for fails the test"""
+    """sysctl/bd/git/notify/gc answered from tables ("FAIL" = rc 1, "TIMEOUT" = no rc, a str = raw stdout, else JSON); a call nobody planned for fails the test"""
 
     def __init__(self):
-        self.t, self.boot, self.sysctl, self.real_git, self.notify_rc = float(NOW), BOOT, None, False, [0]
-        self.calls, self.sleeps, self.notifies, self.t_at, self.lists, self.comments, self.reflogs, self.flaky = [], [], [], [], {}, {}, {}, {}
+        self.t, self.boot, self.sysctl, self.real_git, self.notify_rc, self.mail_rc = float(NOW), BOOT, None, False, [0], [0]
+        self.calls, self.sleeps, self.notifies, self.mails, self.t_at, self.lists, self.comments, self.reflogs, self.flaky = [], [], [], [], [], {}, {}, {}, {}
 
     def now(self): return self.t
 
@@ -118,9 +118,10 @@ class FakeIO:
             assert "reflog" in argv and "--all" in argv and "--date=unix" in argv and (env or {}).get("GIT_OPTIONAL_LOCKS") == "0" and wd in self.reflogs, "git on %s: %s" % (wd, argv)
             v = self.reflogs[wd]
             return (128, "", "fatal") if self.flake(("git", wd)) else self.table(v if isinstance(v, str) else "".join("%s@{%d}\t%s\n" % x for x in v))
-        assert tool == "notify", "unplanned call: %r" % (argv,)
-        self.notifies.append({"argv": list(argv), "env": dict(env or {})})
-        return (self.notify_rc.pop(0) if len(self.notify_rc) > 1 else self.notify_rc[0]), "", ""
+        assert tool in ("notify", "gc"), "unplanned call: %r" % (argv,)
+        sent, rcs = (self.notifies, self.notify_rc) if tool == "notify" else (self.mails, self.mail_rc)
+        sent.append({"argv": list(argv), "env": dict(env or {})})  # recorded even when the answer is a failure: "nothing was sent" has to count calls, not effects
+        return (rcs.pop(0) if len(rcs) > 1 else rcs[0]), "", ""
 
 
 class Base(unittest.TestCase):
@@ -196,7 +197,7 @@ class Proof(Base):
         self.io.comments[(self.wa, "wa-bbb")] = [comment("oracle-wa-gawispgux5v0", BOOT + 21 * 60)]
         self.assertEqual(self.go(), 0)
         d = self.pushes("3")
-        self.assertEqual((len(d), self.pushes("4"), d[0]["env"]), (1, [], {}), "the routine line is plain notify: no force, no strict exit")
+        self.assertEqual((len(d), self.pushes("4"), d[0]["env"], self.io.mails), (1, [], {}, []), "the routine line is plain notify (no force, no strict exit) and mails nobody")
         t = " ".join(d[0]["argv"])
         for s in ("retomaram", "peter-wa (commit", "oracle-wa (comentário", "Sem bead em andamento no boot (não cobradas): digo-wa."):
             self.assertIn(s, t)
@@ -248,7 +249,7 @@ class NotSei(Base):
                 plant(self)
                 self.assertEqual(self.go(), 1)
                 t = self.alert()
-                self.assertTrue("NÃO CONFERIDA" in t and "peter-wa" in t and "SEM retomar" not in t and self.pushes("3") == [], t)
+                self.assertTrue("NÃO CONFERIDA" in t and "peter-wa" in t and "SEM retomar" not in t and self.pushes("3") == [] and len(self.io.mails) == 1, t)
 
     def test_one_readable_proof_wins_over_unreadable_sources_and_none_and_unknown_share_one_push(self):
         self.two()
@@ -273,7 +274,7 @@ class NotSei(Base):
                 plant(self)
                 self.assertEqual(self.go(), 1)
                 t = self.alert()
-                self.assertTrue("NÃO CONFERIDA" in t and word in t and "26/11" in t and self.io.n("bd") == 0, t)
+                self.assertTrue("NÃO CONFERIDA" in t and word in t and "26/11" in t and self.io.n("bd") == 0 and len(self.io.mails) == 1, t)
         self.fresh()
         shutil.rmtree(os.path.join(self.w.city, "agents"))
         os.makedirs(os.path.join(self.w.city, "agents"))
@@ -343,8 +344,8 @@ class Window(Base):
 class Modes(Base):
     def test_dry_run_judges_as_of_now_and_sends_and_writes_nothing(self):
         self.two()
-        self.assertEqual((self.go("--dry-run"), self.io.notifies, self.w.log()), (1, [], ""))
-        self.assertTrue("peter-wa" in self.out and "FALTA" in self.out)
+        self.assertEqual((self.go("--dry-run"), self.io.notifies, self.io.mails, self.w.log()), (1, [], [], ""))
+        self.assertTrue("peter-wa" in self.out and "FALTA" in self.out and "enviaria mail ao mayor" in self.out)
         self.proven("p")
         self.proven("o")
         self.io.t = ts("2026-11-25T23:50:00Z")
@@ -383,7 +384,7 @@ class Modes(Base):
         self.assertEqual((self.io.notifies, self.w.log()), ([], ""), "a human testing at 3 pm must not get the 00:10 alarm")
         self.assertEqual(self.go(), 1)
         t = self.alert()
-        self.assertTrue("NÃO CONFERIDA" in t and "RuntimeError: kaboom" in t and "quebrou" in self.w.log(), t)
+        self.assertTrue("NÃO CONFERIDA" in t and "RuntimeError: kaboom" in t and "quebrou" in self.w.log() and len(self.io.mails) == 1, t)
 
 
 class Delivery(Base):
@@ -403,13 +404,33 @@ class Delivery(Base):
         for rc, delivered in ((0, True), (11, True), (10, False), (12, False), (13, False), (14, False), (1, False), (124, False), (None, False)):  # 10 = held until 07:00, 12 = digest/cap
             with self.subTest(rc=rc):
                 self.fresh()
-                self.io.notify_rc = [rc]
+                self.io.notify_rc, self.io.mail_rc = [rc], [1]  # the Mayor's mail is down: the push is the only channel under test
                 self.assertEqual(self.go(), 1)
                 self.assertEqual((len(self.pushes("4")), "NÃO ENTREGUE" in self.err, "NÃO ENTREGUE" in self.w.log(), self.io.sleeps.count(15)), (1, False, False, 0) if delivered else (2, True, True, 1))
         self.fresh()
-        self.io.notify_rc = [1, 0]
+        self.io.notify_rc, self.io.mail_rc = [1, 0], [1]
         self.go()
         self.assertEqual((len(self.pushes("4")), "NÃO ENTREGUE" in self.err), (2, False), "delivered on the retry")
+
+    def test_the_alarm_also_mails_the_mayor_after_the_push_whatever_the_push_did(self):
+        # (what, notify rcs, mail rcs, pushes made, mails made, lost = neither channel delivered); a push is tried twice unless it is delivered, the mail NRCP_TRIES times unless it answers
+        for what, notify_rc, mail_rc, pushes, mails, lost in (
+                ("push held until 07:00 (rc 10): the mail is the channel", [10], [0], 2, 1, False), ("push delivered: the mail goes too", [0], [0], 1, 1, False),
+                ("push delivered, mail down: the phone was reached", [0], [1], 1, 3, False), ("push held, mail answers on the retry", [10], [1, 0], 2, 2, False),
+                ("push held, mail rc 1", [10], [1], 2, 3, True), ("push held, mail times out", [10], [None], 2, 3, True)):
+            with self.subTest(what):
+                self.fresh()
+                self.io.notify_rc, self.io.mail_rc = notify_rc, mail_rc
+                self.assertEqual(self.go(), 1)
+                tools = [os.path.basename(c[0]) for c in self.io.calls]
+                self.assertEqual(tools[-(pushes + mails):], ["notify"] * pushes + ["gc"] * mails, "the push first, then the mail")
+                self.assertEqual((self.io.sleeps.count(7), "NÃO ENTREGUE" in self.err, "NÃO ENTREGUE" in self.w.log()), (mails - 1, lost, lost))
+                self.assertEqual(("gc mail send mayor: enviado" in self.w.log(), "WARN: gc mail send mayor falhou" in self.w.log()), (mail_rc[-1] == 0, mail_rc[-1] != 0), "the log says what became of the mail")
+                self.assertTrue(not lost or ("rc=1" if mail_rc == [1] else "sem resposta") in self.err, "the alarm that was lost says why the mail failed")
+        self.fresh()
+        self.assertEqual(self.go(), 1)
+        push = self.pushes("4")[0]["argv"]
+        self.assertEqual(self.io.mails[0]["argv"], ["gc", "--city", self.w.city, "mail", "send", "mayor", "-s", push[2], "-m", push[-1] + "\n\n[origem: nightly-reboot-crew-proof.py]"], "the push's title and text (crews, dates, log path) + the origin; no --from (the engine refuses an unknown sender)")
 
     def test_a_routine_digest_that_fails_is_only_logged(self):
         for rc in (1, 11, 124, None):  # plain notify: only 0 is success
@@ -431,7 +452,7 @@ class Delivery(Base):
 
 
 class Real(Base):
-    """real processes (the real IO, `python3 -I script`, stub sysctl/bd/notify), real git (a real local commit in the reflog) and the real clock"""
+    """real processes (the real IO, `python3 -I script`, stub sysctl/bd/notify/gc: a test must never mail the real Mayor), real git (a real local commit in the reflog) and the real clock"""
 
     def prog(self, name, body):
         p = os.path.join(self.tmp, name)
@@ -452,12 +473,13 @@ class Real(Base):
 
     def test_end_to_end_through_real_processes(self):
         now = int(time.time())
-        boot, log = now - 7000, os.path.join(self.tmp, "notify.log")
+        boot, log, gclog = now - 7000, os.path.join(self.tmp, "notify.log"), os.path.join(self.tmp, "gc.log")
         env = {k: v for k, v in os.environ.items() if not k.startswith(("NRCP_", "NOTIFY_"))}
         env.update(self.w.env(
             NRCP_SYSCTL=self.prog("sysctl", 'echo "{ sec = %d, usec = 7 }"\n' % boot),
             NRCP_BD=self.prog("bd", 'case "$3" in list) cat "%s/list-$(basename "$2").json" ;; comments) cat "%s/comments-$4.json" ;; *) exit 9 ;; esac\n' % (self.tmp, self.tmp)),
             NRCP_NOTIFY=self.prog("notify", 'printf "FORCE=%%s STRICT=%%s ARGS=%%s\\n" "${NOTIFY_FORCE_PUSH:-}" "${NOTIFY_STRICT_EXIT:-}" "$(printf %%s "$*" | tr "\\n" "|")" >> "%s"\n' % log),
+            NRCP_GC=self.prog("gc", 'printf "ARGS=%%s\\n" "$(printf %%s "$*" | tr "\\n" "|")" >> "%s"\n' % gclog),
             NRCP_WINDOW_FROM_HHMM=time.strftime("%H:%M", time.localtime(now - 3 * 3600)), NRCP_DEADLINE_HHMM=time.strftime("%H:%M", time.localtime(now - 3600)), NRCP_MIN_GRACE_S="60", NRCP_TRIES="1", NRCP_RETRY_S="1"))
         for n in ("peter-wa", "oracle-wa"):
             os.makedirs(self.w.crew(n))
@@ -478,7 +500,10 @@ class Real(Base):
         self.assertEqual((r.returncode, len(lines)), (1, 1), r.stderr)
         self.assertTrue(lines[0].startswith("FORCE=1 STRICT=1 ARGS=-t Reboot noturno: crew SEM retomar -p 4 ") and "peter-wa: wa-aaa" in lines[0] and "oracle-wa" not in lines[0], lines[0])
         self.assertIn("oracle-wa OK: commit", self.w.log())
-        env.update(NRCP_SYSCTL=os.path.join(self.tmp, "none"), NRCP_NOTIFY=os.path.join(self.tmp, "none"), NRCP_NOTIFY_RETRY_S="1")  # no tools at all: never silent
+        with open(gclog) as fh:
+            mails = fh.read().splitlines()
+        self.assertTrue(len(mails) == 1 and mails[0].startswith("ARGS=--city %s mail send mayor -s Reboot noturno: crew SEM retomar -m " % self.w.city) and "peter-wa: wa-aaa" in mails[0] and mails[0].endswith("||[origem: nightly-reboot-crew-proof.py]"), mails)
+        env.update(NRCP_SYSCTL=os.path.join(self.tmp, "none"), NRCP_NOTIFY=os.path.join(self.tmp, "none"), NRCP_GC=os.path.join(self.tmp, "none"), NRCP_NOTIFY_RETRY_S="1")  # no tools at all: never silent
         r, _ = run()
         self.assertTrue(r.returncode == 1 and "NÃO ENTREGUE" in r.stderr and "NAO-SEI" in self.w.log(), r.stderr)
 
@@ -506,9 +531,9 @@ class Units(unittest.TestCase):
     def test_config_defaults_and_precedence(self):
         c = P.Cfg({})
         self.assertEqual((c.window_from, c.deadline_at, c.grace_s, c.tries, c.retry_s, c.call_t, c.notify_pause), ((23, 0), (0, 10), 1200, 3, 20, 90, 15))
-        self.assertEqual((c.city, c.sysctl, c.bd, c.git, c.notify), ("/Users/athos/gt/.gascity-gastown-hq", "/usr/sbin/sysctl", "bd", "git", "notify"))
+        self.assertEqual((c.city, c.sysctl, c.bd, c.git, c.notify, c.gc), ("/Users/athos/gt/.gascity-gastown-hq", "/usr/sbin/sysctl", "bd", "git", "notify", "gc"))
         self.assertTrue(c.log_path.endswith("/.gc/logs/nightly-reboot.log") and c.off_path.endswith("/.gc/nightly-reboot-crew-proof.off"))
-        self.assertEqual([P.Cfg(e).city for e in ({"NRCP_CITY": "/a", "GC_CITY_PATH": "/b"}, {"GC_CITY_PATH": "/b"})] + [P.Cfg({"NRCP_BD": "x", "BD_BIN": "y"}).bd], ["/a", "/b", "x"])
+        self.assertEqual([P.Cfg(e).city for e in ({"NRCP_CITY": "/a", "GC_CITY_PATH": "/b"}, {"GC_CITY_PATH": "/b"})] + [P.Cfg({"NRCP_BD": "x", "BD_BIN": "y"}).bd, P.Cfg({"NRCP_GC": "x", "GC_BIN": "y"}).gc, P.Cfg({"GC_BIN": "y"}).gc], ["/a", "/b", "x", "x", "y"])
         c = P.Cfg({"NRCP_WINDOW_FROM_HHMM": "22:30", "NRCP_DEADLINE_HHMM": "00:25", "NRCP_MIN_GRACE_S": "600", "NRCP_TRIES": "5", "NRCP_RETRY_S": "9", "NRCP_CALL_TIMEOUT_S": "33", "NRCP_NOTIFY_RETRY_S": "4"})
         self.assertEqual((c.window_from, c.deadline_at, c.grace_s, c.tries, c.retry_s, c.call_t, c.notify_pause), ((22, 30), (0, 25), 600, 5, 9, 33, 4))
 
