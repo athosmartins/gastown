@@ -126,12 +126,19 @@ def tela(sess, run=rodar):
 
 # ───────────────────────────── decisões (puras) ─────────────────────────────
 
+MAYORS = ("gastown__mayor", "gastown.mayor", "mayor")   # os 3 grafismos do Mayor (mesma classe do boot-first-turn.py, camada 1)
+
+
 def dono_da_sessao(sess: str, assignee: str) -> bool:
-    """`oracle-wa` é dono de `oracle-wa-gawispgux5v0`; `gastown.mayor` é dono de `gastown__mayor` (o tmux troca «.» por «__»)."""
-    a = (assignee or "").strip()
+    """Mesma equivalência da camada 1 (boot-first-turn.owns), gate ga-r62eowk: `oracle-wa`, `oracle-wa/` e `oracle-wa-gawispOUTRA`
+    (outra instância da crew) são donos de `oracle-wa-gawispgux5v0`; `mayor`, `mayor/`, `gastown.mayor` e `gastown__mayor` são
+    donos da sessão do Mayor."""
+    a = (assignee or "").strip().rstrip("/") if isinstance(assignee, str) else ""
     if not a:
         return False
-    return any(sess == x or sess.startswith(x + "-ga") for x in {a, a.replace(".", "__")})
+    alias = sess if sess in MAYORS else re.sub(r"-gawisp[a-z0-9]+$", "", sess)
+    nomes = {sess, alias} | (set(MAYORS) if alias in MAYORS else set())
+    return a in nomes or any(re.fullmatch(re.escape(n) + r"-gawisp[a-z0-9]+", a) for n in nomes)
 
 
 def e_pool(nome: str) -> bool:
@@ -243,6 +250,11 @@ def passada(dry: bool = False, run=rodar, agora=None) -> int:
     for store, v in lidos.items():
         if v is None:
             log(f"store ilegível nesta passada: {store} — sessões com bead nele ficam sem ordem nesta passada")
+    # gate ga-r62eowk: bead em andamento cujo dono não casa sessão viva nenhuma é «não sei de quem é» — contada e nomeada no log,
+    # nunca misturada em silêncio às casadas
+    orfas = [b.get("id") for b in beads if (b.get("assignee") or "").strip() and not any(dono_da_sessao(x, b.get("assignee")) for x in sess_list)]
+    if orfas:
+        log(f"{len(orfas)} bead(s) em andamento sem sessão viva do dono: {', '.join(map(str, orfas[:8]))}{' …' if len(orfas) > 8 else ''}")
     injetadas = 0
     for sess in sess_list:
         if e_pool(sess):

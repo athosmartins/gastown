@@ -216,6 +216,22 @@ for k in range(5):
     ciw.passada(dry=True, run=r, agora=1000 + k * 700)
 ciw._DRY = False
 check(not list((TMP / "st").glob("*.json")) and r.enviados == [] and r.mails == [], "9. dry-run: nenhum estado, nenhuma tecla, nenhum mail")
+# 9b. gate ga-r62eowk — dry-run que CHEGA ao ramo da ordem e ao do mail: relógio semeado por uma passada real, depois dry-run
+limpa()
+r = Runner(["oracle-wa-gawispgux5v0"], [ORACLE], {"oracle-wa-gawispgux5v0": OCIOSA})
+ciw.passada(run=r, agora=1000)                     # passada real: começa o relógio
+ciw._DRY = True
+ciw.passada(dry=True, run=r, agora=1000 + 700)     # 11 min parada: em modo real sairia a ordem
+check(r.enviados == [], "9b. dry-run no ramo da ordem: nenhuma tecla no pane")
+(TMP / "st" / "oracle-wa-gawispgux5v0.json").write_text(json.dumps(
+    {"prog": "", "tentativas": 3, "avisado": False, "sig": ciw.assinatura(OCIOSA), "desde": 1000}))
+ciw.passada(dry=True, run=r, agora=1000 + 1400)    # teto de tentativas: em modo real sairia o mail ao Mayor
+check(r.mails_tentados == 0 and r.enviados == [], "9c. dry-run no ramo do teto: nenhum mail tentado")
+rc = Runner(["oracle-wa-gawispgux5v0"], [ORACLE], {"oracle-wa-gawispgux5v0": OCIOSA}, falha_bd=True)
+(TMP / "st" / "_cego.json").write_text(json.dumps({"passadas": 9, "avisado": False}))
+ciw.passada(dry=True, run=rc, agora=1000 + 2100)   # vigia cego: em modo real sairia o mail «cego»
+check(rc.mails_tentados == 0, "9d. dry-run no ramo «cego»: nenhum mail tentado")
+ciw._DRY = False
 
 # 10. gate ga-lw03yn6 — mail que falhou não marca avisado (tenta de novo); send-keys que falhou não conta
 limpa()
@@ -262,5 +278,10 @@ ciw.STORES = [str(TMP)]
 check(ciw.e_pool("wa-worker-adhoc-0cad1bdf00") and ciw.e_pool("dog-ga2695nnf"), "7a. pools fora do vigia")
 check(ciw.dono_da_sessao("gastown__mayor", "gastown.mayor"), "7b. Mayor casa pelo nome do tmux")
 check(not ciw.dono_da_sessao("oracle-wa-gawispgux5v0", "oracle"), "7c. prefixo solto não casa")
+for a in ("mayor", "mayor/", "gastown.mayor", "gastown__mayor"):          # gate ga-r62eowk: os grafismos reais do Mayor
+    check(ciw.dono_da_sessao("gastown__mayor", a) and ciw.dono_da_sessao("mayor", a), f"7d. Mayor dono pelo grafismo {a!r}")
+check(ciw.dono_da_sessao("oracle-wa-gawispgux5v0", "oracle-wa-gawispold123"), "7e. outra instância da mesma crew é dona")
+check(ciw.dono_da_sessao("oracle-wa-gawispgux5v0", "oracle-wa/"), "7f. «/» final do assignee não atrapalha")
+check(not ciw.dono_da_sessao("oracle-wa-gawispgux5v0", "peter-wa"), "7g. outra crew não é dona")
 
 print(f"\n{ok} passaram")
