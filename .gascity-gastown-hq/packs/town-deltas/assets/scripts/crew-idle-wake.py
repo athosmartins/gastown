@@ -56,8 +56,8 @@ STORES = os.environ.get("CREW_IDLE_WAKE_STORES",
 IDLE_MIN_SEC = int(os.environ.get("CREW_IDLE_WAKE_IDLE_SEC", "600"))
 MAX_KICKS = int(os.environ.get("CREW_IDLE_WAKE_MAX_KICKS", "3"))
 BLIND_ALARM_PASSES = 5
-# gate ga-d0n3664: lista POSITIVA — o vigia só digita no pane do Mayor e das crews nomeadas (agente da cidade com provider
-# claude-rc*, o Remote Control que só Mayor e crews têm). Pool, dog, reviewer ou sessão de nome que ninguém cadastrou: fora.
+# gate ga-d0n3664: lista POSITIVA — o vigia só digita no pane do Mayor e das crews nomeadas de load_crews() (a regra da
+# camada 1). Pool, dog, reviewer ou sessão de nome que ninguém cadastrou: fora, e contada na linha final da passada.
 AGENTS_DIR = Path(os.environ.get("CREW_IDLE_WAKE_AGENTS", CITY / "agents"))
 NAO_PENDENTE_PREFIXOS = ("next-action:", "waiting-on:", "blocked")
 NAO_PENDENTE_EXATOS = {"gate:queued", "gate:reviewing", "gate:merging", "gate:passed"}
@@ -142,22 +142,28 @@ def dono_da_sessao(sess: str, assignee: str) -> bool:
     return a in nomes or any(re.fullmatch(re.escape(n) + r"-gawisp[a-z0-9]+", a) for n in nomes)
 
 
-def crews_nomeadas():
-    """Nomes dos agentes com provider claude-rc* em AGENTS_DIR. Diretório ilegível → None («não sei quem é crew»: ninguém
-    recebe ordem); agent.toml ilegível → aquele agente fica fora (desconhecido não age)."""
+def load_crews():
+    """Crews nomeadas = a MESMA regra da camada 1 (scripts/boot-first-turn.py, crews()): agents/<n>/agent.toml com
+    work_dir .../crew/<slug>, slug != worker e max_active_sessions <= 1. Pasta sem agent.toml não é crew. agents/ ilegível ou
+    um agent.toml que existe e não abre → None («não sei quem é crew»: só o Mayor fica no escopo)."""
     try:
-        dirs = list(AGENTS_DIR.iterdir())   # third-state-waiver: diretório ausente coberto no caso 7i de crew-idle-wake.selftest.py (o check não lê selftest .py)
+        names = sorted(os.listdir(AGENTS_DIR))   # third-state-waiver: agents/ ausente coberto no caso 7i de crew-idle-wake.selftest.py (o check não lê selftest .py)
     except OSError:
         return None
-    crews = set()
-    for d in dirs:
+    out = set()
+    for n in names:
         try:
-            txt = (d / "agent.toml").read_text()   # third-state-waiver: agent.toml ausente (sem-toml) coberto no caso 7a de crew-idle-wake.selftest.py
-        except OSError:
+            txt = (AGENTS_DIR / n / "agent.toml").read_text(encoding="utf-8")   # third-state-waiver: agent.toml ausente (sem-toml) no caso 7a e ilegível no 7j de crew-idle-wake.selftest.py
+        except FileNotFoundError:
             continue
-        if re.search(r'^provider\s*=\s*"claude-rc', txt, re.M):
-            crews.add(d.name)
-    return crews
+        except (OSError, ValueError):
+            return None
+        wd = re.search(r'^work_dir\s*=\s*"([^"]*)"', txt, re.M)
+        mx = re.search(r"^max_active_sessions\s*=\s*(\d+)", txt, re.M)
+        slug = re.search(r"/crew/([^/]+)$", wd.group(1)) if wd else None
+        if slug and slug.group(1) != "worker" and not (mx and int(mx.group(1)) > 1):
+            out.add(n)
+    return out
 
 
 def e_vigiada(nome: str, crews) -> bool:
@@ -255,10 +261,10 @@ def passada(dry: bool = False, run=rodar, agora=None) -> int:
     sess_list = sessoes_tmux(run)
     # gate ga-vww9tud: store configurado que sumiu não é descartado em silêncio — `bd -C` num caminho ausente sai rc≠0 → None → «ilegível»
     lidos = {s: beads_em_andamento(s, run) for s in STORES}
-    crews = crews_nomeadas()
+    crews = load_crews()
     if crews is None:
-        log(f"NÃO SEI quais sessões são crews: {AGENTS_DIR} ilegível — nenhuma ordem nesta passada")
-    if sess_list is None or crews is None or all(v is None for v in lidos.values()):
+        log(f"NÃO SEI quais sessões são crews: {AGENTS_DIR} ilegível — nesta passada só o Mayor está no escopo")
+    if sess_list is None or all(v is None for v in lidos.values()):
         n = cego.get("passadas", 0) + 1
         gravar_estado("_cego", {"passadas": n, "avisado": cego.get("avisado", False)})
         log(f"NÃO SEI: tmux={'falhou' if sess_list is None else 'ok'}, stores ilegíveis — nenhuma injeção ({n} seguida(s))")
@@ -278,6 +284,7 @@ def passada(dry: bool = False, run=rodar, agora=None) -> int:
     if orfas:
         log(f"{len(orfas)} bead(s) em andamento sem sessão viva do dono: {', '.join(map(str, orfas[:8]))}{' …' if len(orfas) > 8 else ''}")
     injetadas = 0
+    fora = [x for x in sess_list if not e_vigiada(x, crews)]
     for sess in sess_list:
         if not e_vigiada(sess, crews):
             continue
@@ -342,7 +349,8 @@ def passada(dry: bool = False, run=rodar, agora=None) -> int:
         log(f"{sess}: parada {int(parado // 60)} min com {', '.join(trabalho)} → ordem no pane "
             f"(tentativa {st['tentativas']}/{MAX_KICKS}{', dry-run' if dry else ''})")
         injetadas += 1
-    log(f"passada ok: {len(sess_list)} sessão(ões), {len(beads)} bead(s) em andamento, {injetadas} ordem(ns)")
+    log(f"passada ok: {len(sess_list)} sessão(ões), {len(fora)} fora do escopo, {len(beads)} bead(s) em andamento, "
+        f"{injetadas} ordem(ns)")
     return injetadas
 
 

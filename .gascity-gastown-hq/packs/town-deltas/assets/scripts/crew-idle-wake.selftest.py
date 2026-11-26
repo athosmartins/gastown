@@ -21,10 +21,13 @@ spec = importlib.util.spec_from_file_location("ciw", AQUI / "crew-idle-wake.py")
 ciw = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(ciw)
 ciw.time.sleep = lambda *_: None
-# gate ga-d0n3664: lista positiva — crews nomeadas = agentes com provider claude-rc*; pool com claude-headless
-for nome, prov in (("oracle-wa", "claude-rc-oracle"), ("peter-wa", "claude-rc-peter"), ("wa-worker", "claude-headless")):
+# gate ga-d0n3664: lista positiva — crews nomeadas = a regra da camada 1 (work_dir .../crew/<slug>, slug != worker,
+# max_active_sessions <= 1); os pools reais que a lista negativa deixava passar ficam fora
+for nome, wd, mx in (("oracle-wa", "/x/whatsapp_automation/crew/oracle", 1), ("peter-wa", "/x/whatsapp_automation/crew/peter", 1),
+                     ("wa-worker", "/x/whatsapp_automation/crew/worker", 3), ("auto-refiner", "/x/crew/auto", 3),
+                     ("refino-gate-reviewer", ".gc/agents/refino-gate-reviewer", 3), ("context-check-reviewer", "/x/crew/ccr", 2)):
     (TMP / "agents" / nome).mkdir(parents=True, exist_ok=True)
-    (TMP / "agents" / nome / "agent.toml").write_text(f'provider = "{prov}"   # comentário\n')
+    (TMP / "agents" / nome / "agent.toml").write_text(f'work_dir = "{wd}"\nmax_active_sessions = {mx}\n')
 (TMP / "agents" / "sem-toml").mkdir()
 
 OCIOSA = "⏺ Combinado, deixei essa pergunta de lado.\n\n───────\n❯ \n───────\n  [Opus 5.5] ctx: 9%\n  ⏵⏵ bypass permissions on\n"
@@ -332,24 +335,33 @@ check(fim.get("prog") == "2026-11-26T09:00:00Z" and not fim.get("parcial"), "11c
 ciw.STORES = [str(TMP)]
 
 # 7. pool fica de fora; Mayor casa por «gastown.mayor» → «gastown__mayor»
-crews = ciw.crews_nomeadas()
-check(crews == {"oracle-wa", "peter-wa"}, "7a. crews = provider claude-rc*; pool e agent.toml ilegível ficam fora")
-check(not any(ciw.e_vigiada(n, crews) for n in ("wa-worker-adhoc-0cad1bdf00", "dog-gawispq8n8tg", "sem-toml-gawispabc123",
+crews = ciw.load_crews()
+check(crews == {"oracle-wa", "peter-wa"}, "7a. crews = regra da camada 1; pool e pasta sem agent.toml ficam fora")
+check(not any(ciw.e_vigiada(n, crews) for n in ("wa-worker-adhoc-0cad1bdf00", "dog-gawispq8n8tg", "sem-toml-gawispabc123", "auto-refiner-adhoc-831d3f2efb",
+                                                  "refino-gate-reviewer-adhoc-abc123", "context-check-reviewer-adhoc-abc123",
                                                   "novo-pool-gawispabc123", "control-dispatcher")),
       "7a. pool, dog e nome que ninguém cadastrou: fora (o desconhecido não age)")
 check(ciw.e_vigiada("oracle-wa-gawispgux5v0", crews) and ciw.e_vigiada("gastown__mayor", crews), "7a. crew e Mayor dentro")
 limpa()
-r = Runner(["novo-pool-gawispabc123"], [dict(ORACLE, assignee="novo-pool")], {"novo-pool-gawispabc123": OCIOSA})
-for k in range(4):
+pools = ["auto-refiner-adhoc-831d3f2efb", "refino-gate-reviewer-adhoc-abc123", "novo-pool-gawispabc123"]
+r = Runner(pools, [dict(ORACLE, id=f"wa-p{i}", assignee=p) for i, p in enumerate(pools)], {p: OCIOSA for p in pools})
+for k in range(12):
     ciw.passada(run=r, agora=1000 + k * 601)
-check(r.enviados == [], "7h. sessão de nome desconhecido com bead em andamento: nenhuma ordem digitada")
+check(r.enviados == [] and r.mails == [], "7h. pools reais e nome desconhecido com bead em andamento: nenhuma tecla, nenhum mail")
+check("3 fora do escopo" in (TMP / "log").read_text().splitlines()[-1], "7h. a passada conta as sessões fora do escopo")
 limpa()
 ciw.AGENTS_DIR = TMP / "agents-sumiu"
-r = Runner(["oracle-wa-gawispgux5v0"], [ORACLE], {"oracle-wa-gawispgux5v0": OCIOSA})
+r = Runner(["oracle-wa-gawispgux5v0", "gastown__mayor"], [ORACLE, dict(ORACLE, id="ga-m", assignee="mayor")],
+           {"oracle-wa-gawispgux5v0": OCIOSA, "gastown__mayor": OCIOSA})
 for k in range(4):
     ciw.passada(run=r, agora=1000 + k * 601)
-check(r.enviados == [] and ciw.ler_estado("_cego").get("passadas") == 4,
-      "7i. lista de crews ilegível: ninguém recebe ordem e a passada conta como cega")
+check(r.enviados and all(e[0] == "gastown__mayor" for e in r.enviados), "7i. lista de crews ilegível: só o Mayor fica no escopo")
+ciw.AGENTS_DIR = TMP / "agents"
+(TMP / "agents" / "ilegivel").mkdir()
+(TMP / "agents" / "ilegivel" / "agent.toml").write_bytes(b"\xff\xfe lixo")
+check(ciw.load_crews() is None, "7j. agent.toml que existe e não abre: «não sei» (None), nunca «não é crew»")
+(TMP / "agents" / "ilegivel" / "agent.toml").unlink()
+(TMP / "agents" / "ilegivel").rmdir()
 ciw.AGENTS_DIR = TMP / "agents"
 check(ciw.dono_da_sessao("gastown__mayor", "gastown.mayor"), "7b. Mayor casa pelo nome do tmux")
 check(not ciw.dono_da_sessao("oracle-wa-gawispgux5v0", "oracle"), "7c. prefixo solto não casa")
