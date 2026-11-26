@@ -21,7 +21,11 @@
 #   a limpeza de 14 dias não apaga a baseline · nao-isolado (vazamento medido) é FALHOU, não INERTE · o nó do mbp-run é o mesmo do instalador · o que foi ao nó fica no relatório.
 # PISTAS (ga-282sl1d): lanes_basic (2 lotes ao mesmo tempo, mesmos totais e comparação, ordem dos lotes, 1 pista = o de sempre) · lanes_wait (rc 95 espera sem gastar tentativa) · lanes_nospace (sem espaço até o fim do orçamento = NÃO RODOU) ·
 #   lanes_requeue / lanes_orphan (pista extra que não roda devolve o lote; devolvido tarde roda sozinho) · lanes_leak (vazamento numa pista derruba a outra, sem órfão) · lanes_inerte1 · lanes_order · lanes_invalid.
-# CONTROLES NEGATIVOS: cada mutante do script (M1-M89 e N1-N13, mais M0 neutro) tem de ser REPROVADO pelo caso correspondente (o caso falha quando roda no mutante). Antes deles, um mutante NEUTRO (cópia que só muda
+# REVEZAMENTO (ga-hs43vb2): carry_skip (noite 1 com lote que não rodou grava a lista; noite 2 roda esses arquivos PRIMEIRO, diz isso no relatório, consome a lista e avança a baseline; noite 3 = ordem de sempre) ·
+#   carry_bad (lista em branco / com espaço / com NUL / vazia / sem permissão = ordem de sempre + ATENÇÃO, nunca uma ordem inventada) · carry_gone (arquivo que sumiu, mac-only, duplicado; lista toda sumida) ·
+#   carry_early (INERTE e vazamento deixam a lista e o .meta intactos, mesmo com mtime velho) · carry_replace (lista nova substitui a velha) · carry_halfwrite (batch.N ilegível: não grava, a velha fica) ·
+#   carry_dir (pasta no lugar da lista) · carry_lanes (o mesmo com HZN_LANES=2).
+# CONTROLES NEGATIVOS: cada mutante do script (M1-M89, N1-N13 e R1-R13, mais M0 neutro) tem de ser REPROVADO pelo caso correspondente (o caso falha quando roda no mutante). Antes deles, um mutante NEUTRO (cópia que só muda
 #   um comentário) tem de PASSAR: sem isso o controle não prova nada (a falta dos arquivos irmãos no diretório do mutante reprovava TODO caso, qualquer que fosse a mutação).
 set -u
 HERE="$(cd "$(dirname "$0")" && pwd)"
@@ -520,7 +524,101 @@ case_lanes_invalid() { local v
   for v in abc 0 9 "2 3" -1; do lreset; STUB_RC=0 HZN_LANES="$v" go "$1"
     ck "HZN_LANES='$v': FALHOU, exit 1" rcis 1; ck "HZN_LANES='$v': diz constante inválida" has "$MAIL_LOG" 'constante inválida: (LANES_REQ|HZN_LANES)'; ck "HZN_LANES='$v': nada rodou" empty_dir_file "$CALLS"; done; }
 
-ALL="first second cleanslate xfail inerte leak 97_sem_iso pulado timeout abort noiso nosum implausible lock lock_stale prev_unreadable mailfail egress ssh no_origin stale_report listfail prev_format dash partial fetch keep provenance dur maconly retidos batches batch_list overbudget batch_killed crash nocap cap_inert cap_retry cap_late leak_mid flag_mid badconst notests nobatch escudo partial_cmp stop_clock lanes_basic lanes_wait lanes_nospace lanes_requeue lanes_orphan lanes_leak lanes_inerte1 lanes_order lanes_invalid"
+# ---- revezamento (ga-hs43vb2): os arquivos dos lotes que NÃO rodaram passam à frente na noite seguinte ---------------------------------------------------------------------------------------------
+# Com HZN_BATCH_DEFS=10 a árvore de mentira dá 3 lotes: 1 = a_test + sub/test_c, 2 = test_a, 3 = test_b + test_zero. O lote 3 "não roda" quando o stub devolve rc 137 (MORTO): é o lote do FIM da ordem, o que o orçamento corta de verdade.
+SKF="$LOGDIR/last-skipped.files"; SKM="$LOGDIR/last-skipped.meta"
+b1() { grep '^ARGS:' "$CALLS" | head -n 1 | sed -E 's/.* -- (.*) -n auto.*/\1/'; }   # os arquivos da 1ª chamada do mbp-run (o lote que roda primeiro)
+jf() { tail -n 1 "$JSONL" | jq -c "[$1]"; }   # campos da última linha do jsonl
+nextnight() { : > "$MAIL_LOG"; : > "$CALLS"; : > "$SSH_LOG"; rm -f "$STUB_OUT" "$STUB_OUT".* "$STUB_CNT"; find "$LOCK" -mindepth 1 -delete 2>/dev/null; rmdir "$LOCK" 2>/dev/null; unset STUB_RC_1 STUB_RC_2 STUB_RC_3 STUB_UNREADABLE_BATCH; }   # a noite seguinte: tudo some MENOS o que a rodada deixou em $LOGDIR
+killed3() { MK_TO="$STUB_OUT.3" mkout "$ISO_OK" 0 "" "Killed"; }
+NORMAL1="tests/a_test.py tests/sub/test_c.py tests/test_a.py tests/test_b.py tests/test_zero.py"   # a ordem de caminho de sempre (1 lote só, sem HZN_BATCH_DEFS)
+carry_one() { mkout "$ISO_OK" 0 "1500 passed in 3000.00s" "$(fl 0)"; STUB_RC=0 go "$1"; }   # uma noite de 1 lote que roda inteira
+case_carry_skip() { reset; seed_prev tests/a.py::t1; cp "$PREV" "$T/prev.before"
+  # NOITE 1: o lote 3 (tests/test_b.py e tests/test_zero.py) morre e NÃO RODA; os lotes 1 e 2 rodam
+  okb 1 "400 passed in 100.00s" 0; okb 2 "500 passed in 200.00s" 0; killed3; STUB_RC_1=0 STUB_RC_2=0 STUB_RC_3=137 HZN_BATCH_DEFS=10 go "$1"
+  ck "revezamento, noite 1: FALHOU, exit 1 (o lote 03 não rodou)" rcis 1; ck "revezamento, noite 1: sem lista anterior a ordem é a de sempre (o lote 1 é a_test + test_c)" test "$(b1)" = "tests/a_test.py tests/sub/test_c.py"
+  ck "revezamento, noite 1: grava os arquivos do lote que não rodou, e só eles" test "$(cat "$SKF" 2>/dev/null)" = "$(printf 'tests/test_b.py\ntests/test_zero.py')"
+  ck "revezamento, noite 1: o .meta diz de que noite e quais lotes" has "$SKM" "^$DAY @[0-9a-f]+: 1 de 3 lotes não rodaram \(03\), 2 arquivos\$"
+  ck "revezamento, noite 1: o relatório diz que os 2 arquivos rodam PRIMEIRO na próxima noite" has "$REPORT" 'revezamento: os 2 arquivos dos 1 lote\(s\) que NÃO rodaram \(03\) foram gravados em .*last-skipped\.files e rodam PRIMEIRO na próxima noite'
+  ck "revezamento, noite 1: jsonl diz entrada ausente e saída gravada com 2 arquivos" test "$(jf '.carry_in,.carry_in_files,.carry_in_gone,.carry_out,.carry_out_files')" = '["ausente",null,null,"gravada",2]'
+  ck "revezamento, noite 1: a baseline NÃO anda" cmp -s "$PREV" "$T/prev.before"; ck "revezamento, noite 1: sem lista anterior o relatório não fala de entrada" hasnt "$REPORT" 'rodam PRIMEIRO, nos lotes'
+  # NOITE 2: nada mudou na árvore e tudo roda: os 2 arquivos que ficaram de fora são o 1º lote
+  nextnight; okb 1 "400 passed in 100.00s" 0; okb 2 "500 passed in 200.00s" 0; okb 3 "300 passed in 50.00s" 0; STUB_RC_1=0 STUB_RC_2=0 STUB_RC_3=0 HZN_BATCH_DEFS=10 go "$1"
+  ck "revezamento, noite 2: COMPLETO, exit 0" vd COMPLETO; ck "revezamento, noite 2: exit 0" rcis 0
+  ck "revezamento, noite 2: os arquivos que não rodaram na noite 1 são o 1º lote" test "$(b1)" = "tests/test_b.py tests/test_zero.py"
+  ck "revezamento, noite 2: nenhum arquivo em dois lotes e nenhum fora (todos rodam uma vez)" test "$(grep '^ARGS:' "$CALLS" | grep -o 'tests/[A-Za-z_/]*\.py' | sort | tr '\n' ' ')" = 'tests/a_test.py tests/sub/test_c.py tests/test_a.py tests/test_b.py tests/test_zero.py '
+  ck "revezamento, noite 2: o relatório diz quantos, de que noite, e em que lotes" has "$REPORT" "revezamento: 2 arquivo\(s\) dos lotes que não rodaram em $DAY @[0-9a-f]+: 1 de 3 lotes não rodaram \(03\), 2 arquivos rodam PRIMEIRO, nos lotes 01 a 01"
+  ck "revezamento, noite 2: a noite COMPLETA consome a lista (arquivo e .meta)" test ! -e "$SKF" -a ! -e "$SKM"; ck "revezamento, noite 2: o relatório diz que a lista foi consumida" has "$REPORT" 'noite COMPLETA, todos os arquivos rodaram: .*last-skipped\.files foi consumida'
+  ck "revezamento, noite 2: jsonl diz entrada aplicada (2 arquivos, 0 sumidos) e saída consumida" test "$(jf '.carry_in,.carry_in_files,.carry_in_gone,.carry_out,.carry_out_files')" = '["aplicada",2,0,"consumida",null]'
+  ck "revezamento, noite 2: a baseline anda (só a COMPLETA a avança)" not_same "$PREV" "$T/prev.before"
+  # NOITE 3: sem lista, a ordem volta a ser a de sempre
+  nextnight; okb 1 "400 passed in 100.00s" 0; okb 2 "500 passed in 200.00s" 0; okb 3 "300 passed in 50.00s" 0; STUB_RC_1=0 STUB_RC_2=0 STUB_RC_3=0 HZN_BATCH_DEFS=10 go "$1"
+  ck "revezamento, noite 3: lista consumida, a ordem é a de sempre" test "$(b1)" = "tests/a_test.py tests/sub/test_c.py"; ck "revezamento, noite 3: jsonl diz entrada ausente" test "$(jf '.carry_in,.carry_out')" = '["ausente","inalterada"]'; }
+case_carry_bad() { local v i
+  # lista que não dá para ler → a ordem de sempre, o aviso no relatório, nunca uma ordem inventada com o que deu para ler (a linha tests/test_b.py é VÁLIDA em quase todas: se ela passasse à frente, a lista estaria sendo aceita pela metade)
+  for v in blank space nul empty chmod; do
+    reset; case "$v" in
+      blank) printf 'tests/test_b.py\n\ntests/test_a.py\n' > "$SKF" ;;
+      space) printf 'tests/test_b.py\ntests/test b.py\n' > "$SKF" ;;
+      nul) printf 'tests/test_b.py\n\000tests/test_a.py\n' > "$SKF" ;;
+      empty) : > "$SKF" ;;
+      chmod) [ "$(id -u)" -ne 0 ] || continue; printf 'tests/test_b.py\n' > "$SKF"; chmod 000 "$SKF" ;;
+    esac
+    carry_one "$1"; chmod 644 "$SKF" 2>/dev/null
+    ck "lista $v: COMPLETO e a ordem é a de sempre (nada foi posto à frente)" test "$(vd COMPLETO && b1)" = "$NORMAL1"
+    ck "lista $v: o relatório avisa que a lista não foi lida" has "$REPORT" 'ATENÇÃO — revezamento: a lista .*last-skipped\.files não foi lida \('; ck "lista $v: jsonl diz entrada ilegível, sem contagem" test "$(jf '.carry_in,.carry_in_files,.carry_in_gone')" = '["ilegivel",null,null]'
+    ck "lista $v: a noite COMPLETA remove a lista ilegível (todos os arquivos rodaram)" test ! -e "$SKF"; ck "lista $v: jsonl diz consumida" test "$(jf '.carry_out')" = '["consumida"]'
+  done; }
+case_carry_gone() { reset
+  # a lista traz um arquivo da árvore (test_b), um que SUMIU (gone_test), um que virou mac-only (test_mac_launchd) e o test_b repetido; sem .meta (noite de origem ilegível)
+  printf 'tests/test_b.py\ntests/gone_test.py\ntests/test_mac_launchd.py\ntests/test_b.py\n' > "$SKF"; carry_one "$1"
+  ck "arquivo que sumiu da lista: COMPLETO, exit 0 (nunca um erro)" vd COMPLETO; ck "arquivo que sumiu: o que existe vai à frente, o resto segue em ordem de caminho" test "$(b1)" = "tests/test_b.py tests/a_test.py tests/sub/test_c.py tests/test_a.py tests/test_zero.py"
+  ck "arquivo que sumiu: nenhum lote com o que não existe ou é mac-only" hasnt "$CALLS" 'gone_test|launchd'
+  ck "arquivo que sumiu: o relatório conta os 2 que já não estão na rodada" has "$REPORT" 'rodam PRIMEIRO, nos lotes 01 a 01; 2 da lista já não estão na rodada \(sumiram da árvore, viraram mac-only ou retidos\)'
+  ck "arquivo que sumiu: sem .meta o relatório diz que a noite de origem está ilegível" has "$REPORT" 'noite de origem ilegível'
+  ck "arquivo que sumiu: jsonl diz 1 aplicado, 2 sumidos" test "$(jf '.carry_in,.carry_in_files,.carry_in_gone')" = '["aplicada",1,2]'
+  reset; printf 'tests/gone_test.py\n' > "$SKF"; carry_one "$1"
+  ck "lista só com arquivo que sumiu: COMPLETO na ordem de sempre" test "$(vd COMPLETO && b1)" = "$NORMAL1"; ck "lista só com arquivo que sumiu: o relatório diz que NENHUM está mais na rodada" has "$REPORT" 'NENHUM está mais na rodada: ordem de sempre'
+  ck "lista só com arquivo que sumiu: jsonl diz 0 aplicados, 1 sumido" test "$(jf '.carry_in,.carry_in_files,.carry_in_gone')" = '["aplicada",0,1]'; }
+case_carry_early() { local ex
+  # a lista só muda numa noite COMPLETA (sai) ou numa que fecha com lote sem rodar (é regravada): qualquer outra saída a deixa como estava, mesmo com mais de 14 dias (a limpeza do log não a apaga)
+  for ex in inerte leak; do
+    reset; printf 'tests/test_b.py\n' > "$SKF"; echo "2026-11-20 @abc1234: 1 de 3 lotes não rodaram (03), 1 arquivos" > "$SKM"; cp "$SKF" "$T/skf.before"; cp "$SKM" "$T/skm.before"; touch -t 202601010000 "$SKF" "$SKM"
+    case "$ex" in inerte) mkout "inerte helper-ausente (/usr/local/sbin/gt-netns-run: o root ainda não o instalou)" "" ""; STUB_RC=97 go "$1" ;; leak) mkout "nao-isolado tcp:1.1.1.1:53" "" ""; STUB_RC=97 go "$1" ;; esac
+    ck "saída $ex com lista: o veredito não é COMPLETO" hasnt "$OUT" 'VEREDITO: COMPLETO'; ck "saída $ex: a lista fica como estava (e o .meta)" cmp -s "$SKF" "$T/skf.before"; ck "saída $ex: o .meta fica como estava" cmp -s "$SKM" "$T/skm.before"
+    ck "saída $ex: jsonl diz entrada aplicada, saída inalterada" test "$(jf '.carry_in,.carry_out,.carry_out_files')" = '["aplicada","inalterada",null]'
+    ck "saída $ex: a limpeza de 14 dias não apaga a lista nem o .meta (mtime de janeiro)" test -f "$SKF" -a -f "$SKM"
+  done; }
+case_carry_replace() { reset
+  # a lista velha traz os 2 arquivos do lote 3 e um que sumiu (old_gone_test); hoje o lote 1 (os 2 arquivos que vieram à frente) morre de novo e os lotes 2 e 3 rodam
+  printf 'tests/test_b.py\ntests/test_zero.py\ntests/old_gone_test.py\n' > "$SKF"; echo "2026-11-25 @abc1234: velha" > "$SKM"
+  okb 2 "500 passed in 200.00s" 0; okb 3 "300 passed in 50.00s" 0; MK_TO="$STUB_OUT.1" mkout "$ISO_OK" 0 "" "Killed"; STUB_RC_1=137 STUB_RC_2=0 STUB_RC_3=0 HZN_BATCH_DEFS=10 go "$1"
+  ck "regravada: FALHOU, só o lote 01 não rodou" has "$MAIL_LOG" 'FALHOU: 1 de 3 lotes NÃO RODARAM \(01\)'; ck "regravada: os 2 arquivos vieram à frente (lote 1) e o resto segue em ordem" test "$(b1)" = "tests/test_b.py tests/test_zero.py"
+  ck "regravada: o que não rodou de novo continua na frente e o que sumiu SAI da lista (a lista nova substitui a velha)" test "$(cat "$SKF" 2>/dev/null)" = "$(printf 'tests/test_b.py\ntests/test_zero.py')"
+  ck "regravada: o .meta é desta noite, não o velho" has "$SKM" "^$DAY @[0-9a-f]+: 1 de 3 lotes não rodaram \(01\), 2 arquivos\$"; ck "regravada: o relatório diz a entrada e a saída" has "$REPORT" 'rodam PRIMEIRO, nos lotes 01 a 01; 1 da lista já não estão na rodada'
+  ck "regravada: jsonl diz aplicada (2 arquivos, 1 sumido) e gravada (2)" test "$(jf '.carry_in,.carry_in_files,.carry_in_gone,.carry_out,.carry_out_files')" = '["aplicada",2,1,"gravada",2]'; }
+case_carry_halfwrite() { [ "$(id -u)" -ne 0 ] || return 0; reset
+  # os lotes 2 e 3 não rodam e a lista de arquivos do lote 3 fica ilegível depois de lida: a conta não fecha, a lista NÃO é gravada pela metade (a anterior fica)
+  printf 'tests/test_a.py\n' > "$SKF"; cp "$SKF" "$T/skf.before"
+  okb 1 "1000 passed in 100.00s" 0; MK_TO="$STUB_OUT.2" mkout "$ISO_OK" 0 "" "Killed"; killed3; STUB_RC_1=0 STUB_RC_2=137 STUB_RC_3=137 STUB_UNREADABLE_BATCH=3 HZN_BATCH_DEFS=10 go "$1"
+  ck "lista pela metade: FALHOU, os lotes 02 e 03 não rodaram" has "$MAIL_LOG" 'FALHOU: 2 de 3 lotes NÃO RODARAM \(02, 03\)'; ck "lista pela metade: a lista anterior fica como estava" cmp -s "$SKF" "$T/skf.before"
+  ck "lista pela metade: o relatório avisa que NÃO gravou" has "$REPORT" 'ATENÇÃO — revezamento: NÃO gravei os arquivos dos lotes que não rodaram \(02, 03\)'; ck "lista pela metade: jsonl diz nao-gravada, sem contagem" test "$(jf '.carry_out,.carry_out_files')" = '["nao-gravada",null]'; }
+case_carry_dir() { reset
+  # uma PASTA no lugar da lista: entrada ilegível (não abre como arquivo); gravar não pode "funcionar" movendo o arquivo para dentro dela; consumir não pode dizer que consumiu
+  mkdir "$SKF"; okb 1 "400 passed in 100.00s" 0; okb 2 "500 passed in 200.00s" 0; killed3; STUB_RC_1=0 STUB_RC_2=0 STUB_RC_3=137 HZN_BATCH_DEFS=10 go "$1"
+  ck "pasta no lugar da lista: FALHOU, o lote 03 não rodou" has "$MAIL_LOG" 'FALHOU: 1 de 3 lotes NÃO RODARAM \(03\)'; ck "pasta no lugar da lista: a entrada diz que não abre como arquivo" has "$REPORT" 'last-skipped\.files existe e não abre como arquivo'
+  ck "pasta no lugar da lista: NÃO diz gravada" has "$REPORT" 'ATENÇÃO — revezamento: NÃO gravei os arquivos dos lotes que não rodaram \(03\)'; ck "pasta no lugar da lista: continua pasta, sem arquivo gravado dentro" test -d "$SKF" -a -z "$(ls -A "$SKF")"
+  ck "pasta no lugar da lista: jsonl diz ilegível e nao-gravada" test "$(jf '.carry_in,.carry_out,.carry_out_files')" = '["ilegivel","nao-gravada",null]'
+  reset; mkdir "$SKF"; carry_one "$1"
+  ck "pasta no lugar da lista, noite COMPLETA: não consegue remover e diz" has "$REPORT" 'a noite foi COMPLETA mas NÃO consegui remover .*last-skipped\.files'; ck "pasta no lugar da lista, noite COMPLETA: jsonl diz nao-removida" test "$(jf '.carry_in,.carry_out')" = '["ilegivel","nao-removida"]'; }
+case_carry_lanes() { lreset
+  # com pistas (HZN_LANES=2) o lote que não rodou também vai para a lista, e a noite seguinte o põe à frente
+  okb 1 "400 passed in 100.00s" 0; okb 2 "500 passed in 200.00s" 0; killed3; HZN_RUN="$T/lanes-stub.sh" HZN_LANES=2 STUB_RC_1=0 STUB_RC_2=0 STUB_RC_3=137 HZN_BATCH_DEFS=10 go "$1"
+  ck "pistas: o lote 03 não rodou e a lista tem os arquivos dele" test "$(cat "$SKF" 2>/dev/null)" = "$(printf 'tests/test_b.py\ntests/test_zero.py')"
+  nextnight; mkdir -p "$STUB_LDIR"; okb 1 "400 passed in 100.00s" 0; okb 2 "500 passed in 200.00s" 0; okb 3 "300 passed in 50.00s" 0; HZN_RUN="$T/lanes-stub.sh" HZN_LANES=2 HZN_BATCH_DEFS=10 go "$1"
+  ck "pistas, noite seguinte: COMPLETO" vd COMPLETO; ck "pistas, noite seguinte: o lote 01 é o dos arquivos que não rodaram" has "$LOGDIR/$DAY.out" '^=== lote 01: 2 arquivos, 7 def test_'; ck "pistas, noite seguinte: a lista foi consumida" test ! -e "$SKF"; }
+
+ALL="first second cleanslate xfail inerte leak 97_sem_iso pulado timeout abort noiso nosum implausible lock lock_stale prev_unreadable mailfail egress ssh no_origin stale_report listfail prev_format dash partial fetch keep provenance dur maconly retidos batches batch_list overbudget batch_killed crash nocap cap_inert cap_retry cap_late leak_mid flag_mid badconst notests nobatch escudo partial_cmp stop_clock lanes_basic lanes_wait lanes_nospace lanes_requeue lanes_orphan lanes_leak lanes_inerte1 lanes_order lanes_invalid carry_skip carry_bad carry_gone carry_early carry_replace carry_halfwrite carry_dir carry_lanes"
 for c in $ALL; do "case_$c" "$SUT0"; done
 
 # ---- controles negativos: o caso correspondente tem de FALHAR quando roda no mutante -----------------------------------------
@@ -647,6 +745,20 @@ mutantl N12-leitura-fora-de-ordem lanes_order '  k=0; while [ "$k" -lt "$NB" ]; 
 fi' '  k=0; while [ "$k" -lt "$NB" ]; do k=$((k+1)); post_one_batch "$(( NB - k + 1 ))"; done
 fi'
 mutantl N13-lote-1-inerte-nao-para-a-fila lanes_inerte1 '[ "$k" -ne 1 ] || { : > "$SCR/stop"; break; }' ':'
+# revezamento (ga-hs43vb2)
+mutantl R1-carregados-rodam-por-ultimo carry_skip 'cat "$SCR/carry.in" "$SCR/carry.rest"' 'cat "$SCR/carry.rest" "$SCR/carry.in"'
+mutantl R2-lista-com-linha-invalida-aceita carry_bad 'elif [ "$BADL" -gt 0 ]; then' 'elif false; then'
+mutantl R3-lista-vazia-vira-aplicada carry_bad 'elif [ ! -s "$SKIPF" ]; then' 'elif false; then' '|| [ "${NREAD:-0}" -lt 1 ]' ''
+mutantl R4-arquivos-sumidos-nao-contados carry_gone 'CARRYGONE=$(( NREAD - CARRYN ))' 'CARRYGONE=0'
+mutantl R5-noite-completa-nao-consome-a-lista carry_skip 'rm -f "$SKIPF" "$SKIPM" 2>/dev/null' 'true'
+mutantl R6-saida-sem-decisao-apaga-a-lista carry_early '  jline "$v" "$why"' '  jline "$v" "$why"; rm -f "$LOGDIR/last-skipped.files"'
+mutantl R7-lista-meio-gravada-aceita carry_halfwrite '|| SKW=1; done' '|| :; done' '&& [ "$SKGOT" = "$SKEXP" ]' ''
+mutantl R8-pasta-no-lugar-da-lista-aceita carry_dir '&& [ ! -d "$SKIPF" ]' ''
+mutantl R9-limpeza-de-14-dias-apaga-a-lista carry_early "! -name 'last-skipped.*' " ''
+mutantl R10-lista-que-ficou-vira-consumida carry_dir 'if [ -e "$SKIPF" ] || [ -L "$SKIPF" ]; then CARRYOUT=nao-removida' 'if false; then CARRYOUT=nao-removida'
+mutantl R11-lista-nova-nao-substitui-a-velha carry_replace 'cp "$SCR/skip.files" "$SKIPF.new"' 'cat "$SKIPF" "$SCR/skip.files" > "$SKIPF.new"'
+mutantl R12-meta-ausente-vira-origem-vazia carry_gone 'CARRYSRC=${CARRYSRC:-"noite de origem ilegível (last-skipped.meta)"}' 'CARRYSRC=${CARRYSRC:-}'
+mutantl R13-lote-que-nao-rodou-nao-registrado carry_skip 'SKIPIDX="$SKIPIDX $i"; ' ''
 reset
 echo "---"; echo "$((n-fails))/$n ok ($M mutantes)"
 [ $fails -eq 0 ] && echo "SELFTEST OK" || { echo "SELFTEST FALHOU ($fails)"; exit 1; }

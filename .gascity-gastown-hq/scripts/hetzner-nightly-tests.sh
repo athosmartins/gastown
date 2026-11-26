@@ -2,7 +2,7 @@
 # hetzner-nightly-tests.sh — a suíte INTEIRA do WA no nó Linux (Hetzner), toda madrugada, em LOTES por arquivo, sem rede de saída e sem segredo, com relatório ao Mayor (ga-9p6pte, ga-84gkpab).
 #
 # ## Contents
-#   Por quê · Lotes · Pistas · Veredito · Como roda · O que NÃO faz · Ambiente
+#   Por quê · Lotes · Pistas · Revezamento · Veredito · Como roda · O que NÃO faz · Ambiente
 #
 # POR QUÊ: em 04/10 um teste de branch antiga mandou um e-mail de verdade. Rodar a suíte inteira toda noite só é aceitável com a saída de rede PROVADA
 #   cortada (canário do hetzner-iso-run.sh + helper de root hetzner-netns-run.sh) e ambiente limpo. Sem essa prova nada roda.
@@ -20,6 +20,11 @@
 #   agora (rc 95) ESPERA HZN_LANE_WAIT_S e tenta de novo, sem gastar tentativa nem virar "NÃO RODOU"; pista extra que não consegue rodar por causa do nó (sem slot, ssh, canário, bandeira) devolve o lote à fila e
 #   sai: a pista 1 (a de sempre) o pega, então a falha de uma pista extra não faz perder lote que a noite sem pistas teria rodado. Os lotes são tirados da fila em ordem; o resultado de cada um vai para $SCR/res.<n> e a leitura (soma, tabela,
 #   comparação, relatório) acontece DEPOIS, na ordem dos lotes: nada do que o relatório diz mudou. Vazamento medido ou lote sem prova em QUALQUER pista para a fila e derruba as outras pistas. HZN_LANES=1 = o laço sequencial de antes.
+# REVEZAMENTO (ga-hs43vb2): os lotes são cortados em ordem de caminho, então os do FIM são os que o orçamento corta (24/11: lotes 10 e 11) e os MESMOS arquivos ficariam de fora toda noite em que a suíte não cabe.
+#   A noite que fecha FALHOU com lote que não rodou grava os arquivos desses lotes em $CITY/.gc/logs/hetzner-nightly/last-skipped.files (+ .meta: de que noite) e a noite seguinte os põe À FRENTE da lista, antes de
+#   cortar os lotes: caem nos primeiros, que rodam primeiro. Só a noite COMPLETA remove a lista; qualquer outra saída a deixa como estava. Lista ilegível → ordem de sempre + aviso no relatório (nunca uma ordem inventada);
+#   arquivo da lista que sumiu da árvore é contado e largado. Cada arquivo roda ao menos a cada 2 noites, sem custo de infraestrutura, se a noite comporta ao menos metade da suíte. A baseline (last-complete.failed)
+#   só avança numa noite COMPLETA e a comparação PARCIAL é a de sempre. Campos do jsonl: carry_in/carry_in_files/carry_in_gone e carry_out/carry_out_files (docs/runbooks/hetzner-nightly-tests.md, seção Revezamento).
 # VEREDITO (última linha do stdout `VEREDITO: <x>`; uma linha jsonl por noite em $CITY/.gc/logs/hetzner-nightly.jsonl; um e-mail ao Mayor, salvo PULADO)
 #   COMPLETO  TODOS os lotes rodaram DENTRO do isolamento provado e o resumo do pytest de cada um foi lido: total (somado), falhas, novas falhas contra a última noite COMPLETA, duração.
 #             Teste que falha é dado do relatório, não falha do job (exit 0).
@@ -69,12 +74,16 @@ mkdir -p "$LOGDIR" 2>/dev/null || { say "FALHOU — não consegui criar $LOGDIR"
 
 LANES=1; NWAITS=0   # as pistas da rodada (validadas mais abaixo; até lá, 1) e quantas vezes uma pista esperou o nó ter espaço
 SHA="?"; ISO_LINE=""; EGRESS="?"; MAILRC=0; FETCHST="?"; CMPST="-"; STALE_NOTE=""; DEPLOY=""; NB=0; NRAN=0; NSKIP=0; NMAC=0; NHELD=0; NHF=0; NHP=0; ESCSUM=0; ESCUNK=0
+# revezamento (ga-hs43vb2): o que a noite fez com last-skipped.files. ENTRADA (CARRY): nao-lida (a noite acabou antes de ler) | ausente | aplicada | ilegivel; SAÍDA (CARRYOUT): inalterada (a noite acabou
+# sem decidir: a lista fica como estava) | gravada | nao-gravada | consumida | nao-removida. Os números são null até serem medidos (nunca um 0 que ninguém contou).
+CARRY=nao-lida; CARRYOUT=inalterada; CARRYN=null; CARRYGONE=null; CARRYOUTN=null; CARRYWHY=""; SKIPIDX=""
 jline() { # veredito motivo — a linha do jsonl desta noite (também a das noites PULADAS por lock: uma por noite)
   local escj=null   # escudo: nenhum lote rodou ou a linha GTN-ESCUDO de algum lote veio ilegível → null (não afirmo 0 sem ter lido)
   [ "$ESCUNK" = 0 ] && [ "$NRAN" -gt 0 ] && escj=$ESCSUM
-  jq -cn --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" --arg v "$1" --arg why "$2" --arg sha "$SHA" --arg iso "$ISO_LINE" --arg egress "$EGRESS" --arg fetch "$FETCHST" --arg cmp "$CMPST" \
+  jq -cn --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" --arg v "$1" --arg why "$2" --arg sha "$SHA" --arg iso "$ISO_LINE" --arg egress "$EGRESS" --arg fetch "$FETCHST" --arg cmp "$CMPST" --arg cin "$CARRY" --arg cout "$CARRYOUT" \
      --argjson wall "$(( $(date +%s) - T0 ))" --argjson mailrc "$MAILRC" --argjson nb "$NB" --argjson nr "$NRAN" --argjson ns "$NSKIP" --argjson nm "$NMAC" --argjson nh "$NHELD" --argjson esc "$escj" --argjson lanes "$LANES" --argjson waits "$NWAITS" \
-     '{ts:$ts,verdict:$v,reason:$why,sha:$sha,isolation:$iso,egress_attempts:$egress,fetch:$fetch,compare:$cmp,wall_s:$wall,mail_failed:$mailrc,batches:$nb,batches_ran:$nr,batches_skipped:$ns,mac_only_excluded:$nm,node_held_excluded:$nh,escudo_reports:$esc,lanes:$lanes,lane_waits:$waits}' >> "$JSONL" 2>/dev/null \
+     --argjson cinn "$CARRYN" --argjson cing "$CARRYGONE" --argjson coutn "$CARRYOUTN" \
+     '{ts:$ts,verdict:$v,reason:$why,sha:$sha,isolation:$iso,egress_attempts:$egress,fetch:$fetch,compare:$cmp,wall_s:$wall,mail_failed:$mailrc,batches:$nb,batches_ran:$nr,batches_skipped:$ns,mac_only_excluded:$nm,node_held_excluded:$nh,escudo_reports:$esc,lanes:$lanes,lane_waits:$waits,carry_in:$cin,carry_in_files:$cinn,carry_in_gone:$cing,carry_out:$cout,carry_out_files:$coutn}' >> "$JSONL" 2>/dev/null \
      || say "WARN: não gravei $JSONL"
 }
 finish() { # veredito motivo [exit] — grava o relatório, o jsonl, manda o e-mail (salvo PULADO) e sai
@@ -87,8 +96,9 @@ finish() { # veredito motivo [exit] — grava o relatório, o jsonl, manda o e-m
     $MAIL -s "$subj" -m "$(cat "$REPORT")" >/dev/null 2>&1 || { MAILRC=1; say "WARN: e-mail ao Mayor falhou (relatório em $REPORT)"; [ "$rcx" -ne 0 ] || rcx=1; }
   fi
   jline "$v" "$why"
-  # a linha de base (last-complete.*) fica: apagada depois de 14 dias sem noite COMPLETA, a próxima diria "primeira rodada" sem ser verdade
-  find "$LOGDIR" -type f ! -name 'last-complete.*' -mtime +"${HZN_KEEP_DAYS:-14}" -delete 2>/dev/null
+  # a linha de base (last-complete.*) fica: apagada depois de 14 dias sem noite COMPLETA, a próxima diria "primeira rodada" sem ser verdade. A lista do revezamento (last-skipped.*) também fica: apagada
+  # por idade, o arquivo que ficou sem rodar perderia a vez em silêncio (ela só sai quando uma noite COMPLETA a consome; arquivo que sumiu da árvore a lista descarta sozinha)
+  find "$LOGDIR" -type f ! -name 'last-complete.*' ! -name 'last-skipped.*' -mtime +"${HZN_KEEP_DAYS:-14}" -delete 2>/dev/null
   say "$subj"; say "VEREDITO: $v"; exit "$rcx"
 }
 
@@ -208,6 +218,37 @@ NHELD=$(wc -l < "$HELDX" | tr -d ' ')
 if [ "$NHELD" -gt 0 ]; then LC_ALL=C grep -vxF -f "$HELDX" "$FILES" > "$SCR/files.keep"; [ $? -le 1 ] || finish FALHOU "não tirei da lista os $NHELD arquivos que o nó não recebe: nada rodou" 1; mv -f "$SCR/files.keep" "$FILES"; fi
 NFILES=$(wc -l < "$FILES" | tr -d ' ')
 [ "$NFILES" -ge 1 ] || finish FALHOU "todos os arquivos de tests/ de origin/main@$SHA ficam no mini (mac-only $NMAC, não enviados ao nó $NHELD): nada a rodar no nó" 1
+# REVEZAMENTO (ga-hs43vb2): os arquivos dos lotes que NÃO rodaram na noite anterior rodam PRIMEIRO nesta. Sem isto os mesmos arquivos do fim da ordem de caminho ficam de fora TODA noite em que a suíte não cabe
+# (24/11: lotes 10 e 11). Uma noite que fecha FALHOU com lote que não rodou grava os arquivos deles em last-skipped.files (um caminho por linha, o formato de $FILES; last-skipped.meta diz de que noite) e esta etapa os põe
+# À FRENTE de $FILES, antes de pesar e cortar os lotes: caem nos primeiros lotes, que rodam primeiro. A ordem dos demais não muda. Cada arquivo roda ao menos a cada 2 noites sem custo de infraestrutura (se a noite
+# comporta metade da suíte). A baseline (last-complete.failed) e a comparação PARCIAL não mudam: só a noite COMPLETA avança a baseline.
+# vazio (sem arquivo) → ordem de sempre, sem aviso (CARRY=ausente); falhou/ilegível (a lista existe e não abre, está vazia, tem linha em branco ou nome fora de [A-Za-z0-9_./-], ou a reordenação não fechou a conta)
+# → ordem de sempre E um aviso no relatório (CARRY=ilegivel): a lista é descartada INTEIRA, nunca uma ordem inventada com o que deu para ler. Arquivo da lista que já não está na rodada (sumiu da árvore, virou
+# mac-only ou retido) é contado em CARRYGONE e largado: não vira lote, nem erro.
+SKIPF="$LOGDIR/last-skipped.files"; SKIPM="$LOGDIR/last-skipped.meta"; CARRYSRC=""; CARRY=ausente
+if [ -e "$SKIPF" ] || [ -L "$SKIPF" ]; then
+  CARRY=ilegivel
+  if ! { [ -f "$SKIPF" ] && [ -r "$SKIPF" ]; }; then CARRYWHY="$SKIPF existe e não abre como arquivo"
+  elif [ ! -s "$SKIPF" ]; then CARRYWHY="$SKIPF está vazio (a gravação é atômica e nunca grava lista vazia)"
+  else
+    BADL=$(LC_ALL=C grep -cvE '^[A-Za-z0-9_./-]+$' "$SKIPF" 2>/dev/null); RCB=$?
+    NREAD=$(LC_ALL=C sort -u "$SKIPF" 2>/dev/null | wc -l | tr -d ' ')
+    if [ "$RCB" -gt 1 ] || [ -z "$BADL" ] || [ "${NREAD:-0}" -lt 1 ]; then CARRYWHY="não consegui conferir as linhas de $SKIPF"
+    elif [ "$BADL" -gt 0 ]; then CARRYWHY="$BADL linha(s) de $SKIPF em branco ou com nome fora de [A-Za-z0-9_./-]"
+    else
+      LC_ALL=C grep -xF -f "$SKIPF" "$FILES" > "$SCR/carry.in" 2>/dev/null; RC1=$?
+      LC_ALL=C grep -vxF -f "$SKIPF" "$FILES" > "$SCR/carry.rest" 2>/dev/null; RC2=$?
+      # a conta fecha quando (os da lista que estão na rodada) + (os demais) é, linha a linha, o mesmo conjunto de $FILES: nada some, nada se repete, nada entra
+      if [ "$RC1" -le 1 ] && [ "$RC2" -le 1 ] && cat "$SCR/carry.in" "$SCR/carry.rest" > "$SCR/files.carry" 2>/dev/null \
+         && LC_ALL=C sort "$SCR/files.carry" | cmp -s - "$FILES"; then
+        if mv -f "$SCR/files.carry" "$FILES"; then
+          CARRY=aplicada; CARRYN=$(wc -l < "$SCR/carry.in" | tr -d ' '); CARRYGONE=$(( NREAD - CARRYN ))
+          CARRYSRC=$(head -n 1 "$SKIPM" 2>/dev/null | cut -c1-160)   # vazio/ilegível → o relatório diz "noite de origem ilegível"; a ordem não depende disto
+        else CARRYWHY="não consegui gravar a ordem nova em $FILES"; fi
+      else CARRYWHY="a reordenação com $SKIPF não fechou a conta (grep rc $RC1/$RC2)"; fi
+    fi
+  fi
+fi
 BADNAME=$(LC_ALL=C grep -cvE '^[A-Za-z0-9_./-]+$' "$FILES"); [ "${BADNAME:-0}" -eq 0 ] || finish FALHOU "$BADNAME arquivo(s) de teste com nome fora de [A-Za-z0-9_./-] (primeiro: $(LC_ALL=C grep -vE '^[A-Za-z0-9_./-]+$' "$FILES" | head -n 1)): não passam seguros na linha de comando; nada rodou" 1
 # o peso do arquivo é o nº de `def test_` (mínimo 1): barato, estável e na ordem certa de grandeza do tempo/memória; o nº de lotes SAI da árvore, nunca é fixo
 ( cd "$TREE" && tr '\n' '\0' < "$FILES" | xargs -0 grep -c -H -E '^[[:space:]]*(async[[:space:]]+)?def[[:space:]]+test_' ) > "$WGT" 2>/dev/null
@@ -223,6 +264,20 @@ NBX=$(wc -l < "$SCR/batch.meta" 2>/dev/null | tr -d ' ')
 case "$NBX" in ''|0|*[!0-9]*) finish FALHOU "não montei os lotes ($NFILES arquivos pesados): nada rodou" 1 ;; esac
 NB=$NBX
 NDEFS=$(awk '{s+=$3} END{print s+0}' "$SCR/batch.meta")
+# o texto do revezamento (entrada) para o log e os dois relatórios. Os arquivos à frente ocupam as primeiras linhas de $FILES: o último lote que os contém é onde a soma de arquivos por lote alcança CARRYN
+# (vazio/ilegível → "?", nunca um número chutado). CARRY=ausente fica calado: não há o que dizer.
+CARRYTXT=""
+case "$CARRY" in
+  aplicada)
+    CARRYSRC=${CARRYSRC:-"noite de origem ilegível (last-skipped.meta)"}; CARRYGTXT=""
+    [ "$CARRYGONE" -eq 0 ] || CARRYGTXT="; $CARRYGONE da lista já não estão na rodada (sumiram da árvore, viraram mac-only ou retidos)"
+    if [ "$CARRYN" -eq 0 ]; then CARRYTXT="revezamento: a lista de $CARRYSRC tinha $CARRYGONE arquivo(s) e NENHUM está mais na rodada: ordem de sempre"
+    else
+      CARRYB=$(awk -v n="$CARRYN" '{ c += $2; if (c >= n) { printf "%02d", $1; exit } }' "$SCR/batch.meta" 2>/dev/null); CARRYB=${CARRYB:-?}
+      CARRYTXT="revezamento: $CARRYN arquivo(s) dos lotes que não rodaram em $CARRYSRC rodam PRIMEIRO, nos lotes 01 a $CARRYB$CARRYGTXT"
+    fi ;;
+  ilegivel) CARRYTXT="ATENÇÃO — revezamento: a lista $SKIPF não foi lida ($CARRYWHY): ordem de sempre, nenhum arquivo foi posto à frente (a noite que fechar com lote sem rodar a regrava; a COMPLETA a remove)" ;;
+esac
 
 # ── a rodada ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
 # O orçamento é do SCRIPT: DEADLINE = T0 + TIMEOUT_S − margem do relatório. Cada lote recebe min(o que resta, HZN_BATCH_TIMEOUT_S); com menos que HZN_MIN_BATCH_S ele nem começa.
@@ -242,6 +297,7 @@ fi
 DEADLINE=$(( BUDGET_END - MARGIN ))
 NRAN=0; NSKIP=0; RANSEC=0; RANDEFS=0; RANFILES_BAD=0; : > "$SCR/ran.files"; SKIPLIST=""; TP=0; TF=0; TE=0; TS=0; TXF=0; TXP=0; LISTOK=1; LISTWHY=""; PYSECS=0; PYUNK=0; EGSUM=0; EGUNK=0; EGSEEN=0; FIRSTCAP=""
 say "rodando a suíte do WA @$SHA em $NODE: $NFILES arquivos ($NMAC mac-only e $NHELD não enviados ao nó ficaram de fora), $NDEFS def test_, $NB lotes de ~$BATCH_DEFS (orçamento $(( DEADLINE - $(date +%s) ))s para os lotes, limite: $BUDGET_BY)"
+[ -z "$CARRYTXT" ] || say "$CARRYTXT"
 
 tail1() { grep . "$1" 2>/dev/null | tail -n 1 | cut -c1-200; }
 cnt() { printf '%s' "$SUM" | sed -n -E "s/.*[^0-9]([0-9]+) $1.*/\1/p;s/^([0-9]+) $1.*/\1/p" | head -n 1; }
@@ -403,7 +459,7 @@ post_one_batch() { # n → lê o resultado do lote n e o soma
     # vazio (lote sem arquivo) não existe: o awk só abre lote com arquivo; falhou/ilegível (a lista do lote sumiu) → RANFILES_BAD, e a comparação parcial fica INDISPONÍVEL: sem a lista não sei quais ids da baseline comparar
     cat "$SCR/batch.$i" >> "$SCR/ran.files" 2>/dev/null || RANFILES_BAD=1
     agg_batch "$BOUT" "$nn"
-  else NSKIP=$(( NSKIP + 1 )); SKIPLIST="$SKIPLIST${SKIPLIST:+, }$nn"; say "lote $nn NÃO RODOU: $B_WHY"; fi
+  else NSKIP=$(( NSKIP + 1 )); SKIPLIST="$SKIPLIST${SKIPLIST:+, }$nn"; SKIPIDX="$SKIPIDX $i"; say "lote $nn NÃO RODOU: $B_WHY"; fi
 }
 claim_next() { # → o menor lote ainda sem dono (mkdir é atômico: duas pistas nunca pegam o mesmo); sem lote → rc 1
   local j=0
@@ -490,6 +546,23 @@ if [ "$NSKIP" -gt 0 ]; then
   PACE="ritmo desconhecido (nenhum lote rodou até o fim)"
   if [ "$NRAN" -gt 0 ] && [ "$RANDEFS" -gt 0 ]; then PACE="ritmo medido ${RANSEC}s para $RANDEFS def test_ (~$(( RANSEC * NDEFS / RANDEFS ))s para os $NDEFS da árvore)"; fi
   [ "$LANES" -le 1 ] || PACE="$PACE; $LANETXT"
+  # REVEZAMENTO (saída): os arquivos dos lotes que NÃO rodaram vão para last-skipped.files (a lista inteira da noite SUBSTITUI a anterior: o que rodou hoje sai, o que não rodou de novo continua na frente) e rodam
+  # PRIMEIRO amanhã. Só grava com a conta fechada: os arquivos lidos dos lotes que não rodaram têm de somar a contagem do batch.meta deles. Gravação atômica (cp para .new, mv). vazio (nenhum arquivo, a soma não
+  # fecha) / falhou (cp, mv, leitura de um batch.N) → a lista anterior FICA como estava (nao-gravada) e o relatório avisa que esses arquivos NÃO passam à frente amanhã; nunca uma lista pela metade.
+  # O .meta (de que noite é a lista) sai ANTES da troca e volta depois dela: nunca um .meta de outra noite ao lado da lista nova.
+  SKW=0; : > "$SCR/skip.files"
+  for k in $SKIPIDX; do cat "$SCR/batch.$k" >> "$SCR/skip.files" 2>/dev/null || SKW=1; done
+  SKEXP=$(awk -v s=" $SKIPIDX " 'index(s, " " $1 " ") > 0 { c += $2 } END { print c + 0 }' "$SCR/batch.meta" 2>/dev/null); SKGOT=$(wc -l < "$SCR/skip.files" 2>/dev/null | tr -d ' ')
+  if [ "$SKW" = 0 ] && [ "${SKGOT:-0}" -ge 1 ] && [ "$SKGOT" = "$SKEXP" ] \
+     && [ ! -d "$SKIPF" ] && cp "$SCR/skip.files" "$SKIPF.new" 2>/dev/null && rm -f "$SKIPM" 2>/dev/null && mv -f "$SKIPF.new" "$SKIPF" 2>/dev/null; then   # pasta no lugar da lista: o mv a levaria para DENTRO dela e devolveria 0
+    CARRYOUT=gravada; CARRYOUTN=$SKGOT; COUTM=""
+    echo "$DAY @$SHA: $NSKIP de $NB lotes não rodaram ($SKIPLIST), $SKGOT arquivos" > "$SKIPM" 2>/dev/null || COUTM=" ($SKIPM não gravado: amanhã a noite de origem sai ilegível; a ordem não depende disto)"
+    COUTTXT="revezamento: os $SKGOT arquivos dos $NSKIP lote(s) que NÃO rodaram ($SKIPLIST) foram gravados em $SKIPF e rodam PRIMEIRO na próxima noite$COUTM"
+  else
+    rm -f "$SKIPF.new" 2>/dev/null; CARRYOUT=nao-gravada
+    COUTTXT="ATENÇÃO — revezamento: NÃO gravei os arquivos dos lotes que não rodaram ($SKIPLIST) em $SKIPF (leitura $SKW, lidos ${SKGOT:-?} de $SKEXP): a lista ficou como estava e esses arquivos NÃO passam à frente na próxima noite"
+  fi
+  say "$COUTTXT"
   { echo "# Hetzner nightly $DAY — FALHOU: $NSKIP de $NB lotes NÃO RODARAM"; echo
     echo "- origin/main @$SHA, nó $NODE, $NFILES arquivos de tests/ ($NDEFS def test_) em $NB lotes de ~$BATCH_DEFS"
     [ "$NMAC" -eq 0 ] || echo "- fora da rodada por regra do nó: $NMAC arquivos mac-only (lista em $MACX; rodam no MBP/mini)"
@@ -497,6 +570,8 @@ if [ "$NSKIP" -gt 0 ]; then
     [ -z "$STALE_NOTE" ] || echo "- ATENÇÃO: $STALE_NOTE"
     echo "- instalado no nó: $DEPLOY"
     echo "- lotes que NÃO rodaram: $SKIPLIST (motivo na tabela). Sem eles a suíte NÃO foi completa: não há veredito verde, não há total da suíte e a linha de base não foi tocada"
+    [ -z "$CARRYTXT" ] || echo "- $CARRYTXT"
+    echo "- $COUTTXT"
     echo "- $PCMP"
     echo "- $BUDGETTXT"
     echo "- $PACE"
@@ -526,6 +601,16 @@ elif [ -e "$PREV" ]; then
   else CMP="comparação INDISPONÍVEL: $PREV existe e não pôde ser lido como lista de ids em JSON (as falhas de hoje estão em $CUR)"; CMPST=indisponivel; fi
 else NEWTXT="primeira rodada"; CMPST=ok
 fi
+# REVEZAMENTO (saída): a noite COMPLETA rodou TODOS os arquivos, então a dívida da lista está paga: ela sai (last-skipped.files e .meta), mesmo a que estava ilegível. A lista só muda aqui e na noite que fecha com lote
+# que não rodou (acima); qualquer outra saída (INERTE, PULADO, vazamento, FALHOU antes de fechar a conta, total implausível) a deixa como estava. vazio (não havia lista) → nada a dizer; falhou (rm não removeu) →
+# nao-removida, com aviso: a lista velha só reordena de novo amanhã (inofensivo), mas ninguém fica achando que foi consumida.
+COUTTXT=""; HADLIST=0; { [ -e "$SKIPF" ] || [ -L "$SKIPF" ]; } && HADLIST=1
+rm -f "$SKIPF" "$SKIPM" 2>/dev/null
+if [ "$HADLIST" = 1 ]; then
+  if [ -e "$SKIPF" ] || [ -L "$SKIPF" ]; then CARRYOUT=nao-removida; COUTTXT="ATENÇÃO — revezamento: a noite foi COMPLETA mas NÃO consegui remover $SKIPF: a lista fica e reordena de novo amanhã (nenhum arquivo deixa de rodar)"
+  else CARRYOUT=consumida; COUTTXT="revezamento: noite COMPLETA, todos os arquivos rodaram: $SKIPF foi consumida (removida)"; fi
+  say "$COUTTXT"
+fi
 GOAL="ATINGIDA"; [ "$WALL" -lt "$TIMEOUT_S" ] || GOAL="ESTOURADA"
 ESCTXT="$ESCSUM relatório(s) refeito(s) sem o hook da suíte que quebrou (o teste continua reprovando; linha GTN-ESCUDO nas saídas dos lotes)"
 [ "$ESCSUM" -gt 0 ] || ESCTXT="0 (nenhum hook da suíte quebrou ao montar o relatório)"
@@ -538,6 +623,8 @@ ESCTXT="$ESCSUM relatório(s) refeito(s) sem o hook da suíte que quebrou (o tes
   [ -z "$STALE_NOTE" ] || echo "- ATENÇÃO: $STALE_NOTE"
   echo "- instalado no nó: $DEPLOY"
   echo "- total: $TOTAL ($PASSED passaram, $FAILED falharam, $ERRORS erros, $SKIPPED pulados, $XF xfail, $XP xpass); $NRAN de $NB lotes rodaram"
+  [ -z "$CARRYTXT" ] || echo "- $CARRYTXT"
+  [ -z "$COUTTXT" ] || echo "- $COUTTXT"
   echo "- duração: pytest somado ${DUR} (${PYSECS:-?} s), relógio total ${WALL} s; meta de $(( TIMEOUT_S / 60 )) min: $GOAL"
   [ -z "$LANETXT" ] || echo "- $LANETXT"
   echo "- $CMP"
