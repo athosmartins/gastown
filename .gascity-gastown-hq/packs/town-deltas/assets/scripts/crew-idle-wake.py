@@ -99,7 +99,7 @@ def beads_em_andamento(store, run=rodar):
     if rc != 0:
         return None
     try:
-        dados = json.loads(out or "[]")
+        dados = json.loads(out or "[]")   # third-state-waiver: JSON corrompido coberto no caso 6c/6d de crew-idle-wake.selftest.py (o check não lê selftest .py)
     except ValueError:
         return None
     return dados if isinstance(dados, list) else None
@@ -171,7 +171,7 @@ def mensagem(ids, minutos: int) -> str:
 
 def ler_estado(nome: str) -> dict:
     try:
-        return json.loads((STATE_DIR / f"{nome}.json").read_text())
+        return json.loads((STATE_DIR / f"{nome}.json").read_text())   # third-state-waiver: estado ilegível/corrompido coberto no caso 6e/6f de crew-idle-wake.selftest.py
     except (OSError, ValueError):
         return {}
 
