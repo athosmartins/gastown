@@ -30,8 +30,8 @@ tentativas; 3 seguidas sem a bead andar (updated_at) → mail ao Mayor (uma vez 
 andar. A tela não zera as tentativas: a própria ordem injetada muda a tela.
 
 Falhas (nunca injeta sob dúvida): `tmux` ou `bd` que não respondem → nenhuma injeção na passada, log «não sei»;
-5 passadas seguidas sem conseguir ler → mail ao Mayor (o vigia está cego). Store de beads ilegível → as sessões
-daquele store ficam sem veredito (nunca «sem trabalho»).
+5 passadas seguidas sem conseguir ler → mail ao Mayor (o vigia está cego). Store de beads ilegível (com outro legível) →
+as sessões com bead nele não recebem ordem nesta passada e o relógio delas recomeça (inerte: atrasa, nunca injeta por palpite).
 
 Uso: crew-idle-wake.py [--dry-run]   (launchd a cada 120 s; kill switch: .gc/state/crew-idle-wake.disabled)
 """
@@ -94,7 +94,7 @@ def sessoes_tmux(run=rodar):
 
 
 def beads_em_andamento(store, run=rodar):
-    """Beads in_progress do store. vazio → []; falhou/ilegível → None (as sessões deste store ficam sem veredito)."""
+    """Beads in_progress do store. vazio → []; falhou/ilegível → None (sessões com bead neste store ficam sem ordem nesta passada)."""
     rc, out, _ = run(["bd", "-C", store, "list", "--status", "in_progress", "--limit", "0", "--json"], timeout=60)
     if rc != 0:
         return None
@@ -219,7 +219,7 @@ def passada(dry: bool = False, run=rodar, agora=None) -> int:
     beads = [b for v in lidos.values() if v for b in v]
     for store, v in lidos.items():
         if v is None:
-            log(f"store ilegível nesta passada: {store} — as sessões dele ficam sem veredito")
+            log(f"store ilegível nesta passada: {store} — sessões com bead nele ficam sem ordem nesta passada")
     injetadas = 0
     for sess in sess_list:
         if e_pool(sess):
