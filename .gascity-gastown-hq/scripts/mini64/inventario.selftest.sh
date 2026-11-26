@@ -11,6 +11,8 @@
 #   R4 saída hostil (crase, ESC, token, VAR=segredo) é limpa ou suprimida e o doc segue válido
 #   R5 sonda pendurada: prazo por sonda e orçamento total; sai 0 em segundos   R6 pasta sem escrita: sai 1 e o doc antigo fica; HOME vazio: sai 2
 #   R7 duas rodadas: sem sobra .inventario-work   R8 estático: bash -n (3.2 se MINI64_B32), sem recurso de bash 4, sem comando que varre pasta protegida
+#   R9 uma falha só: o R2 quebra tudo junto e uma seção que falha por outro caminho esconde o «ok» indevido; aqui cada mundo tem 1-3 falhas em seções
+#      DISJUNTAS e o Resumo tem de apontar exatamente essas (e nenhuma no mundo feliz). O mundo mora em /tmp: um TMPDIR longo casaria o SECRET_RE
 set -u
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SCRIPT="${MINI64_INVENTARIO:-$HERE/inventario.sh}"   # o override é da bateria de mutantes: aponta uma cópia mutante
@@ -19,7 +21,7 @@ PASS=0; FAIL=0
 ok()  { PASS=$((PASS+1)); printf '  ok: %s\n' "$1"; }
 bad() { FAIL=$((FAIL+1)); printf '  BAD: %s\n     %s\n' "$1" "${2:-}"; }
 if [ ! -f "$SCRIPT" ]; then bad "o script sob teste existe" "$SCRIPT"; echo "== $PASS ok, $FAIL BAD"; exit 1; fi
-TMP="$(mktemp -d)"; trap 'chmod -R u+rwx "$TMP" 2>/dev/null; rm -rf "$TMP"' EXIT
+TMP="$(TMPDIR=/tmp mktemp -d)"; trap 'chmod -R u+rwx "$TMP" 2>/dev/null; rm -rf "$TMP"' EXIT
 ROOTUSER=0; [ "$(id -u)" = 0 ] && ROOTUSER=1
 NA='não apurado\*\*: '   # o doc escreve **não apurado**: motivo
 
@@ -31,6 +33,8 @@ has()   { local s; s=$(sect "$1"); if grep -qE -e "$2" <<<"$s"; then ok "$3"; el
 hasnt() { local s; s=$(sect "$1"); if grep -qE -e "$2" <<<"$s"; then bad "$3" "seção $1 tem /$2/"; else ok "$3"; fi; }
 docs()  { if grep -qE -e "$1" "$DOC"; then ok "$2"; else bad "$2" "doc sem /$1/"; fi; }
 docnot() { if grep -qE -e "$1" "$DOC"; then bad "$2" "doc tem /$1/"; else ok "$2"; fi; }
+nok()   { awk -F'|' '/^\| [0-9]+\. / && $3 !~ /^ ok $/ { split($2, a, "."); gsub(/ /, "", a[1]); printf "%s ", a[1] }' "$DOC"; }   # nº das seções do Resumo que NÃO estão «ok»
+sf()    { local g; g=$(nok); [ "$g" = "$1" ] && ok "$2 (não ok: [${1% }])" || bad "$2" "seções não ok: esperado [$1] veio [$g]"; }   # sf "<nºs esperados, com espaço no fim>" <descrição>
 
 mkworld() {   # mkworld <nome>: mundo novo e feliz em $TMP/<nome>
   W="$TMP/$1"; H="$W/home"; R="$W/root"; C="$W/city"; B="$W/bin"; G="$W/gen"; FX="$W/fx"; CALLS="$W/calls.log"; DOC="$C/docs/runbooks/mini64/01-inventario.md"
@@ -88,6 +92,11 @@ EOF
   printf '#!/bin/bash\nexec /Users/test/venv/bin/python3 foo.py\nbw serve --port 8087\n' >"$W/wrappers/w1.sh"
   # nomes de item citados pelo código; perfis Claude com token plantado; canários nas pastas protegidas
   printf 'security find-generic-password -s "Claude Code-credentials" >/dev/null 2>&1\nsecurity find-generic-password -s "Pool-Item-Absent" >/dev/null\nsecurity find-generic-password -s "Device-Only-Item" >/dev/null\nTOK=$(secret whapi-token)\nsecret pipedrive-api | head -n1\nx=~/Library/CloudStorage/GoogleDrive-athos@example.test/My\\ Drive\n' >"$C/scripts/keys.sh"
+  cat >>"$C/scripts/keys.sh" <<'FRAG'
+security find-generic-password -s "{svc}" 2>&1
+grep -E 'security find-generic-password -s "([^"]+)"' x
+security find-generic-password -s "{item_service()}" 2>&1
+FRAG
   printf '{"numStartups":3,"oauthAccount":{"emailAddress":"athosmartins@example.test","accessToken":"sk-ant-oat01-PLANTEDTOKEN0123456789abcdef"}}\n' >"$H/.claude.json"
   printf '{"oauthAccount":{"emailAddress":"athosmartins+1@example.test"}}\n' >"$H/.gastown/claude-accounts/acct1/.claude.json"; printf '{"accessToken":"PLANTEDCREDSFILE9876543210"}\n' >"$H/.gastown/claude-accounts/acct1/.credentials.json"
   for d in Desktop Documents Library/CloudStorage; do printf 'SECRET-CANARY\n' >"$H/$d/SECRET-CANARY.txt"; chmod 000 "$H/$d"; done
@@ -161,7 +170,8 @@ has 12 'athosmartins@example\.test · sem \.credentials\.json' "12: conta padrã
 has 13 'GoogleDrive-athos@example\.test' "13: nome de montagem lido do código"; has 13 'não está rodando' "13: Drive parado"; hasnt 13 'canary' "13: ~/Library/CloudStorage não foi aberto"
 has 14 'bw serve --port 8087 --hostname 127\.0\.0\.1' "14: bw serve em execução (só porta e hostname)"; has 14 'com\.gascity\.d' "14: plist com bw serve"; has 14 'w1\.sh' "14: wrapper com bw serve"; has 15 'sleep 0' "15: pmset -g custom"
 docs 'sudo pmset -c autorestart 1' "checklist: comandos do pmset do mini atual"; docs 'Nome do computador = «Mini de Teste»' "checklist: nome"; docs '192\.168\.0\.77 \(MAC atual aa:bb:cc:dd:ee:01\)' "checklist: IP e MAC"; docs '«Python 3\.9\.6»' "checklist: python das CLT"
-docs '^## Resumo' "tem Resumo"; docs '0 linha\(s\) com cara de segredo' "relata zero supressões no mundo limpo"
+docs '^## Resumo' "tem Resumo"; docs '0 linha\(s\) com cara de segredo' "relata zero supressões no mundo limpo"; sf "" "R1/Resumo: no mundo feliz nenhuma seção é parcial"
+hasnt 11 '[{]svc[}]|[(][[]\^|item_service' "11: nome montado por variável ({svc}, ([^…, item_service()) não vira item do Keychain"
 FIRST=$(grep -n '^## ' "$DOC" | head -n 1 | cut -d: -f2); [ "$FIRST" = "## Contents" ] && ok "## Contents é a primeira seção" || bad "## Contents primeiro" "$FIRST"
 if [ -f "$HERE/../doc-rules-lint.py" ] && command -v python3 >/dev/null 2>&1; then lo=$(python3 -I "$HERE/../doc-rules-lint.py" --check --root "$(dirname "$DOC")" 01-inventario.md 2>&1); lrc=$?; [ "$lrc" = 0 ] && ok "doc passa no doc-rules-lint" || bad "doc-rules-lint" "rc=$lrc $lo"; fi
 # nenhum segredo plantado, nem na saída do script
@@ -186,7 +196,7 @@ for b in lsof scutil.get_HostName pkgutil ipconfig; do fxrc "$b" 1; fxerr "$b" b
 runinv
 [ "$RC" = 0 ] && ok "R2: sai 0 mesmo com tudo falhando" || bad "R2 rc" "rc=$RC $ERR"
 has 1 'scutil --get ComputerName: scutil falhou' "R2/1: scutil rc≠0 é não apurado"; has 1 "${NA}scutil --get HostName: scutil falhou .rc=1: boom" "R2/1: rc 1 com erro que não é «not set» é não apurado"; hasnt 1 'não definido' "R2/1: nada vira «não definido»"
-has 1 "${NA}ipconfig getifaddr en0" "R2/1: ipconfig rc 1 com erro é não apurado"; hasnt 1 'sem IPv4' "R2/1: erro não vira «sem IPv4»"; has 1 'não apurado.*networksetup' "R2/1: networksetup"
+has 1 "${NA}ipconfig getifaddr en0" "R2/1: ipconfig rc 1 com erro é não apurado"; hasnt 1 'sem IPv4' "R2/1: erro não vira «sem IPv4»"; hasnt 1 'IP de LAN: nenhuma interface' "R2/1: nem «nenhuma interface tem IPv4»"; has 1 'não apurado.*networksetup' "R2/1: networksetup"
 has 2 'não apurado.*TCC\.db.*[Ss]em Acesso Total ao Disco' "R2/2: TCC.db ilegível"; hasnt 2 '[0-9]+ da cidade,' "R2/2: sem leitura não há contagem «0 da cidade»"; has 2 'python3 → .* · versão não apurada' "R2/2: versão que falhou mantém o caminho"
 has 3 "${NA}Command Line Tools" "R2/3: CLT"; hasnt 3 'não instalados' "R2/3: pkgutil rc 1 com erro não vira «CLT não instaladas»"; has 4 "${NA}systemextensionsctl list" "R2/4: systemextensionsctl"; has 4 "${NA}kextstat: respondeu vazio" "R2/4: kextstat vazio não vale como «nenhum kext»"; hasnt 4 'nenhum da WCH|nenhuma da WCH' "R2/4: falha não vira «nenhum da WCH»"
 has 5 'não apurado.*system_profiler' "R2/5: system_profiler"; has 5 "${NA}celulares: o servidor adb não está rodando" "R2/5: adb parado não vira «0 celulares»"; hasnt 5 'celulares no adb' "R2/5: sem adb não há contagem de celulares"
@@ -217,7 +227,7 @@ mkworld r3; rm -f "$R/Library/LaunchDaemons"/* "$R/etc/sudoers.d"/* "$R/dev"/*; 
 fx kextstat 'Index Refs Address Size Wired Name (Version)'; fx systemextensionsctl '0 extension(s)'; fx sqlite3 'kTCCServiceMicrophone|us.zoom.xos|2'; fxrc lsof 1; fx lsof ''
 fx adb.devices_l 'List of devices attached'; fx brew.leaves ''; fx launchctl.print_disabled 'disabled services = {\n}'; fx launchctl.list 'PID\tStatus\tLabel'; fx ps '/usr/bin/python3 foo.py'
 fxrc pkgutil 1; fx pkgutil ''; fxerr pkgutil "No receipt for 'com.apple.pkg.CLTools_Executables' found at '/'."; fx pluginkit '    com.apple.CloudDocs.iCloudDriveFileProvider(1.0)'
-rm -f "$C/scripts/keys.sh" "$H/Library/LaunchAgents/com.whatsapp.a.plist" "$H/Library/LaunchAgents/com.gascity.d.plist" "$H/Library/LaunchAgents/com.athos.g.plist" "$W/wrappers/w1.sh"; rmdir "$H/.gastown/claude-pool-cred"
+rm -f "$C/scripts/keys.sh" "$H/Library/LaunchAgents/com.whatsapp.a.plist" "$H/Library/LaunchAgents/com.gascity.d.plist" "$H/Library/LaunchAgents/com.athos.g.plist" "$W/wrappers/w1.sh" "$H/.gastown/claude-accounts/acct1"/.claude.json "$H/.gastown/claude-accounts/acct1"/.credentials.json; rmdir "$H/.gastown/claude-pool-cred" "$H/.gastown/claude-accounts/acct1"
 printf '<plist><dict><key>Label</key><string>org.other.p3</string><key>ProgramArguments</key><array><string>%s/usr/bin/python3</string><string>x.py</string></array></dict></plist>\n' "$R" >"$H/Library/LaunchAgents/org.other.p3.plist"
 runinv
 [ "$RC" = 0 ] && ok "R3: sai 0" || bad "R3 rc" "rc=$RC $ERR"
@@ -226,7 +236,7 @@ has 4 'nenhuma da WCH entre as listadas \(apurado\)' "R3/4: extensões sem WCH, 
 has 5 'celulares no adb \(0.*: nenhum' "R3/5: adb sem celular = nenhum"; has 5 'A03 visível no adb: 0' "R3/5: A03 zero"; has 8 '/Library/LaunchDaemons: 0 plist' "R3/8: LaunchDaemons vazio"; has 8 'sudoers\.d.*nenhum \(o comando respondeu vazio\)' "R3/8: sudoers.d vazio"
 has 9 'brew leaves: nenhum \(o comando respondeu vazio\)' "R3/9: brew sem leaves"; hasnt 9 'não apurado' "R3/9: sem falha"; has 10 'nenhum listener TCP visível' "R3/10: lsof rc 1 vazio"; hasnt 10 'não apurado' "R3/10: sem falha"
 has 7 '\| com\.gascity \* \| 1 \| 0 \| 0 \| 1 \|' "R3/7: com override vazio, 0 desabilitado é medido (não «?»)"; has 11 'nenhum' "R3/11: sem nomes citados no código"; has 13 'não está rodando' "R3/13: Drive parado"
-has 14 'nenhum «bw serve» rodando agora' "R3/14: sem bw serve"; has 7 '\| com\.athos \* \| 0 \| 0 \| 0 \| 0 \|' "R3/7: prefixo da cidade sem plist sai com 0 medido (não some)"; has 12 'claude-pool-cred.: pasta não existe \(apurado\)' "R3/12: pasta padrão ausente é dita"
+has 14 'nenhum «bw serve» rodando agora' "R3/14: sem bw serve"; has 7 '\| com\.athos \* \| 0 \| 0 \| 0 \| 0 \|' "R3/7: prefixo da cidade sem plist sai com 0 medido (não some)"; has 12 'claude-pool-cred.: pasta não existe \(apurado\)' "R3/12: pasta padrão ausente é dita"; has 12 'nenhuma conta de pasta própria' "R3/12: pasta de contas que existe e está vazia é «nenhuma conta»"
 has 3 '/root/usr/bin/python3.: não executado' "R3/3: /usr/bin/python3 citado por um plist NÃO roda sem CLT (o shim abriria o instalador)"; hasnt 3 '/root/usr/bin/python3. · Python' "R3/3: nenhuma versão do shim no doc"
 has 11 'Keychain citados no código: nenhum nas [0-9]+ raízes lidas \([0-9]+ candidatas não existem' "R3/11: o «nenhum» dos itens do Keychain diz quantas raízes candidatas não existem"
 has 11 'passados ao secret: nenhum nas [0-9]+ raízes lidas \([0-9]+ candidatas não existem' "R3/11: o «nenhum» dos nomes do secret diz o mesmo"; has 1 'HostName: \(não definido\)' "R3/1: HostName"
@@ -242,10 +252,10 @@ docnot 'abcd1234efgh5678ijkl|ghp_0123' "R4: token na saída de um comando é sup
 if [ -f "$HERE/../doc-rules-lint.py" ] && command -v python3 >/dev/null 2>&1; then python3 -I "$HERE/../doc-rules-lint.py" --check --root "$(dirname "$DOC")" 01-inventario.md >/dev/null 2>&1 && ok "R4: doc segue válido no doc-rules-lint" || bad "R4 lint" "doc-rules-lint reprovou"; fi
 
 echo "== R5 sonda pendurada"
-mkworld r5; printf '30\n' >"$FX/system_profiler.sleep"; for s in pkgutil brew lsof pmset; do printf '3\n' >"$FX/$s.sleep"; done; runinv MINI64_PROBE_S=2 MINI64_BUDGET_S=5
+mkworld r5; printf '30\n' >"$FX/system_profiler.sleep"; for s in pkgutil brew lsof pmset; do printf '3\n' >"$FX/$s.sleep"; done; runinv MINI64_PROBE_S=2 MINI64_BUDGET_S=9
 [ "$RC" = 0 ] && ok "R5: sai 0" || bad "R5 rc" "rc=$RC $ERR"
 [ "$ELAPSED" -le 25 ] && ok "R5: o orçamento corta a espera (${ELAPSED}s, com sondas de 30 s penduradas)" || bad "R5 tempo" "${ELAPSED}s"
-has 5 'system_profiler estourou o prazo' "R5/5: sonda estourada é dita"; docs 'orçamento de 5s esgotado' "R5: acabou o orçamento e o doc diz"
+has 5 'system_profiler estourou o prazo' "R5/5: sonda estourada é dita"; docs 'orçamento de 9s esgotado' "R5: acabou o orçamento e o doc diz"
 
 echo "== R6 pasta sem escrita / HOME vazio"
 mkworld r6; runinv; cksum "$DOC" >"$W/doc.ck"
@@ -267,4 +277,39 @@ if [ -n "${MINI64_B32:-}" ]; then o=$("$MINI64_B32" -n "$SCRIPT" 2>&1); r=$?; { 
 CODE=$(grep -vE '^[[:space:]]*#' "$SCRIPT")
 B4=$(grep -nE '(declare|typeset) +-A|mapfile|readarray|[$][{][A-Za-z_]+(\^\^|,,)[}]|&>>|[|]&|=~|coproc|printf +-v|local +-n' <<<"$CODE" | head -n 3); [ -z "$B4" ] && ok "sem recurso de bash 4 (array associativo, mapfile, =~, \${x^^})" || bad "recurso de bash 4" "$B4"
 SW=$(grep -nE '(ls|find|du|stat|cat|grep|tar|rsync|cp|mv|cd|tree)[^#|;]*(Desktop|Documents|Downloads|Pictures|Movies|Music|CloudStorage|Mobile Documents|/Volumes)|"[$]H"/[*]|[$]HOME/[*]|(ls|find|du|tree|ncdu|grep -r)[^#|;]*"?[$](H|HOME)"?( |$)' <<<"$CODE" | head -n 3); [ -z "$SW" ] && ok "nenhum comando varre o \$HOME nem pasta protegida" || bad "varredura de pasta protegida no código" "$SW"
+echo "== R9 uma falha só (cada mundo: falhas em seções disjuntas; o Resumo aponta exatamente elas)"
+mkworld f1; fxrc security.list_keychains_d_user 3; fxerr security.list_keychains_d_user boom; runinv
+sf "11 12 " "R9/1 só o list-keychains falha: as contas Claude também ficam parciais"; has 12 'Claude Code-credentials. · não apurado \(keychain desta sessão' "R9/1: a linha da conta diz não apurado"
+mkworld f2; ln -s "$W/nao-existe" "$H/Library/LaunchAgents/aaa.plist"; ln -s "$W/nao-existe" "$H/.ssh/aaa.pub"; runinv
+sf "3 6 7 14 " "R9/2 symlink quebrado na frente dos plists e das .pub é leitura parcial"; has 6 "${NA}aaa\.pub" "R9/2: a .pub quebrada é não apurada, não pulada em silêncio"; hasnt 7 'nenhum \*\.plist' "R9/2: não vira «nenhum *.plist»"; hasnt 3 'SEM caminho.*: nenhum' "R9/2: nem «nenhum python sem caminho»"; hasnt 14 'argumentos: nenhum' "R9/2: nem «nenhum bw serve» nos plists"
+if [ "$ROOTUSER" = 0 ]; then mkworld f3; chmod 000 "$H/Library/LaunchAgents/com.gascity.d.plist"; runinv
+  sf "3 7 14 " "R9/3 plist ilegível (o do bw serve) deixa a leitura parcial nas 3 seções"; has 14 'argumentos: não apurado' "R9/3: o «bw serve» dos plists é não apurado"; hasnt 14 'argumentos: nenhum' "R9/3: não vira «nenhum»"
+  chmod 644 "$H/Library/LaunchAgents/com.gascity.d.plist"; chmod 444 "$H/Library/LaunchAgents"; runinv; chmod 755 "$H/Library/LaunchAgents"
+  sf "3 7 14 " "R9/3b pasta de plists só com r--: os nomes casam e nenhum abre, é leitura parcial"; hasnt 7 'nenhum \*\.plist' "R9/3b: não vira «nenhum *.plist»"; fi
+mkworld f4; fx adb.devices_l 'List of devices attached\nR58N00AAAA1234 device usb:1-1 product:x model:SM_A135M device:a13 transport_id:1\nR58N00CCCC9999 unauthorized usb:1-3 transport_id:3'
+fx networksetup.getinfo 'nada que o script reconheça'; runinv MINI64_SCAN_ROOTS=/nao/existe
+sf "1 5 11 13 " "R9/4 adb sem modelo, getinfo fora do formato e nenhuma raiz de código"; has 5 'A03 visível no adb: 0 \(\+1 com modelo ilegível' "R9/4: o 0 de A03 diz que um aparelho não tem modelo legível"
+has 1 "${NA}networksetup -getinfo .*formato inesperado" "R9/4: getinfo sem linha reconhecível é não apurado"; has 13 "${NA}pontos de montagem" "R9/4: sem varredura de nomes o Drive não diz «nenhum»"; hasnt 13 'nenhum encontrado' "R9/4: nem «nenhum encontrado»"
+mkworld f5; fx security.find_generic_password_s_Device_Only_Item '    "acct"<blob>="x"'; fxrc ipconfig.getifaddr_en0 1; fx ipconfig.getifaddr_en0 ''; exp="1 11 "; if [ "$ROOTUSER" = 0 ]; then chmod 000 "$H/.gastown/claude-accounts"; exp="1 11 12 "; fi; runinv; chmod 755 "$H/.gastown/claude-accounts"
+sf "$exp" "R9/5 sem IPv4 em en0..en3, item sem classe de acesso (e, fora do root, pasta de contas ilegível)"; has 1 "${NA}IP de LAN: nenhuma interface" "R9/5: nenhuma interface com IPv4 é não apurado"; docs 'reserva DHCP de \? \(MAC atual \?\)' "R9/5: o item 2 do checklist mostra «?», não um IP inventado"; docs 'ssh-keygen -R <IP do mini>' "R9/5: o marcador «<IP do mini>» não vira «?»"; has 11 'Device-Only-Item. · presente · classe de acesso não apurada' "R9/5: item presente sem pdmn não vira «ThisDeviceOnly: não»"
+[ "$ROOTUSER" = 0 ] && has 12 "${NA}.*claude-accounts" "R9/5: a pasta de contas ilegível é não apurada, não «sem contas»"
+mkworld f6; ln -s /nao/existe "$R/dev/cu.a-quebrado"; LA="$H/Library/LaunchAgents"; rm -f "$LA/com.athos.g.plist" "$LA/com.urblink.e.plist" "$LA/br.urblink.f.plist" "$W/wrappers/w1.sh"
+for i in a b c d e f g h i j k l; do printf '<plist><dict><key>Label</key><string>px%s.y.z</string><key>ProgramArguments</key><array><string>/opt/px/%s/bin/python</string></array></dict></plist>\n' "$i" "$i" >"$LA/px$i.plist"; done
+for i in $(seq 1 27); do printf 'security find-generic-password -s "Item-%s"\n' "$i" >>"$C/scripts/keys.sh"; done
+fxrc ipconfig.getifaddr_en0 1; fx ipconfig.getifaddr_en0 ''; fx ipconfig.getifaddr_en1 192.168.0.88; fx scutil.get_ComputerName "Athos's Mac mini"; fxrc scutil.get_LocalHostName 1; fxerr scutil.get_LocalHostName 'LocalHostName: not set'
+fx lsof 'p100\ncpython3\nf5\nn*:8095\np200\ncnode\nf9\nn127.0.0.1:8095'; fx networksetup.listallnetworkservices 'An asterisk (*) denotes that a network service is disabled.\nEthernet\nWi-Fi\nBridge\nThunderbolt\nUSB LAN\nVPN'; runinv
+sf "" "R9/6 mundo sem falha: tudo que tem resposta fica «ok»"; docs '192\.168\.0\.88 \(MAC atual aa:bb:cc:dd:ee:02\)' "R9/6: o MAC do checklist é o da interface que deu o IP (en1), não o do en0"
+docs "Nome do computador = «Athos's Mac mini»" "R9/6: o apóstrofo do nome do computador sobrevive"; docs 'ssh-keygen -R <nome do mini>\.local' "R9/6: o marcador «<nome do mini>» não vira «?»"
+has 10 '8095 · node' "R9/6: duas listeners na mesma porta: node"; has 10 '8095 · python3' "R9/6: duas listeners na mesma porta: python3"; has 1 '\(\+2 serviços' "R9/6: serviço de rede além dos 4 consultados é contado"
+has 3 '0 lidos, 2 citados e ausentes' "R9/6: wrapper citado e ausente é dito mesmo sem nenhum lido"; has 7 '\(\+3 prefixos omitidos;' "R9/6: o corte da tabela de plists é dito"; has 7 '\| com\.athos \* \| 0 ' "R9/6: prefixo da cidade com 0 plist não é o que o corte derruba"
+has 4 'cu\.a-quebrado' "R9/6: o link quebrado em /dev/cu.* casa o glob e entra na lista"; hasnt 4 'nenhuma \(o /dev' "R9/6: nem «nenhuma»"; has 11 '\(\+5 nomes omitidos;' "R9/6: o corte dos 25 nomes do Keychain é dito"; has 3 '\(\+3 caminhos de python' "R9/6: o corte dos 10 pythons citados pelos plists é dito"
+mkworld f7; rm -f "$B/python3"; fxrc pkgutil 1; fx pkgutil ''; fxerr pkgutil "No receipt for 'com.apple.pkg.CLTools_Executables' found at '/'."
+fx networksetup.listallhardwareports 'Hardware Port: Ethernet\nDevice: en0\nEthernet Address: aa:bb:cc:dd:ee:01\n\nHardware Port: Wi-Fi\nDevice: en1\n\nHardware Port: Thunderbolt\nDevice: en2\nEthernet Address: aa:bb:cc:dd:ee:03'
+fxrc ipconfig.getifaddr_en0 1; fx ipconfig.getifaddr_en0 ''; fx ipconfig.getifaddr_en1 192.168.0.88; runinv MINI64_EXTRA_PATH=":$R/usr/bin"
+sf "1 2 " "R9/7 sem CLT o python3 do PATH é o shim do sistema (versão não pedida); o en1 que deu o IP não tem MAC na lista"; has 1 "${NA}MAC de en1" "R9/7: a interface sem linha de MAC é não apurada"; docnot 'MAC atual aa:bb:cc:dd:ee:03' "R9/7: nem herda o MAC da porta seguinte"; has 2 'python3 → .*versão não executada' "R9/7: a linha diz que não executou"; hasnt 2 'python3 → .* · Python' "R9/7: nenhuma versão do shim no doc"
+mkworld f8; rm -f "$H/Library/LaunchAgents"/* "$B/python3"; runinv MINI64_EXTRA_PATH=":$R/usr/bin"
+sf "" "R9/8 pasta de plists que existe e está vazia, CLT confirmadas: nenhuma seção parcial"; has 7 'nenhum \*\.plist' "R9/8: «nenhum *.plist» quando MEDIU"; has 3 'SEM caminho.*: nenhum' "R9/8: nenhum python sem caminho"
+has 14 'argumentos: nenhum' "R9/8: nenhum bw serve nos plists"; has 2 'python3 → .*usr/bin/python3. · Python 3\.9\.6' "R9/8: com CLT confirmadas o python3 de /usr/bin é executado"
+mkworld f9; rm -f "$H/Library/LaunchAgents"/*; printf '<plist><dict><key>Label</key><string>com.gascity.estrela</string><key>ProgramArguments</key><array><string>/bin/echo</string></array></dict></plist>\n' >"$H/Library/LaunchAgents/*.plist"; runinv
+sf "" "R9/9 uma pasta com um único arquivo chamado «*.plist»: o glob devolve o próprio padrão e o arquivo existe"; has 7 '1 plists lidos' "R9/9: o arquivo é lido, a pasta não é «vazia»"; hasnt 7 'nenhum \*\.plist' "R9/9: não vira «nenhum *.plist»"
 echo "== $PASS ok, $FAIL BAD"; [ "$FAIL" = 0 ]
