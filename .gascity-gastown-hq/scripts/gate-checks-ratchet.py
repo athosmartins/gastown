@@ -4,13 +4,14 @@
 STATE     the check's own conf, <stem>.conf, IS the state: its settings (enforce 50 in trial, enforce 100 promoted, mode=off switched off) and ONE comment line, `# ratchet {json}`, with the trial's key (class `since`), phase, entry time and, once decided, when, why and
           the numbers. Settings and record go in ONE atomic write, so there is no ledger to disagree with the conf and no half-decided state. A conf without that line is somebody else's: NÃO SEI, never overwritten. To restart a class delete its conf; to stop
           it for good set its registry row to desligada (the ratchet then leaves it alone) AND delete the conf (no conf = the check is not switched on). The registry (versioned) is not edited: the city tree only advances by pull --ff-only.
-TRIAL     one per registry row `em-teste` whose `check` cell starts with <dir>/<stem>-check.py (see gate_check_trial.py). Entry = conf enforce 50 (the check reads it through gate_check_trial.resolve; `holdout` runs it as warn); a new `since` is a new trial.
+TRIAL     one per registry row `em-teste` whose `check` cell starts with <dir>/<stem>-check.py (see gate_check_trial.py), and no other row names that check (one conf per check). Entry = conf enforce 50 (the check reads it through gate_check_trial.resolve; `holdout` runs it as warn); a new `since` is a new trial.
 DECISION  after 14 days or 30 beads with a run (whichever first), on the runs the check recorded since the entry: first-attempt approval per arm (the METER's own first_attempt, over the beads whose first verdict came after the check first ran on them) and false
           refusals = beads the check refused in the enforce arm whose cited point shows up WAIVED (`dispensados`) in a LATER run of the same bead: the author overrode it instead of fixing it (the meter has no ground truth for this). Promote iff approval(enforce)
-          >= approval(holdout) and false refusals <= 10% of the refused beads; else switch off and say why. It needs >= 5 first-attempt beads per arm and >= 5 refused beads: with less it WAITS, and at --cap-days (28) it switches off for
-          dados-insuficientes. It never decides on a read that failed.
+          >= approval(holdout) and false refusals <= 10% of the refused beads and the check answered `nao-sei` (could not verify) on at most 20% of the runs of each arm (a blind check passes the first two for free); else switch off and say why. It needs
+          >= 5 first-attempt beads per arm and >= 5 refused beads: with less, or with a check too blind to promote, it WAITS, and at --cap-days (28) it switches off for dados-insuficientes. It never decides on a read that failed OR was only partly readable:
+          a gate log with a damaged line, or a verdict without a usable ts/bead, that may belong to the trial (the meter's rule: one whose ts is legible and older than the entry cannot) is NÃO SEI, and so is a runs file with a damaged line.
 NEVER     edits the meter, its test, the ruler or the check: it writes only the conf of a class in trial.
-Exit: 0 report · 1 a write failed · 2 NÃO SEI (registry, gate log, conf or runs unreadable, a conf that is not ours, a row outside the contract; the other classes are still handled) · 64 usage · 70 unplanned."""
+Exit: 0 report · 1 a write failed · 2 NÃO SEI (registry, gate log, conf or runs unreadable or partly damaged, a conf that is not ours, a row outside the contract or sharing its check with another row; the other classes are still handled) · 64 usage · 70 unplanned."""
 import argparse
 import datetime
 import importlib.util
@@ -23,7 +24,7 @@ sys.dont_write_bytecode = True
 HERE = os.path.dirname(os.path.abspath(__file__))
 SLICE, SCHEMA, UTC = "ga-mw5gdyu.3", 1, datetime.timezone.utc
 DEFAULT_CITY = "/Users/athos/gt/.gascity-gastown-hq"
-DAYS, MIN_SUBMISSIONS, CAP_DAYS, FALSE_MAX_PCT, PHASES = 14, 30, 28, 10, ("trial", "promovida", "desligada")
+DAYS, MIN_SUBMISSIONS, CAP_DAYS, FALSE_MAX_PCT, UNKNOWN_MAX_PCT, PHASES = 14, 30, 28, 10, 20, ("trial", "promovida", "desligada")
 USAGE = "uso: gate-checks-ratchet.py [--apply] [--json] [--days N>=1] [--min-submissions N>=1] [--cap-days N>=days] [--now AAAA-MM-DDTHH:MM:SSZ] [--city DIR]"
 
 
@@ -74,23 +75,26 @@ def record_of(notes):
 
 
 def read_runs(path, stem):
-    """-> (state, rows, bad): rows = [(dt, d)] in the order they were recorded (the file only grows), each a run of the contract whose arm is what the draw gives for that bead; bad = lines that are not (a check that does not use the ruler is damage, not data)."""
-    # vazio → ("ok", [], 0) for an empty file, ("absent", [], 0) when it does not exist; falhou/ilegível → "unreadable", never an empty list
+    """-> (state, rows, bad): rows = [(dt, d)] in the order they were recorded (the file only grows), each a run of the contract whose arm is what the draw gives for that bead; bad = the line numbers (1-based, blank lines counted) of those that are not (a check that
+    does not use the ruler is damage, not data). Lines are cut at "\\n" only: a raw U+2028 a stranger left inside a cited point is not a line break."""
+    # vazio → ("ok", [], []) for an empty file, ("absent", [], []) when it does not exist; falhou/ilegível → "unreadable", never an empty list
     try:
         with open(path, "rb") as fh:
-            lines = [x for x in fh.read().decode("utf-8", errors="replace").splitlines() if x.strip()]
+            lines = fh.read().decode("utf-8", errors="replace").split("\n")
     except FileNotFoundError:
-        return "absent", [], 0
+        return "absent", [], []
     except OSError:
-        return "unreadable", [], 0
-    rows, bad = [], 0
-    for line in lines:
+        return "unreadable", [], []
+    rows, bad = [], []
+    for n, line in enumerate(lines, 1):
+        if not line.strip():
+            continue
         try:
             d = json.loads(line)
         except ValueError:
             d = None
         if d is None or T.row_ok(d) or d["arm"] != T.arm_for(stem, d["bead"], T.TRIAL_PCT):
-            bad += 1
+            bad.append(n)
         else:
             rows.append((try_ts(d["ts"]), d))
     return "ok", rows, bad
@@ -98,17 +102,19 @@ def read_runs(path, stem):
 
 def measure(M, rows, vs, entry, now):
     """-> the evidence from the runs after `entry`. Approval = the meter's first_attempt over the beads whose FIRST verdict came after the check first ran on them (None when the gate log could not be read); a refusal is an `achados` run of the enforce
-    arm, and it is false when a LATER run of that bead waives (`dispensados`) a point it cited."""
-    first_run, refused, waived = {}, {}, {}
+    arm, and it is false when a LATER run of that bead waives (`dispensados`) a point it cited; `unknown` = per arm, how many runs there were and how many of them the check answered `nao-sei` (it could not verify: it did nothing on that run)."""
+    first_run, refused, waived, unknown = {}, {}, {}, {"enforce": [0, 0], "holdout": [0, 0]}
     for t, d in (r for r in rows if r[0] >= entry):
         first_run.setdefault(d["bead"], (t, d["arm"]))
+        unknown[d["arm"]][0] += 1
+        unknown[d["arm"]][1] += d["verdict"] == "nao-sei"
         if d["bead"] in refused:  # a refusal of this bead came strictly before this run
             waived[d["bead"]].update(d.get("dispensados", []))
         if d["arm"] == "enforce" and d["verdict"] == "achados":
             refused.setdefault(d["bead"], set()).update(d["pontos"])
             waived.setdefault(d["bead"], set())
     false = sorted(b for b in refused if refused[b] & waived[b])
-    m = {"submissions": len(first_run), "enforce": None, "holdout": None, "refusals": {"beads": len(refused), "false": len(false)}, "false_beads": false[:5], "min_n": M.MIN_N}
+    m = {"submissions": len(first_run), "enforce": None, "holdout": None, "refusals": {"beads": len(refused), "false": len(false)}, "false_beads": false[:5], "unknown": {a: {"runs": r, "nao_sei": k} for a, (r, k) in unknown.items()}, "min_n": M.MIN_N}
     if vs is not None:
         firsts = {}
         for v in vs:
@@ -122,26 +128,33 @@ def fmt(a):
     return "sem dado" if a["n"] == 0 else "n<5 (n=%d)" % a["n"] if a["state"] != "ok" else "%.0f%% (%d/%d)" % (a["pct"], a["approved"], a["n"])
 
 
-def decide(m, days, args):
-    """-> (verdict, why): em-andamento | aguardando-dados | promover | desligar | nao-sei. Not enough to judge = wait, and at the cap switch off; a gate log that could not be read is never "no data"."""
+def decide(m, days, args, gaps):
+    """-> (verdict, why): em-andamento | aguardando-dados | promover | desligar | nao-sei. Not enough to judge = wait, and at the cap switch off; a gate log that could not be read is never "no data", and one that was only partly readable (`gaps`) is never "all of it"."""
     if days < args.days and m["submissions"] < args.min_submissions:
         return "em-andamento", "%.1f de %d dias, %d de %d beads com rodada" % (days, args.days, m["submissions"], args.min_submissions)
-    enf, hold, ref, n = m["enforce"], m["holdout"], m["refusals"], m["min_n"]
+    enf, hold, ref, n, unk = m["enforce"], m["holdout"], m["refusals"], m["min_n"], m["unknown"]
     if enf is None:
         return "nao-sei", "o quality-gate.jsonl não pôde ser lido: sem a 1ª tentativa por braço nada é decidido"
+    if gaps:
+        return "nao-sei", "o quality-gate.jsonl está parcialmente ilegível (%s): a 1ª tentativa por braço pode estar errada e nada é decidido" % "; ".join(gaps)
 
     def wait(why):
         return ("desligar", "dados-insuficientes: " + why) if days >= args.cap_days else ("aguardando-dados", why)
 
     if enf["state"] != "ok" or hold["state"] != "ok":
         return wait("poucos beads de 1ª tentativa por braço (enforce %s, holdout %s; mínimo %d por braço)" % (fmt(enf), fmt(hold), n))
-    cmp = "aprovação de 1ª tentativa enforce %s vs holdout %s" % (fmt(enf), fmt(hold))
+    cmp = "aprovação de 1ª tentativa enforce %s vs holdout %s; rodadas sem veredito da checagem (nao-sei) enforce %d/%d, holdout %d/%d" % (fmt(enf), fmt(hold), unk["enforce"]["nao_sei"], unk["enforce"]["runs"], unk["holdout"]["nao_sei"], unk["holdout"]["runs"])
     if enf["approved"] * hold["n"] < hold["approved"] * enf["n"]:
         return "desligar", cmp + ": MENOR no braço enforce"
     if ref["beads"] < n:
         return wait("%s; o braço enforce recusou %d bead(s), mínimo %d para medir a recusa falsa" % (cmp, ref["beads"], n))
     rate = "recusa falsa %d de %d bead(s) recusados (%.0f%%)" % (ref["false"], ref["beads"], 100.0 * ref["false"] / ref["beads"])
-    return ("desligar", "%s; %s > %d%%" % (cmp, rate, FALSE_MAX_PCT)) if ref["false"] * 100 > FALSE_MAX_PCT * ref["beads"] else ("promover", "%s; %s <= %d%%" % (cmp, rate, FALSE_MAX_PCT))
+    if ref["false"] * 100 > FALSE_MAX_PCT * ref["beads"]:
+        return "desligar", "%s; %s > %d%%" % (cmp, rate, FALSE_MAX_PCT)
+    blind = [a for a in ("enforce", "holdout") if unk[a]["nao_sei"] * 100 > UNKNOWN_MAX_PCT * unk[a]["runs"]]  # a check that could not verify passes "enforce >= holdout" for free: it does not get promoted without having looked
+    if blind:
+        return wait("%s; %s; a checagem não deu veredito (nao-sei) em mais de %d%% das rodadas do braço %s" % (cmp, rate, UNKNOWN_MAX_PCT, " e ".join(blind)))
+    return "promover", "%s; %s <= %d%%" % (cmp, rate, FALSE_MAX_PCT)
 
 
 def conf_text(c):
@@ -151,7 +164,7 @@ def conf_text(c):
 def put(cx, stem, phase, since, entrou, **extra):
     """Write the conf of `phase` with its record. -> "" or why."""
     mode, pct = expect(phase)
-    return T.write_conf(cx.state, stem, mode, pct, note="ratchet " + json.dumps(dict(extra, v=1, fase=phase, since=since, entrou=entrou), ensure_ascii=False, sort_keys=True))
+    return T.write_conf(cx.state, stem, mode, pct, note="ratchet " + T.dumps_line(dict(extra, v=1, fase=phase, since=since, entrou=entrou)))  # ONE line for every splitter: the real check cuts its conf with str.splitlines()
 
 
 def step(cx, cls, row, rep):
@@ -160,6 +173,9 @@ def step(cx, cls, row, rep):
     stem, _, why = T.stem_of(row["check"])
     if stem is None:
         return dict(out, verdict="fora-do-contrato", why=why)
+    others = sorted(c for c in cx.owners[stem] if c != cls)
+    if others:  # the conf is one per check: a trial would rewrite the conf another row relies on (two trials, each other's at every --apply, restarting each other's window)
+        return dict(out, verdict="fora-do-contrato", why="a checagem %s-check.py também é da classe %s: a conf é uma só por checagem e nada é gravado (dê a cada classe o seu script)" % (stem, ", ".join(others)))
     apply, since = cx.args.apply, row["since"]
     st, mode, pct, notes = T.read_conf(cx.state, stem)
     rec, why = record_of(notes)
@@ -180,17 +196,18 @@ def step(cx, cls, row, rep):
         return dict(out, verdict="nao-sei", why="%s mudou durante o teste (os braços foram sorteados a %d): nada é decidido" % (conf_text((st, mode, pct)), T.TRIAL_PCT))
     rst, rows, bad = read_runs(T.runs_path(cx.state, stem), stem)
     if rst == "unreadable" or bad:
-        return dict(out, verdict="nao-sei", why="o registro de rodadas %s: com ele ilegível ou estragado nada é decidido" % ("tem %d linha(s) fora do contrato" % bad if bad else "não pôde ser lido"))
-    gst, vs = cx.gate()
-    entry = try_ts(rec["entrou"])
-    if vs is None:
-        rep["gaps"].append("classe %s: quality-gate.jsonl %s: a 1ª tentativa por braço NÃO FOI MEDIDA" % (cls, gst))
-    m = measure(cx.M, rows, vs, entry, cx.now)
+        return dict(out, verdict="nao-sei", why="o registro de rodadas %s: com ele ilegível ou estragado nada é decidido" % ("tem %d linha(s) fora do contrato (linhas %s%s)" % (len(bad), ", ".join(map(str, bad[:5])), ", …" if len(bad) > 5 else "") if bad else "não pôde ser lido"))
+    g, entry = cx.gate(), try_ts(rec["entrou"])
+    gaps = cx.gaps(entry)
+    if g["vs"] is None:
+        rep["gaps"].append("classe %s: quality-gate.jsonl %s: a 1ª tentativa por braço NÃO FOI MEDIDA" % (cls, g["state"]))
+    rep["gaps"] += ["classe %s: %s" % (cls, x) for x in gaps]  # said even before a decision is due: it is what will hold it
+    m = measure(cx.M, rows, g["vs"], entry, cx.now)
     days = (cx.now - entry).total_seconds() / 86400.0
-    verdict, why = decide(m, days, cx.args)
+    verdict, why = decide(m, days, cx.args, gaps)
     if rst == "absent" and verdict in ("aguardando-dados", "desligar"):
         why += " (a checagem nunca gravou uma rodada: %s não existe)" % os.path.basename(T.runs_path(cx.state, stem))
-    out.update(days=round(days, 3), submissions=m["submissions"], enforce=m["enforce"], holdout=m["holdout"], refusals=m["refusals"], false_beads=m["false_beads"], why=why)
+    out.update(days=round(days, 3), submissions=m["submissions"], enforce=m["enforce"], holdout=m["holdout"], refusals=m["refusals"], false_beads=m["false_beads"], unknown=m["unknown"], why=why)
     if verdict in ("em-andamento", "aguardando-dados", "nao-sei"):
         return dict(out, verdict=verdict)
     token = "promovida" if verdict == "promover" else "desligada"
@@ -201,19 +218,27 @@ def step(cx, cls, row, rep):
 
 
 class Ctx(object):
-    """One run: the clock, the flags, the meter module; the gate log is read once, and only when a trial needs it."""
+    """One run: the clock, the flags, the meter module, which classes name which check (any status); the gate log is read once, and only when a trial needs it."""
 
-    def __init__(self, args, now, M):
-        self.args, self.now, self.M, self.state, self._gate = args, now, M, os.path.join(args.city, ".gc"), None
+    def __init__(self, args, now, M, owners):
+        self.args, self.now, self.M, self.owners, self.state, self._gate = args, now, M, owners, os.path.join(args.city, ".gc"), None
 
     def gate(self):
-        """-> (state, verdicts): verdicts None when the log is absent, unreadable or has no verdict in it (that is not "0 verdicts")."""
+        """-> the gate log as the meter reads it: {state, vs (the verdicts; None when the log is absent, unreadable or has no verdict in it: that is not "0 verdicts"), rows, bad, bad_ts, unusable} — the damage is kept for gaps(), never thrown away."""
         if self._gate is None:
-            # vazio → "vazio" (no row, or rows with no verdict): verdicts None, and a due decision says NÃO SEI; falhou/ilegível → st absent/unreadable, verdicts None: the same
-            st, rows, _, _ = self.M.read_log(os.path.join(self.state, "quality-gate.jsonl"))
-            vs = (self.M.verdicts(rows)[0] or None) if st == "ok" else None
-            self._gate = (st if st != "ok" or vs else "vazio", vs)
+            # vazio → "vazio" (no row, or rows with no verdict): vs None, and a due decision says NÃO SEI; falhou/ilegível → st absent/unreadable, vs None: the same; linha rasgada ou veredito sem ts/bead → bad/bad_ts/unusable, which gaps() turns into a hold
+            st, rows, bad, bad_ts = self.M.read_log(os.path.join(self.state, "quality-gate.jsonl"))
+            vs, unusable = self.M.verdicts(rows) if st == "ok" else ([], 0)
+            self._gate = {"state": st if st != "ok" or vs else "vazio", "vs": vs or None, "rows": rows, "bad": bad, "bad_ts": bad_ts, "unusable": unusable}
         return self._gate
+
+    def gaps(self, entry):
+        """-> why-lines for what the gate log may be hiding from a trial that entered at `entry` ([] = nothing): the meter's own rule for its window — a damaged line, or a verdict without a usable bead, whose ts is legible and BEFORE the window cannot hide a verdict of it; any other might."""
+        g = self.gate()
+        # vazio → [] (nothing damaged, or all of it provably older than the trial); falhou/ilegível → n/a: this is derived from the ONE read in gate(), nothing is read here
+        maybe = g["bad"] - sum(1 for t in g["bad_ts"] if t < entry)
+        unusable = g["unusable"] - self.M.verdicts([d for d in g["rows"] if (self.M.try_ts(d.get("ts")) or entry) < entry])[1]
+        return (["%d linha(s) ilegível(is) do quality-gate.jsonl podem ser do teste" % maybe] if maybe else []) + (["%d veredito(s) do quality-gate.jsonl sem ts/bead utilizável podem ser do teste" % unusable] if unusable else [])
 
 
 class Parser(argparse.ArgumentParser):
@@ -258,7 +283,10 @@ def cycle(args, now, rep):
     rep["gaps"] += problems
     if st != "ok":
         return finish(2, "NÃO SEI: registro de classes cobertas %s. Nada foi lido nem gravado." % st)
-    cx, trials = Ctx(args, now, M), sorted(c for c, r in regs.items() if r["status"] == "em-teste")
+    owners = {}
+    for c, r in regs.items():  # every row, whatever its status: the conf of a check is one, and a row that is not in trial may still own it
+        owners.setdefault(T.stem_of(r["check"])[0], []).append(c)
+    cx, trials = Ctx(args, now, M, owners), sorted(c for c, r in regs.items() if r["status"] == "em-teste")
     rep["classes"] = [step(cx, cls, regs[cls], rep) for cls in trials]
     count = lambda *v: sum(1 for c in rep["classes"] if c["verdict"] in v)  # noqa: E731
     rc = 1 if count("erro-ao-aplicar") else 2 if count("nao-sei", "fora-do-contrato") else 0

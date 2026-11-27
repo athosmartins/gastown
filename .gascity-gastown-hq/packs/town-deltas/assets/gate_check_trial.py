@@ -8,8 +8,12 @@ CONTRACT (docs/runbooks/gate-checks-ratchet.md), for a check script <dir>/<stem>
   runs   <state>/<stem>-runs.jsonl  one JSON line per run the check records (`record_run`, EVERY run with a bead, also a clean one):
          {bead, ts (UTC, AAAA-MM-DDTHH:MM:SSZ), arm, verdict ok|achados|nao-sei, pontos [cited points], dispensados [points the author waived]}.
          A point is any text that stays the same for the same finding across runs (e.g. "<path>#<sha256 of the line without its whitespace>": a reflow keeps it, an edit changes it). `achados` needs at least one point.
+         `nao-sei` = the check could not verify that run, so it did nothing on it: the ratchet counts them per arm and will not promote a check that was blind on more than 20% of the runs of an arm. Record only runs whose `arm` is enforce|holdout
+         (`resolve` says "-" when there is no draw, e.g. mode warn: such a run is not part of a trial and `record_run` refuses it).
 Three states everywhere: conf absent = "not switched on" (checks nothing); conf unreadable or invalid = NÃO SEI (never "off", never "on"); a run that could not be recorded is said (`record_run` returns why), never dropped quietly."""
 import contextlib
+import datetime
+import errno
 import hashlib
 import json
 import os
@@ -44,7 +48,7 @@ def runs_path(state, stem):
 
 
 def read_conf(state, stem):
-    """-> (st, mode, pct, notes): st = absent | ok | unreadable | invalid:<why> (the grammar of third-state-reads-check.py's load_conf, which the test holds equal), and the text of every full-line comment, all from ONE read of the file (the ratchet keeps its record in a comment)."""
+    """-> (st, mode, pct, notes): st = absent | ok | unreadable | invalid:<why> (the grammar of third-state-reads-check.py's load_conf, which the test holds equal: it cuts lines with str.splitlines() and so does this, on purpose), and the text of every full-line comment, all from ONE read of the file (the ratchet keeps its record in a comment)."""
     # vazio → arquivo vazio/só comentários = invalid:no-keys (é o que um write falho deixa; não liga nada em silêncio); falhou/ilegível → unreadable/invalid, nunca "absent"
     path = conf_path(state, stem)
     try:
@@ -83,8 +87,8 @@ def write_conf(state, stem, mode, pct=None, note=""):
         return "modo %r fora de %s" % (mode, "|".join(MODES))
     if mode == "enforce" and not (type(pct) is int and 1 <= pct <= 100):
         return "enforce_pct %r fora de 1..100" % (pct,)
-    if "\n" in note:
-        return "a nota da conf deve ser UMA linha"
+    if note and note.splitlines() != [note]:  # the real check's load_conf cuts at every str.splitlines() boundary (\r, \x1c, \x85, U+2028...), not only at "\n": the rest of the note would be read as a (broken) setting
+        return "a nota da conf deve ser UMA linha (sem nenhum separador que str.splitlines() corte)"
     path = conf_path(state, stem)
     tmp = "%s.tmp.%d" % (path, os.getpid())
     try:
@@ -106,7 +110,8 @@ def arm_for(stem, bead, pct):
 
 def resolve(state, stem, bead):
     """-> (st, eff, arm, why): what a check does for this bead. st desligado (conf absent or mode=off: check nothing) | ok | nao-sei (conf unreadable/invalid, or enforce_pct<100 with no bead to draw the arm).
-    eff = "enforce" (a finding refuses) | "warn" (records, refuses nothing: mode warn, or the holdout arm); arm = "enforce" | "holdout" | "-" (no draw). Only st == "ok" comes without a why."""
+    eff = "enforce" (a finding refuses) | "warn" (records, refuses nothing: mode warn, or the holdout arm); arm = "enforce" | "holdout" | "-" (no draw: mode warn/off, conf absent or unreadable; such a run belongs to no trial and `record_run` refuses it).
+    Only st == "ok" comes without a why."""
     st, mode, pct = load_conf(state, stem)
     if st == "absent":
         return "desligado", None, "-", "sem %s: a checagem não foi ligada" % os.path.basename(conf_path(state, stem))
@@ -129,7 +134,7 @@ def row_ok(d):
     if not (isinstance(d.get("bead"), str) and d["bead"].strip()):
         return "bead ausente ou vazia"
     try:
-        time.strptime(d.get("ts"), TS_FMT)
+        datetime.datetime.strptime(d.get("ts"), TS_FMT)  # the reader's own parse: time.strptime takes second 60 and 61, which the reader (and the ratchet's measure) cannot place in time
     except (TypeError, ValueError):
         return "ts %r não é AAAA-MM-DDTHH:MM:SSZ" % (d.get("ts"),)
     if d.get("arm") not in ARMS or d.get("verdict") not in VERDICTS:
@@ -141,23 +146,32 @@ def row_ok(d):
     return "achados sem nenhum ponto citado" if d["verdict"] == "achados" and not d.get("pontos") else ""
 
 
+def dumps_line(obj):
+    """-> the JSON of obj as ONE line for every line splitter: json.dumps escapes every control character but leaves U+0085, U+2028 and U+2029 raw, and str.splitlines() (the real check's conf reader) cuts a line at each of them."""
+    return json.dumps(obj, ensure_ascii=False, sort_keys=True).replace("\x85", "\\u0085").replace("\u2028", "\\u2028").replace("\u2029", "\\u2029")
+
+
 def record_run(state, stem, bead, arm, verdict, pontos=(), dispensados=(), ts=None):
-    """-> "" when ONE line was appended to <state>/<stem>-runs.jsonl, else why (nothing written). A row row_ok would reject is not written: the reader would count it as damage and the ratchet would hold the whole trial."""
-    # vazio → n/a (a write); falhou/ilegível → the OSError text (a line torn by a crash is damage the ratchet reports: NÃO SEI, not silence)
+    """-> "" when ONE whole line was appended to <state>/<stem>-runs.jsonl, else why: nothing written, or, when the disk gives out in the middle, half a line (the why says so, and the ratchet counts it as damage). A row row_ok would reject is not written: the reader would count it as damage and the ratchet would hold the whole trial."""
+    # vazio → n/a (a write); falhou/ilegível → the OSError text (a line torn by a crash or a full disk is damage the ratchet reports: NÃO SEI, not silence)
     row = {"bead": bead, "ts": ts or time.strftime(TS_FMT, time.gmtime()), "arm": arm, "verdict": verdict,
            "pontos": list(pontos) if isinstance(pontos, (list, tuple)) else pontos, "dispensados": list(dispensados) if isinstance(dispensados, (list, tuple)) else dispensados}
     why = row_ok(row)
     if why:
         return "linha recusada: " + why
     path = runs_path(state, stem)
-    data = (json.dumps(row, ensure_ascii=False, sort_keys=True) + "\n").encode("utf-8")
+    data = left = (dumps_line(row) + "\n").encode("utf-8", "backslashreplace")  # a lone surrogate (a file name with a non-UTF-8 byte, via os.fsdecode) cannot be encoded: written as its JSON escape it reads back as the same character, and nothing raises out of here
     try:
         fd = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o644)
         try:
-            os.write(fd, data)
+            while left:  # a write may take only part of the line (a full disk, a signal): finish it, or say that it could not be finished
+                n = os.write(fd, left)
+                if n <= 0:
+                    raise OSError(errno.EIO, "a escrita não avançou")
+                left = left[n:]
         finally:
             os.close(fd)
     except OSError as e:
-        return "não consegui gravar %s: %s" % (path, e.strerror or e)
+        return "não consegui gravar %s: %s%s" % (path, e.strerror or e, "" if left == data else " (ficou uma linha parcial no arquivo: a catraca a conta como estragada)")
     return ""
 
