@@ -155,7 +155,8 @@ min_active_sessions = 0
 # Mayor 2026-11-25 22:03 (regra horaria ga-v8p1tx.1): freia 3 -> 2. Disco 4180 MB (< 6000), swap 3,8 GB.
 # Mayor 2026-11-26 00:05 (regra horaria ga-v8p1tx.1): sobe 2 -> 3. Disco 11898 MB (>= 9000), swap 0 GB (pos-reboot 23:42).
 # Mayor 2026-11-27 07:15 (regra horaria ga-v8p1tx.1): freia 3 -> 2. Disco 5907 MB (< 6000), swap 2,2 GB.
-max_active_sessions = 2
+# Mayor 2026-11-27 13:15 (regra horaria ga-v8p1tx.1): sobe 2 -> 3. Disco 9629 MB (>= 9000), swap 2,5 GB (<= 6 GB).
+max_active_sessions = 3
 idle_timeout = "2h"
 wake_mode = "fresh"
 model = "sonnet"
