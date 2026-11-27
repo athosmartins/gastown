@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # gate-root-class.selftest.sh (ga-mw5gdyu.5) — the closed root-class vocabulary: what the reviewer is TOLD (gate-review-task.lib.sh), what the gate DOES with what comes back (gate_root_class_apply: FAIL_REASONS
 # + the `root_class` of the quality-gate.jsonl event) and WHERE the dispatcher calls it. The auditor's own rules are scripts/test_gate_root_class.py; here the glue is judged on what it does when the auditor
-# answers, fails, or is not there. GATE_BASH32=<a real bash 3.2> runs every child shell and the -n checks under it. Exit 0 iff every assertion holds.
+# answers, fails, or is not there; the last section also pins the auditor's boundaries and exit codes, because the hq-mutants lastro runs this file and not that one. GATE_BASH32=<a real bash 3.2> runs every
+# child shell and the -n checks under it. Exit 0 iff every assertion holds.
 set -uo pipefail
 SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 LIB="${TASKLIB_UNDER_TEST:-$SELF_DIR/gate-review-task.lib.sh}"
@@ -141,6 +142,31 @@ line="$(run_dispatcher PASS "" '{"state":"sem_classe"}')"
 check "the event writer prints exactly the record it was given (the reset above is what keeps a PASS from inheriting one)" "sem_classe" "$(printf '%s' "$line" | jq -r '.root_class.state')"
 line="$(run_dispatcher PASS "" 'not json')"
 check "a malformed record is nao_sei in the event and the line is still written (a dropped event would hide the refusal from the meter)" "1 nao_sei" "$(printf '%s' "$line" | jq -rs 'length, .[0].root_class.state' | paste -sd' ' -)"
+
+echo "-- the auditor itself, without the glue: the boundaries and the exit codes the lastro's mutants move (the whole rulebook is scripts/test_gate_root_class.py, which the engine does not run)"
+# vazio/falhou/ilegível (the auditor printed nothing, jq could not read what it printed, a file or a count below cannot be read) → "": no expected value in this section is empty, so the check is red, never a pass
+aud() { printf '%s' "$1" | "$PY" "$HELPER" audit | jq -c '[.state, .valid, .invalid]'; }   # the auditor's own answer as [state, accepted, rejected]
+FH='Reviewer 1 FAIL: VERDICT: FAIL\nBlocking issue 1: x'; FT='\nNon-blocking findings: none\n'   # a refusal in its real shape: the escaped break is the two characters backslash-n
+check "outra with a why of exactly MIN_WHY (8) characters is accepted" '["classificada",["outra"],[]]' "$(aud "$FH root-class:outra - abcdefgh$FT")"
+check "outra with a why of 7 characters is not: the boundary, both sides" '["fora_do_vocabulario",[],["outra"]]' "$(aud "$FH root-class:outra - abcdefg$FT")"
+check "outra whose why sits on the NEXT issue is not accepted: the why is what follows on the SAME line" '["classificada",["error-vs-empty"],["outra"]]' "$(aud "$FH root-class:outra"'\nBlocking issue 2: the lock is taken twice on retry root-class:error-vs-empty'"$FT")"
+# EQUIVALENT 9f56e95c60: `BREAK_RE.split(rest, maxsplit=1)[0]` -> `maxsplit=0`: 0 means no limit and only the first piece is read, which is the text up to the first break either way; only the cost of splitting the rest differs
+check "the blocking part ends at the FIRST «Non-blocking findings:»: a label after it is neither read nor renamed" '["sem_classe",[],[]]' "$(aud 'Reviewer 1 FAIL: VERDICT: FAIL\nBlocking issue 1: x with no class\nNon-blocking findings: low: y root-class:made-up and root-class:error-vs-empty\n')"
+check "…and a text that STARTS with the marker has an empty blocking part: the label after it is not read either" '["sem_classe",[],[]]' "$(aud 'Non-blocking findings: n/a\nReviewer 1 FAIL: VERDICT: FAIL\nBlocking issue 1: x root-class:comment-lies\n')"
+UN1="$(printf '%s\n' "$UNREAD_BODIES" | sed -n 1p)"; UN2="$(printf '%s\n' "$UNREAD_BODIES" | sed -n 2p)"   # the dispatcher's two placeholders, read above
+union_text() {  # FAIL_REASONS as gate_e5_union_reasons (gate-e5-second-reviewer.lib.sh) leaves it, byte for byte: the producer's own text, its last newline cut as the $( ) there cuts it, then the two characters backslash-n: union_text <comment>...
+  "$PY" -I -c 'import importlib.util as u, sys; s = u.spec_from_file_location("e5u", sys.argv[1]); m = u.module_from_spec(s); s.loader.exec_module(m); sys.stdout.write(m.union([{"index": i + 1, "text": c} for i, c in enumerate(sys.argv[2:])])[0].rstrip("\n") + "\\n")' "$SELF_DIR/gate-e5-union.py" "$@"
+}
+check "an E5 union whose every issue is the dispatcher's placeholder is nao_sei: the header counts the issues and the placeholder lines are all of them" '["nao_sei",[],[]]' "$(aud "$(union_text "$UN1" "$UN2")")"
+check "…and one issue a reviewer really wrote makes the union judged: classificada by the label that issue carries" '["classificada",["error-vs-empty"],[]]' "$(aud "$(union_text $'VERDICT: FAIL\nBlocking issue 1: scripts/foo.py:40 x never checks the read root-class:error-vs-empty\nNon-blocking findings: none' "$UN1")")"
+rc=0; "$PY" "$HELPER" task-block > "$TMP/cli.out" 2> "$TMP/cli.err" || rc=$?
+check "task-block exits 0 with the block on stdout and nothing on stderr" "0|yes|0" "$rc|$([ -n "$BLOCK" ] && [ "$(cat "$TMP/cli.out")" = "$BLOCK" ] && echo yes || echo no)|$(wc -c < "$TMP/cli.err" | tr -d ' ')"
+rc=0; "$PY" "$HELPER" bogus > "$TMP/cli.out" 2> "$TMP/cli.err" || rc=$?
+check "an unknown mode exits 2 (usage) with nothing on stdout and the usage line on stderr" "2|0|1" "$rc|$(wc -c < "$TMP/cli.out" | tr -d ' ')|$(grep -c '^uso:' "$TMP/cli.err")"
+rc=0; printf '\377\376 not utf-8' | "$PY" "$HELPER" audit > "$TMP/cli.out" 2> "$TMP/cli.err" || rc=$?
+check "audit on stdin that is not UTF-8 exits 3 with NOTHING on stdout: a caller records nao_sei, never a state" "3|0|1" "$rc|$(wc -c < "$TMP/cli.out" | tr -d ' ')|$(grep -c 'UnicodeDecodeError' "$TMP/cli.err")"
+out="$(printf '%s' "$R_OK" | "$PY" "$HELPER" audit)"
+check "the answer is ASCII json (ensure_ascii) although its note carries accents: no byte above 0x7f, and the accent is there once decoded" "0|true" "$(printf '%s' "$out" | LC_ALL=C tr -d '\000-\177' | wc -c | tr -d ' ')|$(printf '%s' "$out" | jq -r '.note | contains("ç")')"
 
 echo
 echo "== $PASS passed, $FAIL failed =="
