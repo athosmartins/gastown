@@ -1,5 +1,6 @@
 # Classes-raiz do portão que JÁ têm checagem mecânica (ga-mw5gdyu.2). Lido por scripts/gate-refusal-checks.py; versionado.
 # Colunas separadas por TAB. status: ativa | em-teste | desligada. QUALQUER linha conta como «coberta» (inclusive desligada: uma checagem que foi desligada não é reaberta por este ciclo).
 # Linha nova entra na MESMA entrega que a checagem (o bead aberto pelo ciclo pede isso). Arquivo ausente/sem cabeçalho = o script diz NÃO SEI e não abre nada.
+# Linha em-teste: a coluna check COMEÇA pelo caminho <dir>/<nome>-check.py; a catraca (scripts/gate-checks-ratchet.py, docs/runbooks/gate-checks-ratchet.md) a põe a 50%, depois a promove ou desliga.
 class	status	check	bead	since	note
 error-vs-empty	ativa	packs/town-deltas/assets/third-state-reads-check.py (gate-hard-checks.sh passo 2e, braço A/B enforce/holdout)	ga-vywjzsp	2026-10-16	semeada na fatia .2: a classe já tinha checagem antes do ciclo existir; sem esta linha a 1ª rodada abriria bead duplicado

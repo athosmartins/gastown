@@ -196,6 +196,9 @@ class Registry(T):
         self.assertEqual((rows["a-b"]["status"], rows["c-d"]["status"], rows["e-f"]["status"]), ("ativa", "", "desligada"))  # the first row of a class wins; a half row still names its class
         self.assertEqual(len(problems), 4, problems)
         self.assertTrue(any("c-d" in p for p in problems) and any("BAD NAME" in p or "nome de classe" in p for p in problems) and any("repetida" in p for p in problems) and any("g-h" in p for p in problems))
+        self.put_reg(HEAD + "x-y\tem-teste\tfoo-check.py\tga-1\t2026-11-10\tnota\n" + "z-w\tem-teste\tfoo-check.py\n")  # ga-mw5gdyu.3 reads the bead and the date of the row; a row without them has "", not a KeyError
+        rows = P.read_registry(self.reg)[1]
+        self.assertEqual((rows["x-y"]["bead"], rows["x-y"]["since"], rows["z-w"]["bead"], rows["z-w"]["since"]), ("ga-1", "2026-11-10", "", ""))
 
     def test_the_versioned_registry_is_readable_and_seeded_with_the_class_that_already_has_a_check(self):
         real = os.path.join(HERE, "gate-refusal-checks.registry.tsv")
@@ -427,7 +430,7 @@ class Apply(T):
             self.assertNotIn("bead %s " % b, d)
         for i in (4, 3, 2):
             self.assertIn("arquivo: scripts/novo-x-%d.sh:%d" % (i, 10 + i), d)
-        for need in ("gate-run gr-novo-x-4", "scripts/gate-refusal-checks.registry.tsv", "em-teste", "NÃO edite o avaliador", "third-state-reads-check.py", "abc123", ">= 5 recusas em 14 dias", "desligada"):
+        for need in ("gate-run gr-novo-x-4", "scripts/gate-refusal-checks.registry.tsv", "em-teste", "NÃO edite o avaliador", "third-state-reads-check.py", "packs/town-deltas/assets/gate_check_trial.py (resolve e record_run)", "gate_check_trial.py e o sorteio do guard", "gate-checks-ratchet.md", "abc123", ">= 5 recusas em 14 dias", "desligada"):
             self.assertIn(need, d)
         self.assertIn("Falha de novo-x", d)
         self.assertNotIn("so-nao-bloqueante", d)  # the non-blocking part of the verdict is not evidence
