@@ -56,6 +56,12 @@ class Transform(unittest.TestCase):
         with self.assertRaises(bands.SeriesError):
             bands.to_y(-1.0, "sqrt_count")
 
+    def test_a_transform_that_is_not_one_of_the_two_is_an_error_not_none(self):
+        for bad in ("typo", None):
+            with self.subTest(repr(bad)):
+                with self.assertRaises(bands.ConfigError):
+                    bands.to_y(4, bad)
+
 
 class MetricKnobs(unittest.TestCase):
     def test_the_defaults_pass_and_come_back_as_they_are(self):
@@ -144,6 +150,26 @@ class Baseline(unittest.TestCase):
         self.assertEqual(full["n"] - closed["n"], 6)
         self.assertEqual(full["n"] - opened["n"], len(pts) - 8 - 20, "an open-ended range excludes everything from its start on")
 
+    def test_excluded_ranges_given_as_an_iterator_are_read_as_the_list_they_hold_never_as_none(self):
+        # `excluded` is read more than once (the check, the window anchor, the filter): an iterator is empty from the second read on,
+        # and "no open episode" would let the failure into the baseline
+        pts = series([10 + (i % 3) for i in range(40)])
+        now = pts[-1][0]
+        full, _ = bands.compute_baseline(pts, now, self.m, [], 0.0)
+        for name, ranges in (("closed", [[pts[4][0], pts[9][0], "e1"]]), ("open", [[pts[20][0], None, "e2"]])):
+            with self.subTest(name):
+                want, _ = bands.compute_baseline(pts, now, self.m, ranges, 0.0)
+                self.assertLess(want["n"], full["n"], "control: the range drops points")
+                for how, given in (("generator", (r for r in ranges)), ("iterator", iter(ranges))):
+                    got, _ = bands.compute_baseline(pts, now, self.m, given, 0.0)
+                    self.assertEqual(got, want, how)
+
+    def test_a_range_that_starts_and_ends_at_one_instant_is_a_range(self):
+        pts = series([10 + (i % 3) for i in range(40)])
+        full, _ = bands.compute_baseline(pts, pts[-1][0], self.m, [], 0.0)
+        one, _ = bands.compute_baseline(pts, pts[-1][0], self.m, [[pts[4][0], pts[4][0], "e1"]], 0.0)
+        self.assertEqual(full["n"] - one["n"], 1)
+
     def test_an_open_episode_freezes_the_baseline_window_at_its_start(self):
         # 25 days of normal points (10/11), then 15 days of a failure (1) with the episode open since the first bad point:
         # the rolling window would hold nothing but the failure, so the baseline must keep looking at the 14 days BEFORE it.
@@ -211,17 +237,23 @@ class Baseline(unittest.TestCase):
             bands.compute_baseline(pts, pts[-1][0], self.m, [], 0.0)
 
     def test_a_sum_that_overflows_is_an_error_not_a_nan_sigma(self):
-        # an overflowed mean or deviation would leave every z at NaN or 0, beyond nothing, and every rule would read "in band"
-        for name, values in (("the mean", [1e308] * 30), ("the deviation", [1e308, -1e308] * 15)):
+        # an overflowed mean or deviation would leave every z at NaN or 0, beyond nothing, and every rule would read "in band"; a count
+        # in √ keeps its own statistics finite while the mean in the metric's units (what a mail quotes) overflows
+        count = metric(min_baseline_points=5, transform="sqrt_count")
+        for name, values, m in (("the mean", [1e308] * 30, self.m), ("the deviation", [1e308, -1e308] * 15, self.m), ("the raw mean of a count", [1e308] * 30, count)):
             with self.subTest(name):
                 with self.assertRaises(bands.SeriesError):
-                    bands.compute_baseline(series(values), T0 + 30 * H3, self.m, [], 0.0)
+                    bands.compute_baseline(series(values), T0 + 30 * H3, m, [], 0.0)
 
     def test_inputs_the_statistics_cannot_use_raise(self):
         pts = series([10, 12] * 15)
         now = pts[-1][0]
         bad = (dict(now=NAN), dict(now=None), dict(widen=-0.5), dict(widen=NAN), dict(widen=True), dict(accepted_until=NAN), dict(accepted_until="x"),
-               dict(excluded=[[NAN, None, "e"]]), dict(excluded=[["a", None, "e"]]), dict(excluded=[[T0, "b", "e"]]), dict(excluded=["e"]), dict(excluded=[[T0]]))
+               dict(excluded=[[NAN, None, "e"]]), dict(excluded=[["a", None, "e"]]), dict(excluded=[[T0, "b", "e"]]), dict(excluded=["e"]), dict(excluded=[[T0]]),
+               dict(excluded=None), dict(excluded=5),                                     # not a collection of ranges: not "no ranges"
+               dict(excluded=[[T0 + 9 * H3, T0 + 4 * H3, "e"]]),                          # ends before it starts: it would drop no point, silently
+               dict(excluded=[[T0, float("inf"), "e"]]),                                  # json.load reads "Infinity": not a finite end, and not None (open)
+               dict(accepted_until=now + 1.0))                                            # a dismissal never lies ahead of the clock
         for over in bad:
             with self.subTest(over):
                 args = dict(now=now, excluded=[], widen=0.0, accepted_until=None)
@@ -364,7 +396,9 @@ class Judge(unittest.TestCase):
                            ("a missing knob", lambda: bands.judge(pts, now, {"direction": "low"})),
                            ("a negative widening", lambda: bands.judge(pts, now, self.m, widen=-0.5)),
                            ("a NaN acceptance", lambda: bands.judge(pts, now, self.m, accepted_until=NAN)),
-                           ("a malformed range", lambda: bands.judge(pts, now, self.m, excluded=[["a", None, "e"]]))):
+                           ("a malformed range", lambda: bands.judge(pts, now, self.m, excluded=[["a", None, "e"]])),
+                           ("ranges that are not a collection", lambda: bands.judge(pts, now, self.m, excluded=None)),
+                           ("a dismissal ahead of the clock", lambda: bands.judge(pts, now, self.m, accepted_until=now + 1.0))):
             with self.subTest(name):
                 with self.assertRaises(bands.ConfigError):
                     call()
@@ -398,6 +432,20 @@ class Judge(unittest.TestCase):
         pts = self.steady(last=0)
         v = bands.judge(iter(pts), pts[-1][0], self.m)
         self.assertEqual((v["status"], v["decision"]["band"]), ("judged", 3))
+
+    def test_an_iterator_of_excluded_ranges_keeps_the_open_episode_open(self):
+        pts = series([10 + (i % 2) for i in range(200)] + [1 + (i % 2) for i in range(120)])
+        episode = [[pts[200][0], None, "e1"]]
+        for how, given in (("generator", (r for r in episode)), ("iterator", iter(episode))):
+            with self.subTest(how):
+                v = self.judge(pts, excluded=given)
+                self.assertEqual((v["status"], v["decision"]["band"]), ("judged", 3), "an iterator read as empty makes the failure the baseline: band 0")
+
+    def test_how_old_the_latest_point_is_stays_the_callers_to_check(self):
+        pts = self.steady()
+        v = bands.judge(pts, pts[-1][0] + 2 * 86400.0, self.m)
+        self.assertEqual((v["status"], v["decision"]["band"], v["decision"]["last"]["ts"]), ("judged", 0, pts[-1][0]), "a dead collector reads as in band unless the caller compares last.ts")
+        self.assertEqual(bands.judge(pts, pts[-1][0] + 30 * 86400.0, self.m)["status"], "learning", "once every point is older than baseline_days there is no baseline")
 
 
 def run():

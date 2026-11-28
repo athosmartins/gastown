@@ -89,7 +89,10 @@ def _finite(x):
 
 
 def to_y(x, transform):
-    """The value in the scale the statistics run in. Raises SeriesError for what is not a finite number (or a negative count)."""
+    """The value in the scale the statistics run in. Raises SeriesError for what is not a finite number (or a negative count), and
+    ConfigError for a transform that is not one of TRANSFORMS (never read as "none")."""
+    if transform not in TRANSFORMS:
+        raise ConfigError("transform %.40r não é um de %s" % (transform, "/".join(TRANSFORMS)))
     # vazio → n/a (pure arithmetic); falhou/ilegível → SeriesError, never a skipped point or a zero: a corrupt series must not read as in band
     if not _finite(x):
         raise SeriesError("valor %.40r não é um número finito" % (x,))
@@ -122,16 +125,18 @@ def _in_ranges(ts, ranges):
 
 
 def _check_context(now, excluded, widen, accepted_until):
-    """ConfigError unless the clock, the σ widening, the excluded ranges and the acceptance are usable numbers. A NaN would not fail
-    by itself: every comparison with it is false, so `accepted_until` NaN reads as "everything was accepted" and ends in band 0."""
+    """ConfigError unless the clock, the σ widening, the excluded ranges and the acceptance are usable numbers, in their order. None of
+    these would fail by itself: a NaN makes every comparison false, so `accepted_until` NaN reads as "everything was accepted" and ends in
+    band 0; so does an `accepted_until` ahead of the clock (a dismissal is never in the future: a time in ms instead of s would put every
+    point "already accepted" for good); and a range that ends before it starts drops no point, so the failure it was made for stays in the baseline."""
     # vazio → fine: no excluded range is "no open episode", no accepted_until is "nothing accepted"; falhou/ilegível → ConfigError, never the empty reading
     if not (_finite(now) and _finite(widen) and widen >= 0):
         raise ConfigError("agora %r ou widen %r não servem (esperava números finitos, widen 0 ou mais: um σ negativo inverteria o lado do alarme)" % (now, widen))
-    if accepted_until is not None and not _finite(accepted_until):
-        raise ConfigError("accepted_until %r não serve (esperava um tempo ou nada)" % (accepted_until,))
+    if accepted_until is not None and not (_finite(accepted_until) and accepted_until <= now):
+        raise ConfigError("accepted_until %r não serve (esperava um tempo que já passou, até agora, ou nada: uma dispensa não fica à frente do relógio)" % (accepted_until,))
     for r in excluded:
-        if not (isinstance(r, (tuple, list)) and len(r) >= 2 and _finite(r[0]) and (r[1] is None or _finite(r[1]))):
-            raise ConfigError("faixa excluída %.60r não serve (esperava [início, fim ou None, id])" % (r,))
+        if not (isinstance(r, (tuple, list)) and len(r) >= 2 and _finite(r[0]) and (r[1] is None or (_finite(r[1]) and r[1] >= r[0]))):
+            raise ConfigError("faixa excluída %.60r não serve (esperava [início, fim ou None, id], com o fim no início ou depois dele)" % (r,))
 
 
 def compute_baseline(points, now, m, excluded, widen, accepted_until=None):
@@ -140,6 +145,13 @@ def compute_baseline(points, now, m, excluded, widen, accepted_until=None):
     episodes), so a failure never becomes the new normal while it lasts. `widen` scales sigma (a human dismissed alarms of this
     metric); the points up to `accepted_until` (that human's dismissal) are not under test any more: they ARE the baseline now."""
     check_metric(m)
+    # vazio → [] (no range: no open episode); falhou/ilegível → ConfigError when it is not iterable (an error the generator itself raises goes up as
+    # it is), never the empty reading. Read ONCE, here: the check, the window anchor and the filter below each walk the ranges, and an iterator
+    # already walked by the first would read as "no open episode" to the others
+    try:
+        excluded = list(excluded)
+    except TypeError:
+        raise ConfigError("faixas excluídas %.60r não servem (esperava uma lista de [início, fim ou None, id])" % (excluded,))
     _check_context(now, excluded, widen, accepted_until)
     # vazio → (None, why): too few points is LEARNING, not "in band"; falhou/ilegível → SeriesError from _series (a corrupt point), never a shorter baseline
     ys = _series(points, m["transform"])
@@ -154,13 +166,15 @@ def compute_baseline(points, now, m, excluded, widen, accepted_until=None):
         return None, "%d pontos de base (mínimo %d)" % (len(kept), m["min_baseline_points"])
     n = len(kept)
     mean = sum(p[1] for p in kept) / n
+    raw_mean = sum(p[2] for p in kept) / n   # in the metric's own units (what a mail quotes), not in √
     sd = math.sqrt(sum((p[1] - mean) * (p[1] - mean) for p in kept) / (n - 1))
-    if not math.isfinite(sd):   # a mean or a sum of squares that overflows leaves sd infinite or NaN: every z is then 0 or NaN, beyond nothing, band 0
+    # a mean or a sum of squares that overflows leaves sd infinite or NaN: every z is then 0 or NaN, beyond nothing, band 0; a count's raw sum can overflow with its √ statistics finite
+    if not (math.isfinite(sd) and math.isfinite(raw_mean)):
         raise SeriesError("valores grandes demais: a média ou o desvio estouram")
     sigma = max(sd, m["min_sigma"], SQRT_SIGMA_FLOOR if m["transform"] == "sqrt_count" else 0.0)
     if sigma <= 0:
         return None, "σ = 0: a série é constante, defina min_sigma"
-    return {"mean": mean, "sigma": sigma * (1.0 + widen), "sd": sd, "n": n, "raw_mean": sum(p[2] for p in kept) / n, "widen": widen}, None
+    return {"mean": mean, "sigma": sigma * (1.0 + widen), "sd": sd, "n": n, "raw_mean": raw_mean, "widen": widen}, None
 
 
 def classify(points, base, m):
@@ -203,7 +217,9 @@ def judge(points, now, m, excluded=(), widen=0.0, accepted_until=None):
       learning    no baseline yet (too few points in the window, or σ = 0: a constant series needs a min_sigma); `decision` is None
       bad-series  a point is unusable (SeriesError: a value or a time that is not a finite number, points out of order); `decision` is None
     ConfigError is raised, never returned: the metric's knobs, `now`, `excluded`, `widen` or `accepted_until` cannot be used, which
-    says nothing about the series."""
+    says nothing about the series. How old the latest point is, is the caller's to check: a series whose latest point is days older
+    than `now` is still judged, against its old points (until they fall out of baseline_days: then learning), so compare
+    decision["last"]["ts"] with the clock, or a dead collector reads as in band."""
     # vazio → learning (an empty series has no baseline), never band 0; falhou/ilegível → bad-series, never a shorter series
     points = list(points)   # read more than once below: an iterator would be empty the second time
     try:
