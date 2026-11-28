@@ -286,7 +286,7 @@ def _scalar(tok, ln, in_list=False):
     if first == "[":
         if in_list or tok[-1] != "]":
             raise ConfigError("linha %d: lista aninhada ou não fechada" % ln)
-        return [_scalar(p, ln, in_list=True) for p in tok[1:-1].split(",")] if tok[1:-1].strip() else []   # an item with a comma needs no quotes it cannot have
+        return [_scalar(p, ln, in_list=True) for p in tok[1:-1].split(",")] if tok[1:-1].strip() else []   # split on ',': a quoted item with a comma in it leaves unclosed quotes, which are refused
     if first in "{&*!|>%@`" or tok == "-" or tok.startswith("- "):
         raise ConfigError("linha %d: sintaxe YAML não suportada (%s)" % (ln, first))
     if tok in ("true", "false"):
