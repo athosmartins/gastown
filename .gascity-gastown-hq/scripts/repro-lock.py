@@ -12,11 +12,13 @@ import subprocess
 import sys
 
 LOCK, FILE, REL, WHY = "Repro-Lock", "Repro-Lock-File", "Repro-Lock-Release", "Repro-Lock-Release-Reason"
-TRAILER = re.compile(r"^(%s|%s|%s|%s): (\S.*?)\s*$" % (WHY, REL, FILE, LOCK))
+# o valor vai até o fim da linha e parse_trailers tira a cauda com rstrip: `(\S.*?)\s*$` é QUADRÁTICO numa corrida de espaços (texto do construtor: estourava o teto do passo 2f, que vira «não consegui medir»)
+TRAILER = re.compile(r"^(%s|%s|%s|%s): (\S.*)$" % (WHY, REL, FILE, LOCK))
 BEAD = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 SHA = re.compile(r"^[0-9a-fA-F]{7,64}$")
 EDIT_TOOLS = ("Edit", "Write", "MultiEdit", "NotebookEdit")
-MIN_REASON, MAX_REASON, MAX_COMMITS, MAX_LINES, TIMEOUT = 20, 300, 2000, 40, 60
+# MAX_COMMITS: depois da trava o motor roda um `git diff-tree` por commit comum (3-5 ms cada, medido): 500 commits ≈ 2 s, folga larga sob o prazo de 10 s do hook e sob o teto do passo 2f mesmo com o mini carregado; histórico maior: o gate recusa se há trava declarada, o hook desiste e conta
+MIN_REASON, MAX_REASON, MAX_COMMITS, MAX_LINES, TIMEOUT = 20, 300, 500, 40, 60
 BLOCKED = "repro-lock-guard: BLOCKED"
 # a falha de AMBIENTE ou de coleta que um construtor confunde com «reproduz o bug» (--expect desliga a heurística)
 WRONG = re.compile(r"ModuleNotFoundError|ImportError|SyntaxError|IndentationError|command not found|No such file or directory|fixture '[^']*' not found|Permission denied|no tests ran|collected 0 items|ERROR collecting", re.I)
@@ -69,7 +71,7 @@ def safe_rel(path):
 def parse_trailers(msg):
     """[(chave, valor)] dos trailers repro-lock do ÚLTIMO parágrafo."""
     paras = re.split(r"\n[ \t]*\n", msg.replace("\r\n", "\n").rstrip())
-    return [m.groups() for m in map(TRAILER.match, paras[-1].split("\n")) if m]
+    return [(m[1], m[2].rstrip()) for m in map(TRAILER.match, paras[-1].split("\n")) if m]
 
 
 def event_of(msg):
@@ -170,6 +172,14 @@ def read_events(repo, base, head):  # (commits [(sha, pais)], {sha: evento}) de 
     return commits, {s: event_of(m) for s, m in commit_messages(repo, [s for s, _ in commits]).items()}
 
 
+def too_long(repo, base, head):
+    """True se base..head passa de MAX_COMMITS (o custo cresce com o histórico, que é do construtor). vazio ("0") → False; falhou/ilegível (git que cai, contagem que não é número) → Cant."""
+    n = gt(repo, "rev-list", "--count", "%s..%s" % (base, head))
+    if not n.isdigit():
+        raise Cant("git rev-list --count devolveu %r" % n[:20])
+    return int(n) > MAX_COMMITS
+
+
 def has_lock(repo, base, head, bead=""):
     """True se alguma mensagem de base..head traz «Repro-Lock: <bead>» (texto fixo, sem ler commit por commit: serve a histórico longo e ao caminho barato do hook). falhou → Cant."""
     return bool(gt(repo, "log", "-n", "1", "--format=%H", "-F", "--grep=%s: %s" % (LOCK, bead), "%s..%s" % (base, head)))
@@ -178,10 +188,7 @@ def has_lock(repo, base, head, bead=""):
 def analyze(repo, base, head, bead):
     """O veredito de base..head para `bead`: dict(verdict, reason, locks, files, releases, lines). Uma trava declarada que não dá para provar é RECUSA, nunca «não sei»."""
     res = {"verdict": "nao-se-aplica", "reason": "sem-trava-declarada", "locks": 0, "files": 0, "releases": 0, "lines": []}
-    n = gt(repo, "rev-list", "--count", "%s..%s" % (base, head))
-    if not n.isdigit():
-        raise Cant("git rev-list --count devolveu %r" % n[:20])
-    if int(n) > MAX_COMMITS:
+    if too_long(repo, base, head):
         if has_lock(repo, base, head, bead):
             res.update(verdict="fail", reason="historia-longa-demais-com-trava", lines=["mais de %d commits em base..head e uma trava declarada: não dá para provar que o teste não mudou; reduza a branch" % MAX_COMMITS])
         else:
@@ -219,6 +226,16 @@ def base_of(repo):
     return None
 
 
+def toplevel(d):
+    """Raiz do repo que contém `d`. vazio (fora de qualquer repo) → None: o arquivo não pode estar travado; falhou por outro motivo (git ausente, .git ilegível, dono estranho) → Cant: dúvida, nunca «fora do repo»."""
+    try:
+        return gt(d, "rev-parse", "--show-toplevel")
+    except Cant as e:
+        if "not a git repository" in str(e):  # git() fixa LC_ALL=C: o texto do git não muda de língua
+            return None
+        raise
+
+
 def locked_now(repo, base):
     """{arquivo: bead} das travas que valem em HEAD: a MESMA simulação do gate (release libera). vazio → {}; falhou → Cant."""
     commits, evs = read_events(repo, base, "HEAD")
@@ -243,19 +260,26 @@ def guard_cmd(text):
     except ValueError:
         return 0, "UNGUARDED payload do hook não é JSON"
     p = p if isinstance(p, dict) else {}
+    tool = p.get("tool_name")
+    if isinstance(tool, str) and tool not in EDIT_TOOLS:
+        return 0, ""  # outra ferramenta: nada a guardar (o matcher do overlay só entrega as de edição)
     ti = p.get("tool_input") if isinstance(p.get("tool_input"), dict) else {}
     path = ti.get("file_path") or ti.get("notebook_path")
-    if p.get("tool_name") not in EDIT_TOOLS or not isinstance(path, str) or not path:
-        return 0, ""
+    if tool not in EDIT_TOOLS or not isinstance(path, str) or not path:
+        return 0, "UNGUARDED payload sem ferramenta de edição ou sem caminho de arquivo: o formato do hook mudou?"
     target = path if os.path.isabs(path) else os.path.join(p["cwd"] if isinstance(p.get("cwd"), str) else os.getcwd(), path)
     d = os.path.dirname(target)
     while d and not os.path.isdir(d) and os.path.dirname(d) != d:
         d = os.path.dirname(d)  # Write pode criar a pasta: sobe até a que existe
     try:
-        top = gt(d, "rev-parse", "--show-toplevel")
+        top = toplevel(d)
+        if top is None:
+            return 0, ""  # fora de qualquer repo o arquivo não pode estar travado: nada a guardar, e fora da contagem de dúvidas
         base = base_of(top)
         if base is None:
             return 0, "UNGUARDED não achei origin/main nem main em %s" % top
+        if too_long(top, base, "HEAD"):
+            return 0, "UNGUARDED mais de %d commits em origin/main..HEAD: o hook desiste, o gate confere" % MAX_COMMITS
         locked = locked_now(top, base) if has_lock(top, base, "HEAD") else {}
     except Cant as e:
         return 0, "UNGUARDED %s" % e
@@ -263,7 +287,7 @@ def guard_cmd(text):
         if same_file(target, os.path.join(top, f)):
             return 2, ("%s — «%s» está TRAVADO pela bead %s: é o teste que reproduz o bug, e afrouxá-lo junto com o conserto não prova que o bug sumiu. NÃO repita a chamada e NÃO contorne por Bash (sed -i, tee, git checkout): o gate "
                        "compara o teste do tip com o commit da trava e recusa a submissão (passo 2f).\nConserte o CÓDIGO; mais casos vão em OUTRO arquivo de teste. Defeito REAL do teste: `bd comment %s \"<o que está errado>\"` e `git commit --allow-empty -m \"libera a trava\" "
-                       "-m $'Repro-Lock-Release: %s\\nRepro-Lock-Release-Reason: <o que está errado, %d+ caracteres>'`; só então edite (o revisor vê o motivo)." % (BLOCKED, f, bead, bead, bead, MIN_REASON))
+                       "-m $'Repro-Lock-Release: %s\\nRepro-Lock-Release-Reason: <o que está errado, %d+ caracteres>'`; só então edite (o gate registra o motivo no marcador)." % (BLOCKED, f, bead, bead, bead, MIN_REASON))
     return 0, ""
 
 
@@ -295,8 +319,12 @@ def cmd_lock(a):
     t = bead_type(a.bead)  # bd que cai → Cant → «NÃO SEI», nada travado: o estado inerte
     if t != "bug":
         return die("a bead %s é do tipo %r: a trava vale só para bead tipo bug" % (a.bead, t))
-    if not gt(top, "status", "--porcelain", "--", *files):
+    # vazio → árvore limpa: a 1ª recusa abaixo diz que o teste não mudou; falhou (git) → Cant: «NÃO SEI», nada travado
+    st = {e[3:] for e in git(top, "status", "--porcelain", "-z", "-uall", "--no-renames").decode("utf-8", "replace").split("\0") if e}
+    if not st & set(files):
         return die("nenhum arquivo tem mudança nova: a trava é o commit que ADICIONA ou ALTERA o teste")
+    if st - set(files):
+        return die("a árvore tem mudança fora dos arquivos de teste (%s): a reprodução tem de falhar no código de HOJE, não num código alterado à mão; commite, guarde ou descarte antes" % ", ".join(sorted(st - set(files))[:5]))
     base = base_of(top)
     if base is None:
         return die("NÃO SEI: não achei origin/main nem main para conferir que o teste é o 1º commit da branch")
@@ -309,7 +337,7 @@ def cmd_lock(a):
         return die("a reprodução falhou (rc %d), mas %s.\n%s" % (rc, "a saída não casa --expect %r" % a.expect if a.expect else "parece falha de AMBIENTE ou de coleta, não do bug: confirme o motivo com --expect '<regex da asserção>'", tail))
     git(top, "add", "--", *files)
     msg = "test(%s): reproduz o bug antes do conserto (trava de teste)\n\n%s\n" % (a.bead, "\n".join(["%s: %s" % (LOCK, a.bead)] + ["%s: %s" % (FILE, f) for f in files]))
-    git(top, "commit", "-q", "-F", "-", "--", *files, stdin=msg.encode())  # `-- <arquivos>`: o commit leva SÓ os testes, o que mais estiver no índice fica de fora
+    git(top, "commit", "-q", "-F", "-", stdin=msg.encode())  # o índice só tem os arquivos dados: a árvore foi conferida limpa fora deles mais acima
     sha = gt(top, "rev-parse", "HEAD")
     try:
         bd("comment", a.bead, "[repro-lock] TRAVADO: %s @ %s. O teste que reproduz o bug entrou ANTES do conserto e não pode mudar (o gate compara o commit da trava). Reprodução: `%s` saiu com rc=%d (falha no código de hoje)." % (", ".join(files), sha[:7], a.cmd, rc))

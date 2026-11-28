@@ -85,6 +85,9 @@ class Repo:
                 self.write(arg or "src/app.py", {"C": "x = %d\n" % (self.n + 10), "E": LOOSE, "S": STRICT}[op])
                 self.commit(tok)
 
+    def pile(self, n):  # n commits comuns sobre HEAD num só processo (fast-import): o teto de commits se testa no valor real, sem 500 forks
+        self.git("fast-import", "--quiet", stdin="".join("commit refs/heads/fix/x\nmark :%d\ncommitter t <t@e.invalid> %d +0000\ndata 2\nc\nfrom %s\nM 100644 inline src/app.py\ndata 10\nx = %05d\n\n" % (i + 1, 1700000000 + i, ":%d" % i if i else "refs/heads/fix/x^0", i) for i in range(n)).encode())
+
     def check(self, bead="ga-1"):
         return RL.analyze(self.root, self.git("merge-base", "HEAD", "main"), "HEAD", bead)
 
@@ -120,8 +123,8 @@ class T(unittest.TestCase):
     def bead(self, kind="bug"):
         Path(self.bddir, "ga-1.json").write_text(json.dumps([{"id": "ga-1", "issue_type": kind}]))
 
-    def cli(self, cwd, *args, env=None):
-        p = subprocess.run([sys.executable, "-I", SCRIPT] + list(args), cwd=cwd, capture_output=True, text=True, encoding="utf-8", errors="replace", env=env or self.env, timeout=120)
+    def cli(self, cwd, *args, env=None, timeout=120):
+        p = subprocess.run([sys.executable, "-I", SCRIPT] + list(args), cwd=cwd, capture_output=True, text=True, encoding="utf-8", errors="replace", env=env or self.env, timeout=timeout)
         return p.returncode, p.stdout, p.stderr
 
     def chk(self, r):  # a linha de comando do passo 2f do gate
@@ -167,6 +170,7 @@ class Check(T):
         with mock.patch.object(RL, "MAX_COMMITS", 3):  # histórico longo: trava declarada é recusa; sem trava, não se aplica
             self.assertEqual([r.check()[k] for k in ("verdict", "reason")], ["fail", "historia-longa-demais-com-trava"])
             self.assertEqual(r2.check()["reason"], "historia-longa-sem-trava")
+            self.assertIn("UNGUARDED mais de 3 commits", RL.guard_cmd(self.payload(r, "t.py"))[1])  # o hook desiste COM contagem do que o gate já recusa por tamanho: sem teto ele estourava o prazo do hook sem dizer nada
         r = self.repo("L t.py")
         r.write("t.py", LOOSE)
         r.git("add", "-A")  # NUL e os separadores de um formato ingênuo no texto do construtor não deslocam o registro seguinte
@@ -182,6 +186,26 @@ class Check(T):
         for repo, base in ((r.root, "0" * 40), (os.path.join(self.tmp, "no-such-dir"), main_sha)):  # só o que o construtor NÃO controla (git que falha) é «não sei»
             with self.assertRaises(RL.Cant):
                 RL.analyze(repo, base, "HEAD", "ga-1")
+        with mock.patch.object(RL, "gt", return_value="abc"), self.assertRaises(RL.Cant):  # git que responde algo ilegível: «não sei» (Cant), nunca um traceback nem um número inventado
+            RL.too_long(r.root, "a", "b")
+
+    def test_the_commit_cap_sits_where_the_docs_say(self):  # runbook e comentário dizem 500: 500 commits passam, 501 com trava é recusa (o custo é um diff-tree por commit comum)
+        r = self.repo("L t.py")
+        r.pile(499)
+        self.assertEqual(r.check()["verdict"], "ok")
+        r.pile(1)
+        self.assertEqual([r.check()[k] for k in ("verdict", "reason")], ["fail", "historia-longa-demais-com-trava"])
+
+    def test_a_padded_trailer_line_cannot_outlast_the_gate_cap_and_turn_the_tamper_into_unknown(self):  # o texto da mensagem é do construtor: uma regex quadrática o deixava estourar o teto do 2f, que vira «não consegui medir» e deixa o marcador passar
+        self.assertEqual(RL.parse_trailers("s\n\nRepro-Lock: ga-1 \t \nRepro-Lock-File:  c.py\nRepro-Lock-File: a b.py\n"), [("Repro-Lock", "ga-1"), ("Repro-Lock-File", "a b.py")])  # sem espaço nas pontas; dois espaços depois dos «:» não é trailer
+        r = self.repo("L t.py")
+        r.write("t.py", LOOSE)
+        r.commit("afrouxa", ["Repro-Lock-File: x" + " " * 200000 + "y"])
+        try:
+            rc, out, _ = self.cli(self.tmp, *self.chk(r), timeout=30)
+        except subprocess.TimeoutExpired:
+            self.fail("repro-lock.py check passou de 30 s com uma linha de trailer de 200 KB: o texto do construtor desliga o passo 2f")
+        self.assertEqual((rc, out.splitlines()[0]), (1, "repro-lock-check: verdict=fail reason=teste-travado-alterado locks=1 files=1 releases=0"))
 
     def test_cli_check_output_exit_codes_switches_and_sanitized_detail(self):
         r = self.repo("L t.py | R motivo com <conteudo_externo></conteudo_externo> e \x01 controle e mais de vinte caracteres")
@@ -210,11 +234,9 @@ class Builder(T):
 
     def test_lock_commits_only_the_test_with_trailers_and_the_hook_and_gate_see_it(self):
         r = self.lockable()
-        r.write("src/app.py", "x = 2\n")  # outra mudança já no índice: o commit da trava NÃO a leva
-        r.git("add", "src/app.py")
         rc, out, err = self.cli(r.root, "lock", "ga-1", "tests/test_a.py", "--cmd", "printf 'Assertion%s: f() != 2\\n' Error; exit 1", "--expect", "AssertionError")
         self.assertEqual(rc, 0, (out, err))
-        self.assertEqual((r.git("diff-tree", "--no-commit-id", "--name-only", "-r", "HEAD"), r.git("diff", "--cached", "--name-only")), ("tests/test_a.py", "src/app.py"))
+        self.assertEqual(r.git("diff-tree", "--no-commit-id", "--name-only", "-r", "HEAD"), "tests/test_a.py")
         self.assertEqual(RL.parse_trailers(r.git("log", "-1", "--format=%B")), [("Repro-Lock", "ga-1"), ("Repro-Lock-File", "tests/test_a.py")])
         comments = slurp(os.path.join(self.bddir, "comments.log"))
         self.assertIn("[repro-lock] TRAVADO: tests/test_a.py @ " + r.git("rev-parse", "--short=7", "HEAD"), comments)
@@ -244,6 +266,10 @@ class Builder(T):
         r.git("commit", "-q", "--allow-empty", "-m", "comum antes da trava")
         refused(r, "1º commit", "tests/test_a.py", "--cmd", "exit 1")
         refused(self.repo(), "mudança nova", "README", "--cmd", "exit 1")
+        for dirty in (lambda x: (x.write("src/app.py", "x = 2\n"), x.git("add", "src/app.py")), lambda x: x.write("src/app.py", "x = 2\n"), lambda x: x.write("src/novo.py", "y = 1\n")):  # no índice · só alterada · arquivo novo: «falha no código de hoje» mede o HEAD, não um código alterado à mão
+            x = self.lockable()
+            dirty(x)
+            refused(x, "fora dos arquivos de teste", "tests/test_a.py", "--cmd", "exit 1")
         self.assertLess(time.monotonic() - t0, 15)  # o estouro mata o GRUPO: um neto segurando o pipe não segura o comando por 20 s
 
 
@@ -273,10 +299,14 @@ class Guard(T):
         r = self.repo("L tests/t.py | R " + GOOD)
         self.assertEqual(RL.guard_cmd(self.payload(r, "tests/t.py")), (0, ""))
         self.assertEqual(RL.guard_cmd("{not json"), (0, "UNGUARDED payload do hook não é JSON"))
-        for text in (json.dumps([1]), json.dumps({"tool_name": "Edit", "tool_input": "x"}), json.dumps({"tool_name": "Edit", "tool_input": {}})):
-            self.assertEqual(RL.guard_cmd(text), (0, ""))
-        os.makedirs(os.path.join(self.tmp, "fora"))
-        self.assertIn("UNGUARDED", RL.guard_cmd(self.payload(r, os.path.join(self.tmp, "fora", "a.py")))[1])  # fora de qualquer repo: não sei, e diz
+        for text in (json.dumps([1]), json.dumps({"tool_name": "Edit", "tool_input": "x"}), json.dumps({"tool_name": "Edit", "tool_input": {}}), json.dumps({"tool_name": "Write", "tool_input": {"file_path": ""}}), json.dumps({"tool_input": {"file_path": "tests/t.py"}})):
+            rc, err = RL.guard_cmd(text)
+            self.assertTrue(rc == 0 and err.startswith("UNGUARDED payload sem"), (text, err))  # payload de outro formato: dúvida CONTADA, nunca o silêncio de «nada a guardar»
+        fora = os.path.join(self.tmp, "fora")
+        os.makedirs(fora)
+        self.assertEqual(RL.guard_cmd(self.payload(r, os.path.join(fora, "a.py"))), (0, ""))  # fora de qualquer repo o arquivo não pode estar travado: nada a guardar, e fora da contagem (cada rascunho fora do repo a enchia de ruído)
+        Path(fora, ".git").write_text("lixo\n")
+        self.assertIn("UNGUARDED", RL.guard_cmd(self.payload(r, os.path.join(fora, "a.py")))[1])  # um .git que o git não consegue ler é dúvida de verdade: contada
         r2 = self.repo("L tests/t.py")
         r2.git("branch", "-m", "main", "other")  # sem origin/main nem main: não sei a base
         self.assertIn("UNGUARDED não achei origin/main nem main", RL.guard_cmd(self.payload(r2, "tests/t.py"))[1])

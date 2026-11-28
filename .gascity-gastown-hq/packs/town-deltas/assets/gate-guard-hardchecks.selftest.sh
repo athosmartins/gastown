@@ -41,7 +41,7 @@ set -euo pipefail
 log() { printf 'LOG %s\n' "$*" >> "$CALLS"; }
 err() { printf 'ERR %s\n' "$*" >> "$CALLS"; }
 set_gate_status() { printf 'STATUS %s %s\n' "$1" "$2" >> "$CALLS"; }
-bd() { printf 'BD %s\n' "$*" >> "$CALLS"; }
+bd() { printf 'BD %s\n' "$*" >> "$CALLS"; [ -z "${BD_FAIL_COMMENT:-}" ] || [ "${3:-}" != comment ]; }
 . "$BLOCK"
 echo "BLOCK-FELL-THROUGH" >> "$CALLS"
 DRV
@@ -153,6 +153,8 @@ has "$MXCF" "step(s) 2c 2f." && ok "ONE refusal lists both failing steps" || bad
 setstub 2c "$(V ok)\\n"; setstub 2f "$(V2f aviso)\\n  liberada em abc1234: o teste confere 3 mas o contrato diz 2\\n"
 mx "2f VERDICT=aviso (a release with a reason)" pass 2f gate-testlock aviso
 has "$MXCF" "Gate guard note (ga-89ix4m4, step 2f)" && has "$MXCF" "<conteudo_externo>" && has "$MXCF" "o teste confere 3 mas o contrato diz 2" && ok "and the reason is a fenced comment on the marker" || bad "2f note: $(grep -c 'comment' "$MXCF") comment calls"
+mx "2f aviso whose bd comment FAILS" pass 2f gate-testlock aviso BD_FAIL_COMMENT=1
+has "$MXCF" "HARDCHECK-NOTE step=2f: comment on marker ga-marker-1 FAILED" && has "$MXCF" "o teste confere 3 mas o contrato diz 2" && ok "a note whose comment failed is LOGGED with the reason text, never lost silently" || bad "failed note comment: $(grep -c 'HARDCHECK-NOTE' "$MXCF") log lines"
 setstub 2c "$(V aviso)\\n"; setstub 2f "$(V2f ok)\\n"; mx "an aviso of ANOTHER step leaves no 2f note" pass 2c gate-docrules aviso
 hasnt "$MXCF" "Gate guard note (ga-89ix4m4" && ok "no 2f note without a 2f aviso" || bad "a 2f note appeared for another step's aviso"
 for v in ok nao-se-aplica desligado nao-consegui-medir debito-previo nao-ligado banana; do setstub 2f "$(V2f "$v")\\n"; mx "2f VERDICT=$v" pass 2f gate-testlock "${v/banana/nao-consegui-medir}"; done
