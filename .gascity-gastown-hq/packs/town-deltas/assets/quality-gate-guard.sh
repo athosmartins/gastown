@@ -9950,7 +9950,7 @@ for _HC_STEP in 2b 2c 2d 2e 2f; do
     (2c) _HC_LAB="gate-docrules"; _HC_HINT='2c doc rules: python3 .gascity-gastown-hq/scripts/doc-rules-lint.py --check --diff "$(git merge-base HEAD origin/main)...HEAD"   (--fix-contents <file> writes the Contents section)' ;;
     (2d) _HC_LAB="gate-e12cov"; _HC_HINT='2d E12 coverage: bash .gascity-gastown-hq/packs/town-deltas/assets/e12-crew-doctrine.sh check ; ... coverage   (stale text: ... write)' ;;
     (2e) _HC_LAB="gate-tsr"; _HC_HINT='2e third-state reads: python3 .gascity-gastown-hq/packs/town-deltas/assets/third-state-reads-check.py --repo . --base origin/main --head HEAD --bead <bead> --no-record' ;;
-    (*)  _HC_LAB="gate-testlock"; _HC_HINT='2f test lock: python3 .gascity-gastown-hq/scripts/repro-lock.py check --repo . --base "$(git merge-base HEAD origin/main)" --head "$(git rev-parse HEAD)" --bead <bead>   (the locked test may not change after the lock commit; a real defect in the test: repro-lock.py release <bead> --reason "<why>" BEFORE editing it)' ;;
+    (*)  _HC_LAB="gate-testlock"; _HC_HINT='2f test lock: python3 .gascity-gastown-hq/scripts/repro-lock.py check --repo . --base <git merge-base HEAD origin/main> --head <git rev-parse HEAD> --bead <bead>   (the locked test may not change after the lock commit; a real defect in the test: repro-lock.py release <bead> --reason "<why>" BEFORE editing it)' ;;
   esac
   _HC_V="nao-consegui-medir"; _HC_R="$_HC_WHY"; _HC_LINE=""
   if [ "$_HC_MODE" = "off" ]; then
