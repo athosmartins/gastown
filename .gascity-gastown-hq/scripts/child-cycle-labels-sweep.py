@@ -21,6 +21,9 @@ story:done, gate-approved:<sha>, delivery:tested, ...) on an OPEN child, when AL
 Anything else that is a never-inherit label on a child (exec:manual, pilot:*, next-action:*, story:in-flight,
 blocked:*, counters...) is only REPORTED: removing a hold or a park label RELEASES work, which is not the
 inert direction (a human or the Mayor decides), and `pilot:no-auto-dispatch` is the town's creation default.
+An audit:* REVIEW MARKER is reported too (audit:bateria-queda, the mark of the battery's drop alert, ga-hyp55ss.4): it is not
+a completion claim and the mark belongs to the marked bead, so a copy on a follow-up is for a human to take off (`bd label
+remove`). Inside audit:*, only audit:passed and audit:passed-minor are completion claims (strip candidates under the proofs above).
 
 DEFAULT IS DRY-RUN. `--apply` removes (one label per `bd label remove` — multi-arg is a silent no-op),
 re-reads the store to CONFIRM each removal (a `bd` write can exit 0 without persisting), and leaves one audit

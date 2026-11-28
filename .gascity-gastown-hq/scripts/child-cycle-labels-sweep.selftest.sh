@@ -139,6 +139,12 @@ s.append("INSERT INTO dependencies VALUES (UUID(),'ga-c12','blocks','ga-p1')")
 # c13: gate:passed added TWICE and never removed -> "added exactly once" is not met -> report only
 issue("ga-c13", "open", "@t2"); child("ga-c13", "ga-p1"); label("ga-c13", "gate:passed")
 ev("ga-c13", "label_added", "gate:passed", 0); ev("ga-c13", "label_added", "gate:passed", 5)
+# c14: a follow-up of a bead the battery alert MARKED (p3 stands for such a bead, e.g. ga-hyp55ss.4, and carries audit:bateria-queda): `bd create --parent` copied the mark onto it at birth.
+#      Every proof holds (added once at +0 s, never removed, no gate marker, nobody curating), so the ONLY thing between this label and a strip is
+#      "not a completion claim": it is a review marker, so the sweep REPORTS it and a human removes it. audit:passed is a claim; this is not
+issue("ga-p3", "open", "@t30"); label("ga-p3", "audit:bateria-queda"); label("ga-p3", "area:infra")
+issue("ga-c14", "open", "@t2"); child("ga-c14", "ga-p3"); label("ga-c14", "audit:bateria-queda"); label("ga-c14", "area:infra")
+ev("ga-c14", "label_added", "audit:bateria-queda", 0); ev("ga-c14", "label_added", "area:infra", 0)
 r = subprocess.run(["dolt", "sql", "-q", "; ".join(s)], cwd=db, capture_output=True, text=True)
 if r.returncode != 0:
     sys.stderr.write(r.stderr); sys.exit(1)
@@ -173,7 +179,7 @@ c=$(printf '%s\n' "$s" | grep -c 'ga-c1 ') ; [ "$c" -eq 3 ] && ok "c1: exactly 3
 for l in 'gate:passed' 'story:done' 'gate-approved:abc123'; do
   printf '%s\n' "$s" | grep 'ga-c1 ' | grep -q -- "$l" && ok "c1: $l is a strip candidate" || nope "c1: $l missing from STRIP"
 done
-printf '%s\n' "$s" | grep -q -E 'ga-c([2-9]|1[0-3]) ' && nope "STRIP section lists a child that must not be stripped" || ok "only c1 is in the STRIP section"
+printf '%s\n' "$s" | grep -q -E 'ga-c([2-9]|1[0-4]) ' && nope "STRIP section lists a child that must not be stripped" || ok "only c1 is in the STRIP section"
 r="$(section REPORT)"
 printf '%s\n' "$r" | grep 'ga-c1 ' | grep -q 'exec:manual' && ok "c1 exec:manual is REPORTED (a hold is not stripped)" || nope "c1 exec:manual not in REPORT"
 printf '%s\n' "$r" | grep 'ga-c2 ' | grep -q 'gate reviewed' && ok "c2: reviewed by the gate -> report only" || nope "c2 not reported as gate-reviewed"
@@ -184,6 +190,8 @@ printf '%s\n' "$r" | grep 'ga-c9 ' | grep -q 'not proven born-with' && ok "c9: r
 printf '%s\n' "$r" | grep 'ga-c10 ' | grep -q 'not proven born-with' && ok "c10: event stamped before the child existed -> report only" || nope "c10 not reported"
 printf '%s\n' "$r" | grep 'ga-c11 ' | grep -q 'hand-edited in the last 6h' && ok "c11: labels hand-edited an hour ago -> report only (someone is on it)" || nope "c11 not reported as being curated"
 printf '%s\n' "$r" | grep 'ga-c13 ' | grep -q 'not proven born-with' && ok "c13: added twice and never removed -> report only" || nope "c13 not reported"
+# the bracket holds ONE reason: every birth proof holds for c14, so only the claim rule keeps the marker out of STRIP
+printf '%s\n' "$r" | grep 'ga-c14 ' | grep -qF '(parent ga-p3, open)  audit:bateria-queda  [not a completion claim: removing it could release work]' && ok "c14: audit:bateria-queda copied from a marked bead -> report only, for the claim rule alone" || nope "c14 not reported as a lone 'not a completion claim'"
 for x in ga-c5 ga-c6 ga-c7 ga-c12; do
   grep -q "$x " "$OUT_F" && nope "$x must not appear (parent lacks the label / closed / outside the window / not a parent-child edge)" || ok "$x is out of scope and not listed"
 done
@@ -205,6 +213,9 @@ want="area:infra,exec:manual,lane:small"
 [ "$(labels_of ga-c11)" = "gate:passed" ] && ok "apply: c11 (being curated) untouched" || nope "apply touched c11"
 [ "$(labels_of ga-c12)" = "gate:passed" ] && [ "$(labels_of ga-c13)" = "gate:passed" ] && ok "apply: c12 (blocks edge) and c13 (added twice) untouched" || nope "apply touched c12/c13"
 [ "$(labels_of ga-c6)" = "gate:passed" ] && [ "$(labels_of ga-c7)" = "gate:passed" ] && ok "apply: closed / old children untouched" || nope "apply touched c6/c7"
+# vazio → "" ≠ the expected labels → FAIL; falhou/ilegível (labels_of swallows a dolt error) → "" → FAIL: a read that did not answer never passes these two
+[ "$(labels_of ga-c14)" = "area:infra,audit:bateria-queda" ] && ok "apply: c14 keeps audit:bateria-queda (a review marker is reported, never stripped)" || nope "apply changed c14 (labels: $(labels_of ga-c14))"
+[ "$(labels_of ga-p3)" = "area:infra,audit:bateria-queda" ] && ok "apply: the marked bead (p3) keeps its mark" || nope "apply changed p3 (labels: $(labels_of ga-p3))"
 [ "$(labels_of ga-p1 | tr ',' '\n' | sort | paste -sd, -)" = "area:infra,exec:manual,gate-approved:abc123,gate:passed,lane:small,pilot:no-auto-dispatch,story:done" ] && ok "apply: the PARENT is never touched" || nope "apply changed the parent"
 [ "$(n_calls ' label remove ')" -eq 3 ] && ok "apply: exactly 3 single-label removes" || nope "apply: $(n_calls ' label remove ') removes, want 3"
 [ "$(n_calls ' comment ga-c1 ')" -eq 3 ] && ok "apply: one audit comment per removal" || nope "apply: $(n_calls ' comment ga-c1 ') comments, want 3"
