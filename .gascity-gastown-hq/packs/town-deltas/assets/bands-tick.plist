@@ -1,0 +1,26 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <key>Label</key><string>com.gascity.bands-tick</string>
+  <!-- Faixas estatísticas (ga-4mzkfj9, fatia 2a): mede e julga as métricas do bands.yaml que se medem sozinhas (driver tick). Hoje uma:
+       disk_free_delta, EM SOMBRA (conta o que as faixas diriam, não manda nada; os pisos fixos do disco seguem agindo). Uma rodada lê o df,
+       grava UMA linha em .gc/state/bands/series/ e julga; um flock por métrica impede duas rodadas juntas. Não usa Dolt, gc nem bd.
+       NÃO é carregado sozinho: o Mayor instala (docs/runbooks/alarm-bands.md, "Instalar o tick"). -->
+  <key>ProgramArguments</key><array>
+    <string>/usr/bin/python3</string>
+    <string>/Users/athos/gt/.gascity-gastown-hq/packs/town-deltas/assets/scripts/bands.py</string>
+    <string>tick</string>
+  </array>
+  <key>WorkingDirectory</key><string>/Users/athos/gt/.gascity-gastown-hq</string>
+  <key>StartInterval</key><integer>600</integer>
+  <key>RunAtLoad</key><false/>
+  <key>Nice</key><integer>10</integer>
+  <key>LowPriorityIO</key><true/>
+  <key>StandardOutPath</key><string>/Users/athos/gt/.gascity-gastown-hq/.gc/logs/bands-tick-launchd.out</string>
+  <key>StandardErrorPath</key><string>/Users/athos/gt/.gascity-gastown-hq/.gc/logs/bands-tick-launchd.err</string>
+  <key>EnvironmentVariables</key><dict>
+    <key>PATH</key><string>/usr/bin:/bin:/usr/sbin:/sbin</string>
+    <key>HOME</key><string>/Users/athos</string>
+    <key>GC_CITY_PATH</key><string>/Users/athos/gt/.gascity-gastown-hq</string>
+  </dict>
+</dict></plist>
