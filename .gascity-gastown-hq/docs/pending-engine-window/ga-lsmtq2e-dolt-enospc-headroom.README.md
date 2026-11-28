@@ -29,15 +29,20 @@ mini sits near 6.2 GB free, so this is a live risk. Upstream fixed it; the engin
 
 ## Why it is not live (tried 28/11)
 
-The Mayor decided to port it into the local pack copies now ("gc preserves a local pack edit"). That is true for
-non-required packs only: `bd` and `dolt` are **required** packs, and `MaterializeBuiltinPacks`
-(`cmd/gc/embed_builtin_packs.go`, ga-o99jf) always refreshes and validates them from the binary on every `gc start` /
-`gc init`. The three files were replaced atomically at 13:14 and were back to the original bytes at 13:14:48, and a
-temp file left beside them was removed. The originals are intact; nothing is half applied.
+The Mayor decided to port it into the local pack copies now ("gc preserves a local pack edit"). That holds for the
+`dolt` pack here and not for `bd`: in this city `bd` is a **required** pack, which `MaterializeBuiltinPacks`
+(`cmd/gc/embed_builtin_packs.go`, ga-o99jf) refreshes and validates from the binary on every `gc` call that
+materializes; only non-required packs keep operator edits (they carry a `.gc-pack-hashes.json` sidecar, and
+`dolt` has one, `bd` does not). The two `bd` files (`dolt-enospc.sh`, `gc-beads-bd.sh`) were replaced atomically at
+13:14 and were back to the original bytes at 13:14:48; `gc` itself says the `dolt` pack's `commands/restart/run.sh`
+differs from the binary and "your edit is preserved" (that file's replacement did not complete: a temp file beside
+it was removed, so a surviving edit there is inferred from that message, not tried). The core of the fix is in `bd`
+(the helper `restart/run.sh` sources, and `op_recover`, the controller's path), so a port that sticks only in
+`dolt` would protect `gc dolt restart` and leave the sticky refusal in recovery. Live is exactly as before.
 
 ## Applying
 
-Only the engine window can make it stick: take the ENOSPC hunks of `e8547dc572` (not its `setsid` hunks) or this
+Only the engine window can make the `bd` part stick: take the ENOSPC hunks of `e8547dc572` (not its `setsid` hunks) or this
 patch, which is that subset adapted to the packed layout. When the window lands, rename the patch to
 `.APLICADO-<date>` like the others. A deliberate stopgap is `patch -p1 -d .gc/system/packs < <patch>`, which the next
 `gc start` undoes. A restart-path edit stays Mayor-coordinated.

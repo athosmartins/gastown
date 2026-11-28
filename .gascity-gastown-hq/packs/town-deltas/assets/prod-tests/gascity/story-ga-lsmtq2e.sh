@@ -9,11 +9,11 @@
 # dir has less than GC_DOLT_WARN_FREE_BYTES (default 2 GiB) free. Free >= floor -> allowed. Free below
 # the floor, or unreadable -> keeps refusing (the inert state).
 #
-# What it runs on: the bd/dolt packs are REQUIRED packs, which gc re-materializes from its binary on every
-# start (an edit made there is put back within seconds, seen on 28/11), so the port cannot live in
-# .gc/system/packs until the engine window. So: if the live packs carry the port (the engine brought it),
-# test them; if they carry none, apply the tracked patch to a scratch copy of the live files and test that
-# (this also proves the patch still applies to the deployed base); a half-applied or unapplicable state fails.
+# What it runs on: the `bd` pack is REQUIRED here, so gc re-materializes dolt-enospc.sh and gc-beads-bd.sh from its
+# binary and an edit there is put back within seconds (seen 28/11): the port cannot live in .gc/system/packs until
+# the engine window. So: if the live packs carry the port (the engine brought it), test them; if they carry none,
+# apply the tracked patch to a scratch copy of the live files and test that (this also proves the patch still
+# applies to the deployed base); a half-applied or unapplicable state fails.
 set -uo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
