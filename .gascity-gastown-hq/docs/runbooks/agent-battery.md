@@ -21,8 +21,8 @@ causador. Na v1 só mede e avisa: não bloqueia merge. Sem dado de lead no nó H
 |---|---|---|---|
 | 1 | acervo de tarefas a partir do histórico mergeado | ga-hyp55ss | esta entrega |
 | 2 | executor por tarefa, critério reprova-na-base/passa-no-fix, teto de tokens com freio | ga-hyp55ss.1 | entregue (`agent-battery-run.py`, `agent-battery-run.md`) |
-| 3 | ordem noturna no Hetzner + gatilho em merge + relatório por papel com sha de config | ga-hyp55ss.3 | em andamento |
-| 4 | alerta ao Mayor, marca do merge causador, controle negativo | ga-hyp55ss.4 | aberta (depende da 3) |
+| 3 | ordem noturna no Hetzner + gatilho em merge + relatório por papel com sha de config | ga-hyp55ss.3 | entregue (`agent-battery-night.py`, `agent-battery-night.md`) |
+| 4 | alerta ao Mayor, marca do merge causador, controle negativo | ga-hyp55ss.4 | esta entrega (`agent-battery-alert.py`, `agent-battery-alert.md`) |
 
 Pronto quando: 3 noites seguidas com relatório, e uma mudança de prompt deliberadamente ruim derruba a taxa e dispara o aviso.
 
