@@ -8,25 +8,28 @@ version: 1
 # depois dele é. Métrica com evaluate_in_silence: true segue sendo julgada e só a ENTREGA espera a manhã. "off" desliga.
 silence: "22-07"
 
-# 2σ: o agente que só lê. claude -p com Read/Grep/Glob e mais nenhuma ferramenta (restrição por construção, não por prosa).
+# 2σ: o agente de diagnóstico. claude -p SEM ferramenta nenhuma (--tools "": restrição por construção, não por prosa); quem lê os
+# logs é o motor, que entrega os trechos como dado. Sem Read não há escopo de leitura para vazar.
 diagnose:
   enabled: true
   model: sonnet
   effort: medium
-  max_usd: 1.0
+  max_usd: 0.5
   timeout_s: 600
   max_attempts: 2
   max_per_day: 4
 
 # 3σ: a proposta de conserto vira bead (o gate revisa o que a bead construir).
-# labels = a postura de despacho da bead. O padrão é o mesmo do gate-refusal-checks.py, o outro vigia que abre bead sozinho: nasce
-# aprovada e vai direto a um builder, com o texto do modelo fechado em <conteudo_externo> (dado, nunca instrução), encurtado, e as
-# TRAVAS escritas na bead; o gate revisa o que ela construir. Quem preferir um humano/Mayor aprovando ANTES de um builder agir troca
-# esta lista (rótulos que o Pilot não despacha); nada de story:needs-approval, que cai na fila do Athos sem dizer o que ele faz.
+# A bead nasce ESTACIONADA para o Mayor: pilot:no-auto-dispatch (o veto que o Pilot respeita) + dona (assignee), que é o que a
+# doutrina da cidade manda para "só impedir despacho" sem cair na fila do Athos. Ele lê o mail e o diagnóstico (texto de modelo,
+# fechado em <conteudo_externo> e encurtado) e libera com o comando que vem escrito na própria bead. Para despachar sozinha,
+# o molde do gate-refusal-checks.py é labels: ["exec:auto", "story:approved"] e assignee: ""; nesse caso o texto do modelo SAI do
+# corpo da bead (fica no mail e no estado). Nunca story:needs-approval: cai na fila do Athos sem dizer o que ele faz.
 bead:
   enabled: true
   route: gastown.dog
-  labels: ["exec:auto", "story:approved"]
+  labels: ["pilot:no-auto-dispatch"]
+  assignee: "gastown.mayor"
   max_attempts: 3
   max_per_day: 2
 

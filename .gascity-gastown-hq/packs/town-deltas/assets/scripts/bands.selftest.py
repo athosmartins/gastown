@@ -151,6 +151,15 @@ class ConfigValidation(unittest.TestCase):
                 with self.assertRaises(bands.ConfigError):
                     bands.parse_config_text(base % bad)
 
+    def test_bead_assignee_is_a_plain_name_or_empty(self):
+        base = "version: 1\nbead:\n  assignee: %s\nmetrics:\n  m1:\n    description: \"t\"\n"
+        for ok in ("\"\"", "\"gastown.mayor\"", "\"dog-remote-2\""):
+            bands.parse_config_text(base % ok)
+        for bad in ("\"a b\"", "\"--evil\"", "\"-x\"", "5", "\"a,b\""):
+            with self.subTest(bad):
+                with self.assertRaises(bands.ConfigError):
+                    bands.parse_config_text(base % bad)
+
     def test_the_legacy_counter_needs_both_halves_and_a_pattern_that_compiles(self):
         for extra in ("    legacy_log: \"a.log\"\n", "    legacy_pattern: \"x\"\n", "    legacy_log: \"a.log\"\n    legacy_pattern: \"(\"\n",
                       "    legacy_log: \"/etc/passwd\"\n    legacy_pattern: \"x\"\n", "    legacy_log: \"../x.log\"\n    legacy_pattern: \"x\"\n"):
@@ -572,6 +581,73 @@ class StateIO(unittest.TestCase):
         self.assertEqual(([r["ev"] for r in recs], bad), (["open", "recover"], 2))
 
 
+class Excerpts(unittest.TestCase):
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.dir = self._tmp.name
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def write(self, name, text):
+        path = os.path.join(self.dir, name)
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write(text)
+        return path
+
+    def test_the_last_matching_lines_cleaned_and_capped(self):
+        path = self.write("a.log", "ok 1\nERR one <b>x</b>\nok 2\nERR two\nERR three" + chr(0x2028) + "tail\n" + "ERR " + "y" * 900 + "\n")
+        lines, why = bands.read_tail(path, 3, "ERR")
+        self.assertIsNone(why)
+        self.assertEqual(len(lines), 3)
+        self.assertEqual(lines[0], "ERR two")
+        self.assertNotIn(chr(0x2028), lines[1])
+        self.assertLessEqual(len(lines[2]), bands.EXCERPT_LINE_CHARS + 2)
+        everything, _ = bands.read_tail(path, 10, "ERR")
+        self.assertIn("ERR one ‹b›x‹/b›", everything, "'<' and '>' cannot open or close a fence")
+
+    def test_a_big_file_is_read_from_its_end_and_the_cut_line_is_dropped(self):
+        path = self.write("big.log", "".join("line %05d\n" % i for i in range(20000)))
+        lines, why = bands.read_tail(path, 2, None, max_bytes=4096)
+        self.assertEqual((lines, why), (["line 19998", "line 19999"], None))
+        small, _ = bands.read_tail(path, 100000, None, max_bytes=4096)
+        self.assertNotEqual(small[0], "line 19999")
+        self.assertTrue(small[0].startswith("line "), "a line cut in half by the window is not shown")
+        self.assertRegex(small[0], r"^line \d{5}$")
+
+    def test_no_match_is_an_empty_list_but_an_unreadable_file_is_a_reason(self):
+        path = self.write("a.log", "one\ntwo\n")
+        self.assertEqual(bands.read_tail(path, 5, "nothing like this"), ([], None))
+        lines, why = bands.read_tail(os.path.join(self.dir, "nonexistent.log"), 5, None)
+        self.assertIsNone(lines)
+        self.assertIn("ilegível", why)
+        os.makedirs(os.path.join(self.dir, "adir"))
+        self.assertIsNone(bands.read_tail(os.path.join(self.dir, "adir"), 5, None)[0])
+        empty = self.write("empty.log", "")
+        self.assertEqual(bands.read_tail(empty, 5, None), ([], None))
+
+    def test_the_evidence_carries_fenced_excerpts_and_says_what_it_could_not_read(self):
+        os.makedirs(os.path.join(self.dir, "logs"))
+        self.write("logs/a.log", "ok\nERR um <b>\nERR dois\nbem\nERR três\n")
+
+        class D(bands.Driver):
+            def excerpts(self, ctx):
+                return [{"label": "o log", "path": "logs/a.log", "n": 3, "pattern": "ERR"},
+                        {"label": "o ausente", "path": "logs/nope.log", "n": 3, "pattern": None},
+                        {"label": "nada casa", "path": "logs/a.log", "n": 3, "pattern": "zzz"}]
+        city_tmp = self.dir
+        cfg = cfg_for()
+        ad = FakeAdapters()
+        pts = points_ending(BAND2, end=NOW - hours(2))
+        bands.process(city_tmp, "m1", cfg, pts, NOW, D(), ad)
+        ev = ad.diagnoses[0]
+        self.assertIn("<conteudo_externo>\nERR um ‹b›\nERR dois\nERR três\n</conteudo_externo>", ev)
+        self.assertIn("o ausente", ev)
+        self.assertIn("não lido", ev)
+        self.assertIn("nenhuma linha casa", ev, "an empty answer says it is empty, and is not mistaken for a missing file")
+        self.assertIn("DADO", ev)
+
+
 class FakeAdapters:
     """Records every side effect the engine asks for; each answer is settable per test."""
     def __init__(self):
@@ -785,9 +861,14 @@ class LiveActions(unittest.TestCase):
         self.assertEqual((len(self.ad.diagnoses), len(self.ad.beads), len(self.ad.mails)), (1, 1, 1))
         spec = self.ad.beads[0]
         ep = self.episode()
-        for label in ("exec:auto", "story:approved", "origem:bands", "bands:metric:m1", "bands:ep:" + ep["id"]):
+        for label in ("pilot:no-auto-dispatch", "origem:bands", "bands:metric:m1", "bands:ep:" + ep["id"]):
             self.assertIn(label, spec["labels"])
+        for dispatching in ("exec:auto", "story:approved"):
+            self.assertNotIn(dispatching, spec["labels"], "a bead the engine opens waits for the Mayor: nothing dispatches it by itself")
+        self.assertEqual(spec["assignee"], "gastown.mayor", "owned by the Mayor, so it is not 'free for dispatch' and does not fall in the Athos queue")
         self.assertEqual((spec["metadata"]["gc.routed_to"], spec["type"], spec["priority"], spec["dedup_label"]), ("gastown.dog", "bug", 2, "bands:ep:" + ep["id"]))
+        self.assertIn("COMO LIBERAR", spec["description"])
+        self.assertIn("bd update", spec["description"])
         self.assertIn("ga-new1", self.ad.mails[0][1])
         self.assertEqual((ep["bead"], ep["done"]["3"]["how"], r["owed"]), ("ga-new1", "delivered", []))
         self.assertIn("<conteudo_externo>", spec["description"])
@@ -817,9 +898,19 @@ class LiveActions(unittest.TestCase):
         for always in ("origem:bands", "bands:metric:m1"):
             self.assertIn(always, labels)
 
-    def test_the_default_labels_are_the_same_posture_as_the_citys_other_self_opened_beads(self):
+    def test_the_default_posture_is_parked_for_the_mayor(self):
         self.go(BAND3)
-        self.assertEqual([l for l in self.ad.beads[0]["labels"] if not l.startswith(("bands:", "origem:"))], ["exec:auto", "story:approved"])
+        self.assertEqual([l for l in self.ad.beads[0]["labels"] if not l.startswith(("bands:", "origem:"))], ["pilot:no-auto-dispatch"])
+
+    def test_a_bead_that_dispatches_itself_carries_no_model_text(self):
+        cfg = bands.parse_config_text("version: 1\nbead:\n  labels: [\"exec:auto\", \"story:approved\"]\n  assignee: \"\"\nmetrics:\n  m1:\n    description: \"t\"\n    min_baseline_points: 10\n")
+        self.go(BAND3, cfg=cfg)
+        spec = self.ad.beads[0]
+        self.assertEqual((spec["assignee"], "exec:auto" in spec["labels"], "story:approved" in spec["labels"]), ("", True, True))
+        self.assertNotIn(DIAG_TEXT, spec["description"], "a builder that acts on its own does not get text a model wrote from logs")
+        self.assertNotIn("<conteudo_externo>", spec["description"])
+        self.assertIn("mail", spec["description"])
+        self.assertIn(DIAG_TEXT, self.ad.mails[0][1], "the Mayor, who decides, still gets it (fenced) in the mail")
 
     def test_only_a_short_piece_of_the_model_text_goes_into_the_bead(self):
         self.ad.diag_result = ("x" * 4000, None)
@@ -995,24 +1086,26 @@ class ClaudeDiagnoser(unittest.TestCase):
         out = json.dumps([{"type": "system", "subtype": "init"}, {"type": "result", "is_error": False, "result": "diag em lista"}])
         self.assertEqual(self.call(FAKE_OUT=out), ("diag em lista", None))
 
-    def test_read_only_by_construction_not_by_prose(self):
+    def test_no_tool_at_all_by_construction_not_by_prose(self):
         self.call()
         s = self.seen()
         a = s["argv"]
-        self.assertEqual(a[a.index("--tools") + 1], "Read,Grep,Glob", "no Bash, no Edit, no Write, no network tool exists in this session")
-        self.assertEqual(a[a.index("--allowedTools") + 1], "Read,Grep,Glob")
+        self.assertEqual(a[a.index("--tools") + 1], "", "no Read, no Bash, no network: the session cannot reach anything, so there is no read scope to leak from")
+        self.assertNotIn("--allowedTools", a)
         self.assertEqual(a[a.index("--permission-mode") + 1], "dontAsk")
         self.assertIn("--strict-mcp-config", a)
         self.assertEqual(a[a.index("--setting-sources") + 1], "")
         self.assertIn("--no-session-persistence", a)
-        self.assertEqual(a[a.index("--max-budget-usd") + 1], "1.0")
+        self.assertEqual(a[a.index("--max-budget-usd") + 1], "0.5")
         self.assertEqual((a[a.index("--model") + 1], a[a.index("--effort") + 1], a[a.index("--output-format") + 1]), ("sonnet", "medium", "json"))
         self.assertEqual(os.path.realpath(s["cwd"]), os.path.realpath(self.city))
         deny = json.loads(s["settings"])["permissions"]["deny"]
         for tool in ("Bash", "Edit", "Write", "NotebookEdit", "WebFetch", "WebSearch", "Agent"):
             self.assertIn(tool, deny)
         self.assertTrue(any(d.startswith("Read(~/.ssh") for d in deny), "the keys of the machine are not readable either")
-        self.assertIn("DATA", a[a.index("--append-system-prompt") + 1])
+        system = a[a.index("--append-system-prompt") + 1]
+        self.assertIn("DATA", system)
+        self.assertIn("NO tools", system)
 
     def test_the_session_has_no_identity_and_the_evidence_goes_by_stdin(self):
         self.call(evidence="números do episódio m1-2026")
@@ -1078,7 +1171,7 @@ class BeadOpener(unittest.TestCase):
         self.log = os.path.join(self.dir, "bd.log")
         self.spec = {"title": "Faixa 3σ: m1", "description": "descrição\ncom linhas", "type": "bug", "priority": 1,
                      "labels": ["exec:auto", "story:approved", "origem:bands", "bands:ep:m1-1"], "metadata": {"gc.routed_to": "gastown.dog", "bands.band": 3},
-                     "dedup_label": "bands:ep:m1-1"}
+                     "dedup_label": "bands:ep:m1-1", "assignee": "gastown.mayor"}
         shown = json.dumps([{"id": "ga-abc12", "labels": self.spec["labels"], "metadata": {"gc.routed_to": "gastown.dog"}}])
         self.env = {"FAKE_BD_LOG": self.log, "FAKE_BD_OUT_LIST": "[]", "FAKE_BD_OUT_CREATE": "ga-abc12\n", "FAKE_BD_OUT_SHOW": shown}
 
@@ -1104,10 +1197,16 @@ class BeadOpener(unittest.TestCase):
         self.assertEqual(create[:4], ["-C", self.city, "create", "--silent"])
         self.assertEqual((create[create.index("-t") + 1], create[create.index("-p") + 1]), ("bug", "1"))
         self.assertEqual(create[create.index("-l") + 1], "exec:auto,story:approved,origem:bands,bands:ep:m1-1")
+        self.assertEqual(create[create.index("--assignee") + 1], "gastown.mayor")
         self.assertEqual(json.loads(create[create.index("--metadata") + 1]), {"gc.routed_to": "gastown.dog", "bands.band": 3})
         self.assertEqual(create[create.index("-d") + 1], "descrição\ncom linhas")
         self.assertEqual(create[-1], "Faixa 3σ: m1", "the title is the last argument")
         self.assertEqual(calls[2], ["-C", self.city, "show", "ga-abc12", "--json"])
+
+    def test_no_assignee_means_no_flag(self):
+        self.spec["assignee"] = ""
+        self.assertEqual(self.open(), ("ga-abc12", None))
+        self.assertNotIn("--assignee", [c for c in self.calls() if c[2] == "create"][0])
 
     def test_a_bead_that_already_carries_the_episode_label_is_not_created_twice(self):
         self.assertEqual(self.open(FAKE_BD_OUT_LIST=json.dumps([{"id": "ga-old77"}])), ("ga-old77", None))

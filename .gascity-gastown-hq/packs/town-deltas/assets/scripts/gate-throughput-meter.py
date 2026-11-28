@@ -311,10 +311,11 @@ def make_gate_driver(bands):
             lines.append("Fila do gate agora: %s. Causa provável: %s." % (qtext, long_))
             return lines
 
-        def evidence(self, ctx):
-            return "\n".join([super().evidence(ctx), "Arquivos deste vigia (a cidade é %s): .gc/logs/quality-gate-dispatcher.log (as linhas 'Gate run complete' são as revisões; "
-                              "procure o que mudou perto de %s), .gc/gate-focus.state (fila do gate), .gc/logs/gate-throughput-meter.log (o que este vigia já disse)." % (
-                                  ctx["city"], bands._when(ctx["decision"]["last"]["ts"]))])
+        def excerpts(self, ctx):
+            return [{"label": "log do dispatcher do gate: revisões concluídas e linhas de erro", "path": ".gc/logs/quality-gate-dispatcher.log", "n": 40,
+                     "pattern": r"Gate run complete|ERROR|WARN|FAIL|SKIPPED|refus|stall|timeout|Timeout"},
+                    {"label": "fila do gate", "path": ".gc/gate-focus.state", "n": 10, "pattern": None},
+                    {"label": "o que este vigia já disse", "path": ".gc/logs/gate-throughput-meter.log", "n": 12, "pattern": None}]
 
         def mail(self, band, ctx):
             _subject, body = super().mail(band, ctx)
