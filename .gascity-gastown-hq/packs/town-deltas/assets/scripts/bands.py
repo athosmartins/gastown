@@ -31,7 +31,7 @@ answer about the series either: ConfigError.
 Core: the statistics, as pure functions (no clock, no file, no mail, no action). Engine (2a): the strict reader of bands.yaml (an invalid
 file is INERT and says so, never half-read), the episode state machine, state and ledger on disk, the 22-07 h silence, and `tick`, which
 measures the metrics that measure themselves (free disk, in SHADOW: it counts what a live run would have sent and sends nothing).
-Not here, in the next slices: the delivery of each band (diagnosis read-only, mail, bead for the gate: 2b) and the watchers' wiring (3).
+Not here: the shipped bands.yaml, its plist and runbook, and the delivery of each band (diagnosis, mail, bead for the gate) come in 2b; the wiring in 3.
 """
 import argparse
 import bisect
@@ -426,7 +426,7 @@ def _merged_metric(raw, where):
     if acts is not None:
         out["actions"].update(_checked_actions(acts, where + ".actions"))
     if out["mode"] == "live":   # the delivery of the bands is slice 2b: a "live" that delivers nothing would read as "all quiet"
-        raise ConfigError("%s.mode: 'live' ainda não existe (a entrega das faixas chega na fatia 2b, ga-wagjc6w); use shadow" % where)
+        raise ConfigError("%s.mode: 'live' ainda não existe (a entrega das faixas chega na fatia 2b, ga-75uvbfa); use shadow" % where)
     if (out["driver"] == "tick") != bool(out["collector"]):
         raise ConfigError("%s: driver tick e collector andam juntos (quem mede sozinho precisa dizer COMO; quem é medido por um vigia não tem collector)" % where)
     if out["collector"] == "disk_free_delta" and not out["path"]:
@@ -856,8 +856,6 @@ def _take_sample(city, name, m, now, free_fn):
         except OSError:
             pass   # the old readings stay one more run: harmless, and the next run tries again
     return True, None
-
-
 
 
 def tick(city, cfg, now, free_fn=None, dry=False, only=None):
