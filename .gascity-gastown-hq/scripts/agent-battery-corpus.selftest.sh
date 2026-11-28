@@ -5,12 +5,16 @@
 # controle negativo (sha, timestamp, porta ficam); as falhas de leitura que têm de dar o estado INERTE (git ilegível, bd
 # mudo/ausente/vazio/podre, poucas tarefas, uso errado: nada escrito, acervo antigo intacto); e a PUBLICAÇÃO do par: saída que não
 # existe, meta que não troca depois do acervo (o par anterior volta, sem .tmp), falha dupla (PAR TORTO), trava de instância única.
+# E o que o passe de mutantes mostrou que faltava (ga-3w7866s): cada limite de tamanho NO teto, uso e padrões da linha de comando, quantas
+# leituras do `bd`, o resumo/meta/JSONL em UTF-8 cru, os prazos dos subprocessos e o instante em que a espera pela trava acaba.
 # Sai 0 = tudo passou.
 set -uo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 TOOL="$HERE/agent-battery-corpus.py"
 W="$(mktemp -d "${TMPDIR:-/tmp}/abc-selftest.XXXXXX")"
 trap 'rm -rf "$W"' EXIT
+# TMPDIR com barra final (o do macOS) deixa "//" no caminho e o script só imprime caminhos normalizados; se o cd falhar, fica o caminho de antes
+WN="$(cd "$W" && pwd)" && W="$WN"
 FAILS=0
 ok() { echo "ok   $1"; }
 bad() { echo "FAIL $1"; FAILS=$((FAILS + 1)); }
@@ -84,7 +88,8 @@ commit "fix(ga-sp): so o selftest" "$P/scripts/sp.selftest.sh:echo t"
 commit "fix(ga-pt): entrega pt" "$P/scripts/pt.sh:echo pt" "$P/scripts/pt.selftest.sh:echo t"
 
 # bd de mentira: lê $FAKE_BD_DIR/<id>.json; FAKE_BD_MODE = mudo (rc 1) | podre (JSON quebrado) | vazio (rc 0, nada) | listavazia ([]) |
-# semtitulo | semstatus (JSON sem o campo) | rcruim (JSON bom, rc 1) | alterna (a 1ª leitura falha, a 2ª responde, a 3ª falha...)
+# semtitulo | semstatus (JSON sem o campo) | rcruim (JSON bom, rc 1) | alterna (a 1ª leitura falha, a 2ª responde, a 3ª falha...) |
+# primeira (só a 1ª falha). FAKE_BD_LOG=<arquivo> ganha uma linha por chamada.
 BDDIR="$W/beads-json"
 mkdir -p "$BDDIR"
 mk() { # id status descrição [dict]; T= troca o título, SESS= a sessão que construiu. Forma REAL (medida 28/11): `bd show --json` = ARRAY
@@ -93,7 +98,8 @@ mk() { # id status descrição [dict]; T= troca o título, SESS= a sessão que c
   j="$(printf '{"id":"%s","title":"%s","status":"%s","description":"%s","issue_type":"bug","metadata":{"gc.session_name":"%s"}}' "$1" "${T:-t $1}" "$2" "$3" "${SESS:-dog-remote-gawisp1abc}")"
   if [ "${4:-}" = dict ]; then printf '%s' "$j"; else printf '[%s]' "$j"; fi >"$BDDIR/$1.json"
 }
-for b in aaa bbb ccc eee iii rrr mmm; do mk "ga-$b" closed "$DESC"; done
+for b in aaa bbb ccc eee iii rrr; do mk "ga-$b" closed "$DESC"; done
+mk ga-mmm closed "$(printf 'a%.0s' $(seq 1 40))"  # 40 caracteres: o mínimo, que ainda vale
 mk ga-sss closed "$(printf 'a%.0s' $(seq 1 39))"  # 39 caracteres: um a menos que o mínimo de 40
 T="ligar 31987654321 hoje" mk ga-pt closed "$DESC"  # o telefone está só no TÍTULO
 mk ga-pa closed "Cliente 12345678901 reclamou do saldo do lote inteiro do disco e quer o estorno"
@@ -106,8 +112,10 @@ mk ga-hhh closed "Escrever para fulano@exemplo.com.br e conferir o saldo do lote
 mk ga-ggg open "$DESC"
 cat >"$W/bd" <<'EOF'
 #!/usr/bin/env bash
+[ -n "${FAKE_BD_LOG:-}" ] && echo "$*" >>"$FAKE_BD_LOG"   # uma linha por chamada: o teste conta as leituras
 [ "$1" = show ] || exit 2
 case "${FAKE_BD_MODE:-}" in
+  primeira) n="$(cat "$FAKE_BD_DIR/.n" 2>/dev/null || echo 0)"; echo $((n + 1)) >"$FAKE_BD_DIR/.n"; [ "$n" -eq 0 ] && exit 1 ;;  # só a 1ª falha
   mudo) exit 1 ;;
   podre) echo '{"title": '; exit 0 ;;
   vazio) exit 0 ;;
@@ -360,15 +368,80 @@ PY
 check "dado pessoal: formas que pegam e o que não é dado pessoal" "$(cat "$W/out-pii")" ok
 
 # 7e) a ponta é resolvida UMA vez e o `git log` lê esse sha (não o nome da ref): se a main andar entre as duas leituras, o meta não
-#     pode dizer uma ponta que não foi lida.
+#     pode dizer uma ponta que não foi lida. Cada chamada guarda o prazo no fim do comando: git rev-parse 30 s, git log 180 s, bd show 60 s.
 pyt "$R" "$P" >"$W/out-ponta" <<'PY'
 calls, real = [], m.run
-m.run = lambda cmd, timeout: (calls.append(cmd), real(cmd, timeout))[1]
+m.run = lambda cmd, timeout: (calls.append(cmd + [timeout]), real(cmd, timeout))[1]
 head, commits = m.read_history(sys.argv[2], "main", sys.argv[3], 3650)
 log = [c for c in calls if "log" in c][0]
 print("log lê o sha da ponta" if log[4] == head and head != "main" else "log lê %s" % log[4])
+m.run = lambda cmd, timeout: (calls.append(cmd + [timeout]), (0, "[]"))[1]
+m.read_bead(["bd"], "ga-x")
+print("prazos: rev-parse %s, log %s, bd %s" % ([c for c in calls if "rev-parse" in c][0][-1], log[-1], calls[-1][-1]))
 PY
-check "ponta: o git log lê o sha resolvido, não o nome da ref" "$(cat "$W/out-ponta")" "log lê o sha da ponta"
+check "ponta: o git log lê o sha resolvido, não o nome da ref" "$(head -1 "$W/out-ponta")" "log lê o sha da ponta"
+check "prazos: git rev-parse 30 s, git log 180 s, bd show 60 s" "$(tail -1 "$W/out-ponta")" "prazos: rev-parse 30, log 180, bd 60"
+
+# 7f) limites de tamanho NO teto passam (um a mais cai: as beads c5, p7, t4 e iii da seção 1 e o caso de 301 linhas); `-` em UM lado do
+#     numstat já é binário (sem passar por int()); um .md em scripts/ e um .txt em docs/ não são produção; o commit do meio da própria
+#     bead, ou de outra bead que mexe em outros arquivos, não é "intercalada"
+pyt >"$W/out-classify" <<'PY'
+def C(*files, s="fix(ga-x): y"):
+    return {"sha": "s", "parent": "p", "subject": s, "files": [(a, d, ".c/" + f) for a, d, f in files]}
+T, S = ("1", "0", "scripts/t.selftest.sh"), ("1", "0", "scripts/x.sh")
+many = lambda n, pre, suf: [("1", "0", "scripts/%s%d%s" % (pre, i, suf)) for i in range(n)]
+casos = [
+    ("4 commits", [C(T, S), C(S), C(S), C(S)], None),
+    ("6 arquivos de produção", [C(T, *many(6, "p", ".sh"))], None),
+    ("3 selftests", [C(S, *many(3, "t", ".selftest.sh"))], None),
+    ("300 linhas", [C(T, ("150", "150", "scripts/x.sh"))], None),
+    ("301 linhas", [C(T, ("150", "151", "scripts/x.sh"))], "grande_demais"),
+    ("binário só no add", [C(T, ("-", "3", "scripts/x.sh"))], "binario"),
+    ("binário só no del", [C(T, ("3", "-", "scripts/x.sh"))], "binario"),
+    ("só .md em scripts/", [C(T, ("1", "0", "scripts/LEIAME.md"))], "sem_selftest_ou_sem_producao"),
+    ("só .txt em docs/", [C(T, ("1", "0", "docs/nota.txt"))], "sem_selftest_ou_sem_producao"),
+    ("commit do meio é da bead", [C(T, S), C(S), C(S)], None),
+    ("outra bead no meio, outros arquivos", [C(T, S), C(("1", "0", "scripts/outro.sh"), s="fix(ga-y): z"), C(S)], None),
+]
+got = [(n, m.classify("ga-x", [i for i, c in enumerate(cs) if "ga-x" in c["subject"]], cs, ".c"), w) for n, cs, w in casos]
+print([g for g in got if g[1] != g[2]] or "ok")
+PY
+check "classify: cada limite no teto passa, binário em um lado só, .md e .txt em docs/ não são produção, intercalada só com os mesmos arquivos" "$(cat "$W/out-classify")" ok
+
+# 7g) o que o `git log` devolve: numstat solta (antes de qualquer cabeçalho) é ignorada, add e del cada um no seu campo, o 1º pai,
+#     do mais antigo ao mais novo
+pyt >"$W/out-log" <<'PY'
+raw = "9\t9\tscripts/solta.sh\n@@c1\x1fp1 p2\x1fum\n5\t2\tscripts/a.sh\n-\t-\tscripts/b.bin\n\n@@c2\x1fp3\x1fdois\n3\t0\tscripts/c.sh\n"
+m.run = lambda cmd, timeout: (0, raw)
+want = [{"sha": "c2", "parent": "p3", "subject": "dois", "files": [("3", "0", "scripts/c.sh")]},
+        {"sha": "c1", "parent": "p1", "subject": "um", "files": [("5", "2", "scripts/a.sh"), ("-", "-", "scripts/b.bin")]}]
+got = m.read_log("r", "ref", "pfx", 7)
+print("ok" if got == want else got)
+PY
+check "git log: numstat solta ignorada, add e del cada um no seu campo, 1º pai, do mais antigo ao mais novo" "$(cat "$W/out-log")" ok
+
+# 7h) a espera pela trava termina NO prazo, não um tique depois (relógio de mentira: a 2ª leitura marca exatamente o fim); a espera
+#     padrão é a de 30 s do cabeçalho
+RELOGIO="$W/relogio"
+mkdir -p "$RELOGIO"
+pyt "$RELOGIO" >"$W/out-relogio" 2>&1 <<'PY'
+import fcntl, os
+out = os.path.join(sys.argv[2], "tasks.jsonl")
+print("espera=%s" % m.LOCK_WAIT_S)
+fd = os.open(out + ".lock", os.O_CREAT | os.O_RDWR)
+fcntl.flock(fd, fcntl.LOCK_EX)
+class Relogio:   # 1ª leitura = o início; 2ª = o início + a espera (o prazo exato); depois, bem além
+    def __init__(s): s.l, s.dormiu = [100.0, 100.0 + m.LOCK_WAIT_S, 9999.0], []
+    def monotonic(s): return s.l.pop(0)
+    def sleep(s, x): s.dormiu.append(x)
+m.time = r = Relogio()
+try:
+    m.take_lock(out + ".lock")
+except SystemExit as e:
+    print("rc=%s dormiu=%s" % (e.code, r.dormiu))
+PY
+check "trava: a espera padrão é a de 30 s do cabeçalho" "$(grep '^espera=' "$W/out-relogio")" espera=30
+check "trava: com o relógio no prazo exato a espera acaba (rc 4) sem dormir mais" "$(grep '^rc=' "$W/out-relogio")" "rc=4 dormiu=[]"
 
 # 8) --bd com espaço no caminho (entre aspas) e com aspas desbalanceadas (uso errado: rc 2, nada lido)
 mkdir -p "$W/com espaco"
@@ -378,6 +451,75 @@ check "--bd com espaço entre aspas: rc 0" "$?" 0
 check "--bd com espaço entre aspas: leu as beads" "$(printf '%s' "$S" | field selecionadas)" 4
 run --bd "'aberta" --out "$W/espaco/tasks.jsonl" --dry-run >/dev/null 2>&1
 check "--bd com aspas desbalanceadas: rc 2" "$?" 2
+
+# 9) o que o passe de mutantes (ga-3w7866s) mostrou que nenhum caso fixava
+# 9a) uso: --help existe; sem --out e sem GC_CITY_PATH só o --dry-run passa (numa pasta vazia: um --out vazio gravaria ao lado do cwd);
+#     n, min e days NO limite (1) valem; --min, --days e --oversample inválidos, um de cada vez (`a.n < 1` é redundante: ver a declaração
+#     de equivalência no fim); os padrões que a mensagem do rc 3 e o meta mostram
+mkdir -p "$W/semout"
+( cd "$W/semout" && python3 -I "$TOOL" --help >"$W/out-help" 2>/dev/null )
+check "--help: rc 0 e o uso no stdout" "$?,$(grep -c '^usage:' "$W/out-help")" "0,1"
+( cd "$W/semout" && python3 -I "$TOOL" --repo "$R" --prefix "$P" --ref main --bd "$W/bd" --days 3650 >/dev/null 2>"$W/err-semout" )
+check "sem --out e sem GC_CITY_PATH: rc 2 e a mensagem diz isso" "$?,$(grep -c 'sem --out' "$W/err-semout")" "2,1"
+( cd "$W/semout" && python3 -I "$TOOL" --repo "$R" --prefix "$P" --ref main --bd "$W/bd" --days 3650 --n 10 --min 1 --dry-run >/dev/null 2>&1 )
+check "sem --out mas com --dry-run: rc 0 (nada a gravar)" "$?" 0
+S="$(run --out "$W/lim/tasks.jsonl" --n 1 --min 1 --days 1 --dry-run 2>/dev/null)"
+check "n, min e days = 1 (o limite de cada um, com min == n): rc 0 e 1 tarefa" "$?,$(printf '%s' "$S" | field selecionadas)" "0,1"
+for arg in "--min 0" "--days 0" "--oversample 0"; do
+  tag="${arg#--}"
+  tag="${tag// /-}"
+  inerte "uso-$tag" 2 X=1 python3 -I "$TOOL" --repo "$R" --prefix "$P" --ref main --bd "$W/bd" --days 3650 --n 5 --min 1 $arg --out "$W/inerte-uso-$tag/tasks.jsonl"
+done
+inerte min-padrao 3 X=1 python3 -I "$TOOL" --repo "$R" --prefix "$P" --ref main --bd "$W/bd" --days 3650 --out "$W/inerte-min-padrao/tasks.jsonl"
+check "--min padrão 20: a mensagem do rc 3 diz o mínimo" "$(grep -c 'mínimo 20' "$W/err-min-padrao")" 1
+python3 -I "$TOOL" --repo "$R" --prefix "$P" --ref main --bd "$W/bd" --min 1 --out "$W/padrao/tasks.jsonl" >/dev/null 2>&1
+check "--days e --n padrão: 60 e 40 no meta" "$(python3 -I -c 'import json,sys; p=json.load(open(sys.argv[1]+".meta.json"))["params"]; print(p["days"], p["n"])' "$W/padrao/tasks.jsonl")" "60 40"
+# 9b) quantas leituras do bd: sem resposta nenhuma lê n x oversample (padrão 3: --n 2 lê 6, nem 5, nem 7, nem todas as elegíveis); para
+#     em n tarefas; 1 leitura sem resposta de 3 (menos da metade) segue e conta
+rm -f "$BDDIR/.calls" "$BDDIR/.n"
+S="$(FAKE_BD_MODE=mudo FAKE_BD_LOG="$BDDIR/.calls" run --out "$W/leituras/tasks.jsonl" --n 2 --min 1 2>/dev/null)"
+check "bd mudo, --n 2: 6 chamadas ao bd e leituras_de_bead 6" "$(grep -c . "$BDDIR/.calls"),$(printf '%s' "$S" | field leituras_de_bead)" "6,6"
+S="$(run --out "$W/leituras/n2.jsonl" --n 2 --min 1 --oversample 100 --dry-run 2>/dev/null)"
+check "--n 2 com leituras de sobra: para em 2 tarefas (há 4 boas)" "$(printf '%s' "$S" | field selecionadas)" 2
+S="$(FAKE_BD_MODE=primeira run --out "$W/leituras/terco.jsonl" --n 3 --oversample 1 --min 1 --dry-run 2>/dev/null)"
+rc=$?
+rm -f "$BDDIR/.n"
+check "1 leitura sem resposta de 3 (menos da metade): não é rc 5" "$([ "$rc" -ne 5 ] && echo ok || echo "rc=$rc")" ok
+check "1 leitura sem resposta de 3: contada" "$(printf '%s' "$S" | field excluidas.bead_ilegivel)" 1
+S="$(run --out "$W/leituras/min4.jsonl" --n 10 --min 4 --dry-run 2>/dev/null)"
+check "tarefas == --min (4 de 4): rc 0" "$?" 0
+# 9c) o resumo (stdout e meta) e o JSONL saem em UTF-8 cru, não \uXXXX (a única fonte de texto não ASCII no resumo é o nome da ref); o
+#     meta tem recuo 1 e o JSONL as chaves em ordem alfabética
+git -C "$R" branch "ação" main
+U="$W/utf8"
+mkdir -p "$U"
+u8() { # rc_esperado env args...: com --ref "ação", o resumo do stdout traz o texto cru
+  local want="$1" e="$2" o rc
+  shift 2
+  o="$(env "$e" python3 -I "$TOOL" --repo "$R" --prefix "$P" --ref "ação" --bd "$W/bd" --days 3650 "$@" 2>/dev/null)"
+  rc=$?
+  check "resumo com ref não ASCII (rc $want): rc" "$rc" "$want"
+  check "resumo com ref não ASCII (rc $want): UTF-8 cru" "$(printf '%s' "$o" | grep -c '"ref": "ação"')" 1
+}
+u8 5 FAKE_BD_MODE=mudo --out "$U/a.jsonl" --n 2 --min 1
+u8 3 X=1 --out "$U/b.jsonl" --n 10 --min 9
+u8 0 X=1 --out "$U/c.jsonl" --n 10 --min 1 --dry-run
+u8 0 X=1 --out "$U/d.jsonl" --n 10 --min 1
+check "meta: recuo 1 e UTF-8 cru" "$(sed -n 2p "$U/d.jsonl.meta.json")" ' "ref": "ação",'
+check "JSONL: chaves em ordem alfabética (a 1ª é base_sha)" "$(head -c 14 "$U/d.jsonl")" '{"base_sha": "'
+check "JSONL: UTF-8 cru (o byte inválido do enunciado da ga-ok sai como U+FFFD em 3 bytes)" "$(LC_ALL=C grep -c "$(printf '\357\277\275')" "$U/d.jsonl")" 1
+# 9d) com GC_CITY_PATH o bd padrão leva `-C <cidade>`; um --bd explícito segue como está (o bd de mentira de fakebin só anota o argv e falha)
+mkdir -p "$W/fakebin"
+printf '#!/bin/sh\necho "$*" >>"%s"\nexit 1\n' "$W/bd-argv" >"$W/fakebin/bd"
+chmod +x "$W/fakebin/bd"
+env GC_CITY_PATH="$W/cidade" PATH="$W/fakebin:$PATH" python3 -I "$TOOL" --repo "$R" --prefix "$P" --ref main --days 3650 --n 1 --oversample 1 --min 1 --dry-run >/dev/null 2>&1
+check "GC_CITY_PATH + bd padrão: o bd recebe -C <cidade> antes do show" "$(head -1 "$W/bd-argv" | cut -d' ' -f1-3)" "-C $W/cidade show"
+S="$(env GC_CITY_PATH="$W/cidade" PATH="$W/fakebin:$PATH" python3 -I "$TOOL" --repo "$R" --prefix "$P" --ref main --bd "$W/bd" --days 3650 --n 10 --min 1 --dry-run 2>/dev/null)"
+check "GC_CITY_PATH + --bd explícito: o explícito é o usado (não vira bd -C)" "$(printf '%s' "$S" | field selecionadas)" 4
+# 9e) mutantes que o motor troca e que NENHUM caso pode distinguir, cada um comparado com o original lado a lado (um controle que muda o resultado divergiu)
+# EQUIVALENT 858c5b62e2: range(idxs[0] + 0, ...) só acrescenta o j = idxs[0], que está em `own`, e o teste `j not in own` o descarta como antes (20000 históricos aleatórios no classify, 0 divergências)
+# EQUIVALENT 815e947d02: group(0) == group(1) em todo casamento do ROLE_RE: as bordas são lookarounds (largura zero) e o único grupo é o casamento inteiro (20000 beads aleatórias no role_of, 0 divergências)
+# EQUIVALENT 9e55fee9fa: `a.n < 1` -> `a.n < 0`: o único n que muda é 0, e com n = 0 qualquer --min cai em `a.min < 1` ou em `a.min > a.n` (min >= 1 > 0): as mesmas entradas são rejeitadas (grade n, min, days, oversample de -2 a 4 no main: 2401 entradas, 0 divergências)
 
 echo
 if [ "$FAILS" -eq 0 ]; then echo "agent-battery-corpus.selftest: tudo passou"; exit 0; fi
