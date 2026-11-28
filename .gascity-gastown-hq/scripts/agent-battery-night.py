@@ -6,7 +6,7 @@
 
 USO: agent-battery-night.py [--mode night|merge] [--city DIR] [--node HOST] [--ssh CMD] [--mail CMD] [--token-cmd CMD] [--roles A,B,C]
         [--night-cap N] [--merge-cap N] [--min-medidas N] [--limit N] [--run-timeout-s S] [--keep-days N] [--prefix P] [--config-ref REF]
-        [--node-repo DIR] [--node-state DIR]            (cada opção também vem de ABN_<NOME>, ex.: ABN_TOKEN_CMD)
+        [--node-repo DIR] [--node-state DIR] [--role-prompt PAPEL=CAMINHO]       (cada opção também vem de ABN_<NOME>, ex.: ABN_TOKEN_CMD)
 O QUE FAZ: manda o acervo da fatia 1 (<cidade>/.gc/agent-battery/tasks.jsonl + .meta.json) ao nó e roda o executor da fatia 2 (agent-battery-run.py,
   SEMPRE o do origin/main do nó) uma vez por papel (dog, wa-worker, reviewer), em paralelo, cada um com o próprio estado e o próprio teto de tokens
   (--night-cap/--merge-cap são POR PAPEL). Grava a taxa por papel com o config_sha em <cidade>/.gc/logs/agent-battery.jsonl (uma linha por rodada da noite e por medida de merge),
@@ -45,11 +45,12 @@ SECRET_RE = re.compile(r"sk-ant-[A-Za-z0-9_-]+")
 NOT_STARTED = "nao_iniciou"
 SECRETS = []
 EMPTY = {"rc": None, "config_sha": None, "medidas": None, "ok": None, "taxa": None, "por_estado": None, "freio": None, "tokens": None, "config_ref_sha": None,
-         "descartes": None}
+         "descartes": None, "acervo": None}
 OPTS = (("node", "hetzner-teste", str), ("ssh", "ssh -o BatchMode=yes -o ConnectTimeout=20", str), ("mail", "gc mail send mayor", str),
         ("token-cmd", "", str), ("roles", ",".join(ROLES), str), ("night-cap", 1200000, int), ("merge-cap", 1200000, int),
         ("min-medidas", 5, int), ("limit", 0, int), ("run-timeout-s", 9000, int), ("keep-days", 14, int), ("prefix", ".gascity-gastown-hq", str),
         ("config-ref", "origin/main", str), ("node-repo", "/home/runner/gt-remote/git/gascity/repo.git", str),
+        ("role-prompt", "", str),  # PAPEL=CAMINHO: o executor lê esse arquivo do config-ref no lugar do prompt do papel (o controle negativo da fatia 4; nada é escrito no git)
         ("node-state", "/home/runner/gt-remote/agent-battery", str))
 
 def now(fmt="%Y-%m-%dT%H:%M:%SZ"):
@@ -106,6 +107,7 @@ def remote_cmd(a, mode, role, dry):
     cap = a.night_cap if mode == "night" else a.merge_cap
     args = ["--repo", a.node_repo, "--prefix", a.prefix, "--config-ref", a.config_ref, "--state-dir", "%s/%s/%s" % (a.node_state, mode, role),
             "--tasks", a.node_state + "/tasks.jsonl", "--as-role", role, "--token-cap", str(cap)] + (["--limit", str(a.limit)] if a.limit else [])
+    args += ["--role-prompt", a.role_prompt] if a.role_prompt else []
     steps = ['export PATH="$HOME/.local/bin:$PATH"']
     if not dry:
         steps.append("IFS= read -r CLAUDE_CODE_OAUTH_TOKEN && export CLAUDE_CODE_OAUTH_TOKEN")
@@ -154,6 +156,7 @@ def judge(a, mode, role, r):
     n, k, taxa, est = pp.get("medidas", 0), pp.get("ok", 0), pp.get("taxa"), d.get("por_estado")
     rec.update(config_sha=d["config_sha"].get(role), medidas=n, ok=k, taxa=taxa if isinstance(taxa, (int, float)) and not isinstance(taxa, bool) else None,
                por_estado=est if isinstance(est, dict) else None, freio=d.get("freio"), config_ref_sha=d.get("config_ref_sha"), descartes=d.get("descartes"),
+               acervo=d.get("tasks_sha256") if re.fullmatch(r"[0-9a-f]{64}", str(d.get("tasks_sha256"))) else None,  # só noites do MESMO acervo se comparam (fatia 4)
                tokens=d.get("tokens_noite_depois", 0) - d.get("tokens_noite_antes", 0))
     if rc not in (0, 6):
         return "falhou", "o executor terminou com rc %s (freio %s)" % (rc, d.get("freio")), rec
@@ -238,7 +241,7 @@ def finish(a, mode, t0, verdict, why, papeis=None, quiet=None):
     quiet = (mode == "merge" and verdict in ("PULADO", "INERTE")) if quiet is None else quiet
     day, code = now("%Y-%m-%d"), 1 if verdict == "FALHOU" and not quiet else 0
     rec = {"ts": now(), "mode": mode, "dia": day, "verdict": verdict, "reason": why, "wall_s": int(time.time() - t0), "min_medidas": a.min_medidas,
-           "papeis": papeis or {}, "mail_failed": 0}
+           "papeis": papeis or {}, "mail_failed": 0, "role_prompt": a.role_prompt}  # preenchido = medida com o prompt de um papel trocado: a fatia 4 não a mistura com a base nem a avisa
     if not quiet:
         rdir = os.path.join(a.city, ".gc/logs/agent-battery")
         text = scrub(render(a, rec))

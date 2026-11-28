@@ -28,7 +28,7 @@ with open("%s/exec-%s.log" % (L, role), "a") as f:
     f.write(json.dumps({"argv": a, "token": os.environ.get("CLAUDE_CODE_OAUTH_TOKEN"), "path": os.environ.get("PATH", "")}) + "\n")
 rd = lambda k, d: open("%s/%s" % (L, k)).read().strip() if os.path.exists("%s/%s" % (L, k)) else d
 mode, cfg = rd("mode-" + role, "ok"), rd("cfg-" + role, rd("cfg", "v1"))
-plan = {"tarefas": 12, "config_ref_sha": "a" * 40, "config_sha": {role: hashlib.sha256((role + cfg).encode()).hexdigest()}, "teto_noite": int(arg("--token-cap"))}
+plan = {"tarefas": 12, "tasks_sha256": "b" * 64, "config_ref_sha": "a" * 40, "config_sha": {role: hashlib.sha256((role + cfg).encode()).hexdigest()}, "teto_noite": int(arg("--token-cap"))}
 if dry:
     if os.path.exists(L + "/dry-garbage") or os.path.exists(L + "/dry-garbage-" + role):
         print("lixo"); sys.exit(0)
@@ -56,7 +56,9 @@ if mode == "slow":
 n = {"few": 2, "brake0": 0, "brakefew": 2, "zero": 0}.get(mode, 8)
 rc = {"brake": 6, "brake0": 6, "brakefew": 6, "infra": 8}.get(mode, 0)
 freio = {"brake": "teto_de_tokens", "brake0": "teto_de_tokens", "brakefew": "teto_de_tokens", "infra": "infra_repetida"}.get(mode)
-bad = mode == "weirdtaxa"  # números certos, tipos errados só em taxa e por_estado
+bad = mode == "weirdtaxa"  # números certos, tipos errados só em taxa, por_estado e no sha do acervo
+if bad:
+    plan["tasks_sha256"] = "não-é-hex"
 print(json.dumps(dict(plan, por_estado=["x"] if bad else {"medida": n, "descartada": 3}, descartes={"selftest_passa_na_base": 3}, freio=freio, tokens_noite_antes=100000,
                       tokens_noite_depois=100000 + n * 50000, por_papel={role: {"medidas": n, "ok": min(n, 6), "taxa": "x" if bad else round(min(n, 6) / n, 4)}} if n else {})))
 sys.exit(rc)
@@ -126,11 +128,14 @@ check "noite boa: o token chegou ao executor" "$(jq -r .token "$FAKE_LOG/exec-do
 check "controle do varredor: ele acha o token onde ele está" "$(grep -rlF "$TOKEN" "$FAKE_LOG/exec-dog.log" | wc -l | tr -d ' ')" 1
 check "noite boa: o token nunca foi argv, relatório, jsonl, e-mail nem saída" "$(grep -rlF "$TOKEN" "$FAKE_LOG/ssh-argv" "$CITY/.gc/logs" "$FAKE_LOG/mail-body" "$W/out" | wc -l | tr -d ' ')" 0
 check "noite boa: o contrato com o executor (flags, estado de noite por papel, teto da noite)" "$(jq -r '.argv | join(" ")' "$FAKE_LOG/exec-reviewer.log")" "--repo $W/node --prefix $P --config-ref origin/main --state-dir $NS/night/reviewer --tasks $NS/tasks.jsonl --as-role reviewer --token-cap 1100000"
+check "noite boa: o sha do acervo medido vai ao jsonl (a fatia 4 só compara noites do MESMO acervo) e role_prompt fica vazio" "$(jl .papeis.dog.acervo) [$(jl .role_prompt)]" "$(printf 'b%.0s' $(seq 64)) []"
 check "noite boa: acervo e .meta.json no nó idênticos (acento incluso)" "$(cmp "$CITY/.gc/agent-battery/tasks.jsonl" "$NS/tasks.jsonl" && cmp "$CITY/.gc/agent-battery/tasks.jsonl.meta.json" "$NS/tasks.jsonl.meta.json" && echo igual)" igual
 check "noite boa: a linha do dog traz config_sha, medidas, ok e taxa" "$(rep | grep -c -E '^\| dog \| [0-9a-f]{12} \| 8 \| 6 \| 75% \| medida ×8, descartada ×3 \| 400000 \| - \|')" 1
 check "noite boa: o nó acha o claude (~/.local/bin entra no PATH do executor)" "$(jq -r .path "$FAKE_LOG/exec-dog.log" | cut -d: -f1)" "$HOME/.local/bin"
 check "noite boa: o relatório diz o commit medido e avisa amostra pequena" "$(rep | grep -c '@aaaaaaaaaaaa') $(rep | grep -c 'amostra pequena')" "1 1"
 
+reset; drive night --role-prompt dog=scripts/ruim.md; check "--role-prompt vai ao executor, no fim do argv (sem ele o argv é o do contrato acima)" "$(jq -r '.argv | join(" ")' "$FAKE_LOG/exec-dog.log")" "--repo $W/node --prefix $P --config-ref origin/main --state-dir $NS/night/dog --tasks $NS/tasks.jsonl --as-role dog --token-cap 1100000 --role-prompt dog=scripts/ruim.md"
+check "--role-prompt fica registrado no jsonl (a fatia 4 não mistura essa medida com a base)" "$(jl .role_prompt)" "dog=scripts/ruim.md"
 reset; drive night --limit 3; check "--limit vai ao executor" "$(jq -r '.argv | .[index("--limit")+1]' "$FAKE_LOG/exec-dog.log")" 3
 
 reset; echo '{"current":"conta@exemplo.com"}' >"$W/pool.json" # a receita do runbook: a chave da conta atual do pool, como o gc-session-ssh a acha (secret + current)
@@ -166,6 +171,7 @@ reset; mode dog garbage
 drive night; check "resumo ilegível: FALHOU" "$(verdict)" "VEREDITO: FALHOU"
 check "resumo ilegível: o motivo diz isso, e a linha do papel mostra '-' (não None)" "$(jl .papeis.dog.motivo | grep -c 'sem resumo legível') $(rep | grep -c -E '^\| dog \| \? \| - \| - \| - \| - \| - \| - \|')" "1 1"
 check "resumo ilegível: a taxa é null, nunca 0" "$(jl '.papeis.dog | [.cat, .taxa, .medidas] | map(tostring) | join(" ")')" "falhou null null"
+check "resumo ilegível: o papel traz a chave acervo (null): o formato do jsonl é o mesmo medido ou não" "$(jl '.papeis.dog | has("acervo")')" true
 reset; mode dog weird
 drive night; check "resumo com tipos errados: FALHOU com relatório, o driver não cai" "$(verdict) $RC $(jl .papeis.dog.motivo | grep -c "forma inesperada")" "VEREDITO: FALHOU 1 1"
 reset; drive night --token-cmd "'sem fechar"; check "erro inesperado do driver: FALHOU com veredito, relatório e e-mail" "$(verdict) $RC $(jl .reason | grep -c 'erro inesperado') $(grep -c FALHOU "$FAKE_LOG/mail-subj")" "VEREDITO: FALHOU 1 1 1"
@@ -264,6 +270,7 @@ reset; rm -rf "$CITY/.gc/agent-battery"; drive night; check "cidade sem a pasta 
 reset; mode dog nocfg; drive night; check "resumo JSON sem config_sha: ilegível, FALHOU" "$(verdict) $(jl .papeis.dog.motivo | grep -c 'sem resumo legível')" "VEREDITO: FALHOU 1"
 reset; mode dog banner; drive night; check "linha de ruído ANTES do resumo: vale a última linha" "$(verdict) $(jl .papeis.dog.medidas)" "VEREDITO: COMPLETO 8"
 reset; mode dog weirdtaxa; drive night; check "taxa e estados de tipo errado: COMPLETO, no jsonl taxa e por_estado viram null (a fatia 4 lê tipo estável) e o relatório sai" "$(verdict) $(jl '.papeis.dog | [.taxa, .por_estado] | map(tostring) | join(" ")') $(rep | grep -c -E '^\| dog \| [0-9a-f]{12} \| 8 \| 6 \| - \| - \|')" "VEREDITO: COMPLETO null null 1"
+check "sha do acervo que não é hex: o jsonl grava null, nunca o texto estranho" "$(jl .papeis.dog.acervo)" null
 reset; drive merge; cfg dog v2; mode dog zero; drive merge; check "merge, zero medidas SEM freio: FALHOU (só o freio de tokens é PULADO)" "$(verdict)" "VEREDITO: FALHOU"
 reset; drive merge; cfg dog v2; cfg reviewer v2; touch "$FAKE_LOG/dry-badsha-reviewer" "$FAKE_LOG/dry-rc3-wa-worker"; cfg wa-worker v2
 drive merge; check "merge, sondagem com sha torto ou rc ≠ 0: o papel fica de fora" "$(nrun dog) $(nrun reviewer) $(nrun wa-worker)" "1 0 0"

@@ -15,7 +15,7 @@
 Fatia 3 da bateria (ga-hyp55ss): a 1 monta o acervo (`agent-battery.md`), a 2 roda cada tarefa (`agent-battery-run.md`), **esta agenda**. Toda manhã (06:40 local, ordem `hetzner-agent-battery`) e a cada
 mudança de configuração (ordem `hetzner-agent-battery-merge`, sondagem a cada 20 min), `scripts/agent-battery-night.py` manda o acervo ao nó e roda o executor uma vez por papel (dog, wa-worker, reviewer),
 em paralelo, cada um com estado e teto de tokens próprios. Grava a taxa por papel com o `config_sha`, escreve o relatório e avisa o Mayor. Na v1 só mede e avisa: não bloqueia merge e não compara com a
-noite anterior (fatia 4).
+noite anterior: isso é a fatia 4 (`agent-battery-alert.md`).
 
 ## Ligar
 
@@ -45,7 +45,7 @@ E-mail que falha = exit 1 e `mail_failed: 1` no jsonl. Merge: o papel pulado (ba
 ## Onde grava
 
 - `$GC_CITY_PATH/.gc/logs/agent-battery.jsonl`: uma linha por rodada (noite: sempre; merge: só se um papel chegou a rodar). Campos: `ts, mode, dia, verdict, reason, wall_s, min_medidas, mail_failed` e
-  `papeis.<papel>.{cat, motivo, rc, config_sha, config_ref_sha, medidas, ok, taxa, por_estado, descartes, freio, tokens}`. **É isto que a fatia 4 lê.**
+  `papeis.<papel>.{cat, motivo, rc, config_sha, config_ref_sha, acervo, medidas, ok, taxa, por_estado, descartes, freio, tokens}` (`acervo` = o sha256 do acervo medido). **É isto que a fatia 4 lê.**
 - `.gc/logs/agent-battery/<dia>.md` (noite) e `<dia>-merge-<HHMMSS>.md`: relatório (tabela por papel, motivo de cada problema); os `.md` com mais de 14 dias (`--keep-days`) são apagados.
 - `.gc/agent-battery/`: `merge-last.json` (o `config_sha` por papel que o gatilho compara), `night.lock`, `merge.lock`. No nó: `~/gt-remote/agent-battery/` (acervo, e `night/<papel>/` e `merge/<papel>/` com o ledger de tokens e os `runs/` do executor).
 
