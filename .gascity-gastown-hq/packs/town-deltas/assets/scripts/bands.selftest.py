@@ -8,8 +8,8 @@
 ## What it covers
 The baseline (what is held out, what is dropped, the σ floors), the four Western Electric rules and the three-state verdict of
 `judge`: a series that cannot be judged (too short, constant, corrupt, out of order) never reads as band 0, and an input the
-statistics cannot use (a knob, the clock, the widening, a range or an acceptance read from a state file) raises instead of
-answering. Pure functions only: nothing here touches a file, the clock, the city, a mail or a token.
+statistics cannot use (a knob, the clock, the widening, an excluded range, an acceptance) raises instead of answering. Pure
+functions only: no test writes a file, reads the clock, touches the city, sends a mail or spends a token.
 
 ## How to run
   python3 -I bands.selftest.py        (exit 0 = every case passed; the last line counts them)
@@ -211,7 +211,7 @@ class Baseline(unittest.TestCase):
             bands.compute_baseline(pts, pts[-1][0], self.m, [], 0.0)
 
     def test_a_sum_that_overflows_is_an_error_not_a_nan_sigma(self):
-        # NaN is beyond nothing: with a NaN σ every z is NaN and every rule reads "in band"
+        # an overflowed mean or deviation would leave every z at NaN or 0, beyond nothing, and every rule would read "in band"
         for name, values in (("the mean", [1e308] * 30), ("the deviation", [1e308, -1e308] * 15)):
             with self.subTest(name):
                 with self.assertRaises(bands.SeriesError):
@@ -388,7 +388,7 @@ class Judge(unittest.TestCase):
         self.assertEqual((w["status"], w["decision"]["band"]), ("judged", 3))
 
     def test_a_count_metric_is_judged_in_the_sqrt_scale(self):
-        values = [6, 12] * 20 + [0]       # a mean-9 count that alternates 6 / 12: raw σ is 3.05, so a 0 is only 2.95σ below
+        values = [6, 12] * 20 + [0]       # a count that alternates 6 / 12: in the raw scale σ is 3.04 and a 0 is only 2.93σ below the mean, in √ it is 4.75σ
         pts = series(values)
         self.assertEqual(bands.judge(pts, pts[-1][0], metric(min_baseline_points=5))["decision"]["band"], 0)
         v = bands.judge(pts, pts[-1][0], metric(min_baseline_points=5, transform="sqrt_count"))
