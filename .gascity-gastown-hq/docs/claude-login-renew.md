@@ -2,8 +2,9 @@
 
 ## Contents
 
-• **Rodada agendada = só avisa (ga-xy0916u)** · O que a fatia 1 faz · O que NUNCA faz · Inviável por automação (fatia 2) · A rodada agendada (fatia 3)
-• Ativar e desligar · Quem julga · Prova ao vivo e o que não foi medido
+• Rodada agendada = só avisa (ga-xy0916u, 28/11) · O que a fatia 1 faz · O que NUNCA faz
+• Inviável por automação (fatia 2) · A rodada agendada (fatia 3) · Ativar e desligar · Quem julga
+• Prova ao vivo e o que não foi medido
 
 ## Rodada agendada = só avisa (ga-xy0916u, 28/11)
 Decisão do Athos (ga-xoe5ao.6): o pool usa o **token de 1 ano** (`claude setup-token`); só o Mayor e as crews com Remote Control mantêm **login completo**, que o Athos renova **à mão**. Por isso, **por padrão a rodada agendada não abre navegador nem lança tentativa**

@@ -6,6 +6,7 @@ No network, no real `gc`, no real vault: the resolved config is a TOML snapshot 
 import http.server
 import importlib.util
 import json
+import subprocess
 import threading
 from pathlib import Path
 
@@ -120,11 +121,26 @@ def test_check_exits_0_when_every_live_role_is_pinned(tmp_path, monkeypatch, cap
 
 
 def test_an_unreadable_config_is_exit_1_and_said_not_an_empty_map(tmp_path, monkeypatch, capsys):
-    monkeypatch.setenv("CLAUDE_CRED_MAP_CONFIG", str(tmp_path / "nope.toml"))
+    monkeypatch.setenv("CLAUDE_CRED_MAP_CONFIG", str(tmp_path / "nonexistent.toml"))
     assert M.main(["roles"]) == 1 and "could not be read" in capsys.readouterr().err
     (tmp_path / "bad.toml").write_text("this is [not toml")
     monkeypatch.setenv("CLAUDE_CRED_MAP_CONFIG", str(tmp_path / "bad.toml"))
     assert M.main(["check"]) == 1
+
+
+def test_a_gc_that_exits_non_zero_hangs_or_answers_garbage_is_exit_1_and_said_not_an_empty_map(tmp_path, monkeypatch, capsys):
+    monkeypatch.delenv("CLAUDE_CRED_MAP_CONFIG", raising=False)
+    fake = tmp_path / "gc"
+    monkeypatch.setenv("CLAUDE_CRED_GC", str(fake))
+    for body, said in (("echo boom >&2\nexit 3\n", "exited 3"), ("echo 'this is [not toml'\n", "could not be read")):
+        fake.write_text("#!/bin/sh\n" + body)
+        fake.chmod(0o755)
+        assert M.main(["check"]) == 1 and said in capsys.readouterr().err
+
+    def hang(*a, **k):
+        raise subprocess.TimeoutExpired("gc", 90)
+    monkeypatch.setattr(M.subprocess, "run", hang)
+    assert M.main(["roles"]) == 1 and "TimeoutExpired" in capsys.readouterr().err
 
 
 def test_roles_text_and_json(cfg, capsys):
@@ -222,7 +238,7 @@ def test_an_answer_that_is_not_a_list_of_items_is_unreadable_not_empty(vault, ra
 
 
 def test_a_vault_that_does_not_answer_is_unreachable(monkeypatch):
-    monkeypatch.setenv("CLAUDE_CRED_BW_URL", "http://127.0.0.1:9")
+    monkeypatch.setenv("CLAUDE_CRED_BW_URL", "http://127.0.0.1:1")
     assert M.vault_tokens(timeout=2) == ("unreachable", {})
 
 
@@ -262,5 +278,5 @@ def test_the_tokens_command_prints_dates_only(vault, capsys):
 
 
 def test_the_tokens_command_exits_1_when_the_vault_cannot_be_read(monkeypatch, capsys):
-    monkeypatch.setenv("CLAUDE_CRED_BW_URL", "http://127.0.0.1:9")
+    monkeypatch.setenv("CLAUDE_CRED_BW_URL", "http://127.0.0.1:1")
     assert M.main(["tokens"]) == 1 and "could not be read (unreachable)" in capsys.readouterr().err
