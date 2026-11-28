@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # gate-hard-checks.selftest.sh — ga-vywjzsp: proof of gate-hard-checks.sh, the checker behind quality-gate-guard.sh
-# Step 5b-pre5 (the gate's hard checks 2b template parse, 2c doc-rules lint, 2d E12 coverage, 2e third-state reads).
+# Step 5b-pre5 (the gate's hard checks 2b template parse, 2c doc-rules lint, 2d E12 coverage, 2e third-state reads, 2f test lock).
 #
 # WHY. Those four checks lived only in an orphan formula; nothing ran them (see the checker's header). This proves each one runs
 # the REAL tool (copied from the tree under test) over a fixture repo and that its verdict is the right one, in both directions:
@@ -22,7 +22,7 @@ bad() { echo "  ✗ $*"; FAIL=$((FAIL+1)); }
 skip() { echo "  - SKIPPED $*"; SKIP=$((SKIP+1)); }   # a case that could not be exercised here: said and counted, never passed
 
 for t in git python3 jq timeout; do command -v "$t" >/dev/null 2>&1 || { echo "FATAL: $t not found"; exit 1; }; done
-for f in scripts/doc-rules-lint.py packs/town-deltas/assets/third-state-reads-check.py packs/town-deltas/assets/e12-crew-doctrine.sh \
+for f in scripts/doc-rules-lint.py scripts/repro-lock.py packs/town-deltas/assets/third-state-reads-check.py packs/town-deltas/assets/e12-crew-doctrine.sh \
          packs/town-deltas/assets/e12-arms.sh packs/town-deltas/assets/template-fragment-lint-guard.sh city.toml; do
   [ -f "$RHQ/$f" ] || { echo "FATAL: $RHQ/$f not found (the tools the checker runs)"; exit 1; }
 done
@@ -40,7 +40,7 @@ bad_doc() { printf '# Title\n\n## Alpha\n\n'; filler; }
 # mkcity <dir> [skip-tool]: copies of the REAL tools, an empty .gc. Stubs are written over them by the cases that need one.
 mkcity() {
   local c="$1" a="$1/packs/town-deltas/assets" f=""
-  mkdir -p "$c/scripts" "$a" "$c/.gc" && cp "$RHQ/scripts/doc-rules-lint.py" "$c/scripts/" || return 1
+  mkdir -p "$c/scripts" "$a" "$c/.gc" && cp "$RHQ/scripts/doc-rules-lint.py" "$RHQ/scripts/repro-lock.py" "$c/scripts/" || return 1
   for f in third-state-reads-check.py e12-crew-doctrine.sh e12-arms.sh template-fragment-lint-guard.sh; do
     [ "$f" = "${2:-}" ] || cp "$RHQ/packs/town-deltas/assets/$f" "$a/" || return 1
   done
@@ -432,6 +432,74 @@ printf 'print("third-state-reads-check: verdict=ok mode=enforce arm=enforce unco
 run_sut 2e "$R" "$MAIN" "$RTIP" ga-st15;                   expect "an ok line with no reads= cannot say what was read: unmeasured, never 'every read has a test'" nao-consegui-medir saida-ilegivel
 printf 'print("third-state-reads-check: verdict=ok mode=enforce arm=enforce reads=x uncovered=0 waived=0 skipped=0")\n' > "$T5"
 run_sut 2e "$R" "$MAIN" "$RTIP" ga-st16;                   expect "a reads= that is not a number is not zero" nao-consegui-medir saida-ilegivel
+CITY_UNDER=""
+
+echo "E2. 2f test lock (real repro-lock.py: it reads ONLY the git history of base..tip, and a lock is declared by trailer)"
+# lock_commit <rig> <bead> <file> <content>: commits <file> with the Repro-Lock trailers (what `repro-lock.py lock` writes) and prints the sha
+lock_commit() {
+  printf '%b\n' "$4" | put "$1" "$3" && git -C "$1" add -A >/dev/null 2>&1 \
+    && printf 'test(%s): reproduz\n\nRepro-Lock: %s\nRepro-Lock-File: %s\n' "$2" "$2" "$3" | git -C "$1" commit -q -F - && git -C "$1" rev-parse HEAD
+}
+release_commit() { # release_commit <rig> <bead> <reason>: the empty commit `repro-lock.py release` makes
+  printf 'chore(%s): libera\n\nRepro-Lock-Release: %s\nRepro-Lock-Release-Reason: %s\n' "$2" "$2" "$3" | git -C "$1" commit -q --allow-empty -F - && git -C "$1" rev-parse HEAD
+}
+LB=ga-lock; LOCKED='def test_bug():\n    assert f() == 2'; LOOSE='def test_bug():\n    assert True'
+branch_from "$R" main l_none;  printf 'x = 9\n' > "$R/lib/app.py";                              NLTIP="$(commit_all "$R" fix-only)"
+run_sut 2f "$R" "$MAIN" "$NLTIP" "$LB";                    expect "no lock declared: a measured zero (crews and older submissions are untouched)" nao-se-aplica sem-trava-declarada
+branch_from "$R" main l_ok;    lock_commit "$R" "$LB" tests/test_lock.py "$LOCKED" >/dev/null; printf 'x = 2\n' > "$R/lib/app.py"; OKTIP="$(commit_all "$R" fix)"
+run_sut 2f "$R" "$MAIN" "$OKTIP" "$LB";                    expect "the lock commit first, then the fix, the test untouched" ok trava-integra
+branch_from "$R" main l_bad;   lock_commit "$R" "$LB" tests/test_lock.py "$LOCKED" >/dev/null; printf 'x = 2\n' > "$R/lib/app.py"; printf '%b\n' "$LOOSE" | put "$R" tests/test_lock.py; BADTIP="$(commit_all "$R" fix-and-loosen)"
+run_sut 2f "$R" "$MAIN" "$BADTIP" "$LB";                   expect "the fix commit also loosens the locked test: refused" fail teste-travado-alterado
+has "the finding names the locked file and the commit" "tests/test_lock.py depois da trava"
+printf '%s\n' "$LINE" | grep -q ' tip=- base=- arm=-$' && ok "the VERDICT line keeps the shared shape (tip/base/arm columns are -)" || bad "VERDICT line shape: $LINE"
+run_sut 2f "$R" "$MAIN" "$BADTIP" "ga-other";              expect "the same history judged for ANOTHER bead has no lock of that bead, and the reason says a lock of another bead is there" nao-se-aplica trava-so-de-outra-bead
+branch_from "$R" main l_late;  printf 'x = 3\n' > "$R/lib/app.py"; commit_all "$R" fix-first >/dev/null; lock_commit "$R" "$LB" tests/test_lock.py "$LOCKED" >/dev/null; LATETIP="$(git -C "$R" rev-parse HEAD)"
+run_sut 2f "$R" "$MAIN" "$LATETIP" "$LB";                  expect "the lock after a plain commit (the fix came first): refused" fail trava-nao-e-o-primeiro-commit
+branch_from "$R" main l_rel;   lock_commit "$R" "$LB" tests/test_lock.py "$LOCKED" >/dev/null; printf 'x = 2\n' > "$R/lib/app.py"; commit_all "$R" fix >/dev/null
+release_commit "$R" "$LB" "o teste confere 3 mas o contrato diz 2: defeito do teste" >/dev/null; printf '%b\n' "$LOOSE" | put "$R" tests/test_lock.py; RELTIP="$(commit_all "$R" fix-the-test)"
+run_sut 2f "$R" "$MAIN" "$RELTIP" "$LB";                   expect "a release WITH a reason before the edit: an aviso, never a refusal" aviso trava-liberada-com-motivo
+has "the reason reaches the detail the guard comments on the marker" "o teste confere 3 mas o contrato diz 2"
+branch_from "$R" main l_rel2;  lock_commit "$R" "$LB" tests/test_lock.py "$LOCKED" >/dev/null; release_commit "$R" "$LB" "curto" >/dev/null; SHORTTIP="$(git -C "$R" rev-parse HEAD)"
+run_sut 2f "$R" "$MAIN" "$SHORTTIP" "$LB";                 expect "a release whose reason is under 20 characters does not count" fail liberacao-sem-motivo
+run_sut 2f "$R" "$MAIN" "$BADTIP" "$LB" REPRO_LOCK_CHECK=off; expect "the tool's own kill switch (env)" desligado interruptor
+: > "$CITY/.gc/repro-lock-check.off"
+run_sut 2f "$R" "$MAIN" "$BADTIP" "$LB";                   expect "the kill switch file in the city's .gc" desligado interruptor
+rm -f "$CITY/.gc/repro-lock-check.off"
+run_sut 2f "$R" "$MAIN" "$BADTIP" "ga lock";               expect "a bead id with a space is refused" nao-consegui-medir bead-invalido
+branch_from "$R" main l_tool;  printf '# changed\n' | put "$R" "$HQ/scripts/repro-lock.py"; printf 'x = 5\n' > "$R/lib/app.py"; LTTIP="$(commit_all "$R" lock-tool-edit)"
+run_sut 2f "$R" "$MAIN" "$LTTIP" "$LB";                    expect "a diff that edits repro-lock.py is not judged by it" nao-consegui-medir ferramenta-alterada-no-diff
+# a history the tool cannot judge (a merge inside base..tip) is unmeasured: never ok, never a finding
+branch_from "$R" main l_mrg;   lock_commit "$R" "$LB" tests/test_lock.py "$LOCKED" >/dev/null; git -C "$R" checkout -q -b l_side main && printf 'y = 1\n' > "$R/lib/side.py" && commit_all "$R" side >/dev/null
+git -C "$R" checkout -q l_mrg && git -C "$R" merge -q --no-ff -m merge l_side && MGTIP="$(git -C "$R" rev-parse HEAD)"
+run_sut 2f "$R" "$MAIN" "$MGTIP" "$LB";                    expect "a merge commit in the range: could not tell" nao-consegui-medir ferramenta-nao-sei
+has "and the tool's own line says why" "merge"
+# stand-in tool: the checker reads the VERDICT line's fields and the exit status; a field that is not there is not a value
+C6="$WORK/city6"; mkcity "$C6" || { echo "FATAL: cannot build city6"; exit 1; }; CITY_UNDER="$C6"; T6="$C6/scripts/repro-lock.py"
+printf 'print("repro-lock-check: verdict=ok reason=trava-integra locks=2 files=2 releases=0")\n' > "$T6"
+run_sut 2f "$R" "$MAIN" "$OKTIP" "$LB";                    expect "control: a well-formed ok line" ok trava-integra
+printf 'print("repro-lock-check: verdict=nao-se-aplica reason=Bad_Slug! locks=0 files=0 releases=0")\n' > "$T6"
+run_sut 2f "$R" "$MAIN" "$OKTIP" "$LB";                    expect "a not-applicable line whose reason is not a plain slug falls back to the stable reason" nao-se-aplica sem-trava-declarada
+printf 'print("repro-lock-check: verdict=ok reason=trava-integra locks=2 files=2 releases=0")\n' > "$T6"
+printf 'print("repro-lock-check: verdict=ok reason=trava-integra locks=0 files=0 releases=0")\n' > "$T6"
+run_sut 2f "$R" "$MAIN" "$OKTIP" "$LB";                    expect "ok with locks=0 contradicts itself: unmeasured, never 'the lock is intact'" nao-consegui-medir saida-ilegivel
+printf 'print("repro-lock-check: verdict=ok reason=trava-integra files=2 releases=0")\n' > "$T6"
+run_sut 2f "$R" "$MAIN" "$OKTIP" "$LB";                    expect "ok with no locks= field cannot say a lock exists: unmeasured" nao-consegui-medir saida-ilegivel
+printf 'print("repro-lock-check: verdict=aviso reason=trava-liberada-com-motivo locks=1 files=1 releases=0")\n' > "$T6"
+run_sut 2f "$R" "$MAIN" "$OKTIP" "$LB";                    expect "aviso with releases=0 contradicts itself: unmeasured" nao-consegui-medir saida-ilegivel
+printf 'import sys\nprint("repro-lock-check: verdict=fail locks=1 files=1 releases=0")\nprint("  detail line")\nsys.exit(1)\n' > "$T6"
+run_sut 2f "$R" "$MAIN" "$OKTIP" "$LB";                    expect "fail with no reason= field still refuses, under a stable reason" fail teste-travado-violado
+printf 'import sys\nprint("repro-lock-check: verdict=fail reason=Bad_Slug! locks=1 files=1 releases=0")\nsys.exit(1)\n' > "$T6"
+run_sut 2f "$R" "$MAIN" "$OKTIP" "$LB";                    expect "a reason that is not a plain slug is not echoed into the verdict" fail teste-travado-violado
+printf 'import sys\nprint("repro-lock-check: verdict=fail reason=x locks=1 files=1 releases=0")\nsys.exit(0)\n' > "$T6"
+run_sut 2f "$R" "$MAIN" "$OKTIP" "$LB";                    expect "a fail line with exit 0 is not a finding (the exit status disagrees): unmeasured" nao-consegui-medir saida-ilegivel
+printf 'import sys\nprint("repro-lock-check: verdict=nao-sei reason=leitura-falhou locks=- files=- releases=-")\nprint("  git log falhou")\nsys.exit(2)\n' > "$T6"
+run_sut 2f "$R" "$MAIN" "$OKTIP" "$LB";                    expect "the tool says it could not tell (exit 2)" nao-consegui-medir ferramenta-nao-sei
+printf 'import sys\nsys.exit(5)\n' > "$T6"
+run_sut 2f "$R" "$MAIN" "$OKTIP" "$LB";                    expect "a tool that dies with exit 5 and no line" nao-consegui-medir ferramenta-rc5
+printf 'print("hello")\n' > "$T6"
+run_sut 2f "$R" "$MAIN" "$OKTIP" "$LB";                    expect "exit 0 and no verdict line" nao-consegui-medir saida-ilegivel
+rm -f "$T6"
+run_sut 2f "$R" "$MAIN" "$OKTIP" "$LB";                    expect "the tool missing from the city" nao-consegui-medir ferramenta-ilegivel
 CITY_UNDER=""
 
 echo "F. 2d E12 coverage (real e12-crew-doctrine.sh over the fixture's prompts; the city's generator, never the branch's)"

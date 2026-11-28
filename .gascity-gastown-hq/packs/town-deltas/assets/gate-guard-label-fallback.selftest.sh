@@ -33,7 +33,7 @@ has() { grep -qF -- "$2" "$1" 2>/dev/null; }          # has <file> <fixed string
 hasnt() { ! grep -qF -- "$2" "$1" 2>/dev/null; }
 fatal() { echo "FATAL: $*"; echo; echo "gate-guard-label-fallback selftest: $PASS passed, $FAIL failed"; exit 1; }
 
-for f in "$GUARD" "$CHECKER" "$RHQ/scripts/doc-rules-lint.py" "$RHQ/packs/town-deltas/assets/third-state-reads-check.py" "$ALARM"; do [ -f "$f" ] || fatal "missing $f"; done
+for f in "$GUARD" "$CHECKER" "$RHQ/scripts/doc-rules-lint.py" "$RHQ/scripts/repro-lock.py" "$RHQ/packs/town-deltas/assets/third-state-reads-check.py" "$ALARM"; do [ -f "$f" ] || fatal "missing $f"; done
 command -v jq >/dev/null 2>&1 || fatal "jq is required"
 command -v python3 >/dev/null 2>&1 || fatal "python3 is required"
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/guard-lblfb-selftest.XXXXXX")" || fatal "no scratch dir"
@@ -164,7 +164,7 @@ V="$WORK/c6"; run_valid main wa-fx0001 whatsapp_automation > "$V"
 
 echo "D. end to end: a crew/oracle/<bead> marker as Dolt returns it reaches step 2e, is recorded, and the alarm's own readers see it"
 CITY0="$WORK/city0"; AS="$CITY0/packs/town-deltas/assets"
-mkdir -p "$CITY0/scripts" "$AS" "$CITY0/.gc" && cp "$RHQ/scripts/doc-rules-lint.py" "$CITY0/scripts/" && cp "$CHECKER" "$AS/" || fatal "cannot build the fixture city"
+mkdir -p "$CITY0/scripts" "$AS" "$CITY0/.gc" && cp "$RHQ/scripts/doc-rules-lint.py" "$RHQ/scripts/repro-lock.py" "$CITY0/scripts/" && cp "$CHECKER" "$AS/" || fatal "cannot build the fixture city"
 for f in third-state-reads-check.py e12-crew-doctrine.sh e12-arms.sh template-fragment-lint-guard.sh; do cp "$RHQ/packs/town-deltas/assets/$f" "$AS/" || fatal "cannot build the fixture city ($f)"; done
 for f in gate-hard-checks-imports.py gate-hard-checks-lint.py; do cp "$(dirname "$CHECKER")/$f" "$AS/" || fatal "cannot build the fixture city ($f beside the checker)"; done
 printf 'mode=enforce\n' > "$CITY0/.gc/third-state-reads.conf"       # the arm is drawn and recorded only when the check is switched on
@@ -221,7 +221,7 @@ PY
 
 chain "$(mk "$D_PROSE" "$L_ORACLE")" "$B_FIELDS" "$B_VALID"; D1="$CH_DIR"
 [ "$CH_RC" = 0 ] && has "$D1/calls.txt" "CHAIN-REACHED-END" && hasnt "$D1/calls.txt" "STATUS" && ok "the marker passes Step 4 and the sweep reaches the end of Step 5b-pre5 (nothing set to error)" || bad "crew marker chain: rc=$CH_RC :: $(head -3 "$D1/driver.out" | tr '\n' '|') :: $(cat "$D1/calls.txt" | tr '\n' '|' | cut -c1-300)"
-n="$(grep -c 'HARDCHECK step=' "$D1/guard.log")"; [ "$n" = 4 ] && ok "four HARDCHECK lines in the guard log, one per step" || bad "HARDCHECK lines: $n (want 4)"
+n="$(grep -c 'HARDCHECK step=' "$D1/guard.log")"; [ "$n" = 5 ] && ok "five HARDCHECK lines in the guard log, one per step (2b-2e and the 2f test lock)" || bad "HARDCHECK lines: $n (want 5)"
 grep -E 'HARDCHECK step=2e verdict=ok reason=sem-leituras-vistas bead=wa-fx0001 branch=crew/oracle/wa-fx0001 mode=enforce marker=ga-fixture1 checker=\[VERDICT=ok step=2e .* arm=enforce\]' "$D1/guard.log" >/dev/null \
   && ok "the 2e line names the bead and the crew branch and carries the checker's own line with arm=enforce" || bad "2e line: $(grep 'step=2e' "$D1/guard.log" | cut -c1-300)"
 has "$D1/calls.txt" "label add ga-fixture1 gate-tsr:ok" && ok "the marker got its gate-tsr:ok label" || bad "labels: $(grep 'label add' "$D1/calls.txt" | tr '\n' '|')"

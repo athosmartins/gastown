@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # gate-hard-checks.sh — ga-vywjzsp: the measurement behind quality-gate-guard.sh Step 5b-pre5 (the gate's hard checks).
 #
-#   gate-hard-checks.sh <step> <rig-path> <base-sha> <tip-sha> <bead-id>      <step> = 2b | 2c | 2d | 2e
+#   gate-hard-checks.sh <step> <rig-path> <base-sha> <tip-sha> <bead-id>      <step> = 2b | 2c | 2d | 2e | 2f
 #
 # WHY. formulas/mol-quality-gate-runner.toml (run-tests) holds four deterministic hard checks: 2b template parse,
 # 2c doc-rules lint, 2d E12 coverage, 2e third-state reads. Nothing pours that formula: the live gate is guard ->
@@ -9,6 +9,10 @@
 # versions read, 1 June to 27 Oct). A reviewer was seen running 2c by hand (gate-run ga-1htlfu) because it found the
 # formula. This runs each check for every submission, from the guard (the one deterministic path every builder
 # passes), one step per call.
+# 2f (ga-89ix4m4) is not in that formula: the test lock of a BUG bead. A builder that locked its reproducing test (repro-lock.py lock: the test is the
+# first commit of the branch and carries Repro-Lock trailers) may not touch those files in any later commit; 2f reads only the git history of
+# base..tip (no branch file is opened or run) through the merged scripts/repro-lock.py. No lock declared = nao-se-aplica, so crews and every
+# older submission are untouched. A release with a recorded reason is an aviso (the reviewer sees the reason), never a refusal by itself.
 #
 # TRUST. The guard runs this with its own privileges and the branch may come from a sandboxed node, so nothing the
 # branch supplies is EXECUTED: each tool is the copy already merged beside this script (HQ_DIR), run over the branch's
@@ -34,7 +38,7 @@
 #                       "FAIL -- <pack>" line, so another pack, or a "NEW (not on the known list)" line, so another error in a
 #                       pack that was already red; 2d: a red line), and the detail lists just those new lines; for 2b with a base
 #                       that only warned (unlinted), each pack the tip broke must have linted green there. The only verdict the guard refuses on
-#   aviso               2e found reads with no failure test but its mode (warn, or the holdout arm) does not refuse
+#   aviso               2e found reads with no failure test but its mode (warn, or the holdout arm) does not refuse; 2f: the lock was RELEASED with a reason
 #   debito-previo       2b/2d: red on the tip and on the base, and every finding line of the tip is on the base's run too: the
 #                       same break on both sides, main already carried it (the detail is then the tip's own output)
 #   nao-se-aplica       the diff touches nothing this step reads (a MEASURED zero: the diff itself was read; "reads" for 2c is
@@ -43,6 +47,9 @@
 #                       (every .md in the diff was excluded or skipped by the lint)
 #   desligado           a kill switch is on (the tool's own, or E12_COVERAGE_GATE=off / .gc/e12-coverage-gate.off for 2d)
 #   nao-ligado          2e only: .gc/third-state-reads.conf is absent or mode=off, so the tool checked nothing
+#   (2f)                fail = a locked test changed after the lock commit, or the lock is not the branch's first commit / not a clean test-only commit;
+#                       nao-se-aplica = no lock declared; desligado = REPRO_LOCK_CHECK=off or .gc/repro-lock-check.off; nao-consegui-medir = git unreadable, a merge in
+#                       the range, more than 400 commits, a diff that edits scripts/repro-lock.py itself (its own copy cannot vouch for it)
 #   nao-consegui-medir  anything that stopped a measurement (see the reason); the guard fails OPEN on it, loudly
 # rc is the tool's exit code (124 = timeout, 126/127 = could not exec), so a host problem reads in the log at a glance.
 # Always exits 0 after printing; a crash prints no VERDICT= line, which the guard reads as unmeasured.
@@ -267,6 +274,44 @@ step_2e() {
   esac
 }
 
+step_2f() {
+  local tool="$HQ_DIR/scripts/repro-lock.py" out="" line="" v="" r="" nlocks="" nrel=""
+  [ -r "$tool" ] || emit nao-consegui-medir ferramenta-ilegivel
+  tool_altered "$HQ/scripts/repro-lock.py" && emit nao-consegui-medir ferramenta-alterada-no-diff
+  case "$bead" in (''|*[!A-Za-z0-9._-]*) emit nao-consegui-medir bead-invalido ;; esac
+  # The tool reads the git objects of base..tip and nothing else: no tree is extracted and nothing the branch supplies is opened or executed.
+  out="$(env "GC_CITY_PATH=$HQ_DIR" "$TBIN" "$TMO" "$PY" -I "$tool" check --repo "$TOP" --base "$base" --head "$tip" "--bead=$bead" 2>&1)"; RC=$?
+  # vazio → sem linha de veredito: o interruptor (NOTE ... OFF) é a única saída 0 sem ela, qualquer outra é nao-consegui-medir; falhou/ilegível → o grep não acha a linha, o mesmo que vazio
+  line="$(printf '%s\n' "$out" | grep -E '^repro-lock-check: verdict=' | tail -n 1)"
+  if [ -n "$line" ]; then
+    v="${line#*verdict=}"; v="${v%% *}"
+    # vazio → campo ausente: fica vazio e o caso abaixo recusa a leitura (nunca o resto da linha tomado por valor); falhou/ilegível → idem
+    case "$line" in (*' reason='*) r="${line#* reason=}"; r="${r%% *}" ;; esac
+    case "$line" in (*' locks='*) nlocks="${line#* locks=}"; nlocks="${nlocks%% *}" ;; esac
+    case "$line" in (*' releases='*) nrel="${line#* releases=}"; nrel="${nrel%% *}" ;; esac
+    case "$r" in (''|*[!a-z0-9-]*) r="" ;; esac
+  elif [ "$RC" -eq 0 ]; then
+    # Whole lines at the start only (the detail lines echo branch text, indented): see step_2c.
+    if printf '%s\n' "$out" | grep -E -q '^NOTE: repro-lock-check: is switched OFF \('; then emit desligado interruptor; fi
+  fi
+  case "$RC:$v" in
+    # ok: a lock was declared and nothing touched it; locks= and releases= must be numbers (a line that contradicts itself is unmeasured, never "intact")
+    (0:ok) case "$nlocks" in (''|*[!0-9]*) emit nao-consegui-medir saida-ilegivel ;; esac
+           [ "$nlocks" -gt 0 ] || emit nao-consegui-medir saida-ilegivel
+           emit ok trava-integra ;;
+    # the tool's own reason when it is a plain slug: «trava-so-de-outra-bead» says a Repro-Lock exists in the range but for another bead id (the trailer's id must be the branch's)
+    (0:nao-se-aplica) emit nao-se-aplica "${r:-sem-trava-declarada}" ;;
+    (0:aviso) case "$nrel" in (''|*[!0-9]*) emit nao-consegui-medir saida-ilegivel ;; esac
+              [ "$nrel" -gt 0 ] || emit nao-consegui-medir saida-ilegivel
+              DETAIL="$(cap "$out")"; emit aviso trava-liberada-com-motivo ;;
+    (1:fail) [ -n "$r" ] || r=teste-travado-violado
+             DETAIL="$(cap "$out")"; emit fail "$r" ;;
+    (0:nao-sei|2:nao-sei) DETAIL="$(cap "$out")"; emit nao-consegui-medir ferramenta-nao-sei ;;
+    (0:*|1:*|2:*) emit nao-consegui-medir saida-ilegivel ;;
+    (*) emit nao-consegui-medir "ferramenta-rc$RC" ;;
+  esac
+}
+
 # run_e12 <tree> <outfile>: check + coverage of the E12 generator (the city's copy) over <tree>'s prompts, fragment and
 # city.toml; prints "<class> <rc>" (green | red | unknown). Red needs a STALE / BROKEN MARKERS / GAP line AND rc 1.
 run_e12() {
@@ -420,7 +465,7 @@ step_2b() {
 
 main() {
   rig="${2-}"; base="${3-}"; tip="${4-}"; bead="${5-}"
-  case "$STEP" in (2b|2c|2d|2e) ;; (*) emit nao-consegui-medir passo-invalido ;; esac
+  case "$STEP" in (2b|2c|2d|2e|2f) ;; (*) emit nao-consegui-medir passo-invalido ;; esac
   if [ -z "$rig" ] || [ -z "$base" ] || [ -z "$tip" ]; then emit nao-consegui-medir entrada-vazia; fi
   # The shas go into `git diff <base>..<tip>`: anything that is not hex (--output=FILE would be read as an option) is refused.
   case "$base$tip" in (*[!0-9a-fA-F]*) emit nao-consegui-medir entrada-invalida ;; esac
@@ -445,7 +490,7 @@ main() {
     (2b) grep -E '(^|/)template-fragments/|(^|/)prompts/shared/|\.template\.md$|\.md\.tmpl$|(^|/)pack\.toml$' "$SCRATCH/all.nl" > "$SCRATCH/hits.nl" ;;
     (2c) grep -i '\.md$' "$SCRATCH/live.nl" > "$SCRATCH/hits.nl" ;;
     (2d) grep -E "^[.]gascity-gastown-hq/(agents/[^/]+/prompt[.]template[.]md|city[.]toml|packs/town-deltas/(template-fragments/town-deltas[.]template[.]md|assets/(e12-arms[.]sh|e12-crew-doctrine[.]sh|claude-overlays/pool-roles[.]json)))\$" "$SCRATCH/all.nl" > "$SCRATCH/hits.nl" ;;
-    (2e) cp "$SCRATCH/all.nl" "$SCRATCH/hits.nl" ;;
+    (2e|2f) cp "$SCRATCH/all.nl" "$SCRATCH/hits.nl" ;;
   esac
   if [ ! -s "$SCRATCH/hits.nl" ]; then emit nao-se-aplica diff-sem-entradas-do-passo; fi
   pick_tools
