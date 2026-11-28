@@ -1,9 +1,9 @@
 # ga-hyp55ss.4: a queda da taxa da bateria de agentes avisa o Mayor e marca o merge que mudou a configuração do papel. As ordens da fatia 3 medem (noite e gatilho de merge) e gravam uma linha por rodada em $GC_CITY_PATH/.gc/logs/agent-battery.jsonl;
 # esta compara cada linha NOVA com a mediana das últimas noites do mesmo acervo, e uma queda que a sorte não explica vira e-mail ao Mayor (gc mail send) e o rótulo audit:bateria-queda, com comentário, nas beads dos commits que tocaram a configuração do papel
-# entre as duas medições (.claude/, CLAUDE.md, <cidade>/CLAUDE.md, prompt do papel). Só mede e avisa: não bloqueia merge.
+# desde a última noite da linha de base com outra configuração (.claude/, CLAUDE.md, <cidade>/CLAUDE.md, prompt do papel). Só mede e avisa: não bloqueia merge.
 #
 # 20 min: o que ela lê é o jsonl, que só muda quando uma rodada termina (uma por noite e uma por merge de configuração), então olhar mais devagar não perde nada; cada volta lê um arquivo e, só quando avisa, roda um git e alguns bd.
-# timeout 1500s: o pior caso é 3 papéis em queda (git 30+60 s cada) + e-mail (120 s) + até 5 beads com rótulo e comentário (2 x 60 s cada); a volta seguinte conta do fim desta.
+# timeout 1500s: o pior caso é 3 papéis em queda (git 30+60 s cada) + e-mail (120 s) + até 5 beads com rótulo e comentário (2 x 60 s cada) + o 2o e-mail, se alguma marca falhar (120 s) = 1110 s; a volta seguinte conta do fim desta.
 # Sem alerta repetido: uma linha que pede aviso só é dada como vista depois do e-mail; a mesma configuração ainda baixa na noite seguinte não avisa de novo (alert-state.json). A 1a volta só grava a base. O controle negativo NÃO é desta ordem: roda à mão,
 # `python3 -I scripts/agent-battery-alert.py control`, porque gasta tokens de verdade (docs/runbooks/agent-battery-alert.md).
 #

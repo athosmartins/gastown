@@ -11,11 +11,13 @@ A REGRA DA QUEDA: lê as linhas NOVAS de <cidade>/.gc/logs/agent-battery.jsonl (
   ainda acertasse a mediana, é no máximo --alfa (binomial, mediana presa a no máximo 95%). Do tamanho do limiar mas cabendo na sorte = "ruído": só vai ao log. Menos de --min-noites noites de base = sem base:
   não avisa. Avisa UMA vez por queda: a mesma configuração ainda baixa na noite seguinte não repete (volta a valer quando a taxa se recupera ou a configuração muda).
   Linha gravada com --role-prompt (o controle negativo, ou um teste à mão) não é uma rodada: fica fora da base e do aviso, e nunca marca bead.
-O MERGE CAUSADOR: o sha de configuração do papel mudou entre a medição anterior (qualquer modo) e esta? Então lista os commits entre os dois `config_ref_sha` que tocam os caminhos de configuração do
-  executor (.claude/, CLAUDE.md, <cidade>/CLAUDE.md e o prompt do papel), tira a bead do assunto `tipo(<bead>): ...` e põe o rótulo audit:bateria-queda e um comentário com os números em cada uma (no
-  máximo --max-marcar: acima disso não marca ninguém). Sha igual = não houve merge de configuração: o aviso diz isso e nada é marcado. Git sem resposta = não sei: o aviso sai sem marca.
+O MERGE CAUSADOR: a queda é julgada contra a LINHA DE BASE (as noites da mediana), então é dela que a janela parte: acha a noite mais recente da base cuja configuração (`config_sha`) NÃO é a de agora e lista os
+  commits entre o `config_ref_sha` dela e o desta medição que tocam os caminhos de configuração do executor (.claude/, CLAUDE.md, <cidade>/CLAUDE.md e o prompt do papel), tira a bead do assunto `tipo(ga-<bead>): ...`
+  (só id do HQ: o bd -C <cidade> não acha bead de outro rig) e põe o rótulo audit:bateria-queda e um comentário com os números em cada uma (no máximo --max-marcar: acima disso não marca ninguém). A base inteira já
+  com a configuração de agora = nenhum merge explica a queda: o aviso diz isso e nada é marcado. A noite de que a janela partiria sem sha ou commit legível, ou git sem resposta = não sei: o aviso sai sem marca.
 ESTADO: <cidade>/.gc/agent-battery/alert-state.json (quantas linhas do jsonl já foram vistas e o papel em queda); decisões em <cidade>/.gc/logs/agent-battery-alert.jsonl. A 1a varredura só grava a base.
-  E-mail que falha = a linha NÃO é dada como vista (a próxima varredura tenta de novo) e nada é marcado antes dele. Estado ilegível = exit 1 e nada é avaliado: apague-o para regravar a base.
+  E-mail que falha = a linha NÃO é dada como vista (a próxima varredura tenta de novo; se o estado não grava, o MESMO aviso sai de novo: entrega pelo menos uma vez) e nada é marcado antes dele. O e-mail só PEDE as
+  marcas: a que falha vira um 2o e-mail (MARCA FALHOU) e exit 1, o log grava `marcadas` (o rótulo entrou) e `marcas_falhas` por bead, e a varredura não as refaz. Estado ilegível = exit 1 e nada é avaliado: apague-o.
 CONTROLE NEGATIVO: `control` roda o driver da noite UMA vez, numa cidade descartável (o jsonl e o relatório reais não são tocados), com --role-prompt PAPEL=scripts/agent-battery-control-prompt.md: o
   executor lê esse prompt deliberadamente inútil NO LUGAR do prompt do papel, no nó, sem commit nenhum (a main não muda). Julga a taxa contra a linha de base REAL pela mesma regra e manda o resultado
   ao Mayor: PASSOU (a taxa caiu e o aviso teria disparado) · FALHOU (a bateria não enxergou a regressão, ou não mediu) · INERTE (sem base, sem acervo, sem credencial, nó desligado). Gasta tokens de verdade.
@@ -40,7 +42,7 @@ import time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 SHA40, SHA64 = re.compile(r"^[0-9a-f]{40}\Z"), re.compile(r"^[0-9a-f]{64}\Z")
-BEAD = re.compile(r"^[a-z]+\(([a-z][a-z0-9]*-[a-z0-9]+(?:\.[0-9]+)*)\)")
+BEAD = re.compile(r"^[a-z]+\((ga-[a-z0-9]+(?:\.[0-9]+)*)\)")  # só id do HQ: o store do HQ não acha id de outro rig (wa-, ...: medido com `bd show`, não com `label add`), e cada marca que falha gasta o teto de --max-marcar
 LABEL = "audit:bateria-queda"
 OPTS = (("janela", 5, int), ("min-noites", 3, int), ("limiar", 0.20, float), ("alfa", 0.10, float), ("max-marcar", 5, int), ("mail", "", str), ("bd", "bd", str),
         ("role", "dog", str), ("prompt", "scripts/agent-battery-control-prompt.md", str), ("control-timeout-s", 9600, int))
@@ -97,17 +99,20 @@ def p_sorte(k, n, p0):
     p0 = min(p0, 0.95)
     return sum(math.comb(n, i) * p0 ** i * (1 - p0) ** (n - i) for i in range(k + 1))
 
-def base_rates(a, hist, role, acervo):
-    """Taxas das últimas --janela noites medidas do papel no mesmo acervo, da mais antiga à mais nova. Só noites: uma medida de merge é, por construção, a de uma configuração que acabou de mudar."""
-    rates = []
+def base_nights(a, hist, role, acervo):
+    """[(taxa, config_sha, config_ref_sha, ts)] das últimas --janela noites medidas do papel no mesmo acervo, da mais antiga à mais nova: a LINHA DE BASE, e a configuração em que cada noite foi medida.
+    Só noites: uma medida de merge é, por construção, a de uma configuração que acabou de mudar."""
+    nights = []
     for l in hist:
-        b = measure((l["papeis"] or {}).get(role)) if l.get("mode") == "night" else None
+        rec = (l["papeis"] or {}).get(role)
+        b = measure(rec) if l.get("mode") == "night" else None
         if b and b[2] == acervo:
-            rates.append(b[0] / b[1])
-    return rates[-a.janela:]
+            # vazio/falhou (a noite não traz o sha de configuração ou o commit) → None aqui; merges() diz "não sei" se for dessa noite que a janela parte; a taxa vale do mesmo jeito
+            nights.append((b[0] / b[1], rec.get("config_sha"), rec.get("config_ref_sha"), l["ts"]))
+    return nights[-a.janela:]
 
 def judge_drop(a, hist, role, rec):
-    """Veredito de um papel: {kind, taxa, k, n, base, noites, queda, p}; kind = sem_acervo | sem_base | ok | ruido | queda. None = não é uma medida. `hist` = linhas anteriores (dicts)."""
+    """Veredito de um papel: {kind, taxa, k, n, base, noites, queda, p, nights}; kind = sem_acervo | sem_base | ok | ruido | queda; `nights` = a linha de base (base_nights) quando houve. None = não é uma medida. `hist` = linhas anteriores (dicts)."""
     m = measure(rec)
     if m is None:
         return None
@@ -115,13 +120,13 @@ def judge_drop(a, hist, role, rec):
     v = {"taxa": k / n, "k": k, "n": n, "base": None, "noites": 0, "queda": None, "p": None}
     if ac is None:
         return dict(v, kind="sem_acervo")
-    rates = base_rates(a, hist, role, ac)
-    v["noites"] = len(rates)
-    if len(rates) < a.min_noites:
+    nights = base_nights(a, hist, role, ac)
+    v["noites"] = len(nights)
+    if len(nights) < a.min_noites:
         return dict(v, kind="sem_base")
-    base = statistics.median(rates)
+    base = statistics.median(t[0] for t in nights)
     queda, p = round(base - v["taxa"], 4), p_sorte(k, n, base)
-    return dict(v, kind="ok" if queda < a.limiar else ("queda" if p <= a.alfa else "ruido"), base=base, queda=queda, p=p)
+    return dict(v, kind="ok" if queda < a.limiar else ("queda" if p <= a.alfa else "ruido"), base=base, queda=queda, p=p, nights=nights)
 
 def fmt(role, v):
     t = "%s: %s (%d/%d tarefas)" % (role, pct(v["taxa"]), v["k"], v["n"])
@@ -173,22 +178,20 @@ def audit(a, rows):
         say("WARN: não gravei o log de decisões (%s)" % e)
 
 # ── o merge causador ─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
-def previous(hist, role):
-    """(config_sha, config_ref_sha, ts) da medição anterior do papel, de qualquer modo e categoria (o que importa é qual configuração o nó leu); None = nunca vista."""
-    for l in reversed(hist):
-        r = (l["papeis"] or {}).get(role)
-        if isinstance(r, dict) and SHA64.match(str(r.get("config_sha"))) and SHA40.match(str(r.get("config_ref_sha"))):
-            return r["config_sha"], r["config_ref_sha"], l["ts"]
-    return None
-
-def merges(a, role, prev, v):
-    """([(sha, bead|None, assunto)], nota): os commits entre as duas medições que tocam a configuração do papel. Lista vazia SEM nota nunca acontece: sem commits e sem leitura têm notas diferentes."""
-    if prev is None:
-        return [], "sem medição anterior deste papel: não há com o que comparar a configuração"
+def merges(a, role, v):
+    """([(sha, bead|None, assunto)], nota): os commits que tocam a configuração do papel entre a noite da linha de base em que a configuração MUDOU e esta medição. A janela parte da base porque é contra ela que a queda foi
+    julgada: a medição anterior pode já ser da configuração nova (um merge que ficou em ruído). A nota diz sempre o que se sabe ou por que não se sabe: sem commits e sem leitura têm notas diferentes."""
     if not (SHA64.match(str(v["sha"])) and SHA40.match(str(v["ref"]))):
         return [], "a linha não traz o sha de configuração e o commit medido"
-    if prev[0] == v["sha"]:
-        return [], "a configuração do papel não mudou desde a medição anterior (%s): a queda não vem de um merge de prompt, skill ou CLAUDE.md" % prev[2]
+    # vazio (nenhuma noite da base com outro sha: o laço acaba sem break) → a base inteira já tinha esta configuração; falhou/ilegível (a noite não traz o sha ou o commit) → "não sei", nunca "não mudou"
+    # (`queda` exige --min-noites >= 1 noites de base: o laço nunca roda sobre uma base vazia)
+    for _, psha, pref, pts in reversed(v["nights"]):
+        if psha != v["sha"]:
+            break
+    else:
+        return [], "a configuração do papel é a mesma de toda a linha de base (%d noites): a queda não vem de um merge de prompt, skill ou CLAUDE.md" % len(v["nights"])
+    if not (SHA64.match(str(psha)) and SHA40.match(str(pref))):
+        return [], "não sei desde quando a configuração mudou: a noite de %s da linha de base não traz o sha de configuração e o commit medido" % pts
     abr = sibling("agent-battery-run")  # vazio → n/a; falhou ao carregar → sem os caminhos do executor não sei o que olhar: sem lista
     # vazio → n/a; falhou (git sem resposta, fora de um repositório: o stdout vem vazio) → sem raiz nem prefixo não sei onde olhar: sem lista
     top = run(["git", "-C", a.city, "rev-parse", "--show-toplevel", "--show-prefix"], 30)[1]
@@ -198,11 +201,12 @@ def merges(a, role, prev, v):
     pre = pre.strip().strip("/")
     paths = list(abr.CONFIG_PATHS) + ([pre + "/CLAUDE.md"] if pre else []) + [os.path.join(pre, abr.ROLE_PROMPTS[role])]
     # vazio (nenhum commit toca os caminhos) → nota própria; falhou (sha que o clone não tem, git morto) → "não sei", nunca "nenhum commit"
-    rc, out, err = run(["git", "-C", root, "log", "--format=%H%x09%s", "%s..%s" % (prev[1], v["ref"]), "--"] + paths, 60)
+    rc, out, err = run(["git", "-C", root, "log", "--format=%H%x09%s", "%s..%s" % (pref, v["ref"]), "--"] + paths, 60)
     if rc != 0:
-        return [], "não consegui listar os commits entre %s e %s (git: %s)" % (prev[1][:12], v["ref"][:12], first(err, 100) or "sem resposta")
+        return [], "não consegui listar os commits entre %s e %s (git: %s)" % (pref[:12], v["ref"][:12], first(err, 100) or "sem resposta")
     found = [(sha, (BEAD.match(subj) or [None, None])[1], subj) for sha, _, subj in (ln.partition("\t") for ln in out.splitlines())]
-    return found, "" if found else "o sha de configuração mudou, mas nenhum commit entre %s e %s toca os caminhos do papel" % (prev[1][:12], v["ref"][:12])
+    desde = "desde a noite de %s da linha de base" % pts
+    return found, ("mudou " + desde) if found else "o sha de configuração mudou %s, mas nenhum commit entre %s e %s toca os caminhos do papel" % (desde, pref[:12], v["ref"][:12])
 
 def pick(a, cul):
     """({bead: [papéis]}, motivo): as beads a marcar; mais de --max-marcar candidatas = nenhuma (um intervalo grande demais não aponta ninguém)."""
@@ -223,24 +227,25 @@ def render(a, line, fired, cul, beads, why):
     out = ["Queda da taxa na bateria de agentes: %s (%s), medida em %s." % (day, line.get("mode"), line["ts"]), ""]
     for role, v in sorted(fired.items()):
         found, nota = cul[role]
-        out += ["- " + fmt(role, v), "  configuração %s (commit medido %s): %s" % (str(v["sha"])[:12], str(v["ref"])[:12], nota or "mudou desde a medição anterior")]
-        out += ["  commits que mexeram na configuração do papel entre as duas medições:"] * bool(found) + ["    - %s %s: %s" % (s[:12], b or "(sem bead no assunto)", subj[:120]) for s, b, subj in found]
-    out += [""] + (["Marquei com o rótulo %s (e um comentário com os números): %s." % (LABEL, ", ".join(sorted(beads)))] if beads else ["Não marquei nenhuma bead%s." % (": " + why if why else "")])
+        out += ["- " + fmt(role, v), "  configuração %s (commit medido %s): %s" % (str(v["sha"])[:12], str(v["ref"])[:12], nota)]
+        out += ["  commits que mexeram na configuração do papel desde essa noite:"] * bool(found) + ["    - %s %s: %s" % (s[:12], b or "(sem bead do HQ no assunto)", subj[:120]) for s, b, subj in found]
+    # as marcas só são PEDIDAS depois deste e-mail: o texto não pode dizer que já entraram (o bd ainda não respondeu); que alguma falhou dizem o 2o e-mail, o log e o exit 1
+    out += [""] + (["Marcas a pôr logo depois deste e-mail (rótulo %s e um comentário com os números): %s. Se alguma falhar, um 2º e-mail diz qual; confira com o comando abaixo." % (LABEL, ", ".join(sorted(beads)))] if beads else ["Não marquei nenhuma bead%s." % (": " + why if why else "")])
     out += ["Ver todas: bd list --label %s --limit 0. Tirar a marca: bd label remove <bead> %s." % (LABEL, LABEL),
             "A queda pode ser ruído (amostra pequena), do modelo ou do nó, ou de OUTRO commit do intervalo: confira antes de reverter. Relatório do dia: .gc/logs/agent-battery/%s.md." % day]
     return "[agent-battery] QUEDA %s (%s): %s" % (day, line.get("mode"), ", ".join("%s %s→%s" % (r, pct(v["base"]), pct(v["taxa"])) for r, v in sorted(fired.items()))), "\n".join(out)
 
 def mark(a, bead, line, rows):
-    """None = o rótulo E o comentário entraram; senão o que falhou (o e-mail já nomeou a bead, então quem lê pode marcar à mão)."""
+    """(rotulada, falha): rotulada = o rótulo entrou (a bead ESTÁ marcada); falha = "" se o rótulo E o comentário entraram, senão a frase do que não entrou. Rótulo que falha = o comentário nem é tentado."""
     text = "\n".join(["[bateria de agentes] a taxa de um papel caiu depois deste merge, que mexeu na configuração dele (rótulo %s):" % LABEL]
                      + ["- " + fmt(r, v) + " (medição %s)" % line["ts"] for r, v in sorted(rows.items())]
                      + ["Pode ser ruído ou outro commit do intervalo; revise o prompt/skill/CLAUDE.md deste merge. Para tirar: bd label remove %s %s." % (bead, LABEL)])
     base = shlex.split(a.bd) + ["-C", a.city]
-    for what, argv in (("rótulo", base + ["label", "add", bead, LABEL]), ("comentário", base + ["comment", bead, text])):
-        rc, _, err = run(argv, 60)
-        if rc != 0:
-            return "%s: %s" % (what, first(err, 100) or "sem resposta")
-    return None
+    rc, _, err = run(base + ["label", "add", bead, LABEL], 60)
+    if rc != 0:
+        return False, "não marquei %s (rótulo: %s)" % (bead, first(err, 100) or "sem resposta")
+    rc, _, err = run(base + ["comment", bead, text], 60)
+    return True, "" if rc == 0 else "marquei %s, mas SEM o comentário com os números (%s)" % (bead, first(err, 100) or "sem resposta")
 
 # ── a varredura ──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
 def verdicts(a, st, hist, line):
@@ -256,19 +261,26 @@ def verdicts(a, st, hist, line):
         out[role] = dict(v, sha=rec.get("config_sha"), ref=rec.get("config_ref_sha"))
     return out
 
-def announce(a, line, hist, fired):
-    """(enviado, {bead: papéis}, falhas): o e-mail com as quedas da linha e, só DEPOIS dele, as marcas (e-mail que falha não deixa marca órfã nem comentário repetido na volta seguinte)."""
-    cul = {r: merges(a, r, previous(hist, r), v) for r, v in fired.items()}
+def announce(a, line, fired):
+    """(enviado, candidatas, marcadas, falhas): o e-mail com as quedas da linha e, só DEPOIS dele, as marcas (e-mail que falha não deixa marca órfã nem comentário repetido na volta seguinte). O e-mail só PEDE as marcas:
+    candidatas = {bead: papéis}; marcadas = as que ficaram com o rótulo; falhas = {bead: o que não entrou}, e um 2o e-mail as diz (a varredura não as refaz)."""
+    cul = {r: merges(a, r, v) for r, v in fired.items()}
     beads, why = pick(a, cul)
     subj, body = render(a, line, fired, cul, beads, why)
     if run(mail_argv(a) + ["-s", subj, "-m", body], 120)[0] != 0:
-        return False, {}, []
-    fails = []
+        return False, {}, [], {}
+    done, fails = [], {}
     for bead, roles in sorted(beads.items()):
-        err = mark(a, bead, line, {r: fired[r] for r in roles})
+        labeled, err = mark(a, bead, line, {r: fired[r] for r in roles})
+        if labeled:
+            done.append(bead)
         if err:
-            fails.append("não marquei %s (%s)" % (bead, err))
-    return True, beads, fails
+            fails[bead] = err
+    if fails:
+        msg = ["Marca(s) do aviso de queda de %s que NÃO entraram inteiras; a varredura não as refaz. À mão, só o que faltou: rótulo = bd -C %s label add <bead> %s; comentário = os números do aviso (bd -C %s comment <bead> ...):" % (line["ts"], a.city, LABEL, a.city)] + ["- " + f for _, f in sorted(fails.items())]
+        if run(mail_argv(a) + ["-s", "[agent-battery] MARCA FALHOU: " + ", ".join(sorted(fails)), "-m", "\n".join(msg)], 120)[0] != 0:
+            say("WARN: o e-mail das marcas que falharam também falhou")
+    return True, beads, done, fails
 
 def sweep(a):
     jl, sp = os.path.join(a.city, ".gc/logs/agent-battery.jsonl"), os.path.join(a.city, ".gc/agent-battery/alert-state.json")
@@ -299,7 +311,7 @@ def sweep(a):
             hist = [l for l in lines[:i] if l]
             vs = verdicts(a, st, hist, line)
             fired = {r: v for r, v in vs.items() if v["kind"] == "queda"}
-            sent, beads, fails = announce(a, line, hist, fired) if fired else (True, {}, [])
+            sent, beads, done, fails = announce(a, line, fired) if fired else (True, {}, [], {})
             if not sent:  # nada avança: nem o estado desta linha, para a próxima varredura tentar de novo
                 say("WARN: o e-mail ao Mayor falhou: a linha de %s fica para a próxima varredura" % line["ts"])
                 return 1
@@ -308,8 +320,8 @@ def sweep(a):
                     st["papeis"][role] = {"alerta": v["kind"] == "queda", "sha": v["sha"], "ts": line["ts"]}
                 say("%s %s %s: %s" % (line["ts"], role, v["kind"], fmt(role, v)))
             audit(a, [{"ts": now(), "linha": line["ts"], "mode": line.get("mode"), "papel": r, "kind": v["kind"], "taxa": v["taxa"], "base": v["base"], "noites": v["noites"], "queda": v["queda"],
-                       "p": v["p"], "marcadas": sorted(b for b, rs in beads.items() if r in rs)} for r, v in vs.items()])
-            for f in fails:
+                       "p": v["p"], "marcadas": sorted(b for b in done if r in beads[b]), "marcas_falhas": {b: e for b, e in sorted(fails.items()) if r in beads[b]}} for r, v in vs.items()])
+            for f in fails.values():
                 say("WARN: " + f)
             code = 1 if fails else code
         st["linhas"] = i + 1
@@ -333,11 +345,12 @@ def control_run(a, hist):
         return "INERTE", "sem acervo em .gc/agent-battery/tasks.jsonl (rode scripts/agent-battery-corpus.py): nada foi gasto", None
     except OSError as e:
         return "FALHOU", "não consegui ler o acervo (%s): nada foi gasto" % e, None
-    noites = len(base_rates(a, [l for l in hist if l], a.role, ac))
+    noites = len(base_nights(a, [l for l in hist if l], a.role, ac))
     if noites < a.min_noites:
         return "INERTE", "sem linha de base real: %d noite(s) do papel %s no acervo de hoje (mínimo %d); o controle gastaria tokens sem poder ser julgado" % (noites, a.role, a.min_noites), None
-    scratch = tempfile.mkdtemp(prefix="aba-control-")
+    scratch = None  # vazio → nada a limpar; falhou ao criar (disco cheio) → o OSError cai no except abaixo: FALHOU e e-mail, nunca traceback
     try:
+        scratch = tempfile.mkdtemp(prefix="aba-control-")
         st = os.path.join(scratch, ".gc/agent-battery")
         os.makedirs(st)
         for n in ("tasks.jsonl", "tasks.jsonl.meta.json"):  # vazio (sem acervo) → o driver diz INERTE; falhou ao copiar → o OSError sobe para o try de fora
@@ -353,7 +366,8 @@ def control_run(a, hist):
     except OSError as e:
         return "FALHOU", "não consegui preparar a cidade descartável (%s)" % e, None
     finally:
-        shutil.rmtree(scratch, ignore_errors=True)
+        if scratch:
+            shutil.rmtree(scratch, ignore_errors=True)
     if last is None:
         return "FALHOU", "o driver não deixou linha no jsonl (rc %s): %s" % (rc, first(err or out)), None
     why = "o driver disse %s: %s" % (last.get("verdict"), last.get("reason"))
