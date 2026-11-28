@@ -9,41 +9,66 @@ USO: agent-battery-corpus.py [--repo DIR] [--ref REF] [--prefix SUBPASTA] [--day
   Lê o histórico git já MERGEADO (o que o gate empurrou para a main) e devolve até --n tarefas (padrão 40) em JSONL.
   Cada tarefa = uma bead fechada cuja entrega mexeu em código de produção E trouxe um `*.selftest.sh`: o critério de
   sucesso é verificável por máquina (o selftest da entrega REPROVA em base_sha e PASSA com o patch certo). Esta fatia só
-  MONTA o acervo; quem confere "reprova na base / passa no fix" e roda o agente é a fatia 2 (docs/runbooks/agent-battery.md).
+  MONTA o acervo; quem confere "reprova na base / passa no fix" e roda o agente é a fatia 2 (scripts/agent-battery-run.py; o
+  desenho da série está em docs/runbooks/agent-battery.md).
 
 O QUE ENTRA (todas as condições): bead `ga-*` citada no escopo do assunto do commit (`fix(ga-x): …`); dentro dos --days
   (padrão 60); pelo menos 1 `*.selftest.sh` e 1 arquivo de produção (scripts/, packs/, formulas/, commands/); no máximo 4 commits,
   6 arquivos de produção, 3 selftests e 300 linhas de produção; nenhum commit de outra bead mexeu nos mesmos arquivos entre o
   primeiro e o último commit da bead (senão base→fix não isola a entrega); bead legível, fechada, com enunciado.
-O QUE NÃO ENTRA: arquivo fora da allowlist (city.toml, agents/, .beads, .gc, dados), binário, bead reaberta, qualquer
-  telefone, CPF ou e-mail no título/enunciado (zero tolerância: aqui um acerto basta, ao contrário do hetzner-pii-scan.py,
-  que caça LISTA), `revert`. Cada exclusão é CONTADA por motivo na saída; nada some em silêncio.
+O QUE NÃO ENTRA: arquivo fora da allowlist (city.toml, agents/, .beads, .gc, dados), binário, bead reaberta, `revert` (o do git,
+  `Revert "…"`, e o convencional) e dado pessoal: telefone, CPF, e-mail ou qualquer sequência de 10 a 13 dígitos no título, no
+  enunciado ou no assunto dos commits da bead. É heurística de FORMA, não garantia (não pega nome, endereço, número solto de 8-9
+  dígitos nem número colado a letra); um acerto basta, ao contrário do hetzner-pii-scan.py, que caça LISTA. Cada exclusão é CONTADA
+  por motivo na saída; nada some em silêncio. Arquivo apagado ou renomeado pela bead continua na lista (renomear = apagar + criar): o
+  executor confere os SELFTESTS em fix_sha e descarta a tarefa com motivo (selftest_ausente_no_fix); prod_files só informa.
 SAÍDA: JSONL em --out (padrão $GC_CITY_PATH/.gc/agent-battery/tasks.jsonl, fora do git) + <out>.meta.json (sha256 do JSONL,
-  parâmetros, contagens, sha da ponta lida). Escrita atômica (tmp + rename). Resumo JSON no stdout.
-CÓDIGOS: 0 ok · 2 uso errado ou git ilegível (nada escrito) · 3 menos tarefas que --min (nada escrito, o acervo antigo fica)
-  · 4 não consegui gravar · 5 `bd` não respondeu em metade ou mais das leituras (não sei dizer se o filtro é rígido: nada escrito).
+  parâmetros, contagens, sha da ponta lida) + <out>.lock (trava, vazia). `role` = papel de quem construiu a bead (dog, wa-worker,
+  ps-worker, outro, sem-papel), de gc.session_name: a bead fechada perde o assignee e quase sempre o gc.routed_to. Resumo JSON no stdout.
+  PUBLICAÇÃO do par: prepara os DOIS temporários, guarda o acervo antigo, troca o acervo e por ÚLTIMO o meta; se o meta não troca, o
+  acervo antigo volta e nenhum .tmp-corpus-* fica. Duas rodadas ao mesmo tempo: a 2ª espera a trava por até 30 s.
+CÓDIGOS: 0 ok · 2 uso errado (inclui --bd vazio ou com aspas desbalanceadas) ou git ilegível (nada escrito) · 3 menos tarefas que
+  --min (nada escrito, o acervo antigo fica) · 4 não consegui gravar (o par anterior continua; só a FALHA DUPLA, meta que não troca E
+  acervo antigo que não volta, deixa par torto: a mensagem diz PAR TORTO e onde o antigo ficou) · 5 `bd` não respondeu em metade ou
+  mais das leituras (não sei dizer se o filtro é rígido: nada escrito).
 """
 import argparse
+import fcntl
 import hashlib
 import json
 import os
 import re
+import shlex
+import shutil
 import subprocess
 import sys
 import tempfile
 import time
 
-BEAD_RE = re.compile(r"^[a-z]+\((ga-[a-z0-9]+(?:\.[0-9]{1,4})*)\)")
+BEAD = r"\((ga-[a-z0-9]+(?:\.[0-9]{1,4})*)\)"
+BEAD_RE = re.compile(r"^[a-z]+" + BEAD)
+REVERT_RE = re.compile(r'^Revert "[a-z]+' + BEAD)  # o assunto padrão do `git revert`: Revert "fix(ga-x): …"
 ALLOW_ROOTS = ("scripts/", "packs/", "formulas/", "commands/", "docs/")
 PROD_ROOTS = ("scripts/", "packs/", "formulas/", "commands/")
-# Zero tolerância: um telefone, CPF ou e-mail no enunciado tira a tarefa (dado de lead não vai para o nó).
-PII_RE = re.compile(
-    r"(?<![0-9])\+?55 ?\(?[1-9][0-9]\)? ?9?[0-9]{4}-?[0-9]{4}(?![0-9])"
-    r"|\([1-9][0-9]\) ?9?[0-9]{4}-[0-9]{4}(?![0-9])"
-    r"|(?<![0-9])[0-9]{3}\.[0-9]{3}\.[0-9]{3}-[0-9]{2}(?![0-9])"
-    r"|[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}"
-)
+
+
+def _num(p):  # número só como palavra inteira: a guarda alfanumérica evita casar dentro de sha/hex/ids
+    return r"(?<![0-9A-Za-z])" + p + r"(?![0-9A-Za-z])"
+
+
+# Um acerto basta para tirar a tarefa (dado de lead não vai para o nó). É heurística de FORMA, não garantia: não pega nome, endereço,
+# número solto de 8-9 dígitos nem número colado a letra (`fone31987654321`, o preço da guarda). Em troca exclui a mais: uma faixa 4+4
+# (1000-1010, 8095-8097) lê-se como telefone.
+PII_RE = re.compile("|".join([
+    _num(r"[0-9]{10,13}"),                                          # CPF sem pontos, telefone com/sem DDD e 55, id de chat
+    _num(r"\+?(?:55 ?)?\(?[1-9][0-9]\)? ?9?[0-9]{4}[- ]?[0-9]{4}"),  # telefone com DDD: (31) 98765-4321, 31 98765 4321, +55 31 …
+    _num(r"9?[0-9]{4}-[0-9]{4}"),                                    # telefone sem DDD, com hífen
+    _num(r"[0-9]{3}\.[0-9]{3}\.[0-9]{3}-[0-9]{2}"),                  # CPF pontuado
+    r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}",              # e-mail (também 5531…@s.whatsapp.net)
+]))
+ROLE_RE = re.compile(r"(?<![a-z0-9])(wa-worker|ps-worker|dog)(?![a-z0-9])")  # fronteira: hotdog-x não é dog
 LIMITS = {"commits": 4, "prod_files": 6, "test_files": 3, "prod_lines": 300}
+LOCK_WAIT_S = 30  # quanto esperar outra rodada que está gravando (a gravação leva milissegundos)
 
 
 def die(code, msg):
@@ -52,9 +77,10 @@ def die(code, msg):
 
 
 def run(cmd, timeout):
-    """(rc, stdout) — rc None = não rodou (binário ausente) ou estourou o prazo: 'não consegui saber', nunca vazio."""
+    """(rc, stdout) — rc None = não rodou (binário ausente) ou estourou o prazo: 'não consegui saber', nunca vazio.
+    A saída é lida SEMPRE como UTF-8 (byte inválido vira U+FFFD): o locale de quem roda não muda o acervo."""
     try:
-        p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        p = subprocess.run(cmd, capture_output=True, encoding="utf-8", errors="replace", timeout=timeout)
     except (OSError, subprocess.TimeoutExpired):
         return None, ""
     return p.returncode, p.stdout
@@ -63,7 +89,8 @@ def run(cmd, timeout):
 def read_log(repo, ref, prefix, days):
     # vazio → devolve [] e o chamador sai com rc 3 (nada a escolher); falhou/ilegível → die(2), nada é escrito.
     since = "--since=%d days ago" % days
-    rc, out = run(["git", "-C", repo, "log", ref, since, "--no-merges", "--numstat",
+    # --no-renames: sem ele o git escreve `scripts/{a => b}` e o executor descarta a tarefa inteira (caminho fora da regex dele)
+    rc, out = run(["git", "-C", repo, "log", ref, since, "--no-merges", "--no-renames", "--numstat",
                    "--format=@@%H%x1f%P%x1f%s", "--", prefix], 180)
     if rc != 0:
         die(2, "git log falhou em %s (ref %s, rc=%s)" % (repo, ref, rc))
@@ -81,6 +108,15 @@ def read_log(repo, ref, prefix, days):
     return commits
 
 
+def read_history(repo, ref, prefix, days):
+    """(sha da ponta, commits). A ponta é resolvida UMA vez e o log lê esse sha: o meta nunca diz uma ponta que não foi lida."""
+    # vazio → ponta ilegível aborta (não gravo meta sem saber de onde li); falhou → idem, rc 2.
+    rc, head = run(["git", "-C", repo, "rev-parse", ref], 30)
+    if rc != 0 or not head.strip():
+        die(2, "git rev-parse %s falhou" % ref)
+    return head.strip(), read_log(repo, head.strip(), prefix, days)
+
+
 def rel(path, prefix):
     p = prefix.rstrip("/") + "/"
     return path[len(p):] if path.startswith(p) else None
@@ -89,7 +125,7 @@ def rel(path, prefix):
 def group_beads(commits, prefix, ex):
     groups = {}
     for i, c in enumerate(commits):
-        m = BEAD_RE.match(c["subject"])
+        m = BEAD_RE.match(c["subject"]) or REVERT_RE.match(c["subject"])  # o Revert entra na bead que desfaz: classify a exclui
         if not m:
             ex["sem_bead_no_assunto"] += 1
             continue
@@ -149,12 +185,80 @@ def read_bead(bd_cmd, bead):
 
 
 def role_of(b):
+    """Papel de quem construiu a bead. A bead FECHADA perde o assignee (13 de 13 medidas em 28/11) e quase sempre o gc.routed_to (12 de 13);
+    gc.session_name sobra em todas (13 de 13)."""
+    # vazio → "sem-papel" (nenhuma fonte diz quem construiu); falhou/ilegível (campo que não é texto) → conta como vazio, não derruba a leitura.
     meta = b.get("metadata") if isinstance(b.get("metadata"), dict) else {}
-    s = " ".join(str(x) for x in (meta.get("gc.routed_to", ""), b.get("assignee", "")))
-    for key, role in (("wa-worker", "wa-worker"), ("ps-worker", "ps-worker"), ("dog", "dog")):
-        if key in s:
-            return role
-    return "sem-papel" if not s.strip() else "outro"
+    for src in (meta.get("gc.session_name"), b.get("assignee"), meta.get("gc.routed_to")):
+        if isinstance(src, str) and src.strip():
+            hit = ROLE_RE.search(src)
+            return hit.group(1) if hit else "outro"
+    return "sem-papel"
+
+
+def take_lock(path):
+    """Trava de instância única (flock). Ocupada → espera até LOCK_WAIT_S e sai com rc 4, nada trocado; não abrir/travar → OSError."""
+    fd = os.open(path, os.O_CREAT | os.O_RDWR, 0o600)
+    end = time.monotonic() + LOCK_WAIT_S
+    while True:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return fd
+        except BlockingIOError:
+            if time.monotonic() >= end:
+                die(4, "%s ocupada há %s s: outra rodada está gravando o acervo; nada foi trocado" % (path, LOCK_WAIT_S))
+            time.sleep(0.2)
+
+
+def stage(path, data, tmps):
+    """Grava `data` (bytes) num temporário ao lado de `path` e o anota em `tmps`: quem falhar depois limpa a lista inteira."""
+    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path), prefix=".tmp-corpus-")
+    tmps.append(tmp)
+    with os.fdopen(fd, "wb") as f:
+        f.write(data)
+    return tmp
+
+
+def publish(out, body, meta):
+    """Grava o par (acervo, meta) sem deixar meio par: prepara os DOIS temporários, guarda o acervo antigo, troca o acervo e por
+    ÚLTIMO o meta (o selo); se o meta não troca, o acervo antigo volta. rc 4 = o par anterior ficou como estava; a exceção é a falha
+    dupla (o meta não troca E o antigo não volta): aí a mensagem diz PAR TORTO e onde o acervo antigo ficou guardado."""
+    out = os.path.abspath(out)
+    mp, tmps, lock = out + ".meta.json", [], None
+    try:
+        os.makedirs(os.path.dirname(out), exist_ok=True)
+        lock = take_lock(out + ".lock")
+        new_t, new_m = stage(out, body, tmps), stage(mp, meta, tmps)
+        # vazio → não há acervo anterior (desfazer = apagar o novo); falhou/ilegível → sem como guardar o antigo: rc 4, nada trocado.
+        old = None
+        if os.path.exists(out):
+            old = stage(out, b"", tmps)
+            shutil.copyfile(out, old)
+        os.replace(new_t, out)
+        try:
+            os.replace(new_m, mp)
+        except OSError as e:
+            try:
+                if old:
+                    os.replace(old, out)
+                else:
+                    os.unlink(out)
+            except OSError as e2:
+                if old:
+                    tmps.remove(old)  # agora é a ÚNICA cópia do acervo anterior: o finally não pode apagá-la
+                die(4, "PAR TORTO em %s: o meta não trocou (%s) e o acervo anterior não voltou (%s)%s"
+                    % (out, e, e2, "; ele está em " + old if old else ""))
+            raise
+    except OSError as e:
+        die(4, "não consegui gravar %s: %s (o par anterior continua como estava)" % (out, e))
+    finally:
+        for t in tmps:
+            try:
+                os.unlink(t)
+            except OSError:
+                pass
+        if lock is not None:
+            os.close(lock)
 
 
 def main():
@@ -176,17 +280,22 @@ def main():
         die(2, "sem --out e sem GC_CITY_PATH")
     if a.n < 1 or a.min < 1 or a.min > a.n or a.days < 1 or a.oversample < 1:
         die(2, "--n/--min/--days/--oversample inválidos (precisa n>=min>=1)")
+    # vazio/ilegível (aspas desbalanceadas) → uso errado, rc 2, antes de ler qualquer coisa; nunca um bd "que não respondeu" (rc 5).
+    try:
+        bd_cmd = shlex.split(a.bd)
+    except ValueError:
+        bd_cmd = []
+    if not bd_cmd:
+        die(2, "--bd vazio ou com aspas desbalanceadas: %r" % a.bd)
+    if os.environ.get("GC_CITY_PATH") and a.bd == "bd":
+        bd_cmd = ["bd", "-C", os.environ["GC_CITY_PATH"]]
 
     ex = {k: 0 for k in ("sem_bead_no_assunto", "revert", "binario", "fora_da_allowlist", "sem_selftest_ou_sem_producao",
                          "grande_demais", "intercalada", "bead_ilegivel", "bead_nao_fechada", "sem_enunciado",
                          "dado_pessoal")}
-    commits = read_log(a.repo, a.ref, a.prefix, a.days)
+    head, commits = read_history(a.repo, a.ref, a.prefix, a.days)
     if not commits:
         die(3, "nenhum commit em %s nos últimos %d dias; nada a escolher" % (a.ref, a.days))
-    # vazio → ponta ilegível aborta (não gravo meta sem saber de onde li); falhou → idem, rc 2.
-    rc, head = run(["git", "-C", a.repo, "rev-parse", a.ref], 30)
-    if rc != 0 or not head.strip():
-        die(2, "git rev-parse %s falhou" % a.ref)
 
     groups = group_beads(commits, a.prefix, ex)
     eligible = []
@@ -198,9 +307,6 @@ def main():
             eligible.append((hashlib.sha256((a.salt + bead).encode()).hexdigest(), bead, idxs))
     eligible.sort()
 
-    bd_cmd = a.bd.split()
-    if os.environ.get("GC_CITY_PATH") and a.bd == "bd":
-        bd_cmd = ["bd", "-C", os.environ["GC_CITY_PATH"]]
     tasks, tried = [], 0
     for _, bead, idxs in eligible:
         if len(tasks) >= a.n or tried >= a.n * a.oversample:
@@ -217,10 +323,10 @@ def main():
         if len(desc.strip()) < 40:
             ex["sem_enunciado"] += 1
             continue
-        if PII_RE.search(title + "\n" + desc):
+        cs = [commits[i] for i in idxs]
+        if PII_RE.search("\n".join([title, desc] + [c["subject"] for c in cs])):  # o assunto dos commits também vai no acervo
             ex["dado_pessoal"] += 1
             continue
-        cs = [commits[i] for i in idxs]
         tfiles = sorted({rel(p, a.prefix) for c in cs for _, _, p in c["files"] if p.endswith(".selftest.sh")})
         pfiles = sorted({rel(p, a.prefix) for c in cs for _, _, p in c["files"]
                          if rel(p, a.prefix).startswith(PROD_ROOTS) and not p.endswith((".selftest.sh", ".md"))})
@@ -235,7 +341,7 @@ def main():
     roles = {}
     for t in tasks:
         roles[t["role"]] = roles.get(t["role"], 0) + 1
-    summary = {"ref": a.ref, "head": head.strip(), "commits_lidos": len(commits), "beads_vistas": len(groups),
+    summary = {"ref": a.ref, "head": head, "commits_lidos": len(commits), "beads_vistas": len(groups),
                "elegiveis": len(eligible), "leituras_de_bead": tried, "selecionadas": len(tasks), "por_papel": roles,
                "excluidas": ex, "dry_run": a.dry_run}
     if tried and ex["bead_ilegivel"] * 2 >= tried:
@@ -248,19 +354,11 @@ def main():
         print(json.dumps(summary, ensure_ascii=False))
         return 0
 
-    body = "".join(json.dumps(t, ensure_ascii=False, sort_keys=True) + "\n" for t in tasks)
-    sha = hashlib.sha256(body.encode()).hexdigest()
+    body = "".join(json.dumps(t, ensure_ascii=False, sort_keys=True) + "\n" for t in tasks).encode("utf-8")
+    sha = hashlib.sha256(body).hexdigest()
     summary.update({"sha256": sha, "out": a.out, "gerado_em": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
                     "params": {"days": a.days, "n": a.n, "min": a.min, "salt": a.salt, "prefix": a.prefix}})
-    try:
-        os.makedirs(os.path.dirname(os.path.abspath(a.out)), exist_ok=True)
-        for path, text in ((a.out, body), (a.out + ".meta.json", json.dumps(summary, ensure_ascii=False, indent=1) + "\n")):
-            fd, tmp = tempfile.mkstemp(dir=os.path.dirname(os.path.abspath(path)), prefix=".tmp-corpus-")
-            with os.fdopen(fd, "w") as f:
-                f.write(text)
-            os.replace(tmp, path)
-    except OSError as e:
-        die(4, "não consegui gravar %s: %s" % (a.out, e))
+    publish(a.out, body, (json.dumps(summary, ensure_ascii=False, indent=1) + "\n").encode("utf-8"))
     print(json.dumps(summary, ensure_ascii=False))
     return 0
 

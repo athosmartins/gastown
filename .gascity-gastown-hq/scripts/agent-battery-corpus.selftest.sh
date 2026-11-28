@@ -1,7 +1,10 @@
 #!/usr/bin/env bash
 # Selftest de agent-battery-corpus.py (ga-hyp55ss, fatia 1). Repositório git e `bd` de mentira; nada toca a cidade nem a rede.
-# Casos: acervo certo (+ meta + sha), cada motivo de exclusão contado, e as falhas de leitura que têm de dar o estado INERTE
-# (git ilegível, bd mudo/ausente/vazio/com JSON podre, saída sem como gravar, poucas tarefas): nada escrito, acervo antigo intacto.
+# O `bd` de mentira tem a forma REAL (array de 1 dict; bead fechada sem assignee, com gc.session_name), medida em beads de verdade.
+# Casos: acervo certo (+ meta + sha, o mesmo sob locale ASCII); os 11 motivos de exclusão contados, com o dado pessoal por forma e um
+# controle negativo (sha, timestamp, porta ficam); as falhas de leitura que têm de dar o estado INERTE (git ilegível, bd
+# mudo/ausente/vazio/podre, poucas tarefas, uso errado: nada escrito, acervo antigo intacto); e a PUBLICAÇÃO do par: saída que não
+# existe, meta que não troca depois do acervo (o par anterior volta, sem .tmp), falha dupla (PAR TORTO), trava de instância única.
 # Sai 0 = tudo passou.
 set -uo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -48,13 +51,57 @@ commit "fix(ga-hhh): enunciado com email" "$P/scripts/hhh.sh:echo h" "$P/scripts
 big="$(for i in $(seq 1 320); do printf 'echo %s\\n' "$i"; done)"
 commit "fix(ga-iii): gigante" "$P/scripts/iii.sh:$big" "$P/scripts/iii.selftest.sh:echo t"
 commit "feat: sem bead no assunto" "$P/scripts/zzz.sh:echo z"
+# renomeação (o git escreve scripts/{a => b}), revert nas duas formas (a do git e a do convencional), binário e enunciado curto
+commit "chore: base da rrr" "$P/scripts/rrr-old.sh:echo um\necho dois\necho tres"
+git -C "$R" mv "$P/scripts/rrr-old.sh" "$P/scripts/rrr-new.sh"
+commit "fix(ga-rrr): renomeia o script" "$P/scripts/rrr.selftest.sh:echo t"
+commit "fix(ga-qqq): entrega que sera revertida" "$P/scripts/qqq.sh:echo q" "$P/scripts/qqq.selftest.sh:echo t"
+commit 'Revert "fix(ga-qqq): entrega que sera revertida"' "$P/scripts/qqq.sh:echo desfeito"
+commit "fix(ga-kkk): outra entrega" "$P/scripts/kkk.sh:echo k" "$P/scripts/kkk.selftest.sh:echo t"
+commit "revert(ga-kkk): desfaz" "$P/scripts/kkk.sh:echo desfeito"
+commit "fix(ga-bin): traz um binario" "$P/scripts/bin.sh:echo b" "$P/scripts/bin.selftest.sh:echo t" "$P/scripts/blob.dat:a\\0b"
+commit "fix(ga-sss): enunciado curto" "$P/scripts/sss.sh:echo s" "$P/scripts/sss.selftest.sh:echo t"
+# dado pessoal por forma: pa-pd = o que o filtro antigo deixava passar; ok = números que NÃO são dado pessoal e têm de ficar no acervo
+for b in pa pb pc; do commit "fix(ga-$b): entrega $b" "$P/scripts/$b.sh:echo $b" "$P/scripts/$b.selftest.sh:echo t"; done
+commit "fix(ga-ok): entrega única" "$P/scripts/ok.sh:echo ok" "$P/scripts/ok.selftest.sh:echo t"  # acento: o locale de quem roda não pode mudar o acervo
+commit "fix(ga-pd): ligar 31987654321 para conferir" "$P/scripts/pd.sh:echo pd" "$P/scripts/pd.selftest.sh:echo t"
+# o que o passe de mutantes mostrou que nenhuma bead exercitava: entrega de 2 commits (base = pai do 1º, fix = o último), cada limite de
+# tamanho sozinho (5 commits, 7 arquivos de produção, 4 selftests), só selftest sem produção e dado pessoal só no título
+commit "fix(ga-mmm): parte 1" "$P/scripts/mmm.sh:echo 1" "$P/scripts/mmm.selftest.sh:echo t"
+commit "fix(ga-mmm): parte 2" "$P/scripts/mmm.sh:echo 2"
+MMM2_SHA="$(git -C "$R" rev-parse HEAD)"
+MMM1_SHA="$(git -C "$R" rev-parse HEAD^)"
+MMM_BASE="$(git -C "$R" rev-parse HEAD^^)"
+commit "fix(ga-c5): parte 1" "$P/scripts/c5-1.sh:echo 1" "$P/scripts/c5.selftest.sh:echo t"
+for i in 2 3 4 5; do commit "fix(ga-c5): parte $i" "$P/scripts/c5-$i.sh:echo $i"; done
+args=("$P/scripts/p7.selftest.sh:echo t")
+for i in 1 2 3 4 5 6 7; do args+=("$P/scripts/p7-$i.sh:echo $i"); done
+commit "fix(ga-p7): sete arquivos de producao" "${args[@]}"
+args=("$P/scripts/t4.sh:echo t")
+for i in 1 2 3 4; do args+=("$P/scripts/t4-$i.selftest.sh:echo t"); done
+commit "fix(ga-t4): quatro selftests" "${args[@]}"
+commit "fix(ga-sp): so o selftest" "$P/scripts/sp.selftest.sh:echo t"
+commit "fix(ga-pt): entrega pt" "$P/scripts/pt.sh:echo pt" "$P/scripts/pt.selftest.sh:echo t"
 
-# bd de mentira: lê $FAKE_BD_DIR/<id>.json; FAKE_BD_MODE = mudo (rc 1) | podre (JSON quebrado) | vazio (rc 0, nada)
+# bd de mentira: lê $FAKE_BD_DIR/<id>.json; FAKE_BD_MODE = mudo (rc 1) | podre (JSON quebrado) | vazio (rc 0, nada) | listavazia ([]) |
+# semtitulo | semstatus (JSON sem o campo) | rcruim (JSON bom, rc 1) | alterna (a 1ª leitura falha, a 2ª responde, a 3ª falha...)
 BDDIR="$W/beads-json"
 mkdir -p "$BDDIR"
-mk() { printf '{"id":"%s","title":"t %s","status":"%s","description":"%s","issue_type":"bug","assignee":"gastown.dog"}' "$1" "$1" "$2" "$3" >"$BDDIR/$1.json"; }
-for b in aaa bbb ccc eee iii; do mk "ga-$b" closed "$DESC"; done
-mk ga-ddd closed "Ligar para (31) 98765-4321 e conferir o saldo do lote inteiro do disco"
+mk() { # id status descrição [dict]; T= troca o título, SESS= a sessão que construiu. Forma REAL (medida 28/11): `bd show --json` = ARRAY
+  # de 1 dict; a bead fechada perde o assignee e quase sempre o gc.routed_to, e guarda gc.session_name. `dict` = a forma sem array (o ramo aceito).
+  local j
+  j="$(printf '{"id":"%s","title":"%s","status":"%s","description":"%s","issue_type":"bug","metadata":{"gc.session_name":"%s"}}' "$1" "${T:-t $1}" "$2" "$3" "${SESS:-dog-remote-gawisp1abc}")"
+  if [ "${4:-}" = dict ]; then printf '%s' "$j"; else printf '[%s]' "$j"; fi >"$BDDIR/$1.json"
+}
+for b in aaa bbb ccc eee iii rrr mmm; do mk "ga-$b" closed "$DESC"; done
+mk ga-sss closed "$(printf 'a%.0s' $(seq 1 39))"  # 39 caracteres: um a menos que o mínimo de 40
+T="ligar 31987654321 hoje" mk ga-pt closed "$DESC"  # o telefone está só no TÍTULO
+mk ga-pa closed "Cliente 12345678901 reclamou do saldo do lote inteiro do disco e quer o estorno"
+mk ga-pb closed "Ligar para 31 98765-4321 e conferir o saldo do lote inteiro do disco hoje cedo"
+mk ga-pc closed "O contato 31987654321 nao recebeu a mensagem do lote inteiro do disco ontem"
+mk ga-pd closed "$DESC"  # o telefone está só no ASSUNTO do commit
+SESS=wa-worker-gax9 mk ga-ok closed "Falha em 2026-11-28T15:30:08Z no commit 4d758b4bdc9467f45817740e9a49b4db16cb64ed e no sha 1234567890abcdef1234567890abcdef12345678; daemons :8095/:8097, disco 5646 MB, 123456789 itens, linhas L1000-1010 e a bead ga-hyp55ss.1; números não são dado pessoal"$'\377'  # byte inválido em UTF-8: vira U+FFFD, não derruba a leitura
+mk ga-ddd closed "Ligar para (31) 98765-4321 e conferir o saldo do lote inteiro do disco" dict
 mk ga-hhh closed "Escrever para fulano@exemplo.com.br e conferir o saldo do lote inteiro do disco"
 mk ga-ggg open "$DESC"
 cat >"$W/bd" <<'EOF'
@@ -64,6 +111,11 @@ case "${FAKE_BD_MODE:-}" in
   mudo) exit 1 ;;
   podre) echo '{"title": '; exit 0 ;;
   vazio) exit 0 ;;
+  listavazia) echo '[]'; exit 0 ;;
+  semtitulo) echo '[{"id":"x","status":"closed","description":"sem titulo"}]'; exit 0 ;;
+  semstatus) echo '[{"id":"x","title":"t","description":"sem status"}]'; exit 0 ;;
+  rcruim) cat "$FAKE_BD_DIR/$2.json" 2>/dev/null; exit 1 ;;   # JSON bom e rc 1: um bd que falhou não vale, nem pelo que imprimiu
+  alterna) n="$(cat "$FAKE_BD_DIR/.n" 2>/dev/null || echo 0)"; echo $((n + 1)) >"$FAKE_BD_DIR/.n"; [ $((n % 2)) -eq 0 ] && exit 1 ;;  # 1ª falha, 2ª responde...
 esac
 f="$FAKE_BD_DIR/$2.json"
 [ -f "$f" ] || exit 1
@@ -77,27 +129,73 @@ run() { python3 -I "$TOOL" --repo "$R" --prefix "$P" --ref main --bd "$W/bd" --d
 field() { python3 -I -c 'import json,sys,functools; print(functools.reduce(lambda a,k:a[k], sys.argv[1].split("."), json.load(sys.stdin)))' "$1"; }
 ids() { python3 -I -c 'import json,sys; print(",".join(sorted(json.loads(l)["task_id"] for l in open(sys.argv[1]))))' "$1"; }
 
-# 1) caminho feliz: só ga-aaa serve
+# 1) caminho feliz: servem ga-aaa, ga-mmm, ga-rrr e ga-ok; cada uma das outras cai por um motivo, e o motivo é contado
 OUT="$W/out/tasks.jsonl"
 S="$(run --out "$OUT" --n 10 --min 1 2>"$W/err")"
 check "acervo certo: rc 0" "$?" 0
-check "acervo certo: só ga-aaa" "$(ids "$OUT")" "ga-aaa"
-check "contagem: selecionadas" "$(printf '%s' "$S" | field selecionadas)" 1
-check "contagem: sem selftest" "$(printf '%s' "$S" | field excluidas.sem_selftest_ou_sem_producao)" 1
+check "acervo certo: ga-aaa, a de 2 commits ga-mmm, a renomeada ga-rrr e ga-ok (números que não são dado pessoal)" "$(ids "$OUT")" "ga-aaa,ga-mmm,ga-ok,ga-rrr"
+check "contagem: selecionadas" "$(printf '%s' "$S" | field selecionadas)" 4
+check "contagem: revert (as duas formas)" "$(printf '%s' "$S" | field excluidas.revert)" 2
+check "contagem: binário" "$(printf '%s' "$S" | field excluidas.binario)" 1
+check "contagem: sem enunciado" "$(printf '%s' "$S" | field excluidas.sem_enunciado)" 1
+cat >"$W/chk_rename.py" <<'PY'
+import json, re, sys
+t = [x for x in map(json.loads, open(sys.argv[1])) if x["task_id"] == "ga-rrr"][0]
+limpo = all(re.match(r"^[A-Za-z0-9._/-]+$", p) for p in t["prod_files"] + t["test_files"])
+print("ok" if limpo and "scripts/rrr-new.sh" in t["prod_files"] else t["prod_files"])
+PY
+check "renomeação: caminhos sem chaves nem espaço (o executor recusa a tarefa inteira) e o novo na lista" "$(python3 -I "$W/chk_rename.py" "$OUT")" ok
+check "contagem: sem selftest ou sem produção (uma de cada)" "$(printf '%s' "$S" | field excluidas.sem_selftest_ou_sem_producao)" 2
 check "contagem: fora da allowlist" "$(printf '%s' "$S" | field excluidas.fora_da_allowlist)" 1
 check "contagem: intercalada" "$(printf '%s' "$S" | field excluidas.intercalada)" 1
-check "contagem: grande demais" "$(printf '%s' "$S" | field excluidas.grande_demais)" 1
-check "contagem: dado pessoal (telefone + e-mail)" "$(printf '%s' "$S" | field excluidas.dado_pessoal)" 2
+check "contagem: grande demais (linhas, commits, arquivos de produção e selftests, cada limite sozinho)" "$(printf '%s' "$S" | field excluidas.grande_demais)" 4
+check "contagem: dado pessoal (telefone, e-mail, CPF e telefone sem pontuação, no assunto do commit e no título)" "$(printf '%s' "$S" | field excluidas.dado_pessoal)" 7
 check "contagem: bead não fechada" "$(printf '%s' "$S" | field excluidas.bead_nao_fechada)" 1
-check "contagem: sem bead no assunto" "$(printf '%s' "$S" | field excluidas.sem_bead_no_assunto)" 3
-check "tarefa: fix_sha = commit da entrega" "$(python3 -I -c 'import json,sys; print(json.loads(open(sys.argv[1]).readline())["fix_sha"])' "$OUT")" "$AAA_SHA"
-check "tarefa: base_sha = pai do commit" "$(python3 -I -c 'import json,sys; print(json.loads(open(sys.argv[1]).readline())["base_sha"])' "$OUT")" "$(git -C "$R" rev-parse "$AAA_SHA^")"
-check "tarefa: critério é o selftest" "$(python3 -I -c 'import json,sys; print(json.loads(open(sys.argv[1]).readline())["success"]["commands"][0])' "$OUT")" "bash scripts/aaa.selftest.sh"
+check "contagem: sem bead no assunto (o Revert do git já conta na bead dele)" "$(printf '%s' "$S" | field excluidas.sem_bead_no_assunto)" 4
+# a tarefa INTEIRA (dict igual ao esperado: campo errado ou sobrando aparece pelo nome), o papel vindo do gc.session_name, e a de 2 commits
+cat >"$W/chk_task.py" <<'PY'
+import json, sys
+t = [x for x in map(json.loads, open(sys.argv[1])) if x["task_id"] == "ga-aaa"][0]
+sha, base, desc = sys.argv[2:5]
+want = {"task_id": "ga-aaa", "bead": "ga-aaa", "title": "t ga-aaa", "description": desc, "issue_type": "bug", "role": "dog",
+        "base_sha": base, "fix_sha": sha, "commits": [{"sha": sha, "subject": "fix(ga-aaa): contar certo"}],
+        "prod_files": ["scripts/aaa.sh"], "test_files": ["scripts/aaa.selftest.sh"],
+        "success": {"kind": "selftest-fail-to-pass", "commands": ["bash scripts/aaa.selftest.sh"]}}
+print("ok" if t == want else sorted(k for k in set(t) | set(want) if t.get(k) != want.get(k)))
+PY
+check "tarefa ga-aaa: todos os campos (fix = commit da entrega, base = o pai dele, critério = o selftest)" "$(python3 -I "$W/chk_task.py" "$OUT" "$AAA_SHA" "$(git -C "$R" rev-parse "$AAA_SHA^")" "$DESC")" ok
+cat >"$W/chk_mmm.py" <<'PY'
+import json, sys
+t = [x for x in map(json.loads, open(sys.argv[1])) if x["task_id"] == "ga-mmm"][0]
+p1, p2, base = sys.argv[2:5]
+ok = (t["base_sha"] == base and t["fix_sha"] == p2 and [c["sha"] for c in t["commits"]] == [p1, p2]
+      and t["prod_files"] == ["scripts/mmm.sh"] and t["test_files"] == ["scripts/mmm.selftest.sh"])
+print("ok" if ok else {k: t[k] for k in ("base_sha", "fix_sha", "commits")})
+PY
+check "tarefa de 2 commits: base = pai do 1º, fix = o último, commits do mais antigo ao mais novo" "$(python3 -I "$W/chk_mmm.py" "$OUT" "$MMM1_SHA" "$MMM2_SHA" "$MMM_BASE")" ok
+cat >"$W/chk_ordem.py" <<'PY'
+import hashlib, json, sys
+ids = [json.loads(l)["task_id"] for l in open(sys.argv[1])]
+print("ok" if ids == sorted(ids, key=lambda b: hashlib.sha256(("battery-v1" + b).encode()).hexdigest()) else ids)
+PY
+check "seleção: as linhas seguem a ordem do sha256(sal + bead)" "$(python3 -I "$W/chk_ordem.py" "$OUT")" ok
+check "resumo: por_papel (3 dog-remote e 1 wa-worker, vindos de gc.session_name)" "$(printf '%s' "$S" | field por_papel.dog),$(printf '%s' "$S" | field por_papel.wa-worker)" "3,1"
+check "meta: parâmetros gravados" "$(python3 -I -c 'import json,sys; p=json.load(open(sys.argv[1]+".meta.json"))["params"]; print(p["n"], p["min"], p["salt"], p["prefix"])' "$OUT")" "10 1 battery-v1 .city"
+check "meta: gerado_em é um instante UTC" "$(python3 -I -c 'import json,re,sys; print(bool(re.match(r"^20[0-9]{2}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$", json.load(open(sys.argv[1]+".meta.json"))["gerado_em"])))' "$OUT")" True
 check "meta: sha256 = do arquivo" "$(python3 -I -c 'import json,sys; print(json.load(open(sys.argv[1]+".meta.json"))["sha256"])' "$OUT")" "$(shasum -a 256 "$OUT" | cut -d' ' -f1)"
+check "meta: head = a ponta lida" "$(python3 -I -c 'import json,sys; print(json.load(open(sys.argv[1]+".meta.json"))["head"])' "$OUT")" "$(git -C "$R" rev-parse main)"
 H1="$(shasum -a 256 "$OUT" | cut -d' ' -f1)"
 run --out "$OUT" --n 10 --min 1 >/dev/null 2>&1
 check "determinismo: 2ª rodada, mesmo sha" "$(shasum -a 256 "$OUT" | cut -d' ' -f1)" "$H1"
 check "sem lixo .tmp ao lado do acervo" "$(ls -A "$W/out" | grep -c '^\.tmp-corpus-')" 0
+# o acervo não depende do locale de quem roda (cron com LANG=C x terminal em UTF-8). Sem `-I`: ele ignoraria estas variáveis; a cópia
+# do script vai sozinha numa pasta para nenhum .py vizinho entrar no import.
+mkdir -p "$W/loc"
+cp "$TOOL" "$W/loc/corpus.py"
+env LC_ALL=C PYTHONCOERCECLOCALE=0 PYTHONUTF8=0 python3 -B "$W/loc/corpus.py" --repo "$R" --prefix "$P" --ref main --bd "$W/bd" \
+  --days 3650 --n 10 --min 1 --out "$W/loc/tasks.jsonl" >/dev/null 2>"$W/err-loc"
+check "locale ASCII sem coerção: rc 0" "$?" 0
+check "locale ASCII sem coerção: mesmo acervo (mesmo sha)" "$(shasum -a 256 "$W/loc/tasks.jsonl" 2>/dev/null | cut -d' ' -f1)" "$H1"
 
 # 2) --dry-run não grava
 D="$W/dry/tasks.jsonl"
@@ -127,18 +225,159 @@ inerte repo-ruim 2 X=1 python3 -I "$TOOL" --repo "$W/nao-e-repo" --prefix "$P" -
 inerte poucas 3 X=1 python3 -I "$TOOL" --repo "$R" --prefix "$P" --ref main --bd "$W/bd" --days 3650 --n 10 --min 5 --out "$W/inerte-poucas/tasks.jsonl"
 inerte pasta-vazia 3 X=1 python3 -I "$TOOL" --repo "$R" --prefix pasta-sem-commit --ref main --bd "$W/bd" --days 3650 --n 10 --min 1 --out "$W/inerte-pasta-vazia/tasks.jsonl"
 inerte uso-errado 2 X=1 python3 -I "$TOOL" --repo "$R" --prefix "$P" --ref main --bd "$W/bd" --n 3 --min 9 --out "$W/inerte-uso-errado/tasks.jsonl"
+# a ponta ilegível aborta ANTES do log (a mensagem diz qual leitura falhou); `--show-cdup` dá rc 0 e saída vazia
+check "ref ruim: aborta na ponta (git rev-parse), antes do log" "$(grep -c 'git rev-parse' "$W/err-ref-ruim")" 1
+inerte ponta-vazia 2 X=1 python3 -I "$TOOL" --repo "$R" --prefix "$P" --ref=--show-cdup --bd "$W/bd" --days 3650 --n 10 --min 1 --out "$W/inerte-ponta-vazia/tasks.jsonl"
+check "ponta vazia (rc 0, sem sha): aborta na ponta, não no log" "$(grep -c 'git rev-parse' "$W/err-ponta-vazia")" 1
+# o log falhando com a ponta boa (pasta fora do repositório) é rc 2, não "nenhum commit" (rc 3)
+inerte log-falha 2 X=1 python3 -I "$TOOL" --repo "$R" --prefix ../fora --ref main --bd "$W/bd" --days 3650 --n 10 --min 1 --out "$W/inerte-log-falha/tasks.jsonl"
+# um bd que responde, mas não com uma bead (lista vazia, sem título, sem status) ou que falhou (rc 1) apesar do JSON bom, não vale: rc 5
+for modo in listavazia semtitulo semstatus rcruim; do
+  inerte "bd-$modo" 5 FAKE_BD_MODE=$modo python3 -I "$TOOL" --repo "$R" --prefix "$P" --ref main --bd "$W/bd" --days 3650 --n 10 --min 1 --out "$W/inerte-bd-$modo/tasks.jsonl"
+done
+# exatamente a METADE das leituras sem resposta já é rc 5 ("metade ou mais"): com --n 2 --oversample 1 são 2 leituras, a 1ª falha e a 2ª responde
+rm -f "$BDDIR/.n"
+inerte bd-metade 5 FAKE_BD_MODE=alterna python3 -I "$TOOL" --repo "$R" --prefix "$P" --ref main --bd "$W/bd" --days 3650 --n 2 --min 1 --oversample 1 --out "$W/inerte-bd-metade/tasks.jsonl"
+rm -f "$BDDIR/.n"
 
 # 4) bead ilegível em minoria: segue, e CONTA (nunca some em silêncio)
 rm "$BDDIR/ga-hhh.json"
 S="$(run --out "$W/minoria/tasks.jsonl" --n 10 --min 1 2>/dev/null)"
 check "minoria ilegível: rc 0" "$?" 0
 check "minoria ilegível: contada" "$(printf '%s' "$S" | field excluidas.bead_ilegivel)" 1
-check "minoria ilegível: ga-aaa continua" "$(ids "$W/minoria/tasks.jsonl")" "ga-aaa"
+check "minoria ilegível: as outras continuam" "$(ids "$W/minoria/tasks.jsonl")" "ga-aaa,ga-mmm,ga-ok,ga-rrr"
 
 # 5) saída sem como gravar: rc 4 (um ARQUIVO no lugar da pasta)
 echo x >"$W/arquivo"
 run --out "$W/arquivo/tasks.jsonl" --n 10 --min 1 >/dev/null 2>"$W/err-saida"
 check "saída impossível: rc 4" "$?" 4
+check "saída impossível: o arquivo no lugar da pasta segue intacto" "$(cat "$W/arquivo")" x
+
+# 6) meio-caminho (o buraco que o gate mediu): o meta não pode ser trocado (pasta no lugar do arquivo) DEPOIS de o acervo novo estar
+#    pronto. rc 4 e o par anterior fica como estava, sem .tmp-corpus-* esquecido.
+MEIO="$W/meio/tasks.jsonl"
+mkdir -p "$MEIO.meta.json"
+echo OLD >"$MEIO"
+run --out "$MEIO" --n 10 --min 1 >/dev/null 2>"$W/err-meio"
+check "meio-caminho: rc 4" "$?" 4
+check "meio-caminho: acervo antigo intacto" "$(cat "$MEIO")" OLD
+check "meio-caminho: meta continua como estava (pasta)" "$([ -d "$MEIO.meta.json" ] && echo pasta || echo outro)" pasta
+check "meio-caminho: sem .tmp-corpus-*" "$(ls -A "$W/meio" | grep -c '^\.tmp-corpus-')" 0
+check "meio-caminho: a mensagem diz que o par anterior continua" "$(grep -c 'o par anterior continua' "$W/err-meio")" 1
+# o mesmo meio-caminho SEM acervo anterior: o acervo novo já trocado tem de sumir de novo (nunca fica acervo novo sem meta)
+SEM="$W/meio-sem-antigo/tasks.jsonl"
+mkdir -p "$SEM.meta.json"
+run --out "$SEM" --n 10 --min 1 >/dev/null 2>&1
+check "meio-caminho sem acervo anterior: rc 4" "$?" 4
+check "meio-caminho sem acervo anterior: nenhum acervo novo fica sem meta" "$([ -e "$SEM" ] && echo existe || echo nao)" nao
+
+# 7) casos que pedem trocar uma função por uma falha de mentira: o módulo é carregado por caminho, o snippet (stdin) vê `m`.
+pyt() { # $1.. = argumentos do snippet (sys.argv[2:])
+  python3 -I -B -c 'import importlib.util, sys
+s = importlib.util.spec_from_file_location("sob_teste", sys.argv[1]); m = importlib.util.module_from_spec(s); s.loader.exec_module(m)
+exec(sys.stdin.read())' "$TOOL" "$@"
+}
+# 7a) falha dupla: o meta não troca E o acervo antigo não volta → rc 4, a mensagem diz PAR TORTO e nomeia o arquivo onde o antigo
+#     ficou guardado (agora o único lugar em que ele existe).
+DUPLA="$W/dupla"
+mkdir -p "$DUPLA"
+echo OLD >"$DUPLA/tasks.jsonl"
+pyt "$DUPLA" >"$W/out-dupla" 2>"$W/err-dupla" <<'PY'
+import os
+real, dsts = os.replace, []
+def replace(src, dst):
+    dsts.append(os.path.basename(dst))
+    if len(dsts) >= 2:   # a 1ª troca (o acervo) passa; a do meta e o desfazer falham
+        raise OSError("de mentira")
+    real(src, dst)
+os.replace = replace
+try:
+    m.publish(os.path.join(sys.argv[2], "tasks.jsonl"), b"NOVO\n", b"{}\n")
+except SystemExit as e:
+    print("rc=%s" % e.code)
+print("ordem=" + ",".join(dsts))
+PY
+check "falha dupla: rc 4" "$(grep '^rc=' "$W/out-dupla")" rc=4
+check "troca: o acervo primeiro, o meta por último (o selo), e o desfazer volta ao acervo" "$(grep '^ordem=' "$W/out-dupla")" "ordem=tasks.jsonl,tasks.jsonl.meta.json,tasks.jsonl"
+check "falha dupla: a mensagem diz PAR TORTO" "$(grep -c 'PAR TORTO' "$W/err-dupla")" 1
+GUARDADO="$(grep -l '^OLD$' "$DUPLA"/.tmp-corpus-* 2>/dev/null)"
+check "falha dupla: o acervo antigo segue guardado" "$(printf '%s' "$GUARDADO" | grep -c .)" 1
+check "falha dupla: a mensagem nomeia onde ele está" "$([ -n "$GUARDADO" ] && grep -c -F -- "$GUARDADO" "$W/err-dupla" || echo 0)" 1
+
+# 7b) trava de instância única (<acervo>.lock): ocupada além da espera → rc 4 e nada trocado; liberada DENTRO da espera → grava.
+TRAVA="$W/trava"
+mkdir -p "$TRAVA"
+echo OLD >"$TRAVA/tasks.jsonl"
+pyt "$TRAVA" >"$W/out-trava" 2>"$W/err-trava" <<'PY'
+import fcntl, os, threading
+out = os.path.join(sys.argv[2], "tasks.jsonl")
+fd = os.open(out + ".lock", os.O_CREAT | os.O_RDWR)
+fcntl.flock(fd, fcntl.LOCK_EX)
+m.LOCK_WAIT_S = 0.4
+try:
+    m.publish(out, b"NOVO\n", b"{}\n")
+except SystemExit as e:
+    print("ocupada: rc=%s" % e.code)
+print("ocupada: acervo=%s tmp=%d" % (open(out).read().strip(), len([f for f in os.listdir(sys.argv[2]) if f.startswith(".tmp-corpus-")])))
+threading.Timer(0.3, lambda: fcntl.flock(fd, fcntl.LOCK_UN)).start()
+m.LOCK_WAIT_S = 5
+m.publish(out, b"NOVO\n", b"{}\n")
+print("liberada: acervo=%s meta=%s" % (open(out).read().strip(), os.path.exists(out + ".meta.json")))
+m.publish(out, b"TERCEIRO\n", b"{}\n")   # a trava foi solta ao fim do publish anterior: o 2º, no mesmo processo, não espera
+print("de novo: acervo=%s" % open(out).read().strip())
+PY
+check "trava ocupada: rc 4" "$(grep -c '^ocupada: rc=4$' "$W/out-trava")" 1
+check "trava ocupada: nada trocado, sem .tmp" "$(grep '^ocupada: acervo' "$W/out-trava")" "ocupada: acervo=OLD tmp=0"
+check "trava ocupada: a mensagem diz que outra rodada grava" "$(grep -c 'outra rodada' "$W/err-trava")" 1
+check "trava liberada dentro da espera: grava o par" "$(grep '^liberada' "$W/out-trava")" "liberada: acervo=NOVO meta=True"
+check "trava: um 2º publish no mesmo processo não fica preso na trava do 1º" "$(grep '^de novo' "$W/out-trava")" "de novo: acervo=TERCEIRO"
+
+# 7c) papel de quem construiu, com as formas medidas: bead FECHADA guarda gc.session_name (dog-…, dog-remote-…, oracle-wa-…);
+#     a bead aberta ainda traz assignee/gc.routed_to. Sem fonte → sem-papel; fonte que não é pool → outro (nunca o mesmo valor).
+pyt >"$W/out-papel" <<'PY'
+sess = lambda s: {"metadata": {"gc.session_name": s}}
+casos = [
+    (sess("dog-gan6yf03s"), "dog"), (sess("dog-remote-gawisp6t6t71"), "dog"), (sess("oracle-wa-gawispgux5v0"), "outro"),
+    (sess("wa-worker-ga1abc"), "wa-worker"), (sess("ps-worker-ga9xyz"), "ps-worker"), (sess("hotdog-x"), "outro"),
+    (sess("dogfood-x"), "outro"),
+    ({"assignee": "gastown.dog"}, "dog"), ({"metadata": {"gc.routed_to": "gastown.dog"}}, "dog"),
+    ({"metadata": {"gc.session_name": "oracle-wa-x", "gc.routed_to": "gastown.dog"}}, "outro"),
+    ({"assignee": None, "metadata": {}}, "sem-papel"), ({}, "sem-papel"), ({"metadata": "texto"}, "sem-papel"),
+    ({"assignee": 7}, "sem-papel"), ({"assignee": "  "}, "sem-papel"),
+]
+print([(i, m.role_of(b), w) for i, (b, w) in enumerate(casos) if m.role_of(b) != w] or "ok")
+PY
+check "papel: tabela das formas reais" "$(cat "$W/out-papel")" ok
+
+# 7d) o filtro de dado pessoal por forma, no limite de cada alternativa e com o que NÃO é dado pessoal (sha, timestamp, porta, faixa)
+pyt >"$W/out-pii" <<'PY'
+pos = ["12345678901", "1234567890", "0123456789", "1234567890123", "5531987654321", "31987654321.", "31 98765 4321", "(31)98765-4321", "+55 (31) 98765-4321",
+       "tel 98765-4321", "3333-4444", "123.456.789-01", "a.b@exemplo.com.br", "5531987654321@s.whatsapp.net", "tel:31987654321,"]
+neg = ["123456789", "12345678901234", "4d758b4bdc9467f45817740e9a49b4db16cb64ed", "1234567890abcdef", "abc1234567890", "x1234-5678y",
+       "2026-11-28T15:30:08Z", ":8095/:8097 e 52756", "ga-hyp55ss.1", "5646 MB", "127.0.0.1", "R$ 1.234,56", "546-550", "1.1.0"]
+print([t for t in pos if not m.PII_RE.search(t)] + ["falso positivo: " + t for t in neg if m.PII_RE.search(t)] or "ok")
+PY
+check "dado pessoal: formas que pegam e o que não é dado pessoal" "$(cat "$W/out-pii")" ok
+
+# 7e) a ponta é resolvida UMA vez e o `git log` lê esse sha (não o nome da ref): se a main andar entre as duas leituras, o meta não
+#     pode dizer uma ponta que não foi lida.
+pyt "$R" "$P" >"$W/out-ponta" <<'PY'
+calls, real = [], m.run
+m.run = lambda cmd, timeout: (calls.append(cmd), real(cmd, timeout))[1]
+head, commits = m.read_history(sys.argv[2], "main", sys.argv[3], 3650)
+log = [c for c in calls if "log" in c][0]
+print("log lê o sha da ponta" if log[4] == head and head != "main" else "log lê %s" % log[4])
+PY
+check "ponta: o git log lê o sha resolvido, não o nome da ref" "$(cat "$W/out-ponta")" "log lê o sha da ponta"
+
+# 8) --bd com espaço no caminho (entre aspas) e com aspas desbalanceadas (uso errado: rc 2, nada lido)
+mkdir -p "$W/com espaco"
+cp "$W/bd" "$W/com espaco/bd"
+S="$(run --bd "'$W/com espaco/bd'" --out "$W/espaco/tasks.jsonl" --n 10 --min 1 --dry-run 2>/dev/null)"
+check "--bd com espaço entre aspas: rc 0" "$?" 0
+check "--bd com espaço entre aspas: leu as beads" "$(printf '%s' "$S" | field selecionadas)" 4
+run --bd "'aberta" --out "$W/espaco/tasks.jsonl" --dry-run >/dev/null 2>&1
+check "--bd com aspas desbalanceadas: rc 2" "$?" 2
 
 echo
 if [ "$FAILS" -eq 0 ]; then echo "agent-battery-corpus.selftest: tudo passou"; exit 0; fi
