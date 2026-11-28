@@ -52,11 +52,20 @@ ln -s aaa.selftest.sh "$R/$P/scripts/lnk.selftest.sh" # o selftest do fix é um 
 echo 'echo fixed' >"$R/$P/scripts/lnk.sh"
 git -C "$R" add -A && git -C "$R" commit -qm "fix(ga-lnk): selftest é symlink"
 L_SHA="$(git -C "$R" rev-parse HEAD)"
-# a configuração sob teste (HEAD = main) difere da que a base tinha
+printf '#!/usr/bin/env bash\nexit 1\n' >"$R/$P/scripts/ddd.sh" && chmod +x "$R/$P/scripts/ddd.sh" # ddd: o selftest EXECUTA ddd.sh como último comando
+printf '#!/usr/bin/env bash\n"$(dirname "$0")/ddd.sh"\n' >"$R/$P/scripts/ddd.selftest.sh"
+git -C "$R" add -A && git -C "$R" commit -qm "chore: ddd quebrado"
+D_BASE="$(git -C "$R" rev-parse HEAD)"
+printf '#!/usr/bin/env bash\nexit 0\n' >"$R/$P/scripts/ddd.sh"
+git -C "$R" add -A && git -C "$R" commit -qm "fix(ga-ddd): conserta"
+D_SHA="$(git -C "$R" rev-parse HEAD)"
+# a configuração sob teste (HEAD = main) difere da que a base tinha; CFG_C muda SÓ o .claude/ (a perna do overlay que nada mais afirma)
 CFG1="$(git -C "$R" rev-parse HEAD)"
+echo '{"v":"nova"}' >"$R/.claude/settings.json"
+git -C "$R" add -A && git -C "$R" commit -qm "chore: só .claude"
+CFG_C="$(git -C "$R" rev-parse HEAD)"
 echo NOVO >"$R/CLAUDE.md"
 echo NOVO-CIDADE >"$R/$P/CLAUDE.md"
-echo '{"v":"nova"}' >"$R/.claude/settings.json"
 echo "PROMPT DOG v2" >"$R/$P/agents/dog-remote/prompt.template.md"
 git -C "$R" add -A && git -C "$R" commit -qm "chore: config nova"
 
@@ -98,6 +107,10 @@ case "${FAKE_MODE:-ok}" in
   empty) : ;;
   iserr) echo "{\"type\":\"result\",\"subtype\":\"error_during_execution\",\"is_error\":true,$U}" ;;
   maxturns) echo "{\"type\":\"result\",\"subtype\":\"error_max_turns\",\"is_error\":true,$U}" ;;
+  rmprod) tf="$(grep -o 'scripts/[A-Za-z0-9_-]*\.selftest\.sh' "$L/prompt-$n.txt" | head -1)"; rm -f "${tf%.selftest.sh}.sh"
+          echo "{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,$U}" ;;
+  dirtrap) tf="$(grep -o 'scripts/[A-Za-z0-9_-]*\.selftest\.sh' "$L/prompt-$n.txt" | head -1)"; rm -f "$tf"; mkdir "$tf"  # a restauração do selftest vai dar OSError
+          echo "{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,$U}" ;;
   hang) exec sleep 30 ;;
 esac
 EOF
@@ -143,12 +156,15 @@ check "feliz: prompt cita o selftest" "$(grep -c 'scripts/aaa.selftest.sh' "$FAK
 check "feliz: argv traz prompt de papel, teto USD, sem sessão e só a config do projeto" \
   "$(grep -c -x -e '--append-system-prompt-file' -e '--max-budget-usd' -e '--no-session-persistence' -e '--setting-sources' -e project "$FAKE_LOG/argv-1.txt")" 5
 check "feliz: prompt de papel é o do --config-ref (v2)" "$(cat "$FAKE_LOG/role-1.txt")" "PROMPT DOG v2"
-check "feliz: config vista é a nova, não a velha da base" "$(grep -c NOVO "$FAKE_LOG/cfg-1.txt")/$(grep -c VELHO "$FAKE_LOG/cfg-1.txt")" "2/0"
+check "feliz: config vista é a nova (CLAUDE.md, <prefixo>/CLAUDE.md e .claude/settings.json), não a velha da base" \
+  "$(grep -c NOVO "$FAKE_LOG/cfg-1.txt")/$(grep -c VELHO "$FAKE_LOG/cfg-1.txt")/$(grep -c '"v":"nova"' "$FAKE_LOG/cfg-1.txt")/$(grep -c '"v":"velha"' "$FAKE_LOG/cfg-1.txt")" "2/0/1/0"
+check "feliz: duracao_s numérica na linha que chamou o agente" "$(rec "$OUT" ga-aaa duracao_s | grep -cE '^[0-9]+(\.[0-9]+)?$')" 1
 check "feliz: env do agente tem a credencial do claude" "$(grep -c '^ANTHROPIC_API_KEY=k3$' "$FAKE_LOG/env-1.txt")" 1
 check "feliz: env do agente sem GC_*/TOKEN" "$(grep -c -e '^GC_SECRET_X=' -e '^MY_API_TOKEN=' "$FAKE_LOG/env-1.txt")" 0
 check "feliz: env do agente por lista de permitidos (sem SSH_AUTH_SOCK/DATABASE_URL/AWS_*, nomes que a lista de proibidos não pegava)" "$(grep -c -e '^SSH_AUTH_SOCK=' -e '^DATABASE_URL=' -e '^AWS_SESSION=' "$FAKE_LOG/env-1.txt")" 0
 check "feliz: com credencial em env, HOME e TMPDIR são o diretório descartável (não o HOME do operador)" "$(grep -c -e "^HOME=$HOME\$" "$FAKE_LOG/env-1.txt")/$(grep -c '^HOME=.*/battery-[^/]*/home$' "$FAKE_LOG/env-1.txt")/$(grep -c '^TMPDIR=.*/battery-[^/]*/home$' "$FAKE_LOG/env-1.txt")" "0/1/1"
-check "feliz: o agente só pode rodar o próprio selftest (nada de bash scripts/*, cat, git)" "$(grep -c -F -x 'Bash(bash scripts/aaa.selftest.sh:*)' "$FAKE_LOG/argv-1.txt")/$(grep -c -e 'scripts/\*' -e 'cat' -e 'git' -e 'python3' "$FAKE_LOG/argv-1.txt" | tr -d ' ')" "1/0"
+# só a linha DEPOIS de --allowedTools: o argv inteiro leva o caminho do prompt de papel sob o TMPDIR, que pode conter "git" (o scratchpad, o layout do nó)
+check "feliz: o agente só pode rodar o próprio selftest (nada de bash scripts/*, cat, git)" "$(grep -A1 -x -e '--allowedTools' "$FAKE_LOG/argv-1.txt" | tail -1)" 'Bash(bash scripts/aaa.selftest.sh:*)'
 check "feliz: ledger 300" "$(ledger)" 300
 check "feliz: nenhum worktree sobrando" "$(git -C "$R" worktree list | wc -l | tr -d ' ')" 1
 check "feliz: sem .partial" "$(ls "$ST/runs" | grep -c partial)" 0
@@ -207,6 +223,9 @@ newcase ok
   mkline ga-ig "$BASE" "$A_SHA" dog 'scripts/`id`.selftest.sh' scripts/aaa.sh
   mkline ga-ib "$BASE" "$A_SHA" dog "scripts/dir//x.selftest.sh" scripts/aaa.sh
   mkline ga-ic "$BASE" "$A_SHA" dog "scripts/./x.selftest.sh" scripts/aaa.sh
+  mkline ga-n1 "$BASE" "$A_SHA" dog $'scripts/aaa.selftest.sh\n' scripts/aaa.sh
+  mkline ga-n2 "$BASE"$'\n' "$A_SHA" dog scripts/aaa.selftest.sh scripts/aaa.sh
+  mkline $'ga-n3\n' "$BASE" "$A_SHA" dog scripts/aaa.selftest.sh scripts/aaa.sh
   python3 -I -c 'import json,sys; b,a=sys.argv[1:]; print(json.dumps({"task_id":"ga-id","role":["dog"],"base_sha":b,"fix_sha":a,"title":"t","description":"d","prod_files":["scripts/aaa.sh"],"test_files":"scripts/aaa.selftest.sh"}))' "$BASE" "$A_SHA"
   echo '"uma-string"'; } | mkcorpus "$ST/tasks.jsonl"
 run --tasks "$ST/tasks.jsonl"
@@ -225,7 +244,9 @@ check "injeção: role lista / test_files string recusados sem derrubar" "$(rec 
 check "injeção: i8 (success.commands com ';') NÃO é usado: roda só o argv e fica sem erro" "$(rec "$OUT" ga-i8 estado)/$(rec "$OUT" ga-i8 ok)" "medida/true"
 check "injeção: nada foi executado (PWNED não existe)" "$([ -e "$W/PWNED" ] && echo existe || echo nao)" nao
 check "injeção: i-e/i-f/i-g (;, $(), crase, sem barra dupla) recusados" "$(rec "$OUT" ga-ie motivo)/$(rec "$OUT" ga-if motivo)/$(rec "$OUT" ga-ig motivo)" "argumento_invalido:test_files/argumento_invalido:test_files/argumento_invalido:test_files"
-check "injeção: 16 refugos contados (inclui a linha que não é objeto)" "$(summ por_estado.descartada)" 16
+check "injeção: '\\n' final (o \$ da regex aceitava) recusado no caminho, no sha e no task_id" \
+  "$(rec "$OUT" ga-n1 motivo)/$(rec "$OUT" ga-n2 motivo)/$(rec "$OUT" $'ga-n3\n' motivo)" "argumento_invalido:test_files/argumento_invalido:base_sha/argumento_invalido:task_id"
+check "injeção: 19 refugos contados (inclui a linha que não é objeto)" "$(summ por_estado.descartada)" 19
 check "injeção: só o i8 chegou no agente" "$(calls)" 1
 
 # 6) freio de tokens
@@ -276,7 +297,64 @@ aaa ga-aaa | mkcorpus "$ST/tasks.jsonl"
 run --tasks "$ST/tasks.jsonl" --agent-timeout 1
 check "timeout: falha medida, tokens desconhecidos cobram a reserva" \
   "$(rec "$OUT" ga-aaa estado)/$(rec "$OUT" ga-aaa ok)/$(rec "$OUT" ga-aaa motivo)/$(rec "$OUT" ga-aaa tokens)/$(ledger)" "medida/false/agente_timeout/null/400"
+check "timeout: duracao_s gravada (separa pane da API de prompt que gira)" "$(rec "$OUT" ga-aaa duracao_s | grep -cE '^[0-9]+(\.[0-9]+)?$')" 1
 check "timeout: nenhum worktree sobrando" "$(git -C "$R" worktree list | wc -l | tr -d ' ')" 1
+
+# 8b) o claude NÃO INICIA (shebang quebrado: o shutil.which da largada aceita o arquivo): infra, nunca timeout medida; sem reserva; conta no freio de infra
+newcase ok
+printf '#!/nonexistent/interp\n' >"$W/broken-claude" && chmod +x "$W/broken-claude"
+{ aaa ga-n1; aaa ga-n2; aaa ga-n3; aaa ga-n4; } | mkcorpus "$ST/tasks.jsonl"
+run --tasks "$ST/tasks.jsonl" --claude "$W/broken-claude"
+RC=$?
+check "não iniciou: infra/agente_nao_iniciou, ok null, tokens_cobrados ausente" "$(rec "$OUT" ga-n1 estado)/$(rec "$OUT" ga-n1 motivo)/$(rec "$OUT" ga-n1 ok)/$(rec "$OUT" ga-n1 tokens_cobrados)" "infra/agente_nao_iniciou/null/<sem-campo>"
+check "não iniciou: ledger sem gasto, rc 8 no 3º, o resto pulado" "$RC/$([ -e "$ST/spend-2026-01-01.json" ] && echo gravou || echo nada)/$(summ por_estado)" '8/nada/{"infra": 3, "pulada": 1}'
+
+# 8c) OSError depois do agente (a restauração do selftest esbarra num diretório): a TAREFA vira infra, a rodada segue, a reserva é cobrada
+newcase dirtrap
+{ aaa ga-o1; aaa ga-o2; } | mkcorpus "$ST/tasks.jsonl"
+run --tasks "$ST/tasks.jsonl"
+RC=$?
+check "erro de E/S na tarefa: rc 0, 2 linhas infra/erro_de_io, ledger 800, sem worktree" \
+  "$RC/$(nlines "$OUT")/$(rec "$OUT" ga-o1 estado)/$(rec "$OUT" ga-o1 motivo | cut -c1-10)/$(ledger)/$(git -C "$R" worktree list | wc -l | tr -d ' ')" "0/2/infra/erro_de_io/800/1"
+
+# 8d) o agente apaga o que o selftest executa (127 DEPOIS do agente): falha medida, não infra que sumiria da taxa
+newcase rmprod
+mkline ga-ddd "$D_BASE" "$D_SHA" dog scripts/ddd.selftest.sh scripts/ddd.sh | mkcorpus "$ST/tasks.jsonl"
+run --tasks "$ST/tasks.jsonl"
+check "127 após o agente: medida, ok false" "$(rec "$OUT" ga-ddd estado)/$(rec "$OUT" ga-ddd ok)/$(rec "$OUT" ga-ddd motivo)" "medida/false/selftest_reprova_apos_agente"
+
+# 8e) só uma MEDIDA zera a sequência de infra: descartada no meio não "prova" que o agente voltou
+newcase garbage
+{ aaa ga-e1; mkline ga-d1 "$BASE" "$A_SHA" dog "scripts/a b.selftest.sh" scripts/aaa.sh; aaa ga-e2
+  mkline ga-d2 "$BASE" "$A_SHA" dog "scripts/a b.selftest.sh" scripts/aaa.sh; aaa ga-e3; aaa ga-e4; } | mkcorpus "$ST/tasks.jsonl"
+run --tasks "$ST/tasks.jsonl" --infra-stop 3
+check "infra com descartes no meio: rc 8 na 3ª infra, 3 chamadas, a 4ª pulada" "$?/$(calls)/$(rec "$OUT" ga-e4 motivo)" "8/3/infra_repetida"
+
+# 8f) o rc de run_capped/suite_state/git_fail: não-iniciou ≠ timeout ≠ erro do git (carrega o módulo pelo caminho)
+UNIT="$(python3 -I -c 'import importlib.machinery as m, importlib.util as u, sys
+spec = u.spec_from_loader("abr", m.SourceFileLoader("abr", sys.argv[1])); abr = u.module_from_spec(spec); spec.loader.exec_module(abr)
+c = abr.Ctx(); c.config_sha = {}
+gf = lambda rc: (lambda r: r["estado"] + "/" + r["motivo"])(abr.git_fail(c, {"task_id": "ga-x"}, "dog", rc, "checkout_fix_falhou"))
+print(abr.run_capped([sys.argv[2]], None, {}, 5)[0] == abr.NOT_STARTED, abr.run_capped(["sleep", "30"], None, {"PATH": "/bin:/usr/bin"}, 1)[0] is None,
+      abr.suite_state([abr.NOT_STARTED, 0]), abr.suite_state([abr.NOT_STARTED, 1]), abr.suite_state([127], True), abr.suite_state([127]),
+      gf(abr.NOT_STARTED), gf(None), gf(128))' "$TOOL" "$W/broken-claude" 2>&1)"
+check "run_capped/suite_state/git_fail distinguem não-iniciou, timeout e erro" "$UNIT" \
+  "True True indeterminado fail fail indeterminado infra/git_nao_iniciou infra/git_estourou_prazo descartada/checkout_fix_falhou"
+
+# 8g) o ledger é relido DEPOIS do lock: outra rodada que grava entre a 1ª leitura e o flock não pode ser sobrescrita
+newcase ok
+aaa ga-aaa | mkcorpus "$ST/tasks.jsonl"
+python3 -I -c 'import importlib.machinery as m, importlib.util as u, sys, fcntl
+spec = u.spec_from_loader("abr", m.SourceFileLoader("abr", sys.argv[1])); abr = u.module_from_spec(spec); spec.loader.exec_module(abr)
+real, LED = fcntl.flock, sys.argv[2]
+def racy(f, op):  # outra rodada termina exatamente aqui e grava 900 no ledger
+    open(LED, "w").write("{\"date\": \"2026-01-01\", \"tokens\": 900}\n")
+    return real(f, op)
+abr.fcntl = type("F", (), {"flock": staticmethod(racy), "LOCK_EX": fcntl.LOCK_EX, "LOCK_NB": fcntl.LOCK_NB})
+sys.argv = ["abr"] + sys.argv[3:]
+sys.exit(abr.main())' "$TOOL" "$ST/spend-2026-01-01.json" --repo "$R" --prefix "$P" --state-dir "$ST" --claude "$FAKE" --config-ref main --day 2026-01-01 \
+  --token-cap 1000 --task-reserve-tokens 400 --out "$OUT" --tasks "$ST/tasks.jsonl" >"$W/stdout" 2>"$W/stderr"
+check "ledger relido com o lock: o gasto da outra rodada (900) vale, a rodada para (rc 6) sem sobrescrever" "$?/$(calls)/$(ledger)" "6/0/900"
 
 # 9) infra repetida para a rodada
 newcase garbage
@@ -342,6 +420,10 @@ check "linha podre contada, --only filtra" "$?/$(summ linhas_ilegiveis)/$(nlines
 OUT="$W/out${N}l.jsonl"
 run --tasks "$ST/podre.jsonl" --limit 1
 check "--limit 1 roda uma só" "$(nlines "$OUT")" 1
+newcase ok
+aaa ga-u1 | python3 -I -c 'import sys; sys.stdout.buffer.write(sys.stdin.buffer.read().decode().replace("Corrigir", "Corrigir \u2028 \u2029 \u0085").encode())' | mkcorpus "$ST/tasks.jsonl"
+run --tasks "$ST/tasks.jsonl"
+check "U+2028/2029/0085 crus (o produtor grava ensure_ascii=False): 1 tarefa inteira, 0 ilegíveis" "$(summ linhas_ilegiveis)/$(summ tarefas)/$(rec "$OUT" ga-u1 estado)" "0/1/medida"
 
 # 14) papéis: sem prompt → pulada; --as-role troca o prompt; config_sha muda com a configuração e com o papel
 newcase ok
@@ -359,6 +441,8 @@ S_OLD="$(cfgsha dog --config-ref "$CFG1")"
 S_REV="$(cfgsha reviewer --as-role reviewer)"
 check "config_sha determinístico na mesma configuração" "$([ -n "$S_NEW" ] && [ "$S_NEW" = "$S_NEW2" ] && echo igual || echo diferente)" igual
 check "config_sha muda quando a configuração muda" "$([ -n "$S_OLD" ] && [ "$S_OLD" != "$S_NEW" ] && echo muda || echo igual)" muda
+S_C="$(cfgsha dog --config-ref "$CFG_C")"
+check "config_sha muda quando SÓ o .claude/ muda (a perna do overlay que os outros 3 arquivos escondiam)" "$([ -n "$S_C" ] && [ "$S_C" != "$S_OLD" ] && echo muda || echo igual)" muda
 check "config_sha muda de papel para papel" "$([ -n "$S_REV" ] && [ "$S_REV" != "$S_NEW" ] && echo muda || echo igual)" muda
 
 # 15) uso errado

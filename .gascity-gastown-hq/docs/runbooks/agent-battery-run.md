@@ -12,7 +12,7 @@ O executor só lê o **formato** do acervo (JSONL + `.meta.json` com `sha256`), 
 ## O que faz
 
 Lê o acervo da fatia 1 e roda cada tarefa num worktree descartável (sempre removido). Grava um JSONL por rodada em
-`<state-dir>/runs/run-<UTC>.jsonl` (+ `.summary.json`), uma linha por tarefa: `{task, papel, config_sha, estado, ok, tokens, motivo}`.
+`<state-dir>/runs/run-<UTC>.jsonl` (+ `.summary.json`), uma linha por tarefa: `{task, papel, config_sha, estado, ok, tokens, motivo}` (+ `duracao_s` nas que chamaram o agente).
 
 Por tarefa: (1) valida os campos; (2) confere que o selftest **passa em `fix_sha` e reprova em `base_sha`** (com só os `test_files` do fix
 copiados para cima da base), senão descarta e conta o motivo; (3) põe por cima do checkout a configuração sob teste (`--config-ref`,
@@ -23,7 +23,7 @@ padrão `origin/main`: `.claude/`, `CLAUDE.md`, `<prefixo>/CLAUDE.md`) e roda `c
 **Segurança.** `success.commands` do acervo é uma string `bash <caminho>` e **nunca** vai a um shell: o argv `['bash', caminho]` é montado
 aqui. `test_files` casa `^[A-Za-z0-9._/-]+\.selftest\.sh$` (sob `scripts/ packs/ formulas/ commands/ docs/`, sem `..`, `//`, `/./`),
 `prod_files` o equivalente sem o sufixo, `task_id`/shas/papel têm regex própria; o que não casa vira `descartada` (`argumento_invalido:<campo>`)
-e é contado. O ambiente do agente é **lista de permitidos** (`PATH LANG LC_* TERM USER LOGNAME` + `CLAUDE_CODE_OAUTH_TOKEN` ou
+e é contado. O ambiente do agente é **lista de permitidos** (`PATH LANG LC_ALL LC_CTYPE TERM USER LOGNAME` + `CLAUDE_CODE_OAUTH_TOKEN` ou
 `ANTHROPIC_API_KEY`): `SSH_AUTH_SOCK`, `GIT_*`, strings de conexão e `CLAUDE_CONFIG_DIR` não passam. `HOME`/`TMPDIR` são um diretório descartável.
 Sem credencial em env a rodada **não começa** (rc 8); `--agent-real-home` troca isso pelo login guardado no `HOME` real e **expõe o HOME do
 operador ao agente**. `--setting-sources project`: só a configuração do checkout vale (nada de regras, hooks ou MCP do usuário). O agente só
@@ -36,7 +36,8 @@ checagem de sha), não de entrada externa; se isso mudar, ponha o executor num c
 contra o claude real** (login expirado no mini em 28/11/2026: a chamada devolve `is_error` e o executor a conta como `infra`): vigie a 1ª rodada.
 
 **Estados.** `medida` (rodou o agente e conferiu o selftest: só ela entra na taxa) · `descartada` (tarefa não serve; motivo) ·
-`pulada` (freio, ou papel sem prompt) · `infra` (login, cota, API ou saída ilegível: não é falha do prompt, não entra na taxa) ·
+`pulada` (freio, ou papel sem prompt) · `infra` (login, cota, API, saída ilegível, o `claude` que **não iniciou** — `agente_nao_iniciou`, sem
+reserva cobrada — ou git sem resposta: não é falha do prompt, não entra na taxa) ·
 `verificada` (só com `--verify-only`). Timeout do agente e `error_max_turns` são falha **medida**: um prompt que faz o agente girar
 sem parar é exatamente a regressão que a bateria tem de ver.
 
@@ -44,8 +45,9 @@ sem parar é exatamente a regressão que a bateria tem de ver.
 registro) e `--task-budget-usd` por tarefa (`--max-budget-usd` do CLI). O ledger é `<state-dir>/spend-<dia UTC>.json` e soma entre
 rodadas do mesmo dia. Antes de cada tarefa: gasto + `--task-reserve-tokens` (padrão 400 000) > teto → a rodada **para limpa**, o resto
 vira `pulada` (`teto_de_tokens`) e sai rc 6. Saída do agente ilegível, ou sem o bloco de uso, é gasto *desconhecido* e é cobrado como a
-reserva, nunca como zero. Três tarefas `infra` seguidas também param a rodada (rc 8). O teto é de **admissão**: uma tarefa que já
-começou pode passar dele (no máximo pela reserva), e o resumo diz `teto_excedido`.
+reserva, nunca como zero. Três tarefas `infra` seguidas (`--infra-stop`), **sem uma `medida` no meio** — `descartada`/`pulada` não zeram nem contam —
+também param a rodada (rc 8). O teto é de **admissão**: uma tarefa que já começou pode passar dele, e o resumo diz `teto_excedido`; o
+gasto de UMA tarefa é limitado em dólares (`--task-budget-usd`), não em tokens, e o que o agente de fato gastou é o que vai ao ledger.
 
 Códigos de saída: 0 ok · 2 uso errado, acervo ou git ilegível (inclui sha256 do acervo que não bate com o `.meta.json`) · 3 nenhuma tarefa ·
 4 não consegui gravar saída ou ledger · 5 ledger ilegível (não sei quanto já gastei: nada roda) · 6 freio de tokens (parcial gravado) ·

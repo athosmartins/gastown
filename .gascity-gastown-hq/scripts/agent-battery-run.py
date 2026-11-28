@@ -6,10 +6,10 @@
 
 USO: agent-battery-run.py [--tasks ARQ] [--repo DIR] [--prefix SUBPASTA] [--config-ref REF] [--as-role PAPEL] [--limit N]
         [--only BEAD]... [--model M] [--token-cap N] [--task-reserve-tokens N] [--task-budget-usd X] [--agent-timeout S]
-        [--selftest-timeout S] [--state-dir DIR] [--out ARQ] [--claude CMD] [--role-prompt PAPEL=CAMINHO]...
-        [--dry-run | --verify-only]
+        [--selftest-timeout S] [--state-dir DIR] [--out ARQ] [--claude CMD] [--claude-extra ARGS] [--role-prompt PAPEL=CAMINHO]...
+        [--infra-stop N] [--agent-real-home] [--day AAAA-MM-DD] [--dry-run | --verify-only]
   Lê o acervo da fatia 1 (agent-battery-corpus.py) e roda cada tarefa; grava uma linha JSON por tarefa:
-  {task, papel, config_sha, estado, ok, tokens, motivo}. Só `estado == "medida"` entra na taxa; ok é true/false só aí, senão null.
+  {task, papel, config_sha, estado, ok, tokens, motivo} (+ duracao_s nas que chamaram o agente). Só `estado == "medida"` entra na taxa; ok é true/false só aí, senão null.
 
 O QUE FAZ POR TAREFA (um worktree descartável, sempre removido): (1) valida os campos do acervo — `success.commands` NÃO é usado: o argv
   é montado aqui, ['bash', caminho], e caminho/sha fora da regex estrita descartam a tarefa, contada; (2) confere que o selftest PASSA em
@@ -22,8 +22,9 @@ TETO DE TOKENS: por noite (--token-cap, ledger em <state-dir>/spend-<dia>.json, 
   PARA LIMPO: o resto vira `pulada` (motivo teto_de_tokens), rc 6. Saída do agente ilegível = gasto DESCONHECIDO, cobrado como a reserva
   (nunca como zero). Ledger ilegível = não sei quanto já gastei: nada roda (rc 5).
 ESTADOS: medida (rodou o agente e conferiu o selftest) · descartada (tarefa não serve; motivo) · pulada (freio ou papel sem prompt) ·
-  infra (o agente não pôde ser medido: login/cota/API/saída ilegível; não entra na taxa). Timeout do agente é FALHA medida (um prompt que faz
-  o agente girar sem parar é exatamente a regressão que a bateria tem de ver).
+  infra (o agente não pôde ser medido: login/cota/API/saída ilegível, o `claude` não INICIOU, git sem resposta; não entra na taxa).
+  Timeout do agente é FALHA medida (um prompt que faz o agente girar sem parar é exatamente a regressão que a bateria tem de ver);
+  "não iniciou" (OSError no exec) NÃO é timeout: é infra e não cobra reserva. Três infra seguidas SEM uma medida no meio param a rodada.
 CÓDIGOS: 0 ok · 2 uso errado, acervo/git ilegível · 3 nenhuma tarefa utilizável · 4 não consegui gravar saída/ledger · 5 ledger ilegível ·
   6 freio de tokens (parcial gravado) · 7 outra rodada em andamento · 8 claude ausente ou infra repetida (parcial gravado).
 """
@@ -43,11 +44,11 @@ import sys
 import tempfile
 import time
 
-SHA_RE = re.compile(r"^[0-9a-f]{40}$")
-TASK_RE = re.compile(r"^ga-[a-z0-9]+(\.[0-9]{1,4})*$")
-ROLE_RE = re.compile(r"^[a-z][a-z0-9-]{0,30}$")
-PATH_RE = re.compile(r"^[A-Za-z0-9._/-]+$")
-TEST_RE = re.compile(r"^[A-Za-z0-9._/-]+\.selftest\.sh$")
+SHA_RE = re.compile(r"^[0-9a-f]{40}\Z")
+TASK_RE = re.compile(r"^ga-[a-z0-9]+(\.[0-9]{1,4})*\Z")
+ROLE_RE = re.compile(r"^[a-z][a-z0-9-]{0,30}\Z")
+PATH_RE = re.compile(r"^[A-Za-z0-9._/-]+\Z")
+TEST_RE = re.compile(r"^[A-Za-z0-9._/-]+\.selftest\.sh\Z")
 ROOTS = ("scripts/", "packs/", "formulas/", "commands/")  # começa por letra: um caminho nunca vira opção do bash
 TEST_ROOTS = ROOTS + ("docs/",)  # o acervo aceita selftest também em docs/ (ALLOW_ROOTS da fatia 1)
 ROLE_PROMPTS = {"dog": "agents/dog-remote/prompt.template.md", "wa-worker": "agents/wa-worker/prompt.template.md",
@@ -55,6 +56,7 @@ ROLE_PROMPTS = {"dog": "agents/dog-remote/prompt.template.md", "wa-worker": "age
 CONFIG_PATHS = (".claude", "CLAUDE.md")  # + <prefix>/CLAUDE.md
 FSIZE = 512 * 1024 * 1024
 KEEP_SECRET = ("CLAUDE_CODE_OAUTH_TOKEN", "ANTHROPIC_API_KEY")
+NOT_STARTED = "nao_iniciou"  # rc de run_capped: o exec falhou (≠ None, que é o prazo estourado)
 KEEP_ENV = ("PATH", "LANG", "LC_ALL", "LC_CTYPE", "TERM", "USER", "LOGNAME")  # lista de PERMITIDOS: o resto do ambiente não passa
 
 def die(code, msg):
@@ -65,13 +67,14 @@ def _limits():
     resource.setrlimit(resource.RLIMIT_FSIZE, (FSIZE, FSIZE))
 
 def run_capped(argv, cwd, env, timeout, stdin_text=None):
-    """(rc, out, err) — rc None = não rodou (binário ausente) ou estourou o prazo (o grupo todo é morto): 'não sei', nunca 0 nem falha."""
+    """(rc, out, err). rc NOT_STARTED = o exec falhou (binário trocado/shebang quebrado/EMFILE...); rc None = estourou o prazo (o grupo todo é
+    morto); os dois são 'não sei' (nunca 0), mas DIFERENTES: timeout é falha do prompt, não-iniciou é infra."""
     try:
         p = subprocess.Popen(argv, cwd=cwd, env=env, stdin=subprocess.PIPE if stdin_text is not None else subprocess.DEVNULL,
                              stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, errors="replace",
                              start_new_session=True, preexec_fn=_limits)
-    except OSError:
-        return None, "", ""
+    except (OSError, ValueError, subprocess.SubprocessError):  # SubprocessError = preexec_fn falhou
+        return NOT_STARTED, "", ""
     try:
         out, err = p.communicate(stdin_text, timeout=timeout)
     except subprocess.TimeoutExpired:
@@ -148,15 +151,16 @@ def validate(t):
         return "argumento_invalido:enunciado"
     return None
 
-def suite_state(rcs):
-    """pass | fail | indeterminado. 126/127/None = o teste nem rodou: não é falha, é 'não sei' (nunca vira 'reprovou')."""
-    if any(r not in (None, 0, 126, 127) for r in rcs):
+def suite_state(rcs, after_agent=False):
+    """pass | fail | indeterminado. 126/127/None/NOT_STARTED = o teste nem rodou: 'não sei' (nunca 'reprovou'). Depois do agente o mesmo selftest
+    já deu 0 em fix_sha neste ambiente: 126/127 ali é o agente que quebrou o que o selftest chama (apagou, tirou o x) = falha."""
+    if any(isinstance(r, int) and (r not in (0, 126, 127) or (after_agent and r in (126, 127))) for r in rcs):
         return "fail"
-    return "indeterminado" if any(r in (None, 126, 127) for r in rcs) else "pass"
+    return "indeterminado" if any(not isinstance(r, int) or r in (126, 127) for r in rcs) else "pass"
 
-def run_tests(wt_dir, tests, timeout):
+def run_tests(wt_dir, tests, timeout, after_agent=False):
     env = {"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "HOME": wt_dir, "TMPDIR": wt_dir, "LANG": "C.UTF-8"}
-    return suite_state([run_capped(["bash", t], wt_dir, env, timeout)[0] for t in tests])
+    return suite_state([run_capped(["bash", t], wt_dir, env, timeout)[0] for t in tests], after_agent)
 
 def agent_env(home, real_home):
     """Ambiente do agente por lista de permitidos: PATH/LANG/..., a credencial do claude e nada mais. HOME e TMPDIR são o diretório descartável;
@@ -241,6 +245,12 @@ def rec_of(c, t, role, estado, motivo, ok=None, tokens=None, **extra):
     r.update(extra)
     return r
 
+def git_fail(c, t, role, rc, motivo):
+    """git que não deu 0: NOT_STARTED/None (nem iniciou, estourou o prazo) = não sei, é infra; rc ≠ 0 = o git RESPONDEU erro (sha que não existe...):
+    fato da tarefa, descartada com o motivo."""
+    infra = {NOT_STARTED: "git_nao_iniciou", None: "git_estourou_prazo"}.get(rc)
+    return rec_of(c, t, role, "infra", infra) if infra else rec_of(c, t, role, "descartada", motivo)
+
 def run_task(c, t, role):
     why = validate(t)
     if why:
@@ -248,20 +258,24 @@ def run_task(c, t, role):
     pre = c.prefix
     tests = t["test_files"]
     tfiles = tree_files(c.repo, t["fix_sha"], [os.path.join(pre, p) for p in tests])
-    if tfiles is None or len(tfiles) != len(tests):
+    if tfiles is None:  # o ls-tree falhou: não sei se o selftest existe (≠ lista curta, que é 'não existe')
+        return rec_of(c, t, role, "infra", "git_lstree_falhou")
+    if len(tfiles) != len(tests):
         return rec_of(c, t, role, "descartada", "selftest_ausente_no_fix")
     wt = tempfile.mkdtemp(prefix="wt-", dir=c.scratch)
     cwd = os.path.join(wt, pre) if pre else wt
     try:
         rc, _ = git(c.repo, "worktree", "add", "--detach", "--force", wt, t["fix_sha"])
         if rc != 0:
-            return rec_of(c, t, role, "descartada", "checkout_fix_falhou")
+            return git_fail(c, t, role, rc, "checkout_fix_falhou")
         st = run_tests(cwd, tests, c.selftest_timeout)
         if st != "pass":
             return rec_of(c, t, role, "descartada", "selftest_nao_rodou_no_fix" if st == "indeterminado" else "selftest_reprova_no_fix")
         rc, _ = git(wt, "checkout", "-q", "-f", "--detach", t["base_sha"])
-        if rc != 0 or git(wt, "clean", "-fdxq")[0] != 0:
-            return rec_of(c, t, role, "descartada", "checkout_base_falhou")
+        if rc == 0:
+            rc, _ = git(wt, "clean", "-fdxq")
+        if rc != 0:
+            return git_fail(c, t, role, rc, "checkout_base_falhou")
         if not put_files(c.repo, wt, tfiles):
             return rec_of(c, t, role, "infra", "overlay_selftest_falhou")
         st = run_tests(cwd, tests, c.selftest_timeout)
@@ -282,26 +296,30 @@ def run_task(c, t, role):
                                         "--permission-mode", "acceptEdits", "--setting-sources", "project", "--allowedTools", agent_allowed(tests),
                                         "--disallowedTools", "WebFetch,WebSearch", "--max-budget-usd", str(c.task_budget_usd),
                                         "--append-system-prompt-file", c.role_file[role]] + shlex.split(c.claude_extra)
+        c.agent_ran, t0 = True, time.monotonic()
         rc, out, _ = run_capped(argv, cwd, agent_env(c.agent_home, c.real_home), c.agent_timeout, build_prompt(t))
-        if rc is None and not out:
-            # estourou o prazo (ou o binário sumiu: já foi barrado na largada). Tokens desconhecidos → cobra a reserva.
-            return rec_of(c, t, role, "medida", "agente_timeout", ok=False, tokens=None, tokens_cobrados=c.reserve)
+        dur = round(time.monotonic() - t0, 1)
+        if rc == NOT_STARTED:  # nada rodou, nada foi gasto: infra, sem reserva (e conta para --infra-stop)
+            c.agent_ran = False
+            return rec_of(c, t, role, "infra", "agente_nao_iniciou", duracao_s=dur)
+        if rc is None:  # estourou o prazo. Tokens desconhecidos → cobra a reserva.
+            return rec_of(c, t, role, "medida", "agente_timeout", ok=False, tokens=None, tokens_cobrados=c.reserve, duracao_s=dur)
         d = parse_claude(out)
         if d is None:
-            return rec_of(c, t, role, "infra", "saida_do_agente_ilegivel", tokens_cobrados=c.reserve)
+            return rec_of(c, t, role, "infra", "saida_do_agente_ilegivel", tokens_cobrados=c.reserve, duracao_s=dur)
         spent, cache_read = tokens_of(d)
         cobrado = spent if spent is not None else c.reserve
         sub = str(d.get("subtype", ""))
         if d.get("is_error") is not False and not sub.startswith("error_max"):
-            return rec_of(c, t, role, "infra", "agente_erro:" + (sub or "?"), tokens=spent, tokens_cobrados=cobrado)
+            return rec_of(c, t, role, "infra", "agente_erro:" + (sub or "?"), tokens=spent, tokens_cobrados=cobrado, duracao_s=dur)
         if not put_files(c.repo, wt, tfiles):
-            return rec_of(c, t, role, "infra", "restaurar_selftest_falhou", tokens=spent, tokens_cobrados=cobrado)
-        st = run_tests(cwd, tests, c.selftest_timeout)
+            return rec_of(c, t, role, "infra", "restaurar_selftest_falhou", tokens=spent, tokens_cobrados=cobrado, duracao_s=dur)
+        st = run_tests(cwd, tests, c.selftest_timeout, after_agent=True)
         if st == "indeterminado":
-            return rec_of(c, t, role, "infra", "selftest_nao_rodou_apos_agente", tokens=spent, tokens_cobrados=cobrado)
+            return rec_of(c, t, role, "infra", "selftest_nao_rodou_apos_agente", tokens=spent, tokens_cobrados=cobrado, duracao_s=dur)
         ok = st == "pass"
         return rec_of(c, t, role, "medida", "" if ok else (sub if sub.startswith("error_max") else "selftest_reprova_apos_agente"),
-                      ok=ok, tokens=spent, tokens_cobrados=cobrado, cache_read=cache_read, custo_usd=d.get("total_cost_usd"))
+                      ok=ok, tokens=spent, tokens_cobrados=cobrado, cache_read=cache_read, custo_usd=d.get("total_cost_usd"), duracao_s=dur)
     finally:
         git(c.repo, "worktree", "remove", "--force", wt)
         shutil.rmtree(wt, ignore_errors=True)
@@ -326,7 +344,7 @@ def load_tasks(path):
         die(2, "o .meta.json do acervo está ilegível")
     # linha vazia → ignora; linha que não é JSON → conta em linhas_ilegiveis e segue (uma podre não derruba as outras).
     tasks, bad = [], 0
-    for line in raw.decode("utf-8", "replace").splitlines():
+    for line in raw.decode("utf-8", "replace").split("\n"):  # NÃO splitlines: ele também quebra em U+2028/2029/0085, que o produtor grava crus
         if not line.strip():
             continue
         try:
@@ -377,7 +395,7 @@ def main():
             die(2, "--role-prompt inválido: " + spec)
         rp[k] = v
     day = a.day or time.strftime("%Y-%m-%d", time.gmtime())
-    if not re.match(r"^\d{4}-\d{2}-\d{2}$", day):
+    if not re.match(r"^\d{4}-\d{2}-\d{2}\Z", day):
         die(2, "--day inválido")
 
     c = Ctx()
@@ -439,6 +457,11 @@ def main():
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except OSError:
         die(7, "outra rodada em andamento; nada feito")
+    # relido COM o lock (outra rodada pode ter gravado desde a 1ª leitura, e esta sobrescreveria o gasto dela): sem arquivo → 0; ilegível → rc 5, nada roda.
+    spent_before = read_ledger(ledger)
+    if spent_before is None:
+        die(5, "ledger de gasto ilegível (%s): não sei quanto já gastei; nada roda" % ledger)
+    plan["tokens_noite_antes"] = spent_before
     out = a.out or os.path.join(a.state_dir, "runs", "run-%s.jsonl" % time.strftime("%Y%m%dT%H%M%SZ", time.gmtime()))
     os.makedirs(os.path.dirname(os.path.abspath(out)), exist_ok=True)
     c.scratch = tempfile.mkdtemp(prefix="battery-", dir=os.environ.get("TMPDIR") or None)
@@ -471,7 +494,11 @@ def main():
                     brake, code = "teto_de_tokens", 6
                     r = rec_of(c, t, role, "pulada", brake)
                 else:
-                    r = run_task(c, t, role)
+                    c.agent_ran = False
+                    try:
+                        r = run_task(c, t, role)
+                    except OSError as e:  # disco cheio/unlink/mkdtemp: a tarefa vira infra, a rodada segue; cobra a reserva se o agente já tinha rodado
+                        r = rec_of(c, t, role, "infra", "erro_de_io:" + type(e).__name__, tokens_cobrados=c.reserve if c.agent_ran else 0)
                     paid = r.get("tokens_cobrados", r.get("tokens")) or 0
                     spent += paid
                     if paid:
@@ -479,7 +506,10 @@ def main():
                             atomic_write(ledger, json.dumps({"date": day, "tokens": spent}) + "\n")
                         except OSError:
                             brake, code = "ledger_sem_gravar", 4
-                    infra_run = infra_run + 1 if r["estado"] == "infra" else 0
+                    if r["estado"] == "infra":  # só uma MEDIDA zera a sequência: descartada/pulada não provam que o agente voltou a funcionar
+                        infra_run += 1
+                    elif r["estado"] == "medida":
+                        infra_run = 0
                     if infra_run >= a.infra_stop and not brake:
                         brake, code = "infra_repetida", 8
                 results.append(r)
