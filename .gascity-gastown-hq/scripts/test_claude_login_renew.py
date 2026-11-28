@@ -1890,3 +1890,44 @@ def test_an_account_that_was_reset_is_tried_by_the_next_scheduled_run(w):
     assert renew.main(["--reset", EMAIL["b85"]]) == 0
     renew.housekeeping()
     assert launched == [EMAIL["b85"]]
+
+
+# the two real reads of the browser (not the seams the tests above replace): what they answer when the browser is up, down or silent
+def test_cdp_answers_is_true_only_for_a_browser_that_really_answers(monkeypatch):
+    class Up(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            self.send_response(200 if self.path == "/json/version" else 404)
+            self.end_headers()
+            self.wfile.write(b'{"Browser":"Chrome"}')
+
+        def log_message(self, *a):
+            pass
+    srv = http.server.HTTPServer(("127.0.0.1", 0), Up)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    monkeypatch.setenv("CLAUDE_RENEW_CDP", f"http://127.0.0.1:{srv.server_address[1]}")
+    assert renew.cdp_answers() is True
+    srv.shutdown()
+    srv.server_close()
+    assert renew.cdp_answers() is False                                                    # the port is closed now: refused is "does not answer", never "up"
+    monkeypatch.setenv("CLAUDE_RENEW_CDP", "http://127.0.0.1:1")
+    assert renew.cdp_answers() is False
+    monkeypatch.setenv("CLAUDE_RENEW_CDP", "not a url")
+    assert renew.cdp_answers() is False                                                    # a value that cannot even be asked is the same inert answer
+
+
+def test_cdp_restart_says_what_happened_and_only_a_clean_exit_counts_as_ran(w, tmp_path, monkeypatch):
+    def fake(body):
+        p = tmp_path / "fake-cdp"
+        p.write_text("#!/bin/sh\n" + body + "\n")
+        p.chmod(0o700)
+        monkeypatch.setenv("CLAUDE_RENEW_CDP_BIN", str(p))
+    fake("exit 0")
+    assert renew.cdp_restart() == (True, "`cdp restart` exit 0")
+    fake("exit 3")
+    assert renew.cdp_restart() == (False, "`cdp restart` exit 3")
+    monkeypatch.setenv("CLAUDE_RENEW_CDP_BIN", str(tmp_path / "does-not-exist"))
+    ran, said = renew.cdp_restart()
+    assert ran is False and "could not run (FileNotFoundError)" in said
+    monkeypatch.setattr(renew, "CDP_RESTART_TIMEOUT_S", 0.5)
+    fake("sleep 5")
+    assert renew.cdp_restart() == (False, "`cdp restart` did not finish in time")
