@@ -3,7 +3,8 @@
 # Casos: caminho feliz (fail→pass, config sob teste, env limpo, worktree removido), agente que não conserta / trapaceia no selftest,
 # descartes contados (passa na base, reprova no fix, selftest ausente/symlink), caminhos com cara de injeção de shell (recusados e contados,
 # NADA executa), freio de tokens (PULADO, rc 6, ledger entre rodadas), saída do agente ilegível (cobra a reserva, nunca zero), timeout,
-# infra repetida, ledger podre (rc 5), claude ausente (rc 8), rodada concorrente (rc 7), acervo adulterado/ausente/vazio, papéis.
+# infra repetida, ledger podre (rc 5), claude ausente (rc 8), rodada concorrente (rc 7), acervo adulterado/ausente/vazio, papéis, e (seção 16)
+# o módulo em processo: defaults e prazos, funções puras nos limites, laço do main() com o run_task trocado por um roteiro.
 # Sai 0 = tudo passou.
 set -uo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -195,13 +196,15 @@ done
 newcase ok
 { mkline ga-bbb "$(git -C "$R" rev-parse "$B_SHA^")" "$B_SHA" dog scripts/bbb.selftest.sh scripts/bbb.sh
   mkline ga-ccc "$(git -C "$R" rev-parse "$C_SHA^")" "$C_SHA" dog scripts/ccc.selftest.sh scripts/ccc.sh
-  mkline ga-lnk "$(git -C "$R" rev-parse "$L_SHA^")" "$L_SHA" dog scripts/lnk.selftest.sh scripts/lnk.sh; } | mkcorpus "$ST/tasks.jsonl"
+  mkline ga-lnk "$(git -C "$R" rev-parse "$L_SHA^")" "$L_SHA" dog scripts/lnk.selftest.sh scripts/lnk.sh
+  mkline ga-nob "$(printf '%040d' 0)" "$A_SHA" dog scripts/aaa.selftest.sh scripts/aaa.sh; } | mkcorpus "$ST/tasks.jsonl"  # sha bem formado que o repo não tem
 run --tasks "$ST/tasks.jsonl"
 check "descartes: rc 0" "$?" 0
 check "descartes: passa na base" "$(rec "$OUT" ga-bbb estado)/$(rec "$OUT" ga-bbb motivo)" "descartada/selftest_passa_na_base"
 check "descartes: reprova no fix" "$(rec "$OUT" ga-ccc motivo)" selftest_reprova_no_fix
 check "descartes: symlink não vale como selftest" "$(rec "$OUT" ga-lnk motivo)" selftest_ausente_no_fix
-check "descartes: contados no resumo" "$(summ por_estado.descartada)" 3
+check "descartes: base que o git não tem = o git respondeu erro (fato da tarefa), nunca a base 'passou'" "$(rec "$OUT" ga-nob estado)/$(rec "$OUT" ga-nob motivo)" "descartada/checkout_base_falhou"
+check "descartes: contados no resumo" "$(summ por_estado.descartada)" 4
 check "descartes: motivo contado" "$(summ descartes.selftest_passa_na_base)" 1
 check "descartes: agente nunca chamado" "$(calls)" 0
 check "descartes: ok null (não entra na taxa)" "$(rec "$OUT" ga-bbb ok)" null
@@ -444,6 +447,11 @@ check "config_sha muda quando a configuração muda" "$([ -n "$S_OLD" ] && [ "$S
 S_C="$(cfgsha dog --config-ref "$CFG_C")"
 check "config_sha muda quando SÓ o .claude/ muda (a perna do overlay que os outros 3 arquivos escondiam)" "$([ -n "$S_C" ] && [ "$S_C" != "$S_OLD" ] && echo muda || echo igual)" muda
 check "config_sha muda de papel para papel" "$([ -n "$S_REV" ] && [ "$S_REV" != "$S_NEW" ] && echo muda || echo igual)" muda
+# só o prompt do dog muda (um commit que sai de main logo depois): o CLAUDE.md e o .claude/ iguais não escondem mais a perna do blob do prompt
+MAIN0="$(git -C "$R" rev-parse HEAD)"; echo "PROMPT DOG v3" >"$R/$P/agents/dog-remote/prompt.template.md"
+git -C "$R" commit -qam "chore: só o prompt do dog" && PV3="$(git -C "$R" rev-parse HEAD)"; git -C "$R" reset -q --hard "$MAIN0"
+S_P="$(cfgsha dog --config-ref "${PV3:-nao-existe}")"
+check "config_sha muda quando SÓ o prompt do papel muda" "$([ -n "$S_P" ] && [ "$S_P" != "$S_NEW" ] && echo muda || echo igual)" muda
 
 # 15) uso errado
 newcase ok
@@ -456,6 +464,289 @@ run --tasks "$ST/tasks.jsonl" --as-role papel-inventado
 check "--as-role desconhecido: rc 2" "$?" 2
 run --tasks "$ST/tasks.jsonl" --repo "$R/$P"
 check "--repo que não é a raiz do git: rc 2" "$?" 2
+
+# 16) em processo (ga-mdne1az, lastro hq-mutants): o que o ponta a ponta não alcança, com o módulo carregado pelo caminho. (a) UMA rodada de verdade sem
+#     flag de teto nem de prazo, com um relógio de mentira e o run_capped/subprocess.run anotando o que recebem e repassando ao de verdade: os DEFAULTS e a
+#     duração; (b) as funções puras nos limites;
+#     (c) o laço do main() com run_task trocado por um roteiro (ledger, freio, resumo, OSError antes/depois do agente), sem git nem agente por tarefa.
+# EQUIVALENT fcd4a8dbd7: `text=True` -> `False` no Popen do run_capped: o `errors="replace"` da mesma chamada já liga o modo texto do subprocess (Popen: text_mode = encoding or errors or text or universal_newlines), então rc, stdout, stderr e os tipos saem iguais; medido em 12 comandos reais (stdin com acento e CRLF, bytes inválidos, 200 KB, prazo estourado, binário que não existe) em python 3.12.3 e 3.9.25: 0 divergências, com um controle (sem text nem errors) que diverge em 10
+newcase garbage
+aaa ga-aaa | mkcorpus "$ST/tasks.jsonl"
+mkdir -p "$W/unit" && printf '#!/nonexistent/interp\n' >"$W/unit/broken-claude" && chmod +x "$W/unit/broken-claude"
+PYU='
+import contextlib, importlib.machinery as m, importlib.util as u, io, json, os, shutil, subprocess, sys, tempfile, time
+sys.dont_write_bytecode = True
+TOOL, REPO, PFX, WD, FAKE, STATE, TASKS, BROKEN = sys.argv[1:9]
+spec = u.spec_from_loader("abr", m.SourceFileLoader("abr", TOOL)); abr = u.module_from_spec(spec); spec.loader.exec_module(abr)
+os.environ["ANTHROPIC_API_KEY"] = "k"
+ENV0, BAD = dict(os.environ), [0]
+def reset():
+    os.environ.clear(); os.environ.update(ENV0)
+def chk(name, got, want):
+    try:
+        g = got() if callable(got) else got
+    except BaseException as e:
+        g = "raised " + type(e).__name__
+    BAD[0] += g != want
+    print(("ok   " if g == want else "FAIL ") + name + ("" if g == want else " (esperado %r, veio %r)" % (want, g)))
+# vazio -> "" e a checagem que o espera reprova; falhou/ilegivel -> a excecao vira "raised X" no chk, nunca um valor que uma checagem aceite
+def txt(p):
+    with open(p, encoding="utf-8") as f:
+        return f.read()
+def recs(p):
+    return [json.loads(l) for l in txt(p).splitlines()]
+def main_rc(argv):
+    so, se, old = io.StringIO(), io.StringIO(), sys.argv
+    sys.argv = ["abr"] + argv
+    try:
+        with contextlib.redirect_stdout(so), contextlib.redirect_stderr(se):
+            try:
+                rc = abr.main()
+            except SystemExit as e:
+                rc = e.code
+    finally:
+        sys.argv = old
+    return rc, so.getvalue(), se.getvalue()
+def safe(argv):
+    try:
+        return main_rc(argv)
+    except BaseException as e:
+        return ("raised " + type(e).__name__, "", "")
+def task(i, role):
+    return {"task_id": "ga-s%d" % i, "role": role, "base_sha": "a" * 40, "fix_sha": "b" * 40, "title": "t", "description": "d", "test_files": ["scripts/x.selftest.sh"], "prod_files": ["scripts/x.sh"]}
+def wr(p, t):
+    with open(p, "w") as f:
+        f.write(t)
+
+# (a) os defaults: uma rodada real (agente que devolve lixo = infra, reserva cobrada), relogio de 100.0 a 101.26, tudo que roda passa por um espiao
+class Clk:
+    def __init__(self):
+        self.v = iter([100.0, 101.26])
+    def monotonic(self):
+        return next(self.v)
+    def __getattr__(self, n):
+        return getattr(time, n)
+class SP:
+    def __getattr__(self, n):
+        return getattr(subprocess, n)
+    def run(self, *a, **k):
+        BLOB.append(k.get("timeout"))
+        return subprocess.run(*a, **k)
+CALLS, BLOB, ARGV, real_rc, real_sp = [], [], [], abr.run_capped, abr.subprocess
+def spy(argv, cwd, env, timeout, stdin_text=None):
+    CALLS.append((os.path.basename(argv[0]), timeout)); ARGV.append(argv)
+    return real_rc(argv, cwd, env, timeout, stdin_text)
+OUTA = os.path.join(WD, "runA.jsonl")
+abr.time, abr.subprocess, abr.run_capped = Clk(), SP(), spy
+try:
+    RA = safe(["--repo", REPO, "--prefix", PFX, "--state-dir", STATE, "--claude", FAKE, "--config-ref", "main", "--day", "2026-01-01", "--out", OUTA, "--tasks", TASKS])
+finally:
+    abr.time, abr.subprocess, abr.run_capped = time, real_sp, real_rc
+chk("defaults: rc 0, duracao 1.3 (1 casa), reserva de 400000 cobrada, teto de 2000000 no resumo", lambda: (RA[0], recs(OUTA)[0]["duracao_s"], recs(OUTA)[0]["tokens_cobrados"], json.loads(txt(OUTA + ".summary.json"))["teto_noite"]), (0, 1.3, 400000, 2000000))
+chk("defaults de prazo: git 300 s, selftest 600 s, agente 900 s, git cat-file 120 s", lambda: [sorted(set(t for n, t in CALLS if n == x)) for x in ("git", "bash", os.path.basename(FAKE))] + [sorted(set(BLOB))], [[300], [600], [900], [120]])
+BASE = json.loads(txt(TASKS).splitlines()[0])["base_sha"]
+GITA = [a[3:] for a in ARGV if a[:2] == ["git", "-C"]]
+chk("o checkout da base e seguido de git clean -fdxq (a chamada e a ordem; o que o selftest do fix deixou nao pode valer na base)", lambda: GITA[GITA.index(["checkout", "-q", "-f", "--detach", BASE]) + 1], ["clean", "-fdxq"])
+
+# (b) funcoes puras nos limites
+chk("suite_state: 126 e nao-sei (nunca reprovou) e, depois do agente, falha", lambda: [abr.suite_state([126]), abr.suite_state([126], True)], ["indeterminado", "fail"])
+RES = {"type": "result", "k": 1}
+chk("parse_claude: lista = o ultimo result; o que nao e result nao vale", lambda: abr.parse_claude(json.dumps([RES, {"type": "assistant"}])), RES)
+chk("parse_claude: sem result (dict, lista, numero, texto, vazio) = None, nunca erro", lambda: [abr.parse_claude(x) for x in (json.dumps({"type": "assistant"}), "[]", json.dumps([{"type": "assistant"}]), json.dumps([1, "x"]), "7", "\"s\"", "")], [None] * 7)
+def usage(**k):
+    return {"usage": dict({"input_tokens": 1, "output_tokens": 2, "cache_creation_input_tokens": 4, "cache_read_input_tokens": 8}, **k)}
+chk("tokens_of: entrada + saida + cache_creation, o cache_read a parte; zero e valido", lambda: [abr.tokens_of(usage()), abr.tokens_of(usage(input_tokens=0, output_tokens=0, cache_creation_input_tokens=0, cache_read_input_tokens=0))], [(7, 8), (0, 0)])
+chk("tokens_of: negativo, bool, texto, float, faltando, usage que nao e dict = desconhecido", lambda: [abr.tokens_of(x) for x in (usage(input_tokens=-1), usage(output_tokens=True), usage(cache_read_input_tokens="8"), usage(input_tokens=1.5), {"usage": {"input_tokens": 1}}, {"usage": 3}, {})], [(None, None)] * 7)
+def led(t):
+    p = os.path.join(WD, "led.json")
+    with open(p, "w") as f:
+        f.write(t)
+    return abr.read_ledger(p)
+chk("read_ledger: tokens 0 e um ledger valido (nao ilegivel)", lambda: [led("{\"tokens\": 0}"), led("{\"tokens\": 7}")], [0, 7])
+def home_of(real, **ev):
+    reset()
+    for k in ("ANTHROPIC_API_KEY", "CLAUDE_CODE_OAUTH_TOKEN"):
+        os.environ.pop(k, None)
+    os.environ["HOME"] = "/real"
+    os.environ.update(ev)
+    return abr.agent_env("/scr", real)["HOME"]
+chk("agent_env: o HOME real so com --agent-real-home, sem credencial e com HOME; senao o descartavel", lambda: [home_of(False), home_of(True), home_of(True, ANTHROPIC_API_KEY="k"), home_of(True, CLAUDE_CODE_OAUTH_TOKEN="t"), home_of(True, HOME="")], ["/scr", "/real", "/scr", "/scr", "/scr"])
+reset()
+WT, FORA = os.path.join(WD, "wt"), os.path.join(WD, "fora")
+os.makedirs(WT); os.makedirs(FORA); os.symlink(FORA, os.path.join(WT, "lnk"))
+chk("write_into: diretorio que e symlink para fora do checkout = recusa e nao escreve", lambda: (abr.write_into(WT, "lnk/x", b"d", "100644"), os.path.exists(os.path.join(FORA, "x"))), (False, False))
+chk("write_into: dentro do checkout cria o diretorio, escreve e poe o modo", lambda: (abr.write_into(WT, "a/b.sh", b"d", "100755"), oct(os.stat(os.path.join(WT, "a", "b.sh")).st_mode & 0o777)), (True, "0o755"))
+chk("tree_files: (nome, sha do blob, modo); executavel = 100755; symlink fica de fora", lambda: [(os.path.basename(n), len(s), md) for n, s, md in abr.tree_files(REPO, "main", [PFX + "/scripts/aaa.sh", PFX + "/scripts/ddd.sh", PFX + "/scripts/lnk.selftest.sh"])], [("aaa.sh", 40, "100644"), ("ddd.sh", 40, "100755")])
+chk("put_files: blob que o git nao tem = False; lista vazia = True", lambda: [abr.put_files(REPO, WT, [("x/y", "0" * 40, "100644")]), abr.put_files(REPO, WT, [])], [False, True])
+T1 = task(1, "dog")
+chk("validate: lista vazia, nao-lista e enunciado que nao e texto = recusado (nunca erro); a tarefa boa passa", lambda: [abr.validate(dict(T1, test_files=[])), abr.validate(dict(T1, prod_files=5)), abr.validate(dict(T1, description=3)), abr.validate(dict(T1, title=None)), abr.validate(T1)], ["argumento_invalido:test_files", "argumento_invalido:prod_files", "argumento_invalido:enunciado", "argumento_invalido:enunciado", None])
+EX = os.path.join(WD, "ex"); os.makedirs(EX)
+wr(os.path.join(EX, "n127.selftest.sh"), "exit 127\n"); wr(os.path.join(EX, "ok.selftest.sh"), "exit 0\n")
+chk("run_tests: selftest que sai 127 = nao sei (indeterminado), depois do agente = falha; 0 = pass", lambda: [abr.run_tests(EX, ["n127.selftest.sh"], 20), abr.run_tests(EX, ["n127.selftest.sh"], 20, True), abr.run_tests(EX, ["ok.selftest.sh"], 20)], ["indeterminado", "fail", "pass"])
+PYP = "import os, resource; print(resource.getrlimit(resource.RLIMIT_FSIZE), os.getsid(0) == os.getpid(), os.getpgid(0) == os.getpid())"
+chk("run_capped: o filho nasce com RLIMIT_FSIZE de 512 MiB e como lider de sessao (o killpg do prazo o alcanca)", lambda: abr.run_capped([sys.executable, "-I", "-c", PYP], None, {"PATH": os.environ["PATH"]}, 20), (0, "(536870912, 536870912) True True\n", ""))
+real_rm = shutil.rmtree
+def rm_strict(p, ignore_errors=False, *a, **k):
+    if not ignore_errors:
+        raise OSError("nao consegui apagar")
+    return real_rm(p, ignore_errors=True)
+shutil.rmtree = rm_strict   # dai em diante uma limpeza que nao passe ignore_errors=True levanta: o rc e a mensagem da rodada nao podem depender dela
+
+# (c) o laco do main() com run_task de mentira: cada tarefa e um passo do roteiro
+K = [0]
+def go(script, *more, roles=("dog",), pre=None, env=None):
+    reset()
+    os.environ.update(env or {})
+    K[0] += 1
+    sd = os.path.join(WD, "s%d" % K[0]); os.makedirs(sd)
+    tf, out = os.path.join(sd, "tasks.jsonl"), os.path.join(sd, "out.jsonl")
+    with open(tf, "w") as f:
+        for i, r in enumerate(roles):
+            f.write(json.dumps(task(i + 1, r)) + "\n")
+    if pre:
+        pre(out)
+    real = abr.run_task
+    abr.run_task = lambda c, t, role: script[t["task_id"]](c, t, role)
+    try:
+        r = safe(["--repo", REPO, "--prefix", PFX, "--state-dir", sd, "--claude", FAKE, "--config-ref", "main", "--day", "2026-01-01", "--out", out, "--tasks", tf] + list(more))
+    finally:
+        abr.run_task = real
+    return {"rc": r[0], "so": r[1], "se": r[2], "out": out, "sd": sd}
+def rec(estado, motivo="", ok=None, paid=0, ran=False):
+    def step(c, t, role):
+        if ran:
+            c.agent_ran = True
+        return abr.rec_of(c, t, role, estado, motivo, ok=ok, tokens_cobrados=paid)
+    return step
+def boom(ran=False):
+    def step(c, t, role):
+        if ran:
+            c.agent_ran = True
+        raise OSError("disco cheio")
+    return step
+def summ(r):
+    return json.loads(txt(r["out"] + ".summary.json"))
+def spent(r):
+    return json.loads(txt(os.path.join(r["sd"], "spend-2026-01-01.json")))["tokens"]
+D3 = ("dog",) * 3
+r = go({"ga-s1": rec("medida", ok=True, paid=100, ran=True), "ga-s2": rec("medida", "selftest_reprova_apos_agente", ok=False, paid=100, ran=True), "ga-s3": rec("medida", "selftest_reprova_apos_agente", ok=False, paid=100, ran=True)}, "--token-cap", "300", "--task-reserve-tokens", "100", roles=D3)
+chk("laco: gasto + reserva == teto ainda roda; gasto == teto nao excede; sem freio", lambda: (r["rc"], summ(r)["freio"], summ(r)["por_estado"], spent(r), summ(r)["teto_excedido"]), (0, None, {"medida": 3}, 300, False))
+chk("resumo: so a medida que passou soma no ok; taxa com 4 casas", lambda: summ(r)["por_papel"], {"dog": {"medidas": 3, "ok": 1, "taxa": 0.3333}})
+chk("resumo gravado com indent 1", lambda: txt(r["out"] + ".summary.json").split("\n")[1].startswith(" \"tarefas\""), True)
+r = go({"ga-s1": rec("medida", ok=True, paid=300, ran=True), "ga-s2": boom(), "ga-s3": boom(True)}, "--task-reserve-tokens", "50", roles=D3)
+chk("OSError: antes do agente nao cobra (a flag zera a cada tarefa), depois do agente cobra a reserva", lambda: ([(x["estado"], x["motivo"][:10], x["tokens_cobrados"]) for x in recs(r["out"])[1:]], spent(r)), ([("infra", "erro_de_io", 0), ("infra", "erro_de_io", 50)], 350))
+# um claude que nao inicia + um OSError que escapa do finally da tarefa (o git que remove o worktree): a reserva NAO e cobrada, a flag voltou a False
+real_git = abr.git
+def git_boom(repo, *a, **k):
+    r = real_git(repo, *a, **k)
+    if a[:2] == ("worktree", "remove"):
+        raise OSError("pipe quebrado")
+    return r
+SDB = os.path.join(WD, "sb"); os.makedirs(SDB)
+abr.git = git_boom
+try:
+    RB = safe(["--repo", REPO, "--prefix", PFX, "--state-dir", SDB, "--claude", BROKEN, "--config-ref", "main", "--day", "2026-01-01", "--out", os.path.join(SDB, "out.jsonl"), "--tasks", TASKS, "--task-reserve-tokens", "50"])
+finally:
+    abr.git = real_git
+chk("OSError depois de um agente que nao iniciou nao cobra a reserva", lambda: (RB[0], [(x["estado"], x["motivo"][:10], x["tokens_cobrados"]) for x in recs(os.path.join(SDB, "out.jsonl"))]), (0, [("infra", "erro_de_io", 0)]))
+real_aw = abr.atomic_write
+def aw(path, text):
+    if os.path.basename(path).startswith("spend-"):
+        raise OSError("sem espaco")
+    return real_aw(path, text)
+abr.atomic_write = aw
+try:
+    r = go({"ga-s1": rec("medida", ok=True, paid=300, ran=True), "ga-s2": rec("medida", ok=True, paid=300, ran=True)}, roles=("dog", "dog"))
+finally:
+    abr.atomic_write = real_aw
+chk("ledger que nao grava: rc 4, freio ledger_sem_gravar, a 2a tarefa e pulada", lambda: (r["rc"], [(x["estado"], x["motivo"]) for x in recs(r["out"])]), (4, [("medida", ""), ("pulada", "ledger_sem_gravar")]))
+r = go({}, pre=lambda out: os.makedirs(out + ".partial"))
+chk("saida parcial que nao abre: rc 4", lambda: (r["rc"], "gravar" in r["se"]), (4, True))
+r = go({"ga-s1": rec("medida", ok=True, paid=1, ran=True)}, pre=lambda out: os.makedirs(out + ".summary.json"))
+chk("resumo que nao grava: rc 4", lambda: (r["rc"], "resumo" in r["se"]), (4, True))
+real_mk = os.makedirs
+def mk(p, *a, **k):
+    if str(p).endswith("/home"):
+        raise OSError("sem espaco")
+    return real_mk(p, *a, **k)
+os.makedirs = mk
+try:
+    r = go({})
+finally:
+    os.makedirs = real_mk
+chk("HOME descartavel que nao nasce: rc 4 e o scratch nao sobra", lambda: (r["rc"], [x for x in os.listdir(os.environ["TMPDIR"]) if x.startswith("battery-")]), (4, []))
+SEEN = {}
+def cap(c, t, role):
+    SEEN["scratch"] = c.scratch
+    return abr.rec_of(c, t, role, "descartada", "x")
+TD = os.path.join(WD, "tmpd"); os.makedirs(TD); tempfile.tempdir = TD
+try:
+    go({"ga-s1": cap}, env={"TMPDIR": ""})
+finally:
+    tempfile.tempdir = None
+chk("TMPDIR vazio: o scratch nasce no diretorio temporario do tempfile, nunca no diretorio corrente (o mkdtemp com dir vazio do 3.12 ja devolve caminho absoluto)", lambda: os.path.normpath(os.path.dirname(SEEN["scratch"])), os.path.normpath(TD))
+r = go({"ga-s1": rec("descartada", "n\xe3o_serve")})
+raw = txt(r["out"])
+chk("registro, resumo e saida em UTF-8 cru; chaves do registro em ordem (config_sha primeiro)", lambda: ("n\xe3o_serve" in raw, raw.startswith("{\"config_sha\""), "n\xe3o_serve" in txt(r["out"] + ".summary.json"), "n\xe3o_serve" in r["so"]), (True, True, True, True))
+r = go({}, "--dry-run", roles=("dog", "p\xe1pel"))
+chk("dry-run: so o papel sem prompt entra em papeis_sem_prompt; o plano sai em UTF-8 cru", lambda: (json.loads(r["so"])["papeis_sem_prompt"], "p\xe1pel" in r["so"]), (["p\xe1pel"], True))
+def rcs(*more, roles=("dog",)):
+    r = go({}, "--dry-run", *more, roles=roles)
+    return r["rc"], r["se"]
+for flag, val in (("--token-cap", "0"), ("--task-reserve-tokens", "0"), ("--task-budget-usd", "0"), ("--agent-timeout", "0"), ("--selftest-timeout", "0"), ("--limit", "-1"), ("--infra-stop", "0")):
+    chk("uso errado: %s %s -> rc 2" % (flag, val), lambda: rcs(flag, val)[0], 2)
+chk("orcamento de 0.5 USD e valido", lambda: rcs("--task-budget-usd", "0.5")[0], 0)
+chk("--role-prompt valido da prompt a um papel que nao tinha", lambda: json.loads(go({}, "--dry-run", "--role-prompt", "wa-worker=agents/dog-remote/prompt.template.md", roles=("dog", "wa-worker"))["so"])["papeis_sem_prompt"], [])
+for bad in ("Bad=agents/x.md", "dog=../x.md", "dog"):
+    chk("--role-prompt %s -> rc 2" % bad, lambda: rcs("--role-prompt", bad)[0], 2)
+chk("--day fora do formato -> rc 2", lambda: rcs("--day", "2026-1-1")[0], 2)
+r = go({}, "--dry-run", pre=lambda out: wr(os.path.join(os.path.dirname(out), "tasks.jsonl.meta.json"), "{nao json"))
+chk(".meta.json ilegivel: rc 2 pela mensagem do .meta.json", lambda: (r["rc"], "ileg" in r["se"]), (2, True))
+chk("sem --state-dir e sem GC_CITY_PATH: rc 2", lambda: rcs("--state-dir", "")[0], 2)
+chk("limites validos: 1 e aceito em teto, reserva, prazos e --infra-stop", lambda: [rcs(f, "1")[0] for f in ("--token-cap", "--task-reserve-tokens", "--agent-timeout", "--selftest-timeout", "--infra-stop")], [0] * 5)
+r = go({}, "--dry-run", "--role-prompt", "wa-worker=scripts/aaa.sh", "--role-prompt", "ps-worker=scripts/bbb.sh", roles=("wa-worker", "ps-worker"))
+chk("config_sha: o NOME do prompt entra no hash (o mesmo blob em dois caminhos = hashes diferentes)", lambda: (lambda c: [len(c["wa-worker"]), c["wa-worker"] != c["ps-worker"]])(json.loads(r["so"])["config_sha"]), [64, True])
+reads, real_rl = iter([0, None]), abr.read_ledger
+abr.read_ledger = lambda p: next(reads)
+try:
+    r = go({"ga-s1": rec("medida", ok=True, paid=1, ran=True)})
+finally:
+    abr.read_ledger = real_rl
+chk("ledger ilegivel so na releitura com o lock: rc 5 e nada roda", lambda: (r["rc"], os.path.exists(r["out"])), (5, False))
+r = go({"ga-s1": rec("infra", "x"), "ga-s2": rec("infra", "x"), "ga-s3": rec("medida", ok=True, paid=1, ran=True), "ga-s4": rec("infra", "x"), "ga-s5": rec("infra", "x")}, "--infra-stop", "3", roles=("dog",) * 5)
+chk("so uma MEDIDA zera a sequencia de infra (infra, infra, medida, infra, infra nao para a rodada)", lambda: (r["rc"], summ(r)["freio"], summ(r)["por_estado"]), (0, None, {"infra": 4, "medida": 1}))
+real_blob = abr.blob
+abr.blob = lambda repo, sha: None
+try:
+    r = go({})
+finally:
+    abr.blob = real_blob
+chk("prompt do papel que o git nao le: rc 2 pela mensagem do prompt", lambda: (r["rc"], "prompt do papel" in r["se"]), (2, True))
+for label, ans in (("saida 0 que nao e sha", (0, "lixo")), ("rc 1 com saida de sha", (1, "a" * 40 + "\n"))):
+    abr.git = lambda repo, *a, _ans=ans, **k: _ans if a[:2] == ("rev-parse", "--verify") else real_git(repo, *a, **k)
+    try:
+        r = go({}, "--dry-run")
+    finally:
+        abr.git = real_git
+    chk("--config-ref que nao resolve (%s): rc 2 pela mensagem do --config-ref" % label, lambda: (r["rc"], "n\xe3o resolve" in r["se"]), (2, True))
+real_tf = abr.tree_files
+for k, frag in ((1, "ls-tree falhou em"), (2, "no prompt do papel")):
+    n = [0]
+    def tfk(*a, _k=k, _n=n):
+        _n[0] += 1
+        return None if _n[0] == _k else real_tf(*a)
+    abr.tree_files = tfk
+    try:
+        r = go({}, "--dry-run")
+    finally:
+        abr.tree_files = real_tf
+    chk("git ls-tree falhou (chamada %d): rc 2 com a mensagem certa" % k, lambda: (r["rc"], frag in r["se"]), (2, True))
+shutil.rmtree = real_rm
+print("DONE %d" % BAD[0])
+'
+UOUT="$(python3 -I -B -c "$PYU" "$TOOL" "$R" "$P" "$W/unit" "$FAKE" "$ST" "$ST/tasks.jsonl" "$W/unit/broken-claude" 2>&1)"
+printf '%s\n' "$UOUT" | grep -v '^DONE'
+check "em processo: o bloco foi até o fim e nenhuma checagem falhou" "$(printf '%s\n' "$UOUT" | sed -n 's/^DONE //p')" 0
 
 echo
 if [ "$FAILS" -eq 0 ]; then echo "tudo passou"; exit 0; fi
