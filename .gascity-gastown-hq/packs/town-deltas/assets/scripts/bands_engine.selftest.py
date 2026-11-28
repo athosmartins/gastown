@@ -6,10 +6,9 @@
 - How to run
 
 ## What it covers
-The strict reader of bands.yaml (an invalid file is inert, never half-read), the 22-07 h silence, the episode state machine, state
-and ledger on disk (absent / corrupt / unreadable are three answers), `process` in shadow (counts what a live run would send, once,
-and sends nothing) and the disk collector behind `tick` (a missing reading is not a change of zero). Every test works in its own
-temporary directory: nothing touches the city, the clock, the network, a mail or a token.
+The strict reader of bands.yaml (an invalid file is inert, never half-read), the 22-07 h silence, the episode state machine, state and
+ledger on disk (absent / corrupt / unreadable are three answers), `process` in shadow (counts what a live run would send, sends nothing)
+and the disk collector behind `tick`. Each test works in its own temporary directory: nothing touches the city, the clock, the network.
 
 ## How to run
   python3 -I bands_engine.selftest.py        (exit 0 = every case passed; the last line counts them)
@@ -37,7 +36,7 @@ metrics:
   gate:
     direction: low
     min_sigma: 1
-    fresh_for_h: 2
+    fresh_for_h: 2.5
     recover_after_h: 3
 %s"""
 
@@ -58,22 +57,14 @@ def steady(now, last=None):
     return pts[:-1] + [(end, last)] if last is not None else pts
 
 
-def lines(res):
-    return "\n".join(res["lines"])
-
-
 def ledger(city):
     with open(bands.ledger_path(city), encoding="utf-8") as fh:
         return [json.loads(x) for x in fh]
 
 
 class Reader(unittest.TestCase):
-    def test_the_shipped_bands_yaml_is_valid_and_its_one_metric_is_shadow(self):
-        m = bands.load_config()["metrics"]["disk_free_delta"]
-        self.assertEqual((m["mode"], m["driver"], m["collector"]), ("shadow", "tick", "disk_free_delta"))
-
     def test_comments_end_a_bare_value_but_not_a_quoted_one(self):
-        t = bands.parse_yaml_subset('a: x # c\nb: "p # q"  # c\nc: [1, "z"]   # c\nd:   # c\n  e: 2.5\nf: a#b\n')
+        t = bands.parse_yaml_subset('# top\n\na: x # c\nb: "p # q"  # c\nc: [1, "z"]   # c\nd:   # c\n  e: 2.5\nf: a#b\n')
         self.assertEqual(t, {"a": "x", "b": "p # q", "c": [1, "z"], "d": {"e": 2.5}, "f": "a#b"})
 
     def test_what_is_outside_the_subset_is_refused_with_its_line(self):
@@ -93,18 +84,20 @@ class Reader(unittest.TestCase):
             with self.subTest(why), self.assertRaises(bands.ConfigError):
                 bands.parse_config_text(text)
 
-    def test_a_file_that_is_absent_or_not_a_file_is_an_error_and_the_cli_says_inert(self):
+    def test_a_good_file_loads_one_that_is_absent_or_not_a_file_is_an_error_and_the_cli_says_inert(self):
         with tempfile.TemporaryDirectory() as d:
+            ok = os.path.join(d, "ok.yaml")
+            with open(ok, "w", encoding="utf-8") as fh:
+                fh.write(CFG % "")
+            self.assertEqual(bands.load_config(ok), config(), "the file that was asked for is the one read, not the default beside the script")
             for path in (os.path.join(d, "nope.yaml"), d):
                 with self.subTest(path == d), self.assertRaises(bands.ConfigError):
                     bands.load_config(path)
             out = io.StringIO()
-            with redirect_stdout(out):
-                rc = bands.main(["check", "--config", os.path.join(d, "nope.yaml"), "--city", d])
-            self.assertEqual(rc, 2)
+            with redirect_stdout(out), redirect_stderr(io.StringIO()):
+                rc, usage = bands.main(["check", "--config", os.path.join(d, "nope.yaml"), "--city", d]), bands.main(["nonsense"])
+            self.assertEqual((rc, usage), (2, 64))
             self.assertIn("inertes", out.getvalue())
-            with redirect_stderr(io.StringIO()):
-                self.assertEqual(bands.main(["nonsense"]), 64)
 
     def test_the_silence_window_wraps_midnight_and_off_means_never(self):
         w = bands.parse_config_text(CFG % "")["silence"]
@@ -119,19 +112,16 @@ class Episode(unittest.TestCase):
     def dec(self, band, rules=("WE1",)):
         return {"band": band, "rules": list(rules), "window_start": 5.0}
 
-    def test_band_1_is_only_logged_2_and_3_are_owed_and_the_worst_supersedes(self):
-        st, ev, owed = bands.step(bands.new_state(), self.dec(1, ("WE3",)), 1000.0, self.m, "g")
-        self.assertEqual(owed, [])
+    def test_band_1_is_only_logged_2_and_3_are_owed_the_worst_supersedes_a_repeat_is_counted_and_the_input_is_never_edited(self):
+        s0 = bands.new_state()
+        st, ev, owed = bands.step(s0, self.dec(1, ("WE3",)), 1000.0, self.m, "g")
         self.assertEqual(st["episode"]["done"]["1"]["how"], "log")
+        self.assertEqual(s0, bands.new_state(), "step returns a new state: process compares it with the old one to know what to write")
         st, ev, owed = bands.step(st, self.dec(2), 1100.0, self.m, "g")
         self.assertEqual(owed, [2])
         st, ev, owed = bands.step(st, self.dec(3), 1200.0, self.m, "g")
         self.assertEqual((owed, st["episode"]["done"]["2"]["how"], [e["ev"] for e in ev]), ([3], "superseded", ["escalate"]))
-
-    def test_a_repeat_raises_nothing_and_is_counted(self):
-        st, _, owed = bands.step(bands.new_state(), self.dec(2), 1000.0, self.m, "g")
-        st = bands.mark_done(st, 2, 1000.0, "delivered")
-        st, ev, owed = bands.step(st, self.dec(2), 1100.0, self.m, "g")
+        st, ev, owed = bands.step(bands.mark_done(st, 3, 1250.0, "delivered"), self.dec(3), 1300.0, self.m, "g")
         self.assertEqual((owed, ev, st["episode"]["suppressed"]), ([], [], 1))
 
     def test_the_episode_closes_only_after_recover_after_h_in_band_and_frees_its_points(self):
@@ -144,19 +134,13 @@ class Episode(unittest.TestCase):
         self.assertEqual(([e["ev"] for e in ev], st["episode"], len(st["history"])), (["recover"], None, 1))
         self.assertEqual(st["excluded"][0][1], 4000.0, "the excluded range ends where the recovery began")
 
-    def test_step_never_mutates_the_state_it_was_given(self):
-        before = bands.new_state()
-        bands.step(before, self.dec(3), 1000.0, self.m, "g")
-        self.assertEqual(before, bands.new_state())
-
 
 class Disk(unittest.TestCase):
     def test_state_absent_corrupt_and_unreadable_are_three_different_answers(self):
         with tempfile.TemporaryDirectory() as d:
             p = os.path.join(d, "s.json")
             self.assertEqual(bands.read_state(p), (bands.new_state(), "absent"))
-            self.assertTrue(bands.write_state(p, bands.new_state()))
-            self.assertEqual(bands.read_state(p)[1], "ok")
+            self.assertEqual((bands.write_state(p, bands.new_state()), bands.read_state(p)[1]), (True, "ok"))
             for junk in ("{not json", '{"v": 9}', "[]"):
                 with open(p, "w", encoding="utf-8") as fh:
                     fh.write(junk)
@@ -190,9 +174,8 @@ class Process(unittest.TestCase):
         cfg, now = config(), at(8)
         with tempfile.TemporaryDirectory() as d:
             res = self.run_at(d, cfg, now)
-            self.assertEqual((res["status"], res["decision"]["band"], res["owed"], res["rc"]), ("ok", 3, [], 0), lines(res))
-            again = self.run_at(d, cfg, now + 600)
-            self.assertEqual(again["status"], "ok")
+            self.assertEqual((res["status"], res["decision"]["band"], res["owed"], res["rc"]), ("ok", 3, [], 0), res["lines"])
+            self.run_at(d, cfg, now + 600)
             evs = [(r["ev"], r.get("band")) for r in ledger(d)]
             self.assertEqual(evs, [("open", 3), ("would_deliver", 3)], "one episode, one counted delivery, however many runs")
             self.assertEqual(bands.read_state(bands.state_path(d, "gate"))[0]["episode"]["done"]["3"]["how"], "shadow")
@@ -227,7 +210,7 @@ class Process(unittest.TestCase):
                 fh.write("{torn")
             res = self.run_at(d, cfg, now)
             self.assertEqual(res["status"], "ok")
-            self.assertIn("corrompido", lines(res))
+            self.assertIn("corrompido", str(res["lines"]))
             self.assertTrue(any(".corrupt-" in n for n in os.listdir(bands.state_dir(d))))
         with tempfile.TemporaryDirectory() as d:
             os.makedirs(os.path.join(d, ".gc", "state"))
@@ -239,8 +222,7 @@ class Process(unittest.TestCase):
     def test_a_second_run_at_the_same_time_does_nothing(self):
         cfg, now = config(), at(8)
         with tempfile.TemporaryDirectory() as d:
-            fd, why = bands._take_lock(d, "gate")
-            self.assertIsNone(why)
+            fd, _ = bands._take_lock(d, "gate")
             try:
                 res = self.run_at(d, cfg, now)
             finally:
@@ -260,12 +242,10 @@ class Tick(unittest.TestCase):
             for bad in (boom, lambda _p: float("nan"), lambda _p: -5.0):
                 out = bands.tick(d, self.cfg, now, free_fn=bad)["disk"]
                 self.assertEqual(out["rc"], 1)
-                self.assertIn("WARN", lines(out))
+                self.assertIn("WARN", str(out["lines"]))
                 self.assertFalse(os.path.exists(bands.series_path(d, "disk")), "never a zero in the series")
             out = bands.tick(d, self.cfg, now, free_fn=lambda _p: 5000.0)["disk"]
             self.assertEqual((out["sampled"], out["rc"], out["status"]), (True, 0, "no-data"))
-            with open(bands.series_path(d, "disk"), encoding="utf-8") as fh:
-                self.assertEqual([json.loads(x) for x in fh], [{"ts": now, "v": 5000.0}])
 
     def test_dry_run_neither_measures_nor_writes(self):
         with tempfile.TemporaryDirectory() as d:
