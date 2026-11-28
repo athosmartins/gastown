@@ -109,9 +109,11 @@ FAKE_DRIVER = r'''#!/usr/bin/env python3
 import json, os, sys, time
 d = os.environ["FAKE_SEC_DIR"]
 url = sys.stdin.read()
-with open(os.path.join(d, "driver.log"), "a") as f:
+log_p = os.path.join(d, "driver.log")
+first_call = not os.path.exists(log_p)
+with open(log_p, "a") as f:
     f.write(json.dumps({"argv": sys.argv[1:], "stdin_has_url": url.startswith("https://claude.ai/")}) + "\n")
-v = os.environ.get("FAKE_DRIVER_VERDICT", "ok")
+v = os.environ.get("FAKE_DRIVER_FIRST_VERDICT") if first_call and os.environ.get("FAKE_DRIVER_FIRST_VERDICT") else os.environ.get("FAKE_DRIVER_VERDICT", "ok")
 if v == "hang":
     time.sleep(120)
 print("some playwright chatter that is not json")
@@ -149,7 +151,7 @@ def fps(b):
 def _nothing_real_was_touched(tmp_path_factory):
     guard = tmp_path_factory.mktemp("guard")
     hits = guard / "hits.log"
-    for n in ("security", "claude", "open", "xdg-open", "gmail-totp", "notify"):
+    for n in ("security", "claude", "open", "xdg-open", "gmail-totp", "notify", "cdp"):
         (guard / n).write_text(f'#!/bin/sh\necho "$0 $*" >> "{hits}"\nexit 99\n')
         (guard / n).chmod(0o700)
     real = Path(os.path.expanduser("~/.claude/.credentials.json"))
@@ -203,7 +205,7 @@ class World:
                      "CLAUDE_CREW_CRED_FILE": str(self.d / "claude-home" / ".credentials.json"),
                      "CLAUDE_CREW_PROFILE_URL": f"http://127.0.0.1:{self.srv.server_address[1]}/profile", "CLAUDE_CREW_NOW": str(T0)}.items():
             monkeypatch.setenv(k, v)
-        for k in ("CLAUDE_CREW_ACCOUNTS", "FAKE_SEC_FAIL", "FAKE_CLAUDE_MODE", "FAKE_DRIVER_VERDICT", "FAKE_CLAUDE_BLOB", "FAKE_NOTIFY_RC", "FAKE_NOTIFY_CAP", "GC_LOGIN_RENEW"):
+        for k in ("CLAUDE_CREW_ACCOUNTS", "FAKE_SEC_FAIL", "FAKE_CLAUDE_MODE", "FAKE_DRIVER_VERDICT", "FAKE_DRIVER_FIRST_VERDICT", "FAKE_CLAUDE_BLOB", "FAKE_NOTIFY_RC", "FAKE_NOTIFY_CAP", "GC_LOGIN_RENEW"):
             monkeypatch.delenv(k, raising=False)
         monkeypatch.setenv("CLAUDE_CREW_ACCOUNTS", json.dumps(TEST_ACCOUNTS))
         monkeypatch.setattr(renew, "DRY", False, raising=False)  # main() sets it for the whole process: no test leaves a dry run behind
@@ -832,12 +834,15 @@ class _BtnPage(_FPage):
         if which.lower() in ("continuar", "continue", "permitir"):
             self.url = "http://localhost:5555/callback"
 
+    def screenshot(self, path, timeout=0):
+        Path(path).write_bytes(b"png")
 
-def _drive_one_page(monkeypatch, capsys, page):
+
+def _drive_one_page(monkeypatch, capsys, page, connect=None):
     import io
     import types
     ctx = types.SimpleNamespace(new_page=lambda: page, on=lambda ev, fn: None)
-    pw = types.SimpleNamespace(chromium=types.SimpleNamespace(connect_over_cdp=lambda *a, **k: types.SimpleNamespace(contexts=[ctx])))
+    pw = types.SimpleNamespace(chromium=types.SimpleNamespace(connect_over_cdp=connect or (lambda *a, **k: types.SimpleNamespace(contexts=[ctx]))))
     mod = types.ModuleType("playwright.sync_api")
     mod.sync_playwright = lambda: type("SP", (), {"__enter__": lambda s: pw, "__exit__": lambda s, *a: False})()
     monkeypatch.setitem(sys.modules, "playwright", types.ModuleType("playwright"))
@@ -1718,3 +1723,170 @@ def test_a_forced_dry_run_says_it_would_be_skipped_when_the_item_holds_no_login_
     assert renew.main(["--dry-run", "--account", EMAIL["b85"], "--force"]) == 0
     err = capsys.readouterr().err
     assert "would be SKIPPED" in err and "no login object" in err and "would renew it now" not in err and w.calls("claude") == []
+
+
+# ── ga-41u7k92: the browser the job drives was not there = infrastructure, NOT a try of the account ─────────────────────────────────────────────────
+# 22/11 and 27/11: two of the three tries of throw.away.amb@ were "the automation Chrome is not reachable"; the third made the mark failed_3_times and the account waited for a login by hand.
+def _cdp(w, *, answers=False, restart=(True, "`cdp restart` exit 0")):
+    """The seams of the browser: does it answer on its port, and what `cdp restart` does. Returns the list that records each restart."""
+    restarts = []
+    w.mp.setattr(renew, "cdp_answers", lambda: answers)
+    w.mp.setattr(renew, "cdp_restart", lambda: (restarts.append("restart"), restart)[1])
+    return restarts
+
+
+def test_a_browser_that_is_not_reachable_is_restarted_then_deferred_and_the_tries_stay_where_they_were(w, capsys):
+    old = blob("b85-old", rexp_days=3.0)
+    w.own("b85", old)
+    (w.d / "renew_state.json").write_text(json.dumps({"accounts": {EMAIL["b85"]: {"tries": 2}}}))      # two failed tries already: before the fix the next CDP failure was the mark
+    restarts = _cdp(w)
+    w.mp.setenv("FAKE_DRIVER_VERDICT", "cdp_unreachable")
+    assert w.run() == 2
+    out, a = capsys.readouterr().out, acct(w)
+    assert restarts == ["restart"] and len(w.calls("driver")) == 2                          # restarted once; the driver had ONE more go with the same URL
+    assert a["tries"] == 2 and a["infra_deferred"] == 1 and a["next_at"] == T0 + renew.INFRA_RETRY_S
+    assert w.mark() is None and w.calls("notify") == [] and w.get(w.svc("b85")) == old     # no mark, no push to Athos, the item as it was
+    assert "deferred (infra) #1" in out and "tries stay at 2 of 3" in out and " - failed try" not in out and "cdp restart` exit 0, and it is still not reachable" in out
+    assert "deferred (infra) #1" in w.log() and "try 3 of 3" not in w.log() and "failed_3_times" not in w.log()
+
+
+def test_a_browser_that_comes_back_after_the_restart_gets_the_renewal_through(w, capsys):
+    w.own("b85", blob("b85-old", rexp_days=3.0))
+    w.login_will_be("b85", blob("b85-new", rexp_days=30.0))
+    restarts = _cdp(w)
+    w.mp.setenv("FAKE_DRIVER_FIRST_VERDICT", "cdp_unreachable")                              # the first go cannot attach, the second one (driver default: ok) can
+    assert w.run() == 0 and restarts == ["restart"] and len(w.calls("driver")) == 2
+    assert "renewed" in capsys.readouterr().out and "infra_deferred" not in acct(w) and "tries" not in acct(w)
+
+
+def test_a_restart_that_cannot_run_is_said_and_the_driver_does_not_go_again(w, capsys):
+    w.own("b85", blob("b85-old", rexp_days=3.0))
+    _cdp(w, restart=(False, "`cdp restart` could not run (FileNotFoundError)"))
+    w.mp.setenv("FAKE_DRIVER_VERDICT", "cdp_unreachable")
+    assert w.run() == 2 and len(w.calls("driver")) == 1
+    out = capsys.readouterr().out
+    assert "could not run (FileNotFoundError)" in out and "deferred (infra) #1" in out and "tries" not in acct(w)
+    assert "does not answer" in w.log()
+
+
+def test_a_browser_that_answers_is_not_restarted_because_that_would_close_the_tabs_of_whatever_else_uses_the_profile(w, capsys):
+    w.own("b85", blob("b85-old", rexp_days=3.0))
+    restarts = _cdp(w, answers=True)
+    w.mp.setenv("FAKE_DRIVER_VERDICT", "cdp_unreachable")
+    assert w.run() == 2 and restarts == [] and len(w.calls("driver")) == 2                 # one more go, no restart
+    assert "answers on its port, so it was not restarted" in capsys.readouterr().out
+
+
+def test_the_scheduled_run_looks_again_after_30_minutes_not_6_hours_and_a_proof_clears_the_counter(w):
+    w.own("b85", blob("b85-old", rexp_days=3.0))
+    launched, outs = [], iter([("cdp_unreachable", "x", None), ("cdp_unreachable", "x", None), ("renewed", "", PROOF)])
+    w.mp.setattr(renew, "attempt", lambda email, reason, t: (launched.append(email), next(outs))[1])
+    renew.housekeeping()
+    assert launched == [EMAIL["b85"]] and acct(w)["infra_deferred"] == 1 and "tries" not in acct(w) and w.mark() is None
+    w.at(60)
+    renew.housekeeping()
+    assert len(launched) == 1                                                              # inside the wait: nothing launched
+    w.at(renew.INFRA_RETRY_S)
+    renew.housekeeping()
+    assert len(launched) == 2 and acct(w)["infra_deferred"] == 2 and acct(w)["next_at"] == T0 + 2 * renew.INFRA_RETRY_S and w.calls("notify") == []
+    w.at(2 * renew.INFRA_RETRY_S)
+    renew.housekeeping()
+    assert len(launched) == 3 and "infra_deferred" not in acct(w) and "next_at" not in acct(w) and acct(w)["renewed"]["after"]["rfp"] == "rrrr"
+
+
+def test_a_failed_try_that_did_reach_the_browser_ends_a_run_of_deferrals_and_counts(w):
+    w.own("b85", blob("b85-old", rexp_days=3.0))
+    script(w, ("cdp_unreachable", "x", None), ("no_full_login", "nothing new", None))
+    w.run()
+    assert acct(w)["infra_deferred"] == 1
+    w.run()
+    assert "infra_deferred" not in acct(w) and acct(w)["tries"] == 1                       # the browser was there this time: an ordinary failed try
+
+
+def test_the_driver_says_cdp_unreachable_when_it_cannot_attach_and_touches_nothing(monkeypatch, capsys):
+    def refuse(*a, **k):
+        raise TimeoutError("connect timed out")
+    v = _drive_one_page(monkeypatch, capsys, _BtnPage("https://claude.ai/login", "", ["Continue with Google"]), connect=refuse)
+    assert v["verdict"] == "cdp_unreachable" and "TimeoutError" in v["step"]
+    assert "cdp_unreachable" in renew.INFRA and "cdp_unreachable" not in renew.PERMANENT
+
+
+# 26/11 20:18Z throw.away.amb@: `unknown_screen: click_google at claude.ai/login`. The driver clicked «Continue with Google» three times in ~5 s (the popup it opens had no time to finish) and
+# then sat 195 s on a page it could not describe afterwards. It now waits for the popup flow and, when the deadline comes, leaves what the page showed in the log.
+def test_the_driver_clicks_continue_with_google_once_and_waits_for_the_flow_instead_of_clicking_again(monkeypatch, capsys, w):
+    monkeypatch.setattr(renew, "DRIVE_BUDGET_S", 0.3)
+    page = _BtnPage("https://claude.ai/login?returnTo=%2Foauth%2Fauthorize%3Fstate%3DSECRETSTATE", "Sign in to Claude", ["Continue with Google", "Continue with email"])
+    v = _drive_one_page(monkeypatch, capsys, page)                                         # the click does not leave the page: the Google popup is still on its way
+    assert v["verdict"] == "unknown_screen" and page.clicked == ["Continue with Google"]
+    log = w.log()
+    assert "no screen matched - at claude.ai/login" in log and "continue with google" in log and "Sign in to Claude" in log
+    assert "SECRETSTATE" not in log and "returnTo" not in log                             # the address is logged without its query
+    (shot,) = (w.d / "city" / ".gc" / "logs" / "claude-login-renew-screens").glob("*.png")
+    assert shot.read_bytes() == b"png" and oct(shot.stat().st_mode & 0o777) == "0o600" and str(shot) in log
+
+
+def test_the_driver_does_not_click_google_again_while_its_own_popup_is_open(monkeypatch, capsys):
+    monkeypatch.setattr(renew, "DRIVE_BUDGET_S", 0.3)
+    monkeypatch.setattr(renew, "GOOGLE_CLICK_GAP_S", 0)                                    # no time gap: only the open popup holds the second click back
+    popup = _FPage("https://accounts.google.com/o/oauth2/auth", "Loading", [])
+
+    class Opener(_BtnPage):
+        fns = None
+
+        def on(self, ev, fn):
+            self.fns = (self.fns or []) + [(ev, fn)]
+
+        def on_click(self, which):
+            [fn(popup) for ev, fn in (self.fns or []) if ev == "popup"]
+
+    page = Opener("https://claude.ai/login", "Sign in", ["Continue with Google"])
+    v = _drive_one_page(monkeypatch, capsys, page)
+    assert v["verdict"] == "unknown_screen" and page.clicked == ["Continue with Google"]
+    assert popup.closed is True                                                            # our own popup is closed on the way out like our own tab
+
+
+def test_the_driver_clicks_google_again_after_the_gap_when_the_flow_did_not_move(monkeypatch, capsys):
+    monkeypatch.setattr(renew, "DRIVE_BUDGET_S", 0.3)
+    monkeypatch.setattr(renew, "GOOGLE_CLICK_GAP_S", 0)                                    # no popup, no gap: the old behaviour (3 clicks, then the deadline) is what is left
+    page = _BtnPage("https://claude.ai/login", "Sign in", ["Continue with Google"])
+    v = _drive_one_page(monkeypatch, capsys, page)
+    assert v["verdict"] == "unknown_screen" and page.clicked == ["Continue with Google"] * 3
+
+
+# ga-41u7k92 (c): the mark of an account whose tries were spent on the browser being down is forgotten with the job's own lock and state writer, not with a hand-edited json.
+def test_reset_forgets_the_mark_and_the_tries_of_one_account_and_nothing_else_and_launches_and_pushes_nothing(w, capsys):
+    (w.d / "renew_state.json").write_text(json.dumps({"accounts": {
+        EMAIL["amb"]: {"tries": 3, "next_at": T0 + 99, "infeasible": {"verdict": "failed_3_times", "step": "error: x", "pushed": T0 - 5}, "last": {"verdict": "error"}, "renewed": {"svc": "s"}},
+        EMAIL["terr"]: {"infeasible": {"verdict": "no_google_session", "recheck_at": T0 + 50}}}}))
+    assert renew.main(["--reset", EMAIL["amb"].upper()]) == 0
+    a = w.state()["accounts"]
+    assert a[EMAIL["amb"]] == {"last": {"verdict": "error"}, "renewed": {"svc": "s"}}              # the marks and the wait are gone, the history stays
+    assert a[EMAIL["terr"]]["infeasible"]["verdict"] == "no_google_session"                       # another account is not touched
+    assert w.calls("claude") == [] and w.calls("driver") == [] and w.calls("notify") == []
+    out = capsys.readouterr().out
+    assert "forgot infeasible, tries, next_at" in out and "failed_3_times" in out and "reset by hand" in w.log()
+
+
+def test_reset_of_an_account_with_nothing_to_forget_writes_nothing_and_a_wrong_call_is_usage(w, capsys):
+    assert renew.main(["--reset", EMAIL["amb"]]) == 0 and not (w.d / "renew_state.json").exists()
+    assert "nothing to forget" in capsys.readouterr().out
+    for bad in (["--reset"], ["--reset", "not-an-email"], ["--reset", EMAIL["amb"], "--force"]):
+        assert renew.main(bad) == 64
+
+
+def test_reset_with_an_unreadable_state_changes_nothing_because_it_would_overwrite_the_marks_of_the_others(w, capsys):
+    (w.d / "renew_state.json").write_text("{not json")
+    assert renew.main(["--reset", EMAIL["amb"]]) == 1
+    assert (w.d / "renew_state.json").read_text() == "{not json" and "unreadable" in capsys.readouterr().err
+
+
+def test_an_account_that_was_reset_is_tried_by_the_next_scheduled_run(w):
+    w.own("b85", blob("b85-old", rexp_days=3.0))
+    (w.d / "renew_state.json").write_text(json.dumps({"accounts": {EMAIL["b85"]: {"tries": 3, "next_at": T0 + 6 * 3600, "infeasible": {"verdict": "failed_3_times", "step": "x"}}}}))
+    launched = []
+    w.mp.setattr(renew, "attempt", lambda email, reason, t: (launched.append(email), ("no_full_login", "x", None))[1])
+    renew.housekeeping()
+    assert launched == []                                                                  # marked: waits for a login by hand
+    assert renew.main(["--reset", EMAIL["b85"]]) == 0
+    renew.housekeeping()
+    assert launched == [EMAIL["b85"]]

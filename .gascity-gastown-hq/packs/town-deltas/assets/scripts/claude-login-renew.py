@@ -5,6 +5,7 @@
     claude-login-renew.py                                the scheduled run (launchd, every 15 min): lifts the marks of accounts somebody logged in by hand, retries the
                                                          pushes not yet delivered, and launches AT MOST ONE attempt, for the first account the forecast or the outage names
     claude-login-renew.py --dry-run                      the same, but it only SAYS (stderr): nothing launched, written or pushed
+    claude-login-renew.py --reset <email>                forget the mark and the tries of ONE account (ga-41u7k92), after whatever made them fail was fixed by hand; nothing is launched or pushed
     exit: 0 = ran (or nothing to do), 2 = a forced renewal that did not renew, 64 = usage, 1 = the run could not judge (unreadable state / crew state), could not take the lock
           or write its state, or crashed (the log says which)
 
@@ -47,6 +48,7 @@ CLAUDE_RENEW_CDP (default http://127.0.0.1:9222); and every CLAUDE_CREW_* seam o
 from __future__ import annotations
 
 import fcntl
+import http.client
 import importlib.util
 import json
 import os
@@ -57,6 +59,7 @@ import sys
 import tempfile
 import time
 import urllib.parse
+import urllib.request
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -91,6 +94,12 @@ CONTINUE_BUTTONS = ("continue", "continuar", "permitir")     # Google's consent 
 CONTINUE_BTN_RE = re.compile(r"^(?:continue|continuar|permitir)$", re.I)     # the click's name match: the same words as CONTINUE_BUTTONS, anchored, so «Cancelar» can never be the button clicked
 CHROME_FIX = ("no_google_session", "needs_password")     # fixed in the BROWSER: the job can see it worked. The others are fixed by a login by hand (the Keychain shows it)
 PERMANENT = ("puzzle", "no_google_session", "needs_password", "needs_device", "wrong_account")     # a retry cannot change these: a human can
+INFRA = ("cdp_unreachable",)    # ga-41u7k92: the browser the job drives was not there. Infrastructure, NOT a try of the account: no `tries`, no mark, no push - its own counter and a short wait
+INFRA_RETRY_S = 30 * 60         # a deferral (infra) is looked at again after this, not after the 6 h of a failed try: a browser that was down is usually back by the next run
+CDP_RESTART_TIMEOUT_S = 60      # `cdp restart` itself waits up to 20 s for the port
+GOOGLE_CLICK_GAP_S = 25         # ga-41u7k92: «Continue with Google» is clicked again only after this gap. NOT MEASURED that this is what ended the 26/11 try (it may be the popup flow needing more than the ~5 s the 3 clicks took); the log of the screen below is what will say
+SEEN_TEXT_CHARS = 300           # what the driver writes to the log of a screen it could not answer
+SCREEN_KEEP = 10                # screenshots kept next to the log (the oldest are deleted)
 DRY = False                     # --dry-run: logs go to stderr, nothing is written, nothing is pushed, nothing is launched
 
 
@@ -209,6 +218,44 @@ def put_back(svc: str, snap_acct: Optional[str], snap: Optional[dict]) -> bool:
     return r.returncode in (0, 44)
 
 
+def cdp_bin() -> str:
+    return os.environ.get("CLAUDE_RENEW_CDP_BIN") or shutil.which("cdp") or str(Path.home() / ".local" / "bin" / "cdp")
+
+
+def cdp_answers() -> bool:
+    """Does the automation Chrome answer on its debugging port? falhou (refused, timeout, a reply that is not an answer) -> False: a browser the job could not talk to is never called "up"."""
+    try:
+        with urllib.request.urlopen((os.environ.get("CLAUDE_RENEW_CDP") or CDP_URL).rstrip("/") + "/json/version", timeout=3) as r:
+            return r.status == 200
+    except (OSError, ValueError, http.client.HTTPException):
+        return False
+
+
+def cdp_restart() -> Tuple[bool, str]:
+    """`cdp restart` (kickstarts the launchd Chrome, waits up to 20 s for its port). (ran, what to say). `ran` only says the command succeeded: whether the browser is back is judged by the driver's next connect."""
+    try:
+        r = subprocess.run([cdp_bin(), "restart"], capture_output=True, text=True, errors="replace", timeout=CDP_RESTART_TIMEOUT_S, check=False, stdin=subprocess.DEVNULL)
+    except subprocess.TimeoutExpired:
+        return False, "`cdp restart` did not finish in time"
+    except (OSError, subprocess.SubprocessError) as e:
+        return False, f"`cdp restart` could not run ({type(e).__name__})"
+    return r.returncode == 0, f"`cdp restart` exit {r.returncode}"
+
+
+def recover_cdp(url: str, email: str, step: str) -> Tuple[str, str]:
+    """ga-41u7k92: the driver could not attach to the automation Chrome. Restart it when it does not answer at all, then give the driver ONE more go with the same URL (the CLI is still waiting for it).
+    Still not there -> the same verdict `cdp_unreachable`, which is infrastructure and never a try of the account (22/11 and 27/11: two of the three tries of throw.away.amb were this)."""
+    if cdp_answers():                  # it answers but the driver could not attach (a timeout under load): a restart would close the tabs of whatever else uses that profile - no restart, one more go
+        note = "the browser answers on its port, so it was not restarted"
+    else:
+        ok, note = cdp_restart()
+        rlog("WARN", f"{email}: the automation Chrome does not answer - {note}")
+        if not ok:
+            return "cdp_unreachable", f"{step} | {note}"
+    verdict, step2 = run_driver(url, email)
+    return (verdict, f"{step2} | {note}, and it is still not reachable") if verdict == "cdp_unreachable" else (verdict, step2)
+
+
 def attempt(email: str, reason: str, t: float) -> Tuple[str, str, Optional[dict]]:
     """(verdict, step, proof). verdict 'renewed' is the only success."""
     d = acct_dir(email)
@@ -233,6 +280,8 @@ def attempt(email: str, reason: str, t: float) -> Tuple[str, str, Optional[dict]
             verdict, step = "no_browser_request", "the CLI never asked for a browser"
         else:
             verdict, step = run_driver(url, email)
+            if verdict == "cdp_unreachable":
+                verdict, step = recover_cdp(url, email, step)
             url = ""
         try:
             cli.wait(CLI_WAIT_S if verdict == "ok" else 5)
@@ -478,14 +527,21 @@ def run_account(st: dict, crew: dict, email: str, reason: str, t: float) -> Tupl
         t = C.now()                                            # the attempt takes minutes: the marks, tries and pushes are dated when it ENDED
     left = None if v["best_left"] is None else v["best_left"] - (t - t0)      # as of `at` (the push shows the end of the login to the second)
     a["last"] = {"verdict": verdict, "step": step, "at": t}
+    if verdict not in INFRA and verdict != "skipped":          # a try that ended any other way ends the run of consecutive infra deferrals (the counter is for the log: nothing decides on it)
+        a.pop("infra_deferred", None)
     if proof:
-        for k in ("tries", "next_at", "infeasible"):
+        for k in ("tries", "next_at", "infeasible", "infra_deferred"):
             a.pop(k, None)
         a["renewed"] = proof
     elif verdict == "skipped":                                 # nothing was launched: not a failed try
         rlog("WARN", f"{email}: {step}")
     elif verdict in PERMANENT:
         mark_infeasible(st, email, verdict, step, left, t)
+    elif verdict in INFRA:                                     # ga-41u7k92: its own counter, a short wait, no mark, no push; `tries` stays where it was
+        a["infra_deferred"] = int(C._num(a.get("infra_deferred"))) + 1
+        a["next_at"] = t + INFRA_RETRY_S
+        rlog("WARN", f"{email}: deferred (infra) #{a['infra_deferred']} ({verdict}: {step}) - not a failed try: tries stay at {int(C._num(a.get('tries')))} of {MAX_TRIES}; "
+                     f"looked at again after {C._iso(a['next_at'])}")
     else:
         a["tries"] = int(C._num(a.get("tries"))) + 1
         a["next_at"] = t + RETRY_S
@@ -638,7 +694,10 @@ def run_once(email: str) -> int:
         line = f"{email}: NOT renewed ({verdict}: {step})"
     err = settle(st, [email], t)
     mark, tries = acct_rec(st, email).get("infeasible"), acct_rec(st, email).get("tries")
-    if not proof and verdict != "skipped" and not isinstance(mark, dict) and tries:
+    if not proof and verdict in INFRA:
+        line += (f" - deferred (infra) #{int(C._num(acct_rec(st, email).get('infra_deferred')))}: not a failed try, tries stay at {int(C._num(tries))} of {MAX_TRIES}; "
+                 f"the scheduled run looks again after {C._iso(C._num(acct_rec(st, email).get('next_at')))}")
+    elif not proof and verdict != "skipped" and not isinstance(mark, dict) and tries:
         line += f" - failed try {int(C._num(tries))} of {MAX_TRIES}"
     if isinstance(mark, dict):
         again = f"looked at again after {RECHECK_S // 3600} h" if mark.get("verdict") in CHROME_FIX else "no automatic retry until it is logged in by hand"
@@ -652,6 +711,32 @@ def run_once(email: str) -> int:
     rlog("INFO" if proof else "WARN", line)
     print(line)
     return 0 if proof else 2
+
+
+def reset_account(email: str) -> int:
+    """`--reset <email>` (ga-41u7k92): forget the wall mark, the tries, the wait and the infra deferrals of ONE account, for after whatever made them fail was fixed by hand (a browser that was down, a Google
+    session that was added). The history (`last`, `renewed`) and every other account stay. Nothing is launched or pushed: the next scheduled run judges the account from scratch, so a wall that is still
+    there is met - and pushed - again. 0 = done, or the account has nothing to forget; 1 = the state could not be read or written (said)."""
+    st, st_status = load_state()
+    if st_status == "unreadable":                              # vazio/missing = a first run: nothing to forget; ilegível = marks of OTHER accounts we cannot see and must not overwrite with an empty state
+        print(f"{email}: the state {state_path()} is unreadable - nothing changed (fix or remove it first)", file=sys.stderr)
+        return 1
+    a = (st.get("accounts") or {}).get(email)
+    gone = [k for k in ("infeasible", "tries", "next_at", "infra_deferred") if isinstance(a, dict) and k in a]
+    if not gone:
+        print(f"{email}: no mark, tries or wait in the state - nothing to forget")
+        return 0
+    before = {k: a[k] for k in gone if k in ("tries", "infra_deferred")} | ({"mark": a["infeasible"].get("verdict", "?")} if isinstance(a.get("infeasible"), dict) else {})
+    for k in gone:
+        a.pop(k)
+    err = save(st)
+    if err:
+        rlog("ERROR", f"{email}: the state could not be written ({type(err).__name__}): nothing was reset")
+        print(f"{email}: the state could not be written ({type(err).__name__}) - nothing was reset", file=sys.stderr)
+        return 1
+    rlog("INFO", f"{email}: reset by hand - forgot {', '.join(gone)} ({before}); the next scheduled run judges it from scratch")
+    print(f"{email}: forgot {', '.join(gone)} ({before}); the next scheduled run judges it from scratch (a wall that is still there is met, and pushed, again)")
+    return 0
 
 
 def housekeeping() -> int:
@@ -750,6 +835,33 @@ def look(pg) -> dict:
             "email_box": n("input[type=email]:visible, #identifierId:visible") > 0}
 
 
+def snapshot_screen(pg, email: str) -> None:
+    """ga-41u7k92: a screen no action matched (the 26/11 `unknown_screen: click_google at claude.ai/login` left nothing to read). Writes what the page shows to the log - its address WITHOUT the query, the buttons,
+    the fields and the first words of its text - and a screenshot beside it (the last SCREEN_KEEP are kept). Best effort and never raises: a failure to describe or photograph the page is said in the log, because this is evidence and never a step of the flow."""
+    try:
+        u = urllib.parse.urlparse(pg.url)
+        s = look(pg)
+        words = " ".join((s["text"] or "").split())[:SEEN_TEXT_CHARS] if s["text"] is not None else "(the page text could not be read)"
+        rlog("WARN", f"{email}: no screen matched - at {u.hostname or '?'}{u.path[:60]}; buttons={s['buttons'][:12]}; password_field={s['pw']} code_field={s['code']} email_box={s['email_box']}; text: {words!r}")
+    except Exception as e:  # noqa: BLE001
+        rlog("WARN", f"{email}: no screen matched, and the page could not be described ({type(e).__name__})")
+        return
+    try:
+        c = C.city()
+        d = c / ".gc" / "logs" / "claude-login-renew-screens" if c else None
+        if d is None or not (d.parent).is_dir():
+            return
+        d.mkdir(exist_ok=True)
+        f = d / f"{int(time.time())}-{re.sub(r'[^a-z0-9]+', '-', email.lower())}.png"
+        pg.screenshot(path=str(f), timeout=5000)
+        f.chmod(0o600)
+        for old in sorted(d.glob("*.png"))[:-SCREEN_KEEP]:
+            old.unlink(missing_ok=True)
+        rlog("WARN", f"{email}: screenshot of that page: {f}")
+    except Exception as e:  # noqa: BLE001
+        rlog("WARN", f"{email}: the screenshot of that page could not be taken ({type(e).__name__})")
+
+
 def drive() -> int:
     """stdin: the OAuth URL. stdout: json lines, the last one is the verdict. Never prints the URL, a page's text, an e-mail's password or a code."""
     email = os.environ.get("RENEW_EMAIL", "").strip().lower()
@@ -762,13 +874,14 @@ def drive() -> int:
         return say("error", "not an Anthropic OAuth url / no account")
     from playwright.sync_api import sync_playwright   # only importable from the homebrew python (3.14), which is why this is a separate process
     clicked: Dict[str, int] = {}
+    google_at = None                                 # when «Continue with Google» was last clicked
     auth_at = None                                   # when Authorize was clicked: ten quiet seconds after it (no puzzle) = the callback is on its way
     end = time.monotonic() + DRIVE_BUDGET_S
     with sync_playwright() as p:
         try:
             br = p.chromium.connect_over_cdp(os.environ.get("CLAUDE_RENEW_CDP") or CDP_URL, timeout=15000)
         except Exception as e:  # noqa: BLE001
-            return say("error", f"the automation Chrome is not reachable ({type(e).__name__}): `cdp restart`")
+            return say("cdp_unreachable", f"the automation Chrome is not reachable ({type(e).__name__})")      # ga-41u7k92: infrastructure, not an error of the flow: the caller restarts it and defers
         ctx = br.contexts[0]                         # the profile's own context: the Google session Athos signed in once
         owned = [ctx.new_page()]                     # ONLY our own tab and the popups IT opens: the profile is shared (federated-site-login, Athos), so a tab someone else opens is never read, clicked or closed
 
@@ -780,7 +893,8 @@ def drive() -> int:
         try:
             owned[0].goto(url, wait_until="domcontentloaded", timeout=30000)
             while time.monotonic() < end:
-                for pg in [q for q in owned if not q.is_closed()]:
+                live = [q for q in owned if not q.is_closed()]
+                for pg in live:
                     s = look(pg)
                     if s["text"] is None:
                         last = "the page text could not be read"
@@ -796,9 +910,14 @@ def drive() -> int:
                         return say("ok", "authorized, no challenge followed")
                     if act == "wait" or clicked.get(act, 0) >= 3:
                         continue
+                    # ga-41u7k92: a Google popup of ours that is still open is a flow in progress, and a click inside GOOGLE_CLICK_GAP_S of the last one gives it no time to finish: neither is clicked again.
+                    # (26/11: the result was `unknown_screen: click_google`, the 3 clicks fit in ~5 s of a 200 s budget; that the clicks were the cause is a hypothesis, snapshot_screen records what the page shows)
+                    if act == "click_google" and (len(live) > 1 or (google_at is not None and time.monotonic() - google_at < GOOGLE_CLICK_GAP_S)):
+                        continue
                     clicked[act] = clicked.get(act, 0) + 1
                     try:
                         if act == "click_google":
+                            google_at = time.monotonic()
                             pg.get_by_role("button", name=re.compile("continue with google", re.I)).first.click(timeout=5000)
                         elif act == "pick":
                             pg.locator("[data-identifier]").filter(has_text=re.compile(re.escape(email), re.I)).first.click(timeout=5000)
@@ -817,7 +936,10 @@ def drive() -> int:
                     except Exception as e:  # noqa: BLE001 - a click that did not take is looked at again; 3 tries per action, then the deadline decides
                         last = f"{act} failed ({type(e).__name__})"
                 time.sleep(1.5)
-            return say("unknown_screen", last)
+            shown = next((q for q in owned if not q.is_closed()), None)
+            if shown is not None:
+                snapshot_screen(shown, email)
+            return say("unknown_screen", last + " (what the page showed is in the log)")
         finally:
             for q in owned:
                 try:
@@ -835,9 +957,10 @@ def main(argv: List[str]) -> int:
     argv = [x for x in argv if x != "--dry-run"]
     i = argv.index("--account") + 1 if "--account" in argv else 0
     forced = "--force" in argv and 0 < i < len(argv)
-    if argv and not forced:
-        print("usage: claude-login-renew.py [--dry-run] [--account <email> --force]      (--account --force: renew that account's login now; no arguments: the scheduled run; "
-              "--dry-run only says what it would do)", file=sys.stderr)
+    reset = len(argv) == 2 and argv[0] == "--reset" and bool(EMAIL_RE.fullmatch(argv[1].strip()))
+    if argv and not forced and not reset:
+        print("usage: claude-login-renew.py [--dry-run] [--account <email> --force] | --reset <email>      (--account --force: renew that account's login now; --reset: forget that account's mark "
+              "and tries; no arguments: the scheduled run; --dry-run only says what it would do)", file=sys.stderr)
         return 64
     c = C.city()
     lock = (c / ".gc" / "claude-login-renew.lock") if c and (c / ".gc").is_dir() else state_path().with_suffix(".lock")
@@ -852,7 +975,7 @@ def main(argv: List[str]) -> int:
         rlog("ERROR", f"cannot take the lock ({type(e).__name__}) - nothing was done")
         return 1
     try:
-        return run_once(argv[i].strip().lower()) if forced else housekeeping()
+        return reset_account(argv[1].strip().lower()) if reset else run_once(argv[i].strip().lower()) if forced else housekeeping()
     except Exception as e:  # noqa: BLE001 - a launchd job that crashes silently is the failure this exists to remove
         rlog("ERROR", f"run failed ({type(e).__name__}: {str(e)[:120]})")
         return 1
