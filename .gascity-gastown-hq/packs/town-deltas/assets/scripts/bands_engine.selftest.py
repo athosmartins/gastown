@@ -30,6 +30,7 @@ bands = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(bands)
 
 H = 3600.0
+NO_DELIVERY = (bands.Driver(), None)   # a shadow metric never reaches the adapters: None would fail loudly if one did
 CFG = """version: 1
 silence: "22-07"
 metrics:
@@ -76,7 +77,7 @@ class Reader(unittest.TestCase):
 
     def test_a_config_that_cannot_be_trusted_raises_instead_of_loading_empty(self):
         bad = {"typo in a metric": CFG % "    directon: low\n", "knob out of range": CFG % "    test_points: 3\n",
-               "live before the delivery exists": CFG % "    mode: live\n", "tick without a collector": CFG % "    driver: tick\n",
+               "tick without a collector": CFG % "    driver: tick\n",
                "a collector without a path": CFG % "    driver: tick\n    collector: disk_free_delta\n", "unknown band action": CFG % "    actions:\n      band1: [mail]\n",
                "unknown top key": "version: 1\nsilnce: off\nmetrics:\n  a:\n    unit: x\n", "wrong version": "version: 2\nmetrics:\n  a:\n    unit: x\n",
                "no metrics": "version: 1\n", "empty silence window": (CFG % "").replace('"22-07"', '"07-07"'), "metric name": (CFG % "").replace("gate:", "Gate:")}
@@ -168,7 +169,7 @@ class Disk(unittest.TestCase):
 
 class Process(unittest.TestCase):
     def run_at(self, d, cfg, now, last=-300.0, **kw):
-        return bands.process(d, "gate", cfg, steady(now, last), now, **kw)
+        return bands.process(d, "gate", cfg, steady(now, last), now, *NO_DELIVERY, **kw)
 
     def test_a_drop_in_shadow_opens_one_episode_and_counts_one_delivery_that_was_not_sent(self):
         cfg, now = config(), at(8)
@@ -198,7 +199,7 @@ class Process(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             cases = {"no-data": [], "stale": steady(now - 5 * H), "learning": steady(now)[-10:], "bad-series": steady(now)[:-1] + [(now, float("nan"))]}
             for want, pts in cases.items():
-                res = bands.process(d, "gate", cfg, pts, now)
+                res = bands.process(d, "gate", cfg, pts, now, *NO_DELIVERY)
                 self.assertEqual((res["status"], res["decision"], res["rc"]), (want, None, 1 if want == "bad-series" else 0), want)
             self.assertFalse(os.path.exists(bands.state_path(d, "gate")), "nothing judged, nothing remembered")
 
@@ -240,16 +241,16 @@ class Tick(unittest.TestCase):
             raise OSError("no volume")
         with tempfile.TemporaryDirectory() as d:
             for bad in (boom, lambda _p: float("nan"), lambda _p: -5.0):
-                out = bands.tick(d, self.cfg, now, free_fn=bad)["disk"]
+                out = bands.tick(d, self.cfg, now, *NO_DELIVERY, free_fn=bad)["disk"]
                 self.assertEqual(out["rc"], 1)
                 self.assertIn("WARN", str(out["lines"]))
                 self.assertFalse(os.path.exists(bands.series_path(d, "disk")), "never a zero in the series")
-            out = bands.tick(d, self.cfg, now, free_fn=lambda _p: 5000.0)["disk"]
+            out = bands.tick(d, self.cfg, now, *NO_DELIVERY, free_fn=lambda _p: 5000.0)["disk"]
             self.assertEqual((out["sampled"], out["rc"], out["status"]), (True, 0, "no-data"))
 
     def test_dry_run_neither_measures_nor_writes(self):
         with tempfile.TemporaryDirectory() as d:
-            out = bands.tick(d, self.cfg, at(8), free_fn=lambda _p: 1 / 0, dry=True)["disk"]
+            out = bands.tick(d, self.cfg, at(8), *NO_DELIVERY, free_fn=lambda _p: 1 / 0, dry=True)["disk"]
             self.assertEqual((out["rc"], out["sampled"]), (0, False))
             self.assertFalse(os.path.exists(bands.state_dir(d)))
 
@@ -259,10 +260,10 @@ class Tick(unittest.TestCase):
             os.makedirs(os.path.dirname(bands.series_path(d, "disk")))
             with open(bands.series_path(d, "disk"), "w", encoding="utf-8") as fh:
                 fh.write(json.dumps({"ts": now - 40 * 86400.0, "v": 1.0}) + "\n" + json.dumps({"ts": now - 3600.0, "v": 2.0}) + "\n")
-            bands.tick(d, self.cfg, now, free_fn=lambda _p: 3.0)
+            bands.tick(d, self.cfg, now, *NO_DELIVERY, free_fn=lambda _p: 3.0)
             self.assertEqual([v for _, v in bands._read_samples(d, "disk")[0]], [2.0, 3.0])
         meter = config()   # a metric of driver meter belongs to its watcher: tick leaves it alone
-        self.assertEqual(bands.tick("/nonexistent", meter, now, free_fn=lambda _p: 1.0), {})
+        self.assertEqual(bands.tick("/nonexistent", meter, now, *NO_DELIVERY, free_fn=lambda _p: 1.0), {})
 
 
 def run():

@@ -1,0 +1,41 @@
+# bands.yaml — faixas estatísticas dos vigias (ga-4mzkfj9, Athos 28/11). Versionado: mudar uma faixa é um commit.
+# Lido por bands.py com um leitor ESTRITO de subconjunto de YAML (o /usr/bin/python3 do mini não tem PyYAML). Chave desconhecida ou
+# valor fora da faixa = erro, e erro deixa as faixas INERTES com a linha dizendo por quê. Como usar: docs/runbooks/alarm-bands.md
+version: 1
+
+# Horas locais (BRT) em que nada interrompe ninguém. "off" desliga. Métrica com evaluate_in_silence: true segue sendo julgada.
+silence: "22-07"
+
+# A entrega (só vale para métrica com mode: live); os valores abaixo são os do código. BANDS_DIAGNOSE=0 no ambiente desliga o
+# diagnóstico. A bead nasce ESTACIONADA para o Mayor: com exec:auto ou story:approved em labels ela é despachada sozinha.
+diagnose:
+  enabled: true
+  model: sonnet
+  effort: medium
+  max_usd: 0.5
+  timeout_s: 600
+  max_attempts: 2
+  max_per_day: 4
+bead:
+  enabled: true
+  route: "gastown.dog"
+  labels: [pilot:no-auto-dispatch]
+  assignee: "gastown.mayor"
+  max_attempts: 3
+  max_per_day: 2
+
+metrics:
+  disk_free_delta:
+    description: "queda do espaço livre do volume do Dolt e do swap, em MiB por hora. SÓ SOMBRA: os pisos fixos (dolt-disk-floor-guard e cia.) seguem agindo; isto conta o que as faixas diriam"
+    mode: shadow
+    driver: tick
+    collector: disk_free_delta
+    path: "/private/var/vm"
+    direction: low
+    unit: "MiB/h"
+    min_sigma: 100
+    baseline_days: 14
+    min_baseline_points: 48
+    fresh_for_h: 2
+    recover_after_h: 3
+    evaluate_in_silence: true
