@@ -288,6 +288,25 @@ default_sling_target = "ps-worker"
 [rigs.imports.gastown]
 source = ".gc/system/packs/gastown"
 
+# ga-af1ta5l (Athos 28/11 13:0x, AskUserQuestion «Sim, passar para o token (Recomendado)» em ga-xy0916u.1): os papéis POR RIG
+# (polecat/refinery/witness) rodam no token de 1 ano, como o pool (ga-xy0916u). Sem `provider` eles herdavam o `claude` padrão da
+# cidade = o MESMO login completo do Mayor (15 papéis, medido por claude-credential-map.py check). `claude-headless` passa a sessão
+# por claude-lowprio.sh, que a aponta para o item do pool (token inference-only, sem Remote Control). Só o provider: sem overlay_dir
+# (esses papéis rodam no diretório do rig e o overlay escreveria .claude/settings.json dentro do repo) e sem pre_start.
+# Efeito: a sessão VIVA troca no próximo lançamento (provider entra no fingerprint -> drena uma vez); modelo passa a Sonnet (--model do provider).
+# Reverter: apagar os blocos [[rigs.patches]] com provider = "claude-headless" abaixo (volta ao login do Mayor).
+[[rigs.patches]]
+agent = "polecat"
+provider = "claude-headless"
+
+[[rigs.patches]]
+agent = "refinery"
+provider = "claude-headless"
+
+[[rigs.patches]]
+agent = "witness"
+provider = "claude-headless"
+
 [[rigs]]
 name = "marketing"
 prefix = "ma"
@@ -302,6 +321,19 @@ suspended = true
 [rigs.imports.gastown]
 source = ".gc/system/packs/gastown"
 
+# ga-af1ta5l: polecat/refinery/witness no token — ver o bloco de property_scrapers acima.
+[[rigs.patches]]
+agent = "polecat"
+provider = "claude-headless"
+
+[[rigs.patches]]
+agent = "refinery"
+provider = "claude-headless"
+
+[[rigs.patches]]
+agent = "witness"
+provider = "claude-headless"
+
 [[rigs]]
 name = "lexbh"
 prefix = "lx"
@@ -315,6 +347,19 @@ suspended = true
 [rigs.imports.gastown]
 source = ".gc/system/packs/gastown"
 
+# ga-af1ta5l: polecat/refinery/witness no token — ver o bloco de property_scrapers acima.
+[[rigs.patches]]
+agent = "polecat"
+provider = "claude-headless"
+
+[[rigs.patches]]
+agent = "refinery"
+provider = "claude-headless"
+
+[[rigs.patches]]
+agent = "witness"
+provider = "claude-headless"
+
 [[rigs]]
 name = "gastown"
 prefix = "gt"
@@ -326,6 +371,19 @@ formulas_dir = "rig-overrides/formulas"
 # out to this rig.
 [rigs.imports.gastown]
 source = ".gc/system/packs/gastown"
+
+# ga-af1ta5l: polecat/refinery/witness no token — ver o bloco de property_scrapers acima.
+[[rigs.patches]]
+agent = "polecat"
+provider = "claude-headless"
+
+[[rigs.patches]]
+agent = "refinery"
+provider = "claude-headless"
+
+[[rigs.patches]]
+agent = "witness"
+provider = "claude-headless"
 
 [[rigs]]
 name = "whatsapp_automation"
@@ -344,6 +402,15 @@ default_sling_target = "wa-worker"
 [rigs.imports.gastown]
 source = ".gc/system/packs/gastown"
 
+# ga-af1ta5l: polecat/refinery/witness no token — ver o bloco de property_scrapers acima.
+[[rigs.patches]]
+agent = "polecat"
+provider = "claude-headless"
+
+[[rigs.patches]]
+agent = "witness"
+provider = "claude-headless"
+
 # ga-skuoh: refinery patrol's test_command needs WA's actual pytest venv, not
 # the Go-project default. mol-refinery-patrol's [vars.test_command] default is
 # intentionally empty in the canonical formula — this rig-scoped agent patch
@@ -361,6 +428,7 @@ source = ".gc/system/packs/gastown"
 # future pack re-materialization doesn't silently drop it.
 [[rigs.patches]]
 agent = "refinery"
+provider = "claude-headless"
 [rigs.patches.env]
 test_command = "/Users/athos/gt/whatsapp_automation/venv/bin/python3 -m pytest tests/ -q"
 
