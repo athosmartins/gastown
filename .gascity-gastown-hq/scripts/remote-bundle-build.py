@@ -102,6 +102,7 @@ POLICY = [
     ("home-scan-guard", "drop", "guarda do TCC do macOS; no Linux não há TCC"),
     ("cut-output-shadow", "drop", "experimento em sombra; o log é local do mini e ninguém o agregaria"),
     ("ask-athos-relay", "drop", "barra o menu AskUserQuestion no pane de pool do MINI (ga-ij162cl); o servidor fica só com a camada 3 (varredura do mini pelo peek do provider, NÃO provado ao vivo) até o bundle levar o hook"),
+    ("repro-lock-guard", "drop", "trava do teste que reproduz o bug (ga-89ix4m4): no mini o PreToolUse recusa editar o teste travado; o bundle do servidor AINDA não leva o hook (levá-lo é trabalho do builder), então no nó quem confere é o gate, que roda no mini e lê o git da submissão"),
     ("fuse-avoidance.sh", "drop", "CloudStorage/Mobile Documents não existem no servidor"),
     ("ntfy-prompt-submit.sh", "drop", "tópico ntfy privado + CLI notify; o servidor não guarda segredo"),
     ("ntfy-on-stop.sh", "drop", "idem ntfy-prompt-submit.sh"),
@@ -116,7 +117,7 @@ POLICY = [
 ]
 # drop em forma de wrapper: `: <marcador>; P='<cidade>/scripts/<marcador>.sh'; [ -f "$P" ] || <cauda gerada>` (home-scan-guard-activate.sh, overlays).
 # O prefixo é conferido; a cauda é gerada e não é lida: o manifest guarda o sha256 do comando inteiro para ela ser auditável.
-WRAPPERS = {"home-scan-guard", "cut-output-shadow", "ask-athos-relay"}
+WRAPPERS = {"home-scan-guard", "cut-output-shadow", "ask-athos-relay", "repro-lock-guard"}
 # drop de guarda do mini que roda de dentro da cidade (ga-2w0hiow): `python3 -I <cidade>/scripts/<token>`, a forma que o --selfcheck do próprio guarda exige. Só PreToolUse; o comando INTEIRO é conferido.
 CITY_PY = {"live-clone-git-guard.py"}
 GUARD, FILE_TOOLS = "remote-clone-guard.py", "Edit|Write|MultiEdit|NotebookEdit"

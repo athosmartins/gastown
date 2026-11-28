@@ -60,6 +60,16 @@
             "timeout": 5
           }
         ]
+      },
+      {
+        "matcher": "^(Edit|Write|MultiEdit|NotebookEdit)$",
+        "hooks": [
+          {
+            "type": "command",
+            "command": ": repro-lock-guard; P='/Users/athos/gt/.gascity-gastown-hq/scripts/repro-lock-guard.sh'; [ -f \"$P\" ] || exit 0; e=$(/bin/bash \"$P\" 2>&1 >/dev/null); r=$?; case \"$r:$e\" in 2:\"repro-lock-guard: BLOCKED\"*) printf \"%s\\n\" \"$e\" >&2; exit 2;; esac; exit 0",
+            "timeout": 10
+          }
+        ]
       }
     ],
     "PostToolUse": [

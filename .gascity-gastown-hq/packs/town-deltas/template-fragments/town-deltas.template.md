@@ -13,7 +13,7 @@ marcador de uma linha; `grep -n 'td:' <este arquivo>` lista os pontos de entrada
   engine-window-patch · nudge-permission-dialog · research-only-channels ·
   next-action-mayor-waiting · assignee-when-building · claudemd-carryover ·
   dolt-cleanup-hazards · e12-write-time-doctrine (título: Write-time doctrine — experiment E12 (ga-4q2zo5); GERADA por e12-crew-doctrine.sh a partir do e12_block_text; não edite o corpo à mão) ·
-  ram-heavy-hetzner (crew + dog/ps-worker/wa-worker) · witness-startup · patrol-bootstrap
+  ram-heavy-hetzner (crew + dog/ps-worker/wa-worker) · repro-lock (dog/ps-worker/wa-worker) · witness-startup · patrol-bootstrap
 */ -}}
 {{/* td:core:intro */ -}}
 ### Town Deltas (ADITIVO — não substitui operational-awareness nativo)
@@ -1204,6 +1204,14 @@ ninguém aplica.
 - "Failed" has to land in the inert state (do nothing, keep the old value, raise an alarm) — never the same result as "empty", and never a destructive default. If you cannot fill in both halves, decide first, then write the read.
 - A read that has not answered yet is a third state too (it showed up twice in UI slices this week): while it is pending, draw "Carregando…" — never the empty verdict ("Nada por aqui ainda.") — and put a timeout on the request that lands in the error state, so a read that never answers cannot leave "nobody" on the screen for good.
 - Before you run the gate-done skill, re-read every comment in your own diff and ask "does the code next to it do exactly this?" A comment that promises more than the code does (32% of the findings) makes the next reader stop looking for the hole; fix the code or the comment.
+
+{{ end -}}
+{{ if or (eq .TD_ROLE "dog") (eq .TD_ROLE "ps-worker") (eq .TD_ROLE "wa-worker") -}}{{/* td:repro-lock */ -}}
+**Bead tipo BUG: o teste que reproduz o bug entra num commit PRÓPRIO e fica TRAVADO antes do conserto (ga-89ix4m4; runbook `docs/runbooks/repro-lock.md`).** O gate só conferia em metade das submissões se o teste novo falha no código antigo, e nada impedia afrouxar o teste enquanto se conserta. O tipo está em `bd show <bead>`; feature, tarefa e crews ficam como estão. Fluxo:
+1. Escreva o teste SEM tocar no código; rode-o e veja falhar pelo motivo certo (a asserção do bug, não um ImportError).
+2. `python3 "$GC_CITY_PATH/scripts/repro-lock.py" lock <bead> --cmd '<comando do teste>' <arquivos de teste>`: comita só o teste como 1º commit da branch (com trailers), confere que ele FALHA no código de hoje e comenta a bead. Commit do teste feito à mão não tem trailer, então não tem trava. No nó (dog-remote) o caminho é `python3 .gascity-gastown-hq/scripts/repro-lock.py` e o hook que barra a edição não chega lá: quem confere é o gate.
+3. Conserte o CÓDIGO. O hook recusa Edit/Write nos arquivos travados; mais casos vão em OUTRO arquivo de teste. Não contorne por Bash (sed -i, redirecionamento): o passo 2f do gate compara o commit e recusa.
+4. Depois do gate-done: `repro-lock.py done <bead>`. Teste com defeito REAL: `repro-lock.py release <bead> --reason "<o que está errado, 20+ caracteres>"` ANTES de editá-lo; o motivo vai à bead e ao revisor, e sem ele o gate recusa.
 
 {{ end -}}
 {{ if not .TD_ROLE -}}{{/* td:witness-startup */ -}}

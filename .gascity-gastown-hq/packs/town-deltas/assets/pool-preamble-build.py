@@ -553,13 +553,14 @@ def guard_paths(cfg):
 
 
 def hook_dirs(cfg, marker):
-    """Os diretórios `D='...'` que os comandos de hook com `marker` registram, em qualquer evento."""
+    """Os diretórios que os comandos de hook com `marker` registram, em qualquer evento: `D='<pasta>'` (pytest-shim) ou `P='<pasta>/<script>'` (wrapper de guarda,
+    ga-89ix4m4: a pasta do script é onde `live_file` mora)."""
     out = []
     hooks = cfg.get("hooks")
     for entries in (hooks.values() if isinstance(hooks, dict) else []):
         for e in entries if isinstance(entries, list) else []:
             for h in (e.get("hooks") if isinstance(e, dict) and isinstance(e.get("hooks"), list) else []):
-                mm = re.search(r"D='([^']+)'", _cmd(h)) if marker in _cmd(h) else None
+                mm = (re.search(r"D='([^']+)'", _cmd(h)) or re.search(r"P='([^']+)/[^'/]+'", _cmd(h))) if marker in _cmd(h) else None
                 if mm and mm.group(1) not in out:   # dois eventos do mesmo atalho apontam o MESMO diretório: uma vez só
                     out.append(mm.group(1))
     return out

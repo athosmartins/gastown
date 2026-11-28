@@ -221,7 +221,7 @@ expect_fail "overlay commitado do wa-worker sem o hook SessionStart do pytest-sh
 reset_tree; python3 - "$T/packs/town-deltas/assets/claude-overlays/pool-roles.json" <<'PYEOF'
 import json, sys
 p = sys.argv[1]; m = json.load(open(p))
-for r in ("wa-worker", "ps-worker"): del m["roles"][r]["hooks_extra"]
+for r in m["roles"]: m["roles"][r].pop("hooks_extra", None)  # todos os papéis: o dog também lista um (repro-lock, ga-89ix4m4)
 del m["common"]["hooks_extra_defs"]
 json.dump(m, open(p, "w"), indent=1, ensure_ascii=False); open(p, "a").write("\n")
 PYEOF
@@ -295,7 +295,12 @@ if o="$(PP_ASSETS_DIR="$T/packs/town-deltas/assets" python3 "$BUILD" live --gt-r
 chmod 644 "$LIVEROOT/.gascity-gastown-hq/scripts/pytest-shim/bin/python3"
 if o="$(PP_ASSETS_DIR="$T/packs/town-deltas/assets" python3 "$BUILD" live --gt-root "$LIVEROOT" 2>&1)"; then bad "live deveria dar INERT para o atalho sem bit de execução"; else echo "$o" | grep -q 'INERT.*wa-worker.*pytest-shim' && ok "live: atalho de pytest presente mas NÃO executável = INERT no worker, rc != 0" || bad "live: sem INERT do atalho não executável no output: $o"; fi
 chmod 755 "$LIVEROOT/.gascity-gastown-hq/scripts/pytest-shim/bin/python3"
-if o="$(PP_ASSETS_DIR="$T/packs/town-deltas/assets" python3 "$BUILD" live --gt-root "$LIVEROOT" 2>&1)" && [ "$(echo "$o" | grep -c '^  LIVE')" = "8" ]; then ok "live: guard + atalho presentes = 4 guards e, por worker, python3 + venv-rewrite-hook.py (2 papéis × 2) LIVE, rc 0"; else bad "live: esperava 8 LIVE e rc 0: $o"; fi
+# ga-89ix4m4: o hook da trava de teste é `[ -f "$P" ] || exit 0`; `live` confere o script (executável) e o motor ao lado nos TRÊS construtores, e o revisor não o tem
+if o="$(PP_ASSETS_DIR="$T/packs/town-deltas/assets" python3 "$BUILD" live --gt-root "$LIVEROOT" 2>&1)"; then bad "live deveria dar INERT sem repro-lock-guard.sh"; else echo "$o" | grep -q 'INERT.*dog.*repro-lock-guard.sh' && echo "$o" | grep -q 'INERT.*ps-worker.*repro-lock.py' && ! echo "$o" | grep -q 'reviewer.*repro-lock' && ok "live: pytest-shim presente mas repro-lock-guard.sh/repro-lock.py AUSENTES = INERT em dog, wa-worker e ps-worker, rc != 0" || bad "live: sem INERT da trava de teste no output: $o"; fi
+: > "$LIVEROOT/.gascity-gastown-hq/scripts/repro-lock.py"; : > "$LIVEROOT/.gascity-gastown-hq/scripts/repro-lock-guard.sh"; chmod 644 "$LIVEROOT/.gascity-gastown-hq/scripts/repro-lock-guard.sh"
+if o="$(PP_ASSETS_DIR="$T/packs/town-deltas/assets" python3 "$BUILD" live --gt-root "$LIVEROOT" 2>&1)"; then bad "live deveria dar INERT para repro-lock-guard.sh sem bit de execução"; else echo "$o" | grep -q 'INERT.*wa-worker.*repro-lock-guard.sh' && ok "live: repro-lock-guard.sh presente mas NÃO executável = INERT no worker, rc != 0" || bad "live: sem INERT do script sem bit de execução: $o"; fi
+chmod 755 "$LIVEROOT/.gascity-gastown-hq/scripts/repro-lock-guard.sh"
+if o="$(PP_ASSETS_DIR="$T/packs/town-deltas/assets" python3 "$BUILD" live --gt-root "$LIVEROOT" 2>&1)" && [ "$(echo "$o" | grep -c '^  LIVE')" = "14" ]; then ok "live: guard + atalho + trava de teste presentes = 4 guards e, por worker, python3 + venv-rewrite-hook.py (2 papéis × 2) e repro-lock-guard.sh + repro-lock.py (3 papéis × 2) LIVE, rc 0"; else bad "live: esperava 14 LIVE e rc 0: $o"; fi
 reset_tree; python3 - "$T/packs/town-deltas/assets/claude-overlays/pool-roles.json" <<'EOF'
 import json, sys
 p = sys.argv[1]; m = json.load(open(p)); m["common"]["hooks"]["PreToolUse"][0]["hooks"][0]["if"] = "Bash(du *)"

@@ -78,13 +78,14 @@ NOTIFY='export PATH=\"$HOME/go/bin:$HOME/.local/bin:$PATH\" && '
 # a forma REAL dos hooks de guarda do mini (home-scan-guard-activate.sh / overlays): `: marcador; P='<cidade>/scripts/<marcador>.sh'; <cauda>`
 WRAP_TAIL_GUARD='[ -f "$P" ] || exit 0; e=$(/bin/bash "$P" 2>&1 >/dev/null); r=$?; case "$r:$e" in 2:"home-scan-guard: BLOCKED"*) printf "%s\n" "$e" >&2; exit 2;; 0:*) exit 0;; esac; L="${HOME_SCAN_GUARD_LOG:-${HOME:-/tmp}/.gastown/logs/home-scan-guard.log}"; exit 0'
 WRAP_TAIL_ASK='[ -f "$P" ] || exit 0; e=$(/bin/bash "$P" 2>&1 >/dev/null); r=$?; case "$r:$e" in 2:"ask-athos-relay: BLOCKED"*) printf "%s\n" "$e" >&2; exit 2;; esac; exit 0'
+WRAP_TAIL_REPRO='[ -f "$P" ] || exit 0; e=$(/bin/bash "$P" 2>&1 >/dev/null); r=$?; case "$r:$e" in 2:"repro-lock-guard: BLOCKED"*) printf "%s\n" "$e" >&2; exit 2;; esac; exit 0'
 WRAP_TAIL_SHADOW='[ -f "$P" ] || { printf '"'{}'"'; exit 0; }; /bin/bash "$P"'
 wrapper() { printf ": %s; P='%s/scripts/%s.sh'; %s" "$1" "$2" "$1" "$3"; }  # wrapper MARCADOR CIDADE CAUDA
 jstr() { jq -Rn --arg s "$1" '$s'; }  # texto → string JSON (com as aspas)
 
 fixture() {  # fixture DIR — cidade + ~/.claude + papel "dog" com os mesmos tipos de hook do mini
   local d=$1 c=$1/gt/.gascity-gastown-hq h=$1/home/.claude
-  local gw sw aw; gw=$(jstr "$(wrapper home-scan-guard "$c" "$WRAP_TAIL_GUARD")"); sw=$(jstr "$(wrapper cut-output-shadow "$c" "$WRAP_TAIL_SHADOW")"); aw=$(jstr "$(wrapper ask-athos-relay "$c" "$WRAP_TAIL_ASK")")
+  local gw sw aw rw; gw=$(jstr "$(wrapper home-scan-guard "$c" "$WRAP_TAIL_GUARD")"); sw=$(jstr "$(wrapper cut-output-shadow "$c" "$WRAP_TAIL_SHADOW")"); aw=$(jstr "$(wrapper ask-athos-relay "$c" "$WRAP_TAIL_ASK")"); rw=$(jstr "$(wrapper repro-lock-guard "$c" "$WRAP_TAIL_REPRO")")
   mkdir -p "$c/.gc/agents/dog/.claude" "$c/skills/ok-skill" "$h/hooks" "$d/gt/.claude"
   printf '#!/usr/bin/env bash\ncat >/dev/null; jq -n "{}"\n' > "$h/hooks/filter-bash-output.sh"
   printf '#!/usr/bin/env bash\nexit 0\n' > "$h/hooks/ntfy-on-stop.sh"; chmod +x "$h"/hooks/*.sh
@@ -103,7 +104,7 @@ EOF
 EOF
   cat > "$c/.gc/agents/dog/.claude/settings.json" <<EOF
 {"claudeMdExcludes": ["$d/gt/CLAUDE.md"], "autoMemoryEnabled": false, "enabledPlugins": {"x": true},
- "hooks": {"PostToolUse": [{"matcher": "^Bash\$", "hooks": [{"type": "command", "command": ${sw}}]}], "PreToolUse": [{"matcher": "^AskUserQuestion\$", "hooks": [{"type": "command", "command": ${aw}}]}]}}
+ "hooks": {"PostToolUse": [{"matcher": "^Bash\$", "hooks": [{"type": "command", "command": ${sw}}]}], "PreToolUse": [{"matcher": "^AskUserQuestion\$", "hooks": [{"type": "command", "command": ${aw}}]}, {"matcher": "^(Edit|Write|MultiEdit|NotebookEdit)\$", "hooks": [{"type": "command", "command": ${rw}}]}]}}
 EOF
   echo 'SENTINEL_LOCAL_PERMS_9f3a' > "$h/settings.local.json"; cp "$h/settings.local.json" "$d/gt/.claude/settings.local.json"
   echo 'SENTINEL_LOCAL_PERMS_9f3a' > "$c/.gc/agents/dog/.claude/settings.local.json"
@@ -138,7 +139,8 @@ has "$O/home/.claude/settings.json" '"/home/runner/rr/work"'; ok $? "additionalD
 has "$O/role/dog/.claude/settings.json" '/home/runner/rr/work/CLAUDE.md'; ok $? "claudeMdExcludes reescrito"
 [ -x "$O/home/.claude/hooks/filter-bash-output.sh" ]; ok $? "hook keep presente e executável"
 grep -rqi ntfy "$O/home" "$O/city"; g=$?; [ ! -e "$O/home/.claude/hooks/ntfy-on-stop.sh" ] && [ $g = 1 ]; ok $? "hook drop (ntfy) ausente do bundle e das settings"
-grep -q 'home-scan-guard\|cut-output-shadow\|ask-athos-relay' "$O/city/settings.json" "$O/role/dog/.claude/settings.json"; [ $? = 1 ]; ok $? "hooks drop do city e do papel saíram"
+grep -q 'home-scan-guard\|cut-output-shadow\|ask-athos-relay\|repro-lock-guard' "$O/city/settings.json" "$O/role/dog/.claude/settings.json"; [ $? = 1 ]; ok $? "hooks drop do city e do papel saíram"
+jq -e '[.hooks[] | select(.token == "repro-lock-guard")] | length == 1 and .[0].verdict == "drop" and .[0].source == "role:dog" and .[0].event == "PreToolUse"' "$O/manifest.json" >/dev/null; ok $? "o hook repro-lock-guard do papel entra no manifest como drop, com o sha do comando inteiro"
 has "$O/city/settings.json" 'export PATH=\"$HOME/go/bin:$HOME/.local/bin:$PATH\" && gc handoff --auto \"context cycle\"'; ok $? "shim fica VERBATIM (handoff, com o export do PATH)"
 has "$O/city/settings.json" 'GC_MANAGED_SESSION_HOOK=1 GC_HOOK_EVENT_NAME=SessionStart gc prime --hook --hook-format codex'; ok $? "shim fica VERBATIM (prime, com as variáveis)"
 [ "$(jq -c .shim_needs "$O/manifest.json")" = '["handoff --auto \"context cycle\"","mail check --inject","nudge drain --inject","prime --hook --hook-format codex"]' ]; ok $? "shim_needs lista os 4 subcomandos do gc"
@@ -655,7 +657,7 @@ fresh; sed '/"filter-bash-output.sh", "keep"/d' "$B" > "$T/mutant.py"
 python3 -I "$T/mutant.py" build --city "$T/f/gt/.gascity-gastown-hq" --claude-home "$T/f/home/.claude" --mini-home "$T/f/home" --role dog \
   --role-dir "$T/f/gt/.gascity-gastown-hq/.gc/agents/dog" --remote-root /home/runner/rr --remote-home /home/runner --clone-guard "$GUARD" --out "$T/f/mut" 2>/dev/null
 [ $? = 3 ]; ok $? "controle negativo: sem a linha de filter-bash-output.sh na POLICY o build é recusado"
-for row in '"gt tap guard cross-clone-block", "swap"' '"home-scan-guard", "drop"' '"ntfy-on-stop.sh", "drop"' '"ask-athos-relay", "drop"'; do
+for row in '"gt tap guard cross-clone-block", "swap"' '"home-scan-guard", "drop"' '"ntfy-on-stop.sh", "drop"' '"ask-athos-relay", "drop"' '"repro-lock-guard", "drop"'; do
   fresh; grep -qF "$row" "$B"; ok $? "  a POLICY tem a linha $row (o sed abaixo não é um no-op)"
   grep -vF "$row" "$B" > "$T/mutant.py"
   python3 -I "$T/mutant.py" build --city "$T/f/gt/.gascity-gastown-hq" --claude-home "$T/f/home/.claude" --mini-home "$T/f/home" --role dog \
