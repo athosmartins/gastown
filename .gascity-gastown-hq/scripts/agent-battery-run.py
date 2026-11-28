@@ -55,17 +55,14 @@ ROLE_PROMPTS = {"dog": "agents/dog-remote/prompt.template.md", "wa-worker": "age
 CONFIG_PATHS = (".claude", "CLAUDE.md")  # + <prefix>/CLAUDE.md
 FSIZE = 512 * 1024 * 1024
 KEEP_SECRET = ("CLAUDE_CODE_OAUTH_TOKEN", "ANTHROPIC_API_KEY")
-KEEP_ENV = ("PATH", "LANG", "LC_ALL", "LC_CTYPE", "TERM", "USER", "LOGNAME", "CLAUDE_CONFIG_DIR")  # lista de PERMITIDOS: o resto do ambiente não passa
-
+KEEP_ENV = ("PATH", "LANG", "LC_ALL", "LC_CTYPE", "TERM", "USER", "LOGNAME")  # lista de PERMITIDOS: o resto do ambiente não passa
 
 def die(code, msg):
     print("agent-battery-run: " + msg, file=sys.stderr)
     sys.exit(code)
 
-
 def _limits():
     resource.setrlimit(resource.RLIMIT_FSIZE, (FSIZE, FSIZE))
-
 
 def run_capped(argv, cwd, env, timeout, stdin_text=None):
     """(rc, out, err) — rc None = não rodou (binário ausente) ou estourou o prazo (o grupo todo é morto): 'não sei', nunca 0 nem falha."""
@@ -84,10 +81,8 @@ def run_capped(argv, cwd, env, timeout, stdin_text=None):
         return None, "", ""
     return p.returncode, out, err
 
-
 def git(repo, *args, timeout=300):
     return run_capped(["git", "-C", repo] + list(args), None, dict(os.environ, GIT_TERMINAL_PROMPT="0"), timeout)[:2]
-
 
 def tree_files(repo, ref, paths):
     """[(nome, blob_sha, modo)] dos arquivos comuns sob `paths` em `ref`. None = git falhou (≠ lista vazia, que é 'não há')."""
@@ -102,7 +97,6 @@ def tree_files(repo, ref, paths):
             res.append((name, f[2], f[0]))
     return sorted(res)
 
-
 def blob(repo, sha):
     """bytes do blob; None = não consegui ler (um blob vazio legítimo é b'')."""
     try:
@@ -110,7 +104,6 @@ def blob(repo, sha):
     except (OSError, subprocess.TimeoutExpired):
         return None
     return p.stdout if p.returncode == 0 else None
-
 
 def write_into(wt, name, data, mode):
     dest = os.path.join(wt, name)
@@ -125,7 +118,6 @@ def write_into(wt, name, data, mode):
     os.chmod(dest, 0o755 if mode == "100755" else 0o644)
     return True
 
-
 def put_files(repo, wt, entries):
     for name, sha, mode in entries:
         data = blob(repo, sha)
@@ -133,11 +125,9 @@ def put_files(repo, wt, entries):
             return False
     return True
 
-
 def good_path(p, rx, roots=ROOTS):
     return (isinstance(p, str) and rx.match(p) is not None and p.startswith(roots) and "//" not in p
             and ".." not in p.split("/") and "." not in p.split("/"))
-
 
 def validate(t):
     """None se a tarefa serve; senão o motivo. O que o acervo traz NUNCA vai para um shell: só estes campos, só estas regex."""
@@ -158,37 +148,31 @@ def validate(t):
         return "argumento_invalido:enunciado"
     return None
 
-
 def suite_state(rcs):
     """pass | fail | indeterminado. 126/127/None = o teste nem rodou: não é falha, é 'não sei' (nunca vira 'reprovou')."""
     if any(r not in (None, 0, 126, 127) for r in rcs):
         return "fail"
     return "indeterminado" if any(r in (None, 126, 127) for r in rcs) else "pass"
 
-
 def run_tests(wt_dir, tests, timeout):
     env = {"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "HOME": wt_dir, "TMPDIR": wt_dir, "LANG": "C.UTF-8"}
     return suite_state([run_capped(["bash", t], wt_dir, env, timeout)[0] for t in tests])
 
-
-def agent_env(home):
-    """Ambiente do agente por lista de permitidos (nunca por lista de proibidos): PATH/LANG/..., a credencial do claude e nada mais.
-    Com credencial em env, HOME e TMPDIR são o diretório descartável; sem ela (login guardado no HOME), HOME é o real, senão o claude não autentica."""
+def agent_env(home, real_home):
+    """Ambiente do agente por lista de permitidos: PATH/LANG/..., a credencial do claude e nada mais. HOME e TMPDIR são o diretório descartável;
+    só com --agent-real-home e SEM credencial em env o HOME é o real (login guardado), e o agente passa a enxergar o HOME do operador."""
     # vazio/ausente → a variável não passa (o agente roda sem ela); falhou/ilegível → não existe leitura que falhe: os.environ é memória do processo
     env = {k: os.environ[k] for k in KEEP_ENV if k in os.environ}
-    # credencial vazia/ausente → creds vazio: HOME real (login guardado); sem HOME no ambiente → HOME descartável, nunca o diretório do operador
     creds = {k: os.environ[k] for k in KEEP_SECRET if os.environ.get(k)}
     env.update(creds)
-    env["HOME"] = home if creds or not os.environ.get("HOME") else os.environ["HOME"]
+    env["HOME"] = os.environ["HOME"] if real_home and not creds and os.environ.get("HOME") else home
     env["TMPDIR"] = home
     return env
-
 
 def agent_allowed(tests):
     """Só rodar o próprio selftest. Ler/editar dentro do checkout vem do modo acceptEdits e de leitura não pedir permissão;
     nada de bash scripts/* (o agente escreveria um script e o rodaria) nem cat/git, que leem fora do checkout."""
     return ",".join("Bash(bash %s:*)" % t for t in tests)
-
 
 def build_prompt(t):
     esc = lambda s: s.replace("</enunciado_da_bead>", "<\\/enunciado_da_bead>")
@@ -197,7 +181,6 @@ def build_prompt(t):
             "Não edite os selftests: são restaurados antes da conferência. Sem rede, sem commit, nada fora do checkout.\n\n"
             "<enunciado_da_bead id=\"%s\">\n%s\n\n%s\n</enunciado_da_bead>\n"
             % (", ".join(t["test_files"]), t["task_id"], esc(t["title"]), esc(t["description"])))
-
 
 def parse_claude(out):
     """dict do resultado do `claude -p --output-format json`; None = ilegível (vazio e podre dão o MESMO 'não sei', nunca 'ok')."""
@@ -209,7 +192,6 @@ def parse_claude(out):
         d = next((x for x in reversed(d) if isinstance(x, dict) and x.get("type") == "result"), None)
     return d if isinstance(d, dict) and d.get("type") == "result" else None
 
-
 def tokens_of(d):
     """(gasto, cache_read) — gasto = entrada + saída + cache_creation; None se o uso não veio inteiro (desconhecido ≠ zero)."""
     u = d.get("usage") if isinstance(d, dict) else None
@@ -219,7 +201,6 @@ def tokens_of(d):
     if not all(isinstance(v, int) and not isinstance(v, bool) and v >= 0 for v in vals):
         return None, None
     return vals[0] + vals[1] + vals[2], vals[3]
-
 
 def read_ledger(path):
     # vazio (arquivo ausente) → 0 gasto, é a 1ª rodada do dia; falhou/ilegível → None e o chamador sai com rc 5.
@@ -232,7 +213,6 @@ def read_ledger(path):
         return None
     v = d.get("tokens") if isinstance(d, dict) else None
     return v if isinstance(v, int) and not isinstance(v, bool) and v >= 0 else None
-
 
 def atomic_write(path, text):
     d = os.path.dirname(os.path.abspath(path))
@@ -247,23 +227,19 @@ def atomic_write(path, text):
             os.unlink(tmp)
         raise
 
-
 class Ctx:
     pass
-
 
 def role_of(a, t):
     """papel da tarefa (ou o forçado por --as-role); None se o campo não é texto — nunca deixa um valor estranho derrubar a rodada."""
     r = t.get("role") if isinstance(t, dict) else None
     return a.as_role or (r if isinstance(r, str) else None)
 
-
 def rec_of(c, t, role, estado, motivo, ok=None, tokens=None, **extra):
     r = {"task": t.get("task_id") if isinstance(t, dict) else None, "papel": role, "config_sha": c.config_sha.get(role),
          "estado": estado, "ok": ok, "tokens": tokens, "motivo": motivo}
     r.update(extra)
     return r
-
 
 def run_task(c, t, role):
     why = validate(t)
@@ -303,10 +279,10 @@ def run_task(c, t, role):
         if not put_files(c.repo, wt, c.cfg_entries):
             return rec_of(c, t, role, "infra", "overlay_config_falhou")
         argv = shlex.split(c.claude) + ["-p", "--model", c.model, "--output-format", "json", "--no-session-persistence",
-                                        "--permission-mode", "acceptEdits", "--allowedTools", agent_allowed(tests),
+                                        "--permission-mode", "acceptEdits", "--setting-sources", "project", "--allowedTools", agent_allowed(tests),
                                         "--disallowedTools", "WebFetch,WebSearch", "--max-budget-usd", str(c.task_budget_usd),
                                         "--append-system-prompt-file", c.role_file[role]] + shlex.split(c.claude_extra)
-        rc, out, _ = run_capped(argv, cwd, agent_env(c.agent_home), c.agent_timeout, build_prompt(t))
+        rc, out, _ = run_capped(argv, cwd, agent_env(c.agent_home, c.real_home), c.agent_timeout, build_prompt(t))
         if rc is None and not out:
             # estourou o prazo (ou o binário sumiu: já foi barrado na largada). Tokens desconhecidos → cobra a reserva.
             return rec_of(c, t, role, "medida", "agente_timeout", ok=False, tokens=None, tokens_cobrados=c.reserve)
@@ -329,7 +305,6 @@ def run_task(c, t, role):
     finally:
         git(c.repo, "worktree", "remove", "--force", wt)
         shutil.rmtree(wt, ignore_errors=True)
-
 
 def load_tasks(path):
     try:
@@ -360,7 +335,6 @@ def load_tasks(path):
             bad += 1
     return tasks, bad, sha, meta
 
-
 def main():
     city = os.environ.get("GC_CITY_PATH", "")
     ap = argparse.ArgumentParser()
@@ -370,6 +344,7 @@ def main():
     ap.add_argument("--prefix", default=os.path.basename(city) if city else ".gascity-gastown-hq")
     ap.add_argument("--config-ref", default="origin/main")
     ap.add_argument("--as-role", default="")
+    ap.add_argument("--agent-real-home", action="store_true", help="sem credencial em env: usa o login guardado no HOME real (o agente enxerga o HOME)")
     ap.add_argument("--role-prompt", action="append", default=[])
     ap.add_argument("--limit", type=int, default=0)
     ap.add_argument("--only", action="append", default=[])
@@ -454,6 +429,9 @@ def main():
         return 0
     if not a.verify_only and shutil.which(shlex.split(a.claude)[0]) is None:
         die(8, "claude ausente (%s): nada roda" % a.claude)
+    c.real_home = a.agent_real_home
+    if not a.verify_only and not c.real_home and not any(os.environ.get(k) for k in KEEP_SECRET):
+        die(8, "sem CLAUDE_CODE_OAUTH_TOKEN/ANTHROPIC_API_KEY no ambiente: nada roda (ou --agent-real-home, que expõe o HOME ao agente)")
 
     os.makedirs(a.state_dir, exist_ok=True)
     lock = open(os.path.join(a.state_dir, "run.lock"), "w")
@@ -533,7 +511,6 @@ def main():
         die(4, "não consegui gravar o resumo: %s" % e)
     print(json.dumps(summary, ensure_ascii=False))
     return code
-
 
 if __name__ == "__main__":
     sys.exit(main())

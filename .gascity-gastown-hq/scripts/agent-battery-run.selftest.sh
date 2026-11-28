@@ -140,18 +140,15 @@ check "feliz: linha tem task/papel/config_sha/ok/tokens/motivo" "$(python3 -I -c
 check "feliz: claude chamado 1 vez" "$(calls)" 1
 check "feliz: prompt leva o enunciado da bead" "$(grep -c 'Corrigir ga-aaa' "$FAKE_LOG/prompt-1.txt")" 1
 check "feliz: prompt cita o selftest" "$(grep -c 'scripts/aaa.selftest.sh' "$FAKE_LOG/prompt-1.txt")" 1
-check "feliz: argv traz prompt de papel, teto USD e sem sessão" \
-  "$(grep -c -x -e '--append-system-prompt-file' -e '--max-budget-usd' -e '--no-session-persistence' "$FAKE_LOG/argv-1.txt")" 3
+check "feliz: argv traz prompt de papel, teto USD, sem sessão e só a config do projeto" \
+  "$(grep -c -x -e '--append-system-prompt-file' -e '--max-budget-usd' -e '--no-session-persistence' -e '--setting-sources' -e project "$FAKE_LOG/argv-1.txt")" 5
 check "feliz: prompt de papel é o do --config-ref (v2)" "$(cat "$FAKE_LOG/role-1.txt")" "PROMPT DOG v2"
 check "feliz: config vista é a nova, não a velha da base" "$(grep -c NOVO "$FAKE_LOG/cfg-1.txt")/$(grep -c VELHO "$FAKE_LOG/cfg-1.txt")" "2/0"
 check "feliz: env do agente tem a credencial do claude" "$(grep -c '^ANTHROPIC_API_KEY=k3$' "$FAKE_LOG/env-1.txt")" 1
 check "feliz: env do agente sem GC_*/TOKEN" "$(grep -c -e '^GC_SECRET_X=' -e '^MY_API_TOKEN=' "$FAKE_LOG/env-1.txt")" 0
-check "feliz: env do agente por lista de permitidos (sem SSH_AUTH_SOCK/DATABASE_URL/AWS_*, nomes que a lista de proibidos não pegava)" \
-  "$(grep -c -e '^SSH_AUTH_SOCK=' -e '^DATABASE_URL=' -e '^AWS_SESSION=' "$FAKE_LOG/env-1.txt")" 0
-check "feliz: com credencial em env, HOME e TMPDIR são o diretório descartável (não o HOME do operador)" \
-  "$(grep -c -e "^HOME=$HOME\$" "$FAKE_LOG/env-1.txt")/$(grep -c '^HOME=.*/battery-[^/]*/home$' "$FAKE_LOG/env-1.txt")/$(grep -c '^TMPDIR=.*/battery-[^/]*/home$' "$FAKE_LOG/env-1.txt")" "0/1/1"
-check "feliz: o agente só pode rodar o próprio selftest (nada de bash scripts/*, cat, git)" \
-  "$(grep -c -F -x 'Bash(bash scripts/aaa.selftest.sh:*)' "$FAKE_LOG/argv-1.txt")/$(grep -c -e 'scripts/\*' -e 'cat' -e 'git' -e 'python3' "$FAKE_LOG/argv-1.txt" | tr -d ' ')" "1/0"
+check "feliz: env do agente por lista de permitidos (sem SSH_AUTH_SOCK/DATABASE_URL/AWS_*, nomes que a lista de proibidos não pegava)" "$(grep -c -e '^SSH_AUTH_SOCK=' -e '^DATABASE_URL=' -e '^AWS_SESSION=' "$FAKE_LOG/env-1.txt")" 0
+check "feliz: com credencial em env, HOME e TMPDIR são o diretório descartável (não o HOME do operador)" "$(grep -c -e "^HOME=$HOME\$" "$FAKE_LOG/env-1.txt")/$(grep -c '^HOME=.*/battery-[^/]*/home$' "$FAKE_LOG/env-1.txt")/$(grep -c '^TMPDIR=.*/battery-[^/]*/home$' "$FAKE_LOG/env-1.txt")" "0/1/1"
+check "feliz: o agente só pode rodar o próprio selftest (nada de bash scripts/*, cat, git)" "$(grep -c -F -x 'Bash(bash scripts/aaa.selftest.sh:*)' "$FAKE_LOG/argv-1.txt")/$(grep -c -e 'scripts/\*' -e 'cat' -e 'git' -e 'python3' "$FAKE_LOG/argv-1.txt" | tr -d ' ')" "1/0"
 check "feliz: ledger 300" "$(ledger)" 300
 check "feliz: nenhum worktree sobrando" "$(git -C "$R" worktree list | wc -l | tr -d ' ')" 1
 check "feliz: sem .partial" "$(ls "$ST/runs" | grep -c partial)" 0
@@ -159,13 +156,14 @@ check "feliz: sem scratch sobrando" "$(ls "$W/tmp" | wc -l | tr -d ' ')" 0
 check "feliz: taxa do papel dog = 1.0" "$(summ por_papel.dog.taxa)" 1.0
 check "feliz: repo intacto" "$(git -C "$R" status --porcelain | wc -l | tr -d ' ')" 0
 
-# 1b) sem credencial em env (login guardado no HOME): o HOME é o real, senão o claude não autentica; o resto segue por lista de permitidos
+# 1b) sem credencial em env: sem --agent-real-home nada roda (rc 8, claude não é chamado); com ele, HOME é o real e o resto segue por lista de permitidos
 newcase ok
 aaa ga-aaa | mkcorpus "$ST/tasks.jsonl"
-( unset ANTHROPIC_API_KEY CLAUDE_CODE_OAUTH_TOKEN; export SSH_AUTH_SOCK=/tmp/sock-x; run --tasks "$ST/tasks.jsonl" )
-check "sem credencial: rc 0" "$?" 0
-check "sem credencial: HOME é o real" "$(grep -c -e "^HOME=$HOME\$" "$FAKE_LOG/env-1.txt")" 1
-check "sem credencial: sem SSH_AUTH_SOCK nem credencial" "$(grep -c -e '^SSH_AUTH_SOCK=' -e '^ANTHROPIC_API_KEY=' "$FAKE_LOG/env-1.txt")" 0
+( unset ANTHROPIC_API_KEY CLAUDE_CODE_OAUTH_TOKEN; run --tasks "$ST/tasks.jsonl" )
+check "sem credencial e sem --agent-real-home: rc 8, claude não chamado" "$?/$(calls)" "8/0"
+( unset ANTHROPIC_API_KEY CLAUDE_CODE_OAUTH_TOKEN; export SSH_AUTH_SOCK=/tmp/sock-x; run --tasks "$ST/tasks.jsonl" --agent-real-home )
+check "--agent-real-home: rc 0" "$?" 0
+check "--agent-real-home: HOME é o real, sem SSH_AUTH_SOCK nem credencial" "$(grep -c -e "^HOME=$HOME\$" "$FAKE_LOG/env-1.txt")/$(grep -c -e '^SSH_AUTH_SOCK=' -e '^ANTHROPIC_API_KEY=' "$FAKE_LOG/env-1.txt")" "1/0"
 
 # 2) agente que não conserta / 3) agente que trapaceia editando o selftest
 for m in nofix cheat; do
