@@ -378,16 +378,6 @@ def test_a_full_login_ending_is_warned_once_per_level_7_3_1_days_and_forgotten_w
     assert n["strict"] == "1" and n["argv"][2:4] == ["-p", "4"] and crew.relogin_how(EMAIL["b85"]) in n["argv"][4] and "no automation renews it" in n["argv"][4]
 
 
-def test_the_warning_comes_at_least_3_days_before_the_end(w):
-    """The bead's rule: warn >= 3 days ahead. A login 3.5 d from its end has been warned at the 7-day level already; nothing tighter than 3 d is the FIRST word."""
-    _nobrowser(w)
-    healthy(w)
-    w.own("b85", blob("b85-x", rexp_days=6.99))
-    renew.housekeeping()
-    (n,) = w.calls("notify")
-    assert "7 dia(s)" in n["argv"][1]
-
-
 def test_a_setup_token_ending_is_warned_at_21_7_1_days_and_counted_from_gerado_em_when_the_item_has_it(w):
     _nobrowser(w)
     healthy(w)

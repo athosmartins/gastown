@@ -136,10 +136,7 @@ def test_a_gc_that_exits_non_zero_hangs_or_answers_garbage_is_exit_1_and_said_no
         fake.write_text("#!/bin/sh\n" + body)
         fake.chmod(0o755)
         assert M.main(["check"]) == 1 and said in capsys.readouterr().err
-
-    def hang(*a, **k):
-        raise subprocess.TimeoutExpired("gc", 90)
-    monkeypatch.setattr(M.subprocess, "run", hang)
+    monkeypatch.setattr(M.subprocess, "run", lambda *a, **k: (_ for _ in ()).throw(subprocess.TimeoutExpired("gc", 90)))
     assert M.main(["roles"]) == 1 and "TimeoutExpired" in capsys.readouterr().err
 
 

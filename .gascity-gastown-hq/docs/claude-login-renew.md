@@ -14,9 +14,8 @@ Decisão do Athos (ga-xoe5ao.6): o pool usa o **token de 1 ano** (`claude setup-
   a mesma faixa não repete depois de entregue (não entregue: reenvia a cada 5 min); login ou token renovado esquece o registro (`accounts[<e>].warned.{login,token}` no estado). Fim desconhecido (cofre fora do ar, item sem token ou sem data) **não avisa** e a linha do log diz qual dos casos.
 - O fim do token **não está no token**: vem do campo `gerado_em` do item `claude-oauth-token-<e>` do cofre, senão da `revisionDate` (o dia em que foi guardado), + 365 dias (`claude-credential-map.py`; vida **não medida**). O cofre é lido por `bw serve` (`127.0.0.1:18587`); só nome, datas e campos — a nota (o token) é reduzida a «existe», nunca guardada nem logada.
 - A linha `scheduled run:` ganha `; validity: <e>: login <N d>, token <N d>; …`. As marcas `infeasible` antigas não geram mais o push «Relogin automatico impossivel» (o alarme é a voz única).
-- `claude-login-renew.py --status` imprime a mesma validade, só leitura (sem lock, estado ou push); sai 1 se o estado da crew job ou o cofre não puderam ser lidos.
-- `--account <e> --force` (uma pessoa pedindo) **continua** abrindo o navegador, como antes.
-- **Voltar o relogin por navegador na rodada agendada:** `GC_LOGIN_RENEW_BROWSER=1` no ambiente do job. Mapa de quem usa qual credencial, geração e guarda dos tokens: `docs/runbooks/claude-setup-token.md`.
+- `claude-login-renew.py --status` imprime a mesma validade, só leitura (sai 1 se o estado ou o cofre não puderam ser lidos). `--account <e> --force` (uma pessoa pedindo) **continua** abrindo o navegador.
+- **Voltar o relogin por navegador na rodada agendada:** `GC_LOGIN_RENEW_BROWSER=1` no ambiente do job. Quem usa qual credencial e como gerar/guardar os tokens: `docs/runbooks/claude-setup-token.md`.
 
 ## O que a fatia 1 faz
 `python3 packs/town-deltas/assets/scripts/claude-login-renew.py --account <email> --force` renova **agora** o login Claude de UMA conta que tem config dir

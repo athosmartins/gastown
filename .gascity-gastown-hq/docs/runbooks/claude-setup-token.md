@@ -27,7 +27,7 @@ Ninguém contorna a verificação do claude.ai no navegador: o relogin automáti
 - **Login completo:** o Mayor e as crews nomeadas (provider `claude-rc` / `claude-rc-*`).
 - **Token de 1 ano:** provider `claude-headless` (cães, `wa-worker`, `ps-worker`, revisores, refino…). O daemon do pool (`claude-pool-account.py`) escolhe a conta e grava o token dela no item do pool; `claude-lowprio.sh` aponta essas sessões para ele.
 - **Login padrão (sem provider):** `polecat`/`refinery`/`witness` dos rigs. Rodam com o mesmo login do Mayor e **ninguém decidiu** movê-los para o token: `claude-credential-map.py check` os lista (pendência aberta na bead ga-xy0916u).
-- **Sem Claude:** agentes com `command`/`start_command` (os despachantes) e outros fornecedores.
+- **Sem Claude:** agentes com `command`/`start_command` e outros fornecedores.
 
 ## O que o Athos faz (e quando)
 
@@ -56,7 +56,7 @@ python3 /Users/athos/gt/whatsapp_automation/scripts/claude_conta_cadastrar_chave
 Ele pede a chave num prompt **sem eco** (nunca por argumento nem arquivo), testa com uma chamada mínima e só então grava no Bitwarden como `claude-oauth-token-<email>` (nota segura). Ele **não confere de qual conta a chave é**: gere-a logado na conta certa.
 Depois do cadastro o daemon do pool a usa no próximo ciclo (60 s), sem reinício. O token nunca vai para arquivo, log ou argv.
 
-Opcional (melhora o aviso): um campo `gerado_em` (data ISO, ex. `2026-11-28`) no item. Sem o campo, a validade conta a partir da `revisionDate` do item (o dia em que o token foi guardado). O script de cadastro ainda não escreve esse campo (está em outro repositório; pendência registrada na bead).
+Opcional: um campo `gerado_em` (data ISO) no item melhora o aviso; sem ele a validade conta da `revisionDate` (o dia em que o token foi guardado). O script de cadastro (outro repositório) ainda não o escreve.
 
 ## Como saber a validade
 
@@ -93,6 +93,3 @@ Faça a verificação no navegador. A `claude-crew-account` acha o login novo no
 
 - **Voltar o relogin por navegador** (não recomendado; o claude.ai responde ao automático com verificação humana): `GC_LOGIN_RENEW_BROWSER=1` no ambiente do job.
 - **Desligar o job inteiro:** `touch <city>/.gc/no-login-renew` (ou `GC_LOGIN_RENEW=0`).
-- **Um pool com token que falha:** `claude-pool-account.py` já troca de conta pela `ordem_das_contas`; ver `docs/claude-pool-account.md`.
-
-Referências: `docs/claude-login-renew.md` (o job), `docs/claude-pool-account.md` (o pool), `docs/claude-crew-account.md` (Mayor/crews).
