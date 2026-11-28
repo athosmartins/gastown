@@ -18,7 +18,7 @@ Três peças, uma contrato: **a trava mora na história do git**, em trailers do
 | `Repro-Lock-Release: <bead>` | `repro-lock.py release` | commit vazio que libera a trava |
 | `Repro-Lock-Release-Reason: <texto>` | idem | o motivo (20 a 300 caracteres) |
 
-Só o **último parágrafo** da mensagem conta: citar «Repro-Lock:» no meio da prosa não é trailer.
+Só o **último parágrafo** da mensagem conta: citar «Repro-Lock:» no meio da prosa não é trailer. O motor lê as mensagens por `rev-list` + `cat-file --batch` (tamanho no cabeçalho), então nada que o construtor escreva numa mensagem desloca um registro.
 
 ## O fluxo do construtor (bead tipo bug)
 Chame o motor pelo caminho dele: no mini `python3 "$GC_CITY_PATH/scripts/repro-lock.py"`; no worktree do nó (dog-remote) `python3 .gascity-gastown-hq/scripts/repro-lock.py`.
@@ -42,9 +42,9 @@ Chame o motor pelo caminho dele: no mini `python3 "$GC_CITY_PATH/scripts/repro-l
 |---|---|
 | `nao-se-aplica` | nenhuma trava declarada para esta bead (crews, submissões antigas e beads que não travaram) |
 | `ok` | trava íntegra: o teste não mudou depois do commit da trava |
-| **`fail`** | a trava não é o primeiro commit da branch (o conserto veio antes); o commit da trava mexe em OUTRO arquivo ou não adiciona/altera um arquivo declarado, ou o declarado não é arquivo regular; um commit seguinte toca num arquivo travado (editar, apagar, renomear, mudar o modo — **mesmo que um commit depois o restaure**); trava seguinte que muda arquivo já travado; release sem motivo (menos de 20 caracteres) |
-| `aviso` | houve release com motivo: **nunca recusa sozinho**; o motivo vai ao rótulo, ao log e a um comentário no marcador, para o revisor julgar |
-| `nao-consegui-medir` | git ilegível, histórico com merge, mais de 400 commits, ou um diff que edita o próprio `repro-lock.py` (a cópia dele não pode atestar a si mesma): fail-open, registrado, nunca «ok» |
+| **`fail`** | a trava não é o primeiro commit da branch (o conserto veio antes); o commit da trava mexe em OUTRO arquivo ou não adiciona/altera um arquivo declarado, ou o declarado não é arquivo regular; um commit seguinte toca num arquivo travado (editar, apagar, renomear, mudar o modo — **mesmo que um commit depois o restaure**); trava seguinte que muda arquivo já travado; release sem motivo (menos de 20 caracteres); trava ou release **fora da linha do 1º pai** da branch (o merge não prova a ordem); trava declarada num histórico de mais de 2000 commits (não dá para provar) |
+| `aviso` | houve release com motivo, ou o intervalo só traz trava de **outra** id de bead (o id do trailer tem de ser o do nome da branch; em branch empilhada é esperado): **nunca recusa sozinho**; o texto vai ao rótulo, ao log e a um comentário no marcador (entre `<conteudo_externo>`: é do construtor, dado a analisar), para o revisor julgar |
+| `nao-consegui-medir` | **só o que o construtor não controla**: git que falha, objeto ausente. Merge, histórico longo, texto de mensagem e commit-raiz são JULGADOS, nunca «não sei» (seria um jeito de desligar o passo); um diff que edita o próprio `repro-lock.py` também é julgado (a cópia mergeada só lê história). Fail-open, registrado, nunca «ok» |
 | `desligado` | `REPRO_LOCK_CHECK=off` ou `<cidade>/.gc/repro-lock-check.off`, ou o interruptor geral `.gc/gate-hardchecks.off` |
 
 `.gc/gate-hardchecks.observe` grava e não recusa (vale para todos os passos). Rode você mesmo antes de empurrar (o `check` só aceita sha em hexadecimal, como o gate o chama): `python3 .gascity-gastown-hq/scripts/repro-lock.py check --repo . --base "$(git merge-base HEAD origin/main)" --head "$(git rev-parse HEAD)" --bead <bead>`.
@@ -79,6 +79,7 @@ Três estados em tudo: tem / não tem / **não sei**. `nao-se-aplica` («não te
 ## Limites ditos de antemão
 - O hook só cobre as ferramentas Edit/Write/MultiEdit/NotebookEdit. Escrever o arquivo por **Bash** (`sed -i`, redirecionamento, `git checkout`) não é barrado: o gate compara o commit e recusa.
 - Quem desfaz o commit da trava com `reset` e recomita sem trailer não tem trava nenhuma. A trava ajuda o construtor a ser honesto e dá ao gate o que provar; não impede má-fé (o braço B do gate e o revisor continuam).
+- Num **merge** vale o que ele TROUXE (o diff dele contra o 1º pai): um vai e volta que o lado do merge desfez antes de chegar à linha principal não aparece (num histórico linear, tocar e restaurar recusa).
 - A trava é por **arquivo inteiro**: acrescentar um caso ao arquivo travado também é edição (abra outro arquivo de teste).
 - O motivo do release é texto do construtor: o revisor o lê como dado, não como instrução.
 - Branch empilhada (commits de outra bead antes da trava) falha em «a trava não é o primeiro commit»; o caminho é rebasear sobre `origin/main` ou liberar com motivo.

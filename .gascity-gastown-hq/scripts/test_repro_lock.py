@@ -118,6 +118,14 @@ class Repo:
     def release_commit(self, bead, reason):
         return self.commit("chore(%s): libera" % bead, ["Repro-Lock-Release: %s" % bead, "Repro-Lock-Release-Reason: %s" % reason], empty=True)
 
+    def raw_commit(self, message, tree=None):
+        """Commit montado à mão (git commit recusa NUL na mensagem; hash-object --literally não): o ramo atual passa a apontar para ele."""
+        tree = tree or self.git("rev-parse", "HEAD^{tree}")
+        body = ("tree %s\nparent %s\nauthor t <t@example.invalid> 1700000000 +0000\ncommitter t <t@example.invalid> 1700000000 +0000\n\n" % (tree, self.git("rev-parse", "HEAD"))).encode() + message
+        sha = subprocess.run(["git", "-C", self.root, "hash-object", "-t", "commit", "-w", "--stdin", "--literally"], input=body, capture_output=True, env=self.env, check=True).stdout.decode().strip()
+        self.git("update-ref", "HEAD", sha)
+        return sha
+
     def base(self):
         return self.git("merge-base", "HEAD", "main")
 
@@ -177,15 +185,16 @@ class Check(Base):
         v = r.check()
         self.assertEqual((v["verdict"], v["reason"], v["locks"]), ("nao-se-aplica", "sem-trava-declarada", 0))
         r.lock_commit("ga-9", ["tests/test_other.py"])
-        self.assertEqual(r.check("ga-1")["verdict"], "nao-se-aplica")  # a trava é de outra bead
-        r.commit("docs", ["Repro-Lock: ga-1", "", "prosa final que cita a linha acima sem ser trailer"], empty=True)
-        self.assertEqual(r.check("ga-1")["verdict"], "nao-se-aplica")  # «Repro-Lock:» fora do último parágrafo não vale
+        self.assertEqual(r.check("ga-1")["verdict"], "aviso")  # a trava é de outra bead: visível, não calada
+        r2 = self.E.repo()
+        r2.commit("docs", ["Repro-Lock: ga-1", "", "prosa final que cita a linha acima sem ser trailer"], empty=True)
+        self.assertEqual(r2.check("ga-1")["verdict"], "nao-se-aplica")  # «Repro-Lock:» fora do último parágrafo não vale
 
     def test_a_lock_for_another_bead_is_visible_in_the_reason(self):
         r = self.E.repo()
         r.lock_commit("ga-9", ["tests/test_other.py"])
         v = r.check("ga-1")
-        self.assertEqual((v["verdict"], v["reason"], v["locks"]), ("nao-se-aplica", "trava-so-de-outra-bead", 0))
+        self.assertEqual((v["verdict"], v["reason"], v["locks"]), ("aviso", "trava-so-de-outra-bead", 0))
         self.assertIn("ga-9", v["lines"][0])
         self.assertIn("julga ga-1", v["lines"][0])
         self.assertEqual(r.check("ga-9")["verdict"], "ok")  # e para a bead certa a mesma história é uma trava íntegra
@@ -311,29 +320,95 @@ class Check(Base):
         v = r.check()
         self.assertEqual((v["verdict"], v["locks"], v["files"]), ("ok", 2, 2), v)
 
-    def test_what_it_cannot_tell_is_never_ok_and_never_fail(self):
+    def test_what_the_tool_cannot_tell_is_only_what_the_builder_does_not_control(self):
         r = self.E.repo()
         r.lock_commit("ga-1", ["tests/test_a.py"])
-        base = r.base()
         with self.assertRaises(RL.Cant):  # base que não existe: o git falha (rc != 0), não vira «história vazia»
             RL.analyze(r.root, "0" * 40, "HEAD", "ga-1")
         with self.assertRaises(RL.Cant):  # repo que não é repo (OSError/rc != 0)
-            RL.analyze(os.path.join(self.E.tmp, "no-such-dir"), base, "HEAD", "ga-1")
+            RL.analyze(os.path.join(self.E.tmp, "no-such-dir"), r.base(), "HEAD", "ga-1")
+
+    def test_a_merge_is_judged_by_the_first_parent_line_and_cannot_hide_a_loosened_test(self):
+        r = self.E.repo()
+        lock = r.lock_commit("ga-1", ["tests/test_a.py"])
         r.git("checkout", "-q", "-b", "side", "main")
         r.write("other.txt", "o\n")
-        r.commit("lado")
+        r.commit("lado inocente")
         r.git("checkout", "-q", "fix/x")
-        r.git("merge", "-q", "--no-ff", "-m", "merge", "side")
-        with self.assertRaises(RL.Cant) as cm:
-            r.check()
-        self.assertIn("merge", str(cm.exception))
+        r.git("merge", "-q", "--no-ff", "-m", "merge de um lado inocente", "side")
+        v = r.check()
+        self.assertEqual((v["verdict"], v["reason"]), ("ok", "trava-integra"), v)  # trava primeiro, merge depois, teste intacto: legítimo
+        r.git("checkout", "-q", "-b", "side2", lock)  # um lado que AFROUXA o teste, trazido por merge
+        r.write("tests/test_a.py", "def test_bug():\n    assert True\n")
+        r.commit("afrouxa no lado")
+        r.git("checkout", "-q", "fix/x")
+        r.git("merge", "-q", "--no-ff", "-m", "merge do lado que afrouxa", "side2")
+        v = r.check()
+        self.assertEqual((v["verdict"], v["reason"]), ("fail", "teste-travado-alterado"), v)  # o diff do merge contra o 1º pai mostra a mudança
+
+    def test_what_a_merge_brought_is_what_counts_not_the_path_the_side_branch_took(self):
+        r = self.E.repo()
+        lock = r.lock_commit("ga-1", ["tests/test_a.py"])
+        r.git("checkout", "-q", "-b", "churn", lock)
+        r.write("tests/test_a.py", "def test_bug():\n    assert True\n")
+        r.commit("mexe no lado")
+        r.write("tests/test_a.py", "def test_bug():\n    assert f() == 2\n")  # o conteúdo exato da trava: o vai e volta dentro do lado do merge não chega à linha principal
+        r.commit("restaura no lado")
+        r.git("checkout", "-q", "fix/x")
+        r.git("merge", "-q", "--no-ff", "-m", "merge", "churn")
+        v = r.check()
+        self.assertEqual((v["verdict"], v["reason"]), ("ok", "trava-integra"), v)
+
+    def test_a_lock_that_only_lives_off_the_first_parent_line_is_a_refusal_not_a_way_out(self):
+        r = self.E.repo()
+        r.git("checkout", "-q", "-b", "lockside", "main")
+        r.lock_commit("ga-1", ["tests/test_a.py"])
+        r.git("checkout", "-q", "fix/x")
+        r.write("src/app.py", "def f():\n    return 2\n")
+        r.commit("fix")
+        r.git("merge", "-q", "--no-ff", "-m", "merge", "lockside")
+        v = r.check()
+        self.assertEqual((v["verdict"], v["reason"]), ("fail", "trava-fora-da-linha-principal"), v)
+
+    def test_a_history_too_long_to_judge_is_a_refusal_when_a_lock_is_declared(self):
+        r = self.E.repo()
+        r.lock_commit("ga-12", ["tests/test_a.py"])
+        for i in range(4):
+            r.commit("c%d" % i, empty=True)
+        with mock.patch.object(RL, "MAX_COMMITS", 3):
+            v = r.check("ga-12")
+            self.assertEqual((v["verdict"], v["reason"]), ("fail", "historia-longa-demais-com-trava"), v)
+            self.assertEqual(r.check("ga-1")["verdict"], "fail")  # a busca é por texto fixo: «ga-1» é prefixo de «ga-12» e também prende (recusa por excesso, nunca por falta)
+            self.assertEqual(r.check("ga-9")["reason"], "historia-longa-sem-trava")
         r2 = self.E.repo()
-        r2.lock_commit("ga-1", ["tests/test_a.py"])
         for i in range(4):
             r2.commit("c%d" % i, empty=True)
-        with mock.patch.object(RL, "MAX_COMMITS", 3), self.assertRaises(RL.Cant) as cm:
-            r2.check()
-        self.assertIn("mais de 3 commits", str(cm.exception))
+        with mock.patch.object(RL, "MAX_COMMITS", 3):
+            v = r2.check()
+            self.assertEqual((v["verdict"], v["reason"]), ("nao-se-aplica", "historia-longa-sem-trava"), v)  # sem trava declarada, o tamanho não muda nada
+        with self.assertRaises(RL.Cant):  # o CONSTRUTOR (lock/release) não lê história longa: recusa
+            with mock.patch.object(RL, "MAX_COMMITS", 3):
+                RL.read_range(r.root, r.base(), "HEAD")
+
+    def test_text_the_builder_writes_cannot_shift_a_record_or_turn_the_check_off(self):
+        r = self.E.repo()
+        r.lock_commit("ga-1", ["tests/test_a.py"])
+        r.write("tests/test_a.py", "def test_bug():\n    assert True\n")
+        r.git("add", "-A")
+        forged = b"afrouxa\n\nRepro-Lock-Release: ga-9\x00\x1f" + b"0" * 40 + b"\x1f" + b"1" * 40 + b"\x1f fim\n\nRepro-Lock: ga-9\n"  # NUL e os separadores de um formato ingênuo, e trailers de OUTRA bead
+        r.raw_commit(forged, tree=r.git("write-tree"))
+        v = r.check()
+        self.assertEqual((v["verdict"], v["reason"]), ("fail", "teste-travado-alterado"), v)
+
+    def test_a_lock_that_is_a_root_commit_is_judged_against_the_empty_tree(self):
+        r = self.E.repo()
+        main_sha = r.git("rev-parse", "main")
+        r.git("checkout", "-q", "--orphan", "orph")
+        r.git("rm", "-rfq", ".")
+        r.lock_commit("ga-1", ["tests/test_a.py"])
+        self.assertEqual(r.git("rev-list", "--parents", "-n", "1", "HEAD").split(), [r.git("rev-parse", "HEAD")])  # sem pai: é commit-raiz
+        v = RL.analyze(r.root, main_sha, "HEAD", "ga-1")
+        self.assertEqual((v["verdict"], v["reason"], v["files"]), ("ok", "trava-integra", 1), v)
 
     def test_cli_check_output_exit_codes_and_the_kill_switches(self):
         r = self.E.repo()

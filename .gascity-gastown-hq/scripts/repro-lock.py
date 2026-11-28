@@ -27,7 +27,9 @@ O QUE A CHECAGEM DO GATE DECIDE (por bead, em base..head, commits em ordem topol
   commit da trava mexe em OUTRO arquivo    fail (o commit da trava leva só os arquivos declarados, todos adicionados/alterados)
   commit seguinte mexe num arquivo travado fail (inclusive apagar/renomear, e mesmo que um commit depois o restaure)
   release com motivo                       aviso (o motivo vai ao comentário do marcador, ao rótulo e ao log; nunca recusa sozinho)
-  histórico com merge, mais de 400 commits, git que falha ou lê torto → nao-sei (rc 2): NUNCA ok, NUNCA fail.
+  git que falha ou objeto ausente → nao-sei (rc 2): NUNCA ok, NUNCA fail.
+  O que o CONSTRUTOR controla nunca vira «não sei» (seria um jeito de desligar o passo): merge vale pela linha do 1º pai (o que cada merge trouxe aparece no diff dele); trava ou liberação fora
+  dessa linha, e trava declarada num histórico de mais de 2000 commits, são fail; o texto da mensagem não desloca nenhum registro (rev-list + cat-file --batch, tamanho no cabeçalho).
 
 ESTADOS (três, em tudo): tem / não tem / não sei. «Não sei» não vira «sem trava»: a checagem sai 2, o `lock` recusa, o hook (que só atrapalha) falha ABERTO e
 registra UNGUARDED no log, porque quem recusa de verdade é o gate.
@@ -55,7 +57,7 @@ SHA_RE = re.compile(r"^[0-9a-fA-F]{7,64}$")
 STATE_DIR = "repro-lock"
 EDIT_TOOLS = ("Edit", "Write", "MultiEdit", "NotebookEdit")
 MIN_REASON, MAX_REASON = 20, 300
-MAX_COMMITS, MAX_LINES = 400, 40
+MAX_COMMITS, MAX_LINES = 2000, 40
 GIT_TIMEOUT = 60
 BLOCKED = "repro-lock-guard: BLOCKED"
 # a saída de um teste que falha por ambiente ou coleta (não pelo bug) e que um construtor confunde com «reproduz»; --expect desliga a heurística
@@ -168,25 +170,55 @@ def event_of(msg, bead):
 
 
 # ----------------------------------------------------------------------------- história
-def read_range(repo, base, head):
-    """[{sha, parents, msg}] de base..head, do mais velho ao mais novo (topológico). vazio → [] = a branch não tem commit próprio; falhou/ilegível → Cant."""
-    raw = git(repo, "log", "-z", "--reverse", "--topo-order", "--format=%H%x1f%P%x1f%B", "%s..%s" % (base, head))
+def list_commits(repo, base, head, first_parent=False):
+    """[(sha, [pais])] de base..head, do mais velho ao mais novo (topológico). vazio → [] = a branch não tem commit próprio; falhou/ilegível → Cant.
+    Só rev-list: texto do construtor não passa por aqui, então nada que ele escreva desloca um registro."""
+    args = ["rev-list", "--reverse", "--topo-order", "--parents"] + (["--first-parent"] if first_parent else []) + ["%s..%s" % (base, head)]
     out = []
-    for rec in raw.split(b"\0"):
-        if not rec.strip():
-            continue
-        parts = rec.decode("utf-8", "replace").split("\x1f", 2)
-        if len(parts) != 3 or not SHA_RE.match(parts[0].strip()):
-            raise Cant("git log devolveu um registro ilegível")
-        out.append({"sha": parts[0].strip(), "parents": parts[1].split(), "msg": parts[2]})
-    if len(out) > MAX_COMMITS:
-        raise Cant("história com mais de %d commits em base..head: não analiso" % MAX_COMMITS)
+    for line in git_text(repo, *args).splitlines():
+        shas = line.split()
+        if not shas or not all(SHA_RE.match(x) for x in shas):
+            raise Cant("git rev-list devolveu uma linha ilegível")
+        out.append((shas[0], shas[1:]))
     return out
 
 
-def changed_files(repo, sha):
-    """{caminho: status} do commit contra o 1º pai. vazio → {} = commit vazio (o release é assim); falhou/ilegível (par status/caminho torto) → Cant."""
-    raw = git(repo, "diff-tree", "--no-commit-id", "-r", "-z", "--no-renames", "--name-status", sha)
+def commit_messages(repo, shas):
+    """{sha: mensagem}. O `cat-file --batch` põe o TAMANHO de cada objeto no cabeçalho, então o texto do commit (NUL, separadores, trailers falsos) não desloca o registro seguinte: quem escreve a
+    mensagem é o construtor, e um formato que ela pudesse quebrar viraria «não sei» por escolha dele. vazio → {}; falhou/ilegível (objeto ausente, resposta cortada) → Cant."""
+    if not shas:
+        return {}
+    raw = git(repo, "cat-file", "--batch", stdin=("\n".join(shas) + "\n").encode("ascii"))
+    out, pos = {}, 0
+    for sha in shas:
+        nl = raw.find(b"\n", pos)
+        head = raw[pos:nl].decode("ascii", "replace").split() if nl >= 0 else []
+        if len(head) != 3 or head[0] != sha or head[1] != "commit" or not head[2].isdigit():
+            raise Cant("cat-file não trouxe o commit %s (%s)" % (sha[:7], " ".join(head) or "resposta cortada"))
+        size = int(head[2])
+        body = raw[nl + 1:nl + 1 + size]
+        if len(body) != size:
+            raise Cant("cat-file cortou o commit %s" % sha[:7])
+        pos = nl + 1 + size + 1
+        _, sep, msg = body.decode("utf-8", "replace").partition("\n\n")
+        out[sha] = msg if sep else ""
+    return out
+
+
+def read_range(repo, base, head):
+    """[{sha, parents, msg}] de base..head. Para o CONSTRUTOR (lock/release): história longa demais é «não sei» e recusa; o gate não usa isto (ver analyze)."""
+    commits = list_commits(repo, base, head)
+    if len(commits) > MAX_COMMITS:
+        raise Cant("história com mais de %d commits em base..head: não leio" % MAX_COMMITS)
+    msgs = commit_messages(repo, [s for s, _ in commits])
+    return [{"sha": s, "parents": p, "msg": msgs[s]} for s, p in commits]
+
+
+def changed_files(repo, sha, parents):
+    """{caminho: status} do commit contra o 1º pai (contra a árvore vazia se não tem pai: um commit-raiz no meio do intervalo não pode virar «não sei»). vazio → {} = commit vazio (o release é assim);
+    falhou/ilegível (par status/caminho torto) → Cant."""
+    flags = ["diff-tree", "-r", "-z", "--no-renames", "--name-status"]
+    raw = git(repo, *(flags + ["--root", "--no-commit-id", sha] if not parents else flags + [parents[0], sha]))
     toks = raw.split(b"\0")
     if toks and toks[-1] == b"":
         toks.pop()
@@ -212,26 +244,49 @@ def blobs_at(repo, rev, paths):
     return out
 
 
+def grep_lock(repo, base, head, bead):
+    """True se alguma mensagem de base..head traz «Repro-Lock: <bead>» (texto fixo, sem ler commit por commit: serve a histórico longo). vazio → False (a busca respondeu e não achou); falhou → Cant."""
+    return bool(git_text(repo, "log", "-n", "1", "--format=%H", "-F", "--grep=%s: %s" % (LOCK_KEY, bead), "%s..%s" % (base, head)))
+
+
 def analyze(repo, base, head, bead):
-    """O veredito da história de base..head para `bead`: dict(verdict, reason, locks, files, releases, lines)."""
-    commits = read_range(repo, base, head)
-    events = [event_of(c["msg"], bead) for c in commits]
-    nlocks = sum(1 for e in events if e and e[0] == "lock")
-    nrel = sum(1 for e in events if e and e[0] == "release")
-    res = {"verdict": "nao-se-aplica", "reason": "sem-trava-declarada", "locks": nlocks, "files": 0, "releases": nrel, "lines": []}
-    if nlocks == 0:
-        foreign = sorted({b for c in commits for b in lock_beads(c["msg"]) if b != bead})
-        if foreign:
-            res["reason"] = "trava-so-de-outra-bead"
-            res["lines"] = ["trailers Repro-Lock de outra(s) bead(s): %s (o gate julga %s: o id do trailer tem de ser o do nome da branch)" % (", ".join(foreign[:5]), bead)]
+    """O veredito da história de base..head para `bead`: dict(verdict, reason, locks, files, releases, lines).
+    «Não sei» (Cant) só sobra para o que o construtor NÃO controla (git que falha, objeto ausente): o que ele controla (merge, histórico longo, texto da mensagem, commit-raiz) é julgado, e uma trava
+    declarada que não dá para provar é RECUSA, nunca um jeito de desligar o passo."""
+    res = {"verdict": "nao-se-aplica", "reason": "sem-trava-declarada", "locks": 0, "files": 0, "releases": 0, "lines": []}
+    allc = list_commits(repo, base, head)
+    if len(allc) > MAX_COMMITS:
+        if grep_lock(repo, base, head, bead):
+            res.update(verdict="fail", reason="historia-longa-demais-com-trava",
+                       lines=["historia-longa-demais-com-trava: mais de %d commits em base..head e uma trava declarada: não dá para provar que o teste não mudou; reduza a branch (rebase/squash)" % MAX_COMMITS])
+        else:
+            res["reason"] = "historia-longa-sem-trava"
         return res
-    if any(len(c["parents"]) > 1 for c in commits):
-        raise Cant("história com commit de merge em base..head: a ordem dos commits não é linear, não consigo julgar a trava")
+    msgs = commit_messages(repo, [s for s, _ in allc])
+    events_all = {s: event_of(msgs[s], bead) for s, _ in allc}
+    res["locks"] = sum(1 for e in events_all.values() if e and e[0] == "lock")
+    if res["locks"] == 0:
+        foreign = sorted({b for s, _ in allc for b in lock_beads(msgs[s]) if b != bead})
+        if foreign:
+            res.update(verdict="aviso", reason="trava-so-de-outra-bead",
+                       lines=["trailers Repro-Lock de outra(s) bead(s): %s (o gate julga %s: o id do trailer tem de ser o do nome da branch; numa branch empilhada isto é esperado)" % (", ".join(foreign[:5]), bead)])
+        return res
     viol, notes = [], []
+    commits = allc
+    if any(len(p) > 1 for _, p in allc):
+        # com merge a ordem não é uma fila: vale a linha do 1º pai (o que cada merge TROUXE aparece no diff dele contra o 1º pai); evento fora dela não dá para provar
+        commits = list_commits(repo, base, head, first_parent=True)
+        chain = {s for s, _ in commits}
+        off = [s for s, e in events_all.items() if e is not None and s not in chain]
+        if off:
+            viol.append(("trava-fora-da-linha-principal", "o(s) commit(s) %s têm Repro-Lock/Repro-Lock-Release fora da linha do 1º pai da branch: não dá para provar a ordem; refaça a branch sem esse merge (rebase sobre origin/main)" % ", ".join(s[:7] for s in off[:5])))
+    events = [events_all[s] for s, _ in commits]
+    nrel = sum(1 for e in events if e and e[0] == "release")
+    res["releases"] = nrel
     baseline, ever = {}, set()
     first_other = None
-    for i, (c, ev) in enumerate(zip(commits, events)):
-        sha7 = c["sha"][:7]
+    for i, ((sha, parents), ev) in enumerate(zip(commits, events)):
+        sha7 = sha[:7]
         if ev is None and first_other is None:
             first_other = i
         if ev is not None and ev[0] == "release":
@@ -246,14 +301,14 @@ def analyze(repo, base, head, bead):
             if not files or not all(safe_rel(f) for f in files):
                 viol.append(("trava-sem-arquivos", "%s: Repro-Lock sem Repro-Lock-File válido (caminho relativo, sem .., sem espaço nas pontas)" % sha7))
                 continue
-            touched = changed_files(repo, c["sha"])
+            touched = changed_files(repo, sha, parents)
             extra = sorted(set(touched) - set(files))
             if extra:
                 viol.append(("commit-da-trava-mexe-em-outro-arquivo", "%s também mexe em %s" % (sha7, ", ".join(extra[:5]))))
             nomove = sorted(f for f in files if touched.get(f) not in ("A", "M"))
             if nomove:
                 viol.append(("trava-declara-arquivo-que-o-commit-nao-adiciona-nem-altera", "%s declara %s" % (sha7, ", ".join(nomove[:5]))))
-            here = blobs_at(repo, c["sha"], files)
+            here = blobs_at(repo, sha, files)
             for f in files:
                 mode_blob = here.get(f)
                 if mode_blob is None or mode_blob[0] not in ("100644", "100755"):
@@ -265,12 +320,11 @@ def analyze(repo, base, head, bead):
                 ever.add(f)
             continue
         if baseline:
-            hit = sorted(f for f in changed_files(repo, c["sha"]) if f in baseline)
-            for f in hit:
+            for f in sorted(f for f in changed_files(repo, sha, parents) if f in baseline):
                 viol.append(("teste-travado-alterado", "%s mexe em %s depois da trava" % (sha7, f)))
     late_idx = [i for i, ev in enumerate(events) if ev is not None and ev[0] == "lock" and first_other is not None and i > first_other]
     if late_idx:
-        late = ", ".join(commits[i]["sha"][:7] for i in late_idx)
+        late = ", ".join(commits[i][0][:7] for i in late_idx)
         if nrel:
             notes.append("trava depois de commit comum (%s), com liberação registrada" % late)
         else:
@@ -521,7 +575,7 @@ def cmd_lock(a):
     except Cant as e:
         return die("o commit da trava falhou (os arquivos ficaram no índice, nada foi travado): %s" % e)
     sha = git_text(top, "rev-parse", "HEAD")
-    touched = changed_files(top, sha)
+    touched = changed_files(top, sha, [sha + "^"])
     if sorted(touched) != sorted(norm):
         return die("o commit %s mexeu em %s, não só nos arquivos pedidos (um hook de commit mexeu?): NÃO travei. Confira com git show --stat" % (sha[:7], sorted(touched)))
     who = os.environ.get("GC_SESSION_NAME") or os.environ.get("GC_ALIAS") or os.environ.get("GC_AGENT") or ""

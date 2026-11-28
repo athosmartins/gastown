@@ -452,7 +452,7 @@ branch_from "$R" main l_bad;   lock_commit "$R" "$LB" tests/test_lock.py "$LOCKE
 run_sut 2f "$R" "$MAIN" "$BADTIP" "$LB";                   expect "the fix commit also loosens the locked test: refused" fail teste-travado-alterado
 has "the finding names the locked file and the commit" "tests/test_lock.py depois da trava"
 printf '%s\n' "$LINE" | grep -q ' tip=- base=- arm=-$' && ok "the VERDICT line keeps the shared shape (tip/base/arm columns are -)" || bad "VERDICT line shape: $LINE"
-run_sut 2f "$R" "$MAIN" "$BADTIP" "ga-other";              expect "the same history judged for ANOTHER bead has no lock of that bead, and the reason says a lock of another bead is there" nao-se-aplica trava-so-de-outra-bead
+run_sut 2f "$R" "$MAIN" "$BADTIP" "ga-other";              expect "the same history judged for ANOTHER bead: no lock of that bead, but a lock of another id is visible (aviso), never silent" aviso trava-so-de-outra-bead
 branch_from "$R" main l_late;  printf 'x = 3\n' > "$R/lib/app.py"; commit_all "$R" fix-first >/dev/null; lock_commit "$R" "$LB" tests/test_lock.py "$LOCKED" >/dev/null; LATETIP="$(git -C "$R" rev-parse HEAD)"
 run_sut 2f "$R" "$MAIN" "$LATETIP" "$LB";                  expect "the lock after a plain commit (the fix came first): refused" fail trava-nao-e-o-primeiro-commit
 branch_from "$R" main l_rel;   lock_commit "$R" "$LB" tests/test_lock.py "$LOCKED" >/dev/null; printf 'x = 2\n' > "$R/lib/app.py"; commit_all "$R" fix >/dev/null
@@ -467,12 +467,16 @@ run_sut 2f "$R" "$MAIN" "$BADTIP" "$LB";                   expect "the kill swit
 rm -f "$CITY/.gc/repro-lock-check.off"
 run_sut 2f "$R" "$MAIN" "$BADTIP" "ga lock";               expect "a bead id with a space is refused" nao-consegui-medir bead-invalido
 branch_from "$R" main l_tool;  printf '# changed\n' | put "$R" "$HQ/scripts/repro-lock.py"; printf 'x = 5\n' > "$R/lib/app.py"; LTTIP="$(commit_all "$R" lock-tool-edit)"
-run_sut 2f "$R" "$MAIN" "$LTTIP" "$LB";                    expect "a diff that edits repro-lock.py is not judged by it" nao-consegui-medir ferramenta-alterada-no-diff
-# a history the tool cannot judge (a merge inside base..tip) is unmeasured: never ok, never a finding
-branch_from "$R" main l_mrg;   lock_commit "$R" "$LB" tests/test_lock.py "$LOCKED" >/dev/null; git -C "$R" checkout -q -b l_side main && printf 'y = 1\n' > "$R/lib/side.py" && commit_all "$R" side >/dev/null
+run_sut 2f "$R" "$MAIN" "$LTTIP" "$LB";                    expect "a diff that edits repro-lock.py is STILL judged: the merged copy only reads history" nao-se-aplica sem-trava-declarada
+branch_from "$R" main l_tool2; lock_commit "$R" "$LB" tests/test_lock.py "$LOCKED" >/dev/null; printf '# changed\n' | put "$R" "$HQ/scripts/repro-lock.py"; printf '%b\n' "$LOOSE" | put "$R" tests/test_lock.py; LT2TIP="$(commit_all "$R" tool-edit-and-loosen)"
+run_sut 2f "$R" "$MAIN" "$LT2TIP" "$LB";                   expect "editing the tool in the same diff does not switch the lock check off" fail teste-travado-alterado
+# a merge is judged by the first-parent line: fine when the locked test stays intact, a refusal when the merge brings the loosened test (never «could not tell»)
+branch_from "$R" main l_mrg;   LKSHA="$(lock_commit "$R" "$LB" tests/test_lock.py "$LOCKED")"; git -C "$R" checkout -q -b l_side main && printf 'y = 1\n' > "$R/lib/side.py" && commit_all "$R" side >/dev/null
 git -C "$R" checkout -q l_mrg && git -C "$R" merge -q --no-ff -m merge l_side && MGTIP="$(git -C "$R" rev-parse HEAD)"
-run_sut 2f "$R" "$MAIN" "$MGTIP" "$LB";                    expect "a merge commit in the range: could not tell" nao-consegui-medir ferramenta-nao-sei
-has "and the tool's own line says why" "merge"
+run_sut 2f "$R" "$MAIN" "$MGTIP" "$LB";                    expect "a merge of an innocent side branch after the lock: judged, the test is intact" ok trava-integra
+git -C "$R" checkout -q -b l_side2 "$LKSHA" && printf '%b\n' "$LOOSE" | put "$R" tests/test_lock.py && commit_all "$R" loosen-on-side >/dev/null
+git -C "$R" checkout -q l_mrg && git -C "$R" merge -q --no-ff -m merge2 l_side2 && MG2TIP="$(git -C "$R" rev-parse HEAD)"
+run_sut 2f "$R" "$MAIN" "$MG2TIP" "$LB";                   expect "a merge that BRINGS the loosened test: the merge's diff against its first parent shows it" fail teste-travado-alterado
 # stand-in tool: the checker reads the VERDICT line's fields and the exit status; a field that is not there is not a value
 C6="$WORK/city6"; mkcity "$C6" || { echo "FATAL: cannot build city6"; exit 1; }; CITY_UNDER="$C6"; T6="$C6/scripts/repro-lock.py"
 printf 'print("repro-lock-check: verdict=ok reason=trava-integra locks=2 files=2 releases=0")\n' > "$T6"
