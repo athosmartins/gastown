@@ -2,8 +2,9 @@
 
 ## Contents
 
-- A regra · Quem roda em qual credencial · O que o Athos faz (e quando) · Gerar o token de uma conta
-- Guardar o token (Mayor) · Como saber a validade · Os avisos · Renovar um login completo · Reverter
+• A regra · Quem roda em qual credencial · O que o Athos faz (e quando) · Gerar o token de uma conta
+• Guardar o token (Mayor ou o próprio Athos) · Como saber a validade · Os avisos
+• Renovar um login completo · Reverter
 
 ## A regra
 
