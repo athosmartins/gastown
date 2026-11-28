@@ -345,12 +345,24 @@ def test_the_scheduled_run_opens_no_browser_in_an_outage_either_across_many_runs
     assert seen == [] and w.calls("claude") == [] and "renewing " not in w.log() and all("nothing launched" in x for x in summary_lines(w))
 
 
+def test_a_healthy_scheduled_run_reads_each_keychain_item_once_and_writes_no_state(w):
+    """The validity line and the alarm reuse the survey the candidates took (one read per item, not two), and an account with nothing to warn about gets no record (so no state file)."""
+    _nobrowser(w)
+    healthy(w)
+    assert renew.housekeeping() == 0
+    secret_reads = [a[a.index("-s") + 1] for a in map(json.loads, (w.d / "argv.log").read_text().splitlines()) if "-w" in a]
+    assert len(secret_reads) >= 4 and len(secret_reads) == len(set(secret_reads))
+    assert not (w.d / "renew_state.json").exists()
+
+
 def test_GC_LOGIN_RENEW_BROWSER_1_brings_the_attempt_back_rollback(w):
     healthy(w)
     w.own("b85", blob("b85-x", rexp_days=2.0))
+    w.token("crypto", 365 - 5)
     seen = record(w)
     renew.housekeeping()
     assert seen == [(EMAIL["b85"], "forecast")] and "browser relogin off" not in summary_lines(w)[-1]
+    assert _titles(w) == [f"Token Claude vence em ate 7 dia(s): {EMAIL['crypto']}"]      # the attempt's marks are the login's voice now: the alarm warns the token only
 
 
 def test_a_full_login_ending_is_warned_once_per_level_7_3_1_days_and_forgotten_when_renewed(w):
@@ -362,7 +374,7 @@ def test_a_full_login_ending_is_warned_once_per_level_7_3_1_days_and_forgotten_w
     w.own("b85", blob("b85-b", rexp_days=6.9))
     renew.housekeeping()
     renew.housekeeping()                                                          # the same level never repeats once delivered
-    assert _titles(w) == [f"Login Claude vence em ate 7 dia(s): {EMAIL['b85']}"]
+    assert _titles(w) == [f"Login Claude vence em ate 7 dia(s): {EMAIL['b85']}"] and f"{EMAIL['b85']}: login warning sent (level 7 d)" in w.log()
     w.own("b85", blob("b85-c", rexp_days=2.9))
     renew.housekeeping()
     w.own("b85", blob("b85-d", rexp_days=0.9))
@@ -370,12 +382,33 @@ def test_a_full_login_ending_is_warned_once_per_level_7_3_1_days_and_forgotten_w
     assert _titles(w)[1:] == [f"Login Claude vence em ate 3 dia(s): {EMAIL['b85']}", f"Login Claude vence em ate 1 dia(s): {EMAIL['b85']}"]
     w.own("b85", blob("b85-e", rexp_days=29.0))                                   # renewed by hand: the record goes, the next ending warns again
     renew.housekeeping()
-    assert "login" not in w.state()["accounts"][EMAIL["b85"]].get("warned", {})                # the record is gone (and an empty `warned` with it)
+    assert "warned" not in w.state()["accounts"][EMAIL["b85"]]                                  # the record is gone (and an empty `warned` with it)
     w.own("b85", blob("b85-f", rexp_days=6.0))
     renew.housekeeping()
     assert len(_titles(w)) == 4
     n = w.calls("notify")[0]
     assert n["strict"] == "1" and n["argv"][2:4] == ["-p", "4"] and crew.relogin_how(EMAIL["b85"]) in n["argv"][4] and "no automation renews it" in n["argv"][4]
+
+
+@pytest.mark.parametrize("warned", [[], {"login": "junk"}, {"login": {"level_s": "x", "pushed": 1}}, {"login": {"level_s": True, "pushed": 1}}, {"login": {"pushed": 1}}])
+def test_a_damaged_warning_record_is_replaced_and_warned_never_a_crash_nor_taken_for_delivered(w, warned):
+    """A state file edited by hand: a record that cannot be read is no record (it claims `pushed`, and nobody can say what level was told): the warning is made again, once."""
+    _nobrowser(w)
+    healthy(w)
+    w.own("b85", blob("b85-x", rexp_days=2.0))
+    (w.d / "renew_state.json").write_text(json.dumps({"accounts": {EMAIL["b85"]: {"warned": warned}}}))
+    assert renew.housekeeping() == 0
+    assert _titles(w) == [f"Login Claude vence em ate 3 dia(s): {EMAIL['b85']}"]
+
+
+def test_a_full_login_that_has_ended_is_warned_as_ended_once_and_a_zero_left_is_ended_not_0_days(w):
+    _nobrowser(w)
+    healthy(w)
+    w.own("b85", blob("b85-gone", rexp_days=0.0))                                 # its end is this very second: left == 0.0
+    renew.housekeeping()
+    renew.housekeeping()
+    assert _titles(w) == [f"Login Claude ja venceu: {EMAIL['b85']}"]
+    assert "has ALREADY ended" in w.calls("notify")[0]["argv"][4] and f"{EMAIL['b85']}: login ended," in summary_lines(w)[-1]
 
 
 def test_a_setup_token_ending_is_warned_at_21_7_1_days_and_counted_from_gerado_em_when_the_item_has_it(w):
@@ -431,6 +464,20 @@ def test_a_vault_that_cannot_be_read_warns_nobody_and_is_said_not_guessed(w, how
     assert ("token vault unreadable" if how == "garbage" else "token vault unreachable") in summary_lines(w)[-1]
 
 
+def test_an_end_that_is_unknown_for_one_run_does_not_forget_the_warning_so_it_is_not_told_again(w):
+    """The vault blinks (down for one run): the token's end is unknown - not 'fine', not 'renewed' - so the delivered warning stays and the next run that can read it says nothing new."""
+    _nobrowser(w)
+    healthy(w)
+    w.token("b85", 365 - 5)
+    renew.housekeeping()
+    live = os.environ["CLAUDE_CRED_BW_URL"]
+    w.mp.setenv("CLAUDE_CRED_BW_URL", "http://127.0.0.1:9")
+    renew.housekeeping()
+    w.mp.setenv("CLAUDE_CRED_BW_URL", live)
+    renew.housekeeping()
+    assert _titles(w) == [f"Token Claude vence em ate 7 dia(s): {EMAIL['b85']}"]
+
+
 def test_a_vault_token_never_reaches_the_log_the_state_a_push_or_stdout(w, capsys):
     _nobrowser(w)
     healthy(w)
@@ -465,13 +512,57 @@ def test_a_push_that_was_not_delivered_is_retried_every_5_minutes_and_never_agai
     assert len(w.calls("notify")) == 3 and "vence em ate 1 dia(s)" in w.calls("notify")[2]["argv"][1]
 
 
-def test_the_walls_of_old_marks_are_not_pushed_any_more_when_no_browser_is_in_use(w):
-    """A mark left by the browser era (puzzle...) would push 'Relogin automatico impossivel' for an attempt that is never made again: the expiry alarm is the one voice."""
+def test_an_expiry_warning_held_by_the_push_cap_is_asked_once_more_as_a_decision_that_waits_for_athos(w):
+    """The 12 of 04/11 (the cap holds a FORCED push): a warning is a step only a person does, so it is `urgent` like a wall and the cap does not eat it."""
     _nobrowser(w)
     healthy(w)
-    (w.d / "renew_state.json").write_text(json.dumps({"accounts": {EMAIL["b85"]: {"infeasible": {"verdict": "puzzle", "step": "s", "at": T0, "left": 3 * DAY}}}}))
+    w.own("b85", blob("b85-x", rexp_days=2.0))
+    w.mp.setenv("FAKE_NOTIFY_CAP", "1")
     renew.housekeeping()
-    assert not any(x.startswith("Relogin automatico") for x in _titles(w))
+    first, second = w.calls("notify")
+    assert first["force"] == "1" and second["force"] is None and crew.WAITS_FOR_ATHOS in second["argv"][1]
+    assert w.state()["accounts"][EMAIL["b85"]]["warned"]["login"]["pushed"] == T0
+
+
+def test_alarm_lists_what_is_due_once_per_level_and_a_delivered_record_is_never_due_again(w):
+    """The due list on its own (settle() tells it): an undelivered record is due again only when its retry time has come, a delivered one never, however late the clock."""
+    who, row = EMAIL["b85"], {"login_left": 2 * DAY, "login_unread": False, "token": {"state": "none", "end": None, "left": None, "source": None}}
+    st, due = {}, (EMAIL["b85"], "login", 3 * DAY)
+    assert renew.alarm(st, {who: row}, T0) == [due]
+    rec = st["accounts"][who]["warned"]["login"]
+    rec["next_push"] = T0 + renew.PUSH_RETRY_S
+    assert renew.alarm(st, {who: row}, T0 + renew.PUSH_RETRY_S - 1) == [] and renew.alarm(st, {who: row}, T0 + renew.PUSH_RETRY_S) == [due]
+    rec["pushed"] = T0
+    assert renew.alarm(st, {who: row}, T0 + 10 * DAY) == []
+
+
+def test_tell_expiry_asks_once_waits_its_retry_time_and_never_repeats_a_delivered_record(w):
+    st = {"accounts": {EMAIL["b85"]: {"warned": {"login": {"level_s": 3 * DAY, "at": T0}}}}}
+
+    def tell(t):
+        renew.tell_expiry(st, EMAIL["b85"], "login", 3 * DAY, {"login_left": 2 * DAY}, t)
+    w.mp.setenv("FAKE_NOTIFY_RC", "1")                                             # not delivered: asked once, then only after PUSH_RETRY_S
+    tell(T0)
+    tell(T0 + renew.PUSH_RETRY_S - 1)
+    assert len(w.calls("notify")) == 1
+    w.mp.setenv("FAKE_NOTIFY_RC", "10")
+    tell(T0 + renew.PUSH_RETRY_S)
+    tell(T0 + 10 * DAY)                                                            # delivered: never again
+    assert len(w.calls("notify")) == 2
+
+
+@pytest.mark.parametrize("browser", [False, True])
+def test_the_walls_of_old_marks_are_not_pushed_any_more_when_no_browser_is_in_use(w, browser):
+    """A mark left by the browser era (puzzle...) would push 'Relogin automatico impossivel' for an attempt that is not made any more: the expiry alarm is the one voice.
+    `browser` True (GC_LOGIN_RENEW_BROWSER=1, the rollback) is the CONTROL: the very same state DOES push the wall, so the False case withholds a push that exists. The mark's `left` is the login's
+    whole life (29 d): release_marks() lifts a mark whose account now has HAND_LOGIN_GAIN_S MORE life than the mark found, and a lifted mark has nothing left to push whichever way settle() is called."""
+    if not browser:
+        _nobrowser(w)
+    healthy(w)
+    (w.d / "renew_state.json").write_text(json.dumps({"accounts": {EMAIL["b85"]: {"infeasible": {"verdict": "puzzle", "step": "s", "at": T0, "left": 29 * DAY}}}}))
+    renew.housekeeping()
+    assert w.mark("b85")                                                          # still marked: the fixture reached settle(), nothing upstream lifted it
+    assert [x for x in _titles(w) if x.startswith("Relogin automatico")] == ([f"Relogin automatico impossivel (puzzle): {EMAIL['b85']}"] if browser else [])
 
 
 def test_a_dry_run_says_what_it_would_warn_and_pushes_and_writes_nothing(w, capsys):
@@ -499,6 +590,48 @@ def test_status_exits_1_when_the_vault_cannot_be_read(w, capsys):
     w.mp.setenv("CLAUDE_CRED_BW_URL", "http://127.0.0.1:9")
     assert renew.main(["--status"]) == 1
     assert "token vault could not be read (unreachable)" in capsys.readouterr().err
+
+
+def test_a_login_item_that_cannot_be_read_is_unknown_to_the_alarm_and_to_status_never_the_number_of_the_other_item(w, capsys):
+    """b85's own item says 2 days, its reserve item cannot be read (it may hold a longer login): no warning, and `--status` says unknown and exits 1 - not the 2 days of the readable half."""
+    _nobrowser(w)
+    healthy(w)
+    w.own("b85", blob("b85-x", rexp_days=2.0))
+    w.mp.setenv("FAKE_SEC_FAIL", crew.reserve_service(EMAIL["b85"]))
+    renew.housekeeping()
+    assert _titles(w) == []
+    assert renew.main(["--status"]) == 1
+    out = capsys.readouterr()
+    line = next(x for x in out.out.splitlines() if x.startswith(EMAIL["b85"]))
+    assert "full login unknown" in line and "WARN" not in line and EMAIL["b85"] in out.err
+
+
+def test_status_says_unknown_for_the_holder_when_the_file_the_sessions_read_cannot_be_read(w, capsys):
+    _nobrowser(w)
+    healthy(w)
+    w.crew_state(current=EMAIL["crypto"])
+    w.put_file(blob("crypto-file", rexp_days=25.0))
+    real = w.d / "elsewhere.json"
+    real.write_bytes(w.cred.read_bytes())
+    w.cred.unlink()
+    w.cred.symlink_to(real)                                                        # a path the crew job refuses: the file may hold a login nobody can look at
+    assert renew.main(["--status"]) == 1
+    out = capsys.readouterr()
+    assert f"{EMAIL['crypto']}: full login unknown" in out.out and EMAIL["crypto"] in out.err
+
+
+def test_without_a_readable_crew_state_the_token_is_still_warned_and_status_says_why(w, capsys):
+    """The ends of the full logins cannot be known without the crew job's state (no login is judged, exit 1), but a token's end is the vault's alone: its warning goes."""
+    _nobrowser(w)
+    healthy(w)
+    w.own("b85", blob("b85-x", rexp_days=2.0))                                     # a login that WOULD be warned about if it were judged
+    (w.d / "crew_state.json").write_text("{not json")
+    w.token("b85", 365 - 5)
+    assert renew.housekeeping() == 1
+    assert _titles(w) == [f"Token Claude vence em ate 7 dia(s): {EMAIL['b85']}"]
+    assert renew.main(["--status"]) == 1
+    out = capsys.readouterr()
+    assert "the crew state" in out.err and "login item" not in out.err and "full login unknown" in out.out and "setup-token 5.0 d" in out.out
 
 
 def test_a_forced_renewal_by_a_person_still_opens_the_browser_attempt(w):
@@ -1468,8 +1601,11 @@ def test_a_burned_backup_login_does_not_stop_the_outage_and_the_account_with_no_
     renew.housekeeping()
     assert seen == [(EMAIL["amb"], "outage")]
     assert renew.main(["--dry-run"]) == 0
+    import re
     err = capsys.readouterr().err
-    assert EMAIL["martins"] not in "\n".join(x.split("; validity:")[0] for x in err.splitlines())      # it may be NAMED in the validity list (ga-xy0916u); it is never a try, a launch or a passed-over account
+    assert EMAIL["martins"] in err                                                                  # control: the validity list (ga-xy0916u) does name it, so the cut below removes something
+    # only the validity list is excused: the segments AFTER it on the scheduled-run line ("passed over:", "ignored, not an account...") are exactly where a try or a pass-over would name it
+    assert EMAIL["martins"] not in re.sub(r"; validity: .*?(?=; passed over:|; ignored, not an account|$)", "", err, flags=re.M)      # it is never a try, a launch or a passed-over account
 
 
 def test_the_forecast_goes_before_the_outage_and_the_dry_run_says_the_whole_order(w, capsys):

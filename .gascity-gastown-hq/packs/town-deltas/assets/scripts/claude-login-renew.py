@@ -12,9 +12,9 @@
 ga-xy0916u (Athos 28/11: «Token de 1 ano + você só onde precisa»): THE SCHEDULED RUN OPENS NO BROWSER ANY MORE. The pool (dogs, wa-worker, ps-worker, reviewers, refino) runs on the 1-year
 setup-token (claude-pool-account.py); only Remote Control (Mayor, named crews) needs a FULL login, and claude.ai answers an automated relogin with a human check we do not get around. So the
 scheduled run still reads everything and logs its usual `scheduled run:` line (the accounts that WOULD have been renewed are listed as passed over: "browser relogin is off"), and it WARNS:
-  * a FULL login ends within 7 / 3 / 1 days or has ended -> one `notify -p 4` push per level (>= 3 days ahead of the end), with the exact hand step;
+  * a FULL login ends within 7 / 3 / 1 days or has ended -> one `notify -p 4` push per level, the first one 7 days ahead of the end (the rule is >= 3), with the exact hand step;
   * a setup-token ends within 21 / 7 / 1 days or has ended (its end = the vault item's `gerado_em` field, else its revisionDate, + 365 days) -> the same, with the runbook.
-Each line of the log carries every account's validity. GC_LOGIN_RENEW_BROWSER=1 brings the browser attempts back (rollback). `--account <e> --force` (a person asking) is unchanged.
+The `scheduled run:` line of the log carries every account's validity. GC_LOGIN_RENEW_BROWSER=1 brings the browser attempts back (rollback). `--account <e> --force` (a person asking) is unchanged.
 Everything below describing the scheduled run's attempts is what GC_LOGIN_RENEW_BROWSER=1 runs.
     exit: 0 = ran (or nothing to do), 2 = a forced renewal that did not renew, 64 = usage (an e-mail that is not one of the job's accounts included, for --reset), 1 = the run could not judge
           (unreadable state / crew state), could not take the lock (a --reset that found the lock taken too: nothing was reset) or write its state, or crashed (the log says which)
@@ -604,14 +604,14 @@ def browser_relogin_on() -> bool:
 
 def validity(crew: Optional[dict], t: float, surveys: Optional[Dict[str, dict]] = None) -> Tuple[str, Dict[str, dict]]:
     """(vault status, {email: {login_left, login_unread, token}}) for every account of the crew job. login_left = seconds to the end of the account's best FULL login (None = no end recorded,
-    or the crew state is unknown: `crew` None); token = M.token_state of its vault item (None-left when the vault could not be read: said by the status, never guessed).
+    or the crew state is unknown: `crew` None, or an item of the account could not be read: `login_unread`); token = M.token_state of its vault item (None-left when the vault could not be read: said by the status, never guessed).
     `surveys` = the ones candidates() already took this run (one read of the Keychain per run, not two)."""
     vstatus, vault = M.vault_tokens()
     cf = cred_view(crew, t) if crew is not None and not surveys else None
     rows: Dict[str, dict] = {}
     for e in C.accounts():
         v = (surveys or {}).get(e) or (survey(e, crew, t, cf) if crew is not None else {"best_left": None, "unread": False})
-        rows[e] = {"login_left": v["best_left"], "login_unread": v["unread"], "token": M.token_state(vault.get(e), t)}
+        rows[e] = {"login_left": None if v["unread"] else v["best_left"], "login_unread": v["unread"], "token": M.token_state(vault.get(e), t)}      # an item that cannot be read may hold the LONGER login: the readable half's number is no end
     return vstatus, rows
 
 
@@ -630,7 +630,7 @@ def alarm(st: dict, rows: Dict[str, dict], t: float, logins: bool = True) -> Lis
     forgets its record (the next ending warns again). `logins` False (the browser relogin is ON, the rollback): the full logins are the attempt's business (its marks push), only the tokens are warned. An end that is not known (no date, an item that could not be read) says nothing: it is not 'fine' and not 'ending'."""
     due: List[Tuple[str, str, int]] = []
     for email, r in rows.items():
-        for kind, left, thr in (("login", None if r["login_unread"] else r["login_left"], M.LOGIN_WARN_S), ("token", r["token"]["left"], M.TOKEN_WARN_S)):
+        for kind, left, thr in (("login", r["login_left"], M.LOGIN_WARN_S), ("token", r["token"]["left"], M.TOKEN_WARN_S)):
             if left is None or (kind == "login" and not logins):
                 continue
             a = (st.get("accounts") or {}).get(email)          # read, never create: an account with nothing to warn about gets no record (and the run no state write)
@@ -677,7 +677,7 @@ def tell_expiry(st: dict, email: str, kind: str, lvl: int, r: dict, t: float) ->
     title, text = warn_text(email, kind, lvl, r, t)
     if push(title, text):
         rec["pushed"] = t
-        rlog("WARN", f"{email}: {kind} warning sent (level {lvl // 86400 if lvl else 0} d)")
+        rlog("WARN", f"{email}: {kind} warning sent (level {lvl // 86400} d)")
 
 
 def status() -> int:
@@ -695,7 +695,10 @@ def status() -> int:
               + (f"{_days(tk['left'])} (ends {C._iso(tk['end'])}, from {tk['source']}){' - WARN' if tl is not None else ''}" if tk["state"] == "ok" else tk["state"]))
     if vstatus != "ok":
         print(f"the token vault could not be read ({vstatus}): no token date is known", file=sys.stderr)
-    return 0 if crew_status == "ok" and vstatus == "ok" else 1
+    unread = [e for e, r in rows.items() if r["login_unread"]]
+    if unread:
+        print(f"{', '.join(unread)}: a login item (or the credentials file) could not be read, so the end of its full login is unknown", file=sys.stderr)
+    return 0 if crew_status == "ok" and vstatus == "ok" and not unread else 1
 
 
 def disabled() -> Optional[str]:
@@ -928,9 +931,9 @@ def housekeeping() -> int:
              + (f"; passed over: {', '.join(passed)}" if passed else "") + (f"; ignored, not an account of the crew job: {', '.join(gone)}" if gone else ""))
     if DRY:
         for email, kind, lvl in warns:
-            rlog("INFO", f"{email}: would warn ({kind}, level {lvl // 86400 if lvl else 0} d) - nothing pushed")
+            rlog("INFO", f"{email}: would warn ({kind}, level {lvl // 86400} d) - nothing pushed")
     live = [e for e in (st.get("accounts") or {}) if e not in gone]       # only these get their push retried (and a run with none of them saves nothing); a cancelled one's record is kept, never pushed
-    err = None if DRY or not live else settle(st, live if browser else [], t, [w for w in warns if w[0] not in gone], rows)      # ga-xy0916u: without the browser the walls of old marks are not pushed (the expiry alarm says it)
+    err = None if DRY or not live else settle(st, live if browser else [], t, warns, rows)      # ga-xy0916u: without the browser the walls of old marks are not pushed (the expiry alarm says it)
     if err:
         rlog("ERROR", f"the state could not be written ({type(err).__name__}): this run's marks, tries and pushes are NOT recorded")
     return 0 if crew_status == "ok" and not err else 1

@@ -14,11 +14,13 @@ THE RULE (Athos, 28/11, ga-xoe5ao.6: «Token de 1 ano + você só onde precisa»
 A role that has an explicit `command`/`start_command` (the control dispatchers) runs no Claude at all.
 
 SOURCE OF THE MAP: `gc config show` (the RESOLVED config: pack agents and city patches together). CLAUDE_CRED_MAP_CONFIG = a path to a TOML file of the same shape (tests, snapshots).
+`roles` and `check` need Python 3.11+ (tomllib; the system python3 of the mini is 3.9: exit 1 and says so); `tokens` and the vault dates (claude-login-renew.py) run on 3.9.
 
 THE TOKEN'S END is NOT in the token (it is opaque). It is the vault item's `gerado_em` field (an ISO date, when the item has one) else the item's revisionDate (the day the
 token was last stored: registration writes the item once per token) + TOKEN_LIFE_S (365 days, what `claude setup-token` says; not measured here). The token itself never
 leaves this process, and never reaches a log, argv, a file or stdout: the vault answer is read for name/dates/fields only and `notes` is reduced to "is there one".
-SEAMS (tests): CLAUDE_CRED_MAP_CONFIG, CLAUDE_CRED_BW_URL (default http://127.0.0.1:18587, the bw serve of `secret`), CLAUDE_CRED_TOKEN_LIFE_S, CLAUDE_CRED_GC (the gc binary).
+SEAMS (tests): CLAUDE_CRED_MAP_CONFIG, CLAUDE_CRED_BW_URL (default http://127.0.0.1:18587: the local `bw serve` that `secret` waits for after a boot, the same `BW` as lib/contatos_corretor_credencial.py
+and the item name of lib/claude_account_pool.py in whatsapp_automation - read there, origin/main of 28/11), CLAUDE_CRED_TOKEN_LIFE_S, CLAUDE_CRED_GC (the gc binary).
 """
 from __future__ import annotations
 
@@ -40,7 +42,7 @@ DAY = 86400
 ITEM_PREFIX = "claude-oauth-token-"                            # the vault item of an account's token: lib/claude_account_pool.py (whatsapp_automation) names it the same
 TOKEN_LIFE_S = 365 * DAY                                       # `claude setup-token`: "valid for one year". Not measured here (a token is only ever tried, never decoded)
 TOKEN_WARN_S = (21 * DAY, 7 * DAY, 1 * DAY)                    # the token is Athos's ~2 min step: asked early, then again closer
-LOGIN_WARN_S = (7 * DAY, 3 * DAY, 1 * DAY)                     # a full login lasts ~30 days and costs a human step each time: >= 3 days ahead, three times
+LOGIN_WARN_S = (7 * DAY, 3 * DAY, 1 * DAY)                     # a full login lasts ~30 days and costs a human step each time: the first word comes 7 days ahead (the rule is >= 3), then 3 and 1
 FULL, TOKEN, DEFAULT, NO_CLAUDE = "full-login", "token", "default-login", "no-claude"
 
 
@@ -58,14 +60,17 @@ def kind_of(agent: dict, providers: dict, workspace_provider: str) -> str:
         return TOKEN
     if p == "claude-rc" or p.startswith("claude-rc-"):
         return FULL
-    if p == "claude" or p.startswith("claude"):
+    if p.startswith("claude"):                                 # `claude` and any other claude-* the two lines above did not name: the default login, so `check` lists it (never hidden as "no Claude")
         return DEFAULT
     return NO_CLAUDE                                           # hybrid, kimi, codex...: not a Claude login
 
 
 def load_config() -> dict:
     """The resolved config (dict). Raises OSError/ValueError when it cannot be had: the caller says so."""
-    import tomllib                                             # here, not at the top: the system python3 (3.9) has none, and claude-login-renew.py imports this file for the vault dates alone
+    try:
+        import tomllib                                         # here, not at the top: the system python3 (3.9) has none, and claude-login-renew.py imports this file for the vault dates alone
+    except ImportError as e:                                   # `roles`/`check` on that python3: the documented exit 1 with what to do, not an uncaught traceback
+        raise OSError(f"Python 3.11+ is needed to read the config (this is {sys.version.split()[0]}, it has no tomllib): run it with python3.11 or newer") from e
     seam = os.environ.get("CLAUDE_CRED_MAP_CONFIG")
     if seam:
         return tomllib.loads(Path(seam).read_text())
@@ -112,7 +117,7 @@ def vault_url() -> str:
 
 def vault_tokens(timeout: float = 10.0) -> Tuple[str, Dict[str, dict]]:
     """(status, {email: {generated, source, has_token}}). status: 'ok' (an empty vault is ok: no token registered) | 'unreachable' (bw serve does not answer) | 'unreadable' (an answer with no
-    shape of a list of items). An item with no readable date has generated=None: its token is there and its end is unknown. The token (`notes`) is never kept."""
+    shape of a list of items). An item with no readable date has generated=None: its end is unknown (has_token says whether a token is in it). The token (`notes`) is never kept."""
     q = urllib.parse.urlencode({"search": ITEM_PREFIX})
     try:
         with urllib.request.urlopen(f"{vault_url()}/list/object/items?{q}", timeout=timeout) as r:     # urlopen of a loopback URL: the host is ours, the query has no account in it

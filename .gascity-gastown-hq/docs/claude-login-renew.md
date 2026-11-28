@@ -10,11 +10,11 @@
 Decisão do Athos (ga-xoe5ao.6): o pool usa o **token de 1 ano** (`claude setup-token`); só o Mayor e as crews com Remote Control mantêm **login completo**, que o Athos renova **à mão**. Por isso, **por padrão a rodada agendada não abre navegador nem lança tentativa**
 (o claude.ai responde ao relogin automático com verificação humana, e isso não se contorna). O que ela faz no lugar:
 - A conta devida (previsão, outage, inutilizável) entra em `passed over` da linha `scheduled run:` com «due: <motivo>; browser relogin is off», e a linha ganha `; browser relogin off`.
-- **Alarme de validade**: um push (`notify -p 4`) por conta, tipo e faixa. Login completo: **7 / 3 / 1 dia(s)** e já vencido (≥ 3 dias de antecedência desde a primeira faixa). Token de 1 ano: **21 / 7 / 1 dia(s)** e já vencido. Faixa mais apertada = push novo;
+- **Alarme de validade**: um push (`notify -p 4`) por conta, tipo e faixa. Login completo: **7 / 3 / 1 dia(s)** e já vencido (o primeiro aviso vem 7 dias antes; a regra é ≥ 3). Token de 1 ano: **21 / 7 / 1 dia(s)** e já vencido. Faixa mais apertada = push novo;
   a mesma faixa não repete depois de entregue (não entregue: reenvia a cada 5 min); login ou token renovado esquece o registro (`accounts[<e>].warned.{login,token}` no estado). Fim desconhecido (cofre fora do ar, item sem token ou sem data) **não avisa** e a linha do log diz qual dos casos.
 - O fim do token **não está no token**: vem do campo `gerado_em` do item `claude-oauth-token-<e>` do cofre, senão da `revisionDate` (o dia em que foi guardado), + 365 dias (`claude-credential-map.py`; vida **não medida**). O cofre é lido por `bw serve` (`127.0.0.1:18587`); só nome, datas e campos — a nota (o token) é reduzida a «existe», nunca guardada nem logada.
 - A linha `scheduled run:` ganha `; validity: <e>: login <N d>, token <N d>; …`. As marcas `infeasible` antigas não geram mais o push «Relogin automatico impossivel» (o alarme é a voz única).
-- `claude-login-renew.py --status` imprime a mesma validade, só leitura (sai 1 se o estado ou o cofre não puderam ser lidos). `--account <e> --force` (uma pessoa pedindo) **continua** abrindo o navegador.
+- `claude-login-renew.py --status` imprime a mesma validade, só leitura (sai 1 se o estado, o cofre ou um item de login não puderam ser lidos). `--account <e> --force` (uma pessoa pedindo) **continua** abrindo o navegador.
 - **Voltar o relogin por navegador na rodada agendada:** `GC_LOGIN_RENEW_BROWSER=1` no ambiente do job. Quem usa qual credencial e como gerar/guardar os tokens: `docs/runbooks/claude-setup-token.md`.
 
 ## O que a fatia 1 faz

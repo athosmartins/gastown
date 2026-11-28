@@ -7,6 +7,7 @@ import http.server
 import importlib.util
 import json
 import subprocess
+import sys
 import threading
 from pathlib import Path
 
@@ -128,16 +129,77 @@ def test_an_unreadable_config_is_exit_1_and_said_not_an_empty_map(tmp_path, monk
     assert M.main(["check"]) == 1
 
 
+def test_a_provider_that_is_neither_rc_nor_headless_but_claude_is_the_default_login_and_listed(tmp_path, monkeypatch, capsys):
+    p = tmp_path / "c.toml"
+    p.write_text('[workspace]\nprovider = "claude"\n[[agent]]\nname = "x"\nprovider = "claude-experimental"\n[[agent]]\nname = "y"\nprovider = "codex"\n')
+    monkeypatch.setenv("CLAUDE_CRED_MAP_CONFIG", str(p))
+    assert {r["role"]: r["credential"] for r in M.roles(M.load_config())} == {"x": M.DEFAULT, "y": M.NO_CLAUDE}
+    assert M.main(["check"]) == 3 and "unpinned: x" in capsys.readouterr().err
+
+
+def test_gc_config_show_runs_in_the_city_dir_because_gc_finds_the_city_from_its_cwd(tmp_path, monkeypatch):
+    monkeypatch.delenv("CLAUDE_CRED_MAP_CONFIG", raising=False)
+    fake = tmp_path / "gc"
+    fake.write_text(f'#!/bin/sh\npwd -P > "{tmp_path}/cwd"\necho \'[workspace]\'\n')
+    fake.chmod(0o755)
+    monkeypatch.setenv("CLAUDE_CRED_GC", str(fake))
+    assert M.main(["roles"]) == 0
+    assert (tmp_path / "cwd").read_text().strip() == str(M.city_root().resolve())
+    assert (M.city_root() / "packs" / "town-deltas" / "assets" / "scripts" / SCRIPT.name).is_file()      # the city is the dir this script lives in, whatever the checkout is called
+
+
+def test_a_gc_that_is_not_installed_is_exit_1_and_said(tmp_path, monkeypatch, capsys):
+    monkeypatch.delenv("CLAUDE_CRED_MAP_CONFIG", raising=False)
+    monkeypatch.delenv("CLAUDE_CRED_GC", raising=False)
+    monkeypatch.setenv("PATH", str(tmp_path))                                 # no gc anywhere
+    assert M.main(["check"]) == 1 and "FileNotFoundError" in capsys.readouterr().err
+
+
 def test_a_gc_that_exits_non_zero_hangs_or_answers_garbage_is_exit_1_and_said_not_an_empty_map(tmp_path, monkeypatch, capsys):
     monkeypatch.delenv("CLAUDE_CRED_MAP_CONFIG", raising=False)
     fake = tmp_path / "gc"
     monkeypatch.setenv("CLAUDE_CRED_GC", str(fake))
-    for body, said in (("echo boom >&2\nexit 3\n", "exited 3"), ("echo 'this is [not toml'\n", "could not be read")):
+    for body, said in (("echo boom >&2\nexit 3\n", "exited 3"), ("echo boom >&2\nexit 1\n", "exited 1"), ("echo 'this is [not toml'\n", "could not be read")):
         fake.write_text("#!/bin/sh\n" + body)
         fake.chmod(0o755)
         assert M.main(["check"]) == 1 and said in capsys.readouterr().err
     monkeypatch.setattr(M.subprocess, "run", lambda *a, **k: (_ for _ in ()).throw(subprocess.TimeoutExpired("gc", 90)))
     assert M.main(["roles"]) == 1 and "TimeoutExpired" in capsys.readouterr().err
+
+
+def test_an_interpreter_without_tomllib_is_exit_1_and_names_the_fix_not_a_traceback(cfg, monkeypatch, capsys):
+    """The system python3 of the mini is 3.9 (no tomllib): `roles` and `check` there are the documented exit 1 with what to do, not an uncaught ModuleNotFoundError."""
+    monkeypatch.setitem(sys.modules, "tomllib", None)             # `import tomllib` raises ModuleNotFoundError, as on 3.9
+    for cmd in ("roles", "check"):
+        assert M.main([cmd]) == 1
+        err = capsys.readouterr().err
+        assert "Python 3.11" in err and f"this is {sys.version.split()[0]}," in err                  # what to run it with, and what it ran on
+
+
+def test_roles_text_groups_each_role_under_the_credential_it_runs_on(cfg, capsys):
+    """What the person reads: hand-derived from CONFIG (a role listed under the wrong header would still contain every name)."""
+    assert M.main(["roles"]) == 0
+    assert capsys.readouterr().out == "\n".join([
+        "FULL LOGIN (Remote Control: Mayor + named crews) - 2 role(s)",
+        "    gastown/crew-a  [claude-rc]",
+        "    mayor  [claude-rc-mayor]",
+        "1-YEAR SETUP-TOKEN (pool: inference only) - 2 role(s)",
+        "    dog  [claude-headless]",
+        "    whatsapp_automation/wa-worker  [claude-headless]",
+        "DEFAULT LOGIN (no provider pinned: the Mayor's login) - 2 role(s)",
+        "    gastown/polecat  [(claude, the workspace default)]",
+        "    lexbh/witness  [(claude, the workspace default)]  (suspended)",
+        "no Claude - 3 role(s)",
+        "    control-dispatcher  [(claude, the workspace default)]",
+        "    kimi-thing  [kimi]",
+        "    scripted  [(claude, the workspace default)]",
+    ]) + "\n"
+
+
+def test_the_script_run_as_a_program_passes_its_arguments_on_and_exits_with_the_code_of_main(cfg):
+    """What the runbook types: `python3 claude-credential-map.py check` (a wrong argv slice at the entry point would answer usage, 64, to everything)."""
+    r = subprocess.run([sys.executable, str(SCRIPT), "check"], capture_output=True, text=True, timeout=60)
+    assert r.returncode == 3 and "unpinned: gastown/polecat" in r.stderr
 
 
 def test_roles_text_and_json(cfg, capsys):
@@ -200,22 +262,27 @@ def test_the_vault_is_asked_only_for_the_token_items_and_the_answer_keeps_dates_
 
 def test_gerado_em_wins_over_revisionDate_and_creationDate(vault):
     vault.item("a@x.com", revision=iso(T0), creation=iso(T0 - 9 * DAY), gerado=iso(T0 - 100 * DAY))
+    vault.item("b@x.com", revision=iso(T0), fields=["junk", None, 3, {"name": "other"}, {"name": "gerado_em", "value": iso(T0 - 50 * DAY)}])      # a field that is no object is skipped, not a crash
     assert M.vault_tokens()[1]["a@x.com"] == {"generated": T0 - 100 * DAY, "source": "gerado_em", "has_token": True}
+    assert M.vault_tokens()[1]["b@x.com"] == {"generated": T0 - 50 * DAY, "source": "gerado_em", "has_token": True}
 
 
 def test_creationDate_is_used_when_there_is_no_revisionDate_and_a_bad_date_is_no_date(vault):
     vault.item("a@x.com", creation=iso(T0 - DAY))
     vault.item("b@x.com", revision="not a date", creation=None)
     vault.item("c@x.com", gerado="garbage", revision=iso(T0))                  # a gerado_em nobody can read falls back to the item's own date
+    vault.item("d@x.com", revision=iso(T0 - 5 * DAY), creation=iso(T0 - 300 * DAY))      # re-stored 5 days ago: the token's day is the LAST storing, not the item's birth
     items = M.vault_tokens()[1]
     assert items["a@x.com"]["source"] == "creationDate" and items["b@x.com"]["generated"] is None and items["c@x.com"]["source"] == "revisionDate"
+    assert items["d@x.com"]["generated"] == T0 - 5 * DAY and items["d@x.com"]["source"] == "revisionDate"
 
 
 def test_items_of_other_kinds_deleted_items_and_nameless_ones_are_not_accounts(vault):
     vault.body += [{"name": "something-else-a@x.com"}, {"name": M.ITEM_PREFIX}, {"name": 7}, "junk", None]
     vault.item("gone@x.com", revision=iso(T0), deletedDate=iso(T0))
     vault.item("ok@x.com", revision=iso(T0))
-    assert list(M.vault_tokens()[1]) == ["ok@x.com"]
+    vault.item("  Spaced@X.com ", revision=iso(T0))                               # the name as a person typed it: the account is its trimmed, lowercase address
+    assert sorted(M.vault_tokens()[1]) == ["ok@x.com", "spaced@x.com"]
 
 
 def test_an_item_with_no_token_in_it_is_there_but_has_no_token(vault):
@@ -228,7 +295,7 @@ def test_an_empty_vault_is_ok_and_empty(vault):
     assert M.vault_tokens() == ("ok", {})
 
 
-@pytest.mark.parametrize("raw", ["<html>nonsense</html>", "[]", '{"data": 3}', '{"data": {"data": "x"}}', "null", ""])
+@pytest.mark.parametrize("raw", ["<html>nonsense</html>", "[]", '{"data": 3}', '{"data": {"data": "x"}}', "null", "", pytest.param("[" * 100000, id="nested-past-the-recursion-limit")])
 def test_an_answer_that_is_not_a_list_of_items_is_unreadable_not_empty(vault, raw):
     vault.raw = raw
     assert M.vault_tokens() == ("unreadable", {})

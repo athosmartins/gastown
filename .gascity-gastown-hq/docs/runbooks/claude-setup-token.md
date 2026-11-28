@@ -23,6 +23,7 @@ Ninguém contorna a verificação do claude.ai no navegador: o relogin automáti
 ## Quem roda em qual credencial
 
 `python3 packs/town-deltas/assets/scripts/claude-credential-map.py roles` lista cada agente da config resolvida (`gc config show`) agrupado pela credencial; `check` sai 3 e nomeia os papéis vivos sem provider.
+`roles` e `check` pedem **Python 3.11+** (tomllib). Se o `python3` do terminal for mais antigo (o do sistema no macOS é o 3.9), o script sai 1 e diz isso: use o do Homebrew (`/opt/homebrew/bin/python3`, o mesmo do driver do relogin). `tokens` e `--status` rodam no 3.9.
 
 - **Login completo:** o Mayor e as crews nomeadas (provider `claude-rc` / `claude-rc-*`).
 - **Token de 1 ano:** provider `claude-headless` (cães, `wa-worker`, `ps-worker`, revisores, refino…). O daemon do pool (`claude-pool-account.py`) escolhe a conta e grava o token dela no item do pool; `claude-lowprio.sh` aponta essas sessões para ele.
@@ -31,7 +32,7 @@ Ninguém contorna a verificação do claude.ai no navegador: o relogin automáti
 
 ## O que o Athos faz (e quando)
 
-1. **Hoje:** nada, se `claude-login-renew.py --status` mostra o `setup-token` de cada conta com mais de 21 dias. Os 5 tokens do cofre foram guardados em 30/09 (≈306 dias de vida contados a partir daí; a vida de 365 dias **não foi medida**).
+1. **Hoje:** nada, se `claude-login-renew.py --status` mostra o `setup-token` de cada conta com mais de 21 dias. Os tokens das 4 contas do job foram guardados em 30/09 (`--status` de 28/11: terminam em 30/09/2027, ≈306 dias; a vida de 365 dias **não foi medida**). O cofre pode ter mais tokens que as 4 contas do job (o doc do pool fala em 5): só `claude-credential-map.py tokens` os lista todos.
 2. **Quando o aviso «Login Claude vence em ate N dia(s)» chegar:** renovar o login completo dessa conta à mão — seção "Renovar um login completo" (~2 min).
 3. **Só se um token morrer** (aviso «Token Claude vence…/ja venceu», ou o pool marcar a conta inválida): gerar outro — seção seguinte.
 
@@ -65,8 +66,9 @@ python3 packs/town-deltas/assets/scripts/claude-login-renew.py --status
 python3 packs/town-deltas/assets/scripts/claude-credential-map.py tokens
 ```
 
-`--status` imprime, por conta, o fim do login completo e o fim do token, com `- WARN` quando já entrou na faixa de aviso. Só datas e dias: **nunca o token**. Sai 1 se o estado da crew job ou o cofre não puderam ser lidos (e diz qual).
+`--status` imprime, por conta, o fim do login completo e o fim do token, com `- WARN` quando já entrou na faixa de aviso. Só datas e dias: **nunca o token**. Sai 1 se o estado da crew job, o cofre ou um item de login de alguma conta não puderam ser lidos (e diz qual); um item ilegível dá «full login unknown», nunca o número da metade legível.
 A linha `scheduled run:` do log (`.gc/logs/claude-login-renew.log`) repete a validade a cada 15 min.
+O aviso e o `--status` cobrem as contas **do job** (as 4 acima). `claude-credential-map.py tokens` lista todo item `claude-oauth-token-*` do cofre: o de uma conta fora do job aparece só ali e **não tem aviso**.
 
 ## Os avisos
 
