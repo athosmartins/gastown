@@ -11,6 +11,8 @@
 • The Escape exception — unsticking a pool session on the limit screen (ga-8hcnvb.2.1)
 • Known limits · Exit codes (`launchctl list` → last exit status)
 
+Which roles run on this pool's 1-year setup-token and which keep a full login (Remote Control), how each token is generated and stored, and the expiry alarm (ga-xy0916u): `docs/runbooks/claude-setup-token.md`. The map: `claude-credential-map.py roles|check|tokens`.
+
 The headless pool (dog, wa-worker, ps-worker, gate-reviewer, boot, deacon, auto-refiner — ~90% of the spend)
 follows ONE Claude account, which a script chooses. The script moves the pool away from the account in use when that account
 **says the limit is hit** (an HTTP 429, or a `rejected` status in the `anthropic-ratelimit-unified-*` headers) or **refuses its key**

@@ -8,6 +8,8 @@ Fase 2 da ga-xoe5ao. O pool headless (ga-8hcnvb.1, `claude-pool-account.py`) dec
 para quem usa Remote Control (Mayor + crews), reescrevendo o item DEFAULT do Keychain `Claude Code-credentials`.
 Decisão do Athos (06/10): ao vivo, sem reiniciar — mesmo link de RC, conversa intacta.
 
+Quem usa **login completo** (este job: Mayor e crews com Remote Control) e quem usa o **token de 1 ano** (o pool headless) está em `docs/runbooks/claude-setup-token.md`; o login completo não se renova sozinho (`claude-login-renew.py` só avisa; ga-xy0916u).
+
 ## O que faz (a cada 60 s, sob flock)
 1. Pergunta ao endpoint de perfil quem segura o item default (não confia em memória nem em `~/.claude.json`).
 2. **Sync-back** (3 resultados: salvou / nada a salvar / **não conseguiu ou não soube dizer**): copia o login do default de volta
