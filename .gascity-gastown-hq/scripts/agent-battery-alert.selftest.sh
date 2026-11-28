@@ -28,9 +28,11 @@ R2=$(touch_commit .city/scripts/foo.sh x2 "fix(ga-bbb2): script que não é conf
 R3=$(touch_commit .city/CLAUDE.md x3 "docs(ga-ccc3): CLAUDE.md da cidade")
 R4=$(touch_commit .claude/skills/x.md x4 "chore: skill sem bead no assunto")
 R5=$(touch_commit .city/agents/gate-reviewer/prompt.template.md x5 "fix(ga-ddd4.2): prompt do reviewer")
+R6=$(touch_commit .city/agents/dog-remote/prompt.template.md x6 "fix(wa-eee5): prompt do dog, bead de outro rig")
+R7=$(touch_commit .city/agents/dog-remote/prompt.template.md x7 "fix(ga-fff6): prompt do dog")
 
-printf '#!/usr/bin/env bash\n[ -e "$FAKE_LOG/mail-fail" ] && exit 1\nprintf "%%s\\n" "$2" >>"$FAKE_LOG/mail-subj"; printf "%%s\\n" "$4" >"$FAKE_LOG/mail-body"; printf "%%s\\n" "$PATH" >"$FAKE_LOG/mail-path"; [ "$1$3" = "-s-m" ] || echo "forma errada: $*" >>"$FAKE_LOG/mail-bad"\n' >"$W/fake-mail"
-printf '#!/usr/bin/env bash\nif [ "$3" = comment ]; then echo "$1 $2 $3 $4" >>"$FAKE_LOG/bd"; else echo "$*" >>"$FAKE_LOG/bd"; fi\ncase "$3" in label) [ -e "$FAKE_LOG/bd-fail-label" ] && { echo "bd: sem rótulo" >&2; exit 1; } ;; comment) [ -e "$FAKE_LOG/bd-fail-comment" ] && exit 1; printf "%%s\\n" "$5" >>"$FAKE_LOG/bd-comments" ;; esac\nexit 0\n' >"$W/fake-bd"
+printf '#!/usr/bin/env bash\n[ -e "$FAKE_LOG/mail-fail" ] && exit 1\n[ -e "$FAKE_LOG/mail-fail-2nd" ] && [ -e "$FAKE_LOG/mail-subj" ] && exit 1\nprintf "%%s\\n" "$2" >>"$FAKE_LOG/mail-subj"; printf "%%s\\n" "$4" >"$FAKE_LOG/mail-body"; printf "%%s\\n----\\n" "$4" >>"$FAKE_LOG/mail-bodies"; printf "%%s\\n" "$PATH" >"$FAKE_LOG/mail-path"; [ "$1$3" = "-s-m" ] || echo "forma errada: $*" >>"$FAKE_LOG/mail-bad"\n' >"$W/fake-mail"
+printf '#!/usr/bin/env bash\nif [ "$3" = comment ]; then echo "$1 $2 $3 $4" >>"$FAKE_LOG/bd"; else echo "$*" >>"$FAKE_LOG/bd"; fi\ncase "$3" in label) [ -e "$FAKE_LOG/bd-fail-label" ] && { [ ! -s "$FAKE_LOG/bd-fail-label" ] || [ "$5" = "$(cat "$FAKE_LOG/bd-fail-label")" ]; } && { echo "bd: sem rótulo" >&2; exit 1; } ;; comment) [ -e "$FAKE_LOG/bd-fail-comment" ] && exit 1; printf "%%s\\n" "$5" >>"$FAKE_LOG/bd-comments" ;; esac\nexit 0\n' >"$W/fake-bd"
 chmod +x "$W/fake-mail" "$W/fake-bd"
 mkdir -p "$W/bin"; printf '#!/usr/bin/env bash\necho "$*" >>"$FAKE_LOG/gc-calls"\n' >"$W/bin/gc"; chmod +x "$W/bin/gc"; export PATH="$W/bin:$PATH" # um gc de mentira: quem o chamar deixa a linha de comando
 cnt() { [ -e "$1" ] && wc -l <"$1" | tr -d ' ' || echo 0; }
@@ -157,40 +159,59 @@ check "uma noite 'ruído' (6 de 10: 20 pp mas cabe na sorte) no meio de uma qued
 reset; base "$H1" "$R0"; L dog night 0 10 "$H2" "$R5"; sw
 check "merge causador: marca as 2 beads cujos commits tocam a configuração do dog (prompt do dog e CLAUDE.md da cidade)" "$(grep -c -E '^-C '"$CITY"' label add ga-(aaa1|ccc3) audit:bateria-queda$' "$FAKE_LOG/bd") $(grep -c ' comment ' "$FAKE_LOG/bd") $(bds)" "2 2 4"
 check "merge causador: o script que não é configuração e o prompt do reviewer ficam de fora" "$(grep -c -E 'ga-bbb2|ga-ddd4' "$FAKE_LOG/bd") $(grep -c -E 'ga-bbb2|ga-ddd4' "$FAKE_LOG/mail-body")" "0 0"
-check "merge causador: o e-mail lista os commits e diz que o commit sem bead não foi marcado" "$(grep -c -E '^    - [0-9a-f]{12} (ga-aaa1|ga-ccc3|\(sem bead no assunto\)): ' "$FAKE_LOG/mail-body")" 3
-check "merge causador: o e-mail diz o que foi marcado e como ver e tirar" "$(grep -c 'Marquei com o rótulo audit:bateria-queda .*: ga-aaa1, ga-ccc3\.' "$FAKE_LOG/mail-body") $(grep -c 'bd list --label audit:bateria-queda --limit 0' "$FAKE_LOG/mail-body")" "1 1"
+check "merge causador: o e-mail lista os commits e diz que o commit sem bead do HQ não foi marcado" "$(grep -c -E '^    - [0-9a-f]{12} (ga-aaa1|ga-ccc3|\(sem bead do HQ no assunto\)): ' "$FAKE_LOG/mail-body")" 3
+check "merge causador: o e-mail diz as marcas que VAI pôr (nunca que já pôs: o bd ainda não respondeu) e como ver e tirar" "$(grep -c 'Marcas a pôr logo depois deste e-mail (rótulo audit:bateria-queda .*): ga-aaa1, ga-ccc3\.' "$FAKE_LOG/mail-body") $(grep -c 'Marquei' "$FAKE_LOG/mail-body") $(grep -c 'bd list --label audit:bateria-queda --limit 0' "$FAKE_LOG/mail-body")" "1 0 1"
 check "merge causador: o comentário traz os números e a medição" "$(grep -c 'dog: 0% (0/10 tarefas) contra 80%' "$FAKE_LOG/bd-comments")" 2
 check "merge causador: o comentário diz de qual medição vem e como tirar a marca" "$(grep -c '(medição 2026-11-01T00:04:00Z)' "$FAKE_LOG/bd-comments") $(grep -c 'bd label remove ga-aaa1 audit:bateria-queda' "$FAKE_LOG/bd-comments")" "2 1"
-check "merge causador: o e-mail traz os 12 primeiros caracteres do sha de configuração e do commit medido" "$(grep -c "configuração ${H2:0:12} (commit medido ${R5:0:12}): mudou desde a medição anterior" "$FAKE_LOG/mail-body")" 1
+check "merge causador: o e-mail traz os 12 primeiros caracteres do sha de configuração e do commit medido, e a noite da base de onde a configuração mudou" "$(grep -c "configuração ${H2:0:12} (commit medido ${R5:0:12}): mudou desde a noite de 2026-11-01T00:03:00Z da linha de base" "$FAKE_LOG/mail-body")" 1
 check "merge causador: o log de decisões diz quais beads foram marcadas" "$(tail -n 1 "$AUDIT" | jq -r '.marcadas | join(",")')" "ga-aaa1,ga-ccc3"
 reset; base "$H1" "$R1"; L dog night 0 10 "$H2" "$R2"; sw
 check "só um commit que NÃO é configuração no intervalo: o aviso sai, ninguém é marcado, e o motivo é dito" "$(mails) $(bds) $(grep -c 'nenhum commit entre' "$FAKE_LOG/mail-body")" "1 0 1"
 reset; base "$H1" "$R0"; L dog night 0 10 "$H2" "$R5"; sw --max-marcar 2
 check "exatamente --max-marcar candidatas: marca as duas" "$(mails) $(bds)" "1 4"
 reset; nights 2 dog night 8 10 "$H1" "$R0"; L dog night 8 10 "$H1" "$R1"; sw; L dog night 0 10 "$H2" "$R5"; sw
-check "a medição anterior é a ÚLTIMA (não a primeira): só os commits depois dela entram" "$(grep -c 'label add ga-aaa1' "$FAKE_LOG/bd") $(grep -c 'label add ga-ccc3' "$FAKE_LOG/bd")" "0 1"
+check "a noite da base com outra configuração é a ÚLTIMA (não a primeira): só os commits depois dela entram" "$(grep -c 'label add ga-aaa1' "$FAKE_LOG/bd") $(grep -c 'label add ga-ccc3' "$FAKE_LOG/bd")" "0 1"
 reset; base "$H1" "$R0"; L dog night 0 10 "$H2" "$R5"; sw --max-marcar 1
 check "mais beads candidatas que --max-marcar: o aviso sai e NINGUÉM é marcado" "$(mails) $(bds) $(grep -c 'são 2 beads candidatas (máximo 1)' "$FAKE_LOG/mail-body")" "1 0 1"
 reset; base "$H1" "$R0"; L dog night 0 10 "$H1" "$R5"; sw
-check "mesmo sha de configuração nas duas medições: não houve merge de configuração, nada é marcado e o aviso diz isso, com a data da medição anterior" "$(mails) $(bds) $(grep -c 'a configuração do papel não mudou desde a medição anterior (2026-11-01T00:03:00Z)' "$FAKE_LOG/mail-body")" "1 0 1"
+check "a linha de base inteira já tinha a configuração de agora: nenhum merge explica a queda, nada é marcado e o aviso diz isso, com quantas noites" "$(mails) $(bds) $(grep -c 'a configuração do papel é a mesma de toda a linha de base (3 noites)' "$FAKE_LOG/mail-body")" "1 0 1"
 reset; base "$H1" "$R0"; L dog night 0 10 "$H2" "$(rep f 40)"; sw
 check "commit medido que o clone não tem: aviso sem marca, com o 'não sei' dito (não 'nenhum commit')" "$RC $(mails) $(bds) $(grep -c 'não consegui listar os commits' "$FAKE_LOG/mail-body")" "0 1 0 1"
 reset; base "$H1" "x"; L dog night 0 10 "$H2" "$R5"; sw
-check "medição anterior sem commit legível: sem marca, e o aviso diz que não há com o que comparar" "$(mails) $(bds) $(grep -c 'sem medição anterior' "$FAKE_LOG/mail-body")" "1 0 1"
+check "noite da base com outra configuração mas sem commit legível: sem marca, e o aviso diz que NÃO SABE desde quando (e de que noite)" "$(mails) $(bds) $(grep -c 'não sei desde quando a configuração mudou: a noite de 2026-11-01T00:03:00Z da linha de base' "$FAKE_LOG/mail-body")" "1 0 1"
 reset; base "$H1" "$R0"; L dog night 0 10 "$H2" "x"; sw
 check "linha sem o commit medido: sem marca" "$(mails) $(bds) $(grep -c 'não traz o sha' "$FAKE_LOG/mail-body")" "1 0 1"
 reset; base "$H1" "$R0"; L dog merge 0 10 "$H2" "$R1"; sw
-check "a medição anterior vale de qualquer modo: o merge medido logo após o commit aponta só o commit do dog" "$(grep -c 'label add ga-aaa1 ' "$FAKE_LOG/bd") $(grep -c 'label add ga-ccc3' "$FAKE_LOG/bd")" "1 0"
+check "a linha que cai pode ser de merge (não só de noite): o merge medido logo após o commit aponta só o commit do dog" "$(grep -c 'label add ga-aaa1 ' "$FAKE_LOG/bd") $(grep -c 'label add ga-ccc3' "$FAKE_LOG/bd")" "1 0"
+# a janela do merge causador nasce na LINHA DE BASE (as noites da mediana), não na medição anterior: o merge que ficou em ruído (6 de 10: p=0,12) já era da configuração nova (gate-fix 1)
+reset; base "$H1" "$R0"; L dog merge 6 10 "$H2" "$R5"; sw; L dog night 4 10 "$H2" "$R5"; sw
+check "merge em ruído e depois a queda da noite, com a MESMA configuração nova: ruído e queda, UM aviso" "$(mails) $(kinds)" "1 dog:ruido dog:queda "
+check "...a janela parte da linha de base: marca as 2 beads do dog, não diz que a configuração não mudou e diz de que noite da base ela mudou" "$(grep -c -E '^-C '"$CITY"' label add ga-(aaa1|ccc3) audit:bateria-queda$' "$FAKE_LOG/bd") $(grep -c -E 'não mudou|a mesma de toda' "$FAKE_LOG/mail-body") $(grep -c 'mudou desde a noite de 2026-11-01T00:03:00Z da linha de base' "$FAKE_LOG/mail-body")" "2 0 1"
+reset; base "$H1" "$R0"; L dog merge 6 10 "$H3" "$R1"; sw; L dog merge 6 10 "$H2" "$R3"; sw; L dog night 4 10 "$H2" "$R5"; sw
+check "dois merges em ruído com configurações DIFERENTES no meio: a janela vai até a noite da base e aponta os dois commits (não só os depois do último merge de outra configuração)" "$(kinds) $(grep -c 'label add ga-aaa1 ' "$FAKE_LOG/bd") $(grep -c 'label add ga-ccc3 ' "$FAKE_LOG/bd")" "dog:ruido dog:ruido dog:queda  1 1"
+reset; L dog night 8 10 "$H3" "$R0"; nights 3 dog night 8 10 "$H1" "$R1"; sw --janela 3; L dog night 0 10 "$H1" "$R5"; sw --janela 3
+check "outra configuração só numa noite ANTERIOR à linha de base (fora da janela de 3): nenhum merge explica a queda, ninguém é marcado e o aviso diz 'a mesma de toda a linha de base'" "$(lastkind) $(mails) $(bds) $(grep -c 'a configuração do papel é a mesma de toda a linha de base (3 noites)' "$FAKE_LOG/mail-body")" "queda 1 0 1"
+reset; nights 2 dog night 8 10 "$H1" "$R0"; L dog night 8 10 "" "$R0"; sw; L dog night 0 10 "$H2" "$R5"; sw
+check "a noite da base mais recente SEM SHA de configuração (o commit é legível): 'não sei desde quando' (nem 'não mudou', nem a janela de uma noite mais velha), sem marca" "$(lastkind) $(mails) $(bds) $(grep -c 'não sei desde quando a configuração mudou: a noite de 2026-11-01T00:03:00Z da linha de base' "$FAKE_LOG/mail-body")" "queda 1 0 1"
+# só id do HQ (ga-) vira marca: o store do HQ não acha id de outro rig (medido com bd show, não com label add), e cada marca que falha gasta o teto de --max-marcar
+reset; base "$H1" "$R5"; L dog night 0 10 "$H2" "$R7"; sw --max-marcar 1
+check "commit com bead de OUTRO rig no assunto (wa-): não é marcado nem conta para o teto: com --max-marcar 1 só a ga- entra" "$(grep -c 'label add' "$FAKE_LOG/bd") $(grep -c 'label add ga-fff6 ' "$FAKE_LOG/bd") $(grep -c 'wa-eee5' "$FAKE_LOG/bd")" "1 1 0"
+check "...e o e-mail o lista como commit sem bead do HQ, com o assunto (que traz o id) para quem quiser marcar à mão" "$(grep -c -E '^    - [0-9a-f]{12} \(sem bead do HQ no assunto\): fix\(wa-eee5\)' "$FAKE_LOG/mail-body")" 1
 reset; rm -rf "$CITY"; mkdir -p "$W/plain/.gc/logs" "$W/plain/.gc/agent-battery"; CITY0=$CITY; CITY="$W/plain"; JSONL="$CITY/.gc/logs/agent-battery.jsonl"; FAKE_LOG="$W/log"
 base "$H1" "$R0"; L dog night 0 10 "$H2" "$R5"; sw
 check "cidade fora de um repositório git: o aviso sai sem marca e diz que não montou os caminhos" "$RC $(mails) $(bds) $(grep -c 'não consegui montar os caminhos' "$FAKE_LOG/mail-body")" "0 1 0 1"
 CITY=$CITY0; JSONL="$CITY/.gc/logs/agent-battery.jsonl"
+two() { # 3 noites de base dos dois papéis e, em seguida, uma linha em que os dois caem (ainda por varrer)
 reset; nights 3 dog night 8 10 "$H1" "$R0"; nights 3 reviewer night 8 10 "$H1" "$R0"; sw
 jq -nc --arg ac "$AC" --arg h1 "$H1" --arg h2 "$H2" --arg r0 "$R0" --arg r5 "$R5" '{ts:"2026-12-01T00:00:00Z", mode:"night", dia:"2026-12-01", papeis:{dog:{cat:"ok", ok:0, medidas:10, acervo:$ac, config_sha:$h2, config_ref_sha:$r5}, reviewer:{cat:"ok", ok:0, medidas:10, acervo:$ac, config_sha:$h2, config_ref_sha:$r5}}}' >>"$JSONL"
-sw
+}
+two; sw
 check "dois papéis na mesma linha: UM e-mail com os dois, as beads sem repetição" "$(mails) $(grep -c '^\[agent-battery\] QUEDA .*dog 80%→0%, reviewer 80%→0%' "$FAKE_LOG/mail-subj") $(grep -c 'label add' "$FAKE_LOG/bd")" "1 1 3"
 check "dois papéis: a bead que afeta os dois (CLAUDE.md) leva os dois no comentário" "$(grep -c -E '^- (dog|reviewer): 0%' "$FAKE_LOG/bd-comments")" 4
 check "dois papéis: a bead com número depois do ponto (ga-ddd4.2) entra inteira" "$(grep -c 'label add ga-ddd4.2 ' "$FAKE_LOG/bd")" 1
+check "dois papéis: o log divide as marcadas por papel (a do CLAUDE.md está nas duas linhas)" "$(jq -c 'select(.papel == "dog") | .marcadas' "$AUDIT") $(jq -c 'select(.papel == "reviewer") | .marcadas' "$AUDIT")" '["ga-aaa1","ga-ccc3"] ["ga-ccc3","ga-ddd4.2"]'
+two; echo ga-ddd4.2 >"$FAKE_LOG/bd-fail-label"; sw
+check "dois papéis e uma bead que falha (só a do reviewer): a falha só na linha do reviewer, que perde a bead dela das marcadas; a do CLAUDE.md segue nas duas" "$(jq -c 'select(.papel == "dog") | [.marcadas, .marcas_falhas]' "$AUDIT") $(jq -c 'select(.papel == "reviewer") | [.marcadas, (.marcas_falhas | keys)]' "$AUDIT")" '[["ga-aaa1","ga-ccc3"],{}] [["ga-ccc3"],["ga-ddd4.2"]]'
 reset; nights 3 outro night 8 10 "$H1" "$R0"; sw; L outro night 0 10 "$H2" "$R5"; sw
 check "papel que a tabela do executor não conhece: o aviso sai sem marca e sem erro" "$RC $(mails) $(bds) $(grep -c 'não consegui montar os caminhos' "$FAKE_LOG/mail-body")" "0 1 0 1"
 mkdir -p "$W/lonely"; cp "$TOOL" "$W/lonely/agent-battery-alert.py"
@@ -204,10 +225,15 @@ rm "$FAKE_LOG/mail-fail"; sw
 check "na volta seguinte o e-mail sai UMA vez e as marcas entram" "$RC $(mails) $(bds) $(st .linhas)" "0 1 4 4"
 sw; check "e depois disso nada se repete" "$(mails) $(bds)" "1 4"
 reset; base "$H1" "$R0"; L dog night 0 10 "$H2" "$R5"; touch "$FAKE_LOG/bd-fail-label"; sw
-check "bd que falha no rótulo: exit 1 e o aviso já saiu, o motivo é dito e o comentário não é tentado" "$RC $(mails) $(bds) $(grep -c 'não marquei ga-aaa1' "$W/out")" "1 1 2 1"
-sw; check "bd que falha: o estado avançou, o aviso NÃO é repetido" "$RC $(mails)" "0 1"
+check "bd que falha no rótulo: exit 1, o comentário não é tentado e a varredura diz, por bead, que NÃO marcou e por quê" "$RC $(bds) $(grep -c 'não marquei ga-aaa1 (rótulo: bd: sem rótulo)' "$W/out") $(grep -c 'não marquei ga-ccc3 (rótulo: bd: sem rótulo)' "$W/out")" "1 2 1 1"
+check "bd que falha no rótulo: o 1o e-mail só PEDE as marcas (nunca 'Marquei') e um 2o, MARCA FALHOU, diz quais não entraram" "$(mails) $(grep -c 'Marquei' "$FAKE_LOG/mail-bodies") $(sed -n 2p "$FAKE_LOG/mail-subj" | grep -c -x '\[agent-battery\] MARCA FALHOU: ga-aaa1, ga-ccc3') $(grep -c -E '^- não marquei (ga-aaa1|ga-ccc3) \(rótulo: bd: sem rótulo\)$' "$FAKE_LOG/mail-bodies")" "2 0 1 2"
+check "bd que falha no rótulo: o log durável NÃO diz que marcou (marcadas vazio) e traz as falhas por bead" "$(tail -n 1 "$AUDIT" | jq -c '[.kind, .marcadas, (.marcas_falhas | keys)]')" '["queda",[],["ga-aaa1","ga-ccc3"]]'
+sw; check "bd que falha: o estado avançou e nada se repete (nem a marca, nem os e-mails)" "$RC $(mails) $(bds)" "0 2 2"
+reset; base "$H1" "$R0"; L dog night 0 10 "$H2" "$R5"; touch "$FAKE_LOG/bd-fail-label" "$FAKE_LOG/mail-fail-2nd"; sw
+check "o e-mail MARCA FALHOU que também falha: a varredura diz, segue e sai 1 (o aviso da queda já tinha saído)" "$RC $(mails) $(grep -c 'o e-mail das marcas que falharam também falhou' "$W/out")" "1 1 1"
 reset; base "$H1" "$R0"; L dog night 0 10 "$H2" "$R5"; touch "$FAKE_LOG/bd-fail-comment"; sw
-check "bd que falha no comentário: exit 1, e o rótulo já tinha entrado (o motivo é dito)" "$RC $(grep -c 'label add' "$FAKE_LOG/bd") $(grep -c 'comentário' "$W/out")" "1 2 2"
+check "bd que falha no comentário: exit 1, o rótulo ENTROU nas 2 e a falha é dita como comentário, nunca como 'não marquei'" "$RC $(grep -c 'label add' "$FAKE_LOG/bd") $(grep -c 'marquei ga-aaa1, mas SEM o comentário com os números' "$W/out") $(grep -c 'não marquei' "$W/out")" "1 2 1 0"
+check "bd que falha no comentário: o log traz a bead entre as marcadas (rótulo entrou) E entre as falhas (comentário não), e o 2o e-mail sai" "$(tail -n 1 "$AUDIT" | jq -c '[.marcadas, (.marcas_falhas | keys)]') $(mails)" '[["ga-aaa1","ga-ccc3"],["ga-aaa1","ga-ccc3"]] 2'
 reset; base; L dog night 0 10 "$H2" "$R5"; echo 'isto não é json' >"$STATE"; sw
 check "estado ilegível: exit 1, nada é avaliado, sem traceback, e o arquivo fica como estava" "$(badstate) $(cnt "$AUDIT") $(cat "$STATE")" "1 0 0 1 0 isto não é json"
 reset; base; L dog night 0 10 "$H2" "$R5"; echo '{"linhas":"3","papeis":{}}' >"$STATE"; sw
@@ -219,8 +245,10 @@ check "estado sem o campo papeis: o mesmo (e sem KeyError)" "$(badstate)" "1 0 0
 if [ "$(id -u)" != 0 ]; then
   reset; chmod 555 "$CITY/.gc/agent-battery"; L dog night 0 10; sw; chmod 755 "$CITY/.gc/agent-battery"
   check "1a varredura que não consegue gravar a base: exit 1" "$RC" 1
-  reset; base; chmod 555 "$CITY/.gc/agent-battery"; L dog night 0 10 "$H2" "$R5"; sw; chmod 755 "$CITY/.gc/agent-battery"
+  reset; base; chmod 555 "$CITY/.gc/agent-battery"; L dog night 0 10 "$H2" "$R5"; sw
   check "estado que não grava no meio da varredura: exit 1 (o e-mail já tinha saído)" "$RC $(mails)" "1 1"
+  sw; check "...e enquanto ele não grava a linha não é dada como vista: o MESMO aviso sai de novo (entrega pelo menos uma vez, dito no runbook)" "$RC $(mails)" "1 2"
+  chmod 755 "$CITY/.gc/agent-battery"
 fi
 if [ "$(id -u)" != 0 ]; then
   reset; base; chmod 000 "$JSONL"; sw
@@ -328,6 +356,8 @@ if [ "$(id -u)" != 0 ]; then
 fi
 cset 0; ctl --city "$W/plain-sem-nada"
 check "cidade que não existe: INERTE (sem acervo), nunca traceback" "$RC $(tail -n 1 "$W/out") $(grep -c Traceback "$W/out")" "0 CONTROLE: INERTE 0"
+cset 0; python3 -I -c 'import importlib.util,sys; s = importlib.util.spec_from_file_location("t", sys.argv[1]); m = importlib.util.module_from_spec(s); s.loader.exec_module(m); m.tempfile.mkdtemp = lambda **k: (_ for _ in ()).throw(OSError(28, "No space left on device")); sys.argv = ["t", "control", "--city", sys.argv[2], "--mail", sys.argv[3]]; sys.exit(m.main())' "$TOOL" "$CITY" "$W/fake-mail" >"$W/out" 2>&1; RC=$?
+check "disco cheio ao criar a cidade descartável (mkdtemp): FALHOU e e-mail ao Mayor, sem traceback e sem rodar o executor" "$RC $(tail -n 1 "$W/out") $(grep -c Traceback "$W/out") $(grep -c 'não consegui preparar a cidade descartável (\[Errno 28\] No space left on device)' "$FAKE_LOG/mail-body") $(ran)" "1 CONTROLE: FALHOU 0 1 nao-rodou"
 
 # o arquivo do prompt ruim e a ordem
 PROMPT="$HERE/agent-battery-control-prompt.md"
