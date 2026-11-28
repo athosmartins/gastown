@@ -170,7 +170,8 @@ def _pin_env(monkeypatch, tmp_path):
                  "GC_CITY_PATH": tmp_path / "pinned-city", "CLAUDE_CREW_STATE": tmp_path / "pinned-crew-state.json",
                  "CLAUDE_CREW_ACCOUNTS_DIR": tmp_path / "pinned-accts", "HOME": tmp_path / "pinned-home", "CLAUDE_CREW_NOTIFY": g / "notify",
                  "CLAUDE_RENEW_STATE": tmp_path / "pinned-renew-state.json", "CLAUDE_CREW_DECISION": tmp_path / "pinned-decision.json",
-                 "CLAUDE_CREW_CRED_FILE": tmp_path / "pinned-home" / ".claude" / ".credentials.json"}.items():
+                 "CLAUDE_CREW_CRED_FILE": tmp_path / "pinned-home" / ".claude" / ".credentials.json",
+                 "CLAUDE_CRED_BW_URL": "http://127.0.0.1:9"}.items():       # ga-xy0916u: the token vault - a closed port, never the real bw serve
         monkeypatch.setenv(k, str(v))
     monkeypatch.setenv("PATH", f"{g}:/usr/bin:/bin")
 
@@ -195,6 +196,21 @@ class World:
 
         self.srv = http.server.HTTPServer(("127.0.0.1", 0), H)
         threading.Thread(target=self.srv.serve_forever, daemon=True).start()
+        self.vault_items = []                                   # ga-xy0916u: what the fake `bw serve` lists for `claude-oauth-token-`
+        self.vault_raw = None                                   # a raw body to answer instead (a vault that talks nonsense)
+
+        class V(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                body = w.vault_raw if w.vault_raw is not None else json.dumps({"success": True, "data": {"object": "list", "data": w.vault_items}})
+                self.send_response(200)
+                self.end_headers()
+                self.wfile.write(body.encode())
+
+            def log_message(self, *a):
+                pass
+
+        self.vsrv = http.server.HTTPServer(("127.0.0.1", 0), V)
+        threading.Thread(target=self.vsrv.serve_forever, daemon=True).start()
         for name, body in (("security", FAKE_SECURITY), ("claude", FAKE_CLAUDE), ("driver", FAKE_DRIVER), ("notify", FAKE_NOTIFY)):
             (self.d / name).write_text(body.replace("#!/usr/bin/env python3", f"#!{sys.executable}"))
             (self.d / name).chmod(0o700)
@@ -204,7 +220,8 @@ class World:
                      "CLAUDE_CREW_NOTIFY": str(self.d / "notify"), "CLAUDE_RENEW_STATE": str(self.d / "renew_state.json"), "CLAUDE_CREW_DECISION": str(self.d / "pool_decision.json"),
                      "CLAUDE_CREW_ACCOUNTS_DIR": str(self.d / "accts"), "CLAUDE_CREW_USER": "athos", "GC_CITY_PATH": str(self.d / "city"),
                      "CLAUDE_CREW_CRED_FILE": str(self.d / "claude-home" / ".credentials.json"),
-                     "CLAUDE_CREW_PROFILE_URL": f"http://127.0.0.1:{self.srv.server_address[1]}/profile", "CLAUDE_CREW_NOW": str(T0)}.items():
+                     "CLAUDE_CREW_PROFILE_URL": f"http://127.0.0.1:{self.srv.server_address[1]}/profile", "CLAUDE_CREW_NOW": str(T0),
+                     "CLAUDE_CRED_BW_URL": f"http://127.0.0.1:{self.vsrv.server_address[1]}", "GC_LOGIN_RENEW_BROWSER": "1"}.items():
             monkeypatch.setenv(k, v)
         for k in ("CLAUDE_CREW_ACCOUNTS", "FAKE_SEC_FAIL", "FAKE_CLAUDE_MODE", "FAKE_DRIVER_VERDICT", "FAKE_DRIVER_FIRST_VERDICT", "FAKE_CLAUDE_BLOB", "FAKE_NOTIFY_RC", "FAKE_NOTIFY_CAP", "GC_LOGIN_RENEW"):
             monkeypatch.delenv(k, raising=False)
@@ -213,6 +230,12 @@ class World:
         self.mp = monkeypatch
         self.crew_state()                                          # the crew job's state: empty but READABLE (a missing or corrupt one is a case of its own)
         assert str(crew.security_bin()).startswith(str(self.d)) and str(crew.city()).startswith(str(self.d))
+
+    def token(self, key, age_days, *, field=False, notes="sk-ant-oat01-VAULTSECRET-NEVER-LOGGED"):
+        """A vault item `claude-oauth-token-<e>` whose token was stored `age_days` ago (revisionDate), or - `field` - generated then (the explicit `gerado_em` field, with an older revisionDate)."""
+        when = crew._iso(T0 - age_days * DAY)
+        self.vault_items.append({"name": "claude-oauth-token-" + EMAIL[key], "notes": notes, "creationDate": when, "revisionDate": crew._iso(T0 - 1) if field else when,
+                                 "fields": [{"name": "gerado_em", "value": when, "type": 0}] if field else []})
 
     def production_accounts(self):
         """The list launchd's job runs with (the crew script's own), not the fixtures' five: what a test of a CANCELLED account must run on."""
@@ -287,6 +310,214 @@ class World:
 @pytest.fixture
 def w(tmp_path, monkeypatch):
     return World(tmp_path, monkeypatch)
+
+
+# ── ga-xy0916u: the scheduled run opens NO browser; it warns (full login 7/3/1 d, setup-token 21/7/1 d) ────────────────────────────────────────────
+# First in the file on purpose (the gate runs this file on the pre-fix tree with failfast): on the old tree the scheduled run launches the browser attempt and has no alarm.
+def _nobrowser(w):
+    w.mp.delenv("GC_LOGIN_RENEW_BROWSER", raising=False)      # the production default: the World sets it to "1" for the tests of the attempt machinery below
+
+
+def _titles(w):
+    return [c["argv"][1] for c in w.calls("notify")]
+
+
+def test_the_scheduled_run_opens_no_browser_for_a_forecast_and_says_why_it_passed_the_account_over(w):
+    """Breaks on the old tree: it launches the attempt (and `claude auth login` + the driver run). claude.ai answers an automated relogin with a human check: nothing to launch."""
+    _nobrowser(w)
+    healthy(w)
+    w.own("b85", blob("b85-x", rexp_days=2.0))
+    seen = record(w)
+    assert renew.housekeeping() == 0
+    assert seen == [] and w.calls("claude") == [] and w.calls("driver") == []
+    (line,) = summary_lines(w)
+    assert "nothing launched" in line and "browser relogin off" in line and f"{EMAIL['b85']} (due: forecast; browser relogin is off)" in line
+    assert "renewing " not in w.log()
+
+
+def test_the_scheduled_run_opens_no_browser_in_an_outage_either_across_many_runs(w):
+    _nobrowser(w)
+    outage(w)
+    seen = record(w)
+    for i in range(6):
+        w.at(i * 3600)
+        assert renew.housekeeping() == 0
+    assert seen == [] and w.calls("claude") == [] and "renewing " not in w.log() and all("nothing launched" in x for x in summary_lines(w))
+
+
+def test_GC_LOGIN_RENEW_BROWSER_1_brings_the_attempt_back_rollback(w):
+    healthy(w)
+    w.own("b85", blob("b85-x", rexp_days=2.0))
+    seen = record(w)
+    renew.housekeeping()
+    assert seen == [(EMAIL["b85"], "forecast")] and "browser relogin off" not in summary_lines(w)[-1]
+
+
+def test_a_full_login_ending_is_warned_once_per_level_7_3_1_days_and_forgotten_when_renewed(w):
+    _nobrowser(w)
+    healthy(w)
+    w.own("b85", blob("b85-a", rexp_days=7.1))
+    renew.housekeeping()
+    assert _titles(w) == []                                                       # 7.1 d: not yet
+    w.own("b85", blob("b85-b", rexp_days=6.9))
+    renew.housekeeping()
+    renew.housekeeping()                                                          # the same level never repeats once delivered
+    assert _titles(w) == [f"Login Claude vence em ate 7 dia(s): {EMAIL['b85']}"]
+    w.own("b85", blob("b85-c", rexp_days=2.9))
+    renew.housekeeping()
+    w.own("b85", blob("b85-d", rexp_days=0.9))
+    renew.housekeeping()
+    assert _titles(w)[1:] == [f"Login Claude vence em ate 3 dia(s): {EMAIL['b85']}", f"Login Claude vence em ate 1 dia(s): {EMAIL['b85']}"]
+    w.own("b85", blob("b85-e", rexp_days=29.0))                                   # renewed by hand: the record goes, the next ending warns again
+    renew.housekeeping()
+    assert "login" not in w.state()["accounts"][EMAIL["b85"]].get("warned", {})                # the record is gone (and an empty `warned` with it)
+    w.own("b85", blob("b85-f", rexp_days=6.0))
+    renew.housekeeping()
+    assert len(_titles(w)) == 4
+    n = w.calls("notify")[0]
+    assert n["strict"] == "1" and n["argv"][2:4] == ["-p", "4"] and crew.relogin_how(EMAIL["b85"]) in n["argv"][4] and "no automation renews it" in n["argv"][4]
+
+
+def test_the_warning_comes_at_least_3_days_before_the_end(w):
+    """The bead's rule: warn >= 3 days ahead. A login 3.5 d from its end has been warned at the 7-day level already; nothing tighter than 3 d is the FIRST word."""
+    _nobrowser(w)
+    healthy(w)
+    w.own("b85", blob("b85-x", rexp_days=6.99))
+    renew.housekeeping()
+    (n,) = w.calls("notify")
+    assert "7 dia(s)" in n["argv"][1]
+
+
+def test_a_setup_token_ending_is_warned_at_21_7_1_days_and_counted_from_gerado_em_when_the_item_has_it(w):
+    _nobrowser(w)
+    healthy(w)
+    w.token("b85", 365 - 22)                                                       # 22 d left: not yet
+    renew.housekeeping()
+    assert _titles(w) == []
+    w.vault_items.clear()
+    w.token("b85", 365 - 20)
+    renew.housekeeping()
+    w.vault_items.clear()
+    w.token("b85", 365 - 6, field=True)                                            # the explicit gerado_em (365-6 d ago) beats the fresh revisionDate
+    renew.housekeeping()
+    t = _titles(w)
+    assert t == [f"Token Claude vence em ate 21 dia(s): {EMAIL['b85']}", f"Token Claude vence em ate 7 dia(s): {EMAIL['b85']}"]
+    body = w.calls("notify")[1]["argv"][4]
+    assert "claude setup-token" in body and "docs/runbooks/claude-setup-token.md" in body and "gerado_em" in body
+
+
+def test_a_setup_token_that_has_ended_is_warned_as_ended_and_a_fresh_one_is_not_warned(w):
+    _nobrowser(w)
+    healthy(w)
+    w.token("b85", 366)
+    w.token("crypto", 10)
+    renew.housekeeping()
+    assert _titles(w) == [f"Token Claude ja venceu: {EMAIL['b85']}"]
+    assert "ALREADY ended" in w.calls("notify")[0]["argv"][4]
+
+
+def test_no_token_and_no_date_say_nothing_and_are_not_fine_either(w):
+    """An account with no vault item, an item with no token in it, and a token with no date: no push (nothing to count from), and the line says each one's state."""
+    _nobrowser(w)
+    healthy(w)
+    w.vault_items.append({"name": "claude-oauth-token-" + EMAIL["b85"], "notes": "", "revisionDate": crew._iso(T0 - 400 * DAY), "fields": []})
+    w.vault_items.append({"name": "claude-oauth-token-" + EMAIL["crypto"], "notes": "sk-ant-oat01-x", "fields": []})
+    renew.housekeeping()
+    assert _titles(w) == []
+    line = summary_lines(w)[-1]
+    assert f"{EMAIL['b85']}: login" in line and "token empty" in line and "token undated" in line and f"{EMAIL['terr']}: login 29.0 d, token none" in line
+
+
+@pytest.mark.parametrize("how", ["garbage", "down"])
+def test_a_vault_that_cannot_be_read_warns_nobody_and_is_said_not_guessed(w, how):
+    _nobrowser(w)
+    healthy(w)
+    if how == "garbage":
+        w.vault_raw = "<html>nonsense</html>"
+    else:
+        w.mp.setenv("CLAUDE_CRED_BW_URL", "http://127.0.0.1:9")
+    renew.housekeeping()
+    assert _titles(w) == []
+    assert ("token vault unreadable" if how == "garbage" else "token vault unreachable") in summary_lines(w)[-1]
+
+
+def test_a_vault_token_never_reaches_the_log_the_state_a_push_or_stdout(w, capsys):
+    _nobrowser(w)
+    healthy(w)
+    w.token("b85", 365 - 5)
+    w.token("crypto", 100)
+    renew.housekeeping()
+    renew.main(["--status"])
+    out = capsys.readouterr()
+    everything = w.log() + json.dumps(w.state()) + json.dumps(w.calls("notify")) + out.out + out.err
+    assert "VAULTSECRET" not in everything and "sk-ant" not in everything and len(w.calls("notify")) == 1
+
+
+def test_a_push_that_was_not_delivered_is_retried_every_5_minutes_and_never_again_once_delivered_expiry_warning(w):
+    _nobrowser(w)
+    healthy(w)
+    w.own("b85", blob("b85-x", rexp_days=2.0))
+    w.mp.setenv("FAKE_NOTIFY_RC", "1")
+    renew.housekeeping()
+    assert len(w.calls("notify")) == 1 and "pushed" not in w.state()["accounts"][EMAIL["b85"]]["warned"]["login"]
+    w.at(renew.PUSH_RETRY_S - 1)
+    renew.housekeeping()
+    assert len(w.calls("notify")) == 1
+    w.mp.setenv("FAKE_NOTIFY_RC", "10")
+    w.at(renew.PUSH_RETRY_S)
+    renew.housekeeping()
+    assert len(w.calls("notify")) == 2 and w.state()["accounts"][EMAIL["b85"]]["warned"]["login"]["pushed"] == T0 + renew.PUSH_RETRY_S
+    w.at(1 * DAY - 1)                                                              # 1 d + 1 s left: still the 3-day level, delivered: silent
+    renew.housekeeping()
+    assert len(w.calls("notify")) == 2
+    w.at(2 * DAY - 1)                                                              # 1 s left: the 1-day level is a NEW level: it speaks
+    renew.housekeeping()
+    assert len(w.calls("notify")) == 3 and "vence em ate 1 dia(s)" in w.calls("notify")[2]["argv"][1]
+
+
+def test_the_walls_of_old_marks_are_not_pushed_any_more_when_no_browser_is_in_use(w):
+    """A mark left by the browser era (puzzle...) would push 'Relogin automatico impossivel' for an attempt that is never made again: the expiry alarm is the one voice."""
+    _nobrowser(w)
+    healthy(w)
+    (w.d / "renew_state.json").write_text(json.dumps({"accounts": {EMAIL["b85"]: {"infeasible": {"verdict": "puzzle", "step": "s", "at": T0, "left": 3 * DAY}}}}))
+    renew.housekeeping()
+    assert not any(x.startswith("Relogin automatico") for x in _titles(w))
+
+
+def test_a_dry_run_says_what_it_would_warn_and_pushes_and_writes_nothing(w, capsys):
+    _nobrowser(w)
+    healthy(w)
+    w.own("b85", blob("b85-x", rexp_days=2.0))
+    assert renew.main(["--dry-run"]) == 0
+    assert w.calls("notify") == [] and not (w.d / "renew_state.json").exists() and "would warn (login, level 3 d)" in capsys.readouterr().err
+
+
+def test_status_shows_each_accounts_full_login_and_token_end_and_writes_nothing(w, capsys):
+    _nobrowser(w)
+    healthy(w, 4.5, "crypto")
+    w.token("crypto", 365 - 30)
+    w.token("b85", 365 - 5)
+    assert renew.main(["--status"]) == 0
+    out = capsys.readouterr().out.splitlines()
+    by = {l.split(":")[0]: l for l in out}
+    assert "full login 4.5 d" in by[EMAIL["crypto"]] and "WARN" in by[EMAIL["crypto"]] and "setup-token 30.0 d" in by[EMAIL["crypto"]] and by[EMAIL["crypto"]].count("WARN") == 1
+    assert "setup-token 5.0 d" in by[EMAIL["b85"]] and by[EMAIL["b85"]].count("WARN") == 1 and "none" in by[EMAIL["terr"]]
+    assert w.calls("notify") == [] and not (w.d / "renew_state.json").exists()
+
+
+def test_status_exits_1_when_the_vault_cannot_be_read(w, capsys):
+    w.mp.setenv("CLAUDE_CRED_BW_URL", "http://127.0.0.1:9")
+    assert renew.main(["--status"]) == 1
+    assert "token vault could not be read (unreachable)" in capsys.readouterr().err
+
+
+def test_a_forced_renewal_by_a_person_still_opens_the_browser_attempt(w):
+    """`--account <e> --force` is a person asking: unchanged, whatever the scheduled run does."""
+    _nobrowser(w)
+    healthy(w)
+    w.own("b85", blob("b85-old", rexp_days=3.0))
+    script(w, ("renewed", "", PROOF))
+    assert w.run() == 0
 
 
 # ── ga-8pxmcrb: a login that is another account's is no login of THIS account - its end must not make the account look healthy ──────────────────
@@ -1246,7 +1477,9 @@ def test_a_burned_backup_login_does_not_stop_the_outage_and_the_account_with_no_
     seen = record(w)
     renew.housekeeping()
     assert seen == [(EMAIL["amb"], "outage")]
-    assert renew.main(["--dry-run"]) == 0 and EMAIL["martins"] not in capsys.readouterr().err
+    assert renew.main(["--dry-run"]) == 0
+    err = capsys.readouterr().err
+    assert EMAIL["martins"] not in "\n".join(x.split("; validity:")[0] for x in err.splitlines())      # it may be NAMED in the validity list (ga-xy0916u); it is never a try, a launch or a passed-over account
 
 
 def test_the_forecast_goes_before_the_outage_and_the_dry_run_says_the_whole_order(w, capsys):

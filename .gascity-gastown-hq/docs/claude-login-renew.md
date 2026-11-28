@@ -2,8 +2,20 @@
 
 ## Contents
 
-• O que a fatia 1 faz · O que NUNCA faz · Inviável por automação (fatia 2) · A rodada agendada (fatia 3)
+• **Rodada agendada = só avisa (ga-xy0916u)** · O que a fatia 1 faz · O que NUNCA faz · Inviável por automação (fatia 2) · A rodada agendada (fatia 3)
 • Ativar e desligar · Quem julga · Prova ao vivo e o que não foi medido
+
+## Rodada agendada = só avisa (ga-xy0916u, 28/11)
+Decisão do Athos (ga-xoe5ao.6): o pool usa o **token de 1 ano** (`claude setup-token`); só o Mayor e as crews com Remote Control mantêm **login completo**, que o Athos renova **à mão**. Por isso, **por padrão a rodada agendada não abre navegador nem lança tentativa**
+(o claude.ai responde ao relogin automático com verificação humana, e isso não se contorna). O que ela faz no lugar:
+- A conta devida (previsão, outage, inutilizável) entra em `passed over` da linha `scheduled run:` com «due: <motivo>; browser relogin is off», e a linha ganha `; browser relogin off`.
+- **Alarme de validade**: um push (`notify -p 4`) por conta, tipo e faixa. Login completo: **7 / 3 / 1 dia(s)** e já vencido (≥ 3 dias de antecedência desde a primeira faixa). Token de 1 ano: **21 / 7 / 1 dia(s)** e já vencido. Faixa mais apertada = push novo;
+  a mesma faixa não repete depois de entregue (não entregue: reenvia a cada 5 min); login ou token renovado esquece o registro (`accounts[<e>].warned.{login,token}` no estado). Fim desconhecido (cofre fora do ar, item sem token ou sem data) **não avisa** e a linha do log diz qual dos casos.
+- O fim do token **não está no token**: vem do campo `gerado_em` do item `claude-oauth-token-<e>` do cofre, senão da `revisionDate` (o dia em que foi guardado), + 365 dias (`claude-credential-map.py`; vida **não medida**). O cofre é lido por `bw serve` (`127.0.0.1:18587`); só nome, datas e campos — a nota (o token) é reduzida a «existe», nunca guardada nem logada.
+- A linha `scheduled run:` ganha `; validity: <e>: login <N d>, token <N d>; …`. As marcas `infeasible` antigas não geram mais o push «Relogin automatico impossivel» (o alarme é a voz única).
+- `claude-login-renew.py --status` imprime a mesma validade, só leitura (sem lock, estado ou push); sai 1 se o estado da crew job ou o cofre não puderam ser lidos.
+- `--account <e> --force` (uma pessoa pedindo) **continua** abrindo o navegador, como antes.
+- **Voltar o relogin por navegador na rodada agendada:** `GC_LOGIN_RENEW_BROWSER=1` no ambiente do job. Mapa de quem usa qual credencial, geração e guarda dos tokens: `docs/runbooks/claude-setup-token.md`.
 
 ## O que a fatia 1 faz
 `python3 packs/town-deltas/assets/scripts/claude-login-renew.py --account <email> --force` renova **agora** o login Claude de UMA conta que tem config dir
@@ -60,7 +72,7 @@ Saídas da rodada agendada: **0** rodou (inclui «nada a fazer», desligado e lo
 `cp packs/town-deltas/assets/pending-activation/claude-login-renew.plist ~/Library/LaunchAgents/com.gascity.claude-login-renew.plist && launchctl load ~/Library/LaunchAgents/com.gascity.claude-login-renew.plist`
 O label é próprio — **não** é `com.gascity.claude-account-relog` (o swap por quota, ga-jf689).
 
-**Chave de desligar**, sem recarregar nada: `touch <city>/.gc/no-login-renew` (apague para religar) ou `GC_LOGIN_RENEW=0` no ambiente; só o valor `0` desliga. Sem `GC_CITY_PATH` o arquivo não pode ser olhado: o log diz (WARN) e só `GC_LOGIN_RENEW=0` desliga. Vale para a rodada agendada (sai 0, dito no log) e para a forçada (sai 2, dito na linha).
+**Relogin por navegador na rodada agendada: desligado por padrão** (`GC_LOGIN_RENEW_BROWSER=1` liga; ga-xy0916u). **Chave de desligar** o job inteiro, sem recarregar nada: `touch <city>/.gc/no-login-renew` (apague para religar) ou `GC_LOGIN_RENEW=0` no ambiente; só o valor `0` desliga. Sem `GC_CITY_PATH` o arquivo não pode ser olhado: o log diz (WARN) e só `GC_LOGIN_RENEW=0` desliga. Vale para a rodada agendada (sai 0, dito no log) e para a forçada (sai 2, dito na linha).
 
 ## Quem julga
 O **Keychain**, não o driver: o item precisa ter um login **novo e completo** (escopo `user:sessions:claude_code` + refresh token) cujo perfil diga que é da conta `<e>`. Login não completo ou de outra

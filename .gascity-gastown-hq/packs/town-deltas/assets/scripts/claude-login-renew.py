@@ -7,6 +7,15 @@
     claude-login-renew.py --dry-run                      the same, but it only SAYS (stderr): nothing launched, written or pushed
     claude-login-renew.py --reset <email>                forget the mark and the tries of ONE account (ga-41u7k92), after whatever made them fail was fixed by hand; nothing is launched or pushed
                                                          (with --dry-run it only says what it would forget and writes nothing)
+    claude-login-renew.py --status                       (ga-xy0916u) each account's full-login end and setup-token end, read-only, no lock; exit 1 if the crew state or the token vault could not be read
+
+ga-xy0916u (Athos 28/11: «Token de 1 ano + você só onde precisa»): THE SCHEDULED RUN OPENS NO BROWSER ANY MORE. The pool (dogs, wa-worker, ps-worker, reviewers, refino) runs on the 1-year
+setup-token (claude-pool-account.py); only Remote Control (Mayor, named crews) needs a FULL login, and claude.ai answers an automated relogin with a human check we do not get around. So the
+scheduled run still reads everything and logs its usual `scheduled run:` line (the accounts that WOULD have been renewed are listed as passed over: "browser relogin is off"), and it WARNS:
+  * a FULL login ends within 7 / 3 / 1 days or has ended -> one `notify -p 4` push per level (>= 3 days ahead of the end), with the exact hand step;
+  * a setup-token ends within 21 / 7 / 1 days or has ended (its end = the vault item's `gerado_em` field, else its revisionDate, + 365 days) -> the same, with the runbook.
+Each line of the log carries every account's validity. GC_LOGIN_RENEW_BROWSER=1 brings the browser attempts back (rollback). `--account <e> --force` (a person asking) is unchanged.
+Everything below describing the scheduled run's attempts is what GC_LOGIN_RENEW_BROWSER=1 runs.
     exit: 0 = ran (or nothing to do), 2 = a forced renewal that did not renew, 64 = usage (an e-mail that is not one of the job's accounts included, for --reset), 1 = the run could not judge
           (unreadable state / crew state), could not take the lock (a --reset that found the lock taken too: nothing was reset) or write its state, or crashed (the log says which)
 
@@ -69,6 +78,9 @@ HERE = Path(__file__).resolve().parent
 _spec = importlib.util.spec_from_file_location("claude_crew_account_for_renew", HERE / "claude-crew-account.py")
 C = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(C)               # the crew job's Keychain/profile helpers: one reader of the items, not two
+_mspec = importlib.util.spec_from_file_location("claude_credential_map_for_renew", HERE / "claude-credential-map.py")
+M = importlib.util.module_from_spec(_mspec)
+_mspec.loader.exec_module(M)              # ga-xy0916u: the vault's token dates and the warning thresholds (dates only, never a token)
 
 DEFAULT_STATE = "/Users/athos/shared/data/claude_login_renew.json"
 RETRY_S = 6 * 3600              # a failed (transient) try is not repeated sooner
@@ -570,14 +582,120 @@ def run_account(st: dict, crew: dict, email: str, reason: str, t: float) -> Tupl
     return verdict, step, proof
 
 
-def settle(st: dict, emails: List[str], t: float) -> Optional[OSError]:
+def settle(st: dict, emails: List[str], t: float, warns: Optional[List[Tuple[str, str, int]]] = None, rows: Optional[Dict[str, dict]] = None) -> Optional[OSError]:
     """The state is written BEFORE the pushes (a crash in between re-sends a wall, it does not forget it), the pushes go, the state is written again.
-    A state that cannot be written is RETURNED (the caller says it) and never keeps Athos from hearing about a wall."""
+    A state that cannot be written is RETURNED (the caller says it) and never keeps Athos from hearing about a wall. `warns` (ga-xy0916u): the expiry warnings due, told after the walls."""
     errs = [save(st)]
     for email in emails:
         tell(st, email, t)
+    for email, kind, lvl in warns or []:
+        tell_expiry(st, email, kind, lvl, (rows or {}).get(email) or {}, t)
     errs.append(save(st))
     return next((e for e in errs if e), None)
+
+
+# ── ga-xy0916u: no browser login in the scheduled run; the job WARNS instead ───────────────────────────────────
+def browser_relogin_on() -> bool:
+    """The scheduled run opens no browser since ga-xy0916u: claude.ai answers an automated relogin with a human-verification puzzle (04/10, 26/11: `unknown_screen`) and the pool no longer needs a
+    login - it runs on the 1-year setup-token. A full login is needed only by Remote Control (Mayor and the named crews) and a person renews it when this job warns. GC_LOGIN_RENEW_BROWSER=1
+    brings the old behaviour back (rollback); `--account <e> --force` is a person asking and is not affected."""
+    return os.environ.get("GC_LOGIN_RENEW_BROWSER") == "1"
+
+
+def validity(crew: Optional[dict], t: float, surveys: Optional[Dict[str, dict]] = None) -> Tuple[str, Dict[str, dict]]:
+    """(vault status, {email: {login_left, login_unread, token}}) for every account of the crew job. login_left = seconds to the end of the account's best FULL login (None = no end recorded,
+    or the crew state is unknown: `crew` None); token = M.token_state of its vault item (None-left when the vault could not be read: said by the status, never guessed).
+    `surveys` = the ones candidates() already took this run (one read of the Keychain per run, not two)."""
+    vstatus, vault = M.vault_tokens()
+    cf = cred_view(crew, t) if crew is not None and not surveys else None
+    rows: Dict[str, dict] = {}
+    for e in C.accounts():
+        v = (surveys or {}).get(e) or (survey(e, crew, t, cf) if crew is not None else {"best_left": None, "unread": False})
+        rows[e] = {"login_left": v["best_left"], "login_unread": v["unread"], "token": M.token_state(vault.get(e), t)}
+    return vstatus, rows
+
+
+def _days(left: Optional[float]) -> str:
+    return "unknown" if left is None else "ended" if left <= 0 else f"{left / 86400:.1f} d"
+
+
+def validity_text(vstatus: str, rows: Dict[str, dict]) -> str:
+    parts = [f"{e}: login {_days(r['login_left'])}, token " + (_days(r["token"]["left"]) if r["token"]["state"] == "ok" else r["token"]["state"]) for e, r in rows.items()]
+    return "; ".join(parts) + ("" if vstatus == "ok" else f" (token vault {vstatus}: no token date known)")
+
+
+def alarm(st: dict, rows: Dict[str, dict], t: float, logins: bool = True) -> List[Tuple[str, str, int]]:
+    """What must be told now: [(email, kind, level_s)], kind 'login' (a FULL login, the Remote Control's) or 'token' (the 1-year setup-token). ONE push per account, kind and level
+    (login 7/3/1 d and ended, token 21/7/1 d and ended): a tighter level is a new push, the same level never repeats once delivered, a login or token with more life than the loosest level
+    forgets its record (the next ending warns again). `logins` False (the browser relogin is ON, the rollback): the full logins are the attempt's business (its marks push), only the tokens are warned. An end that is not known (no date, an item that could not be read) says nothing: it is not 'fine' and not 'ending'."""
+    due: List[Tuple[str, str, int]] = []
+    for email, r in rows.items():
+        for kind, left, thr in (("login", None if r["login_unread"] else r["login_left"], M.LOGIN_WARN_S), ("token", r["token"]["left"], M.TOKEN_WARN_S)):
+            if left is None or (kind == "login" and not logins):
+                continue
+            a = (st.get("accounts") or {}).get(email)          # read, never create: an account with nothing to warn about gets no record (and the run no state write)
+            w = a.get("warned") if isinstance(a, dict) and isinstance(a.get("warned"), dict) else {}
+            lvl = M.level(left, thr)
+            if lvl is None:
+                if kind in w:
+                    del w[kind]
+                    if not w:
+                        a.pop("warned", None)
+                continue
+            rec = w.get(kind) if isinstance(w.get(kind), dict) else None
+            if rec is None or not isinstance(rec.get("level_s"), int) or isinstance(rec.get("level_s"), bool) or lvl < rec["level_s"]:
+                a = acct_rec(st, email)
+                if not isinstance(a.get("warned"), dict):
+                    a["warned"] = {}
+                rec = a["warned"][kind] = {"level_s": lvl, "at": t}
+            if not rec.get("pushed") and t >= C._num(rec.get("next_push")):
+                due.append((email, kind, lvl))
+    return due
+
+
+def warn_text(email: str, kind: str, lvl: int, r: dict, t: float) -> Tuple[str, str]:
+    """(title, text) of one expiry push. The level is in the TITLE (notify drops a push whose title went out < 30 min ago). No token, no URL."""
+    within = "ja venceu" if lvl == 0 else f"vence em ate {lvl // 86400} dia(s)"
+    if kind == "login":
+        left = r["login_left"]
+        ends = "has ALREADY ended" if lvl == 0 else f"ends {C._iso(t + left)} ({_days(left)} left)"
+        return (f"Login Claude {within}: {email}",
+                f"the full login of {email} {ends}. It is the one Remote Control (Mayor and crews) needs; no automation renews it any more (claude.ai asks a human check). Step: {C.relogin_how(email)}")
+    tk = r["token"]
+    ends = "has ALREADY ended" if lvl == 0 else f"ends {C._iso(tk['end'])} ({_days(tk['left'])} left, counted from the vault item's {tk['source']})"
+    return (f"Token Claude {within}: {email}",
+            f"the 1-year setup-token of {email} {ends}. The pool (dogs, workers, reviewers) runs on it. Step: sign in to claude.ai AS {email}, run `claude setup-token` and store the result "
+            f"with `claude_conta_cadastrar_chave.py {email}` - docs/runbooks/claude-setup-token.md")
+
+
+def tell_expiry(st: dict, email: str, kind: str, lvl: int, r: dict, t: float) -> None:
+    """One push per record, retried every PUSH_RETRY_S while notify does not deliver it, never again once it did (the same contract as `tell`)."""
+    rec = ((acct_rec(st, email).get("warned") or {}).get(kind))
+    if not isinstance(rec, dict) or rec.get("pushed") or t < C._num(rec.get("next_push")):
+        return
+    rec["next_push"] = t + PUSH_RETRY_S
+    title, text = warn_text(email, kind, lvl, r, t)
+    if push(title, text):
+        rec["pushed"] = t
+        rlog("WARN", f"{email}: {kind} warning sent (level {lvl // 86400 if lvl else 0} d)")
+
+
+def status() -> int:
+    """`--status`: each account's validity, read-only (no lock, no state written, no push): the full login's end, the setup-token's end and the level the alarm is at. 0 = everything was read; 1 = something could not be."""
+    t = C.now()
+    crew, crew_status = C.load_state()
+    if crew_status != "ok":
+        print(f"the crew state {C.state_path()} is {crew_status}: the end of the full logins is unknown", file=sys.stderr)
+    vstatus, rows = validity(crew if crew_status == "ok" else None, t)
+    for e, r in rows.items():
+        tk = r["token"]
+        ll, tl = M.level(r["login_left"], M.LOGIN_WARN_S), M.level(tk["left"], M.TOKEN_WARN_S)
+        print(f"{e}: full login {_days(r['login_left'])}" + (f" (ends {C._iso(t + r['login_left'])})" if r["login_left"] is not None else "")
+              + f"{' - WARN' if ll is not None else ''}; setup-token "
+              + (f"{_days(tk['left'])} (ends {C._iso(tk['end'])}, from {tk['source']}){' - WARN' if tl is not None else ''}" if tk["state"] == "ok" else tk["state"]))
+    if vstatus != "ok":
+        print(f"the token vault could not be read ({vstatus}): no token date is known", file=sys.stderr)
+    return 0 if crew_status == "ok" and vstatus == "ok" else 1
 
 
 def disabled() -> Optional[str]:
@@ -600,6 +718,7 @@ def candidates(st: dict, crew: dict, dec, t: float, facts: Optional[dict] = None
     cf = cred_view(crew, t)                                    # read ONCE: the file is the holder's second store (the sessions read and rotate in it), not an account's
     surveys = {e: survey(e, crew, t, cf) for e in C.accounts()}      # ALL of them: an account with no config dir (a backup or reserve item) is a login the crew job heals from
     facts["accounts"] = len(surveys)
+    facts["surveys"] = surveys                                 # ga-xy0916u: the validity line and the expiry alarm reuse them (no second read of every Keychain item)
     forecast, outage, unusable = [], [], []
     ep = crew.get("no_login")
     since = ep.get("since") if isinstance(ep, dict) and isinstance(ep.get("since"), (int, float)) and not isinstance(ep.get("since"), bool) else None
@@ -779,11 +898,17 @@ def housekeeping() -> int:
         return 1
     crew, crew_status = C.load_state()
     todo, facts, launched = [], {}, None
+    browser = browser_relogin_on()
     if crew_status == "ok":
         release_marks(st, crew, t)
         todo = candidates(st, crew, C.load_json(C.decision_path()), t, facts)
+        if todo and not browser:                               # ga-xy0916u: said, never launched - the alarm below is what tells a person
+            facts.setdefault("passed", []).extend(f"{e} (due: {why}; browser relogin is off)" for e, why in todo)
+            todo = []
     else:                                                      # who holds the default and who has no login is unknown: no login is judged, only the pending pushes go
         rlog("ERROR", f"the crew state {C.state_path()} is {crew_status}: no login is judged and nothing is launched")
+    vstatus, rows = validity(crew if crew_status == "ok" else None, t, facts.get("surveys"))      # ga-xy0916u: the end of every full login and of every setup-token; the token's does not need the crew state
+    warns = alarm(st, rows, t, logins=not browser)      # the browser relogin on = the old behaviour: it renews a login and pushes its own marks; the token alarm has no browser to replace
     if todo and DRY:
         rlog("INFO", f"{todo[0][0]}: would be renewed now ({todo[0][1]}) - nothing launched" + (f"; then, in later runs: {', '.join(e for e, _ in todo[1:])}" if todo[1:] else ""))
         launched = f"would launch {todo[0][0]} ({todo[0][1]})"
@@ -799,9 +924,13 @@ def housekeeping() -> int:
     if crew_status == "ok":                                    # ga-i4t0lzx: EVERY scheduled run leaves a line - 04/11 13:48Z-15:00Z the log stood still and silence looked the same as a job that was not running
         passed = facts.get("passed") or []
         rlog("INFO", f"scheduled run: {facts.get('accounts', 0)} account(s) looked at; {facts.get('outage', 'no outage')}; " + (launched or "nothing launched")
+             + ("" if browser else "; browser relogin off") + (f"; validity: {validity_text(vstatus, rows)}")
              + (f"; passed over: {', '.join(passed)}" if passed else "") + (f"; ignored, not an account of the crew job: {', '.join(gone)}" if gone else ""))
+    if DRY:
+        for email, kind, lvl in warns:
+            rlog("INFO", f"{email}: would warn ({kind}, level {lvl // 86400 if lvl else 0} d) - nothing pushed")
     live = [e for e in (st.get("accounts") or {}) if e not in gone]       # only these get their push retried (and a run with none of them saves nothing); a cancelled one's record is kept, never pushed
-    err = None if DRY or not live else settle(st, live, t)
+    err = None if DRY or not live else settle(st, live if browser else [], t, [w for w in warns if w[0] not in gone], rows)      # ga-xy0916u: without the browser the walls of old marks are not pushed (the expiry alarm says it)
     if err:
         rlog("ERROR", f"the state could not be written ({type(err).__name__}): this run's marks, tries and pushes are NOT recorded")
     return 0 if crew_status == "ok" and not err else 1
@@ -985,12 +1114,14 @@ def main(argv: List[str]) -> int:
     global DRY
     DRY = "--dry-run" in argv
     argv = [x for x in argv if x != "--dry-run"]
+    if argv == ["--status"]:                                   # ga-xy0916u: read-only, takes no lock
+        return status()
     i = argv.index("--account") + 1 if "--account" in argv else 0
     forced = "--force" in argv and 0 < i < len(argv)
     reset = len(argv) == 2 and argv[0] == "--reset" and bool(EMAIL_RE.fullmatch(argv[1].strip()))
     if argv and not forced and not reset:
-        print("usage: claude-login-renew.py [--dry-run] [--account <email> --force] | --reset <email>      (--account --force: renew that account's login now; --reset: forget that account's mark "
-              "and tries; no arguments: the scheduled run; --dry-run only says what it would do)", file=sys.stderr)
+        print("usage: claude-login-renew.py [--dry-run] [--account <email> --force] | --reset <email> | --status      (--account --force: renew that account's login now, by a browser, a person asking; --reset: forget that "
+              "account's mark and tries; --status: each account's full-login and setup-token end, read-only; no arguments: the scheduled run - warns, opens no browser; --dry-run only says what it would do)", file=sys.stderr)
         return 64
     c = C.city()
     lock = (c / ".gc" / "claude-login-renew.lock") if c and (c / ".gc").is_dir() else state_path().with_suffix(".lock")
