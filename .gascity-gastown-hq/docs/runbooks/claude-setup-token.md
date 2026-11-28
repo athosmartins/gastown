@@ -27,7 +27,7 @@ Ninguém contorna a verificação do claude.ai no navegador: o relogin automáti
 
 - **Login completo:** o Mayor e as crews nomeadas (provider `claude-rc` / `claude-rc-*`).
 - **Token de 1 ano:** provider `claude-headless` (cães, `wa-worker`, `ps-worker`, revisores, refino…). O daemon do pool (`claude-pool-account.py`) escolhe a conta e grava o token dela no item do pool; `claude-lowprio.sh` aponta essas sessões para ele.
-- **Login padrão (sem provider):** `polecat`/`refinery`/`witness` dos rigs. Rodam com o mesmo login do Mayor e **ninguém decidiu** movê-los para o token: `claude-credential-map.py check` os lista (pendência aberta na bead ga-xy0916u).
+- **Login padrão (sem provider):** o que `claude-credential-map.py check` listar: roda com o mesmo login do Mayor sem que ninguém o tenha fixado. Eram `polecat`/`refinery`/`witness` dos 5 rigs; em 28/11 14:04 a `main` os moveu para o token (ga-af1ta5l: `[[rigs.patches]] provider = "claude-headless"` no `city.toml`). O que `check` mostra depois dessa mudança não foi medido aqui (`gc config show` só existe no mini).
 - **Sem Claude:** agentes com `command`/`start_command` e outros fornecedores.
 
 ## O que o Athos faz (e quando)
