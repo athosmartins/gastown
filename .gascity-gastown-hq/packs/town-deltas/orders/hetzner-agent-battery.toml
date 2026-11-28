@@ -1,0 +1,17 @@
+# ga-hyp55ss.3: a bateria de agentes roda toda manhã no nó Hetzner — as tarefas reais do acervo medem a configuração de hoje (.claude/, CLAUDE.md e o prompt do papel) — e o Mayor recebe a taxa por papel (dog, wa-worker, reviewer) com o sha da config.
+#
+# CRON É UTC (ver hetzner-nightly-tests.toml): 09:40Z = 06:40 local (-03). Depois do fim da suíte do WA (08:40Z) e do reseed do nó (08:55Z), antes do relatório diário (11:00Z); o rebuild dos lotes no mini é 06:30 local (09:30Z), por isso o :40.
+# TIMEOUT 10200s (2h50) > o prazo do executor no nó (--run-timeout-s 9000, que o próprio nó faz valer com `timeout`) + envio do acervo, relatório e e-mail: o desfecho é gravado antes de a ordem ser morta.
+#
+# O QUE FAZ: scripts/agent-battery-night.py manda o acervo ao nó e roda scripts/agent-battery-run.py (o do origin/main do nó) uma vez por papel, cada um com teto de tokens próprio (o executor para limpo ao esgotá-lo; `tokens` e `freio` de cada papel vão ao relatório).
+# Veredito na última linha do stdout (COMPLETO / INERTE / FALHOU / PULADO), uma linha por rodada em $GC_CITY_PATH/.gc/logs/agent-battery.jsonl, relatório em .gc/logs/agent-battery/<dia>.md (14 dias), e-mail ao Mayor
+# (salvo PULADO). INERTE = falta pré-requisito (acervo da fatia 1, ABN_TOKEN_CMD, claude no nó) e o e-mail diz qual. Não bloqueia merge. Operação e limites: docs/runbooks/agent-battery-night.md.
+#
+# Conferir depois de um reload:  gc order show hetzner-agent-battery   -> Source: .../packs/town-deltas/...
+#                                tail -n 3 $GC_CITY_PATH/.gc/logs/agent-battery.jsonl   (uma linha por rodada)
+[order]
+description = "Madrugada (06:40 local): bateria de agentes no nó Hetzner — taxa de acerto por papel (dog, wa-worker, reviewer) sobre tarefas reais, gravada com o sha da config, com relatório ao Mayor (ga-hyp55ss.3)"
+trigger = "cron"
+schedule = "40 9 * * *"
+exec = "python3 -I $PACK_DIR/../../scripts/agent-battery-night.py --mode night"
+timeout = "10200s"

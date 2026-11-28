@@ -1,0 +1,15 @@
+# ga-hyp55ss.3: gatilho de merge da bateria de agentes. Prompt, skill, CLAUDE.md e .claude/ mudam toda semana sem medição; aqui cada mudança que o executor enxerga (.claude/ com as skills de projeto, CLAUDE.md, o prompt do papel) é medida UMA vez, sem esperar a noite.
+#
+# COMO DETECTA: não olha o git do mini. A cada sondagem scripts/agent-battery-night.py --mode merge pergunta ao nó, por `--dry-run` do executor (sem token, sem gasto), o config_sha de cada papel (o hash de .claude/, CLAUDE.md, <cidade>/CLAUDE.md e do prompt do
+# papel no origin/main do ESPELHO do nó, que atrasa até 5 min) e só mede o papel cujo sha difere do último medido (.gc/agent-battery/merge-last.json, gravado também pela noite). 1ª sondagem só grava a base. Uma mudança é tentada UMA vez: falhou? a noite repete.
+# SILÊNCIO: PULADO/INERTE e falha antes de chegar a rodar um papel viram uma linha de stdout; relatório e jsonl só quando um papel chegou a rodar (COMPLETO ou FALHOU); e-mail ao Mayor só em FALHOU. O teto de tokens do merge é POR PAPEL e POR DIA UTC, separado do da noite.
+# 20 min: o espelho do nó atualiza a cada 5 min e uma sondagem custa 5 ssh curtos (2 de envio do acervo, 3 de `--dry-run`). Se uma rodada passar de 20 min, a seguinte encontra o lock do modo (.gc/agent-battery/merge.lock) e fica PULADO em silêncio.
+#
+# Conferir depois de um reload:  gc order show hetzner-agent-battery-merge   -> Source: .../packs/town-deltas/...
+#                                cat $GC_CITY_PATH/.gc/agent-battery/merge-last.json   (config_sha por papel, o que o gatilho compara)
+[order]
+description = "Gatilho de merge da bateria de agentes (ga-hyp55ss.3): a cada 20 min o nó diz o config_sha de cada papel; só o papel cuja configuração (.claude/, CLAUDE.md, prompt do papel) mudou desde a última medida é medido de novo"
+trigger = "cooldown"
+interval = "20m"
+exec = "python3 -I $PACK_DIR/../../scripts/agent-battery-night.py --mode merge"
+timeout = "10200s"
