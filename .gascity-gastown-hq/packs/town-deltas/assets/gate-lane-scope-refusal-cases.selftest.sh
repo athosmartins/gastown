@@ -3,7 +3,9 @@
 # bug and its fix on the incident's own shape). Here: the recognizer's edges, the controls that keep a code rejection a code rejection, the lane's
 # opt-out on the resubmission, the risk list for daemons/routes/cls_*.py, a drift guard against the lane prompt's wording, and one mutant per moving part.
 #
-#   a) gate_fail_is_lane_scope_refusal says yes only when EVERY "Blocking issue N" header opens with "out of the task-rapida scope"
+#   a) gate_fail_is_lane_scope_refusal says yes only when EVERY "Blocking issue" header opens with "out of the task-rapida scope"
+#   a2) a header is a header under every decoration the project's other parsers read (**, -, >, #N, no number): a code issue under one is never hidden
+#      behind a refusal, and a refusal under one is still seen (gate review of 604f11b82)
 #   b) class hold only for a task-rapida run whose EVERY judged FAIL is such a refusal; a code FAIL anywhere, a FAIL whose reason could not be read,
 #      an empty-reason FAIL, another lane (or none) stay class code — and the run is still an evaluated FAIL (NO_EVAL=0: gate:fix-attempt advances)
 #   c) the relay is recomputed per collect and zeroed by finalize
@@ -98,6 +100,19 @@ expect_pred "empty text" no ""
 expect_pred "the INCONCLUSIVE placeholder" no "INCONCLUSIVE — verdict:FAIL with empty/unparseable reason (raw bead x; see forensics log above)"
 expect_pred "awk unavailable (answers no, never nothing)" no "$REF1" /nonexistent
 
+echo "── a2. a header the project's own parsers read (gate-e5-union ISSUE_RE, gate-refusal-meter TITLE_RE, e4_parse RX_MARK) is a header here too ──"
+# A header this cannot see is read as "no other issue": a code rejection under it would be stamped hold (gate review of 604f11b82, root-class:error-vs-empty).
+RP='out of the task-rapida scope: writes the classifications table root-class:wrong-scope'; CI='off-by-one in the retry cap root-class:error-vs-empty'
+for d in '**Blocking issue <n>:** ' '**Blocking issue <n>**: ' '- Blocking issue <n>: ' '> Blocking issue <n>: ' '## Blocking issue <n>: ' '**Blocking** issue <n>: ' \
+         'Blocking issue #<n>: ' '1. Blocking issue <n>: ' 'BLOCKING ISSUE <n> — ' 'Blocking issue: '; do
+  expect_pred "a refusal headed «${d/<n>/1}», alone" yes "VERDICT: FAIL"$'\n'"${d/<n>/1}$RP"
+  expect_pred "a refusal, then a code issue headed «${d/<n>/2}»" no "VERDICT: FAIL"$'\n'"Blocking issue 1: $RP"$'\n'"${d/<n>/2}$CI"
+  expect_pred "a code issue headed «${d/<n>/1}», then a refusal" no "VERDICT: FAIL"$'\n'"${d/<n>/1}$CI"$'\n'"Blocking issue 2: $RP"
+done
+expect_pred "a decorated header whose text only quotes the phrase" no $'VERDICT: FAIL\n**Blocking issue 1:** the guard says out of the task-rapida scope but the diff is fine'
+expect_pred "a non-blocking line that talks about issues is not a header" yes "VERDICT: FAIL"$'\n'"Blocking issue 1: $RP"$'\nNon-blocking issue: off-by-one in the retry cap'
+expect_pred "a plural «issues» header counts as a header and is never read as a refusal (stays code, the safe direction)" no $'VERDICT: FAIL\nBlocking issues: '"$RP"
+
 echo "── b/c. class through the real collect + finalize blocks ──"
 mk_vb r-scope "verdict:FAIL" "$(jt "$REF1")";   mk_vb r-scope2 "verdict:FAIL" "$(jt "$REF2")"
 mk_vb r-race "" "$(jt "$REF1")"   # the verdict:FAIL label lost the race, the anchored FAIL comment landed
@@ -105,7 +120,10 @@ mk_vb r-code "verdict:FAIL" "$(jt "$CODE1")";   mk_vb r-mixed "verdict:FAIL" "$(
 mk_vb r-empty "verdict:FAIL" "[]"; mk_vb r-pass "verdict:PASS" "[]"
 mk_vb r-unread "verdict:FAIL" "$(jt "$REF1")"; : > "$FIX/r-unread.comments.fail"   # label says FAIL, its reason could not be read
 mk_vb r-unread2 "" "[]"; : > "$FIX/r-unread2.comments.fail"                       # no label, comments unreadable: a FAIL cannot be ruled out
-expect "task-rapida, one refusal"                          "$(run_case "$DISPATCHER" task-rapida 0 r-scope)" 1 1 hold
+mk_vb r-boldscope "verdict:FAIL" "$(jt $'VERDICT: FAIL\n**Blocking issue 1:** out of the task-rapida scope: touches the CRM root-class:wrong-scope')"
+mk_vb r-boldmixed "verdict:FAIL" "$(jt $'VERDICT: FAIL\nBlocking issue 1: out of the task-rapida scope: touches the CRM root-class:wrong-scope\n**Blocking issue 2:** off-by-one in the retry cap root-class:error-vs-empty')"
+mk_vb r-unnummixed "verdict:FAIL" "$(jt $'VERDICT: FAIL\nBlocking issue 1: out of the task-rapida scope: touches the CRM root-class:wrong-scope\n- Blocking issue: off-by-one in the retry cap root-class:error-vs-empty')"
+expect "task-rapida, one refusal"                         "$(run_case "$DISPATCHER" task-rapida 0 r-scope)" 1 1 hold
 expect "task-rapida, two refusals in one verdict"          "$(run_case "$DISPATCHER" task-rapida 0 r-scope2)" 1 1 hold
 expect "task-rapida, refusal delivered as a comment only"  "$(run_case "$DISPATCHER" task-rapida 0 r-race)" 1 1 hold
 expect "task-rapida, two reviewers, both refuse"           "$(run_case "$DISPATCHER" task-rapida 0 r-scope r-scope2)" 1 1 hold
@@ -114,6 +132,9 @@ expect "task-rapida, a code rejection"                     "$(run_case "$DISPATC
 expect "task-rapida, refusal + code issue in one verdict"  "$(run_case "$DISPATCHER" task-rapida 0 r-mixed)" 1 0 code
 expect "task-rapida, refusal then a code FAIL"             "$(run_case "$DISPATCHER" task-rapida 0 r-scope r-code)" 1 0 code
 expect "task-rapida, a code FAIL then a refusal"           "$(run_case "$DISPATCHER" task-rapida 0 r-code r-scope)" 1 0 code
+expect "task-rapida, a refusal under a bold header"        "$(run_case "$DISPATCHER" task-rapida 0 r-boldscope)" 1 1 hold
+expect "task-rapida, refusal + a code issue under a bold header" "$(run_case "$DISPATCHER" task-rapida 0 r-boldmixed)" 1 0 code
+expect "task-rapida, refusal + an unnumbered bulleted code issue" "$(run_case "$DISPATCHER" task-rapida 0 r-unnummixed)" 1 0 code
 expect "task-rapida, FAIL with no reason (INCONCLUSIVE)"   "$(run_case "$DISPATCHER" task-rapida 0 r-empty)" 1 0 code
 expect "task-rapida, refusal + a FAIL whose reason is unreadable" "$(run_case "$DISPATCHER" task-rapida 0 r-scope r-unread)" 1 0 code
 expect "task-rapida, refusal + a no-label bead with unreadable comments" "$(run_case "$DISPATCHER" task-rapida 0 r-scope r-unread2)" 1 0 code
@@ -193,6 +214,13 @@ g="$(pred "$MIXED")"; [ "$g" = yes ] && ok "M8 at the recognizer: the mixed verd
 mutate 'if (l ~ /^out of the task-rapida scope/) s++' 'if (l ~ /out of the task-rapida scope/) s++' && [ "$(pred $'VERDICT: FAIL\nBlocking issue 1: the guard says out of the task-rapida scope but the diff is fine')" = yes ] \
   && ok "M9 phrase not anchored to the title: the phrase quoted inside another issue reads yes" || bad "M9: stayed green (or could not build)"
 mutate "|| printf 'no'" '' && [ -z "$(pred "$REF1" /nonexistent)" ] && ok "M10 no fallback: awk missing answers nothing, not no" || bad "M10: stayed green (or could not build)"
+H='l ~ /^[^a-z]*blocking[^a-z]+issue/ {'
+mutate "$H" 'l ~ /^[ \t]*#*[ \t]*blocking[^a-z]+issue/ {' && [ "$(pred "VERDICT: FAIL"$'\n'"Blocking issue 1: $RP"$'\n**Blocking issue 2:** '"$CI")" = yes ] && [ "$(pred $'VERDICT: FAIL\n**Blocking issue 1:** '"$RP")" = no ] \
+  && ok "M11 prefix narrowed back to #*: a code issue under ** hides behind the refusal, a refusal under ** is not seen" || bad "M11: stayed green (or could not build)"
+mutate "$H" 'l ~ /^[^a-z]*blocking[^a-z]+issue[^a-z]*[0-9]/ {' && [ "$(pred "VERDICT: FAIL"$'\n'"Blocking issue 1: $RP"$'\n- Blocking issue: '"$CI")" = yes ] \
+  && ok "M12 number required again: an unnumbered code issue hides behind the refusal" || bad "M12: stayed green (or could not build)"
+mutate 'sub(/^[^a-z]*blocking[^a-z]+issue[^a-z]*/, "", l)' 'sub(/^[^a-z]*blocking[^a-z]+issue[ \t0-9:]*/, "", l)' && [ "$(pred "$REF1")" = yes ] && [ "$(pred $'VERDICT: FAIL\n**Blocking issue 1:** '"$RP")" = no ] \
+  && ok "M13 decoration left in front of the title: a refusal under ** is not recognised (liveness: the plain refusal still reads yes, so awk ran)" || bad "M13: stayed green (or could not build)"
 
 echo ""
 echo "== gate-lane-scope-refusal-cases: PASS=$PASS FAIL=$FAIL =="

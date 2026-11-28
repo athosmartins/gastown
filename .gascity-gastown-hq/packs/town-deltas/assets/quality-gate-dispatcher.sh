@@ -9284,9 +9284,10 @@ fi
 # guard close the same commit's resubmission (with gate:normal-only, which the refusal asks for) before any reviewer saw it. The words alone are not
 # enough: only the lane's prompt asks for them, and a normal-gate reviewer reading a diff of that very prompt can quote them, so the run must also have
 # been admitted under the lane (GATE_LANE; Phase C restores it from the run's record). Besides the lane's own block and phase-c-lane-restore, this is the
-# one place that sets or tests GATE_LANE as task-rapida, and gate-taskrapida.selftest.sh exempts this block by name. Zeroed like GATE_FAIL_NO_EVAL (a
-# stale 1 never reaches a later bead). Unlike no-eval, gate:fix-attempt still advances: a builder that resubmits WITHOUT the label meets the same
-# refusal again, and the cap ends that loop.
+# one place that sets or tests GATE_LANE as task-rapida, and gate-taskrapida.selftest.sh exempts this block by name. Zeroed here once read, and at the
+# entry of every gate_collect_verdicts (the requeue returns above this block skip the zeroing here; the zero-reviewer finalize, fast lane or remerge, has
+# no collect before it, the same exposure GATE_FAIL_NO_EVAL has). Unlike no-eval, gate:fix-attempt still advances: a builder that resubmits WITHOUT the
+# label meets the same refusal again, and the cap ends that loop.
 if [ "${GATE_FAIL_LANE_SCOPE:-0}" = "1" ] && [ "${GATE_LANE:-}" = "task-rapida" ]; then
   GATE_SHA_FAIL_CLASS="hold"  # ga-wnaxl43: the lane's scope refusal judged no code
 fi
@@ -13343,17 +13344,23 @@ gate_check_verdict_identity_link() {
 gate_reasons_escape() {
   printf '%s' "${1-}" | sed 's/\\/\\\\/g'
 }
-# gate_fail_is_lane_scope_refusal <fail-comment> — pure. Prints "yes" iff the reviewer's FAIL text has at least one "Blocking issue N" header
-# and EVERY one of them opens with the task-rapida lane's SCOPE CHECK refusal, "out of the task-rapida scope" (ga-wnaxl43: gate-review-task.lib.sh
-# tells that reviewer to answer with that one blocking issue and to review nothing else, so nobody judged the code). "no" for everything else:
-# another title, a header-less text, the phrase quoted in the middle of a line, an empty text, awk failing. A refusal this cannot recognise is
-# judged as the code rejection it was before. Inside this block for the reason given above.
+# gate_fail_is_lane_scope_refusal <fail-comment> — pure. Prints "yes" iff the reviewer's FAIL text has at least one "Blocking issue" header and
+# EVERY one of them opens with the task-rapida lane's SCOPE CHECK refusal, "out of the task-rapida scope" (ga-wnaxl43: gate-review-task.lib.sh
+# tells that reviewer to answer with that one blocking issue and to review nothing else, so nobody judged the code). A header is any line whose
+# first letters are "blocking" and "issue" (case ignored), with anything but letters before them (# ** - > _ 1. ...), between them (**Blocking**
+# issue) and after them (a number, #2, a colon, a closing **, a dash, or nothing). That is wider than the header grammars of gate-e5-union.py
+# (ISSUE_RE) and gate-refusal-meter.py (TITLE_RE) on purpose: a header this cannot see is read as "no other issue", and the relaxation code->hold
+# is safe only when no code issue is hidden under one (gate review of 604f11b82). The words "Blocking issue" are the verdict format's contract:
+# an issue written under another word is not seen. "no" for everything else: another title (a plural "issues" header included), a header-less
+# text, the phrase quoted in the middle of a line, an empty text, awk failing. A refusal this cannot recognise is judged as the code rejection
+# it was before. Inside this block for the reason given above.
 gate_fail_is_lane_scope_refusal() {
-  # vazio (no "Blocking issue" header) → no; falhou/ilegível (awk missing or exiting non-zero) → no as well: the class-code direction, never the permissive one
+  # vazio (no header-like line) → no; falhou/ilegível (awk missing or exiting non-zero) → no as well: the class-code direction, never the permissive one;
+  # a header-like line this cannot read as a refusal counts in n and not in s, so it vetoes
   printf '%s\n' "${1-}" | awk '
     { l = tolower($0) }
-    l ~ /^[ \t]*#*[ \t]*blocking issue[ \t]+[0-9]+/ {
-      n++; sub(/^[ \t]*#*[ \t]*blocking issue[ \t]+[0-9]+[^a-z0-9]*/, "", l)
+    l ~ /^[^a-z]*blocking[^a-z]+issue/ {
+      n++; sub(/^[^a-z]*blocking[^a-z]+issue[^a-z]*/, "", l)
       if (l ~ /^out of the task-rapida scope/) s++
     }
     END { print ((n >= 1 && s == n) ? "yes" : "no") }' 2>/dev/null || printf 'no'
