@@ -9,13 +9,10 @@
 # versions read, 1 June to 27 Oct). A reviewer was seen running 2c by hand (gate-run ga-1htlfu) because it found the
 # formula. This runs each check for every submission, from the guard (the one deterministic path every builder
 # passes), one step per call.
-# 2f (ga-89ix4m4) is not in that formula: the test lock of a BUG bead. A builder that locked its reproducing test (repro-lock.py lock: the test is the
-# first commit of the branch and carries Repro-Lock trailers) may not touch those files in any later commit; 2f reads only the git history of
-# base..tip (no branch file is opened or run) through the merged scripts/repro-lock.py. No lock declared = nao-se-aplica, so crews and every
-# older submission are untouched. A release with a recorded reason is an aviso (the reviewer sees the reason), never a refusal by itself.
-# Unlike 2c/2e, a diff that edits the tool is STILL judged: the merged copy never executes branch code, it only reads history, and skipping the step
-# would let one stray line in scripts/repro-lock.py switch the control off. And what the BUILDER controls (a merge, a long history, the text of a
-# message) is judged by the tool, never turned into "could not measure": that would be a way out of the lock.
+# 2f (ga-89ix4m4) is not in that formula: the test lock of a BUG bead (repro-lock.py lock makes the reproducing test the branch's first commit, with
+# Repro-Lock trailers; no later commit may touch it). 2f reads only the git history of base..tip through the merged scripts/repro-lock.py (no branch file
+# is opened or run). No lock declared = nao-se-aplica (crews and older submissions are untouched); a release with a recorded reason is an aviso. Unlike
+# 2c/2e a diff that edits the tool is STILL judged (it only reads history), and what the BUILDER controls (a merge, a long history, a message text) is judged, never "unmeasured".
 #
 # TRUST. The guard runs this with its own privileges and the branch may come from a sandboxed node, so nothing the
 # branch supplies is EXECUTED: each tool is the copy already merged beside this script (HQ_DIR), run over the branch's
@@ -41,7 +38,7 @@
 #                       "FAIL -- <pack>" line, so another pack, or a "NEW (not on the known list)" line, so another error in a
 #                       pack that was already red; 2d: a red line), and the detail lists just those new lines; for 2b with a base
 #                       that only warned (unlinted), each pack the tip broke must have linted green there. The only verdict the guard refuses on
-#   aviso               2e found reads with no failure test but its mode (warn, or the holdout arm) does not refuse; 2f: the lock was RELEASED with a reason
+#   aviso               2e found reads with no failure test but its mode (warn, or the holdout arm) does not refuse
 #   debito-previo       2b/2d: red on the tip and on the base, and every finding line of the tip is on the base's run too: the
 #                       same break on both sides, main already carried it (the detail is then the tip's own output)
 #   nao-se-aplica       the diff touches nothing this step reads (a MEASURED zero: the diff itself was read; "reads" for 2c is
@@ -50,10 +47,9 @@
 #                       (every .md in the diff was excluded or skipped by the lint)
 #   desligado           a kill switch is on (the tool's own, or E12_COVERAGE_GATE=off / .gc/e12-coverage-gate.off for 2d)
 #   nao-ligado          2e only: .gc/third-state-reads.conf is absent or mode=off, so the tool checked nothing
-#   (2f)                fail = a locked test changed after the lock commit, or the lock is not the branch's first commit / not a clean test-only commit / off the first-parent
-#                       line, or a lock declared in a history too long to judge; aviso = the lock was released with a reason, or the range holds only a lock of ANOTHER bead
-#                       id; nao-se-aplica = no lock declared; desligado = REPRO_LOCK_CHECK=off or .gc/repro-lock-check.off; nao-consegui-medir = only what the builder does
-#                       not control (git failing, an object missing)
+#   (2f)                fail = a locked test changed after the lock commit, or the lock is not the branch's first commit / not a clean test-only commit / a merge in a branch that declares a lock;
+#                       aviso = released with a reason, or only a lock of ANOTHER bead id; nao-se-aplica = no lock declared; desligado = REPRO_LOCK_CHECK=off or .gc/repro-lock-check.off;
+#                       nao-consegui-medir = only what the builder does not control (git failing, an object missing)
 #   nao-consegui-medir  anything that stopped a measurement (see the reason); the guard fails OPEN on it, loudly
 # rc is the tool's exit code (124 = timeout, 126/127 = could not exec), so a host problem reads in the log at a glance.
 # Always exits 0 after printing; a crash prints no VERDICT= line, which the guard reads as unmeasured.
@@ -281,9 +277,7 @@ step_2e() {
 step_2f() {
   local tool="$HQ_DIR/scripts/repro-lock.py" out="" line="" v="" r="" nlocks="" nrel=""
   [ -r "$tool" ] || emit nao-consegui-medir ferramenta-ilegivel
-  # No tool_altered skip here (see the header): the merged copy only READS the history, so a diff that edits it cannot be a reason not to judge the diff.
   case "$bead" in (''|*[!A-Za-z0-9._-]*) emit nao-consegui-medir bead-invalido ;; esac
-  # The tool reads the git objects of base..tip and nothing else: no tree is extracted and nothing the branch supplies is opened or executed.
   out="$(env "GC_CITY_PATH=$HQ_DIR" "$TBIN" "$TMO" "$PY" -I "$tool" check --repo "$TOP" --base "$base" --head "$tip" "--bead=$bead" 2>&1)"; RC=$?
   # vazio → sem linha de veredito: o interruptor (NOTE ... OFF) é a única saída 0 sem ela, qualquer outra é nao-consegui-medir; falhou/ilegível → o grep não acha a linha, o mesmo que vazio
   line="$(printf '%s\n' "$out" | grep -E '^repro-lock-check: verdict=' | tail -n 1)"
@@ -295,17 +289,14 @@ step_2f() {
     case "$line" in (*' releases='*) nrel="${line#* releases=}"; nrel="${nrel%% *}" ;; esac
     case "$r" in (''|*[!a-z0-9-]*) r="" ;; esac
   elif [ "$RC" -eq 0 ]; then
-    # Whole lines at the start only (the detail lines echo branch text, indented): see step_2c.
     if printf '%s\n' "$out" | grep -E -q '^NOTE: repro-lock-check: is switched OFF \('; then emit desligado interruptor; fi
   fi
+  # locks= / releases= must be numbers above 0 where the verdict needs them: a line that contradicts itself is unmeasured, never "intact" (aviso: a release, or a lock of ANOTHER bead id)
   case "$RC:$v" in
-    # ok: a lock was declared and nothing touched it; locks= and releases= must be numbers (a line that contradicts itself is unmeasured, never "intact")
     (0:ok) case "$nlocks" in (''|*[!0-9]*) emit nao-consegui-medir saida-ilegivel ;; esac
            [ "$nlocks" -gt 0 ] || emit nao-consegui-medir saida-ilegivel
            emit ok trava-integra ;;
-    # the tool's own reason when it is a plain slug: «trava-so-de-outra-bead» says a Repro-Lock exists in the range but for another bead id (the trailer's id must be the branch's)
     (0:nao-se-aplica) emit nao-se-aplica "${r:-sem-trava-declarada}" ;;
-    # aviso = a release with a reason (releases= must be > 0: a line that contradicts itself is unmeasured) or a Repro-Lock trailer of ANOTHER bead id (visible: the trailer's id must be the branch's)
     (0:aviso) if [ "$r" = trava-so-de-outra-bead ]; then DETAIL="$(cap "$out")"; emit aviso trava-so-de-outra-bead; fi
               case "$nrel" in (''|*[!0-9]*) emit nao-consegui-medir saida-ilegivel ;; esac
               [ "$nrel" -gt 0 ] || emit nao-consegui-medir saida-ilegivel

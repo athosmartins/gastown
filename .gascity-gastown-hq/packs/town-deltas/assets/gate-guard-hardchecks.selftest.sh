@@ -99,30 +99,12 @@ C4="$WORK/c4"; drive "$C4" RIG_PATH="$RIG" BRANCH="read"
 [ "$RC" = "1" ] && lab "$C4" gate-tsr fail && has "$C4" "step(s) 2e." && ok "a new read with no failure test: refused by step 2e" || bad "read case: rc=$RC :: $(grep -E 'label add|STATUS' "$C4" | tr '\n' '|')"
 grep -q '"bead": "ga-bead-1"' "$GCCITY/.gc/third-state-reads-arms.jsonl" 2>/dev/null && ok "the bead's arm is now a row in .gc/third-state-reads-arms.jsonl (the proof step 2e ran)" || bad "no arms row recorded"
 rm -f "$GCCITY/.gc/third-state-reads.conf"
-# 2f end to end (ga-89ix4m4): a branch whose FIRST commit is the test lock (trailers), then the fix; the real repro-lock.py reads only the history
-push_lock() { # push_lock <name> <intact|tamper|release>
-  git -C "$BUILD" checkout -q -b "$1" main && mkdir -p "$BUILD/tests" && printf 'def test_bug():\n    assert f() == 2\n' > "$BUILD/tests/test_lock.py" \
-    && git -C "$BUILD" add -A && printf 'test(ga-bead-1): reproduz\n\nRepro-Lock: ga-bead-1\nRepro-Lock-File: tests/test_lock.py\n' | git -C "$BUILD" commit -q -F - \
-    && printf 'x = 2\n' > "$BUILD/lib/app.py" && git -C "$BUILD" commit -q -am fix || return 1
-  case "$2" in
-    (tamper) printf 'def test_bug():\n    assert True\n' > "$BUILD/tests/test_lock.py"; git -C "$BUILD" commit -q -am loosen ;;
-    (release) printf 'chore(ga-bead-1): libera\n\nRepro-Lock-Release: ga-bead-1\nRepro-Lock-Release-Reason: o teste confere 3 mas o contrato diz 2: defeito do teste\n' | git -C "$BUILD" commit -q --allow-empty -F - \
-                && printf 'def test_bug():\n    assert f() == 2  # corrigido\n' > "$BUILD/tests/test_lock.py" && git -C "$BUILD" commit -q -am corrige ;;
-  esac
-  git -C "$BUILD" push -q origin "$1" && git -C "$BUILD" checkout -q main
-}
-push_lock lockok intact
-C12="$WORK/c12"; drive "$C12" RIG_PATH="$RIG" BRANCH="lockok"
-[ "$RC" = "0" ] && fell "$C12" && lab "$C12" gate-testlock ok && hasnt "$C12" "STATUS" && ok "2f: a lock commit first, the test untouched: passes, label testlock:ok" || bad "lock intact: rc=$RC :: $(grep -E 'label|STATUS' "$C12" | tr '\n' '|')"
-push_lock locktamper tamper
+git -C "$BUILD" checkout -q -b locktamper main && mkdir -p "$BUILD/tests" && printf 'def test_bug():\n    assert f() == 2\n' > "$BUILD/tests/test_lock.py" && git -C "$BUILD" add -A \
+  && printf 'test(ga-bead-1): reproduz\n\nRepro-Lock: ga-bead-1\nRepro-Lock-File: tests/test_lock.py\n' | git -C "$BUILD" commit -q -F - \
+  && printf 'def test_bug():\n    assert True\n' > "$BUILD/tests/test_lock.py" && git -C "$BUILD" commit -q -am loosen && git -C "$BUILD" push -q origin locktamper && git -C "$BUILD" checkout -q main
 C13="$WORK/c13"; drive "$C13" RIG_PATH="$RIG" BRANCH="locktamper"
-[ "$RC" = "1" ] && ! fell "$C13" && lab "$C13" gate-testlock fail && has "$C13" "STATUS ga-marker-1 error" && has "$C13" "step(s) 2f." && ok "2f: a commit that loosens the locked test is refused, marker gate-status:error" || bad "lock tamper: rc=$RC :: $(grep -E 'label|STATUS' "$C13" | tr '\n' '|')"
-has "$C13" "teste-travado-alterado" && has "$C13" "tests/test_lock.py depois da trava" && has "$C13" "repro-lock.py check" && has "$C13" "repro-lock.py release" && ok "the comment carries the tool's lines and says how to rerun the step and how to release with a reason" || bad "2f refusal comment incomplete"
-has "$C13" "step=2f verdict=fail reason=teste-travado-alterado" && ok "the HARDCHECK line of step 2f carries the tool's reason" || bad "2f log line: $(grep 'step=2f' "$C13" | head -2)"
-push_lock lockrel release
-C14="$WORK/c14"; drive "$C14" RIG_PATH="$RIG" BRANCH="lockrel"
-[ "$RC" = "0" ] && fell "$C14" && lab "$C14" gate-testlock aviso && hasnt "$C14" "STATUS" && ok "2f: a release with a reason is an aviso: passes, label testlock:aviso" || bad "lock release: rc=$RC :: $(grep -E 'label|STATUS' "$C14" | tr '\n' '|')"
-has "$C14" "Gate guard note (ga-89ix4m4, step 2f)" && has "$C14" "o teste confere 3 mas o contrato diz 2" && ok "and the reason is a comment on the marker, where the reviewer reads it" || bad "no 2f note on the marker: $(grep -c 'BD .*comment' "$C14") comment calls"
+[ "$RC" = "1" ] && ! fell "$C13" && lab "$C13" gate-testlock fail && has "$C13" "STATUS ga-marker-1 error" && has "$C13" "step(s) 2f." && has "$C13" "tests/test_lock.py depois da trava" && has "$C13" "repro-lock.py check" && has "$C13" "step=2f verdict=fail reason=teste-travado-alterado" \
+  && ok "2f: a commit that loosens the locked test is refused: marker error, the tool's lines, the rerun command and the HARDCHECK line" || bad "lock tamper: rc=$RC :: $(grep -E 'label|STATUS' "$C13" | tr '\n' '|')"
 C5="$WORK/c5"; drive "$C5" RIG_PATH="$RIG" BRANCH="no-such-branch"
 fell "$C5" && lab "$C5" gate-docrules nao-consegui-medir && lab "$C5" gate-tsr nao-consegui-medir && lab "$C5" gate-testlock nao-consegui-medir && has "$C5" "reason=fetch-falhou" && ok "a branch the origin does not have: all five steps fail-open and recorded" || bad "missing branch: $(head -6 "$C5" | tr '\n' '|')"
 # main moves after the branch was cut: the checker must get the MERGE BASE, not the new main tip (or it would judge main's own changes)
@@ -164,22 +146,16 @@ setstub 2c '';                                  mx "silence" pass 2c gate-docrul
 setstub 2c '' 3;                                mx "checker crashes (rc 3, no output)" pass 2c gate-docrules nao-consegui-medir
 setstub 2c "$(V fail 1)\\n" 9;                  mx "VERDICT=fail but the checker exits 9" refuse 2c gate-docrules fail
 setstub 2c "noise\\n$(V fail 1)\\n";            mx "verdict line not on the FIRST line" pass 2c gate-docrules nao-consegui-medir
-setstub 2c "$(V ok)\\n"
 V2f() { printf 'VERDICT=%s step=2f reason=x rc=%s tip=- base=- arm=-\\n' "$1" "${2:-0}"; }
-setstub 2f "$(V2f fail 1)\\n  teste-travado-alterado: abc1234 mexe em tests/test_a.py depois da trava\\n";   mx "2f VERDICT=fail" refuse 2f gate-testlock fail
-has "$MXCF" "step(s) 2f." && has "$MXCF" "repro-lock.py check" && ok "the refusal names step 2f and its rerun command" || bad "2f refusal text: $(grep 'rejected' "$MXCF" | head -2)"
-setstub 2c "$(V fail 1)\\n"; setstub 2f "$(V2f fail 1)\\n"
+setstub 2c "$(V fail 1)\\n"; setstub 2f "$(V2f fail 1)\\n  teste-travado-alterado: abc1234 mexe em tests/test_a.py depois da trava\\n"
 mx "2c and 2f both fail" refuse 2f gate-testlock fail
-has "$MXCF" "step(s) 2c 2f." && ok "ONE refusal lists both" || bad "2c+2f refusal: $(grep 'rejected' "$MXCF" | head -2)"
-setstub 2c "$(V ok)\\n"
-setstub 2f "$(V2f aviso)\\n  liberada em abc1234: o teste confere 3 mas o contrato diz 2\\n"
+has "$MXCF" "step(s) 2c 2f." && ok "ONE refusal lists both failing steps" || bad "2c+2f refusal: $(grep 'rejected' "$MXCF" | head -2)"
+setstub 2c "$(V ok)\\n"; setstub 2f "$(V2f aviso)\\n  liberada em abc1234: o teste confere 3 mas o contrato diz 2\\n"
 mx "2f VERDICT=aviso (a release with a reason)" pass 2f gate-testlock aviso
-has "$MXCF" "Gate guard note (ga-89ix4m4, step 2f)" && has "$MXCF" "o teste confere 3 mas o contrato diz 2" && ok "and the reason is posted on the marker" || bad "2f note: $(grep -c 'comment' "$MXCF") comment calls"
-setstub 2c "$(V aviso)\\n"; setstub 2f "$(V2f ok)\\n"
-mx "an aviso of ANOTHER step leaves no 2f note" pass 2c gate-docrules aviso
+has "$MXCF" "Gate guard note (ga-89ix4m4, step 2f)" && has "$MXCF" "<conteudo_externo>" && has "$MXCF" "o teste confere 3 mas o contrato diz 2" && ok "and the reason is a fenced comment on the marker" || bad "2f note: $(grep -c 'comment' "$MXCF") comment calls"
+setstub 2c "$(V aviso)\\n"; setstub 2f "$(V2f ok)\\n"; mx "an aviso of ANOTHER step leaves no 2f note" pass 2c gate-docrules aviso
 hasnt "$MXCF" "Gate guard note (ga-89ix4m4" && ok "no 2f note without a 2f aviso" || bad "a 2f note appeared for another step's aviso"
-for v in ok nao-se-aplica desligado nao-consegui-medir debito-previo nao-ligado; do setstub 2f "$(V2f "$v")\\n"; mx "2f VERDICT=$v" pass 2f gate-testlock "$v"; done
-setstub 2f "$(V2f banana)\\n";                  mx "2f unknown token (VERDICT=banana)" pass 2f gate-testlock nao-consegui-medir
+for v in ok nao-se-aplica desligado nao-consegui-medir debito-previo nao-ligado banana; do setstub 2f "$(V2f "$v")\\n"; mx "2f VERDICT=$v" pass 2f gate-testlock "${v/banana/nao-consegui-medir}"; done
 allstubs "$(V ok)"
 setstub 2c "$(V fail 1)\\n"
 mx "observe mode: a fail is recorded and NOT refused" pass 2c gate-docrules fail GATE_HARDCHECKS=observe

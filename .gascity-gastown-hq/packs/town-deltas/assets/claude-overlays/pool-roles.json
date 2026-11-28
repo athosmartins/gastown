@@ -98,6 +98,13 @@
   },
   "hooks_extra_defs": {
    "_why": "ga-fl2nek (épico ga-sokx7u): o pytest dirigido dos workers vai ao MacBook Pro por um atalho no PATH (scripts/pytest-shim/, política do gate-pytest.sh). O diretório do atalho entra NA FRENTE do PATH por um hook SessionStart que escreve em CLAUDE_ENV_FILE (o Claude Code lê esse arquivo antes de cada comando Bash; verificado ao vivo com `claude -p`: `command -v pytest` devolveu o atalho). Overlay `env.PATH` não serve: é valor literal, sem `$PATH`, e trocaria o PATH inteiro da sessão (bd, gc, secret, ~/.local/bin). Só os papéis que listam `hooks_extra: [\"pytest-shim\"]` o recebem (wa-worker e ps-worker); dog e revisores ficam byte-idênticos. MATCHER próprio `^(startup|resume|clear|compact)$`: o motor mescla hooks por identidade de matcher (hookEntryKey), e o `gc prime --hook` do workdir vive noutra entrada de SessionStart — o matcher exato dele seria SUBSTITUÍDO por este. FAIL-OPEN: sem CLAUDE_ENV_FILE ou com o atalho ausente (checkout que ainda não recebeu o merge) o comando sai 0 sem escrever nada; é idempotente (grep antes de acrescentar, pois resume/compact reexecutam o hook). O diretório vem da checkout PRINCIPAL ({gt_root}), nunca de um worktree. As crews (sem overlay gerado) recebem o MESMO hook por scripts/pytest-shim-activate.sh. pool-preamble-build.py check exige o hook exatamente nos papéis que o listam e em nenhum outro.",
+   "repro-lock": {
+    "marker": "repro-lock-guard",
+    "live_file": "repro-lock-guard.sh",
+    "live_also": ["repro-lock.py"],
+    "_why": "ga-89ix4m4: PreToolUse que recusa editar o teste travado por `repro-lock.py lock` (a trava vem da história git; o gate confere o mesmo, passo 2f). Só dog e wa-worker: o revisor lê, não edita; crews e ps-worker não recebem (follow-up). MATCHER PRÓPRIO: o motor mescla por identidade de matcher (hookEntryKey). FAIL-OPEN e CONTADO (UNGUARDED). O PREFIXO `: repro-lock-guard; P='<cidade>/scripts/repro-lock-guard.sh'; [ -f \"$P\" ] || ` é o wrapper que o remote-bundle-build.py reconhece (POLICY drop: o hook NÃO chega ao nó ainda). Contrato: docs/runbooks/repro-lock.md.",
+    "hooks": {"PreToolUse": [{"matcher": "^(Edit|Write|MultiEdit|NotebookEdit)$", "hooks": [{"type": "command", "command": ": repro-lock-guard; P='{gt_root}/.gascity-gastown-hq/scripts/repro-lock-guard.sh'; [ -f \"$P\" ] || exit 0; e=$(/bin/bash \"$P\" 2>&1 >/dev/null); r=$?; case \"$r:$e\" in 2:\"repro-lock-guard: BLOCKED\"*) printf \"%s\\n\" \"$e\" >&2; exit 2;; esac; exit 0", "timeout": 10}]}]}
+   },
    "pytest-shim": {
     "marker": "pytest-shim",
     "live_file": "python3",
@@ -124,26 +131,6 @@
          "if": "Bash(*pytest*)",
          "command": ": pytest-shim; D='{gt_root}/.gascity-gastown-hq/scripts/pytest-shim/bin'; [ -x \"$D/python3\" ] && [ -f \"$D/../venv-rewrite-hook.py\" ] && command -v python3 >/dev/null 2>&1 || exit 0; exec python3 -I \"$D/../venv-rewrite-hook.py\"",
          "timeout": 5
-        }
-       ]
-      }
-     ]
-    }
-   },
-   "repro-lock": {
-    "marker": "repro-lock-guard",
-    "live_file": "repro-lock-guard.sh",
-    "live_also": ["repro-lock.py"],
-    "_why": "ga-89ix4m4: o teste que REPRODUZ o bug é commitado antes do conserto (`repro-lock.py lock`) e este PreToolUse recusa Edit/Write/MultiEdit/NotebookEdit nele até o gate-done, para o construtor não afrouxar o teste enquanto conserta (o gate confere o mesmo no git, passo 2f do gate-hard-checks.sh: o hook só avisa cedo). Só os construtores (dog, wa-worker, ps-worker) o recebem: o revisor lê, não edita, e as crews não têm overlay gerado (não quebram). MATCHER PRÓPRIO `^(Edit|Write|MultiEdit|NotebookEdit)$`: o motor mescla hooks por identidade de matcher (hookEntryKey) e um matcher igual ao de uma entrada do workdir a SUBSTITUIRIA. FAIL-OPEN em três camadas, como o home-scan-guard: script ausente = exit 0 (inerte; `pool-preamble-build.py live` acusa INERT), o próprio script sai 0 em qualquer erro (e conta UNGUARDED no log), e o COMANDO deixa passar só o veredito de bloqueio (rc 2 + «repro-lock-guard: BLOCKED» no início do stderr). Forma do comando: o PREFIXO `: repro-lock-guard; P='<cidade>/scripts/repro-lock-guard.sh'; [ -f \"$P\" ] || ` é o que remote-bundle-build.py reconhece como wrapper (linha na POLICY: no servidor Hetzner o hook é DESCARTADO, como o ask-athos-relay; levá-lo ao nó é trabalho do builder do bundle). O hook sem trava local custa um `[ -d ]`: nenhum python sobe. Estado e contrato: docs/runbooks/repro-lock.md.",
-    "hooks": {
-     "PreToolUse": [
-      {
-       "matcher": "^(Edit|Write|MultiEdit|NotebookEdit)$",
-       "hooks": [
-        {
-         "type": "command",
-         "command": ": repro-lock-guard; P='{gt_root}/.gascity-gastown-hq/scripts/repro-lock-guard.sh'; [ -f \"$P\" ] || exit 0; e=$(/bin/bash \"$P\" 2>&1 >/dev/null); r=$?; case \"$r:$e\" in 2:\"repro-lock-guard: BLOCKED\"*) printf \"%s\\n\" \"$e\" >&2; exit 2;; esac; exit 0",
-         "timeout": 10
         }
        ]
       }
@@ -289,10 +276,8 @@
      "recall"
     ]
    },
-   "plugins_off": [],
-   "hooks_extra": [
-    "repro-lock"
-   ]
+   "hooks_extra": ["repro-lock"],
+   "plugins_off": []
   },
   "wa-worker": {
    "overlay": "pool-wa-worker",
@@ -371,8 +356,7 @@
    "plugins_off": [],
    "auto_memory": true,
    "hooks_extra": [
-    "pytest-shim",
-    "repro-lock"
+    "pytest-shim"
    ]
   },
   "reviewer": {
@@ -431,6 +415,7 @@
    "pool-probe-script"
   ],
   "guarded": {
+   "repro-lock": {"roles": ["dog", "wa-worker"], "show_unset": false, "_why": "ga-89ix4m4: a trava é opt-in do construtor: sem a seção ninguém a usa. Só dog e wa-worker (os que recebem o hook); Mayor e crews não têm TD_ROLE e não devem ver a regra."},
    "mockup-s3": {
     "roles": [
      "ps-worker",
@@ -528,15 +513,6 @@
     ],
     "show_unset": false,
     "_why": "ga-57e7l0 (a): o bloco de doutrina de escrita do E12 (ga-4q2zo5) chegava ao builder SÓ como texto anexado à mensagem do Pilot, e o caminho do pool o descartava (dispatch_one abre o worker com `gc session new` pelado), o top-up (passo 2d) nunca teve mensagem e um FAIL do gate devolve a bead ao pool, onde o worker se serve sozinho: medido 16/10, 70% das beads revisadas não tinham linha no roster. O PROMPT é o único canal que cobre os três, então o texto mora aqui. O corpo é GERADO a partir do mesmo e12_block_text que o Pilot usa (`bash packs/town-deltas/assets/e12-crew-doctrine.sh write`; o selftest e o gate falham se divergir). show_unset=false: crew não tem TD_ROLE e já carrega a própria região marcada (ga-0nz1wi) — receberia o bloco em duplicata."
-   },
-   "repro-lock": {
-    "roles": [
-     "dog",
-     "ps-worker",
-     "wa-worker"
-    ],
-    "show_unset": false,
-    "_why": "ga-89ix4m4: a trava do teste que reproduz o bug é opt-in do construtor (repro-lock.py lock): se o prompt não diz que ela existe, ninguém a usa e o hook/gate nunca têm o que guardar. Só os construtores do pool que RECEBEM o hook (dog, wa-worker, ps-worker). show_unset=false: crew não tem TD_ROLE, não tem o hook e já lê o gate-done.md; a regra não deve aparecer no prompt do Mayor nem das crews."
    }
   },
   "core_sentinels": {
@@ -626,6 +602,7 @@
     }
    },
    "never_cut": {
+    "repro-lock": "Relevância não é função do texto da tarefa: o tipo «bug» vem do bd, não da descrição, e a trava é opt-in do construtor (sem a seção ninguém a usa e o hook/gate não têm o que guardar); a seção custa ~0,7k tokens.",
     "claudemd-carryover": "Regras de segurança que SÓ vivem aqui depois que o overlay exclui o CLAUDE.md (dados pessoais do Athos, bd reclaim cru, restart cosmético). Valem para qualquer tarefa, independente do que o texto diz.",
     "dolt-cleanup-hazards": "O prompt nativo do dog recomenda `gc dolt cleanup --force` (= DROP DATABASE) para QUALQUER tarefa; o texto da tarefa não prevê se o agente vai alcançá-lo, e o dano é irreversível.",
     "e12-write-time-doctrine": "A doutrina de escrita é o que impede o 'não consegui ler' virar vazio (ga-57e7l0); relevância não é função do texto da tarefa — toda tarefa que ESCREVE código lê alguma coisa — e o Jev responder 'não precisa' é exatamente o buraco que a seção fecha.",
@@ -633,8 +610,7 @@
     "hq-selftest-node": "Relevância não é função do texto: qualquer tarefa que mexa em scripts/ ou packs/ do hq pode acabar numa bateria *.selftest.sh pesada, e a seção é curta (dois parágrafos, ~2,5k chars desde a ga-vln2py) — o Jev dispensá-la devolve a carga ao mini (load 45-60) com o nó parado.",
     "ram-heavy-hetzner": "Relevância não é função do texto: qualquer tarefa pode virar um build ou backfill de mais de 1 GB na hora de rodar, e o estrago (swapfile permanente no disco do mini, que o macOS só devolve no reboot) não desfaz; a seção é um parágrafo (~0,8k tokens), cortar quase não economiza.",
     "research-only-channels": "Protege contra mutação irreversível pra fora (API viva de terceiros, identidade) por subagente; se a sessão vai delegar pesquisa não é função do texto da tarefa, e o estrago não desfaz.",
-    "next-action-mayor-waiting": "Relevância não é função do texto: QUALQUER tarefa pode travar esperando decisão. Jev responderia ruído, e a falha (sessão invisível parada por 76 min) é a que a seção existe pra evitar.",
-    "repro-lock": "Relevância não é função do texto da tarefa: o tipo «bug» vem do bd, não da descrição, e a trava é opt-in do construtor (sem a seção ninguém a usa e o hook/gate não têm o que guardar); a seção custa ~0,7k tokens."
+    "next-action-mayor-waiting": "Relevância não é função do texto: QUALQUER tarefa pode travar esperando decisão. Jev responderia ruído, e a falha (sessão invisível parada por 76 min) é a que a seção existe pra evitar."
    },
    "must_include": {
     "_doc": "Piso ESTRUTURAL: independe do Jev. Casa por campo do bead (issue_type, chaves de metadata, labels) e por regex no título+descrição (sem diferenciar maiúsculas). Disparou = a seção entra, seja qual for a resposta do Jev.",
