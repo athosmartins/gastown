@@ -9,6 +9,7 @@ when the fake driver says the callback happened, the driver is a fake that print
   * anti-bot puzzle / Google asking for what this job does not do / a browser signed in as another account: NOT circumvented, no retry, said;
   * the third state: an item that cannot be read is never overwritten; a driver or CLI that hangs, lies or cannot be read is a failed try, not a success.
 """
+import http.client
 import http.server
 import importlib.util
 import json
@@ -838,7 +839,7 @@ class _BtnPage(_FPage):
         Path(path).write_bytes(b"png")
 
 
-def _drive_one_page(monkeypatch, capsys, page, connect=None):
+def _drive_one_page(monkeypatch, capsys, page, connect=None, sleep=None):
     import io
     import types
     ctx = types.SimpleNamespace(new_page=lambda: page, on=lambda ev, fn: None)
@@ -849,7 +850,7 @@ def _drive_one_page(monkeypatch, capsys, page, connect=None):
     monkeypatch.setitem(sys.modules, "playwright.sync_api", mod)
     monkeypatch.setattr(sys, "stdin", io.StringIO("https://claude.ai/oauth/authorize?x=1"))
     monkeypatch.setenv("RENEW_EMAIL", EMAIL["b85"])
-    monkeypatch.setattr(renew.time, "sleep", lambda s: None)
+    monkeypatch.setattr(renew.time, "sleep", sleep or (lambda s: None))
     assert renew.drive() == 0
     return json.loads(capsys.readouterr().out.strip().splitlines()[-1])
 
@@ -1728,7 +1729,7 @@ def test_a_forced_dry_run_says_it_would_be_skipped_when_the_item_holds_no_login_
 # ── ga-41u7k92: the browser the job drives was not there = infrastructure, NOT a try of the account ─────────────────────────────────────────────────
 # 22/11 and 27/11: two of the three tries of throw.away.amb@ were "the automation Chrome is not reachable"; the third made the mark failed_3_times and the account waited for a login by hand.
 def _cdp(w, *, answers=False, restart=(True, "`cdp restart` exit 0")):
-    """The seams of the browser: does it answer on its port, and what `cdp restart` does. Returns the list that records each restart."""
+    """The seams of the browser: does it answer on its port (True = yes, False = the port refuses, None = could not tell), and what `cdp restart` does. Returns the list that records each restart."""
     restarts = []
     w.mp.setattr(renew, "cdp_answers", lambda: answers)
     w.mp.setattr(renew, "cdp_restart", lambda: (restarts.append("restart"), restart)[1])
@@ -1777,6 +1778,15 @@ def test_a_browser_that_answers_is_not_restarted_because_that_would_close_the_ta
     assert "answers on its port, so it was not restarted" in capsys.readouterr().out
 
 
+def test_a_browser_that_could_not_be_told_up_or_down_is_not_restarted_either_because_a_slow_chrome_is_not_a_dead_one(w, capsys):
+    w.own("b85", blob("b85-old", rexp_days=3.0))
+    restarts = _cdp(w, answers=None)                                                       # timed out under load: the inert answer
+    w.mp.setenv("FAKE_DRIVER_VERDICT", "cdp_unreachable")
+    assert w.run() == 2 and restarts == [] and len(w.calls("driver")) == 2
+    out = capsys.readouterr().out
+    assert "could not tell whether the browser answers" in out and "was not restarted" in out and "deferred (infra) #1 of 48" in out and "tries" not in acct(w)
+
+
 def test_the_scheduled_run_looks_again_after_30_minutes_not_6_hours_and_a_proof_clears_the_counter(w):
     w.own("b85", blob("b85-old", rexp_days=3.0))
     launched, outs = [], iter([("cdp_unreachable", "x", None), ("cdp_unreachable", "x", None), ("renewed", "", PROOF)])
@@ -1803,6 +1813,24 @@ def test_a_failed_try_that_did_reach_the_browser_ends_a_run_of_deferrals_and_cou
     assert "infra_deferred" not in acct(w) and acct(w)["tries"] == 1                       # the browser was there this time: an ordinary failed try
 
 
+def test_a_browser_that_never_comes_back_is_deferred_for_24_hours_and_then_counts_so_athos_hears_once(w, capsys):
+    w.own("b85", blob("b85-old", rexp_days=3.0))
+    (w.d / "renew_state.json").write_text(json.dumps({"accounts": {EMAIL["b85"]: {"infra_deferred": renew.INFRA_DEFER_MAX - 1}}}))     # 47 deferrals in a row already
+    script(w, *[("cdp_unreachable", "x", None)] * 5)
+    w.run()
+    a = acct(w)
+    assert a["infra_deferred"] == renew.INFRA_DEFER_MAX and "tries" not in a and w.mark() is None            # the 48th is the last free one
+    assert "deferred (infra) #48 of 48" in capsys.readouterr().out
+    w.run()
+    a, out = acct(w), capsys.readouterr().out
+    assert a["tries"] == 1 and a["infra_deferred"] == renew.INFRA_DEFER_MAX + 1 and a["next_at"] == T0 + renew.RETRY_S      # the 49th counts: the 6 h of an ordinary failed try
+    assert "failed try 1 of 3" in out and "deferred (infra)" not in out and "counts as a failed try" in w.log()
+    w.run()
+    w.run()
+    m = w.mark()
+    assert m["verdict"] == "failed_3_times" and m["step"].startswith("cdp_unreachable") and len(w.calls("notify")) == 1      # the one mark and the one push, as before this slice
+
+
 def test_the_driver_says_cdp_unreachable_when_it_cannot_attach_and_touches_nothing(monkeypatch, capsys):
     def refuse(*a, **k):
         raise TimeoutError("connect timed out")
@@ -1817,12 +1845,21 @@ def test_the_driver_clicks_continue_with_google_once_and_waits_for_the_flow_inst
     monkeypatch.setattr(renew, "DRIVE_BUDGET_S", 0.3)
     page = _BtnPage("https://claude.ai/login?returnTo=%2Foauth%2Fauthorize%3Fstate%3DSECRETSTATE", "Sign in to Claude", ["Continue with Google", "Continue with email"])
     v = _drive_one_page(monkeypatch, capsys, page)                                         # the click does not leave the page: the Google popup is still on its way
-    assert v["verdict"] == "unknown_screen" and page.clicked == ["Continue with Google"]
+    assert v["verdict"] == "unknown_screen" and page.clicked == ["Continue with Google"] and v["step"].endswith("(what the page showed is in the log)")
     log = w.log()
     assert "no screen matched - at claude.ai/login" in log and "continue with google" in log and "Sign in to Claude" in log
     assert "SECRETSTATE" not in log and "returnTo" not in log                             # the address is logged without its query
     (shot,) = (w.d / "city" / ".gc" / "logs" / "claude-login-renew-screens").glob("*.png")
     assert shot.read_bytes() == b"png" and oct(shot.stat().st_mode & 0o777) == "0o600" and str(shot) in log
+
+
+def test_the_verdict_only_says_the_page_is_in_the_log_when_the_log_took_it(monkeypatch, capsys, tmp_path):
+    monkeypatch.setattr(renew, "DRIVE_BUDGET_S", 0.3)
+    monkeypatch.delenv("GC_CITY_PATH", raising=False)                                      # no city: rlog falls back to the driver's stderr, which nobody reads
+    monkeypatch.setattr(crew, "city", lambda: None)
+    page = _BtnPage("https://claude.ai/login", "Sign in to Claude", ["Continue with Google"])
+    v = _drive_one_page(monkeypatch, capsys, page)
+    assert v["verdict"] == "unknown_screen" and "in the log" not in v["step"]
 
 
 def test_the_driver_does_not_click_google_again_while_its_own_popup_is_open(monkeypatch, capsys):
@@ -1853,6 +1890,46 @@ def test_the_driver_clicks_google_again_after_the_gap_when_the_flow_did_not_move
     assert v["verdict"] == "unknown_screen" and page.clicked == ["Continue with Google"] * 3
 
 
+class _Clock:
+    """A clock the driver's own sleep advances (10 s per loop turn), so the real 25 s gap can be walked through without waiting: `renew.time` becomes this for the test."""
+    def __init__(self):
+        self.now = 1000.0
+
+    def monotonic(self):
+        return self.now
+
+    def sleep(self, s):
+        self.now += 10
+
+    def __getattr__(self, name):
+        return getattr(time, name)
+
+
+def _google_click_times(monkeypatch, capsys, gap):
+    clock = _Clock()
+    monkeypatch.setattr(renew, "time", clock)
+    monkeypatch.setattr(renew, "DRIVE_BUDGET_S", 100)
+    monkeypatch.setattr(renew, "GOOGLE_CLICK_GAP_S", gap)
+    times = []
+
+    class Timed(_BtnPage):
+        def on_click(self, which):
+            times.append(clock.now)
+    page = Timed("https://claude.ai/login", "Sign in", ["Continue with Google"])
+    v = _drive_one_page(monkeypatch, capsys, page, sleep=clock.sleep)
+    assert v["verdict"] == "unknown_screen"
+    return times
+
+
+def test_the_driver_clicks_google_again_only_once_the_25_seconds_have_passed_not_before(monkeypatch, capsys):
+    assert renew.GOOGLE_CLICK_GAP_S == 25
+    assert _google_click_times(monkeypatch, capsys, renew.GOOGLE_CLICK_GAP_S) == [1000.0, 1030.0, 1060.0]     # turns at +10 and +20 s held back; +30 s clicks; 3 clicks is the cap
+
+
+def test_with_a_gap_longer_than_the_whole_budget_google_is_clicked_exactly_once(monkeypatch, capsys):
+    assert _google_click_times(monkeypatch, capsys, 1000) == [1000.0]
+
+
 # ga-41u7k92 (c): the mark of an account whose tries were spent on the browser being down is forgotten with the job's own lock and state writer, not with a hand-edited json.
 def test_reset_forgets_the_mark_and_the_tries_of_one_account_and_nothing_else_and_launches_and_pushes_nothing(w, capsys):
     (w.d / "renew_state.json").write_text(json.dumps({"accounts": {
@@ -1872,6 +1949,38 @@ def test_reset_of_an_account_with_nothing_to_forget_writes_nothing_and_a_wrong_c
     assert "nothing to forget" in capsys.readouterr().out
     for bad in (["--reset"], ["--reset", "not-an-email"], ["--reset", EMAIL["amb"], "--force"]):
         assert renew.main(bad) == 64
+
+
+def test_a_dry_run_of_the_reset_says_what_it_would_forget_and_writes_nothing(w, capsys):
+    raw = json.dumps({"accounts": {EMAIL["amb"]: {"tries": 3, "next_at": T0 + 99, "infeasible": {"verdict": "failed_3_times", "step": "x"}, "last": {"verdict": "error"}}}})
+    (w.d / "renew_state.json").write_text(raw)
+    assert renew.main(["--dry-run", "--reset", EMAIL["amb"]]) == 0
+    cap = capsys.readouterr()
+    assert (w.d / "renew_state.json").read_text() == raw                                  # byte for byte: the mark, the tries and the wait are all still there
+    assert "[dry-run] would forget infeasible, tries, next_at" in cap.err and "forgot" not in cap.out and w.log() == ""
+    assert w.calls("claude") == [] and w.calls("driver") == [] and w.calls("notify") == []
+
+
+def test_a_reset_that_finds_the_lock_taken_is_not_a_quiet_zero_and_forgets_nothing(w, capsys):
+    import fcntl
+    raw = json.dumps({"accounts": {EMAIL["amb"]: {"tries": 3, "infeasible": {"verdict": "failed_3_times", "step": "x"}}}})
+    (w.d / "renew_state.json").write_text(raw)
+    fd = os.open(str(w.d / "city" / ".gc" / "claude-login-renew.lock"), os.O_CREAT | os.O_RDWR)
+    fcntl.flock(fd, fcntl.LOCK_EX)
+    try:
+        assert renew.main(["--reset", EMAIL["amb"]]) == 1                                 # whoever checks the exit code must not read "forgotten"
+    finally:
+        os.close(fd)
+    assert (w.d / "renew_state.json").read_text() == raw and "holds the lock" in capsys.readouterr().err
+    assert renew.main(["--reset", EMAIL["amb"]]) == 0 and "infeasible" not in acct(w, "amb")          # the lock free again: the same call now resets
+
+
+def test_a_reset_of_an_address_that_is_not_an_account_of_the_job_is_a_usage_error_not_a_clean_account(w, capsys):
+    (w.d / "renew_state.json").write_text(json.dumps({"accounts": {EMAIL["amb"]: {"tries": 2}}}))
+    before = (w.d / "renew_state.json").read_text()
+    assert renew.main(["--reset", "typo@example.com"]) == 64
+    assert "not one of the job's accounts" in capsys.readouterr().err and (w.d / "renew_state.json").read_text() == before
+    assert renew.main(["--reset", EMAIL["b85"]]) == 0 and "nothing to forget" in capsys.readouterr().out      # a real account with no record is a clean one
 
 
 def test_reset_with_an_unreadable_state_changes_nothing_because_it_would_overwrite_the_marks_of_the_others(w, capsys):
@@ -1912,7 +2021,28 @@ def test_cdp_answers_is_true_only_for_a_browser_that_really_answers(monkeypatch)
     monkeypatch.setenv("CLAUDE_RENEW_CDP", "http://127.0.0.1:1")
     assert renew.cdp_answers() is False
     monkeypatch.setenv("CLAUDE_RENEW_CDP", "not a url")
-    assert renew.cdp_answers() is False                                                    # a value that cannot even be asked is the same inert answer
+    assert renew.cdp_answers() is None                                                     # a value that cannot even be asked is "could not tell", which never restarts anything
+
+
+def test_cdp_answers_could_not_tell_is_not_the_same_as_refused_so_a_slow_or_odd_browser_is_never_restarted(monkeypatch):
+    import socket
+    import urllib.error
+
+    def raising(exc):
+        def f(*a, **k):
+            raise exc
+        return f
+    for exc in (urllib.error.URLError(TimeoutError("timed out")), TimeoutError("read timed out"), socket.timeout("timed out"),
+                urllib.error.URLError(OSError("no route")), urllib.error.HTTPError("http://x/json/version", 500, "boom", None, None),
+                http.client.RemoteDisconnected("closed")):
+        monkeypatch.setattr(renew.urllib.request, "urlopen", raising(exc))
+        assert renew.cdp_answers() is None, exc                                            # a timeout, an HTTP error, a half-closed reply: could not tell
+    for exc in (urllib.error.URLError(ConnectionRefusedError(61, "refused")), ConnectionRefusedError(61, "refused")):
+        monkeypatch.setattr(renew.urllib.request, "urlopen", raising(exc))
+        assert renew.cdp_answers() is False, exc                                           # only a refusal is "the browser is down"
+    ok = type("R", (), {"status": 204, "__enter__": lambda s: s, "__exit__": lambda s, *a: False})()
+    monkeypatch.setattr(renew.urllib.request, "urlopen", lambda *a, **k: ok)
+    assert renew.cdp_answers() is None                                                     # an answer that is not the DevTools 200
 
 
 def test_cdp_restart_says_what_happened_and_only_a_clean_exit_counts_as_ran(w, tmp_path, monkeypatch):

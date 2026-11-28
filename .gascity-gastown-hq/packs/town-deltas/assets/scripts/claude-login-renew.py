@@ -6,8 +6,9 @@
                                                          pushes not yet delivered, and launches AT MOST ONE attempt, for the first account the forecast or the outage names
     claude-login-renew.py --dry-run                      the same, but it only SAYS (stderr): nothing launched, written or pushed
     claude-login-renew.py --reset <email>                forget the mark and the tries of ONE account (ga-41u7k92), after whatever made them fail was fixed by hand; nothing is launched or pushed
-    exit: 0 = ran (or nothing to do), 2 = a forced renewal that did not renew, 64 = usage, 1 = the run could not judge (unreadable state / crew state), could not take the lock
-          or write its state, or crashed (the log says which)
+                                                         (with --dry-run it only says what it would forget and writes nothing)
+    exit: 0 = ran (or nothing to do), 2 = a forced renewal that did not renew, 64 = usage (an e-mail that is not one of the job's accounts included, for --reset), 1 = the run could not judge
+          (unreadable state / crew state), could not take the lock (a --reset that found the lock taken too: nothing was reset) or write its state, or crashed (the log says which)
 
 When the scheduled run acts (one account per run, the forecast first by nearest end, then the outage with the pool's pick first):
   * FORECAST: the best login of a config-dir account (its own item, its reserve) ends within EXPIRY_WARN_S (7 days) or already ended. The account that HOLDS the
@@ -58,6 +59,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 from pathlib import Path
@@ -96,6 +98,7 @@ CHROME_FIX = ("no_google_session", "needs_password")     # fixed in the BROWSER:
 PERMANENT = ("puzzle", "no_google_session", "needs_password", "needs_device", "wrong_account")     # a retry cannot change these: a human can
 INFRA = ("cdp_unreachable",)    # ga-41u7k92: the browser the job drives was not there. Infrastructure, NOT a try of the account: no `tries`, no mark, no push - its own counter and a short wait
 INFRA_RETRY_S = 30 * 60         # a deferral (infra) is looked at again after this, not after the 6 h of a failed try: a browser that was down is usually back by the next run
+INFRA_DEFER_MAX = 48            # ...but not for ever: 48 deferrals in a row (24 h) and the next infra failure counts as a failed try, so a browser that never comes back ends in the one mark + the one push (the contas vencem)
 CDP_RESTART_TIMEOUT_S = 60      # `cdp restart` itself waits up to 20 s for the port
 GOOGLE_CLICK_GAP_S = 25         # ga-41u7k92: «Continue with Google» is clicked again only after this gap. NOT MEASURED that this is what ended the 26/11 try (it may be the popup flow needing more than the ~5 s the 3 clicks took); the log of the screen below is what will say
 SEEN_TEXT_CHARS = 300           # what the driver writes to the log of a screen it could not answer
@@ -222,13 +225,19 @@ def cdp_bin() -> str:
     return os.environ.get("CLAUDE_RENEW_CDP_BIN") or shutil.which("cdp") or str(Path.home() / ".local" / "bin" / "cdp")
 
 
-def cdp_answers() -> bool:
-    """Does the automation Chrome answer on its debugging port? falhou (refused, timeout, a reply that is not an answer) -> False: a browser the job could not talk to is never called "up"."""
+def cdp_answers() -> Optional[bool]:
+    """Does the automation Chrome answer on its debugging port? True = it answers; False = the port REFUSES (nothing listens: the browser is down, the only answer that justifies a restart);
+    None = could not tell (it timed out - a live browser under load is slow, not dead -, a reply that is not the DevTools one, an address that cannot even be asked). A restart closes the tabs of
+    whatever else uses the profile, so None is never a reason to restart: it is the inert answer."""
     try:
         with urllib.request.urlopen((os.environ.get("CLAUDE_RENEW_CDP") or CDP_URL).rstrip("/") + "/json/version", timeout=3) as r:
-            return r.status == 200
-    except (OSError, ValueError, http.client.HTTPException):
+            return True if r.status == 200 else None
+    except urllib.error.URLError as e:            # urlopen wraps the socket error: a refused connect is the reason, a timeout or an HTTP error status is not
+        return False if isinstance(e.reason, ConnectionRefusedError) else None
+    except ConnectionRefusedError:
         return False
+    except (OSError, ValueError, http.client.HTTPException):
+        return None
 
 
 def cdp_restart() -> Tuple[bool, str]:
@@ -243,10 +252,12 @@ def cdp_restart() -> Tuple[bool, str]:
 
 
 def recover_cdp(url: str, email: str, step: str) -> Tuple[str, str]:
-    """ga-41u7k92: the driver could not attach to the automation Chrome. Restart it when it does not answer at all, then give the driver ONE more go with the same URL (the CLI is still waiting for it).
-    Still not there -> the same verdict `cdp_unreachable`, which is infrastructure and never a try of the account (22/11 and 27/11: two of the three tries of throw.away.amb were this)."""
-    if cdp_answers():                  # it answers but the driver could not attach (a timeout under load): a restart would close the tabs of whatever else uses that profile - no restart, one more go
-        note = "the browser answers on its port, so it was not restarted"
+    """ga-41u7k92: the driver could not attach to the automation Chrome. Restart it ONLY when its port refuses (it is down), then give the driver ONE more go with the same URL (the CLI is still waiting
+    for it) - if the restart did not run there is no second go. Still not there -> the same verdict `cdp_unreachable`, which is infrastructure and never a try of the account (22/11 and 27/11: two of the
+    three tries of throw.away.amb were this) - until INFRA_DEFER_MAX of them in a row, see run_account."""
+    up = cdp_answers()
+    if up is not False:                # it answers, or it could not be told (a timeout under load): a restart would close the tabs of whatever else uses that profile - no restart, one more go
+        note = "the browser answers on its port, so it was not restarted" if up else "could not tell whether the browser answers (no clear reply), so it was not restarted"
     else:
         ok, note = cdp_restart()
         rlog("WARN", f"{email}: the automation Chrome does not answer - {note}")
@@ -515,6 +526,11 @@ def mark_infeasible(st: dict, email: str, verdict: str, step: str, left, t: floa
     rlog("WARN", f"{email}: marked 'inviavel por automacao' ({verdict}: {step}) - one push; " + (f"looked at again after {RECHECK_S // 3600} h" if verdict in CHROME_FIX else "no more tries until it is logged in by hand"))
 
 
+def deferred(a: dict, verdict: str) -> bool:
+    """Was the attempt that just ended a free deferral (an infra verdict inside the INFRA_DEFER_MAX run) rather than a failed try? Read off the counter run_account kept."""
+    return verdict in INFRA and 0 < int(C._num(a.get("infra_deferred"))) <= INFRA_DEFER_MAX
+
+
 def run_account(st: dict, crew: dict, email: str, reason: str, t: float) -> Tuple[str, str, Optional[dict]]:
     """One attempt and what it leaves in the state: a proof clears the account's tries and mark; a wall marks it; a transient failure counts."""
     a = acct_rec(st, email)
@@ -527,7 +543,7 @@ def run_account(st: dict, crew: dict, email: str, reason: str, t: float) -> Tupl
         t = C.now()                                            # the attempt takes minutes: the marks, tries and pushes are dated when it ENDED
     left = None if v["best_left"] is None else v["best_left"] - (t - t0)      # as of `at` (the push shows the end of the login to the second)
     a["last"] = {"verdict": verdict, "step": step, "at": t}
-    if verdict not in INFRA and verdict != "skipped":          # a try that ended any other way ends the run of consecutive infra deferrals (the counter is for the log: nothing decides on it)
+    if verdict not in INFRA and verdict != "skipped":          # an attempt that ended in any verdict but an infra one (whatever it reached) ends the run of consecutive infra failures
         a.pop("infra_deferred", None)
     if proof:
         for k in ("tries", "next_at", "infeasible", "infra_deferred"):
@@ -537,12 +553,15 @@ def run_account(st: dict, crew: dict, email: str, reason: str, t: float) -> Tupl
         rlog("WARN", f"{email}: {step}")
     elif verdict in PERMANENT:
         mark_infeasible(st, email, verdict, step, left, t)
-    elif verdict in INFRA:                                     # ga-41u7k92: its own counter, a short wait, no mark, no push; `tries` stays where it was
+    elif verdict in INFRA and int(C._num(a.get("infra_deferred"))) < INFRA_DEFER_MAX:     # ga-41u7k92: its own counter, a short wait, no mark, no push; `tries` stays where it was
         a["infra_deferred"] = int(C._num(a.get("infra_deferred"))) + 1
         a["next_at"] = t + INFRA_RETRY_S
-        rlog("WARN", f"{email}: deferred (infra) #{a['infra_deferred']} ({verdict}: {step}) - not a failed try: tries stay at {int(C._num(a.get('tries')))} of {MAX_TRIES}; "
+        rlog("WARN", f"{email}: deferred (infra) #{a['infra_deferred']} of {INFRA_DEFER_MAX} ({verdict}: {step}) - not a failed try: tries stay at {int(C._num(a.get('tries')))} of {MAX_TRIES}; "
                      f"looked at again after {C._iso(a['next_at'])}")
     else:
+        if verdict in INFRA:                                   # the free deferrals are over (24 h of the browser not coming back, or an attach that fails for good): from here it counts, and the third is the one push
+            a["infra_deferred"] = int(C._num(a.get("infra_deferred"))) + 1
+            rlog("WARN", f"{email}: {INFRA_DEFER_MAX} deferrals (infra) in a row and the browser is still not there: this one counts as a failed try")
         a["tries"] = int(C._num(a.get("tries"))) + 1
         a["next_at"] = t + RETRY_S
         rlog("WARN", f"{email}: try {a['tries']} of {MAX_TRIES} failed ({verdict}: {step})")
@@ -694,8 +713,8 @@ def run_once(email: str) -> int:
         line = f"{email}: NOT renewed ({verdict}: {step})"
     err = settle(st, [email], t)
     mark, tries = acct_rec(st, email).get("infeasible"), acct_rec(st, email).get("tries")
-    if not proof and verdict in INFRA:
-        line += (f" - deferred (infra) #{int(C._num(acct_rec(st, email).get('infra_deferred')))}: not a failed try, tries stay at {int(C._num(tries))} of {MAX_TRIES}; "
+    if not proof and deferred(acct_rec(st, email), verdict):
+        line += (f" - deferred (infra) #{int(C._num(acct_rec(st, email).get('infra_deferred')))} of {INFRA_DEFER_MAX}: not a failed try, tries stay at {int(C._num(tries))} of {MAX_TRIES}; "
                  f"the scheduled run looks again after {C._iso(C._num(acct_rec(st, email).get('next_at')))}")
     elif not proof and verdict != "skipped" and not isinstance(mark, dict) and tries:
         line += f" - failed try {int(C._num(tries))} of {MAX_TRIES}"
@@ -716,7 +735,9 @@ def run_once(email: str) -> int:
 def reset_account(email: str) -> int:
     """`--reset <email>` (ga-41u7k92): forget the wall mark, the tries, the wait and the infra deferrals of ONE account, for after whatever made them fail was fixed by hand (a browser that was down, a Google
     session that was added). The history (`last`, `renewed`) and every other account stay. Nothing is launched or pushed: the next scheduled run judges the account from scratch, so a wall that is still
-    there is met - and pushed - again. 0 = done, or the account has nothing to forget; 1 = the state could not be read or written (said)."""
+    there is met - and pushed - again. With --dry-run (DRY) it says what it would forget and writes nothing, like every other path of this script.
+    0 = done, or the account is one of the job's and has nothing to forget; 64 = an e-mail that is not one of the job's accounts and has no record in the state (a typo: nothing changed);
+    1 = the state could not be read or written (said; main also answers 1 when the lock is taken)."""
     st, st_status = load_state()
     if st_status == "unreadable":                              # vazio/missing = a first run: nothing to forget; ilegível = marks of OTHER accounts we cannot see and must not overwrite with an empty state
         print(f"{email}: the state {state_path()} is unreadable - nothing changed (fix or remove it first)", file=sys.stderr)
@@ -724,9 +745,15 @@ def reset_account(email: str) -> int:
     a = (st.get("accounts") or {}).get(email)
     gone = [k for k in ("infeasible", "tries", "next_at", "infra_deferred") if isinstance(a, dict) and k in a]
     if not gone:
+        if not isinstance(a, dict) and email not in C.accounts():      # no record and not an account of the job: "nothing to forget" would be the same words for a typo as for a clean account
+            print(f"{email}: not one of the job's accounts and no record of it in the state - a typo? nothing changed", file=sys.stderr)
+            return 64
         print(f"{email}: no mark, tries or wait in the state - nothing to forget")
         return 0
     before = {k: a[k] for k in gone if k in ("tries", "infra_deferred")} | ({"mark": a["infeasible"].get("verdict", "?")} if isinstance(a.get("infeasible"), dict) else {})
+    if DRY:
+        print(f"{email}: [dry-run] would forget {', '.join(gone)} ({before}) - nothing written", file=sys.stderr)
+        return 0
     for k in gone:
         a.pop(k)
     err = save(st)
@@ -835,9 +862,10 @@ def look(pg) -> dict:
             "email_box": n("input[type=email]:visible, #identifierId:visible") > 0}
 
 
-def snapshot_screen(pg, email: str) -> None:
+def snapshot_screen(pg, email: str) -> bool:
     """ga-41u7k92: a screen no action matched (the 26/11 `unknown_screen: click_google at claude.ai/login` left nothing to read). Writes what the page shows to the log - its address WITHOUT the query, the buttons,
-    the fields and the first words of its text - and a screenshot beside it (the last SCREEN_KEEP are kept). Best effort and never raises: a failure to describe or photograph the page is said in the log, because this is evidence and never a step of the flow."""
+    the fields and the first words of its text - and a screenshot beside it (the last SCREEN_KEEP are kept). Best effort and never raises: a failure to describe or photograph the page is said in the log, because this is evidence and never a step of the flow.
+    True only when the description REACHED the log file (rlog falls back to this process's stderr, which run_driver discards, when the city or its logs dir is missing): the verdict's step may then say so, and only then."""
     try:
         u = urllib.parse.urlparse(pg.url)
         s = look(pg)
@@ -845,12 +873,13 @@ def snapshot_screen(pg, email: str) -> None:
         rlog("WARN", f"{email}: no screen matched - at {u.hostname or '?'}{u.path[:60]}; buttons={s['buttons'][:12]}; password_field={s['pw']} code_field={s['code']} email_box={s['email_box']}; text: {words!r}")
     except Exception as e:  # noqa: BLE001
         rlog("WARN", f"{email}: no screen matched, and the page could not be described ({type(e).__name__})")
-        return
+        return False
+    c = C.city()
+    in_the_log = bool(c and (c / ".gc" / "logs").is_dir())     # the same test rlog makes before it writes to the file
     try:
-        c = C.city()
         d = c / ".gc" / "logs" / "claude-login-renew-screens" if c else None
         if d is None or not (d.parent).is_dir():
-            return
+            return in_the_log
         d.mkdir(exist_ok=True)
         f = d / f"{int(time.time())}-{re.sub(r'[^a-z0-9]+', '-', email.lower())}.png"
         pg.screenshot(path=str(f), timeout=5000)
@@ -860,10 +889,12 @@ def snapshot_screen(pg, email: str) -> None:
         rlog("WARN", f"{email}: screenshot of that page: {f}")
     except Exception as e:  # noqa: BLE001
         rlog("WARN", f"{email}: the screenshot of that page could not be taken ({type(e).__name__})")
+    return in_the_log
 
 
 def drive() -> int:
-    """stdin: the OAuth URL. stdout: json lines, the last one is the verdict. Never prints the URL, a page's text, an e-mail's password or a code."""
+    """stdin: the OAuth URL. stdout: json lines, the last one is the verdict. Never prints the URL, an e-mail's password or a code, and never puts a page's text on stdout: when no screen matched, the first
+    words of the page go to the renew LOG only (snapshot_screen: address without its query, buttons, fields, SEEN_TEXT_CHARS of text)."""
     email = os.environ.get("RENEW_EMAIL", "").strip().lower()
     url = sys.stdin.read().strip()
 
@@ -937,9 +968,8 @@ def drive() -> int:
                         last = f"{act} failed ({type(e).__name__})"
                 time.sleep(1.5)
             shown = next((q for q in owned if not q.is_closed()), None)
-            if shown is not None:
-                snapshot_screen(shown, email)
-            return say("unknown_screen", last + " (what the page showed is in the log)")
+            logged = snapshot_screen(shown, email) if shown is not None else False
+            return say("unknown_screen", last + (" (what the page showed is in the log)" if logged else ""))
         finally:
             for q in owned:
                 try:
@@ -970,7 +1000,7 @@ def main(argv: List[str]) -> int:
         fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except BlockingIOError:
         print("another run holds the lock - nothing done this time", file=sys.stderr)
-        return 2 if forced else 0                              # a forced renewal that did not run is "not renewed", never a quiet 0
+        return 2 if forced else 1 if reset else 0              # a forced renewal that did not run is "not renewed" and a reset that did not run is "nothing was reset" (1, the lock row of the header): never a quiet 0
     except OSError as e:
         rlog("ERROR", f"cannot take the lock ({type(e).__name__}) - nothing was done")
         return 1
