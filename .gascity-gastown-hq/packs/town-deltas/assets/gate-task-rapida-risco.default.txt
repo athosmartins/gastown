@@ -43,3 +43,9 @@ migrations/
 *.sqlite
 *.sqlite3
 *schema*.sql
+
+# --- customer data under a path with none of the words above (ga-wnaxl43)
+# daemons/routes/cls_*.py are the blueprints of the whatsapp_automation classification dashboard (contacts, leads, sending messages). wa-4e3efc (28/11)
+# got this lane for a diff of cls_property.py that wrote the classifications table and re-pushed deals to the CRM: no word above is in that path.
+# Global on purpose, no [rig] section: a section that does not match the rig's name drops the pattern without a word.
+daemons/routes/cls_

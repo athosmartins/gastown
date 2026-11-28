@@ -1747,6 +1747,8 @@ reconcile_bare_main_to_origin() {
 #          ga-lxz5w checks below) downgraded it AFTER the code was already
 #          judged clean. The code itself was never rejected, so once the hold
 #          clears this exact SHA may re-earn a PASS with no new commit.
+#          Also hold: a FAIL in which nobody judged the code — no verdict was delivered (ga-mcapdq, ga-w7pm55), or the
+#          task-rapida lane's reviewer refused on SCOPE and reviewed nothing else (ga-wnaxl43).
 # Defaults to "code" when omitted — the safe/blocking branch, so any call
 # site that forgets to classify never accidentally unblocks a real rejection.
 gate_sha_fail_label() {
@@ -9277,6 +9279,18 @@ GATE_FAIL_NO_EVAL=0
 if [ "$GATE_FAIL_NO_EVAL_RUN" = "1" ]; then
   GATE_SHA_FAIL_CLASS="hold"  # ga-mcapdq: timeout produced no verdict from anyone — not a code rejection
 fi
+# ga-wnaxl43: the task-rapida lane's scope refusal. gate_collect_verdicts raises GATE_FAIL_LANE_SCOPE only when EVERY judged FAIL of the run is worded as
+# one. That reviewer was told to review nothing else, so the FAIL says nothing about the code, and a class-code stamp would make the ga-l7mvtw STALE-SHA
+# guard close the same commit's resubmission (with gate:normal-only, which the refusal asks for) before any reviewer saw it. The words alone are not
+# enough: only the lane's prompt asks for them, and a normal-gate reviewer reading a diff of that very prompt can quote them, so the run must also have
+# been admitted under the lane (GATE_LANE; Phase C restores it from the run's record). Besides the lane's own block and phase-c-lane-restore, this is the
+# one place that sets or tests GATE_LANE as task-rapida, and gate-taskrapida.selftest.sh exempts this block by name. Zeroed like GATE_FAIL_NO_EVAL (a
+# stale 1 never reaches a later bead). Unlike no-eval, gate:fix-attempt still advances: a builder that resubmits WITHOUT the label meets the same
+# refusal again, and the cap ends that loop.
+if [ "${GATE_FAIL_LANE_SCOPE:-0}" = "1" ] && [ "${GATE_LANE:-}" = "task-rapida" ]; then
+  GATE_SHA_FAIL_CLASS="hold"  # ga-wnaxl43: the lane's scope refusal judged no code
+fi
+GATE_FAIL_LANE_SCOPE=0
 # SELFTEST-EXTRACT finalize-failclass-reset: END
 
 # ── ga-nooaw: FAIL-CLOSED BY SHA ─────────────────────────────────────────────
@@ -13329,6 +13343,21 @@ gate_check_verdict_identity_link() {
 gate_reasons_escape() {
   printf '%s' "${1-}" | sed 's/\\/\\\\/g'
 }
+# gate_fail_is_lane_scope_refusal <fail-comment> — pure. Prints "yes" iff the reviewer's FAIL text has at least one "Blocking issue N" header
+# and EVERY one of them opens with the task-rapida lane's SCOPE CHECK refusal, "out of the task-rapida scope" (ga-wnaxl43: gate-review-task.lib.sh
+# tells that reviewer to answer with that one blocking issue and to review nothing else, so nobody judged the code). "no" for everything else:
+# another title, a header-less text, the phrase quoted in the middle of a line, an empty text, awk failing. A refusal this cannot recognise is
+# judged as the code rejection it was before. Inside this block for the reason given above.
+gate_fail_is_lane_scope_refusal() {
+  # vazio (no "Blocking issue" header) → no; falhou/ilegível (awk missing or exiting non-zero) → no as well: the class-code direction, never the permissive one
+  printf '%s\n' "${1-}" | awk '
+    { l = tolower($0) }
+    l ~ /^[ \t]*#*[ \t]*blocking issue[ \t]+[0-9]+/ {
+      n++; sub(/^[ \t]*#*[ \t]*blocking issue[ \t]+[0-9]+[^a-z0-9]*/, "", l)
+      if (l ~ /^out of the task-rapida scope/) s++
+    }
+    END { print ((n >= 1 && s == n) ? "yes" : "no") }' 2>/dev/null || printf 'no'
+}
 gate_collect_verdicts() {
   VERDICTS_RECEIVED=0
   ANY_FAIL=0
@@ -13342,6 +13371,10 @@ gate_collect_verdicts() {
   # (same leak concern as QUOTA_REQUEUE/REQUEUE_REASON at the call sites).
   GATE_FAIL_NO_EVAL=0
   local _judged_fails=0 _noverdict_fails=0 _e5x=0
+  # ga-wnaxl43: the lane-scope relay (raised after the loop), recomputed from scratch on every call like GATE_FAIL_NO_EVAL above: a stale 1 must
+  # not survive into the next bead's collect. _scope_fails counts the judged FAILs worded as the task-rapida lane's scope refusal.
+  GATE_FAIL_LANE_SCOPE=0
+  local _scope_fails=0
   # ga-h8vc8y: the judged-FAIL count is ALSO handed to the caller (the local
   # above dies with this function), because Phase C's timeout branch runs right
   # after this collect and must know whether a reviewer that DID deliver
@@ -13484,6 +13517,8 @@ gate_collect_verdicts() {
             FAIL_COMMENT="INCONCLUSIVE — verdict:FAIL with empty/unparseable reason (raw bead $VB; see forensics log above)"
           fi
         fi
+        # ga-wnaxl43: the recognizer reads words only (the placeholders above never carry them); whether the run was the lane's is finalize's call
+        if [ "$(gate_fail_is_lane_scope_refusal "$FAIL_COMMENT")" = "yes" ]; then _scope_fails=$((_scope_fails + 1)); fi
         FAIL_REASONS="${FAIL_REASONS}Reviewer $((j+1)) FAIL: $(gate_reasons_escape "$FAIL_COMMENT")\n"
         GATE_E5_FAIL_IDX+=("$((j+1))"); GATE_E5_FAIL_TXT+=("$FAIL_COMMENT")
       else
@@ -13566,6 +13601,7 @@ gate_collect_verdicts() {
             _judged_fails=$((_judged_fails + 1))
             if [ "$_e5x" = "1" ]; then GATE_E5_EXTRA_VERDICT="FAIL"; fi   # ga-syxaki (E5): a rescued FAIL is a DELIVERED FAIL — it is in FAIL_REASONS and in the union below, so the log must say so
             log "  Reviewer $((j+1)) (bead $VB) closed WITHOUT a verdict:FAIL label but its verdict COMMENT is an explicit FAIL — counting as a real reviewer rejection (ga-w7pm55, mirror of the ga-86l90a8 PASS rescue). comment=$(printf '%s' "$FAIL_COMMENT" | tr '\n' ' ' | cut -c1-200)"
+            if [ "$(gate_fail_is_lane_scope_refusal "$FAIL_COMMENT")" = "yes" ]; then _scope_fails=$((_scope_fails + 1)); fi   # ga-wnaxl43, as at the label branch
             FAIL_REASONS="${FAIL_REASONS}Reviewer $((j+1)) FAIL: $(gate_reasons_escape "$FAIL_COMMENT")\n"
             GATE_E5_FAIL_IDX+=("$((j+1))"); GATE_E5_FAIL_TXT+=("$FAIL_COMMENT")
           elif [ "$FAIL_COMMENT_UNREADABLE" = "1" ]; then
@@ -13593,6 +13629,14 @@ gate_collect_verdicts() {
   # code: it is a real rejection, whatever the other reviewers did.
   if [ "$ANY_FAIL" = "1" ] && [ "$_judged_fails" -eq 0 ] && [ "$_noverdict_fails" -gt 0 ]; then
     GATE_FAIL_NO_EVAL=1
+  fi
+  # ga-wnaxl43: relay to gate_finalize_run(), same idiom as GATE_FAIL_NO_EVAL above. EVERY judged FAIL of the run is worded as the task-rapida lane's
+  # scope refusal (a second reviewer's code FAIL, or a FAIL whose comments could not be read, keeps the run at class code). Whether that makes the
+  # stamp class hold is finalize's call, which also asks whether the run was admitted under the lane (finalize-failclass-reset). Pinned by
+  # gate-lane-scope-refusal-not-code-fail.selftest.sh (the locked repro) and gate-lane-scope-refusal-cases.selftest.sh (the cases and the mutants).
+  if [ "$ANY_FAIL" = "1" ] && [ "$_scope_fails" -gt 0 ] && [ "$_scope_fails" -eq "$_judged_fails" ]; then
+    GATE_FAIL_LANE_SCOPE=1
+    log "  Every reviewer FAIL of this run is worded as the task-rapida lane's scope refusal (ga-wnaxl43): on a lane run gate_finalize_run stamps class hold, not code."
   fi
   GATE_COLLECT_JUDGED_FAILS="$_judged_fails"  # ga-h8vc8y: read by Phase C's timeout branch
   # ga-syxaki (E5): only a run that HAS an extra reviewer slot gets the union; any failure in

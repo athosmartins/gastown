@@ -522,9 +522,14 @@ L_GUARD=$(grep -n 'GATE_GUARD_LIB_ONLY=1' "$DISPATCHER" | head -1 | cut -d: -f1)
 # admitted under. It decides nothing: no branch of the merge path reads it as anything but "not fast". It is exempt as a delimited
 # block, never as a line pattern, so a use anywhere else (or a missing block) is still reported; gate-phase-c-lane-restore.selftest.sh
 # pins what the block does.
+# ga-wnaxl43: a SECOND place may -- the finalize block that classes a FAIL's stamp (SELFTEST-EXTRACT finalize-failclass-reset): the lane's reviewer
+# refuses on scope in words only its prompt asks for, and only a run admitted under the lane may read them as "the code was not judged" (class hold).
+# Exempt as a delimited block too; gate-lane-scope-refusal-cases.selftest.sh pins what it does.
 L_RST_B=$(grep -n 'SELFTEST-EXTRACT phase-c-lane-restore: BEGIN' "$DISPATCHER" | head -1 | cut -d: -f1)
 L_RST_E=$(grep -n 'SELFTEST-EXTRACT phase-c-lane-restore: END' "$DISPATCHER" | head -1 | cut -d: -f1)
-BAD_LANE_USES=$(grep -n 'GATE_LANE' "$DISPATCHER" | grep -F 'task-rapida' | awk -F: -v b="${L_TRD_B:-0}" -v e="${L_TRD_E:-0}" -v rb="${L_RST_B:-0}" -v re="${L_RST_E:-0}" '($1 < b || $1 > e) && !($1 > rb && $1 < re) && $0 !~ /^[0-9]+:[[:space:]]*#/' || true)
+L_CLS_B=$(grep -n 'SELFTEST-EXTRACT finalize-failclass-reset: BEGIN' "$DISPATCHER" | head -1 | cut -d: -f1)
+L_CLS_E=$(grep -n 'SELFTEST-EXTRACT finalize-failclass-reset: END' "$DISPATCHER" | head -1 | cut -d: -f1)
+BAD_LANE_USES=$(grep -n 'GATE_LANE' "$DISPATCHER" | grep -F 'task-rapida' | awk -F: -v b="${L_TRD_B:-0}" -v e="${L_TRD_E:-0}" -v rb="${L_RST_B:-0}" -v re="${L_RST_E:-0}" -v cb="${L_CLS_B:-0}" -v ce="${L_CLS_E:-0}" '($1 < b || $1 > e) && !($1 > rb && $1 < re) && !($1 > cb && $1 < ce) && $0 !~ /^[0-9]+:[[:space:]]*#/' || true)
 [ -z "$BAD_LANE_USES" ] && ok "no line outside the lane's own block treats GATE_LANE=task-rapida specially (the merge path is the normal gate's)" || bad "something else in the dispatcher special-cases task-rapida: $BAD_LANE_USES"
 
 echo
