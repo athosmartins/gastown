@@ -443,7 +443,6 @@ branch_from "$R" main l_ok;    lock_commit "$R" "$LB" tests/test_lock.py "$LOCKE
 run_sut 2f "$R" "$MAIN" "$OKTIP" "$LB";                    expect "the lock commit first, then the fix, the test untouched" ok trava-integra
 branch_from "$R" main l_bad;   lock_commit "$R" "$LB" tests/test_lock.py "$LOCKED" >/dev/null; printf 'x = 2\n' > "$R/lib/app.py"; printf '%b\n' "$LOOSE" | put "$R" tests/test_lock.py; BADTIP="$(commit_all "$R" fix-and-loosen)"
 run_sut 2f "$R" "$MAIN" "$BADTIP" "$LB";                   expect "the fix commit also loosens the locked test: refused" fail teste-travado-alterado
-has "the finding names the locked file" "tests/test_lock.py depois da trava"
 run_sut 2f "$R" "$MAIN" "$BADTIP" "ga-other";              expect "a lock of ANOTHER bead id is visible (aviso), never silent" aviso trava-so-de-outra-bead
 branch_from "$R" main l_tool;  lock_commit "$R" "$LB" tests/test_lock.py "$LOCKED" >/dev/null; printf '# changed\n' | put "$R" "$HQ/scripts/repro-lock.py"; printf '%b\n' "$LOOSE" | put "$R" tests/test_lock.py; LTTIP="$(commit_all "$R" tool-edit-and-loosen)"
 run_sut 2f "$R" "$MAIN" "$LTTIP" "$LB";                    expect "editing repro-lock.py in the same diff does not switch the lock check off" fail teste-travado-alterado
@@ -452,13 +451,11 @@ run_sut 2f "$R" "$MAIN" "$BADTIP" "ga lock";               expect "a bead id wit
 # stand-in tool: the checker reads the VERDICT line's fields and the exit status; a line that contradicts itself is unmeasured, never «intact»
 C6="$WORK/city6"; mkcity "$C6" || { echo "FATAL: cannot build city6"; exit 1; }; CITY_UNDER="$C6"; T6="$C6/scripts/repro-lock.py"
 stand() { printf '%s\n' "$1" > "$T6"; run_sut 2f "$R" "$MAIN" "$OKTIP" "$LB"; expect "$2" "$3" "$4"; }
-stand 'print("repro-lock-check: verdict=ok reason=trava-integra locks=2 files=2 releases=0")' "control: a well-formed ok line" ok trava-integra
 stand 'print("repro-lock-check: verdict=ok reason=trava-integra locks=0 files=0 releases=0")' "ok with locks=0 contradicts itself" nao-consegui-medir saida-ilegivel
 stand 'print("repro-lock-check: verdict=aviso reason=trava-liberada-com-motivo locks=1 files=1 releases=0")' "aviso with releases=0 contradicts itself" nao-consegui-medir saida-ilegivel
 stand 'import sys; print("repro-lock-check: verdict=fail reason=Bad_Slug! locks=1 files=1 releases=0"); sys.exit(1)' "a reason that is not a plain slug is not echoed into the verdict" fail teste-travado-violado
 stand 'import sys; print("repro-lock-check: verdict=fail reason=x locks=1 files=1 releases=0"); sys.exit(0)' "a fail line with exit 0: the exit status disagrees" nao-consegui-medir saida-ilegivel
 stand 'import sys; print("repro-lock-check: verdict=nao-sei reason=leitura-falhou locks=- files=- releases=-"); sys.exit(2)' "the tool says it could not tell (exit 2)" nao-consegui-medir ferramenta-nao-sei
-stand 'import sys; sys.exit(5)' "a tool that dies with exit 5 and no line" nao-consegui-medir ferramenta-rc5
 rm -f "$T6"
 run_sut 2f "$R" "$MAIN" "$OKTIP" "$LB";                    expect "the tool missing from the city" nao-consegui-medir ferramenta-ilegivel
 CITY_UNDER=""

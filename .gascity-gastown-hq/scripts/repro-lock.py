@@ -2,7 +2,7 @@
 """repro-lock.py (ga-89ix4m4): o teste que REPRODUZ o bug é commitado antes do conserto e fica TRAVADO. Contrato, fluxo e limites: docs/runbooks/repro-lock.md.
 
 A trava mora na HISTÓRIA do git (trailers do ÚLTIMO parágrafo da mensagem: Repro-Lock, Repro-Lock-File, Repro-Lock-Release, Repro-Lock-Release-Reason), então hook e gate leem a mesma coisa pela MESMA simulação.
-lock/release: o construtor · guard: o motor do hook PreToolUse (exit 2 num arquivo travado) · check: o passo 2f do gate (lê só o git de base..head). Testes: scripts/test_repro_lock.py.
+lock: o construtor (a liberação é um commit vazio com os trailers de release: runbook) · guard: o motor do hook PreToolUse (exit 2 num arquivo travado) · check: o passo 2f do gate (lê só o git de base..head). Testes: scripts/test_repro_lock.py.
 «Não sei» (rc 2) só para o que o construtor NÃO controla (git que falha, objeto ausente); merge, histórico longo e texto de mensagem são JULGADOS: virar «não sei» seria um jeito de desligar o passo.
 """
 import json
@@ -236,7 +236,7 @@ def same_file(a, b):
         return os.path.realpath(a) == os.path.realpath(b)
 
 
-def guard_cmd(text, who):
+def guard_cmd(text):
     """Motor do hook -> (rc, stderr). rc 2 só com o arquivo TRAVADO; dúvida é 0 (o hook só atrapalha, quem recusa de verdade é o gate) com «UNGUARDED …» para o wrapper contar."""
     try:
         p = json.loads(text)
@@ -262,7 +262,8 @@ def guard_cmd(text, who):
     for f, bead in sorted(locked.items()):
         if same_file(target, os.path.join(top, f)):
             return 2, ("%s — «%s» está TRAVADO pela bead %s: é o teste que reproduz o bug, e afrouxá-lo junto com o conserto não prova que o bug sumiu. NÃO repita a chamada e NÃO contorne por Bash (sed -i, tee, git checkout): o gate "
-                       "compara o teste do tip com o commit da trava e recusa a submissão (passo 2f).\nConserte o CÓDIGO; mais casos vão em OUTRO arquivo de teste; defeito REAL do teste: %s release %s --reason \"<o que está errado, %d+ caracteres>\" (o motivo vai à bead e ao revisor) e só então edite." % (BLOCKED, f, bead, who, bead, MIN_REASON))
+                       "compara o teste do tip com o commit da trava e recusa a submissão (passo 2f).\nConserte o CÓDIGO; mais casos vão em OUTRO arquivo de teste. Defeito REAL do teste: `bd comment %s \"<o que está errado>\"` e `git commit --allow-empty -m \"libera a trava\" "
+                       "-m $'Repro-Lock-Release: %s\\nRepro-Lock-Release-Reason: <o que está errado, %d+ caracteres>'`; só então edite (o revisor vê o motivo)." % (BLOCKED, f, bead, bead, bead, MIN_REASON))
     return 0, ""
 
 
@@ -287,12 +288,10 @@ def run_repro(top, cmd, timeout):
 
 def cmd_lock(a):
     top = gt(os.getcwd(), "rev-parse", "--show-toplevel")
-    files = []
-    for f in a.files:
-        rel = os.path.relpath(os.path.realpath(os.path.join(os.getcwd(), f)), os.path.realpath(top)).replace(os.sep, "/")
-        if not safe_rel(rel) or not os.path.isfile(os.path.join(top, rel)):
+    files = [os.path.relpath(os.path.realpath(f), os.path.realpath(top)).replace(os.sep, "/") for f in a.files]
+    for f in files:
+        if not safe_rel(f) or not os.path.isfile(os.path.join(top, f)):
             return die("%r não é arquivo regular dentro do repo (ou o nome não cabe num trailer)" % f)
-        files += [rel] if rel not in files else []
     t = bead_type(a.bead)  # bd que cai → Cant → «NÃO SEI», nada travado: o estado inerte
     if t != "bug":
         return die("a bead %s é do tipo %r: a trava vale só para bead tipo bug" % (a.bead, t))
@@ -320,20 +319,6 @@ def cmd_lock(a):
     return 0
 
 
-def cmd_release(a):
-    reason = " ".join(a.reason.split())[:MAX_REASON]
-    if len(reason) < MIN_REASON:
-        return die("--reason precisa de pelo menos %d caracteres: diga o que está errado no teste (o revisor lê isto)" % MIN_REASON, 64)
-    top = gt(os.getcwd(), "rev-parse", "--show-toplevel")
-    bd("comment", a.bead, "[repro-lock] LIBERADA a trava da bead. Motivo: %s" % reason)  # a bead é o registro que o revisor lê: sem o comentário gravado NADA é liberado (Cant sai antes)
-    head = gt(top, "rev-parse", "HEAD")
-    msg = "chore(%s): libera a trava de teste (motivo registrado)\n\n%s: %s\n%s: %s\n" % (a.bead, REL, a.bead, WHY, reason)
-    new = git(top, "commit-tree", gt(top, "rev-parse", "HEAD^{tree}"), "-p", head, "-F", "-", stdin=msg.encode()).decode().strip()
-    git(top, "update-ref", "-m", "repro-lock: release", "HEAD", new, head)
-    print("repro-lock: trava da bead %s LIBERADA em %s; o motivo está na bead e no commit, e o gate o mostra ao revisor." % (a.bead, new[:7]))
-    return 0
-
-
 def cmd_check(a):
     if not (SHA.match(a.base) and SHA.match(a.head) and BEAD.match(a.bead)):
         return die("check: base/head precisam ser sha em hexadecimal e a bead um id válido", 64)
@@ -354,7 +339,7 @@ def cmd_check(a):
 
 def cmd_guard(a):
     try:
-        rc, err = guard_cmd(sys.stdin.read(), "python3 %s" % os.path.abspath(__file__))
+        rc, err = guard_cmd(sys.stdin.read())
     except (OSError, ValueError) as e:  # vazio/ilegível → UNGUARDED (rc 0, contado no log pelo wrapper), nunca bloqueio
         rc, err = 0, "UNGUARDED stdin ilegível: %s" % e
     sys.stderr.write(err + "\n" if err else "")
@@ -372,18 +357,12 @@ def main(argv=None):
     p.add_argument("--expect", help="regex que a saída da falha tem de casar (o motivo certo)")
     p.add_argument("--timeout", type=int, default=900)
     p.set_defaults(fn=cmd_lock)
-    p = sub.add_parser("release", help="saída de emergência: libera a trava com motivo registrado")
-    p.add_argument("bead")
-    p.add_argument("--reason", required=True)
-    p.set_defaults(fn=cmd_release)
     p = sub.add_parser("check", help="a checagem do gate (passo 2f do gate-hard-checks.sh)")
     for k in ("repo", "base", "head", "bead"):
         p.add_argument("--" + k, required=True)
     p.set_defaults(fn=cmd_check)
     sub.add_parser("guard", help="motor do hook PreToolUse (payload JSON no stdin)").set_defaults(fn=cmd_guard)
     a = ap.parse_args(argv)
-    if a.sub in ("lock", "release") and not BEAD.match(a.bead):
-        return die("id de bead inválido: %r" % a.bead, 64)
     try:
         return a.fn(a)
     except Cant as e:

@@ -9951,7 +9951,7 @@ for _HC_STEP in 2b 2c 2d 2e 2f; do
     (2b) _HC_LAB="gate-tmplparse"; _HC_HINT='2b template parse: bash .gascity-gastown-hq/packs/town-deltas/assets/template-fragment-lint-guard.sh <repo root> <changed template files>   (needs gc and jq)' ;;
     (2c) _HC_LAB="gate-docrules"; _HC_HINT='2c doc rules: python3 .gascity-gastown-hq/scripts/doc-rules-lint.py --check --diff "$(git merge-base HEAD origin/main)...HEAD"   (--fix-contents <file> writes the Contents section)' ;;
     (2d) _HC_LAB="gate-e12cov"; _HC_HINT='2d E12 coverage: bash .gascity-gastown-hq/packs/town-deltas/assets/e12-crew-doctrine.sh check ; ... coverage   (stale text: ... write)' ;;
-    (2f) _HC_LAB="gate-testlock"; _HC_HINT='2f test lock: python3 .gascity-gastown-hq/scripts/repro-lock.py check --repo . --base <git merge-base HEAD origin/main> --head <git rev-parse HEAD> --bead <bead>   (the locked test may not change after the lock commit; a real defect in the test: repro-lock.py release <bead> --reason "<why>" BEFORE editing it)' ;;
+    (2f) _HC_LAB="gate-testlock"; _HC_HINT='2f test lock: python3 .gascity-gastown-hq/scripts/repro-lock.py check --repo . --base <git merge-base HEAD origin/main> --head <git rev-parse HEAD> --bead <bead>   (the locked test may not change after the lock commit; a real defect in the test: commit a release with a reason BEFORE editing it, see docs/runbooks/repro-lock.md)' ;;
     (*)  _HC_LAB="gate-tsr"; _HC_HINT='2e third-state reads: python3 .gascity-gastown-hq/packs/town-deltas/assets/third-state-reads-check.py --repo . --base origin/main --head HEAD --bead <bead> --no-record' ;;
   esac
   _HC_V="nao-consegui-medir"; _HC_R="$_HC_WHY"; _HC_LINE=""
@@ -9976,7 +9976,6 @@ for _HC_STEP in 2b 2c 2d 2e 2f; do
             # non-zero status that set -e turns into the death of the whole sweep. The checker caps itself; this is for a misbehaving one.
             _HC_DETAIL="$_HC_DETAIL"$'\n'"--- step $_HC_STEP ($_HC_LAB) ---"$'\n'"$(printf '%s\n' "$_HC_OUT" | awk 'NR > 1 && NR <= 21 { print substr($0, 1, 200) }')"
           fi
-          # 2f aviso (a released lock, or a lock of ANOTHER bead id) is no refusal, but whoever judges the submission has to SEE it
           if [ "$_HC_V" = "aviso" ] && [ "$_HC_STEP" = "2f" ]; then _HC_NOTE=$'\n'"$(printf '%s\n' "$_HC_OUT" | awk 'NR > 1 && NR <= 21 { print substr($0, 1, 200) }')"; fi
           ;;
         (*) _HC_R="resposta-ilegivel" ;;

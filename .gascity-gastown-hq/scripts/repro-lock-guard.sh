@@ -1,16 +1,13 @@
 #!/bin/bash
-# repro-lock-guard.sh (ga-89ix4m4): hook PreToolUse:Edit|Write|MultiEdit|NotebookEdit dos construtores de pool (dog, wa-worker; fiado em claude-overlays/pool-roles.json por hooks_extra). Recusa (exit 2 +
-# «repro-lock-guard: BLOCKED …» no stderr, que o claude devolve ao modelo) a edição de arquivo de teste TRAVADO por `repro-lock.py lock`: a trava vem da história git, a MESMA que o gate confere no passo 2f.
-# FAIL-OPEN em tudo, mas CONTADO (UNGUARDED no log): um hook que trava todo Edit/Write é pior que o buraco que tapa, e quem recusa de verdade é o gate. O prazo é o `timeout` do overlay (o claude deixa a
-# chamada seguir se estoura). Só sessão com identidade de construtor (GC_TEMPLATE, senão GC_AGENT, senão GC_ALIAS). Desligar: REPRO_LOCK_HOOK=0 ou touch $GC_CITY_PATH/.gc/repro-lock-hook.off.
-# Contrato e saída de emergência: docs/runbooks/repro-lock.md. Ganchos de teste (env): REPRO_LOCK_GUARD_LOG, REPRO_LOCK_GUARD_PY.
+# repro-lock-guard.sh (ga-89ix4m4): hook PreToolUse:Edit|Write|MultiEdit|NotebookEdit dos construtores de pool (dog, wa-worker; hooks_extra em claude-overlays/pool-roles.json). Recusa (exit 2 + «repro-lock-guard: BLOCKED …» no
+# stderr) a edição de arquivo de teste TRAVADO por `repro-lock.py lock` (a trava vem da história git, a MESMA que o gate confere no passo 2f). FAIL-OPEN em tudo, mas CONTADO (UNGUARDED no log): um hook que trava todo Edit/Write é pior
+# que o buraco que tapa. Só sessão com identidade de construtor (GC_TEMPLATE, senão GC_AGENT, senão GC_ALIAS). Desligar: REPRO_LOCK_HOOK=0 ou touch $GC_CITY_PATH/.gc/repro-lock-hook.off. Ganchos de teste: REPRO_LOCK_GUARD_LOG, REPRO_LOCK_GUARD_PY. Contrato: docs/runbooks/repro-lock.md.
 set -u
 BLOCKED="repro-lock-guard: BLOCKED"
 who=${GC_TEMPLATE:-${GC_AGENT:-${GC_ALIAS:-}}}; who=${who##*/}; who=${who#gastown.}
 note() {   # o log é melhor-esforço: uma falha ao gravar nunca muda o veredito
   local log="${REPRO_LOCK_GUARD_LOG:-${HOME:-/tmp}/.gastown/logs/repro-lock-guard.log}"
   mkdir -p "$(dirname "$log")" 2>/dev/null && printf '%s\tagent=%s\tresult=%s\treason=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "${who:-none}" "$1" "$2" >> "$log" 2>/dev/null
-  return 0
 }
 # vazio (arquivo ausente) → o hook segue LIGADO; falhou (sem GC_CITY_PATH, sem permissão) → idem: um -e que não consegue testar lê «ausente»
 if [ "${REPRO_LOCK_HOOK:-1}" = 0 ] || [ -e "${GC_CITY_PATH:-/nonexistent}/.gc/repro-lock-hook.off" ]; then exit 0; fi

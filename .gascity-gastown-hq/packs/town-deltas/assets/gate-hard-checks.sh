@@ -9,10 +9,9 @@
 # versions read, 1 June to 27 Oct). A reviewer was seen running 2c by hand (gate-run ga-1htlfu) because it found the
 # formula. This runs each check for every submission, from the guard (the one deterministic path every builder
 # passes), one step per call.
-# 2f (ga-89ix4m4) is not in that formula: the test lock of a BUG bead (repro-lock.py lock makes the reproducing test the branch's first commit, with
-# Repro-Lock trailers; no later commit may touch it). 2f reads only the git history of base..tip through the merged scripts/repro-lock.py (no branch file
-# is opened or run). No lock declared = nao-se-aplica (crews and older submissions are untouched); a release with a recorded reason is an aviso. Unlike
-# 2c/2e a diff that edits the tool is STILL judged (it only reads history), and what the BUILDER controls (a merge, a long history, a message text) is judged, never "unmeasured".
+# 2f (ga-89ix4m4) is not in that formula: the test lock of a BUG bead (repro-lock.py lock makes the reproducing test the branch's first commit, with Repro-Lock trailers;
+# no later commit may touch it). It reads only the git history of base..tip through the merged scripts/repro-lock.py (no branch file is opened or run), so, unlike 2c/2e, a diff
+# that edits the tool is STILL judged; what the BUILDER controls (a merge, a long history, a message text) is judged too, never "unmeasured". No lock declared = nao-se-aplica.
 #
 # TRUST. The guard runs this with its own privileges and the branch may come from a sandboxed node, so nothing the
 # branch supplies is EXECUTED: each tool is the copy already merged beside this script (HQ_DIR), run over the branch's
@@ -47,9 +46,8 @@
 #                       (every .md in the diff was excluded or skipped by the lint)
 #   desligado           a kill switch is on (the tool's own, or E12_COVERAGE_GATE=off / .gc/e12-coverage-gate.off for 2d)
 #   nao-ligado          2e only: .gc/third-state-reads.conf is absent or mode=off, so the tool checked nothing
-#   (2f)                fail = a locked test changed after the lock commit, or the lock is not the branch's first commit / not a clean test-only commit / a merge in a branch that declares a lock;
-#                       aviso = released with a reason, or only a lock of ANOTHER bead id; nao-se-aplica = no lock declared; desligado = REPRO_LOCK_CHECK=off or .gc/repro-lock-check.off;
-#                       nao-consegui-medir = only what the builder does not control (git failing, an object missing)
+#   (2f)                fail = a locked test changed after the lock commit, or the lock is not the branch's first commit / not a clean test-only commit / a merge in a branch that declares a lock; aviso = released with a reason,
+#                       or only a lock of ANOTHER bead id; nao-se-aplica = no lock declared; desligado = REPRO_LOCK_CHECK=off or .gc/repro-lock-check.off; nao-consegui-medir = only what the builder does not control (git failing, an object missing)
 #   nao-consegui-medir  anything that stopped a measurement (see the reason); the guard fails OPEN on it, loudly
 # rc is the tool's exit code (124 = timeout, 126/127 = could not exec), so a host problem reads in the log at a glance.
 # Always exits 0 after printing; a crash prints no VERDICT= line, which the guard reads as unmeasured.
@@ -293,13 +291,11 @@ step_2f() {
   fi
   # locks= / releases= must be numbers above 0 where the verdict needs them: a line that contradicts itself is unmeasured, never "intact" (aviso: a release, or a lock of ANOTHER bead id)
   case "$RC:$v" in
-    (0:ok) case "$nlocks" in (''|*[!0-9]*) emit nao-consegui-medir saida-ilegivel ;; esac
-           [ "$nlocks" -gt 0 ] || emit nao-consegui-medir saida-ilegivel
+    (0:ok) [ "${nlocks:-0}" -gt 0 ] 2>/dev/null || emit nao-consegui-medir saida-ilegivel
            emit ok trava-integra ;;
     (0:nao-se-aplica) emit nao-se-aplica "${r:-sem-trava-declarada}" ;;
     (0:aviso) if [ "$r" = trava-so-de-outra-bead ]; then DETAIL="$(cap "$out")"; emit aviso trava-so-de-outra-bead; fi
-              case "$nrel" in (''|*[!0-9]*) emit nao-consegui-medir saida-ilegivel ;; esac
-              [ "$nrel" -gt 0 ] || emit nao-consegui-medir saida-ilegivel
+              [ "${nrel:-0}" -gt 0 ] 2>/dev/null || emit nao-consegui-medir saida-ilegivel
               DETAIL="$(cap "$out")"; emit aviso trava-liberada-com-motivo ;;
     (1:fail) [ -n "$r" ] || r=teste-travado-violado
              DETAIL="$(cap "$out")"; emit fail "$r" ;;

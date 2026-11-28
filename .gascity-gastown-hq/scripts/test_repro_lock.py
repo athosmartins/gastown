@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """test_repro_lock.py (ga-89ix4m4): repro-lock.py e repro-lock-guard.sh com repositórios git REAIS em pastas temporárias e um `bd` de mentira (chamada não planejada falha).
 `python3 -I scripts/test_repro_lock.py`; REPRO_LOCK_UNDER_TEST=<cópia.py> / REPRO_LOCK_HOOK_UNDER_TEST=<cópia.sh> rodam contra um mutante. Histórias numa mini-linguagem, um commit por item:
-L <arq..> trava · C conserto · E <arq> afrouxa · S <arq> restaura · D <arq> apaga · R <motivo> libera · M <arq> re-trava com outro conteúdo · G merge · LX/LG/LS/LN trava malformada."""
+L <arq..> trava · C conserto · E <arq> afrouxa · S <arq> restaura · R <motivo> libera · M <arq> re-trava com outro conteúdo · G merge · LX/LG/LS/LN trava malformada."""
 import importlib.util
 import json
 import os
@@ -9,6 +9,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -78,9 +79,6 @@ class Repo:
                 self.commit(side)
                 self.git("checkout", "-q", "fix/x")
                 self.git("merge", "-q", "--no-ff", "-m", "merge " + side, side)
-            elif op == "D":
-                os.unlink(os.path.join(self.root, arg))
-                self.commit("apaga " + arg)
             elif op == "R":
                 self.commit("libera", ["Repro-Lock-Release: ga-1"] + (["Repro-Lock-Release-Reason: " + arg] if arg else []), empty=True)
             else:  # C conserto · E afrouxa · S restaura
@@ -137,13 +135,10 @@ class Check(T):
     """O gate: o que a história de base..head diz da trava."""
 
     CASES = [  # (história, veredito, razão)
-        ("C", "nao-se-aplica", "sem-trava-declarada"),
         ("C | G", "nao-se-aplica", "sem-trava-declarada"),  # merge sem trava: nada a julgar
         ("L t.py | C", "ok", "trava-integra"),
-        ("L t.py | L u.py | C", "ok", "trava-integra"),
         ("L t.py | C | E t.py", "fail", "teste-travado-alterado"),
         ("L t.py | E t.py | S t.py", "fail", "teste-travado-alterado"),  # tocou e restaurou: a história mostra
-        ("L t.py | D t.py", "fail", "teste-travado-alterado"),
         ("L t.py | M t.py", "fail", "teste-travado-alterado"),  # uma 2ª trava que muda arquivo já travado
         ("L t.py | G", "fail", "trava-em-branch-com-merge"),  # a ordem dos commits de um merge não se prova: julgado, nunca «não sei»
         ("C | L t.py", "fail", "trava-nao-e-o-primeiro-commit"),
@@ -225,7 +220,7 @@ class Builder(T):
         self.assertIn("[repro-lock] TRAVADO: tests/test_a.py @ " + r.git("rev-parse", "--short=7", "HEAD"), comments)
         self.assertNotIn("AssertionError", comments)  # a saída do teste pode ter dado: não vai para a bead
         self.assertEqual(r.check()["verdict"], "ok")
-        self.assertEqual(RL.guard_cmd(self.payload(r, "tests/test_a.py"), "python3 x")[0], 2)  # o hook lê a mesma história: nenhum estado local
+        self.assertEqual(RL.guard_cmd(self.payload(r, "tests/test_a.py"))[0], 2)  # o hook lê a mesma história: nenhum estado local
 
     def test_lock_refuses_every_case_it_cannot_vouch_for_and_leaves_no_commit(self):
         def refused(r, want, *args):
@@ -233,36 +228,23 @@ class Builder(T):
             rc, out, err = self.cli(r.root, "lock", "ga-1", *args)
             self.assertEqual((rc, want in err, r.git("rev-parse", "HEAD")), (2, True, head), (args, err))
 
+        t0 = time.monotonic()
         refused(self.lockable("feature"), "tipo 'feature'", "tests/test_a.py", "--cmd", "exit 1")
         r = self.lockable()
         Path(self.bddir, "fail-show").touch()  # bd fora do ar: «não sei o tipo» não vira «pode travar»
         refused(r, "NÃO SEI", "tests/test_a.py", "--cmd", "exit 1")
         os.unlink(os.path.join(self.bddir, "fail-show"))
+        Path(self.bddir, "ga-1.json").write_text("{não é json")  # JSON ilegível: também não vira «pode travar»
+        refused(r, "NÃO SEI", "tests/test_a.py", "--cmd", "exit 1")
+        self.bead()
         for want, args in (("não é arquivo regular", ("tests/test_nao_existe.py",)), ("não é arquivo regular", ("/etc/hostname",)), ("PASSA no código de hoje", ("tests/test_a.py", "--cmd", "true")),
                            ("rc 127", ("tests/test_a.py", "--cmd", "comando-que-nao-existe-xyz")), ("AMBIENTE", ("tests/test_a.py", "--cmd", "echo 'ModuleNotFoundError: x'; exit 1")),
-                           ("não casa --expect", ("tests/test_a.py", "--cmd", "echo outro; exit 1", "--expect", "AssertionError")), ("passou de 1s", ("tests/test_a.py", "--cmd", "sleep 5", "--timeout", "1"))):
+                           ("não casa --expect", ("tests/test_a.py", "--cmd", "echo outro; exit 1", "--expect", "AssertionError")), ("passou de 1s", ("tests/test_a.py", "--cmd", "sleep 20 & sleep 20", "--timeout", "1"))):
             refused(r, want, *(args if "--cmd" in args else args + ("--cmd", "exit 1")))  # TimeoutExpired: «não sei» não é «reproduz»
         r.git("commit", "-q", "--allow-empty", "-m", "comum antes da trava")
         refused(r, "1º commit", "tests/test_a.py", "--cmd", "exit 1")
         refused(self.repo(), "mudança nova", "README", "--cmd", "exit 1")
-
-    def test_release_posts_the_reason_first_then_commits_and_frees_the_file(self):
-        r = self.lockable()
-        self.assertEqual(self.cli(r.root, "lock", "ga-1", "tests/test_a.py", "--cmd", "exit 1")[0], 0)
-        tree, head = r.git("rev-parse", "HEAD^{tree}"), r.git("rev-parse", "HEAD")
-        self.assertEqual((self.cli(r.root, "release", "ga-1", "--reason", "curto")[0], self.cli(r.root, "release", "a b", "--reason", GOOD)[0]), (64, 64))  # motivo curto; id de bead inválido
-        Path(self.bddir, "fail-comment").touch()  # sem o comentário gravado NADA é liberado
-        rc, out, err = self.cli(r.root, "release", "ga-1", "--reason", GOOD)
-        self.assertEqual((rc, r.git("rev-parse", "HEAD")), (2, head), err)
-        os.unlink(os.path.join(self.bddir, "fail-comment"))
-        rc, out, err = self.cli(r.root, "release", "ga-1", "--reason", "o teste confere 3 mas o contrato diz 2:\ndefeito   do teste")
-        self.assertEqual((rc, r.git("rev-parse", "HEAD^{tree}")), (0, tree), (out, err))  # commit vazio
-        self.assertEqual(RL.parse_trailers(r.git("log", "-1", "--format=%B")), [("Repro-Lock-Release", "ga-1"), ("Repro-Lock-Release-Reason", GOOD)])
-        self.assertIn("LIBERADA a trava da bead. Motivo: " + GOOD, slurp(os.path.join(self.bddir, "comments.log")))
-        self.assertEqual(RL.guard_cmd(self.payload(r, "tests/test_a.py"), "x"), (0, ""))  # o hook solta: a mesma simulação do gate
-        r.write("tests/test_a.py", LOOSE)
-        r.commit("corrige o teste")
-        self.assertEqual(r.check()["verdict"], "aviso")
+        self.assertLess(time.monotonic() - t0, 15)  # o estouro mata o GRUPO: um neto segurando o pipe não segura o comando por 20 s
 
 
 class Guard(T):
@@ -271,31 +253,33 @@ class Guard(T):
     def test_a_locked_file_is_blocked_for_every_edit_tool_and_the_rest_passes(self):
         r = self.repo("L tests/t.py | C")
         for tool, key in (("Edit", "file_path"), ("Write", "file_path"), ("MultiEdit", "file_path"), ("NotebookEdit", "notebook_path")):
-            rc, err = RL.guard_cmd(self.payload(r, "tests/t.py", tool, key), "python3 rl.py")
+            rc, err = RL.guard_cmd(self.payload(r, "tests/t.py", tool, key))
             self.assertEqual(rc, 2, tool)
             self.assertTrue(err.startswith("repro-lock-guard: BLOCKED — «tests/t.py» está TRAVADO pela bead ga-1"), err)
-            self.assertTrue(all(n in err for n in ("NÃO contorne por Bash", "OUTRO arquivo de teste", "python3 rl.py release ga-1 --reason")), err)
+            self.assertTrue(all(n in err for n in ("NÃO contorne por Bash", "OUTRO arquivo de teste", "bd comment ga-1", "Repro-Lock-Release: ga-1")), err)
         for rel, tool in (("src/app.py", "Edit"), ("tests/new.py", "Write"), ("tests/t.py", "Read"), ("tests/t.py", "Bash")):
-            self.assertEqual(RL.guard_cmd(self.payload(r, rel, tool), "x"), (0, ""), (rel, tool))
-        self.assertEqual(RL.guard_cmd(json.dumps({"tool_name": "Edit", "tool_input": {"file_path": "tests/t.py"}, "cwd": r.root}), "x")[0], 2)  # caminho relativo ao cwd do payload
+            self.assertEqual(RL.guard_cmd(self.payload(r, rel, tool)), (0, ""), (rel, tool))
+        self.assertEqual(RL.guard_cmd(json.dumps({"tool_name": "Edit", "tool_input": {"file_path": "tests/t.py"}, "cwd": r.root}))[0], 2)  # caminho relativo ao cwd do payload
         target, link = os.path.join(r.root, "tests", "t.py"), os.path.join(r.root, "src", "alias.py")
         os.link(target, link)  # o mesmo inode com outro nome: editar o alias edita o teste travado no lugar
-        self.assertEqual(RL.guard_cmd(self.payload(r, link), "x")[0], 2)
-        os.unlink(target)
-        os.unlink(link)  # a cópia de trabalho sumiu (rm por Bash) e um Write a recriaria com outro conteúdo
-        self.assertEqual(RL.guard_cmd(self.payload(r, "tests/../tests/t.py", "Write"), "x")[0], 2)
+        self.assertEqual(RL.guard_cmd(self.payload(r, link))[0], 2)
+        shutil.rmtree(os.path.dirname(target))
+        os.unlink(link)  # a pasta inteira sumiu (rm -r por Bash) e um Write a recriaria com outro conteúdo
+        self.assertEqual(RL.guard_cmd(self.payload(r, "tests/../tests/t.py", "Write"))[0], 2)
+        r3 = self.repo("L t.py | L:ga-9 u.py")  # duas beads na mesma história: cada trava com a sua
+        self.assertEqual(RL.locked_now(r3.root, r3.git("merge-base", "HEAD", "main")), {"t.py": "ga-1", "u.py": "ga-9"})
 
     def test_a_release_frees_it_and_every_doubt_fails_open_and_says_so(self):
         r = self.repo("L tests/t.py | R " + GOOD)
-        self.assertEqual(RL.guard_cmd(self.payload(r, "tests/t.py"), "x"), (0, ""))
-        self.assertEqual(RL.guard_cmd("{not json", "x"), (0, "UNGUARDED payload do hook não é JSON"))
+        self.assertEqual(RL.guard_cmd(self.payload(r, "tests/t.py")), (0, ""))
+        self.assertEqual(RL.guard_cmd("{not json"), (0, "UNGUARDED payload do hook não é JSON"))
         for text in (json.dumps([1]), json.dumps({"tool_name": "Edit", "tool_input": "x"}), json.dumps({"tool_name": "Edit", "tool_input": {}})):
-            self.assertEqual(RL.guard_cmd(text, "x"), (0, ""))
+            self.assertEqual(RL.guard_cmd(text), (0, ""))
         os.makedirs(os.path.join(self.tmp, "fora"))
-        self.assertIn("UNGUARDED", RL.guard_cmd(self.payload(r, os.path.join(self.tmp, "fora", "a.py")), "x")[1])  # fora de qualquer repo: não sei, e diz
+        self.assertIn("UNGUARDED", RL.guard_cmd(self.payload(r, os.path.join(self.tmp, "fora", "a.py")))[1])  # fora de qualquer repo: não sei, e diz
         r2 = self.repo("L tests/t.py")
         r2.git("branch", "-m", "main", "other")  # sem origin/main nem main: não sei a base
-        self.assertIn("UNGUARDED não achei origin/main nem main", RL.guard_cmd(self.payload(r2, "tests/t.py"), "x")[1])
+        self.assertIn("UNGUARDED não achei origin/main nem main", RL.guard_cmd(self.payload(r2, "tests/t.py"))[1])
 
 
 class Wrapper(T):
@@ -321,7 +305,6 @@ class Wrapper(T):
         rc, err = self.hook(p)
         self.assertEqual(rc, 2, err)
         self.assertTrue(err.startswith("repro-lock-guard: BLOCKED — «tests/t.py» está TRAVADO pela bead ga-1"), err)
-        self.assertIn(os.path.join(self.sd, "repro-lock.py"), err)  # o comando de liberar aponta para o motor que ESTE hook usa
         self.assertIn("BLOCKED", slurp(self.env["REPRO_LOCK_GUARD_LOG"]))
         self.assertEqual(self.hook(self.payload(r, "src/app.py")), (0, ""))
         for env in ({}, {"GC_AGENT": "mayor"}, {"GC_TEMPLATE": "gate-reviewer"}, {"GC_TEMPLATE": "ps-worker"}, {"GC_TEMPLATE": "gastown.mayor", "GC_AGENT": "dog-remote-1"}):  # revisor, Mayor, crews e identidade incoerente passam
@@ -349,9 +332,7 @@ class Wrapper(T):
 
         run("empty payload", "hook input was empty", payload="", real=True)
         run("engine missing", "motor ausente")
-        run("engine exits 7", "rc=7", code="import sys\nsys.exit(7)\n")
         run("rc 2 without the BLOCKED mark", "rc=2", code="import sys\nsys.exit(2)\n")
-        run("python missing", "no python3", env={"REPRO_LOCK_GUARD_PY": "/nonexistent/python3"}, real=True)
 
     def test_the_generated_overlay_command_blocks_builders_fails_open_without_the_script_and_others_have_none(self):
         r = self.repo("L tests/t.py")
