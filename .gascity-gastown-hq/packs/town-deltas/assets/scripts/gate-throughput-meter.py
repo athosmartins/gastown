@@ -37,13 +37,14 @@ meter does NOT send mail (it could not remember having sent it → one mail ever
        GTM_QUEUE_MAX_AGE_S (1200) · GTM_GC_BIN (gc)
   One instance at a time (flock on .gc/state/gate-throughput-meter.lock); a second one logs and exits 0.
 """
-import argparse, datetime, fcntl, json, os, re, shutil, subprocess, sys, time
+import argparse, bisect, datetime, fcntl, importlib.util, json, os, re, shutil, subprocess, sys, time
 
 sys.dont_write_bytecode = True  # imported by gate-daily-report.py from a tracked directory: no __pycache__ there
 
 BRT = datetime.timezone(datetime.timedelta(hours=-3))
 LINE_TS = re.compile(r"^\[(\d{4}-\d\d-\d\d \d\d:\d\d:\d\d)\]")
 RUN_DONE = re.compile(r"=== Gate run complete: gate_run=(\S+) .*?verdict=(PASS|FAIL)\b")
+BANDS_METRIC = "gate_throughput"   # the key of this meter in bands.yaml
 
 
 def nm(why):
@@ -259,6 +260,121 @@ def logline(city, msg, out=True):
         pass  # the stdout line above is still kept by launchd
 
 
+def load_bands():
+    """(module, None) or (None, why): the bands engine that lives beside this file."""
+    # falhou/ilegível (file missing, SyntaxError, a bug at import) → (None, why): the meter then runs on its old fixed rule, loudly; it never runs without an alarm
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "bands.py")
+    try:
+        spec = importlib.util.spec_from_file_location("bands", path)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+    except Exception as e:   # whatever stops the engine from loading leaves the old rule in charge
+        return None, "%s: %s" % (e.__class__.__name__, e)
+    return mod, None
+
+
+def block_points(runs, first, now, m):
+    """[(end_ts, reviews)] oldest first: every COMPLETE block of the active window (07-22 h local, blocks of 3 h by default) of the last
+    baseline_days+2 days that the log covers from its first stamp on. The grid is fixed (07-10-13-16-19-22), so a point never moves."""
+    # vazio → [] (no complete block in reach); a block the log does not cover whole is LEFT OUT, never counted as 0: an unknown block is not an empty one
+    times = [t for t, _ in runs]
+    today = datetime.datetime.fromtimestamp(now, BRT).replace(hour=0, minute=0, second=0, microsecond=0)
+    out = []
+    for back in range(m["baseline_days"] + 2, -1, -1):
+        day = today - datetime.timedelta(days=back)
+        for h in range(m["active_from"], m["active_to"], m["block_hours"]):
+            lo = (day + datetime.timedelta(hours=h)).timestamp()
+            hi = lo + m["block_hours"] * 3600
+            if hi > now or lo < first:
+                continue
+            out.append((hi, bisect.bisect_left(times, hi) - bisect.bisect_left(times, lo)))
+    return out
+
+
+def make_gate_driver(bands):
+    """The words of the gate meter for the bands engine: reviews per hour, the product target as a REFERENCE, the queue and its probable cause."""
+
+    class GateDriver(bands.Driver):
+        def cause(self, ctx):
+            depth, qtext = queue_read(ctx["city"], ctx["now"], env_num("GTM_QUEUE_MAX_AGE_S", 1200))
+            short, long_ = cause_of(depth)
+            return short, long_, qtext
+
+        def facts(self, ctx):
+            lines = super().facts(ctx)
+            bh, last, base = ctx["m"]["block_hours"], ctx["decision"]["last"], ctx["baseline"]
+            target = env_num("GTM_TARGET", 8.0)
+            _short, long_, qtext = self.cause(ctx)
+            lines.append("Em revisadas por hora: %s/h no último bloco de %dh; típico %s/h." % (fmt(last["value"] / bh), bh, fmt(base["raw_mean"] / bh)))
+            lines.append("Meta do produto (Athos, 14/11): ≥ %s/h. É referência, não gatilho: este aviso é por MUDANÇA em relação ao normal do gate nos últimos %d dias, "
+                         "não por estar abaixo da meta (o relatório da manhã segue mostrando a meta)." % (fmt(target), ctx["m"]["baseline_days"]))
+            lines.append("Fila do gate agora: %s. Causa provável: %s." % (qtext, long_))
+            return lines
+
+        def evidence(self, ctx):
+            return "\n".join([super().evidence(ctx), "Arquivos deste vigia (a cidade é %s): .gc/logs/quality-gate-dispatcher.log (as linhas 'Gate run complete' são as revisões; "
+                              "procure o que mudou perto de %s), .gc/gate-focus.state (fila do gate), .gc/logs/gate-throughput-meter.log (o que este vigia já disse)." % (
+                                  ctx["city"], bands._when(ctx["decision"]["last"]["ts"]))])
+
+        def mail(self, band, ctx):
+            _subject, body = super().mail(band, ctx)
+            short, _long, _q = self.cause(ctx)
+            last, base = ctx["decision"]["last"], ctx["baseline"]
+            subject = "Gate %s (%dσ): %d revisadas no último bloco de %dh (típico %s) — %s" % (
+                "fora da faixa" if band == 2 else "MUITO fora da faixa", band, round(last["value"]), ctx["m"]["block_hours"], fmt(base["raw_mean"]), short)
+            return subject, body
+
+    return GateDriver()
+
+
+def clear_legacy_alarm(city):
+    """The bands took over: an alarm the fixed rule left in its state, and a blindness it already got over, no longer exist."""
+    sp = state_path(city)
+    st = read_state(sp)
+    keys = [k for k in ("alarm_since", "last_mail", "blind_since", "blind_mailed") if k in st]
+    if keys:
+        for k in keys:
+            st.pop(k)
+        if not write_state(sp, st):
+            logline(city, "WARN: não consegui limpar o estado do alarme antigo em %s (a regra fixa lê as mesmas chaves, nada se perde)" % sp)
+
+
+def run_bands(city, now, runs, first, dry, report):
+    """None → the fixed rule decides this run (bands off, unavailable, still learning, or only counting in shadow); an int → the bands
+    judged the run and that is its exit code. Silence, a busy lock and a series with nothing new are judged too: they do NOT fall back."""
+    mode = os.environ.get("GTM_BANDS", "").strip().lower()
+    if mode == "0":
+        return None
+    emit = print if report else (lambda msg: logline(city, msg))
+    bands, why = load_bands()
+    cfg = None
+    if bands is not None:
+        # falhou/ilegível (file missing, a typo in a key, a value out of range) → ConfigError: the old rule decides and says why, never a silent default
+        try:
+            cfg = bands.load_config(os.environ.get("GTM_BANDS_CONFIG") or None)
+        except bands.ConfigError as e:
+            why = "bands.yaml: %s" % e
+    if cfg is None or BANDS_METRIC not in cfg["metrics"]:
+        emit("WARN: faixas indisponíveis (%s) — a regra fixa decide esta rodada" % (why or "a métrica %s não está no bands.yaml" % BANDS_METRIC))
+        return None
+    m = cfg["metrics"][BANDS_METRIC]
+    shadow = True if mode == "shadow" else None
+    res = bands.process(city, BANDS_METRIC, cfg, block_points(runs, first, now, m), now, make_gate_driver(bands),
+                        bands.make_adapters(city, cfg, lambda subject, body: send_mail(city, subject, body)), shadow=shadow, dry=dry or report)
+    for line in res["lines"]:
+        emit(line)
+    if res["status"] == "ok":
+        if shadow or m["mode"] == "shadow":
+            return None
+        if not (dry or report):
+            clear_legacy_alarm(city)
+        return 1 if any(l.startswith("WARN") for l in res["lines"]) else 0
+    if res["status"] in ("silent", "busy", "stale"):
+        return 0
+    emit("FAIXA indisponível (%s): a regra fixa decide esta rodada" % (res["status"] + (", " + res["why"] if res["why"] else "")))
+    return None
+
+
 def daily_summary(city, day, now=None):
     """The morning report's line 7 for local day `day` (a date): the day's average per hour, how many hours reached the
     target, and the trailing 3 h at report time. 'não medido (<why>)' for what cannot be known."""
@@ -326,8 +442,13 @@ def run(city, now, dry, report):
     summary = "%d revisadas em %dh = %s/h (por hora, mais recente primeiro: %s); média 24 h %s; fila: %s" % (
         ev["n"], hours, fmt(ev["rate"]), "/".join(str(c) for c in ev["per_hour"]), avg24, qtext)
     if report:
+        run_bands(city, now, runs, first, True, True)
         print("%s: %s | %s" % (ev["state"].upper(), summary, cause[1]))
         return 0
+
+    banded = run_bands(city, now, runs, first, dry, False)
+    if banded is not None:
+        return banded
 
     if ev["state"] == "ok":
         if st.get("alarm_since"):

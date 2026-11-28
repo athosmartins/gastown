@@ -3,10 +3,13 @@
 <plist version="1.0"><dict>
   <key>Label</key><string>com.gascity.gate-throughput-meter</string>
   <!-- Reviews per hour done by the gate (ga-v8p1tx.1.1; Athos 14/11: "ao menos 8 revisadas por hora").
-       Counts the 'Gate run complete' lines (PASS+FAIL) of quality-gate-dispatcher.log; under 8/h over 3 h → ONE mail
-       to the Mayor with the hourly counts, the 24 h average and the probable cause (empty queue = supply, full
-       queue = reviewers). Silence = healthy. One run reads the ~16 MB log in about 0.5 s of CPU, far under the
-       10 min interval, and a flock keeps a second instance out. Its own log: .gc/logs/gate-throughput-meter.log -->
+       Counts the 'Gate run complete' lines (PASS+FAIL) of quality-gate-dispatcher.log. Since ga-4mzkfj9 the ALARM is by statistical
+       band (bands.py + bands.yaml): the gate is judged against its OWN last 14 days in blocks of 3 h (07-22 h), 1σ only logs, 2σ mails
+       the Mayor once with the diagnosis of a read-only agent, 3σ also opens a bead; nothing repeats and nothing interrupts 22-07 h.
+       The 8/h target stays a REFERENCE (mail text, morning report), not the trigger. While the baseline is still short (or if the bands
+       cannot start) the old fixed rule decides, exactly as before: under 8/h over 3 h → ONE mail, repeated every 6 h while it lasts.
+       Silence = healthy. One run reads the ~16 MB log in about 0.5 s of CPU, far under the 10 min interval, and a flock keeps a second
+       instance out. Its own log: .gc/logs/gate-throughput-meter.log -->
   <key>ProgramArguments</key><array>
     <string>/usr/bin/python3</string>
     <string>/Users/athos/gt/.gascity-gastown-hq/packs/town-deltas/assets/scripts/gate-throughput-meter.py</string>
@@ -28,6 +31,9 @@
     <!-- <key>GTM_WINDOW_H</key><string>3</string> -->
     <!-- Dry run: decide and log, send no mail, write no state. -->
     <!-- <key>GTM_DRY_RUN</key><string>1</string> -->
+    <!-- Bands: GTM_BANDS=0 goes back to the old fixed rule only; GTM_BANDS=shadow keeps the fixed rule deciding and only COUNTS what the
+         bands would have done (ledger); BANDS_DIAGNOSE=0 switches off the read-only agent of the 2σ/3σ bands. -->
+    <!-- <key>GTM_BANDS</key><string>shadow</string> -->
     <!-- Kill-switch: GTM_ENABLED=0 turns the meter off entirely. -->
     <!-- <key>GTM_ENABLED</key><string>1</string> -->
     <key>BEADS_DOLT_AUTO_START</key><string>0</string>

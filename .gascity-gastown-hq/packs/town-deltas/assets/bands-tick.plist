@@ -1,0 +1,32 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <key>Label</key><string>com.gascity.bands-tick</string>
+  <!-- Faixas estatísticas (ga-4mzkfj9): mede e julga as métricas do bands.yaml que se medem sozinhas (driver tick). Hoje uma:
+       disk_free_delta, a queda do espaço livre do volume do Dolt e do swap por hora, EM SOMBRA (conta o que as faixas diriam, não manda
+       nada; os pisos fixos do disco seguem agindo). Uma rodada lê o df, grava UMA linha em .gc/state/bands/series/ e julga: bem abaixo
+       de 1 s, muito aquém dos 10 min do intervalo; um flock por métrica impede duas rodadas juntas.
+       NÃO é carregado sozinho: o Mayor instala (docs/runbooks/alarm-bands.md, "Instalar o tick"). RunAtLoad false de propósito: o
+       wait-for-dolt-plan só enxerga RunAtLoad e este job nem usa o Dolt (só o `gc mail`/`bd` de uma métrica que um dia vire "live"). -->
+  <key>ProgramArguments</key><array>
+    <string>/usr/bin/python3</string>
+    <string>/Users/athos/gt/.gascity-gastown-hq/packs/town-deltas/assets/scripts/bands.py</string>
+    <string>tick</string>
+  </array>
+  <key>WorkingDirectory</key><string>/Users/athos/gt/.gascity-gastown-hq</string>
+  <key>StartInterval</key><integer>600</integer>
+  <key>RunAtLoad</key><false/>
+  <key>Nice</key><integer>10</integer>
+  <key>LowPriorityIO</key><true/>
+  <key>StandardOutPath</key><string>/Users/athos/gt/.gascity-gastown-hq/.gc/logs/bands-tick-launchd.out</string>
+  <key>StandardErrorPath</key><string>/Users/athos/gt/.gascity-gastown-hq/.gc/logs/bands-tick-launchd.err</string>
+  <key>EnvironmentVariables</key><dict>
+    <key>PATH</key><string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:/Users/athos/go/bin:/Users/athos/.local/bin</string>
+    <key>HOME</key><string>/Users/athos</string>
+    <key>GC_CITY_PATH</key><string>/Users/athos/gt/.gascity-gastown-hq</string>
+    <key>BD_ACTOR</key><string>automation</string>
+    <!-- Desliga o agente que só lê (2σ/3σ): BANDS_DIAGNOSE=0. -->
+    <!-- <key>BANDS_DIAGNOSE</key><string>0</string> -->
+    <key>BEADS_DOLT_AUTO_START</key><string>0</string>
+  </dict>
+</dict></plist>

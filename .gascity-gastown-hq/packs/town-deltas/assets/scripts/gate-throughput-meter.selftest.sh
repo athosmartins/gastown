@@ -9,8 +9,9 @@ PASS=0; FAIL=0
 ok()  { PASS=$((PASS+1)); }
 bad() { FAIL=$((FAIL+1)); echo "FAIL: $*"; }
 M="$HERE/gate-throughput-meter.py"
+S_DIR="$HERE"
 export HOME="$W/home"; mkdir -p "$HOME"
-unset GTM_ENABLED GTM_DRY_RUN GTM_TARGET GTM_WINDOW_H GTM_REMAIL_S GTM_BLIND_MAIL_S GTM_QUEUE_MAX_AGE_S
+unset GTM_ENABLED GTM_DRY_RUN GTM_TARGET GTM_WINDOW_H GTM_REMAIL_S GTM_BLIND_MAIL_S GTM_QUEUE_MAX_AGE_S GTM_BANDS GTM_BANDS_CONFIG BANDS_DIAGNOSE
 
 # fake gc: appends one line per call to $FAKE_GC_LOG, exits with the number in $FAKE_GC_RC_FILE (default 0)
 mkdir -p "$W/bin"
@@ -23,6 +24,24 @@ exit "$rc"
 EOF
 chmod +x "$W/bin/gc"
 export GTM_GC_BIN="$W/bin/gc"
+# fake claude (the read-only diagnostician) and fake bd: every call is recorded, nothing leaves the scratch dir
+cat > "$W/bin/claude" <<'EOF'
+#!/usr/bin/env bash
+cat > "$FAKE_CLAUDE_LOG.stdin"
+printf 'CALL %s\n' "$*" >> "$FAKE_CLAUDE_LOG"
+printf '{"type":"result","subtype":"success","is_error":false,"result":"diagnóstico de teste: a fila do gate esvaziou"}\n'
+EOF
+cat > "$W/bin/bd" <<'EOF'
+#!/usr/bin/env bash
+printf 'CALL %s\n' "$*" >> "$FAKE_BD_LOG"
+case "$3" in
+  list) echo '[]' ;;
+  create) echo 'ga-test01' ;;
+  show) echo '[{"id":"ga-test01","labels":["exec:auto","story:approved","origem:bands","bands:ep:gate_throughput-20261114-1200"],"metadata":{"gc.routed_to":"gastown.dog"}}]' ;;
+esac
+EOF
+chmod +x "$W/bin/claude" "$W/bin/bd"
+export BANDS_CLAUDE_BIN="$W/bin/claude" BANDS_BD_BIN="$W/bin/bd"
 
 NOW="$(TZ=UTC python3 -c 'import datetime;print(int(datetime.datetime(2026,11,14,15,0,0,tzinfo=datetime.timezone.utc).timestamp()))')"  # 12:00 BRT
 # newcity <name> — fresh scratch city; sets C, FAKE_GC_LOG
@@ -185,6 +204,120 @@ print(m.daily_summary(sys.argv[2], datetime.date(2026, 11, 13), float(sys.argv[3
 PY
 )"
 echo "$S" | grep -q '^não medido (log do dispatcher ilegível' && ! echo "$S" | grep -q '0,0/h' && ok || bad "T16b unreadable log must read 'não medido': $S"
+
+
+# ---- statistical bands (ga-4mzkfj9): the meter judges the gate against its OWN last 14 days; the 8/h target stays a reference ----
+# genband <city> <days-of-log> <rate/h in the active hours 07-22 BRT> [<hours_ago_lo>:<hours_ago_hi>:<exact rate/h>]... — a dispatcher log with
+# a deterministic jitter (seed 7) on the base rate; the overridden hours have an EXACT count, so a block's band does not depend on luck
+genband() {
+  python3 - "$1" "$NOW" "$2" "$3" "${@:4}" <<'PY'
+import sys, datetime, random
+city, now, days, rate = sys.argv[1], float(sys.argv[2]), float(sys.argv[3]), float(sys.argv[4])
+over = [tuple(float(x) for x in s.split(":")) for s in sys.argv[5:]]
+brt = datetime.timezone(datetime.timedelta(hours=-3))
+rng = random.Random(7)
+def st(t): return datetime.datetime.fromtimestamp(t, brt).strftime("%Y-%m-%d %H:%M:%S")
+out = ["[%s] [quality-gate-dispatcher] dispatcher start" % st(now - days * 86400 - 600)]
+n, t = 0, (int(now - days * 86400) // 3600) * 3600
+while t < now:
+    h = datetime.datetime.fromtimestamp(t, brt).hour
+    ago_lo, ago_hi = (now - t - 3600) / 3600.0, (now - t) / 3600.0
+    exact = [rr for lo, hi, rr in over if ago_lo >= lo and ago_hi <= hi]
+    if exact: c = int(exact[0])
+    elif 7 <= h < 22: c = max(0, int(round(rate + rng.uniform(-1.2, 1.2))))
+    else: c = 0
+    for i in range(c):
+        n += 1
+        out.append("[%s] [quality-gate-dispatcher] === Gate run complete: gate_run=ga-b%d branch=x verdict=PASS elapsed=100s ===" % (st(t + 60 + i * (3000.0 / c)), n))
+    t += 3600
+open(city + "/.gc/logs/quality-gate-dispatcher.log", "w").write("\n".join(sorted(out)) + "\n")
+PY
+}
+newband() { newcity "$1"; export FAKE_BD_LOG="$W/$1.bd" FAKE_CLAUDE_LOG="$W/$1.claude"; : > "$FAKE_BD_LOG"; : > "$FAKE_CLAUDE_LOG"; }
+calls() { grep -c '^CALL ' "$1"; }
+NOW_NIGHT="$(TZ=UTC python3 -c 'import datetime;print(int(datetime.datetime(2026,11,15,2,0,0,tzinfo=datetime.timezone.utc).timestamp()))')"  # 23:00 BRT on 14/11
+
+# T17 the headline: a STABLE shortfall (3/h for 14 days, far under the 8/h target) is no alarm any more; the old fixed rule alarmed on it
+newband t17; genband "$C" 15 3; focus "$C" 4 "$((NOW-60))"
+OUT="$(meter)"; RC=$?
+[ "$RC" = 0 ] && echo "$OUT" | grep -q 'FAIXA ok:' && ! echo "$OUT" | grep -q 'ALARM' && [ "$(mails)" = 0 ] && [ "$(calls "$FAKE_BD_LOG")" = 0 ] && ok || bad "T17 steady shortfall must stay quiet under the bands: rc=$RC mails=$(mails) out=$OUT"
+[ -z "$(state alarm_since)" ] && ok || bad "T17 the fixed rule's state must stay untouched"
+OUT="$(GTM_BANDS=0 meter)"; echo "$OUT" | grep -q 'ALARM: ' && [ "$(mails)" = 1 ] && ok || bad "T17b control: with the bands off the SAME log alarms by the fixed rule (that is the noise the bands remove): mails=$(mails) out=$OUT"
+
+# T18 a collapse (the 07-10 block has NO review) → 3σ: ONE diagnosis, ONE bead, ONE mail citing both; nothing repeats
+newband t18; genband "$C" 15 3 "2:5:0"; focus "$C" 0 "$((NOW-60))"
+OUT="$(meter)"; RC=$?
+[ "$RC" = 0 ] && echo "$OUT" | grep -q 'FAIXA 3σ \[WE1' && [ "$(mails)" = 1 ] && [ "$(calls "$FAKE_CLAUDE_LOG")" = 1 ] && ok || bad "T18 3σ: rc=$RC mails=$(mails) claude=$(calls "$FAKE_CLAUDE_LOG") out=$OUT"
+grep -q '^CALL mail send mayor -s Gate MUITO fora da faixa (3σ)' "$FAKE_GC_LOG" && grep -q 'ga-test01' "$FAKE_GC_LOG" && grep -q 'diagnóstico de teste' "$FAKE_GC_LOG" && grep -q 'Meta do produto' "$FAKE_GC_LOG" && ok || bad "T18 mail must name the band, the bead, the diagnosis and the target as a reference: $(cat "$FAKE_GC_LOG")"
+grep -q -- '--tools Read,Grep,Glob' "$FAKE_CLAUDE_LOG" && ! grep -q -- 'Bash' "$FAKE_CLAUDE_LOG" && ok || bad "T18 the diagnostician is read-only by construction: $(cat "$FAKE_CLAUDE_LOG")"
+grep -q 'quality-gate-dispatcher.log' "$FAKE_CLAUDE_LOG.stdin" && grep -q 'gate-focus.state' "$FAKE_CLAUDE_LOG.stdin" && grep -q 'Últimos pontos' "$FAKE_CLAUDE_LOG.stdin" && ok || bad "T18 the evidence must point at THIS meter's files and carry the series tail: $(cat "$FAKE_CLAUDE_LOG.stdin")"
+grep -q 'nos últimos 14 dias' "$FAKE_GC_LOG" && ! grep -q 'últimas 14 dias' "$FAKE_GC_LOG" && grep -q 'Último ponto (até 14/11 10:00): 0 revisadas/3h, z = ' "$FAKE_GC_LOG" && ok || bad "T18 mail wording: $(cat "$FAKE_GC_LOG")"
+grep -q 'create --silent -t bug -p 1' "$FAKE_BD_LOG" && grep -q 'bands:ep:gate_throughput-20261114-1200' "$FAKE_BD_LOG" && ok || bad "T18 bead: $(cat "$FAKE_BD_LOG")"
+for k in 1 2 3; do python3 -I "$M" --city "$C" --now "$((NOW+300*k))" >/dev/null 2>&1; done
+[ "$(mails)" = 1 ] && [ "$(calls "$FAKE_CLAUDE_LOG")" = 1 ] && [ "$(grep -c ' create ' "$FAKE_BD_LOG")" = 1 ] && ok || bad "T18b nothing may repeat on the runs that follow: mails=$(mails) claude=$(calls "$FAKE_CLAUDE_LOG") bd=$(cat "$FAKE_BD_LOG")"
+[ -z "$(state alarm_since)" ] && ok || bad "T18c the bands do not touch the fixed rule's alarm state"
+
+# T19 2σ (two low blocks in a row of the series): the diagnosis and ONE mail, no bead (proposing a fix is for 3σ)
+newband t19; genband "$C" 15 3 "2:5:1" "14:17:1"; focus "$C" 0 "$((NOW-60))"
+OUT="$(meter)"
+echo "$OUT" | grep -q 'FAIXA 2σ \[WE2\]' && [ "$(mails)" = 1 ] && [ "$(calls "$FAKE_CLAUDE_LOG")" = 1 ] && [ "$(grep -c ' create ' "$FAKE_BD_LOG")" = 0 ] && grep -q 'Gate fora da faixa (2σ)' "$FAKE_GC_LOG" && ok || bad "T19 2σ: mails=$(mails) claude=$(calls "$FAKE_CLAUDE_LOG") out=$OUT / $(cat "$FAKE_GC_LOG")"
+
+# T20 the mail fails (gc down) → rc 1, nothing stamped; when gc is back the next run delivers and does not spend the diagnosis again
+newband t20; genband "$C" 15 3 "2:5:0"; focus "$C" 0 "$((NOW-60))"; echo 1 > "$FAKE_GC_RC_FILE"
+OUT="$(meter)"; RC=$?
+[ "$RC" = 1 ] && echo "$OUT" | grep -q 'WARN: mail da faixa 3σ FALHOU' && ok || bad "T20 failing mail: rc=$RC out=$OUT"
+echo 0 > "$FAKE_GC_RC_FILE"; python3 -I "$M" --city "$C" --now "$((NOW+300))" >/dev/null 2>&1
+[ "$(grep -c '^CALL mail send mayor -s Gate MUITO' "$FAKE_GC_LOG")" = 2 ] && [ "$(calls "$FAKE_CLAUDE_LOG")" = 1 ] && [ "$(grep -c ' create ' "$FAKE_BD_LOG")" = 1 ] && ok || bad "T20 retry: gc=$(cat "$FAKE_GC_LOG") claude=$(calls "$FAKE_CLAUDE_LOG") bd=$(cat "$FAKE_BD_LOG")"
+
+# T21 shadow (GTM_BANDS=shadow): the fixed rule still decides; the bands only count what they WOULD have done
+newband t21; genband "$C" 15 3 "2:5:0"; focus "$C" 0 "$((NOW-60))"
+OUT="$(GTM_BANDS=shadow meter)"
+echo "$OUT" | grep -q 'ALARM: ' && [ "$(mails)" = 1 ] && grep -q '^CALL mail send mayor -s Gate abaixo de 8,0/h' "$FAKE_GC_LOG" && [ "$(calls "$FAKE_CLAUDE_LOG")" = 0 ] && [ "$(calls "$FAKE_BD_LOG")" = 0 ] && ok || bad "T21 shadow must leave the fixed rule in charge and call nothing: mails=$(mails) out=$OUT"
+grep -q '"ev": "would_deliver"' "$C/.gc/state/bands/ledger.jsonl" && grep -q '"shadow": true' "$C/.gc/state/bands/ledger.jsonl" && ok || bad "T21 the ledger must carry what the bands would have sent: $(cat "$C/.gc/state/bands/ledger.jsonl" 2>&1)"
+
+# T22 kill-switch GTM_BANDS=0 → the old rule only, and the bands do not even create their directory
+newband t22; genband "$C" 15 3 "2:5:0"; focus "$C" 0 "$((NOW-60))"
+OUT="$(GTM_BANDS=0 meter)"
+echo "$OUT" | grep -q 'ALARM: ' && [ "$(mails)" = 1 ] && [ ! -e "$C/.gc/state/bands" ] && ok || bad "T22 GTM_BANDS=0: mails=$(mails) bands-dir=$(ls "$C/.gc/state" 2>&1) out=$OUT"
+
+# T23 silence 22-07: a 3σ at 23:00 is judged by nobody (the alarm waits, it is not lost): no mail, no claude, no bead, no state
+newband t23; genband "$C" 15 3 "2:5:0"; focus "$C" 0 "$((NOW_NIGHT-60))"
+OUT="$(python3 -I "$M" --city "$C" --now "$NOW_NIGHT" 2>&1)"; RC=$?
+[ "$RC" = 0 ] && echo "$OUT" | grep -q 'SILÊNCIO 22-07 h' && ! echo "$OUT" | grep -q 'ALARM' && [ "$(mails)" = 0 ] && [ "$(calls "$FAKE_CLAUDE_LOG")" = 0 ] && ok || bad "T23 silence: rc=$RC mails=$(mails) out=$OUT"
+
+# T24 --report prints the band line and stays read-only (no bands dir, no lock, no mail); --dry-run decides and sends nothing
+newband t24; genband "$C" 15 3 "2:5:0"; focus "$C" 0 "$((NOW-60))"
+OUT="$(meter --report)"
+echo "$OUT" | grep -q 'FAIXA 3σ' && [ ! -e "$C/.gc/state/bands" ] && [ "$(mails)" = 0 ] && ok || bad "T24 --report: state=$(ls "$C/.gc" 2>&1) out=$OUT"
+OUT="$(meter --dry-run)"
+echo "$OUT" | grep -q 'FAIXA 3σ' && [ "$(mails)" = 0 ] && [ "$(calls "$FAKE_CLAUDE_LOG")" = 0 ] && [ ! -e "$C/.gc/state/bands/gate_throughput.json" ] && ok || bad "T24b --dry-run: mails=$(mails) out=$OUT"
+
+# T25 the bands cannot start (config unreadable) → loud WARN and the OLD rule stays in charge; never silence
+newband t25; genband "$C" 15 3 "2:5:0"; focus "$C" 0 "$((NOW-60))"
+OUT="$(GTM_BANDS_CONFIG="$W/nonexistent/bands.yaml" meter)"
+echo "$OUT" | grep -q 'WARN: faixas indisponíveis' && echo "$OUT" | grep -q 'ALARM: ' && [ "$(mails)" = 1 ] && ok || bad "T25 unreadable bands.yaml: mails=$(mails) out=$OUT"
+printf 'version: 1\nmetrcs:\n' > "$W/typo.yaml"
+newband t25b; genband "$C" 15 3 "2:5:0"; focus "$C" 0 "$((NOW-60))"
+OUT="$(GTM_BANDS_CONFIG="$W/typo.yaml" meter)"
+echo "$OUT" | grep -q 'WARN: faixas indisponíveis' && [ "$(mails)" = 1 ] && ok || bad "T25b a typo in bands.yaml must not silence the gate alarm: out=$OUT"
+
+# T26 learning: a log with only 5 days has too few blocks for a baseline → the old rule decides (no regression while the bands learn)
+newband t26; genband "$C" 5 3 "2:5:0"; focus "$C" 0 "$((NOW-60))"
+OUT="$(meter)"
+echo "$OUT" | grep -q 'FAIXA aprendendo' && echo "$OUT" | grep -q 'ALARM: ' && [ "$(mails)" = 1 ] && ok || bad "T26 learning: mails=$(mails) out=$OUT"
+
+# T27 an alarm state left by the old rule is cleared when the bands take over (a later fallback must not think an alarm is still open)
+newband t27; genband "$C" 15 3; focus "$C" 4 "$((NOW-60))"
+echo "{\"alarm_since\": $((NOW-90000)), \"last_mail\": $((NOW-90000)), \"blind_since\": 5}" > "$C/.gc/state/gate-throughput-meter.json"
+meter >/dev/null
+[ -z "$(state alarm_since)" ] && [ -z "$(state last_mail)" ] && [ -z "$(state blind_since)" ] && ok || bad "T27 legacy keys (an old blindness is over too: a stale blind_since would fire the next blindness mail at once): alarm_since=$(state alarm_since) last_mail=$(state last_mail) blind_since=$(state blind_since)"
+
+# T28 a dismissal (bands.py dismiss): the same data is NOT re-alarmed, and the reason is in the ledger
+newband t28; genband "$C" 15 3 "2:5:0"; focus "$C" 0 "$((NOW-60))"
+meter >/dev/null
+python3 -I "$S_DIR/bands.py" dismiss --city "$C" --metric gate_throughput --reason "manutenção planejada do gate" --by teste --now "$((NOW+60))" >/dev/null
+OUT="$(python3 -I "$M" --city "$C" --now "$((NOW+120))" 2>&1)"
+echo "$OUT" | grep -q 'FAIXA ok' && [ "$(mails)" = 1 ] && grep -q 'manutenção planejada do gate' "$C/.gc/state/bands/ledger.jsonl" && ok || bad "T28 dismissal: mails=$(mails) out=$OUT"
 
 echo "gate-throughput-meter.selftest: $PASS ok, $FAIL failed"
 [ "$FAIL" = 0 ]

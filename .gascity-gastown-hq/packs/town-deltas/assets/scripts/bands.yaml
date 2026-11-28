@@ -1,0 +1,69 @@
+# bands.yaml — faixas estatísticas dos vigias (ga-4mzkfj9, Athos 28/11). Versionado: mudar uma faixa é um commit.
+# Lido por bands.py com um leitor ESTRITO de subconjunto de YAML (o /usr/bin/python3 do mini não tem PyYAML): mapas com 2
+# espaços, escalares, listas em linha. Chave desconhecida ou valor fora da faixa = erro (typo não desliga alarme em silêncio).
+# O que cada chave faz, como dispensar um alarme e como ler a contagem antes/depois: docs/runbooks/alarm-bands.md
+version: 1
+
+# Horas locais (BRT) em que nada interrompe ninguém. Métrica com ritmo diário (o gate) não é julgada nesse intervalo: o 1º ponto novo
+# depois dele é. Métrica com evaluate_in_silence: true segue sendo julgada e só a ENTREGA espera a manhã. "off" desliga.
+silence: "22-07"
+
+# 2σ: o agente que só lê. claude -p com Read/Grep/Glob e mais nenhuma ferramenta (restrição por construção, não por prosa).
+diagnose:
+  enabled: true
+  model: sonnet
+  effort: medium
+  max_usd: 1.0
+  timeout_s: 600
+  max_attempts: 2
+  max_per_day: 4
+
+# 3σ: a proposta de conserto vira bead (o gate revisa o que a bead construir).
+# labels = a postura de despacho da bead. O padrão é o mesmo do gate-refusal-checks.py, o outro vigia que abre bead sozinho: nasce
+# aprovada e vai direto a um builder, com o texto do modelo fechado em <conteudo_externo> (dado, nunca instrução), encurtado, e as
+# TRAVAS escritas na bead; o gate revisa o que ela construir. Quem preferir um humano/Mayor aprovando ANTES de um builder agir troca
+# esta lista (rótulos que o Pilot não despacha); nada de story:needs-approval, que cai na fila do Athos sem dizer o que ele faz.
+bead:
+  enabled: true
+  route: gastown.dog
+  labels: ["exec:auto", "story:approved"]
+  max_attempts: 3
+  max_per_day: 2
+
+metrics:
+  gate_throughput:
+    description: "revisadas pelo gate por bloco de 3 h, 07-22 h; a meta de 8/h do Athos segue como referência no relatório da manhã, não como gatilho"
+    mode: live
+    direction: low
+    transform: sqrt_count
+    unit: "revisadas/3h"
+    block_hours: 3
+    active_from: 7
+    active_to: 22
+    baseline_days: 14
+    min_baseline_points: 20
+    fresh_for_h: 4
+    recover_after_h: 6
+    bead_type: bug
+    bead_priority: 1
+    legacy_log: ".gc/logs/gate-throughput-meter.log"
+    legacy_pattern: "MAIL: alarme enviado ao Mayor"
+
+  disk_free_delta:
+    description: "queda do espaço livre do volume do Dolt e do swap, em MiB por hora. SÓ SOMBRA: os pisos fixos (dolt-disk-floor-guard e cia.) seguem agindo; isto conta o que as faixas diriam"
+    mode: shadow
+    driver: tick
+    collector: disk_free_delta
+    path: "/private/var/vm"
+    direction: low
+    unit: "MiB/h"
+    min_sigma: 100
+    baseline_days: 14
+    min_baseline_points: 48
+    fresh_for_h: 2
+    recover_after_h: 3
+    evaluate_in_silence: true
+    # antes: SUBCONTAGEM declarada. Só entram os mails de CRITICAL ao Mayor (a linha «mailing Mayor» do guarda de disco); avisos do
+    # nível WARN e nudges aos pools não têm linha própria que eu tenha confirmado no log, então não entram na conta.
+    legacy_log: ".gc/logs/dolt-disk-floor-guard.log"
+    legacy_pattern: "mailing Mayor [(]avail="
